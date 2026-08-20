@@ -35,6 +35,7 @@ quality one — it can never buy cheaper egress with a worse pixel.
 from __future__ import annotations
 
 import datetime
+import functools
 import itertools
 import logging
 import re
@@ -42,6 +43,7 @@ from collections.abc import Iterable, Sequence
 from typing import Any
 
 from tessera_embeddings.ingest.asset_locations import (
+    READ_ASSET_KEYS,
     item_is_in_preferred_location,
     read_set_is_complete,
 )
@@ -89,7 +91,10 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
     return int(match.group(1)) if match else None
 
 
-def _preference_key(item: Any) -> tuple[int, float, int, int, int, int, str]:  # noqa: ANN401
+def _preference_key(
+    item: Any,  # noqa: ANN401
+    read_keys: tuple[str, ...] = READ_ASSET_KEYS,
+) -> tuple[int, float, int, int, int, int, str]:
     """How much we would rather read this copy than another. Lower sorts first.
 
     **Context-free:** no term is relative to the set being sorted, so the same key orders copies
@@ -105,8 +110,9 @@ def _preference_key(item: Any) -> tuple[int, float, int, int, int, int, str]:  #
     3. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
        cheaper egress with an older pixel, and inert for unreadable baselines so it cannot decide
        a comparison the baseline could not enter.
-    4. **Read-set completeness.** A copy missing an asset we would read cannot deliver the
-       tile-date, so it loses to one that can.
+    4. **Read-set completeness**, over ``read_keys`` — the assets THIS load will request, extra
+       bands included. A copy missing one of them cannot deliver the tile-date, so it loses to one
+       that can.
     5. **Sequence, descending, then id.** The id makes the order total, so the choice is
        independent of catalogue response order and a rerun cannot produce a different mosaic.
     """
@@ -115,15 +121,15 @@ def _preference_key(item: Any) -> tuple[int, float, int, int, int, int, str]:  #
     return (
         0 if baseline is not None else 1,
         -(baseline or 0.0),
-        (0 if item_is_in_preferred_location(item) else 1) if baseline is not None else 0,
-        0 if read_set_is_complete(item) else 1,
+        (0 if item_is_in_preferred_location(item, keys=read_keys) else 1) if baseline is not None else 0,
+        0 if read_set_is_complete(item, read_keys) else 1,
         0 if sequence is not None else 1,
         -(sequence or 0),
         str(getattr(item, "id", "")),
     )
 
 
-def _rank_copies(copies: list[Any]) -> list[Any]:
+def _rank_copies(copies: list[Any], read_keys: tuple[str, ...] = READ_ASSET_KEYS) -> list[Any]:
     """Order copies of one acquisition, PREFERRED first.
 
     An unreadable baseline ranks last rather than suspending the comparison: such a copy refuses
@@ -131,7 +137,7 @@ def _rank_copies(copies: list[Any]) -> list[Any]:
     read-failure ladder recovers from a read error but not from a refusal. A reprocessing that can
     be corrected beats a newer one that cannot be processed at all.
     """
-    return sorted(copies, key=_preference_key)
+    return sorted(copies, key=functools.partial(_preference_key, read_keys=read_keys))
 
 
 #: How far apart two acquisition instants must be to be different acquisitions rather
@@ -199,12 +205,18 @@ def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
 
 def select_preferred_duplicates(
     items: Sequence[Any],
+    read_keys: tuple[str, ...] = READ_ASSET_KEYS,
 ) -> tuple[list[Any], dict[tuple[str, str], list[Any]]]:
     """Keep one item per (tile, solar day); return the survivors and the alternates.
 
     Items must already be normalised to solar days — the grouping key is the solar day, so
     an un-normalised item would be grouped under the wrong one. :func:`solar_day_of` raises
     rather than guessing, which is what enforces the ordering.
+
+    ``read_keys`` is the asset set THIS load will request, extra bands included. Readability and
+    locality are judged over it, so a copy missing a band the caller asked for loses to one that
+    has it; judging a fixed set instead let a preferred copy lack a requested extra asset and fail
+    at load.
 
     Items whose tile cannot be determined are passed through untouched and never grouped:
     the radar path has no such duplicates, and an item we cannot key is safer kept than
@@ -245,14 +257,14 @@ def select_preferred_duplicates(
     for key, copies in groups.items():
         rejected: list[Any] = []
         for acquisition in _by_acquisition(copies):
-            ranked = _rank_copies(acquisition)
+            ranked = _rank_copies(acquisition, read_keys)
             survivors.add(id(ranked[0]))
             rejected.extend(ranked[1:])
         if rejected:
             # ONE order over every rejected copy of the tile-date, not a concatenation of
             # per-acquisition ladders. The unattributed recovery consumes `copies[0]` on each
             # retry, so every position is a choice and the whole list has to be ranked.
-            alternates[key] = sorted(rejected, key=_preference_key)
+            alternates[key] = sorted(rejected, key=functools.partial(_preference_key, read_keys=read_keys))
 
     kept = [it for it in items if id(it) in survivors]
     return kept, alternates

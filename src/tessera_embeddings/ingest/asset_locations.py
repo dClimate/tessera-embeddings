@@ -172,14 +172,15 @@ def read_set_is_complete(item: Any, keys: tuple[str, ...] = READ_ASSET_KEYS) -> 
 def item_is_in_preferred_location(
     item: Any,  # noqa: ANN401 — any STAC-like item
     buckets: frozenset[str] = PREFERRED_ASSET_BUCKETS,
+    keys: tuple[str, ...] = READ_ASSET_KEYS,
 ) -> bool:
     """Whether every asset this ingest would READ sits in a preferred bucket.
 
-    All of the read set, not any. An item whose bands straddle two buckets cannot deliver the
-    locality being claimed, and an incomplete item cannot deliver the read at all. An item
-    exposing none of them is remote: absence of evidence is not locality.
+    All of ``keys``, not any. An item whose bands straddle two buckets cannot deliver the locality
+    being claimed, and an incomplete item cannot deliver the read at all. An item exposing none of
+    them is remote: absence of evidence is not locality.
     """
-    return read_asset_sources(item).all_in(buckets)
+    return read_asset_sources(item, keys).all_in(buckets)
 
 
 class Harmonisation(enum.Enum):

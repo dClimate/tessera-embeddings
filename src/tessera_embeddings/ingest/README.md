@@ -1307,9 +1307,10 @@ The key reads five fields, in this order:
 2. **Locality, among equal baselines only.** A copy whose read assets all sit in a preferred
    bucket is cheaper to read, so it wins a baseline tie. Restricting locality to ties is what
    stops it buying cheaper egress with an older pixel.
-3. **Read-set completeness.** A copy missing any asset the ingest would read cannot deliver
-   the tile-date, so it loses to one that can. Without this term an unreadable copy could win
-   an otherwise total tie on the alphabetical id tiebreak.
+3. **Read-set completeness**, judged over the assets *this* load will request — extra bands
+   included, not a fixed list. A copy missing one of them cannot deliver the tile-date, so it
+   loses to one that can. Callers pass their own set: `ingest_tile` derives it from
+   `_loadable_assets`, and `s2_roi` from the extra-band list its loads use.
 4. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of
    catalogue response order, so a rerun cannot silently produce a different mosaic — and it makes
    the key a total order, so no comparison ever falls back to input order.

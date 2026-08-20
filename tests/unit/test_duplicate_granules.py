@@ -1178,3 +1178,39 @@ class TestCompletenessSurvivesTheSequenceOnlyFallback:
         older = self._copy("older", sequence="1", baseline="05.00", complete=True)
         kept, _ = select_preferred_duplicates([unreadable, newer, older])
         assert [it.id for it in kept] == ["newer"]
+
+
+class TestRankingJudgesTheAssetsThisLoadWillRequest:
+    """Readability is judged over the set the caller asked for, extra bands included.
+
+    A fixed read set let a preferred copy lack a requested extra asset while a rejected copy had
+    it; `odc.stac.load` then asked for that band and either failed or returned missing coverage.
+    """
+
+    def _copy(self, ident: str, *, sequence: str, extra: bool) -> _Item:
+        assets = _bands_at(_IN_REGION)
+        if extra:
+            assets["qa"] = {"href": f"{_IN_REGION}/qa.tif"}
+        return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **{"s2:processing_baseline": "05.00"}), assets)
+
+    def test_a_copy_missing_a_requested_extra_band_loses(self) -> None:
+        without = self._copy("newer-without-qa", sequence="9", extra=False)
+        with_qa = self._copy("older-with-qa", sequence="1", extra=True)
+        kept, _ = select_preferred_duplicates([without, with_qa], (*READ_ASSET_KEYS, "qa"))
+        assert [it.id for it in kept] == ["older-with-qa"]
+
+    def test_the_same_pair_prefers_the_newer_copy_when_the_band_is_not_requested(self) -> None:
+        """The complement: the extra band must only matter when the caller asks for it."""
+        without = self._copy("newer-without-qa", sequence="9", extra=False)
+        with_qa = self._copy("older-with-qa", sequence="1", extra=True)
+        kept, _ = select_preferred_duplicates([without, with_qa])
+        assert [it.id for it in kept] == ["newer-without-qa"]
+
+    def test_locality_is_judged_over_the_requested_set_too(self) -> None:
+        """A remote extra band makes the copy remote, since that read costs egress as well."""
+        local = _with_assets(
+            _Item("x", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"}),
+            {**_bands_at(_IN_REGION), "qa": {"href": f"{_REMOTE}/qa.jp2"}},
+        )
+        assert item_is_in_preferred_location(local) is True, "not requested: irrelevant"
+        assert item_is_in_preferred_location(local, keys=(*READ_ASSET_KEYS, "qa")) is False

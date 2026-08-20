@@ -1388,7 +1388,9 @@ def ingest_tile(
         # query left that driver with an empty ladder, so a single unreadable object lost the date
         # instead of stepping down to the copy sitting behind it. Selection belongs to the layer
         # that owns the fallback — which here is nobody, so the copies are genuinely spare.
-        items, alternates = select_preferred_duplicates(items)
+        items, alternates = select_preferred_duplicates(
+            items, tuple(sorted(_loadable_assets(collection_config, extra_bands)))
+        )
         log_duplicate_selection(logger, f"tile {tile_id}" if tile_id else f"bbox {bbox}", alternates, kept=items)
         # Provenance must describe what was KEPT. `query_stac_items` built this map from the
         # unpruned list, so a rejected copy that happened to sort last supplied the recorded

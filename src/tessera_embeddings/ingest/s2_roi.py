@@ -57,6 +57,7 @@ import xarray as xr
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS, auto_batch_dates
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
+from tessera_embeddings.ingest.asset_locations import READ_ASSET_KEYS
 from tessera_embeddings.ingest.duplicates import (
     copies_label,
     is_unreadable_source,
@@ -123,6 +124,10 @@ logger = logging.getLogger(__name__)
 #: the asset at query time and the load then fails on a band that was there in the
 #: catalogue. Passing the same tuple to both is what makes the two agree.
 _LOADED_EXTRA_BANDS = ["scl"]
+
+#: The assets this driver's loads request, which is what duplicate selection judges a copy's
+#: readability over. Built from the same extra-band list the loads pass, so the two cannot drift.
+_READ_ASSET_KEYS: tuple[str, ...] = (*READ_ASSET_KEYS, *(b for b in _LOADED_EXTRA_BANDS if b not in READ_ASSET_KEYS))
 
 
 @final
@@ -769,7 +774,7 @@ def ingest_s2_roi_reflectance(
         # read failure. (The BASELINE a date is corrected by is derived later, from the
         # items a preparation actually loads — pruning here does not by itself make the two
         # agree, and an earlier version of this comment claimed it did.)
-        items, alternates = select_preferred_duplicates(items)
+        items, alternates = select_preferred_duplicates(items, _READ_ASSET_KEYS)
         log_duplicate_selection(log, roi_label, alternates, kept=items)
         date_alternates.update(alternates)
 
