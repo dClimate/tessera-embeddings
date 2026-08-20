@@ -76,3 +76,20 @@ class TestUnreadableIsOneThing:
     def test_a_large_but_representable_value_still_parses(self) -> None:
         """So the guard rejects only what genuinely cannot be scaled."""
         assert processing_baseline(_item("1e10")) == 10**12
+
+
+class TestANegativeBaselineIsNotAVersion:
+    """A negative processing version is no evidence that pixels predate baseline 04.00.
+
+    Read as a real value it sits below every threshold, so an unharmonised item carrying one was
+    exempted from a correction it may well have been owed. Raised on PR #107.
+    """
+
+    @pytest.mark.parametrize("raw", ["-1.00", "-0.01", "-99", -4.0])
+    def test_a_negative_baseline_is_unreadable(self, raw: object) -> None:
+        assert processing_baseline(_item(raw)) is None
+
+    def test_zero_is_still_readable(self) -> None:
+        """The boundary: 0 is a real declared value, and distinguishable from "declared nothing"."""
+        assert processing_baseline(_item("00.00")) == 0
+        assert processing_baseline(_item(None)) is None

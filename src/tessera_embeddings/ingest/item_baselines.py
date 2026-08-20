@@ -28,9 +28,11 @@ BASELINE_SCALE = 100
 def processing_baseline(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like item
     """The baseline an item declares, as an integer hundredth, or ``None`` if it declares none.
 
-    ``"NaN"`` and ``"Infinity"`` are rejected: :func:`float` accepts both, and neither is a
-    baseline — every NaN comparison is false, and an infinity outranks every real value. A finite
-    value that overflows when scaled is rejected for the same reason.
+    ``"NaN"``, ``"Infinity"`` and negatives are rejected: :func:`float` accepts all three, and
+    none is a baseline. Every NaN comparison is false, an infinity outranks every real value, and a
+    negative version is no evidence that pixels predate baseline 04.00 — read as a real value it
+    would sit below every threshold and exempt the date from a correction it may well be owed. A
+    finite value that overflows when scaled is rejected for the same reason.
     """
     properties = getattr(item, "properties", None)
     raw = properties.get("s2:processing_baseline") if isinstance(properties, dict) else None
@@ -40,6 +42,9 @@ def processing_baseline(item: Any) -> int | None:  # noqa: ANN401 — any STAC-l
         value = float(raw)
     except (TypeError, ValueError):
         logger.debug("Unparseable s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
+        return None
+    if value < 0:
+        logger.debug("Negative s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
         return None
     scaled = value * BASELINE_SCALE if math.isfinite(value) else value
     if not math.isfinite(scaled):

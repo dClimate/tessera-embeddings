@@ -1367,9 +1367,11 @@ def ingest_tile(
         item_provider_fn: Optional callable that returns ready-to-load items,
               bypassing CMR-STAC search entirely. Used by the OPERA RTC-S1
               path to build items from the native CMR granule API.
-        preserve_low_values: When True, baseline correction only subtracts
-              from pixels >= abs(offset), matching Tessera's harmonize_arr().
-              When False (default), subtracts from all pixels.
+        preserve_low_values: When True (default), baseline correction only subtracts
+              from pixels >= abs(offset), matching Tessera's harmonize_arr(), and
+              returns the input dtype. When False, subtracts from all pixels and
+              returns int16, so low values go negative — not compatible with the
+              unsigned ROI store.
         groupby: How to group STAC items into time slices. Must be "solar_day",
               which merges same-day tiles into one mosaic; :func:`_load_from_stac`
               rejects anything else and says why.

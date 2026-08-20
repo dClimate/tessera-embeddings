@@ -1251,3 +1251,51 @@ class TestTheAuditUsesTheSameReadSetAsSelection:
         caplog.clear()
         # With the fixed default it lacks `scl` and is reported remote, contradicting the decision.
         assert "0 in-region, 1 remote" in self._emit(caplog, [winner], alternates)
+
+
+class TestACopyThatWouldRefuseItsDateLosesToOneThatWouldNot:
+    """A copy whose reflectance bands span a harmonised and a raw producer refuses its date at or
+    above the correction threshold, and nothing retries a refusal — the fallback ladder steps down
+    on a read error, not on this. So it must lose to a homogeneous copy, even an older one.
+    Raised on PR #107.
+    """
+
+    @staticmethod
+    def _copy_at_baseline(ident: str, baseline: str, *, mixed: bool, sequence: str = "0") -> _Item:
+        assets = _bands_at(_IN_REGION)
+        if mixed:
+            assets["red"] = {"href": f"{_REMOTE}/B04.jp2"}
+        return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **{"s2:processing_baseline": baseline}), assets)
+
+    def test_a_homogeneous_older_copy_beats_a_mixed_newer_one(self) -> None:
+        mixed_new = self._copy_at_baseline("mixed-05", "05.00", mixed=True)
+        clean_old = self._copy_at_baseline("clean-04", "04.00", mixed=False)
+        kept, alternates = select_preferred_duplicates([mixed_new, clean_old])
+        assert [it.id for it in kept] == ["clean-04"]
+        assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["mixed-05"]
+
+    def test_below_the_threshold_the_baseline_still_decides(self) -> None:
+        """The term is inert there: a mixed producer changes no pixel that gets no offset."""
+        mixed_new = self._copy_at_baseline("mixed-03", "03.00", mixed=True)
+        clean_old = self._copy_at_baseline("clean-02", "02.00", mixed=False)
+        kept, _ = select_preferred_duplicates([mixed_new, clean_old])
+        assert [it.id for it in kept] == ["mixed-03"]
+
+    def test_two_homogeneous_copies_are_still_ranked_on_baseline(self) -> None:
+        """The complement, or the term could be penalising everything."""
+        new = self._copy_at_baseline("clean-05", "05.00", mixed=False)
+        old = self._copy_at_baseline("clean-04", "04.00", mixed=False)
+        kept, _ = select_preferred_duplicates([new, old])
+        assert [it.id for it in kept] == ["clean-05"]
+
+    def test_an_incomplete_copy_is_not_penalised_twice(self) -> None:
+        """It is already last on completeness, and reports an undecidable producer BECAUSE it is
+        incomplete — counting that again inverted the baseline preference among incomplete copies.
+        """
+        assets = {k: {"href": f"{_IN_REGION}/{k}"} for k in READ_ASSET_KEYS[:3]}
+        newer = _with_assets(_Item("partial-05", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"}), assets)
+        older = _with_assets(
+            _Item("partial-04", "MGRS-33TWM", "0", **{"s2:processing_baseline": "04.00"}), dict(assets)
+        )
+        kept, _ = select_preferred_duplicates([newer, older])
+        assert [it.id for it in kept] == ["partial-05"]

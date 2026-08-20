@@ -42,8 +42,11 @@ import re
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+from tessera_embeddings.config.satellites import S2_BASELINE_THRESHOLD
 from tessera_embeddings.ingest.asset_locations import (
     READ_ASSET_KEYS,
+    Harmonisation,
+    item_harmonisation,
     item_is_in_preferred_location,
     read_set_is_complete,
 )
@@ -91,10 +94,34 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
     return int(match.group(1)) if match else None
 
 
+def _would_refuse_its_date(
+    item: Any,  # noqa: ANN401
+    baseline: int | None,
+    read_keys: tuple[str, ...],
+) -> bool:
+    """Whether choosing this otherwise-usable copy makes its date refuse rather than load.
+
+    :func:`~tessera_embeddings.ingest.stac.dates_exempt_from_correction` refuses a date at or above
+    the threshold whose item straddles two producers, or whose producer cannot be identified,
+    because no date-wide offset decision is correct for it. Nothing retries a refusal — the
+    read-failure ladder steps down on a read error, not on this — so a copy that causes one must
+    lose to a copy that does not, even an older one.
+
+    Only asked of copies whose read set is complete. An incomplete copy is already ranked last, and
+    it reports an undecidable producer *because* it is incomplete, so counting it here would say the
+    same thing twice and invert the baseline preference among copies that are all incomplete.
+    """
+    if baseline is None or baseline < S2_BASELINE_THRESHOLD:
+        return False
+    if not read_set_is_complete(item, read_keys):
+        return False
+    return item_harmonisation(item) in (Harmonisation.MIXED, Harmonisation.UNKNOWN)
+
+
 def _preference_key(
     item: Any,  # noqa: ANN401
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
-) -> tuple[int, int, float, int, int, int, str]:
+) -> tuple[int, int, int, float, int, int, int, str]:
     """How much we would rather read this copy than another. Lower sorts first.
 
     **Context-free:** no term is relative to the set being sorted, so the same key orders copies
@@ -107,20 +134,26 @@ def _preference_key(
        because a copy missing one of them cannot deliver the tile-date at any baseline, and the
        generic paths have no recovery for it: a missing band is not one of the read failures the
        fallback ladder recognises, so an incomplete winner fails the acquisition outright.
-    2. **Whether the baseline is readable.** Unknown sorts last: a copy that declares nothing is
-       the copy whose offset correction cannot be decided, which refuses its date downstream.
-    3. **The baseline, descending, by value** — not by "is it the best", so every rung of the
+    2. **Whether the producer is decidable**, where it would matter. A copy whose own reflectance
+       bands span a harmonised and a raw producer, or whose producer cannot be identified at all,
+       refuses its date at or above the correction threshold — and neither the generic path nor the
+       read-failure ladder retries a refusal. Below the threshold the term is inert, because there
+       the producer changes no pixel.
+    3. **Whether the baseline is readable.** Unknown sorts last, for the same reason: a copy that
+       declares nothing is one whose correction cannot be decided, so it refuses its date too.
+    4. **The baseline, descending, by value** — not by "is it the best", so every rung of the
        fallback ladder stays in descending baseline order.
-    4. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
+    5. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
        cheaper egress with an older pixel, and inert for unreadable baselines so it cannot decide
        a comparison the baseline could not enter.
-    5. **Sequence, descending, then id.** The id makes the order total, so the choice is
+    6. **Sequence, descending, then id.** The id makes the order total, so the choice is
        independent of catalogue response order and a rerun cannot produce a different mosaic.
     """
     baseline = item_processing_baseline(item)
     sequence = item_sequence(item)
     return (
         0 if read_set_is_complete(item, read_keys) else 1,
+        1 if _would_refuse_its_date(item, baseline, read_keys) else 0,
         0 if baseline is not None else 1,
         -(baseline or 0.0),
         (0 if item_is_in_preferred_location(item, keys=read_keys) else 1) if baseline is not None else 0,
