@@ -1260,7 +1260,19 @@ sometimes from more than one region. `duplicates.py` reduces each tile-date to o
 copies of one acquisition would be blended into one pixel stack at two different processing
 baselines, and the baseline recorded on the store would match neither.
 
-Copies of one acquisition are ordered on four signals, in this order:
+Preference is expressed as **one sort key** (`_preference_key`), and the property that makes it
+work is that it is **context-free**: no term means "best in my group", so the same tuple orders two
+copies of one acquisition and two copies from different ones. An earlier version ranked against the
+group's own best baseline, which made a cross-acquisition comparison meaningless and needed a
+second key alongside it — after which every fix had to be applied twice, and that is how the
+read-set term reached one key and not the other. If you add a signal, add it here and nowhere else.
+
+The key reads five fields, in this order:
+
+0. **Whether the baseline is readable at all**, with unknown sorting last. An absent baseline is
+   an absence of evidence, and `_extract_baseline` maps it to 0 downstream, so a copy that
+   declares nothing is also the copy whose offset correction will silently be skipped.
+
 
 1. **Processing baseline, descending.** The signal that carries data vintage. Ordered by
    value rather than by "is it the best", so every rung of the fallback ladder stays in
@@ -1273,7 +1285,14 @@ Copies of one acquisition are ordered on four signals, in this order:
    the tile-date, so it loses to one that can. Without this term an unreadable copy could win
    an otherwise total tie on the alphabetical id tiebreak.
 4. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of
-   catalogue response order, so a rerun cannot silently produce a different mosaic.
+   catalogue response order, so a rerun cannot silently produce a different mosaic — and it makes
+   the key a total order, so no comparison ever falls back to input order.
+
+Choosing an acquisition's **winner** is the one place that does not use this key directly: if any
+copy there declares no readable baseline, the whole group falls back to sequence order. Within one
+acquisition an unreadable baseline may still belong to the newest reprocessing, so demoting it
+could select an older one; across acquisitions there is no such reason and the key's own
+unknown-last ordering applies. The audit log names which of the two ran.
 
 Two properties of that ordering are easy to get wrong and are held by tests:
 

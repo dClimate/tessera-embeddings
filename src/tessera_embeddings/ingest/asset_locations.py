@@ -150,9 +150,12 @@ def item_is_in_preferred_location(
     # a COMPLETE remote one on a baseline tie, then fails at load with no source href to
     # attribute, sending the recovery ladder stepping down every duplicated tile-date of that
     # day. Locality is a claim about the whole read, so an incomplete item cannot make it.
-    if not read_set_is_complete(item):
-        return False
-    return all(bucket in buckets for bucket in read_asset_buckets(item))
+    #
+    # Checked from the same walk that reads the buckets rather than by calling
+    # `read_set_is_complete`, which would walk the asset dict and re-parse every href a second
+    # time — this runs once per copy per rank comparison.
+    found = read_asset_buckets(item)
+    return len(found) == len(READ_ASSET_KEYS) and all(bucket in buckets for bucket in found)
 
 
 class Harmonisation(enum.Enum):

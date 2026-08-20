@@ -26,10 +26,12 @@ from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.config.satellites import S2_BASELINE_OFFSET, S2_BASELINE_THRESHOLD
 from tessera_embeddings.ingest.asset_locations import (
     HARMONISED_ASSET_BUCKETS,
+    PREFERRED_ASSET_BUCKETS,
     READ_ASSET_KEYS,
     REFLECTANCE_ASSET_KEYS,
     Harmonisation,
     item_harmonisation,
+    item_is_in_preferred_location,
 )
 from tessera_embeddings.ingest.stac import (
     HeterogeneousProducerError,
@@ -665,3 +667,29 @@ class TestThePerItemCheckIsScopedToTheCollectionThatNeedsIt:
             stac_module.load_stac_items(
                 [self._pc_item()], "earth-search", "sentinel-2-l2a", baselines={"2022-01-07": 510}
             )
+
+
+class TestTheTwoBucketSetsAreIndependent:
+    """`PREFERRED_ASSET_BUCKETS` and `HARMONISED_ASSET_BUCKETS` hold the same values today and
+    mean different things: one is "cheap to read from here", the other is "the offset is already
+    subtracted". Nothing may rely on the coincidence — the day someone mirrors UNHARMONISED data
+    in region, the sets diverge and code that conflated them silently skips a correction.
+    """
+
+    def test_locality_reads_only_the_locality_set(self) -> None:
+        item = _Item(None, "05.00")
+        item.assets = {k: {"href": f"s3://a-new-in-region-mirror/{k}"} for k in READ_ASSET_KEYS}
+        assert item_is_in_preferred_location(item, buckets=frozenset({"a-new-in-region-mirror"})) is True
+        # The same bucket, asked the harmonisation question, is NOT harmonised.
+        assert item_harmonisation(item) is Harmonisation.RAW
+
+    def test_harmonisation_reads_only_the_harmonisation_set(self) -> None:
+        item = _Item(None, "05.00")
+        item.assets = {k: {"href": f"s3://some-harmonised-mirror/{k}"} for k in READ_ASSET_KEYS}
+        assert item_harmonisation(item, buckets=frozenset({"some-harmonised-mirror"})) is Harmonisation.HARMONISED
+        assert item_is_in_preferred_location(item) is False
+
+    def test_the_raw_archive_is_absent_from_both(self) -> None:
+        """Adding it to either would silently reinstate a different bug."""
+        assert "sentinel-s2-l2a" not in HARMONISED_ASSET_BUCKETS
+        assert "sentinel-s2-l2a" not in PREFERRED_ASSET_BUCKETS

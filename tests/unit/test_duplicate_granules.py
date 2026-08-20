@@ -27,6 +27,7 @@ from tessera_embeddings.ingest.asset_locations import (
     read_set_is_complete,
 )
 from tessera_embeddings.ingest.duplicates import (
+    _preference_key,
     alternates_for,
     copies_label,
     is_unreadable_source,
@@ -1057,3 +1058,76 @@ class TestAMalformedHrefDoesNotAbortTheSelection:
         kept, alternates = select_preferred_duplicates([item])
         assert [it.id for it in kept] == ["only"]
         assert alternates == {}
+
+
+class TestThePreferenceKeyHoldsItsInvariants:
+    """One key orders copies within an acquisition and across acquisitions, so the properties it
+    must hold are worth asserting directly rather than only through the outcomes above.
+
+    This class exists because there used to be TWO keys expressing the same preference, and every
+    fix had to be applied to both — which is how the read-set term reached one and not the other.
+    """
+
+    @staticmethod
+    def _item(ident: str, *, baseline: str | None, sequence: str | None, local: bool, complete: bool) -> _Item:
+        extra: dict[str, object] = {}
+        if baseline is not None:
+            extra["s2:processing_baseline"] = baseline
+        item = _Item(ident, "MGRS-33TWM", sequence, **extra)
+        keys = READ_ASSET_KEYS if complete else READ_ASSET_KEYS[:3]
+        root = _IN_REGION if local else _REMOTE
+        return _with_assets(item, {k: {"href": f"{root}/{k}"} for k in keys})
+
+    def _pool(self) -> list[_Item]:
+        out, n = [], 0
+        for baseline in ("05.00", "04.00", None):
+            for sequence in ("0", "2", None):
+                for local in (True, False):
+                    for complete in (True, False):
+                        out.append(
+                            self._item(f"i{n}", baseline=baseline, sequence=sequence, local=local, complete=complete)
+                        )
+                        n += 1
+        return out
+
+    def test_a_readable_baseline_always_beats_an_unreadable_one(self) -> None:
+        pool = self._pool()
+        known = [i for i in pool if item_processing_baseline(i) is not None]
+        unknown = [i for i in pool if item_processing_baseline(i) is None]
+        assert known and unknown
+        for k in known:
+            for u in unknown:
+                assert _preference_key(k) < _preference_key(u), f"{u.id} outranked {k.id}"
+
+    def test_locality_never_outranks_a_higher_baseline(self) -> None:
+        """The P1 this ordering exists to prevent: cheaper egress must not buy an older pixel."""
+        remote_new = self._item("remote-new", baseline="05.00", sequence="0", local=False, complete=True)
+        local_old = self._item("local-old", baseline="04.00", sequence="9", local=True, complete=True)
+        assert _preference_key(remote_new) < _preference_key(local_old)
+
+    def test_locality_does_not_participate_when_the_baseline_is_unreadable(self) -> None:
+        local = self._item("local", baseline=None, sequence="1", local=True, complete=True)
+        remote = self._item("remote", baseline=None, sequence="2", local=False, complete=True)
+        assert _preference_key(remote) < _preference_key(local), "locality decided a baseline-free comparison"
+
+    def test_an_incomplete_copy_loses_to_an_otherwise_identical_complete_one(self) -> None:
+        complete = self._item("z-complete", baseline="05.00", sequence="0", local=False, complete=True)
+        partial = self._item("a-partial", baseline="05.00", sequence="0", local=False, complete=False)
+        assert _preference_key(complete) < _preference_key(partial), "the id tiebreak decided readability"
+
+    def test_the_key_is_a_total_order_with_no_ties_between_distinct_items(self) -> None:
+        """Ties would make the sort depend on catalogue response order, so a rerun could produce
+        a different mosaic. The id term is what rules them out.
+        """
+        keys = [_preference_key(i) for i in self._pool()]
+        assert len(set(keys)) == len(keys)
+
+    def test_it_is_context_free(self) -> None:
+        """The property that lets ONE key serve both regimes: an item's rank cannot depend on
+        which other copies it is being compared against.
+        """
+        pool = self._pool()
+        alone = {i.id: _preference_key(i) for i in pool}
+        for subset in (pool[:5], pool[3:11], list(reversed(pool))):
+            for item in subset:
+                assert _preference_key(item) == alone[item.id]

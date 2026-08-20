@@ -128,53 +128,41 @@ def _sequence_key(item: Any) -> tuple[int, int, str]:  # noqa: ANN401 — any ST
     return (-has_sequence, -(sequence or 0), str(getattr(item, "id", "")))
 
 
-def _baseline_locality_key(item: Any) -> tuple[float, int, int, int, int, str]:  # noqa: ANN401
-    """Descending processing baseline, then locality among EQUAL baselines, then sequence.
+def _preference_key(item: Any) -> tuple[int, float, int, int, int, int, str]:  # noqa: ANN401
+    """How much we would rather read this copy than another. Lower sorts first.
 
-    Only used when every copy's baseline is readable, which is what makes the locality term
-    safe: it can then only ever separate copies the baseline term has already tied, so it
-    cannot buy cheaper egress with a worse pixel.
+    One key for both regimes, because it is CONTEXT-FREE: no term means "best in my group", so
+    the same tuple orders two copies of one acquisition and two copies from different ones. An
+    earlier version ranked against the group's own best baseline, which made a cross-acquisition
+    comparison meaningless and needed a second key to work around — and every fix then had to be
+    applied twice, which is how the read-set term reached one key and not the other.
 
-    The baseline is ordered by VALUE rather than by "is it the best", so every rung of the
-    fallback ladder stays in descending baseline order. Collapsing non-best baselines into one
-    tier let a read failure skip a 04.00 copy and hand out a 03.00 one because it happened to
-    be in region.
-    """
-    baseline = item_processing_baseline(item)
-    remote = 0 if item_is_in_preferred_location(item) else 1
-    incomplete = 0 if read_set_is_complete(item) else 1
-    sequence = item_sequence(item)
-    has_sequence = 0 if sequence is None else 1
-    return (
-        -(baseline or 0.0),
-        remote,
-        incomplete,
-        -has_sequence,
-        -(sequence or 0),
-        str(getattr(item, "id", "")),
-    )
+    The fields, in order:
 
-
-def _across_acquisitions_key(item: Any) -> tuple[int, float, int, int, int, int, str]:  # noqa: ANN401
-    """Context-free rank, for ordering one acquisition's ladder against another's.
-
-    Deliberately NOT group-relative: it compares a spare from one acquisition with a spare from
-    a different one, where "best in my group" means nothing. An unknown baseline sorts last here
-    rather than suspending the comparison, because suspending it is what leaked one acquisition's
-    malformed metadata into another's ordering.
+    1. **Whether the baseline is readable at all.** Unknown sorts last rather than being treated
+       as a tie: an absent baseline is an absence of evidence, and ``_extract_baseline`` maps it
+       to 0 downstream, so a copy that declares nothing is also the copy whose offset correction
+       will silently be skipped.
+    2. **The baseline, descending.** By VALUE, not by "is it the best": collapsing every
+       non-best baseline into one tier let a read failure skip a 04.00 copy and hand out a 03.00
+       one because it happened to be in region.
+    3. **Locality, and only where the baseline is readable.** Ranked below the baseline so it can
+       never buy cheaper egress with an older pixel, and suspended entirely for unreadable
+       baselines so it cannot decide a comparison the baseline could not enter — among copies
+       that all declare nothing, sequence is the only evidence there is.
+    4. **Read-set completeness.** A copy missing an asset we would read cannot deliver the
+       tile-date, so it loses to one that can. Below locality because locality already implies
+       completeness; it is here to break the tie locality leaves, which the id term would
+       otherwise settle alphabetically.
+    5. **Sequence, descending, then id.** The id keeps the choice independent of catalogue
+       response order, so a rerun cannot silently produce a different mosaic.
     """
     baseline = item_processing_baseline(item)
     sequence = item_sequence(item)
-    # Locality participates only where the baseline is READABLE, the same rule `_rank_copies`
-    # applies. Among copies that all declare nothing, locality was deciding ahead of sequence,
-    # so a local sequence-1 spare was handed out before a remote sequence-2 one — buying cheaper
-    # egress with an older reprocessing, which is the precise trade this ordering exists to
-    # refuse. Neutral rather than absent, so the tuple width stays fixed.
-    remote = (0 if item_is_in_preferred_location(item) else 1) if baseline is not None else 0
     return (
         0 if baseline is not None else 1,
         -(baseline or 0.0),
-        remote,
+        (0 if item_is_in_preferred_location(item) else 1) if baseline is not None else 0,
         0 if read_set_is_complete(item) else 1,
         0 if sequence is not None else 1,
         -(sequence or 0),
@@ -197,7 +185,7 @@ def _rank_copies(copies: list[Any]) -> list[Any]:
     """
     if any(item_processing_baseline(item) is None for item in copies):
         return sorted(copies, key=_sequence_key)
-    return sorted(copies, key=_baseline_locality_key)
+    return sorted(copies, key=_preference_key)
 
 
 #: How far apart two acquisition instants must be to be different acquisitions rather
@@ -319,13 +307,13 @@ def select_preferred_duplicates(
             # unattributed recovery in `s2_roi` consumes `copies[0]` on each retry, so the second
             # retry takes A01 and skips the better B04 — degrading imagery to avoid nothing.
             #
-            # A single sort by `_across_acquisitions_key` is the priority-preserving merge those
+            # A single sort by `_preference_key` is the priority-preserving merge those
             # comments ask for, with the same comparator applied at every position rather than
             # only at the heads. Nothing is suspended, so no acquisition can leak its metadata
             # into another's order, and an unknown baseline sorts LAST instead of suspending the
             # comparison — which addresses the same risk more directly, since a copy whose
             # baseline cannot be read is the one whose correction will silently be skipped.
-            alternates[key] = sorted(rejected, key=_across_acquisitions_key)
+            alternates[key] = sorted(rejected, key=_preference_key)
 
     kept = [it for it in items if id(it) in survivors]
     return kept, alternates
