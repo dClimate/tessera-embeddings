@@ -168,7 +168,10 @@ def mock_stac_item():
             # record of it once normalize_to_solar_day has stamped `.datetime` with noon. Duplicate
             # selection reads this to tell distinct same-day passes from reprocessings of one, so a
             # fixture without it makes every scene of a day look like one acquisition.
-            "datetime": date,
+            # Timezone-aware, as every real STAC item's is. A naive stamp now reads as
+            # UNREADABLE, because one naive value among aware ones makes the acquisition sort
+            # raise and abort duplicate selection for a whole query.
+            "datetime": date if date.endswith("Z") or "+" in date else f"{date}Z",
         }
         # REAL asset hrefs, because whether the BOA offset is corrected is decided from where
         # the assets live. A bare Mock auto-creates `assets`, so an href read off it is a Mock

@@ -477,11 +477,14 @@ processed at 05.10.
 When active, `_apply_baseline_corrections_by_date` builds a per-date correction mask vectorised
 across the time dimension. Two modes:
 
-- **Default** (`preserve_low_values=False`) — subtracts the offset from all pixels. Values
-  below 1000 go negative, which acts as a nodata/dark-pixel signal in the cloud-mask model.
-- **Tessera mode** (`preserve_low_values=True`) — only subtracts from pixels where
-  `value >= abs(offset)`, leaving dark pixels unchanged. Matches Tessera's `harmonize_arr()`
-  behaviour for inference.
+- **Default** (`preserve_low_values=True`) — only subtracts from pixels where
+  `value >= abs(offset)`, leaving dark pixels unchanged, and returns the INPUT dtype. Matches
+  Tessera's `harmonize_arr()` behaviour for inference, and is the default because it is the only
+  mode that round-trips into the unsigned store this repo writes.
+- **Signed mode** (`preserve_low_values=False`) — subtracts the offset from all pixels and returns
+  `int16`. Values below 1000 go negative, which acts as a nodata/dark-pixel signal for an in-memory
+  consumer. **Not compatible with the ROI store**, whose arrays take their dtype from the first
+  date: a negative value written to an unsigned store reads as roughly 65535.
 
 Values above `65535 + offset` (i.e. 64535) are clamped before subtraction to prevent uint16
 overflow. The correction is applied only to spectral bands; SCL and other extra bands are

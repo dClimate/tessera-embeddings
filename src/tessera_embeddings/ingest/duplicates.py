@@ -92,31 +92,23 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
 def _preference_key(item: Any) -> tuple[int, float, int, int, int, int, str]:  # noqa: ANN401
     """How much we would rather read this copy than another. Lower sorts first.
 
-    One key for both regimes, because it is CONTEXT-FREE: no term means "best in my group", so
-    the same tuple orders two copies of one acquisition and two copies from different ones. An
-    earlier version ranked against the group's own best baseline, which made a cross-acquisition
-    comparison meaningless and needed a second key to work around — and every fix then had to be
-    applied twice, which is how the read-set term reached one key and not the other.
+    **Context-free:** no term is relative to the set being sorted, so the same key orders copies
+    of one acquisition and copies from different acquisitions. That is what lets one key serve
+    both, and it must hold for any term added here.
 
     The fields, in order:
 
-    1. **Whether the baseline is readable at all.** Unknown sorts last rather than being treated
-       as a tie: an absent baseline is an absence of evidence, and ``_extract_baseline`` maps it
-       to 0 downstream, so a copy that declares nothing is also the copy whose offset correction
-       will silently be skipped.
-    2. **The baseline, descending.** By VALUE, not by "is it the best": collapsing every
-       non-best baseline into one tier let a read failure skip a 04.00 copy and hand out a 03.00
-       one because it happened to be in region.
-    3. **Locality, and only where the baseline is readable.** Ranked below the baseline so it can
-       never buy cheaper egress with an older pixel, and suspended entirely for unreadable
-       baselines so it cannot decide a comparison the baseline could not enter — among copies
-       that all declare nothing, sequence is the only evidence there is.
+    1. **Whether the baseline is readable.** Unknown sorts last: a copy that declares nothing is
+       the copy whose offset correction cannot be decided, which refuses its date downstream.
+    2. **The baseline, descending, by value** — not by "is it the best", so every rung of the
+       fallback ladder stays in descending baseline order.
+    3. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
+       cheaper egress with an older pixel, and inert for unreadable baselines so it cannot decide
+       a comparison the baseline could not enter.
     4. **Read-set completeness.** A copy missing an asset we would read cannot deliver the
-       tile-date, so it loses to one that can. Below locality because locality already implies
-       completeness; it is here to break the tie locality leaves, which the id term would
-       otherwise settle alphabetically.
-    5. **Sequence, descending, then id.** The id keeps the choice independent of catalogue
-       response order, so a rerun cannot silently produce a different mosaic.
+       tile-date, so it loses to one that can.
+    5. **Sequence, descending, then id.** The id makes the order total, so the choice is
+       independent of catalogue response order and a rerun cannot produce a different mosaic.
     """
     baseline = item_processing_baseline(item)
     sequence = item_sequence(item)
@@ -132,22 +124,12 @@ def _preference_key(item: Any) -> tuple[int, float, int, int, int, int, str]:  #
 
 
 def _rank_copies(copies: list[Any]) -> list[Any]:
-    """Order copies of one acquisition, PREFERRED first. One key, no special cases.
+    """Order copies of one acquisition, PREFERRED first.
 
-    An unreadable baseline used to suspend the whole comparison here and fall back to sequence
-    order, on the reasoning that such a copy might still be the newest reprocessing and demoting
-    it could select an older one. That reasoning no longer holds: a selected unharmonised copy
-    with no readable baseline now REFUSES its date in
-    :func:`~tessera_embeddings.ingest.stac.dates_exempt_from_correction`, because whether its
-    pixels carry the offset cannot be determined — and the read-failure ladder cannot recover from
-    a refusal, only from a read error. So preferring it does not risk an older pixel, it throws
-    the date away while a usable copy sits behind it. An older reprocessing that can be corrected
-    correctly beats a newer one that cannot be processed at all.
-
-    :func:`_preference_key` already ranks a readable baseline first and already declines to let
-    locality decide a comparison the baseline could not enter, so the fallback it replaced was
-    both redundant and worse — and being a second key, it was where the read-set term went missing
-    once already.
+    An unreadable baseline ranks last rather than suspending the comparison: such a copy refuses
+    its date in :func:`~tessera_embeddings.ingest.stac.dates_exempt_from_correction`, and the
+    read-failure ladder recovers from a read error but not from a refusal. A reprocessing that can
+    be corrected beats a newer one that cannot be processed at all.
     """
     return sorted(copies, key=_preference_key)
 
@@ -173,35 +155,45 @@ def acquisition_instant(item: Any) -> datetime.datetime | None:  # noqa: ANN401 
     if not isinstance(raw, str) or not raw:
         return None
     try:
-        return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         logger.debug("Unparseable datetime %r on %s", raw, getattr(item, "id", "?"))
         return None
+    # No offset means UNREADABLE, not assumed UTC: guessing would place the acquisition up to a
+    # day out, and a naive value alongside aware ones makes the sort in `_by_acquisition` raise.
+    if parsed.tzinfo is None:
+        logger.debug("Timezone-less datetime %r on %s", raw, getattr(item, "id", "?"))
+        return None
+    return parsed
 
 
 def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
     """Split one tile-date's copies into one list per distinct acquisition.
 
-    Copies whose instant cannot be read stay together in a single group, which is the
-    pre-existing behaviour and the conservative one: without an instant there is no
-    evidence they are distinct, and treating them as distinct would keep duplicate
-    reprocessings and hand the loader exactly the fused-baseline problem this module
-    exists to prevent.
+    **If ANY copy's instant cannot be read, the whole tile-date is one acquisition.** An
+    unreadable instant is no evidence that the copy is a distinct pass, and the two errors are not
+    symmetric: giving it its own group leaves two copies to be fused at two processing baselines,
+    which is what this module prevents, while collapsing at worst discards a genuinely distinct
+    pass.
+
+    Where instants ARE readable, splitting on them protects real coverage: keying on (tile, solar
+    day) alone dropped 493 of 2,733 items as duplicates when they were distinct acquisitions.
     """
-    dated = [(inst, it) for it in copies if (inst := acquisition_instant(it)) is not None]
-    undated = [it for it in copies if acquisition_instant(it) is None]
-    if not dated:
+    instants = [acquisition_instant(it) for it in copies]
+    if any(instant is None for instant in instants):
         return [copies]
 
-    dated.sort(key=lambda pair: pair[0])
+    # Narrowed by the guard above; restated for the type checker rather than cast.
+    known: list[tuple[datetime.datetime, Any]] = [
+        (instant, item) for instant, item in zip(instants, copies, strict=True) if instant is not None
+    ]
+    dated = sorted(known, key=lambda pair: pair[0])
     clusters: list[list[Any]] = [[dated[0][1]]]
     for previous, current in itertools.pairwise(dated):
         if (current[0] - previous[0]).total_seconds() > _SAME_ACQUISITION_S:
             clusters.append([current[1]])
         else:
             clusters[-1].append(current[1])
-    if undated:
-        clusters.append(undated)
     return clusters
 
 
@@ -257,26 +249,9 @@ def select_preferred_duplicates(
             survivors.add(id(ranked[0]))
             rejected.extend(ranked[1:])
         if rejected:
-            # ONE global order over every rejected copy, by a context-free key.
-            #
-            # `_rank_copies` cannot build this list. It suspends the baseline comparison whenever
-            # any baseline in its input is unreadable, which is right for picking an
-            # acquisition's winner and wrong here: applied to a whole tile-date, one malformed
-            # item reverted every acquisition's ladder to sequence order, so a read failure could
-            # hand out a 03.00 copy while a 04.00 one sat further down.
-            #
-            # Ranking each acquisition separately and concatenating is also wrong, and by a
-            # subtler route: it orders the ladder heads and then flattens, so with A holding
-            # 05.00 and 01.00 spares and B holding 04.00 it yields [A05, A01, B04]. The
-            # unattributed recovery in `s2_roi` consumes `copies[0]` on each retry, so the second
-            # retry takes A01 and skips the better B04 — degrading imagery to avoid nothing.
-            #
-            # A single sort by `_preference_key` is the priority-preserving merge those
-            # comments ask for, with the same comparator applied at every position rather than
-            # only at the heads. Nothing is suspended, so no acquisition can leak its metadata
-            # into another's order, and an unknown baseline sorts LAST instead of suspending the
-            # comparison — which addresses the same risk more directly, since a copy whose
-            # baseline cannot be read is the one whose correction will silently be skipped.
+            # ONE order over every rejected copy of the tile-date, not a concatenation of
+            # per-acquisition ladders. The unattributed recovery consumes `copies[0]` on each
+            # retry, so every position is a choice and the whole list has to be ranked.
             alternates[key] = sorted(rejected, key=_preference_key)
 
     kept = [it for it in items if id(it) in survivors]
@@ -286,9 +261,8 @@ def select_preferred_duplicates(
 def _contested_key(item: Any) -> tuple[str, str] | None:  # noqa: ANN401 — any STAC-like item
     """An item's ``(tile, solar_day)`` key, or ``None`` if it cannot be keyed.
 
-    Returns ``None`` rather than raising because the only caller is a log line, and
-    :func:`solar_day_of` raises on an item that has not been normalised. A logging call that
-    can abort an ingest is worse than a log line that omits a figure.
+    Returns ``None`` rather than raising: the only caller is a log line, and a logging call must
+    not be able to abort an ingest.
     """
     tile = item_tile(item)
     if tile is None:
@@ -312,18 +286,12 @@ def log_duplicate_selection(
     bury the outcomes that are not routine. The tile-dates that carry alternates are named
     only when a fallback actually fires, where the identity matters.
 
-    **Reports WHERE the surviving copies came from, because the preference is no longer purely
-    "newest".** This line said "newest kept" while the ranking preferred an in-region copy over
-    a higher-sequence remote one — a log misreporting its own behaviour. It is also the only
-    audit trail for that decision: where two copies carry the same baseline their pixels are
-    identical, so nothing downstream can show which was read, and the choice is otherwise
-    invisible in the store, the mosaic and the metrics.
+    **Reports WHERE the surviving copies came from.** This is the only audit trail for that
+    decision: where two copies carry the same baseline their pixels are identical, so nothing
+    downstream can show which was read.
 
-    **Counted over the CONTESTED tile-dates only.** ``kept`` is every survivor on the ROI, and
-    on a wide one almost none of them had a duplicate at all. Counting them all reported the
-    composition of the whole supply — "1 in-region, 100 remote" — while saying nothing about
-    the choices this line exists to record, and the one figure that matters was rounded away by
-    the hundred dates that were never in question.
+    Counted over the CONTESTED tile-dates only. ``kept`` is every survivor on the ROI, most of
+    which had no duplicate, so counting them all would describe the supply rather than the choices.
     """
     if not alternates:
         return
@@ -334,11 +302,6 @@ def log_duplicate_selection(
         local = sum(1 for it in winners if item_is_in_preferred_location(it))
         where = f"; winners by source: {local} in-region, {len(winners) - local} remote"
 
-    # One ranking, always, so the line can state it unconditionally. It used to describe a
-    # baseline-first preference while `_rank_copies` had silently fallen back to sequence order
-    # for any acquisition with an unreadable baseline — the wrong mechanism named on exactly the
-    # uncertain-metadata dates this line exists to explain. That fallback is gone rather than
-    # reported: see `_rank_copies`.
     how = "newest baseline, then in-region, then complete read set, then newest sequence"
     log.info(
         "Duplicate catalogue items pruned roi=%s: %d tile-date(s) had more than one copy, "

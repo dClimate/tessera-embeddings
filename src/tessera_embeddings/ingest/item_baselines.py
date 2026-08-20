@@ -1,22 +1,16 @@
-"""The ONE reader of an item's Sentinel-2 processing baseline.
+"""Reading a Sentinel-2 item's processing baseline.
 
-This module exists because there were two of these, and they disagreed. One parsed
-``s2:processing_baseline`` into a float (``5.1``) for ranking duplicate copies; the other scaled it
-to an integer (``510``) for comparing against the correction threshold. Same string, two answers,
-two notions of "unreadable" — and every numeric edge case had to be fixed twice. It was found once
-they had drifted: one still accepted ``"1e308"`` as a baseline while the other had learned to
-reject it.
+The single reader for ``s2:processing_baseline``, so the scale and the notion of "unreadable" are
+defined once.
 
-**One scale.** The value is reported as an integer hundredth — ``"04.00"`` is ``400``, ``"05.10"``
-is ``510``. That is the space :data:`S2_BASELINE_THRESHOLD` is expressed in, so a comparison
-against the threshold needs no conversion, and a conversion is where a factor of a hundred goes
-missing.
+**Scale.** Reported as an integer hundredth: ``"04.00"`` is ``400``, ``"05.10"`` is ``510``. This is
+the space :data:`~tessera_embeddings.config.satellites.S2_BASELINE_THRESHOLD` is expressed in, so a
+comparison against the threshold needs no conversion.
 
-**One notion of unreadable.** ``None`` means the item does not tell us its baseline: the property
-is absent, or empty, or not a number, or a number that cannot be represented on this scale.
-Callers that need a number substitute their own default explicitly, which keeps "declared 0" and
-"declared nothing" distinguishable — they are different facts and one of them is a correctness
-question, since a baseline of 0 is below every threshold.
+**Unreadable.** ``None`` means the item does not declare a usable baseline — absent, empty,
+non-numeric, or not representable on this scale. Callers substitute their own default explicitly,
+which keeps "declared 0" distinguishable from "declared nothing"; a baseline of 0 is below every
+threshold, so conflating them hides a correctness question.
 """
 
 from __future__ import annotations
@@ -34,12 +28,9 @@ BASELINE_SCALE = 100
 def processing_baseline(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like item
     """The baseline an item declares, as an integer hundredth, or ``None`` if it declares none.
 
-    Rejects ``"NaN"`` and ``"Infinity"``, which :func:`float` accepts and which are not baselines:
-    every NaN comparison is false, so it leaves an ordering dependent on catalogue response order,
-    and an infinity outranks every real value. Rejects a finite value that overflows when scaled
-    — ``"1e308"`` passes a finiteness test on its own and becomes infinity multiplied by a
-    hundred, where :func:`round` raises :class:`OverflowError` and would abort a whole batch over
-    one item's metadata.
+    ``"NaN"`` and ``"Infinity"`` are rejected: :func:`float` accepts both, and neither is a
+    baseline — every NaN comparison is false, and an infinity outranks every real value. A finite
+    value that overflows when scaled is rejected for the same reason.
     """
     properties = getattr(item, "properties", None)
     raw = properties.get("s2:processing_baseline") if isinstance(properties, dict) else None
@@ -54,5 +45,5 @@ def processing_baseline(item: Any) -> int | None:  # noqa: ANN401 — any STAC-l
     if not math.isfinite(scaled):
         logger.debug("Unrepresentable s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
         return None
-    # round() rather than int(), because 5.10 * 100 is 509.999... in binary floating point.
+    # round() rather than int(): 5.10 * 100 is 509.999... in binary floating point.
     return round(scaled)

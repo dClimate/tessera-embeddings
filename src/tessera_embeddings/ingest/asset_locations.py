@@ -87,9 +87,8 @@ def asset_bucket(href: str) -> str | None:
     try:
         parsed = urllib.parse.urlparse(href)
     except ValueError:
-        # Malformed authorities raise — an unmatched IPv6 bracket, for one. Locality is
-        # evaluated for every copy including singletons, so propagating would let a single
-        # malformed catalogue href abort the whole selection. Unrecognised means remote.
+        # A malformed authority raises. Unrecognised means remote, so one bad href cannot
+        # abort a whole selection.
         logger.debug("Unparseable asset href %r", href)
         return None
     if parsed.scheme == "s3":
@@ -108,26 +107,21 @@ def asset_bucket(href: str) -> str | None:
 
 @dataclasses.dataclass(frozen=True)
 class AssetSources:
-    """Where every REQUESTED asset of an item lives — including the ones that are not there.
+    """Where every REQUESTED asset of an item lives, including the ones that are not there.
 
-    The point of this type is that it cannot lose a key. Its predecessor returned a bare list of
-    the buckets it managed to resolve and silently dropped the rest, so every caller had to
-    remember to compare the length against what it asked for, and three of them did not. That one
-    omission produced the same defect three times over: locality granted from a single local band,
-    a producer named from one visible band while others were served under names we never looked
-    for, and a subset read as evidence about the whole. Ask this object a question instead and the
-    incompleteness is part of the answer.
+    Carries the missing keys rather than dropping them, so no caller has to re-derive whether the
+    set it asked for was complete.
     """
 
-    #: The bucket serving each requested key that resolved. ``None`` where the href is not an
-    #: S3 URL we recognise, which is a real answer: "somewhere we have not listed".
+    #: The bucket serving each requested key that resolved. ``None`` for an href that is not a
+    #: recognised S3 URL, which is a distinct answer from a key that is absent.
     buckets: dict[str, str | None]
-    #: The requested keys with no resolvable href at all.
+    #: The requested keys with no resolvable href.
     missing: tuple[str, ...]
 
     @property
     def complete(self) -> bool:
-        """Whether every requested key resolved. Absence of evidence is not evidence."""
+        """Whether every requested key resolved."""
         return not self.missing
 
     @property
@@ -136,10 +130,9 @@ class AssetSources:
         return not self.buckets
 
     def all_in(self, buckets: frozenset[str]) -> bool:
-        """Whether the COMPLETE requested set is served from ``buckets``.
+        """Whether the complete requested set is served from ``buckets``.
 
-        False for an incomplete set, deliberately: a claim about every asset cannot be made from
-        a subset of them.
+        False for an incomplete set: a claim about every asset cannot be made from a subset.
         """
         return self.complete and all(bucket in buckets for bucket in self.buckets.values())
 
@@ -167,13 +160,11 @@ def read_set_is_complete(item: Any, keys: tuple[str, ...] = READ_ASSET_KEYS) -> 
     """Whether every asset this ingest would READ resolves to an href.
 
     Answers "can this copy be read at all", where :func:`item_is_in_preferred_location` answers
-    "from where". Locality implies completeness, but ranking needs the weaker claim on its own:
-    with locality tied, an incomplete copy would be separated from a complete one only by the id
-    tiebreak and could win a tile-date it cannot deliver.
+    "from where". Ranking needs the weaker claim separately, so that a copy which cannot be read
+    loses to one that can even when locality ties.
 
-    Items carrying no assets at all — radar copies, and any product whose bands are not named by
-    :data:`READ_ASSET_KEYS` — are uniformly incomplete, so this term ties across such a set and
-    changes no ordering there.
+    Items carrying none of :data:`READ_ASSET_KEYS` are uniformly incomplete, so the term ties
+    across such a set and changes no ordering.
     """
     return read_asset_sources(item, keys).complete
 
@@ -184,11 +175,9 @@ def item_is_in_preferred_location(
 ) -> bool:
     """Whether every asset this ingest would READ sits in a preferred bucket.
 
-    All of the read set, not any: an item whose bands straddle two buckets cannot deliver the
-    locality being claimed, and an item exposing only some of them cannot deliver the read at all
-    — that copy displaces a complete remote one on a baseline tie, then fails at load with no
-    source href to attribute, sending the recovery ladder stepping down every duplicated tile-date
-    of the day. An item exposing none of them is remote: absence of evidence is not locality.
+    All of the read set, not any. An item whose bands straddle two buckets cannot deliver the
+    locality being claimed, and an incomplete item cannot deliver the read at all. An item
+    exposing none of them is remote: absence of evidence is not locality.
     """
     return read_asset_sources(item).all_in(buckets)
 
@@ -227,17 +216,11 @@ def item_harmonisation(
     correction shifts values by a visible 1000, while a skipped one leaves plausible pixels that
     are quietly wrong.
 
-    An item that does not expose EVERY reflectance band under the configured names is ``UNKNOWN``,
-    which is a different answer for a different reason and not a softer version of ``RAW``. Nothing
-    here can see the alias table that maps a band name to an asset key, so a band absent under the
-    requested name may still be served under a native one — ``_prune_item_dict`` in ``stac.py``
-    exists for exactly that case, and preserves PARTIALLY aliased items for it.
-    Calling such an item raw would subtract 1000 from pixels that may already be harmonised,
-    which is the corruption this whole module was written to prevent, and it would do it while
-    reporting nothing. The live Element 84 catalogue serves the configured alias keys, so this
-    state does not arise there today; the caller refuses on it rather than guessing, so a
-    catalogue that changed its key naming would stop the ingest instead of silently halving the
-    reflectance of a season.
+    An item that does not expose EVERY reflectance band under the configured names is ``UNKNOWN``
+    rather than ``RAW``. Nothing here can resolve the alias table mapping a band name to an asset
+    key, so a band absent under the requested name may still be served under a native one, and
+    calling such an item raw would subtract the offset from pixels that may already be harmonised.
+    The caller refuses on ``UNKNOWN`` rather than guessing.
     """
     sources = read_asset_sources(item, keys)
     if not sources.complete:

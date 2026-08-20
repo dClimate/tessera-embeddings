@@ -331,23 +331,15 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
     for date_str, group in sorted(by_date.items()):
         kinds = {item: item_harmonisation(item) for item in group}
 
-        # Every item is judged on its OWN declared baseline, in the scaled space `threshold` is
-        # expressed in (400, not 4.0). A caller's per-date map is deliberately NOT consulted as a
-        # fallback: in the production path it is built by `extract_baselines(day_items)` from
-        # these very items, so for a lone item with unreadable metadata it supplies the same
-        # parsed zero and rescues nothing, and on a multi-item date it supplies an arbitrary last
-        # item's value — leaving post-04.00 pixels 1000 too high or taking 1000 off pre-04.00
-        # ones, both silently. A value derived from the items cannot be evidence about an item,
-        # so an unreadable baseline is treated as the ambiguity it is and refused below.
+        # Each item on its OWN declared baseline. A caller's per-date map is not consulted as a
+        # fallback: it is derived from these same items, so it cannot be evidence about them.
         def _owed_baseline(item: Any) -> int:  # noqa: ANN401
             own = _declared_baseline(item)
             return 0 if own is None else own
 
-        # Unharmonised items whose baseline cannot be read at all. Correcting risks taking 1000
-        # off pre-04.00 pixels, exempting risks leaving post-04.00 pixels that much too high, and
-        # neither is discoverable afterwards — so the date refuses rather than guessing. A
-        # HARMONISED item is owed nothing whatever its baseline says, so its metadata being
-        # unreadable is harmless and never reaches here.
+        # Unharmonised items whose baseline cannot be read. Correcting and exempting are both
+        # silently wrong in opposite directions, so the date refuses. A HARMONISED item is owed
+        # nothing whatever it declares, so an unreadable baseline there is harmless.
         unreadable = [
             it for it, k in kinds.items() if k is not Harmonisation.HARMONISED and _declared_baseline(it) is None
         ]
@@ -360,10 +352,8 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
                 f"Fix the catalogue metadata rather than guessing."
             )
         owed = [it for it, k in kinds.items() if k is not Harmonisation.HARMONISED and _owed_baseline(it) >= threshold]
-        # An item whose PRODUCER cannot be determined, where the answer would matter. Correcting
-        # risks taking the offset off already-harmonised pixels; exempting risks leaving raw ones
-        # high. Both are silent, so neither is chosen. Gated on the threshold, so a pre-04.00
-        # date is exempt rather than refused — there, which producer served it changes nothing.
+        # Items whose PRODUCER cannot be determined, where it would change a pixel. Gated on the
+        # threshold: below it, which producer served the date changes nothing.
         undetermined = [it for it, k in kinds.items() if k is Harmonisation.UNKNOWN and _owed_baseline(it) >= threshold]
         if undetermined:
             raise HeterogeneousProducerError(
@@ -389,12 +379,6 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
         # high. Unreachable while the backfill is entirely pre-04.00, and refused rather than
         # resolved for exactly that reason.
         #
-        # This one guard reads the item's OWN declaration rather than the date's, because its
-        # whole purpose is to detect that the date-wide baseline is unrepresentative of the items
-        # being fused — tested against itself it would answer nothing. Items whose declaration is
-        # unreadable are excluded rather than counted as 0: they carry no per-item evidence to
-        # contradict the map with, and counting them would refuse the very dates the map exists
-        # to rescue.
         under = [
             it
             for it, k in kinds.items()
@@ -413,11 +397,8 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
                 f"harmonised one, and the correction is applied per date to the whole mosaic, so "
                 f"either choice is wrong for some of its pixels. Load the producers separately."
             )
-        # THE ASSUMPTION THIS CHANGE RESTS ON, MADE OBSERVABLE — announced LAST, after every
-        # refusal above, so the line is only ever emitted for a date that really will be
-        # corrected. Ahead of them it claimed a correction had been applied to dates that then
-        # raised and were never loaded at all, which is a log saying the opposite of what
-        # happened. Every raw item measured on the
+        # Announced LAST, after every refusal above, so the line only ever describes a date that
+        # really will be corrected. Every raw item measured on the
         # live catalogue reports a pre-04.00 baseline, so this branch has never been reached on
         # real data — which means the correction path itself has never run in production. Say so
         # at WARNING the first time it does, per date: sampling a catalogue cannot prove the
@@ -1142,25 +1123,6 @@ def query_stac_items(
             )
         )
 
-    if collection_config.harmonisation_varies_by_item:
-        # Reduce to one copy per acquisition HERE: after the single solar-offset application above,
-        # and before provenance is extracted below.
-        #
-        # After normalisation, because `select_preferred_duplicates` derives the solar day with
-        # `solar_day_of`, which refuses an un-normalised item rather than guessing at its day.
-        #
-        # Before `extract_baselines`, because that map is the store's `baselines_applied` and is
-        # returned to the caller unchanged. Built from the unpruned list, a REJECTED copy that
-        # happened to sort last supplied the recorded baseline while the selected copy supplied the
-        # pixels, so the store described imagery it had not written.
-        #
-        # And in this path rather than in `load_stac_items`, because this is where items are
-        # normalised. Pruning below would have imposed that precondition on every direct caller of
-        # the public loader, which previously accepted raw catalogue items and has no longitude to
-        # normalise them with.
-        items, alternates = select_preferred_duplicates(items)
-        log_duplicate_selection(logger, query_label, alternates, kept=items)
-
     baselines = extract_baselines(items)
 
     if existing_dates:
@@ -1238,29 +1200,21 @@ def load_stac_items(
     if collection_config.requires_baseline_correction and baselines:
         loaded_dates = {str(t.values)[:10] for t in data.time}
         filtered_baselines = {d: b for d, b in baselines.items() if d in loaded_dates}
-        # The correction input is built from the ITEMS where producers can disagree, and from the
-        # caller's map where they cannot. Never a mixture: masking the map with an item-derived
-        # decision left the decision and the value on different evidence, so a date the items
-        # showed was owed the offset kept its pixels 1000 high whenever the map omitted it or
-        # carried a stale lower value. `baselines` stays untouched either way — it is provenance
-        # and reaches the store's `baselines_applied`.
+        # Built from the ITEMS where producers can disagree, and from the caller's map where they
+        # cannot — never a mixture, or the decision and the value sit on different evidence.
+        # `baselines` stays untouched either way: it is provenance and reaches the store's
+        # `baselines_applied`.
         #
         # The per-item read looks for assets keyed by the names in `bands`, which is how Earth
-        # Search keys its assets and NOT how Planetary Computer does — PC keys them natively
-        # (`B02`, `SCL`) and relies on the loader resolving the common names, so that read finds
-        # nothing there. Running it anyway classified every modern PC item as UNKNOWN and refused
-        # every date at baseline >= 04.00, breaking a working provider. PC serves ESA's values
-        # unharmonised throughout, so its answer is the collection's: correct per the declared
-        # baseline, which the threshold alone already does.
+        # Search keys them and not how Planetary Computer does (`B02`, `SCL`, resolved by the
+        # loader). PC serves ESA's values unharmonised throughout, so its answer belongs to the
+        # collection and the threshold alone is correct there.
         if collection_config.harmonisation_varies_by_item:
             correction_baselines = {d: b for d, b in correction_baselines_by_date(items).items() if d in loaded_dates}
         else:
             correction_baselines = dict(filtered_baselines)
-        # Skip the corrector outright when nothing reaches the threshold. It is a no-op on those
-        # dates, but not a free one: it clips, casts, adds and `xr.where`s every reflectance band
-        # in the graph before deciding to change nothing. Setting the threshold for Earth Search
-        # made the already-harmonised path the common case rather than an unused branch, so that
-        # work would now be paid on the majority of every ingest.
+        # Skip the corrector when nothing reaches the threshold: it changes no values there, but
+        # still clips, casts and builds an `xr.where` for every reflectance band.
         threshold = collection_config.baseline_threshold
         if any(b >= threshold for b in correction_baselines.values()):  # type: ignore[operator]
             data = _apply_baseline_corrections_by_date(
@@ -1418,6 +1372,29 @@ def ingest_tile(
         if baselines:
             logger.info("All dates already exist in store - nothing to load")
         return None, baselines
+
+    collection_config = _get_collection_config(provider, collection)
+    if collection_config.harmonisation_varies_by_item:
+        # Reduce to one copy per acquisition, HERE and not in `query_stac_items`.
+        #
+        # `odc.stac.load` fuses a solar day, so an unpruned harmonised COG beside a raw
+        # reprocessing of one acquisition reaches the producer check as a genuine conflict and
+        # refuses a date that selecting one copy resolves. Refusing what we can decide is the one
+        # outcome those refusals are not for.
+        #
+        # But this belongs to THIS entry point, not to the shared query. `s2_roi` calls
+        # `query_stac_items` and then runs its own selection, KEEPING the rejected copies as the
+        # ladder `step_down_copies` walks when a source object will not read. Pruning in the shared
+        # query left that driver with an empty ladder, so a single unreadable object lost the date
+        # instead of stepping down to the copy sitting behind it. Selection belongs to the layer
+        # that owns the fallback — which here is nobody, so the copies are genuinely spare.
+        items, alternates = select_preferred_duplicates(items)
+        log_duplicate_selection(logger, f"tile {tile_id}" if tile_id else f"bbox {bbox}", alternates, kept=items)
+        # Provenance must describe what was KEPT. `query_stac_items` built this map from the
+        # unpruned list, so a rejected copy that happened to sort last supplied the recorded
+        # baseline for pixels the selected copy provided — and this map is returned to the caller
+        # and becomes the store's `baselines_applied`.
+        baselines = extract_baselines(items)
 
     data = load_stac_items(
         items,

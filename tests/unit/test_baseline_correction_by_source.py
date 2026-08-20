@@ -37,6 +37,7 @@ from tessera_embeddings.ingest.asset_locations import (
     item_is_in_preferred_location,
     read_asset_sources,
 )
+from tessera_embeddings.ingest.duplicates import select_preferred_duplicates
 from tessera_embeddings.ingest.stac import (
     HeterogeneousProducerError,
     _apply_baseline_corrections_by_date,
@@ -842,23 +843,23 @@ class TestTheCorrectionValueComesFromTheSameEvidenceAsTheDecision:
         assert extract_baselines([_Item(_HARMONISED, "05.10")]) == {"2022-01-07": 510}
 
 
-class TestTheQueryPathPrunesBeforeExtractingProvenance:
-    """Duplicate selection sits in the normalised query path, and the ORDER matters twice.
+class TestTheGenericEntryPointPrunesAndTheRoiLadderSurvives:
+    """Duplicate selection belongs to the layer that owns the fallback ladder — and `ingest_tile`
+    is the layer that has none.
 
-    Only `s2_roi` used to prune, so the generic entry point handed the producer check an unpruned
-    set and a harmonised COG beside a raw reprocessing of one acquisition refused a date that
-    selecting one copy resolves. Pruning it in the loader fixed that and broke something else:
-    `extract_baselines` had already run on the unpruned list, so a REJECTED copy that sorted last
-    could supply the recorded baseline while the selected copy supplied the pixels — and that map
-    is the store's `baselines_applied`. Both raised on PR #107.
-
-    It therefore runs after normalisation (the selector refuses an un-normalised item rather than
-    guessing its solar day) and before provenance is extracted.
+    Three findings interlock here. Only `s2_roi` used to prune, so the generic entry point handed
+    the producer check an unpruned set and a harmonised COG beside a raw reprocessing of one
+    acquisition refused a date that selecting one copy resolves. Pruning inside the shared
+    `query_stac_items` fixed that and broke two other things: the caller's baseline map had already
+    been built from the unpruned list, so a REJECTED copy sorting last supplied the recorded
+    baseline for pixels the selected copy provided — and `s2_roi` runs its own selection after that
+    query and KEEPS the rejected copies as the ladder `step_down_copies` walks, so pruning upstream
+    left it with nothing to step down to and one unreadable object lost the date.
     """
 
     @staticmethod
     def _pair() -> list[_Item]:
-        """One acquisition, two producers, DIFFERENT baselines, raw sorted last."""
+        """One acquisition, two producers, DIFFERENT baselines, the rejected copy sorted last."""
         harmonised = _Item(_HARMONISED, "05.10")
         harmonised.id = "S2A_33TWM_20220107_1_L2A"
         harmonised.properties["s2:sequence"] = "1"
@@ -870,37 +871,45 @@ class TestTheQueryPathPrunesBeforeExtractingProvenance:
             item.properties["datetime"] = "2022-01-07T10:20:31.024000Z"
         return [harmonised, raw]
 
-    def _query(self, items: list[_Item]) -> tuple[list, dict]:
-        return stac_module.query_stac_items(
+    def test_the_shared_query_leaves_duplicates_for_the_roi_driver(self) -> None:
+        """It must NOT prune: `s2_roi` selects afterwards and needs the rejected copies as its
+        fallback ladder. An empty ladder turns one unreadable object into a lost date.
+        """
+        items, _ = stac_module.query_stac_items(
             provider="earth-search",
             collection="sentinel-2-l2a",
             tile_id="33TWM",
             start_date="2022-01-01",
             end_date="2022-01-31",
             mid_longitude=15.0,
-            item_provider_fn=lambda **_: items,
+            item_provider_fn=lambda **_: self._pair(),
+        )
+        assert len(items) == 2, "the shared query pruned copies the ROI ladder needs"
+        _, alternates = select_preferred_duplicates(items)
+        assert alternates, "the ROI driver would have had nothing to step down to"
+
+    def test_the_generic_entry_point_prunes(self, monkeypatch) -> None:
+        loaded: list[str] = []
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
         )
 
-    def test_two_producers_of_one_acquisition_are_pruned_to_one(self) -> None:
-        kept, _ = self._query(self._pair())
-        assert [it.id for it in kept] == ["S2A_33TWM_20220107_1_L2A"], "the harmonised 05.10 copy wins"
+        def fake_load(items, *a, **k):
+            loaded.extend(i.id for i in items)
+            return data
 
-    def test_provenance_describes_the_copy_that_was_kept(self) -> None:
-        """THE SECOND FINDING. Built from the unpruned list, the rejected raw 02.06 copy sorted
-        last and supplied the recorded baseline for pixels it did not provide.
-        """
-        kept, baselines = self._query(self._pair())
-        assert baselines == {"2022-01-07": 510}
-        assert _extract_baseline(kept[0]) == 510, "the map must describe the surviving item"
-
-    def test_the_pruned_date_is_not_refused_downstream(self) -> None:
-        """The first finding: unpruned, these two reach the producer check as a genuine conflict."""
-        kept, _ = self._query(self._pair())
-        assert dates_exempt_from_correction(kept) == {"2022-01-07"}
-
-    def test_a_single_copy_is_unaffected(self) -> None:
-        """The overwhelmingly common case must pass through untouched."""
-        only = self._pair()[0]
-        kept, baselines = self._query([only])
-        assert [it.id for it in kept] == [only.id]
+        monkeypatch.setattr(stac_module, "_load_from_stac", fake_load)
+        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
+        _, baselines = stac_module.ingest_tile(
+            provider="earth-search",
+            collection="sentinel-2-l2a",
+            tile_id="33TWM",
+            start_date="2022-01-01",
+            end_date="2022-01-31",
+            mid_longitude=15.0,
+            item_provider_fn=lambda **_: self._pair(),
+        )
+        assert loaded == ["S2A_33TWM_20220107_1_L2A"], "the generic path refused instead of selecting"
+        # And provenance describes the copy that was kept, not the one that sorted last.
         assert baselines == {"2022-01-07": 510}
