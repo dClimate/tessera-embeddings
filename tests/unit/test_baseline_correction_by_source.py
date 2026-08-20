@@ -1333,3 +1333,50 @@ class TestTheRefusalNamesTheCatalogueFailureItActuallyFound:
         message = str(exc.value)
         assert "native asset keys" in message
         assert "some-new-mirror" in message
+
+
+class TestProvenanceRealignsWheneverSelectionPruned:
+    """Gated on whether selection changed the items, not on whether a fallback survived.
+
+    `select_preferred_duplicates` drops rejected copies that would refuse their date, so a pruned
+    tile-date can come back with NO alternates — and gating the realignment on alternates left the
+    caller's map describing a copy that is not being loaded. Raised on PR #107.
+    """
+
+    @staticmethod
+    def _pair() -> list[_Item]:
+        """The winner is harmonised; the rejected copy is raw with no readable baseline, so the
+        ladder filter removes it and `alternates` comes back empty.
+        """
+        winner = _Item(_HARMONISED, "05.10")
+        winner.id = "S2A_33TWM_20220107_1_L2A"
+        winner.properties["s2:sequence"] = "1"
+        loser = _Item(_RAW_ESA, None)
+        loser.id = "S2A_33TWM_20220107_0_L2A"
+        loser.properties["s2:sequence"] = "0"
+        for item in (winner, loser):
+            item.properties["grid:code"] = "MGRS-33TWM"
+            item.properties["datetime"] = "2022-01-07T10:20:31.024000Z"
+        return [winner, loser]
+
+    def test_the_fixture_really_yields_no_alternates(self) -> None:
+        """Otherwise this would pass through the old gate and prove nothing."""
+        kept, alternates = select_preferred_duplicates(self._pair())
+        assert [i.id for i in kept] == ["S2A_33TWM_20220107_1_L2A"]
+        assert alternates == {}, "the ladder filter must have emptied it"
+
+    def test_the_map_is_realigned_even_with_no_alternates(self, monkeypatch) -> None:
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
+        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
+        items = self._pair()
+        # What the split workflow hands over: last-wins over the UNPRUNED list, so the rejected
+        # copy's absent baseline reads as 0.
+        baselines = extract_baselines(items)
+        assert baselines == {"2022-01-07": 0}, "the fixture must start describing the rejected copy"
+
+        stac_module.load_stac_items(items, "earth-search", "sentinel-2-l2a", baselines=baselines)
+        assert baselines == {"2022-01-07": 510}, "provenance still described a copy not being loaded"

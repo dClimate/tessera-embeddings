@@ -313,6 +313,16 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
         items: the items a preparation will LOAD, after duplicate selection.
         threshold: baselines at or above this are owed the offset (matches the collection's).
 
+    **A known limit, measured and accepted.** The producers are judged over the items of one solar
+    day, which is the right scope — but duplicate selection chooses each tile's copy without seeing
+    its neighbours, so a tile whose only copy is raw-and-owed can refuse a day that another of its
+    tiles could have agreed with. Measured on multi-tile boxes: days whose tiles disagree about
+    producer are common in the early archive (11 of 25 in one 2017 window) and absent from modern
+    data, but NONE of them refuses, because a refusal also needs a raw copy at or above the
+    threshold and the raw backfill is entirely pre-04.00. Making selection day-aware is the fix if
+    that ever changes; refusing is correct in the meantime, and this docstring is the record of the
+    decision rather than an oversight.
+
     Raises:
         HeterogeneousProducerError: no single date-wide decision is correct for the date — it
             fuses a raw item owed a correction with a harmonised one, carries an item whose own
@@ -1231,7 +1241,11 @@ def load_stac_items(
         # already requires normalised items for that decision, so the precondition is unchanged.
         read_keys = _requested_assets(collection_config, extra_bands)
         pruned, alternates = select_preferred_duplicates(items, read_keys)
-        if alternates:
+        # Gated on whether SELECTION CHANGED THE ITEMS, not on whether any usable fallback
+        # survived. `select_preferred_duplicates` drops rejected copies that would refuse their
+        # date, so `alternates` can be empty on a tile-date that was still pruned — and gating on
+        # it left the caller's map describing a copy that is not being loaded.
+        if len(pruned) != len(items):
             log_duplicate_selection(logger, f"load {collection}", alternates, kept=pruned, read_keys=read_keys)
             # Realign the caller's provenance with what is about to be loaded. `baselines` becomes
             # the store's `baselines_applied`, and on the split workflow it was built by
