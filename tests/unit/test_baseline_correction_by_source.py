@@ -528,7 +528,7 @@ class TestAnUndeterminedProducerRefusesRatherThanGuessing:
 
     def test_a_post_threshold_undetermined_item_refuses_the_date(self) -> None:
         item = _Item(None, "05.00")
-        with pytest.raises(HeterogeneousProducerError, match="none of the reflectance bands"):
+        with pytest.raises(HeterogeneousProducerError, match="cannot be determined"):
             dates_exempt_from_correction([item])
 
     def test_a_pre_threshold_undetermined_item_is_exempt_not_refused(self) -> None:
@@ -618,7 +618,7 @@ class TestThePerItemCheckIsScopedToTheCollectionThatNeedsIt:
             coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
         )
         monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
-        with pytest.raises(HeterogeneousProducerError, match="none of the reflectance bands"):
+        with pytest.raises(HeterogeneousProducerError, match="cannot be determined"):
             stac_module.load_stac_items(
                 [self._pc_item()], "earth-search", "sentinel-2-l2a", baselines={"2022-01-07": 510}
             )
@@ -1293,3 +1293,43 @@ class TestRawRequiresEveryBandFromAKnownProducer:
         item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
         with pytest.raises(HeterogeneousProducerError):
             dates_exempt_from_correction([item])
+
+
+class TestTheRefusalNamesTheCatalogueFailureItActuallyFound:
+    """UNKNOWN has two causes needing different fixes, so the message must say which.
+
+    It read as "expose none of the reflectance bands ... resolve the naming", which is only true
+    for the incomplete case; an operator following it for a complete-but-unlisted bucket cannot fix
+    the refusal that way. Raised on PR #107.
+    """
+
+    @staticmethod
+    def _unlisted() -> _Item:
+        item = _Item(None, "05.00")
+        item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
+        return item
+
+    @staticmethod
+    def _partial() -> _Item:
+        item = _Item(_HARMONISED, "05.00")
+        for key in REFLECTANCE_ASSET_KEYS[1:]:
+            del item.assets[key]
+        return item
+
+    def test_an_unlisted_bucket_is_named_and_the_fix_is_classification(self) -> None:
+        with pytest.raises(HeterogeneousProducerError, match=r"not\s+classified as harmonised") as exc:
+            dates_exempt_from_correction([self._unlisted()])
+        assert "some-new-mirror" in str(exc.value), "the operator needs the bucket name"
+        assert "native asset keys" not in str(exc.value), "the wrong remedy must not be offered"
+
+    def test_missing_names_are_named_and_the_fix_is_the_naming(self) -> None:
+        with pytest.raises(HeterogeneousProducerError, match="native asset keys") as exc:
+            dates_exempt_from_correction([self._partial()])
+        assert "not classified" not in str(exc.value)
+
+    def test_a_date_with_both_causes_reports_both(self) -> None:
+        with pytest.raises(HeterogeneousProducerError) as exc:
+            dates_exempt_from_correction([self._unlisted(), self._partial()])
+        message = str(exc.value)
+        assert "native asset keys" in message
+        assert "some-new-mirror" in message

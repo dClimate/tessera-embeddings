@@ -738,7 +738,8 @@ class TestTheDuplicateLogIsAnAuditTrail:
         local = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
         remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
         msg = self._emit(caplog, [local], {("MGRS-33TWM", "2021-09-08"): [remote]})
-        assert "complete read set, then newest baseline, then in-region, then newest sequence" in msg
+        assert "complete read set, then a decidable producer and readable baseline" in msg
+        assert "then newest baseline, then in-region, then newest sequence" in msg
         assert "newest kept" not in msg, "the stale claim must not come back"
 
     def test_it_names_where_the_survivors_came_from(self, caplog) -> None:
@@ -795,7 +796,8 @@ class TestTheDuplicateLogIsAnAuditTrail:
         winner = _copy("a", sequence="1", baseline="00.01", host_root=_IN_REGION)
         unreadable = _with_assets(_Item("b", "MGRS-33TWM", "0"), _bands_at(_REMOTE))
         msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [unreadable]})
-        assert "complete read set, then newest baseline, then in-region, then newest sequence" in msg
+        assert "complete read set, then a decidable producer and readable baseline" in msg
+        assert "then newest baseline, then in-region, then newest sequence" in msg
         assert "sequence alone" not in msg, "a mode that cannot happen must not be reported"
 
     def test_no_duplicates_logs_nothing(self, caplog) -> None:

@@ -32,9 +32,11 @@ from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.asset_locations import (
+    REFLECTANCE_ASSET_KEYS,
     Harmonisation,
     item_harmonisation,
     item_is_from_raw_archive,
+    read_asset_sources,
 )
 from tessera_embeddings.ingest.catalogue_refusal import (
     CatalogueRequest,
@@ -356,12 +358,32 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
         # threshold: below it, which producer served the date changes nothing.
         undetermined = [it for it, k in kinds.items() if k is Harmonisation.UNKNOWN and _owed_baseline(it) >= threshold]
         if undetermined:
+            # Two different catalogue failures reach UNKNOWN and need different fixes, so the
+            # message has to say which: bands absent under the configured names (resolve the
+            # naming), or present but served from a bucket nobody has classified (classify it).
+            incomplete = [it for it in undetermined if not read_asset_sources(it, REFLECTANCE_ASSET_KEYS).complete]
+            unlisted = [it for it in undetermined if it not in incomplete]
+            causes = []
+            if incomplete:
+                causes.append(
+                    f"{len(incomplete)} expose only some of the reflectance bands under the "
+                    f"configured names, so they may be served under native asset keys — resolve "
+                    f"the naming rather than guessing the producer"
+                )
+            if unlisted:
+                buckets = sorted(
+                    str(b)
+                    for it in unlisted
+                    for b in set(read_asset_sources(it, REFLECTANCE_ASSET_KEYS).buckets.values())
+                )
+                causes.append(
+                    f"{len(unlisted)} are served complete from bucket(s) {buckets}, which are not "
+                    f"classified as harmonised or unharmonised — add them to the appropriate set"
+                )
             raise HeterogeneousProducerError(
-                f"{date_str}: {len(undetermined)} item(s) expose none of the reflectance bands "
-                f"under the configured names, so which producer served them cannot be determined "
-                f"— and at baseline >= {threshold} that decides whether {abs(S2_BASELINE_OFFSET)} "
-                f"is subtracted. The bands may be served under native asset keys; resolve the "
-                f"names rather than guessing the producer."
+                f"{date_str}: which producer served {len(undetermined)} item(s) cannot be "
+                f"determined, and at baseline >= {threshold} that decides whether "
+                f"{abs(S2_BASELINE_OFFSET)} is subtracted. " + "; ".join(causes) + "."
             )
         straddling = [it for it, k in kinds.items() if k is Harmonisation.MIXED and _owed_baseline(it) >= threshold]
         if straddling:
