@@ -1214,3 +1214,31 @@ class TestRankingJudgesTheAssetsThisLoadWillRequest:
         )
         assert item_is_in_preferred_location(local) is True, "not requested: irrelevant"
         assert item_is_in_preferred_location(local, keys=(*READ_ASSET_KEYS, "qa")) is False
+
+
+class TestTheAuditUsesTheSameReadSetAsSelection:
+    """The audit line is the only record of which source won, so it must judge locality over the
+    set selection ranked on. Raised on PR #107.
+    """
+
+    def _emit(self, caplog, kept, alternates, read_keys=None) -> str:
+        log = logging.getLogger("dup-audit-readkeys")
+        with caplog.at_level(logging.INFO, logger="dup-audit-readkeys"):
+            from tessera_embeddings.ingest.duplicates import log_duplicate_selection
+
+            kwargs = {} if read_keys is None else {"read_keys": read_keys}
+            log_duplicate_selection(log, "roi-x", alternates, kept=kept, **kwargs)
+        return " ".join(r.getMessage() for r in caplog.records)
+
+    def test_a_winner_is_local_when_the_missing_asset_was_not_requested(self, caplog) -> None:
+        bands = tuple(k for k in READ_ASSET_KEYS if k != "scl")
+        winner = _with_assets(
+            _Item("a", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"}),
+            {k: {"href": f"{_IN_REGION}/{k}"} for k in bands},
+        )
+        rejected = _copy("b", sequence="1", baseline="05.00", host_root=_REMOTE)
+        alternates = {("MGRS-33TWM", "2021-09-08"): [rejected]}
+        assert "1 in-region, 0 remote" in self._emit(caplog, [winner], alternates, read_keys=bands)
+        caplog.clear()
+        # With the fixed default it lacks `scl` and is reported remote, contradicting the decision.
+        assert "0 in-region, 1 remote" in self._emit(caplog, [winner], alternates)

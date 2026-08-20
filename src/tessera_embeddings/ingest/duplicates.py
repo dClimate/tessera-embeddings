@@ -291,6 +291,7 @@ def log_duplicate_selection(
     roi: str,
     alternates: dict[tuple[str, str], list[Any]],
     kept: Iterable[Any] = (),
+    read_keys: tuple[str, ...] = READ_ASSET_KEYS,
 ) -> None:
     """Record that duplicates were pruned, at a level that survives a fleet-wide log.
 
@@ -304,6 +305,10 @@ def log_duplicate_selection(
 
     Counted over the CONTESTED tile-dates only. ``kept`` is every survivor on the ROI, most of
     which had no duplicate, so counting them all would describe the supply rather than the choices.
+
+    ``read_keys`` must be the set selection ranked on, or the line reports a locality the decision
+    did not use — a winner serving every requested band locally reads as remote for lacking an
+    asset nobody asked for.
     """
     if not alternates:
         return
@@ -311,7 +316,7 @@ def log_duplicate_selection(
     winners = [it for it in kept if _contested_key(it) in alternates]
     where = ""
     if winners:
-        local = sum(1 for it in winners if item_is_in_preferred_location(it))
+        local = sum(1 for it in winners if item_is_in_preferred_location(it, keys=read_keys))
         where = f"; winners by source: {local} in-region, {len(winners) - local} remote"
 
     how = "newest baseline, then in-region, then complete read set, then newest sequence"

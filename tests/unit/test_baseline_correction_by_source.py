@@ -1005,3 +1005,51 @@ class TestRankingUsesTheRequestedAssetsNotThePruningSet:
         local_no_scl.assets = {b: {"href": f"{_HARMONISED}/{b}.tif"} for b in config.bands}
         assert item_is_in_preferred_location(local_no_scl, keys=keys) is True
         assert item_is_in_preferred_location(local_no_scl) is False, "the fixed set demands scl"
+
+
+class TestTheSplitWorkflowProvenanceFollowsTheSelectedCopy:
+    """The loader selects duplicates, so the caller's baseline map goes stale.
+
+    `query_stac_items` builds that map from the unpruned list and the caller keeps it for
+    `baselines_applied`, so a rejected copy that sorted last could describe pixels the selected
+    copy provided. Raised on PR #107.
+    """
+
+    @staticmethod
+    def _pair() -> list[_Item]:
+        """Different baselines, and the copy that will be REJECTED sorts last."""
+        winner = _Item(_HARMONISED, "05.10")
+        winner.id = "S2A_33TWM_20220107_1_L2A"
+        winner.properties["s2:sequence"] = "1"
+        loser = _Item(_HARMONISED, "02.06")
+        loser.id = "S2A_33TWM_20220107_0_L2A"
+        loser.properties["s2:sequence"] = "0"
+        for item in (winner, loser):
+            item.properties["grid:code"] = "MGRS-33TWM"
+            item.properties["datetime"] = "2022-01-07T10:20:31.024000Z"
+        return [winner, loser]
+
+    def test_the_supplied_map_is_realigned_with_the_survivor(self, monkeypatch) -> None:
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
+        items = self._pair()
+        # What `query_stac_items` hands back: last-wins over the UNPRUNED list.
+        baselines = extract_baselines(items)
+        assert baselines == {"2022-01-07": 206}, "the fixture must start with the rejected copy's value"
+
+        stac_module.load_stac_items(items, "earth-search", "sentinel-2-l2a", baselines=baselines)
+        assert baselines == {"2022-01-07": 510}, "provenance still described the rejected copy"
+
+    def test_a_map_is_untouched_when_there_are_no_duplicates(self, monkeypatch) -> None:
+        """It must only realign what selection actually changed."""
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
+        baselines = {"2022-01-07": 510}
+        stac_module.load_stac_items([self._pair()[0]], "earth-search", "sentinel-2-l2a", baselines=baselines)
+        assert baselines == {"2022-01-07": 510}

@@ -655,12 +655,13 @@ def _apply_baseline_corrections_by_date(
     first, and casts every date of the other kind. Tessera mode returns the input dtype and
     cannot go negative, which is why it is the default.
 
-    - Default (preserve_low_values=False): Subtracts offset from all pixels,
-      allowing values below abs(offset) to go negative. Matches
-      generate_cloudmask.py behavior where negative values signal nodata/dark.
-    - Tessera mode (preserve_low_values=True): Only subtracts from pixels
-      where value >= abs(offset), leaving low values unchanged. Matches
-      Tessera's harmonize_arr() behavior.
+    - Default (preserve_low_values=True): Only subtracts from pixels where value >= abs(offset),
+      leaving low/dark pixels unchanged, and returns the INPUT dtype. Matches Tessera's
+      harmonize_arr() behaviour, and is the default because it is the only mode that round-trips
+      into an unsigned store.
+    - Signed mode (preserve_low_values=False): Subtracts offset from all pixels and returns int16,
+      so values below abs(offset) go negative and signal nodata/dark to an in-memory consumer.
+      NOT compatible with an unsigned store.
 
     Args:
         ds: xarray Dataset with time dimension
@@ -1201,7 +1202,18 @@ def load_stac_items(
         # pair of producers for one acquisition would reach the correction decision as a genuine
         # conflict. Selecting again over an already-selected set is a no-op, and this function
         # already requires normalised items for that decision, so the precondition is unchanged.
-        items, _ = select_preferred_duplicates(items, _requested_assets(collection_config, extra_bands))
+        read_keys = _requested_assets(collection_config, extra_bands)
+        pruned, alternates = select_preferred_duplicates(items, read_keys)
+        if alternates:
+            log_duplicate_selection(logger, f"load {collection}", alternates, kept=pruned, read_keys=read_keys)
+            # Realign the caller's provenance with what is about to be loaded. `baselines` becomes
+            # the store's `baselines_applied`, and on the split workflow it was built by
+            # `query_stac_items` from the UNPRUNED list — so a rejected copy that sorted last could
+            # describe pixels the selected copy provided. Updated in place: the caller holds this
+            # dict and there is no return value to carry it.
+            if baselines is not None:
+                baselines.update(extract_baselines(pruned))
+        items = pruned
 
     data = _load_from_stac(
         items,
@@ -1407,8 +1419,15 @@ def ingest_tile(
         # query left that driver with an empty ladder, so a single unreadable object lost the date
         # instead of stepping down to the copy sitting behind it. Selection belongs to the layer
         # that owns the fallback — which here is nobody, so the copies are genuinely spare.
-        items, alternates = select_preferred_duplicates(items, _requested_assets(collection_config, extra_bands))
-        log_duplicate_selection(logger, f"tile {tile_id}" if tile_id else f"bbox {bbox}", alternates, kept=items)
+        read_keys = _requested_assets(collection_config, extra_bands)
+        items, alternates = select_preferred_duplicates(items, read_keys)
+        log_duplicate_selection(
+            logger,
+            f"tile {tile_id}" if tile_id else f"bbox {bbox}",
+            alternates,
+            kept=items,
+            read_keys=read_keys,
+        )
         # Provenance must describe what was KEPT. `query_stac_items` built this map from the
         # unpruned list, so a rejected copy that happened to sort last supplied the recorded
         # baseline for pixels the selected copy provided — and this map is returned to the caller
