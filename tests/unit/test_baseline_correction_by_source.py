@@ -33,6 +33,7 @@ from tessera_embeddings.ingest.asset_locations import (
 )
 from tessera_embeddings.ingest.stac import (
     HeterogeneousProducerError,
+    _declared_baseline,
     _extract_baseline,
     dates_exempt_from_correction,
     extract_baselines,
@@ -304,3 +305,125 @@ class TestTheCorrectionPathAnnouncesItself:
         with caplog.at_level(logging.WARNING, logger="tessera_embeddings.ingest.stac"):
             dates_exempt_from_correction([_Item(_HARMONISED, "05.10")])
         assert not [r for r in caplog.records if "correction ACTIVE" in r.message]
+
+
+class TestTheThresholdFollowsTheBaselineTheCorrectionWillApply:
+    """The exemption must be decided on the caller's map, not on re-parsed metadata.
+
+    `load_stac_items` builds a per-date baseline map, hands it to the correction, and asked
+    this function separately — which re-read each item instead. The two normally agree, since
+    the map was built from these items. Where they do not, the correction applies the map's
+    value while the exemption was decided on the item's, so the decision described a baseline
+    that was never used. Raised three times in review of PR #108.
+    """
+
+    def test_a_supplied_baseline_rescues_an_item_with_unreadable_metadata(self) -> None:
+        """THE FAILURE NAMED. Malformed metadata parses as 0, which is under the threshold, so
+        the date was exempted and its pixels stayed 1000 too high while the caller had
+        correctly supplied 500.
+        """
+        item = _Item(_RAW_ESA, "not-a-number")
+        assert _extract_baseline(item) == 0, "the fixture must actually be unreadable"
+
+        assert dates_exempt_from_correction([item]) == {"2022-01-07"}, "no map: nothing to go on"
+        assert dates_exempt_from_correction([item], {"2022-01-07": 500}) == set()
+
+    def test_a_missing_baseline_property_is_also_rescued(self) -> None:
+        item = _Item(_RAW_ESA, None)
+        assert dates_exempt_from_correction([item], {"2022-01-07": 500}) == set()
+
+    def test_the_map_is_read_in_the_scaled_space_the_threshold_uses(self) -> None:
+        """500 is baseline 05.00, not 500.00. A map read at the wrong scale would exempt
+        every date, since 5.0 is under a threshold of 400.
+        """
+        assert S2_BASELINE_THRESHOLD == 400
+        item = _Item(_RAW_ESA, None)
+        assert dates_exempt_from_correction([item], {"2022-01-07": 500}) == set()
+        assert dates_exempt_from_correction([item], {"2022-01-07": 399}) == {"2022-01-07"}
+        assert dates_exempt_from_correction([item], {"2022-01-07": 400}) == set(), "the threshold is inclusive"
+
+    def test_a_supplied_pre_threshold_baseline_exempts_a_raw_item(self) -> None:
+        """The other direction, so the rule is not "always correct". The correction applies the
+        map's value, so a map under the threshold means no offset is applied whatever the item
+        declares — and the exemption has to agree with that rather than contradict it.
+        """
+        item = _Item(_RAW_ESA, "05.00")
+        assert dates_exempt_from_correction([item]) == set()
+        assert dates_exempt_from_correction([item], {"2022-01-07": 300}) == {"2022-01-07"}
+
+    def test_a_date_the_map_does_not_carry_falls_back_to_the_item(self) -> None:
+        """A partial map must not exempt the dates it happens to omit."""
+        item = _Item(_RAW_ESA, "05.00")
+        assert dates_exempt_from_correction([item], {"1999-01-01": 300}) == set()
+
+    def test_an_unreadable_item_does_not_refuse_the_date_it_was_rescued_for(self) -> None:
+        """The straddle guard reads each item's OWN baseline. Counting an unreadable one as 0
+        would raise for exactly the date the map is there to rescue, turning a silent wrong
+        answer into a lost date rather than a correct one.
+        """
+        readable = _Item(_RAW_ESA, "05.00")
+        unreadable = _Item(_RAW_ESA, None)
+        assert dates_exempt_from_correction([readable, unreadable], {"2022-01-07": 500}) == set()
+
+    def test_a_genuine_straddle_still_refuses(self) -> None:
+        """So the test above cannot pass by having disabled the guard."""
+        over = _Item(_RAW_ESA, "05.00")
+        under = _Item(_RAW_ESA, "03.00")
+        with pytest.raises(HeterogeneousProducerError, match="straddle the correction threshold"):
+            dates_exempt_from_correction([over, under], {"2022-01-07": 500})
+
+
+class TestTheActivationWarningDescribesWhatHappened:
+    """The warning must not claim a correction that a refusal then prevented. PR #108 review."""
+
+    def _records(self, caplog, items, baselines=None) -> list[logging.LogRecord]:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="tessera_embeddings.ingest.stac"):
+            try:
+                dates_exempt_from_correction(items, baselines)
+            except HeterogeneousProducerError:
+                pass
+        return [r for r in caplog.records if "Baseline correction" in r.getMessage()]
+
+    def test_a_date_that_refuses_logs_no_correction(self, caplog) -> None:
+        """Emitted before the checks, the line announced a correction on a date that then
+        raised and was never loaded at all.
+        """
+        raw_over = _Item(_RAW_ESA, "05.00")
+        harmonised = _Item(_HARMONISED, "05.00")
+        records = self._records(caplog, [raw_over, harmonised])
+        assert records == [], f"a refused date announced a correction: {[r.getMessage() for r in records]}"
+
+    def test_a_straddling_date_logs_no_correction(self, caplog) -> None:
+        raw_over = _Item(_RAW_ESA, "05.00")
+        raw_under = _Item(_RAW_ESA, "03.00")
+        assert self._records(caplog, [raw_over, raw_under]) == []
+
+    def test_a_date_that_is_actually_corrected_still_warns(self, caplog) -> None:
+        """The complement: silencing the warning entirely would pass every test above."""
+        records = self._records(caplog, [_Item(_RAW_ESA, "05.00")])
+        assert [r.levelno for r in records] == [logging.WARNING]
+        assert "ESA-archive" in records[0].getMessage()
+
+
+class TestTheBaselineParserReportsUnknown:
+    """`_extract_baseline` maps a missing baseline to 0, so it cannot say "unknown"."""
+
+    @pytest.mark.parametrize("raw", [None, "", "not-a-number", "NaN", "Infinity", "-Infinity"])
+    def test_an_undeclared_or_nonsense_baseline_is_unknown(self, raw) -> None:
+        assert _declared_baseline(_Item(_RAW_ESA, raw)) is None
+
+    @pytest.mark.parametrize(("raw", "scaled"), [("04.00", 400), ("05.10", 510), ("00.01", 1)])
+    def test_a_real_baseline_is_scaled_by_a_hundred(self, raw: str, scaled: int) -> None:
+        assert _declared_baseline(_Item(_RAW_ESA, raw)) == scaled
+
+    def test_an_infinite_baseline_does_not_raise_out_of_the_parser(self) -> None:
+        """`round(inf)` raises OverflowError, which the parser's except clause did not catch —
+        so a single malformed catalogue value aborted the whole preparation.
+        """
+        assert _extract_baseline(_Item(_RAW_ESA, "Infinity")) == 0
+
+    def test_a_declared_zero_is_distinguishable_from_an_absent_one(self) -> None:
+        assert _declared_baseline(_Item(_RAW_ESA, "00.00")) == 0
+        assert _declared_baseline(_Item(_RAW_ESA, None)) is None
+        assert _extract_baseline(_Item(_RAW_ESA, "00.00")) == _extract_baseline(_Item(_RAW_ESA, None)) == 0

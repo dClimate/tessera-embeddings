@@ -722,7 +722,7 @@ class TestTheDuplicateLogIsAnAuditTrail:
         """
         local = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
         remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
-        msg = self._emit(caplog, [local], {("MGRS-33TWM", "2018-06-04"): [remote]})
+        msg = self._emit(caplog, [local], {("MGRS-33TWM", "2021-09-08"): [remote]})
         assert "newest baseline, then in-region, then newest sequence" in msg
         assert "newest kept" not in msg, "the stale claim must not come back"
 
@@ -733,7 +733,7 @@ class TestTheDuplicateLogIsAnAuditTrail:
         """
         local = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
         remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
-        msg = self._emit(caplog, [local], {("MGRS-33TWM", "2018-06-04"): [remote]})
+        msg = self._emit(caplog, [local], {("MGRS-33TWM", "2021-09-08"): [remote]})
         assert "1 in-region, 0 remote" in msg
 
     def test_it_reports_a_remote_survivor_as_remote(self, caplog) -> None:
@@ -741,8 +741,35 @@ class TestTheDuplicateLogIsAnAuditTrail:
         or it is decoration rather than evidence.
         """
         remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
-        msg = self._emit(caplog, [remote], {("MGRS-33TWM", "2018-06-04"): [remote]})
+        msg = self._emit(caplog, [remote], {("MGRS-33TWM", "2021-09-08"): [remote]})
         assert "0 in-region, 1 remote" in msg
+
+    def test_it_counts_only_the_contested_tile_dates(self, caplog) -> None:
+        """THE FINDING. `kept` is every survivor on the ROI, and on a wide one almost none of
+        them had a duplicate. Counting them all described the composition of the whole supply
+        rather than the choices this line exists to record.
+        """
+        contested_winner = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
+        rejected = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
+        # A hundred tile-dates that were never in question, all served from elsewhere.
+        untouched = [_with_assets(_Item(f"u{i}", f"MGRS-33TW{i:02d}", "0"), _bands_at(_REMOTE)) for i in range(100)]
+        msg = self._emit(
+            caplog,
+            [contested_winner, *untouched],
+            {("MGRS-33TWM", "2021-09-08"): [rejected]},
+        )
+        assert "1 in-region, 0 remote" in msg, "the 100 uncontested dates drowned out the decision"
+        assert "winners by source" in msg
+
+    def test_an_unkeyable_survivor_does_not_break_the_line(self, caplog) -> None:
+        """`solar_day_of` raises on an un-normalised item, and a log call must not abort an
+        ingest. The figure is omitted for that item rather than propagated.
+        """
+        winner = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
+        stray = _with_assets(_Item("stray", "MGRS-33TWM", "0"), _bands_at(_REMOTE))
+        stray.datetime = datetime(2021, 9, 8, 7, 30, 0, tzinfo=UTC)
+        msg = self._emit(caplog, [winner, stray], {("MGRS-33TWM", "2021-09-08"): [stray]})
+        assert "1 in-region, 0 remote" in msg
 
     def test_no_duplicates_logs_nothing(self, caplog) -> None:
         assert self._emit(caplog, [], {}) == ""

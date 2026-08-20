@@ -322,6 +322,23 @@ def select_preferred_duplicates(
     return kept, alternates
 
 
+def _contested_key(item: Any) -> tuple[str, str] | None:  # noqa: ANN401 — any STAC-like item
+    """An item's ``(tile, solar_day)`` key, or ``None`` if it cannot be keyed.
+
+    Returns ``None`` rather than raising because the only caller is a log line, and
+    :func:`solar_day_of` raises on an item that has not been normalised. A logging call that
+    can abort an ingest is worse than a log line that omits a figure.
+    """
+    tile = item_tile(item)
+    if tile is None:
+        return None
+    try:
+        return (tile, solar_day_of(item))
+    except Exception:
+        logger.debug("Could not key %s for the duplicate audit line", getattr(item, "id", "?"))
+        return None
+
+
 def log_duplicate_selection(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     roi: str,
@@ -340,15 +357,21 @@ def log_duplicate_selection(
     audit trail for that decision: where two copies carry the same baseline their pixels are
     identical, so nothing downstream can show which was read, and the choice is otherwise
     invisible in the store, the mosaic and the metrics.
+
+    **Counted over the CONTESTED tile-dates only.** ``kept`` is every survivor on the ROI, and
+    on a wide one almost none of them had a duplicate at all. Counting them all reported the
+    composition of the whole supply — "1 in-region, 100 remote" — while saying nothing about
+    the choices this line exists to record, and the one figure that matters was rounded away by
+    the hundred dates that were never in question.
     """
     if not alternates:
         return
     pruned = sum(len(v) for v in alternates.values())
-    survivors = list(kept)
+    winners = [it for it in kept if _contested_key(it) in alternates]
     where = ""
-    if survivors:
-        local = sum(1 for it in survivors if item_is_in_preferred_location(it))
-        where = f"; survivors by source: {local} in-region, {len(survivors) - local} remote"
+    if winners:
+        local = sum(1 for it in winners if item_is_in_preferred_location(it))
+        where = f"; winners by source: {local} in-region, {len(winners) - local} remote"
     log.info(
         "Duplicate catalogue items pruned roi=%s: %d tile-date(s) had more than one copy, "
         "%d rejected. Preference: newest baseline, then in-region, then newest sequence "

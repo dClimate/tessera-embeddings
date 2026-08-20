@@ -365,14 +365,51 @@ These happen before `odc.stac.load` is called:
 
 #### Sentinel-2 Baseline Correction
 
-ESA changed the S2 L2A processing baseline at version 04.00, adding +1000 to all pixel values.
-The correction logic in `_apply_baseline_corrections_by_date` is enabled per-collection via
-the `requires_baseline_correction` flag in `CollectionConfig`. In practice, the Earth Search
-catalog (used by the Tessera ROI ingestion flow) already delivers pre-corrected values, so
-the correction is **not applied** in the current production flow.
+ESA changed the S2 L2A processing baseline at version 04.00 (January 2022), adding +1000 to all
+surface reflectance values. Whether that offset has to be subtracted is a property of **who
+served the pixels**, not of the collection: Element 84 harmonises its own COGs and subtracts it
+for you, while ESA's originals carry it.
 
-The code is retained for collections or catalog providers that still require it. When active,
-it builds a per-date correction mask vectorised across the time dimension. Two modes:
+The Earth Search collection config therefore used to leave `baseline_threshold` unset, on the
+reasoning that its items are always harmonised. That stopped being true when the same collection
+began indexing items whose assets point at ESA's archive. Reading the collection alone exempts
+or corrects both kinds together, and one of those is always wrong, silently: a skipped
+correction leaves plausible pixels 1000 too high, a doubled one shifts every value by 1000.
+
+So the threshold **is** set for Earth Search, and the exemption is decided per item from where
+its reflectance assets live (`asset_locations.item_harmonisation`). Three properties of that
+decision are worth stating:
+
+- **Judged over the reflectance bands only.** A real Element 84 item carries the original JP2s
+  as extra assets beside its COG bands, so judging every asset reports a straddle for an item
+  that is wholly harmonised where it matters. `scl` is excluded even though it *is* read: it is
+  categorical and never corrected, so its producer cannot make the reflectance ambiguous. This
+  is a different asset set from the one locality is judged over — see the duplicate selector,
+  which uses the full read set including `scl`.
+- **Decided per DATE, not per item.** `odc.stac.load` fuses a solar day into one time slice and
+  the correction is applied per date from one baseline, so the question asked of a date is
+  whether *anything* in it is actually owed a correction. Mixed-producer days are real — a
+  census of four tile-years found 7 in 522 — and after duplicate selection their survivors pair
+  a harmonised COG with a raw item at an old baseline, which is owed nothing.
+- **Thresholded on the baseline that will actually be applied**, which is the per-date map the
+  caller passes down, not the item's own metadata re-parsed. The two normally agree because the
+  map is built from those items, but a raw item whose `s2:processing_baseline` is absent or
+  malformed parses as 0 and would exempt a date the caller correctly supplied a post-threshold
+  baseline for.
+
+Genuinely ambiguous dates **refuse** (`HeterogeneousProducerError`) rather than picking a side,
+because no date-wide answer is right for them and both mistakes are silent: an item whose own
+bands straddle the two producers, raw items on opposite sides of the threshold, and a raw item
+owed the offset fused with an already-harmonised one. None has been observed on the live
+catalogue, which is why they are refused rather than engineered around.
+
+The correction path had never run in production, so it announces itself at WARNING the first
+time it does for a date — but only for items served from ESA's archive, since every Planetary
+Computer item is unharmonised too and correcting those is routine. The line is emitted after
+every refusal above, so it can only ever describe a date that really was corrected.
+
+When active, `_apply_baseline_corrections_by_date` builds a per-date correction mask vectorised
+across the time dimension. Two modes:
 
 - **Default** (`preserve_low_values=False`) — subtracts the offset from all pixels. Values
   below 1000 go negative, which acts as a nodata/dark-pixel signal in the cloud-mask model.
