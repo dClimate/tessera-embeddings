@@ -875,12 +875,27 @@ def coverage_from_validity(valid: np.ndarray, months: np.ndarray) -> tuple[np.nd
         an unwritten pixel reads — absence of evidence and evidence of absence are not distinguished
         here, exactly as a count of 0 does not distinguish them.
     """
-    obs_count = valid.sum(axis=0).astype(np.uint16)
+    # `dtype=` rather than a trailing `.astype`: summing a bool array defaults to int64, which for
+    # a 2048-px chunk is a 33 MB temporary thrown away on the next line.
+    obs_count = valid.sum(axis=0, dtype=np.uint16)
     month_covered = np.zeros((MONTHS_IN_YEAR, *obs_count.shape), dtype=bool)
-    for month in range(1, MONTHS_IN_YEAR + 1):
-        in_month = months == month
-        if in_month.any():
-            month_covered[month - 1] = valid[in_month].any(axis=0)
+
+    # Accumulated per TIMESTEP rather than gathered per month. Selecting `valid[months == m]` copies
+    # that month's timesteps into a fresh array before reducing it, so a pass over twelve months
+    # copies the whole mask — tens of MB per chunk per sensor, and now three sensors rather than
+    # one. OR-ing each timestep into its month's plane touches the same bytes with no temporary at
+    # all, and each iteration is still one vectorised operation over the full grid.
+    if valid.shape[0]:
+        index = np.asarray(months, dtype=np.intp) - 1
+        if index.min() < 0 or index.max() >= MONTHS_IN_YEAR:
+            # Guarded because the failure would otherwise be SILENT and wrong rather than loud:
+            # a month of 0 indexes -1, which is December, so a mislabelled timestep would quietly
+            # mark the wrong end of the year. The previous formulation dropped out-of-range months
+            # instead, which is a different silent answer. `_filter_times_from_zarr` derives these
+            # modulo 12, so neither should ever happen; this says so rather than assuming it.
+            raise ValueError(f"month labels out of range 1..{MONTHS_IN_YEAR}: {np.unique(months)}")
+        for timestep, month_index in enumerate(index):
+            month_covered[month_index] |= valid[timestep]
     return obs_count, month_covered
 
 

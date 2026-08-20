@@ -215,6 +215,19 @@ class TestCoverageFromValidity:
         assert covered.shape == (MONTHS_IN_YEAR, 3, 3)
         assert not covered.any()
 
+    def test_a_month_label_outside_the_calendar_is_refused_rather_than_absorbed(self):
+        """A 0 would index -1 — December — and mark the wrong end of the year in silence.
+
+        The accumulation indexes a plane per timestep, so an out-of-range label is either a crash
+        or a wrong answer, and negative indexing makes it the wrong answer. `_filter_times_from_zarr`
+        derives months modulo 12 so this should be unreachable; the guard says so rather than
+        leaving the reader to work out that it is safe.
+        """
+        valid = np.ones((1, 2, 2), dtype=bool)
+        for bad in (0, 13):
+            with pytest.raises(ValueError, match="month labels out of range"):
+                coverage_from_validity(valid, np.asarray([bad], dtype=np.int16))
+
     def test_the_pair_cannot_disagree_about_which_pixels_were_seen(self):
         """The property the shared helper exists to guarantee: a pixel with a non-zero count has at
         least one covered month, and a pixel with a zero count has none. Two separately-derived
