@@ -725,9 +725,9 @@ class TestScalingCannotOverflowThePicker:
         assert _declared_baseline(_Item(_RAW_ESA, raw)) is None
         assert _extract_baseline(_Item(_RAW_ESA, raw)) == 0
 
-    def test_a_large_but_scalable_value_still_parses(self) -> None:
-        """So the guard rejects only what genuinely cannot be scaled."""
-        assert _declared_baseline(_Item(_RAW_ESA, "1e10")) == 10**12
+    def test_a_high_but_plausible_version_still_parses(self) -> None:
+        """The bound must leave headroom above ESA's 05.x rather than pinning today's value."""
+        assert _declared_baseline(_Item(_RAW_ESA, "99.99")) == 9999
 
     def test_the_batch_is_not_aborted_by_one_such_item(self) -> None:
         """The consequence: `extract_baselines` must survive it rather than raising."""

@@ -73,9 +73,16 @@ class TestUnreadableIsOneThing:
         """
         assert processing_baseline(_item("1e308")) is None
 
-    def test_a_large_but_representable_value_still_parses(self) -> None:
-        """So the guard rejects only what genuinely cannot be scaled."""
-        assert processing_baseline(_item("1e10")) == 10**12
+    @pytest.mark.parametrize("raw", ["1e10", "1e308", "999.00", "100.01"])
+    def test_a_value_beyond_any_real_version_is_unreadable(self, raw: str) -> None:
+        """No processing version reaches these. Read as numbers they clear every threshold, so a
+        nonsense value would force a correction rather than being refused as ambiguous.
+        """
+        assert processing_baseline(_item(raw)) is None
+
+    def test_a_high_but_plausible_version_still_parses(self) -> None:
+        """The bound must leave real headroom above ESA's 05.x rather than pinning today's value."""
+        assert processing_baseline(_item("99.99")) == 9999
 
 
 class TestANegativeBaselineIsNotAVersion:
@@ -93,3 +100,28 @@ class TestANegativeBaselineIsNotAVersion:
         """The boundary: 0 is a real declared value, and distinguishable from "declared nothing"."""
         assert processing_baseline(_item("00.00")) == 0
         assert processing_baseline(_item(None)) is None
+
+
+class TestABaselineMustLandOnAHundredth:
+    """A processing baseline is a two-decimal version, so a value between hundredths is malformed.
+
+    `"03.999"` scaled by a hundred is 399.9, which rounds to 400 and crosses the correction
+    threshold — forcing a subtraction on metadata that should have been refused as ambiguous.
+    Raised on PR #107.
+    """
+
+    @pytest.mark.parametrize("raw", ["03.999", "04.001", "3.9999", "0.001"])
+    def test_a_value_between_hundredths_is_unreadable(self, raw: str) -> None:
+        assert processing_baseline(_item(raw)) is None
+
+    def test_the_specific_threshold_crossing_case(self) -> None:
+        """`"03.999"` must not become 400 and trigger a correction."""
+        assert processing_baseline(_item("03.999")) is None
+        assert processing_baseline(_item("04.00")) == 400
+
+    @pytest.mark.parametrize(("raw", "expected"), [("05.10", 510), ("00.01", 1), ("5.1", 510), ("4", 400)])
+    def test_exact_hundredths_still_parse_however_written(self, raw: str, expected: int) -> None:
+        """Trailing-zero and shorthand forms are the same value, and binary floating point is why
+        this is checked with Decimal: 5.10 * 100 is 509.999... as a float.
+        """
+        assert processing_baseline(_item(raw)) == expected
