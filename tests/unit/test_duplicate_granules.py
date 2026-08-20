@@ -13,23 +13,26 @@ newer, so the older copy is a fallback and never a default.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 import pystac
 import pytest
 
-from tessera_embeddings.ingest.duplicates import (
+from tessera_embeddings.ingest.asset_locations import (
     PREFERRED_ASSET_BUCKETS,
     READ_ASSET_KEYS,
-    alternates_for,
     asset_bucket,
+    item_is_in_preferred_location,
+    read_set_is_complete,
+)
+from tessera_embeddings.ingest.duplicates import (
+    alternates_for,
     copies_label,
     is_unreadable_source,
-    item_is_in_preferred_location,
     item_processing_baseline,
     item_sequence,
     item_tile,
-    read_set_is_complete,
     select_preferred_duplicates,
     step_down_copies,
 )
@@ -701,6 +704,96 @@ class TestFallbackLadderKeepsBaselineOrder:
         assert ladder == [middle.id, worst_local.id], "the ladder skipped a newer reprocessing"
 
 
+class TestTheDuplicateLogIsAnAuditTrail:
+    """The only record of which copy won, so it has to be accurate."""
+
+    def _emit(self, caplog, kept, alternates):
+        log = logging.getLogger("dup-audit-test")
+        with caplog.at_level(logging.INFO, logger="dup-audit-test"):
+            copies_label  # noqa: B018 — keep the import honest
+            from tessera_embeddings.ingest.duplicates import log_duplicate_selection
+
+            log_duplicate_selection(log, "roi-x", alternates, kept=kept)
+        return " ".join(r.getMessage() for r in caplog.records)
+
+    def test_it_states_the_actual_preference(self, caplog) -> None:
+        """It said "newest kept" while the ranking preferred an in-region copy over a
+        higher-sequence remote one — a line misreporting its own behaviour.
+        """
+        local = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
+        remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
+        msg = self._emit(caplog, [local], {("MGRS-33TWM", "2021-09-08"): [remote]})
+        assert "newest baseline, then in-region, then newest sequence" in msg
+        assert "newest kept" not in msg, "the stale claim must not come back"
+
+    def test_it_names_where_the_survivors_came_from(self, caplog) -> None:
+        """THE AUDIT TRAIL. Where two copies share a baseline their pixels are identical, so
+        nothing downstream can show which was read — not the store, not the mosaic, not the
+        metrics. Without this the decision is unobservable in production.
+        """
+        local = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
+        remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
+        msg = self._emit(caplog, [local], {("MGRS-33TWM", "2021-09-08"): [remote]})
+        assert "1 in-region, 0 remote" in msg
+
+    def test_it_reports_a_remote_survivor_as_remote(self, caplog) -> None:
+        """The complement: the line must be capable of saying the preference did NOT apply,
+        or it is decoration rather than evidence.
+        """
+        remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
+        msg = self._emit(caplog, [remote], {("MGRS-33TWM", "2021-09-08"): [remote]})
+        assert "0 in-region, 1 remote" in msg
+
+    def test_it_counts_only_the_contested_tile_dates(self, caplog) -> None:
+        """THE FINDING. `kept` is every survivor on the ROI, and on a wide one almost none of
+        them had a duplicate. Counting them all described the composition of the whole supply
+        rather than the choices this line exists to record.
+        """
+        contested_winner = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
+        rejected = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
+        # A hundred tile-dates that were never in question, all served from elsewhere.
+        untouched = [_with_assets(_Item(f"u{i}", f"MGRS-33TW{i:02d}", "0"), _bands_at(_REMOTE)) for i in range(100)]
+        msg = self._emit(
+            caplog,
+            [contested_winner, *untouched],
+            {("MGRS-33TWM", "2021-09-08"): [rejected]},
+        )
+        assert "1 in-region, 0 remote" in msg, "the 100 uncontested dates drowned out the decision"
+        assert "winners by source" in msg
+
+    def test_an_unkeyable_survivor_does_not_break_the_line(self, caplog) -> None:
+        """`solar_day_of` raises on an un-normalised item, and a log call must not abort an
+        ingest. The figure is omitted for that item rather than propagated.
+        """
+        winner = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
+        stray = _with_assets(_Item("stray", "MGRS-33TWM", "0"), _bands_at(_REMOTE))
+        stray.datetime = datetime(2021, 9, 8, 7, 30, 0, tzinfo=UTC)
+        msg = self._emit(caplog, [winner, stray], {("MGRS-33TWM", "2021-09-08"): [stray]})
+        assert "1 in-region, 0 remote" in msg
+
+    def test_it_names_the_sequence_only_fallback_when_that_is_what_ran(self, caplog) -> None:
+        """`_rank_copies` abandons BOTH baseline and locality when a copy declares no readable
+        baseline, and chooses on sequence alone. On exactly the uncertain-metadata dates this
+        line exists to explain, it was describing the wrong mechanism.
+        """
+        winner = _copy("a", sequence="1", baseline="00.01", host_root=_IN_REGION)
+        unreadable = _with_assets(_Item("b", "MGRS-33TWM", "0"), _bands_at(_REMOTE))
+        msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [unreadable]})
+        assert "ranked on sequence alone" in msg
+        assert "1 tile-date(s) where a copy declared no readable baseline" in msg
+
+    def test_it_does_not_claim_a_fallback_that_did_not_happen(self, caplog) -> None:
+        """The complement, or the clause above would just always be present."""
+        winner = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
+        rejected = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
+        msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [rejected]})
+        assert "sequence alone" not in msg
+        assert "newest baseline, then in-region, then newest sequence" in msg
+
+    def test_no_duplicates_logs_nothing(self, caplog) -> None:
+        assert self._emit(caplog, [], {}) == ""
+
+
 def _copy_at(ident: str, *, acquired: str, sequence: str, baseline: str | None, host_root: str = _IN_REGION) -> _Item:
     """A copy pinned to a given ACQUISITION instant, for cross-acquisition ordering tests."""
     extra: dict[str, object] = {"datetime": acquired}
@@ -917,3 +1010,50 @@ class TestTheLadderKeepsGlobalPriorityPastItsHead:
         _, alternates = select_preferred_duplicates(items)
         ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
         assert ladder == ["a-04", "b-03", "a-unknown"]
+
+
+class TestLocalityDoesNotDecideBetweenUnknownBaselines:
+    """In the ladder key, locality was ranked ahead of sequence for copies that declare no
+    readable baseline — so a local sequence-1 spare came out before a remote sequence-2 one,
+    buying cheaper egress with an older reprocessing. Raised on PR #107.
+    """
+
+    _A = "2021-09-08T10:00:00Z"
+
+    def test_sequence_decides_between_two_unknown_baseline_spares(self) -> None:
+        items = [
+            _copy_at("winner", acquired=self._A, sequence="3", baseline=None),
+            _copy_at("remote-seq2", acquired=self._A, sequence="2", baseline=None, host_root=_REMOTE),
+            _copy_at("local-seq1", acquired=self._A, sequence="1", baseline=None, host_root=_IN_REGION),
+        ]
+        kept, alternates = select_preferred_duplicates(items)
+        assert [it.id for it in kept] == ["winner"]
+        ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
+        assert ladder == ["remote-seq2", "local-seq1"], "locality outranked the newer sequence"
+
+    def test_locality_still_decides_between_two_equal_known_baselines(self) -> None:
+        """The complement: neutralising locality everywhere would pass the test above."""
+        items = [
+            _copy_at("winner", acquired=self._A, sequence="3", baseline="05.00"),
+            _copy_at("remote", acquired=self._A, sequence="1", baseline="04.00", host_root=_REMOTE),
+            _copy_at("local", acquired=self._A, sequence="1", baseline="04.00", host_root=_IN_REGION),
+        ]
+        _, alternates = select_preferred_duplicates(items)
+        ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
+        assert ladder == ["local", "remote"]
+
+
+class TestAMalformedHrefDoesNotAbortTheSelection:
+    """`urlparse` raises on some malformed authorities, and locality is evaluated for every copy
+    including singletons — so one bad catalogue href aborted the whole selection. PR #107.
+    """
+
+    @pytest.mark.parametrize("href", ["https://[oops/B02.tif", "https://[::1/x", "s3://[/key"])
+    def test_an_unparseable_href_reads_as_remote(self, href: str) -> None:
+        assert asset_bucket(href) is None
+
+    def test_a_singleton_group_with_a_malformed_href_still_returns(self) -> None:
+        item = _with_assets(_Item("only", "MGRS-33TWM", "0"), {"blue": {"href": "https://[oops/B02.tif"}})
+        kept, alternates = select_preferred_duplicates([item])
+        assert [it.id for it in kept] == ["only"]
+        assert alternates == {}

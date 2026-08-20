@@ -9,6 +9,7 @@ Supports multiple providers (Earth Search, Planetary Computer) and collections
 """
 
 import logging
+import math
 import time
 from collections.abc import Callable, Iterator
 from itertools import count
@@ -31,6 +32,11 @@ from tessera_embeddings.config import (
 from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
+from tessera_embeddings.ingest.asset_locations import (
+    Harmonisation,
+    item_harmonisation,
+    item_is_from_raw_archive,
+)
 from tessera_embeddings.ingest.catalogue_refusal import (
     CatalogueRequest,
     bbox_area_label,
@@ -42,6 +48,7 @@ from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
     resolve_grouping_longitude,
+    solar_day_of,
 )
 
 # =============================================================================
@@ -208,8 +215,42 @@ def _build_stac_query(
     return query_params
 
 
+def _declared_baseline(item: Item) -> int | None:
+    """The baseline an item REPORTS, scaled to an integer, or ``None`` if it declares none.
+
+    The ``None`` is the whole reason this exists beside :func:`_extract_baseline`: that function
+    maps a missing baseline to 0, which is indistinguishable from an item genuinely declaring
+    0 and makes "unknown" untestable. A decision that has a fallback for unknown — such as
+    whether a date is owed a correction, which defers to the caller's baseline map — needs to
+    tell the two apart.
+
+    ``"NaN"`` and ``"Infinity"`` parse as floats but are not baselines, and rejecting them here
+    also removes an ``OverflowError`` that ``round()`` raises on an infinity and that
+    :func:`_extract_baseline` did not catch.
+
+    Returns:
+        The baseline scaled by 100 ("04.00" -> 400, "05.10" -> 510), or ``None``.
+    """
+    try:
+        baseline_str = item.properties.get("s2:processing_baseline", "")
+        if not baseline_str:
+            return None
+        value = float(baseline_str)
+    except (AttributeError, ValueError, TypeError):
+        return None
+    if not math.isfinite(value):
+        return None
+    # round() rather than int(), because 5.10 * 100 is 509.999... in binary floating point.
+    return round(value * 100)
+
+
 def _extract_baseline(item: Item) -> int:
-    """Extract processing baseline from a STAC item as an integer.
+    """The baseline an item REPORTS, as an integer. A parser, and nothing more.
+
+    Deliberately free of the harmonisation policy: whether that baseline is owed a correction
+    depends on which producer served the pixels, and that belongs in
+    :func:`extract_baselines`, which is where the per-date decision is made. Keeping this a
+    parser is what lets it be tested as one.
 
     Args:
         item: pystac Item or similar object with properties dict
@@ -218,15 +259,8 @@ def _extract_baseline(item: Item) -> int:
         Baseline as integer (e.g., "04.00" -> 400, "05.10" -> 510)
         Returns 0 if baseline property is not found.
     """
-    try:
-        baseline_str = item.properties.get("s2:processing_baseline", "")
-        if not baseline_str:
-            return 0
-        # Convert "04.00" to 400, "05.10" to 510
-        # Use round() to avoid float precision issues (5.10 * 100 = 509.999...)
-        return round(float(baseline_str) * 100)
-    except (AttributeError, ValueError, TypeError):
-        return 0
+    declared = _declared_baseline(item)
+    return 0 if declared is None else declared
 
 
 def extract_baselines(items: list[Any]) -> dict[str, int]:
@@ -238,17 +272,205 @@ def extract_baselines(items: list[Any]) -> dict[str, int]:
     name a baseline belonging to an item the loader never sees, and the reflectance
     offset it selects is applied to the pixels of the items it does.
 
+    **Reports what each item DECLARES, and nothing about whether a correction is owed.** The
+    returned map is provenance: it is carried through ``_PreparedDate`` into the store's
+    ``baselines_applied`` attribute, whose contract is the processing baseline of the item
+    actually loaded. Encoding a correction decision here — writing 0 for an item that is
+    already harmonised — made the store misreport its own vintage, which is worse than the
+    error it was avoiding because it cannot be recovered afterwards. The decision lives in
+    :func:`dates_exempt_from_correction`.
+
     Args:
         items: STAC items, in the order they will be loaded.
 
     Returns:
-        Dict mapping date strings (YYYY-MM-DD) to baseline integers.
+        Dict mapping date strings (YYYY-MM-DD) to the baseline each date's item REPORTS.
     """
     baselines = {}
     for item in items:
         date_str = item.datetime.strftime("%Y-%m-%d")
         baselines[date_str] = _extract_baseline(item)
     return baselines
+
+
+class HeterogeneousProducerError(RuntimeError):
+    """One solar day's tiles came from producers that disagree about the BOA offset.
+
+    Deterministic: re-dispatching cannot change which producers the catalogue names, so this is
+    not something a retry ladder should absorb.
+    """
+
+
+def dates_exempt_from_correction(
+    items: list[Any],
+    baselines: dict[str, int] | None = None,
+    threshold: int = S2_BASELINE_THRESHOLD,
+) -> set[str]:
+    """The solar days owed no BOA offset correction.
+
+    Kept apart from :func:`extract_baselines` because the two answer different questions — one
+    records what an item declares, the other decides what is owed — and collapsing them made a
+    correction decision overwrite the store's provenance.
+
+    **A date is judged over every item that will be fused into it, not over one.**
+    ``odc.stac.load`` mosaics a solar day's tiles into a single time slice, and duplicate
+    selection keeps one copy per *(tile, acquisition)* rather than one per date, so a date can
+    still carry several items — measured at 16 of 16 dates over a four-tile ROI. Reading one
+    item per date and letting the last win decided a whole mosaic by catalogue sort order.
+
+    **The question asked of a date is whether anything in it is actually OWED a correction**,
+    not whether its producers agree. That distinction matters because mixed-producer days are
+    real: a full census of four tile-years found 7 such days in 522, and after duplicate
+    selection the survivors pair a harmonised COG with a raw item at an OLD baseline. Nothing
+    there is owed a correction, so exempting the date is right — and refusing it, as an earlier
+    version of this did, would have lost real dates for an ambiguity that was not present.
+
+    So a date is exempt unless some item is BOTH raw and at or above the threshold. Only when
+    such an item shares a date with a harmonised one is the answer genuinely ambiguous: the
+    correction is date-wide, so exempting leaves raw tiles 1000 high while correcting drops 1000
+    from harmonised ones, and both are silent. That case refuses. It has never been observed,
+    which is why it is refused rather than engineered around.
+
+    **Each item is judged on its OWN declared baseline, with the caller's map as the fallback for
+    items that declare none.** An absent or malformed ``s2:processing_baseline`` parses as 0,
+    which is under the threshold, so reading only the item exempted a date the caller had
+    correctly supplied a post-threshold baseline for. The map cannot simply replace the items
+    either: :func:`extract_baselines` is last-wins, so it carries one arbitrary item's value, and
+    applying that to every item would make the decision depend on the caller's sort order — the
+    exact fault this function exists to remove.
+
+    Args:
+        items: the items a preparation will LOAD, after duplicate selection.
+        baselines: the per-date baselines the correction will apply, keyed by solar day. Consulted
+            only for items whose own declaration is absent or malformed.
+        threshold: baselines at or above this are owed the offset (matches the collection's).
+
+    Raises:
+        HeterogeneousProducerError: a date fuses a raw item owed a correction with a harmonised
+            one, or carries an item whose own bands straddle both, so no date-wide decision is
+            correct for it.
+    """
+    # Grouped by the SOLAR day, which is what `odc.stac.load` fuses on. Grouping by the UTC date
+    # checked different sets from the ones that will be mosaicked: near a day boundary two UTC
+    # dates fuse into one slice, so a raw item and a harmonised one could sit in one output
+    # pixel stack while being checked separately and passing. `solar_day_of` raises on an item
+    # that has not been normalised rather than deriving a plausible-looking wrong day, which
+    # makes an unnormalised caller a loud error instead of a silent evasion of these guards.
+    by_date: dict[str, list[Any]] = {}
+    for item in items:
+        by_date.setdefault(solar_day_of(item), []).append(item)
+
+    exempt: set[str] = set()
+    for date_str, group in sorted(by_date.items()):
+        kinds = {item: item_harmonisation(item) for item in group}
+        # The value the correction will apply for this date, which is what the threshold has to
+        # be tested against. Only where the map is silent does an item's own declaration decide.
+        # The date's baseline is a FALLBACK for items whose own declaration cannot be read, not a
+        # replacement for the ones that can. `extract_baselines` is last-wins, so the map holds
+        # one arbitrary item's value: using it for every item made the decision depend on the
+        # caller's sort order, which is the failure this whole function exists to remove. A raw
+        # 05.00 item beside a raw 02.06 one read as wholly pre-threshold and exempted the date,
+        # leaving the 05.00 pixels 1000 high; with the harmonised item sorted last, the raw 02.06
+        # one read as post-threshold and refused a date that needed nothing.
+        #
+        # Both sides are in the scaled space `threshold` is expressed in (400, not 4.0), which is
+        # the only scale a comparison against it is meaningful in.
+        supplied = None if baselines is None else baselines.get(date_str)
+
+        def _owed_baseline(item: Any, supplied: int | None = supplied) -> int:  # noqa: ANN401
+            own = _declared_baseline(item)
+            if own is not None:
+                return own
+            return 0 if supplied is None else supplied
+
+        owed = [it for it, k in kinds.items() if k is not Harmonisation.HARMONISED and _owed_baseline(it) >= threshold]
+        # An item whose producer cannot be determined at all, where the answer would matter.
+        # Correcting it risks subtracting 1000 from already-harmonised pixels; exempting it risks
+        # leaving raw pixels 1000 high. Both are silent, so neither is chosen.
+        undetermined = [it for it, k in kinds.items() if k is Harmonisation.UNKNOWN and _owed_baseline(it) >= threshold]
+        if undetermined:
+            raise HeterogeneousProducerError(
+                f"{date_str}: {len(undetermined)} item(s) expose none of the reflectance bands "
+                f"under the configured names, so which producer served them cannot be determined "
+                f"— and at baseline >= {threshold} that decides whether 1000 is subtracted. The "
+                f"bands may be served under native asset keys; resolve the names rather than "
+                f"guessing the producer."
+            )
+        straddling = [it for it, k in kinds.items() if k is Harmonisation.MIXED and _owed_baseline(it) >= threshold]
+        if straddling:
+            raise HeterogeneousProducerError(
+                f"{date_str}: an item's read bands span a harmonised and a raw producer at "
+                f"baseline >= {threshold}, so no date-wide offset decision is correct for it. "
+                f"Load the producers separately."
+            )
+        if not owed:
+            exempt.add(date_str)
+            continue
+        # A date carries ONE baseline (`extract_baselines` is last-wins by construction), so raw
+        # items on opposite sides of the threshold cannot both be served: correcting shifts the
+        # pre-threshold pixels down by the offset, not correcting leaves the post-threshold ones
+        # high. Unreachable while the backfill is entirely pre-04.00, and refused rather than
+        # resolved for exactly that reason.
+        #
+        # This one guard reads the item's OWN declaration rather than the date's, because its
+        # whole purpose is to detect that the date-wide baseline is unrepresentative of the items
+        # being fused — tested against itself it would answer nothing. Items whose declaration is
+        # unreadable are excluded rather than counted as 0: they carry no per-item evidence to
+        # contradict the map with, and counting them would refuse the very dates the map exists
+        # to rescue.
+        under = [
+            it
+            for it, k in kinds.items()
+            if k is not Harmonisation.HARMONISED and (own := _declared_baseline(it)) is not None and own < threshold
+        ]
+        if under:
+            raise HeterogeneousProducerError(
+                f"{date_str}: raw items straddle the correction threshold "
+                f"(baselines {sorted(_extract_baseline(it) for it in kinds)}), and the correction "
+                f"is applied per date from one baseline, so either choice is wrong for some of its "
+                f"pixels. Load the baselines as separate groups."
+            )
+        if any(k is Harmonisation.HARMONISED for k in kinds.values()):
+            raise HeterogeneousProducerError(
+                f"{date_str}: fuses a raw item owed the offset correction with an already "
+                f"harmonised one, and the correction is applied per date to the whole mosaic, so "
+                f"either choice is wrong for some of its pixels. Load the producers separately."
+            )
+        # THE ASSUMPTION THIS CHANGE RESTS ON, MADE OBSERVABLE — announced LAST, after every
+        # refusal above, so the line is only ever emitted for a date that really will be
+        # corrected. Ahead of them it claimed a correction had been applied to dates that then
+        # raised and were never loaded at all, which is a log saying the opposite of what
+        # happened. Every raw item measured on the
+        # live catalogue reports a pre-04.00 baseline, so this branch has never been reached on
+        # real data — which means the correction path itself has never run in production. Say so
+        # at WARNING the first time it does, per date: sampling a catalogue cannot prove the
+        # combination never appears (a 100-item page of a 146-item year told me it did not), and
+        # a monitored fact beats an inference from a sample. Not an error: correcting a raw item
+        # over the threshold is exactly right, and this is the path doing its job.
+        # WARNING only for the ESA archive, which is the route believed impossible. Every
+        # Planetary Computer item is unharmonised as well, and correcting those is routine — a
+        # warning on each of them would fire on every date of an MPC ingest and would also be
+        # saying something untrue, since for that provider it is not a new combination at all.
+        from_archive = [it for it in owed if item_is_from_raw_archive(it)]
+        if from_archive:
+            logger.warning(
+                "Baseline correction ACTIVE on ESA-archive data for %s: %d item(s) at baseline(s) "
+                "%s are owed the %d offset. A harmonised-COG catalogue is pointing at the raw "
+                "archive for data that needs correcting — verify the reflectance rather than "
+                "assuming it.",
+                date_str,
+                len(from_archive),
+                sorted({_extract_baseline(it) for it in from_archive}),
+                S2_BASELINE_OFFSET,
+            )
+        else:
+            logger.debug(
+                "Baseline correction applied for %s: %d unharmonised item(s) at baseline(s) %s.",
+                date_str,
+                len(owed),
+                sorted({_extract_baseline(it) for it in owed}),
+            )
+    return exempt
 
 
 def _filter_existing_dates(
@@ -961,14 +1183,32 @@ def load_stac_items(
     if collection_config.requires_baseline_correction and baselines:
         loaded_dates = {str(t.values)[:10] for t in data.time}
         filtered_baselines = {d: b for d, b in baselines.items() if d in loaded_dates}
-        data = _apply_baseline_corrections_by_date(
-            data,
-            filtered_baselines,
-            baseline_threshold=collection_config.baseline_threshold,  # type: ignore[arg-type]
-            baseline_offset=collection_config.baseline_offset,
-            bands=list(collection_config.bands),
-            preserve_low_values=preserve_low_values,
-        )
+        # Mask a LOCAL copy for the corrector. `baselines` itself is provenance and reaches the
+        # store's `baselines_applied`, so zeroing it there would make the store misreport its
+        # vintage. Zero means "no correction owed", which is what an already-harmonised
+        # producer means.
+        exempt = dates_exempt_from_correction(items, filtered_baselines)
+        correction_baselines = {d: (0 if d in exempt else b) for d, b in filtered_baselines.items()}
+        # Skip the corrector outright when nothing reaches the threshold. It is a no-op on those
+        # dates, but not a free one: it clips, casts, adds and `xr.where`s every reflectance band
+        # in the graph before deciding to change nothing. Setting the threshold for Earth Search
+        # made the already-harmonised path the common case rather than an unused branch, so that
+        # work would now be paid on the majority of every ingest.
+        threshold = collection_config.baseline_threshold
+        if any(b >= threshold for b in correction_baselines.values()):  # type: ignore[operator]
+            data = _apply_baseline_corrections_by_date(
+                data,
+                correction_baselines,
+                baseline_threshold=threshold,  # type: ignore[arg-type]
+                baseline_offset=collection_config.baseline_offset,
+                bands=list(collection_config.bands),
+                preserve_low_values=preserve_low_values,
+            )
+        else:
+            logger.debug(
+                "No baseline correction owed on any of %d loaded date(s); corrector skipped.",
+                len(correction_baselines),
+            )
 
     if post_load_fn is not None:
         data = post_load_fn(data)

@@ -770,7 +770,7 @@ def ingest_s2_roi_reflectance(
         # items a preparation actually loads — pruning here does not by itself make the two
         # agree, and an earlier version of this comment claimed it did.)
         items, alternates = select_preferred_duplicates(items)
-        log_duplicate_selection(log, roi_label, alternates)
+        log_duplicate_selection(log, roi_label, alternates, kept=items)
         date_alternates.update(alternates)
 
         def _record_unreadable(

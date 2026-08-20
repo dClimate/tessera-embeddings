@@ -39,11 +39,13 @@ import itertools
 import logging
 import math
 import re
-import urllib.parse
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from tessera_embeddings.config.providers import S2_L2A_BANDS
+from tessera_embeddings.ingest.asset_locations import (
+    item_is_in_preferred_location,
+    read_set_is_complete,
+)
 from tessera_embeddings.ingest.solar_days import solar_day_of
 
 logger = logging.getLogger(__name__)
@@ -85,105 +87,6 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
             logger.debug("Unparseable s2:sequence %r on %s", raw, getattr(item, "id", "?"))
     match = _ID_SEQUENCE_RE.search(str(getattr(item, "id", "")))
     return int(match.group(1)) if match else None
-
-
-#: Buckets known to sit in the same region as our compute. Reads against these go through the
-#: VPC's S3 gateway endpoint; anything else egresses through NAT, which is metered, slower and a
-#: shared ceiling. An unrecognised bucket is treated as remote rather than assumed local — the
-#: conservative direction, since under-claiming locality costs only a lost tiebreak while
-#: over-claiming it routes bulk reads through NAT believing they are free.
-PREFERRED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-cogs", "e84-earth-search-sentinel-data"})
-
-#: The asset keys an S2 ingest actually reads: the configured bands plus the scene classification
-#: layer. Locality is judged over THESE and not over every asset, because these are the only reads
-#: that cost anything — and because a real Element 84 item carries the original JP2s as extra
-#: assets alongside its COG bands, so judging all of them calls the cheap copy remote.
-READ_ASSET_KEYS: tuple[str, ...] = (*S2_L2A_BANDS, "scl")
-
-
-def _asset_href(asset: Any) -> str | None:  # noqa: ANN401 — pystac Asset or a plain dict
-    """An asset's href, whether it arrives as a pystac ``Asset`` or a raw dict."""
-    href = getattr(asset, "href", None)
-    if href is None and isinstance(asset, dict):
-        href = asset.get("href")
-    return href if isinstance(href, str) and href else None
-
-
-def asset_bucket(href: str) -> str | None:
-    """The S3 bucket an href addresses, or ``None`` if it does not address one.
-
-    Parsed rather than substring-matched, because a substring test answers yes to things that
-    are not the bucket: ``s3://sentinel-cogs-backup/...`` and
-    ``https://elsewhere.example/sentinel-cogs/...`` both contain a preferred bucket's name while
-    being somewhere else entirely. Returning ``None`` for anything unrecognised is what keeps the
-    unlisted-is-remote rule honest.
-
-    Handles the three forms the catalogues emit: ``s3://bucket/key``, virtual-hosted
-    ``https://bucket.s3.<region>.amazonaws.com/key``, and path-style
-    ``https://s3.<region>.amazonaws.com/bucket/key``.
-    """
-    parsed = urllib.parse.urlparse(href)
-    if parsed.scheme == "s3":
-        return parsed.netloc or None
-    host = parsed.netloc.split("@")[-1].split(":")[0].lower()
-    if not host.endswith(".amazonaws.com"):
-        return None
-    labels = host.split(".")
-    if len(labels) > 3 and labels[1] == "s3":  # virtual-hosted
-        return labels[0] or None
-    if labels[0] == "s3":  # path-style
-        first_segment = parsed.path.lstrip("/").split("/", 1)[0]
-        return first_segment or None
-    return None
-
-
-def item_is_in_preferred_location(
-    item: Any,  # noqa: ANN401 — any STAC-like item
-    buckets: frozenset[str] = PREFERRED_ASSET_BUCKETS,
-    keys: tuple[str, ...] = READ_ASSET_KEYS,
-) -> bool:
-    """Whether every asset this ingest would READ sits in a preferred bucket.
-
-    **Judged over the read set, not over every asset, and that distinction is the whole
-    correctness of this function.** A real Element 84 item carries its COG bands *and* the
-    original JP2s as extra assets — 35 assets across two buckets on the pair this was measured
-    against. Requiring all 35 silently disabled the entire preference: a live-catalogue check
-    found zero mixed tile-dates where five existed. The extras are never fetched, so their
-    location cannot make a read expensive.
-
-    All of the read set, not any: an item whose *bands* straddle two buckets cannot deliver the
-    locality being claimed. An item exposing none of them is remote — absence of evidence is not
-    locality.
-    """
-    # EVERY requested key must resolve, not merely the ones present. Asserting over only the
-    # keys an item happens to carry let a single local band read as fully in-region: that copy
-    # displaces a COMPLETE remote one on a baseline tie, then fails at load with no source href
-    # to attribute, sending the recovery ladder stepping down every duplicated tile-date of that
-    # day. Locality is a claim about the whole read, so an incomplete item cannot make it.
-    if not read_set_is_complete(item, keys):
-        return False
-    assets = item.assets
-    return all(asset_bucket(_asset_href(assets[key]) or "") in buckets for key in keys)
-
-
-def read_set_is_complete(
-    item: Any,  # noqa: ANN401 — any STAC-like item
-    keys: tuple[str, ...] = READ_ASSET_KEYS,
-) -> bool:
-    """Whether every asset this ingest would READ resolves to an href.
-
-    Separate from :func:`item_is_in_preferred_location` because it answers a different
-    question — *can* this copy be read at all, rather than *from where*. Locality now implies
-    completeness, so the two are correlated, but ranking needs the weaker claim on its own:
-    with locality tied, an incomplete copy would otherwise be separated from a complete one
-    only by the id tiebreak, and could win a tile-date it cannot deliver.
-
-    Items carrying no assets at all — radar copies, and any non-S2 product whose bands are not
-    named by :data:`READ_ASSET_KEYS` — are uniformly incomplete, so this term ties across the
-    whole set and changes no ordering there.
-    """
-    assets = getattr(item, "assets", None) or {}
-    return all((asset := assets.get(key)) is not None and _asset_href(asset) is not None for key in keys)
 
 
 def item_processing_baseline(item: Any) -> float | None:  # noqa: ANN401 — any STAC-like item
@@ -262,10 +165,16 @@ def _across_acquisitions_key(item: Any) -> tuple[int, float, int, int, int, int,
     """
     baseline = item_processing_baseline(item)
     sequence = item_sequence(item)
+    # Locality participates only where the baseline is READABLE, the same rule `_rank_copies`
+    # applies. Among copies that all declare nothing, locality was deciding ahead of sequence,
+    # so a local sequence-1 spare was handed out before a remote sequence-2 one — buying cheaper
+    # egress with an older reprocessing, which is the precise trade this ordering exists to
+    # refuse. Neutral rather than absent, so the tuple width stays fixed.
+    remote = (0 if item_is_in_preferred_location(item) else 1) if baseline is not None else 0
     return (
         0 if baseline is not None else 1,
         -(baseline or 0.0),
-        0 if item_is_in_preferred_location(item) else 1,
+        remote,
         0 if read_set_is_complete(item) else 1,
         0 if sequence is not None else 1,
         -(sequence or 0),
@@ -422,26 +331,97 @@ def select_preferred_duplicates(
     return kept, alternates
 
 
+def _contested_key(item: Any) -> tuple[str, str] | None:  # noqa: ANN401 — any STAC-like item
+    """An item's ``(tile, solar_day)`` key, or ``None`` if it cannot be keyed.
+
+    Returns ``None`` rather than raising because the only caller is a log line, and
+    :func:`solar_day_of` raises on an item that has not been normalised. A logging call that
+    can abort an ingest is worse than a log line that omits a figure.
+    """
+    tile = item_tile(item)
+    if tile is None:
+        return None
+    try:
+        return (tile, solar_day_of(item))
+    except Exception:
+        logger.debug("Could not key %s for the duplicate audit line", getattr(item, "id", "?"))
+        return None
+
+
+def _keys_ranked_by_sequence_only(
+    alternates: dict[tuple[str, str], list[Any]],
+    winners: Iterable[Any],
+) -> set[tuple[str, str]]:
+    """The contested tile-dates whose ranking fell back to sequence order.
+
+    :func:`_rank_copies` suspends the baseline and locality terms for an acquisition in which any
+    copy's baseline is unreadable, so the audit line cannot claim a baseline-first preference for
+    those dates. Recomputed here rather than threaded out of the selector, because it is needed
+    only to word one log line and a return-value change would reach every caller.
+    """
+    unreadable: set[tuple[str, str]] = set()
+    for key, copies in alternates.items():
+        if any(item_processing_baseline(it) is None for it in copies):
+            unreadable.add(key)
+    for winner in winners:
+        if item_processing_baseline(winner) is None and (winner_key := _contested_key(winner)) is not None:
+            unreadable.add(winner_key)
+    return unreadable & set(alternates)
+
+
 def log_duplicate_selection(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     roi: str,
     alternates: dict[tuple[str, str], list[Any]],
+    kept: Iterable[Any] = (),
 ) -> None:
     """Record that duplicates were pruned, at a level that survives a fleet-wide log.
 
     Summary only, and deliberately: duplicates are routine, so a line per pruned copy would
     bury the outcomes that are not routine. The tile-dates that carry alternates are named
     only when a fallback actually fires, where the identity matters.
+
+    **Reports WHERE the surviving copies came from, because the preference is no longer purely
+    "newest".** This line said "newest kept" while the ranking preferred an in-region copy over
+    a higher-sequence remote one — a log misreporting its own behaviour. It is also the only
+    audit trail for that decision: where two copies carry the same baseline their pixels are
+    identical, so nothing downstream can show which was read, and the choice is otherwise
+    invisible in the store, the mosaic and the metrics.
+
+    **Counted over the CONTESTED tile-dates only.** ``kept`` is every survivor on the ROI, and
+    on a wide one almost none of them had a duplicate at all. Counting them all reported the
+    composition of the whole supply — "1 in-region, 100 remote" — while saying nothing about
+    the choices this line exists to record, and the one figure that matters was rounded away by
+    the hundred dates that were never in question.
     """
     if not alternates:
         return
     pruned = sum(len(v) for v in alternates.values())
+    winners = [it for it in kept if _contested_key(it) in alternates]
+    where = ""
+    if winners:
+        local = sum(1 for it in winners if item_is_in_preferred_location(it))
+        where = f"; winners by source: {local} in-region, {len(winners) - local} remote"
+
+    # Name the ranking that actually ran. `_rank_copies` abandons BOTH the baseline and the
+    # locality terms for an acquisition where any copy declares no readable baseline, and
+    # chooses on sequence alone — so on exactly the uncertain-metadata dates this line exists to
+    # explain, stating the baseline-then-locality preference described the wrong mechanism.
+    unreadable = _keys_ranked_by_sequence_only(alternates, winners)
+    how = "newest baseline, then in-region, then newest sequence"
+    if unreadable:
+        how += (
+            f" — except {len(unreadable)} tile-date(s) where a copy declared no readable "
+            f"baseline, ranked on sequence alone"
+        )
     log.info(
         "Duplicate catalogue items pruned roi=%s: %d tile-date(s) had more than one copy, "
-        "%d rejected, newest kept (rejected copies stay available as a fallback)",
+        "%d rejected. Preference: %s (rejected copies stay available as a fallback)%s",
         roi,
         len(alternates),
         pruned,
+        how,
+        where,
     )
 
 

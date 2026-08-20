@@ -227,7 +227,7 @@ class TestProviderConfiguration:
         [
             # Earth Search S2 COGs are already BOA-corrected; its S1 threshold
             # constant is None — so both are False.
-            ("earth-search", "sentinel-2-l2a", False),
+            ("earth-search", "sentinel-2-l2a", True),
             ("earth-search", "sentinel-1-grd", False),
             ("earth-search", "landsat-c2-l2", False),
             # Planetary Computer S2 sets a baseline_threshold (=400) → True.
@@ -340,8 +340,10 @@ class TestIngestTile:
         )
 
         assert result_data is not None
-        # blue (B02) values should stay same
-        assert result_data["blue"].values[0, 0, 0] == 2000
+        # Corrected: the fixture serves ESA originals, which carry the offset. This asserted the
+        # value was UNCHANGED while Earth Search exempted its whole collection, so the test name
+        # described an intent its assertion contradicted.
+        assert result_data["blue"].values[0, 0, 0] == 1000
         assert result_baselines == {"2024-01-01": 400}
 
     def test_ingest_tile_does_not_correct_extra_bands(self, mock_stac_item, sample_reflectance_data, monkeypatch):
@@ -378,9 +380,12 @@ class TestIngestTile:
         )
 
         assert result_data is not None
-        # blue doesn't need to be corrected
-        assert result_data["blue"].values[0, 0, 0] == 2000
-        # scl should NOT be corrected (still 4)
+        # A configured band IS corrected, which is what makes the next assertion mean anything.
+        # While Earth Search exempted its whole collection nothing here was corrected, so "extra
+        # bands are not corrected" was trivially true and this test could not have failed.
+        assert result_data["blue"].values[0, 0, 0] == 1000
+        # scl is an extra band and must be left alone even so — it is a class label, not
+        # reflectance, and subtracting 1000 from it would be meaningless.
         assert result_data["scl"].values[0, 0, 0] == 4
 
     def test_ingest_tile_applies_post_load_fn(self, mock_stac_item, sample_reflectance_data, monkeypatch):
