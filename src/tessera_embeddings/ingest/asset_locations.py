@@ -36,11 +36,20 @@ PREFERRED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-cogs", "e84-earth
 #: while a skipped one leaves plausible-looking pixels that are silently 1000 too high.
 HARMONISED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-cogs", "e84-earth-search-sentinel-data"})
 
-#: The asset keys an S2 ingest actually reads: the configured bands plus the scene
-#: classification layer. Every question here is asked of THESE and not of every asset, because
-#: a real Element 84 item carries the original JP2s as extras alongside its COG bands — so
-#: judging all of them answers about assets that are never fetched.
+#: Everything an S2 ingest actually reads: the configured bands plus the scene classification
+#: layer. Used for LOCALITY, because every one of these is fetched and so every one costs egress.
+#: Asked of these and not of every asset, because a real Element 84 item carries the original
+#: JP2s as extras alongside its COG bands — judging all of them answers about assets that are
+#: never fetched at all.
 READ_ASSET_KEYS: tuple[str, ...] = (*S2_L2A_BANDS, "scl")
+
+#: The subset the BOA offset is applied to. Used for HARMONISATION, and deliberately EXCLUDES
+#: ``scl``: the scene classification layer is categorical and never baseline-corrected —
+#: subtracting 1000 from a class label is meaningless — so which producer served it cannot make
+#: the reflectance correction ambiguous. Including it let an item whose reflectance is uniformly
+#: harmonised be classified MIXED because of a layer that is never touched, and a MIXED item can
+#: refuse an entire date.
+REFLECTANCE_ASSET_KEYS: tuple[str, ...] = tuple(S2_L2A_BANDS)
 
 
 def asset_href(asset: Any) -> str | None:  # noqa: ANN401 — pystac Asset or a plain dict
@@ -119,19 +128,22 @@ class Harmonisation(enum.Enum):
 def item_harmonisation(
     item: Any,  # noqa: ANN401 — any STAC-like item
     buckets: frozenset[str] = HARMONISED_ASSET_BUCKETS,
+    keys: tuple[str, ...] = REFLECTANCE_ASSET_KEYS,
 ) -> Harmonisation:
-    """Which producer served the bands this ingest would READ.
+    """Which producer served the REFLECTANCE bands — the only ones the offset touches.
 
-    Judged over the read set alone: a real Element 84 item carries the original JP2s as extra
-    assets beside its COG bands, so judging every asset reports ``MIXED`` for an item that is
-    wholly harmonised where it matters.
+    Judged over the reflectance bands alone, for two separate reasons. A real Element 84 item
+    carries the original JP2s as extra assets beside its COG bands, so judging *every* asset
+    reports ``MIXED`` for an item that is wholly harmonised where it matters. And ``scl`` is
+    excluded even though it IS read: it is categorical and never corrected, so its producer
+    cannot make the reflectance decision ambiguous.
 
-    An item exposing none of the read bands is ``RAW``, and so is one served from a bucket
+    An item exposing none of the reflectance bands is ``RAW``, and so is one served from a bucket
     nobody has listed. **Absence of evidence must not buy an exemption from a correction**, and
     of the two mistakes only one is discoverable: a doubled correction shifts values by a
     visible 1000, while a skipped one leaves plausible pixels that are quietly wrong.
     """
-    found = read_asset_buckets(item)
+    found = read_asset_buckets(item, keys)
     if not found:
         return Harmonisation.RAW
     harmonised = [bucket in buckets for bucket in found]

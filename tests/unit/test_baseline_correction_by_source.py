@@ -26,6 +26,7 @@ from tessera_embeddings.config.satellites import S2_BASELINE_OFFSET, S2_BASELINE
 from tessera_embeddings.ingest.asset_locations import (
     HARMONISED_ASSET_BUCKETS,
     READ_ASSET_KEYS,
+    REFLECTANCE_ASSET_KEYS,
     Harmonisation,
     item_harmonisation,
 )
@@ -208,3 +209,52 @@ class TestHarmonisationPredicate:
     def test_the_raw_archive_is_not_in_the_harmonised_set(self) -> None:
         """Guards the constant: adding `sentinel-s2-l2a` here would silently reinstate the bug."""
         assert "sentinel-s2-l2a" not in HARMONISED_ASSET_BUCKETS
+
+
+class TestSclDoesNotDecideHarmonisation:
+    """`scl` is read, so it counts for egress — and never corrected, so it cannot make the
+    reflectance correction ambiguous.
+    """
+
+    def test_scl_is_read_but_not_reflectance(self) -> None:
+        """Guards the split itself. Collapsing these back into one tuple reinstates the bug."""
+        assert "scl" in READ_ASSET_KEYS, "scl IS fetched, so it counts toward locality"
+        assert "scl" not in REFLECTANCE_ASSET_KEYS, "scl is categorical and never offset-corrected"
+
+    def test_raw_scl_beside_harmonised_reflectance_is_still_harmonised(self) -> None:
+        """THE REPORTED CASE. Subtracting 1000 from a class label is meaningless, so the
+        producer of `scl` cannot make the reflectance decision ambiguous — and while it could,
+        a single raw `scl` classified the item MIXED and refused the whole date.
+        """
+        item = _Item(_HARMONISED, "05.00")
+        item.assets["scl"] = {"href": f"{_RAW_ESA}/scl"}
+        assert item_harmonisation(item) is Harmonisation.HARMONISED
+        assert dates_exempt_from_correction([item]) == {"2022-01-07"}
+
+    def test_a_raw_reflectance_band_still_makes_it_mixed(self) -> None:
+        """The complement: excluding scl must not weaken the reflectance check itself."""
+        item = _Item(_HARMONISED, "05.00")
+        item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
+        assert item_harmonisation(item) is Harmonisation.MIXED
+
+
+class TestRawDatesStraddlingTheThreshold:
+    """One date carries one baseline, so raw items on opposite sides cannot both be served."""
+
+    def test_raw_items_across_the_threshold_raise(self) -> None:
+        """`extract_baselines` is last-wins by construction, so the date-wide baseline serves one
+        side or the other: correcting shifts the pre-threshold pixels down 1000, not correcting
+        leaves the post-threshold ones 1000 high.
+        """
+        over, under = _Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "03.01")
+        with pytest.raises(HeterogeneousProducerError, match="straddle the correction threshold"):
+            dates_exempt_from_correction([over, under])
+
+    def test_raw_items_all_under_the_threshold_are_fine(self) -> None:
+        """The common case for the backfill, which is entirely pre-04.00: nothing owed, no
+        conflict, no refusal.
+        """
+        assert dates_exempt_from_correction([_Item(_RAW_ESA, "02.06"), _Item(_RAW_ESA, "03.01")]) == {"2022-01-07"}
+
+    def test_raw_items_all_over_the_threshold_are_corrected(self) -> None:
+        assert dates_exempt_from_correction([_Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "05.09")]) == set()

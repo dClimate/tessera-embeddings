@@ -328,6 +328,21 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
         if not owed:
             exempt.add(date_str)
             continue
+        # A date carries ONE baseline (`extract_baselines` is last-wins by construction), so raw
+        # items on opposite sides of the threshold cannot both be served: correcting shifts the
+        # pre-threshold pixels down by the offset, not correcting leaves the post-threshold ones
+        # high. Unreachable while the backfill is entirely pre-04.00, and refused rather than
+        # resolved for exactly that reason.
+        under = [
+            it for it, k in kinds.items() if k is not Harmonisation.HARMONISED and _extract_baseline(it) < threshold
+        ]
+        if under:
+            raise HeterogeneousProducerError(
+                f"{date_str}: raw items straddle the correction threshold "
+                f"(baselines {sorted(_extract_baseline(it) for it in kinds)}), and the correction "
+                f"is applied per date from one baseline, so either choice is wrong for some of its "
+                f"pixels. Load the baselines as separate groups."
+            )
         if any(k is Harmonisation.HARMONISED for k in kinds.values()):
             raise HeterogeneousProducerError(
                 f"{date_str}: fuses a raw item owed the offset correction with an already "
