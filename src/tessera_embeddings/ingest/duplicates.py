@@ -17,19 +17,24 @@ side of the reflectance-offset threshold from the other, so a fused date can hol
 processed both ways while exactly one correction is applied to the result — decided by item
 order rather than by which copy supplied the pixels.
 
-The preference is **newest baseline first, then in-region, then newest sequence**. A newer
-reprocessing is the better data in the overwhelming majority of cases, so the baseline term
-leads and nothing below it may override it. Corruption in a newer copy is rare: sampling
-duplicate pairs chosen independently of failure found every copy intact. It is also not a
-property of being newer — so the losing copy is a *fallback*, never a default. Callers step
-down the alternates only on a demonstrated read failure.
+The preference is **usable first, then newest baseline, then in-region, then newest sequence**,
+and "usable" leads for a reason: a copy this ingest cannot read, or cannot decide a correction for,
+is no use however new it is. So a complete read set comes first, then a decidable producer and a
+readable baseline — a copy failing either of those refuses or fails its date, and neither outcome
+is something the fallback ladder can recover from. Only among copies that are all usable does the
+baseline decide, and there a newer reprocessing is the better data in the overwhelming majority of
+cases. Corruption in a newer copy is rare — sampling duplicate pairs chosen independently of
+failure found every copy intact — and not a property of being newer, so the losing copy is a
+*fallback*, never a default. Callers step down the alternates only on a demonstrated read failure.
+:func:`_preference_key` is the single statement of this order; add a term there and nowhere else.
 
 **Locality breaks ties, and only ties.** A catalogue can index the same granule from more
 than one region; when it does, the copies carry the same baseline and the same acquisition
 instant, so the data is identical and the only difference is what the read costs. In-region
 assets go through the VPC's S3 gateway endpoint while anything else egresses through NAT.
 Ranking locality *below* the baseline is what keeps this a cost decision rather than a
-quality one — it can never buy cheaper egress with a worse pixel.
+quality one — it can never buy cheaper egress with a worse pixel. It is also inert where the
+baseline cannot be read, so it never decides a comparison the baseline could not enter.
 """
 
 from __future__ import annotations
