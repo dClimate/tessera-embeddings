@@ -9,7 +9,6 @@ Supports multiple providers (Earth Search, Planetary Computer) and collections
 """
 
 import logging
-import math
 import time
 from collections.abc import Callable, Iterator
 from itertools import count
@@ -42,6 +41,7 @@ from tessera_embeddings.ingest.catalogue_refusal import (
     bbox_area_label,
     raise_catalogue_query_error,
 )
+from tessera_embeddings.ingest.item_baselines import processing_baseline as _declared_baseline
 from tessera_embeddings.ingest.solar_days import (
     SolarDayRange,
     month_ranges,
@@ -213,40 +213,6 @@ def _build_stac_query(
         )
 
     return query_params
-
-
-def _declared_baseline(item: Item) -> int | None:
-    """The baseline an item REPORTS, scaled to an integer, or ``None`` if it declares none.
-
-    The ``None`` is the whole reason this exists beside :func:`_extract_baseline`: that function
-    maps a missing baseline to 0, which is indistinguishable from an item genuinely declaring
-    0 and makes "unknown" untestable. A decision that has a fallback for unknown — such as
-    whether a date is owed a correction, which defers to the caller's baseline map — needs to
-    tell the two apart.
-
-    ``"NaN"`` and ``"Infinity"`` parse as floats but are not baselines, and rejecting them here
-    also removes an ``OverflowError`` that ``round()`` raises on an infinity and that
-    :func:`_extract_baseline` did not catch.
-
-    Returns:
-        The baseline scaled by 100 ("04.00" -> 400, "05.10" -> 510), or ``None``.
-    """
-    try:
-        baseline_str = item.properties.get("s2:processing_baseline", "")
-        if not baseline_str:
-            return None
-        value = float(baseline_str)
-    except (AttributeError, ValueError, TypeError):
-        return None
-    # round() rather than int(), because 5.10 * 100 is 509.999... in binary floating point.
-    # Checked AFTER the multiplication as well as before it: a finite but enormous value such as
-    # "1e308" passes an isfinite test on its own and then becomes infinity when scaled, where
-    # round() raises OverflowError — which is not in the except clause above and aborted the whole
-    # batch over one item's metadata.
-    scaled = value * 100 if math.isfinite(value) else value
-    if not math.isfinite(scaled):
-        return None
-    return round(scaled)
 
 
 def _extract_baseline(item: Item) -> int:

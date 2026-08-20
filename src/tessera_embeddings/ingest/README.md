@@ -12,6 +12,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 |---|---|
 | `stac.py` | STAC-based data loading via `odc.stac.load`. Handles multiple providers (Earth Search, Planetary Computer), S2 baseline correction, and date filtering. |
 | `opera_query.py` | OPERA RTC-S1 query utilities: spatial bbox construction, item construction from the native CMR Granule Search API (bypasses CMR-STAC search; orbit-direction filtered server-side), UTM EPSG derivation, and asset preparation. |
+| `item_baselines.py` | The ONE reader of `s2:processing_baseline`. Reports an integer hundredth (`04.00` -> `400`), the same scale `S2_BASELINE_THRESHOLD` is expressed in, and `None` for every kind of unreadable. Exists because there were two readers on two scales with two notions of unreadable, so each numeric edge case had to be fixed twice — and they had drifted before anyone noticed. |
 | `duplicates.py` | Chooses between DUPLICATE catalogue items for one tile-date — Element 84 publishes more than one whenever a granule is reprocessed, distinguished by `s2:sequence`. Newest is preferred; the rejected copies are retained as a fallback the write steps down when a source object will never read. Reducing to one copy before the loader is what makes a fallback possible at all, since `odc.stac.load` FUSES a solar-day group — and it is also what makes the recorded baseline match the pixels written. |
 | `loader_failures.py` | Names the source object a failed load could not read. `odc.stac.load` reports it in its OWN log record and raises an exception that does not carry it, so a logging handler on every reader process records each aborted href, and the caller collects them after a failure and maps them back to tile-dates. That name is what lets the duplicate ladder step down ONE copy instead of every duplicated tile in the date. Attribution is best effort by design: an empty answer means "attribute nothing", never "nothing was at fault", and the recovery it sharpens still works without it. |
 | `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary AWS credentials minted by ASF, ~1 hour) and legacy CloudFront signed URL resolution. Those credentials expire on their OWN clock, unrelated to any unit of work, so renewal must be driven by a timer and by the advertised expiry — never by the work loop, which can only renew between units and so cannot renew inside one that outlives the margin. |
@@ -1293,6 +1294,20 @@ copy there declares no readable baseline, the whole group falls back to sequence
 acquisition an unreadable baseline may still belong to the newest reprocessing, so demoting it
 could select an older one; across acquisitions there is no such reason and the key's own
 unknown-last ordering applies. The audit log names which of the two ran.
+
+Two primitives carry most of the correctness here, and both are shaped so the mistakes they used
+to invite are no longer expressible:
+
+- **`AssetSources`** (`asset_locations.py`) resolves every REQUESTED asset key and reports which
+  ones are missing, rather than returning a list of only the ones that resolved. The flat list
+  dropped keys silently, so each caller had to remember to compare the length against what it
+  asked for — and three did not, producing the same defect three times: locality granted from a
+  single local band, a producer named from one visible band while others were served under names
+  nobody looked for, and a subset read as evidence about the whole. `all_in()` is false for an
+  incomplete set by construction, because a claim about every asset cannot be made from some of
+  them, and an unrecognised bucket stays distinct from an absent key: one is evidence ("served
+  from somewhere we have not listed"), the other is its absence.
+- **`item_baselines.processing_baseline`** is the only reader of the baseline, on the only scale.
 
 Two properties of that ordering are easy to get wrong and are held by tests:
 

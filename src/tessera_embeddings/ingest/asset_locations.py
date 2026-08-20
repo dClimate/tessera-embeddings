@@ -17,6 +17,7 @@ corrected" from a fact about its location. Two constants make that impossible to
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import logging
 import urllib.parse
@@ -105,57 +106,91 @@ def asset_bucket(href: str) -> str | None:
     return None
 
 
-def read_asset_buckets(item: Any, keys: tuple[str, ...] = READ_ASSET_KEYS) -> list[str | None]:  # noqa: ANN401
-    """The bucket of each asset this ingest would READ. ``None`` for anything unrecognised."""
+@dataclasses.dataclass(frozen=True)
+class AssetSources:
+    """Where every REQUESTED asset of an item lives — including the ones that are not there.
+
+    The point of this type is that it cannot lose a key. Its predecessor returned a bare list of
+    the buckets it managed to resolve and silently dropped the rest, so every caller had to
+    remember to compare the length against what it asked for, and three of them did not. That one
+    omission produced the same defect three times over: locality granted from a single local band,
+    a producer named from one visible band while others were served under names we never looked
+    for, and a subset read as evidence about the whole. Ask this object a question instead and the
+    incompleteness is part of the answer.
+    """
+
+    #: The bucket serving each requested key that resolved. ``None`` where the href is not an
+    #: S3 URL we recognise, which is a real answer: "somewhere we have not listed".
+    buckets: dict[str, str | None]
+    #: The requested keys with no resolvable href at all.
+    missing: tuple[str, ...]
+
+    @property
+    def complete(self) -> bool:
+        """Whether every requested key resolved. Absence of evidence is not evidence."""
+        return not self.missing
+
+    @property
+    def empty(self) -> bool:
+        """Whether nothing at all resolved."""
+        return not self.buckets
+
+    def all_in(self, buckets: frozenset[str]) -> bool:
+        """Whether the COMPLETE requested set is served from ``buckets``.
+
+        False for an incomplete set, deliberately: a claim about every asset cannot be made from
+        a subset of them.
+        """
+        return self.complete and all(bucket in buckets for bucket in self.buckets.values())
+
+    def any_in(self, buckets: frozenset[str]) -> bool:
+        """Whether any resolved key is served from ``buckets``."""
+        return any(bucket in buckets for bucket in self.buckets.values())
+
+
+def read_asset_sources(item: Any, keys: tuple[str, ...] = READ_ASSET_KEYS) -> AssetSources:  # noqa: ANN401
+    """Resolve every key in ``keys`` against the item's assets, reporting what is missing."""
     assets = getattr(item, "assets", None) or {}
-    return [
-        asset_bucket(href) for key in keys if (asset := assets.get(key)) is not None and (href := asset_href(asset))
-    ]
+    found: dict[str, str | None] = {}
+    missing: list[str] = []
+    for key in keys:
+        asset = assets.get(key)
+        href = asset_href(asset) if asset is not None else None
+        if href is None:
+            missing.append(key)
+        else:
+            found[key] = asset_bucket(href)
+    return AssetSources(buckets=found, missing=tuple(missing))
 
 
 def read_set_is_complete(item: Any, keys: tuple[str, ...] = READ_ASSET_KEYS) -> bool:  # noqa: ANN401
     """Whether every asset this ingest would READ resolves to an href.
 
-    Separate from :func:`item_is_in_preferred_location` because it answers a different question
-    — *can* this copy be read at all, rather than *from where*. Locality implies completeness,
-    so the two are correlated, but ranking needs the weaker claim on its own: with locality
-    tied, an incomplete copy would otherwise be separated from a complete one only by the id
-    tiebreak, and could win a tile-date it cannot deliver.
+    Answers "can this copy be read at all", where :func:`item_is_in_preferred_location` answers
+    "from where". Locality implies completeness, but ranking needs the weaker claim on its own:
+    with locality tied, an incomplete copy would be separated from a complete one only by the id
+    tiebreak and could win a tile-date it cannot deliver.
 
-    Items carrying no assets at all — radar copies, and any non-S2 product whose bands are not
-    named by :data:`READ_ASSET_KEYS` — are uniformly incomplete, so this term ties across the
-    whole set and changes no ordering there.
-
-    Note this is NOT the rule :func:`item_harmonisation` uses. An item whose reflectance bands
-    cannot be read is still ``RAW`` there, on purpose: absence of evidence must not buy an
-    exemption from a correction, whereas absence of evidence must not buy a locality claim.
-    Same absence, opposite safe directions.
+    Items carrying no assets at all — radar copies, and any product whose bands are not named by
+    :data:`READ_ASSET_KEYS` — are uniformly incomplete, so this term ties across such a set and
+    changes no ordering there.
     """
-    assets = getattr(item, "assets", None) or {}
-    return all((asset := assets.get(key)) is not None and asset_href(asset) is not None for key in keys)
+    return read_asset_sources(item, keys).complete
 
 
 def item_is_in_preferred_location(
     item: Any,  # noqa: ANN401 — any STAC-like item
     buckets: frozenset[str] = PREFERRED_ASSET_BUCKETS,
 ) -> bool:
-    """Whether every asset this ingest would read sits in a preferred bucket.
+    """Whether every asset this ingest would READ sits in a preferred bucket.
 
     All of the read set, not any: an item whose bands straddle two buckets cannot deliver the
-    locality being claimed. An item exposing none of them is remote — absence of evidence is
-    not locality.
+    locality being claimed, and an item exposing only some of them cannot deliver the read at all
+    — that copy displaces a complete remote one on a baseline tie, then fails at load with no
+    source href to attribute, sending the recovery ladder stepping down every duplicated tile-date
+    of the day. An item exposing none of them is remote: absence of evidence is not locality.
     """
-    # EVERY read key must resolve, not merely the ones present. Asserting over only the keys an
-    # item happens to carry let a single local band read as fully in-region: that copy displaces
-    # a COMPLETE remote one on a baseline tie, then fails at load with no source href to
-    # attribute, sending the recovery ladder stepping down every duplicated tile-date of that
-    # day. Locality is a claim about the whole read, so an incomplete item cannot make it.
-    #
-    # Checked from the same walk that reads the buckets rather than by calling
-    # `read_set_is_complete`, which would walk the asset dict and re-parse every href a second
-    # time — this runs once per copy per rank comparison.
-    found = read_asset_buckets(item)
-    return len(found) == len(READ_ASSET_KEYS) and all(bucket in buckets for bucket in found)
+    return read_asset_sources(item).all_in(buckets)
 
 
 class Harmonisation(enum.Enum):
@@ -204,19 +239,12 @@ def item_harmonisation(
     catalogue that changed its key naming would stop the ingest instead of silently halving the
     reflectance of a season.
     """
-    found = read_asset_buckets(item, keys)
-    # The COMPLETE reflectance set, not merely a non-empty subset. `read_asset_buckets` omits keys
-    # that do not resolve, so an item exposing one alias while serving its other bands under
-    # native keys was classified from the visible band alone — and `_prune_item_dict` preserves
-    # exactly those partially aliased items so the loader can still read the native ones. If the
-    # visible band is harmonised while a hidden one is raw, the date-wide decision then exempts or
-    # corrects every band and silently corrupts the subset nothing here could see.
-    if len(found) != len(keys):
+    sources = read_asset_sources(item, keys)
+    if not sources.complete:
         return Harmonisation.UNKNOWN
-    harmonised = [bucket in buckets for bucket in found]
-    if all(harmonised):
+    if sources.all_in(buckets):
         return Harmonisation.HARMONISED
-    if any(harmonised):
+    if sources.any_in(buckets):
         return Harmonisation.MIXED
     return Harmonisation.RAW
 
@@ -231,4 +259,4 @@ def item_is_from_raw_archive(
     unharmonised too, and correcting those is routine rather than notable. Only the archive a
     harmonised-COG catalogue has started pointing at is a surprise worth a warning.
     """
-    return any(b in buckets for b in read_asset_buckets(item, REFLECTANCE_ASSET_KEYS))
+    return read_asset_sources(item, REFLECTANCE_ASSET_KEYS).any_in(buckets)

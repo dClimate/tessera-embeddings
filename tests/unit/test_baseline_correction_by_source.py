@@ -35,6 +35,7 @@ from tessera_embeddings.ingest.asset_locations import (
     Harmonisation,
     item_harmonisation,
     item_is_in_preferred_location,
+    read_asset_sources,
 )
 from tessera_embeddings.ingest.stac import (
     HeterogeneousProducerError,
@@ -728,3 +729,55 @@ class TestScalingCannotOverflowThePicker:
         good = _Item(_HARMONISED, "05.10")
         bad = _Item(_HARMONISED, "1e308")
         assert extract_baselines([good, bad])["2022-01-07"] in (510, 0)
+
+
+class TestAssetSourcesCannotLoseAKey:
+    """The primitive that generated the same defect three times, now typed so it cannot.
+
+    Its predecessor returned a bare list of the buckets it managed to resolve and dropped the
+    rest, so every caller had to remember to compare the length against what it asked for. Three
+    did not: locality was granted from one local band, a producer was named from one visible band,
+    and a subset was read as evidence about the whole set.
+    """
+
+    def test_a_complete_set_reports_complete(self) -> None:
+        sources = read_asset_sources(_Item(_HARMONISED, "05.00"))
+        assert sources.complete is True
+        assert sources.missing == ()
+        assert set(sources.buckets) == set(READ_ASSET_KEYS)
+
+    def test_a_missing_key_is_named_rather_than_dropped(self) -> None:
+        item = _Item(_HARMONISED, "05.00")
+        del item.assets[READ_ASSET_KEYS[0]]
+        sources = read_asset_sources(item)
+        assert sources.complete is False
+        assert sources.missing == (READ_ASSET_KEYS[0],)
+
+    def test_an_href_less_key_counts_as_missing(self) -> None:
+        item = _Item(_HARMONISED, "05.00")
+        item.assets[READ_ASSET_KEYS[0]] = {}
+        assert read_asset_sources(item).missing == (READ_ASSET_KEYS[0],)
+
+    def test_an_unrecognised_bucket_is_a_real_answer_not_a_missing_key(self) -> None:
+        """The distinction the flat list could not express: "served from somewhere we have not
+        listed" is evidence, "not served at all" is the absence of evidence.
+        """
+        item = _Item(None, "05.00")
+        item.assets = {k: {"href": f"https://elsewhere.example/{k}"} for k in READ_ASSET_KEYS}
+        sources = read_asset_sources(item)
+        assert sources.complete is True
+        assert set(sources.buckets.values()) == {None}
+
+    def test_all_in_is_false_for_an_incomplete_set(self) -> None:
+        """The property every one of those three defects needed and none of them checked."""
+        item = _Item(_HARMONISED, "05.00")
+        for key in READ_ASSET_KEYS[1:]:
+            del item.assets[key]
+        sources = read_asset_sources(item)
+        assert sources.any_in(HARMONISED_ASSET_BUCKETS) is True, "the one visible band IS harmonised"
+        assert sources.all_in(HARMONISED_ASSET_BUCKETS) is False, "but that says nothing about the rest"
+
+    def test_an_item_with_no_assets_is_empty_and_incomplete(self) -> None:
+        sources = read_asset_sources(_Item(None, "05.00"))
+        assert sources.empty is True
+        assert sources.complete is False

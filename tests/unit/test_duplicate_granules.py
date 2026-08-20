@@ -879,8 +879,13 @@ class TestNonFiniteBaselinesAreUnknown:
         assert item_processing_baseline(_Item("x", "MGRS-33TWM", "0", **{"s2:processing_baseline": raw})) is None
 
     def test_a_real_baseline_still_reads(self) -> None:
-        """So the test above cannot pass by rejecting everything."""
-        assert item_processing_baseline(_Item("x", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"})) == 5.0
+        """So the test above cannot pass by rejecting everything.
+
+        Reported as an integer hundredth (500, not 5.0) — the scale the correction threshold is
+        expressed in. There used to be two parsers on two scales, and unifying them is what let
+        the numeric edge cases be fixed once instead of twice.
+        """
+        assert item_processing_baseline(_Item("x", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"})) == 500
 
     def test_infinity_does_not_outrank_a_real_baseline(self) -> None:
         infinite = _copy("infinite", sequence="0", baseline="Infinity", host_root=_IN_REGION)

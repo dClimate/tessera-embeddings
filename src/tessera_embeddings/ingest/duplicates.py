@@ -37,7 +37,6 @@ from __future__ import annotations
 import datetime
 import itertools
 import logging
-import math
 import re
 from collections.abc import Iterable, Sequence
 from typing import Any
@@ -46,6 +45,7 @@ from tessera_embeddings.ingest.asset_locations import (
     item_is_in_preferred_location,
     read_set_is_complete,
 )
+from tessera_embeddings.ingest.item_baselines import processing_baseline as item_processing_baseline
 from tessera_embeddings.ingest.solar_days import solar_day_of
 
 logger = logging.getLogger(__name__)
@@ -87,32 +87,6 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
             logger.debug("Unparseable s2:sequence %r on %s", raw, getattr(item, "id", "?"))
     match = _ID_SEQUENCE_RE.search(str(getattr(item, "id", "")))
     return int(match.group(1)) if match else None
-
-
-def item_processing_baseline(item: Any) -> float | None:  # noqa: ANN401 — any STAC-like item
-    """The item's processing baseline as a float, or ``None`` if it cannot be read.
-
-    Higher is a newer reprocessing of the same acquisition. Read because it, and not
-    ``s2:sequence``, is the signal that carries data vintage: a catalogue can index the same
-    granule twice at one baseline and give the copies different sequences.
-    """
-    raw = item.properties.get("s2:processing_baseline")
-    if raw is None:
-        return None
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        logger.debug("Unparseable s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
-        return None
-    # `float()` accepts "NaN" and "Infinity", so a malformed catalogue value would otherwise
-    # count as a KNOWN baseline. NaN makes every comparison false and leaves the order dependent
-    # on catalogue response order; +inf outranks every real baseline and can later make the
-    # integer conversion raise. Neither is a baseline, so both are unknown — which falls back to
-    # sequence ordering, the same as an absent value.
-    if not math.isfinite(value):
-        logger.debug("Non-finite s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
-        return None
-    return value
 
 
 def _sequence_key(item: Any) -> tuple[int, int, int, str]:  # noqa: ANN401 — any STAC-like item
