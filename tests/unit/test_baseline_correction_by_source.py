@@ -17,6 +17,7 @@ every value by 1000.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 import pytest
@@ -258,3 +259,36 @@ class TestRawDatesStraddlingTheThreshold:
 
     def test_raw_items_all_over_the_threshold_are_corrected(self) -> None:
         assert dates_exempt_from_correction([_Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "05.09")]) == set()
+
+
+class TestTheCorrectionPathAnnouncesItself:
+    """Tier 5: the assumption this change rests on, made observable at runtime.
+
+    Every raw item measured on the live catalogue reports a pre-04.00 baseline, so the
+    correction has never actually run on real data. Sampling cannot prove the combination never
+    appears — a 100-item page of a 146-item year said it did not — so the honest close is a
+    signal on the day it does, rather than an inference from a sample.
+    """
+
+    def test_it_warns_when_a_raw_item_is_actually_corrected(self, caplog) -> None:
+        """Not an error: correcting a raw item over the threshold is exactly right. The warning
+        says the path has gone live, so its output gets verified instead of assumed.
+        """
+        with caplog.at_level(logging.WARNING, logger="tessera_embeddings.ingest.stac"):
+            assert dates_exempt_from_correction([_Item(_RAW_ESA, "05.00")]) == set()
+        assert any("correction ACTIVE on raw-producer data" in r.message for r in caplog.records)
+        assert any("500" in str(r.args) for r in caplog.records), "the baseline must be named"
+
+    def test_it_stays_quiet_below_the_threshold(self, caplog) -> None:
+        """The entire backfill is pre-04.00, so this is the common path. A signal that fires on
+        every historical date is noise and would be filtered out before the day it matters.
+        """
+        with caplog.at_level(logging.WARNING, logger="tessera_embeddings.ingest.stac"):
+            dates_exempt_from_correction([_Item(_RAW_ESA, "02.06")])
+        assert not [r for r in caplog.records if "correction ACTIVE" in r.message]
+
+    def test_it_stays_quiet_for_harmonised_data(self, caplog) -> None:
+        """Harmonised items are exempt, so nothing is corrected and nothing is announced."""
+        with caplog.at_level(logging.WARNING, logger="tessera_embeddings.ingest.stac"):
+            dates_exempt_from_correction([_Item(_HARMONISED, "05.10")])
+        assert not [r for r in caplog.records if "correction ACTIVE" in r.message]

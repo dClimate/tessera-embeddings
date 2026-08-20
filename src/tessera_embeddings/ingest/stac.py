@@ -328,6 +328,23 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
         if not owed:
             exempt.add(date_str)
             continue
+        # THE ASSUMPTION THIS CHANGE RESTS ON, MADE OBSERVABLE. Every raw item measured on the
+        # live catalogue reports a pre-04.00 baseline, so this branch has never been reached on
+        # real data — which means the correction path itself has never run in production. Say so
+        # at WARNING the first time it does, per date: sampling a catalogue cannot prove the
+        # combination never appears (a 100-item page of a 146-item year told me it did not), and
+        # a monitored fact beats an inference from a sample. Not an error: correcting a raw item
+        # over the threshold is exactly right, and this is the path doing its job.
+        logger.warning(
+            "Baseline correction ACTIVE on raw-producer data for %s: %d item(s) at baseline(s) %s "
+            "are owed the %d offset. This combination had not been observed upstream, so this is "
+            "the first real exercise of the correction path — verify the reflectance rather than "
+            "assuming it.",
+            date_str,
+            len(owed),
+            sorted({_extract_baseline(it) for it in owed}),
+            S2_BASELINE_OFFSET,
+        )
         # A date carries ONE baseline (`extract_baselines` is last-wins by construction), so raw
         # items on opposite sides of the threshold cannot both be served: correcting shifts the
         # pre-threshold pixels down by the offset, not correcting leaves the post-threshold ones
