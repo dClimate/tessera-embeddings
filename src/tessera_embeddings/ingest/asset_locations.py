@@ -189,10 +189,11 @@ def item_harmonisation(
     correction shifts values by a visible 1000, while a skipped one leaves plausible pixels that
     are quietly wrong.
 
-    An item exposing NONE of the reflectance bands is ``UNKNOWN``, which is a different answer for
-    a different reason and not a softer version of ``RAW``. Nothing here can see the alias table
-    that maps a band name to an asset key, so a band absent under the requested name may still be
-    served under a native one — ``_prune_item_dict`` in ``stac.py`` exists for exactly that case.
+    An item that does not expose EVERY reflectance band under the configured names is ``UNKNOWN``,
+    which is a different answer for a different reason and not a softer version of ``RAW``. Nothing
+    here can see the alias table that maps a band name to an asset key, so a band absent under the
+    requested name may still be served under a native one — ``_prune_item_dict`` in ``stac.py``
+    exists for exactly that case, and preserves PARTIALLY aliased items for it.
     Calling such an item raw would subtract 1000 from pixels that may already be harmonised,
     which is the corruption this whole module was written to prevent, and it would do it while
     reporting nothing. The live Element 84 catalogue serves the configured alias keys, so this
@@ -201,7 +202,13 @@ def item_harmonisation(
     reflectance of a season.
     """
     found = read_asset_buckets(item, keys)
-    if not found:
+    # The COMPLETE reflectance set, not merely a non-empty subset. `read_asset_buckets` omits keys
+    # that do not resolve, so an item exposing one alias while serving its other bands under
+    # native keys was classified from the visible band alone — and `_prune_item_dict` preserves
+    # exactly those partially aliased items so the loader can still read the native ones. If the
+    # visible band is harmonised while a hidden one is raw, the date-wide decision then exempts or
+    # corrects every band and silently corrupts the subset nothing here could see.
+    if len(found) != len(keys):
         return Harmonisation.UNKNOWN
     harmonised = [bucket in buckets for bucket in found]
     if all(harmonised):

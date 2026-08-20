@@ -409,8 +409,11 @@ at all. None has been observed on the live catalogue, which is why they are refu
 engineered around. Every refusal is gated on the date actually being owed a correction — where
 nothing is owed, which producer served the pixels cannot change any of them.
 
-That last case is worth naming, because the safe direction inverts. An item exposing none of the
-reflectance bands under the configured names is `UNKNOWN`, not `RAW`. Nothing in this module can
+That last case is worth naming, because the safe direction inverts. An item that does not expose
+EVERY reflectance band under the configured names is `UNKNOWN`, not `RAW` — a non-empty subset is
+not enough, because `_prune_item_dict` specifically preserves PARTIALLY aliased items, and letting
+one visible harmonised band speak for a hidden native-keyed one corrupts the subset nothing here
+could see. Nothing in this module can
 see the alias table that maps a band name to an asset key, so a band absent under `blue` may be
 served under `B02` — `_prune_item_dict` exists for exactly that mismatch. Calling such an item
 raw would subtract 1000 from pixels that may already be harmonised, silently. The live Element 84

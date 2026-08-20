@@ -216,6 +216,32 @@ class TestHarmonisationPredicate:
         item.assets = {f"B{n:02d}": {"href": f"{_HARMONISED}/B{n:02d}.tif"} for n in (2, 3, 4, 8)}
         assert item_harmonisation(item) is Harmonisation.UNKNOWN
 
+    def test_a_partly_aliased_item_is_undetermined(self) -> None:
+        """The subset case, and the one `_prune_item_dict` is specifically written for: asked for
+        `blue` and `scl`, carrying `B02` and `scl`. Classifying from the visible band alone let a
+        harmonised alias speak for a hidden native-keyed band that may be raw, and the date-wide
+        decision then corrupts the subset nothing here could see.
+        """
+        item = _Item(None, "05.00")
+        item.assets = {"blue": {"href": f"{_HARMONISED}/blue.tif"}}
+        for n in (3, 4, 8):
+            item.assets[f"B{n:02d}"] = {"href": f"{_RAW_ESA}/B{n:02d}.jp2"}
+        assert item_harmonisation(item) is Harmonisation.UNKNOWN
+
+    def test_one_missing_reflectance_band_is_enough_to_be_undetermined(self) -> None:
+        """The boundary: a complete-but-one set is still an incomplete set."""
+        item = _Item(_HARMONISED, "05.00")
+        del item.assets[REFLECTANCE_ASSET_KEYS[-1]]
+        assert item_harmonisation(item) is Harmonisation.UNKNOWN
+
+    def test_a_missing_scl_does_not_make_the_producer_undetermined(self) -> None:
+        """`scl` is not a reflectance band, so it cannot affect this predicate — the complement
+        of the completeness rule, and the reason the two key sets stay separate.
+        """
+        item = _Item(_HARMONISED, "05.00")
+        del item.assets["scl"]
+        assert item_harmonisation(item) is Harmonisation.HARMONISED
+
     def test_the_live_catalogue_serves_the_configured_alias_keys(self) -> None:
         """Why UNKNOWN does not fire in production: real Element 84 items key their assets by
         the configured band names, so they classify HARMONISED on the normal path.
