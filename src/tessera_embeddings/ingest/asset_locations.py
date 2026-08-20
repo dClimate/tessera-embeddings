@@ -236,10 +236,12 @@ def item_harmonisation(
         return Harmonisation.HARMONISED
     if sources.any_in(buckets):
         return Harmonisation.MIXED
-    # RAW only for a producer explicitly identified as unharmonised. An unlisted bucket is UNKNOWN:
+    # RAW only when EVERY band comes from a producer explicitly identified as unharmonised. One raw
+    # band beside bands from an unlisted bucket is not a raw item — correcting it would subtract the
+    # offset from bands that may already have had it removed. An unlisted bucket is UNKNOWN:
     # were a harmonised mirror to move behind a new bucket or CDN, calling it raw would subtract the
     # offset from pixels that already had it removed. The caller refuses on UNKNOWN.
-    if sources.any_in(UNHARMONISED_ASSET_BUCKETS):
+    if sources.all_in(UNHARMONISED_ASSET_BUCKETS):
         return Harmonisation.RAW
     return Harmonisation.UNKNOWN
 

@@ -353,7 +353,7 @@ def log_duplicate_selection(
         local = sum(1 for it in winners if item_is_in_preferred_location(it, keys=read_keys))
         where = f"; winners by source: {local} in-region, {len(winners) - local} remote"
 
-    how = "newest baseline, then in-region, then complete read set, then newest sequence"
+    how = "complete read set, then newest baseline, then in-region, then newest sequence"
     log.info(
         "Duplicate catalogue items pruned roi=%s: %d tile-date(s) had more than one copy, "
         "%d rejected. Preference: %s (rejected copies stay available as a fallback)%s",

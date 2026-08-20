@@ -1262,3 +1262,34 @@ class TestTheCorrectionDoesNotCorruptTheBrightestCodes:
         assert got.min() >= 0
         # Every eligible pixel loses exactly the offset; the two below it are untouched.
         np.testing.assert_array_equal(got, np.array([[[64535, 59000, 0, 999, 0]]], dtype=np.uint16))
+
+
+class TestRawRequiresEveryBandFromAKnownProducer:
+    """One raw band beside bands from an unlisted bucket is not a raw item.
+
+    `any_in` classified such a set as RAW, and the date-wide corrector then subtracted the offset
+    from bands whose producer is unknown and may already have had it removed. Raised on PR #107.
+    """
+
+    def test_raw_plus_unlisted_is_undetermined(self) -> None:
+        item = _Item(None, "05.00")
+        item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
+        item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
+        assert item_harmonisation(item) is Harmonisation.UNKNOWN
+
+    def test_every_band_from_the_known_archive_is_raw(self) -> None:
+        """The complement: an item genuinely served by the archive must still be corrected."""
+        assert item_harmonisation(_Item(_RAW_ESA, "05.00")) is Harmonisation.RAW
+
+    def test_raw_plus_harmonised_is_still_mixed(self) -> None:
+        """The three-way distinction survives: straddling KNOWN producers stays MIXED."""
+        item = _Item(_HARMONISED, "05.00")
+        item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
+        assert item_harmonisation(item) is Harmonisation.MIXED
+
+    def test_the_undetermined_set_refuses_rather_than_correcting(self) -> None:
+        item = _Item(None, "05.00")
+        item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
+        item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
+        with pytest.raises(HeterogeneousProducerError):
+            dates_exempt_from_correction([item])
