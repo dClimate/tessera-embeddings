@@ -761,6 +761,16 @@ def _loadable_assets(collection_config: CollectionConfig, extra_bands: "list[str
     return frozenset(names)
 
 
+def _requested_assets(collection_config: CollectionConfig, extra_bands: "list[str] | None" = None) -> tuple[str, ...]:
+    """The assets a load will actually REQUEST, in a stable order.
+
+    Narrower than :func:`_loadable_assets`, which is a pruning set and deliberately generous — it
+    keeps ``scl`` for any collection that has one, whether or not this call asks for it. Ranking a
+    duplicate copy on that broader set penalises it for lacking an asset the load never reads.
+    """
+    return (*collection_config.bands, *(b for b in (extra_bands or ()) if b not in collection_config.bands))
+
+
 def _prune_item_dict(item: dict[str, Any], keep_assets: frozenset[str]) -> dict[str, Any]:
     """Drop assets the loader never reads, plus links, from a STAC item dict.
 
@@ -1184,6 +1194,15 @@ def load_stac_items(
     """
     collection_config = _get_collection_config(provider, collection)
 
+    if collection_config.harmonisation_varies_by_item:
+        # Also here, and idempotently. `ingest_tile` prunes before extracting provenance and
+        # `s2_roi` prunes before building its fallback ladder, but the documented
+        # `query_stac_items` -> `load_stac_items` workflow passes through neither, so an unpruned
+        # pair of producers for one acquisition would reach the correction decision as a genuine
+        # conflict. Selecting again over an already-selected set is a no-op, and this function
+        # already requires normalised items for that decision, so the precondition is unchanged.
+        items, _ = select_preferred_duplicates(items, _requested_assets(collection_config, extra_bands))
+
     data = _load_from_stac(
         items,
         collection_config,
@@ -1388,9 +1407,7 @@ def ingest_tile(
         # query left that driver with an empty ladder, so a single unreadable object lost the date
         # instead of stepping down to the copy sitting behind it. Selection belongs to the layer
         # that owns the fallback — which here is nobody, so the copies are genuinely spare.
-        items, alternates = select_preferred_duplicates(
-            items, tuple(sorted(_loadable_assets(collection_config, extra_bands)))
-        )
+        items, alternates = select_preferred_duplicates(items, _requested_assets(collection_config, extra_bands))
         log_duplicate_selection(logger, f"tile {tile_id}" if tile_id else f"bbox {bbox}", alternates, kept=items)
         # Provenance must describe what was KEPT. `query_stac_items` built this map from the
         # unpruned list, so a rejected copy that happened to sort last supplied the recorded

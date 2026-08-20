@@ -913,3 +913,95 @@ class TestTheGenericEntryPointPrunesAndTheRoiLadderSurvives:
         assert loaded == ["S2A_33TWM_20220107_1_L2A"], "the generic path refused instead of selecting"
         # And provenance describes the copy that was kept, not the one that sorted last.
         assert baselines == {"2022-01-07": 510}
+
+
+class TestEverySentinel2PathHasASelectionOwner:
+    """Three entry points, three reasons to select, and one path that had none.
+
+    `s2_roi` selects to build its fallback ladder, `ingest_tile` selects before extracting
+    provenance — and the documented `query_stac_items` -> `load_stac_items` workflow passed through
+    neither, so an unpruned pair of producers for one acquisition reached the correction decision as
+    a genuine conflict. The loader selects too, idempotently.
+    """
+
+    @staticmethod
+    def _pair() -> list[_Item]:
+        harmonised = _Item(_HARMONISED, "05.10")
+        harmonised.id = "S2A_33TWM_20220107_1_L2A"
+        harmonised.properties["s2:sequence"] = "1"
+        raw = _Item(_RAW_ESA, "05.00")
+        raw.id = "S2A_33TWM_20220107_0_L2A"
+        raw.properties["s2:sequence"] = "0"
+        for item in (harmonised, raw):
+            item.properties["grid:code"] = "MGRS-33TWM"
+            item.properties["datetime"] = "2022-01-07T10:20:31.024000Z"
+        return [harmonised, raw]
+
+    def test_the_split_workflow_loads_rather_than_refusing(self, monkeypatch) -> None:
+        loaded: list[str] = []
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+
+        def fake_load(items, *a, **k):
+            loaded.extend(i.id for i in items)
+            return data
+
+        monkeypatch.setattr(stac_module, "_load_from_stac", fake_load)
+        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
+        # Exactly the documented two-step: the query does not prune, so the loader must.
+        items, baselines = stac_module.query_stac_items(
+            provider="earth-search",
+            collection="sentinel-2-l2a",
+            tile_id="33TWM",
+            start_date="2022-01-01",
+            end_date="2022-01-31",
+            mid_longitude=15.0,
+            item_provider_fn=lambda **_: self._pair(),
+        )
+        assert len(items) == 2, "the query must leave duplicates for the ROI ladder"
+        stac_module.load_stac_items(items, "earth-search", "sentinel-2-l2a", baselines=baselines)
+        assert loaded == ["S2A_33TWM_20220107_1_L2A"]
+
+    def test_selecting_twice_changes_nothing(self) -> None:
+        """What makes it safe to select in more than one place."""
+        once, _ = select_preferred_duplicates(self._pair())
+        twice, alternates = select_preferred_duplicates(once)
+        assert [i.id for i in twice] == [i.id for i in once]
+        assert alternates == {}
+
+
+class TestRankingUsesTheRequestedAssetsNotThePruningSet:
+    """`_loadable_assets` is a pruning set and deliberately generous — it keeps `scl` for any
+    collection that has one, whether or not the call asks for it. Ranking on that penalises a copy
+    for lacking an asset the load never reads. Raised on PR #107.
+    """
+
+    def test_scl_is_not_requested_unless_asked_for(self) -> None:
+        config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
+        assert config.has_scl is True
+        assert "scl" in stac_module._loadable_assets(config), "the pruning set keeps it"
+        assert "scl" not in stac_module._requested_assets(config), "the read set does not"
+
+    def test_an_explicit_extra_band_is_requested(self) -> None:
+        config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
+        assert "scl" in stac_module._requested_assets(config, ["scl"])
+
+    def test_the_requested_set_does_not_duplicate_a_configured_band(self) -> None:
+        config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
+        requested = stac_module._requested_assets(config, ["blue", "qa"])
+        assert requested.count("blue") == 1
+        assert requested[-1] == "qa"
+
+    def test_a_copy_lacking_scl_is_not_penalised_when_scl_is_not_read(self) -> None:
+        """The consequence: an equal-baseline local copy losing to a remote one over an asset this
+        call never reads, which is an unnecessary cross-region read.
+        """
+        config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
+        keys = stac_module._requested_assets(config)
+        local_no_scl = _Item(None, "05.00")
+        local_no_scl.id = "local"
+        local_no_scl.assets = {b: {"href": f"{_HARMONISED}/{b}.tif"} for b in config.bands}
+        assert item_is_in_preferred_location(local_no_scl, keys=keys) is True
+        assert item_is_in_preferred_location(local_no_scl) is False, "the fixed set demands scl"

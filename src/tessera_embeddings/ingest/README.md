@@ -420,19 +420,15 @@ the value sat on different evidence: a date the items showed was owed the offset
 stale lower value. `extract_baselines` remains separate and untouched — it records what each item
 declared and is what reaches the store's `baselines_applied`.
 
-Duplicate selection runs inside `query_stac_items`, and its position there is load-bearing in both
-directions. **After** normalisation, because the selector derives the solar day with `solar_day_of`,
-which refuses an un-normalised item rather than guessing. **Before** `extract_baselines`, because
-that map becomes the store's `baselines_applied`: built from the unpruned list, a rejected copy that
-sorted last supplied the recorded baseline while the selected copy supplied the pixels, so the store
-described imagery it had not written.
+Duplicate selection has **three owners, one per entry point**, and none of them is the shared
+query. `query_stac_items` deliberately does not prune: `s2_roi` runs its own selection over that
+output and keeps the rejected copies as the ladder `step_down_copies` walks when a source object
+will not read, so pruning upstream would leave it nothing to step down to. `ingest_tile` prunes
+before `extract_baselines`, because that map becomes the store's `baselines_applied` and must
+describe the copy that was kept. `load_stac_items` prunes as well, for the documented
+`query_stac_items` -> `load_stac_items` workflow that passes through neither of the others.
 
-It lives there rather than in `load_stac_items` for a third reason. Only `s2_roi` used to prune, so
-the generic path handed the producer check an unpruned set and a harmonised COG beside a raw
-reprocessing of one acquisition refused a date that selecting one copy resolves. Pruning inside the
-loader fixed that and imposed the normalisation precondition on every direct caller of the public
-loader — which previously accepted raw catalogue items and has no longitude to normalise them with.
-`load_stac_items` documents what it expects instead.
+Selecting over an already-selected set is a no-op, which is what makes more than one owner safe.
 
 Genuinely ambiguous dates **refuse** (`HeterogeneousProducerError`) rather than picking a side,
 because no date-wide answer is right for them and both mistakes are silent: an item whose own
@@ -1307,10 +1303,11 @@ The key reads five fields, in this order:
 2. **Locality, among equal baselines only.** A copy whose read assets all sit in a preferred
    bucket is cheaper to read, so it wins a baseline tie. Restricting locality to ties is what
    stops it buying cheaper egress with an older pixel.
-3. **Read-set completeness**, judged over the assets *this* load will request — extra bands
-   included, not a fixed list. A copy missing one of them cannot deliver the tile-date, so it
-   loses to one that can. Callers pass their own set: `ingest_tile` derives it from
-   `_loadable_assets`, and `s2_roi` from the extra-band list its loads use.
+3. **Read-set completeness**, judged over the assets *this* load will request — the configured
+   bands plus the caller's `extra_bands`, not a fixed list and not the broader pruning set, which
+   keeps `scl` whether or not the call asks for it. A copy missing a requested asset cannot deliver
+   the tile-date, so it loses to one that can; penalising it for an asset the load never reads
+   would buy an unnecessary cross-region read.
 4. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of
    catalogue response order, so a rerun cannot silently produce a different mosaic — and it makes
    the key a total order, so no comparison ever falls back to input order.
