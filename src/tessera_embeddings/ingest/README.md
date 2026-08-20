@@ -1342,11 +1342,12 @@ Two properties of that ordering are easy to get wrong and are held by tests:
   altogether. It is also judged over the *whole* read set: one local band among many remote
   ones is not locality, and an item exposing none of them is remote, because absence of
   evidence is not evidence of locality.
-- **An unreadable baseline suspends locality entirely** for the copies of that acquisition,
-  restoring sequence-first ordering. A missing baseline is an absence of evidence rather than
-  a tie, and treating it as a tie let an in-region copy with no baseline displace a remote
-  copy at 05.00 — which both selects an older reprocessing and skips the post-04.00 offset
-  correction downstream. The suspension applies only to choosing an acquisition's winner.
+- **An unreadable baseline sorts LAST, and makes locality inert for that copy.** A missing
+  baseline is an absence of evidence rather than a tie: treating it as a tie let an in-region copy
+  with no baseline displace a remote copy at 05.00, selecting an older reprocessing *and* skipping
+  the offset correction. Such a copy also refuses its whole date downstream, and the read-failure
+  ladder recovers from a read error but not from a refusal, so a reprocessing that can be corrected
+  beats a newer one that cannot be processed at all.
 
 The **fallback ladder** — the rejected copies, in the order a read failure steps down them — is
 built by one global sort over the whole tile-date instead, using a key that has no notion of

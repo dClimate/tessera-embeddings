@@ -1228,9 +1228,13 @@ def load_stac_items(
         geobox=geobox,
     )
 
-    if collection_config.requires_baseline_correction and baselines:
+    # Not gated on `baselines` being truthy. Where producers can disagree the correction is derived
+    # from the items, so a caller passing no map at all would otherwise leave a raw post-04.00 item
+    # uncorrected — the offset intact, silently. The map is still required where it IS the evidence.
+    item_derived = collection_config.harmonisation_varies_by_item
+    if collection_config.requires_baseline_correction and (item_derived or baselines):
         loaded_dates = {str(t.values)[:10] for t in data.time}
-        filtered_baselines = {d: b for d, b in baselines.items() if d in loaded_dates}
+        filtered_baselines = {d: b for d, b in (baselines or {}).items() if d in loaded_dates}
         # Built from the ITEMS where producers can disagree, and from the caller's map where they
         # cannot — never a mixture, or the decision and the value sit on different evidence.
         # `baselines` stays untouched either way: it is provenance and reaches the store's
@@ -1240,7 +1244,7 @@ def load_stac_items(
         # Search keys them and not how Planetary Computer does (`B02`, `SCL`, resolved by the
         # loader). PC serves ESA's values unharmonised throughout, so its answer belongs to the
         # collection and the threshold alone is correct there.
-        if collection_config.harmonisation_varies_by_item:
+        if item_derived:
             correction_baselines = {d: b for d, b in correction_baselines_by_date(items).items() if d in loaded_dates}
         else:
             correction_baselines = dict(filtered_baselines)
@@ -1428,11 +1432,10 @@ def ingest_tile(
             kept=items,
             read_keys=read_keys,
         )
-        # Provenance must describe what was KEPT. `query_stac_items` built this map from the
-        # unpruned list, so a rejected copy that happened to sort last supplied the recorded
-        # baseline for pixels the selected copy provided — and this map is returned to the caller
-        # and becomes the store's `baselines_applied`.
-        baselines = extract_baselines(items)
+        # Provenance must describe what was KEPT, for the dates selection touched — UPDATED and
+        # not replaced. `query_stac_items` returns entries for every queried date, including ones
+        # whose items were filtered out as already present, and replacing the map dropped those.
+        baselines = {**baselines, **extract_baselines(items)}
 
     data = load_stac_items(
         items,

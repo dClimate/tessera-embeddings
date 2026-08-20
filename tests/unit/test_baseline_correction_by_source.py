@@ -1114,3 +1114,90 @@ class TestTheThemesThatGeneratedTheReviewStayClosed:
         harmonised = [_Item(_HARMONISED, "05.10")]
         assert extract_baselines(harmonised) == {"2022-01-07": 510}
         assert correction_baselines_by_date(harmonised) == {"2022-01-07": 0}
+
+
+class TestTheCorrectionDoesNotDependOnTheCallerSupplyingAMap:
+    """Where producers can disagree the correction is derived from the ITEMS, so gating the whole
+    block on the caller's map being truthy left a raw post-04.00 item uncorrected. Raised twice.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, items, baselines) -> list[dict]:
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.full((1, 2, 2), 3000, dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            stac_module,
+            "_apply_baseline_corrections_by_date",
+            lambda d, corrections, **kw: calls.append({"corrections": corrections}) or d,
+        )
+        stac_module.load_stac_items(items, "earth-search", "sentinel-2-l2a", baselines=baselines)
+        return calls
+
+    @pytest.mark.parametrize("baselines", [None, {}])
+    def test_a_raw_post_threshold_item_is_corrected_with_no_map(self, monkeypatch, baselines) -> None:
+        calls = self._run(monkeypatch, [_Item(_RAW_ESA, "05.00")], baselines)
+        assert calls == [{"corrections": {"2022-01-07": 500}}], "the offset was left in the pixels"
+
+    @pytest.mark.parametrize("baselines", [None, {}])
+    def test_a_harmonised_item_is_still_not_corrected(self, monkeypatch, baselines) -> None:
+        """The complement: running the block unconditionally must not correct what is exempt."""
+        assert self._run(monkeypatch, [_Item(_HARMONISED, "05.10")], baselines) == []
+
+    def test_a_collection_without_the_per_item_decision_still_needs_its_map(self, monkeypatch) -> None:
+        """Planetary Computer's answer IS the caller's map, so with no map there is nothing to
+        apply and the block must stay out of the way.
+        """
+        item = _Item(None, "05.10")
+        item.assets = {k: {"href": f"https://x.blob.core.windows.net/{k}"} for k in ("B02", "B03")}
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
+        calls: list[dict] = []
+        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, c, **kw: calls.append(c) or d)
+        stac_module.load_stac_items([item], "planetary-computer", "sentinel-2-l2a", baselines=None)
+        assert calls == []
+
+
+class TestProvenanceKeepsTheDatesSelectionDidNotTouch:
+    """`query_stac_items` returns entries for every queried date, including ones whose items were
+    filtered out as already present. Replacing the map dropped those. Raised on PR #107.
+    """
+
+    def test_an_existing_date_survives_the_realignment(self, monkeypatch) -> None:
+        contested = _Item(_HARMONISED, "05.10")
+        contested.id = "S2A_33TWM_20220107_1_L2A"
+        contested.properties.update({"s2:sequence": "1", "grid:code": "MGRS-33TWM"})
+        contested.properties["datetime"] = "2022-01-07T10:20:31.024000Z"
+        rejected = _Item(_HARMONISED, "02.06")
+        rejected.id = "S2A_33TWM_20220107_0_L2A"
+        rejected.properties.update({"s2:sequence": "0", "grid:code": "MGRS-33TWM"})
+        rejected.properties["datetime"] = "2022-01-07T10:20:31.024000Z"
+
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
+        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
+        # An existing date whose items were filtered out keeps its provenance entry.
+        monkeypatch.setattr(
+            stac_module,
+            "query_stac_items",
+            lambda **_: ([contested, rejected], {"2022-01-07": 206, "2021-12-25": 500}),
+        )
+        _, baselines = stac_module.ingest_tile(
+            provider="earth-search",
+            collection="sentinel-2-l2a",
+            tile_id="33TWM",
+            start_date="2022-01-01",
+            end_date="2022-01-31",
+            mid_longitude=15.0,
+        )
+        assert baselines["2022-01-07"] == 510, "the contested date must follow the survivor"
+        assert baselines["2021-12-25"] == 500, "an already-present date lost its provenance"
