@@ -41,6 +41,7 @@ import re
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+from tessera_embeddings.config.providers import S2_L2A_BANDS
 from tessera_embeddings.ingest.solar_days import solar_day_of
 
 logger = logging.getLogger(__name__)
@@ -96,24 +97,44 @@ PREFERRED_ASSET_HOSTS: tuple[str, ...] = (
 )
 
 
+#: The asset keys an S2 ingest actually reads: the configured bands plus the scene
+#: classification layer. Locality is judged over THESE and not over every asset, because
+#: these are the only reads that cost anything.
+READ_ASSET_KEYS: tuple[str, ...] = (*S2_L2A_BANDS, "scl")
+
+
+def _asset_href(asset: Any) -> str | None:  # noqa: ANN401 — pystac Asset or a plain dict
+    """An asset's href, whether it arrives as a pystac ``Asset`` or a raw dict."""
+    href = getattr(asset, "href", None)
+    if href is None and isinstance(asset, dict):
+        href = asset.get("href")
+    return href if isinstance(href, str) and href else None
+
+
 def item_is_in_preferred_location(
     item: Any,  # noqa: ANN401 — any STAC-like item
     hosts: tuple[str, ...] = PREFERRED_ASSET_HOSTS,
+    keys: tuple[str, ...] = READ_ASSET_KEYS,
 ) -> bool:
-    """Whether EVERY resolvable asset href of *item* sits in a preferred host.
+    """Whether every asset this ingest would READ sits in a preferred host.
 
-    All, not any: an item whose assets straddle two locations cannot deliver the locality
-    the preference is claiming, so it sorts as remote. An item with no readable hrefs also
-    sorts as remote — absence of evidence is not locality.
+    **Judged over the read set, not over every asset, and that distinction is the whole
+    correctness of this function.** A real Element 84 item carries its COG bands *and* the
+    original JP2s as extra assets — 35 assets across two buckets on the pair this was
+    measured against. Requiring all 35 to be in a preferred host marked that item remote,
+    which silently disabled the entire in-region preference: the first version of this did
+    exactly that and a live-catalogue check found zero mixed tile-dates where two existed.
+
+    Judging the read set also makes the answer mean what the caller needs it to mean. The
+    extra JP2s are never fetched, so their location cannot make a read expensive, and an
+    item whose bands are in region genuinely is the cheap copy.
+
+    All of the read set, not any: an item whose *bands* straddle two locations cannot deliver
+    the locality being claimed. An item exposing none of them sorts as remote — absence of
+    evidence is not locality.
     """
-    hrefs = [
-        href
-        for asset in (getattr(item, "assets", None) or {}).values()
-        if isinstance(
-            href := getattr(asset, "href", None) or (asset.get("href") if isinstance(asset, dict) else None), str
-        )
-        and href
-    ]
+    assets = getattr(item, "assets", None) or {}
+    hrefs = [href for key in keys if (asset := assets.get(key)) is not None and (href := _asset_href(asset))]
     return bool(hrefs) and all(any(h in href for h in hosts) for href in hrefs)
 
 
