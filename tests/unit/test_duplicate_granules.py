@@ -19,9 +19,10 @@ import pystac
 import pytest
 
 from tessera_embeddings.ingest.duplicates import (
-    PREFERRED_ASSET_HOSTS,
+    PREFERRED_ASSET_BUCKETS,
     READ_ASSET_KEYS,
     alternates_for,
+    asset_bucket,
     copies_label,
     is_unreadable_source,
     item_is_in_preferred_location,
@@ -612,8 +613,87 @@ class TestLocalityPredicate:
         assert item_is_in_preferred_location(_Item("x")) is False
         assert item_is_in_preferred_location(_with_assets(_Item("x"), {"thumbnail": {"href": _IN_REGION}})) is False
 
-    def test_the_remote_host_is_not_in_the_preferred_list(self) -> None:
+    def test_the_remote_bucket_is_not_in_the_preferred_set(self) -> None:
         """Guards the constant itself: if `sentinel-s2-l2a` were ever added to
-        PREFERRED_ASSET_HOSTS the whole fix would silently invert.
+        PREFERRED_ASSET_BUCKETS the whole fix would silently invert.
         """
-        assert not any("sentinel-s2-l2a/" in h for h in PREFERRED_ASSET_HOSTS)
+        assert "sentinel-s2-l2a" not in PREFERRED_ASSET_BUCKETS
+
+
+class TestAssetBucketParsing:
+    """The bucket is PARSED, because a substring test answers yes to the wrong things."""
+
+    @pytest.mark.parametrize(
+        ("href", "expected"),
+        [
+            ("s3://sentinel-cogs/sentinel-s2-l2a-cogs/33/T/WM/B04.tif", "sentinel-cogs"),
+            ("https://sentinel-cogs.s3.us-west-2.amazonaws.com/x/B04.tif", "sentinel-cogs"),
+            ("https://sentinel-cogs.s3.amazonaws.com/x/B04.tif", "sentinel-cogs"),
+            ("https://s3.us-west-2.amazonaws.com/sentinel-cogs/x/B04.tif", "sentinel-cogs"),
+            ("s3://sentinel-s2-l2a/tiles/33/T/WM/B04.jp2", "sentinel-s2-l2a"),
+        ],
+    )
+    def test_the_three_forms_the_catalogues_emit(self, href: str, expected: str) -> None:
+        assert asset_bucket(href) == expected
+
+    @pytest.mark.parametrize(
+        "href",
+        [
+            "s3://sentinel-cogs-backup/x/B04.tif",
+            "https://sentinel-cogs-backup.s3.us-west-2.amazonaws.com/x/B04.tif",
+            "https://elsewhere.example/sentinel-cogs/x/B04.tif",
+            "https://sentinel-cogs.attacker.example/x/B04.tif",
+        ],
+    )
+    def test_lookalikes_are_not_the_preferred_bucket(self, href: str) -> None:
+        """Each of these CONTAINS a preferred bucket's name while being somewhere else. A
+        substring test called them local and would have routed the reads through NAT believing
+        they were free.
+        """
+        assert asset_bucket(href) not in PREFERRED_ASSET_BUCKETS
+
+    def test_a_non_s3_href_has_no_bucket(self) -> None:
+        assert asset_bucket("https://example.com/data/B04.tif") is None
+
+
+class TestUnknownBaselineSuspendsLocality:
+    """An absent baseline is not a tie, and treating it as one is wrong twice over."""
+
+    def test_an_unknown_baseline_does_not_win_on_locality(self) -> None:
+        """The reported P1. A local copy with NO baseline must not displace a remote copy at
+        05.00: that can select an older reprocessing, AND `_extract_baseline` maps the missing
+        value to 0 downstream, so the post-04.00 offset correction is skipped and the
+        reflectance is wrong with nothing raising.
+        """
+        local_unknown = _Item("S2A_33TWM_20220107_0_L2A", "MGRS-33TWM", "0")
+        _with_assets(local_unknown, _bands_at(_IN_REGION))
+        remote_best = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="05.00", host_root=_REMOTE)
+        kept, _ = select_preferred_duplicates([local_unknown, remote_best])
+        assert [i.id for i in kept] == [remote_best.id], "sequence must decide when a baseline is unknown"
+
+    def test_an_unknown_baseline_still_wins_on_sequence(self) -> None:
+        """The complement: suspending locality must not become demoting the unknown. A newest
+        copy that omits the property is still the newest.
+        """
+        local_old = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="05.00", host_root=_IN_REGION)
+        remote_unknown = _Item("S2A_33TWM_20220107_1_L2A", "MGRS-33TWM", "1")
+        _with_assets(remote_unknown, _bands_at(_REMOTE))
+        kept, _ = select_preferred_duplicates([local_old, remote_unknown])
+        assert [i.id for i in kept] == [remote_unknown.id]
+
+
+class TestFallbackLadderKeepsBaselineOrder:
+    """Every rung stays in descending baseline order, not just the top one."""
+
+    def test_a_middle_baseline_is_not_skipped_for_a_local_older_one(self) -> None:
+        """The reported MEDIUM. With 05.00 selected, a remote 04.00 and a local 03.00, a read
+        failure must step to 04.00. Collapsing every non-best baseline into one tier let
+        locality hand out the 03.00 copy and needlessly degrade the imagery.
+        """
+        best = _copy("S2A_33TWM_20220107_2_L2A", sequence="2", baseline="05.00", host_root=_REMOTE)
+        middle = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="04.00", host_root=_REMOTE)
+        worst_local = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="03.00", host_root=_IN_REGION)
+        kept, alternates = select_preferred_duplicates([worst_local, middle, best])
+        assert [i.id for i in kept] == [best.id]
+        ladder = [i.id for i in next(iter(alternates.values()))]
+        assert ladder == [middle.id, worst_local.id], "the ladder skipped a newer reprocessing"
