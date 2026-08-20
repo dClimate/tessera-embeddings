@@ -41,7 +41,7 @@ from tessera_embeddings.ingest.catalogue_refusal import (
     bbox_area_label,
     raise_catalogue_query_error,
 )
-from tessera_embeddings.ingest.duplicates import select_preferred_duplicates
+from tessera_embeddings.ingest.duplicates import log_duplicate_selection, select_preferred_duplicates
 from tessera_embeddings.ingest.item_baselines import processing_baseline as _declared_baseline
 from tessera_embeddings.ingest.solar_days import (
     SolarDayRange,
@@ -1142,6 +1142,25 @@ def query_stac_items(
             )
         )
 
+    if collection_config.harmonisation_varies_by_item:
+        # Reduce to one copy per acquisition HERE: after the single solar-offset application above,
+        # and before provenance is extracted below.
+        #
+        # After normalisation, because `select_preferred_duplicates` derives the solar day with
+        # `solar_day_of`, which refuses an un-normalised item rather than guessing at its day.
+        #
+        # Before `extract_baselines`, because that map is the store's `baselines_applied` and is
+        # returned to the caller unchanged. Built from the unpruned list, a REJECTED copy that
+        # happened to sort last supplied the recorded baseline while the selected copy supplied the
+        # pixels, so the store described imagery it had not written.
+        #
+        # And in this path rather than in `load_stac_items`, because this is where items are
+        # normalised. Pruning below would have imposed that precondition on every direct caller of
+        # the public loader, which previously accepted raw catalogue items and has no longitude to
+        # normalise them with.
+        items, alternates = select_preferred_duplicates(items)
+        log_duplicate_selection(logger, query_label, alternates, kept=items)
+
     baselines = extract_baselines(items)
 
     if existing_dates:
@@ -1192,17 +1211,16 @@ def load_stac_items(
 
     Returns:
         Corrected xarray Dataset
+
+    Expects items that have already passed ``normalize_to_solar_day`` and, for a collection whose
+    harmonisation varies by item, duplicate selection — both of which :func:`query_stac_items`
+    does. The correction decision derives each date with ``solar_day_of``, which refuses an
+    un-normalised item rather than deriving a plausible-looking wrong day from its UTC stamp, and
+    it judges a date over every item that will be fused into it, so an unpruned pair of producers
+    for one acquisition reads as a genuine conflict and refuses the date.
+
     """
     collection_config = _get_collection_config(provider, collection)
-
-    if collection_config.harmonisation_varies_by_item:
-        # Reduce to one copy per acquisition BEFORE loading. `s2_roi` already does this, so this
-        # is a no-op there — but the generic entry point did not, and `odc.stac.load` fuses a
-        # solar day, so an unpruned harmonised COG beside a raw ESA reprocessing of the same
-        # acquisition reached the producer check as a genuine conflict and refused a date that
-        # selecting one copy resolves cleanly. Refusing what we can decide is the one outcome the
-        # refusals are not for.
-        items, _ = select_preferred_duplicates(items)
 
     data = _load_from_stac(
         items,

@@ -37,7 +37,6 @@ from tessera_embeddings.ingest.asset_locations import (
     item_is_in_preferred_location,
     read_asset_sources,
 )
-from tessera_embeddings.ingest.duplicates import select_preferred_duplicates
 from tessera_embeddings.ingest.stac import (
     HeterogeneousProducerError,
     _apply_baseline_corrections_by_date,
@@ -843,46 +842,65 @@ class TestTheCorrectionValueComesFromTheSameEvidenceAsTheDecision:
         assert extract_baselines([_Item(_HARMONISED, "05.10")]) == {"2022-01-07": 510}
 
 
-class TestTheGenericPathPrunesDuplicatesBeforeDeciding:
-    """Only `s2_roi` called `select_preferred_duplicates`, so the generic entry point handed the
-    producer check an unpruned set — and a harmonised COG beside a raw reprocessing of the SAME
-    acquisition refused a date that selecting one copy resolves. Raised on PR #107.
+class TestTheQueryPathPrunesBeforeExtractingProvenance:
+    """Duplicate selection sits in the normalised query path, and the ORDER matters twice.
+
+    Only `s2_roi` used to prune, so the generic entry point handed the producer check an unpruned
+    set and a harmonised COG beside a raw reprocessing of one acquisition refused a date that
+    selecting one copy resolves. Pruning it in the loader fixed that and broke something else:
+    `extract_baselines` had already run on the unpruned list, so a REJECTED copy that sorted last
+    could supply the recorded baseline while the selected copy supplied the pixels — and that map
+    is the store's `baselines_applied`. Both raised on PR #107.
+
+    It therefore runs after normalisation (the selector refuses an un-normalised item rather than
+    guessing its solar day) and before provenance is extracted.
     """
 
     @staticmethod
-    def _item(item_id: str, host: str, baseline: str, sequence: str) -> _Item:
-        item = _Item(host, baseline)
-        item.id = item_id
-        item.properties["s2:sequence"] = sequence
-        item.properties["grid:code"] = "MGRS-33TWM"
-        item.properties["datetime"] = "2022-01-07T10:20:31.024000Z"
-        return item
+    def _pair() -> list[_Item]:
+        """One acquisition, two producers, DIFFERENT baselines, raw sorted last."""
+        harmonised = _Item(_HARMONISED, "05.10")
+        harmonised.id = "S2A_33TWM_20220107_1_L2A"
+        harmonised.properties["s2:sequence"] = "1"
+        raw = _Item(_RAW_ESA, "02.06")
+        raw.id = "S2A_33TWM_20220107_0_L2A"
+        raw.properties["s2:sequence"] = "0"
+        for item in (harmonised, raw):
+            item.properties["grid:code"] = "MGRS-33TWM"
+            item.properties["datetime"] = "2022-01-07T10:20:31.024000Z"
+        return [harmonised, raw]
 
-    def _run(self, monkeypatch, items) -> list[str]:
-        loaded: list[str] = []
-        data = xr.Dataset(
-            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
-            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+    def _query(self, items: list[_Item]) -> tuple[list, dict]:
+        return stac_module.query_stac_items(
+            provider="earth-search",
+            collection="sentinel-2-l2a",
+            tile_id="33TWM",
+            start_date="2022-01-01",
+            end_date="2022-01-31",
+            mid_longitude=15.0,
+            item_provider_fn=lambda **_: items,
         )
 
-        def fake_load(loaded_items, *a, **k):
-            loaded.extend(i.id for i in loaded_items)
-            return data
+    def test_two_producers_of_one_acquisition_are_pruned_to_one(self) -> None:
+        kept, _ = self._query(self._pair())
+        assert [it.id for it in kept] == ["S2A_33TWM_20220107_1_L2A"], "the harmonised 05.10 copy wins"
 
-        monkeypatch.setattr(stac_module, "_load_from_stac", fake_load)
-        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
-        stac_module.load_stac_items(items, "earth-search", "sentinel-2-l2a", baselines={"2022-01-07": 500})
-        return loaded
+    def test_provenance_describes_the_copy_that_was_kept(self) -> None:
+        """THE SECOND FINDING. Built from the unpruned list, the rejected raw 02.06 copy sorted
+        last and supplied the recorded baseline for pixels it did not provide.
+        """
+        kept, baselines = self._query(self._pair())
+        assert baselines == {"2022-01-07": 510}
+        assert _extract_baseline(kept[0]) == 510, "the map must describe the surviving item"
 
-    def test_two_producers_of_one_acquisition_are_pruned_not_refused(self, monkeypatch) -> None:
-        harmonised = self._item("harmonised", _HARMONISED, "05.10", "1")
-        raw = self._item("raw", _RAW_ESA, "05.00", "0")
-        # Unpruned, these two reach the producer check as a genuine conflict and raise.
-        assert self._run(monkeypatch, [harmonised, raw]) == ["harmonised"]
+    def test_the_pruned_date_is_not_refused_downstream(self) -> None:
+        """The first finding: unpruned, these two reach the producer check as a genuine conflict."""
+        kept, _ = self._query(self._pair())
+        assert dates_exempt_from_correction(kept) == {"2022-01-07"}
 
-    def test_an_already_pruned_set_is_unchanged(self) -> None:
-        """`s2_roi` prunes first, so this must be idempotent there."""
-        items = [self._item("only", _HARMONISED, "05.10", "0")]
-        kept, alternates = select_preferred_duplicates(items)
-        assert [i.id for i in kept] == ["only"]
-        assert alternates == {}
+    def test_a_single_copy_is_unaffected(self) -> None:
+        """The overwhelmingly common case must pass through untouched."""
+        only = self._pair()[0]
+        kept, baselines = self._query([only])
+        assert [it.id for it in kept] == [only.id]
+        assert baselines == {"2022-01-07": 510}

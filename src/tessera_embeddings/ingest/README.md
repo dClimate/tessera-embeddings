@@ -420,10 +420,19 @@ the value sat on different evidence: a date the items showed was owed the offset
 stale lower value. `extract_baselines` remains separate and untouched — it records what each item
 declared and is what reaches the store's `baselines_applied`.
 
-Duplicate selection runs **before** the load on this path, not only in `s2_roi`. `odc.stac.load`
-fuses a solar day, so an unpruned harmonised COG beside a raw reprocessing of the same acquisition
-reached the producer check as a genuine conflict and refused a date that selecting one copy
-resolves. It is idempotent, so the campaign path that already prunes is unaffected.
+Duplicate selection runs inside `query_stac_items`, and its position there is load-bearing in both
+directions. **After** normalisation, because the selector derives the solar day with `solar_day_of`,
+which refuses an un-normalised item rather than guessing. **Before** `extract_baselines`, because
+that map becomes the store's `baselines_applied`: built from the unpruned list, a rejected copy that
+sorted last supplied the recorded baseline while the selected copy supplied the pixels, so the store
+described imagery it had not written.
+
+It lives there rather than in `load_stac_items` for a third reason. Only `s2_roi` used to prune, so
+the generic path handed the producer check an unpruned set and a harmonised COG beside a raw
+reprocessing of one acquisition refused a date that selecting one copy resolves. Pruning inside the
+loader fixed that and imposed the normalisation precondition on every direct caller of the public
+loader — which previously accepted raw catalogue items and has no longitude to normalise them with.
+`load_stac_items` documents what it expects instead.
 
 Genuinely ambiguous dates **refuse** (`HeterogeneousProducerError`) rather than picking a side,
 because no date-wide answer is right for them and both mistakes are silent: an item whose own
