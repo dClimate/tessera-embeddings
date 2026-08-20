@@ -1131,3 +1131,38 @@ class TestThePreferenceKeyHoldsItsInvariants:
         for subset in (pool[:5], pool[3:11], list(reversed(pool))):
             for item in subset:
                 assert _preference_key(item) == alone[item.id]
+
+
+class TestCompletenessSurvivesTheSequenceOnlyFallback:
+    """When any copy of an acquisition declares no readable baseline, `_rank_copies` drops to
+    `_sequence_key` — which omitted the read-set term, so a higher-sequence copy missing an asset
+    beat a complete lower-sequence one. That guarantees the eager `No such band/alias` failure,
+    which names no object, so the recovery steps every duplicated tile-date of the day rather
+    than this one. Raised on PR #107.
+    """
+
+    def _copy(self, ident: str, *, sequence: str, baseline: str | None, complete: bool) -> _Item:
+        extra: dict[str, object] = {}
+        if baseline is not None:
+            extra["s2:processing_baseline"] = baseline
+        keys = READ_ASSET_KEYS if complete else READ_ASSET_KEYS[:3]
+        return _with_assets(
+            _Item(ident, "MGRS-33TWM", sequence, **extra),
+            {k: {"href": f"{_IN_REGION}/{k}"} for k in keys},
+        )
+
+    def test_a_complete_copy_beats_a_higher_sequence_incomplete_one(self) -> None:
+        # The unreadable baseline is what forces the sequence-only path for the whole group.
+        unreadable = self._copy("unreadable", sequence="0", baseline=None, complete=True)
+        incomplete_newer = self._copy("incomplete-newer", sequence="9", baseline="05.00", complete=False)
+        complete_older = self._copy("complete-older", sequence="1", baseline="05.00", complete=True)
+        kept, _ = select_preferred_duplicates([unreadable, incomplete_newer, complete_older])
+        assert [it.id for it in kept] == ["complete-older"]
+
+    def test_sequence_still_decides_between_two_complete_copies(self) -> None:
+        """The complement: completeness must not have displaced the sequence preference."""
+        unreadable = self._copy("unreadable", sequence="0", baseline=None, complete=True)
+        newer = self._copy("newer", sequence="9", baseline="05.00", complete=True)
+        older = self._copy("older", sequence="1", baseline="05.00", complete=True)
+        kept, _ = select_preferred_duplicates([unreadable, newer, older])
+        assert [it.id for it in kept] == ["newer"]

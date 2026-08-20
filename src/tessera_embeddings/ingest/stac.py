@@ -238,10 +238,15 @@ def _declared_baseline(item: Item) -> int | None:
         value = float(baseline_str)
     except (AttributeError, ValueError, TypeError):
         return None
-    if not math.isfinite(value):
-        return None
     # round() rather than int(), because 5.10 * 100 is 509.999... in binary floating point.
-    return round(value * 100)
+    # Checked AFTER the multiplication as well as before it: a finite but enormous value such as
+    # "1e308" passes an isfinite test on its own and then becomes infinity when scaled, where
+    # round() raises OverflowError — which is not in the except clause above and aborted the whole
+    # batch over one item's metadata.
+    scaled = value * 100 if math.isfinite(value) else value
+    if not math.isfinite(scaled):
+        return None
+    return round(scaled)
 
 
 def _extract_baseline(item: Item) -> int:
@@ -301,11 +306,7 @@ class HeterogeneousProducerError(RuntimeError):
     """
 
 
-def dates_exempt_from_correction(
-    items: list[Any],
-    baselines: dict[str, int] | None = None,
-    threshold: int = S2_BASELINE_THRESHOLD,
-) -> set[str]:
+def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_THRESHOLD) -> set[str]:
     """The solar days owed no BOA offset correction.
 
     Kept apart from :func:`extract_baselines` because the two answer different questions — one
@@ -331,24 +332,23 @@ def dates_exempt_from_correction(
     from harmonised ones, and both are silent. That case refuses. It has never been observed,
     which is why it is refused rather than engineered around.
 
-    **Each item is judged on its OWN declared baseline, with the caller's map as the fallback for
-    items that declare none.** An absent or malformed ``s2:processing_baseline`` parses as 0,
-    which is under the threshold, so reading only the item exempted a date the caller had
-    correctly supplied a post-threshold baseline for. The map cannot simply replace the items
-    either: :func:`extract_baselines` is last-wins, so it carries one arbitrary item's value, and
-    applying that to every item would make the decision depend on the caller's sort order — the
-    exact fault this function exists to remove.
+    **Each item is judged on its OWN declared baseline, and an unreadable one refuses the date.**
+    A missing or malformed ``s2:processing_baseline`` parses as 0, which is under the threshold,
+    so reading it naively exempts a date whose pixels may carry the offset. Taking the answer
+    from a caller-supplied per-date map instead does not help and was tried: the production path
+    builds that map from these same items, so for a lone unreadable item it supplies the same
+    parsed zero, and on a multi-item date it supplies an arbitrary last item's value. A figure
+    derived from the items cannot be evidence about an item, so the ambiguity is refused.
 
     Args:
         items: the items a preparation will LOAD, after duplicate selection.
-        baselines: the per-date baselines the correction will apply, keyed by solar day. Consulted
-            only for items whose own declaration is absent or malformed.
         threshold: baselines at or above this are owed the offset (matches the collection's).
 
     Raises:
-        HeterogeneousProducerError: a date fuses a raw item owed a correction with a harmonised
-            one, or carries an item whose own bands straddle both, so no date-wide decision is
-            correct for it.
+        HeterogeneousProducerError: no single date-wide decision is correct for the date — it
+            fuses a raw item owed a correction with a harmonised one, carries an item whose own
+            bands straddle both, carries raw items on opposite sides of the threshold, or carries
+            an item whose producer or baseline cannot be determined.
     """
     # Grouped by the SOLAR day, which is what `odc.stac.load` fuses on. Grouping by the UTC date
     # checked different sets from the ones that will be mosaicked: near a day boundary two UTC
@@ -363,38 +363,48 @@ def dates_exempt_from_correction(
     exempt: set[str] = set()
     for date_str, group in sorted(by_date.items()):
         kinds = {item: item_harmonisation(item) for item in group}
-        # The value the correction will apply for this date, which is what the threshold has to
-        # be tested against. Only where the map is silent does an item's own declaration decide.
-        # The date's baseline is a FALLBACK for items whose own declaration cannot be read, not a
-        # replacement for the ones that can. `extract_baselines` is last-wins, so the map holds
-        # one arbitrary item's value: using it for every item made the decision depend on the
-        # caller's sort order, which is the failure this whole function exists to remove. A raw
-        # 05.00 item beside a raw 02.06 one read as wholly pre-threshold and exempted the date,
-        # leaving the 05.00 pixels 1000 high; with the harmonised item sorted last, the raw 02.06
-        # one read as post-threshold and refused a date that needed nothing.
-        #
-        # Both sides are in the scaled space `threshold` is expressed in (400, not 4.0), which is
-        # the only scale a comparison against it is meaningful in.
-        supplied = None if baselines is None else baselines.get(date_str)
 
-        def _owed_baseline(item: Any, supplied: int | None = supplied) -> int:  # noqa: ANN401
+        # Every item is judged on its OWN declared baseline, in the scaled space `threshold` is
+        # expressed in (400, not 4.0). A caller's per-date map is deliberately NOT consulted as a
+        # fallback: in the production path it is built by `extract_baselines(day_items)` from
+        # these very items, so for a lone item with unreadable metadata it supplies the same
+        # parsed zero and rescues nothing, and on a multi-item date it supplies an arbitrary last
+        # item's value — leaving post-04.00 pixels 1000 too high or taking 1000 off pre-04.00
+        # ones, both silently. A value derived from the items cannot be evidence about an item,
+        # so an unreadable baseline is treated as the ambiguity it is and refused below.
+        def _owed_baseline(item: Any) -> int:  # noqa: ANN401
             own = _declared_baseline(item)
-            if own is not None:
-                return own
-            return 0 if supplied is None else supplied
+            return 0 if own is None else own
 
+        # Unharmonised items whose baseline cannot be read at all. Correcting risks taking 1000
+        # off pre-04.00 pixels, exempting risks leaving post-04.00 pixels that much too high, and
+        # neither is discoverable afterwards — so the date refuses rather than guessing. A
+        # HARMONISED item is owed nothing whatever its baseline says, so its metadata being
+        # unreadable is harmless and never reaches here.
+        unreadable = [
+            it for it, k in kinds.items() if k is not Harmonisation.HARMONISED and _declared_baseline(it) is None
+        ]
+        if unreadable:
+            raise HeterogeneousProducerError(
+                f"{date_str}: {len(unreadable)} unharmonised item(s) declare no readable "
+                f"processing baseline, so whether their pixels already carry the offset cannot be "
+                f"determined. Correcting them would take {abs(S2_BASELINE_OFFSET)} off pre-04.00 "
+                f"pixels and exempting them would leave post-04.00 pixels that much too high. "
+                f"Fix the catalogue metadata rather than guessing."
+            )
         owed = [it for it, k in kinds.items() if k is not Harmonisation.HARMONISED and _owed_baseline(it) >= threshold]
-        # An item whose producer cannot be determined at all, where the answer would matter.
-        # Correcting it risks subtracting 1000 from already-harmonised pixels; exempting it risks
-        # leaving raw pixels 1000 high. Both are silent, so neither is chosen.
+        # An item whose PRODUCER cannot be determined, where the answer would matter. Correcting
+        # risks taking the offset off already-harmonised pixels; exempting risks leaving raw ones
+        # high. Both are silent, so neither is chosen. Gated on the threshold, so a pre-04.00
+        # date is exempt rather than refused — there, which producer served it changes nothing.
         undetermined = [it for it, k in kinds.items() if k is Harmonisation.UNKNOWN and _owed_baseline(it) >= threshold]
         if undetermined:
             raise HeterogeneousProducerError(
                 f"{date_str}: {len(undetermined)} item(s) expose none of the reflectance bands "
                 f"under the configured names, so which producer served them cannot be determined "
-                f"— and at baseline >= {threshold} that decides whether 1000 is subtracted. The "
-                f"bands may be served under native asset keys; resolve the names rather than "
-                f"guessing the producer."
+                f"— and at baseline >= {threshold} that decides whether {abs(S2_BASELINE_OFFSET)} "
+                f"is subtracted. The bands may be served under native asset keys; resolve the "
+                f"names rather than guessing the producer."
             )
         straddling = [it for it, k in kinds.items() if k is Harmonisation.MIXED and _owed_baseline(it) >= threshold]
         if straddling:
@@ -650,7 +660,7 @@ def _apply_baseline_corrections_by_date(
     baseline_threshold: int = S2_BASELINE_THRESHOLD,
     baseline_offset: int = S2_BASELINE_OFFSET,
     bands: list[str] | None = None,
-    preserve_low_values: bool = False,
+    preserve_low_values: bool = True,
 ) -> xr.Dataset:
     """Apply baseline corrections to dataset based on per-date baselines.
 
@@ -659,6 +669,12 @@ def _apply_baseline_corrections_by_date(
     a different baseline.
 
     Two modes of operation:
+    **The mode has to match the store's dtype.** A store's arrays are seeded from the first
+    date's dataset, and a date that skips correction keeps its unsigned input dtype — so a mode
+    that returns signed values makes the store's dtype depend on which date happened to land
+    first, and casts every date of the other kind. Tessera mode returns the input dtype and
+    cannot go negative, which is why it is the default.
+
     - Default (preserve_low_values=False): Subtracts offset from all pixels,
       allowing values below abs(offset) to go negative. Matches
       generate_cloudmask.py behavior where negative values signal nodata/dark.
@@ -706,16 +722,29 @@ def _apply_baseline_corrections_by_date(
                 # Tessera mode: only subtract from pixels >= abs(offset),
                 # leave low/dark pixels unchanged
                 pixel_eligible = ds[var] >= abs_offset
+                # Widened to int32 for the arithmetic. Adding a negative Python int to a uint16
+                # array raises OverflowError under numpy 2, which is how we know this branch had
+                # never run: nothing in the repo set `preserve_low_values`, so the mode existed
+                # and was unreachable. Only the arithmetic is signed — the result is cast back
+                # below, and where the pixel is eligible it is already >= the offset, so nothing
+                # can land below zero.
+                widened = ds[var].astype(np.int32)
                 corrected_values = xr.where(
                     pixel_eligible,
-                    ds[var].clip(max=clamp_max) + baseline_offset,
-                    ds[var],
+                    widened.clip(max=clamp_max) + baseline_offset,
+                    widened,
                 )
+                # The INPUT dtype, not int16. This mode subtracts only where the pixel is already
+                # at or above the offset, so nothing can go negative and an unsigned input stays
+                # representable. Forcing int16 was wrong twice: a corrected date entered a store
+                # whose dtype is seeded from the FIRST date's dataset, so mixing corrected and
+                # exempt dates cast one of them — and `clip(max=64535) - 1000` is 63535, which
+                # does not fit int16 anyway, so bright pixels wrapped even without the mixing.
                 corrected = xr.where(
                     needs_correction,
                     corrected_values,
-                    ds[var],
-                ).astype(np.int16)
+                    widened,
+                ).astype(ds[var].dtype)
             else:
                 # Default: subtract from all pixels, low values go negative
                 clamped = ds[var].clip(max=clamp_max).astype(np.int32)
@@ -1134,7 +1163,7 @@ def load_stac_items(
     crs: str | None = None,
     resolution: int | None = None,
     post_load_fn: Callable[[xr.Dataset], xr.Dataset] | None = None,
-    preserve_low_values: bool = False,
+    preserve_low_values: bool = True,
     groupby: str = "solar_day",
     geobox: GeoBox | None = None,
 ) -> xr.Dataset:
@@ -1194,11 +1223,7 @@ def load_stac_items(
         # UNKNOWN and refused every date at baseline >= 04.00, breaking a working provider. PC
         # serves ESA's values unharmonised throughout, so its answer is the collection's: correct
         # per the declared baseline, which is what the threshold alone already does.
-        exempt = (
-            dates_exempt_from_correction(items, filtered_baselines)
-            if collection_config.harmonisation_varies_by_item
-            else set()
-        )
+        exempt = dates_exempt_from_correction(items) if collection_config.harmonisation_varies_by_item else set()
         correction_baselines = {d: (0 if d in exempt else b) for d, b in filtered_baselines.items()}
         # Skip the corrector outright when nothing reaches the threshold. It is a no-op on those
         # dates, but not a free one: it clips, casts, adds and `xr.where`s every reflectance band
@@ -1275,7 +1300,7 @@ def ingest_tile(
     post_load_fn: Callable[[xr.Dataset], xr.Dataset] | None = None,
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
     item_provider_fn: Callable[[], list[Any]] | None = None,
-    preserve_low_values: bool = False,
+    preserve_low_values: bool = True,
     groupby: str = "solar_day",
     geobox: GeoBox | None = None,
     mid_longitude: float | None = None,

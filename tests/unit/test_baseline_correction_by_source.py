@@ -20,10 +20,13 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
+import numpy as np
 import pytest
+import xarray as xr
 
 from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.config.satellites import S2_BASELINE_OFFSET, S2_BASELINE_THRESHOLD
+from tessera_embeddings.ingest import stac as stac_module
 from tessera_embeddings.ingest.asset_locations import (
     HARMONISED_ASSET_BUCKETS,
     PREFERRED_ASSET_BUCKETS,
@@ -35,6 +38,7 @@ from tessera_embeddings.ingest.asset_locations import (
 )
 from tessera_embeddings.ingest.stac import (
     HeterogeneousProducerError,
+    _apply_baseline_corrections_by_date,
     _declared_baseline,
     _extract_baseline,
     dates_exempt_from_correction,
@@ -353,108 +357,67 @@ class TestTheCorrectionPathAnnouncesItself:
         assert not [r for r in caplog.records if "correction ACTIVE" in r.message]
 
 
-class TestTheThresholdFollowsTheBaselineTheCorrectionWillApply:
-    """The exemption must be decided on the caller's map, not on re-parsed metadata.
+class TestAnUnreadableBaselineRefusesRatherThanBeingGuessed:
+    """An unharmonised item that declares no readable baseline is ambiguous, and refused.
 
-    `load_stac_items` builds a per-date baseline map, hands it to the correction, and asked
-    this function separately — which re-read each item instead. The two normally agree, since
-    the map was built from these items. Where they do not, the correction applies the map's
-    value while the exemption was decided on the item's, so the decision described a baseline
-    that was never used. Raised three times in review of PR #108.
+    This went through three rounds of review. Reading the item naively exempted the date, because
+    a malformed `s2:processing_baseline` parses as 0 and 0 is under the threshold. Taking the
+    answer from the caller's per-date map instead was tried and is worse: the production path
+    builds that map with `extract_baselines(day_items)` from these very items, so a lone
+    unreadable item supplies the same parsed zero and is rescued from nothing, while on a
+    multi-item date it inherits an arbitrary last item's value — leaving post-04.00 pixels 1000
+    too high or taking 1000 off pre-04.00 ones. A figure derived from the items cannot be
+    evidence about an item.
     """
 
-    def test_a_supplied_baseline_rescues_an_item_with_unreadable_metadata(self) -> None:
-        """THE FAILURE NAMED. Malformed metadata parses as 0, which is under the threshold, so
-        the date was exempted and its pixels stayed 1000 too high while the caller had
-        correctly supplied 500.
-        """
+    def test_a_malformed_baseline_refuses_the_date(self) -> None:
         item = _Item(_RAW_ESA, "not-a-number")
         assert _extract_baseline(item) == 0, "the fixture must actually be unreadable"
+        with pytest.raises(HeterogeneousProducerError, match="no readable processing baseline"):
+            dates_exempt_from_correction([item])
 
-        assert dates_exempt_from_correction([item]) == {"2022-01-07"}, "no map: nothing to go on"
-        assert dates_exempt_from_correction([item], {"2022-01-07": 500}) == set()
+    def test_a_missing_baseline_property_refuses_the_date(self) -> None:
+        with pytest.raises(HeterogeneousProducerError, match="no readable processing baseline"):
+            dates_exempt_from_correction([_Item(_RAW_ESA, None)])
 
-    def test_a_missing_baseline_property_is_also_rescued(self) -> None:
-        item = _Item(_RAW_ESA, None)
-        assert dates_exempt_from_correction([item], {"2022-01-07": 500}) == set()
-
-    def test_the_map_is_read_in_the_scaled_space_the_threshold_uses(self) -> None:
-        """500 is baseline 05.00, not 500.00. A map read at the wrong scale would exempt
-        every date, since 5.0 is under a threshold of 400.
-        """
-        assert S2_BASELINE_THRESHOLD == 400
-        item = _Item(_RAW_ESA, None)
-        assert dates_exempt_from_correction([item], {"2022-01-07": 500}) == set()
-        assert dates_exempt_from_correction([item], {"2022-01-07": 399}) == {"2022-01-07"}
-        assert dates_exempt_from_correction([item], {"2022-01-07": 400}) == set(), "the threshold is inclusive"
+    def test_a_harmonised_item_with_no_baseline_is_harmless(self) -> None:
+        """It is owed nothing whatever its baseline says, so the ambiguity cannot bite."""
+        assert dates_exempt_from_correction([_Item(_HARMONISED, None)]) == {"2022-01-07"}
 
     def test_a_readable_item_is_judged_on_its_own_baseline(self) -> None:
-        """The map is a FALLBACK, not a replacement. `extract_baselines` is last-wins, so it
-        carries one arbitrary item's value; letting it override a readable declaration would put
-        the decision back under the caller's sort order.
-        """
-        item = _Item(_RAW_ESA, "05.00")
-        assert dates_exempt_from_correction([item]) == set()
-        assert dates_exempt_from_correction([item], {"2022-01-07": 300}) == set()
+        assert dates_exempt_from_correction([_Item(_RAW_ESA, "05.00")]) == set()
+        assert dates_exempt_from_correction([_Item(_RAW_ESA, "03.00")]) == {"2022-01-07"}
 
-    def test_a_last_wins_map_does_not_exempt_a_post_threshold_item(self) -> None:
-        """THE REGRESSION. With raw 05.00 and raw 02.06 on one day, the last-wins map supplies
-        02.06 for the date. Applying that to both items read the whole day as pre-threshold,
-        exempted it, and left the 05.00 pixels 1000 too high.
+    def test_the_threshold_is_read_in_the_scaled_space(self) -> None:
+        """500 is baseline 05.00, not 500.00. A comparison at the wrong scale would exempt
+        everything, since 5.0 is under a threshold of 400.
         """
-        over = _Item(_RAW_ESA, "05.00")
-        under = _Item(_RAW_ESA, "02.06")
-        with pytest.raises(HeterogeneousProducerError, match="straddle the correction threshold"):
-            dates_exempt_from_correction([over, under], {"2022-01-07": 206})
-
-    def test_a_last_wins_map_does_not_refuse_a_date_that_needs_nothing(self) -> None:
-        """The mirror image, from the recorded 2017-12-19 case: cloud sorting left the harmonised
-        05.00 item last, so applying the date's baseline to the raw 02.06 item read it as
-        post-threshold and refused a date where nothing was owed at all.
-        """
-        harmonised = _Item(_HARMONISED, "05.00")
-        raw_old = _Item(_RAW_ESA, "02.06")
-        # The map holds the HARMONISED item's 500, because it sorted last.
-        assert dates_exempt_from_correction([harmonised, raw_old], {"2022-01-07": 500}) == {"2022-01-07"}
+        assert S2_BASELINE_THRESHOLD == 400
+        assert dates_exempt_from_correction([_Item(_RAW_ESA, "04.00")]) == set(), "inclusive"
+        assert dates_exempt_from_correction([_Item(_RAW_ESA, "03.99")]) == {"2022-01-07"}
 
     def test_the_decision_does_not_depend_on_item_order(self) -> None:
-        """The general property both regressions violated."""
+        """The property the map-based version violated: a last-wins figure made the answer a
+        function of the caller's sort.
+        """
         harmonised = _Item(_HARMONISED, "05.00")
         raw_old = _Item(_RAW_ESA, "02.06")
-        forward = dates_exempt_from_correction([harmonised, raw_old], {"2022-01-07": 500})
-        reverse = dates_exempt_from_correction([raw_old, harmonised], {"2022-01-07": 206})
-        assert forward == reverse == {"2022-01-07"}
-
-    def test_a_date_the_map_does_not_carry_falls_back_to_the_item(self) -> None:
-        """A partial map must not exempt the dates it happens to omit."""
-        item = _Item(_RAW_ESA, "05.00")
-        assert dates_exempt_from_correction([item], {"1999-01-01": 300}) == set()
-
-    def test_an_unreadable_item_does_not_refuse_the_date_it_was_rescued_for(self) -> None:
-        """The straddle guard reads each item's OWN baseline. Counting an unreadable one as 0
-        would raise for exactly the date the map is there to rescue, turning a silent wrong
-        answer into a lost date rather than a correct one.
-        """
-        readable = _Item(_RAW_ESA, "05.00")
-        unreadable = _Item(_RAW_ESA, None)
-        assert dates_exempt_from_correction([readable, unreadable], {"2022-01-07": 500}) == set()
+        assert dates_exempt_from_correction([harmonised, raw_old]) == {"2022-01-07"}
+        assert dates_exempt_from_correction([raw_old, harmonised]) == {"2022-01-07"}
 
     def test_a_genuine_straddle_still_refuses(self) -> None:
-        """So the test above cannot pass by having disabled the guard."""
-        over = _Item(_RAW_ESA, "05.00")
-        under = _Item(_RAW_ESA, "03.00")
         with pytest.raises(HeterogeneousProducerError, match="straddle the correction threshold"):
-            dates_exempt_from_correction([over, under], {"2022-01-07": 500})
+            dates_exempt_from_correction([_Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "03.00")])
 
 
 class TestTheActivationWarningDescribesWhatHappened:
     """The warning must not claim a correction that a refusal then prevented. PR #108 review."""
 
-    def _records(self, caplog, items, baselines=None) -> list[logging.LogRecord]:
+    def _records(self, caplog, items) -> list[logging.LogRecord]:
         caplog.clear()
         with caplog.at_level(logging.DEBUG, logger="tessera_embeddings.ingest.stac"):
             try:
-                dates_exempt_from_correction(items, baselines)
+                dates_exempt_from_correction(items)
             except HeterogeneousProducerError:
                 pass
         return [r for r in caplog.records if "Baseline correction" in r.getMessage()]
@@ -514,10 +477,6 @@ class TestTheCorrectorIsSkippedWhenNothingIsOwed:
 
     @staticmethod
     def _run(monkeypatch, items, baselines) -> list[dict]:
-        import numpy as np
-        import xarray as xr
-
-        from tessera_embeddings.ingest import stac as stac_module
 
         data = xr.Dataset(
             {"B02": (("time", "y", "x"), np.ones((1, 2, 2), dtype="uint16"))},
@@ -630,11 +589,6 @@ class TestThePerItemCheckIsScopedToTheCollectionThatNeedsIt:
         """End to end through the documented entry point: the PC path must reach the corrector
         with its declared baseline, not raise.
         """
-        import numpy as np
-        import xarray as xr
-
-        from tessera_embeddings.ingest import stac as stac_module
-
         data = xr.Dataset(
             {"B02": (("time", "y", "x"), np.ones((1, 2, 2), dtype="uint16"))},
             coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
@@ -653,11 +607,6 @@ class TestThePerItemCheckIsScopedToTheCollectionThatNeedsIt:
 
     def test_the_earth_search_path_still_refuses_an_undetermined_item(self, monkeypatch) -> None:
         """The guard must survive being scoped — it still fires where it is meant to."""
-        import numpy as np
-        import xarray as xr
-
-        from tessera_embeddings.ingest import stac as stac_module
-
         data = xr.Dataset(
             {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype="uint16"))},
             coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
@@ -693,3 +642,89 @@ class TestTheTwoBucketSetsAreIndependent:
         """Adding it to either would silently reinstate a different bug."""
         assert "sentinel-s2-l2a" not in HARMONISED_ASSET_BUCKETS
         assert "sentinel-s2-l2a" not in PREFERRED_ASSET_BUCKETS
+
+
+class TestCorrectedAndExemptDatesShareOneStorageDtype:
+    """A ROI store's arrays take their dtype from the FIRST date's dataset
+    (`zarr_store.py`: `var_dtypes={v: day_ds[v].dtype ...}`), and existing production stores are
+    unsigned. So a corrected date and an exempt date must come out of the corrector with the same
+    dtype, or the store's dtype depends on which date happened to land first and every date of
+    the other kind is cast on the way in. Raised on PR #107.
+
+    The failure is silent and severe in both directions: a negative corrected pixel written to an
+    unsigned store reads as roughly 65535, and an uncorrected bright pixel written to a signed
+    store wraps negative. Either looks like extreme reflectance to inference.
+    """
+
+    @staticmethod
+    def _dataset(values: np.ndarray, date: str) -> xr.Dataset:
+
+        return xr.Dataset(
+            {"blue": (("time", "y", "x"), values)},
+            coords={"time": [np.datetime64(f"{date}T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+
+    def test_a_corrected_date_keeps_the_unsigned_dtype_it_arrived_with(self) -> None:
+
+        ds = self._dataset(np.array([[[1500, 2000], [3000, 4000]]], dtype=np.uint16), "2022-01-07")
+        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
+        assert out["blue"].dtype == np.uint16
+        np.testing.assert_array_equal(out["blue"].values, np.array([[[500, 1000], [2000, 3000]]], dtype=np.uint16))
+
+    def test_an_exempt_date_keeps_the_same_dtype(self) -> None:
+
+        ds = self._dataset(np.array([[[1500, 2000], [3000, 4000]]], dtype=np.uint16), "2022-01-07")
+        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 0}, bands=["blue"])
+        assert out["blue"].dtype == np.uint16
+
+    def test_no_corrected_pixel_can_go_negative(self) -> None:
+        """What makes the unsigned dtype safe: the subtraction only touches pixels already at or
+        above the offset, so the floor is 0 rather than -1000.
+        """
+        ds = self._dataset(np.array([[[0, 999], [1000, 1001]]], dtype=np.uint16), "2022-01-07")
+        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
+        # 0 and 999 are below the offset and untouched; 1000 and 1001 lose exactly 1000.
+        np.testing.assert_array_equal(out["blue"].values, np.array([[[0, 999], [0, 1]]], dtype=np.uint16))
+        assert out["blue"].values.min() >= 0
+
+    def test_a_bright_pixel_does_not_wrap(self) -> None:
+        """`clip(max=64535) - 1000` is 63535, which does not fit int16 — so the previous cast
+        wrapped bright pixels even without any dtype mixing.
+        """
+        ds = self._dataset(np.array([[[60000, 65535], [40000, 33000]]], dtype=np.uint16), "2022-01-07")
+        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
+        assert out["blue"].values.min() >= 0, f"a bright pixel wrapped: {out['blue'].values}"
+        np.testing.assert_array_equal(out["blue"].values, np.array([[[59000, 63535], [39000, 32000]]], dtype=np.uint16))
+
+    def test_the_signed_mode_is_opt_in(self) -> None:
+        """It is still available and still returns int16 — it is just no longer the default, since
+        it cannot round-trip into the unsigned store this repo writes.
+        """
+        ds = self._dataset(np.array([[[500, 800], [1000, 1500]]], dtype=np.uint16), "2022-01-07")
+        out = _apply_baseline_corrections_by_date(
+            ds, baselines={"2022-01-07": 500}, bands=["blue"], preserve_low_values=False
+        )
+        assert out["blue"].dtype == np.int16
+        assert out["blue"].values.min() < 0
+
+
+class TestScalingCannotOverflowThePicker:
+    """`math.isfinite` was checked BEFORE the multiplication, so a finite but enormous value
+    became infinity when scaled and `round()` raised `OverflowError` — aborting the whole batch
+    over one item's metadata. Raised on PR #107 after the earlier non-finite fix.
+    """
+
+    @pytest.mark.parametrize("raw", ["1e308", "-1e308", "9" * 400])
+    def test_a_value_that_overflows_when_scaled_reads_as_unknown(self, raw: str) -> None:
+        assert _declared_baseline(_Item(_RAW_ESA, raw)) is None
+        assert _extract_baseline(_Item(_RAW_ESA, raw)) == 0
+
+    def test_a_large_but_scalable_value_still_parses(self) -> None:
+        """So the guard rejects only what genuinely cannot be scaled."""
+        assert _declared_baseline(_Item(_RAW_ESA, "1e10")) == 10**12
+
+    def test_the_batch_is_not_aborted_by_one_such_item(self) -> None:
+        """The consequence: `extract_baselines` must survive it rather than raising."""
+        good = _Item(_HARMONISED, "05.10")
+        bad = _Item(_HARMONISED, "1e308")
+        assert extract_baselines([good, bad])["2022-01-07"] in (510, 0)

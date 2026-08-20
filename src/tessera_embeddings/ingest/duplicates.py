@@ -115,8 +115,16 @@ def item_processing_baseline(item: Any) -> float | None:  # noqa: ANN401 — any
     return value
 
 
-def _sequence_key(item: Any) -> tuple[int, int, str]:  # noqa: ANN401 — any STAC-like item
-    """The pre-existing order: newest sequence, then a deterministic tiebreak. No locality.
+def _sequence_key(item: Any) -> tuple[int, int, int, str]:  # noqa: ANN401 — any STAC-like item
+    """Readable read set, then newest sequence, then a deterministic tiebreak. No locality.
+
+    Used where the baseline comparison is suspended, so it deliberately omits both the baseline
+    and the locality terms — but NOT completeness, which is orthogonal to either. A copy missing
+    an asset the ingest would read cannot deliver the tile-date whatever its sequence says, and
+    letting a higher-sequence incomplete copy win guaranteed the eager ``No such band/alias``
+    failure. That failure names no object, so the recovery steps every duplicated tile-date of
+    the day rather than this one, and can downgrade healthy imagery before ever reaching the
+    complete alternate sitting right behind it.
 
     An item whose sequence cannot be read never displaces one whose can — an unreadable
     sequence must not win a comparison it cannot participate in. The id tiebreak makes the
@@ -125,7 +133,8 @@ def _sequence_key(item: Any) -> tuple[int, int, str]:  # noqa: ANN401 — any ST
     """
     sequence = item_sequence(item)
     has_sequence = 0 if sequence is None else 1
-    return (-has_sequence, -(sequence or 0), str(getattr(item, "id", "")))
+    incomplete = 0 if read_set_is_complete(item) else 1
+    return (incomplete, -has_sequence, -(sequence or 0), str(getattr(item, "id", "")))
 
 
 def _preference_key(item: Any) -> tuple[int, float, int, int, int, int, str]:  # noqa: ANN401

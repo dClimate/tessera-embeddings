@@ -56,11 +56,16 @@ class TestBaselineCorrection:
         np.testing.assert_array_equal(result["B03"].values, expected)
 
     def test_low_values_go_negative_after_correction(self):
-        """Values below 1000 become negative after offset is applied."""
+        """Values below 1000 become negative after offset is applied.
+
+        The signed mode specifically, named rather than inherited: the default is now the
+        dtype-preserving one, because the store's arrays take their dtype from the first date
+        and a signed result made that depend on which date landed first.
+        """
         values = np.array([[[500, 800], [1000, 1500]]], dtype=np.uint16)
         data = self._make_dataset({"B02": values}, ["2024-01-01"])
 
-        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400})
+        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400}, preserve_low_values=False)
 
         # 500-1000=-500, 800-1000=-200, 1000-1000=0, 1500-1000=500
         np.testing.assert_array_equal(
