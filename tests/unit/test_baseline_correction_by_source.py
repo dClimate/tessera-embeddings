@@ -586,3 +586,82 @@ class TestTheExemptionGroupsByTheDayTheLoaderFuses:
     def test_a_normalised_item_groups_on_its_solar_day(self) -> None:
         """The canonical noon stamp IS the solar day, so the common path is unchanged."""
         assert dates_exempt_from_correction([_Item(_HARMONISED, "05.10")]) == {"2022-01-07"}
+
+
+class TestThePerItemCheckIsScopedToTheCollectionThatNeedsIt:
+    """Planetary Computer keys its assets NATIVELY, so a per-item read of asset locations finds
+    nothing there. Raised on PR #107 and confirmed against the live catalogue: real PC items at
+    baseline 05.10 expose `B02`..`B12`, `SCL` and none of the configured common names.
+
+    Running the per-item check anyway classified every modern PC item UNKNOWN and refused every
+    date at baseline >= 04.00 — a working provider broken by a guard meant for another one. PC
+    serves ESA's values unharmonised throughout, so its answer belongs to the collection.
+    """
+
+    #: Exactly what the live API returns, minus the assets the ingest never reads.
+    _PC_NATIVE_KEYS = ("B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12", "SCL")
+
+    def _pc_item(self, baseline: str = "05.10") -> _Item:
+        item = _Item(None, baseline)
+        item.assets = {
+            k: {"href": f"https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/{k}.tif"}
+            for k in self._PC_NATIVE_KEYS
+        }
+        return item
+
+    def test_a_native_keyed_item_reads_as_undetermined_on_its_own(self) -> None:
+        """The predicate genuinely cannot answer for these items — which is why the CALLER, not
+        the predicate, is what had to change.
+        """
+        assert item_harmonisation(self._pc_item()) is Harmonisation.UNKNOWN
+
+    def test_the_planetary_computer_collection_does_not_use_the_per_item_check(self) -> None:
+        config = PROVIDERS["planetary-computer"].collections["sentinel-2-l2a"]
+        assert config.requires_baseline_correction is True, "PC data is raw and IS owed the offset"
+        assert config.harmonisation_varies_by_item is False
+
+    def test_earth_search_does_use_the_per_item_check(self) -> None:
+        """The complement: turning the flag off everywhere would pass the test above."""
+        assert PROVIDERS["earth-search"].collections["sentinel-2-l2a"].harmonisation_varies_by_item is True
+
+    def test_a_native_keyed_item_is_corrected_rather_than_refused(self, monkeypatch) -> None:
+        """End to end through the documented entry point: the PC path must reach the corrector
+        with its declared baseline, not raise.
+        """
+        import numpy as np
+        import xarray as xr
+
+        from tessera_embeddings.ingest import stac as stac_module
+
+        data = xr.Dataset(
+            {"B02": (("time", "y", "x"), np.ones((1, 2, 2), dtype="uint16"))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            stac_module,
+            "_apply_baseline_corrections_by_date",
+            lambda d, corrections, **kw: calls.append({"corrections": corrections}) or d,
+        )
+        stac_module.load_stac_items(
+            [self._pc_item()], "planetary-computer", "sentinel-2-l2a", baselines={"2022-01-07": 510}
+        )
+        assert calls == [{"corrections": {"2022-01-07": 510}}], "PC data must still be corrected"
+
+    def test_the_earth_search_path_still_refuses_an_undetermined_item(self, monkeypatch) -> None:
+        """The guard must survive being scoped — it still fires where it is meant to."""
+        import numpy as np
+        import xarray as xr
+
+        from tessera_embeddings.ingest import stac as stac_module
+
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype="uint16"))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
+        with pytest.raises(HeterogeneousProducerError, match="none of the reflectance bands"):
+            stac_module.load_stac_items(
+                [self._pc_item()], "earth-search", "sentinel-2-l2a", baselines={"2022-01-07": 510}
+            )

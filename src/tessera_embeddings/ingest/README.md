@@ -401,6 +401,16 @@ decision are worth stating:
   harmonised item sorted last the raw 02.06 one read as post-threshold and refused a date that
   needed nothing.
 
+**The per-item decision is scoped to the collections that need it**, via
+`CollectionConfig.harmonisation_varies_by_item`. It reads asset locations under the keys named in
+`bands`, which is how Earth Search keys its assets and is NOT how every provider does: Planetary
+Computer serves the same imagery under native keys (`B02`, `SCL`) and relies on the loader
+resolving the common names, so that read finds nothing there. PC also serves ESA's values
+unharmonised *throughout*, so its answer belongs to the collection rather than to each item —
+correct per the declared baseline, which the threshold alone already does. Running the per-item
+check there instead classified every modern PC item as undeterminable and refused every date at
+baseline 04.00 or above.
+
 Genuinely ambiguous dates **refuse** (`HeterogeneousProducerError`) rather than picking a side,
 because no date-wide answer is right for them and both mistakes are silent: an item whose own
 bands straddle the two producers, raw items on opposite sides of the threshold, a raw item owed

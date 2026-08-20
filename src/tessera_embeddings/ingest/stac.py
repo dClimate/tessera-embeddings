@@ -1187,7 +1187,18 @@ def load_stac_items(
         # store's `baselines_applied`, so zeroing it there would make the store misreport its
         # vintage. Zero means "no correction owed", which is what an already-harmonised
         # producer means.
-        exempt = dates_exempt_from_correction(items, filtered_baselines)
+        # Only where items can actually disagree. The per-item read looks for assets keyed by the
+        # names in `bands`, which is true of Earth Search and NOT of Planetary Computer — PC keys
+        # its assets natively (`B02`, `SCL`) and relies on the loader resolving the common names,
+        # so this read finds nothing there. Running it anyway classified every modern PC item as
+        # UNKNOWN and refused every date at baseline >= 04.00, breaking a working provider. PC
+        # serves ESA's values unharmonised throughout, so its answer is the collection's: correct
+        # per the declared baseline, which is what the threshold alone already does.
+        exempt = (
+            dates_exempt_from_correction(items, filtered_baselines)
+            if collection_config.harmonisation_varies_by_item
+            else set()
+        )
         correction_baselines = {d: (0 if d in exempt else b) for d, b in filtered_baselines.items()}
         # Skip the corrector outright when nothing reaches the threshold. It is a no-op on those
         # dates, but not a free one: it clips, casts, adds and `xr.where`s every reflectance band

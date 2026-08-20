@@ -32,6 +32,9 @@ class CollectionConfig:
         tile_id_property: STAC property containing tile/grid ID
         tile_id_prefix: Prefix for tile ID in queries (e.g., "MGRS-")
         has_scl: whether this collection provides an SCL layer to use for cloudmask
+        harmonisation_varies_by_item: whether items in this collection can disagree about
+            whether the BOA offset has already been subtracted, so the decision has to be made
+            per item from where its assets live rather than once for the collection
     """
 
     collection_id: str
@@ -42,6 +45,11 @@ class CollectionConfig:
     tile_id_property: str | None = "grid:code"
     tile_id_prefix: str = ""
     has_scl: bool = False
+    #: Off by default, because a collection served by one producer has one answer. Turning it on
+    #: makes the producer decision read each item's asset LOCATIONS, which only works where the
+    #: assets are keyed by the names in `bands` — Planetary Computer serves the same imagery under
+    #: native keys (`B02`, `SCL`), where that read finds nothing and could refuse every date.
+    harmonisation_varies_by_item: bool = False
 
     @property
     def requires_baseline_correction(self) -> bool:
@@ -85,9 +93,9 @@ PROVIDERS: dict[str, STACProvider] = {
             # Earth Search harmonises the BOA offset (subtracts 1000 from post-baseline
             # 04.00 data) in ITS OWN COGs, but this collection also indexes items whose
             # assets point at ESA's originals, which carry the offset. So the threshold is
-            # set and the exemption is made per item, from where the assets live, by
-            # `ingest.stac._extract_baseline`. Leaving the threshold unset exempts the whole
-            # collection and is only correct while every item is a harmonised COG.
+            # set and `harmonisation_varies_by_item` makes the exemption per item, from where
+            # the assets live. Leaving the threshold unset exempts the whole collection and is
+            # only correct while every item is a harmonised COG.
             # The raster:bands offset=-0.1 and earthsearch:boa_offset_applied metadata are
             # unreliable (see sertit/eoreader#120), so the asset location is the signal.
             "sentinel-2-l2a": CollectionConfig(
@@ -99,6 +107,7 @@ PROVIDERS: dict[str, STACProvider] = {
                 tile_id_property="grid:code",
                 tile_id_prefix="MGRS-",
                 has_scl=True,
+                harmonisation_varies_by_item=True,
             ),
             "sentinel-2-l1c": CollectionConfig(
                 collection_id="sentinel-2-l1c",
@@ -153,6 +162,11 @@ PROVIDERS: dict[str, STACProvider] = {
         name="Microsoft Planetary Computer",
         catalog_url="https://planetarycomputer.microsoft.com/api/stac/v1",
         collections={
+            # Planetary Computer serves ESA's values unharmonised, and serves them ALL that
+            # way — so the answer is the collection's, not each item's, and
+            # `harmonisation_varies_by_item` stays off. It also keys its assets natively
+            # (`B02`, `SCL`) and relies on the loader resolving the common names in `bands`,
+            # so a per-item read of asset locations would find nothing here and refuse.
             "sentinel-2-l2a": CollectionConfig(
                 collection_id="sentinel-2-l2a",
                 bands=S2_L2A_BANDS,
