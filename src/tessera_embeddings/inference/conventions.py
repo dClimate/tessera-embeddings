@@ -99,6 +99,25 @@ DEFAULT_SOURCE_DATA: tuple[str, ...] = (
 QUANTIZED_DTYPE = "int8"
 
 
+def expected_model_url(model_url: str | None = None, model_version: ModelVersion | None = None) -> str:
+    """The ``geoemb:model`` URL this build stamps for the current encoder version.
+
+    A seeded store records this once at its root; the fill re-derives it to verify
+    the running code embeds with the SAME encoder the store was seeded for — a
+    mismatch means a model upgrade slipped in between seeding and filling. Passing
+    *model_url* mirrors the seed-time override so a store seeded with a custom URL
+    round-trips.
+
+    Routed through :func:`~tessera_embeddings.config.inference.encoder_url` rather than a
+    module constant, and taking *model_version*, on the instruction that function's own
+    docstring left for this merge: with one hard-coded encoder version the gate compares a
+    v2 fill against v1.1's URL — rejecting a correct run, or waving through a real mismatch
+    when the seed happened to carry the same stale constant. Omitting *model_version* keeps
+    the historical single-encoder behaviour.
+    """
+    return model_url or encoder_url(model_version or DEFAULT_MODEL_VERSION)
+
+
 def tile_id_to_epsg(tile_id: str) -> str | None:
     """Derive EPSG code from a Sentinel-2 MGRS tile ID.
 
@@ -227,6 +246,86 @@ def _compute_bbox(y_coords: np.ndarray, x_coords: np.ndarray) -> list[float]:
     return [x_min, y_min, x_max, y_max]
 
 
+def _geoemb_fields(
+    *,
+    embedding_dim: int,
+    model_version: str | None,
+    model_url: str | None,
+    data_type: str,
+    gsd: float | None,
+    spatial_layout: str | None,
+    source_data: tuple[str, ...],
+    encoder_version: ModelVersion | None = None,
+) -> dict:
+    """The ``geoemb:*`` (+ ``checkpoint_id``) attrs, shared by the single-ROI root
+    builder and the multi-group root builder.
+
+    *gsd* is already resolved to a trustworthy metre value or ``None`` — the caller
+    decides how (derived from a metre-CRS grid, or explicit). See
+    :func:`build_convention_attrs` for the meaning of each ``geoemb:`` field.
+    """
+    attrs: dict = {
+        "geoemb:type": "pixel",  # per-pixel embeddings (not chip)
+        "geoemb:dimensions": embedding_dim,
+        # The PUBLIC encoder reference, resolved from the model FAMILY and never from
+        # *model_version* — which in production is an internal checkpoint filename stem
+        # (`checkpoint_to_version(...)`). That stem is kept separately as `checkpoint_id`
+        # below, so a v1.0 / future / custom checkpoint cannot advertise a synthetic public
+        # URL. Keyed by encoder_version so v2 Large stamps its own URL rather than v1.1's.
+        "geoemb:model": model_url or encoder_url(encoder_version or DEFAULT_MODEL_VERSION),
+        "geoemb:source_data": list(source_data),
+        "geoemb:data_type": data_type,
+        # build_version is the SOFTWARE build (this package) per the convention.
+        "geoemb:build_version": _software_version(),
+        "geoemb:quantization": {
+            "method": "per_pixel_scale",  # absmax-per-pixel: value = quantized * scale
+            "original_dtype": "float32",
+            "quantized_dtype": data_type,
+            # Per-pixel float32 dequantization factors live in the `scales` array;
+            # absent/ocean pixels carry NaN there (assembly fills float vars NaN).
+            "scale": {"type": "array", "array_name": "scales", "nodata": "NaN"},
+        },
+    }
+    if model_version:
+        attrs["checkpoint_id"] = model_version
+    if gsd is not None:
+        attrs["geoemb:gsd"] = gsd
+    if spatial_layout is not None:
+        attrs["geoemb:spatial_layout"] = spatial_layout
+    return attrs
+
+
+def build_geoemb_root_attrs(
+    *,
+    embedding_dim: int,
+    spatial_layout: str,
+    gsd: float | None = None,
+    model_version: str | None = None,
+    model_url: str | None = None,
+    data_type: str = QUANTIZED_DTYPE,
+    source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
+) -> dict:
+    """``geoemb:`` attrs for the ROOT of a multi-group store (``utm_zones`` / ``global``).
+
+    In the geoembeddings ``utm_zones`` layout the encoder/quantization provenance is
+    stated ONCE at the root (it is identical across zones), while ``proj:``/``spatial:``
+    live on each per-zone group (their CRS and grid differ) — build those with
+    :func:`build_convention_attrs` and ``include_geoemb=False``. *gsd* is explicit
+    here because the root has no single coordinate grid to derive it from.
+    """
+    attrs = _geoemb_fields(
+        embedding_dim=embedding_dim,
+        model_version=model_version,
+        model_url=model_url,
+        data_type=data_type,
+        gsd=gsd,
+        spatial_layout=spatial_layout,
+        source_data=source_data,
+    )
+    attrs["zarr_conventions"] = [_GEOEMB_CONVENTION]
+    return attrs
+
+
 def build_convention_attrs(
     *,
     tile_id: str | None = None,
@@ -243,6 +342,7 @@ def build_convention_attrs(
     gsd: float | None = None,
     spatial_layout: str | None = None,
     source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
+    include_geoemb: bool = True,
 ) -> dict:
     """Build GeoZarr convention attributes for the root group.
 
@@ -272,6 +372,11 @@ def build_convention_attrs(
     field, no false metre value). *spatial_layout* is ``"utm_zones"``/``"global"``
     and OMITTED when ``None`` (a single-ROI store has no utmNN/global groups);
     *source_data* the source-dataset URLs.
+
+    Set *include_geoemb* to False to emit only ``proj:``/``spatial:`` (no ``geoemb:``):
+    the multi-group campaign store carries geoemb: once at the root
+    (:func:`build_geoemb_root_attrs`) and uses this builder only for each zone's
+    CRS/grid.
     """
     conventions: list[dict] = []
     attrs: dict = {}
@@ -301,47 +406,31 @@ def build_convention_attrs(
         attrs["spatial:registration"] = "pixel"
 
     # --- geoemb: convention ---
-    conventions.append(_GEOEMB_CONVENTION)
-    attrs["geoemb:type"] = "pixel"  # per-pixel embeddings (not chip)
-    attrs["geoemb:dimensions"] = embedding_dim
-    # geoemb:model is the PUBLIC encoder reference URL. A caller passes the exact
-    # public URI for the encoder it used (model_url); otherwise it is looked up
-    # from the model FAMILY (encoder_version). It is NEVER built from
-    # *model_version*, which in production is an internal checkpoint filename
-    # stem (checkpoint_to_version(...)) — that is kept as separate `checkpoint_id`
-    # provenance, so a v1.0 / future / custom checkpoint doesn't advertise a
-    # synthetic or wrong public model URL.
-    attrs["geoemb:model"] = model_url or encoder_url(encoder_version or DEFAULT_MODEL_VERSION)
-    if model_version:
-        attrs["checkpoint_id"] = model_version
-    attrs["geoemb:source_data"] = list(source_data)
-    attrs["geoemb:data_type"] = data_type
-    # geoemb:gsd is OPTIONAL and defined in metres, so emit it ONLY with a
-    # trustworthy metric value: derived from the coordinate spacing of a
-    # metre-based CRS, or an explicit gsd the caller vouches for. A non-metre CRS
-    # (EPSG:4326 degrees, foot-based) or missing coords → OMIT it entirely rather
-    # than advertise a false metre value.
-    if x_coords is not None and len(x_coords) > 1 and _is_metre_crs(effective_epsg):
-        attrs["geoemb:gsd"] = abs(float(np.median(np.diff(x_coords))))
-    elif gsd is not None:
-        attrs["geoemb:gsd"] = gsd
-    # spatial_layout is OPTIONAL and only meaningful for a store organised into
-    # utmNN / global groups. A single-ROI store writes arrays at its own root,
-    # so omit it unless a caller (e.g. the 120-group campaign) sets it.
-    if spatial_layout is not None:
-        attrs["geoemb:spatial_layout"] = spatial_layout
-    # build_version is the SOFTWARE build (this package) per the convention;
-    # the public encoder reference is geoemb:model and the checkpoint id (if any)
-    # is the plain checkpoint_id attr above.
-    attrs["geoemb:build_version"] = _software_version()
-    attrs["geoemb:quantization"] = {
-        "method": "per_pixel_scale",  # absmax-per-pixel: value = quantized * scale
-        "original_dtype": "float32",
-        "quantized_dtype": data_type,
-        # Per-pixel float32 dequantization factors live in the `scales` array;
-        # absent/ocean pixels carry NaN there (assembly fills float vars NaN).
-        "scale": {"type": "array", "array_name": "scales", "nodata": "NaN"},
-    }
+    # Omitted when *include_geoemb* is False: the multi-group campaign store states
+    # geoemb: ONCE at the root (build_geoemb_root_attrs) and uses this function only
+    # for per-zone proj:/spatial:, whose CRS/grid differ by zone.
+    if include_geoemb:
+        conventions.append(_GEOEMB_CONVENTION)
+        # geoemb:gsd is OPTIONAL and defined in metres, so emit it ONLY with a
+        # trustworthy metric value: derived from the coordinate spacing of a
+        # metre-based CRS, or an explicit gsd the caller vouches for. A non-metre CRS
+        # (EPSG:4326 degrees, foot-based) or missing coords → OMIT it (no false value).
+        if x_coords is not None and len(x_coords) > 1 and _is_metre_crs(effective_epsg):
+            gsd_val: float | None = abs(float(np.median(np.diff(x_coords))))
+        else:
+            gsd_val = gsd
+        attrs.update(
+            _geoemb_fields(
+                embedding_dim=embedding_dim,
+                model_version=model_version,
+                encoder_version=encoder_version,
+                model_url=model_url,
+                data_type=data_type,
+                gsd=gsd_val,
+                spatial_layout=spatial_layout,
+                source_data=source_data,
+            )
+        )
 
     if conventions:
         attrs["zarr_conventions"] = conventions

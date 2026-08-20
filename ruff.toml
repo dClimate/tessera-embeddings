@@ -65,4 +65,17 @@ convention = "google"
 "tests/**/*.py" = ["ANN", "ARG", "RUF059", "F841", "D102", "D103", "N803", "N806", "C408"]
 "examples/**/*.py" = ["T201"]
 "scripts/**/*.py" = ["T201"]
+# Scale-test benchmarks use conventional short module aliases (V=variants,
+# SB=store_builder) that read well across these many-call scripts.
+"scripts/scale_tests/**/*.py" = ["N812"]
 "src/tessera_embeddings/architecture_tests/**/*.py" = ["T201"]
+# Operator CLIs that live in the package so they can ship as console scripts.
+# Printing IS their output contract: the profiling tools emit JSON on stdout
+# for an agent to consume plus a human view on stderr, so T201 doesn't apply
+# (same reasoning as architecture_tests above).
+"src/tessera_embeddings/profiling/**/*.py" = ["T201"]
+# A diagnostic that reports how the world's UTM zones divide across N Ray
+# clusters. Printing IS its output contract, same as the tools above — it lives
+# in tests/ rather than profiling/ because it drives the real partitioner, which
+# is inside the Prefect layer and so cannot be imported from the package.
+"tests/unit/test_cluster_balance.py" = ["T201"]

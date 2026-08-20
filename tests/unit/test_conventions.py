@@ -6,7 +6,12 @@ import numpy as np
 import pytest
 
 from tessera_embeddings.config.inference import encoder_url
-from tessera_embeddings.inference.conventions import ENCODER_VERSION, build_convention_attrs, tile_id_to_epsg
+from tessera_embeddings.inference.conventions import (
+    ENCODER_VERSION,
+    build_convention_attrs,
+    build_geoemb_root_attrs,
+    tile_id_to_epsg,
+)
 
 _PKG_VERSION = _dist_version("tessera_embeddings")
 
@@ -275,3 +280,44 @@ class TestBuildConventionAttrs:
         assert "spatial:dimensions" not in attrs
         # proj: should still work
         assert attrs["proj:code"] == "EPSG:32633"
+
+
+class TestMultiGroupPlacement:
+    """Root-vs-per-zone geoemb placement for the utm_zones campaign store."""
+
+    def test_include_geoemb_false_omits_geoemb(self) -> None:
+        """A per-zone call emits only proj:/spatial: — geoemb: is stated on the root."""
+        y = np.arange(6200000.0, 6199000.0, -10.0)
+        x = np.arange(500000.0, 501000.0, 10.0)
+        attrs = build_convention_attrs(
+            epsg_code="EPSG:32633",
+            total_y=100,
+            total_x=100,
+            embedding_dim=128,
+            y_coords=y,
+            x_coords=x,
+            include_geoemb=False,
+        )
+        assert "geoemb:type" not in attrs
+        names = [c["name"] for c in attrs["zarr_conventions"]]
+        assert "geoemb:" not in names
+        assert {"proj:", "spatial:"} <= set(names)
+        assert attrs["proj:code"] == "EPSG:32633"
+
+    def test_root_attrs_are_geoemb_only(self) -> None:
+        """The root builder emits geoemb: (no proj:/spatial:) with an explicit gsd."""
+        attrs = build_geoemb_root_attrs(
+            embedding_dim=128,
+            spatial_layout="utm_zones",
+            gsd=10.0,
+            model_version="best_model_fsdp_20250608",
+        )
+        assert attrs["geoemb:type"] == "pixel"
+        assert attrs["geoemb:dimensions"] == 128
+        assert attrs["geoemb:spatial_layout"] == "utm_zones"
+        assert attrs["geoemb:gsd"] == 10.0
+        assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"
+        assert attrs["checkpoint_id"] == "best_model_fsdp_20250608"  # model_version is provenance, not the URL
+        assert [c["name"] for c in attrs["zarr_conventions"]] == ["geoemb:"]
+        assert "proj:code" not in attrs
+        assert "spatial:dimensions" not in attrs

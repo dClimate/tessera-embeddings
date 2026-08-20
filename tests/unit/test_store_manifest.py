@@ -7,8 +7,12 @@ hash chaining (ROI -> ingest -> embedding), and validation edge cases.
 
 from __future__ import annotations
 
-import pytest
+from typing import ClassVar
 
+import pytest
+import zarr
+
+from tessera_embeddings.config.ingest import ingest_code_identity
 from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.storage.manifest import (
     EmbeddingManifest,
@@ -353,3 +357,195 @@ class TestEmbeddingManifestFromUpstreamStores:
         assert m.reflectance_manifest_hash is None
         assert m.sar_manifest_hash is None
         assert m.num_obs_checkpoints == (8, 16)
+
+
+class TestIngestCodeIsPartOfMosaicIdentity:
+    """A resumed mosaic must have been built by the code that is resuming it.
+
+    A campaign runs for weeks and its ingest source changes in that time. Resume skips
+    dates already committed, so without this a deploy mid-cell appends dates built under
+    a new duplicate-copy preference, validity gate or query onto dates built under the
+    old one, and stamps a single completion fingerprint over the pair.
+    """
+
+    @staticmethod
+    def _roi(tmp_path) -> str:
+        """A bare ROI store — no manifest of its own, which is not what is under test."""
+        path = str(tmp_path / "roi.zarr")
+        zarr.open_group(path, mode="w")
+        return path
+
+    def test_a_fresh_manifest_records_the_ingest_code(self, tmp_path):
+        m = IngestManifest.from_roi_store(self._roi(tmp_path))
+        assert m.ingest_code_identity == ingest_code_identity()
+        assert m.ingest_code_identity.startswith("ingcode-")
+
+    def test_resuming_a_store_built_by_other_code_is_refused(self, tmp_path):
+        roi = self._roi(tmp_path)
+        stored = IngestManifest.from_roi_store(roi).to_dict()
+        stored["ingest_code_identity"] = "ingcode-0000000000000000"
+        with pytest.raises(ConfigMismatchError, match="ingest_code_identity"):
+            IngestManifest.from_roi_store(roi).validate_against(stored, "s3://in/mosaics/33N/2025/reflectance.zarr")
+
+    def test_a_store_that_records_no_ingest_code_cannot_be_resumed(self, tmp_path):
+        """Absent here is "cannot be shown compatible", not "nothing to contradict".
+
+        A mosaic written before this field existed carries no record of the code that
+        built it — and the ingest source demonstrably changes mid-campaign, which is why
+        the field was added at all. Letting it through protected every mosaic EXCEPT the
+        ones whose provenance is unknown, which are the only ones that needed it. The
+        refusal is cheap where it fires: a store being appended to is incomplete anyway.
+        """
+        legacy = {"manifest_type": "IngestManifest", "roi_manifest_hash": None}
+        with pytest.raises(ConfigMismatchError, match="ingest_code_identity"):
+            IngestManifest.from_roi_store(self._roi(tmp_path)).validate_against(legacy, "legacy.zarr")
+
+    def test_the_identity_is_deterministic(self):
+        assert ingest_code_identity() == ingest_code_identity()
+
+
+class TestS2OnlyPolicyIsPartOfEmbeddingIdentity:
+    """``allow_s2_only`` decides which pixels become embeddings and which stay fill.
+
+    Nothing else in the manifest reflects that, so without it a store could hold two
+    time slices produced under opposite per-pixel S1 policies and the append gate
+    would see nothing wrong.
+    """
+
+    def test_turning_the_policy_on_changes_the_digest(self):
+        off = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, allow_s2_only=False)
+        on = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, allow_s2_only=True)
+        assert off.hash() != on.hash()
+
+    def test_the_policy_off_matches_a_store_written_before_the_field_existed(self):
+        """False and unrecorded are the SAME state — a store written by the old code
+        was written with the policy off — so an append must not be rejected for it.
+        """
+        legacy = EmbeddingManifest(model_checkpoint="ckpt", num_obs_checkpoints=(8,))
+        off = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, allow_s2_only=False)
+        assert off.allow_s2_only is None
+        assert off.hash() == legacy.hash()
+        assert "allow_s2_only" not in off.to_dict()
+
+    def test_the_policy_survives_a_round_trip(self):
+        on = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, allow_s2_only=True)
+        assert EmbeddingManifest.from_dict(on.to_dict()).allow_s2_only is True
+
+
+class TestOpticalMinObsIsPartOfEmbeddingIdentity:
+    """The minimum-depth rule decides which pixels become embeddings and which stay fill.
+
+    Exactly the argument that put ``allow_s2_only`` in this manifest, and the reason the
+    two sit beside each other: nothing else here reflects the rule, so a store could hold
+    two time slices admitted under different lines and the append gate would see nothing
+    wrong. The store's advertised root rule is write-once for the same reason — this is the
+    per-append half of it.
+    """
+
+    def test_a_different_line_changes_the_digest(self):
+        a = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, optical_min_obs=25)
+        b = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, optical_min_obs=30)
+        assert a.hash() != b.hash()
+
+    def test_no_rule_matches_a_store_written_before_the_field_existed(self):
+        """Unrecorded and "no rule" are the same state, so such an append must be allowed."""
+        legacy = EmbeddingManifest(model_checkpoint="ckpt", num_obs_checkpoints=(8,))
+        none = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, optical_min_obs=None)
+        assert none.optical_min_obs is None
+        assert none.hash() == legacy.hash()
+        assert "optical_min_obs" not in none.to_dict()
+
+    def test_introducing_a_rule_over_a_store_that_has_none_is_refused(self):
+        """The case the general "skip a key the store lacks" rule cannot see: the store says
+        nothing, the run says 25, and nothing disagrees unless absence is read as a value.
+        """
+        legacy = EmbeddingManifest(model_checkpoint="ckpt", num_obs_checkpoints=(8,)).to_dict()
+        withrule = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, optical_min_obs=25)
+        with pytest.raises(ConfigMismatchError, match="optical_min_obs"):
+            withrule.validate_against(legacy, "existing.zarr")
+
+    def test_the_rule_survives_a_round_trip(self):
+        m = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, optical_min_obs=25)
+        assert EmbeddingManifest.from_dict(m.to_dict()).optical_min_obs == 25
+
+
+class TestAdmissionThresholdIsPartOfIngestIdentity:
+    """A resumed mosaic must be built to ONE admission policy.
+
+    The mask says where a date could land; `min_valid_coverage` decides which dates were
+    admitted at all, and an interrupted store records it nowhere else. Resuming at a
+    different threshold skips the dates the old run admitted and appends new ones under
+    the new rule, ending with a mosaic built to two policies and a marker claiming one.
+    """
+
+    BASE: ClassVar[dict[str, str]] = {"roi_manifest_hash": "roi-1", "coverage_sha256": "cov-1"}
+
+    def test_a_changed_threshold_is_refused(self):
+        built = IngestManifest(**self.BASE, min_valid_coverage=10.0)
+        resumed = IngestManifest(**self.BASE, min_valid_coverage=30.0)
+
+        with pytest.raises(ConfigMismatchError, match="min_valid_coverage"):
+            resumed.validate_against(built.to_dict(), "s3://m/reflectance.zarr")
+
+    def test_an_identical_resume_proceeds(self):
+        """The guard has to let the ordinary interruption through, or resume is dead."""
+        built = IngestManifest(**self.BASE, min_valid_coverage=10.0)
+        IngestManifest(**self.BASE, min_valid_coverage=10.0).validate_against(
+            built.to_dict(), "s3://m/reflectance.zarr"
+        )
+
+    def test_a_store_predating_the_field_is_not_retro_blocked(self):
+        """Nothing recorded means nothing to contradict — the legacy allowance."""
+        legacy = IngestManifest(**self.BASE).to_dict()
+        assert "min_valid_coverage" not in legacy
+
+        IngestManifest(**self.BASE, min_valid_coverage=30.0).validate_against(legacy, "s3://m/reflectance.zarr")
+
+    def test_the_field_does_not_move_an_existing_hash(self):
+        """What makes this safe to add: `to_dict` drops None, so the digest is unchanged.
+
+        The hash is chained into every embedding store as `reflectance_manifest_hash`, so
+        a field that shifted it would reject appends to stores that are perfectly valid.
+        """
+        before_the_field_existed = {**self.BASE, "manifest_type": "IngestManifest"}
+        round_tripped = IngestManifest.from_dict(before_the_field_existed)
+
+        assert round_tripped.min_valid_coverage is None
+        assert round_tripped.to_dict() == before_the_field_existed
+        assert round_tripped.hash() == IngestManifest(**self.BASE).hash()
+
+    def test_sar_stores_carry_no_threshold(self):
+        """Only the optical store has an admission gate; the SAR ones have no such knob."""
+        assert IngestManifest.from_dict({**self.BASE}).min_valid_coverage is None
+
+
+class TestAbsenceIsAValueForAPolicyField:
+    """A store that records nothing about a policy was built with that policy off.
+
+    ``validate_against`` skips a key the store lacks, so a manifest written by newer code
+    can carry fields older stores never had. That is right for a field DESCRIBING a store
+    and wrong for one stating a POLICY it was built under: turning the policy on is
+    exactly the append to refuse, and it is the one shape the general rule cannot see —
+    the store says nothing, the current manifest says True, and nothing disagrees.
+    """
+
+    def _legacy(self) -> dict:
+        """An embedding store written before ``allow_s2_only`` existed."""
+        return EmbeddingManifest(model_checkpoint="ckpt", num_obs_checkpoints=(8,)).to_dict()
+
+    def test_turning_the_policy_on_against_a_legacy_store_is_refused(self):
+        current = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, allow_s2_only=True)
+        with pytest.raises(ConfigMismatchError, match="allow_s2_only"):
+            current.validate_against(self._legacy(), "s3://out/embeddings/roi.zarr")
+
+    def test_leaving_the_policy_off_against_a_legacy_store_is_accepted(self):
+        """Off and unrecorded are the same state, so this append changes nothing."""
+        current = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, allow_s2_only=False)
+        current.validate_against(self._legacy(), "s3://out/embeddings/roi.zarr")
+
+    def test_a_field_outside_the_policy_set_keeps_the_forward_compatible_rule(self):
+        """The general rule survives: a descriptive field the store never recorded is
+        unknown, not a disagreement, or every manifest gaining a field would break appends.
+        """
+        legacy = {"manifest_type": "IngestManifest"}
+        IngestManifest(roi_manifest_hash="abc123").validate_against(legacy, "legacy.zarr")

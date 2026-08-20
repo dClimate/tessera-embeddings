@@ -21,7 +21,7 @@ roi:
   name: quickstart_denver_co
   geojson: examples/quickstart/roi.geojson
   resolution: 10.0
-  chunk_size: 2000
+  chunk_size: 2048
   # Denver, CO falls in UTM zone 13N. Rasterisation requires a
   # projected CRS (metres, not degrees); the GeoJSON itself is CRS84.
   force_crs: "EPSG:32613"

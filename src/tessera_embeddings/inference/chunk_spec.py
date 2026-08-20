@@ -57,7 +57,20 @@ class ChunkSpec:
     @property
     def label(self) -> str:
         """Human-readable label for this chunk."""
-        return f"chunk_{self.row}_{self.col}"
+        return chunk_label(self.row, self.col)
+
+
+def chunk_label(row: int, col: int) -> str:
+    """The staged-artifact label for a grid position (single owner of the format)."""
+    return f"chunk_{row}_{col}"
+
+
+def parse_chunk_label(label: str) -> tuple[int, int]:
+    """Parse a :func:`chunk_label` back into ``(row, col)``; raises on anything else."""
+    parts = label.split("_")
+    if len(parts) != 3 or parts[0] != "chunk":
+        raise ValueError(f"Label {label!r} is not of the form 'chunk_<row>_<col>'")
+    return int(parts[1]), int(parts[2])
 
 
 def enumerate_chunks(
@@ -123,6 +136,8 @@ def enumerate_chunks_from_dataset(
 def filter_chunks_by_roi_mask(
     chunks: list[ChunkSpec],
     roi_zarr_path: str,
+    *,
+    storage_options: dict | None = None,
 ) -> list[ChunkSpec]:
     """Return only the chunks whose spatial extent intersects the ROI mask.
 
@@ -135,11 +150,17 @@ def filter_chunks_by_roi_mask(
     Args:
         chunks: Full chunk grid from :func:`enumerate_chunks_from_dataset`.
         roi_zarr_path: S3 URI or local path to the ROI boolean zarr.
+        storage_options: fsspec options for the open — the credential and region a
+            deployment needs to read its own ROI. The mask is a PLAIN zarr, not an
+            Icechunk store, so it does not travel on the Icechunk callback its callers
+            thread everywhere else, and without this it opened on the ambient chain: in
+            a callback-only or non-default-region deployment, the wrong credentials or
+            none at all, on the one read that decides which chunks exist.
 
     Returns:
         Subset of *chunks* that contain at least one ROI pixel.
     """
-    mask = zarr.open(roi_zarr_path, mode="r")
+    mask = zarr.open(roi_zarr_path, mode="r", storage_options=storage_options)
 
     def intersects(chunk: ChunkSpec) -> bool:
         return bool(mask[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop].any())  # type: ignore[index]

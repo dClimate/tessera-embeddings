@@ -18,10 +18,12 @@ from typing import Any
 from dask.distributed import get_client
 from prefect import get_run_logger, task
 
+from tessera_embeddings.config.ingest import INGEST_MANIFEST_SPLIT
+from tessera_embeddings.ingest.roi import StorageOptions
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
-from tessera_embeddings.storage.zarr_store import credentials_provider
+from tessera_embeddings.storage.zarr_store import credentials_provider, manifest_split
 
 
 @task(name="process-roi-reflectance")
@@ -34,7 +36,15 @@ def process_roi_reflectance(
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
     provider: str = "earth-search",
     collection: str = "sentinel-2-l2a",
-    storage_options: dict | None = None,
+    storage_options: StorageOptions = None,
+    stream_stac_monthly: bool = True,
+    overlap_window_writes: bool = True,
+    pipeline_dates: bool = False,
+    # ``int | None``, not ``int``: None is the value that means "derive from the ROI's size"
+    # (config.ingest.auto_batch_dates), so an ``int``-annotated shell defaulting to 1 cannot
+    # express it and pins any caller that omits the flag to never batching.
+    batch_dates: int | None = None,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Prefect task: ingest S2 reflectance for one ROI.
 
@@ -48,18 +58,47 @@ def process_roi_reflectance(
     transient cases, and outer retries would re-run the whole
     multi-day loop.
     """
-    result = ingest_s2_roi_reflectance(
-        roi_zarr_path=roi_zarr_path,
-        start_date=start_date,
-        end_date=end_date,
-        store_path=store_path,
-        client=get_client(),
-        min_valid_coverage=min_valid_coverage,
-        provider=provider,
-        collection=collection,
-        log=get_run_logger(),
-        storage_options=storage_options,
-    )
+    # The store writes below open the reflectance repo WITHOUT an explicit
+    # get_credentials, so in a callback-only deployment they fall back to Icechunk's
+    # ambient chain and fail to create or append the S3 mosaic. The radar task next door
+    # registers the provider for exactly this reason; optical needs it just as much, and
+    # only its being wired first hid that. Gated on the store being on S3 — the import
+    # pulls in botocore, which lives only in the optional `aws` extra, so a local run must
+    # not need it. The ROI's fsspec options default the same way for the same reason: a
+    # plain zarr read does not travel on the Icechunk callback.
+    cred_provider_cm: Any = nullcontext()
+    if store_path.startswith("s3://"):
+        from tessera_embeddings.providers.aws.credentials import (
+            iam_icechunk_credentials,
+            iam_s3_storage_options,
+        )
+
+        cred_provider_cm = credentials_provider(iam_icechunk_credentials)
+        if storage_options is None and roi_zarr_path.startswith("s3://"):
+            # The CALLABLE, not its result: a role credential resolved once here is a
+            # snapshot, and an S2 leg outlives it (see the radar task's note).
+            storage_options = iam_s3_storage_options
+
+    # Shard the mosaic's manifests: the store is created and appended to entirely
+    # within this call, so create and every later append see the same config.
+    with cred_provider_cm, manifest_split(INGEST_MANIFEST_SPLIT):
+        result = ingest_s2_roi_reflectance(
+            roi_zarr_path=roi_zarr_path,
+            start_date=start_date,
+            end_date=end_date,
+            store_path=store_path,
+            client=get_client(),
+            min_valid_coverage=min_valid_coverage,
+            provider=provider,
+            collection=collection,
+            log=get_run_logger(),
+            storage_options=storage_options,
+            stream_stac_monthly=stream_stac_monthly,
+            overlap_window_writes=overlap_window_writes,
+            pipeline_dates=pipeline_dates,
+            s3_region=s3_region,
+            batch_dates=batch_dates,
+        )
     return asdict(result)
 
 
@@ -75,7 +114,14 @@ def process_roi_sar(
     edl_credentials_fn: Callable[[], dict[str, str]] | None = None,
     apply_credentials_fn: Callable[[dict[str, str]], None] | None = None,
     use_s3_direct: bool = True,
-    storage_options: dict | None = None,
+    storage_options: StorageOptions = None,
+    # Mirror the domain defaults: these shells forward knobs, so a default here that
+    # disagrees with s1_roi.ingest_s1_roi_sar silently changes behaviour for any caller
+    # that does not pass the flag explicitly.
+    overlap_window_writes: bool = True,
+    pipeline_batches: bool = True,
+    narrow_windows_per_date: bool = True,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Prefect task: ingest S1 OPERA SAR for one ROI.
 
@@ -117,9 +163,16 @@ def process_roi_sar(
         cred_provider_cm = credentials_provider(iam_icechunk_credentials)
 
         if storage_options is None and roi_zarr_path.startswith("s3://"):
-            storage_options = iam_s3_storage_options()
+            # The CALLABLE, not its result. Resolved once here it is a snapshot, and the
+            # role credential behind it expires — an ECS task role lasts hours, which a
+            # radar leg outlives, and every mask read after that point fails on a bucket
+            # our role can always read. Passing the provider moves resolution to each read.
+            storage_options = iam_s3_storage_options
 
-    with cred_provider_cm:
+    # manifest_split for the same reason as the S2 task: this mosaic is
+    # region-written once per date batch, so an unsharded manifest makes each
+    # commit rewrite every ref written so far.
+    with cred_provider_cm, manifest_split(INGEST_MANIFEST_SPLIT):
         result = ingest_s1_roi_sar(
             roi_zarr_path=roi_zarr_path,
             start_date=start_date,
@@ -133,5 +186,9 @@ def process_roi_sar(
             use_s3_direct=use_s3_direct,
             log=get_run_logger(),
             storage_options=storage_options,
+            overlap_window_writes=overlap_window_writes,
+            pipeline_batches=pipeline_batches,
+            narrow_windows_per_date=narrow_windows_per_date,
+            s3_region=s3_region,
         )
     return asdict(result)

@@ -45,12 +45,12 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import fsspec
 import numpy as np
 import zarr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
-from tessera_embeddings.storage.zarr_store import TIME_ENCODING, _create_repo, compute_doy
+from tessera_embeddings.config.store_layout import clamp_chunks_and_shards
+from tessera_embeddings.storage.zarr_store import TIME_ENCODING, _create_repo, _delete_store, compute_doy
 from tessera_embeddings.utils import utcnow_iso
 
 if TYPE_CHECKING:
@@ -114,7 +114,9 @@ class VarSpec:
     pass an explicit value to override. ``serializer`` / ``compressors`` are
     forwarded to ``zarr.Group.create_array`` verbatim — the default ``"auto"``
     matches what xarray's zarr backend would pick, while a caller can pin e.g.
-    ``pcodec_serializer()`` + ``compressors=None`` for a float embeddings array.
+    a PCodec serializer + ``compressors=None`` for a float array. (Sharded
+    layouts belong to the global store's ``ArrayLayout``/``StoreLayout`` path —
+    see ``config.store_layout`` and ``storage.global_store``.)
     """
 
     dims: tuple[str, ...]
@@ -129,6 +131,60 @@ class VarSpec:
         if self.fill_value is _DEFAULT_FILL:
             return _fill_for_dtype(self.dtype)
         return self.fill_value
+
+
+def _write_coord_arrays(node: zarr.Group, coords: dict[str, np.ndarray]) -> None:
+    """Write 1-D coordinate arrays onto a zarr group node.
+
+    ``time`` is special-cased: stored as int64 nanoseconds with
+    :data:`TIME_ENCODING` (matching ``write_dataset``); other coords are written
+    as their values. Shared by the single-store and multi-group seed paths.
+    """
+    for name, values in coords.items():
+        if name == "time":
+            time_int = np.asarray(values, dtype="datetime64[ns]").astype("int64")
+            # max(len, 1): a zero-length chunk is invalid, and an EMPTY time axis is a
+            # legitimate seed (the cropped ingest appends each date atomically with
+            # its pixels — committing a date before its windows would let a crash
+            # strand an all-fill timestep that later dedupe treats as ingested).
+            time_arr = node.create_array(
+                "time", data=time_int, chunks=(max(len(time_int), 1),), dimension_names=("time",)
+            )
+            time_arr.attrs.update(TIME_ENCODING)
+        else:
+            arr = np.asarray(values)
+            node.create_array(name, data=arr, chunks=(len(arr),), dimension_names=(name,))
+
+
+def _write_group_schema(
+    node: zarr.Group,
+    coords: dict[str, np.ndarray],
+    var_specs: dict[str, VarSpec],
+    attrs: dict | None,
+) -> None:
+    """Create schema-only data arrays + coord arrays + attrs on a group node.
+
+    Data variables are created with shape/chunks but no chunk data (all fill),
+    so cost is independent of spatial extent.
+    """
+    for name, spec in var_specs.items():
+        shape = tuple(len(coords[d]) for d in spec.dims)
+        # One clamp implementation for on-disk geometry, shared with
+        # ArrayLayout.create_kwargs (config.store_layout).
+        chunks, _ = clamp_chunks_and_shards(shape, spec.chunks, None)
+        node.create_array(
+            name,
+            shape=shape,
+            chunks=chunks,
+            dtype=spec.dtype,
+            fill_value=spec.resolved_fill(),
+            dimension_names=spec.dims,
+            serializer=spec.serializer,
+            compressors=spec.compressors,
+        )
+    _write_coord_arrays(node, coords)
+    if attrs:
+        node.attrs.update(attrs)
 
 
 def create_empty_store_from_coords(
@@ -183,49 +239,20 @@ def create_empty_store_from_coords(
     store = session.store
     try:
         root = zarr.open_group(store, mode="w")
-
-        # Data variables: schema only, no chunks written (all fill).
-        for name, spec in var_specs.items():
-            shape = tuple(len(coords[d]) for d in spec.dims)
-            chunks = tuple(min(c, s) for c, s in zip(spec.chunks, shape, strict=True))
-            root.create_array(
-                name,
-                shape=shape,
-                chunks=chunks,
-                dtype=spec.dtype,
-                fill_value=spec.resolved_fill(),
-                dimension_names=spec.dims,
-                serializer=spec.serializer,
-                compressors=spec.compressors,
-            )
-
-        # Coordinate arrays — 1-D, written in full. ``time`` is stored as int64
-        # nanoseconds since epoch to match TIME_ENCODING; others as their values.
-        for name, values in coords.items():
-            if name == "time":
-                time_int = np.asarray(values, dtype="datetime64[ns]").astype("int64")
-                time_arr = root.create_array("time", data=time_int, chunks=(len(time_int),), dimension_names=("time",))
-                time_arr.attrs.update(TIME_ENCODING)
-            else:
-                arr = np.asarray(values)
-                root.create_array(name, data=arr, chunks=(len(arr),), dimension_names=(name,))
-
-        if attrs:
-            root.attrs.update(attrs)
-
+        _write_group_schema(root, coords, var_specs, attrs)
         session.commit(commit_msg)
     except Exception:
         # Mirror write_dataset's cleanup_on_failure — delete partial store on
         # error, but only when we created the repo. A caller-supplied repo owns
         # its own lifecycle (and may already hold data we must not delete).
+        #
+        # Delegates to `_delete_store` rather than opening its own fsspec filesystem: that
+        # duplicate is how the credential gap stayed hidden in two places at once. This
+        # branch has no credentials to pass (the whole `repo is None` path resolves them
+        # ambiently), but going through the shared helper means it inherits any fix.
         if owns_repo:
             logger.warning("Empty store creation failed, cleaning up %s", store_path)
-            try:
-                fs = fsspec.filesystem(fsspec.utils.get_protocol(store_path))
-                if fs.exists(store_path):
-                    fs.rm(store_path, recursive=True)
-            except Exception as cleanup_err:
-                logger.warning("Failed to clean up partial store %s: %s", store_path, cleanup_err)
+            _delete_store(store_path)
         raise
 
 
@@ -240,6 +267,7 @@ def create_empty_store(
     chunks: dict[str, int] | None = None,
     baselines: dict[str, int] | None = None,
     manifest: IngestManifest | None = None,
+    repo: Repository | None = None,
 ) -> None:
     """Create a 100%-empty store over the ROI extent and given dates.
 
@@ -269,6 +297,9 @@ def create_empty_store(
         baselines: Baseline map written to root attrs. Defaults to empty (no
             baseline correction is meaningful for an unpopulated store).
         manifest: Optional ingest manifest for provenance / append-safety.
+        repo: Pre-opened repository to create the store in. Pass one when the
+            caller's credentials or region differ from the defaults — otherwise
+            this opens its own with the default storage config.
     """
     chunks = chunks if chunks is not None else INGEST_CHUNKS
     times = np.asarray(times, dtype="datetime64[ns]")
@@ -312,6 +343,10 @@ def create_empty_store(
 
     create_empty_store_from_coords(
         store_path,
+        # A caller with callback-only credentials or a non-default region opens the
+        # repo itself and passes it; otherwise from_coords creates one with the
+        # default storage config.
+        repo=repo,
         coords={"time": times, "northing": northing, "easting": easting},
         var_specs={
             name: VarSpec(

@@ -63,6 +63,15 @@ you've stored the EC2 resource IDs your Ray nodes need.
 DEFAULT_CLOUDWATCH_LOG_GROUP = "/ec2/tessera/ray"
 """Default CloudWatch log group for Ray agent logs."""
 
+RAY_DOWN_TIMEOUT_S = 300
+"""Upper bound (seconds) on a cancellation-time ``ray down``.
+
+``ray down`` SSHes into the head to tear the cluster down; if the head is
+unreachable or the CLI wedges it can block forever. A cancellation hook that
+hangs here never reaches the tag-based EC2 termination fallback, leaving GPU
+workers running and billed — so the call is bounded and a timeout falls through
+to tag termination. Generous enough for a normal teardown (~1-2 min)."""
+
 PROJECT_TAG_VALUE = "tessera-embeddings"
 """Value of the ``Project`` EC2 tag stamped on every Ray node.
 
@@ -77,6 +86,110 @@ this in lockstep with the deployment's IAM condition (yield CDK:
 _REQUIRED_SSM_KEYS = frozenset(
     {"security-group-id", "instance-profile-arn", "private-subnet-ids", "key-pair-name", "key-pair-id"}
 )
+
+
+def resolve_ami_id(ami_ssm_name: str, region: str = "us-west-2") -> str:
+    """Resolve the worker AMI ID the ``ami_ssm_name`` SSM parameter currently points at.
+
+    The campaign resolves this ONCE up front and pins it into every fill's
+    provisioning (``ray_cluster(ami_id=...)``), so a re-bake that repoints the SSM
+    parameter mid-campaign can't make a fill boot a different image than the one its
+    staging fingerprint recorded — see :func:`resolve_code_artifact_identity`.
+    """
+    return boto3.client("ssm", region_name=region).get_parameter(Name=ami_ssm_name)["Parameter"]["Value"]
+
+
+def resolve_code_artifact_identity(
+    ami_ssm_name: str,
+    code_bucket: str | None = None,
+    code_suffix: str = "",
+    region: str = "us-west-2",
+    ami_id: str | None = None,
+) -> str:
+    """Immutable identity of the code a Ray fill will run, for the staging fingerprint.
+
+    Returns ``ami=<ami-id>`` and, when a source tarball overlays the AMI, appends
+    ``|tarball=<etag>`` — the same two artifacts :func:`provision_ray_cluster` boots
+    from (the AMI behind ``ami_ssm_name`` and ``s3://{code_bucket}/code/src{suffix}.tar.gz``).
+
+    The global campaign folds this into each cell's staging ``run_id`` because
+    ``code_suffix`` alone is NOT immutable: it is empty for a baked production AMI and
+    only a filename/branch stem for a tarball, so re-baking the AMI under the same SSM
+    name, or overwriting the tarball, leaves it unchanged. A retry would then resume
+    tiles staged by the OLD code while remaining tiles run the NEW code, permanently
+    publishing a mixed-version year. Resolving the real AMI ID and tarball ETag makes
+    any code change flip the fingerprint, so a fresh staging prefix is used.
+
+    KNOWN RESIDUAL WINDOW (dev-overlay path only). The ETag is read here, once, while
+    workers later download the mutable key ``code/src{code_suffix}.tar.gz``. Overwrite
+    that object mid-campaign and workers boot code the fingerprint does not describe.
+    Re-reading the ETag just before launch would narrow the window, not close it — the
+    overwrite can land between that HEAD and the worker's GET — so this is left as a
+    constraint rather than a partial mitigation: DO NOT overwrite a tarball a campaign
+    is running against. Production is unaffected (a baked AMI passes ``code_bucket=None``
+    and has no tarball term at all). To close it properly, upload content-addressed keys
+    (``code/src-<sha>.tar.gz``) so the object is immutable by construction, rather than
+    threading an S3 versionId through provisioning. Same reasoning as the model
+    checkpoint's filename-not-bytes identity in ``_staging_run_id``.
+
+    Args:
+        ami_ssm_name: SSM parameter holding the worker AMI ID.
+        code_bucket: S3 bucket of the source tarball; ``None`` for a pure-AMI deploy.
+        code_suffix: Tarball filename suffix (``code/src{code_suffix}.tar.gz``).
+        region: AWS region for the SSM/S3 clients (the store's region; us-west-2 default).
+        ami_id: A pre-resolved AMI ID to fingerprint instead of reading ``ami_ssm_name``.
+            Pass the SAME id that provisioning is pinned to (``ray_cluster(ami_id=...)``)
+            so the fingerprint and the booted image are guaranteed identical — a caller
+            that pins provisioning must pin the fingerprint too, or the two could resolve
+            the SSM pointer at different instants and disagree.
+    """
+    parts = [f"ami={ami_id if ami_id is not None else resolve_ami_id(ami_ssm_name, region)}"]
+    tarball = source_tarball_identity(code_bucket, code_suffix, region)
+    if tarball:
+        parts.append(tarball)
+    return "|".join(parts)
+
+
+def source_tarball_identity(code_bucket: str | None, code_suffix: str, region: str) -> str:
+    """``tarball=<etag>`` for the source archive workers overlay, or ``""`` when there is none.
+
+    Split out of :func:`resolve_code_artifact_identity` so the staging fingerprint can carry
+    the TARBALL term without the AMI one. Those two have opposite properties for staging
+    reuse: re-baking an AMI does not change what a staged tile contains, so folding it in
+    abandoned every staged tile for nothing — which is why the staging identity was narrowed
+    on 2026-07-30 — while replacing the tarball changes exactly what a worker executes.
+
+    **Empty for a baked-AMI deploy** (``code_bucket=None``), which is production. So a
+    fingerprint that includes this is unchanged there and gains the term only on the
+    dev-overlay path, where it is the whole exposure.
+
+    The residual window in :func:`resolve_code_artifact_identity` applies here unchanged: the
+    ETag is read once while workers later GET the mutable key, so do not overwrite a tarball
+    a campaign is running against.
+    """
+    if not code_bucket:
+        return ""
+    s3 = boto3.client("s3", region_name=region)
+    etag = s3.head_object(Bucket=code_bucket, Key=f"code/src{code_suffix}.tar.gz")["ETag"].strip('"')
+    return f"tarball={etag}"
+
+
+def cluster_name_for_flow_run(flow_run_id: object, cluster_yaml: Path = DEFAULT_CLUSTER_TEMPLATE) -> str | None:
+    """Deterministic Ray cluster name for a flow run, or ``None`` if no id is known.
+
+    The name must be recomputable from nothing but the flow-run id: Prefect runs
+    cancellation/crash hooks in a freshly imported module after the flow's child
+    process is killed, so a hook can re-derive the cluster tag (and terminate the
+    fleet) even with the flow's module globals unset. Both the ``tessera_embeddings``
+    and ``fill-zone-year`` flows pass this as ``ray_cluster(cluster_name=...)`` so the
+    provisioned name and the hook's re-derived name always match. The base comes from
+    the shipped cluster template so it stays in sync with what ``ray up`` uses.
+    """
+    if not flow_run_id:
+        return None
+    with cluster_yaml.open() as f:
+        base = yaml.safe_load(f).get("cluster_name", "tessera-inference")
+    return f"{base}-{str(flow_run_id).replace('-', '')[:8]}"
 
 
 def _build_cloudwatch_setup_command(
@@ -119,6 +232,7 @@ def _resolve_ray_config(
     *,
     region: str = "us-west-2",
     ami_ssm_name: str,
+    ami_id: str | None = None,
     ssm_prefix: str = DEFAULT_SSM_PREFIX,
     cluster_name: str | None = None,
     instance_tags: list[dict[str, str]] | None = None,
@@ -126,6 +240,7 @@ def _resolve_ray_config(
     code_suffix: str = "",
     cloudwatch_log_group: str = DEFAULT_CLOUDWATCH_LOG_GROUP,
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
+    idle_timeout_minutes: int | None = None,
 ) -> str:
     """Inject AWS resource IDs from SSM into a Ray cluster YAML template.
 
@@ -141,7 +256,12 @@ def _resolve_ray_config(
         cluster_yaml: Path to the cluster YAML template. Use
             :data:`DEFAULT_CLUSTER_TEMPLATE` for the bundled template.
         region: AWS region for SSM and EC2 clients.
-        ami_ssm_name: SSM parameter name holding the worker AMI ID.
+        ami_ssm_name: SSM parameter name holding the worker AMI ID. Used only
+            when ``ami_id`` is not given.
+        ami_id: A pre-resolved worker AMI ID that PINS the image, bypassing the
+            ``ami_ssm_name`` lookup. The campaign resolves the AMI once and threads
+            it here so a mid-campaign re-bake can't repoint the SSM parameter and
+            boot a different image than a fill's staging fingerprint recorded.
         ssm_prefix: Prefix under which Ray resource IDs are stored.
             Required keys: ``security-group-id``, ``instance-profile-arn``,
             ``private-subnet-ids``, ``key-pair-name``, ``key-pair-id``.
@@ -160,6 +280,12 @@ def _resolve_ray_config(
             production tarballs; ``"-mybranch"`` for dev branches.
         cloudwatch_log_group: CloudWatch log group for Ray agent logs.
         cloudwatch_template: Path to the CloudWatch agent JSON template.
+        idle_timeout_minutes: Override the template's autoscaler idle-down
+            delay. The template default (2 min) suits single-ROI runs, where
+            any idle worker is surplus; a multi-zone sequential fill holds one
+            cluster across zones and must survive the inter-zone gap
+            (staged-completeness verify + next zone's dispatch), so it passes
+            a larger value. ``None`` keeps the template's value.
 
     Returns:
         Path to the resolved YAML tempfile.
@@ -174,6 +300,8 @@ def _resolve_ray_config(
 
     if cluster_name:
         config["cluster_name"] = cluster_name
+    if idle_timeout_minutes is not None:
+        config["idle_timeout_minutes"] = idle_timeout_minutes
 
     ssm = boto3.client("ssm", region_name=region)
 
@@ -227,12 +355,16 @@ def _resolve_ray_config(
     azs = list(dict.fromkeys(az_by_subnet[sid] for sid in all_subnet_ids))
     config["provider"]["availability_zone"] = ",".join(azs)
 
-    ami_param = ssm.get_parameter(Name=ami_ssm_name)
-    ami_id = ami_param["Parameter"]["Value"]
+    # Prefer a caller-PINNED AMI ID (the campaign resolves it once and threads it
+    # through every fill) over re-reading the SSM pointer here: re-reading would let
+    # a mid-campaign re-bake boot a different image than the fill's staging
+    # fingerprint recorded. Fall back to the SSM lookup when unpinned (direct/dev
+    # invocations), where the pointer is authoritative.
+    resolved_ami_id = ami_id if ami_id is not None else ssm.get_parameter(Name=ami_ssm_name)["Parameter"]["Value"]
 
     for node_type_cfg in config["available_node_types"].values():
         nc = node_type_cfg["node_config"]
-        nc["ImageId"] = ami_id
+        nc["ImageId"] = resolved_ami_id
         nc["KeyName"] = key_name
         nc["SecurityGroupIds"] = sg_ids
         nc["IamInstanceProfile"] = iam_profile
@@ -272,7 +404,13 @@ def _resolve_ray_config(
     config["head_start_ray_commands"].append(cw_cmd)
     config["worker_start_ray_commands"].append(cw_cmd)
 
-    # Substitute {CODE_BUCKET} and {CODE_SUFFIX} in setup_commands.
+    # Substitute {CODE_BUCKET} and {CODE_SUFFIX} in setup_commands. With no bucket the
+    # command is DROPPED, not left alone: an unsubstituted `aws s3 cp
+    # s3://{CODE_BUCKET}/...` is a valid command line over a bucket name that cannot
+    # exist, so `ray up` runs it on every node and every node fails setup. `None` is the
+    # documented default and means the AMI already carries the code, so there is nothing
+    # to fetch — dropping the line is what that default has to mean for the cluster to
+    # boot at all.
     if code_bucket is not None:
         config["setup_commands"] = [
             cmd.replace("{CODE_BUCKET}", code_bucket).replace("{CODE_SUFFIX}", code_suffix)
@@ -280,6 +418,8 @@ def _resolve_ray_config(
             else cmd
             for cmd in config["setup_commands"]
         ]
+    else:
+        config["setup_commands"] = [cmd for cmd in config["setup_commands"] if "{CODE_BUCKET}" not in str(cmd)]
 
     resolved_fd, resolved_path = tempfile.mkstemp(prefix="ray_cluster_", suffix=".yaml")
     with os.fdopen(resolved_fd, "w") as rf:
@@ -390,9 +530,17 @@ def _log_ray_dashboard_ssm_command(
     ``AmazonSSMManagedInstanceCore``, so the port-forward works against the
     instance ID.
 
-    Best-effort: warns and returns on any failure, never raises. No
-    ``--profile`` is printed — credentials come from the operator's
-    environment (``AWS_PROFILE`` or their default).
+    Uses ``AWS-StartPortForwardingSession``, which targets a port on the
+    managed instance itself. The ``...ToRemoteHost`` variant addresses hosts
+    reachable *from* the instance, and the SSM agent rejects loopback
+    destinations for it.
+
+    ``--region`` is filled in from the region the head node was looked up in,
+    so an operator whose default region differs doesn't get a "target not
+    connected" from SSM. No ``--profile`` is printed — credentials come from
+    the operator's environment (``AWS_PROFILE`` or their default).
+
+    Best-effort: warns and returns on any failure, never raises.
 
     Args:
         cluster_name: Resolved, unique ``ray-cluster-name`` tag value (with
@@ -419,8 +567,9 @@ def _log_ray_dashboard_ssm_command(
             "To view the Ray dashboard, run:\n\n"
             "aws ssm start-session \\\n"
             f"  --target {instance_id} \\\n"
-            "  --document-name AWS-StartPortForwardingSessionToRemoteHost \\\n"
-            '  --parameters \'{"host":["localhost"],"portNumber":["8265"],"localPortNumber":["8265"]}\'\n\n'
+            "  --document-name AWS-StartPortForwardingSession \\\n"
+            f"  --region {region} \\\n"
+            '  --parameters \'{"portNumber":["8265"],"localPortNumber":["8265"]}\'\n\n'
             "Then open http://localhost:8265"
         )
     except Exception:
@@ -506,9 +655,23 @@ def _stop_ray_cluster(
     Returns True if ``ray down`` exited 0, False otherwise (caller may then fall
     back to tag-based termination so a head that ``ray down`` couldn't reach
     doesn't leak).
+
+    BOUNDED by ``RAY_DOWN_TIMEOUT_S``, for the reason that constant documents: this
+    SSHes into the head, and an unreachable head makes it hang indefinitely. Unbounded,
+    the fallback in the sentence above is unreachable exactly when it is needed — the
+    call never returns, so nothing terminates the fleet by tag and the GPUs bill on. A
+    timeout is therefore reported as a failed ``ray down``, not raised.
     """
     log.info("Tearing down Ray cluster")
-    result = subprocess.run(["ray", "down", cluster_yaml, "-y"], check=False)
+    try:
+        result = subprocess.run(["ray", "down", cluster_yaml, "-y"], check=False, timeout=RAY_DOWN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "ray down did not finish within %ds — treating as failed so the caller falls "
+            "back to terminating instances by ray-cluster-name tag.",
+            RAY_DOWN_TIMEOUT_S,
+        )
+        return False
     if result.returncode == 0:
         log.info("Ray cluster stopped")
         return True
@@ -526,6 +689,7 @@ def ray_cluster(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     *,
     ami_ssm_name: str,
+    ami_id: str | None = None,
     ray_address: str | None = None,
     cluster_yaml: str | Path | None = None,
     cluster_name: str | None = None,
@@ -537,6 +701,7 @@ def ray_cluster(
     code_suffix: str = "",
     cloudwatch_log_group: str = DEFAULT_CLOUDWATCH_LOG_GROUP,
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
+    idle_timeout_minutes: int | None = None,
 ) -> Iterator[str | None]:
     """Provision an AWS-backed Ray cluster; tear it down on exit.
 
@@ -553,7 +718,12 @@ def ray_cluster(
         log: Logger.
         ami_ssm_name: SSM parameter name holding the worker AMI ID.
             Required even when ``ray_address`` is given (kept as a
-            consistent signature; ignored in that path).
+            consistent signature; ignored in that path). Used only when
+            ``ami_id`` is not given.
+        ami_id: Pre-resolved AMI ID that PINS the worker image (bypasses the
+            ``ami_ssm_name`` lookup). The campaign threads the AMI it resolved
+            once into every fill so a mid-campaign re-bake can't boot a
+            different image than the fill's staging fingerprint recorded.
         ray_address: Connect to an existing cluster instead of launching one.
         cluster_yaml: Path to the cluster YAML template. Defaults to the
             template shipped at :data:`DEFAULT_CLUSTER_TEMPLATE`.
@@ -572,6 +742,9 @@ def ray_cluster(
         code_suffix: Filename suffix for the tarball.
         cloudwatch_log_group: CloudWatch log group for Ray agent logs.
         cloudwatch_template: CloudWatch agent JSON template path.
+        idle_timeout_minutes: Optional override of the template's autoscaler
+            idle-down delay; ``None`` keeps the template's value. Rationale at
+            :func:`_resolve_ray_config`.
 
     Yields:
         Path to the resolved cluster YAML tempfile when this context
@@ -614,6 +787,7 @@ def ray_cluster(
                 cluster_yaml,
                 region=region,
                 ami_ssm_name=ami_ssm_name,
+                ami_id=ami_id,
                 ssm_prefix=ssm_prefix,
                 cluster_name=cluster_name,
                 instance_tags=instance_tags,
@@ -621,6 +795,7 @@ def ray_cluster(
                 code_suffix=code_suffix,
                 cloudwatch_log_group=cloudwatch_log_group,
                 cloudwatch_template=cloudwatch_template,
+                idle_timeout_minutes=idle_timeout_minutes,
             )
             head_ip = _start_ray_cluster(resolved_yaml, log)
             head_address = f"ray://{head_ip}:10001"

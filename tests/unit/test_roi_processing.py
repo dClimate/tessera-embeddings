@@ -52,30 +52,32 @@ class TestApplyROIMask:
         mask_2d = da.from_array(np.array([[True, False], [False, True]]), chunks=(2, 2))
 
         with patch("tessera_embeddings.ingest.roi_processing.read_roi_mask", return_value=mask_2d):
-            result, pixel_count = apply_roi_mask(ds, "fake.zarr", {"northing": 2, "easting": 2})
+            result = apply_roi_mask(ds, "fake.zarr", {"northing": 2, "easting": 2})
 
-        assert pixel_count == 2
         red = result["red"].compute().values[0]
         np.testing.assert_array_equal(red, [[10, 0], [0, 40]])
         green = result["green"].compute().values[0]
         np.testing.assert_array_equal(green, [[10, 0], [0, 40]])
 
-    def test_returns_correct_pixel_count(self):
-        """roi_pixel_count should equal the sum of True pixels in the mask."""
+    def test_masking_is_lazy(self):
+        """Nothing may compute here: both sensors call this once per date.
+
+        Counts computes rather than inspecting the return value, so eagerness fails
+        wherever it is reintroduced.
+        """
         band = np.ones((1, 4, 4), dtype=np.int16)
         ds = _make_dataset({"band": band})
+        mask_2d = da.from_array(np.ones((4, 4), dtype=bool), chunks=(4, 4))
 
-        # 6 of 16 pixels inside ROI
-        mask_np = np.zeros((4, 4), dtype=bool)
-        mask_np[0, :2] = True
-        mask_np[1, :2] = True
-        mask_np[2, :2] = True
-        mask_2d = da.from_array(mask_np, chunks=(4, 4))
+        computes = []
+        with (
+            patch("tessera_embeddings.ingest.roi_processing.read_roi_mask", return_value=mask_2d),
+            patch.object(da.Array, "compute", lambda self, **kw: computes.append(1)),
+        ):
+            out = apply_roi_mask(ds, "fake.zarr", {"northing": 4, "easting": 4})
 
-        with patch("tessera_embeddings.ingest.roi_processing.read_roi_mask", return_value=mask_2d):
-            _, pixel_count = apply_roi_mask(ds, "fake.zarr", {"northing": 4, "easting": 4})
-
-        assert pixel_count == 6
+        assert computes == [], f"apply_roi_mask computed eagerly {len(computes)} time(s)"
+        assert isinstance(out, xr.Dataset)
 
     def test_custom_fill_value(self):
         """fill_value should replace pixels outside the ROI mask."""
@@ -85,7 +87,7 @@ class TestApplyROIMask:
         mask_2d = da.from_array(np.array([[True, False], [False, True]]), chunks=(2, 2))
 
         with patch("tessera_embeddings.ingest.roi_processing.read_roi_mask", return_value=mask_2d):
-            result, _ = apply_roi_mask(ds, "fake.zarr", {"northing": 2, "easting": 2}, fill_value=-9999)
+            result = apply_roi_mask(ds, "fake.zarr", {"northing": 2, "easting": 2}, fill_value=-9999)
 
         red = result["red"].compute().values[0]
         np.testing.assert_array_equal(red, [[10, -9999], [-9999, 40]])

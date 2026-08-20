@@ -41,6 +41,21 @@ class MosaicChunkInferenceDataset:
         num_obs_checkpoints: Sorted bucket sizes. A pixel with ``k`` valid
             observations is mapped to the smallest checkpoint ``>= k``.
         s1_orbit: Which S1 orbit direction(s) are active. Only affects logging.
+            ``"none"`` means radar-free land, where every pixel takes the
+            ``allow_s2_only`` branch below.
+        allow_s2_only: Keep S2-valid pixels with ZERO S1 observations (sub-zone
+            SAR coverage gaps, or an ROI with no radar at all). They land in the
+            smallest S1 bucket and receive the upstream v1.1 missing-S1 input: an
+            all-zeros normalized-space S1 slice (``resample_s1_bucket``
+            zero-count rows == ucam-eo/tessera's ``_sample_s1_merged`` zero
+            return). Default False: such pixels are skipped entirely (no
+            embedding — this pipeline's historical gate).
+        optical_min_obs: Minimum valid optical observations for a pixel to be embedded at
+            all. ``None`` embeds every pixel that has any optical input, which is the
+            historical behaviour and what every non-campaign caller wants. A positive value
+            refuses thinner pixels, which is **not** a filter a consumer can undo: the
+            refused pixel has no embedding, so recovering it means re-running its shard.
+            Zero is rejected rather than treated as "off" — see ``__init__``.
         stats: Band normalisation statistics, from
             :func:`config.inference.band_stats`. Defaults to the v1.1 AWS stats.
             Each model version standardises with the stats it was trained on, so
@@ -52,11 +67,24 @@ class MosaicChunkInferenceDataset:
         self,
         chunk_data: ChunkData,
         num_obs_checkpoints: tuple[int, ...] = DEFAULT_NUM_OBS_CHECKPOINTS,
-        s1_orbit: Literal["ascending", "descending", "both"] = "both",
+        s1_orbit: Literal["ascending", "descending", "both", "none"] = "both",
+        allow_s2_only: bool = False,
+        optical_min_obs: int | None = None,
         stats: dict[str, list[float]] | None = None,
     ) -> None:
+        if optical_min_obs is not None and optical_min_obs <= 0:
+            # Zero would refuse nothing while reading as a configured rule, so a caller that
+            # meant "no minimum" and a caller whose config silently resolved to 0 would be
+            # indistinguishable — and the second is a campaign publishing under no rule while
+            # believing it has one.
+            raise ValueError(
+                f"optical_min_obs={optical_min_obs} refuses nothing — pass None for no minimum, "
+                "or a positive number of observations."
+            )
         self.num_obs_checkpoints = _normalize_obs_checkpoints(num_obs_checkpoints)
         self.s1_orbit = s1_orbit
+        self.allow_s2_only = allow_s2_only
+        self.optical_min_obs = optical_min_obs
         self.H = chunk_data.height
         self.W = chunk_data.width
 
@@ -105,7 +133,32 @@ class MosaicChunkInferenceDataset:
             s1_desc_valid = np.any(s1_desc != 0, axis=-1).sum(axis=0).astype(np.int32)
         s1_total_valid = s1_asc_valid + s1_desc_valid
 
-        valid_mask = s2_nonzero & (s2_valid_count > 0) & (s1_total_valid > 0)
+        # A pixel needs real S2 to embed at all. The S1 term is the optional part:
+        # by default a pixel with zero S1 observations is skipped (historical gate);
+        # with allow_s2_only it is kept and flows through as the upstream v1.1
+        # missing-S1 convention (all-zeros normalized S1 slice, smallest bucket via
+        # compute_bin_keys' clip). Per-pixel provenance stays exact either way —
+        # s1_asc/desc_obs_count are written as 0 for these pixels.
+        # THREE refusal reasons, kept apart rather than folded into one boolean: a pixel can
+        # fail for having no optical input at all, for having too little of it, or for having no
+        # radar. Downstream records count them separately — one is a property of the imagery, one
+        # is this campaign's quality rule, and one is a coverage fact — and a caller cannot
+        # recover the distinction from a single mask.
+        has_optical = s2_nonzero & (s2_valid_count > 0)
+        deep_enough = (
+            np.ones_like(has_optical) if self.optical_min_obs is None else s2_valid_count >= self.optical_min_obs
+        )
+        has_radar = s1_total_valid > 0
+
+        valid_mask = has_optical & deep_enough
+        if not self.allow_s2_only:
+            valid_mask &= has_radar
+        # Kept for the per-chunk record: eligible-but-refused, by reason. "Thin" counts only
+        # pixels that HAD optical and lost on depth, so the two optical reasons partition rather
+        # than overlap, and their sum is the optical refusal total.
+        self.refused_no_optical = int((~has_optical).sum())
+        self.refused_thin = int((has_optical & ~deep_enough).sum())
+        self.refused_no_radar = 0 if self.allow_s2_only else int((has_optical & deep_enough & ~has_radar).sum())
         rows, cols = np.where(valid_mask)
 
         self._rows = rows

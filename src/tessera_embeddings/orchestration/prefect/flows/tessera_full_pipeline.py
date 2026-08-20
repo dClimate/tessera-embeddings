@@ -84,6 +84,7 @@ async def tessera_full_pipeline(
     num_actors: int | None = None,
     # Behaviour
     s1_orbit: str = "both",
+    allow_s2_only: bool = False,
     skip_coverage_check: bool = False,
     ami_ssm_name: str = "/tessera/ray/ami-id",
     ssm_prefix: str = "/tessera/ray/",
@@ -112,6 +113,11 @@ async def tessera_full_pipeline(
         num_actors: Override for Ray GPU actor count.
         s1_orbit: SAR orbit direction — ``"ascending"``, ``"descending"``,
             or ``"both"``. ``"both"`` ingests both orbits concurrently.
+        allow_s2_only: Forwarded to the embeddings stage: embed S2-valid pixels
+            that have ZERO S1 observations (sub-zone SAR coverage gaps) via the
+            upstream v1.1 missing-S1 convention instead of skipping them.
+            Default False (historical behaviour); quality is unvalidated for
+            this S1-trained checkpoint — see the optional-S1 ADR.
         skip_coverage_check: Skip the time-window coverage validation
             on the embeddings stage.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
@@ -245,6 +251,7 @@ async def tessera_full_pipeline(
             "code_suffix": code_suffix,
             "num_actors": num_actors,
             "s1_orbit": s1_orbit,
+            "allow_s2_only": allow_s2_only,
             "dev_params": {
                 "skip_coverage_check": skip_coverage_check,
                 "sync_source_path": sync_source_path,

@@ -99,17 +99,57 @@ class TestPkgLoggerSetup:
         configure_gdal_environment()
         assert restore_pkg_logger.level == logging.INFO
 
-    def test_attaches_a_handler(self, monkeypatch, restore_pkg_logger):
-        """A StreamHandler is attached when the package logger has none."""
+    def test_attaches_a_handler_when_nothing_else_will_emit(self, monkeypatch, restore_pkg_logger):
+        """Standalone (bare root logger): we are the only emitter, so attach one.
+
+        Root is patched rather than cleared in a fixture: pytest's logging plugin
+        re-attaches its own root handler for the call phase, after fixtures run.
+        """
         monkeypatch.delenv("SRC_LOG_LEVEL", raising=False)
+        monkeypatch.setattr(logging.root, "handlers", [])
         restore_pkg_logger.handlers[:] = []
         configure_gdal_environment()
         assert len(restore_pkg_logger.handlers) == 1
         assert isinstance(restore_pkg_logger.handlers[0], logging.StreamHandler)
 
+    def test_no_handler_when_the_root_logger_is_already_configured(self, monkeypatch, restore_pkg_logger):
+        """Under Prefect (or any basicConfig caller) we must NOT add a second emitter.
+
+        Prefect puts a PrefectConsoleHandler on the ROOT logger and our records
+        reach it by propagation. Attaching our own handler too emitted every line
+        twice to CloudWatch in two formats — a 2x on log ingest at campaign scale
+        that also silently inflated any line-counting analysis.
+        """
+        monkeypatch.delenv("SRC_LOG_LEVEL", raising=False)
+        restore_pkg_logger.handlers[:] = []
+        monkeypatch.setattr(logging.root, "handlers", [logging.NullHandler()])  # stand-in for Prefect's
+        configure_gdal_environment()
+        assert restore_pkg_logger.handlers == []
+        assert restore_pkg_logger.level == logging.INFO  # the LEVEL still applies
+
+    def test_one_record_reaches_one_handler_under_prefect(self, monkeypatch, restore_pkg_logger):
+        """End-to-end: a module log line is emitted exactly once, not twice."""
+        monkeypatch.delenv("SRC_LOG_LEVEL", raising=False)
+        restore_pkg_logger.handlers[:] = []
+
+        class _Counter(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.n = 0
+
+            def emit(self, record):
+                self.n += 1
+
+        counter = _Counter()
+        monkeypatch.setattr(logging.root, "handlers", [counter])
+        configure_gdal_environment()
+        logging.getLogger("tessera_embeddings.some_module").info("hello")
+        assert counter.n == 1
+
     def test_does_not_add_duplicate_handlers(self, monkeypatch, restore_pkg_logger):
         """Repeated calls must not stack duplicate handlers (the `if not handlers` guard)."""
         monkeypatch.delenv("SRC_LOG_LEVEL", raising=False)
+        monkeypatch.setattr(logging.root, "handlers", [])
         restore_pkg_logger.handlers[:] = []
         configure_gdal_environment()
         configure_gdal_environment()

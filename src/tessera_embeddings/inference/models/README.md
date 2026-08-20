@@ -52,10 +52,12 @@ documented in its docstring).
 
 ## What not to touch
 
-- **`modules.py`**: `V11TransformerEncoder`, `TemporalPositionalEncoder`, `AttentionPooling`,
-  `TemporalAwarePooling`, `ProjectionHead` — these define the exact architecture the
-  v1.1 checkpoint was trained with. Changing layer dimensions, activation functions, or the
-  forward pass will break checkpoint loading.
+- **`modules.py`**: `V11TransformerEncoder`, `TemporalPositionalEncoder`,
+  `TemporalEncoding`, `TemporalAwarePooling`, and the `CustomGRU` / `CustomGRUCell`
+  pair — these define the exact architecture the v1.1 checkpoint was trained with.
+  Changing layer dimensions, activation functions, or the forward pass will break
+  checkpoint loading. (`TransformerEncoder` was renamed `V11TransformerEncoder` when
+  v2 arrived, so the two versions' encoders can sit side by side.)
 
 - **`ssl_model.py`**: `MultimodalBTInferenceModel` (the shared inference wrapper)
   and `build_dim_reducer` (v1.1 reducer). The fusion method (`concat` vs `sum`) and

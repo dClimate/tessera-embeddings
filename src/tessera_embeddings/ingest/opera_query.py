@@ -12,9 +12,8 @@ import logging
 import re
 import time
 import warnings
-from collections import defaultdict
+from collections import Counter
 from collections.abc import Callable
-from datetime import UTC, datetime
 from typing import Any
 
 import mgrs
@@ -26,6 +25,7 @@ from requests.adapters import HTTPAdapter
 from tessera_embeddings.config import S1_OPERA_BANDS
 from tessera_embeddings.ingest._http import make_logging_retry
 from tessera_embeddings.ingest.auth import get_edl_session, resolve_item_assets, rewrite_assets_to_s3
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +41,20 @@ _CMR_OPERA_SHORT_NAME = "OPERA_L2_RTC-S1_V1"
 _CMR_PROVIDER = "ASF"
 _CMR_PAGE_SIZE = 2000
 
+#: Polarisation required of every granule, filtered server-side.
+#:
+#: Co-pol only: CMR matches a multi-valued attribute if ANY value matches, so requiring VV
+#: admits every VV+VH granule while excluding the HH/HV ones outright. Requiring VH as well
+#: would be redundant, and requiring it INSTEAD would admit nothing that VV does not.
+_REQUIRED_POLARIZATION = "VV"
+
 # Granule data links carry the per-band COG download URLs. The ``rel`` ends
-# in ``/data#`` and the HTTPS href ends in ``_<BAND>.tif`` (BAND ∈ VV/VH/mask).
+# in ``/data#`` and the HTTPS href ends in ``_<BAND>.tif``. HH/HV are matched
+# for RECOGNITION ONLY (EW-mode polar granules carry them instead of VV/VH) so
+# the skip log can say what a rejected granule actually had — the pipeline
+# still ingests exclusively dual-pol VV+VH (``S1_OPERA_BANDS``).
 _CMR_DATA_REL_SUFFIX = "/data#"
-_BAND_HREF_RE = re.compile(r"_(VV|VH|mask)\.tif$")
+_BAND_HREF_RE = re.compile(r"_(VV|VH|HH|HV|mask)\.tif$")
 
 
 # CMR intermittently times out or returns 5xx under load. urllib3's Retry
@@ -120,40 +130,28 @@ def mgrs_tile_to_utm_epsg(tile_id: str) -> str:
         return f"EPSG:327{zone_number:02d}"
 
 
-def normalize_opera_timestamps(items: list[Any]) -> list[Any]:
-    """Normalize OPERA item datetimes so bursts on the same date share a timestamp.
+def normalize_opera_timestamps(items: list[Any], *, mid_longitude: float | None = None) -> list[Any]:
+    """Stamp OPERA burst granules with noon UTC of the **solar day** they belong to.
 
-    OPERA RTC-S1 products are individual burst granules. A single MGRS tile
-    bbox query returns ~10 bursts per date, each with a slightly different
-    sub-second timestamp. When passed to odc.stac.load, each burst becomes
-    a separate time step instead of being mosaicked into one.
+    A thin wrapper over
+    :func:`~tessera_embeddings.ingest.solar_days.normalize_to_solar_day`, kept because the
+    OPERA reason for normalising is its own: a single bbox query returns ~10 burst granules
+    per pass, each with a slightly different sub-second timestamp, and ``odc.stac.load``
+    would make every burst its own time step instead of mosaicking them. Sharing one
+    timestamp is what merges them.
 
-    This function groups items by date (YYYY-MM-DD) and sets all items in
-    each group to noon UTC of that date. odc.stac.load then auto-mosaics
-    spatially overlapping items sharing the same timestamp into a single
-    time step.
-
-    Args:
-        items: List of pystac Items with datetime attributes.
-
-    Returns:
-        The same items with datetimes normalized (modified in-place).
+    **This grouped by UTC DATE until 2026-07-30, and that made the whole solar-day
+    apparatus on the S1 path inert.** Everything downstream — ownership, footprint
+    derivation, the written label — derived its "solar day" from a timestamp that had
+    already been flattened to noon of the UTC date, so it recovered the UTC date and
+    nothing else. Radar was therefore labelled in UTC while optical was labelled in solar
+    days, and in a high-offset zone the same calendar label in the two stores meant
+    different 24-hour windows that inference then paired per pixel.
     """
-    groups: dict[str, list[Any]] = defaultdict(list)
-    for item in items:
-        date_key = item.datetime.strftime("%Y-%m-%d")
-        groups[date_key].append(item)
-
-    for date_str, group in groups.items():
-        year, month, day = (int(p) for p in date_str.split("-"))
-        canonical = datetime(year, month, day, 12, 0, 0, tzinfo=UTC)
-        for item in group:
-            item.datetime = canonical
-
-    return items
+    return normalize_to_solar_day(items, mid_longitude=mid_longitude)
 
 
-def _granule_to_item(entry: dict[str, Any]) -> Item | None:
+def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = None) -> Item | None:
     """Build a pystac ``Item`` from one CMR granule search entry.
 
     Maps the granule's data download links onto the ``S1_OPERA_BANDS`` asset
@@ -162,14 +160,23 @@ def _granule_to_item(entry: dict[str, Any]) -> Item | None:
     dtype, nodata, and CRS from the COGs themselves (we pass an explicit
     geobox), so only the band hrefs, id, datetime, geometry, and bbox matter.
 
+    Only dual-pol VV+VH granules are accepted — a partial-pol granule would
+    otherwise ingest a fabricated all-nodata band that the encoder reads as a
+    confident physical signal (see the optional-S1 ADR). The skip log names
+    what WAS found (``VV-only``, EW-mode ``HH/HV``, …) so regional data loss
+    is quantifiable; ``skip_counts`` (optional) accumulates the same
+    categories for a per-query summary.
+
     Args:
         entry: One element of ``feed.entry`` from the CMR granule search JSON.
+        skip_counts: Optional counter of skip categories, incremented on skip.
 
     Returns:
-        A pystac ``Item``, or ``None`` if the entry lacks the expected VV/VH
-        data links (e.g. a non-RTC product slipped through the query).
+        A pystac ``Item``, or ``None`` if the entry lacks BOTH VV and VH data
+        links (single-pol granule, EW-mode HH/HV granule, or a non-RTC product
+        that slipped through the query).
     """
-    # Map band suffix (VV/VH) -> datapool HTTPS href from the data links.
+    # Map band suffix (VV/VH/HH/HV) -> datapool HTTPS href from the data links.
     band_hrefs: dict[str, str] = {}
     for link in entry.get("links", []):
         if not link.get("rel", "").endswith(_CMR_DATA_REL_SUFFIX):
@@ -187,7 +194,32 @@ def _granule_to_item(entry: dict[str, Any]) -> Item | None:
             assets[band_key] = Asset(href=href, roles=["data"])
 
     if len(assets) < len(S1_OPERA_BANDS):
-        logger.warning("Skipping granule %s: missing VV/VH data links", entry.get("title", "<unknown>"))
+        pols = sorted(k for k in band_hrefs if k != "mask")
+        if {"HH", "HV"} & set(pols):
+            # NOT "EW-mode": this said so speculatively for a while and cost real
+            # investigation time. Checked against CMR, the Greenland granules carrying HH/HV
+            # report BEAM_MODE=IW, and a BEAM_MODE=EW query over that region returns nothing.
+            # Cross-pol is a choice of polarisation, not of swath mode — so name only what
+            # was observed.
+            category = f"{'/'.join(pols)} (cross-pol, no VV+VH)"
+        elif pols:
+            category = f"{'/'.join(pols)}-only"
+        else:
+            category = "no data links"
+        if skip_counts is not None:
+            skip_counts[category] += 1
+        # A SAFETY NET now, not the primary filter: the query already excludes granules whose
+        # POLARIZATION lacks VV, so reaching here means one advertised VV in its metadata and
+        # then did not publish the band pair. That is a catalogue inconsistency worth seeing,
+        # which is why it stays at WARNING — but it should now be rare, and a burst of these
+        # means something changed upstream rather than that this region is cross-pol.
+        logger.warning(
+            "Skipping granule %s: CMR reported %s but the published bands are %s — needs "
+            "both VV and VH, so this granule is inconsistent with its own metadata",
+            entry.get("title", "<unknown>"),
+            _REQUIRED_POLARIZATION,
+            pols or "none",
+        )
         return None
 
     # OPERA polygons are space-separated "lat lon lat lon ..." rings; pystac /
@@ -233,13 +265,15 @@ def _query_cmr_granules(
 ) -> list[Item]:
     """Query the CMR Granule Search API for OPERA items in a bbox/date/orbit.
 
-    Pages cleanly at ``_CMR_PAGE_SIZE`` against ``cmr.earthdata.nasa.gov``,
-    using the ``CMR-Search-After`` header for pagination and ``attribute[]``
-    for server-side orbit-direction filtering. Returns fully-built pystac
-    ``Item`` objects so callers never touch CMR-STAC search.
+    CMR's ``bounding_box`` is lower-left/upper-right (west,south,east,north) and
+    does NOT read a west>east box as antimeridian-crossing — it would match
+    nothing. An ROI whose live-tile envelope crosses ±180° (zones 01*/60*) is
+    stored with a GeoJSON-style west>east bbox (see ``land_mask.export_zone_roi``),
+    so here we split it at the antimeridian into two CMR-valid boxes and merge
+    (dedup by granule id). A normal box queries once.
 
     Args:
-        bbox: (west, south, east, north) in WGS84 degrees.
+        bbox: (west, south, east, north) in WGS84 degrees; west>east = crosses ±180°.
         start_date: Start date (YYYY-MM-DD).
         end_date: End date (YYYY-MM-DD).
         orbit_direction: "ascending" or "descending".
@@ -247,17 +281,58 @@ def _query_cmr_granules(
     Returns:
         List of pystac ``Item`` objects matching the orbit direction.
     """
-    params: dict[str, str | int] = {
+    west, south, east, north = bbox
+    if west > east:
+        left = _query_cmr_granules_one((west, south, 180.0, north), start_date, end_date, orbit_direction)
+        right = _query_cmr_granules_one((-180.0, south, east, north), start_date, end_date, orbit_direction)
+        merged: list[Item] = []
+        seen: set[str] = set()
+        for item in (*left, *right):
+            if item.id not in seen:
+                seen.add(item.id)
+                merged.append(item)
+        logger.info(
+            f"CMR granule query ({orbit_direction}): antimeridian bbox split into 2 → "
+            f"{len(merged)} unique items ({len(left)}+{len(right)} pre-dedup)"
+        )
+        return merged
+    return _query_cmr_granules_one(bbox, start_date, end_date, orbit_direction)
+
+
+def _query_cmr_granules_one(
+    bbox: tuple[float, float, float, float],
+    start_date: str,
+    end_date: str,
+    orbit_direction: str,
+) -> list[Item]:
+    """Query CMR for OPERA items in ONE (west<=east) bbox, paging all results.
+
+    Pages cleanly at ``_CMR_PAGE_SIZE`` against ``cmr.earthdata.nasa.gov``,
+    using the ``CMR-Search-After`` header for pagination and ``attribute[]``
+    for server-side orbit-direction filtering.
+    """
+    # BOTH filters server-side. The polarisation one is what stops us paying to page
+    # granules we will always reject: ingest needs dual-pol VV+VH, so a granule whose
+    # POLARIZATION does not include VV can never qualify, and asking CMR to exclude them
+    # discards nothing reachable. Measured on zone 23N, whose land is all Greenland: 138,276
+    # granules paged over ~160 s per orbit-year, every one rejected client-side, become 0
+    # returned immediately. A list value is how requests encodes a repeated query parameter —
+    # a dict cannot hold two "attribute[]" keys.
+    params: dict[str, str | int | list[str]] = {
         "short_name": _CMR_OPERA_SHORT_NAME,
         "provider": _CMR_PROVIDER,
         "bounding_box": ",".join(str(c) for c in bbox),
         "temporal": f"{start_date}T00:00:00Z,{end_date}T23:59:59Z",
         "page_size": _CMR_PAGE_SIZE,
-        "attribute[]": f"string,ASCENDING_DESCENDING,{orbit_direction.upper()}",
+        "attribute[]": [
+            f"string,ASCENDING_DESCENDING,{orbit_direction.upper()}",
+            f"string,POLARIZATION,{_REQUIRED_POLARIZATION}",
+        ],
     }
 
     items: list[Item] = []
     headers: dict[str, str] = {}
+    skip_counts: Counter[str] = Counter()
 
     logger.info(f"CMR granule query ({orbit_direction}) starting for {start_date}..{end_date} bbox={bbox}")
     t0 = time.monotonic()
@@ -273,7 +348,7 @@ def _query_cmr_granules(
         if not entries:
             break
 
-        items.extend(item for item in (_granule_to_item(e) for e in entries) if item is not None)
+        items.extend(item for item in (_granule_to_item(e, skip_counts) for e in entries) if item is not None)
         logger.info(
             f"CMR granule query ({orbit_direction}): page {page} returned {len(entries)} entries "
             f"({len(items)} items so far, {time.monotonic() - t0:.1f}s)"
@@ -289,6 +364,19 @@ def _query_cmr_granules(
         f"CMR granule query ({orbit_direction}): {len(items)} items across {page} page(s) "
         f"in {time.monotonic() - t0:.1f}s"
     )
+    if skip_counts:
+        # These SURVIVED the server-side VV filter and were still unusable, so the count is no
+        # longer a measure of how cross-pol a region is — it is a measure of catalogue
+        # inconsistency. Before the filter this line routinely reported six figures over polar
+        # land and read as normal; a non-trivial count here now is a genuine anomaly.
+        logger.warning(
+            "CMR granule query (%s): %d granule(s) passed the %s filter but published no "
+            "VV+VH pair: %s — inconsistent metadata upstream, not a regional coverage fact",
+            orbit_direction,
+            sum(skip_counts.values()),
+            _REQUIRED_POLARIZATION,
+            dict(sorted(skip_counts.items())),
+        )
     return items
 
 
@@ -298,6 +386,8 @@ def make_s1_item_provider(
     start_date: str,
     end_date: str,
     use_s3_direct: bool = True,
+    *,
+    mid_longitude: float | None = None,
 ) -> Callable[[], list[Item]]:
     """Create an item_provider_fn that builds OPERA items from the native CMR granule API.
 
@@ -327,6 +417,9 @@ def make_s1_item_provider(
             URIs for direct in-region bucket access. When False, resolve each
             asset through ASF's OAuth redirect chain to obtain a CloudFront
             signed URL.
+        mid_longitude: ROI geobox centroid longitude, used to stamp each granule with
+            the SOLAR day it belongs to. Supply it whenever the loader groups by solar
+            day — which the campaign always does. Omitting it groups by UTC date.
 
     Returns:
         Zero-argument callable that returns a list of ready-to-load pystac Items.
@@ -354,7 +447,7 @@ def make_s1_item_provider(
             for item in items:
                 resolve_item_assets(session, item, S1_OPERA_BANDS)
 
-        normalize_opera_timestamps(items)
+        normalize_opera_timestamps(items, mid_longitude=mid_longitude)
         return items
 
     return provide_items

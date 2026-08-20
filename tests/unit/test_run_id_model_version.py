@@ -22,45 +22,54 @@ from tessera_embeddings.orchestration.prefect.flows.tessera_embeddings import (
 )
 
 
+def _run_id(previous_run_id, *, model_version):
+    """``_resolve_run_id`` with the S2-only axis held at its default.
+
+    That axis is exercised in ``test_s2_only_flow_wiring``; pinning it here keeps every
+    assertion below a statement about the ENCODER prefix alone.
+    """
+    return _resolve_run_id(previous_run_id, model_version=model_version, allow_s2_only=False, assembly_only=False)
+
+
 def test_fresh_v11_run_keeps_the_historical_bare_uuid():
     """The single-model path must be untouched by this change."""
-    run_id = _resolve_run_id(None, model_version="v1.1")
+    run_id = _run_id(None, model_version="v1.1")
     assert not run_id.startswith(V2_RUN_PREFIX)
     assert len(run_id) == 12
 
 
 def test_fresh_v2_run_is_namespaced():
-    assert _resolve_run_id(None, model_version="v2-large").startswith(V2_RUN_PREFIX)
+    assert _run_id(None, model_version="v2-large").startswith(V2_RUN_PREFIX)
 
 
 def test_fresh_run_ids_are_unique():
-    ids = {_resolve_run_id(None, model_version="v2-large") for _ in range(50)}
+    ids = {_run_id(None, model_version="v2-large") for _ in range(50)}
     assert len(ids) == 50
 
 
 @pytest.mark.parametrize("model_version", ["v1.1", "v2-large"])
 def test_resuming_with_the_matching_model_is_allowed(model_version):
-    original = _resolve_run_id(None, model_version=model_version)
-    assert _resolve_run_id(original, model_version=model_version) == original
+    original = _run_id(None, model_version=model_version)
+    assert _run_id(original, model_version=model_version) == original
 
 
 def test_resuming_a_v2_run_as_v11_is_refused():
     """The defect: v2 staging finished by the v1.1 encoder and stamped v1.1."""
-    v2_run = _resolve_run_id(None, model_version="v2-large")
+    v2_run = _run_id(None, model_version="v2-large")
     with pytest.raises(ValueError, match="staged by v2"):
-        _resolve_run_id(v2_run, model_version="v1.1")
+        _run_id(v2_run, model_version="v1.1")
 
 
 def test_resuming_a_v11_run_as_v2_is_refused():
-    v11_run = _resolve_run_id(None, model_version="v1.1")
+    v11_run = _run_id(None, model_version="v1.1")
     with pytest.raises(ValueError, match=r"staged by v1\.1"):
-        _resolve_run_id(v11_run, model_version="v2-large")
+        _run_id(v11_run, model_version="v2-large")
 
 
 def test_error_names_both_versions_so_the_fix_is_obvious():
-    v2_run = _resolve_run_id(None, model_version="v2-large")
+    v2_run = _run_id(None, model_version="v2-large")
     with pytest.raises(ValueError) as exc:
-        _resolve_run_id(v2_run, model_version="v1.1")
+        _run_id(v2_run, model_version="v1.1")
     msg = str(exc.value)
     assert v2_run in msg
     assert "v1.1" in msg and "v2" in msg

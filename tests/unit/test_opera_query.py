@@ -1,5 +1,7 @@
 """Unit tests for opera_query.py - OPERA RTC-S1 query utilities."""
 
+import logging
+from collections import Counter
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
@@ -214,6 +216,35 @@ class TestGranuleToItem:
         """A granule lacking a VV or VH data link is skipped."""
         assert _granule_to_item(_granule_entry("g1", bands=("VV",))) is None
 
+    def test_skip_reports_polarizations_found(self, caplog):
+        """The counter names WHAT was published, so an anomaly is quantifiable per query.
+
+        Since the query filters POLARIZATION server-side, anything reaching here advertised VV
+        in its metadata and then published something else — a catalogue inconsistency rather
+        than a regional coverage fact, which is what the message now says.
+
+        The cross-pol label deliberately does NOT claim EW mode. It used to read
+        "(EW-mode?)", and that guess cost real investigation time: checked against CMR, the
+        Greenland granules carrying HH/HV report BEAM_MODE=IW, and a BEAM_MODE=EW query over
+        that region returns nothing. Cross-pol is a polarisation choice, not a swath mode.
+        """
+        skip_counts: Counter[str] = Counter()
+        with caplog.at_level(logging.WARNING):
+            assert _granule_to_item(_granule_entry("g-vv", bands=("VV",)), skip_counts) is None
+            assert _granule_to_item(_granule_entry("g-xpol", bands=("HH", "HV")), skip_counts) is None
+            assert _granule_to_item(_granule_entry("g-none", bands=()), skip_counts) is None
+            # Dual-pol is accepted and never counted.
+            assert _granule_to_item(_granule_entry("g-ok"), skip_counts) is not None
+        assert skip_counts == {
+            "VV-only": 1,
+            "HH/HV (cross-pol, no VV+VH)": 1,
+            "no data links": 1,
+        }
+        assert "EW-mode" not in caplog.text, "the swath-mode guess must not come back"
+        assert "the published bands are ['VV']" in caplog.text
+        assert "the published bands are ['HH', 'HV']" in caplog.text
+        assert "the published bands are none" in caplog.text
+
     def test_handles_missing_polygon(self):
         item = _granule_to_item(_granule_entry("g1", with_ring=False))
         assert item is not None
@@ -235,13 +266,36 @@ class TestQueryCmrGranules:
         assert {item.id for item in items} == {"g-1", "g-2"}
         assert all(set(item.assets) == {"0_VV", "0_VH"} for item in items)
 
-    def test_passes_attribute_filter(self):
+    def test_passes_attribute_filters(self):
+        """BOTH filters, orbit and polarisation, and both server-side.
+
+        The polarisation one is a cost fix, not a correctness one: ingest needs dual-pol
+        VV+VH, so a granule whose POLARIZATION lacks VV is rejected client-side anyway. Asking
+        CMR to exclude them is what stops us paying to page them. Measured on the all-Greenland
+        zone 23N, a month's descending query went from 7.9 s over 138k rejected granules to
+        0.6 s over none, and on mixed zone 25N from 11.6 s to 2.7 s returning the SAME 2,799
+        usable items — which is the property that makes it safe.
+        """
         patcher, mock_get = _patch_cmr_session(return_value=_cmr_response([]))
         with patcher:
             _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "descending")
 
-        params = mock_get.call_args.kwargs["params"]
-        assert params["attribute[]"] == "string,ASCENDING_DESCENDING,DESCENDING"
+        # A list value is how requests encodes a REPEATED query parameter; a dict cannot hold
+        # two "attribute[]" keys, so a plain string here would silently drop one filter.
+        assert mock_get.call_args.kwargs["params"]["attribute[]"] == [
+            "string,ASCENDING_DESCENDING,DESCENDING",
+            "string,POLARIZATION,VV",
+        ]
+
+    def test_requires_co_pol_only(self):
+        """Requiring VH as well would be redundant; requiring it instead would admit nothing new.
+
+        CMR matches a multi-valued attribute if ANY value matches, so VV alone admits every
+        VV+VH granule.
+        """
+        from tessera_embeddings.ingest.opera_query import _REQUIRED_POLARIZATION
+
+        assert _REQUIRED_POLARIZATION == "VV"
 
     def test_paginates_with_cmr_search_after(self):
         page1 = _cmr_response(
@@ -256,6 +310,30 @@ class TestQueryCmrGranules:
         assert any(item.id == "g-final" for item in items)
         _, kwargs2 = mock_get.call_args_list[1]
         assert kwargs2["headers"]["CMR-Search-After"] == "token123"
+
+    def test_normal_bbox_queries_once(self):
+        """A west<east bbox issues a single CMR query (no antimeridian split)."""
+        with patch("tessera_embeddings.ingest.opera_query._query_cmr_granules_one", return_value=[]) as one:
+            _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
+        one.assert_called_once()
+
+    def test_antimeridian_bbox_splits_and_dedupes(self):
+        """A west>east (antimeridian) bbox is split at ±180 into two CMR-valid
+        boxes and their granules merged with dedup — CMR reads bounding_box as
+        lower-left/upper-right, so a single west>east query would match nothing.
+        """
+        calls: list[tuple] = []
+
+        def fake_one(bbox, start, end, orbit):
+            calls.append(bbox)
+            # West half returns g1; east half returns g1 (shared burst) + g2.
+            return [MagicMock(id="g1")] if bbox[0] >= 170.0 else [MagicMock(id="g1"), MagicMock(id="g2")]
+
+        with patch("tessera_embeddings.ingest.opera_query._query_cmr_granules_one", side_effect=fake_one):
+            items = _query_cmr_granules((170.0, -10.0, -170.0, 10.0), "2024-01-01", "2024-01-15", "ascending")
+
+        assert calls == [(170.0, -10.0, 180.0, 10.0), (-180.0, -10.0, -170.0, 10.0)]
+        assert {i.id for i in items} == {"g1", "g2"}  # shared granule deduped across halves
 
     def test_empty_response(self):
         patcher, _ = _patch_cmr_session(return_value=_cmr_response([]))

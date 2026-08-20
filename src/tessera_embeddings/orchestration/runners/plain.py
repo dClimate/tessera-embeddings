@@ -1,9 +1,9 @@
 """Orchestrator-free pipeline runner.
 
 Runs ROI generation → S2 + S1 ingestion → inference → assembly
-end-to-end using local Ray + local Dask. Proves layer separation
-is real — every step calls the same domain function the Prefect
-flows do.
+end-to-end using local Dask for ingest, local Ray for inference, and
+worker processes for assembly. Proves layer separation is real —
+every step calls the same domain function the Prefect flows do.
 
 Device is controlled by the ``device`` key in the YAML config
 (``"auto"`` | ``"cpu"`` | ``"cuda"``; default ``"auto"`` uses
@@ -27,7 +27,7 @@ from typing import Any, Literal
 import yaml
 from dask.distributed import Client
 
-from tessera_embeddings.config.dask import AssemblyConfig
+from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.inference import (
     DEFAULT_MODEL_VERSION,
     INFERENCE_CHUNK_SIZE,
@@ -43,7 +43,6 @@ from tessera_embeddings.inference.data_loading import _active_orbits, resolve_s1
 from tessera_embeddings.inference.orchestration_helpers import (
     build_inference_config,
     checkpoint_to_version,
-    compute_assembly_worker_counts,
     enumerate_mosaic_chunks,
     read_upstream_manifests,
 )
@@ -160,9 +159,10 @@ def _run_inference_and_assemble(
     checkpoint_url: str | None,
     model_version: ModelVersion,
     num_gpus: int,
+    allow_s2_only: bool = False,
     log: logging.Logger,
 ) -> dict[str, Any]:
-    """Run inference under local Ray, then assemble under local Dask."""
+    """Run inference under local Ray, then assemble with local worker processes."""
     inputs_bucket = paths.inputs
     output_bucket = paths.outputs
 
@@ -182,7 +182,20 @@ def _run_inference_and_assemble(
 
     # Probe for available SAR stores before dispatching inference; if s1_orbit="both"
     # is requested but only one orbit was ingested, fall back gracefully.
-    effective_orbit = resolve_s1_orbit(mosaic_base, s1_orbit)
+    #
+    # Radar is DEMANDED here, matching the single-cell flows: this runner exists to fill
+    # one named ROI on one machine, so no radar at all is far more likely to be a broken
+    # ingest than genuinely radar-free terrain, and the operator should be told.
+    #
+    # THERE IS NO ESCAPE HATCH, deliberately, and ``s1_orbit: none`` in the YAML is not
+    # one: it is refused here even though ``_run_ingest`` accepts it and writes
+    # reflectance alone. Honouring it would let a run that demanded radar publish
+    # optical-only embeddings and report success, which is the outcome ``require_s1``
+    # exists to prevent — pinned by ``test_asking_for_no_radar_while_demanding_radar_is
+    # _refused``. Radar-free land is filled through the campaign flows, which pass the
+    # resolved orbit back in with radar allowed. (An earlier version of this comment
+    # said a caller "passes s1_orbit explicitly"; that was never true of this runner.)
+    effective_orbit = resolve_s1_orbit(mosaic_base, s1_orbit, allow_none=False)
     config = build_inference_config(
         s1_orbit=effective_orbit,
         time_window=time_window,
@@ -191,6 +204,7 @@ def _run_inference_and_assemble(
         output_bucket=output_bucket,
         num_gpus=num_gpus,
         model_version=model_version,
+        allow_s2_only=allow_s2_only,
     )
 
     chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, config.chunk_size or INFERENCE_CHUNK_SIZE, log)
@@ -226,9 +240,9 @@ def _run_inference_and_assemble(
         msg = f"{len(failed)} chunks failed during inference"
         raise RuntimeError(msg)
 
-    # Assembly under local Dask
+    # Assembly: worker processes on this host (raw-zarr fork/merge — no Dask)
     n_live = len(live_chunks)
-    _min_workers, max_workers = compute_assembly_worker_counts(n_live, AssemblyConfig())
+    n_assembly_workers = AssemblyConfig().compute_n_workers(n_live)
     output_path = f"{output_bucket.rstrip('/')}/embeddings/{roi_name}.zarr"
     writer = ZarrWriter(staging_base)
     # Provenance id: the checkpoint filename stem, not the ModelVersion literal.
@@ -238,25 +252,25 @@ def _run_inference_and_assemble(
         model_checkpoint=checkpoint_id,
         num_obs_checkpoints=config.num_obs_checkpoints,
         upstream_manifests=upstream_manifests,
+        allow_s2_only=config.allow_s2_only,
     )
 
-    with _dask_client(min(2, max_workers)):
-        writer.assemble(
-            chunks,
-            total_y,
-            total_x,
-            run_id,
-            output_path,
-            roi_zarr_path=roi_path,
-            mosaic_base=mosaic_base,
-            log=log,
-            time_window=time_window,
-            tile_id=roi_name,
-            model_version=checkpoint_id,
-            encoder_version=config.model_version,
-            manifest=manifest,
-            n_workers=max_workers,
-        )
+    writer.assemble(
+        chunks,
+        total_y,
+        total_x,
+        run_id,
+        output_path,
+        roi_zarr_path=roi_path,
+        mosaic_base=mosaic_base,
+        log=log,
+        time_window=time_window,
+        tile_id=roi_name,
+        model_version=checkpoint_id,
+        encoder_version=config.model_version,
+        manifest=manifest,
+        n_workers=n_assembly_workers,
+    )
 
     return {
         "run_id": run_id,
@@ -280,13 +294,14 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
               name: my-roi
               geojson: examples/quickstart/roi.geojson    # optional
               resolution: 10.0
-              chunk_size: 2000
+              chunk_size: 2048
               force_crs: null                              # or "EPSG:32615"
             time_window_end: "June 2025"
             time_range:
               start: "2024-07-01"
               end: "2025-07-01"
             s1_orbit: ascending    # or "descending" or "both"
+            allow_s2_only: false   # embed S2-valid pixels with zero S1 observations
             n_workers: 2
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
             checkpoint_url: null    # full checkpoint URI (s3://, https://, …); overrides checkpoint_dir
@@ -367,6 +382,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         checkpoint_url=cfg.get("checkpoint_url"),
         model_version=cfg.get("model_version", DEFAULT_MODEL_VERSION),
         num_gpus=num_gpus,
+        allow_s2_only=cfg.get("allow_s2_only", False),
         log=log,
     )
     log.info("Pipeline complete: %s", summary)

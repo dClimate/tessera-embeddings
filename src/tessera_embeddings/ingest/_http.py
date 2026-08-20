@@ -1,8 +1,10 @@
-"""Shared HTTP retry helpers for ingest catalog/granule queries."""
+"""Shared retry and abandonment helpers for ingest catalogue/granule queries."""
 
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Callable
 from types import TracebackType
 
 from urllib3.connectionpool import ConnectionPool
@@ -55,3 +57,46 @@ def make_logging_retry(label: str, **kwargs: object) -> Retry:
             )
 
     return _LoggingRetry(**kwargs)  # type: ignore[arg-type]
+
+
+def spawn_abandonable[A, T](fn: Callable[[A], T], arg: A) -> Callable[..., T]:
+    """Start ``fn(arg)`` on a DAEMON thread; return a waiter that may give up on it.
+
+    For catalogue calls that must be bounded by a deadline the caller owns. Two things about
+    ``ThreadPoolExecutor`` make it the wrong tool here, and both are silent:
+
+    ``shutdown(wait=False)`` returns without abandoning anything. The executor's workers are
+    NON-DAEMON and joined by an ``atexit`` hook, so a stalled HTTP read holds the interpreter — and on
+    the Prefect path the whole ECS task — open for the rest of that call's timeout-and-retry budget,
+    long after the code that wanted the answer stopped waiting. ``cancel_futures=True`` does not help
+    either: it only drops futures that have not STARTED.
+
+    A daemon thread does not hold the process open, so abandonment costs nothing beyond a socket the
+    OS reclaims. There is no cancel — an in-flight ``requests`` call is not interruptible from
+    outside — so abandonment is the only mechanism available, and it is enough.
+
+    The waiter takes an optional ``timeout`` and raises :class:`TimeoutError` when it expires, leaving
+    the thread running. Exceptions from ``fn`` are re-raised in the CALLER's thread, where a
+    ``future.result()`` would have raised them.
+    """
+    out: list[T] = []
+    err: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            out.append(fn(arg))
+        except BaseException as exc:
+            err.append(exc)
+
+    thread = threading.Thread(target=target, name=f"abandonable-{getattr(fn, '__name__', 'call')}", daemon=True)
+    thread.start()
+
+    def result(timeout: float | None = None) -> T:
+        thread.join(timeout)
+        if thread.is_alive():
+            raise TimeoutError(f"call did not finish within {timeout}s and was abandoned")
+        if err:
+            raise err[0]
+        return out[0]
+
+    return result

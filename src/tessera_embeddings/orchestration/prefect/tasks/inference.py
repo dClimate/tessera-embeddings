@@ -8,10 +8,10 @@ Two shells:
   cluster the flow has already entered.
 * :func:`assemble_embeddings_task` — wraps
   :class:`tessera_embeddings.inference.assembly.ZarrWriter` ``.assemble``.
-  Runs on the Prefect flow runner; the assembly Dask cluster is
-  managed by the calling flow.
+  Runs on the Prefect flow runner; the raw-zarr engine forks its own
+  worker processes on that host (no Dask cluster).
 
-Cluster lifecycle (Ray + Dask) is the *flow's* concern, not the task's.
+Cluster lifecycle (Ray) is the *flow's* concern, not the task's.
 That keeps each task shell thin enough to be obviously correct.
 """
 
@@ -29,11 +29,11 @@ from tessera_embeddings.config.inference import InferenceConfig, TimeWindow
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks
 from tessera_embeddings.inference.orchestration_helpers import (
+    build_embedding_manifest,
     checkpoint_to_version,
-    read_upstream_manifests,
+    embedding_store_path,
 )
 from tessera_embeddings.inference.runner import run_inference
-from tessera_embeddings.storage.manifest import EmbeddingManifest
 
 
 @task(name="run-inference")
@@ -48,6 +48,7 @@ def run_inference_task(
     t0: float,
     on_actor_retire: Callable[[str], None] | None = None,
     get_credentials: Callable[[], Any] | None = None,
+    s3_region: str | None = None,
 ) -> list[dict]:
     """Prefect task: create Ray actors, run work-stealing inference.
 
@@ -66,6 +67,7 @@ def run_inference_task(
         log=get_run_logger(),
         on_actor_retire=on_actor_retire,
         get_credentials=get_credentials,
+        s3_region=s3_region,
     )
 
 
@@ -95,10 +97,9 @@ def assemble_embeddings_task(
 ) -> dict:
     """Prefect task: assemble staged chunks into the final Icechunk store.
 
-    The Dask cluster is managed by the flow that calls this task — the
-    task itself does no cluster provisioning. ``n_workers`` is the
-    cluster's ``max_workers`` value, used by the assembler to divide
-    the fleet-wide S3 concurrency budget across workers.
+    The raw-zarr engine forks ``n_workers`` worker processes on this host;
+    the same count divides the fleet-wide S3 concurrency budget into the
+    per-fork request cap. No cluster is provisioned.
 
     The full chunk grid is reconstructed in-task from ``total_y``,
     ``total_x``, and ``chunk_size`` via :func:`enumerate_chunks` rather
@@ -120,7 +121,7 @@ def assemble_embeddings_task(
         roi_zarr_path: Path to the ROI boolean zarr.
         config: Inference configuration.
         t0: Flow start time for elapsed logging.
-        n_workers: Max Dask worker count for this assembly run.
+        n_workers: Worker-process count for this assembly run.
         run_started_at: Flow trigger time for the time coordinate.
         results: Inference result dicts; ``None`` in assemble-only mode.
         mosaic_base: Base path for input mosaic stores. Used to copy
@@ -145,17 +146,15 @@ def assemble_embeddings_task(
 
     chunks = enumerate_chunks(total_y, total_x, chunk_size)
 
-    zarr_name = f"{roi_name}{output_name_suffix}"
-    output_path = f"{output_bucket.rstrip('/')}/embeddings/{zarr_name}.zarr"
+    output_path = embedding_store_path(output_bucket, roi_name, output_name_suffix)
     log.info("Assembling %d chunks into %s", len(chunks), output_path)
     writer = ZarrWriter(staging_base)
 
     model_version = checkpoint_to_version(config.checkpoint_path)
-    upstream_manifests = read_upstream_manifests(mosaic_base, config.s1_orbit) if mosaic_base else {}
-    embedding_manifest = EmbeddingManifest.from_upstream_stores(
-        model_checkpoint=model_version,
-        num_obs_checkpoints=config.num_obs_checkpoints,
-        upstream_manifests=upstream_manifests,
+    # Same builder the flow's preflight gate uses, so the manifest validated
+    # before the cluster is the manifest written here.
+    embedding_manifest = build_embedding_manifest(
+        config=config, mosaic_base=mosaic_base, get_credentials=get_credentials, s3_region=s3_region
     )
 
     writer.assemble(

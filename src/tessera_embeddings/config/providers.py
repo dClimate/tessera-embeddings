@@ -70,7 +70,7 @@ class STACProvider:
     entirely and queries the native CMR granule API instead (see
     ``opera_query.make_s1_item_provider``), so this value does not apply there.
     Raising it for CMR-STAC made the 500s worse, not better — see
-    context_docs/decisions/007-native-cmr-granule-query.md."""
+    context_docs/decisions/009-native-cmr-granule-query.md."""
 
 
 # =============================================================================
@@ -119,6 +119,17 @@ PROVIDERS: dict[str, STACProvider] = {
                 tile_id_prefix="",
             ),
         },
+        # BELOW the class default, and measured rather than guessed. This catalogue's search
+        # returns 502 for some (area, date-window) pairs at 250 items per page while
+        # answering the SAME query at 100 in under two seconds, and answering an adjacent
+        # year at 250 without trouble — so it is a page-size sensitivity in the service, not
+        # our load and not missing data. It also defeats the nine attempts of backoff
+        # underneath us, so the retry ladder cannot absorb it and only a smaller page can.
+        # Roughly twice the page requests for a query that answers at all is a good trade:
+        # search calls are a rounding error against the per-scene COG reads that dominate an
+        # ingest. Set per provider rather than on the class default, because nothing implicates
+        # the other catalogues. Reproduction: `scripts/e84_search_502_probe.py` (yield-embeddings).
+        max_page_size=100,
     ),
     "cmr-asf": STACProvider(
         name="NASA CMR-STAC (ASF)",

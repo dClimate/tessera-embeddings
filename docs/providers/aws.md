@@ -212,7 +212,7 @@ billing assumptions.
 - [`src/tessera_embeddings/providers/aws/gotchas.md`](../../src/tessera_embeddings/providers/aws/gotchas.md) —
   AMI baking, teardown defence-in-depth, CloudWatch wiring,
   diagnostics shim.
-- [`docs/prefect-setup.md`](prefect-setup.md) — Prefect-server side
+- [`docs/prefect-setup.md`](../prefect-setup.md) — Prefect-server side
   of the deployment.
 - [`docs/providers/adding-your-own.md`](adding-your-own.md) —
   applying these patterns to GCP, Azure, or k8s.
