@@ -497,11 +497,30 @@ so a staged 2048-px tile *is* the 8×8 inner-chunk grid of the output region it 
 and the band axis is never split (ADR-008 D2).
 
 Alongside embeddings, each staged chunk includes float32 `scales` and the per-pixel
-provenance layers: three **observation count** arrays (`s2_obs_count`, `s1_asc_obs_count`,
-`s1_desc_obs_count`) — uint16 (H, W), how many valid timesteps contributed to each pixel —
-and `s2_month_covered`, twelve booleans per pixel recording *which* calendar months those
-optical observations fell in (dims `time, northing, easting, month`; the month axis is never
-split, like the band axis).
+provenance layers, which come in **pairs — one count and one month mask per sensor**:
+
+| Sensor | How many (`uint16`, H×W) | Which months (12 booleans) |
+|---|---|---|
+| Optical | `s2_obs_count` | `s2_month_covered` |
+| Radar, ascending | `s1_asc_obs_count` | `s1_asc_month_covered` |
+| Radar, descending | `s1_desc_obs_count` | `s1_desc_month_covered` |
+
+The month masks carry dims `time, northing, easting, month`, and the month axis is never
+split, like the band axis. Both halves of a pair are derived from **one** validity mask per
+sensor, in `data_loading.coverage_from_validity`, so the count and the spread cannot disagree
+about what counted — whatever a sensor treats as a usable observation is what both describe.
+
+```
+                per-timestep validity            coverage_from_validity
+ optical  SCL classes            (T,H,W) ──┐
+ asc      any non-zero pol       (T,H,W) ──┼──▶  .sum(axis=0)  ──▶  <sensor>_obs_count   (H,W)
+ desc     any non-zero pol       (T,H,W) ──┘     any() per month ─▶  <sensor>_month_covered (12,H,W)
+```
+
+**Per sensor rather than merged**, because the sensors fail differently: optical gaps are
+weather and repeat seasonally, while radar gaps are orbital — the S1B failure left regions
+with a single orbit direction for years. Or-ing them into one mask would report a pixel as
+covered in a month it was seen only by the sensor a given reader cannot use.
 
 **Which of these assembly copies into the destination is derived from the store layout, not
 written out.** `store_layout.REQUIRED_VARS` is what every staged tile must carry and every
@@ -510,7 +529,8 @@ layout's own array set. Assembly keeps whichever of them are present in *both* t
 and the destination, so a store predating an array, or a run that stages nothing for one,
 needs no special case. Adding an array to the layout is therefore sufficient to have it
 carried — which was not true while the copy set was a hand-written tuple, and cost one
-published zone-year of empty `s2_month_covered` planes.
+published zone-year of empty `s2_month_covered` planes. The two radar masks joined by
+being added to the layout and nothing else — the proof that the derivation works.
 
 A 4-D variable's trailing extent comes from `store_layout.trailing_extent`, per variable:
 `band` is as wide as the embedding, `month` is twelve. There is deliberately no "4-D means

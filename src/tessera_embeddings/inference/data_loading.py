@@ -186,6 +186,13 @@ class ChunkData:
     # (it is ~10x smaller than S2); these hold the pre-crop counts.
     s1_asc_obs_count_full: np.ndarray | None = None  # (H, full W), uint16
     s1_desc_obs_count_full: np.ndarray | None = None  # (H, full W), uint16
+    # Which months each pixel was seen in per orbit, (MONTHS_IN_YEAR, H, W) bool, paired with the
+    # counts above and cropped alongside them. S2's equivalent rides on the mask bundle instead,
+    # because optical SCL is loaded whole-chunk once and shared across strips.
+    s1_asc_month_covered: np.ndarray | None = None
+    s1_desc_month_covered: np.ndarray | None = None
+    s1_asc_month_covered_full: np.ndarray | None = None  # (MONTHS_IN_YEAR, H, full W), bool
+    s1_desc_month_covered_full: np.ndarray | None = None
 
 
 def _load_sar_bands_from_zarr(
@@ -655,11 +662,17 @@ def check_time_window_coverage(
 # ---------------------------------------------------------------------------
 
 
-def _empty_sar_arrays(height: int, width: int) -> tuple[np.ndarray, np.ndarray]:
-    """Return empty SAR band and DOY arrays for a skipped orbit direction."""
+def _empty_sar_arrays(height: int, width: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return empty SAR band, DOY and month arrays for a skipped orbit direction.
+
+    Length zero rather than absent, so a skipped orbit flows through the same derivation as a
+    present one: :func:`coverage_from_validity` over an empty mask yields a zero count and an
+    all-False month mask, which is what a pixel that orbit never saw should read.
+    """
     return (
         np.empty((0, height, width, 2), dtype=np.uint16),
         np.empty((0,), dtype=np.int32),
+        np.empty((0,), dtype=np.int16),
     )
 
 
@@ -712,16 +725,10 @@ def load_s2_mask_bundle(
 
     mask_full = _load_scl_mask(root, window_indices, y_slice, x_slice)
     t_full = mask_full.shape[0]
-    # obs_count from the full (pre-prune) mask so pixels aren't under-counted.
-    obs_count = mask_full.sum(axis=0).astype(np.uint16)
-    # Month coverage from that SAME mask, so "how many" and "which months" cannot disagree about
-    # what counted. Pruning only drops timesteps with no valid pixel anywhere in the chunk, which
-    # contribute to neither, but deriving both here removes the question.
-    month_covered = np.zeros((MONTHS_IN_YEAR, *obs_count.shape), dtype=bool)
-    for month in range(1, MONTHS_IN_YEAR + 1):
-        in_month = months_full == month
-        if in_month.any():
-            month_covered[month - 1] = mask_full[in_month].any(axis=0)
+    # Both from the full (PRE-PRUNE) mask, so pixels aren't under-counted, and both from the SAME
+    # mask, so "how many" and "which months" cannot disagree about what counted. Pruning only drops
+    # timesteps with no valid pixel anywhere in the chunk, which contribute to neither.
+    obs_count, month_covered = coverage_from_validity(mask_full, months_full)
     logger.info("Loaded full-chunk SCL for %d S2 timesteps", t_full)
 
     # Prune timesteps with no valid pixel anywhere in the chunk — the v1.1
@@ -846,6 +853,37 @@ def _load_s2(
     return s2_bands, s2_masks, s2_doys, s2_obs_count
 
 
+def coverage_from_validity(valid: np.ndarray, months: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(obs_count, month_covered)`` from one per-timestep validity mask.
+
+    **The pair is derived together so it cannot disagree, for every sensor rather than one.** A
+    count and a month mask answer different questions about the same evidence — how many usable
+    observations a pixel had, and how they were spread — and the only way they can contradict each
+    other is by being computed from two different notions of "usable". The optical path already
+    took this care and said so in a comment; radar computed the count alone and dropped the dates
+    on the floor. Taking a validity mask and returning both makes the property structural: whatever
+    a caller counts as valid is what both outputs describe, because there is only one input.
+
+    Args:
+        valid: ``(T, H, W)`` boolean-ish mask, True where timestep ``t`` is usable at that pixel.
+            Optical passes its SCL mask; radar passes a non-zero test over the polarisation axis.
+        months: ``(T,)`` calendar month of each timestep, 1 = January.
+
+    Returns:
+        ``obs_count`` ``(H, W)`` uint16, and ``month_covered`` ``(MONTHS_IN_YEAR, H, W)`` bool with
+        January first. A month with no timestep at all is False everywhere, which is the same value
+        an unwritten pixel reads — absence of evidence and evidence of absence are not distinguished
+        here, exactly as a count of 0 does not distinguish them.
+    """
+    obs_count = valid.sum(axis=0).astype(np.uint16)
+    month_covered = np.zeros((MONTHS_IN_YEAR, *obs_count.shape), dtype=bool)
+    for month in range(1, MONTHS_IN_YEAR + 1):
+        in_month = months == month
+        if in_month.any():
+            month_covered[month - 1] = valid[in_month].any(axis=0)
+    return obs_count, month_covered
+
+
 def _load_sar_orbit(
     mosaic_base: str,
     chunk: ChunkSpec,
@@ -853,23 +891,27 @@ def _load_sar_orbit(
     time_window: TimeWindow,
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Load SAR bands and DOYs for a single orbit direction.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load SAR bands, DOYs and calendar months for a single orbit direction.
 
     ``y_sub`` is an optional chunk-relative northing slice (full easting width);
     ``None`` reads the full chunk.
 
+    The months were always read here — ``_filter_times_from_zarr`` returns them alongside the DOYs
+    — and were discarded at this line, which is why radar could report how many observations a
+    pixel had but not when. Returning them costs a slice of an array already in hand.
+
     Returns:
-        Tuple of (bands, doys) with shapes (T, H, W, 2) uint16 and (T,) int32.
+        Tuple of (bands, doys, months) with shapes (T, H, W, 2) uint16, (T,) int32 and (T,) int16.
     """
     if store_opener is None:
         store_opener = open_store_as_zarr_group
     root = store_opener(f"{mosaic_base}/sar_{orbit}.zarr")
-    window_indices, doys_full, _months = _filter_times_from_zarr(root, time_window)
+    window_indices, doys_full, months_full = _filter_times_from_zarr(root, time_window)
     y_slice = _resolve_y_slice(chunk, y_sub)
     x_slice = slice(chunk.x_start, chunk.x_stop)
     bands, kept = _load_sar_bands_from_zarr(root, window_indices, y_slice, x_slice)
-    return bands, doys_full[kept]
+    return bands, doys_full[kept], months_full[kept]
 
 
 def load_chunk(
@@ -956,14 +998,14 @@ def load_chunk(
     # Skipped orbits get FULL-width placeholders: every SAR array must be
     # full-width here because the x_sub block below crops them all uniformly
     # (after capturing the full-width obs-count side channel).
-    s1_asc_bands, s1_asc_doys = (
+    s1_asc_bands, s1_asc_doys, s1_asc_months = (
         _load_sar_orbit(
             mosaic_base, chunk, "ascending", time_window=time_window, y_sub=y_sub, store_opener=store_opener
         )
         if "ascending" in active
         else _empty_sar_arrays(height, chunk.width)
     )
-    s1_desc_bands, s1_desc_doys = (
+    s1_desc_bands, s1_desc_doys, s1_desc_months = (
         _load_sar_orbit(
             mosaic_base, chunk, "descending", time_window=time_window, y_sub=y_sub, store_opener=store_opener
         )
@@ -971,19 +1013,32 @@ def load_chunk(
         else _empty_sar_arrays(height, chunk.width)
     )
 
-    s1_asc_obs_count = np.any(s1_asc_bands != 0, axis=-1).sum(axis=0).astype(np.uint16)
-    s1_desc_obs_count = np.any(s1_desc_bands != 0, axis=-1).sum(axis=0).astype(np.uint16)
+    # A non-zero sample in either polarisation is the radar validity test, and it is the SAME
+    # expression the count was already built from — passing it to `coverage_from_validity` is what
+    # makes the count and the month mask two views of one decision rather than two decisions.
+    s1_asc_obs_count, s1_asc_month_covered = coverage_from_validity(np.any(s1_asc_bands != 0, axis=-1), s1_asc_months)
+    s1_desc_obs_count, s1_desc_month_covered = coverage_from_validity(
+        np.any(s1_desc_bands != 0, axis=-1), s1_desc_months
+    )
 
     s1_asc_obs_count_full: np.ndarray | None = None
     s1_desc_obs_count_full: np.ndarray | None = None
+    s1_asc_month_covered_full: np.ndarray | None = None
+    s1_desc_month_covered_full: np.ndarray | None = None
     if x_sub is not None:
         # SAR was read full-width (see the x_sub docstring): keep the full-width
         # counts for the saved obs layers, then crop the grid-shaped arrays to
         # match the S2 grid. ascontiguousarray drops the full-width parents.
+        # The month masks travel with their counts — same full-extent fidelity, same crop, one axis
+        # further right because month leads their shape.
         s1_asc_obs_count_full = s1_asc_obs_count
         s1_desc_obs_count_full = s1_desc_obs_count
+        s1_asc_month_covered_full = s1_asc_month_covered
+        s1_desc_month_covered_full = s1_desc_month_covered
         s1_asc_obs_count = np.ascontiguousarray(s1_asc_obs_count[:, x_sub])
         s1_desc_obs_count = np.ascontiguousarray(s1_desc_obs_count[:, x_sub])
+        s1_asc_month_covered = np.ascontiguousarray(s1_asc_month_covered[:, :, x_sub])
+        s1_desc_month_covered = np.ascontiguousarray(s1_desc_month_covered[:, :, x_sub])
         s1_asc_bands = np.ascontiguousarray(s1_asc_bands[:, :, x_sub, :])
         s1_desc_bands = np.ascontiguousarray(s1_desc_bands[:, :, x_sub, :])
 
@@ -1012,4 +1067,8 @@ def load_chunk(
         s1_desc_obs_count=s1_desc_obs_count,
         s1_asc_obs_count_full=s1_asc_obs_count_full,
         s1_desc_obs_count_full=s1_desc_obs_count_full,
+        s1_asc_month_covered=s1_asc_month_covered,
+        s1_desc_month_covered=s1_desc_month_covered,
+        s1_asc_month_covered_full=s1_asc_month_covered_full,
+        s1_desc_month_covered_full=s1_desc_month_covered_full,
     )

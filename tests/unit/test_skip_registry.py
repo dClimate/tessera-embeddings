@@ -24,13 +24,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import pytest
 import zarr
 
 import tessera_embeddings.inference.assembly as _assembly_mod
-from tessera_embeddings.config.store_layout import MONTH_COVERED_VAR, MONTHS_IN_YEAR, OBS_COUNT_VARS
+from tessera_embeddings.config.store_layout import (
+    MONTH_COVERED_VARS,
+    MONTHS_IN_YEAR,
+    OBS_COUNT_VARS,
+)
 from tessera_embeddings.inference.assembly import (
     REFUSAL_REASONS,
     AllChunksSkippedError,
@@ -272,9 +277,20 @@ class TestCoverageOnlyStaging:
             "s1_asc_obs_count": np.full((h, w), 3, dtype=np.uint16),
             "s1_desc_obs_count": np.zeros((h, w), dtype=np.uint16),
         }
-        months = np.zeros((MONTHS_IN_YEAR, h, w), dtype=bool)
-        months[:4] = True
+        # A DIFFERENT span per sensor, deliberately: three identical masks would let the write path
+        # mix them up — stage optical's array under radar's name, say — while every assertion still
+        # passed. The spans are the fingerprints that make a swap visible.
+        months = {}
+        for i, var in enumerate(MONTH_COVERED_VARS):
+            mask = np.zeros((MONTHS_IN_YEAR, h, w), dtype=bool)
+            mask[: 4 + i * 2] = True
+            months[var] = mask
         return obs, months
+
+    #: Months covered by each sensor in :meth:`_coverage`, as the 1-based labels a reader would use.
+    _SPANS: ClassVar[dict[str, list[int]]] = {
+        var: list(range(1, 5 + 2 * i)) for i, var in enumerate(MONTH_COVERED_VARS)
+    }
 
     def test_it_stages_what_write_chunk_would_have(self, tmp_path: Path) -> None:
         """The equivalence that keeps two code paths in step.
@@ -292,7 +308,7 @@ class TestCoverageOnlyStaging:
         full = writer.write_chunk(chunk, emb, run_id="run2", scales=scales, obs_counts=obs, month_covered=months)
 
         cov_g, full_g = zarr.open_group(cov, mode="r"), zarr.open_group(full, mode="r")
-        for var in (*OBS_COUNT_VARS, MONTH_COVERED_VAR):
+        for var in (*OBS_COUNT_VARS, *MONTH_COVERED_VARS):
             assert cov_g[var].dtype == full_g[var].dtype, var
             assert cov_g[var].shape == full_g[var].shape, var
             np.testing.assert_array_equal(cov_g[var][:], full_g[var][:], err_msg=var)
@@ -340,24 +356,32 @@ class TestCoverageOnlyStaging:
             staging_base=str(tmp_path / "staging"),
             run_id="run1",
             shards=(),
-            variables=("embeddings", "s2_obs_count", "s1_asc_obs_count", MONTH_COVERED_VAR),
+            variables=("embeddings", "s2_obs_count", "s1_asc_obs_count", *MONTH_COVERED_VARS),
             shard_px=8,
             dtypes=(
                 ("embeddings", "int8"),
                 ("s2_obs_count", "uint16"),
                 ("s1_asc_obs_count", "uint16"),
-                (MONTH_COVERED_VAR, "int8"),
+                *((var, "int8") for var in MONTH_COVERED_VARS),
             ),
             embedding_dim=128,
             cleared=((0, 0),),
-            fill_values=(("embeddings", 0), ("s2_obs_count", 0), ("s1_asc_obs_count", 0), (MONTH_COVERED_VAR, 0)),
+            fill_values=(
+                ("embeddings", 0),
+                ("s2_obs_count", 0),
+                ("s1_asc_obs_count", 0),
+                *((var, 0) for var in MONTH_COVERED_VARS),
+            ),
         )
         block = source.load((0, 0))
 
         assert block["s2_obs_count"].max() == 7, "measured, not filled"
         assert block["s1_asc_obs_count"].max() == 3
-        assert block[MONTH_COVERED_VAR][..., :4].all(), "the months it did see"
-        assert not block[MONTH_COVERED_VAR][..., 4:].any()
+        # Each sensor's own span, so a mask staged under the wrong sensor's name fails here rather
+        # than passing because all three happened to hold the same thing.
+        for var, span in self._SPANS.items():
+            covered = [m + 1 for m in range(MONTHS_IN_YEAR) if block[var][..., m].any()]
+            assert covered == span, f"{var} kept the months it saw"
         assert block["embeddings"].shape == (1, 8, 8, 128)
         assert not block["embeddings"].any(), "the embeddings are what it failed to produce — fill"
 
