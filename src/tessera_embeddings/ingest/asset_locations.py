@@ -103,6 +103,28 @@ def read_asset_buckets(item: Any, keys: tuple[str, ...] = READ_ASSET_KEYS) -> li
     ]
 
 
+def read_set_is_complete(item: Any, keys: tuple[str, ...] = READ_ASSET_KEYS) -> bool:  # noqa: ANN401
+    """Whether every asset this ingest would READ resolves to an href.
+
+    Separate from :func:`item_is_in_preferred_location` because it answers a different question
+    — *can* this copy be read at all, rather than *from where*. Locality implies completeness,
+    so the two are correlated, but ranking needs the weaker claim on its own: with locality
+    tied, an incomplete copy would otherwise be separated from a complete one only by the id
+    tiebreak, and could win a tile-date it cannot deliver.
+
+    Items carrying no assets at all — radar copies, and any non-S2 product whose bands are not
+    named by :data:`READ_ASSET_KEYS` — are uniformly incomplete, so this term ties across the
+    whole set and changes no ordering there.
+
+    Note this is NOT the rule :func:`item_harmonisation` uses. An item whose reflectance bands
+    cannot be read is still ``RAW`` there, on purpose: absence of evidence must not buy an
+    exemption from a correction, whereas absence of evidence must not buy a locality claim.
+    Same absence, opposite safe directions.
+    """
+    assets = getattr(item, "assets", None) or {}
+    return all((asset := assets.get(key)) is not None and asset_href(asset) is not None for key in keys)
+
+
 def item_is_in_preferred_location(
     item: Any,  # noqa: ANN401 — any STAC-like item
     buckets: frozenset[str] = PREFERRED_ASSET_BUCKETS,
@@ -113,8 +135,14 @@ def item_is_in_preferred_location(
     locality being claimed. An item exposing none of them is remote — absence of evidence is
     not locality.
     """
-    found = read_asset_buckets(item)
-    return bool(found) and all(bucket in buckets for bucket in found)
+    # EVERY read key must resolve, not merely the ones present. Asserting over only the keys an
+    # item happens to carry let a single local band read as fully in-region: that copy displaces
+    # a COMPLETE remote one on a baseline tie, then fails at load with no source href to
+    # attribute, sending the recovery ladder stepping down every duplicated tile-date of that
+    # day. Locality is a claim about the whole read, so an incomplete item cannot make it.
+    if not read_set_is_complete(item):
+        return False
+    return all(bucket in buckets for bucket in read_asset_buckets(item))
 
 
 class Harmonisation(enum.Enum):

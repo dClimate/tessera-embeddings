@@ -37,11 +37,15 @@ from __future__ import annotations
 import datetime
 import itertools
 import logging
+import math
 import re
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from tessera_embeddings.ingest.asset_locations import item_is_in_preferred_location
+from tessera_embeddings.ingest.asset_locations import (
+    item_is_in_preferred_location,
+    read_set_is_complete,
+)
 from tessera_embeddings.ingest.solar_days import solar_day_of
 
 logger = logging.getLogger(__name__)
@@ -96,10 +100,19 @@ def item_processing_baseline(item: Any) -> float | None:  # noqa: ANN401 — any
     if raw is None:
         return None
     try:
-        return float(raw)
+        value = float(raw)
     except (TypeError, ValueError):
         logger.debug("Unparseable s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
         return None
+    # `float()` accepts "NaN" and "Infinity", so a malformed catalogue value would otherwise
+    # count as a KNOWN baseline. NaN makes every comparison false and leaves the order dependent
+    # on catalogue response order; +inf outranks every real baseline and can later make the
+    # integer conversion raise. Neither is a baseline, so both are unknown — which falls back to
+    # sequence ordering, the same as an absent value.
+    if not math.isfinite(value):
+        logger.debug("Non-finite s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
+        return None
+    return value
 
 
 def _sequence_key(item: Any) -> tuple[int, int, str]:  # noqa: ANN401 — any STAC-like item
@@ -115,7 +128,7 @@ def _sequence_key(item: Any) -> tuple[int, int, str]:  # noqa: ANN401 — any ST
     return (-has_sequence, -(sequence or 0), str(getattr(item, "id", "")))
 
 
-def _baseline_locality_key(item: Any) -> tuple[float, int, int, int, str]:  # noqa: ANN401
+def _baseline_locality_key(item: Any) -> tuple[float, int, int, int, int, str]:  # noqa: ANN401
     """Descending processing baseline, then locality among EQUAL baselines, then sequence.
 
     Only used when every copy's baseline is readable, which is what makes the locality term
@@ -129,9 +142,38 @@ def _baseline_locality_key(item: Any) -> tuple[float, int, int, int, str]:  # no
     """
     baseline = item_processing_baseline(item)
     remote = 0 if item_is_in_preferred_location(item) else 1
+    incomplete = 0 if read_set_is_complete(item) else 1
     sequence = item_sequence(item)
     has_sequence = 0 if sequence is None else 1
-    return (-(baseline or 0.0), remote, -has_sequence, -(sequence or 0), str(getattr(item, "id", "")))
+    return (
+        -(baseline or 0.0),
+        remote,
+        incomplete,
+        -has_sequence,
+        -(sequence or 0),
+        str(getattr(item, "id", "")),
+    )
+
+
+def _across_acquisitions_key(item: Any) -> tuple[int, float, int, int, int, int, str]:  # noqa: ANN401
+    """Context-free rank, for ordering one acquisition's ladder against another's.
+
+    Deliberately NOT group-relative: it compares a spare from one acquisition with a spare from
+    a different one, where "best in my group" means nothing. An unknown baseline sorts last here
+    rather than suspending the comparison, because suspending it is what leaked one acquisition's
+    malformed metadata into another's ordering.
+    """
+    baseline = item_processing_baseline(item)
+    sequence = item_sequence(item)
+    return (
+        0 if baseline is not None else 1,
+        -(baseline or 0.0),
+        0 if item_is_in_preferred_location(item) else 1,
+        0 if read_set_is_complete(item) else 1,
+        0 if sequence is not None else 1,
+        -(sequence or 0),
+        str(getattr(item, "id", "")),
+    )
 
 
 def _rank_copies(copies: list[Any]) -> list[Any]:
@@ -264,7 +306,17 @@ def select_preferred_duplicates(
             # one's newest. Safe to sort globally because the keys are absolute — an earlier
             # version ranked against the group's own best baseline, which is what made a
             # cross-acquisition comparison meaningless.
-            alternates[key] = _rank_copies(rejected)
+            # Ranked WITHIN each acquisition, then the acquisitions ordered by their own best
+            # spare. Ranking the whole tile-date in one call leaked one acquisition's unknown
+            # baseline into another's order: `_rank_copies` reverts the entire set to sequence
+            # ordering when any baseline is unreadable, so a single malformed item in acquisition
+            # A could push A's 03.00/seq-1 spare ahead of B's 04.00/seq-0 one. Ranking per
+            # acquisition keeps each ladder baseline-first, and ordering the groups by their best
+            # member keeps `copies[0]` the best overall answer, which is what
+            # `_first_for_failed_acquisition` documents it needs when nothing was attributed.
+            ladders = [_rank_copies(g) for g in _by_acquisition(rejected)]
+            ladders.sort(key=lambda ladder: _across_acquisitions_key(ladder[0]))
+            alternates[key] = [copy for ladder in ladders for copy in ladder]
 
     kept = [it for it in items if id(it) in survivors]
     return kept, alternates

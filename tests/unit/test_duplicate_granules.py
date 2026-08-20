@@ -24,11 +24,13 @@ from tessera_embeddings.ingest.asset_locations import (
     READ_ASSET_KEYS,
     asset_bucket,
     item_is_in_preferred_location,
+    read_set_is_complete,
 )
 from tessera_embeddings.ingest.duplicates import (
     alternates_for,
     copies_label,
     is_unreadable_source,
+    item_processing_baseline,
     item_sequence,
     item_tile,
     select_preferred_duplicates,
@@ -744,3 +746,164 @@ class TestTheDuplicateLogIsAnAuditTrail:
 
     def test_no_duplicates_logs_nothing(self, caplog) -> None:
         assert self._emit(caplog, [], {}) == ""
+
+
+def _copy_at(ident: str, *, acquired: str, sequence: str, baseline: str | None, host_root: str = _IN_REGION) -> _Item:
+    """A copy pinned to a given ACQUISITION instant, for cross-acquisition ordering tests."""
+    extra: dict[str, object] = {"datetime": acquired}
+    if baseline is not None:
+        extra["s2:processing_baseline"] = baseline
+    return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **extra), _bands_at(host_root))
+
+
+class TestLocalityNeedsTheCompleteReadSet:
+    """An asset-incomplete item cannot claim locality. Regression: review on PR #107.
+
+    The predicate skipped keys that were absent or href-less and then asserted over what
+    remained, so a single local band satisfied it. That copy reads as fully in-region,
+    displaces a COMPLETE remote copy on a baseline tie, and then fails at load — sending
+    the recovery ladder stepping down every duplicated tile-date of that day.
+    """
+
+    def test_one_local_band_is_not_a_local_item(self) -> None:
+        assert (
+            item_is_in_preferred_location(_with_assets(_Item("x"), {"blue": {"href": f"{_IN_REGION}/B02.tif"}}))
+            is False
+        )
+
+    def test_the_complete_read_set_is_local(self) -> None:
+        assert item_is_in_preferred_location(_with_assets(_Item("x"), _bands_at(_IN_REGION))) is True
+
+    def test_a_read_key_missing_from_an_otherwise_local_item_is_not_local(self) -> None:
+        assets = _bands_at(_IN_REGION)
+        dropped = assets.pop(READ_ASSET_KEYS[-1])
+        assert dropped is not None, "the fixture must actually have carried that key"
+        assert item_is_in_preferred_location(_with_assets(_Item("x"), assets)) is False
+
+    def test_a_read_key_present_but_href_less_is_not_local(self) -> None:
+        assets = _bands_at(_IN_REGION)
+        assets[READ_ASSET_KEYS[0]] = {}
+        assert item_is_in_preferred_location(_with_assets(_Item("x"), assets)) is False
+
+    def test_an_incomplete_local_copy_does_not_displace_a_complete_remote_one(self) -> None:
+        """The consequence the reviewer named, asserted on the selector and not the predicate.
+
+        Sequence is what decides here once locality ties, so pre-fix and post-fix disagree:
+        locality outranks sequence, so a "local" partial copy beat the complete copy that
+        carried the newer sequence.
+        """
+        complete_remote = _copy("remote", sequence="1", baseline="05.00", host_root=_REMOTE)
+        partial_local = _with_assets(
+            _Item("local", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"}),
+            {"blue": {"href": f"{_IN_REGION}/B02.tif"}},
+        )
+        kept, _ = select_preferred_duplicates([partial_local, complete_remote])
+        assert [it.id for it in kept] == ["remote"]
+
+    def test_an_incomplete_copy_loses_an_otherwise_total_tie(self) -> None:
+        """Completeness is its own rank field, so the id tiebreak cannot hand it the date.
+
+        `local` sorts before `remote`, so with baseline, locality and sequence all tied the
+        alphabetical tiebreak used to award the tile-date to the copy that cannot be read.
+        """
+        complete = _copy("remote", sequence="0", baseline="05.00", host_root=_REMOTE)
+        partial = _with_assets(
+            _Item("local", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"}),
+            {"blue": {"href": f"{_IN_REGION}/B02.tif"}},
+        )
+        kept, _ = select_preferred_duplicates([partial, complete])
+        assert [it.id for it in kept] == ["remote"]
+
+    def test_the_completeness_predicate_answers_readability_not_location(self) -> None:
+        """A complete REMOTE read set is complete — the two predicates must not conflate."""
+        assert read_set_is_complete(_with_assets(_Item("x"), _bands_at(_REMOTE))) is True
+        assert item_is_in_preferred_location(_with_assets(_Item("x"), _bands_at(_REMOTE))) is False
+
+    def test_an_item_with_no_assets_is_incomplete(self) -> None:
+        """Radar copies and non-S2 products tie here rather than being ordered by it."""
+        assert read_set_is_complete(_Item("x")) is False
+
+
+class TestNonFiniteBaselinesAreUnknown:
+    """`float()` accepts "NaN" and "Infinity". Neither is a baseline. Review on PR #107."""
+
+    @pytest.mark.parametrize("raw", ["NaN", "nan", "Infinity", "inf", "-inf", "-Infinity"])
+    def test_a_non_finite_baseline_reads_as_unknown(self, raw: str) -> None:
+        assert item_processing_baseline(_Item("x", "MGRS-33TWM", "0", **{"s2:processing_baseline": raw})) is None
+
+    def test_a_real_baseline_still_reads(self) -> None:
+        """So the test above cannot pass by rejecting everything."""
+        assert item_processing_baseline(_Item("x", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"})) == 5.0
+
+    def test_infinity_does_not_outrank_a_real_baseline(self) -> None:
+        infinite = _copy("infinite", sequence="0", baseline="Infinity", host_root=_IN_REGION)
+        real = _copy("real", sequence="1", baseline="05.00", host_root=_IN_REGION)
+        kept, _ = select_preferred_duplicates([infinite, real])
+        # Unknown suspends the baseline comparison, so sequence decides and 1 beats 0.
+        assert [it.id for it in kept] == ["real"]
+
+    def test_a_nan_baseline_does_not_leave_the_order_response_dependent(self) -> None:
+        """Every NaN comparison is false, so a NaN in the ladder preserved the given order."""
+
+        def _run(order: list[str]) -> list[str]:
+            by_id = {
+                "nan": _copy("nan", sequence="0", baseline="NaN", host_root=_IN_REGION),
+                "real": _copy("real", sequence="2", baseline="04.00", host_root=_IN_REGION),
+            }
+            kept, _ = select_preferred_duplicates([by_id[i] for i in order])
+            return [it.id for it in kept]
+
+        assert _run(["nan", "real"]) == _run(["real", "nan"]) == ["real"]
+
+
+class TestUnknownBaselineStaysScopedToItsAcquisition:
+    """One acquisition's unreadable baseline must not reorder another's. Review on PR #107.
+
+    `_rank_copies` reverts to sequence ordering when ANY baseline in the list it is given is
+    unknown — correct within an acquisition, where it stops locality promoting a copy over a
+    possibly-newer one. The alternates list was built by ranking a whole tile-date in one
+    call, so a single malformed item leaked that suspension across acquisition boundaries.
+    """
+
+    _A = "2021-09-08T10:00:00Z"
+    _B = "2021-09-08T14:00:00Z"
+
+    def test_a_neighbours_unknown_baseline_keeps_this_ladder_baseline_first(self) -> None:
+        """The unknown copy must be a REJECTED one — that is what puts it in the shared list.
+
+        Acquisition A holds an unreadable baseline on its LOSING copy, so `rejected` spans
+        both acquisitions and contains an unknown. Ranking that whole list in one call
+        suspends the baseline term for B as well.
+        """
+        items = [
+            # A: the unknown loses on sequence, so it lands in the shared rejected list.
+            _copy_at("a-keep", acquired=self._A, sequence="5", baseline="04.00"),
+            _copy_at("a-unknown", acquired=self._A, sequence="0", baseline=None),
+            # B: readable throughout, so its ladder must stay in descending baseline order.
+            _copy_at("b-best", acquired=self._B, sequence="0", baseline="05.00"),
+            _copy_at("b-mid", acquired=self._B, sequence="1", baseline="04.00"),
+            _copy_at("b-newer-seq", acquired=self._B, sequence="9", baseline="03.00"),
+        ]
+        kept, alternates = select_preferred_duplicates(items)
+
+        assert sorted(it.id for it in kept) == ["a-keep", "b-best"]
+
+        ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
+        assert "a-unknown" in ladder, "the fixture must put the unknown into the shared list"
+        # Pre-fix the shared call fell back to sequence ordering for the WHOLE tile-date, which
+        # put b-newer-seq (sequence 9, baseline 03.00) ahead of b-mid (sequence 1, baseline
+        # 04.00) — a read failure would then have handed out the older reprocessing.
+        assert [i for i in ladder if i.startswith("b-")] == ["b-mid", "b-newer-seq"]
+
+    def test_the_best_spare_overall_is_still_first(self) -> None:
+        """`_first_for_failed_acquisition` falls back to copies[0] when nothing is attributed."""
+        items = [
+            _copy_at("a-win", acquired=self._A, sequence="0", baseline="05.00"),
+            _copy_at("a-spare", acquired=self._A, sequence="0", baseline="03.00"),
+            _copy_at("b-win", acquired=self._B, sequence="0", baseline="05.00"),
+            _copy_at("b-spare", acquired=self._B, sequence="0", baseline="04.00"),
+        ]
+        _, alternates = select_preferred_duplicates(items)
+        ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
+        # b-spare (04.00) outranks a-spare (03.00) despite belonging to the later acquisition.
+        assert ladder == ["b-spare", "a-spare"]
