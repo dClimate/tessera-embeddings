@@ -13,6 +13,7 @@ newer, so the older copy is a fallback and never a default.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 import pystac
@@ -699,3 +700,47 @@ class TestFallbackLadderKeepsBaselineOrder:
         assert [i.id for i in kept] == [best.id]
         ladder = [i.id for i in next(iter(alternates.values()))]
         assert ladder == [middle.id, worst_local.id], "the ladder skipped a newer reprocessing"
+
+
+class TestTheDuplicateLogIsAnAuditTrail:
+    """The only record of which copy won, so it has to be accurate."""
+
+    def _emit(self, caplog, kept, alternates):
+        log = logging.getLogger("dup-audit-test")
+        with caplog.at_level(logging.INFO, logger="dup-audit-test"):
+            copies_label  # noqa: B018 — keep the import honest
+            from tessera_embeddings.ingest.duplicates import log_duplicate_selection
+
+            log_duplicate_selection(log, "roi-x", alternates, kept=kept)
+        return " ".join(r.getMessage() for r in caplog.records)
+
+    def test_it_states_the_actual_preference(self, caplog) -> None:
+        """It said "newest kept" while the ranking preferred an in-region copy over a
+        higher-sequence remote one — a line misreporting its own behaviour.
+        """
+        local = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
+        remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
+        msg = self._emit(caplog, [local], {("MGRS-33TWM", "2018-06-04"): [remote]})
+        assert "newest baseline, then in-region, then newest sequence" in msg
+        assert "newest kept" not in msg, "the stale claim must not come back"
+
+    def test_it_names_where_the_survivors_came_from(self, caplog) -> None:
+        """THE AUDIT TRAIL. Where two copies share a baseline their pixels are identical, so
+        nothing downstream can show which was read — not the store, not the mosaic, not the
+        metrics. Without this the decision is unobservable in production.
+        """
+        local = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
+        remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
+        msg = self._emit(caplog, [local], {("MGRS-33TWM", "2018-06-04"): [remote]})
+        assert "1 in-region, 0 remote" in msg
+
+    def test_it_reports_a_remote_survivor_as_remote(self, caplog) -> None:
+        """The complement: the line must be capable of saying the preference did NOT apply,
+        or it is decoration rather than evidence.
+        """
+        remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
+        msg = self._emit(caplog, [remote], {("MGRS-33TWM", "2018-06-04"): [remote]})
+        assert "0 in-region, 1 remote" in msg
+
+    def test_no_duplicates_logs_nothing(self, caplog) -> None:
+        assert self._emit(caplog, [], {}) == ""

@@ -274,22 +274,37 @@ def log_duplicate_selection(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     roi: str,
     alternates: dict[tuple[str, str], list[Any]],
+    kept: Iterable[Any] = (),
 ) -> None:
     """Record that duplicates were pruned, at a level that survives a fleet-wide log.
 
     Summary only, and deliberately: duplicates are routine, so a line per pruned copy would
     bury the outcomes that are not routine. The tile-dates that carry alternates are named
     only when a fallback actually fires, where the identity matters.
+
+    **Reports WHERE the surviving copies came from, because the preference is no longer purely
+    "newest".** This line said "newest kept" while the ranking preferred an in-region copy over
+    a higher-sequence remote one — a log misreporting its own behaviour. It is also the only
+    audit trail for that decision: where two copies carry the same baseline their pixels are
+    identical, so nothing downstream can show which was read, and the choice is otherwise
+    invisible in the store, the mosaic and the metrics.
     """
     if not alternates:
         return
     pruned = sum(len(v) for v in alternates.values())
+    survivors = list(kept)
+    where = ""
+    if survivors:
+        local = sum(1 for it in survivors if item_is_in_preferred_location(it))
+        where = f"; survivors by source: {local} in-region, {len(survivors) - local} remote"
     log.info(
         "Duplicate catalogue items pruned roi=%s: %d tile-date(s) had more than one copy, "
-        "%d rejected, newest kept (rejected copies stay available as a fallback)",
+        "%d rejected. Preference: newest baseline, then in-region, then newest sequence "
+        "(rejected copies stay available as a fallback)%s",
         roi,
         len(alternates),
         pruned,
+        where,
     )
 
 
