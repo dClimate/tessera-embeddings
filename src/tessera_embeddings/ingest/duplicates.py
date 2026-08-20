@@ -258,11 +258,15 @@ def acquisition_instant(item: Any) -> datetime.datetime | None:  # noqa: ANN401 
 def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
     """Split one tile-date's copies into one list per distinct acquisition.
 
-    **If ANY copy's instant cannot be read, the whole tile-date is one acquisition.** An
-    unreadable instant is no evidence that the copy is a distinct pass, so it JOINS a cluster rather
-    than forming its own — competing for one slot instead of adding one. Which cluster is arbitrary
-    and safe. Collapsing the whole tile-date instead would prevent the same fusion by discarding
-    coverage from passes whose instants were perfectly readable.
+    **Every readable instant keeps its own cluster; a copy without one JOINS a cluster rather than
+    forming its own.** That makes it compete for one slot instead of adding one, which is what stops
+    two copies of a pass being fused at two processing baselines. Collapsing the whole tile-date
+    would prevent the same fusion by discarding coverage from passes whose instants were perfectly
+    readable — this function exists to preserve those, so it does not.
+
+    Which cluster an undated copy joins is arbitrary, which is why it cannot WIN one
+    (:func:`_preference_key` ranks a readable instant above data vintage) and why attributed
+    recovery will not place one (:func:`_first_for_failed_acquisition`).
 
     Where instants ARE readable, splitting on them protects real coverage: keying on (tile, solar
     day) alone dropped 493 of 2,733 items as duplicates when they were distinct acquisitions.

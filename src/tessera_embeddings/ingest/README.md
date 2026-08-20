@@ -482,7 +482,10 @@ across the time dimension. Two modes:
   consumer. **Not compatible with the ROI store**, whose arrays take their dtype from the first
   date: a negative value written to an unsigned store reads as roughly 65535.
 
-Values above `65535 + offset` (i.e. 64535) are clamped before subtraction to prevent uint16
+The offset is subtracted BEFORE any bound is applied, so 65535 becomes 64535. Clamping first cost
+the highest `abs(offset)` input codes a further 1000 — 65535 became 63535 — and in the default
+mode no upper bound is needed at all, since subtraction cannot overflow upward. Legacy note on the
+signed mode: values above `65535 + offset` (i.e. 64535) are clamped to prevent uint16
 overflow. The correction is applied only to spectral bands; SCL and other extra bands are
 passed through unchanged.
 

@@ -217,10 +217,11 @@ def item_harmonisation(
     excluded even though it IS read: it is categorical and never corrected, so its producer
     cannot make the reflectance decision ambiguous.
 
-    An item served from a bucket nobody has listed is ``RAW``: **absence of evidence must not buy
-    an exemption from a correction**, and of the two mistakes only one is discoverable — a doubled
-    correction shifts values by a visible 1000, while a skipped one leaves plausible pixels that
-    are quietly wrong.
+    **Absence of evidence buys neither a correction nor an exemption.** Both mistakes are silent
+    and neither is safe to default to: a doubled correction takes 1000 off pixels that already had
+    it removed, a skipped one leaves plausible pixels 1000 too high. So an item served from a
+    bucket nobody has listed is ``UNKNOWN``, and the caller refuses the date rather than guessing
+    — see the next paragraph for the two ways that state arises.
 
     An item is ``UNKNOWN`` rather than ``RAW`` in two cases: it does not expose every reflectance
     band under the configured names, or the bucket serving them is not one we have identified as
