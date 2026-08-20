@@ -403,9 +403,25 @@ decision are worth stating:
 
 Genuinely ambiguous dates **refuse** (`HeterogeneousProducerError`) rather than picking a side,
 because no date-wide answer is right for them and both mistakes are silent: an item whose own
-bands straddle the two producers, raw items on opposite sides of the threshold, and a raw item
-owed the offset fused with an already-harmonised one. None has been observed on the live
-catalogue, which is why they are refused rather than engineered around.
+bands straddle the two producers, raw items on opposite sides of the threshold, a raw item owed
+the offset fused with an already-harmonised one, and an item whose producer cannot be determined
+at all. None has been observed on the live catalogue, which is why they are refused rather than
+engineered around. Every refusal is gated on the date actually being owed a correction — where
+nothing is owed, which producer served the pixels cannot change any of them.
+
+That last case is worth naming, because the safe direction inverts. An item exposing none of the
+reflectance bands under the configured names is `UNKNOWN`, not `RAW`. Nothing in this module can
+see the alias table that maps a band name to an asset key, so a band absent under `blue` may be
+served under `B02` — `_prune_item_dict` exists for exactly that mismatch. Calling such an item
+raw would subtract 1000 from pixels that may already be harmonised, silently. The live Element 84
+catalogue keys its assets by the configured band names, so this does not arise there today; a
+catalogue that changed its naming would stop the ingest rather than halve a season's reflectance.
+
+The dates are grouped by **solar day**, the same key `odc.stac.load` fuses on, and derived through
+`solar_day_of`, which raises on an item that has not passed `normalize_to_solar_day`. Grouping by
+UTC date checked different sets from the ones that get mosaicked: near a day boundary two UTC
+dates fuse into one time slice, so a raw item and a harmonised one could share an output pixel
+stack while being checked separately and passing.
 
 The correction path had never run in production, so it announces itself at WARNING the first
 time it does for a date — but only for items served from ESA's archive, since every Planetary

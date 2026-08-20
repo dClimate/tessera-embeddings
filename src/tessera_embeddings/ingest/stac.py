@@ -48,6 +48,7 @@ from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
     resolve_grouping_longitude,
+    solar_day_of,
 )
 
 # =============================================================================
@@ -349,9 +350,15 @@ def dates_exempt_from_correction(
             one, or carries an item whose own bands straddle both, so no date-wide decision is
             correct for it.
     """
+    # Grouped by the SOLAR day, which is what `odc.stac.load` fuses on. Grouping by the UTC date
+    # checked different sets from the ones that will be mosaicked: near a day boundary two UTC
+    # dates fuse into one slice, so a raw item and a harmonised one could sit in one output
+    # pixel stack while being checked separately and passing. `solar_day_of` raises on an item
+    # that has not been normalised rather than deriving a plausible-looking wrong day, which
+    # makes an unnormalised caller a loud error instead of a silent evasion of these guards.
     by_date: dict[str, list[Any]] = {}
     for item in items:
-        by_date.setdefault(item.datetime.strftime("%Y-%m-%d"), []).append(item)
+        by_date.setdefault(solar_day_of(item), []).append(item)
 
     exempt: set[str] = set()
     for date_str, group in sorted(by_date.items()):
@@ -377,6 +384,18 @@ def dates_exempt_from_correction(
             return 0 if supplied is None else supplied
 
         owed = [it for it, k in kinds.items() if k is not Harmonisation.HARMONISED and _owed_baseline(it) >= threshold]
+        # An item whose producer cannot be determined at all, where the answer would matter.
+        # Correcting it risks subtracting 1000 from already-harmonised pixels; exempting it risks
+        # leaving raw pixels 1000 high. Both are silent, so neither is chosen.
+        undetermined = [it for it, k in kinds.items() if k is Harmonisation.UNKNOWN and _owed_baseline(it) >= threshold]
+        if undetermined:
+            raise HeterogeneousProducerError(
+                f"{date_str}: {len(undetermined)} item(s) expose none of the reflectance bands "
+                f"under the configured names, so which producer served them cannot be determined "
+                f"— and at baseline >= {threshold} that decides whether 1000 is subtracted. The "
+                f"bands may be served under native asset keys; resolve the names rather than "
+                f"guessing the producer."
+            )
         straddling = [it for it, k in kinds.items() if k is Harmonisation.MIXED and _owed_baseline(it) >= threshold]
         if straddling:
             raise HeterogeneousProducerError(

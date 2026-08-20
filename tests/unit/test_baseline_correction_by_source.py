@@ -200,9 +200,27 @@ class TestHarmonisationPredicate:
         item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
         assert item_harmonisation(item) is Harmonisation.MIXED, "MIXED, not silently one or the other"
 
-    def test_an_item_with_no_read_bands_is_not_harmonised(self) -> None:
-        """Absence of evidence must not buy an exemption from a correction."""
-        assert item_harmonisation(_Item(None, "05.00")) is Harmonisation.RAW
+    def test_an_item_with_no_read_bands_is_undetermined_not_raw(self) -> None:
+        """Absence of evidence must not buy an exemption — and must not buy a CORRECTION either.
+
+        This returned RAW, which reads as "we know it is unharmonised" when what we know is
+        nothing. Nothing here can see the alias table, so a band absent under the configured name
+        may be served under a native one — and calling that raw subtracts 1000 from pixels that
+        may already be harmonised. The caller refuses on UNKNOWN instead of guessing.
+        """
+        assert item_harmonisation(_Item(None, "05.00")) is Harmonisation.UNKNOWN
+
+    def test_an_item_serving_bands_under_native_keys_is_undetermined(self) -> None:
+        """The concrete alias case, which `_prune_item_dict` in `stac.py` exists to preserve."""
+        item = _Item(None, "05.00")
+        item.assets = {f"B{n:02d}": {"href": f"{_HARMONISED}/B{n:02d}.tif"} for n in (2, 3, 4, 8)}
+        assert item_harmonisation(item) is Harmonisation.UNKNOWN
+
+    def test_the_live_catalogue_serves_the_configured_alias_keys(self) -> None:
+        """Why UNKNOWN does not fire in production: real Element 84 items key their assets by
+        the configured band names, so they classify HARMONISED on the normal path.
+        """
+        assert item_harmonisation(_Item(_HARMONISED, "05.00")) is Harmonisation.HARMONISED
 
     def test_an_unrecognised_bucket_is_not_harmonised(self) -> None:
         """A future mirror nobody has told us about gets corrected rather than exempted."""
@@ -510,3 +528,35 @@ class TestTheCorrectorIsSkippedWhenNothingIsOwed:
         baselines = {"2022-01-07": 510}
         self._run(monkeypatch, [_Item(_HARMONISED, "05.10")], baselines)
         assert baselines == {"2022-01-07": 510}
+
+
+class TestAnUndeterminedProducerRefusesRatherThanGuessing:
+    """UNKNOWN is refused where the answer matters, and ignored where it does not. PR #108."""
+
+    def test_a_post_threshold_undetermined_item_refuses_the_date(self) -> None:
+        item = _Item(None, "05.00")
+        with pytest.raises(HeterogeneousProducerError, match="none of the reflectance bands"):
+            dates_exempt_from_correction([item])
+
+    def test_a_pre_threshold_undetermined_item_is_exempt_not_refused(self) -> None:
+        """Nothing is owed, so which producer served it cannot change any pixel."""
+        item = _Item(None, "03.00")
+        assert dates_exempt_from_correction([item]) == {"2022-01-07"}
+
+    def test_a_normal_harmonised_date_is_unaffected(self) -> None:
+        """The guard must not fire on the common path."""
+        assert dates_exempt_from_correction([_Item(_HARMONISED, "05.10")]) == {"2022-01-07"}
+
+
+class TestTheExemptionGroupsByTheDayTheLoaderFuses:
+    """`odc.stac.load` fuses a SOLAR day. Checking UTC dates checked different sets. PR #108."""
+
+    def test_an_unnormalised_item_is_refused_rather_than_grouped_by_utc_date(self) -> None:
+        item = _Item(_RAW_ESA, "05.00")
+        item.datetime = datetime(2022, 1, 7, 23, 40, 0, tzinfo=UTC)
+        with pytest.raises(ValueError, match=r"canonical\s+noon-UTC solar-day timestamp"):
+            dates_exempt_from_correction([item])
+
+    def test_a_normalised_item_groups_on_its_solar_day(self) -> None:
+        """The canonical noon stamp IS the solar day, so the common path is unchanged."""
+        assert dates_exempt_from_correction([_Item(_HARMONISED, "05.10")]) == {"2022-01-07"}

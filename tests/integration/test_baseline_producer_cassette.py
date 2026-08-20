@@ -37,6 +37,7 @@ import pytest
 
 from tessera_embeddings.config.satellites import S2_BASELINE_THRESHOLD
 from tessera_embeddings.ingest.asset_locations import Harmonisation, item_harmonisation
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 from tessera_embeddings.ingest.stac import (
     dates_exempt_from_correction,
     extract_baselines,
@@ -83,6 +84,24 @@ def _items() -> list[Any]:
     return list(search.items())
 
 
+#: UTM zone 33's central meridian. `normalize_to_solar_day` needs the ROI's longitude, and every
+#: item in this fixture is on one tile, so the tile's own zone is the right answer.
+TILE_MID_LONGITUDE = 15.0
+
+
+def _normalised() -> list[Any]:
+    """The fixture's items, through the chokepoint the real pipeline puts them through.
+
+    `dates_exempt_from_correction` derives the solar day with `solar_day_of`, which refuses an
+    item that has not been normalised rather than deriving a plausible-looking wrong day from its
+    UTC stamp. The ingest normalises at the catalogue chokepoint, so a test that skips it is
+    testing a call the pipeline never makes — and this guard is what caught these two doing it.
+    """
+    items = _items()
+    normalize_to_solar_day(items, mid_longitude=TILE_MID_LONGITUDE)
+    return items
+
+
 @pytest.mark.integration
 @pytest.mark.vcr(CASSETTE_NAME)
 class TestRecordedProducerSplit:
@@ -99,6 +118,14 @@ class TestRecordedProducerSplit:
         assert kinds[Harmonisation.RAW] > 0, f"no raw-producer items recorded: {dict(kinds)}"
         assert kinds[Harmonisation.HARMONISED] > 0, f"no harmonised items recorded: {dict(kinds)}"
         assert kinds[Harmonisation.MIXED] == 0, "an item straddling producers would need its own handling"
+        # The claim that makes UNKNOWN safe to refuse on. Real Element 84 items key their assets
+        # by the configured band names, so the producer is always determinable and the refusal
+        # never fires in production. If this ever trips, the catalogue changed its asset naming
+        # and the ingest will stop rather than subtract 1000 from harmonised pixels.
+        assert kinds[Harmonisation.UNKNOWN] == 0, (
+            "a real item's producer could not be determined; the catalogue may have moved to "
+            "native asset keys, which the harmonisation check cannot resolve"
+        )
 
     def test_raw_items_report_old_baselines(self) -> None:
         """Why the correction never fires on today's archive: the backfill is of the OLD
@@ -123,7 +150,7 @@ class TestRecordedProducerSplit:
         every mixed-producer date and would have thrown this away — a real date lost to an
         ambiguity that was not present.
         """
-        on_day = [it for it in _items() if it.datetime.strftime("%Y-%m-%d") == MIXED_DAY]
+        on_day = [it for it in _normalised() if it.datetime.strftime("%Y-%m-%d") == MIXED_DAY]
         assert len(on_day) > 1, f"{MIXED_DAY} no longer carries multiple items; re-pick the fixture day"
         assert {item_harmonisation(it) for it in on_day} == {
             Harmonisation.HARMONISED,
@@ -145,7 +172,7 @@ class TestRecordedProducerSplit:
         which is the only way to exercise it — stated plainly because a synthetic property on
         real structure is evidence about the routing and not about the archive.
         """
-        raw = next(it for it in _items() if item_harmonisation(it) is Harmonisation.RAW)
+        raw = next(it for it in _normalised() if item_harmonisation(it) is Harmonisation.RAW)
         raw.properties["s2:processing_baseline"] = "05.00"
         day = raw.datetime.strftime("%Y-%m-%d")
         assert day not in dates_exempt_from_correction([raw]), "a raw item over the threshold is owed the offset"

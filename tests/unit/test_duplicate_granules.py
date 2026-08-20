@@ -1010,3 +1010,50 @@ class TestTheLadderKeepsGlobalPriorityPastItsHead:
         _, alternates = select_preferred_duplicates(items)
         ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
         assert ladder == ["a-04", "b-03", "a-unknown"]
+
+
+class TestLocalityDoesNotDecideBetweenUnknownBaselines:
+    """In the ladder key, locality was ranked ahead of sequence for copies that declare no
+    readable baseline — so a local sequence-1 spare came out before a remote sequence-2 one,
+    buying cheaper egress with an older reprocessing. Raised on PR #107.
+    """
+
+    _A = "2021-09-08T10:00:00Z"
+
+    def test_sequence_decides_between_two_unknown_baseline_spares(self) -> None:
+        items = [
+            _copy_at("winner", acquired=self._A, sequence="3", baseline=None),
+            _copy_at("remote-seq2", acquired=self._A, sequence="2", baseline=None, host_root=_REMOTE),
+            _copy_at("local-seq1", acquired=self._A, sequence="1", baseline=None, host_root=_IN_REGION),
+        ]
+        kept, alternates = select_preferred_duplicates(items)
+        assert [it.id for it in kept] == ["winner"]
+        ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
+        assert ladder == ["remote-seq2", "local-seq1"], "locality outranked the newer sequence"
+
+    def test_locality_still_decides_between_two_equal_known_baselines(self) -> None:
+        """The complement: neutralising locality everywhere would pass the test above."""
+        items = [
+            _copy_at("winner", acquired=self._A, sequence="3", baseline="05.00"),
+            _copy_at("remote", acquired=self._A, sequence="1", baseline="04.00", host_root=_REMOTE),
+            _copy_at("local", acquired=self._A, sequence="1", baseline="04.00", host_root=_IN_REGION),
+        ]
+        _, alternates = select_preferred_duplicates(items)
+        ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
+        assert ladder == ["local", "remote"]
+
+
+class TestAMalformedHrefDoesNotAbortTheSelection:
+    """`urlparse` raises on some malformed authorities, and locality is evaluated for every copy
+    including singletons — so one bad catalogue href aborted the whole selection. PR #107.
+    """
+
+    @pytest.mark.parametrize("href", ["https://[oops/B02.tif", "https://[::1/x", "s3://[/key"])
+    def test_an_unparseable_href_reads_as_remote(self, href: str) -> None:
+        assert asset_bucket(href) is None
+
+    def test_a_singleton_group_with_a_malformed_href_still_returns(self) -> None:
+        item = _with_assets(_Item("only", "MGRS-33TWM", "0"), {"blue": {"href": "https://[oops/B02.tif"}})
+        kept, alternates = select_preferred_duplicates([item])
+        assert [it.id for it in kept] == ["only"]
+        assert alternates == {}

@@ -165,10 +165,16 @@ def _across_acquisitions_key(item: Any) -> tuple[int, float, int, int, int, int,
     """
     baseline = item_processing_baseline(item)
     sequence = item_sequence(item)
+    # Locality participates only where the baseline is READABLE, the same rule `_rank_copies`
+    # applies. Among copies that all declare nothing, locality was deciding ahead of sequence,
+    # so a local sequence-1 spare was handed out before a remote sequence-2 one — buying cheaper
+    # egress with an older reprocessing, which is the precise trade this ordering exists to
+    # refuse. Neutral rather than absent, so the tuple width stays fixed.
+    remote = (0 if item_is_in_preferred_location(item) else 1) if baseline is not None else 0
     return (
         0 if baseline is not None else 1,
         -(baseline or 0.0),
-        0 if item_is_in_preferred_location(item) else 1,
+        remote,
         0 if read_set_is_complete(item) else 1,
         0 if sequence is not None else 1,
         -(sequence or 0),

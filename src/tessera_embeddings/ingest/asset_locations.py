@@ -18,10 +18,13 @@ corrected" from a fact about its location. Two constants make that impossible to
 from __future__ import annotations
 
 import enum
+import logging
 import urllib.parse
 from typing import Any
 
 from tessera_embeddings.config.providers import S2_L2A_BANDS
+
+logger = logging.getLogger(__name__)
 
 #: Buckets in the same region as our compute — reads against these reach the S3 gateway
 #: endpoint. An unrecognised bucket is REMOTE rather than assumed local: under-claiming
@@ -80,7 +83,14 @@ def asset_bucket(href: str) -> str | None:
     ``https://bucket.s3.<region>.amazonaws.com/key``, and path-style
     ``https://s3.<region>.amazonaws.com/bucket/key``.
     """
-    parsed = urllib.parse.urlparse(href)
+    try:
+        parsed = urllib.parse.urlparse(href)
+    except ValueError:
+        # Malformed authorities raise — an unmatched IPv6 bracket, for one. Locality is
+        # evaluated for every copy including singletons, so propagating would let a single
+        # malformed catalogue href abort the whole selection. Unrecognised means remote.
+        logger.debug("Unparseable asset href %r", href)
+        return None
     if parsed.scheme == "s3":
         return parsed.netloc or None
     host = parsed.netloc.split("@")[-1].split(":")[0].lower()
@@ -158,6 +168,7 @@ class Harmonisation(enum.Enum):
     HARMONISED = "harmonised"
     RAW = "raw"
     MIXED = "mixed"
+    UNKNOWN = "unknown"
 
 
 def item_harmonisation(
@@ -173,14 +184,25 @@ def item_harmonisation(
     excluded even though it IS read: it is categorical and never corrected, so its producer
     cannot make the reflectance decision ambiguous.
 
-    An item exposing none of the reflectance bands is ``RAW``, and so is one served from a bucket
-    nobody has listed. **Absence of evidence must not buy an exemption from a correction**, and
-    of the two mistakes only one is discoverable: a doubled correction shifts values by a
-    visible 1000, while a skipped one leaves plausible pixels that are quietly wrong.
+    An item served from a bucket nobody has listed is ``RAW``: **absence of evidence must not buy
+    an exemption from a correction**, and of the two mistakes only one is discoverable — a doubled
+    correction shifts values by a visible 1000, while a skipped one leaves plausible pixels that
+    are quietly wrong.
+
+    An item exposing NONE of the reflectance bands is ``UNKNOWN``, which is a different answer for
+    a different reason and not a softer version of ``RAW``. Nothing here can see the alias table
+    that maps a band name to an asset key, so a band absent under the requested name may still be
+    served under a native one — ``_prune_item_dict`` in ``stac.py`` exists for exactly that case.
+    Calling such an item raw would subtract 1000 from pixels that may already be harmonised,
+    which is the corruption this whole module was written to prevent, and it would do it while
+    reporting nothing. The live Element 84 catalogue serves the configured alias keys, so this
+    state does not arise there today; the caller refuses on it rather than guessing, so a
+    catalogue that changed its key naming would stop the ingest instead of silently halving the
+    reflectance of a season.
     """
     found = read_asset_buckets(item, keys)
     if not found:
-        return Harmonisation.RAW
+        return Harmonisation.UNKNOWN
     harmonised = [bucket in buckets for bucket in found]
     if all(harmonised):
         return Harmonisation.HARMONISED
