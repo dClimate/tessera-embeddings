@@ -273,8 +273,8 @@ class HeterogeneousProducerError(RuntimeError):
     """
 
 
-def dates_exempt_from_correction(items: list[Any]) -> set[str]:
-    """The solar days whose pixels already have the baseline-04.00 offset removed.
+def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_THRESHOLD) -> set[str]:
+    """The solar days owed no BOA offset correction.
 
     Kept apart from :func:`extract_baselines` because the two answer different questions — one
     records what an item declares, the other decides what is owed — and collapsing them made a
@@ -282,43 +282,58 @@ def dates_exempt_from_correction(items: list[Any]) -> set[str]:
 
     **A date is judged over every item that will be fused into it, not over one.**
     ``odc.stac.load`` mosaics a solar day's tiles into a single time slice, and duplicate
-    selection keeps one copy per *(tile, acquisition)* rather than one per date, so a date
-    routinely carries many items — measured at 16 of 16 dates over a four-tile ROI. Reading one
+    selection keeps one copy per *(tile, acquisition)* rather than one per date, so a date can
+    still carry several items — measured at 16 of 16 dates over a four-tile ROI. Reading one
     item per date and letting the last win decided a whole mosaic by catalogue sort order.
 
-    **A date whose items disagree raises rather than picking.** The correction is date-wide, so
-    a mixed date has no right answer: exempting it leaves raw tiles 1000 high, correcting it
-    drops 1000 from harmonised ones. Both are silent. Refusing costs one date and says so; the
-    resolution is to load the producers as separate groups. Not observed on the live catalogue,
-    which is why it is refused rather than engineered around — a path this rare would be wrong
-    and never exercised.
+    **The question asked of a date is whether anything in it is actually OWED a correction**,
+    not whether its producers agree. That distinction matters because mixed-producer days are
+    real: a full census of four tile-years found 7 such days in 522, and after duplicate
+    selection the survivors pair a harmonised COG with a raw item at an OLD baseline. Nothing
+    there is owed a correction, so exempting the date is right — and refusing it, as an earlier
+    version of this did, would have lost real dates for an ambiguity that was not present.
 
-    A ``MIXED`` item — read bands straddling two producers — is refused on the same reasoning.
+    So a date is exempt unless some item is BOTH raw and at or above the threshold. Only when
+    such an item shares a date with a harmonised one is the answer genuinely ambiguous: the
+    correction is date-wide, so exempting leaves raw tiles 1000 high while correcting drops 1000
+    from harmonised ones, and both are silent. That case refuses. It has never been observed,
+    which is why it is refused rather than engineered around.
+
+    Args:
+        items: the items a preparation will LOAD, after duplicate selection.
+        threshold: baselines at or above this are owed the offset (matches the collection's).
 
     Raises:
-        HeterogeneousProducerError: a date carries items, or an item carries bands, from
-            producers that disagree about whether the offset has been applied.
+        HeterogeneousProducerError: a date fuses a raw item owed a correction with a harmonised
+            one, or carries an item whose own bands straddle both, so no date-wide decision is
+            correct for it.
     """
-    by_date: dict[str, set[Harmonisation]] = {}
+    by_date: dict[str, list[Any]] = {}
     for item in items:
-        date_str = item.datetime.strftime("%Y-%m-%d")
-        by_date.setdefault(date_str, set()).add(item_harmonisation(item))
+        by_date.setdefault(item.datetime.strftime("%Y-%m-%d"), []).append(item)
+
     exempt: set[str] = set()
-    for date_str, kinds in sorted(by_date.items()):
-        if Harmonisation.MIXED in kinds:
+    for date_str, group in sorted(by_date.items()):
+        kinds = {item: item_harmonisation(item) for item in group}
+        owed = [
+            it for it, k in kinds.items() if k is not Harmonisation.HARMONISED and _extract_baseline(it) >= threshold
+        ]
+        straddling = [it for it, k in kinds.items() if k is Harmonisation.MIXED and _extract_baseline(it) >= threshold]
+        if straddling:
             raise HeterogeneousProducerError(
-                f"{date_str}: an item's read bands span a harmonised and a raw producer, so no "
-                f"date-wide offset decision is correct for it. Load the producers separately."
+                f"{date_str}: an item's read bands span a harmonised and a raw producer at "
+                f"baseline >= {threshold}, so no date-wide offset decision is correct for it. "
+                f"Load the producers separately."
             )
-        if len(kinds) > 1:
-            raise HeterogeneousProducerError(
-                f"{date_str}: tiles come from both a harmonised and a raw producer "
-                f"({sorted(k.value for k in kinds)}), and the offset correction is applied per "
-                f"date to the fused mosaic, so either choice is wrong for some of its pixels. "
-                f"Load the producers as separate groups."
-            )
-        if kinds == {Harmonisation.HARMONISED}:
+        if not owed:
             exempt.add(date_str)
+            continue
+        if any(k is Harmonisation.HARMONISED for k in kinds.values()):
+            raise HeterogeneousProducerError(
+                f"{date_str}: fuses a raw item owed the offset correction with an already "
+                f"harmonised one, and the correction is applied per date to the whole mosaic, so "
+                f"either choice is wrong for some of its pixels. Load the producers separately."
+            )
     return exempt
 
 

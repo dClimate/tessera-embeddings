@@ -121,21 +121,45 @@ class TestProvenanceIsNotOverwritten:
         assert extract_baselines([_Item(_HARMONISED, "05.10")]) == {"2022-01-07": 510}
 
 
-class TestHeterogeneousDatesAreRefused:
-    """A date-wide correction has no right answer when its tiles disagree, so it refuses."""
+class TestMixedProducerDates:
+    """Mixed-producer days are REAL, so the question is what is owed — not who disagrees."""
 
-    def test_a_date_with_both_producers_raises(self) -> None:
-        """`odc.stac.load` fuses a solar day's tiles into one slice, and duplicate selection
-        keeps one copy per (tile, acquisition) rather than per date — measured at 16 of 16 dates
-        over a four-tile ROI. Letting the last item win decided a whole mosaic by sort order.
+    def test_a_mixed_date_owing_nothing_is_exempt_not_refused(self) -> None:
+        """THE REAL CASE, and the one an earlier version of this got wrong by refusing.
+
+        A full census of four tile-years found 7 mixed days in 522. After duplicate selection
+        the survivors pair a harmonised COG with a raw item at an OLD baseline — measured on
+        33TWM 2017-12-19, a COG at 05.00 beside a raw item at 02.06, kept apart because their
+        instants are 209 s apart and so count as distinct acquisitions. Nothing there is owed a
+        correction, so exempting is right and refusing would lose a real date.
         """
-        raw, harmonised = _Item(_RAW_ESA, "05.00"), _Item(_HARMONISED, "05.00")
-        with pytest.raises(HeterogeneousProducerError, match="2022-01-07"):
-            dates_exempt_from_correction([raw, harmonised])
+        harmonised = _Item(_HARMONISED, "05.00")
+        raw_old = _Item(_RAW_ESA, "02.06")
+        assert dates_exempt_from_correction([harmonised, raw_old]) == {"2022-01-07"}
 
-    def test_a_mixed_band_item_raises(self) -> None:
-        """Same reasoning one level down: exempting leaves the raw band high, correcting drops
-        1000 from the harmonised ones, and a boolean picks one silently.
+    def test_a_mixed_date_that_genuinely_owes_a_correction_raises(self) -> None:
+        """The unobserved case that has no right answer: a raw item at or above the threshold
+        fused with a harmonised one. Exempting leaves the raw tiles 1000 high, correcting drops
+        1000 from the harmonised ones, and the correction is date-wide.
+        """
+        with pytest.raises(HeterogeneousProducerError, match="fuses a raw item"):
+            dates_exempt_from_correction([_Item(_HARMONISED, "05.00"), _Item(_RAW_ESA, "05.00")])
+
+    def test_an_all_raw_date_over_the_threshold_is_corrected(self) -> None:
+        """No ambiguity when every item is raw — correct the whole date."""
+        assert dates_exempt_from_correction([_Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "05.00")]) == set()
+
+    def test_a_mixed_band_item_below_the_threshold_is_not_refused(self) -> None:
+        """Straddling bands only matter if something is actually owed. Below the threshold there
+        is nothing to get wrong, so refusing would be gratuitous.
+        """
+        item = _Item(_HARMONISED, "02.06")
+        item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
+        assert dates_exempt_from_correction([item]) == {"2022-01-07"}
+
+    def test_a_mixed_band_item_over_the_threshold_raises(self) -> None:
+        """Same reasoning one level down: no date-wide answer is correct for a single item whose
+        own bands come from both producers.
         """
         item = _Item(_HARMONISED, "05.00")
         item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
