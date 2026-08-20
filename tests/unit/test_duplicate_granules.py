@@ -771,6 +771,25 @@ class TestTheDuplicateLogIsAnAuditTrail:
         msg = self._emit(caplog, [winner, stray], {("MGRS-33TWM", "2021-09-08"): [stray]})
         assert "1 in-region, 0 remote" in msg
 
+    def test_it_names_the_sequence_only_fallback_when_that_is_what_ran(self, caplog) -> None:
+        """`_rank_copies` abandons BOTH baseline and locality when a copy declares no readable
+        baseline, and chooses on sequence alone. On exactly the uncertain-metadata dates this
+        line exists to explain, it was describing the wrong mechanism.
+        """
+        winner = _copy("a", sequence="1", baseline="00.01", host_root=_IN_REGION)
+        unreadable = _with_assets(_Item("b", "MGRS-33TWM", "0"), _bands_at(_REMOTE))
+        msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [unreadable]})
+        assert "ranked on sequence alone" in msg
+        assert "1 tile-date(s) where a copy declared no readable baseline" in msg
+
+    def test_it_does_not_claim_a_fallback_that_did_not_happen(self, caplog) -> None:
+        """The complement, or the clause above would just always be present."""
+        winner = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
+        rejected = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
+        msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [rejected]})
+        assert "sequence alone" not in msg
+        assert "newest baseline, then in-region, then newest sequence" in msg
+
     def test_no_duplicates_logs_nothing(self, caplog) -> None:
         assert self._emit(caplog, [], {}) == ""
 

@@ -330,17 +330,18 @@ def dates_exempt_from_correction(
     from harmonised ones, and both are silent. That case refuses. It has never been observed,
     which is why it is refused rather than engineered around.
 
-    **The threshold is evaluated against the baseline the correction will actually apply**, which
-    is the caller's map and not the items' own metadata. The two normally agree, because the map
-    was built from these items — but where a raw item's ``s2:processing_baseline`` is absent or
-    malformed it parses as 0, and reading only the item exempted a date the caller had correctly
-    supplied a post-threshold baseline for, leaving those pixels 1000 too high with nothing
-    raising. Producer is still decided per item; only the baseline comes from the map.
+    **Each item is judged on its OWN declared baseline, with the caller's map as the fallback for
+    items that declare none.** An absent or malformed ``s2:processing_baseline`` parses as 0,
+    which is under the threshold, so reading only the item exempted a date the caller had
+    correctly supplied a post-threshold baseline for. The map cannot simply replace the items
+    either: :func:`extract_baselines` is last-wins, so it carries one arbitrary item's value, and
+    applying that to every item would make the decision depend on the caller's sort order — the
+    exact fault this function exists to remove.
 
     Args:
         items: the items a preparation will LOAD, after duplicate selection.
-        baselines: the per-date baselines the correction will apply, keyed by solar day. Falls
-            back to each item's own declared baseline for a date the map does not carry.
+        baselines: the per-date baselines the correction will apply, keyed by solar day. Consulted
+            only for items whose own declaration is absent or malformed.
         threshold: baselines at or above this are owed the offset (matches the collection's).
 
     Raises:
@@ -357,15 +358,23 @@ def dates_exempt_from_correction(
         kinds = {item: item_harmonisation(item) for item in group}
         # The value the correction will apply for this date, which is what the threshold has to
         # be tested against. Only where the map is silent does an item's own declaration decide.
-        # Both sides are already in the scaled space `threshold` is expressed in (400, not 4.0),
-        # which is the only scale a comparison against it is meaningful in.
-        effective = None if baselines is None else baselines.get(date_str)
+        # The date's baseline is a FALLBACK for items whose own declaration cannot be read, not a
+        # replacement for the ones that can. `extract_baselines` is last-wins, so the map holds
+        # one arbitrary item's value: using it for every item made the decision depend on the
+        # caller's sort order, which is the failure this whole function exists to remove. A raw
+        # 05.00 item beside a raw 02.06 one read as wholly pre-threshold and exempted the date,
+        # leaving the 05.00 pixels 1000 high; with the harmonised item sorted last, the raw 02.06
+        # one read as post-threshold and refused a date that needed nothing.
+        #
+        # Both sides are in the scaled space `threshold` is expressed in (400, not 4.0), which is
+        # the only scale a comparison against it is meaningful in.
+        supplied = None if baselines is None else baselines.get(date_str)
 
-        def _owed_baseline(item: Any, effective: int | None = effective) -> int:  # noqa: ANN401
-            if effective is not None:
-                return effective
+        def _owed_baseline(item: Any, supplied: int | None = supplied) -> int:  # noqa: ANN401
             own = _declared_baseline(item)
-            return 0 if own is None else own
+            if own is not None:
+                return own
+            return 0 if supplied is None else supplied
 
         owed = [it for it, k in kinds.items() if k is not Harmonisation.HARMONISED and _owed_baseline(it) >= threshold]
         straddling = [it for it, k in kinds.items() if k is Harmonisation.MIXED and _owed_baseline(it) >= threshold]
@@ -1161,14 +1170,26 @@ def load_stac_items(
         # producer means.
         exempt = dates_exempt_from_correction(items, filtered_baselines)
         correction_baselines = {d: (0 if d in exempt else b) for d, b in filtered_baselines.items()}
-        data = _apply_baseline_corrections_by_date(
-            data,
-            correction_baselines,
-            baseline_threshold=collection_config.baseline_threshold,  # type: ignore[arg-type]
-            baseline_offset=collection_config.baseline_offset,
-            bands=list(collection_config.bands),
-            preserve_low_values=preserve_low_values,
-        )
+        # Skip the corrector outright when nothing reaches the threshold. It is a no-op on those
+        # dates, but not a free one: it clips, casts, adds and `xr.where`s every reflectance band
+        # in the graph before deciding to change nothing. Setting the threshold for Earth Search
+        # made the already-harmonised path the common case rather than an unused branch, so that
+        # work would now be paid on the majority of every ingest.
+        threshold = collection_config.baseline_threshold
+        if any(b >= threshold for b in correction_baselines.values()):  # type: ignore[operator]
+            data = _apply_baseline_corrections_by_date(
+                data,
+                correction_baselines,
+                baseline_threshold=threshold,  # type: ignore[arg-type]
+                baseline_offset=collection_config.baseline_offset,
+                bands=list(collection_config.bands),
+                preserve_low_values=preserve_low_values,
+            )
+        else:
+            logger.debug(
+                "No baseline correction owed on any of %d loaded date(s); corrector skipped.",
+                len(correction_baselines),
+            )
 
     if post_load_fn is not None:
         data = post_load_fn(data)

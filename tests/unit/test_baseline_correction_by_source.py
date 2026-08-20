@@ -342,14 +342,42 @@ class TestTheThresholdFollowsTheBaselineTheCorrectionWillApply:
         assert dates_exempt_from_correction([item], {"2022-01-07": 399}) == {"2022-01-07"}
         assert dates_exempt_from_correction([item], {"2022-01-07": 400}) == set(), "the threshold is inclusive"
 
-    def test_a_supplied_pre_threshold_baseline_exempts_a_raw_item(self) -> None:
-        """The other direction, so the rule is not "always correct". The correction applies the
-        map's value, so a map under the threshold means no offset is applied whatever the item
-        declares — and the exemption has to agree with that rather than contradict it.
+    def test_a_readable_item_is_judged_on_its_own_baseline(self) -> None:
+        """The map is a FALLBACK, not a replacement. `extract_baselines` is last-wins, so it
+        carries one arbitrary item's value; letting it override a readable declaration would put
+        the decision back under the caller's sort order.
         """
         item = _Item(_RAW_ESA, "05.00")
         assert dates_exempt_from_correction([item]) == set()
-        assert dates_exempt_from_correction([item], {"2022-01-07": 300}) == {"2022-01-07"}
+        assert dates_exempt_from_correction([item], {"2022-01-07": 300}) == set()
+
+    def test_a_last_wins_map_does_not_exempt_a_post_threshold_item(self) -> None:
+        """THE REGRESSION. With raw 05.00 and raw 02.06 on one day, the last-wins map supplies
+        02.06 for the date. Applying that to both items read the whole day as pre-threshold,
+        exempted it, and left the 05.00 pixels 1000 too high.
+        """
+        over = _Item(_RAW_ESA, "05.00")
+        under = _Item(_RAW_ESA, "02.06")
+        with pytest.raises(HeterogeneousProducerError, match="straddle the correction threshold"):
+            dates_exempt_from_correction([over, under], {"2022-01-07": 206})
+
+    def test_a_last_wins_map_does_not_refuse_a_date_that_needs_nothing(self) -> None:
+        """The mirror image, from the recorded 2017-12-19 case: cloud sorting left the harmonised
+        05.00 item last, so applying the date's baseline to the raw 02.06 item read it as
+        post-threshold and refused a date where nothing was owed at all.
+        """
+        harmonised = _Item(_HARMONISED, "05.00")
+        raw_old = _Item(_RAW_ESA, "02.06")
+        # The map holds the HARMONISED item's 500, because it sorted last.
+        assert dates_exempt_from_correction([harmonised, raw_old], {"2022-01-07": 500}) == {"2022-01-07"}
+
+    def test_the_decision_does_not_depend_on_item_order(self) -> None:
+        """The general property both regressions violated."""
+        harmonised = _Item(_HARMONISED, "05.00")
+        raw_old = _Item(_RAW_ESA, "02.06")
+        forward = dates_exempt_from_correction([harmonised, raw_old], {"2022-01-07": 500})
+        reverse = dates_exempt_from_correction([raw_old, harmonised], {"2022-01-07": 206})
+        assert forward == reverse == {"2022-01-07"}
 
     def test_a_date_the_map_does_not_carry_falls_back_to_the_item(self) -> None:
         """A partial map must not exempt the dates it happens to omit."""
@@ -427,3 +455,58 @@ class TestTheBaselineParserReportsUnknown:
         assert _declared_baseline(_Item(_RAW_ESA, "00.00")) == 0
         assert _declared_baseline(_Item(_RAW_ESA, None)) is None
         assert _extract_baseline(_Item(_RAW_ESA, "00.00")) == _extract_baseline(_Item(_RAW_ESA, None)) == 0
+
+
+class TestTheCorrectorIsSkippedWhenNothingIsOwed:
+    """Setting the threshold for Earth Search made the already-harmonised path the COMMON case.
+
+    The corrector is a no-op on a date owed nothing, but not a free one: it clips, casts, adds
+    and `xr.where`s every reflectance band into the graph before deciding to change nothing.
+    Raised on PR #108 — before this change that branch was unreachable, so the cost never
+    landed on a real ingest.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, items, baselines) -> list[dict]:
+        import numpy as np
+        import xarray as xr
+
+        from tessera_embeddings.ingest import stac as stac_module
+
+        data = xr.Dataset(
+            {"B02": (("time", "y", "x"), np.ones((1, 2, 2), dtype="uint16"))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
+
+        calls: list[dict] = []
+
+        def _spy(_data, corrections, **kwargs):
+            calls.append({"corrections": corrections, **kwargs})
+            return _data
+
+        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", _spy)
+        stac_module.load_stac_items(items, "earth-search", "sentinel-2-l2a", baselines=baselines)
+        return calls
+
+    def test_an_all_harmonised_date_does_not_enter_the_corrector(self, monkeypatch) -> None:
+        calls = self._run(monkeypatch, [_Item(_HARMONISED, "05.10")], {"2022-01-07": 510})
+        assert calls == [], "the corrector ran for a date whose correction baseline is 0"
+
+    def test_a_pre_threshold_date_does_not_enter_the_corrector(self, monkeypatch) -> None:
+        calls = self._run(monkeypatch, [_Item(_RAW_ESA, "03.00")], {"2022-01-07": 300})
+        assert calls == []
+
+    def test_a_date_that_is_owed_the_offset_still_enters_the_corrector(self, monkeypatch) -> None:
+        """The complement. Skipping unconditionally would pass both tests above."""
+        calls = self._run(monkeypatch, [_Item(_RAW_ESA, "05.00")], {"2022-01-07": 500})
+        assert len(calls) == 1
+        assert calls[0]["corrections"] == {"2022-01-07": 500}
+
+    def test_the_provenance_map_is_untouched_by_the_skip(self, monkeypatch) -> None:
+        """The store's `baselines_applied` records the vintage of what was loaded, so the
+        harmonised item's real 510 must survive a load that corrected nothing.
+        """
+        baselines = {"2022-01-07": 510}
+        self._run(monkeypatch, [_Item(_HARMONISED, "05.10")], baselines)
+        assert baselines == {"2022-01-07": 510}

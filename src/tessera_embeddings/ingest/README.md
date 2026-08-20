@@ -391,11 +391,15 @@ decision are worth stating:
   whether *anything* in it is actually owed a correction. Mixed-producer days are real — a
   census of four tile-years found 7 in 522 — and after duplicate selection their survivors pair
   a harmonised COG with a raw item at an old baseline, which is owed nothing.
-- **Thresholded on the baseline that will actually be applied**, which is the per-date map the
-  caller passes down, not the item's own metadata re-parsed. The two normally agree because the
-  map is built from those items, but a raw item whose `s2:processing_baseline` is absent or
-  malformed parses as 0 and would exempt a date the caller correctly supplied a post-threshold
-  baseline for.
+- **Thresholded per item on its own declared baseline, with the caller's per-date map as the
+  fallback for items that declare none.** An absent or malformed `s2:processing_baseline` parses
+  as 0, which is under the threshold, so reading only the item exempted a date the caller had
+  correctly supplied a post-threshold baseline for. The map cannot simply replace the items
+  either: `extract_baselines` is last-wins, so it holds one arbitrary item's value, and applying
+  that to every item puts the decision back under the caller's sort order — a raw 05.00 item
+  beside a raw 02.06 one read as wholly pre-threshold and exempted the date, and with the
+  harmonised item sorted last the raw 02.06 one read as post-threshold and refused a date that
+  needed nothing.
 
 Genuinely ambiguous dates **refuse** (`HeterogeneousProducerError`) rather than picking a side,
 because no date-wide answer is right for them and both mistakes are silent: an item whose own
@@ -407,6 +411,16 @@ The correction path had never run in production, so it announces itself at WARNI
 time it does for a date — but only for items served from ESA's archive, since every Planetary
 Computer item is unharmonised too and correcting those is routine. The line is emitted after
 every refusal above, so it can only ever describe a date that really was corrected.
+
+The corrector is skipped outright when no date's baseline reaches the threshold, which since
+this collection's threshold was set is the common case rather than an unused branch. It is a
+no-op on such a date but not a free one: it clips, casts, adds and `xr.where`s every reflectance
+band into the graph before deciding to change nothing.
+
+The provenance map is never masked in place. `extract_baselines` records the baseline of the item
+actually loaded and reaches the store's `baselines_applied` attribute; the exemption masks a
+local copy for the corrector, so a store cannot end up reporting baseline 0 for imagery that was
+processed at 05.10.
 
 When active, `_apply_baseline_corrections_by_date` builds a per-date correction mask vectorised
 across the time dimension. Two modes:

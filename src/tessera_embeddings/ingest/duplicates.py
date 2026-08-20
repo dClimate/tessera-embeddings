@@ -342,6 +342,27 @@ def _contested_key(item: Any) -> tuple[str, str] | None:  # noqa: ANN401 — any
         return None
 
 
+def _keys_ranked_by_sequence_only(
+    alternates: dict[tuple[str, str], list[Any]],
+    winners: Iterable[Any],
+) -> set[tuple[str, str]]:
+    """The contested tile-dates whose ranking fell back to sequence order.
+
+    :func:`_rank_copies` suspends the baseline and locality terms for an acquisition in which any
+    copy's baseline is unreadable, so the audit line cannot claim a baseline-first preference for
+    those dates. Recomputed here rather than threaded out of the selector, because it is needed
+    only to word one log line and a return-value change would reach every caller.
+    """
+    unreadable: set[tuple[str, str]] = set()
+    for key, copies in alternates.items():
+        if any(item_processing_baseline(it) is None for it in copies):
+            unreadable.add(key)
+    for winner in winners:
+        if item_processing_baseline(winner) is None and (winner_key := _contested_key(winner)) is not None:
+            unreadable.add(winner_key)
+    return unreadable & set(alternates)
+
+
 def log_duplicate_selection(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     roi: str,
@@ -375,13 +396,25 @@ def log_duplicate_selection(
     if winners:
         local = sum(1 for it in winners if item_is_in_preferred_location(it))
         where = f"; winners by source: {local} in-region, {len(winners) - local} remote"
+
+    # Name the ranking that actually ran. `_rank_copies` abandons BOTH the baseline and the
+    # locality terms for an acquisition where any copy declares no readable baseline, and
+    # chooses on sequence alone — so on exactly the uncertain-metadata dates this line exists to
+    # explain, stating the baseline-then-locality preference described the wrong mechanism.
+    unreadable = _keys_ranked_by_sequence_only(alternates, winners)
+    how = "newest baseline, then in-region, then newest sequence"
+    if unreadable:
+        how += (
+            f" — except {len(unreadable)} tile-date(s) where a copy declared no readable "
+            f"baseline, ranked on sequence alone"
+        )
     log.info(
         "Duplicate catalogue items pruned roi=%s: %d tile-date(s) had more than one copy, "
-        "%d rejected. Preference: newest baseline, then in-region, then newest sequence "
-        "(rejected copies stay available as a fallback)%s",
+        "%d rejected. Preference: %s (rejected copies stay available as a fallback)%s",
         roi,
         len(alternates),
         pruned,
+        how,
         where,
     )
 
