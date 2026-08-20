@@ -18,14 +18,16 @@ from datetime import UTC, datetime
 import pystac
 import pytest
 
-from tessera_embeddings.ingest.duplicates import (
+from tessera_embeddings.ingest.asset_locations import (
     PREFERRED_ASSET_BUCKETS,
     READ_ASSET_KEYS,
-    alternates_for,
     asset_bucket,
+    item_is_in_preferred_location,
+)
+from tessera_embeddings.ingest.duplicates import (
+    alternates_for,
     copies_label,
     is_unreadable_source,
-    item_is_in_preferred_location,
     item_sequence,
     item_tile,
     select_preferred_duplicates,

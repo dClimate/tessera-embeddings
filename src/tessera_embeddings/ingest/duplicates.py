@@ -38,11 +38,10 @@ import datetime
 import itertools
 import logging
 import re
-import urllib.parse
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from tessera_embeddings.config.providers import S2_L2A_BANDS
+from tessera_embeddings.ingest.asset_locations import item_is_in_preferred_location
 from tessera_embeddings.ingest.solar_days import solar_day_of
 
 logger = logging.getLogger(__name__)
@@ -84,79 +83,6 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
             logger.debug("Unparseable s2:sequence %r on %s", raw, getattr(item, "id", "?"))
     match = _ID_SEQUENCE_RE.search(str(getattr(item, "id", "")))
     return int(match.group(1)) if match else None
-
-
-#: Buckets known to sit in the same region as our compute. Reads against these go through the
-#: VPC's S3 gateway endpoint; anything else egresses through NAT, which is metered, slower and a
-#: shared ceiling. An unrecognised bucket is treated as remote rather than assumed local — the
-#: conservative direction, since under-claiming locality costs only a lost tiebreak while
-#: over-claiming it routes bulk reads through NAT believing they are free.
-PREFERRED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-cogs", "e84-earth-search-sentinel-data"})
-
-#: The asset keys an S2 ingest actually reads: the configured bands plus the scene classification
-#: layer. Locality is judged over THESE and not over every asset, because these are the only reads
-#: that cost anything — and because a real Element 84 item carries the original JP2s as extra
-#: assets alongside its COG bands, so judging all of them calls the cheap copy remote.
-READ_ASSET_KEYS: tuple[str, ...] = (*S2_L2A_BANDS, "scl")
-
-
-def _asset_href(asset: Any) -> str | None:  # noqa: ANN401 — pystac Asset or a plain dict
-    """An asset's href, whether it arrives as a pystac ``Asset`` or a raw dict."""
-    href = getattr(asset, "href", None)
-    if href is None and isinstance(asset, dict):
-        href = asset.get("href")
-    return href if isinstance(href, str) and href else None
-
-
-def asset_bucket(href: str) -> str | None:
-    """The S3 bucket an href addresses, or ``None`` if it does not address one.
-
-    Parsed rather than substring-matched, because a substring test answers yes to things that
-    are not the bucket: ``s3://sentinel-cogs-backup/...`` and
-    ``https://elsewhere.example/sentinel-cogs/...`` both contain a preferred bucket's name while
-    being somewhere else entirely. Returning ``None`` for anything unrecognised is what keeps the
-    unlisted-is-remote rule honest.
-
-    Handles the three forms the catalogues emit: ``s3://bucket/key``, virtual-hosted
-    ``https://bucket.s3.<region>.amazonaws.com/key``, and path-style
-    ``https://s3.<region>.amazonaws.com/bucket/key``.
-    """
-    parsed = urllib.parse.urlparse(href)
-    if parsed.scheme == "s3":
-        return parsed.netloc or None
-    host = parsed.netloc.split("@")[-1].split(":")[0].lower()
-    if not host.endswith(".amazonaws.com"):
-        return None
-    labels = host.split(".")
-    if len(labels) > 3 and labels[1] == "s3":  # virtual-hosted
-        return labels[0] or None
-    if labels[0] == "s3":  # path-style
-        first_segment = parsed.path.lstrip("/").split("/", 1)[0]
-        return first_segment or None
-    return None
-
-
-def item_is_in_preferred_location(
-    item: Any,  # noqa: ANN401 — any STAC-like item
-    buckets: frozenset[str] = PREFERRED_ASSET_BUCKETS,
-    keys: tuple[str, ...] = READ_ASSET_KEYS,
-) -> bool:
-    """Whether every asset this ingest would READ sits in a preferred bucket.
-
-    **Judged over the read set, not over every asset, and that distinction is the whole
-    correctness of this function.** A real Element 84 item carries its COG bands *and* the
-    original JP2s as extra assets — 35 assets across two buckets on the pair this was measured
-    against. Requiring all 35 silently disabled the entire preference: a live-catalogue check
-    found zero mixed tile-dates where five existed. The extras are never fetched, so their
-    location cannot make a read expensive.
-
-    All of the read set, not any: an item whose *bands* straddle two buckets cannot deliver the
-    locality being claimed. An item exposing none of them is remote — absence of evidence is not
-    locality.
-    """
-    assets = getattr(item, "assets", None) or {}
-    hrefs = [href for key in keys if (asset := assets.get(key)) is not None and (href := _asset_href(asset))]
-    return bool(hrefs) and all(asset_bucket(href) in buckets for href in hrefs)
 
 
 def item_processing_baseline(item: Any) -> float | None:  # noqa: ANN401 — any STAC-like item

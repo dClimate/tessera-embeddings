@@ -31,6 +31,7 @@ from tessera_embeddings.config import (
 from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
+from tessera_embeddings.ingest.asset_locations import item_is_pre_harmonised
 from tessera_embeddings.ingest.catalogue_refusal import (
     CatalogueRequest,
     bbox_area_label,
@@ -209,7 +210,12 @@ def _build_stac_query(
 
 
 def _extract_baseline(item: Item) -> int:
-    """Extract processing baseline from a STAC item as an integer.
+    """The baseline an item REPORTS, as an integer. A parser, and nothing more.
+
+    Deliberately free of the harmonisation policy: whether that baseline is owed a correction
+    depends on which producer served the pixels, and that belongs in
+    :func:`extract_baselines`, which is where the per-date decision is made. Keeping this a
+    parser is what lets it be tested as one.
 
     Args:
         item: pystac Item or similar object with properties dict
@@ -238,16 +244,31 @@ def extract_baselines(items: list[Any]) -> dict[str, int]:
     name a baseline belonging to an item the loader never sees, and the reflectance
     offset it selects is applied to the pixels of the items it does.
 
+    **An item whose pixels are already harmonised reports 0 — no correction due — whatever
+    baseline it declares.** Element 84 subtracts the post-04.00 offset in its own COGs while
+    ESA's originals carry it, and one Earth Search collection now indexes both, so the
+    collection cannot decide this: exempting or correcting the whole collection is wrong for
+    half of it, and nothing raises either way. The producer is read from where the assets live.
+
+    **The two mistakes are not equally discoverable, so the default is to correct.** A doubled
+    correction shifts values by a visible 1000; a skipped one leaves plausible pixels silently
+    1000 too high. An unrecognised producer is therefore treated as unharmonised.
+
+    Deciding per item is sound here precisely because this is derived from the items being
+    LOADED: after duplicate selection there is one copy per date, so the item whose producer is
+    read is the item whose pixels arrive.
+
     Args:
         items: STAC items, in the order they will be loaded.
 
     Returns:
-        Dict mapping date strings (YYYY-MM-DD) to baseline integers.
+        Dict mapping date strings (YYYY-MM-DD) to the baseline to CORRECT BY — the reported
+        baseline, or 0 where no correction is owed.
     """
     baselines = {}
     for item in items:
         date_str = item.datetime.strftime("%Y-%m-%d")
-        baselines[date_str] = _extract_baseline(item)
+        baselines[date_str] = 0 if item_is_pre_harmonised(item) else _extract_baseline(item)
     return baselines
 
 

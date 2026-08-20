@@ -82,15 +82,20 @@ PROVIDERS: dict[str, STACProvider] = {
         name="Earth Search (Element 84)",
         catalog_url="https://earth-search.aws.element84.com/v1",
         collections={
-            # Earth Search v1 already applies the BOA offset correction
-            # (subtracts 1000 from post-baseline 4.00 data) in its COGs.
-            # The raster:bands offset=-0.1 and earthsearch:boa_offset_applied
-            # metadata are unreliable (see sertit/eoreader#120), but the
-            # pixel values are consistently harmonized. No correction needed.
+            # Earth Search harmonises the BOA offset (subtracts 1000 from post-baseline
+            # 04.00 data) in ITS OWN COGs, but this collection also indexes items whose
+            # assets point at ESA's originals, which carry the offset. So the threshold is
+            # set and the exemption is made per item, from where the assets live, by
+            # `ingest.stac._extract_baseline`. Leaving the threshold unset exempts the whole
+            # collection and is only correct while every item is a harmonised COG.
+            # The raster:bands offset=-0.1 and earthsearch:boa_offset_applied metadata are
+            # unreliable (see sertit/eoreader#120), so the asset location is the signal.
             "sentinel-2-l2a": CollectionConfig(
                 collection_id="sentinel-2-l2a",
                 bands=S2_L2A_BANDS,
                 resolution=10,
+                baseline_threshold=S2_BASELINE_THRESHOLD,
+                baseline_offset=S2_BASELINE_OFFSET,
                 tile_id_property="grid:code",
                 tile_id_prefix="MGRS-",
                 has_scl=True,
