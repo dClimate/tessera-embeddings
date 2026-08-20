@@ -55,7 +55,9 @@ def processing_baseline(item: Any) -> int | None:  # noqa: ANN401 — any STAC-l
     except (decimal.InvalidOperation, TypeError, ValueError):
         logger.debug("Unparseable s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
         return None
-    if not value.is_finite() or value < 0:
+    # Bounded BEFORE scaling: `Decimal("1e999999")` is finite and constructs happily, but
+    # multiplying it raises `decimal.Overflow`, which would abort a whole batch over one item.
+    if not value.is_finite() or value < 0 or value > MAX_BASELINE:
         logger.debug("Not a baseline: s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
         return None
     scaled = value * BASELINE_SCALE

@@ -699,7 +699,9 @@ class TestUnknownBaselineSuspendsLocality:
         _with_assets(remote_unknown, _bands_at(_REMOTE))
         kept, alternates = select_preferred_duplicates([local_old, remote_unknown])
         assert [i.id for i in kept] == [local_old.id]
-        assert [i.id for i in alternates[("MGRS-33TWM", "2021-09-08")]] == [remote_unknown.id]
+        # And it is not offered as a fallback either: a refusal is not a read failure, so handing
+        # it to the ladder would escape rather than step down.
+        assert alternates == {}
 
 
 class TestFallbackLadderKeepsBaselineOrder:
@@ -1042,9 +1044,12 @@ class TestLocalityDoesNotDecideBetweenUnknownBaselines:
             _copy_at("local-seq1", acquired=self._A, sequence="1", baseline=None, host_root=_IN_REGION),
         ]
         kept, alternates = select_preferred_duplicates(items)
+        # Sequence decides the winner among copies that all declare nothing readable.
         assert [it.id for it in kept] == ["winner"]
-        ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
-        assert ladder == ["remote-seq2", "local-seq1"], "locality outranked the newer sequence"
+        # The RAW spare is dropped from the ladder — unharmonised with no readable baseline refuses
+        # the date, and a refusal is not something the ladder can step down on. The harmonised one
+        # stays: it is owed nothing whatever its baseline says, so it cannot refuse.
+        assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["local-seq1"]
 
     def test_locality_still_decides_between_two_equal_known_baselines(self) -> None:
         """The complement: neutralising locality everywhere would pass the test above."""
@@ -1274,7 +1279,9 @@ class TestACopyThatWouldRefuseItsDateLosesToOneThatWouldNot:
         clean_old = self._copy_at_baseline("clean-04", "04.00", mixed=False)
         kept, alternates = select_preferred_duplicates([mixed_new, clean_old])
         assert [it.id for it in kept] == ["clean-04"]
-        assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["mixed-05"]
+        # The mixed copy is excluded from the ladder as well as losing the selection: offering it
+        # would raise `HeterogeneousProducerError`, which is not a read failure.
+        assert alternates == {}
 
     def test_below_the_threshold_the_baseline_still_decides(self) -> None:
         """The term is inert there: a mixed producer changes no pixel that gets no offset."""
@@ -1301,3 +1308,65 @@ class TestACopyThatWouldRefuseItsDateLosesToOneThatWouldNot:
         )
         kept, _ = select_preferred_duplicates([newer, older])
         assert [it.id for it in kept] == ["partial-05"]
+
+
+class TestTheLadderOnlyOffersCopiesItCanRecoverWith:
+    """A refusal is not a read failure, so the ladder cannot step down on one.
+
+    `step_down_copies` exists for a source object that will not read. Handing it a copy that makes
+    `dates_exempt_from_correction` raise means the exception escapes instead of the next usable
+    copy being tried or the date being recorded as lost. Raised on PR #107.
+    """
+
+    def _copy(
+        self, ident: str, *, baseline: str | None, sequence: str, mixed: bool = False, raw: bool = False
+    ) -> _Item:
+        extra: dict[str, object] = {}
+        if baseline is not None:
+            extra["s2:processing_baseline"] = baseline
+        # A HARMONISED copy is owed nothing whatever its baseline says, so it never refuses — the
+        # unreadable-baseline case only bites an unharmonised one.
+        assets = _bands_at(_REMOTE if raw else _IN_REGION)
+        if mixed:
+            assets["red"] = {"href": f"{_REMOTE}/B04.jp2"}
+        return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **extra), assets)
+
+    def test_a_harmonised_spare_with_no_baseline_is_still_offered(self) -> None:
+        """It is owed nothing, so it cannot refuse, so it remains a usable fallback."""
+        winner = self._copy("win", baseline="05.00", sequence="9")
+        spare = self._copy("harmonised-no-baseline", baseline=None, sequence="1")
+        _, alternates = select_preferred_duplicates([winner, spare])
+        assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["harmonised-no-baseline"]
+
+    def test_a_usable_spare_is_still_offered(self) -> None:
+        """The complement first: the ladder must not have been emptied wholesale."""
+        winner = self._copy("win", baseline="05.00", sequence="9")
+        spare = self._copy("spare", baseline="04.00", sequence="1")
+        _, alternates = select_preferred_duplicates([winner, spare])
+        assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["spare"]
+
+    def test_a_spare_with_an_unreadable_baseline_is_excluded(self) -> None:
+        winner = self._copy("win", baseline="05.00", sequence="9")
+        unusable = self._copy("no-baseline", baseline=None, sequence="1", raw=True)
+        _, alternates = select_preferred_duplicates([winner, unusable])
+        assert alternates == {}
+
+    def test_a_mixed_producer_spare_is_excluded_above_the_threshold(self) -> None:
+        winner = self._copy("win", baseline="05.00", sequence="9")
+        unusable = self._copy("mixed", baseline="05.00", sequence="1", mixed=True)
+        _, alternates = select_preferred_duplicates([winner, unusable])
+        assert alternates == {}
+
+    def test_a_mixed_producer_spare_is_kept_below_the_threshold(self) -> None:
+        """Nothing is owed there, so the date does not refuse and the copy is a usable fallback."""
+        winner = self._copy("win", baseline="03.00", sequence="9")
+        spare = self._copy("mixed", baseline="03.00", sequence="1", mixed=True)
+        _, alternates = select_preferred_duplicates([winner, spare])
+        assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["mixed"]
+
+    def test_the_usable_spares_survive_alongside_an_excluded_one(self) -> None:
+        winner = self._copy("win", baseline="05.10", sequence="9")
+        usable = self._copy("usable", baseline="05.00", sequence="2")
+        unusable = self._copy("no-baseline", baseline=None, sequence="1", raw=True)
+        _, alternates = select_preferred_duplicates([winner, usable, unusable])
+        assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["usable"]

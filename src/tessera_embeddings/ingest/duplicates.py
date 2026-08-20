@@ -99,6 +99,34 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
     return int(match.group(1)) if match else None
 
 
+def refuses_its_date(item: Any, read_keys: tuple[str, ...] = READ_ASSET_KEYS) -> bool:  # noqa: ANN401
+    """Whether loading this copy makes its date REFUSE rather than fail to read.
+
+    Two shapes, both raised by
+    :func:`~tessera_embeddings.ingest.stac.dates_exempt_from_correction` because no date-wide
+    offset decision is correct: an unharmonised copy declaring no readable baseline, and a copy
+    whose producer is undecidable at or above the correction threshold.
+
+    A refusal is not a read failure, so the fallback ladder cannot recover from one — which is why
+    such a copy is both ranked last and excluded from the ladder entirely.
+    """
+    # Only asked of copies whose read set is complete, so this answers "we can see that it
+    # refuses" rather than "we cannot see anything". An incomplete copy fails to READ, which the
+    # ladder does handle, and it reports an undecidable producer only because it is incomplete.
+    if not read_set_is_complete(item, read_keys):
+        return False
+    harmonisation = item_harmonisation(item)
+    if harmonisation is Harmonisation.HARMONISED:
+        return False
+    baseline = item_processing_baseline(item)
+    if baseline is None:
+        return True
+    return baseline >= S2_BASELINE_THRESHOLD and harmonisation in (
+        Harmonisation.MIXED,
+        Harmonisation.UNKNOWN,
+    )
+
+
 def _would_refuse_its_date(
     item: Any,  # noqa: ANN401
     baseline: int | None,
@@ -303,7 +331,21 @@ def select_preferred_duplicates(
             # ONE order over every rejected copy of the tile-date, not a concatenation of
             # per-acquisition ladders. The unattributed recovery consumes `copies[0]` on each
             # retry, so every position is a choice and the whole list has to be ranked.
-            alternates[key] = sorted(rejected, key=functools.partial(_preference_key, read_keys=read_keys))
+            # Copies that would REFUSE their date are dropped rather than offered. The ladder
+            # steps down on a read failure; a refusal is not one, so handing one over escapes as
+            # `HeterogeneousProducerError` instead of trying the next usable copy or recording the
+            # date as lost.
+            usable = [it for it in rejected if not refuses_its_date(it, read_keys)]
+            if len(usable) != len(rejected):
+                logger.debug(
+                    "%s: %d of %d spare copies excluded from the fallback ladder — they would "
+                    "refuse the date rather than fail to read",
+                    key,
+                    len(rejected) - len(usable),
+                    len(rejected),
+                )
+            if usable:
+                alternates[key] = sorted(usable, key=functools.partial(_preference_key, read_keys=read_keys))
 
     kept = [it for it in items if id(it) in survivors]
     return kept, alternates
