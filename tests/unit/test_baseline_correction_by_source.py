@@ -270,13 +270,25 @@ class TestTheCorrectionPathAnnouncesItself:
     signal on the day it does, rather than an inference from a sample.
     """
 
+    def test_a_routinely_unharmonised_producer_does_not_warn(self, caplog) -> None:
+        """FOUND BY THE REGRESSION SWEEP. Planetary Computer serves unharmonised data on Azure,
+        so every one of its dates is corrected as a matter of course. Warning on each would fire
+        on every date of an MPC ingest AND would assert something untrue — that the combination
+        had not been seen before. Narrowed to the ESA archive, which is the route a
+        harmonised-COG catalogue was not expected to take.
+        """
+        azure = _Item("https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/33/T/TG/x", "05.10")
+        with caplog.at_level(logging.WARNING, logger="tessera_embeddings.ingest.stac"):
+            assert dates_exempt_from_correction([azure]) == set(), "it must still be corrected"
+        assert not [r for r in caplog.records if "correction ACTIVE" in r.message]
+
     def test_it_warns_when_a_raw_item_is_actually_corrected(self, caplog) -> None:
         """Not an error: correcting a raw item over the threshold is exactly right. The warning
         says the path has gone live, so its output gets verified instead of assumed.
         """
         with caplog.at_level(logging.WARNING, logger="tessera_embeddings.ingest.stac"):
             assert dates_exempt_from_correction([_Item(_RAW_ESA, "05.00")]) == set()
-        assert any("correction ACTIVE on raw-producer data" in r.message for r in caplog.records)
+        assert any("correction ACTIVE on ESA-archive data" in r.message for r in caplog.records)
         assert any("500" in str(r.args) for r in caplog.records), "the baseline must be named"
 
     def test_it_stays_quiet_below_the_threshold(self, caplog) -> None:

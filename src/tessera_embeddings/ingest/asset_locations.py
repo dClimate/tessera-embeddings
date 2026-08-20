@@ -29,6 +29,13 @@ from tessera_embeddings.config.providers import S2_L2A_BANDS
 #: they are free.
 PREFERRED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-cogs", "e84-earth-search-sentinel-data"})
 
+#: The ESA archive that a Sentinel-2 catalogue may point at INSTEAD of a harmonised mirror.
+#: Named because reaching it is the surprising route: Earth Search was believed to serve only
+#: its own harmonised COGs, so a correction owed on data from here is the case worth announcing.
+#: Other unharmonised producers (Planetary Computer, on Azure) are corrected as a matter of
+#: course and need no announcement.
+RAW_ARCHIVE_BUCKETS: frozenset[str] = frozenset({"sentinel-s2-l2a"})
+
 #: Buckets whose Sentinel-2 surface reflectance already has the post-baseline-04.00 offset
 #: subtracted. An unrecognised bucket is treated as NOT harmonised, so the correction is
 #: applied: over-correcting harmonised data and under-correcting raw data are both wrong, but
@@ -152,3 +159,16 @@ def item_harmonisation(
     if any(harmonised):
         return Harmonisation.MIXED
     return Harmonisation.RAW
+
+
+def item_is_from_raw_archive(
+    item: Any,  # noqa: ANN401 — any STAC-like item
+    buckets: frozenset[str] = RAW_ARCHIVE_BUCKETS,
+) -> bool:
+    """Whether this item's reflectance comes from the ESA archive named in ``buckets``.
+
+    Narrower than "not harmonised", and deliberately: every Planetary Computer item is
+    unharmonised too, and correcting those is routine rather than notable. Only the archive a
+    harmonised-COG catalogue has started pointing at is a surprise worth a warning.
+    """
+    return any(b in buckets for b in read_asset_buckets(item, REFLECTANCE_ASSET_KEYS))

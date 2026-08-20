@@ -31,7 +31,11 @@ from tessera_embeddings.config import (
 from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
-from tessera_embeddings.ingest.asset_locations import Harmonisation, item_harmonisation
+from tessera_embeddings.ingest.asset_locations import (
+    Harmonisation,
+    item_harmonisation,
+    item_is_from_raw_archive,
+)
 from tessera_embeddings.ingest.catalogue_refusal import (
     CatalogueRequest,
     bbox_area_label,
@@ -335,16 +339,29 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
         # combination never appears (a 100-item page of a 146-item year told me it did not), and
         # a monitored fact beats an inference from a sample. Not an error: correcting a raw item
         # over the threshold is exactly right, and this is the path doing its job.
-        logger.warning(
-            "Baseline correction ACTIVE on raw-producer data for %s: %d item(s) at baseline(s) %s "
-            "are owed the %d offset. This combination had not been observed upstream, so this is "
-            "the first real exercise of the correction path — verify the reflectance rather than "
-            "assuming it.",
-            date_str,
-            len(owed),
-            sorted({_extract_baseline(it) for it in owed}),
-            S2_BASELINE_OFFSET,
-        )
+        # WARNING only for the ESA archive, which is the route believed impossible. Every
+        # Planetary Computer item is unharmonised as well, and correcting those is routine — a
+        # warning on each of them would fire on every date of an MPC ingest and would also be
+        # saying something untrue, since for that provider it is not a new combination at all.
+        from_archive = [it for it in owed if item_is_from_raw_archive(it)]
+        if from_archive:
+            logger.warning(
+                "Baseline correction ACTIVE on ESA-archive data for %s: %d item(s) at baseline(s) "
+                "%s are owed the %d offset. A harmonised-COG catalogue is pointing at the raw "
+                "archive for data that needs correcting — verify the reflectance rather than "
+                "assuming it.",
+                date_str,
+                len(from_archive),
+                sorted({_extract_baseline(it) for it in from_archive}),
+                S2_BASELINE_OFFSET,
+            )
+        else:
+            logger.debug(
+                "Baseline correction applied for %s: %d unharmonised item(s) at baseline(s) %s.",
+                date_str,
+                len(owed),
+                sorted({_extract_baseline(it) for it in owed}),
+            )
         # A date carries ONE baseline (`extract_baselines` is last-wins by construction), so raw
         # items on opposite sides of the threshold cannot both be served: correcting shifts the
         # pre-threshold pixels down by the offset, not correcting leaves the post-threshold ones
