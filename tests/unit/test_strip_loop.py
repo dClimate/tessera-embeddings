@@ -22,7 +22,10 @@ import zarr
 import tessera_embeddings.inference.actors as _actors_mod
 import tessera_embeddings.inference.data_loading as _dl_mod
 from tessera_embeddings.config.inference import S2_BAND_ORDER
-from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
+from tessera_embeddings.config.store_layout import (
+    MONTH_COVERED_FOR_OBS,
+    MONTHS_IN_YEAR,
+)
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.actors import (
     _MIN_STRIP_H,
@@ -259,11 +262,18 @@ def _make_actor(inference_config, test_model):
     return actor
 
 
-def _open_store_side_effect():
-    return store_opener(_CHUNK, n_t_s2=8, n_t_sar=5)
+#: SAR dates that reach March, where the 8-date optical axis stops in February. The default stays 5
+#: so every other test in this file is unaffected; only the month-coverage test needs the sensors to
+#: disagree, and it needs that badly — with identical spans a mask read from the wrong sensor is
+#: indistinguishable from the right one.
+_N_T_SAR_SPANNING_MARCH = 8
 
 
-def _run_process_chunk(inference_config, test_model):
+def _open_store_side_effect(n_t_sar: int = 5):
+    return store_opener(_CHUNK, n_t_s2=8, n_t_sar=n_t_sar)
+
+
+def _run_process_chunk(inference_config, test_model, n_t_sar: int = 5):
     """Run process_chunk capturing the single whole-chunk write."""
     inference_config.s1_orbit = "both"
     # Synthetic stores carry 2024 dates; align the window so the filter keeps them.
@@ -274,7 +284,7 @@ def _run_process_chunk(inference_config, test_model):
     _CapturingWriter.last_skip = None
 
     with (
-        patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
+        patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect(n_t_sar)),
         patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
     ):
         result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
@@ -338,10 +348,11 @@ class TestProcessChunkStriping:
             for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
                 np.testing.assert_array_equal(write_one["obs_counts"][var], other["obs_counts"][var], err_msg=var)
             # Month coverage is assembled strip by strip like the obs counts, so a
-            # tiling-dependent bug would show as a mismatch on the strip boundaries.
-            np.testing.assert_array_equal(
-                write_one["month_covered"], other["month_covered"], err_msg="s2_month_covered"
-            )
+            # tiling-dependent bug would show as a mismatch on the strip boundaries. Every sensor,
+            # because they take different routes into the buffer: optical is sliced out of a
+            # whole-chunk mask bundle, radar is assigned from each strip's own array.
+            for var in MONTH_COVERED_FOR_OBS.values():
+                np.testing.assert_array_equal(write_one["month_covered"][var], other["month_covered"][var], err_msg=var)
 
     def test_month_coverage_is_populated_and_agrees_with_the_obs_count(self, inference_config, test_model):
         """The actor must pass month flags that describe its own observations.
@@ -354,30 +365,54 @@ class TestProcessChunkStriping:
         both PRESENT and consistent with the count they partition.
         """
         with patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=False)):
-            result, write = _run_process_chunk(inference_config, test_model)
+            result, write = _run_process_chunk(inference_config, test_model, n_t_sar=_N_T_SAR_SPANNING_MARCH)
 
         assert result["status"] == "success"
-        covered = write["month_covered"]
-        obs = write["obs_counts"]["s2_obs_count"]
-        assert covered is not None, "the actor passed no month coverage at all"
-        assert covered.shape == (MONTHS_IN_YEAR, _CHUNK.height, _CHUNK.width)
-        assert covered.dtype == np.bool_
-        assert covered.any(), "month coverage is entirely False despite a successful chunk"
-        # Every flagged month needs an observation behind it, and a pixel cannot cover more
-        # months than it has observations. Both directions, since either alone admits a bug:
-        # an all-True buffer satisfies "some month is set" but not this.
-        months_per_px = covered.sum(axis=0)
-        assert np.all(months_per_px <= obs), "a pixel covers more months than it has observations"
-        assert np.all((months_per_px > 0) == (obs > 0)), "a month flag and the obs count disagree on emptiness"
-        # Exactly the months the fixture's own S2 time axis falls in — every pixel of this
-        # synthetic chunk is valid at every timestep, so the flags are the axis's months and
-        # nothing else. Read off the fixture rather than written out, so it stays true if the
-        # fixture's date spacing changes.
-        s2_times = np.asarray(make_s2_group(8, _CHUNK.height, _CHUNK.width, seed=S2_SEED)["time"][:])
-        want_months = sorted(
-            {int(m) for m in s2_times.astype("datetime64[ns]").astype("datetime64[M]").astype(int) % 12 + 1}
+        masks = write["month_covered"]
+        assert masks is not None, "the actor passed no month coverage at all"
+        assert set(masks) == set(MONTH_COVERED_FOR_OBS.values()), "one mask per sensor"
+
+        # Every sensor is checked against ITS OWN paired count, via the layout's pairing rather
+        # than a name spelled here — the radar masks reach the buffer by a different route from the
+        # optical one, so a route that silently drops a sensor leaves an all-False plane that looks
+        # exactly like a pixel nothing ever saw.
+        for obs_var, cov_var in MONTH_COVERED_FOR_OBS.items():
+            covered = masks[cov_var]
+            obs = write["obs_counts"][obs_var]
+            assert covered.shape == (MONTHS_IN_YEAR, _CHUNK.height, _CHUNK.width), cov_var
+            assert covered.dtype == np.bool_, cov_var
+            assert covered.any(), f"{cov_var} is entirely False despite a successful chunk"
+            # Every flagged month needs an observation behind it, and a pixel cannot cover more
+            # months than it has observations. Both directions, since either alone admits a bug:
+            # an all-True buffer satisfies "some month is set" but not this.
+            months_per_px = covered.sum(axis=0)
+            assert np.all(months_per_px <= obs), f"{cov_var}: more months than observations"
+            assert np.all((months_per_px > 0) == (obs > 0)), f"{cov_var}: disagrees with {obs_var} on emptiness"
+
+        # Exactly the months each fixture's own time axis falls in — every pixel of this synthetic
+        # chunk is valid at every timestep of every sensor, so the flags are the axis's months and
+        # nothing else. Read off the fixtures rather than written out, so they stay true if the
+        # date spacing changes. The two sensors deliberately have DIFFERENT spans (S2 is 6-daily
+        # over ten dates, SAR 12-daily over five), which is what makes a mask copied from the wrong
+        # sensor visible instead of coincidentally right.
+        def _months(times: np.ndarray) -> list[int]:
+            return sorted({int(m) for m in times.astype("datetime64[ns]").astype("datetime64[M]").astype(int) % 12 + 1})
+
+        want = {
+            "s2_month_covered": _months(
+                np.asarray(make_s2_group(8, _CHUNK.height, _CHUNK.width, seed=S2_SEED)["time"][:])
+            ),
+            "s1_asc_month_covered": _months(
+                np.asarray(make_sar_group(_N_T_SAR_SPANNING_MARCH, _CHUNK.height, _CHUNK.width)["time"][:])
+            ),
+        }
+        want["s1_desc_month_covered"] = want["s1_asc_month_covered"]
+        assert want["s2_month_covered"] != want["s1_asc_month_covered"], (
+            "the fixtures must disagree, or this test cannot see a mask taken from the wrong sensor"
         )
-        assert [m + 1 for m in range(MONTHS_IN_YEAR) if covered[m].any()] == want_months
+        for cov_var, months in want.items():
+            got = [m + 1 for m in range(MONTHS_IN_YEAR) if masks[cov_var][m].any()]
+            assert got == months, cov_var
 
     def test_multi_strip_actually_splits(self):
         # The strip height used in the equality test genuinely splits this chunk.

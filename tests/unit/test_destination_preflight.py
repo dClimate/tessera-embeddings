@@ -17,7 +17,12 @@ import numpy as np
 import pytest
 import zarr
 
-from tessera_embeddings.config.store_layout import CARRIED_VARS, GLOBAL, MONTH_COVERED_VAR, REQUIRED_VARS
+from tessera_embeddings.config.store_layout import (
+    CARRIED_VARS,
+    GLOBAL,
+    MONTH_COVERED_VARS,
+    REQUIRED_VARS,
+)
 from tessera_embeddings.storage.global_store import check_destination_types
 
 
@@ -41,25 +46,31 @@ def test_a_correctly_seeded_group_passes() -> None:
     check_destination_types(g, GLOBAL)  # must not raise
 
 
-def test_the_bool_month_array_that_cost_two_fills_is_refused() -> None:
+@pytest.mark.parametrize("var", MONTH_COVERED_VARS)
+def test_the_bool_month_array_that_cost_two_fills_is_refused(var: str) -> None:
     """The exact 2026-08-18 case: seeded bool, staged int8, discovered at assembly.
 
     `Dataset.to_zarr` stores a bool array as int8 with attrs dtype="bool" and ignores an encoding
     dtype asking for bool, so a bool destination can never match what the writer produces.
+
+    Parametrized over every sensor rather than optical alone: the radar masks were added by
+    deriving their names and their layout from the same lists, and a guard that only covers the one
+    array someone remembered to name is how the second and third get seeded wrongly.
     """
-    g = _group(**{MONTH_COVERED_VAR: ("bool", {})})
+    g = _group(**{var: ("bool", {})})
     with pytest.raises(ValueError, match="Refusing to fill") as exc:
         check_destination_types(g, GLOBAL, where="09S year 2022")
-    assert "s2_month_covered: dtype bool on disk, layout declares int8" in str(exc.value)
+    assert f"{var}: dtype bool on disk, layout declares int8" in str(exc.value)
     assert "09S year 2022" in str(exc.value)
     assert "write-once" in str(exc.value), "the remedy is a fresh store, and the message must say so"
 
 
-def test_a_missing_bool_attr_is_refused_because_it_is_part_of_the_type() -> None:
+@pytest.mark.parametrize("var", MONTH_COVERED_VARS)
+def test_a_missing_bool_attr_is_refused_because_it_is_part_of_the_type(var: str) -> None:
     """int8 with no `dtype="bool"` attr reads back as 0/1 integers, not booleans — a different
     published type, and one no reader of the docs would expect.
     """
-    g = _group(**{MONTH_COVERED_VAR: ("int8", {})})
+    g = _group(**{var: ("int8", {})})
     with pytest.raises(ValueError, match="attr dtype=None on disk, layout declares 'bool'"):
         check_destination_types(g, GLOBAL)
 
@@ -85,10 +96,12 @@ def test_geometry_is_deliberately_not_compared() -> None:
 
 def test_every_mismatch_is_named_at_once() -> None:
     """One report, not one per run: a reader fixing a seeded store needs the whole list."""
-    g = _group(**{MONTH_COVERED_VAR: ("bool", {}), "s2_obs_count": ("int32", {})})
+    g = _group(**{v: ("bool", {}) for v in MONTH_COVERED_VARS} | {"s2_obs_count": ("int32", {})})
     with pytest.raises(ValueError) as exc:
         check_destination_types(g, GLOBAL)
-    assert "s2_month_covered" in str(exc.value) and "s2_obs_count" in str(exc.value)
+    reported = str(exc.value)
+    assert all(v in reported for v in MONTH_COVERED_VARS), "every sensor's mask, not the first one"
+    assert "s2_obs_count" in reported
 
 
 def test_an_array_the_layout_does_not_declare_is_not_this_gates_business() -> None:

@@ -49,39 +49,59 @@ warnings.filterwarnings("ignore", message="Numcodecs codecs are not in the Zarr 
 
 DIMS_4D: tuple[str, str, str, str] = ("time", "northing", "easting", "band")
 DIMS_3D: tuple[str, str, str] = ("time", "northing", "easting")
-#: Trailing axis of :data:`MONTH_COVERED_VAR` — twelve calendar months, not bands.
+#: Trailing axis of :data:`MONTH_COVERED_VARS` — twelve calendar months, not bands.
 DIMS_4D_MONTH: tuple[str, str, str, str] = ("time", "northing", "easting", "month")
+
+#: The three observation sources a pixel can be seen by, as the prefix their per-sensor arrays are
+#: named from. ONE list, because every per-sensor array is a pair — a count and a month mask — and
+#: the pair is derived from a single validity mask per sensor. Spelling the sensors once and
+#: deriving both name lists means a fourth source, or a renamed one, cannot arrive in half the
+#: arrays; the names produced here are exactly the ones already on disk.
+SENSORS: tuple[str, ...] = ("s2", "s1_asc", "s1_desc")
 
 #: obs-count variables carried through inference (canonical definition;
 #: inference.assembly re-exports it).
-OBS_COUNT_VARS: tuple[str, ...] = ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count")
+OBS_COUNT_VARS: tuple[str, ...] = tuple(f"{sensor}_obs_count" for sensor in SENSORS)
 
 #: Months in the coverage axis, and the coordinate values written for it (1 = January), so a reader
 #: can say ``cov.sel(month=7)`` and mean July rather than having to know the axis is 0-based.
 MONTHS_IN_YEAR = 12
 MONTH_COORD = tuple(range(1, MONTHS_IN_YEAR + 1))
 
-#: Per-pixel record of WHICH months a pixel was seen in, as twelve booleans.
+#: Per-pixel record of WHICH months a pixel was seen in, as twelve booleans, PER SENSOR.
 #:
-#: ``s2_obs_count`` says how many usable optical observations a pixel had; this says how they were
-#: distributed. The two answer different questions and only the second one can distinguish a pixel
-#: seen twenty times in July from one seen twelve times, once a month — which for a year-long
-#: embedding is the difference between a partial season and a whole one.
+#: The ``*_obs_count`` arrays say how many usable observations a pixel had; these say how they were
+#: distributed. The two answer different questions and only the second can distinguish a pixel seen
+#: twenty times in July from one seen twelve times, once a month — which for a year-long embedding
+#: is the difference between a partial season and a whole one.
 #:
-#: **It gates nothing.** ``config.inference.OPTICAL_MIN_OBS`` remains the only rule that decides
-#: whether a pixel is embedded. This exists so a reader can apply their own view of sufficiency
-#: without re-deriving it from imagery we do not publish — the mosaics this is computed from are
+#: **Per sensor, because the sensors fail differently and a merged mask would hide it.** Optical
+#: gaps are weather and are seasonal: a cloudy monsoon removes the same months every year. Radar
+#: gaps are orbital, and the S1B failure left whole regions with one orbit direction for years, so
+#: an ascending gap and a descending gap over the same pixel mean different things about what the
+#: embedding saw. Or-ing the three into one mask would report a pixel as covered in a month it was
+#: seen only by the sensor a given reader cannot use.
+#:
+#: **They gate nothing.** ``config.inference.OPTICAL_MIN_OBS`` remains the only rule that decides
+#: whether a pixel is embedded. These exist so a reader can apply their own view of sufficiency
+#: without re-deriving it from imagery we do not publish — the mosaics they are computed from are
 #: deleted after a fill, so it is captured here or nowhere.
 #:
-#: Presence, not counts: a month is covered when at least one timestep that month passed the same
-#: SCL validity classes ``s2_obs_count`` totals, so the twelve flags partition the observations that
-#: count feeds on. ``False`` also reads for an unwritten pixel, exactly as ``s2_obs_count`` reads 0.
+#: Presence, not counts, and each mask partitions ITS OWN count: a month is covered when at least
+#: one timestep that month passed the same validity test the paired ``*_obs_count`` totals — SCL
+#: classes for optical, a non-zero backscatter sample for radar. Both come from one validity mask
+#: per sensor (see ``data_loading.coverage_from_validity``), so "how many" and "which months" cannot
+#: disagree about what counted. ``False`` also reads for an unwritten pixel, exactly as a count of 0.
 #:
 #: Stored as ``int8`` carrying the attribute ``dtype="bool"``, which is how xarray represents a
 #: boolean array — so a reader gets booleans back, while the on-disk type is the one the staging
 #: writer can actually produce (``Dataset.to_zarr`` stores bool as int8 regardless of encoding, and
 #: assembly reads staged tiles with raw zarr).
-MONTH_COVERED_VAR = "s2_month_covered"
+MONTH_COVERED_VARS: tuple[str, ...] = tuple(f"{sensor}_month_covered" for sensor in SENSORS)
+
+#: The month mask paired with each obs-count array, so a caller holding one can name the other
+#: without slicing a name apart.
+MONTH_COVERED_FOR_OBS: dict[str, str] = dict(zip(OBS_COUNT_VARS, MONTH_COVERED_VARS, strict=True))
 
 # codec keys
 _ZSTD = "zstd"  # default bytes codec + default (zstd) compressor
@@ -246,15 +266,18 @@ def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
         # the dtype guard. Matching the destination to what the writer can express keeps the guard
         # intact, and the attribute is what makes an xarray reader see booleans rather than 0/1 — so
         # `cov.sel(month=7)` is still a boolean mask. Size is unchanged: numpy bool is already 1 byte.
-        MONTH_COVERED_VAR: ArrayLayout(
-            DIMS_4D_MONTH,
-            _INNER_4D_MONTH,
-            "int8",
-            0,
-            _ZSTD,
-            shards=_SHARD_4D_MONTH,
-            attrs=(("dtype", "bool"),),
-        ),
+        **{
+            var: ArrayLayout(
+                DIMS_4D_MONTH,
+                _INNER_4D_MONTH,
+                "int8",
+                0,
+                _ZSTD,
+                shards=_SHARD_4D_MONTH,
+                attrs=(("dtype", "bool"),),
+            )
+            for var in MONTH_COVERED_VARS
+        },
     }
     if include_std:
         arrays["embedding_std"] = ArrayLayout(DIMS_4D, _INNER_4D, "float32", float("nan"), _PCODEC, shards=_SHARD_4D)

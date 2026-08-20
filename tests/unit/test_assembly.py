@@ -28,7 +28,7 @@ from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     GLOBAL,
     INNER_PX,
-    MONTH_COVERED_VAR,
+    MONTH_COVERED_VARS,
     MONTHS_IN_YEAR,
     SHARD_PX,
     SINGLE,
@@ -2409,7 +2409,8 @@ class TestAssembleGlobal:
         with pytest.raises(IncompleteStageError, match="missing required variable"):
             writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runC", n_workers=1)
 
-    def test_month_coverage_survives_the_real_staging_path(self, tmp_path):
+    @pytest.mark.parametrize("var", MONTH_COVERED_VARS)
+    def test_month_coverage_survives_the_real_staging_path(self, tmp_path, var):
         """A BOOL buffer handed to write_chunk must reach an int8 destination with its values.
 
         Staged through the production path — ``write_chunk``, which writes an xarray Dataset — rather
@@ -2423,7 +2424,7 @@ class TestAssembleGlobal:
         bool. A fixture that writes by a different route than production is not testing the route.
         """
         dim = 8
-        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim, carried=(MONTH_COVERED_VAR,))
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim, carried=(var,))
         writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
         rng = np.random.default_rng(19)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE)
@@ -2434,17 +2435,17 @@ class TestAssembleGlobal:
             rng.integers(-100, 100, size=(self.TILE, self.TILE, dim)).astype(np.int8),
             "runM",
             scales=rng.random((self.TILE, self.TILE)).astype(np.float32),
-            month_covered=covered,
+            month_covered={var: covered},
         )
         assert writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runM", n_workers=1)
 
         repo = open_global_repo(store_path)
         node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[self.ZONE]
-        got = np.asarray(node[MONTH_COVERED_VAR][self.YEARS.index(2025)])
+        got = np.asarray(node[var][self.YEARS.index(2025)])
         # Destination axis order is (northing, easting, month); the actor's buffer is (month, y, x).
         np.testing.assert_array_equal(got.astype(bool), covered.transpose(1, 2, 0))
         # And the attribute that makes an xarray reader see booleans rather than 0/1 integers.
-        assert dict(node[MONTH_COVERED_VAR].attrs).get("dtype") == "bool"
+        assert dict(node[var].attrs).get("dtype") == "bool"
 
     def _carried_pattern(self, var: str, dim: int, rng) -> np.ndarray:
         """A distinctive per-tile array for *var*, shaped and typed from the GLOBAL layout.
@@ -2475,7 +2476,8 @@ class TestAssembleGlobal:
         """
         dim = 8
         carried = tuple(v for v in CARRIED_VARS if v in GLOBAL.arrays)
-        assert MONTH_COVERED_VAR in carried  # the array whose omission this guards
+        # Every sensor's mask, not just the optical one whose omission first caused this.
+        assert all(v in carried for v in MONTH_COVERED_VARS)
         store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim, carried=carried)
         rng = np.random.default_rng(11)
         expected = {var: self._carried_pattern(var, dim, rng) for var in carried}

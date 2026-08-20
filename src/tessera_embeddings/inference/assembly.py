@@ -68,7 +68,7 @@ from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     INNER_PX,
     MONTH_COORD,
-    MONTH_COVERED_VAR,
+    MONTH_COVERED_VARS,
     MONTHS_IN_YEAR,
     OBS_COUNT_VARS,
     REQUIRED_VARS,
@@ -943,12 +943,54 @@ class ZarrWriter:
             )
         return summary
 
+    @staticmethod
+    def _stage_month_masks(
+        data_vars: dict[str, tuple[list[str], np.ndarray]],
+        encoding: dict[str, dict],
+        month_covered: Mapping[str, np.ndarray | None] | None,
+        chunk: ChunkSpec,
+        staged_chunks_2d: tuple[int, int],
+    ) -> None:
+        """Add every present month mask to a staged tile's ``data_vars``/``encoding``, in place.
+
+        **One implementation because there were already two.** :meth:`write_chunk` and
+        :meth:`write_coverage_only` staged this identically — same transpose, same chunking, same
+        deliberate absence of a dtype — and ``test_coverage_only_staging`` exists precisely because
+        the two could drift. Three sensors would have made it three copies. Sharing the code retires
+        the drift rather than continuing to test for it.
+
+        Month axis LAST in the staged file, matching the destination's ``(northing, easting, month)``
+        so nothing has to transpose on the way in; the actor keeps it FIRST because that is the axis
+        order the mask bundle slices on.
+
+        No dtype in the encoding, deliberately. ``to_zarr`` stores a bool array as int8 with
+        ``attrs dtype="bool"`` — its own boolean representation — and IGNORES an encoding dtype
+        asking for bool, so the staged tile is int8 either way. The destination is seeded int8 to
+        match, because assembly reads staged tiles with RAW zarr and so compares against what is on
+        disk rather than what xarray hands back. A bool destination refused every staged month tile
+        on the dtype guard; asking for bool here only looks like a fix.
+        """
+        if month_covered is None:
+            return
+        expected = (MONTHS_IN_YEAR, chunk.height, chunk.width)
+        for var in MONTH_COVERED_VARS:
+            arr = month_covered.get(var)
+            if arr is None:
+                continue
+            if arr.shape != expected:
+                raise ValueError(f"Expected {var} shape {expected}, got {arr.shape}")
+            data_vars[var] = (
+                ["northing", "easting", "month"],
+                np.ascontiguousarray(arr.transpose(1, 2, 0)),
+            )
+            encoding[var] = {"chunks": (*staged_chunks_2d, MONTHS_IN_YEAR), "compressors": None}
+
     def write_coverage_only(
         self,
         chunk: ChunkSpec,
         run_id: str,
         obs_counts: Mapping[str, np.ndarray | None],
-        month_covered: np.ndarray | None,
+        month_covered: Mapping[str, np.ndarray | None] | None,
     ) -> str:
         """Stage the coverage arrays of a chunk that embedded nothing. Call BEFORE the marker.
 
@@ -974,21 +1016,7 @@ class ZarrWriter:
                 raise ValueError(f"Expected {var_name} shape {expected_2d}, got {arr.shape}")
             data_vars[var_name] = (["northing", "easting"], arr)
             encoding[var_name] = {"chunks": staged_chunks_2d, "compressors": None}
-        if month_covered is not None:
-            expected_month = (MONTHS_IN_YEAR, chunk.height, chunk.width)
-            if month_covered.shape != expected_month:
-                raise ValueError(f"Expected {MONTH_COVERED_VAR} shape {expected_month}, got {month_covered.shape}")
-            # Month axis LAST, and no dtype in the encoding — both for the reasons write_chunk
-            # states at length: the destination is (northing, easting, month) so nothing transposes
-            # on the way in, and `to_zarr` stores bool as int8 whatever an encoding asks for.
-            data_vars[MONTH_COVERED_VAR] = (
-                ["northing", "easting", "month"],
-                np.ascontiguousarray(month_covered.transpose(1, 2, 0)),
-            )
-            encoding[MONTH_COVERED_VAR] = {
-                "chunks": (*staged_chunks_2d, MONTHS_IN_YEAR),
-                "compressors": None,
-            }
+        self._stage_month_masks(data_vars, encoding, month_covered, chunk, staged_chunks_2d)
         if not data_vars:
             raise ValueError(f"Chunk {chunk.label}: no coverage arrays to stage")
         ds = xr.Dataset(
@@ -1185,7 +1213,7 @@ class ZarrWriter:
         scales: np.ndarray,
         embeddings_std: np.ndarray | None = None,
         obs_counts: Mapping[str, np.ndarray | None] | None = None,
-        month_covered: np.ndarray | None = None,
+        month_covered: Mapping[str, np.ndarray | None] | None = None,
     ) -> str:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 
@@ -1205,10 +1233,11 @@ class ZarrWriter:
             scales: Per-pixel scale factors of shape (H, W), float32.
                 Used to dequantize int8 embeddings.
             embeddings_std: Optional std array, same shape as embeddings, float32.
-            month_covered: Optional (12, H, W) bool array — which calendar months each pixel was
-                seen in, month 0 = January. Staged transposed to (H, W, month) so it lands in the
-                same axis order as the destination array, which the assembly graph writes without
-                reordering.
+            month_covered: Optional dict mapping month-mask variable names to (12, H, W) bool
+                arrays — which calendar months each pixel was seen in per sensor, month 0 = January.
+                Keys should be from ``MONTH_COVERED_VARS``. Staged transposed to (H, W, month) so
+                each lands in the same axis order as its destination array, which the assembly graph
+                writes without reordering.
             obs_counts: Optional dict mapping obs count variable names to (H, W)
                 uint16 arrays. Keys should be from ``OBS_COUNT_VARS``.
 
@@ -1269,28 +1298,7 @@ class ZarrWriter:
                     data_vars[var_name] = (["northing", "easting"], arr)
                     encoding[var_name] = {"chunks": staged_chunks_2d, "compressors": None}
 
-        if month_covered is not None:
-            expected_month = (MONTHS_IN_YEAR, chunk.height, chunk.width)
-            if month_covered.shape != expected_month:
-                msg = f"Expected {MONTH_COVERED_VAR} shape {expected_month}, got {month_covered.shape}"
-                raise ValueError(msg)
-            # Month axis LAST in the staged file, matching the destination's
-            # (northing, easting, month) so nothing has to transpose on the way in. The actor keeps
-            # it first because that is the axis order the mask bundle slices on.
-            data_vars[MONTH_COVERED_VAR] = (
-                ["northing", "easting", "month"],
-                np.ascontiguousarray(month_covered.transpose(1, 2, 0)),
-            )
-            # No dtype in the encoding, deliberately. `to_zarr` stores a bool array as int8 with
-            # attrs dtype="bool" — its own boolean representation — and IGNORES an encoding dtype
-            # asking for bool, so the staged tile is int8 either way. The destination is seeded int8
-            # to match, because assembly reads staged tiles with RAW zarr and so compares against
-            # what is on disk rather than what xarray hands back. A bool destination refused every
-            # staged month tile on the dtype guard; asking for bool here only looks like a fix.
-            encoding[MONTH_COVERED_VAR] = {
-                "chunks": (*staged_chunks_2d, MONTHS_IN_YEAR),
-                "compressors": None,
-            }
+        self._stage_month_masks(data_vars, encoding, month_covered, chunk, staged_chunks_2d)
 
         ds = xr.Dataset(
             data_vars,
@@ -1804,11 +1812,12 @@ class ZarrWriter:
             "easting": spatial.easting if spatial else np.arange(total_x),
             "band": np.arange(self.embedding_dim),
         }
-        if MONTH_COVERED_VAR in variables:
-            # Only when the array that uses the axis is created — a bare `month`
-            # coordinate in a store with no month dimension is a schema surprise for
-            # readers. 1..12, so `cov.sel(month=7)` means July rather than the eighth
-            # index, mirroring what the global store's seeder writes.
+        if any(var in variables for var in MONTH_COVERED_VARS):
+            # Only when an array that uses the axis is created — a bare `month` coordinate in a
+            # store with no month dimension is a schema surprise for readers. ANY of the three
+            # sensors introduces the axis and they share it, so the coordinate is written once.
+            # 1..12, so `cov.sel(month=7)` means July rather than the eighth index, mirroring what
+            # the global store's seeder writes.
             coords["month"] = np.asarray(MONTH_COORD, dtype="int16")
         _write_coord_arrays(root, coords)
 
@@ -2141,7 +2150,7 @@ class ZarrWriter:
                     "month": MONTHS_IN_YEAR,
                 }
                 create_layout_arrays(root, _layout_matching_store(root, layout, missing), missing, sizes)
-                if MONTH_COVERED_VAR in missing and "month" not in root:
+                if any(var in missing for var in MONTH_COVERED_VARS) and "month" not in root:
                     # The axis this array introduces to a store that predates it; without
                     # the coordinate a reader gets a positional month axis and has to know
                     # it is 0-based (see `_create_schema`).

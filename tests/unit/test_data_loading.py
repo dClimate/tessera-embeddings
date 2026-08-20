@@ -9,6 +9,7 @@ import zarr
 
 import tessera_embeddings.inference.data_loading as _dl_mod
 from tessera_embeddings.config.inference import S1_ORBIT_NONE, S2_BAND_ORDER, SCL_VALID_CLASSES
+from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -17,6 +18,7 @@ from tessera_embeddings.inference.data_loading import (
     _load_s2_bands,
     _load_sar_orbit,
     _load_scl_mask,
+    coverage_from_validity,
     load_chunk,
     load_s2_mask_bundle,
     make_store_opener,
@@ -140,12 +142,25 @@ class TestLoadSarOrbit:
         n_t, h, w = 6, _CHUNK.height, _CHUNK.width
         root = make_sar_group(n_t, h, w)
         with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
-            bands, doys = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
+            bands, doys, months = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
 
         assert bands.shape == (n_t, h, w, 2)
         assert bands.dtype == np.uint16
         assert doys.shape == (n_t,)
         assert doys.dtype == np.int32
+        # The months were always read here and thrown away; radar month coverage is derived from
+        # them, so they are returned alongside the DOYs and must survive the same `kept` filter.
+        assert months.shape == (n_t,)
+        assert set(months.tolist()) <= set(range(1, 13))
+
+    def test_the_months_returned_line_up_with_the_doys_they_came_from(self):
+        """One filter, both outputs. A months array indexed differently from the DOYs would put a
+        pixel's observation in the wrong calendar month while every shape still checked out.
+        """
+        root = make_sar_group(6, _CHUNK.height, _CHUNK.width)
+        with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
+            _, doys, months = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
+        assert doys.shape == months.shape
 
     def test_store_path_uses_orbit_name(self):
         root = make_sar_group(3, _CHUNK.height, _CHUNK.width)
@@ -157,10 +172,72 @@ class TestLoadSarOrbit:
         n_t, h, w = 4, _CHUNK.height, _CHUNK.width
         root = make_sar_group(n_t, h, w)
         with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
-            bands, _ = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
+            bands, _, _ = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
 
         np.testing.assert_array_equal(bands[:, :, :, 0], root["0_VV"][:])
         np.testing.assert_array_equal(bands[:, :, :, 1], root["0_VH"][:])
+
+
+class TestCoverageFromValidity:
+    """The count and the month mask are two views of one validity decision."""
+
+    def test_the_count_is_the_total_and_the_mask_is_the_spread(self):
+        valid = np.zeros((4, 2, 2), dtype=bool)
+        valid[0] = True  # January
+        valid[1] = True  # January again — same month, second observation
+        valid[2] = True  # July
+        months = np.asarray([1, 1, 7, 3], dtype=np.int16)
+        valid[3] = False  # March timestep exists but nothing valid in it
+
+        obs, covered = coverage_from_validity(valid, months)
+
+        assert obs.dtype == np.uint16
+        np.testing.assert_array_equal(obs, np.full((2, 2), 3))
+        assert covered.shape == (MONTHS_IN_YEAR, 2, 2)
+        assert [m + 1 for m in range(MONTHS_IN_YEAR) if covered[m].any()] == [1, 7]
+
+    def test_a_month_with_timesteps_but_no_valid_pixel_is_not_covered(self):
+        """Presence of a timestep is not presence of an observation — the distinction the paired
+        count already makes, and the reason both come from the same mask.
+        """
+        valid = np.zeros((2, 1, 1), dtype=bool)
+        months = np.asarray([5, 5], dtype=np.int16)
+        obs, covered = coverage_from_validity(valid, months)
+        assert obs.sum() == 0
+        assert not covered.any()
+
+    def test_no_timesteps_at_all_yields_zero_and_all_false(self):
+        """The skipped-orbit case. An orbit a pixel was never seen by reads exactly like a pixel
+        with no valid observation, which is what `_empty_sar_arrays` relies on.
+        """
+        obs, covered = coverage_from_validity(np.empty((0, 3, 3), dtype=bool), np.empty((0,), dtype=np.int16))
+        np.testing.assert_array_equal(obs, np.zeros((3, 3)))
+        assert covered.shape == (MONTHS_IN_YEAR, 3, 3)
+        assert not covered.any()
+
+    def test_a_month_label_outside_the_calendar_is_refused_rather_than_absorbed(self):
+        """A 0 would index -1 — December — and mark the wrong end of the year in silence.
+
+        The accumulation indexes a plane per timestep, so an out-of-range label is either a crash
+        or a wrong answer, and negative indexing makes it the wrong answer. `_filter_times_from_zarr`
+        derives months modulo 12 so this should be unreachable; the guard says so rather than
+        leaving the reader to work out that it is safe.
+        """
+        valid = np.ones((1, 2, 2), dtype=bool)
+        for bad in (0, 13):
+            with pytest.raises(ValueError, match="month labels out of range"):
+                coverage_from_validity(valid, np.asarray([bad], dtype=np.int16))
+
+    def test_the_pair_cannot_disagree_about_which_pixels_were_seen(self):
+        """The property the shared helper exists to guarantee: a pixel with a non-zero count has at
+        least one covered month, and a pixel with a zero count has none. Two separately-derived
+        arrays could satisfy every shape and dtype assertion and still break this.
+        """
+        rng = np.random.default_rng(20260820)
+        valid = rng.random((9, 6, 6)) > 0.6
+        months = rng.integers(1, 13, size=9).astype(np.int16)
+        obs, covered = coverage_from_validity(valid, months)
+        np.testing.assert_array_equal(obs > 0, covered.any(axis=0))
 
 
 class TestLoadS2:
