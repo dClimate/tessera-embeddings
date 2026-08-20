@@ -17,6 +17,7 @@ corrected" from a fact about its location. Two constants make that impossible to
 
 from __future__ import annotations
 
+import enum
 import urllib.parse
 from typing import Any
 
@@ -100,19 +101,42 @@ def item_is_in_preferred_location(
     return bool(found) and all(bucket in buckets for bucket in found)
 
 
-def item_is_pre_harmonised(
+class Harmonisation(enum.Enum):
+    """Whether an item's reflectance already has the baseline-04.00 offset removed.
+
+    Three states and not a boolean, because ``MIXED`` needs a different response from either
+    answer rather than a default. The correction is applied per DATE to every band at once, so
+    an item whose bands straddle two producers has no correct date-wide answer: exempting it
+    leaves the raw band 1000 high, correcting it drops 1000 from every harmonised band. A
+    boolean forces one of those silently.
+    """
+
+    HARMONISED = "harmonised"
+    RAW = "raw"
+    MIXED = "mixed"
+
+
+def item_harmonisation(
     item: Any,  # noqa: ANN401 — any STAC-like item
     buckets: frozenset[str] = HARMONISED_ASSET_BUCKETS,
-) -> bool:
-    """Whether this item's reflectance already has the baseline-04.00 offset removed.
+) -> Harmonisation:
+    """Which producer served the bands this ingest would READ.
 
-    All of the read set, not any, and for a sharper reason than locality: the correction is
-    applied per DATE to every band at once, so a partly-harmonised item has no single right
-    answer and the safe reading is "not harmonised" — under-correcting one band is a smaller
-    error than over-correcting the rest.
+    Judged over the read set alone: a real Element 84 item carries the original JP2s as extra
+    assets beside its COG bands, so judging every asset reports ``MIXED`` for an item that is
+    wholly harmonised where it matters.
 
-    An item exposing none of the read bands is likewise not harmonised. Absence of evidence
-    must not buy an exemption from a correction.
+    An item exposing none of the read bands is ``RAW``, and so is one served from a bucket
+    nobody has listed. **Absence of evidence must not buy an exemption from a correction**, and
+    of the two mistakes only one is discoverable: a doubled correction shifts values by a
+    visible 1000, while a skipped one leaves plausible pixels that are quietly wrong.
     """
     found = read_asset_buckets(item)
-    return bool(found) and all(bucket in buckets for bucket in found)
+    if not found:
+        return Harmonisation.RAW
+    harmonised = [bucket in buckets for bucket in found]
+    if all(harmonised):
+        return Harmonisation.HARMONISED
+    if any(harmonised):
+        return Harmonisation.MIXED
+    return Harmonisation.RAW

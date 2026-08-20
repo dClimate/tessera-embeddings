@@ -26,9 +26,15 @@ from tessera_embeddings.config.satellites import S2_BASELINE_OFFSET, S2_BASELINE
 from tessera_embeddings.ingest.asset_locations import (
     HARMONISED_ASSET_BUCKETS,
     READ_ASSET_KEYS,
-    item_is_pre_harmonised,
+    Harmonisation,
+    item_harmonisation,
 )
-from tessera_embeddings.ingest.stac import _extract_baseline, extract_baselines
+from tessera_embeddings.ingest.stac import (
+    HeterogeneousProducerError,
+    _extract_baseline,
+    dates_exempt_from_correction,
+    extract_baselines,
+)
 
 _HARMONISED = "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/33/T/WM/2022/1"
 _RAW_ESA = "s3://sentinel-s2-l2a/tiles/33/T/WM/2022/1/7/0"
@@ -70,7 +76,9 @@ class TestPerItemExemption:
         """THE POINT OF THIS CHANGE. Raw ESA pixels at baseline 05.00 carry the offset, and
         before this they were silently left 1000 too high.
         """
-        assert _extract_baseline(_Item(_RAW_ESA, "05.00")) == 500
+        item = _Item(_RAW_ESA, "05.00")
+        assert _extract_baseline(item) == 500
+        assert dates_exempt_from_correction([item]) == set(), "raw pixels are owed the correction"
 
     def test_a_harmonised_item_over_the_threshold_is_left_alone(self) -> None:
         """The safety direction, and the bug this change could introduce. Element 84's COGs
@@ -79,7 +87,8 @@ class TestPerItemExemption:
         """
         item = _Item(_HARMONISED, "05.09")
         assert _extract_baseline(item) == 509, "the parser reports what the item declares"
-        assert extract_baselines([item]) == {"2022-01-07": 0}, "the policy owes it no correction"
+        assert extract_baselines([item]) == {"2022-01-07": 509}, "provenance keeps the real baseline"
+        assert dates_exempt_from_correction([item]) == {"2022-01-07"}, "but no correction is owed"
 
     def test_a_raw_esa_item_below_the_threshold_reports_its_baseline(self) -> None:
         """Reporting the real baseline is what lets the threshold decide. 301 is under 400, so
@@ -92,31 +101,68 @@ class TestPerItemExemption:
         """Pre-existing behaviour, unchanged."""
         assert _extract_baseline(_Item(_RAW_ESA, baseline)) == 0
 
-    def test_the_exemption_is_per_item_within_one_date_map(self) -> None:
-        """`extract_baselines` is built over the items a preparation actually LOADS, so two
-        dates sourced differently must get different answers from one call.
-        """
+    def test_two_dates_from_different_producers_get_different_answers(self) -> None:
+        """Derived over the items a preparation actually loads, so one call must separate them."""
         raw = _Item(_RAW_ESA, "05.00")
         harmonised = _Item(_HARMONISED, "05.00")
         harmonised.datetime = datetime(2022, 1, 8, 12, 0, 0, tzinfo=UTC)
-        assert extract_baselines([raw, harmonised]) == {"2022-01-07": 500, "2022-01-08": 0}
+        items = [raw, harmonised]
+        assert extract_baselines(items) == {"2022-01-07": 500, "2022-01-08": 500}, "provenance is untouched"
+        assert dates_exempt_from_correction(items) == {"2022-01-08"}
+
+
+class TestProvenanceIsNotOverwritten:
+    """The reported baseline reaches the store's `baselines_applied` and must survive."""
+
+    def test_a_harmonised_item_still_reports_its_real_baseline(self) -> None:
+        """Encoding the exemption as a baseline of 0 made the store misreport its own vintage —
+        worse than the error it avoided, because it cannot be recovered after the fact.
+        """
+        assert extract_baselines([_Item(_HARMONISED, "05.10")]) == {"2022-01-07": 510}
+
+
+class TestHeterogeneousDatesAreRefused:
+    """A date-wide correction has no right answer when its tiles disagree, so it refuses."""
+
+    def test_a_date_with_both_producers_raises(self) -> None:
+        """`odc.stac.load` fuses a solar day's tiles into one slice, and duplicate selection
+        keeps one copy per (tile, acquisition) rather than per date — measured at 16 of 16 dates
+        over a four-tile ROI. Letting the last item win decided a whole mosaic by sort order.
+        """
+        raw, harmonised = _Item(_RAW_ESA, "05.00"), _Item(_HARMONISED, "05.00")
+        with pytest.raises(HeterogeneousProducerError, match="2022-01-07"):
+            dates_exempt_from_correction([raw, harmonised])
+
+    def test_a_mixed_band_item_raises(self) -> None:
+        """Same reasoning one level down: exempting leaves the raw band high, correcting drops
+        1000 from the harmonised ones, and a boolean picks one silently.
+        """
+        item = _Item(_HARMONISED, "05.00")
+        item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
+        with pytest.raises(HeterogeneousProducerError, match="read bands span"):
+            dates_exempt_from_correction([item])
+
+    def test_a_homogeneous_multi_tile_date_is_fine(self) -> None:
+        """The common case must NOT refuse: many tiles per date is the norm, and they agree."""
+        tiles = [_Item(_HARMONISED, "05.00") for _ in range(4)]
+        assert dates_exempt_from_correction(tiles) == {"2022-01-07"}
 
 
 class TestHarmonisationPredicate:
-    """`item_is_pre_harmonised` — all of the read set, and unrecognised means NOT harmonised."""
+    """`item_harmonisation` — three states, because MIXED needs its own response."""
 
     def test_a_harmonised_bucket_is_recognised(self) -> None:
-        assert item_is_pre_harmonised(_Item(_HARMONISED, "05.00")) is True
+        assert item_harmonisation(_Item(_HARMONISED, "05.00")) is Harmonisation.HARMONISED
 
     def test_raw_esa_is_not(self) -> None:
-        assert item_is_pre_harmonised(_Item(_RAW_ESA, "05.00")) is False
+        assert item_harmonisation(_Item(_RAW_ESA, "05.00")) is Harmonisation.RAW
 
     def test_extra_assets_elsewhere_do_not_change_the_answer(self) -> None:
         """Only the bands we read matter; a real Element 84 item carries the original JP2s
         alongside its COGs and they are never fetched.
         """
         item = _Item(_HARMONISED, "05.00", extra={"aot": {"href": f"{_RAW_ESA}/AOT.jp2"}})
-        assert item_is_pre_harmonised(item) is True
+        assert item_harmonisation(item) is Harmonisation.HARMONISED
 
     def test_bands_straddling_two_producers_are_not_harmonised(self) -> None:
         """The correction is applied per DATE to every band at once, so a partly-harmonised
@@ -125,15 +171,15 @@ class TestHarmonisationPredicate:
         """
         item = _Item(_HARMONISED, "05.00")
         item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
-        assert item_is_pre_harmonised(item) is False
+        assert item_harmonisation(item) is Harmonisation.MIXED, "MIXED, not silently one or the other"
 
     def test_an_item_with_no_read_bands_is_not_harmonised(self) -> None:
         """Absence of evidence must not buy an exemption from a correction."""
-        assert item_is_pre_harmonised(_Item(None, "05.00")) is False
+        assert item_harmonisation(_Item(None, "05.00")) is Harmonisation.RAW
 
     def test_an_unrecognised_bucket_is_not_harmonised(self) -> None:
         """A future mirror nobody has told us about gets corrected rather than exempted."""
-        assert item_is_pre_harmonised(_Item("s3://some-new-mirror/tiles/33/T/WM", "05.00")) is False
+        assert item_harmonisation(_Item("s3://some-new-mirror/tiles/33/T/WM", "05.00")) is Harmonisation.RAW
 
     def test_the_raw_archive_is_not_in_the_harmonised_set(self) -> None:
         """Guards the constant: adding `sentinel-s2-l2a` here would silently reinstate the bug."""

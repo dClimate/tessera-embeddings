@@ -31,7 +31,7 @@ from tessera_embeddings.config import (
 from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
-from tessera_embeddings.ingest.asset_locations import item_is_pre_harmonised
+from tessera_embeddings.ingest.asset_locations import Harmonisation, item_harmonisation
 from tessera_embeddings.ingest.catalogue_refusal import (
     CatalogueRequest,
     bbox_area_label,
@@ -244,32 +244,82 @@ def extract_baselines(items: list[Any]) -> dict[str, int]:
     name a baseline belonging to an item the loader never sees, and the reflectance
     offset it selects is applied to the pixels of the items it does.
 
-    **An item whose pixels are already harmonised reports 0 — no correction due — whatever
-    baseline it declares.** Element 84 subtracts the post-04.00 offset in its own COGs while
-    ESA's originals carry it, and one Earth Search collection now indexes both, so the
-    collection cannot decide this: exempting or correcting the whole collection is wrong for
-    half of it, and nothing raises either way. The producer is read from where the assets live.
-
-    **The two mistakes are not equally discoverable, so the default is to correct.** A doubled
-    correction shifts values by a visible 1000; a skipped one leaves plausible pixels silently
-    1000 too high. An unrecognised producer is therefore treated as unharmonised.
-
-    Deciding per item is sound here precisely because this is derived from the items being
-    LOADED: after duplicate selection there is one copy per date, so the item whose producer is
-    read is the item whose pixels arrive.
+    **Reports what each item DECLARES, and nothing about whether a correction is owed.** The
+    returned map is provenance: it is carried through ``_PreparedDate`` into the store's
+    ``baselines_applied`` attribute, whose contract is the processing baseline of the item
+    actually loaded. Encoding a correction decision here — writing 0 for an item that is
+    already harmonised — made the store misreport its own vintage, which is worse than the
+    error it was avoiding because it cannot be recovered afterwards. The decision lives in
+    :func:`dates_exempt_from_correction`.
 
     Args:
         items: STAC items, in the order they will be loaded.
 
     Returns:
-        Dict mapping date strings (YYYY-MM-DD) to the baseline to CORRECT BY — the reported
-        baseline, or 0 where no correction is owed.
+        Dict mapping date strings (YYYY-MM-DD) to the baseline each date's item REPORTS.
     """
     baselines = {}
     for item in items:
         date_str = item.datetime.strftime("%Y-%m-%d")
-        baselines[date_str] = 0 if item_is_pre_harmonised(item) else _extract_baseline(item)
+        baselines[date_str] = _extract_baseline(item)
     return baselines
+
+
+class HeterogeneousProducerError(RuntimeError):
+    """One solar day's tiles came from producers that disagree about the BOA offset.
+
+    Deterministic: re-dispatching cannot change which producers the catalogue names, so this is
+    not something a retry ladder should absorb.
+    """
+
+
+def dates_exempt_from_correction(items: list[Any]) -> set[str]:
+    """The solar days whose pixels already have the baseline-04.00 offset removed.
+
+    Kept apart from :func:`extract_baselines` because the two answer different questions — one
+    records what an item declares, the other decides what is owed — and collapsing them made a
+    correction decision overwrite the store's provenance.
+
+    **A date is judged over every item that will be fused into it, not over one.**
+    ``odc.stac.load`` mosaics a solar day's tiles into a single time slice, and duplicate
+    selection keeps one copy per *(tile, acquisition)* rather than one per date, so a date
+    routinely carries many items — measured at 16 of 16 dates over a four-tile ROI. Reading one
+    item per date and letting the last win decided a whole mosaic by catalogue sort order.
+
+    **A date whose items disagree raises rather than picking.** The correction is date-wide, so
+    a mixed date has no right answer: exempting it leaves raw tiles 1000 high, correcting it
+    drops 1000 from harmonised ones. Both are silent. Refusing costs one date and says so; the
+    resolution is to load the producers as separate groups. Not observed on the live catalogue,
+    which is why it is refused rather than engineered around — a path this rare would be wrong
+    and never exercised.
+
+    A ``MIXED`` item — read bands straddling two producers — is refused on the same reasoning.
+
+    Raises:
+        HeterogeneousProducerError: a date carries items, or an item carries bands, from
+            producers that disagree about whether the offset has been applied.
+    """
+    by_date: dict[str, set[Harmonisation]] = {}
+    for item in items:
+        date_str = item.datetime.strftime("%Y-%m-%d")
+        by_date.setdefault(date_str, set()).add(item_harmonisation(item))
+    exempt: set[str] = set()
+    for date_str, kinds in sorted(by_date.items()):
+        if Harmonisation.MIXED in kinds:
+            raise HeterogeneousProducerError(
+                f"{date_str}: an item's read bands span a harmonised and a raw producer, so no "
+                f"date-wide offset decision is correct for it. Load the producers separately."
+            )
+        if len(kinds) > 1:
+            raise HeterogeneousProducerError(
+                f"{date_str}: tiles come from both a harmonised and a raw producer "
+                f"({sorted(k.value for k in kinds)}), and the offset correction is applied per "
+                f"date to the fused mosaic, so either choice is wrong for some of its pixels. "
+                f"Load the producers as separate groups."
+            )
+        if kinds == {Harmonisation.HARMONISED}:
+            exempt.add(date_str)
+    return exempt
 
 
 def _filter_existing_dates(
@@ -982,9 +1032,15 @@ def load_stac_items(
     if collection_config.requires_baseline_correction and baselines:
         loaded_dates = {str(t.values)[:10] for t in data.time}
         filtered_baselines = {d: b for d, b in baselines.items() if d in loaded_dates}
+        # Mask a LOCAL copy for the corrector. `baselines` itself is provenance and reaches the
+        # store's `baselines_applied`, so zeroing it there would make the store misreport its
+        # vintage. Zero means "no correction owed", which is what an already-harmonised
+        # producer means.
+        exempt = dates_exempt_from_correction(items)
+        correction_baselines = {d: (0 if d in exempt else b) for d, b in filtered_baselines.items()}
         data = _apply_baseline_corrections_by_date(
             data,
-            filtered_baselines,
+            correction_baselines,
             baseline_threshold=collection_config.baseline_threshold,  # type: ignore[arg-type]
             baseline_offset=collection_config.baseline_offset,
             bands=list(collection_config.bands),
