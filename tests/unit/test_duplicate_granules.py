@@ -19,9 +19,11 @@ import pystac
 import pytest
 
 from tessera_embeddings.ingest.duplicates import (
+    PREFERRED_ASSET_HOSTS,
     alternates_for,
     copies_label,
     is_unreadable_source,
+    item_is_in_preferred_location,
     item_sequence,
     item_tile,
     select_preferred_duplicates,
@@ -490,3 +492,99 @@ def test_a_failure_in_one_tile_does_not_downgrade_a_neighbouring_tile():
     assert b_old in items, "the tile that failed steps down"
     assert a_new in items, "the neighbouring tile keeps its newest copy"
     assert keys == {("MGRS-34WFB", "2021-09-08")}
+
+
+# The two hosts that matter, spelled out rather than taken from the constant, so a change to
+# the constant has to be a deliberate edit here too.
+_IN_REGION = "s3://sentinel-cogs/sentinel-s2-l2a-cogs/33/T/WM/2017/1/B04.tif"
+_REMOTE = "s3://sentinel-s2-l2a/tiles/33/T/WM/2017/1/20/1/R10m/B04.jp2"
+
+
+def _with_assets(item: _Item, *hrefs: str) -> _Item:
+    """Attach asset hrefs, the only thing the locality test reads."""
+    item.assets = {f"b{i}": {"href": h} for i, h in enumerate(hrefs)}
+    return item
+
+
+def _copy(ident: str, *, sequence: str, baseline: str, href: str) -> _Item:
+    """One copy of a tile-date, at a given baseline/sequence, from a given host."""
+    it = _Item(ident, "MGRS-33TWM", sequence, **{"s2:processing_baseline": baseline})
+    return _with_assets(it, href)
+
+
+class TestInRegionPreference:
+    """Locality decides between copies the catalogue indexed from two regions.
+
+    Written from the real pair measured on the live catalogue: tile 35QKC on 2017-01-20 is
+    indexed twice, both at baseline 00.01 and the SAME acquisition instant, with the remote
+    copy carrying the HIGHER sequence. A sequence-first key therefore preferred the remote
+    copy on every duplicated date.
+    """
+
+    def test_equal_baseline_prefers_the_in_region_copy(self) -> None:
+        """The measured case. Same baseline and instant, so the pixels are identical and the
+        only difference is whether the read egresses through NAT.
+        """
+        remote = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="00.01", href=_REMOTE)
+        local = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="00.01", href=_IN_REGION)
+        kept, _ = select_preferred_duplicates([remote, local])
+        assert [i.id for i in kept] == [local.id], "the in-region copy must survive"
+
+    def test_the_remote_copy_stays_available_as_a_fallback(self) -> None:
+        """Preferring in-region must not DISCARD the remote copy — it is still the ladder a
+        caller steps down when the chosen copy cannot be read.
+        """
+        remote = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="00.01", href=_REMOTE)
+        local = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="00.01", href=_IN_REGION)
+        _kept, alternates = select_preferred_duplicates([remote, local])
+        assert [i.id for i in next(iter(alternates.values()))] == [remote.id]
+
+    def test_locality_never_outranks_a_newer_baseline(self) -> None:
+        """The complement, and the reason locality sits BELOW the baseline term: a cheaper
+        read must never be bought with a worse pixel.
+        """
+        local_old = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="02.06", href=_IN_REGION)
+        remote_new = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="05.00", href=_REMOTE)
+        kept, _ = select_preferred_duplicates([local_old, remote_new])
+        assert [i.id for i in kept] == [remote_new.id], "a newer baseline must win despite egress"
+
+    def test_sequence_still_decides_when_baseline_and_locality_tie(self) -> None:
+        """No regression: with nothing to separate them but sequence, the old rule stands."""
+        low = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="05.00", href=_IN_REGION)
+        high = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="05.00", href=_IN_REGION)
+        kept, _ = select_preferred_duplicates([low, high])
+        assert [i.id for i in kept] == [high.id]
+
+    def test_an_all_remote_date_still_selects_one(self) -> None:
+        """Most backfilled dates have NO in-region copy. They must still reduce to one item
+        rather than being dropped or raising — the majority case by a wide margin.
+        """
+        a = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="02.06", href=_REMOTE)
+        b = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="02.06", href=_REMOTE)
+        kept, _ = select_preferred_duplicates([a, b])
+        assert [i.id for i in kept] == [b.id], "all-remote falls through to sequence"
+
+
+class TestLocalityPredicate:
+    """`item_is_in_preferred_location` — ALL assets, not any."""
+
+    def test_every_asset_in_a_preferred_host_is_local(self) -> None:
+        assert item_is_in_preferred_location(_with_assets(_Item("x"), _IN_REGION, _IN_REGION)) is True
+
+    def test_a_mixed_item_is_not_local(self) -> None:
+        """An item straddling two locations cannot deliver the locality the preference
+        claims, so it must not be credited with it.
+        """
+        assert item_is_in_preferred_location(_with_assets(_Item("x"), _IN_REGION, _REMOTE)) is False
+
+    def test_an_item_with_no_hrefs_is_not_local(self) -> None:
+        """Absence of evidence is not locality — and this is the case every pre-existing
+        fixture in this file hits, which is why they keep their old relative order.
+        """
+        assert item_is_in_preferred_location(_Item("x")) is False
+
+    def test_the_remote_host_is_not_in_the_preferred_list(self) -> None:
+        """Guards the constant itself: if `sentinel-s2-l2a` were ever added to
+        PREFERRED_ASSET_HOSTS the whole fix would silently invert.
+        """
+        assert not any("sentinel-s2-l2a/" in h for h in PREFERRED_ASSET_HOSTS)

@@ -17,11 +17,19 @@ side of the reflectance-offset threshold from the other, so a fused date can hol
 processed both ways while exactly one correction is applied to the result — decided by item
 order rather than by which copy supplied the pixels.
 
-The preference is **newest first**, which is the newer reprocessing and the better data in
-the overwhelming majority of cases. Corruption in a newer copy is rare: sampling duplicate
-pairs chosen independently of failure found every copy intact. It is also not a property of
-being newer — so the older copy is a *fallback*, never a default. Callers step down the
-alternates only on a demonstrated read failure.
+The preference is **newest baseline first, then in-region, then newest sequence**. A newer
+reprocessing is the better data in the overwhelming majority of cases, so the baseline term
+leads and nothing below it may override it. Corruption in a newer copy is rare: sampling
+duplicate pairs chosen independently of failure found every copy intact. It is also not a
+property of being newer — so the losing copy is a *fallback*, never a default. Callers step
+down the alternates only on a demonstrated read failure.
+
+**Locality breaks ties, and only ties.** A catalogue can index the same granule from more
+than one region; when it does, the copies carry the same baseline and the same acquisition
+instant, so the data is identical and the only difference is what the read costs. In-region
+assets go through the VPC's S3 gateway endpoint while anything else egresses through NAT.
+Ranking locality *below* the baseline is what keeps this a cost decision rather than a
+quality one — it can never buy cheaper egress with a worse pixel.
 """
 
 from __future__ import annotations
@@ -76,16 +84,97 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
     return int(match.group(1)) if match else None
 
 
-def _preference_key(item: Any) -> tuple[int, int, str]:  # noqa: ANN401 — any STAC-like item
-    """Sort key placing the PREFERRED copy first: newest sequence, then a stable tiebreak.
+#: Asset hosts known to sit in the same region as our compute, most preferred first.
+#: Reads against these go through the VPC's S3 gateway endpoint; anything else egresses
+#: through NAT, which is metered, slower and a shared ceiling. An unlisted host is treated
+#: as remote rather than assumed local — the conservative direction, since the cost of
+#: under-claiming locality is only a lost tiebreak while over-claiming it routes bulk reads
+#: through NAT believing they are free.
+PREFERRED_ASSET_HOSTS: tuple[str, ...] = (
+    "sentinel-cogs",
+    "e84-earth-search-sentinel-data",
+)
 
-    The id tiebreak is only there to make the choice deterministic when two copies claim the
-    same sequence; without it the preferred copy would depend on catalogue response order,
-    and a rerun could pick differently and silently produce a different mosaic.
+
+def item_is_in_preferred_location(
+    item: Any,  # noqa: ANN401 — any STAC-like item
+    hosts: tuple[str, ...] = PREFERRED_ASSET_HOSTS,
+) -> bool:
+    """Whether EVERY resolvable asset href of *item* sits in a preferred host.
+
+    All, not any: an item whose assets straddle two locations cannot deliver the locality
+    the preference is claiming, so it sorts as remote. An item with no readable hrefs also
+    sorts as remote — absence of evidence is not locality.
     """
-    sequence = item_sequence(item)
-    known = 0 if sequence is None else 1
-    return (-known, -(sequence or 0), str(getattr(item, "id", "")))
+    hrefs = [
+        href
+        for asset in (getattr(item, "assets", None) or {}).values()
+        if isinstance(
+            href := getattr(asset, "href", None) or (asset.get("href") if isinstance(asset, dict) else None), str
+        )
+        and href
+    ]
+    return bool(hrefs) and all(any(h in href for h in hosts) for href in hrefs)
+
+
+def item_processing_baseline(item: Any) -> float | None:  # noqa: ANN401 — any STAC-like item
+    """The item's processing baseline as a float, or ``None`` if it cannot be read.
+
+    Higher is a newer reprocessing of the same acquisition. Read because it, and not
+    ``s2:sequence``, is the signal that carries data vintage: a catalogue can index the same
+    granule twice at one baseline and give the copies different sequences.
+    """
+    raw = item.properties.get("s2:processing_baseline")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.debug("Unparseable s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
+        return None
+
+
+def _rank_copies(copies: list[Any]) -> list[Any]:
+    """Order one acquisition's copies, PREFERRED first.
+
+    Precedence, and the reason for each rank:
+
+    1. **A demonstrably older processing baseline is demoted.** This is the only term that
+       speaks to data quality, so nothing below it may override it.
+
+       An **unreadable baseline is neutral, not demoted** — it neither claims vintage nor
+       loses any. That asymmetry is load-bearing and is why this is a group-relative ranking
+       rather than a sort key: a key can express "unknown loses" or "unknown wins", but the
+       correct answer is "unknown does not compete", which needs the group's best baseline as
+       context. Demoting the unknown silently preferred an OLDER copy whenever the newest
+       reprocessing happened to omit the property.
+    2. **Locality.** Among copies no older than the best in the group the pixels are the
+       same, so the tiebreak is free to be about cost: prefer an asset reachable through the
+       region's S3 gateway endpoint over one that must egress through NAT. Ranked BELOW the
+       baseline term on purpose — locality is worth a tiebreak, never a worse pixel.
+    3. **Newest sequence.** A copy whose sequence cannot be read never displaces one whose
+       can, since an unreadable sequence must not win a comparison it cannot participate in.
+    4. **The id**, purely so the choice is deterministic when two copies tie on everything
+       else; without it the preferred copy would depend on catalogue response order, and a
+       rerun could pick differently and silently produce a different mosaic.
+
+    Locality was added after a catalogue backfill began indexing the same granules from a
+    second region. The remote copies carried a HIGHER sequence at the SAME baseline and the
+    same acquisition instant, so a sequence-first order preferred them systematically and
+    every duplicated date paid egress for pixels that were also available in region.
+    """
+    known = [b for item in copies if (b := item_processing_baseline(item)) is not None]
+    best = max(known) if known else None
+
+    def rank(item: Any) -> tuple[int, int, int, int, str]:  # noqa: ANN401 — any STAC-like item
+        baseline = item_processing_baseline(item)
+        older = 1 if (baseline is not None and best is not None and baseline < best) else 0
+        remote = 0 if item_is_in_preferred_location(item) else 1
+        sequence = item_sequence(item)
+        has_sequence = 0 if sequence is None else 1
+        return (older, remote, -has_sequence, -(sequence or 0), str(getattr(item, "id", "")))
+
+    return sorted(copies, key=rank)
 
 
 #: How far apart two acquisition instants must be to be different acquisitions rather
@@ -189,11 +278,14 @@ def select_preferred_duplicates(
     for key, copies in groups.items():
         rejected: list[Any] = []
         for acquisition in _by_acquisition(copies):
-            ranked = sorted(acquisition, key=_preference_key)
+            ranked = _rank_copies(acquisition)
             survivors.add(id(ranked[0]))
             rejected.extend(ranked[1:])
         if rejected:
-            alternates[key] = sorted(rejected, key=_preference_key)
+            # Already in preference order per acquisition, and NOT re-sorted: the ranking is
+            # relative to its own acquisition's best baseline, so a global re-sort would
+            # compare copies against a baseline from a different acquisition.
+            alternates[key] = rejected
 
     kept = [it for it in items if id(it) in survivors]
     return kept, alternates
