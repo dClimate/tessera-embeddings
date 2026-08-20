@@ -778,8 +778,9 @@ def ingest_s2_roi_reflectance(
         # read failure. (The BASELINE a date is corrected by is derived later, from the
         # items a preparation actually loads — pruning here does not by itself make the two
         # agree, and an earlier version of this comment claimed it did.)
+        supplied = items
         items, alternates = select_preferred_duplicates(items, _READ_ASSET_KEYS)
-        log_duplicate_selection(log, roi_label, alternates, kept=items, read_keys=_READ_ASSET_KEYS)
+        log_duplicate_selection(log, roi_label, alternates, kept=items, read_keys=_READ_ASSET_KEYS, items=supplied)
         date_alternates.update(alternates)
 
         def _record_unreadable(

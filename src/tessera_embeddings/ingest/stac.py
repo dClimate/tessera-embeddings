@@ -1246,7 +1246,9 @@ def load_stac_items(
         # date, so `alternates` can be empty on a tile-date that was still pruned — and gating on
         # it left the caller's map describing a copy that is not being loaded.
         if len(pruned) != len(items):
-            log_duplicate_selection(logger, f"load {collection}", alternates, kept=pruned, read_keys=read_keys)
+            log_duplicate_selection(
+                logger, f"load {collection}", alternates, kept=pruned, read_keys=read_keys, items=items
+            )
             # Realign the caller's provenance with what is about to be loaded. `baselines` becomes
             # the store's `baselines_applied`, and on the split workflow it was built by
             # `query_stac_items` from the UNPRUNED list — so a rejected copy that sorted last could
@@ -1467,6 +1469,7 @@ def ingest_tile(
         # instead of stepping down to the copy sitting behind it. Selection belongs to the layer
         # that owns the fallback — which here is nobody, so the copies are genuinely spare.
         read_keys = _requested_assets(collection_config, extra_bands)
+        supplied = items
         items, alternates = select_preferred_duplicates(items, read_keys)
         log_duplicate_selection(
             logger,
@@ -1474,6 +1477,7 @@ def ingest_tile(
             alternates,
             kept=items,
             read_keys=read_keys,
+            items=supplied,
         )
         # Provenance must describe what was KEPT, for the dates selection touched — UPDATED and
         # not replaced. `query_stac_items` returns entries for every queried date, including ones

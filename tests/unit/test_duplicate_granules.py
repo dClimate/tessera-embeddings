@@ -741,7 +741,7 @@ class TestTheDuplicateLogIsAnAuditTrail:
         remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
         msg = self._emit(caplog, [local], {("MGRS-33TWM", "2021-09-08"): [remote]})
         assert "complete read set, then a decidable producer and readable baseline" in msg
-        assert "then newest baseline, then in-region, then newest sequence" in msg
+        assert "then newest baseline, then in-region, then a readable acquisition instant, then newest sequence" in msg
         assert "newest kept" not in msg, "the stale claim must not come back"
 
     def test_it_names_where_the_survivors_came_from(self, caplog) -> None:
@@ -799,7 +799,7 @@ class TestTheDuplicateLogIsAnAuditTrail:
         unreadable = _with_assets(_Item("b", "MGRS-33TWM", "0"), _bands_at(_REMOTE))
         msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [unreadable]})
         assert "complete read set, then a decidable producer and readable baseline" in msg
-        assert "then newest baseline, then in-region, then newest sequence" in msg
+        assert "then newest baseline, then in-region, then a readable acquisition instant, then newest sequence" in msg
         assert "sequence alone" not in msg, "a mode that cannot happen must not be reported"
 
     def test_no_duplicates_logs_nothing(self, caplog) -> None:
@@ -1370,3 +1370,98 @@ class TestTheLadderOnlyOffersCopiesItCanRecoverWith:
         unusable = self._copy("no-baseline", baseline=None, sequence="1", raw=True)
         _, alternates = select_preferred_duplicates([winner, usable, unusable])
         assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["usable"]
+
+
+class TestKnownAcquisitionsSurviveAnUndatedSibling:
+    """Two readable passes plus one undated copy must keep BOTH passes.
+
+    Raised four times in review, and I twice reported it fixed when it was not — a later edit had
+    reinstated the collapse while leaving the docstring describing the replacement. These assert
+    the outcome rather than the mechanism, so a revert fails here instead of in a fifth review.
+    """
+
+    _A = "2021-09-08T10:00:00Z"
+    _B = "2021-09-08T14:00:00Z"
+
+    def _at(self, ident: str, acquired: str | None, sequence: str) -> _Item:
+        extra: dict[str, object] = {"s2:processing_baseline": "05.00"}
+        if acquired is not None:
+            extra["datetime"] = acquired
+        return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **extra), _bands_at(_IN_REGION))
+
+    def test_both_readable_passes_survive(self) -> None:
+        items = [
+            self._at("pass-a", self._A, "0"),
+            self._at("pass-b", self._B, "0"),
+            self._at("undated", None, "1"),
+        ]
+        kept, _ = select_preferred_duplicates(items)
+        assert sorted(it.id for it in kept) == ["pass-a", "pass-b"], "a readable pass was discarded"
+
+    def test_the_undated_copy_competes_rather_than_surviving_alongside(self) -> None:
+        """It must not add a third survivor — that is the fusion this module prevents."""
+        items = [self._at("pass-a", self._A, "0"), self._at("undated", None, "1")]
+        kept, alternates = select_preferred_duplicates(items)
+        assert len(kept) == 1, "the undated copy survived as its own acquisition"
+        assert alternates[("MGRS-33TWM", "2021-09-08")], "the loser must remain a fallback"
+
+    def test_three_passes_and_two_undated_keep_three_survivors(self) -> None:
+        items = [
+            self._at("pass-a", self._A, "0"),
+            self._at("pass-b", self._B, "0"),
+            self._at("pass-c", "2021-09-08T18:00:00Z", "0"),
+            self._at("undated-1", None, "1"),
+            self._at("undated-2", None, "2"),
+        ]
+        kept, _ = select_preferred_duplicates(items)
+        assert len(kept) == 3, f"expected one per readable pass, got {[i.id for i in kept]}"
+
+    def test_all_undated_still_reduces_to_one(self) -> None:
+        """With no readable instant anywhere there is no evidence of distinctness at all."""
+        items = [self._at("u1", None, "0"), self._at("u2", None, "1")]
+        kept, _ = select_preferred_duplicates(items)
+        assert len(kept) == 1
+
+
+class TestTheAuditReportsWhatSelectionDidNotWhatSurvivedTheFilter:
+    """The ladder filter drops copies that would refuse, so the audit could not be derived from it.
+
+    On a date whose every spare was unusable the INFO line vanished entirely, and elsewhere it
+    undercounted while claiming every rejected copy was still available. Raised on PR #107.
+    """
+
+    def _emit(self, caplog, supplied, kept, alternates) -> str:
+        log = logging.getLogger("dup-audit-counts")
+        with caplog.at_level(logging.INFO, logger="dup-audit-counts"):
+            from tessera_embeddings.ingest.duplicates import log_duplicate_selection
+
+            log_duplicate_selection(log, "roi-x", alternates, kept=kept, items=supplied)
+        return " ".join(r.getMessage() for r in caplog.records)
+
+    def _copy(self, ident: str, *, baseline: str | None, raw: bool = False) -> _Item:
+        extra: dict[str, object] = {}
+        if baseline is not None:
+            extra["s2:processing_baseline"] = baseline
+        return _with_assets(_Item(ident, "MGRS-33TWM", "0", **extra), _bands_at(_REMOTE if raw else _IN_REGION))
+
+    def test_the_line_appears_and_separates_rejected_from_recoverable(self, caplog) -> None:
+        winner = self._copy("win", baseline="05.00")
+        refuser = self._copy("refuser", baseline=None, raw=True)
+        supplied = [winner, refuser]
+        kept, alternates = select_preferred_duplicates(supplied)
+        assert alternates == {}, "the fixture must have had its only spare filtered out"
+        msg = self._emit(caplog, supplied, kept, alternates)
+        assert msg, "the audit vanished on a date whose spare was unusable"
+        assert "1 rejected, 0 of those available as a fallback" in msg
+
+    def test_a_usable_spare_is_reported_as_recoverable(self, caplog) -> None:
+        winner = self._copy("win", baseline="05.10")
+        usable = self._copy("usable", baseline="05.00")
+        supplied = [winner, usable]
+        kept, alternates = select_preferred_duplicates(supplied)
+        msg = self._emit(caplog, supplied, kept, alternates)
+        assert "1 rejected, 1 of those available as a fallback" in msg
+
+    def test_nothing_pruned_logs_nothing(self, caplog) -> None:
+        only = self._copy("only", baseline="05.00")
+        assert self._emit(caplog, [only], [only], {}) == ""

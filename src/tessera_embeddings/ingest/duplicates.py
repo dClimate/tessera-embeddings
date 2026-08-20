@@ -154,7 +154,7 @@ def _would_refuse_its_date(
 def _preference_key(
     item: Any,  # noqa: ANN401
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
-) -> tuple[int, int, int, float, int, int, int, str]:
+) -> tuple[int, int, int, float, int, int, int, int, str]:
     """How much we would rather read this copy than another. Lower sorts first.
 
     **Context-free:** no term is relative to the set being sorted, so the same key orders copies
@@ -179,7 +179,10 @@ def _preference_key(
     5. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
        cheaper egress with an older pixel, and inert for unreadable baselines so it cannot decide
        a comparison the baseline could not enter.
-    6. **Sequence, descending, then id.** The id makes the order total, so the choice is
+    6. **A readable acquisition instant.** A copy without one is attached to a cluster
+       arbitrarily, since nothing says which pass it belongs to, so it must not displace a copy
+       that does say. Below the baseline terms because it concerns provenance, not pixels.
+    7. **Sequence, descending, then id.** The id makes the order total, so the choice is
        independent of catalogue response order and a rerun cannot produce a different mosaic.
     """
     baseline = item_processing_baseline(item)
@@ -190,6 +193,7 @@ def _preference_key(
         0 if baseline is not None else 1,
         -(baseline or 0.0),
         (0 if item_is_in_preferred_location(item, keys=read_keys) else 1) if baseline is not None else 0,
+        0 if acquisition_instant(item) is not None else 1,
         0 if sequence is not None else 1,
         -(sequence or 0),
         str(getattr(item, "id", "")),
@@ -244,22 +248,25 @@ def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
     """Split one tile-date's copies into one list per distinct acquisition.
 
     **If ANY copy's instant cannot be read, the whole tile-date is one acquisition.** An
-    unreadable instant is no evidence that the copy is a distinct pass, and the two errors are not
-    symmetric: giving it its own group leaves two copies to be fused at two processing baselines,
-    which is what this module prevents, while collapsing at worst discards a genuinely distinct
-    pass.
+    unreadable instant is no evidence that the copy is a distinct pass, so it JOINS a cluster rather
+    than forming its own — competing for one slot instead of adding one. Which cluster is arbitrary
+    and safe. Collapsing the whole tile-date instead would prevent the same fusion by discarding
+    coverage from passes whose instants were perfectly readable.
 
     Where instants ARE readable, splitting on them protects real coverage: keying on (tile, solar
     day) alone dropped 493 of 2,733 items as duplicates when they were distinct acquisitions.
     """
-    instants = [acquisition_instant(it) for it in copies]
-    if any(instant is None for instant in instants):
+    known: list[tuple[datetime.datetime, Any]] = []
+    undated: list[Any] = []
+    for item in copies:
+        instant = acquisition_instant(item)
+        if instant is None:
+            undated.append(item)
+        else:
+            known.append((instant, item))
+    if not known:
         return [copies]
 
-    # Narrowed by the guard above; restated for the type checker rather than cast.
-    known: list[tuple[datetime.datetime, Any]] = [
-        (instant, item) for instant, item in zip(instants, copies, strict=True) if instant is not None
-    ]
     dated = sorted(known, key=lambda pair: pair[0])
     clusters: list[list[Any]] = [[dated[0][1]]]
     for previous, current in itertools.pairwise(dated):
@@ -267,6 +274,7 @@ def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
             clusters.append([current[1]])
         else:
             clusters[-1].append(current[1])
+    clusters[0].extend(undated)
     return clusters
 
 
@@ -373,6 +381,7 @@ def log_duplicate_selection(
     alternates: dict[tuple[str, str], list[Any]],
     kept: Iterable[Any] = (),
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
+    items: Iterable[Any] = (),
 ) -> None:
     """Record that duplicates were pruned, at a level that survives a fleet-wide log.
 
@@ -391,9 +400,26 @@ def log_duplicate_selection(
     did not use — a winner serving every requested band locally reads as remote for lacking an
     asset nobody asked for.
     """
-    if not alternates:
+    # Counted from what selection DID, not from what survived the ladder filter. Copies that would
+    # refuse their date are excluded from `alternates`, so deriving the audit from it suppressed the
+    # line entirely on a date whose every spare was unusable, and elsewhere undercounted while
+    # implying every rejected copy remained available as a fallback.
+    supplied, survivors = list(items), list(kept)
+    if supplied:
+        pruned = len(supplied) - len(survivors)
+        contested = max(
+            len({k for it in supplied if (k := _contested_key(it)) is not None})
+            - len({k for it in survivors if (k := _contested_key(it)) is not None}),
+            len(alternates),
+        )
+    else:
+        # Nothing to compare against, so report the ladder — what callers passing only
+        # `alternates` have always received.
+        pruned = sum(len(v) for v in alternates.values())
+        contested = len(alternates)
+    if pruned <= 0:
         return
-    pruned = sum(len(v) for v in alternates.values())
+    recoverable = sum(len(v) for v in alternates.values())
     winners = [it for it in kept if _contested_key(it) in alternates]
     where = ""
     if winners:
@@ -402,14 +428,15 @@ def log_duplicate_selection(
 
     how = (
         "complete read set, then a decidable producer and readable baseline, then newest baseline, "
-        "then in-region, then newest sequence"
+        "then in-region, then a readable acquisition instant, then newest sequence"
     )
     log.info(
         "Duplicate catalogue items pruned roi=%s: %d tile-date(s) had more than one copy, "
-        "%d rejected. Preference: %s (rejected copies stay available as a fallback)%s",
+        "%d rejected, %d of those available as a fallback. Preference: %s%s",
         roi,
-        len(alternates),
+        contested,
         pruned,
+        recoverable,
         how,
         where,
     )
