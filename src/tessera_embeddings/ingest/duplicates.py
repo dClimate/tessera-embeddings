@@ -396,17 +396,27 @@ def select_preferred_duplicates(
             survivors.add(id(ranked[0]))
             rejected.extend(ranked[1:])
         if rejected:
-            # Ranked WITHIN each acquisition, then the acquisitions ordered by their own best
-            # spare. Ranking the whole tile-date in one call leaked one acquisition's unknown
-            # baseline into another's order: `_rank_copies` reverts the entire set to sequence
-            # ordering when any baseline is unreadable, so a single malformed item in acquisition
-            # A could push A's 03.00/seq-1 spare ahead of B's 04.00/seq-0 one. Ranking per
-            # acquisition keeps each ladder baseline-first, and ordering the groups by their best
-            # member keeps `copies[0]` the best overall answer, which is what
-            # `_first_for_failed_acquisition` documents it needs when nothing was attributed.
-            ladders = [_rank_copies(g) for g in _by_acquisition(rejected)]
-            ladders.sort(key=lambda ladder: _across_acquisitions_key(ladder[0]))
-            alternates[key] = [copy for ladder in ladders for copy in ladder]
+            # ONE global order over every rejected copy, by a context-free key.
+            #
+            # `_rank_copies` cannot build this list. It suspends the baseline comparison whenever
+            # any baseline in its input is unreadable, which is right for picking an
+            # acquisition's winner and wrong here: applied to a whole tile-date, one malformed
+            # item reverted every acquisition's ladder to sequence order, so a read failure could
+            # hand out a 03.00 copy while a 04.00 one sat further down.
+            #
+            # Ranking each acquisition separately and concatenating is also wrong, and by a
+            # subtler route: it orders the ladder heads and then flattens, so with A holding
+            # 05.00 and 01.00 spares and B holding 04.00 it yields [A05, A01, B04]. The
+            # unattributed recovery in `s2_roi` consumes `copies[0]` on each retry, so the second
+            # retry takes A01 and skips the better B04 — degrading imagery to avoid nothing.
+            #
+            # A single sort by `_across_acquisitions_key` is the priority-preserving merge those
+            # comments ask for, with the same comparator applied at every position rather than
+            # only at the heads. Nothing is suspended, so no acquisition can leak its metadata
+            # into another's order, and an unknown baseline sorts LAST instead of suspending the
+            # comparison — which addresses the same risk more directly, since a copy whose
+            # baseline cannot be read is the one whose correction will silently be skipped.
+            alternates[key] = sorted(rejected, key=_across_acquisitions_key)
 
     kept = [it for it in items if id(it) in survivors]
     return kept, alternates

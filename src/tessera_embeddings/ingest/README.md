@@ -1207,9 +1207,19 @@ Two properties of that ordering are easy to get wrong and are held by tests:
   restoring sequence-first ordering. A missing baseline is an absence of evidence rather than
   a tie, and treating it as a tie let an in-region copy with no baseline displace a remote
   copy at 05.00 — which both selects an older reprocessing and skips the post-04.00 offset
-  correction downstream. The suspension is scoped to the acquisition it belongs to: applying
-  it across a whole tile-date let one malformed item revert an unrelated acquisition's ladder
-  to sequence order.
+  correction downstream. The suspension applies only to choosing an acquisition's winner.
+
+The **fallback ladder** — the rejected copies, in the order a read failure steps down them — is
+built by one global sort over the whole tile-date instead, using a key that has no notion of
+"best in my group". Two other constructions were wrong. Ranking the tile-date with the same
+function used for winners let one malformed item's suspension revert every acquisition's ladder
+to sequence order. Ranking each acquisition separately and concatenating them behind their
+sorted heads is wrong further down: with one acquisition holding 05.00 and 01.00 spares and
+another holding 04.00, it yields `[05, 01, 04]`, and the unattributed recovery consumes the head
+on each retry, so the second retry takes 01.00 and never tries the 04.00. In the global order an
+unreadable baseline sorts last rather than suspending anything, which is the same protection by a
+more direct route: a copy whose baseline cannot be read is the one whose correction will silently
+be skipped.
 
 Buckets are compared by parsing the href's host and path rather than by substring, so a
 lookalike host cannot be mistaken for a preferred one. `"NaN"` and `"Infinity"` parse as
