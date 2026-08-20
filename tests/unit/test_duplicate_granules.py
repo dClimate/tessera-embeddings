@@ -1134,9 +1134,26 @@ class TestThePreferenceKeyHoldsItsInvariants:
         assert _preference_key(remote_new) < _preference_key(local_old)
 
     def test_locality_does_not_participate_when_the_baseline_is_unreadable(self) -> None:
-        local = self._item("local", baseline=None, sequence="1", local=True, complete=True)
+        """Compared like with like: both raw, so the baseline-readable term ties and only locality
+        and sequence are left. A harmonised copy would not tie here — it needs no correction, so an
+        unreadable baseline costs it nothing.
+        """
+        local = self._item("local", baseline=None, sequence="1", local=False, complete=True)
         remote = self._item("remote", baseline=None, sequence="2", local=False, complete=True)
         assert _preference_key(remote) < _preference_key(local), "locality decided a baseline-free comparison"
+
+    def test_a_harmonised_copy_is_not_penalised_on_the_readable_term(self) -> None:
+        """It needs no correction whatever the baseline says, so an unreadable baseline is not
+        evidence against it the way it is against a raw copy — which refuses its date.
+
+        Note the narrower claim: this is about the READABLE term, not the baseline VALUE. A
+        harmonised copy declaring nothing still loses to a raw copy declaring 03.00, because an
+        absent baseline is no vintage information at all and this module does not let absence of
+        evidence win a comparison. That is consistent rather than accidental.
+        """
+        harmonised = self._item("harmonised", baseline=None, sequence="0", local=True, complete=True)
+        raw_same = self._item("raw-no-baseline", baseline=None, sequence="9", local=False, complete=True)
+        assert _preference_key(harmonised) < _preference_key(raw_same)
 
     def test_an_incomplete_copy_loses_to_an_otherwise_identical_complete_one(self) -> None:
         complete = self._item("z-complete", baseline="05.00", sequence="0", local=False, complete=True)
@@ -1453,6 +1470,9 @@ class TestTheAuditReportsWhatSelectionDidNotWhatSurvivedTheFilter:
         msg = self._emit(caplog, supplied, kept, alternates)
         assert msg, "the audit vanished on a date whose spare was unusable"
         assert "1 rejected, 0 of those available as a fallback" in msg
+        # Counted by multiplicity: the tile-date keeps its key while losing a copy, so a set
+        # difference reported 0 contested dates beside 1 rejected copy — a self-contradiction.
+        assert "1 tile-date(s) had more than one copy" in msg
 
     def test_a_usable_spare_is_reported_as_recoverable(self, caplog) -> None:
         winner = self._copy("win", baseline="05.10")
@@ -1465,3 +1485,54 @@ class TestTheAuditReportsWhatSelectionDidNotWhatSurvivedTheFilter:
     def test_nothing_pruned_logs_nothing(self, caplog) -> None:
         only = self._copy("only", baseline="05.00")
         assert self._emit(caplog, [only], [only], {}) == ""
+
+
+class TestTheLadderStepsNothingWhenTheFailedAcquisitionHasNoSpare:
+    """Attribution named the failing objects and no copy belongs to their acquisition.
+
+    Falling back to the best overall alternate there swapped a HEALTHY acquisition down to an older
+    copy while leaving the known-bad one selected, then rebuilt and re-read the whole date only to
+    fail identically — once per unrelated spare before recording the loss. Raised on PR #107.
+    """
+
+    _A = "2021-09-08T10:00:00Z"
+    _B = "2021-09-08T14:00:00Z"
+
+    def _at(self, ident: str, acquired: str, sequence: str, baseline: str = "05.00") -> _Item:
+        return _with_assets(
+            _Item(ident, "MGRS-33TWM", sequence, **{"s2:processing_baseline": baseline, "datetime": acquired}),
+            _bands_at(_IN_REGION),
+        )
+
+    def test_nothing_is_stepped_when_only_a_healthy_acquisition_has_a_spare(self) -> None:
+        bad = self._at("bad-a", self._A, "1")  # the one that failed; no spare of its own
+        healthy = self._at("healthy-b", self._B, "1")  # a different acquisition...
+        spare_b = self._at("spare-b", self._B, "0")  # ...which DOES have a spare
+        kept, alternates = select_preferred_duplicates([bad, healthy, spare_b])
+        assert sorted(i.id for i in kept) == ["bad-a", "healthy-b"]
+
+        stepped = step_down_copies(alternates, kept, implicated=[bad])
+        assert stepped is None, "a healthy acquisition was downgraded for a failure it did not have"
+
+    def test_the_failed_acquisition_is_stepped_when_it_does_have_a_spare(self) -> None:
+        """The complement, or returning None unconditionally would pass the test above."""
+        bad = self._at("bad-a", self._A, "1")
+        spare_a = self._at("spare-a", self._A, "0")
+        healthy = self._at("healthy-b", self._B, "1")
+        kept, alternates = select_preferred_duplicates([bad, spare_a, healthy])
+        stepped = step_down_copies(alternates, kept, implicated=[bad])
+        assert stepped is not None
+        swapped, _keys = stepped
+        assert "spare-a" in [i.id for i in swapped], "the failed acquisition was not stepped"
+        assert "healthy-b" in [i.id for i in swapped], "the healthy acquisition must be untouched"
+
+    def test_unattributed_failure_still_steps_the_best_spare(self) -> None:
+        """With nothing attributed there is no acquisition to match, and the pre-existing
+        behaviour — take the best-ranked alternate — is still right.
+        """
+        first = self._at("first", self._A, "1")
+        spare = self._at("spare", self._A, "0")
+        kept, alternates = select_preferred_duplicates([first, spare])
+        stepped = step_down_copies(alternates, kept, implicated=[])
+        assert stepped is not None
+        assert "spare" in [i.id for i in stepped[0]]

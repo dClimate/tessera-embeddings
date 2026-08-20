@@ -125,3 +125,25 @@ class TestABaselineMustLandOnAHundredth:
         this is checked with Decimal: 5.10 * 100 is 509.999... as a float.
         """
         assert processing_baseline(_item(raw)) == expected
+
+
+class TestScalingCannotUnderflowToAConfidentZero:
+    """A tiny positive exponent underflows rather than overflowing.
+
+    `Decimal("1e-1000000000") * 100` becomes `0E-1000026`, which IS integral, so the parser
+    reported a confident baseline of 0 — read downstream as a real pre-threshold version, which
+    exempts the date instead of refusing ambiguous metadata. Raised on PR #107.
+    """
+
+    @pytest.mark.parametrize("raw", ["1e-1000000000", "1e-9", "0.001", "0.009"])
+    def test_a_value_below_one_hundredth_is_unreadable(self, raw: str) -> None:
+        assert processing_baseline(_item(raw)) is None
+
+    def test_one_hundredth_itself_still_parses(self) -> None:
+        """The boundary: 00.01 is a real version and the smallest representable one."""
+        assert processing_baseline(_item("00.01")) == 1
+
+    def test_a_declared_zero_stays_readable(self) -> None:
+        """Zero is a real declared value; only positive values BELOW a hundredth are rejected."""
+        assert processing_baseline(_item("00.00")) == 0
+        assert processing_baseline(_item("0")) == 0

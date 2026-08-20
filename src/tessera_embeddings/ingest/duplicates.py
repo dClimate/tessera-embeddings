@@ -39,6 +39,7 @@ baseline cannot be read, so it never decides a comparison the baseline could not
 
 from __future__ import annotations
 
+import collections
 import datetime
 import functools
 import itertools
@@ -131,6 +132,7 @@ def _would_refuse_its_date(
     item: Any,  # noqa: ANN401
     baseline: int | None,
     read_keys: tuple[str, ...],
+    harmonisation: Harmonisation,
 ) -> bool:
     """Whether choosing this otherwise-usable copy makes its date refuse rather than load.
 
@@ -148,7 +150,7 @@ def _would_refuse_its_date(
         return False
     if not read_set_is_complete(item, read_keys):
         return False
-    return item_harmonisation(item) in (Harmonisation.MIXED, Harmonisation.UNKNOWN)
+    return harmonisation in (Harmonisation.MIXED, Harmonisation.UNKNOWN)
 
 
 def _preference_key(
@@ -172,8 +174,11 @@ def _preference_key(
        refuses its date at or above the correction threshold — and neither the generic path nor the
        read-failure ladder retries a refusal. Below the threshold the term is inert, because there
        the producer changes no pixel.
-    3. **Whether the baseline is readable.** Unknown sorts last, for the same reason: a copy that
-       declares nothing is one whose correction cannot be decided, so it refuses its date too.
+    3. **Whether the baseline is readable — for producers whose correction depends on it.** A copy
+       declaring nothing is one whose correction cannot be decided, so it refuses its date. An
+       already-harmonised copy is the exception: its pixels need no correction whatever the
+       baseline says, so penalising it here would hand a tile-date to an OLDER raw reprocessing,
+       which is the opposite of the usable-first rule this key starts with.
     4. **The baseline, descending, by value** — not by "is it the best", so every rung of the
        fallback ladder stays in descending baseline order.
     5. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
@@ -187,10 +192,13 @@ def _preference_key(
     """
     baseline = item_processing_baseline(item)
     sequence = item_sequence(item)
+    # Resolved once and shared with the refusal check, which needs the same answer.
+    harmonisation = item_harmonisation(item)
+    baseline_matters = harmonisation is not Harmonisation.HARMONISED
     return (
         0 if read_set_is_complete(item, read_keys) else 1,
-        1 if _would_refuse_its_date(item, baseline, read_keys) else 0,
-        0 if baseline is not None else 1,
+        1 if _would_refuse_its_date(item, baseline, read_keys, harmonisation) else 0,
+        0 if baseline is not None or not baseline_matters else 1,
         -(baseline or 0.0),
         (0 if item_is_in_preferred_location(item, keys=read_keys) else 1) if baseline is not None else 0,
         0 if acquisition_instant(item) is not None else 1,
@@ -407,11 +415,11 @@ def log_duplicate_selection(
     supplied, survivors = list(items), list(kept)
     if supplied:
         pruned = len(supplied) - len(survivors)
-        contested = max(
-            len({k for it in supplied if (k := _contested_key(it)) is not None})
-            - len({k for it in survivors if (k := _contested_key(it)) is not None}),
-            len(alternates),
-        )
+        # By MULTIPLICITY, not by set difference: a tile-date that loses a copy keeps its key in
+        # both sets, so subtracting cardinalities reported zero contested dates beside a non-zero
+        # rejected count — the line contradicting itself.
+        seen = collections.Counter(k for it in supplied if (k := _contested_key(it)) is not None)
+        contested = sum(1 for n in seen.values() if n > 1)
     else:
         # Nothing to compare against, so report the ladder — what callers passing only
         # `alternates` have always received.
@@ -573,6 +581,10 @@ def step_down_copies(
     swap: dict[int, Any] = {}
     for key, copies in remaining.items():
         alternate = _first_for_failed_acquisition(copies, failed_by_key.get(key, ()))
+        if alternate is None:
+            # The failed acquisition has no spare. Leave every copy available and step nothing:
+            # swapping a healthy acquisition here cannot fix the failure and costs a whole re-read.
+            continue
         alternates[key] = [c for c in copies if c is not alternate]
         target = _alternate_for(alternate, survivors.get(key, ()), taken=swap)
         if target is not None:
@@ -582,11 +594,17 @@ def step_down_copies(
     return [swap.get(id(item), item) for item in items], set(remaining)
 
 
-def _first_for_failed_acquisition(copies: list[Any], implicated: Sequence[Any]) -> Any:  # noqa: ANN401
-    """The best-ranked alternate belonging to an acquisition that FAILED, else the best overall.
+def _first_for_failed_acquisition(copies: list[Any], implicated: Sequence[Any]) -> Any | None:  # noqa: ANN401
+    """The best-ranked alternate belonging to an acquisition that FAILED, or ``None``.
 
     ``copies`` is already preference-ordered, so the plain answer is ``copies[0]`` — and that
     is what this returns when nothing was attributed, which is the pre-existing behaviour.
+
+    **When attribution DID name the failing objects and none of the copies belongs to their
+    acquisition, the answer is ``None``.** Falling back to the best overall alternate there swapped
+    a healthy acquisition down to an older copy while leaving the known-bad one selected, then
+    rebuilt and re-read the whole date only to fail the same way — once per unrelated spare before
+    recording the loss. Nothing to step means nothing to step.
 
     When the caller identified the failing objects, prefer an alternate sharing an acquisition
     with one of them. Otherwise a tile-date holding two acquisitions steps whichever has the
@@ -600,7 +618,7 @@ def _first_for_failed_acquisition(copies: list[Any], implicated: Sequence[Any]) 
         for cluster in _by_acquisition([*implicated, candidate]):
             if any(it is candidate for it in cluster) and any(any(it is bad for bad in implicated) for it in cluster):
                 return candidate
-    return copies[0]
+    return None
 
 
 def _alternate_for(alternate: Any, survivors: Iterable[Any], *, taken: dict[int, Any]) -> Any | None:  # noqa: ANN401
