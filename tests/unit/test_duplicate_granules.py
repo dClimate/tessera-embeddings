@@ -1102,14 +1102,23 @@ class TestThePreferenceKeyHoldsItsInvariants:
                         n += 1
         return out
 
-    def test_a_readable_baseline_always_beats_an_unreadable_one(self) -> None:
-        pool = self._pool()
+    def test_a_readable_baseline_beats_an_unreadable_one_among_equally_complete_copies(self) -> None:
+        """Qualified by completeness, which ranks ahead of it: a copy that cannot be read is no
+        use at any baseline, and the generic paths have no recovery for a missing band.
+        """
+        pool = [i for i in self._pool() if read_set_is_complete(i)]
         known = [i for i in pool if item_processing_baseline(i) is not None]
         unknown = [i for i in pool if item_processing_baseline(i) is None]
         assert known and unknown
         for k in known:
             for u in unknown:
                 assert _preference_key(k) < _preference_key(u), f"{u.id} outranked {k.id}"
+
+    def test_completeness_outranks_the_baseline(self) -> None:
+        """An incomplete 05.00 copy must lose to a complete 04.00 one."""
+        incomplete_new = self._item("a", baseline="05.00", sequence="9", local=True, complete=False)
+        complete_old = self._item("z", baseline="04.00", sequence="0", local=False, complete=True)
+        assert _preference_key(complete_old) < _preference_key(incomplete_new)
 
     def test_locality_never_outranks_a_higher_baseline(self) -> None:
         """The P1 this ordering exists to prevent: cheaper egress must not buy an older pixel."""

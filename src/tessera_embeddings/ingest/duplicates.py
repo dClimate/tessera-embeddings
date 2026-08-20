@@ -94,7 +94,7 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
 def _preference_key(
     item: Any,  # noqa: ANN401
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
-) -> tuple[int, float, int, int, int, int, str]:
+) -> tuple[int, int, float, int, int, int, str]:
     """How much we would rather read this copy than another. Lower sorts first.
 
     **Context-free:** no term is relative to the set being sorted, so the same key orders copies
@@ -103,26 +103,27 @@ def _preference_key(
 
     The fields, in order:
 
-    1. **Whether the baseline is readable.** Unknown sorts last: a copy that declares nothing is
+    1. **Read-set completeness**, over ``read_keys`` — the assets THIS load will request. First,
+       because a copy missing one of them cannot deliver the tile-date at any baseline, and the
+       generic paths have no recovery for it: a missing band is not one of the read failures the
+       fallback ladder recognises, so an incomplete winner fails the acquisition outright.
+    2. **Whether the baseline is readable.** Unknown sorts last: a copy that declares nothing is
        the copy whose offset correction cannot be decided, which refuses its date downstream.
-    2. **The baseline, descending, by value** — not by "is it the best", so every rung of the
+    3. **The baseline, descending, by value** — not by "is it the best", so every rung of the
        fallback ladder stays in descending baseline order.
-    3. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
+    4. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
        cheaper egress with an older pixel, and inert for unreadable baselines so it cannot decide
        a comparison the baseline could not enter.
-    4. **Read-set completeness**, over ``read_keys`` — the assets THIS load will request, extra
-       bands included. A copy missing one of them cannot deliver the tile-date, so it loses to one
-       that can.
     5. **Sequence, descending, then id.** The id makes the order total, so the choice is
        independent of catalogue response order and a rerun cannot produce a different mosaic.
     """
     baseline = item_processing_baseline(item)
     sequence = item_sequence(item)
     return (
+        0 if read_set_is_complete(item, read_keys) else 1,
         0 if baseline is not None else 1,
         -(baseline or 0.0),
         (0 if item_is_in_preferred_location(item, keys=read_keys) else 1) if baseline is not None else 0,
-        0 if read_set_is_complete(item, read_keys) else 1,
         0 if sequence is not None else 1,
         -(sequence or 0),
         str(getattr(item, "id", "")),

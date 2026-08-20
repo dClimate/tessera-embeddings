@@ -1291,48 +1291,26 @@ read-set term reached one key and not the other. If you add a signal, add it her
 
 The key reads five fields, in this order:
 
-0. **Whether the baseline is readable at all**, with unknown sorting last. An absent baseline is
-   an absence of evidence, and `_extract_baseline` maps it to 0 downstream, so a copy that
-   declares nothing is also the copy whose offset correction will silently be skipped.
-
-
-1. **Processing baseline, descending.** The signal that carries data vintage. Ordered by
-   value rather than by "is it the best", so every rung of the fallback ladder stays in
-   descending baseline order — collapsing the non-best baselines into one tier let a read
-   failure skip a 04.00 copy and hand out a 03.00 one.
-2. **Locality, among equal baselines only.** A copy whose read assets all sit in a preferred
-   bucket is cheaper to read, so it wins a baseline tie. Restricting locality to ties is what
-   stops it buying cheaper egress with an older pixel.
-3. **Read-set completeness**, judged over the assets *this* load will request — the configured
+1. **Read-set completeness**, judged over the assets *this* load will request — the configured
    bands plus the caller's `extra_bands`, not a fixed list and not the broader pruning set, which
-   keeps `scl` whether or not the call asks for it. A copy missing a requested asset cannot deliver
-   the tile-date, so it loses to one that can; penalising it for an asset the load never reads
-   would buy an unnecessary cross-region read.
-4. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of
-   catalogue response order, so a rerun cannot silently produce a different mosaic — and it makes
-   the key a total order, so no comparison ever falls back to input order.
-
-There is no second ranking and no fallback mode. Choosing a winner and building the ladder use the
-same key. An earlier version suspended the baseline and locality terms for any acquisition holding
-an unreadable baseline and ordered it on sequence alone, reasoning that such a copy might still be
-the newest reprocessing. That stopped being true once an unreadable baseline came to **refuse** its
-date: the read-failure ladder cannot recover from a refusal, so preferring that copy discards the
-date while a usable one sits behind it. An older reprocessing that can be corrected correctly beats
-a newer one that cannot be processed at all.
-
-Two primitives carry most of the correctness here, and both are shaped so the mistakes they used
-to invite are no longer expressible:
-
-- **`AssetSources`** (`asset_locations.py`) resolves every REQUESTED asset key and reports which
-  ones are missing, rather than returning a list of only the ones that resolved. The flat list
-  dropped keys silently, so each caller had to remember to compare the length against what it
-  asked for — and three did not, producing the same defect three times: locality granted from a
-  single local band, a producer named from one visible band while others were served under names
-  nobody looked for, and a subset read as evidence about the whole. `all_in()` is false for an
-  incomplete set by construction, because a claim about every asset cannot be made from some of
-  them, and an unrecognised bucket stays distinct from an absent key: one is evidence ("served
-  from somewhere we have not listed"), the other is its absence.
-- **`item_baselines.processing_baseline`** is the only reader of the baseline, on the only scale.
+   keeps `scl` whether or not the call asks for it. First, because a copy missing one of them
+   cannot deliver the tile-date at any baseline, and the generic paths have no recovery for it: a
+   missing band is not one of the read failures the fallback ladder recognises, so an incomplete
+   winner fails the acquisition outright.
+2. **Whether the baseline is readable at all**, with unknown sorting last. An absent baseline is
+   an absence of evidence, and such a copy refuses its whole date downstream, so an older
+   reprocessing that can be corrected beats a newer one that cannot be processed at all.
+3. **Processing baseline, descending.** The signal that carries data vintage. Ordered by value
+   rather than by "is it the best", so every rung of the fallback ladder stays in descending
+   baseline order — collapsing the non-best baselines into one tier let a read failure skip a
+   04.00 copy and hand out a 03.00 one.
+4. **Locality, among equal baselines only.** A copy whose read assets all sit in a preferred
+   bucket is cheaper to read, so it wins a baseline tie. Restricting locality to ties is what
+   stops it buying cheaper egress with an older pixel, and it is inert where the baseline is
+   unreadable, so it cannot decide a comparison the baseline could not enter.
+5. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of catalogue
+   response order, so a rerun cannot silently produce a different mosaic — and it makes the key a
+   total order, so no comparison ever falls back to input order.
 
 Two properties of that ordering are easy to get wrong and are held by tests:
 

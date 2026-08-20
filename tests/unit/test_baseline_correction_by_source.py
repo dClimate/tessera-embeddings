@@ -259,7 +259,7 @@ class TestHarmonisationPredicate:
 
     def test_an_unrecognised_bucket_is_not_harmonised(self) -> None:
         """A future mirror nobody has told us about gets corrected rather than exempted."""
-        assert item_harmonisation(_Item("s3://some-new-mirror/tiles/33/T/WM", "05.00")) is Harmonisation.RAW
+        assert item_harmonisation(_Item("s3://some-new-mirror/tiles/33/T/WM", "05.00")) is Harmonisation.UNKNOWN
 
     def test_the_raw_archive_is_not_in_the_harmonised_set(self) -> None:
         """Guards the constant: adding `sentinel-s2-l2a` here would silently reinstate the bug."""
@@ -331,10 +331,13 @@ class TestTheCorrectionPathAnnouncesItself:
         had not been seen before. Narrowed to the ESA archive, which is the route a
         harmonised-COG catalogue was not expected to take.
         """
+        # An unidentified producer is UNDETERMINED, so it refuses rather than warning — the
+        # warning's claim is specifically about the ESA archive.
         azure = _Item("https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/33/T/TG/x", "05.10")
+        assert item_harmonisation(azure) is Harmonisation.UNKNOWN
         with caplog.at_level(logging.WARNING, logger="tessera_embeddings.ingest.stac"):
-            assert dates_exempt_from_correction([azure]) == set(), "it must still be corrected"
-        assert not [r for r in caplog.records if "correction ACTIVE" in r.message]
+            assert dates_exempt_from_correction([_Item(_RAW_ESA, "05.00")]) == set()
+        assert [r for r in caplog.records if "correction ACTIVE" in r.message], "the archive must warn"
 
     def test_it_warns_when_a_raw_item_is_actually_corrected(self, caplog) -> None:
         """Not an error: correcting a raw item over the threshold is exactly right. The warning
@@ -633,7 +636,7 @@ class TestTheTwoBucketSetsAreIndependent:
         item.assets = {k: {"href": f"s3://a-new-in-region-mirror/{k}"} for k in READ_ASSET_KEYS}
         assert item_is_in_preferred_location(item, buckets=frozenset({"a-new-in-region-mirror"})) is True
         # The same bucket, asked the harmonisation question, is NOT harmonised.
-        assert item_harmonisation(item) is Harmonisation.RAW
+        assert item_harmonisation(item) is Harmonisation.UNKNOWN
 
     def test_harmonisation_reads_only_the_harmonisation_set(self) -> None:
         item = _Item(None, "05.00")
@@ -697,7 +700,7 @@ class TestCorrectedAndExemptDatesShareOneStorageDtype:
         ds = self._dataset(np.array([[[60000, 65535], [40000, 33000]]], dtype=np.uint16), "2022-01-07")
         out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
         assert out["blue"].values.min() >= 0, f"a bright pixel wrapped: {out['blue'].values}"
-        np.testing.assert_array_equal(out["blue"].values, np.array([[[59000, 63535], [39000, 32000]]], dtype=np.uint16))
+        np.testing.assert_array_equal(out["blue"].values, np.array([[[59000, 64535], [39000, 32000]]], dtype=np.uint16))
 
     def test_the_signed_mode_is_opt_in(self) -> None:
         """It is still available and still returns int16 — it is just no longer the default, since
@@ -1201,3 +1204,61 @@ class TestProvenanceKeepsTheDatesSelectionDidNotTouch:
         )
         assert baselines["2022-01-07"] == 510, "the contested date must follow the survivor"
         assert baselines["2021-12-25"] == 500, "an already-present date lost its provenance"
+
+
+class TestAnUnlistedBucketIsUndeterminedNotRaw:
+    """`RAW` means "we have identified this producer as unharmonised". An unlisted bucket is not
+    that: were a harmonised mirror to move behind a new bucket or CDN, calling it raw would
+    subtract the offset from pixels that already had it removed. Raised on PR #107.
+    """
+
+    def test_a_complete_set_from_an_unlisted_bucket_is_undetermined(self) -> None:
+        item = _Item(None, "05.00")
+        item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
+        assert item_harmonisation(item) is Harmonisation.UNKNOWN
+
+    def test_the_named_raw_archive_is_still_raw(self) -> None:
+        """The complement: a producer we HAVE identified must still be corrected."""
+        assert item_harmonisation(_Item(_RAW_ESA, "05.00")) is Harmonisation.RAW
+
+    def test_a_harmonised_producer_is_still_harmonised(self) -> None:
+        assert item_harmonisation(_Item(_HARMONISED, "05.00")) is Harmonisation.HARMONISED
+
+    def test_an_unlisted_bucket_refuses_rather_than_double_correcting(self) -> None:
+        item = _Item(None, "05.00")
+        item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
+        with pytest.raises(HeterogeneousProducerError, match="cannot be determined"):
+            dates_exempt_from_correction([item])
+
+    def test_a_pre_threshold_unlisted_bucket_is_exempt(self) -> None:
+        """Gated on the date being owed a correction, like every other refusal."""
+        item = _Item(None, "03.00")
+        item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
+        assert dates_exempt_from_correction([item]) == {"2022-01-07"}
+
+
+class TestTheCorrectionDoesNotCorruptTheBrightestCodes:
+    """Clamping before subtraction cost the top `abs(offset)` input codes their range: 65535 was
+    clipped to 64535 and then reduced to 63535 rather than 64535. Raised on PR #107.
+    """
+
+    @staticmethod
+    def _corrected(values: np.ndarray) -> np.ndarray:
+        ds = xr.Dataset(
+            {"blue": (("time", "y", "x"), values)},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0], "x": list(range(values.shape[2]))},
+        )
+        out = stac_module._apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
+        return out["blue"].values
+
+    def test_the_top_codes_lose_exactly_the_offset(self) -> None:
+        got = self._corrected(np.array([[[65535, 65000, 64535, 30000]]], dtype=np.uint16))
+        np.testing.assert_array_equal(got, np.array([[[64535, 64000, 63535, 29000]]], dtype=np.uint16))
+
+    def test_nothing_wraps_or_saturates(self) -> None:
+        values = np.array([[[65535, 60000, 1000, 999, 0]]], dtype=np.uint16)
+        got = self._corrected(values)
+        assert got.dtype == np.uint16
+        assert got.min() >= 0
+        # Every eligible pixel loses exactly the offset; the two below it are untouched.
+        np.testing.assert_array_equal(got, np.array([[[64535, 59000, 0, 999, 0]]], dtype=np.uint16))

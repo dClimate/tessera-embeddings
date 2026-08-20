@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 #: they are free.
 PREFERRED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-cogs", "e84-earth-search-sentinel-data"})
 
+#: Producers known to serve ESA's values with the offset still present. Membership is what makes a
+#: correction safe to apply: an unlisted bucket is UNKNOWN rather than raw, because correcting
+#: already-harmonised pixels is as wrong as leaving raw ones alone, and equally silent.
+UNHARMONISED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-s2-l2a"})
+
 #: The ESA archive that a Sentinel-2 catalogue may point at INSTEAD of a harmonised mirror.
 #: Named because reaching it is the surprising route: Earth Search was believed to serve only
 #: its own harmonised COGs, so a correction owed on data from here is the case worth announcing.
@@ -217,11 +222,12 @@ def item_harmonisation(
     correction shifts values by a visible 1000, while a skipped one leaves plausible pixels that
     are quietly wrong.
 
-    An item that does not expose EVERY reflectance band under the configured names is ``UNKNOWN``
-    rather than ``RAW``. Nothing here can resolve the alias table mapping a band name to an asset
-    key, so a band absent under the requested name may still be served under a native one, and
-    calling such an item raw would subtract the offset from pixels that may already be harmonised.
-    The caller refuses on ``UNKNOWN`` rather than guessing.
+    An item is ``UNKNOWN`` rather than ``RAW`` in two cases: it does not expose every reflectance
+    band under the configured names, or the bucket serving them is not one we have identified as
+    unharmonised. Nothing here can resolve the alias table mapping a band name to an asset key, so
+    a band absent under the requested name may still be served under a native one — and either way,
+    calling the item raw would subtract the offset from pixels that may already be harmonised. The
+    caller refuses on ``UNKNOWN`` rather than guessing.
     """
     sources = read_asset_sources(item, keys)
     if not sources.complete:
@@ -230,7 +236,12 @@ def item_harmonisation(
         return Harmonisation.HARMONISED
     if sources.any_in(buckets):
         return Harmonisation.MIXED
-    return Harmonisation.RAW
+    # RAW only for a producer explicitly identified as unharmonised. An unlisted bucket is UNKNOWN:
+    # were a harmonised mirror to move behind a new bucket or CDN, calling it raw would subtract the
+    # offset from pixels that already had it removed. The caller refuses on UNKNOWN.
+    if sources.any_in(UNHARMONISED_ASSET_BUCKETS):
+        return Harmonisation.RAW
+    return Harmonisation.UNKNOWN
 
 
 def item_is_from_raw_archive(

@@ -710,9 +710,14 @@ def _apply_baseline_corrections_by_date(
                 # below, and where the pixel is eligible it is already >= the offset, so nothing
                 # can land below zero.
                 widened = ds[var].astype(np.int32)
+                # Subtract, THEN bound. Clamping first cost the highest `abs(offset)` input codes
+                # their range: 65535 was clipped to 64535 and then reduced to 63535 rather than
+                # 64535. No upper clamp is needed because subtraction cannot overflow upward, and
+                # the lower bound is a no-op by construction — this branch only touches pixels
+                # already at or above the offset.
                 corrected_values = xr.where(
                     pixel_eligible,
-                    widened.clip(max=clamp_max) + baseline_offset,
+                    (widened + baseline_offset).clip(min=0),
                     widened,
                 )
                 # The INPUT dtype, not int16. This mode subtracts only where the pixel is already
