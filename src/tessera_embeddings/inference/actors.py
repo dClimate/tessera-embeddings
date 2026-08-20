@@ -38,7 +38,7 @@ from tessera_embeddings.config.inference import (
     InferenceConfig,
     S1Orbit,
 )
-from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
+from tessera_embeddings.config.store_layout import MONTH_COVERED_VARS, MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -1209,11 +1209,15 @@ class InferenceActor:
             obs_buffers: dict[str, np.ndarray] = {
                 var: np.zeros((chunk.height, chunk.width), dtype=np.uint16) for var in OBS_COUNT_VARS
             }
-            # Which months each pixel was seen in, accumulated per strip like the obs counts. Gates
-            # nothing — it is published so a reader can apply their own view of sufficiency without
-            # the imagery, which is deleted after the fill. Month axis first so a strip assigns as
-            # `[:, strip, :]`, matching how the mask bundle is sliced.
-            month_buffer = np.zeros((MONTHS_IN_YEAR, chunk.height, chunk.width), dtype=bool)
+            # Which months each pixel was seen in, PER SENSOR, accumulated per strip like the obs
+            # counts and keyed the same way. Gates nothing — published so a reader can apply their
+            # own view of sufficiency without the imagery, which is deleted after the fill. Month
+            # axis first so a strip assigns as `[:, strip, :]`, matching how the mask bundle is
+            # sliced. Keyed off the layout rather than named here, so the buffers and the arrays on
+            # disk cannot come to disagree about which sensors exist.
+            month_buffers: dict[str, np.ndarray] = {
+                var: np.zeros((MONTHS_IN_YEAR, chunk.height, chunk.width), dtype=bool) for var in MONTH_COVERED_VARS
+            }
 
             total_valid = 0
             # Refusals accumulate across STRIPS: one dataset is built per strip, so its counters
@@ -1322,26 +1326,42 @@ class InferenceActor:
                     t_s1_asc = len(chunk_data.s1_asc_doys)
                     t_s1_desc = len(chunk_data.s1_desc_doys)
 
+                    # SAR month masks: the strip's own when the grid is uncropped, the full-width
+                    # side channel when it is — exactly the choice the SAR obs counts make, and for
+                    # the same reason (the saved provenance layers keep full-extent fidelity even
+                    # where the inferred grid is narrower). Either way the array is
+                    # (month, strip rows, full width), so both assign through the same slice below.
+                    sar_months = (
+                        (chunk_data.s1_asc_month_covered, chunk_data.s1_desc_month_covered)
+                        if x_sub is None
+                        else (chunk_data.s1_asc_month_covered_full, chunk_data.s1_desc_month_covered_full)
+                    )
                     if x_sub is None:
                         for var in OBS_COUNT_VARS:
                             arr = getattr(chunk_data, var)
                             if arr is not None:
                                 obs_buffers[var][strip] = arr
                         if mask_bundle is not None:
-                            month_buffer[:, strip, :] = mask_bundle.month_covered[:, strip, :]
+                            # Sliced, not assigned whole: the bundle is a WHOLE-CHUNK array loaded
+                            # once and shared by every strip, unlike the strip-shaped SAR arrays.
+                            month_buffers["s2_month_covered"][:, strip, :] = mask_bundle.month_covered[:, strip, :]
                     else:
                         # Cropped grid: the saved obs layers keep full-extent
                         # fidelity — S2 counts come from the (full-width) mask
                         # bundle, SAR counts from the full-width side channel
                         # (SAR is read full-width regardless; see load_chunk).
                         obs_buffers["s2_obs_count"][strip] = mask_bundle.obs_count[strip, :]
-                        month_buffer[:, strip, :] = mask_bundle.month_covered[:, strip, :]
+                        month_buffers["s2_month_covered"][:, strip, :] = mask_bundle.month_covered[:, strip, :]
                         for var, full in (
                             ("s1_asc_obs_count", chunk_data.s1_asc_obs_count_full),
                             ("s1_desc_obs_count", chunk_data.s1_desc_obs_count_full),
                         ):
                             if full is not None:
                                 obs_buffers[var][strip] = full
+
+                    for var, arr in zip(("s1_asc_month_covered", "s1_desc_month_covered"), sar_months, strict=True):
+                        if arr is not None:
+                            month_buffers[var][:, strip, :] = arr
 
                     if len(dataset) == 0:
                         # Empty strip: leave its output rows at the initialised
@@ -1426,7 +1446,7 @@ class InferenceActor:
                 # MARKER turns a benign skip into a failed chunk and wedges the cell on every retry
                 # under the stable run id. Same rule as the record inside the marker.
                 try:
-                    writer.write_coverage_only(chunk, run_id, obs_buffers, month_buffer)
+                    writer.write_coverage_only(chunk, run_id, obs_buffers, month_buffers)
                 except Exception:
                     logger.exception(
                         "Chunk %s: coverage-only tile could not be staged; its counts will publish as "
@@ -1552,7 +1572,7 @@ class InferenceActor:
                         embeddings_std=None,
                         scales=scales,
                         obs_counts=obs_buffers,
-                        month_covered=month_buffer,
+                        month_covered=month_buffers,
                     )
                     # One line per chunk: how long the backgrounded upload took
                     # (the phase table's write_s is ~0 by design — this is the
