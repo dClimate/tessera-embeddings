@@ -934,3 +934,60 @@ class TestUnknownBaselineStaysScopedToItsAcquisition:
         ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
         # b-spare (04.00) outranks a-spare (03.00) despite belonging to the later acquisition.
         assert ladder == ["b-spare", "a-spare"]
+
+
+class TestTheLadderKeepsGlobalPriorityPastItsHead:
+    """`s2_roi`'s unattributed recovery consumes `copies[0]` on each retry, so EVERY position in
+    the ladder is a choice, not only the first. Raised on PR #107 against a per-acquisition
+    ranking that ordered the ladder heads and then flattened whole ladders behind them.
+    """
+
+    _A = "2021-09-08T10:00:00Z"
+    _B = "2021-09-08T14:00:00Z"
+
+    def test_a_second_retry_does_not_skip_a_better_copy_in_another_acquisition(self) -> None:
+        items = [
+            _copy_at("a-win", acquired=self._A, sequence="9", baseline="05.10"),
+            _copy_at("a-05", acquired=self._A, sequence="2", baseline="05.00"),
+            _copy_at("a-01", acquired=self._A, sequence="1", baseline="01.00"),
+            _copy_at("b-win", acquired=self._B, sequence="9", baseline="05.10"),
+            _copy_at("b-04", acquired=self._B, sequence="2", baseline="04.00"),
+        ]
+        _, alternates = select_preferred_duplicates(items)
+        ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
+        # Concatenating whole ladders behind their sorted heads gave [a-05, a-01, b-04], so the
+        # second retry downgraded to baseline 01.00 while a 04.00 copy was still untried.
+        assert ladder == ["a-05", "b-04", "a-01"]
+
+    def test_every_position_is_in_descending_baseline_order(self) -> None:
+        """The general property, over three acquisitions interleaved at every rung."""
+        items = [
+            _copy_at(f"{tag}-win", acquired=acq, sequence="9", baseline="05.10")
+            for tag, acq in (("a", self._A), ("b", self._B))
+        ] + [
+            _copy_at("a-hi", acquired=self._A, sequence="3", baseline="05.00"),
+            _copy_at("a-lo", acquired=self._A, sequence="1", baseline="02.00"),
+            _copy_at("b-mid", acquired=self._B, sequence="3", baseline="04.00"),
+            _copy_at("b-low", acquired=self._B, sequence="1", baseline="03.00"),
+        ]
+        _, alternates = select_preferred_duplicates(items)
+        ladder = alternates[("MGRS-33TWM", "2021-09-08")]
+        baselines = [item_processing_baseline(it) for it in ladder]
+        assert baselines == sorted(baselines, reverse=True), f"ladder out of order: {baselines}"
+        assert [it.id for it in ladder] == ["a-hi", "b-mid", "b-low", "a-lo"]
+
+    def test_an_unreadable_baseline_sorts_last_rather_than_suspending_the_order(self) -> None:
+        """The alternative — suspending the comparison — is what leaked one acquisition's
+        malformed metadata into another's ladder. A copy whose baseline cannot be read is also
+        the one whose correction will silently be skipped, so it belongs at the end.
+        """
+        items = [
+            _copy_at("a-win", acquired=self._A, sequence="9", baseline="05.10"),
+            _copy_at("a-unknown", acquired=self._A, sequence="5", baseline=None),
+            _copy_at("a-04", acquired=self._A, sequence="1", baseline="04.00"),
+            _copy_at("b-win", acquired=self._B, sequence="9", baseline="05.10"),
+            _copy_at("b-03", acquired=self._B, sequence="1", baseline="03.00"),
+        ]
+        _, alternates = select_preferred_duplicates(items)
+        ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
+        assert ladder == ["a-04", "b-03", "a-unknown"]
