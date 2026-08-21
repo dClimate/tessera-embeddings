@@ -118,6 +118,31 @@ def expected_model_url(model_url: str | None = None, model_version: ModelVersion
     return model_url or encoder_url(model_version or DEFAULT_MODEL_VERSION)
 
 
+def assert_encoder_matches(published: str | None, *, model_version: ModelVersion | None, where: str) -> None:
+    """Refuse a write whose encoder disagrees with the store's published one.
+
+    **One implementation because there are several readers.** The assembly append gate and the
+    pre-flight that runs before any compute is provisioned both have to answer the same question,
+    and two copies of "is this the same encoder" is how they end up disagreeing about one store —
+    worse than either answer alone, because a run is then refused or admitted depending on which
+    door it arrived through.
+
+    ``published is None`` is read as v1.1, NOT waved through: ``geoemb:model`` postdates v1.1 and
+    predates v2, so a store lacking it necessarily holds v1.1 embeddings. Treating absence as "no
+    claim" is what let a v2 run append to a legacy store and restamp the whole thing.
+    """
+    expected = expected_model_url(model_version=model_version)
+    actual = published or expected_model_url(model_version=DEFAULT_MODEL_VERSION)
+    if actual != expected:
+        raise ValueError(
+            f"Refusing to append to {where}: it was published by encoder {actual!r} and this run "
+            f"uses {expected!r}. Appending would mix two model families in one store and restamp "
+            "the whole thing with this run's encoder. Assemble into a store of the matching "
+            "family, or a fresh path. (A store carrying no geoemb:model at all is read as v1.1 — "
+            "the attr predates v2, so its absence dates the store rather than leaving it open.)"
+        )
+
+
 def tile_id_to_epsg(tile_id: str) -> str | None:
     """Derive EPSG code from a Sentinel-2 MGRS tile ID.
 
@@ -301,6 +326,7 @@ def build_geoemb_root_attrs(
     spatial_layout: str,
     gsd: float | None = None,
     model_version: str | None = None,
+    encoder_version: ModelVersion | None = None,
     model_url: str | None = None,
     data_type: str = QUANTIZED_DTYPE,
     source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
@@ -316,6 +342,7 @@ def build_geoemb_root_attrs(
     attrs = _geoemb_fields(
         embedding_dim=embedding_dim,
         model_version=model_version,
+        encoder_version=encoder_version,
         model_url=model_url,
         data_type=data_type,
         gsd=gsd,

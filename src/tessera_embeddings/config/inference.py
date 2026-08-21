@@ -707,7 +707,12 @@ class InferenceConfig:
             raise ValueError(f"Invalid model_version: {self.model_version!r}. Must be one of {valid}.")
 
         if self.model_version == "v1.1":
-            self.norm_source = self.norm_source or "aws"
+            # `is None`, not truthiness. An explicit "" is falsy, so `or "aws"` accepted it and
+            # silently selected AWS statistics — pairing a checkpoint with the wrong band stats
+            # produces embeddings that are wrong and entirely well-formed. Only the UNSET case
+            # defaults; every supplied value goes through the check below.
+            if self.norm_source is None:
+                self.norm_source = "aws"
             if self.norm_source not in _NORM_STATS:
                 valid = ", ".join(repr(k) for k in _NORM_STATS)
                 raise ValueError(f"Invalid norm_source: {self.norm_source!r}. Must be one of {valid}.")

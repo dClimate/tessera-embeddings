@@ -171,3 +171,16 @@ def test_a_rule_that_refuses_nothing_is_refused_by_the_config() -> None:
 def test_allow_s2_only_defaults_off() -> None:
     assert _minimal_config().allow_s2_only is False
     assert _minimal_config(allow_s2_only=True).allow_s2_only is True
+
+
+def test_an_explicitly_empty_norm_source_is_refused_not_defaulted() -> None:
+    """`or "aws"` accepted every falsy value and silently selected AWS statistics.
+
+    Pairing a checkpoint with the wrong band statistics produces embeddings that are wrong and
+    perfectly well-formed — no shape error, no NaN, nothing downstream to object. Only the UNSET
+    case may default; anything supplied goes through validation.
+    """
+    with pytest.raises(ValueError, match="Invalid norm_source"):
+        _minimal_config(norm_source="")  # type: ignore[arg-type]
+    assert _minimal_config(norm_source=None).norm_source == "aws", "unset still defaults"
+    assert _minimal_config(norm_source="mpc").norm_source == "mpc"

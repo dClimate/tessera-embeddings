@@ -216,7 +216,12 @@ def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: Sto
     return attrs
 
 
-def _root_attrs(layout: StoreLayout, model_version: str | None, optical_min_obs: int | None) -> dict:
+def _root_attrs(
+    layout: StoreLayout,
+    model_version: str | None,
+    optical_min_obs: int | None,
+    encoder_version: str | None = None,
+) -> dict:
     """Root-group attrs for the multi-zone campaign store: geoemb: stated once.
 
     The geoembeddings ``utm_zones`` layout puts the encoder/quantization provenance
@@ -231,11 +236,15 @@ def _root_attrs(layout: StoreLayout, model_version: str | None, optical_min_obs:
     was no rule — zero is a threshold that refuses nothing, which is a different statement
     from never having had one.
     """
+    # The FAMILY, separate from the checkpoint stem. Without it a v2 store is stamped with
+    # v1.1's public URL — wrong provenance, and the cross-family gate then refuses the very
+    # append the store was seeded for.
     attrs = build_geoemb_root_attrs(
         embedding_dim=_layout_band(layout),
         spatial_layout="utm_zones",
         gsd=float(PIXEL_M),  # every zone is the same fixed-metre grid; the root has none to derive from
         model_version=model_version,
+        encoder_version=encoder_version,
     )
     if optical_min_obs is not None:
         attrs["optical_min_obs"] = int(optical_min_obs)

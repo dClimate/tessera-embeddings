@@ -59,7 +59,6 @@ import zarr
 from tessera_embeddings.config.environment import code_identity
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import (
-    DEFAULT_MODEL_VERSION,
     EMBEDDING_DIM,
     OPTICAL_MIN_OBS,
     RADAR_THIN_MAX_OBS,
@@ -79,7 +78,7 @@ from tessera_embeddings.config.store_layout import (
     trailing_extent,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
-from tessera_embeddings.inference.conventions import build_convention_attrs, expected_model_url
+from tessera_embeddings.inference.conventions import assert_encoder_matches, build_convention_attrs
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
@@ -2066,36 +2065,15 @@ class ZarrWriter:
                 manifest.validate_against(extract_manifest(root.attrs), output_path)
             # A CROSS-FAMILY APPEND, refused here rather than discovered later. The manifest
             # check above cannot catch it: it compares the checkpoint filename STEM, which two
-            # families can share, and it is skipped ENTIRELY for a legacy store that has no
-            # `_manifest` at all. A v2 run extending a v1.1 store therefore passed both doors —
-            # and the attrs write at the end of this method would then restamp `geoemb:model`
-            # for the WHOLE store, relabelling v1.1 pixels as v2 with nothing objecting.
-            #
-            # Compared against the published encoder URL specifically, because that is the field
-            # every downstream reader identifies the product by, and it is derived the same way
-            # on both sides (`expected_model_url`) so seed and fill cannot disagree by construction.
-            #
-            # A store with NO `geoemb:model` is read as v1.1, NOT waved through. An earlier
-            # version of this guard skipped the check when the attr was absent, reasoning there
-            # was "no claim to contradict" — which is tidy and wrong. Absence is not silence: the
-            # attr postdates v1.1 and predates v2, so a store without it necessarily holds v1.1
-            # embeddings, and the case the skip allowed was exactly the dangerous one — a v2
-            # append to a legacy store, which then restamps the whole thing v2. The stores most
-            # likely to lack the attr are also the ones least likely to have a `_manifest`, so
-            # both doors stood open together.
-            published_encoder = root.attrs.get("geoemb:model") or expected_model_url(
-                model_version=DEFAULT_MODEL_VERSION
+            # families can share, and is skipped ENTIRELY for a legacy store with no `_manifest`.
+            # Past both, the attrs write at the end of this method restamps `geoemb:model` for the
+            # WHOLE store. Shared with the pre-flight so the two doors cannot disagree.
+            assert_encoder_matches(
+                cast("str | None", root.attrs.get("geoemb:model")),
+                model_version=encoder_version,
+                where=output_path,
             )
-            this_encoder = expected_model_url(model_version=encoder_version)
-            if published_encoder != this_encoder:
-                raise ValueError(
-                    f"Refusing to append to {output_path}: it was published by encoder "
-                    f"{published_encoder!r} and this run uses {this_encoder!r}. Appending would mix "
-                    "two model families in one store and restamp the whole thing with this run's "
-                    "encoder. Assemble into a store of the matching family, or a fresh path. "
-                    "(A store carrying no geoemb:model at all is read as v1.1 — the attr predates "
-                    "v2, so its absence dates the store rather than leaving the question open.)"
-                )
+
             # The store's own grid is authoritative: raw region writes would
             # silently land in a corner (or be clamp-truncated) on a mismatched
             # extent — the loud check xarray's append used to provide.

@@ -11,12 +11,13 @@ from __future__ import annotations
 import gc
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import icechunk
 
 from tessera_embeddings.config.inference import InferenceConfig, TimeWindow
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks_from_dataset
+from tessera_embeddings.inference.conventions import assert_encoder_matches
 from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store, open_store_as_zarr_group
@@ -117,6 +118,16 @@ def assert_output_store_accepts(
         if is_missing_repo(exc):
             return
         raise
+    # BEFORE the manifest, and deliberately not only in `assemble`. The encoder mismatch is
+    # DETERMINISTIC — it depends on the store and this run's config, not on anything inference
+    # discovers — so leaving it to assembly meant the whole GPU run completed and could then
+    # never be published. The manifest cannot stand in for it: it compares a checkpoint stem and
+    # is skipped outright for a legacy store, which is the case that needs catching most.
+    assert_encoder_matches(
+        cast("str | None", root.attrs.get("geoemb:model")),
+        model_version=config.model_version,
+        where=path,
+    )
     build_embedding_manifest(
         config=config, mosaic_base=mosaic_base, get_credentials=get_credentials, s3_region=s3_region
     ).validate_against(extract_manifest(dict(root.attrs)), path)
