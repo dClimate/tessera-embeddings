@@ -228,6 +228,47 @@ This is a correctness fix for water and shadow, not a change to most of the imag
 
 ---
 
+## 4b. What the end-to-end run found
+
+The pixel comparison above tests the arithmetic. It cannot test what happens when the whole pipeline
+runs over a year of real imagery, so three zone-years were ingested on the development account:
+
+| arm | zone | year | why this one | outcome |
+|---|---|---|---|---|
+| A | 01N | 2017 | densest ESA-original coverage found anywhere | ran clean |
+| B | 57S | 2017 | most duplicate copies of one photograph | ran clean |
+| C | 01N | 2024 | same ground, later year — do the dynamics hold? | **failed** |
+
+**Arms A and B behaved as intended.** Duplicate reduction ran and reported itself: zone 01N pruned
+15 tile-days that had more than one copy, with 11 winners in our own cloud region and 4 elsewhere;
+zone 57S pruned 64 tile-days, 68 copies rejected and all 68 retained as fallbacks. No day was
+refused in either. One Sentinel-1 read failed with a permission error and its retry succeeded — an
+infrastructure hiccup, unrelated.
+
+**Arm C failed, and that is the useful result.** The optical leg died three times, once per retry,
+every time on the same day, 2 January 2024, with: *"fuses a raw item owed the offset correction with
+an already harmonised one."* Because a refusal is deterministic, each retry reached the same day and
+failed identically, so the whole zone-year was lost to one day's metadata.
+
+**The later year is much worse than the early one**, which is the opposite of what we assumed:
+
+| zone | days refused, late 2017 | days refused, early 2024 |
+|---|---|---|
+| 01N | 2 of 54 (3.7%) | **26 of 60 (43.3%)** |
+| 33N (Europe) | 0 of 38 | 5 of 60 (8.3%) |
+| 59N | 0 of 50 | 2 of 60 (3.3%) |
+| 02N | 0 of 46 | 2 of 60 (3.3%) |
+
+In 2017 the refusals come from ESA originals spanning two processing eras. In 2024 they come from
+ESA originals at a current version sitting beside already-corrected copies — a normal, ongoing state
+of the archive, and present in Europe as well as at the antimeridian.
+
+**What changed as a result.** A refused day is now skipped on its own, loudly, and counted, instead
+of failing the leg. The correction decision is untouched — a day that cannot be decided is still not
+corrected — but the loss is one day instead of a year. This is mitigation, not a fix; see limit 1.
+
+---
+
 ## 5. What this costs — four honest limits, and three of them are one problem
 
 ### Limit 1 — A whole day of imagery can be refused, and this happens for real
@@ -276,10 +317,15 @@ for full years:
 A single case was also found outside that region, in map zone 59 in 2019. So this is a recurring
 and increasing population, not a one-off in a single year.
 
+**How often, and how bad.** Measured on the live catalogue: 26 of 60 days in early 2024 refuse in
+zone 01N, and 5 of 60 even in Europe. A refused day used to fail the whole optical leg — the run
+that found this lost a whole zone-year to one day — so a refused day is now skipped alone and
+counted. The loss is bounded at one day per affected day, and it is announced.
+
 **The fix** is to apply the correction to each image before they are combined, rather than to the
-combined result. That is a change to how imagery is loaded, and it is owed as separate work. Until
-then, days of this shape are lost rather than corrupted — which is the right way round, but it is a
-loss.
+combined result. That removes the conflict instead of isolating it, because different tiles occupy
+different ground: there is no pixel that is both corrected and uncorrected. It is a change to how
+imagery is loaded, and it is owed as separate work.
 
 ### Limit 2 — The floor is applied after images are resized
 
