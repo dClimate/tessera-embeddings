@@ -56,6 +56,11 @@ class MosaicChunkInferenceDataset:
             refuses thinner pixels, which is **not** a filter a consumer can undo: the
             refused pixel has no embedding, so recovering it means re-running its shard.
             Zero is rejected rather than treated as "off" — see ``__init__``.
+        model_version: Which student's PADDING RULE to resample with. Versioned for the same
+            reason ``stats`` is, and just as invisibly if wrong: v1.1 and v2 disagree on the
+            index pattern for almost every inexact observation count, and the resulting tensor
+            is the correct shape and dtype either way, so a mismatch reaches the model as a
+            plausible but untrained observation sequence rather than as an error.
         stats: Band normalisation statistics, from
             :func:`config.inference.band_stats`. Defaults to the v1.1 AWS stats.
             Each model version standardises with the stats it was trained on, so
@@ -71,6 +76,7 @@ class MosaicChunkInferenceDataset:
         allow_s2_only: bool = False,
         optical_min_obs: int | None = None,
         stats: dict[str, list[float]] | None = None,
+        model_version: str = "v1.1",
     ) -> None:
         if optical_min_obs is not None and optical_min_obs <= 0:
             # Zero would refuse nothing while reading as a configured rule, so a caller that
@@ -81,6 +87,7 @@ class MosaicChunkInferenceDataset:
                 f"optical_min_obs={optical_min_obs} refuses nothing — pass None for no minimum, "
                 "or a positive number of observations."
             )
+        self.model_version = model_version
         self.num_obs_checkpoints = _normalize_obs_checkpoints(num_obs_checkpoints)
         self.s1_orbit = s1_orbit
         self.allow_s2_only = allow_s2_only
@@ -273,6 +280,7 @@ class MosaicChunkInferenceDataset:
             target=s2_target,
             s2_mean=self.s2_band_mean,
             s2_std=self.s2_band_std,
+            model_version=self.model_version,
         )
 
         s1 = resample_s1_bucket(
@@ -285,6 +293,7 @@ class MosaicChunkInferenceDataset:
             s1a_std=self.s1a_band_std,
             s1d_mean=self.s1d_band_mean,
             s1d_std=self.s1d_band_std,
+            model_version=self.model_version,
         )
 
         return {

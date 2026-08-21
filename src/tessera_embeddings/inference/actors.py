@@ -791,6 +791,7 @@ class InferenceActor:
             allow_s2_only=allow_s2_only,
             optical_min_obs=self.config.optical_min_obs,
             stats=band_stats(self.config.model_version, self.config.norm_source),
+            model_version=self.config.model_version,
         )
         return data, dataset
 
