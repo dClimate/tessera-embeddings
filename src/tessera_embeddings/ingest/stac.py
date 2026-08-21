@@ -249,6 +249,18 @@ def extract_baselines(items: list[Any]) -> dict[str, int]:
     name a baseline belonging to an item the loader never sees, and the reflectance
     offset it selects is applied to the pixels of the items it does.
 
+    **A date whose tiles declare DIFFERENT baselines is described by one of them.** Such a date
+    loads: the correction is decided per source, so a day holding 00.01 and 05.00 imagery needs no
+    single answer for its pixels. This map still holds one integer per date, and it is the last
+    item's — the CLEAREST tile on both ingest paths, because the query sorts a date's items
+    cloud-descending. The day's other vintages are recorded nowhere.
+
+    Documented rather than widened because nothing reads this. It is written to the store's root
+    attrs and merged forward on append; no code here consumes a value, and no correction, mask or
+    coverage decision derives from one. Naming every baseline a date carries would change the
+    attribute's type on newly written dates while existing ones stay integers — a cost paid by
+    whoever eventually reads it, for a record nobody reads yet.
+
     **Reports what each item DECLARES, and nothing about whether a correction is owed.** The
     returned map is provenance: it is carried through ``_PreparedDate`` into the store's
     ``baselines_applied`` attribute, whose contract is the processing baseline of the item
@@ -1196,20 +1208,28 @@ def load_stac_items(
 
     Expects items that have already passed ``normalize_to_solar_day`` and, for a collection whose
     harmonisation varies by item, duplicate selection — both of which :func:`query_stac_items`
-    does. The correction decision derives each date with ``solar_day_of``, which refuses an
-    un-normalised item rather than deriving a plausible-looking wrong day from its UTC stamp, and
-    it judges a date over every item that will be fused into it, so an unpruned pair of producers
-    for one acquisition reads as a genuine conflict and refuses the date.
+    does. Selection runs again below, idempotently, because the documented ``query_stac_items``
+    -> ``load_stac_items`` workflow is the one path that has had neither; it groups by
+    ``solar_day_of``, which refuses an un-normalised item rather than deriving a plausible-looking
+    wrong day from its UTC stamp.
+
+    **A refusal belongs to the ITEM LIST this is called with, not to a day inside it.**
+    ``HeterogeneousProducerError`` is raised while ``odc.stac.load`` parses that list
+    synchronously, so it abandons the whole call. Pass ONE SOLAR DAY at a time wherever a day that
+    cannot be decided should be skipped alone — which is what ``s2_roi`` does, and why the
+    refusals it reports cost one date each. A multi-day list handed straight to this function
+    forfeits every day in it, sound or not.
 
     """
     collection_config = _get_collection_config(provider, collection)
 
     # Gated on there BEING an offset decision, not on the producer varying between items. Both are
-    # exposed to the same defect: `odc.stac.load` fuses a solar day, so two reprocessings of one
-    # acquisition are blended into one pixel stack, and where their baselines straddle the
-    # threshold the date is refused outright for an ambiguity that selecting one copy resolves.
-    # Measured on the live Planetary Computer catalogue over six tiles: 1,000 redundant copies of
-    # one observation fused, and 12 solar days that would refuse.
+    # exposed to the same fusion: `odc.stac.load` blends every copy of one acquisition into one
+    # pixel stack, so redundant copies are read, resampled and painted over one another for a
+    # single observation. Measured on the live Planetary Computer catalogue over six tiles: 1,000
+    # redundant copies of one observation fused. Selection also routes around the one refusal that
+    # remains — a copy whose producer cannot be determined is ranked last and withheld from the
+    # fallback ladder — which a date carrying a sound copy beside it should not pay for.
     #
     # NOT ungated further, though the same fusion argument reaches any collection with duplicates.
     # Landsat items key perfectly well here (`grid:code` is `WRS2-190028`), so removing the gate

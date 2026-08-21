@@ -465,6 +465,13 @@ A refusal that does still happen is skipped alone and counted rather than failin
 duplicate selection routes around it: a copy that would refuse is ranked last *and* withheld from
 the fallback ladder, because a refusal is not a read failure and nothing retries one.
 
+"Alone" is a property of `s2_roi`, which loads ONE solar day per call — not of the refusal, which
+is raised while `odc.stac.load` parses its item list synchronously and so abandons whatever list it
+was given. A caller pairing `query_stac_items` with `load_stac_items` over a multi-day list
+forfeits every day in it, so pass a day at a time wherever one undecidable day should not cost the
+window. Production does not reach this: the only `ingest_tile` caller is the S1 path, whose
+collections have no baseline threshold and therefore no offset decision to refuse.
+
 The surviving case is worth naming, because the safe direction inverts. An item that does not expose
 EVERY reflectance band under the configured names is `UNKNOWN`, not `RAW` — a non-empty subset is
 not enough, because `_prune_item_dict` specifically preserves PARTIALLY aliased items, and letting
@@ -487,6 +494,13 @@ refuses and an unresolvable band name fails the load.
 
 `extract_baselines` records the baseline of the item actually loaded and reaches the store's
 `baselines_applied` attribute. Nothing masks it, and nothing derives a correction from it.
+
+One integer per date is a **lossy** record of a day whose tiles declare different baselines, and
+those days now load — the three-tile day in ADR 021 is exactly that shape. The value is the last
+item's, the clearest tile, because the query sorts a date's items cloud-descending; the day's other
+vintages are recorded nowhere. Left that way deliberately: the attribute is written and merged
+forward on append, and nothing in this package reads a value from it, so widening its type would
+charge a future reader for a record nobody reads yet.
 
 `correct_boa_dn` does the arithmetic, once, on one source's pixels:
 
