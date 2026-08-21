@@ -38,7 +38,6 @@ from tessera_embeddings.config.inference import (
     S2_BAND_ORDER,
     InferenceConfig,
     S1Orbit,
-    band_stats,
     est_px_per_sec,
 )
 from tessera_embeddings.config.store_layout import MONTH_COVERED_VARS, MONTHS_IN_YEAR
@@ -790,8 +789,8 @@ class InferenceActor:
             s1_orbit=s1_orbit,
             allow_s2_only=allow_s2_only,
             optical_min_obs=self.config.optical_min_obs,
-            stats=band_stats(self.config.model_version, self.config.norm_source),
             model_version=self.config.model_version,
+            norm_source=self.config.norm_source,
         )
         return data, dataset
 

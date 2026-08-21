@@ -19,7 +19,9 @@ from typing import Literal
 import numpy as np
 
 from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
     DEFAULT_NUM_OBS_CHECKPOINTS,
+    ModelVersion,
     _normalize_obs_checkpoints,
     band_stats,
 )
@@ -61,11 +63,10 @@ class MosaicChunkInferenceDataset:
             index pattern for almost every inexact observation count, and the resulting tensor
             is the correct shape and dtype either way, so a mismatch reaches the model as a
             plausible but untrained observation sequence rather than as an error.
-        stats: Band normalisation statistics, from
-            :func:`config.inference.band_stats`. Defaults to the v1.1 AWS stats.
-            Each model version standardises with the stats it was trained on, so
-            actors pass the set for their ``config.model_version`` /
-            ``config.norm_source``.
+        norm_source: v1.1 statistic set — ``"aws"`` (the default when ``None``) or ``"mpc"``.
+            Ignored by v2, which hard-codes one set. The band statistics are DERIVED from this
+            and ``model_version`` rather than passed in, so normalisation and resampling cannot
+            describe different students.
     """
 
     def __init__(
@@ -75,8 +76,8 @@ class MosaicChunkInferenceDataset:
         s1_orbit: Literal["ascending", "descending", "both", "none"] = "both",
         allow_s2_only: bool = False,
         optical_min_obs: int | None = None,
-        stats: dict[str, list[float]] | None = None,
-        model_version: str = "v1.1",
+        model_version: ModelVersion = DEFAULT_MODEL_VERSION,
+        norm_source: str | None = None,
     ) -> None:
         if optical_min_obs is not None and optical_min_obs <= 0:
             # Zero would refuse nothing while reading as a configured rule, so a caller that
@@ -95,7 +96,11 @@ class MosaicChunkInferenceDataset:
         self.H = chunk_data.height
         self.W = chunk_data.width
 
-        stats = stats if stats is not None else band_stats()
+        # DERIVED, not accepted. `stats` used to be a separate argument, so a caller could pass
+        # v2's model_version with v1.1's statistics — or the reverse — and get an embedding
+        # normalised by one student and resampled by the other. Both halves describe the same
+        # thing, so only one of them is an input now and the contradiction cannot be expressed.
+        stats = band_stats(model_version, norm_source)
         self.s2_band_mean = np.array(stats["s2_mean"], dtype=np.float32)
         self.s2_band_std = np.array(stats["s2_std"], dtype=np.float32)
         self.s1a_band_mean = np.array(stats["s1_asc_mean"], dtype=np.float32)

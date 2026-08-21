@@ -277,7 +277,12 @@ def test_v2_runs_the_unmodified_inference_loop(v2_model, sample_chunk_data) -> N
     dataset = MosaicChunkInferenceDataset(
         chunk,
         num_obs_checkpoints=config.num_obs_checkpoints,
-        stats=band_stats(config.model_version, config.norm_source),
+        # Both halves from the config. This call previously passed v2 STATISTICS while leaving
+        # the version at its v1.1 default — so it normalised as v2 and resampled as v1.1, which
+        # is exactly the mismatch that made these two separate arguments a defect. The test was
+        # demonstrating the bug it should have caught.
+        model_version=config.model_version,
+        norm_source=config.norm_source,
     )
 
     result = run_inference(v2_model, dataset, config, torch.device("cpu"))

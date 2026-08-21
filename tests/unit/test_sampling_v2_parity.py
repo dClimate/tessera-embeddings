@@ -120,3 +120,31 @@ def test_the_actor_passes_its_configured_version_to_the_dataset() -> None:
     assert "model_version=self.config.model_version," in src, (
         "the actor must hand its configured model version to the dataset, beside the band stats"
     )
+
+
+def test_normalisation_and_resampling_cannot_describe_different_students() -> None:
+    """The mismatch is removed rather than validated.
+
+    `stats` was a separate argument, so v2's `model_version` could be paired with v1.1's
+    statistics — normalised by one student, resampled by the other, and the output is a
+    correctly-shaped array of plausible floats either way. The statistics are now derived from
+    the version, so the contradiction has no way to be expressed: there is one input, not two
+    halves of one identity that a caller has to keep in step.
+    """
+    import inspect
+
+    from tessera_embeddings.config.inference import band_stats
+    from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
+
+    params = inspect.signature(MosaicChunkInferenceDataset.__init__).parameters
+    assert "stats" not in params, "band statistics must not be an independent input"
+    assert "model_version" in params and "norm_source" in params
+
+    from tests.unit.test_dataset_v11 import CKPS, _make_chunk_data
+
+    chunk_data = _make_chunk_data(rng=np.random.default_rng(5))
+    v2 = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS, model_version="v2-large")
+    np.testing.assert_array_equal(v2.s2_band_mean, np.array(band_stats("v2-large")["s2_mean"], dtype=np.float32))
+
+    v11 = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS)
+    assert not np.array_equal(v11.s2_band_mean, v2.s2_band_mean), "the two students normalise differently"
