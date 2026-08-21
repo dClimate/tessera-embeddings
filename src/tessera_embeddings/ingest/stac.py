@@ -267,6 +267,25 @@ def extract_baselines(items: list[Any]) -> dict[str, int]:
     return baselines
 
 
+def collection_harmonisation(config: CollectionConfig) -> Harmonisation | None:
+    """The producer state the COLLECTION settles, or ``None`` where it does not settle one.
+
+    ``None`` for two different reasons that need the same handling. A collection whose
+    harmonisation varies by item has no collection-wide answer by definition. And a collection with
+    no correction threshold is owed no offset at all, so naming a producer for it would be a claim
+    about data nobody corrects — Landsat is not "harmonised", it is unrelated.
+
+    Otherwise the configuration already answers it: a correction threshold on a collection whose
+    producer cannot vary says every item is unharmonised, which is what the threshold exists to
+    correct. Supplying that answer is what lets a provider serving its bands under native asset
+    keys (``B02``, ``SCL``) be judged from its items at all, since a per-item read looks assets up
+    by the names in ``bands`` and finds nothing there.
+    """
+    if config.harmonisation_varies_by_item or not config.requires_baseline_correction:
+        return None
+    return Harmonisation.RAW
+
+
 class HeterogeneousProducerError(RuntimeError):
     """One solar day's tiles came from producers that disagree about the BOA offset.
 
@@ -1275,13 +1294,7 @@ def load_stac_items(
     if collection_config.requires_baseline_correction:
         loaded_dates = {str(t.values)[:10] for t in data.time}
         threshold = collection_config.baseline_threshold
-        # Where the producer cannot vary between items, the collection's configuration already
-        # settles it: a correction threshold on such a collection says every item is unharmonised,
-        # which is what the threshold is there to correct. Supplying it is also what lets a
-        # provider serving its bands under native asset keys be judged from its items at all — a
-        # per-item read looks assets up by the names in `bands`, which is how Earth Search keys
-        # them and not how Planetary Computer does (`B02`, `SCL`, resolved by the loader).
-        known_kind = None if collection_config.harmonisation_varies_by_item else Harmonisation.RAW
+        known_kind = collection_harmonisation(collection_config)
         correction_baselines = {
             d: b
             for d, b in correction_baselines_by_date(items, threshold, known_kind).items()  # type: ignore[arg-type]

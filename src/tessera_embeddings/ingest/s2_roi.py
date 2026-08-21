@@ -58,6 +58,7 @@ from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS, a
 from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
+from tessera_embeddings.ingest.asset_locations import Harmonisation
 from tessera_embeddings.ingest.duplicates import (
     copies_label,
     is_unreadable_source,
@@ -98,6 +99,7 @@ from tessera_embeddings.ingest.solar_days import (
 )
 from tessera_embeddings.ingest.stac import (
     _requested_assets,
+    collection_harmonisation,
     extract_baselines,
     group_items_by_date,
     load_stac_items,
@@ -125,6 +127,17 @@ logger = logging.getLogger(__name__)
 #: the asset at query time and the load then fails on a band that was there in the
 #: catalogue. Passing the same tuple to both is what makes the two agree.
 _LOADED_EXTRA_BANDS = ["scl"]
+
+
+def _known_harmonisation(provider: str, collection: str) -> Harmonisation | None:
+    """The producer state this driver's collection settles, for duplicate selection to rank on.
+
+    Paired with :func:`_read_asset_keys` and load-bearing where that returns nothing: without it a
+    collection whose asset keys cannot be inspected reports every copy's producer as undecidable,
+    and a spare that WILL refuse its date is offered to the fallback ladder — which recovers from a
+    read failure and not from a refusal, so reaching that rung aborts the ingest.
+    """
+    return collection_harmonisation(PROVIDERS[provider].collections[collection])
 
 
 def _read_asset_keys(provider: str, collection: str) -> tuple[str, ...]:
@@ -788,7 +801,8 @@ def ingest_s2_roi_reflectance(
         # agree, and an earlier version of this comment claimed it did.)
         supplied = items
         read_keys = _read_asset_keys(provider, collection)
-        items, alternates = select_preferred_duplicates(items, read_keys)
+        known_kind = _known_harmonisation(provider, collection)
+        items, alternates = select_preferred_duplicates(items, read_keys, known_kind)
         log_duplicate_selection(log, roi_label, alternates, kept=items, read_keys=read_keys, items=supplied)
         date_alternates.update(alternates)
 

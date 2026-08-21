@@ -1326,12 +1326,15 @@ The key reads these signals, in this order:
    an absence of evidence, and such a copy refuses its whole date downstream, so an older
    reprocessing that can be corrected beats a newer one that cannot be processed at all. Above the
    next term because a refusal has no recovery while owing a correction merely gets one.
-5. **Whether the copy owes an offset correction at all.** The correction is decided per solar day
-   over every tile fused into it, so one raw copy at or above the threshold can refuse the whole
-   day. A copy owing nothing removes that risk for the date rather than for itself, which is a
-   coverage argument, so this is the one term allowed to cost a reprocessing. Inert below the
-   threshold, where no producer changes a pixel — which is every ESA-hosted copy in the archive as
-   indexed, so the term is not observed to cost a baseline at all.
+5. **Whether the copy owes an offset correction at all**, where the producer is an item's own
+   property. The correction is decided per solar day over every tile fused into it, so one raw copy
+   at or above the threshold can refuse the whole day. A copy owing nothing removes that risk for
+   the date rather than for itself, which is a coverage argument, so this is the one term allowed
+   to cost a reprocessing. Inert below the threshold, where no producer changes a pixel — which is
+   every ESA-hosted copy in the archive as indexed, so the term is not observed to cost a baseline
+   at all. Also inert where the producer is the COLLECTION's answer: every copy then has the same
+   producer, so a term that compares producers would discriminate on the threshold alone, which is
+   the baseline ranked below it and in the opposite direction.
 6. **Processing baseline, descending.** The signal that carries data vintage. Ordered by value
    rather than by "is it the best", so every rung of the fallback ladder stays in descending
    baseline order. Collapsing the non-best baselines into one tier lets a read failure skip a
@@ -1376,11 +1379,27 @@ Splitting on a real acquisition is what protects genuine same-day coverage — s
 revisit a high-latitude tile the same day, and keying on `(tile, solar day)` alone dropped 493 of
 2,733 items as duplicates when they were distinct acquisitions.
 
+A copy naming **no** datatake joins an identified acquisition its timestamp places it in, before it
+is allowed to start one, and it is matched against *any* member of that acquisition — members of
+one observation do not agree on the timestamp, which is the whole reason identity is primary, so
+closeness to any of them is the available evidence. Without that, one reprocessing declaring the
+datatake while its sibling omitted it were never compared however close their timestamps, and both
+survived to be fused.
+
 **The tile key is read from whichever property the catalogue populates**, `grid:code` or
 `s2:mgrs_tile`, then the item id — all canonicalised to one form, so two catalogues naming one
 tile produce one grouping key. Planetary Computer needs its own property: its ids carry the tile
 in a field the Element 84 pattern does not match, so without it every item was unkeyable and
 duplicate selection was a no-op for the whole provider.
+
+**Where the producer cannot be read from an item's assets, the collection supplies it**, through
+`known_harmonisation` on `select_preferred_duplicates` — the same value `stac.collection_harmonisation`
+gives the correction path, so the two cannot disagree. This is load-bearing rather than an
+optimisation, and the two changes above are why: making Planetary Computer items keyable gave that
+provider a fallback ladder for the first time, and deriving the correction from the items made its
+unreadable baselines refuse. A spare judged only on visible assets therefore looked harmless, would
+be offered to the ladder, and would abort the ingest when a read failure stepped down to it, since
+the recovery loop steps down on a read failure and not on a refusal.
 
 The **fallback ladder** — the rejected copies, in the order a read failure steps down them — is
 built by one global sort over the whole tile-date instead, using a key that has no notion of

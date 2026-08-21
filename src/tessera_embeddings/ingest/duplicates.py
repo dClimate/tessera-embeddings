@@ -128,20 +128,36 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
     return int(match.group(1)) if match else None
 
 
-def _producer_is_visible(item: Any, read_keys: tuple[str, ...]) -> bool:  # noqa: ANN401
-    """Whether this copy's producer can be judged from its assets at all.
+def _producer_of(
+    item: Any,  # noqa: ANN401
+    read_keys: tuple[str, ...],
+    known_harmonisation: Harmonisation | None,
+) -> Harmonisation | None:
+    """The producer state a term may rank this copy on, or ``None`` where none may.
 
-    False in two cases, and every term that asks about the producer has to be inert in both. An
-    empty read set means the collection's configured names are not its asset keys, so nothing is
-    found under them; an incomplete read set means what IS found describes a subset. Either way
+    ``known_harmonisation`` is the collection's own answer, for a collection whose producer cannot
+    vary between items. Where it is given it is used directly, because the assets have nothing to
+    add and — for a provider keying its assets natively — nothing to say.
+
+    Otherwise the answer comes from the assets, and ``None`` means it cannot be had: an empty read
+    set means the collection's configured names are not its asset keys, so nothing is found under
+    them, and an incomplete read set means what IS found describes a subset. Either way
     :func:`~tessera_embeddings.ingest.asset_locations.item_harmonisation` answers ``UNKNOWN`` for
     every copy, so a term that counted that would rank them all as producer-problems and hand the
     tile-date to an older pre-threshold copy — the opposite of the usable-first rule.
     """
-    return bool(read_keys) and read_set_is_complete(item, read_keys)
+    if known_harmonisation is not None:
+        return known_harmonisation
+    if not read_keys or not read_set_is_complete(item, read_keys):
+        return None
+    return item_harmonisation(item)
 
 
-def refuses_its_date(item: Any, read_keys: tuple[str, ...] = READ_ASSET_KEYS) -> bool:  # noqa: ANN401
+def refuses_its_date(
+    item: Any,  # noqa: ANN401
+    read_keys: tuple[str, ...] = READ_ASSET_KEYS,
+    known_harmonisation: Harmonisation | None = None,
+) -> bool:
     """Whether loading this copy makes its date REFUSE rather than fail to read.
 
     Two shapes, both raised by
@@ -150,14 +166,16 @@ def refuses_its_date(item: Any, read_keys: tuple[str, ...] = READ_ASSET_KEYS) ->
     whose producer is undecidable at or above the correction threshold.
 
     A refusal is not a read failure, so the fallback ladder cannot recover from one — which is why
-    such a copy is both ranked last and excluded from the ladder entirely.
+    such a copy is both ranked last and excluded from the ladder entirely. That makes
+    ``known_harmonisation`` load-bearing rather than an optimisation: on a collection whose
+    producer it settles, the correction path refuses an unreadable baseline whatever the assets
+    look like, so a spare judged only on visible assets would be offered to the ladder and abort
+    the ingest when the ladder reached it.
     """
     # Answers "we can see that it refuses" and never "we cannot see anything" — an incomplete copy
     # fails to READ, which the ladder does handle.
-    if not _producer_is_visible(item, read_keys):
-        return False
-    harmonisation = item_harmonisation(item)
-    if harmonisation is Harmonisation.HARMONISED:
+    harmonisation = _producer_of(item, read_keys, known_harmonisation)
+    if harmonisation is None or harmonisation is Harmonisation.HARMONISED:
         return False
     baseline = item_processing_baseline(item)
     if baseline is None:
@@ -169,10 +187,8 @@ def refuses_its_date(item: Any, read_keys: tuple[str, ...] = READ_ASSET_KEYS) ->
 
 
 def _would_refuse_its_date(
-    item: Any,  # noqa: ANN401
     baseline: int | None,
-    read_keys: tuple[str, ...],
-    harmonisation: Harmonisation,
+    harmonisation: Harmonisation | None,
 ) -> bool:
     """Whether choosing this otherwise-usable copy makes its date refuse rather than load.
 
@@ -188,27 +204,26 @@ def _would_refuse_its_date(
     """
     if baseline is None or baseline < S2_BASELINE_THRESHOLD:
         return False
-    if not _producer_is_visible(item, read_keys):
-        return False
     return harmonisation in (Harmonisation.MIXED, Harmonisation.UNKNOWN)
 
 
 def _owes_a_correction(
-    item: Any,  # noqa: ANN401
     baseline: int | None,
-    read_keys: tuple[str, ...],
-    harmonisation: Harmonisation,
+    harmonisation: Harmonisation | None,
 ) -> bool:
     """Whether choosing this copy puts an offset decision on its date.
 
     A strictly wider question than :func:`_would_refuse_its_date`: a raw copy owes a correction
     without being ambiguous about it. Gated identically — on the threshold, because below it no
-    producer changes a pixel, and on :func:`_producer_is_visible`, because a copy nobody can judge
-    must not be ranked as though it had been judged and found wanting.
+    producer changes a pixel, and on the producer being known at all, because a copy nobody can
+    judge must not be ranked as though it had been judged and found wanting.
+
+    **Asked only where the producer was determined per ITEM**, which is the caller's job to
+    enforce: this term compares producers, and where the collection settles the producer there is
+    nothing to compare. It would then discriminate on the threshold alone, which is the baseline
+    ranked below it and in the opposite direction, and so would prefer older data.
     """
-    if baseline is None or baseline < S2_BASELINE_THRESHOLD:
-        return False
-    if not _producer_is_visible(item, read_keys):
+    if baseline is None or baseline < S2_BASELINE_THRESHOLD or harmonisation is None:
         return False
     return harmonisation is not Harmonisation.HARMONISED
 
@@ -225,6 +240,7 @@ def _acquisition_is_known(item: Any) -> bool:  # noqa: ANN401 — any STAC-like 
 def _preference_key(
     item: Any,  # noqa: ANN401
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
+    known_harmonisation: Harmonisation | None = None,
 ) -> tuple[int, int, int, int, int, float, int, int, int, str]:
     """How much we would rather read this copy than another. Lower sorts first.
 
@@ -255,7 +271,8 @@ def _preference_key(
        An already-harmonised copy is the exception: its pixels need no correction whatever the
        baseline says, so penalising it here would hand a tile-date to an OLDER raw reprocessing,
        which is the opposite of the usable-first rule this key starts with.
-    5. **Whether the copy owes an offset correction at all.** A copy that does not removes a
+    5. **Whether the copy owes an offset correction at all**, where the producer is an item's own
+       property. A copy that does not removes a
        whole class of failure rather than one copy's: the correction is date-wide, so a single raw
        copy at or above the threshold can refuse the entire solar day and every tile fused into
        it. Above the baseline VALUE, so it may cost a reprocessing — and unlike the locality term
@@ -273,15 +290,18 @@ def _preference_key(
     """
     baseline = item_processing_baseline(item)
     sequence = item_sequence(item)
-    # Resolved once and shared with the refusal check, which needs the same answer.
-    harmonisation = item_harmonisation(item)
+    # Resolved once and shared by every term that asks about the producer, so they cannot disagree.
+    harmonisation = _producer_of(item, read_keys, known_harmonisation)
     baseline_matters = harmonisation is not Harmonisation.HARMONISED
+    # Inert where the producer came from the COLLECTION rather than the item — see
+    # `_owes_a_correction` for why a term that compares producers has nothing to compare there.
+    owes = known_harmonisation is None and _owes_a_correction(baseline, harmonisation)
     return (
         0 if read_set_is_complete(item, read_keys) else 1,
-        1 if _would_refuse_its_date(item, baseline, read_keys, harmonisation) else 0,
+        1 if _would_refuse_its_date(baseline, harmonisation) else 0,
         0 if _acquisition_is_known(item) else 1,
         0 if baseline is not None or not baseline_matters else 1,
-        1 if _owes_a_correction(item, baseline, read_keys, harmonisation) else 0,
+        1 if owes else 0,
         -(baseline or 0.0),
         (0 if item_is_in_preferred_location(item, keys=read_keys) else 1) if baseline is not None else 0,
         0 if sequence is not None else 1,
@@ -290,7 +310,11 @@ def _preference_key(
     )
 
 
-def _rank_copies(copies: list[Any], read_keys: tuple[str, ...] = READ_ASSET_KEYS) -> list[Any]:
+def _rank_copies(
+    copies: list[Any],
+    read_keys: tuple[str, ...] = READ_ASSET_KEYS,
+    known_harmonisation: Harmonisation | None = None,
+) -> list[Any]:
     """Order copies of one acquisition, PREFERRED first.
 
     An unreadable baseline ranks last rather than suspending the comparison: such a copy refuses
@@ -298,7 +322,10 @@ def _rank_copies(copies: list[Any], read_keys: tuple[str, ...] = READ_ASSET_KEYS
     read-failure ladder recovers from a read error but not from a refusal. A reprocessing that can
     be corrected beats a newer one that cannot be processed at all.
     """
-    return sorted(copies, key=functools.partial(_preference_key, read_keys=read_keys))
+    return sorted(
+        copies,
+        key=functools.partial(_preference_key, read_keys=read_keys, known_harmonisation=known_harmonisation),
+    )
 
 
 #: How far apart two catalogue timestamps must be to be different acquisitions rather than
@@ -375,6 +402,12 @@ def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
     mosaicked together. The remainder falls back to the timestamps, clustered within
     :data:`_SAME_ACQUISITION_S`.
 
+    **A copy without an identity JOINS an identified acquisition its timestamp places it in**,
+    rather than always starting a cluster of its own. One reprocessing declaring the datatake while
+    its sibling omits it would otherwise never be compared, however close their timestamps, so both
+    would survive to be fused — the same defect identity was introduced to fix, by a different
+    route.
+
     **A copy with neither JOINS a cluster rather than forming its own.** That makes it compete for
     one slot instead of adding one, which is what stops two copies of a pass being fused at two
     processing baselines. Collapsing the whole tile-date would prevent the same fusion by
@@ -404,10 +437,33 @@ def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
             known.append((instant, item))
 
     clusters: list[list[Any]] = [group for _, group in sorted(identified.items())]
-    if known:
-        dated = sorted(known, key=lambda pair: pair[0])
-        clusters.append([dated[0][1]])
-        for previous, current in itertools.pairwise(dated):
+
+    # A timestamp-only copy joins an identified acquisition it is close to, before it is allowed to
+    # start one. Matched against ANY member, because members of one acquisition do not agree on the
+    # timestamp — that disagreement is why identity is the primary key — so being close to any of
+    # them is the whole of the available evidence.
+    orphans: list[tuple[datetime.datetime, Any]] = []
+    for instant, item in sorted(known, key=lambda pair: pair[0]):
+        joined = next(
+            (
+                cluster
+                for cluster in clusters
+                if any(
+                    (sibling_instant := acquisition_instant(sibling)) is not None
+                    and abs((instant - sibling_instant).total_seconds()) <= _SAME_ACQUISITION_S
+                    for sibling in cluster
+                )
+            ),
+            None,
+        )
+        if joined is None:
+            orphans.append((instant, item))
+        else:
+            joined.append(item)
+
+    if orphans:
+        clusters.append([orphans[0][1]])
+        for previous, current in itertools.pairwise(orphans):
             if (current[0] - previous[0]).total_seconds() > _SAME_ACQUISITION_S:
                 clusters.append([current[1]])
             else:
@@ -422,6 +478,7 @@ def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
 def select_preferred_duplicates(
     items: Sequence[Any],
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
+    known_harmonisation: Harmonisation | None = None,
 ) -> tuple[list[Any], dict[tuple[str, str], list[Any]]]:
     """Keep one item per (tile, solar day); return the survivors and the alternates.
 
@@ -433,6 +490,12 @@ def select_preferred_duplicates(
     locality are judged over it, so a copy missing a band the caller asked for loses to one that
     has it; judging a fixed set instead let a preferred copy lack a requested extra asset and fail
     at load.
+
+    ``known_harmonisation`` is the producer state the COLLECTION settles, for a collection whose
+    items cannot disagree about it. Supplying it is what lets a provider serving its bands under
+    native asset keys be judged at all: without it every copy reports an undecidable producer, and
+    a spare that will refuse its date is offered to the fallback ladder, which cannot recover from
+    a refusal.
 
     Items whose tile cannot be determined are passed through untouched and never grouped:
     the radar path has no such duplicates, and an item we cannot key is safer kept than
@@ -473,7 +536,7 @@ def select_preferred_duplicates(
     for key, copies in groups.items():
         rejected: list[Any] = []
         for acquisition in _by_acquisition(copies):
-            ranked = _rank_copies(acquisition, read_keys)
+            ranked = _rank_copies(acquisition, read_keys, known_harmonisation)
             survivors.add(id(ranked[0]))
             rejected.extend(ranked[1:])
         if rejected:
@@ -484,7 +547,7 @@ def select_preferred_duplicates(
             # steps down on a read failure; a refusal is not one, so handing one over escapes as
             # `HeterogeneousProducerError` instead of trying the next usable copy or recording the
             # date as lost.
-            usable = [it for it in rejected if not refuses_its_date(it, read_keys)]
+            usable = [it for it in rejected if not refuses_its_date(it, read_keys, known_harmonisation)]
             if len(usable) != len(rejected):
                 logger.debug(
                     "%s: %d of %d spare copies excluded from the fallback ladder — they would "
@@ -494,7 +557,12 @@ def select_preferred_duplicates(
                     len(rejected),
                 )
             if usable:
-                alternates[key] = sorted(usable, key=functools.partial(_preference_key, read_keys=read_keys))
+                alternates[key] = sorted(
+                    usable,
+                    key=functools.partial(
+                        _preference_key, read_keys=read_keys, known_harmonisation=known_harmonisation
+                    ),
+                )
 
     kept = [it for it in items if id(it) in survivors]
     return kept, alternates

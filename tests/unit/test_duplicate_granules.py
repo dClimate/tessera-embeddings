@@ -22,6 +22,7 @@ import pytest
 from tessera_embeddings.ingest.asset_locations import (
     PREFERRED_ASSET_BUCKETS,
     READ_ASSET_KEYS,
+    Harmonisation,
     asset_bucket,
     item_is_in_preferred_location,
     read_set_is_complete,
@@ -418,6 +419,117 @@ class TestReprocessingsAreOneAcquisitionHoweverTheyAreTimestamped:
         del new.properties["s2:datatake_id"]
         kept, _ = select_preferred_duplicates([old, new])
         assert len(kept) == 2, "the timestamp fallback stopped clustering"
+
+
+class TestASpareThatWillRefuseIsKeptOffTheLadderWithoutVisibleAssets:
+    """The reported P2/MEDIUM. Two changes on this branch interlock to create it.
+
+    Reading `s2:mgrs_tile` made Planetary Computer items keyable, so that provider has a fallback
+    ladder for the first time; deriving the correction from the items made its unreadable
+    baselines refuse. Together, a raw spare declaring no baseline could enter the ladder and abort
+    the ingest when a read failure stepped down to it — the recovery loop handles a read failure,
+    not a refusal.
+
+    The producer cannot be read from that provider's assets, so the collection has to say it.
+    """
+
+    @staticmethod
+    def _native_key_copy(ident: str, sequence: str, baseline: str | None) -> _Item:
+        """A copy whose assets are keyed natively, so nothing can be looked up by band name."""
+        extra: dict[str, object] = {"datetime": "2022-01-07T10:20:31.024000Z"}
+        if baseline is not None:
+            extra["s2:processing_baseline"] = baseline
+        item = _Item(ident, "MGRS-33TWM", sequence, **extra)
+        item.assets = {k: {"href": f"https://x.blob.core.windows.net/{k}"} for k in ("B02", "SCL")}
+        return item
+
+    def test_without_the_collection_answer_the_spare_looks_harmless(self) -> None:
+        """The state that produced the finding, asserted so the fix below is not vacuous."""
+        spare = self._native_key_copy("no-baseline", "1", None)
+        assert refuses_its_date(spare, ()) is False
+
+    def test_with_it_the_spare_is_recognised_as_refusing(self) -> None:
+        spare = self._native_key_copy("no-baseline", "1", None)
+        assert refuses_its_date(spare, (), Harmonisation.RAW) is True
+
+    def test_such_a_spare_is_excluded_from_the_ladder(self) -> None:
+        best = self._native_key_copy("S2A_33TWM_20220107_2_L2A", "2", "05.00")
+        unreadable = self._native_key_copy("S2A_33TWM_20220107_1_L2A", "1", None)
+        kept, alternates = select_preferred_duplicates([unreadable, best], (), Harmonisation.RAW)
+        assert [i.id for i in kept] == [best.id]
+        assert alternates == {}, "a spare that will refuse the date must not be offered"
+
+    def test_a_usable_spare_is_still_offered(self) -> None:
+        """The complement, or the exclusion above could be excluding everything."""
+        best = self._native_key_copy("S2A_33TWM_20220107_2_L2A", "2", "05.00")
+        older = self._native_key_copy("S2A_33TWM_20220107_1_L2A", "1", "04.00")
+        kept, alternates = select_preferred_duplicates([older, best], (), Harmonisation.RAW)
+        assert [i.id for i in kept] == [best.id]
+        assert [i.id for i in next(iter(alternates.values()))] == [older.id]
+
+    def test_the_collection_answer_does_not_invert_the_baseline_preference(self) -> None:
+        """The hole this must not reopen: with the producer known raw, every copy at or above the
+        threshold owes a correction, so the term ties among them rather than deranking the newest.
+        """
+        new = self._native_key_copy("S2A_33TWM_20220107_1_L2A", "1", "05.00")
+        old = self._native_key_copy("S2A_33TWM_20220107_0_L2A", "0", "03.00")
+        kept, _ = select_preferred_duplicates([old, new], (), Harmonisation.RAW)
+        assert [i.id for i in kept] == [new.id], "a pre-threshold copy won on owing no correction"
+
+    def test_the_driver_supplies_it_for_the_provider_that_needs_it(self) -> None:
+        """The wiring, so the fix cannot be correct in the library and absent at the call site."""
+        from tessera_embeddings.ingest.s2_roi import _known_harmonisation, _read_asset_keys
+
+        assert _read_asset_keys("planetary-computer", "sentinel-2-l2a") == ()
+        assert _known_harmonisation("planetary-computer", "sentinel-2-l2a") is Harmonisation.RAW
+        # Where the producer varies by item the assets ARE the evidence, so there is no
+        # collection-wide answer to give.
+        assert _known_harmonisation("earth-search", "sentinel-2-l2a") is None
+        # And a collection owed no offset at all has no producer worth naming.
+        assert _known_harmonisation("earth-search", "sentinel-2-l1c") is None
+
+
+class TestATimestampOnlyCopyJoinsAnIdentifiedAcquisition:
+    """The reported MEDIUM. Identity clusters were built first and timestamp-only copies always
+    started their own, so one reprocessing declaring the datatake while its sibling omitted it were
+    never compared — and both survived to be fused, which is the defect identity was added to fix.
+    """
+
+    @staticmethod
+    def _copy_of_one_granule(sequence: str, baseline: str, acquired: str, *, datatake: bool) -> _Item:
+        extra: dict[str, object] = {"s2:processing_baseline": baseline, "datetime": acquired}
+        if datatake:
+            extra["s2:datatake_id"] = f"GS2B_20171219T095409_004109_N{baseline}"
+        item = _Item(f"S2B_33TWM_20171219_{sequence}_L2A", "MGRS-33TWM", sequence, **extra)
+        return _with_assets(item, _bands_at(_IN_REGION))
+
+    def test_a_sibling_without_a_datatake_still_reduces(self) -> None:
+        identified = self._copy_of_one_granule("1", "05.00", "2017-12-19T09:54:10.457000Z", datatake=True)
+        anonymous = self._copy_of_one_granule("0", "02.06", "2017-12-19T09:54:41.000000Z", datatake=False)
+        kept, alternates = select_preferred_duplicates([anonymous, identified])
+        assert [i.id for i in kept] == [identified.id], "the copies were never compared"
+        assert [i.id for i in next(iter(alternates.values()))] == [anonymous.id]
+
+    def test_a_distant_timestamp_still_forms_its_own_acquisition(self) -> None:
+        """The complement: joining must be decided by the timestamp, not granted to anything
+        lacking a datatake, or a genuine second pass would be swallowed.
+        """
+        identified = self._copy_of_one_granule("1", "05.00", "2017-12-19T09:54:10.457000Z", datatake=True)
+        other_pass = self._copy_of_one_granule("0", "05.00", "2017-12-19T10:44:10.457000Z", datatake=False)
+        other_pass.id = "S2B_33TWM_20171219_9_L2A"
+        kept, _ = select_preferred_duplicates([identified, other_pass])
+        assert len(kept) == 2, "a distinct pass was absorbed into an identified acquisition"
+
+    def test_it_is_matched_against_any_member_of_the_acquisition(self) -> None:
+        """Members of one acquisition do NOT agree on the timestamp — that disagreement is why
+        identity is primary — so closeness to any member is the whole of the evidence.
+        """
+        early = self._copy_of_one_granule("0", "02.06", "2017-12-19T09:54:10.457000Z", datatake=True)
+        late = self._copy_of_one_granule("1", "05.00", "2017-12-19T09:57:39.063000Z", datatake=True)
+        # Close to `late` only, and 209s from `early`.
+        anonymous = self._copy_of_one_granule("2", "04.00", "2017-12-19T09:57:50.000000Z", datatake=False)
+        kept, _ = select_preferred_duplicates([early, late, anonymous])
+        assert [i.id for i in kept] == [late.id], "all three are one observation"
 
 
 class TestDistinctAcquisitionsOnOneDay:
