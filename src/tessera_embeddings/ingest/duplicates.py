@@ -190,6 +190,8 @@ def risks_refusing_its_date(
     item: Any,  # noqa: ANN401
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
     known_harmonisation: Harmonisation | None = None,
+    *,
+    replacing_a_copy_that_owes: bool = False,
 ) -> bool:
     """Whether OFFERING this copy as a fallback risks its date refusing rather than loading.
 
@@ -203,9 +205,10 @@ def risks_refusing_its_date(
     failure, so handing it a copy that refuses turns one unreadable object into an aborted ingest
     rather than a recorded loss.
 
-    **The trade is deliberate and it is not free.** Excluding such a spare costs a fallback rung on
-    an all-raw date that would have recovered with it — which is why this is asked only of providers
-    whose copies can disagree about the producer in the first place. Offering it can abort a whole run. A lost
+    **The trade is deliberate and it is not free**, which is why it is asked as narrowly as
+    possible: only of providers whose copies can disagree about the producer at all, and only where
+    the copy being replaced does NOT already owe the correction. Where it does, the swap cannot
+    change the day's decision and the spare is kept. Offering it can abort a whole run. A lost
     date is bounded and recorded; an aborted run is neither, so the exclusion is the cheaper
     mistake. Validating the spare against the whole solar day would be better than either, and
     needs the day-aware selection recorded as owed work in
@@ -217,6 +220,12 @@ def risks_refusing_its_date(
     # owes the same correction, so owing one is the norm rather than a risk — excluding on it would
     # empty the ladder for a whole provider. Same reasoning as the matching ranking term.
     if known_harmonisation is not None:
+        return False
+    # And only where the swap would CHANGE the day's decision. If the copy being replaced already
+    # owes the correction, the day already contains one that does, so a spare that also owes it
+    # introduces nothing: the decision is whatever it already was. Withholding such a spare cost a
+    # recoverable date on an all-raw day for no gain.
+    if replacing_a_copy_that_owes:
         return False
     harmonisation = _producer_of(item, read_keys, None)
     return _owes_a_correction(item_processing_baseline(item), harmonisation)
@@ -570,11 +579,17 @@ def select_preferred_duplicates(
     survivors: set[int] = {id(it) for it in ungrouped}
     alternates: dict[tuple[str, str], list[Any]] = {}
     for key, copies in groups.items():
-        rejected: list[Any] = []
+        # Each spare paired with whether the copy it would REPLACE already owes the correction.
+        # Paired per acquisition, because that is the copy a fallback actually stands in for.
+        rejected: list[tuple[Any, bool]] = []
         for acquisition in _by_acquisition(copies):
             ranked = _rank_copies(acquisition, read_keys, known_harmonisation)
             survivors.add(id(ranked[0]))
-            rejected.extend(ranked[1:])
+            winner_owes = known_harmonisation is None and _owes_a_correction(
+                item_processing_baseline(ranked[0]),
+                _producer_of(ranked[0], read_keys, None),
+            )
+            rejected.extend((copy, winner_owes) for copy in ranked[1:])
         if rejected:
             # ONE order over every rejected copy of the tile-date, not a concatenation of
             # per-acquisition ladders. The unattributed recovery consumes `copies[0]` on each
@@ -584,7 +599,13 @@ def select_preferred_duplicates(
             # down on a read failure; a refusal is not one, so handing one over escapes as
             # `HeterogeneousProducerError` instead of trying the next usable copy or recording the
             # date as lost.
-            usable = [it for it in rejected if not risks_refusing_its_date(it, read_keys, known_harmonisation)]
+            usable = [
+                it
+                for it, winner_owes in rejected
+                if not risks_refusing_its_date(
+                    it, read_keys, known_harmonisation, replacing_a_copy_that_owes=winner_owes
+                )
+            ]
             if len(usable) != len(rejected):
                 logger.debug(
                     "%s: %d of %d spare copies excluded from the fallback ladder — they would "

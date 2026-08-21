@@ -467,6 +467,30 @@ class TestASpareThatWillRefuseIsKeptOffTheLadderWithoutVisibleAssets:
         assert [i.id for i in kept] == [best.id]
         assert [i.id for i in next(iter(alternates.values()))] == [older.id]
 
+    def test_a_spare_is_kept_when_the_copy_it_replaces_already_owes(self) -> None:
+        """The exclusion applies only to a swap that CHANGES the day's decision.
+
+        If the copy being replaced already owes the correction, the day already contains one that
+        does, so a spare that also owes it introduces nothing. Withholding it there cost a
+        recoverable date on an all-raw day for no gain.
+        """
+        remote_scl = {"scl": {"href": f"{_REMOTE}/scl"}}
+        winner = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="05.10", host_root=_REMOTE)
+        spare = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="05.00", host_root=_REMOTE, extra=remote_scl)
+        kept, alternates = select_preferred_duplicates([spare, winner])
+        assert [i.id for i in kept] == [winner.id]
+        assert [i.id for i in next(iter(alternates.values()))] == [spare.id], (
+            "both copies owe the correction, so swapping cannot change the day — keep the ladder"
+        )
+
+    def test_a_spare_is_still_withheld_when_the_winner_owes_nothing(self) -> None:
+        """The complement, or the test above would pass with the exclusion deleted."""
+        harmonised = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="04.00", host_root=_IN_REGION)
+        raw_spare = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="05.00", host_root=_REMOTE)
+        kept, alternates = select_preferred_duplicates([raw_spare, harmonised])
+        assert [i.id for i in kept] == [harmonised.id]
+        assert alternates == {}, "swapping in a copy that owes the offset would refuse the day"
+
     def test_the_collection_answer_does_not_invert_the_baseline_preference(self) -> None:
         """The hole this must not reopen: with the producer known raw, every copy at or above the
         threshold owes a correction, so the term ties among them rather than deranking the newest.
