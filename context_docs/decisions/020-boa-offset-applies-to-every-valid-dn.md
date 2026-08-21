@@ -437,7 +437,16 @@ above.
 They are not below anything — the offset was added to the whole range precisely so that
 below-zero reflectance survives.
 
-**Trust the metadata field about the offset.** Discussed under limit 3.
+**Trust the metadata field about the offset.** Discussed under limit 4.
+
+**Correct each image before combining them** — the change that would dissolve limits 1, 2 and 3.
+Not because it is wrong, but because it is the right change and too large to make as a side effect
+of this one: it alters how every ingest loads imagery, and the pixels every existing store was
+written with. It is the single most valuable follow-up here.
+
+**Keep offering a fallback copy that needs correcting.** Discussed under limit 3, where the two
+costs are laid out — the case is closer than it was, and reasonable people could take it the other
+way.
 
 **Widen the tolerance on timestamps** past the 209 seconds observed. A tolerance around a per-copy
 timestamp cannot separate two reprocessings from two genuinely different passes without getting one
