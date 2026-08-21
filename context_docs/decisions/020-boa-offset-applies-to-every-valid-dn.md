@@ -300,8 +300,11 @@ In 2017 the refusals come from ESA originals spanning two processing eras. In 20
 ESA originals at a current version sitting beside already-corrected copies — a normal, ongoing state
 of the archive, and present in Europe as well as at the antimeridian.
 
-**What changed as a result.** A refused day is now skipped on its own, loudly, and counted, instead
-of failing the leg. The correction decision is untouched — a day that cannot be decided is still not
+**What changed as a result.** A refused day is now skipped on its own, counted under its own name,
+and recorded on the store — not folded into the coverage-rejection count, and not left to a log
+line that expires. An assessed region-year missing 347 days now says so durably, and says why;
+before, it would have looked coverage-filtered and would never have been revisited. The day is
+skipped instead of failing the leg. The correction decision is untouched — a day that cannot be decided is still not
 corrected — but the run continues past it.
 
 **Confirmed on a re-run**, from the pipeline's own logs:
@@ -442,29 +445,26 @@ than a bug fix. And the affected pixels are the immediate neighbourhood of the v
 above — well under 0.1% of a scene. But this does have live exposure, because ESA originals needing
 correction do occur (limit 1), so it is a real if small error and not a theoretical one.
 
-### Limit 3 — A fallback copy may be withheld
+### Limit 3 — A fallback copy may be withheld, in one narrow case
 
 When the copy we chose cannot be read, we fall back to another copy of the same photograph. A
-fallback that itself needs the offset removed is now **withheld**, because swapping it in beside the
-already-corrected tiles of the same day would refuse that day (limit 1) — and the recovery machinery
-knows how to handle a file that will not read, not a day that refuses.
+fallback that itself needs the offset removed is **withheld** — but only when the copy it would
+replace needs *no* correction, because only then does the swap change anything:
 
-The cost is real, and it cuts both ways:
+```
+  the copy that failed        the spare offered        what the swap does
+  ───────────────────        ─────────────────        ──────────────────
+  needs no correction   +    needs correction    ──►  the day now refuses.  WITHHELD
+  needs correction      +    needs correction    ──►  nothing changes.      OFFERED
+```
 
-- **Withholding it** loses the day, on a day where everything needed correcting and the fallback
-  would have worked.
-- **Offering it** loses the day too, on a mixed day, because the day would then refuse.
+The second row was originally withheld too, which cost a recoverable day on an all-corrected-nothing
+day for no gain. A reviewer pointed out that the two cases are distinguishable without needing to
+look at the whole day, which is what the code now does.
 
-So the question is which kind of day is more common, and the measurement says the mixed kind by a
-wide margin — 26 of 60 days in one zone in early 2024, against all-corrected days being the rarer
-shape.
-
-**Being honest about the strength of that argument.** When this was decided, offering the fallback
-risked stopping the *whole run*, which made withholding clearly cheaper. A refused day is now
-skipped alone, so both branches cost one day and the case is much closer than it was. It is left as
-it is because the frequency argument still favours it, not because it is obviously right. Checking
-the fallback against the whole day would settle it properly, and is part of the same owed work as
-limits 1 and 2.
+What remains is the first row, and it is a genuine loss: the day is lost where the fallback would
+have delivered it, had the day not also contained corrected copies. That is the same conflict as
+limit 1, met from the recovery side, and the same fix dissolves it.
 
 ### Limit 4 — If Element 84 ever publishes an uncorrected file, we will not notice
 
