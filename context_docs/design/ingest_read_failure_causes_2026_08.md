@@ -1,7 +1,9 @@
-# Ingest source-read failures: three causes, and the retry budget they share
+# Ingest source-read failures: four causes, and the retry budget they share
 
 Investigation record. Causes 1 and 2 traced 2026-08-04/05 on `global-tessera-dev`; cause 3 absorbed
-2026-08-18 from its own document, for the reason given at that section. Traces
+2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20
+from a live campaign leg. **Corrected in place: this document said "three causes" until cause 4 was
+added.** Traces
 `WarpOperationError('Chunk and warp failed')` and `PermissionError: The provided token has
 expired` to their exact causes, so the guards can be aimed at the right terms.
 
@@ -481,6 +483,82 @@ the bbox and the page ordinal, which is a complete reproduction. Until then the 
 symptom without a repro, and should be sent as such rather than with a guessed query.
 
 ---
+
+# Cause 4 — the object was never published (optical)
+
+Traced 2026-08-20 from a live campaign leg. A separate cause rather than a variant of cause 2
+because the two differ in exactly the way the guard reads: cause 2 is an object whose BYTES will
+not decode, and this is an object that is not there at all. The remedy is the same (step down to
+another catalogue copy, and give the date up if there is none); the detection is not.
+
+### The failure
+
+One optical leg abandoned an entire zone-year because **one object out of the 6,424 that day
+needed did not exist**:
+
+```
+s3://sentinel-s2-l2a/tiles/33/P/WM/2018/1/24/0/B02.jp2
+item S2A_33PWM_20180124_0_L2A, zone 33N, 2018-01-24
+```
+
+Upstream mechanism, and it is not our bug: Element 84 published no B01/B02 COG for that granule,
+so earth-search fills those asset slots with ESA JPEG-2000 hrefs — and those hrefs omit the
+`R10m/` path segment, so the href names a key one level above the file that exists. The date is
+recoverable by the ladder; the leg was not, because the failure never reached the ladder.
+
+### Why the existing markers missed it
+
+Every marker in `_UNREADABLE_MARKERS` before this change is emitted by a BLOCK READ:
+`ZIPDecode`, `TIFFReadEncodedTile`, `IReadBlock failed`, and the two wrappers around them. A
+missing object fails at `rasterio.open`, before any block is requested, so none of them appears.
+`is_unreadable_source` therefore answered no, `s2_roi` re-raised, and the whole zone-year died
+where one date should have been skipped.
+
+What the driver receives is:
+
+```
+Exception("RasterioIOError('ObjectNotFound: The specified key does not exist.')")
+```
+
+A plain `Exception` carrying a repr — the read runs on a Dask worker and tblib cannot reconstruct
+rasterio's GDAL-backed classes across the boundary. **An `isinstance` check against a rasterio or
+GDAL type is therefore not available here**, however much it would be the better test. Text is the
+only evidence that survives, which is why the fix is three markers — `ObjectNotFound` (GDAL and
+rasterio), `NoSuchKey` (the S3 API error code), and `The specified key does not exist` (the
+response body) — covering the three layers that can be the one to surface it.
+
+### The leg was not even retried, for an unrelated reason
+
+`_NON_RETRYABLE_LEG_MARKERS` in `ingest_zone_year.py` already contained `ObjectNotFound`, listed
+there for a completely different meaning: **Prefect's** `ObjectNotFound`, raised when a child
+deployment is not registered. The two names collide, so a source object's 404 matched the marker
+and the zone-year was classified deterministic and never re-dispatched. The classification was
+right by accident — a retry would have read the same absent object — but nothing in the code knew
+that, and the collision is still live for any future S3 404 reaching that classifier.
+
+### Why the skip has to be bounded
+
+Skipping the date is right for one missing object and wrong for a hundred, and **a single date
+cannot tell the two apart**: an unpublished granule and a vanished prefix produce the identical
+not-found. Two further reasons the unbounded version is worse than it looks:
+
+- the marker cannot say WHOSE object was missing. A hole in the DESTINATION store reports the
+  same not-found as a missing source href, and nothing narrower is available at that boundary.
+- one recorded unreadable date **excuses its whole month** from the downstream coverage gate
+  (`inference.data_loading._months_holding_unreadable_dates`). The record that makes the loss
+  visible is also what stops the gate from catching it, so k recorded dates can excuse k months.
+
+So `s2_roi.MAX_UNREADABLE_DATES` caps it at **6**, bounded from both directions: a healthy
+zone-year records none, occasionally one or two (cause 2 above: only four distinct broken objects
+appeared in eight hours of fleet logs), so a tighter ceiling would refuse legitimate runs; and 6 of
+a calendar year's 12 months is the most this path may ever excuse. Crossing it raises
+`TooManyUnreadableDatesError`, which names the count and the ceiling, and which is refused BEFORE
+the assessed-window record is written — a leg that stopped part-way has accounted for nothing, and
+writing that attribute anyway would hand the next run an excuse for gaps nobody assessed.
+
+`NoSuchBucket` is deliberately NOT matched. A bucket or prefix that has gone is systemic by
+construction and every remaining date fails identically, so it must fail the leg on the first date
+rather than spend the ceiling discovering it one date at a time.
 
 ## Coupling to the leg retry
 

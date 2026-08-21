@@ -743,12 +743,28 @@ def alternates_for(
 #: rasterio's ``WarpOperationError('Chunk and warp failed')`` is a wrapper that discards the
 #: reason, and the reason — a codec that cannot inflate a tile — is what says the object is
 #: broken rather than briefly unavailable.
+#:
+#: Matched as TEXT, and that is forced rather than chosen: the read runs on a Dask worker and
+#: the failure is re-raised on the driver through tblib, which cannot reconstruct rasterio's
+#: GDAL-backed exception classes. What arrives is a plain ``Exception`` carrying the original's
+#: repr, so an ``isinstance`` check matches nothing and the message is the only evidence left.
 _UNREADABLE_MARKERS = (
+    # The object is there and its bytes will not decode.
     "ZIPDecode",
     "TIFFReadEncodedTile",
     "IReadBlock failed",
     "Chunk and warp failed",
     "Read failed. See previous exception",
+    # The object is not there at all, which none of the markers above can see: those are
+    # emitted by a block read, and a missing object fails at open, before any block is
+    # requested. A catalogue item can name an href that was never published, and no retry
+    # publishes it. Three forms because three layers report the one condition — GDAL and
+    # rasterio raise ``ObjectNotFound``, the S3 API answers with the ``NoSuchKey`` code, and
+    # the response body carries the sentence — and which of them surfaces depends on the
+    # reader, so matching a single form leaves the other two as gaps.
+    "ObjectNotFound",
+    "NoSuchKey",
+    "The specified key does not exist",
 )
 
 
@@ -763,6 +779,14 @@ def is_unreadable_source(exc: BaseException) -> bool:
 
     An expired credential is explicitly excluded for that reason, even though it surfaces
     through the same wrapper.
+
+    A missing object qualifies, and the text that says so cannot say WHOSE object it was:
+    a source href that was never published and a hole in the destination store report the
+    same not-found. Nothing narrower is available at this boundary, so the caller bounds how
+    many dates one run may give up this way — see
+    :data:`~tessera_embeddings.ingest.s2_roi.MAX_UNREADABLE_DATES`. Note what is NOT matched:
+    a whole bucket or prefix being gone, which is systemic by definition and must fail the run
+    on the first date rather than be skipped date by date.
     """
     seen: list[str] = []
     current: BaseException | None = exc

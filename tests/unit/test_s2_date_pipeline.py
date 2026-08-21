@@ -532,6 +532,52 @@ def test_a_coverage_gate_read_failure_reaches_the_duplicate_ladder(run_ingest, m
     assert "DATA LOSS" in caplog.text
 
 
+@pytest.mark.parametrize(
+    "n_dates, refuses",
+    [(s2_roi.MAX_UNREADABLE_DATES, False), (s2_roi.MAX_UNREADABLE_DATES + 1, True)],
+)
+def test_the_unreadable_skip_is_bounded_per_leg(run_ingest, monkeypatch, caplog, n_dates, refuses):
+    """One missing object costs its date; a run of them has to cost the run.
+
+    Both are the same failure seen one date at a time, and no single date can tell them
+    apart: an object the provider never published and a prefix that has gone produce the
+    identical not-found. So the count is what separates them. Under the ceiling the leg
+    finishes and records each loss; over it the leg refuses, because the alternative is
+    committing a mosaic quietly short of those dates and reporting success — and every
+    date recorded excuses its whole month from the gate that would otherwise catch it.
+    """
+
+    def gate_finds_no_object(*_a, **_k):
+        # The form the Dask boundary delivers: a plain exception carrying rasterio's repr.
+        raise Exception("RasterioIOError('ObjectNotFound: The specified key does not exist.')")
+
+    monkeypatch.setattr(s2_roi, "_coverage_from_scl", gate_finds_no_object)
+    assessed: list[str] = []
+    monkeypatch.setattr(s2_roi, "record_assessed_window", lambda path, *_a, **_k: assessed.append(path))
+    dates = {f"2024-01-{day:02d}": True for day in range(1, n_dates + 1)}
+    # Over an already-populated store, so the assessed-window record is reached on the
+    # completing run — without that it is skipped either way and the assertion below on the
+    # refusing run would hold for the wrong reason.
+    populated = {"2023-12-31"}
+
+    if refuses:
+        expected = rf"{n_dates} date\(s\).*ceiling of {s2_roi.MAX_UNREADABLE_DATES}"
+        with pytest.raises(s2_roi.TooManyUnreadableDatesError, match=expected):
+            run_ingest(dates, pipeline_dates=False, existing_dates=populated)
+        # And it refuses BEFORE the assessed window is recorded: that attribute says the
+        # range was examined and its holes accounted for, which a leg that stopped part-way
+        # has not done. Written anyway, it would excuse gaps nobody assessed.
+        assert assessed == []
+        return
+
+    with caplog.at_level(logging.ERROR):
+        run = run_ingest(dates, pipeline_dates=False, existing_dates=populated)
+
+    assert run.result.dates_filtered_coverage == n_dates
+    assert "DATA LOSS" in caplog.text
+    assert assessed == ["memory://store/reflectance.zarr"]
+
+
 def test_a_non_read_failure_in_preparation_still_fails_the_leg(run_ingest, monkeypatch):
     """Only an unreadable SOURCE is turned into a per-date outcome. Anything else is a
     fault in the run, and swallowing it per date would hide it behind a coverage figure.
