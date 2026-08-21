@@ -340,7 +340,7 @@ and increasing population, not a one-off in a single year.
 **How often, and how bad.** Measured on the live catalogue: 26 of 60 days in early 2024 refuse in
 zone 01N, and 5 of 60 even in Europe. A refused day used to fail the whole optical leg — the run
 that found this lost a whole zone-year to one day — so a refused day is now skipped alone and
-counted. The loss is bounded at one day per affected day, and it is announced.
+counted, so the loss is bounded to that day and is announced.
 
 **The fix** is to apply the correction to each image before they are combined, rather than to the
 combined result. That removes the conflict instead of isolating it, because different tiles occupy
@@ -375,13 +375,24 @@ correction do occur (limit 1), so it is a real if small error and not a theoreti
 When the copy we chose cannot be read, we fall back to another copy of the same photograph. A
 fallback that itself needs the offset removed is now **withheld**, because swapping it in beside the
 already-corrected tiles of the same day would refuse that day (limit 1) — and the recovery machinery
-knows how to handle a file that will not read, not a day that refuses. One unreadable file would
-otherwise stop the whole run.
+knows how to handle a file that will not read, not a day that refuses.
 
-The cost is real: on a day where everything needs correcting, that fallback would have worked, and
-withholding it loses the day instead. We accept that because a lost day is bounded and recorded,
-whereas a stopped run is neither. Checking the fallback against the whole day would be better than
-either, and is part of the same owed work as limits 1 and 2.
+The cost is real, and it cuts both ways:
+
+- **Withholding it** loses the day, on a day where everything needed correcting and the fallback
+  would have worked.
+- **Offering it** loses the day too, on a mixed day, because the day would then refuse.
+
+So the question is which kind of day is more common, and the measurement says the mixed kind by a
+wide margin — 26 of 60 days in one zone in early 2024, against all-corrected days being the rarer
+shape.
+
+**Being honest about the strength of that argument.** When this was decided, offering the fallback
+risked stopping the *whole run*, which made withholding clearly cheaper. A refused day is now
+skipped alone, so both branches cost one day and the case is much closer than it was. It is left as
+it is because the frequency argument still favours it, not because it is obviously right. Checking
+the fallback against the whole day would settle it properly, and is part of the same owed work as
+limits 1 and 2.
 
 ### Limit 4 — If Element 84 ever publishes an uncorrected file, we will not notice
 
