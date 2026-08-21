@@ -115,6 +115,26 @@ a raw ESA copy at or above the threshold — where preferring the harmonised cop
 choice. It is recorded here because a reader will otherwise read it as buying cheaper egress with
 older imagery, which is the rule directly below it and the opposite of this one.
 
+**The floor is applied after resampling, and does not commute with it.** `odc.stac.load` reads and
+resamples in one step, so the correction acts on resampled values. Six of the ten configured bands
+are natively 20 m loaded onto a 10 m grid, so this is the normal case rather than an edge one. Two
+raw neighbours at DN 500 and 1500 average to 1000 and then floor to 1, where Element 84 — flooring
+each source pixel first — would average 1 and 500 to about 251.
+
+Not fixed here, for three reasons, and recorded so the trade is visible rather than implied. The
+ordering is **inherited**: the reference pipeline in `yield-modeling` also applies
+`_apply_baseline_corrections_by_date` after `odc.stac.load`, and this store feeds that pipeline, so
+correcting on the native grid would diverge from the reference it is meant to match. The affected
+pixels are the resampling neighbourhood of the DN-below-1000 population, which is 0.0006%–0.08% of a
+real scene. And the parity claim it weakens has no live exposure: the correction never fires on Earth
+Search data, because every ESA-hosted copy in the archive is pre-04.00, while on Planetary Computer
+it fires on most dates but there is no harmonised counterpart there to be in parity with.
+
+It becomes real the day an ESA-hosted post-04.00 copy appears — the same case term 5 of the ranking
+key exists for. Fixing it means loading at native resolution, correcting, then resampling
+separately, which changes the graph shape and the memory profile of every ingest; that is separate
+work, not a side effect of this one.
+
 **The residual risk on the bucket list is real.** If an unharmonised post-04.00 COG ever appears in
 `sentinel-cogs`, it is exempted and stays 1000 DN high, silently. Nothing detects that today.
 

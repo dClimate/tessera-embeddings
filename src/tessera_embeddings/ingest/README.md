@@ -496,6 +496,15 @@ differ only in what becomes of the values that were negative:
   arrays take their dtype from the first date: a negative value written to an unsigned store reads
   as roughly 65535.
 
+**The correction runs after the load, so the floor acts on resampled values.** `odc.stac.load` reads
+and resamples in one step, and six of the ten configured bands are natively 20 m on a 10 m grid, so
+a pixel whose resampling kernel spans the DN-1000 boundary is floored where Element 84 — flooring
+each source pixel first — would not have been. The ordering is inherited from the reference pipeline
+this store feeds, the affected pixels are the neighbourhood of a population that is well under 0.1%
+of a scene, and the parity it weakens has no live exposure today; see
+`context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md` for the full accounting and
+what fixing it would cost.
+
 The arithmetic is done in `int32` and the result saturated once at the end, so nothing wraps. The
 default mode needs no upper bound at all — the offset is negative and the floor is positive, so an
 unsigned input stays representable — while the signed mode needs one because neither `65535 - 1000`
