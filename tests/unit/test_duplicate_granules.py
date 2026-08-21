@@ -467,11 +467,11 @@ class TestASpareThatWillRefuseIsKeptOffTheLadderWithoutVisibleAssets:
         assert [i.id for i in kept] == [best.id]
         assert [i.id for i in next(iter(alternates.values()))] == [older.id]
 
-    def test_a_spare_is_kept_when_the_copy_it_replaces_already_owes(self) -> None:
-        """The exclusion applies only to a swap that CHANGES the day's decision.
+    def test_an_all_raw_tile_date_keeps_its_spare(self) -> None:
+        """Two raw copies, so the winner and the spare owe the same correction.
 
-        If the copy being replaced already owes the correction, the day already contains one that
-        does, so a spare that also owes it introduces nothing. Withholding it there cost a
+        The ladder's exclusion is per copy and asks only whether that copy would REFUSE. Merely
+        owing the offset is not a refusal, so the spare stays available. Withholding it cost a
         recoverable date on an all-raw day for no gain.
         """
         remote_scl = {"scl": {"href": f"{_REMOTE}/scl"}}
@@ -480,7 +480,7 @@ class TestASpareThatWillRefuseIsKeptOffTheLadderWithoutVisibleAssets:
         kept, alternates = select_preferred_duplicates([spare, winner])
         assert [i.id for i in kept] == [winner.id]
         assert [i.id for i in next(iter(alternates.values()))] == [spare.id], (
-            "both copies owe the correction, so swapping cannot change the day — keep the ladder"
+            "merely owing the offset is not a refusal, so the spare belongs on the ladder"
         )
 
     def test_a_spare_that_merely_owes_the_offset_is_now_offered(self) -> None:
@@ -828,9 +828,9 @@ class TestInRegionPreference:
         """The complement, and the reason locality sits BELOW the baseline term: a cheaper
         read must never be bought with a worse pixel.
 
-        Both copies are below the correction threshold, so neither owes an offset correction and
-        the term that DOES outrank the baseline is inert. That is what leaves locality alone with
-        the baseline, which is the pair this test is about.
+        Both copies are below the correction threshold, so both producer terms are inert — the
+        owes term, which sits below the baseline, and the refusal term, which sits above it. That
+        is what leaves locality alone with the baseline, which is the pair this test is about.
         """
         local_old = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="02.06", host_root=_IN_REGION)
         remote_new = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="03.01", host_root=_REMOTE)
@@ -1515,8 +1515,8 @@ class TestThePreferenceKeyHoldsItsInvariants:
     def test_locality_never_outranks_a_higher_baseline(self) -> None:
         """The P1 this ordering exists to prevent: cheaper egress must not buy an older pixel.
 
-        Both baselines are below the correction threshold, so neither copy owes an offset and the
-        one term that does outrank the baseline is inert. Locality is then alone with the
+        Both baselines are below the correction threshold, so both producer terms are inert — the
+        owes term below the baseline and the refusal term above it. Locality is then alone with the
         baseline, which is what this asserts.
         """
         remote_new = self._item("remote-new", baseline="03.01", sequence="0", local=False, complete=True)
@@ -1568,12 +1568,13 @@ class TestThePreferenceKeyHoldsItsInvariants:
                 assert _preference_key(item) == alone[item.id]
 
 
-class TestCompletenessSurvivesTheSequenceOnlyFallback:
-    """When any copy of an acquisition declares no readable baseline, `_rank_copies` drops to
-    `_sequence_key` — which omitted the read-set term, so a higher-sequence copy missing an asset
-    beat a complete lower-sequence one. That guarantees the eager `No such band/alias` failure,
-    which names no object, so the recovery steps every duplicated tile-date of the day rather
-    than this one. Raised on PR #107.
+class TestCompletenessOutranksTheSequenceWhenABaselineIsUnreadable:
+    """A copy missing an asset must lose to a complete one even when a sibling cannot be dated.
+
+    Read-set completeness is term 1 of `_preference_key` while an unreadable baseline is only
+    term 4, so one undatable copy cannot put the group on the sequence alone. A higher-sequence
+    incomplete winner guarantees the eager `No such band/alias` failure, which names no object, so
+    recovery steps every duplicated tile-date of the day rather than this one. Raised on PR #107.
     """
 
     def _copy(self, ident: str, *, sequence: str, baseline: str | None, complete: bool) -> _Item:
@@ -1587,7 +1588,7 @@ class TestCompletenessSurvivesTheSequenceOnlyFallback:
         )
 
     def test_a_complete_copy_beats_a_higher_sequence_incomplete_one(self) -> None:
-        # The unreadable baseline is what forces the sequence-only path for the whole group.
+        # Present to put a copy nobody can date into the group alongside the two being compared.
         unreadable = self._copy("unreadable", sequence="0", baseline=None, complete=True)
         incomplete_newer = self._copy("incomplete-newer", sequence="9", baseline="05.00", complete=False)
         complete_older = self._copy("complete-older", sequence="1", baseline="05.00", complete=True)
@@ -1667,11 +1668,13 @@ class TestTheAuditUsesTheSameReadSetAsSelection:
         assert "0 in-region, 1 remote" in self._emit(caplog, [winner], alternates)
 
 
-class TestACopyThatWouldRefuseItsDateLosesToOneThatWouldNot:
-    """A copy whose reflectance bands span a harmonised and a raw producer refuses its date at or
-    above the correction threshold, and nothing retries a refusal — the fallback ladder steps down
-    on a read error, not on this. So it must lose to a homogeneous copy, even an older one.
-    Raised on PR #107.
+class TestAMixedProducerCopyIsRankedOnItsBaselineLikeAnyOther:
+    """A copy whose reflectance bands span a harmonised and a raw producer is ordinary.
+
+    Each of its sources is decided on its own bucket, so it is corrected band by band rather than
+    refused, and the refusal term is therefore inert for it at every baseline. What is left to
+    decide these comparisons is the baseline — the module's rule holding: nothing below "will this
+    work at all" may buy its preference with an older reprocessing. Raised on PR #107.
     """
 
     @staticmethod
@@ -1696,7 +1699,7 @@ class TestACopyThatWouldRefuseItsDateLosesToOneThatWouldNot:
         assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["clean-04"]
 
     def test_below_the_threshold_the_baseline_still_decides(self) -> None:
-        """The term is inert there: a mixed producer changes no pixel that gets no offset."""
+        """And below the threshold, where no producer changes a pixel at all."""
         mixed_new = self._copy_at_baseline("mixed-03", "03.00", mixed=True)
         clean_old = self._copy_at_baseline("clean-02", "02.00", mixed=False)
         kept, _ = select_preferred_duplicates([mixed_new, clean_old])
@@ -1776,7 +1779,7 @@ class TestTheLadderOnlyOffersCopiesItCanRecoverWith:
         assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["mixed"]
 
     def test_a_mixed_producer_spare_is_kept_below_the_threshold(self) -> None:
-        """Nothing is owed there, so the date does not refuse and the copy is a usable fallback."""
+        """Below the threshold too, where no producer changes a pixel, so the spare stays usable."""
         winner = self._copy("win", baseline="03.00", sequence="9")
         spare = self._copy("mixed", baseline="03.00", sequence="1", mixed=True)
         _, alternates = select_preferred_duplicates([winner, spare])
