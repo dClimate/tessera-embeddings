@@ -39,6 +39,13 @@ dependencies = [
     # so a minor bump can move either without a deprecation. See
     # context_docs/decisions/021-correct-the-boa-offset-per-image.md.
     "odc-stac>=0.5.2,<0.6",
+    # Bounded SEPARATELY, because the line above bounds nothing here: `odc-stac` 0.5.2 requires
+    # only `odc-loader>=0.6.4`, so a fresh resolution can satisfy it with a breaking 0.7.
+    # `RioReader` and the `read` contract the subclass overrides are public — both are in
+    # `odc.loader.__all__`, and `read` matches the documented `RasterReader` protocol — but the
+    # subclass reaches `self._src` for the offset stamped onto the source, and that attribute is
+    # on no protocol. At 0.x the minor version is where breaking changes land either way.
+    "odc-loader>=0.6.4,<0.7",
     "odc-geo",
     "rasterio",
     "rioxarray",
