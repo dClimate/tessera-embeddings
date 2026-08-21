@@ -122,9 +122,13 @@ raw neighbours at DN 500 and 1500 average to 1000 and then floor to 1, where Ele
 each source pixel first — would average 1 and 500 to about 251.
 
 Not fixed here, for three reasons, and recorded so the trade is visible rather than implied. The
-ordering is **inherited**: the reference pipeline in `yield-modeling` also applies
-`_apply_baseline_corrections_by_date` after `odc.stac.load`, and this store feeds that pipeline, so
-correcting on the native grid would diverge from the reference it is meant to match. The affected
+ordering is **what already ships**: `main` corrects after the load too (`load_stac_items` calls
+`_load_from_stac`, then the corrector), as does `Arbol-Project/yield-modeling`, the repository these
+ingest modules were lifted from. Reordering is therefore a change to the pixels every existing store
+was written with, not a change confined to a new path — and it would have to be justified as an
+improvement over shipped behaviour rather than as a bug fix. (An earlier version of this paragraph
+called yield-modeling a downstream consumer of this store. It is not; it is the predecessor the code
+came from. The inheritance argument stands on `main`.) The affected
 pixels are the resampling neighbourhood of the DN-below-1000 population, which is 0.0006%–0.08% of a
 real scene. And the parity claim it weakens has no live exposure: the correction never fires on Earth
 Search data, because every ESA-hosted copy in the archive is pre-04.00, while on Planetary Computer
