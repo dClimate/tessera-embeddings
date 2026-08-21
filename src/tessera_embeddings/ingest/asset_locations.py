@@ -46,8 +46,21 @@ UNHARMONISED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-s2-l2a"})
 RAW_ARCHIVE_BUCKETS: frozenset[str] = frozenset({"sentinel-s2-l2a"})
 
 #: Buckets whose Sentinel-2 surface reflectance already has the post-baseline-04.00 offset
-#: subtracted. An unrecognised bucket is neither harmonised nor known-raw, so it is UNKNOWN and
-#: the caller refuses the date: over-correcting harmonised data and under-correcting raw data are
+#: subtracted. Membership is a determination about the PRODUCER, taken from the pixels and NOT
+#: from the catalogue's own account of itself.
+#:
+#: That distinction is the whole reason this is a bucket list rather than an item-level read.
+#: ``earthsearch:boa_offset_applied`` is absent on exactly the items whose producer is in
+#: question, ``raster:bands`` carries an offset that contradicts the data (sertit/eoreader#120),
+#: and Element 84's own documentation describes legacy COGs whose offset state varies. An
+#: item-level signal would therefore be read from fields that are missing or wrong precisely
+#: where a decision is needed. Every Element 84 COG measured against its ESA original is
+#: harmonised, so that is what this encodes — see
+#: ``context_docs/design/s2-boa-offset-and-duplicate-selection.md`` for the measurement and for
+#: what would have to change to revisit it.
+#:
+#: An unrecognised bucket is neither harmonised nor known-raw, so it is UNKNOWN and the caller
+#: refuses the date: over-correcting harmonised data and under-correcting raw data are
 #: both wrong and both silent, so neither is safe to default to.
 HARMONISED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-cogs", "e84-earth-search-sentinel-data"})
 
@@ -190,11 +203,11 @@ def item_is_in_preferred_location(
 class Harmonisation(enum.Enum):
     """Whether an item's reflectance already has the baseline-04.00 offset removed.
 
-    Three states and not a boolean, because ``MIXED`` needs a different response from either
-    answer rather than a default. The correction is applied per DATE to every band at once, so
-    an item whose bands straddle two producers has no correct date-wide answer: exempting it
-    leaves the raw band 1000 high, correcting it drops 1000 from every harmonised band. A
-    boolean forces one of those silently.
+    Four states and not a boolean, because two of them need a response neither answer gives.
+    The correction is applied per DATE to every band at once, so an item whose bands straddle a
+    harmonised and a raw producer has no correct date-wide answer: exempting it leaves the raw
+    band 1000 high, correcting it drops 1000 from every harmonised band. ``UNKNOWN`` is the
+    same problem without even that much evidence. A boolean forces one of those silently.
     """
 
     HARMONISED = "harmonised"
@@ -222,20 +235,19 @@ def item_harmonisation(
     bucket nobody has listed is ``UNKNOWN``, and the caller refuses the date rather than guessing
     — see the next paragraph for the two ways that state arises.
 
-    An item is ``UNKNOWN`` rather than ``RAW`` in two cases: it does not expose every reflectance
-    band under the configured names, or the bucket serving them is not one we have identified as
-    unharmonised. Nothing here can resolve the alias table mapping a band name to an asset key, so
-    a band absent under the requested name may still be served under a native one — and either way,
-    calling the item raw would subtract the offset from pixels that may already be harmonised. The
-    caller refuses on ``UNKNOWN`` rather than guessing.
+    An item is ``UNKNOWN`` rather than ``RAW`` or ``MIXED`` whenever a bucket serving it has not
+    been classified: it does not expose every reflectance band under the configured names, or some
+    band comes from a bucket in neither list. Nothing here can resolve the alias table mapping a
+    band name to an asset key, so a band absent under the requested name may still be served under
+    a native one — and either way, calling the item raw would subtract the offset from pixels that
+    may already be harmonised. The caller refuses on ``UNKNOWN`` rather than guessing, and its
+    message names classifying the bucket as the fix.
     """
     sources = read_asset_sources(item, keys)
     if not sources.complete:
         return Harmonisation.UNKNOWN
     if sources.all_in(buckets):
         return Harmonisation.HARMONISED
-    if sources.any_in(buckets):
-        return Harmonisation.MIXED
     # RAW only when EVERY band comes from a producer explicitly identified as unharmonised. One raw
     # band beside bands from an unlisted bucket is not a raw item — correcting it would subtract the
     # offset from bands that may already have had it removed. An unlisted bucket is UNKNOWN:
@@ -243,6 +255,13 @@ def item_harmonisation(
     # offset from pixels that already had it removed. The caller refuses on UNKNOWN.
     if sources.all_in(UNHARMONISED_ASSET_BUCKETS):
         return Harmonisation.RAW
+    # MIXED needs BOTH known classes present, because MIXED is the state no date-wide decision
+    # fits. Harmonised bands beside bands from a bucket nobody has classified is UNKNOWN instead:
+    # nothing there is known to be raw, so the actionable fix is to classify the bucket, which is
+    # what the caller's UNKNOWN message says. Reporting MIXED sent the operator to split the date
+    # by producer for an ambiguity that may not exist.
+    if sources.any_in(buckets) and sources.any_in(UNHARMONISED_ASSET_BUCKETS):
+        return Harmonisation.MIXED
     return Harmonisation.UNKNOWN
 
 

@@ -29,6 +29,8 @@ from tessera_embeddings.ingest.asset_locations import (
 from tessera_embeddings.ingest.duplicates import (
     _first_for_failed_acquisition,
     _preference_key,
+    acquisition_identity,
+    acquisition_instant,
     alternates_for,
     copies_label,
     is_unreadable_source,
@@ -309,6 +311,115 @@ class TestWhenToStepDown:
         assert not is_unreadable_source(ValueError("some unrelated bug"))
 
 
+class TestKeyingACopyAcrossProviders:
+    """The tile and the acquisition, read from fields each catalogue actually populates."""
+
+    def test_the_planetary_computer_tile_property_is_read(self) -> None:
+        """Its ids carry the tile as `_T33TWM_` in a later field, which the Element 84 pattern
+        does not match — so without the property every one of its items was unkeyable and
+        duplicate selection was a no-op for the whole provider.
+        """
+        item = _Item("S2A_MSIL2A_20171219T095409_R079_T33TWM_20230807T060445", **{"s2:mgrs_tile": "33TWM"})
+        assert item_tile(item) == "MGRS-33TWM"
+
+    def test_the_planetary_computer_id_alone_is_not_enough(self) -> None:
+        """The fixture above must be earning its keep, not passing on the id fallback."""
+        assert item_tile(_Item("S2A_MSIL2A_20171219T095409_R079_T33TWM_20230807T060445")) is None
+
+    def test_both_providers_key_one_tile_the_same_way(self) -> None:
+        """The two properties name the tile in different forms, so they are canonicalised — a
+        grouping key that depended on which catalogue answered would split one tile's copies.
+        """
+        earth_search = _Item("x", "MGRS-33TWM")
+        planetary = _Item("y", **{"s2:mgrs_tile": "33TWM"})
+        assert item_tile(earth_search) == item_tile(planetary)
+
+    def test_a_value_that_is_not_a_grid_square_is_not_accepted(self) -> None:
+        assert item_tile(_Item("not-a-sentinel-id", **{"s2:mgrs_tile": "whatever"})) is None
+
+    def test_the_datatake_names_the_observation_without_its_baseline(self) -> None:
+        """The processing baseline is the only field a reprocessing changes, so the head of the
+        value is the observation itself.
+        """
+        item = _Item("x", **{"s2:datatake_id": "GS2B_20171219T095409_004109_N05.00"})
+        assert acquisition_identity(item) == "GS2B_20171219T095409_004109"
+
+    @pytest.mark.parametrize(
+        "raw", ["", "GS2B_20171219T095409_004109", "not a datatake", "GS2B_20171219T095409_004109_N05.00.1", 5.0]
+    )
+    def test_anything_that_is_not_a_datatake_id_is_refused(self, raw: object) -> None:
+        """Matched as a whole rather than split on underscores, so a value of another shape sends
+        the caller to the timestamp instead of yielding a plausible-looking wrong key.
+        """
+        assert acquisition_identity(_Item("x", **{"s2:datatake_id": raw})) is None
+
+    def test_an_item_without_the_property_falls_back(self) -> None:
+        assert acquisition_identity(_Item("x")) is None
+
+
+class TestReprocessingsAreOneAcquisitionHoweverTheyAreTimestamped:
+    """The reported MEDIUM, taken from the committed 2017-12-19 cassette.
+
+    Two copies of one granule — same sensing time, orbit and tile, baselines 02.06 and 05.00 —
+    carry catalogue timestamps 209 seconds apart. Clustering on those timestamps put them in
+    separate acquisitions, so both survived selection and were mosaicked together, and a
+    post-threshold version of the same shape would have refused the date as mixed-producer.
+    """
+
+    @staticmethod
+    def _reprocessing(sequence: str, baseline: str, acquired: str, host_root: str) -> _Item:
+        item = _Item(
+            f"S2B_33TWM_20171219_{sequence}_L2A",
+            "MGRS-33TWM",
+            sequence,
+            **{
+                "s2:processing_baseline": baseline,
+                "s2:datatake_id": f"GS2B_20171219T095409_004109_N{baseline}",
+                "datetime": acquired,
+            },
+        )
+        return _with_assets(item, _bands_at(host_root))
+
+    def _cassette_pair(self) -> tuple[_Item, _Item]:
+        old = self._reprocessing("0", "02.06", "2017-12-19T09:54:10.457000Z", _REMOTE)
+        new = self._reprocessing("1", "05.00", "2017-12-19T09:57:39.063000Z", _IN_REGION)
+        return old, new
+
+    def test_the_fixture_really_straddles_the_timestamp_window(self) -> None:
+        """Otherwise this would pass on the old timestamp clustering and prove nothing."""
+        old, new = self._cassette_pair()
+        skew = abs((acquisition_instant(new) - acquisition_instant(old)).total_seconds())
+        assert skew > 120, f"the copies are only {skew}s apart — the fixture no longer bites"
+
+    def test_they_reduce_to_one_copy(self) -> None:
+        old, new = self._cassette_pair()
+        kept, alternates = select_preferred_duplicates([old, new])
+        assert [i.id for i in kept] == [new.id], "two reprocessings of one granule were both loaded"
+        assert [i.id for i in next(iter(alternates.values()))] == [old.id]
+
+    def test_two_genuine_passes_are_still_kept_apart(self) -> None:
+        """The complement, and the reason this cannot simply collapse the tile-date: successive
+        orbits revisit a high-latitude tile the same day, and those are separate imagery.
+        """
+        first = self._reprocessing("0", "05.00", "2017-12-19T09:54:10.457000Z", _IN_REGION)
+        first.properties["s2:datatake_id"] = "GS2B_20171219T095409_004109_N05.00"
+        second = self._reprocessing("0", "05.00", "2017-12-19T10:44:10.457000Z", _IN_REGION)
+        second.id = "S2B_33TWM_20171219_9_L2A"
+        second.properties["s2:datatake_id"] = "GS2B_20171219T104409_004110_N05.00"
+        kept, _ = select_preferred_duplicates([first, second])
+        assert len(kept) == 2, "two distinct passes were collapsed into one"
+
+    def test_a_copy_without_a_datatake_still_clusters_on_its_timestamp(self) -> None:
+        """The fallback has to keep working: an item naming no observation is placed by its
+        timestamp, exactly as before.
+        """
+        old, new = self._cassette_pair()
+        del old.properties["s2:datatake_id"]
+        del new.properties["s2:datatake_id"]
+        kept, _ = select_preferred_duplicates([old, new])
+        assert len(kept) == 2, "the timestamp fallback stopped clustering"
+
+
 class TestDistinctAcquisitionsOnOneDay:
     """A tile-date can hold two ACQUISITIONS, not just two copies of one.
 
@@ -570,11 +681,45 @@ class TestInRegionPreference:
     def test_locality_never_outranks_a_newer_baseline(self) -> None:
         """The complement, and the reason locality sits BELOW the baseline term: a cheaper
         read must never be bought with a worse pixel.
+
+        Both copies are below the correction threshold, so neither owes an offset correction and
+        the term that DOES outrank the baseline is inert. That is what leaves locality alone with
+        the baseline, which is the pair this test is about.
         """
         local_old = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="02.06", host_root=_IN_REGION)
-        remote_new = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="05.00", host_root=_REMOTE)
+        remote_new = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="03.01", host_root=_REMOTE)
         kept, _ = select_preferred_duplicates([local_old, remote_new])
         assert [i.id for i in kept] == [remote_new.id], "a newer baseline must win despite egress"
+
+    def test_a_copy_owing_no_correction_outranks_a_newer_one_that_does(self) -> None:
+        """The one term that IS allowed to cost a reprocessing, and the reason it may.
+
+        The offset correction is decided per solar day over every tile fused into it, so a single
+        raw copy at or above the threshold can refuse the whole day. Avoiding that is a coverage
+        decision, not a cost one, so unlike locality it ranks above the baseline.
+
+        Unobservable on the archive as indexed — every copy served from the ESA bucket is at a
+        pre-04.00 baseline and so owes nothing either way — which is why the case this pins is
+        the one the ingest logs at WARNING as unexpected.
+        """
+        harmonised_old = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="04.00", host_root=_IN_REGION)
+        raw_new = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="05.00", host_root=_REMOTE)
+        kept, alternates = select_preferred_duplicates([harmonised_old, raw_new])
+        assert [i.id for i in kept] == [harmonised_old.id]
+        assert [i.id for i in next(iter(alternates.values()))] == [raw_new.id], (
+            "the raw copy must stay on the ladder — it reads fine, it just costs a correction"
+        )
+
+    def test_below_the_threshold_the_correction_term_is_inert(self) -> None:
+        """The complement of the test above, and what stops it degrading the whole archive.
+
+        A pre-04.00 copy owes no correction whichever bucket serves it, so the term ties and the
+        baseline decides. This is the case that actually occurs.
+        """
+        harmonised_old = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="02.06", host_root=_IN_REGION)
+        raw_new = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="03.01", host_root=_REMOTE)
+        kept, _ = select_preferred_duplicates([harmonised_old, raw_new])
+        assert [i.id for i in kept] == [raw_new.id]
 
     def test_sequence_still_decides_when_baseline_and_locality_tie(self) -> None:
         """No regression: with nothing to separate them but sequence, the old rule stands."""
@@ -674,16 +819,29 @@ class TestUnknownBaselineSuspendsLocality:
     """An absent baseline is not a tie, and treating it as one is wrong twice over."""
 
     def test_an_unknown_baseline_does_not_win_on_locality(self) -> None:
-        """The reported P1. A local copy with NO baseline must not displace a remote copy at
-        05.00: that can select an older reprocessing, AND `_extract_baseline` maps the missing
-        value to 0 downstream, so the post-04.00 offset correction is skipped and the
-        reflectance is wrong with nothing raising.
+        """The reported P1, posed where it applies: BOTH copies raw, so the missing baseline is
+        the only difference.
+
+        A raw copy declaring no baseline cannot be corrected or exempted on evidence, so its date
+        is refused — and a refusal is not a read failure, so nothing recovers from it. The copy
+        with a usable baseline must win however its sequence compares.
         """
-        local_unknown = _Item("S2A_33TWM_20220107_0_L2A", "MGRS-33TWM", "0")
-        _with_assets(local_unknown, _bands_at(_IN_REGION))
-        remote_best = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="05.00", host_root=_REMOTE)
-        kept, _ = select_preferred_duplicates([local_unknown, remote_best])
-        assert [i.id for i in kept] == [remote_best.id], "sequence must decide when a baseline is unknown"
+        raw_unknown = _Item("S2A_33TWM_20220107_1_L2A", "MGRS-33TWM", "1")
+        _with_assets(raw_unknown, _bands_at(_REMOTE))
+        raw_best = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="05.00", host_root=_REMOTE)
+        kept, _ = select_preferred_duplicates([raw_unknown, raw_best])
+        assert [i.id for i in kept] == [raw_best.id], "a usable baseline must beat an unreadable one"
+
+    def test_a_harmonised_copy_needs_no_baseline_to_be_usable(self) -> None:
+        """The other side, and it does NOT reverse: an unreadable baseline costs a harmonised copy
+        nothing, because no offset decision rests on it. Penalising it here would hand the
+        tile-date to a raw copy whose date may then be refused outright.
+        """
+        harmonised_unknown = _Item("S2A_33TWM_20220107_0_L2A", "MGRS-33TWM", "0")
+        _with_assets(harmonised_unknown, _bands_at(_IN_REGION))
+        raw_best = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="05.00", host_root=_REMOTE)
+        kept, _ = select_preferred_duplicates([harmonised_unknown, raw_best])
+        assert [i.id for i in kept] == [harmonised_unknown.id]
 
     def test_a_usable_baseline_beats_a_higher_sequence_without_one(self) -> None:
         """REVERSED deliberately, and the reason is worth reading.
@@ -710,13 +868,23 @@ class TestFallbackLadderKeepsBaselineOrder:
     """Every rung stays in descending baseline order, not just the top one."""
 
     def test_a_middle_baseline_is_not_skipped_for_a_local_older_one(self) -> None:
-        """The reported MEDIUM. With 05.00 selected, a remote 04.00 and a local 03.00, a read
-        failure must step to 04.00. Collapsing every non-best baseline into one tier let
+        """The reported MEDIUM. With 05.00 selected, a less-local 04.00 and a fully local 03.00, a
+        read failure must step to 04.00. Collapsing every non-best baseline into one tier let
         locality hand out the 03.00 copy and needlessly degrade the imagery.
+
+        All three are harmonised, and locality is varied through ``scl`` alone — an asset this
+        ingest reads but never corrects. That is what separates the two claims the bucket lists
+        make: the copies agree about the producer and disagree about egress, so the term under
+        test is locality and nothing else.
         """
-        best = _copy("S2A_33TWM_20220107_2_L2A", sequence="2", baseline="05.00", host_root=_REMOTE)
-        middle = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="04.00", host_root=_REMOTE)
+        remote_scl = {"scl": {"href": f"{_REMOTE}/scl"}}
+        best = _copy("S2A_33TWM_20220107_2_L2A", sequence="2", baseline="05.00", host_root=_IN_REGION, extra=remote_scl)
+        middle = _copy(
+            "S2A_33TWM_20220107_1_L2A", sequence="1", baseline="04.00", host_root=_IN_REGION, extra=remote_scl
+        )
         worst_local = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="03.00", host_root=_IN_REGION)
+        assert item_is_in_preferred_location(worst_local)
+        assert not item_is_in_preferred_location(best), "the fixture must actually differ in locality"
         kept, alternates = select_preferred_duplicates([worst_local, middle, best])
         assert [i.id for i in kept] == [best.id]
         ladder = [i.id for i in next(iter(alternates.values()))]
@@ -1112,16 +1280,22 @@ class TestThePreferenceKeyHoldsItsInvariants:
         return out
 
     def test_a_readable_baseline_beats_an_unreadable_one_among_equally_complete_copies(self) -> None:
-        """Qualified by completeness, which ranks ahead of it: a copy that cannot be read is no
-        use at any baseline, and the generic paths have no recovery for a missing band.
+        """Qualified twice, by the two terms that rank ahead of it.
+
+        By completeness, because a copy that cannot be read is no use at any baseline and the
+        generic paths have no recovery for a missing band. And by producer, because a harmonised
+        copy owes no correction and so is compared on different terms from a raw one — the
+        readable-baseline rule holds within each producer, which is where it is claimed.
         """
         pool = [i for i in self._pool() if read_set_is_complete(i)]
-        known = [i for i in pool if item_processing_baseline(i) is not None]
-        unknown = [i for i in pool if item_processing_baseline(i) is None]
-        assert known and unknown
-        for k in known:
-            for u in unknown:
-                assert _preference_key(k) < _preference_key(u), f"{u.id} outranked {k.id}"
+        for producer in (True, False):
+            same = [i for i in pool if item_is_in_preferred_location(i) is producer]
+            known = [i for i in same if item_processing_baseline(i) is not None]
+            unknown = [i for i in same if item_processing_baseline(i) is None]
+            assert known and unknown
+            for k in known:
+                for u in unknown:
+                    assert _preference_key(k) < _preference_key(u), f"{u.id} outranked {k.id}"
 
     def test_completeness_outranks_the_baseline(self) -> None:
         """An incomplete 05.00 copy must lose to a complete 04.00 one."""
@@ -1130,9 +1304,14 @@ class TestThePreferenceKeyHoldsItsInvariants:
         assert _preference_key(complete_old) < _preference_key(incomplete_new)
 
     def test_locality_never_outranks_a_higher_baseline(self) -> None:
-        """The P1 this ordering exists to prevent: cheaper egress must not buy an older pixel."""
-        remote_new = self._item("remote-new", baseline="05.00", sequence="0", local=False, complete=True)
-        local_old = self._item("local-old", baseline="04.00", sequence="9", local=True, complete=True)
+        """The P1 this ordering exists to prevent: cheaper egress must not buy an older pixel.
+
+        Both baselines are below the correction threshold, so neither copy owes an offset and the
+        one term that does outrank the baseline is inert. Locality is then alone with the
+        baseline, which is what this asserts.
+        """
+        remote_new = self._item("remote-new", baseline="03.01", sequence="0", local=False, complete=True)
+        local_old = self._item("local-old", baseline="02.06", sequence="9", local=True, complete=True)
         assert _preference_key(remote_new) < _preference_key(local_old)
 
     def test_locality_does_not_participate_when_the_baseline_is_unreadable(self) -> None:

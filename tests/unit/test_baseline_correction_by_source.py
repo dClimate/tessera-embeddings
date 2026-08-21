@@ -684,14 +684,33 @@ class TestCorrectedAndExemptDatesShareOneStorageDtype:
         assert out["blue"].dtype == np.uint16
 
     def test_no_corrected_pixel_can_go_negative(self) -> None:
-        """What makes the unsigned dtype safe: the subtraction only touches pixels already at or
-        above the offset, so the floor is 0 rather than -1000.
+        """What makes the unsigned dtype safe: the offset is subtracted from every valid DN and
+        the result floored at zero, which is exactly what the harmonised COGs contain — they are
+        unsigned too, so the floor is forced there as well.
         """
         ds = self._dataset(np.array([[[0, 999], [1000, 1001]]], dtype=np.uint16), "2022-01-07")
         out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
-        # 0 and 999 are below the offset and untouched; 1000 and 1001 lose exactly 1000.
-        np.testing.assert_array_equal(out["blue"].values, np.array([[[0, 999], [0, 1]]], dtype=np.uint16))
+        # 0 is nodata and untouched. 999 encoded a reflectance of -1, which floors to 0.
+        np.testing.assert_array_equal(out["blue"].values, np.array([[[0, 0], [0, 1]]], dtype=np.uint16))
         assert out["blue"].values.min() >= 0
+
+    def test_a_dark_pixel_is_corrected_rather_than_left_alone(self) -> None:
+        """The reported HIGH, stated on its own. ESA adds the offset to every DN from 1 upward,
+        precisely so that negative surface reflectance over water and shadow is representable in
+        an unsigned type. Leaving DN 1-999 unchanged left those pixels up to 999 too high and made
+        a corrected raw copy disagree with a harmonised one across every dark surface.
+        """
+        ds = self._dataset(np.array([[[1, 250], [500, 750]]], dtype=np.uint16), "2022-01-07")
+        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
+        np.testing.assert_array_equal(out["blue"].values, np.zeros((1, 2, 2), dtype=np.uint16))
+
+    def test_nodata_is_the_one_code_the_offset_does_not_touch(self) -> None:
+        """DN 0 is nodata at every baseline, so it is not shifted — and because the floor is zero
+        it could not be distinguished from a floored dark pixel afterwards anyway.
+        """
+        ds = self._dataset(np.array([[[0, 0], [0, 2000]]], dtype=np.uint16), "2022-01-07")
+        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
+        np.testing.assert_array_equal(out["blue"].values, np.array([[[0, 0], [0, 1000]]], dtype=np.uint16))
 
     def test_a_bright_pixel_does_not_wrap(self) -> None:
         """`clip(max=64535) - 1000` is 63535, which does not fit int16 — so the previous cast
@@ -703,15 +722,28 @@ class TestCorrectedAndExemptDatesShareOneStorageDtype:
         np.testing.assert_array_equal(out["blue"].values, np.array([[[59000, 64535], [39000, 32000]]], dtype=np.uint16))
 
     def test_the_signed_mode_is_opt_in(self) -> None:
-        """It is still available and still returns int16 — it is just no longer the default, since
-        it cannot round-trip into the unsigned store this repo writes.
+        """It is still available and still returns int16 — it is just not the default, since it
+        cannot round-trip into the unsigned store this repo writes. It keeps the negative
+        reflectance the floor discards, for a consumer that wants the true value.
         """
         ds = self._dataset(np.array([[[500, 800], [1000, 1500]]], dtype=np.uint16), "2022-01-07")
         out = _apply_baseline_corrections_by_date(
-            ds, baselines={"2022-01-07": 500}, bands=["blue"], preserve_low_values=False
+            ds, baselines={"2022-01-07": 500}, bands=["blue"], clamp_negatives=False
         )
         assert out["blue"].dtype == np.int16
-        assert out["blue"].values.min() < 0
+        np.testing.assert_array_equal(out["blue"].values, np.array([[[-500, -200], [0, 500]]], dtype=np.int16))
+
+    def test_the_signed_mode_cannot_wrap_a_bright_pixel(self) -> None:
+        """int16 holds neither `65535 - 1000` nor an uncorrected bright pixel on a date that
+        skipped correction, so the result saturates once at the end rather than wrapping. The
+        previous bound clamped the INPUT at 64535 and let 63535 wrap to a negative.
+        """
+        ds = self._dataset(np.array([[[65535, 40000], [33768, 0]]], dtype=np.uint16), "2022-01-07")
+        out = _apply_baseline_corrections_by_date(
+            ds, baselines={"2022-01-07": 500}, bands=["blue"], clamp_negatives=False
+        )
+        assert out["blue"].values.min() >= 0, f"a bright pixel wrapped: {out['blue'].values}"
+        np.testing.assert_array_equal(out["blue"].values, np.array([[[32767, 32767], [32767, 0]]], dtype=np.int16))
 
 
 class TestScalingCannotOverflowThePicker:
@@ -1172,12 +1204,17 @@ class TestTheCorrectionDoesNotDependOnTheCallerSupplyingAMap:
         """The complement: running the block unconditionally must not correct what is exempt."""
         assert self._run(monkeypatch, [_Item(_HARMONISED, "05.10")], baselines) == []
 
-    def test_a_collection_without_the_per_item_decision_still_needs_its_map(self, monkeypatch) -> None:
-        """Planetary Computer's answer IS the caller's map, so with no map there is nothing to
-        apply and the block must stay out of the way.
+    @staticmethod
+    def _pc_item(baseline: str | None) -> _Item:
+        """A Planetary Computer item: native asset keys, so its producer cannot be read from its
+        assets and comes from the collection's configuration instead.
         """
-        item = _Item(None, "05.10")
+        item = _Item(None, baseline)
         item.assets = {k: {"href": f"https://x.blob.core.windows.net/{k}"} for k in ("B02", "B03")}
+        return item
+
+    @staticmethod
+    def _run_pc(monkeypatch, items, baselines) -> list[dict]:
         data = xr.Dataset(
             {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
             coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
@@ -1185,8 +1222,31 @@ class TestTheCorrectionDoesNotDependOnTheCallerSupplyingAMap:
         monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
         calls: list[dict] = []
         monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, c, **kw: calls.append(c) or d)
-        stac_module.load_stac_items([item], "planetary-computer", "sentinel-2-l2a", baselines=None)
-        assert calls == []
+        stac_module.load_stac_items(items, "planetary-computer", "sentinel-2-l2a", baselines=baselines)
+        return calls
+
+    @pytest.mark.parametrize("baselines", [None, {}, {"2022-01-07": 0}])
+    def test_a_collection_wide_raw_provider_is_corrected_from_its_items(self, monkeypatch, baselines) -> None:
+        """The reported MEDIUM. Planetary Computer serves ESA's values unharmonised throughout, so
+        a threshold set on a collection whose producer cannot vary between items says every item
+        is raw — the configuration answers what the assets cannot. Taking the correction from the
+        caller's map instead meant a map that was absent, empty, or carrying the 0 that an
+        unreadable baseline collapses to left the offset in the pixels with nothing said.
+        """
+        calls = self._run_pc(monkeypatch, [self._pc_item("05.10")], baselines)
+        assert calls == [{"2022-01-07": 510}], "the offset was left in the pixels"
+
+    def test_an_unreadable_baseline_refuses_rather_than_reading_as_zero(self, monkeypatch) -> None:
+        """The other half of the same finding. A raw item declaring nothing readable cannot be
+        corrected or exempted on evidence, so its date is refused — the same rule the per-item
+        provider already followed, now reached by the collection-wide one too.
+        """
+        with pytest.raises(HeterogeneousProducerError, match="no readable"):
+            self._run_pc(monkeypatch, [self._pc_item("5.100")], None)
+
+    def test_a_pre_threshold_collection_wide_date_is_left_alone(self, monkeypatch) -> None:
+        """The complement, or the tests above would pass with the exemption deleted."""
+        assert self._run_pc(monkeypatch, [self._pc_item("03.00")], None) == []
 
 
 class TestProvenanceKeepsTheDatesSelectionDidNotTouch:
@@ -1282,8 +1342,8 @@ class TestTheCorrectionDoesNotCorruptTheBrightestCodes:
         got = self._corrected(values)
         assert got.dtype == np.uint16
         assert got.min() >= 0
-        # Every eligible pixel loses exactly the offset; the two below it are untouched.
-        np.testing.assert_array_equal(got, np.array([[[64535, 59000, 0, 999, 0]]], dtype=np.uint16))
+        # Every valid DN loses exactly the offset and floors at zero; nodata 0 stays 0.
+        np.testing.assert_array_equal(got, np.array([[[64535, 59000, 0, 0, 0]]], dtype=np.uint16))
 
 
 class TestRawRequiresEveryBandFromAKnownProducer:
@@ -1314,6 +1374,41 @@ class TestRawRequiresEveryBandFromAKnownProducer:
         item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
         item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
         with pytest.raises(HeterogeneousProducerError):
+            dates_exempt_from_correction([item])
+
+
+class TestMixedNeedsBothKnownProducers:
+    """MIXED is the state no date-wide decision fits, so it must not be reported for a state that
+    only needs a bucket classified. Raised on PR #107.
+
+    A harmonised band beside a band from an unlisted bucket returned MIXED, whose message directs
+    an operator to load the producers separately — for an ambiguity that may not exist. Nothing in
+    such an item is known to be raw, so the actionable remedy is to classify the bucket, and
+    classifying it as harmonised may remove the refusal altogether.
+    """
+
+    @staticmethod
+    def _harmonised_plus_unlisted() -> _Item:
+        item = _Item(_HARMONISED, "05.00")
+        item.assets["red"] = {"href": "s3://some-new-mirror/B04.tif"}
+        return item
+
+    def test_harmonised_plus_unlisted_is_undetermined(self) -> None:
+        assert item_harmonisation(self._harmonised_plus_unlisted()) is Harmonisation.UNKNOWN
+
+    def test_it_gets_the_message_that_names_the_bucket(self) -> None:
+        """The point of the change: the diagnostic an operator can act on."""
+        with pytest.raises(HeterogeneousProducerError, match=r"not\s+classified as harmonised") as exc:
+            dates_exempt_from_correction([self._harmonised_plus_unlisted()])
+        assert "some-new-mirror" in str(exc.value)
+        assert "separately" not in str(exc.value), "the wrong remedy must not be offered"
+
+    def test_straddling_two_known_producers_is_still_mixed(self) -> None:
+        """The complement, or this would pass with MIXED deleted."""
+        item = _Item(_HARMONISED, "05.00")
+        item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
+        assert item_harmonisation(item) is Harmonisation.MIXED
+        with pytest.raises(HeterogeneousProducerError, match="separately"):
             dates_exempt_from_correction([item])
 
 

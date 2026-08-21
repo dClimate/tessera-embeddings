@@ -37,6 +37,11 @@ import pytest
 
 from tessera_embeddings.config.satellites import S2_BASELINE_THRESHOLD
 from tessera_embeddings.ingest.asset_locations import Harmonisation, item_harmonisation
+from tessera_embeddings.ingest.duplicates import (
+    acquisition_identity,
+    acquisition_instant,
+    select_preferred_duplicates,
+)
 from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 from tessera_embeddings.ingest.stac import (
     dates_exempt_from_correction,
@@ -157,6 +162,30 @@ class TestRecordedProducerSplit:
             Harmonisation.RAW,
         }, "this day is supposed to be the mixed-producer case"
         assert MIXED_DAY in dates_exempt_from_correction(on_day)
+
+    def test_the_real_reprocessing_pair_reduces_to_one_copy(self) -> None:
+        """The reported MEDIUM, checked against the recorded catalogue rather than a fixture.
+
+        Both items on this day are reprocessings of ONE observation — same sensing time, orbit and
+        tile — but their catalogue timestamps are more than three minutes apart, so clustering on
+        those timestamps kept both and handed both to the loader to mosaic together. They share a
+        datatake, which is what now reduces them.
+        """
+        on_day = [it for it in _normalised() if it.datetime.strftime("%Y-%m-%d") == MIXED_DAY]
+        identities = {acquisition_identity(it) for it in on_day}
+        assert identities and None not in identities, f"the recorded items name no datatake: {identities}"
+        assert len(identities) == 1, f"{MIXED_DAY} is no longer one observation; re-pick the fixture day"
+
+        skew = max(acquisition_instant(it) for it in on_day) - min(acquisition_instant(it) for it in on_day)
+        assert skew.total_seconds() > 120, (
+            f"the recorded copies are only {skew.total_seconds()}s apart, so timestamp clustering "
+            f"would already have reduced them and this asserts nothing"
+        )
+
+        kept, alternates = select_preferred_duplicates(on_day)
+        assert len(kept) == 1, f"two reprocessings of one observation were both loaded: {[i.id for i in kept]}"
+        assert item_harmonisation(kept[0]) is Harmonisation.HARMONISED, "the harmonised copy is the one to keep"
+        assert alternates, "the raw copy must stay on the fallback ladder"
 
     def test_provenance_records_the_real_baselines(self) -> None:
         """`extract_baselines` reaches the store's `baselines_applied`, so it must report what

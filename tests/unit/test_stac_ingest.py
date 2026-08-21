@@ -65,7 +65,7 @@ class TestBaselineCorrection:
         values = np.array([[[500, 800], [1000, 1500]]], dtype=np.uint16)
         data = self._make_dataset({"B02": values}, ["2024-01-01"])
 
-        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400}, preserve_low_values=False)
+        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400}, clamp_negatives=False)
 
         # 500-1000=-500, 800-1000=-200, 1000-1000=0, 1500-1000=500
         np.testing.assert_array_equal(

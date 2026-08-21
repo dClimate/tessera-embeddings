@@ -275,7 +275,11 @@ class HeterogeneousProducerError(RuntimeError):
     """
 
 
-def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_THRESHOLD) -> set[str]:
+def dates_exempt_from_correction(
+    items: list[Any],
+    threshold: int = S2_BASELINE_THRESHOLD,
+    known_harmonisation: Harmonisation | None = None,
+) -> set[str]:
     """The solar days owed no BOA offset correction.
 
     Kept apart from :func:`extract_baselines` because the two answer different questions — one
@@ -312,6 +316,9 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
     Args:
         items: the items a preparation will LOAD, after duplicate selection.
         threshold: baselines at or above this are owed the offset (matches the collection's).
+        known_harmonisation: the producer state to assume for EVERY item, for a collection whose
+            configuration already settles it. Asset locations are not consulted then, which is
+            what lets a provider serving its bands under native asset keys be judged here at all.
 
     **A known limit, measured and accepted.** The producers are judged over the items of one solar
     day, which is the right scope — but duplicate selection chooses each tile's copy without seeing
@@ -341,7 +348,10 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
 
     exempt: set[str] = set()
     for date_str, group in sorted(by_date.items()):
-        kinds = {item: item_harmonisation(item) for item in group}
+        kinds = {
+            item: (known_harmonisation if known_harmonisation is not None else item_harmonisation(item))
+            for item in group
+        }
 
         # Each item on its OWN declared baseline. A caller's per-date map is not consulted as a
         # fallback: it is derived from these same items, so it cannot be evidence about them.
@@ -463,7 +473,11 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
     return exempt
 
 
-def correction_baselines_by_date(items: list[Any], threshold: int = S2_BASELINE_THRESHOLD) -> dict[str, int]:
+def correction_baselines_by_date(
+    items: list[Any],
+    threshold: int = S2_BASELINE_THRESHOLD,
+    known_harmonisation: Harmonisation | None = None,
+) -> dict[str, int]:
     """The baseline to CORRECT each solar day at, ``0`` where no correction is owed.
 
     Derived from the same items :func:`dates_exempt_from_correction` decides on, so the decision
@@ -479,12 +493,13 @@ def correction_baselines_by_date(items: list[Any], threshold: int = S2_BASELINE_
     is what reaches the store's ``baselines_applied``; this is only the correction input, so a
     store cannot end up reporting baseline 0 for imagery processed at 05.10.
     """
-    exempt = dates_exempt_from_correction(items, threshold)
+    exempt = dates_exempt_from_correction(items, threshold, known_harmonisation)
     owed: dict[str, int] = {}
     for item in items:
         date_str = solar_day_of(item)
         owed.setdefault(date_str, 0)
-        if date_str in exempt or item_harmonisation(item) is Harmonisation.HARMONISED:
+        kind = known_harmonisation if known_harmonisation is not None else item_harmonisation(item)
+        if date_str in exempt or kind is Harmonisation.HARMONISED:
             continue
         declared = _declared_baseline(item)
         if declared is not None:
@@ -669,28 +684,27 @@ def _apply_baseline_corrections_by_date(
     baseline_threshold: int = S2_BASELINE_THRESHOLD,
     baseline_offset: int = S2_BASELINE_OFFSET,
     bands: list[str] | None = None,
-    preserve_low_values: bool = True,
+    clamp_negatives: bool = True,
 ) -> xr.Dataset:
-    """Apply baseline corrections to dataset based on per-date baselines.
+    """Remove the BOA offset from the dates that carry it, one baseline per date.
 
-    Unlike _apply_baseline_correction which applies a single baseline to all data,
-    this function handles datasets with multiple dates where each date may have
-    a different baseline.
+    **The offset applies to every valid DN, not only to bright ones.** ESA's baseline 04.00
+    products add it to the whole reflectance range precisely so that negative surface
+    reflectance — routine over water and deep shadow — can be encoded in an unsigned type. DN 0
+    is the nodata code and is the one value that carries no offset, so it is left alone.
 
-    Two modes of operation:
+    Two modes, differing only in what happens to reflectance that was negative:
+
+    - ``clamp_negatives=True`` (default) floors it at zero and returns the INPUT dtype. This is
+      what the harmonised Element 84 COGs contain — they are unsigned, so the floor is forced —
+      which is what makes a corrected raw copy comparable with a harmonised one.
+    - ``clamp_negatives=False`` keeps the negative values and returns ``int16``, for an in-memory
+      consumer that wants true reflectance. Not compatible with an unsigned store.
+
     **The mode has to match the store's dtype.** A store's arrays are seeded from the first
     date's dataset, and a date that skips correction keeps its unsigned input dtype — so a mode
     that returns signed values makes the store's dtype depend on which date happened to land
-    first, and casts every date of the other kind. Tessera mode returns the input dtype and
-    cannot go negative, which is why it is the default.
-
-    - Default (preserve_low_values=True): Only subtracts from pixels where value >= abs(offset),
-      leaving low/dark pixels unchanged, and returns the INPUT dtype. Matches Tessera's
-      harmonize_arr() behaviour, and is the default because it is the only mode that round-trips
-      into an unsigned store.
-    - Signed mode (preserve_low_values=False): Subtracts offset from all pixels and returns int16,
-      so values below abs(offset) go negative and signal nodata/dark to an in-memory consumer.
-      NOT compatible with an unsigned store.
+    first, and casts every date of the other kind.
 
     Args:
         ds: xarray Dataset with time dimension
@@ -698,9 +712,8 @@ def _apply_baseline_corrections_by_date(
         baseline_threshold: Minimum baseline requiring correction (default: S2 threshold)
         baseline_offset: Value to add to pixels (typically negative, default: S2 offset)
         bands: List of band names to correct. If None, corrects all data variables.
-        preserve_low_values: When True, only subtract from pixels where
-            value >= abs(offset), leaving low/dark pixels unchanged. When False,
-            subtract from all pixels (low values go negative).
+        clamp_negatives: When True, floor corrected reflectance at zero and return the input
+            dtype. When False, keep negatives and return int16.
 
     Returns:
         Corrected xarray Dataset
@@ -721,57 +734,28 @@ def _apply_baseline_corrections_by_date(
             f"Applying baseline correction to {corrected_count}/{len(dates)} dates for bands: {bands_to_correct}"
         )
 
-    abs_offset = abs(baseline_offset)
-    clamp_max = 65535 + baseline_offset  # 64535 for S2
-
-    # Apply correction vectorized across time
     result_vars = {}
     for var in ds.data_vars:
-        if var in bands_to_correct:
-            if preserve_low_values:
-                # Tessera mode: only subtract from pixels >= abs(offset),
-                # leave low/dark pixels unchanged
-                pixel_eligible = ds[var] >= abs_offset
-                # Widened to int32 for the arithmetic. Adding a negative Python int to a uint16
-                # array raises OverflowError under numpy 2, which is how we know this branch had
-                # never run: nothing in the repo set `preserve_low_values`, so the mode existed
-                # and was unreachable. Only the arithmetic is signed — the result is cast back
-                # below, and where the pixel is eligible it is already >= the offset, so nothing
-                # can land below zero.
-                widened = ds[var].astype(np.int32)
-                # Subtract, THEN bound. Clamping first cost the highest `abs(offset)` input codes
-                # their range: 65535 was clipped to 64535 and then reduced to 63535 rather than
-                # 64535. No upper clamp is needed because subtraction cannot overflow upward, and
-                # the lower bound is a no-op by construction — this branch only touches pixels
-                # already at or above the offset.
-                corrected_values = xr.where(
-                    pixel_eligible,
-                    (widened + baseline_offset).clip(min=0),
-                    widened,
-                )
-                # The INPUT dtype, not int16. This mode subtracts only where the pixel is already
-                # at or above the offset, so nothing can go negative and an unsigned input stays
-                # representable. Forcing int16 was wrong twice: a corrected date entered a store
-                # whose dtype is seeded from the FIRST date's dataset, so mixing corrected and
-                # exempt dates cast one of them — and `clip(max=64535) - 1000` is 63535, which
-                # does not fit int16 anyway, so bright pixels wrapped even without the mixing.
-                corrected = xr.where(
-                    needs_correction,
-                    corrected_values,
-                    widened,
-                ).astype(ds[var].dtype)
-            else:
-                # Default: subtract from all pixels, low values go negative
-                clamped = ds[var].clip(max=clamp_max).astype(np.int32)
-                corrected_values = clamped + baseline_offset
-                corrected = xr.where(
-                    needs_correction,
-                    corrected_values,
-                    ds[var].astype(np.int32),
-                ).astype(np.int16)
-            result_vars[str(var)] = corrected
-        else:
+        if var not in bands_to_correct:
             result_vars[str(var)] = ds[str(var)]
+            continue
+        # Widened for the arithmetic: adding a negative Python int to a uint16 array raises
+        # OverflowError under numpy 2.
+        widened = ds[var].astype(np.int32)
+        shifted = widened + baseline_offset
+        if clamp_negatives:
+            shifted = shifted.clip(min=0)
+        # DN 0 is the nodata code, and the only value the offset is not applied to.
+        corrected = xr.where(needs_correction, xr.where(widened > 0, shifted, widened), widened)
+        if clamp_negatives:
+            # The input dtype. Nothing here exceeds the input's own range: the offset is
+            # negative and the floor is zero, so an unsigned input stays representable.
+            result_vars[str(var)] = corrected.astype(ds[var].dtype)
+        else:
+            # Saturated once, at the end. `65535 - 1000` does not fit int16, and neither does a
+            # bright pixel on a date that skipped correction and so was never shifted at all.
+            limits = np.iinfo(np.int16)
+            result_vars[str(var)] = corrected.clip(min=limits.min, max=limits.max).astype(np.int16)
 
     return xr.Dataset(result_vars, coords=ds.coords, attrs=ds.attrs)
 
@@ -1188,7 +1172,7 @@ def load_stac_items(
     crs: str | None = None,
     resolution: int | None = None,
     post_load_fn: Callable[[xr.Dataset], xr.Dataset] | None = None,
-    preserve_low_values: bool = True,
+    clamp_negatives: bool = True,
     groupby: str = "solar_day",
     geobox: GeoBox | None = None,
 ) -> xr.Dataset:
@@ -1202,8 +1186,8 @@ def load_stac_items(
         items: List of pystac Items to load (must be non-empty)
         provider: Provider name (e.g., "earth-search")
         collection: Collection alias (e.g., "sentinel-2-l2a")
-        baselines: Dict mapping date strings to baseline integers. Required
-            for collections that need baseline correction.
+        baselines: Dict mapping date strings to baseline integers. PROVENANCE only — the
+            correction is derived from ``items``, so this decides no pixel.
         bbox: Optional bounding box for spatial subsetting
         chunks: Optional chunk sizes for odc.stac.load
         extra_bands: Additional bands to load (e.g., ["scl"])
@@ -1211,7 +1195,8 @@ def load_stac_items(
         crs: Explicit CRS override for odc.stac.load
         resolution: Override pixel resolution in metres
         post_load_fn: Optional function applied after loading and correction
-        preserve_low_values: Tessera-style baseline correction mode
+        clamp_negatives: Whether corrected reflectance is floored at zero (see
+              :func:`_apply_baseline_corrections_by_date`)
         groupby: How to group items into time slices. Must be "solar_day" —
               :func:`_load_from_stac` rejects anything else and says why.
         geobox: Optional output grid specification
@@ -1268,29 +1253,28 @@ def load_stac_items(
         geobox=geobox,
     )
 
-    # Not gated on `baselines` being truthy. Where producers can disagree the correction is derived
-    # from the items, so a caller passing no map at all would otherwise leave a raw post-04.00 item
-    # uncorrected — the offset intact, silently. The map is still required where it IS the evidence.
-    item_derived = collection_config.harmonisation_varies_by_item
-    if collection_config.requires_baseline_correction and (item_derived or baselines):
+    # Derived from the ITEMS, never from `baselines`, and not gated on `baselines` being truthy.
+    # The map is provenance — it is what reaches the store's `baselines_applied` — and it is
+    # last-wins per date, so on a multi-item date it names an arbitrary item's baseline and where
+    # an item's baseline could not be read at all it says 0. Correcting from it therefore left raw
+    # post-04.00 pixels uncorrected, the offset intact, with nothing said about it.
+    if collection_config.requires_baseline_correction:
         loaded_dates = {str(t.values)[:10] for t in data.time}
-        filtered_baselines = {d: b for d, b in (baselines or {}).items() if d in loaded_dates}
-        # Built from the ITEMS where producers can disagree, and from the caller's map where they
-        # cannot — never a mixture, or the decision and the value sit on different evidence.
-        # `baselines` stays untouched either way: it is provenance and reaches the store's
-        # `baselines_applied`.
-        #
-        # The per-item read looks for assets keyed by the names in `bands`, which is how Earth
-        # Search keys them and not how Planetary Computer does (`B02`, `SCL`, resolved by the
-        # loader). PC serves ESA's values unharmonised throughout, so its answer belongs to the
-        # collection and the threshold alone is correct there.
-        if item_derived:
-            correction_baselines = {d: b for d, b in correction_baselines_by_date(items).items() if d in loaded_dates}
-        else:
-            correction_baselines = dict(filtered_baselines)
+        threshold = collection_config.baseline_threshold
+        # Where the producer cannot vary between items, the collection's configuration already
+        # settles it: a correction threshold on such a collection says every item is unharmonised,
+        # which is what the threshold is there to correct. Supplying it is also what lets a
+        # provider serving its bands under native asset keys be judged from its items at all — a
+        # per-item read looks assets up by the names in `bands`, which is how Earth Search keys
+        # them and not how Planetary Computer does (`B02`, `SCL`, resolved by the loader).
+        known_kind = None if collection_config.harmonisation_varies_by_item else Harmonisation.RAW
+        correction_baselines = {
+            d: b
+            for d, b in correction_baselines_by_date(items, threshold, known_kind).items()  # type: ignore[arg-type]
+            if d in loaded_dates
+        }
         # Skip the corrector when nothing reaches the threshold: it changes no values there, but
         # still clips, casts and builds an `xr.where` for every reflectance band.
-        threshold = collection_config.baseline_threshold
         if any(b >= threshold for b in correction_baselines.values()):  # type: ignore[operator]
             data = _apply_baseline_corrections_by_date(
                 data,
@@ -1298,7 +1282,7 @@ def load_stac_items(
                 baseline_threshold=threshold,  # type: ignore[arg-type]
                 baseline_offset=collection_config.baseline_offset,
                 bands=list(collection_config.bands),
-                preserve_low_values=preserve_low_values,
+                clamp_negatives=clamp_negatives,
             )
         else:
             logger.debug(
@@ -1360,7 +1344,7 @@ def ingest_tile(
     post_load_fn: Callable[[xr.Dataset], xr.Dataset] | None = None,
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
     item_provider_fn: Callable[[], list[Any]] | None = None,
-    preserve_low_values: bool = True,
+    clamp_negatives: bool = True,
     groupby: str = "solar_day",
     geobox: GeoBox | None = None,
     mid_longitude: float | None = None,
@@ -1402,11 +1386,10 @@ def ingest_tile(
         item_provider_fn: Optional callable that returns ready-to-load items,
               bypassing CMR-STAC search entirely. Used by the OPERA RTC-S1
               path to build items from the native CMR granule API.
-        preserve_low_values: When True (default), baseline correction only subtracts
-              from pixels >= abs(offset), matching Tessera's harmonize_arr(), and
-              returns the input dtype. When False, subtracts from all pixels and
-              returns int16, so low values go negative — not compatible with the
-              unsigned ROI store.
+        clamp_negatives: When True (default), baseline correction floors corrected
+              reflectance at zero and returns the input dtype, matching the harmonised
+              Element 84 COGs. When False, negatives are kept and the result is int16 —
+              not compatible with the unsigned ROI store.
         groupby: How to group STAC items into time slices. Must be "solar_day",
               which merges same-day tiles into one mosaic; :func:`_load_from_stac`
               rejects anything else and says why.
@@ -1493,7 +1476,7 @@ def ingest_tile(
         crs=crs,
         resolution=resolution,
         post_load_fn=post_load_fn,
-        preserve_low_values=preserve_low_values,
+        clamp_negatives=clamp_negatives,
         groupby=groupby,
         geobox=geobox,
     )

@@ -17,24 +17,30 @@ side of the reflectance-offset threshold from the other, so a fused date can hol
 processed both ways while exactly one correction is applied to the result — decided by item
 order rather than by which copy supplied the pixels.
 
-The preference is **usable first, then newest baseline, then in-region, then newest sequence**,
-and "usable" leads for a reason: a copy this ingest cannot read, or cannot decide a correction for,
-is no use however new it is. So a complete read set comes first, then a decidable producer and a
-readable baseline — a copy failing either of those refuses or fails its date, and neither outcome
-is something the fallback ladder can recover from. Only among copies that are all usable does the
-baseline decide, and there a newer reprocessing is the better data in the overwhelming majority of
-cases. Corruption in a newer copy is rare — sampling duplicate pairs chosen independently of
-failure found every copy intact — and not a property of being newer, so the losing copy is a
-*fallback*, never a default. Callers step down the alternates only on a demonstrated read failure.
-:func:`_preference_key` is the single statement of this order; add a term there and nowhere else.
+The preference is **usable first, then already-harmonised, then newest baseline, then in-region,
+then newest sequence**, and "usable" leads for a reason: a copy this ingest cannot read, or cannot
+decide a correction for, is no use however new it is. So a complete read set comes first, then a
+decidable producer and a known acquisition — a copy failing either of those refuses or fails its
+date, and neither outcome is something the fallback ladder can recover from. Only among copies that
+are all usable does the baseline decide, and there a newer reprocessing is the better data in the
+overwhelming majority of cases. Corruption in a newer copy is rare — sampling duplicate pairs
+chosen independently of failure found every copy intact — and not a property of being newer, so the
+losing copy is a *fallback*, never a default. Callers step down the alternates only on a
+demonstrated read failure. :func:`_preference_key` is the single statement of this order; add a
+term there and nowhere else.
 
-**Locality breaks ties, and only ties.** A catalogue can index the same granule from more
-than one region; when it does, the copies carry the same baseline and the same acquisition
-instant, so the data is identical and the only difference is what the read costs. In-region
-assets go through the VPC's S3 gateway endpoint while anything else egresses through NAT.
-Ranking locality *below* the baseline is what keeps this a cost decision rather than a
-quality one — it can never buy cheaper egress with a worse pixel. It is also inert where the
-baseline cannot be read, so it never decides a comparison the baseline could not enter.
+**Harmonisation outranks the baseline; locality does not.** These are two different claims about
+where an item's assets live and they sit on opposite sides of the baseline for a reason.
+
+An already-harmonised copy needs no offset decision, and the offset decision is made per solar
+day: one raw copy at or above the threshold can refuse a whole day, taking every tile fused into
+it. Preferring the harmonised copy is therefore about how much coverage survives, and buying that
+with an older reprocessing is a trade worth making.
+
+Locality is only about what the read costs — in-region assets go through the VPC's S3 gateway
+endpoint while anything else egresses through NAT — so it must never buy cheaper egress with a
+worse pixel, and it stays below the baseline. It is also inert where the baseline cannot be read,
+so it never decides a comparison the baseline could not enter.
 """
 
 from __future__ import annotations
@@ -71,18 +77,33 @@ _SEQUENCE_VALUE_RE = re.compile(r"[0-9]+")
 #: The MGRS tile in an Element 84 item id — the second underscore-separated field.
 _ID_TILE_RE = re.compile(r"^[A-Z0-9]+_([0-9]{1,2}[A-Z]{3})_")
 
+#: A bare MGRS grid square: UTM zone, latitude band, 100 km square. Matched rather than
+#: accepted as any string, because the property it reads is only ever this.
+_MGRS_SQUARE_RE = re.compile(r"[0-9]{1,2}[A-Z]{3}")
+
 
 def item_tile(item: Any) -> str | None:  # noqa: ANN401 — any STAC-like item
     """The MGRS tile an item covers, or ``None`` if it cannot be determined.
 
-    Prefers the ``grid:code`` property and falls back to the item id. ``None`` means "do not
-    treat this item as having duplicates", which is the safe answer: a wrong tile key would
-    either merge two different tiles (dropping real imagery) or split one tile's duplicates
-    (defeating the point).
+    Three sources, in order: ``grid:code`` as Earth Search names it, ``s2:mgrs_tile`` as
+    Planetary Computer names it, then the item id. All three are returned in one canonical
+    form, so nothing downstream has to know which one answered.
+
+    Planetary Computer needs its own property rather than the id fallback: its ids carry the
+    tile as ``_T33TWM_`` in a later field, which the Element 84 pattern does not match, so
+    without this every one of its items was unkeyable and duplicate selection was a no-op for
+    the whole provider.
+
+    ``None`` means "do not treat this item as having duplicates", which is the safe answer: a
+    wrong tile key would either merge two different tiles (dropping real imagery) or split one
+    tile's duplicates (defeating the point).
     """
     code = item.properties.get("grid:code")
     if isinstance(code, str) and code:
         return code
+    square = item.properties.get("s2:mgrs_tile")
+    if isinstance(square, str) and _MGRS_SQUARE_RE.fullmatch(square.strip()):
+        return f"MGRS-{square.strip()}"
     match = _ID_TILE_RE.match(str(getattr(item, "id", "")))
     return f"MGRS-{match.group(1)}" if match else None
 
@@ -107,6 +128,19 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
     return int(match.group(1)) if match else None
 
 
+def _producer_is_visible(item: Any, read_keys: tuple[str, ...]) -> bool:  # noqa: ANN401
+    """Whether this copy's producer can be judged from its assets at all.
+
+    False in two cases, and every term that asks about the producer has to be inert in both. An
+    empty read set means the collection's configured names are not its asset keys, so nothing is
+    found under them; an incomplete read set means what IS found describes a subset. Either way
+    :func:`~tessera_embeddings.ingest.asset_locations.item_harmonisation` answers ``UNKNOWN`` for
+    every copy, so a term that counted that would rank them all as producer-problems and hand the
+    tile-date to an older pre-threshold copy — the opposite of the usable-first rule.
+    """
+    return bool(read_keys) and read_set_is_complete(item, read_keys)
+
+
 def refuses_its_date(item: Any, read_keys: tuple[str, ...] = READ_ASSET_KEYS) -> bool:  # noqa: ANN401
     """Whether loading this copy makes its date REFUSE rather than fail to read.
 
@@ -118,16 +152,9 @@ def refuses_its_date(item: Any, read_keys: tuple[str, ...] = READ_ASSET_KEYS) ->
     A refusal is not a read failure, so the fallback ladder cannot recover from one — which is why
     such a copy is both ranked last and excluded from the ladder entirely.
     """
-    # Inert without a read set to inspect. An empty one means the collection's configured names are
-    # not its asset keys, so `item_harmonisation` finds nothing and returns UNKNOWN for every copy —
-    # which would mark them all as refusing and hand a tile-date to an older pre-threshold copy. A
-    # collection whose producer is decided at collection level has nothing for this term to say.
-    if not read_keys:
-        return False
-    # Otherwise only asked of copies whose read set is complete, so this answers "we can see that it
-    # refuses" rather than "we cannot see anything". An incomplete copy fails to READ, which the
-    # ladder does handle, and it reports an undecidable producer only because it is incomplete.
-    if not read_set_is_complete(item, read_keys):
+    # Answers "we can see that it refuses" and never "we cannot see anything" — an incomplete copy
+    # fails to READ, which the ladder does handle.
+    if not _producer_is_visible(item, read_keys):
         return False
     harmonisation = item_harmonisation(item)
     if harmonisation is Harmonisation.HARMONISED:
@@ -161,17 +188,44 @@ def _would_refuse_its_date(
     """
     if baseline is None or baseline < S2_BASELINE_THRESHOLD:
         return False
-    # Inert without a read set — see `refuses_its_date` for why an empty one means this term has
-    # nothing to say rather than everything to condemn.
-    if not read_keys or not read_set_is_complete(item, read_keys):
+    if not _producer_is_visible(item, read_keys):
         return False
     return harmonisation in (Harmonisation.MIXED, Harmonisation.UNKNOWN)
+
+
+def _owes_a_correction(
+    item: Any,  # noqa: ANN401
+    baseline: int | None,
+    read_keys: tuple[str, ...],
+    harmonisation: Harmonisation,
+) -> bool:
+    """Whether choosing this copy puts an offset decision on its date.
+
+    A strictly wider question than :func:`_would_refuse_its_date`: a raw copy owes a correction
+    without being ambiguous about it. Gated identically — on the threshold, because below it no
+    producer changes a pixel, and on :func:`_producer_is_visible`, because a copy nobody can judge
+    must not be ranked as though it had been judged and found wanting.
+    """
+    if baseline is None or baseline < S2_BASELINE_THRESHOLD:
+        return False
+    if not _producer_is_visible(item, read_keys):
+        return False
+    return harmonisation is not Harmonisation.HARMONISED
+
+
+def _acquisition_is_known(item: Any) -> bool:  # noqa: ANN401 — any STAC-like item
+    """Whether this copy says which observation it came from.
+
+    True on either evidence :func:`_by_acquisition` clusters by. A copy with neither was attached
+    to a cluster arbitrarily, so nothing may be concluded from which cluster it landed in.
+    """
+    return acquisition_identity(item) is not None or acquisition_instant(item) is not None
 
 
 def _preference_key(
     item: Any,  # noqa: ANN401
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
-) -> tuple[int, int, int, int, float, int, int, int, str]:
+) -> tuple[int, int, int, int, int, float, int, int, int, str]:
     """How much we would rather read this copy than another. Lower sorts first.
 
     **Context-free:** no term is relative to the set being sorted, so the same key orders copies
@@ -189,23 +243,32 @@ def _preference_key(
        refuses its date at or above the correction threshold — and neither the generic path nor the
        read-failure ladder retries a refusal. Below the threshold the term is inert, because there
        the producer changes no pixel.
-    3. **Whether this copy demonstrably belongs to the acquisition it is ranked in.** A copy with
-       no readable instant was attached to a cluster arbitrarily — nothing says which pass it came
-       from — so it must not displace one that does say, whatever its baseline. Above the baseline
-       terms deliberately: a known member at an older baseline still represents that pass, while a
-       possibly-unrelated copy at a newer one may duplicate another pass and drop this one's
-       coverage entirely.
+    3. **Whether this copy demonstrably belongs to the acquisition it is ranked in.** A copy that
+       names neither an observation nor an instant was attached to a cluster arbitrarily — nothing
+       says which pass it came from — so it must not displace one that does say, whatever its
+       baseline. Above the baseline terms deliberately: a known member at an older baseline still
+       represents that pass, while a possibly-unrelated copy at a newer one may duplicate another
+       pass and drop this one's coverage entirely.
     4. **Whether the baseline is readable — for producers whose correction depends on it.** A copy
-       declaring nothing is one whose correction cannot be decided, so it refuses its date. An
-       already-harmonised copy is the exception: its pixels need no correction whatever the
+       declaring nothing is one whose correction cannot be decided, so it refuses its date. Above
+       the next term because a refusal has no recovery while owing a correction merely gets one.
+       An already-harmonised copy is the exception: its pixels need no correction whatever the
        baseline says, so penalising it here would hand a tile-date to an OLDER raw reprocessing,
        which is the opposite of the usable-first rule this key starts with.
-    5. **The baseline, descending, by value** — not by "is it the best", so every rung of the
+    5. **Whether the copy owes an offset correction at all.** A copy that does not removes a
+       whole class of failure rather than one copy's: the correction is date-wide, so a single raw
+       copy at or above the threshold can refuse the entire solar day and every tile fused into
+       it. Above the baseline VALUE, so it may cost a reprocessing — and unlike the locality term
+       below, that is deliberate. Locality is a cost decision and must never buy cheaper egress
+       with a worse pixel; this is a coverage decision and is allowed to. Inert below the
+       threshold, where no producer changes a pixel, and inert without a read set, where every
+       copy reports an undecidable producer and the term therefore ties.
+    6. **The baseline, descending, by value** — not by "is it the best", so every rung of the
        fallback ladder stays in descending baseline order.
-    6. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
+    7. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
        cheaper egress with an older pixel, and inert for unreadable baselines so it cannot decide
        a comparison the baseline could not enter.
-    7. **Sequence, descending, then id.** The id makes the order total, so the choice is
+    8. **Sequence, descending, then id.** The id makes the order total, so the choice is
        independent of catalogue response order and a rerun cannot produce a different mosaic.
     """
     baseline = item_processing_baseline(item)
@@ -216,8 +279,9 @@ def _preference_key(
     return (
         0 if read_set_is_complete(item, read_keys) else 1,
         1 if _would_refuse_its_date(item, baseline, read_keys, harmonisation) else 0,
-        0 if acquisition_instant(item) is not None else 1,
+        0 if _acquisition_is_known(item) else 1,
         0 if baseline is not None or not baseline_matters else 1,
+        1 if _owes_a_correction(item, baseline, read_keys, harmonisation) else 0,
         -(baseline or 0.0),
         (0 if item_is_in_preferred_location(item, keys=read_keys) else 1) if baseline is not None else 0,
         0 if sequence is not None else 1,
@@ -237,12 +301,41 @@ def _rank_copies(copies: list[Any], read_keys: tuple[str, ...] = READ_ASSET_KEYS
     return sorted(copies, key=functools.partial(_preference_key, read_keys=read_keys))
 
 
-#: How far apart two acquisition instants must be to be different acquisitions rather
-#: than reprocessings of one. Reprocessings carry the same instant to sub-second
-#: precision; the closest genuinely distinct pair observed on the live catalogue is a
-#: successive orbit ~50 minutes later, so this sits more than an order of magnitude
-#: clear of both populations and no plausible catalogue jitter reaches it.
+#: How far apart two catalogue timestamps must be to be different acquisitions rather than
+#: reprocessings of one, used only where :func:`acquisition_identity` cannot answer. The closest
+#: genuinely distinct pair observed on the live catalogue is a successive orbit ~50 minutes later.
+#: It is NOT a safe margin against reprocessings, which is why identity is tried first: an earlier
+#: version of this comment claimed reprocessings agree to sub-second precision, and copies of one
+#: granule at baselines 02.06 and 05.00 are timestamped more than three minutes apart.
 _SAME_ACQUISITION_S = 120.0
+
+#: ``s2:datatake_id``, e.g. ``GS2B_20171219T095409_004109_N05.00``: mission, sensing start,
+#: absolute orbit, then the processing baseline. Only the last field changes between
+#: reprocessings, so the head of it names the observation itself.
+_DATATAKE_RE = re.compile(r"(G[A-Z0-9]{2,}_[0-9]{8}T[0-9]{6}_[0-9]+)_N[0-9]{1,2}\.[0-9]{1,2}")
+
+
+def acquisition_identity(item: Any) -> str | None:  # noqa: ANN401 — any STAC-like item
+    """A stable name for the OBSERVATION, shared by every reprocessing of it.
+
+    Preferred over :func:`acquisition_instant` for deciding whether two copies are the same
+    acquisition. The catalogue ``datetime`` is a per-copy field and reprocessings do not agree on
+    it, so a tolerance around it cannot separate "two reprocessings" from "two passes" without
+    getting one of them wrong. Mission, sensing start and orbit are identical across a
+    reprocessing pair and different across passes, so no tolerance is needed at all.
+
+    ``None`` where the property is absent or not this shape, which sends the caller to the
+    instant. Matched as a whole rather than split on underscores, so a value that is not a
+    datatake id is rejected instead of yielding a plausible-looking wrong key.
+    """
+    raw = item.properties.get("s2:datatake_id")
+    if not isinstance(raw, str):
+        return None
+    match = _DATATAKE_RE.fullmatch(raw.strip())
+    if match is None:
+        logger.debug("Not a datatake id: %r on %s", raw, getattr(item, "id", "?"))
+        return None
+    return match.group(1)
 
 
 def acquisition_instant(item: Any) -> datetime.datetime | None:  # noqa: ANN401 — any STAC-like item
@@ -251,8 +344,10 @@ def acquisition_instant(item: Any) -> datetime.datetime | None:  # noqa: ANN401 
     Read from ``properties["datetime"]`` and never from ``item.datetime``, because by
     the time duplicates are selected the latter has been overwritten with the canonical
     noon-UTC solar-day stamp (:func:`normalize_to_solar_day`) and every copy of a day
-    therefore carries an identical value. The property is the only surviving record of
-    which acquisition a copy came from.
+    therefore carries an identical value.
+
+    A per-copy field: reprocessings of one granule do not agree on it, so it is the FALLBACK
+    for placing a copy and :func:`acquisition_identity` is the primary.
     """
     raw = item.properties.get("datetime")
     if not isinstance(raw, str) or not raw:
@@ -273,38 +368,54 @@ def acquisition_instant(item: Any) -> datetime.datetime | None:  # noqa: ANN401 
 def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
     """Split one tile-date's copies into one list per distinct acquisition.
 
-    **Every readable instant keeps its own cluster; a copy without one JOINS a cluster rather than
-    forming its own.** That makes it compete for one slot instead of adding one, which is what stops
-    two copies of a pass being fused at two processing baselines. Collapsing the whole tile-date
-    would prevent the same fusion by discarding coverage from passes whose instants were perfectly
-    readable — this function exists to preserve those, so it does not.
+    **Identity first, timestamps only where there is no identity.** Copies naming the same
+    observation (:func:`acquisition_identity`) are one cluster however far apart their catalogue
+    timestamps are — which is how reprocessings of one granule actually present themselves, so
+    grouping them by timestamp fused nothing and left both copies of a granule to be loaded and
+    mosaicked together. The remainder falls back to the timestamps, clustered within
+    :data:`_SAME_ACQUISITION_S`.
 
-    Which cluster an undated copy joins is arbitrary, which is why it cannot WIN one
-    (:func:`_preference_key` ranks a readable instant above data vintage) and why attributed
+    **A copy with neither JOINS a cluster rather than forming its own.** That makes it compete for
+    one slot instead of adding one, which is what stops two copies of a pass being fused at two
+    processing baselines. Collapsing the whole tile-date would prevent the same fusion by
+    discarding coverage from passes that identified themselves perfectly well — this function
+    exists to preserve those, so it does not.
+
+    Which cluster such a copy joins is arbitrary, which is why it cannot WIN one
+    (:func:`_preference_key` ranks a known acquisition above data vintage) and why attributed
     recovery will not place one (:func:`_first_for_failed_acquisition`).
 
-    Where instants ARE readable, splitting on them protects real coverage: keying on (tile, solar
-    day) alone dropped 493 of 2,733 items as duplicates when they were distinct acquisitions.
+    Splitting on a real acquisition protects real coverage: keying on (tile, solar day) alone
+    dropped 493 of 2,733 items as duplicates when they were distinct acquisitions.
     """
+    # Sorted so the cluster ORDER is a property of the items and not of catalogue response order.
+    identified: dict[str, list[Any]] = {}
     known: list[tuple[datetime.datetime, Any]] = []
-    undated: list[Any] = []
+    unplaceable: list[Any] = []
     for item in copies:
+        identity = acquisition_identity(item)
+        if identity is not None:
+            identified.setdefault(identity, []).append(item)
+            continue
         instant = acquisition_instant(item)
         if instant is None:
-            undated.append(item)
+            unplaceable.append(item)
         else:
             known.append((instant, item))
-    if not known:
-        return [copies]
 
-    dated = sorted(known, key=lambda pair: pair[0])
-    clusters: list[list[Any]] = [[dated[0][1]]]
-    for previous, current in itertools.pairwise(dated):
-        if (current[0] - previous[0]).total_seconds() > _SAME_ACQUISITION_S:
-            clusters.append([current[1]])
-        else:
-            clusters[-1].append(current[1])
-    clusters[0].extend(undated)
+    clusters: list[list[Any]] = [group for _, group in sorted(identified.items())]
+    if known:
+        dated = sorted(known, key=lambda pair: pair[0])
+        clusters.append([dated[0][1]])
+        for previous, current in itertools.pairwise(dated):
+            if (current[0] - previous[0]).total_seconds() > _SAME_ACQUISITION_S:
+                clusters.append([current[1]])
+            else:
+                clusters[-1].append(current[1])
+
+    if not clusters:
+        return [copies]
+    clusters[0].extend(unplaceable)
     return clusters
 
 
@@ -630,8 +741,8 @@ def _first_for_failed_acquisition(copies: list[Any], implicated: Sequence[Any]) 
     ``copies`` is already preference-ordered, so the plain answer is ``copies[0]`` — and that
     is what this returns when nothing was attributed, which is the pre-existing behaviour.
 
-    **When attribution DID name the failing objects, only candidates with a readable acquisition
-    instant are considered, and the answer is ``None`` if none of them belongs to the failing
+    **When attribution DID name the failing objects, only candidates whose own acquisition is
+    known are considered, and the answer is ``None`` if none of them belongs to the failing
     acquisition.** Falling back to the best overall alternate there swapped
     a healthy acquisition down to an older copy while leaving the known-bad one selected, then
     rebuilt and re-read the whole date only to fail the same way — once per unrelated spare before
@@ -646,14 +757,15 @@ def _first_for_failed_acquisition(copies: list[Any], implicated: Sequence[Any]) 
     if not implicated:
         return copies[0]
     for candidate in copies:
-        # A candidate with no readable instant is attached to a cluster ARBITRARILY, and the two
+        # A candidate naming neither an observation nor an instant is attached to a cluster
+        # ARBITRARILY, and the two
         # calls that need its acquisition see different item sets: this one clusters it against the
         # implicated copies, while `_alternate_for` clusters it against the survivors and lands on
         # the earliest. So it could be chosen as the spare for the acquisition that FAILED and then
         # swapped onto a healthy one — consuming the spare, leaving the failure selected, and
         # recovering nothing. Attributed recovery therefore only considers candidates whose
         # acquisition is a fact rather than a guess.
-        if acquisition_instant(candidate) is None:
+        if not _acquisition_is_known(candidate):
             continue
         for cluster in _by_acquisition([*implicated, candidate]):
             if any(it is candidate for it in cluster) and any(any(it is bad for bad in implicated) for it in cluster):
@@ -666,9 +778,8 @@ def _alternate_for(alternate: Any, survivors: Iterable[Any], *, taken: dict[int,
 
     Decided by :func:`_by_acquisition` rather than by a second notion of sameness, so the
     ladder can only ever step a copy down onto the acquisition it came from. Falls back to
-    the first un-swapped survivor when the acquisition instants cannot be read at all, which
-    is the pre-acquisition-split behaviour and correct for the single-acquisition case that
-    produced it.
+    the first un-swapped survivor when no copy names its acquisition at all, which is the
+    pre-acquisition-split behaviour and correct for the single-acquisition case that produced it.
     """
     free = [it for it in survivors if id(it) not in taken]
     if not free:
