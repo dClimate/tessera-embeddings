@@ -688,8 +688,9 @@ def log_duplicate_selection(
         where = f"; winners by source: {local} in-region, {len(winners) - local} remote"
 
     # Must name the terms in the ORDER `_preference_key` applies them. An operator reads this line
-    # to explain a selected pixel, so a stale order gives them the wrong explanation — and the
-    # already-harmonised term now outranks baseline freshness, which is the surprising one.
+    # to explain a selected pixel, so a stale order gives them the wrong explanation. Note where
+    # `owing no offset correction` sits: BELOW newest baseline, because the correction is applied
+    # per source and so owing one is no longer a reason to pass over a newer reprocessing.
     how = (
         "complete read set, then a decidable producer, then a known acquisition, then a readable "
         "baseline, then newest baseline, then owing no offset correction, then in-region, then "

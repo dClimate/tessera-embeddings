@@ -6,14 +6,14 @@ subtracts it from its own COGs; ESA's originals carry it. Which of those served 
 property of **where that band's object lives**, so the question is asked of a single asset rather
 than of an item, a date, or a collection.
 
-**One atom, three callers.** :func:`source_decision` is the only place the question is answered.
-The load path builds its per-source correction table from it, the load path's refusal guard reads
-it, and duplicate selection asks it of a candidate copy. Those three used to be separate
-derivations of an item-level answer, and they drifted: a spare that the correction path would
-refuse was offered to the fallback ladder, which recovers from a read failure and not from a
-refusal, so a single unreadable object aborted a whole ingest. Keeping the atom here — and keeping
-it free of any notion of *item* — is what makes that class of drift unrepresentable rather than
-merely tested for.
+**One atom.** :func:`source_decision` is the only place the question is answered. Its production
+caller is the load path's metadata parser, which stamps the answer onto each source as odc opens
+it; duplicate selection reaches the same evidence through :mod:`asset_locations` when it ranks a
+candidate copy. The answer used to be derived separately at item level in more than one place, and
+those derivations drifted: a spare that the correction path would refuse was offered to the
+fallback ladder, which recovers from a read failure and not from a refusal, so a single unreadable
+object aborted a whole ingest. Keeping the atom here — and keeping it free of any notion of *item*
+— is what makes that class of drift unrepresentable rather than merely tested for.
 
 Deliberately imports no odc. The GDAL environment has to be configured before ``odc.stac`` is
 imported (see :mod:`tessera_embeddings.config.environment` and the import ordering in

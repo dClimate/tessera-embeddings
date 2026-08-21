@@ -63,8 +63,9 @@ from odc.loader import RioDriver, RioReader  # noqa: E402
 
 # Private, and the only private odc import here. `_resolve_driver` uses a driver's own `md_parser`
 # when it supplies one, so stamping the per-source offset at parse time means subclassing odc's
-# STAC parser. Paid for by a 48x reduction in graph size against the alternative — see
-# `BoaOffsetParser` — and the reason `odc-stac` is pinned rather than floating.
+# STAC parser. Paid for by what the parser carries instead of a lookup table — 158 bytes against a
+# measured 14.6 MB, see `BoaOffsetParser` — and the reason `odc-stac` is pinned rather than
+# floating.
 from odc.stac._mdtools import StacMDParser  # noqa: E402
 
 # Dimension name mapping: the project uses northing/easting everywhere, but
@@ -1142,9 +1143,9 @@ def query_stac_items(
     # `groupby="solar_day"`, and odc.stac's painter keeps the last item written for a pixel. Sorting
     # clearest-first therefore let the CLOUDIEST scene win wherever two scenes of one solar day
     # overlap — the opposite of the intent, and silent, because the output has the right shape and
-    # the right dates. The campaign's own S2 path (`s2_roi._ingest_s2_dates`) already reverses the
-    # order for exactly this reason and says so; the two orderings disagreed, and this generic API
-    # was the one that was wrong.
+    # the right dates. The campaign's own S2 path in `s2_roi` already reverses the order for
+    # exactly this reason and says so; the two orderings disagreed, and this generic API was the
+    # one that was wrong.
     #
     # Keyed on the SOLAR day, matching `normalize_to_solar_day` just above and the loader's own
     # grouping. Keying on the UTC date instead splits a group the loader treats as one, in the
@@ -1349,23 +1350,20 @@ def load_stac_items(
 def group_items_by_date(items: list[Any]) -> dict[str, list[Any]]:
     """Group STAC items by day, matching how the loader will group them.
 
-    Pass ``mid_longitude`` — the ROI geobox centroid's longitude in WGS84 — whenever the
-    load uses ``groupby="solar_day"``, which is every S2 path. The loader groups by LOCAL
-    solar day, shifting each timestamp by that longitude; grouping here by UTC calendar
-    date instead lets the two disagree, and a group the caller believes is one day then
-    loads as TWO time slices.
+    Groups on ``solar_day_of``, which reads the solar day each item was already stamped with.
+    Items must therefore have passed :func:`normalize_to_solar_day` first — it is what applies the
+    longitude shift, and grouping by UTC calendar date instead lets this and the loader disagree,
+    so a group the caller believes is one day loads as TWO time slices.
 
-    That divergence is not hypothetical and not uniform: it appears where the solar offset
-    is large enough to push acquisitions across UTC midnight, i.e. the far-eastern and
-    far-western zones, and never in the middle longitudes. Downstream code assumes one
-    slice per group (the cloud mask is reduced to a single 2-D slice), so the mismatch
-    surfaces as a dimension conflict rather than as anything that names the cause.
+    That divergence is not uniform: it appears where the solar offset is large enough to push
+    acquisitions across UTC midnight, i.e. the far-eastern and far-western zones, and never in the
+    middle longitudes. Downstream code assumes one slice per group (the cloud mask is reduced to a
+    single 2-D slice), so the mismatch surfaces as a dimension conflict rather than as anything
+    that names the cause.
 
-    Omitting ``mid_longitude`` keeps the old UTC-date behaviour, which is correct only for
-    callers that do not group by solar day.
-
-    Items should typically be pre-sorted by (date, cloud_cover) via ``query_stac_items``
-    so that within each group, clearer tiles come first.
+    Within-group order is the caller's. ``query_stac_items`` sorts a date CLOUD-DESCENDING, so the
+    cloudiest tile comes first and the clearest last — which is what the loader's painter needs,
+    since it keeps the LAST item written for a pixel.
 
     Returns:
         Dict mapping ``YYYY-MM-DD`` to lists of items, preserving insertion order and

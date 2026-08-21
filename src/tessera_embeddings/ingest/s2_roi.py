@@ -544,21 +544,24 @@ def ingest_s2_roi_reflectance(
             # The day has no correct offset decision, so it is SKIPPED — loudly, and alone.
             #
             # Not carried back as a read failure. The duplicate-copy ladder recovers from an
-            # object that will not read, and this is not that: the conflict is between different
-            # TILES of the day, so no other copy of any one tile resolves it. Stepping down would
-            # burn every rung and refuse identically.
+            # object that will not read, and this is not that. The ladder cannot contain a refusing
+            # copy by construction: `_preference_key` ranks one last and `select_preferred_duplicates`
+            # withholds it from the alternates, so stepping down would burn every rung and refuse
+            # identically.
             #
             # And not raised, which is what it used to do. A refusal is deterministic and belongs
             # to ONE day, so propagating it failed the whole leg — every retry of the leg then
             # reached the same day and died the same way, losing a whole zone-year to one day's
-            # metadata. Measured on zone 01N: 26 of 60 days in early 2024 refuse, so propagating
-            # made that cell unfillable rather than merely incomplete.
+            # metadata. Measured on zone 01N: 347 of 366 days in 2024 refused, so propagating made
+            # that cell unfillable rather than merely incomplete.
             #
             # The correction stays refused either way: nothing here corrects a day it cannot
             # decide. This changes only how much is lost when it cannot — one day instead of the
-            # year. The real fix removes the conflict rather than isolating it, by correcting each
-            # item before the mosaic; see
-            # `context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md`.
+            # year. What remains reachable is narrow: the offset is decided per source, so a day
+            # mixing producers no longer refuses. A source whose bucket is classified as neither
+            # harmonised nor unharmonised does, and the fix for that is to classify the bucket in
+            # `asset_locations` or to correct the catalogue's `s2:processing_baseline` — see
+            # `context_docs/decisions/021-correct-the-boa-offset-per-image.md`.
             log.warning(
                 "Skipping %s for roi=%s: no single offset decision fits the day. %s",
                 date,
@@ -1241,7 +1244,9 @@ def ingest_s2_roi_reflectance(
             "DATA LOSS SUMMARY roi=%s: %d date(s) refused because no single offset decision fits "
             "the day — %s. Recorded on the store as assessed_unreadable_dates with "
             "scope=producer-conflict. These are NOT coverage rejections and are counted "
-            "separately; they need the correction applied per item before the mosaic, not a retry.",
+            "separately, and no retry or fallback copy addresses one. The remedy is to classify the "
+            "source's bucket in `asset_locations` as harmonised or unharmonised, or to fix the "
+            "catalogue item's `s2:processing_baseline`; the exception text names which applies.",
             roi_label,
             len(producer_conflict_dates),
             "; ".join(f"{c['date']} tiles={c['tiles']}" for c in producer_conflict_dates[:20]),

@@ -38,13 +38,6 @@ PREFERRED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-cogs", "e84-earth
 #: already-harmonised pixels is as wrong as leaving raw ones alone, and equally silent.
 UNHARMONISED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-s2-l2a"})
 
-#: The ESA archive that a Sentinel-2 catalogue may point at INSTEAD of a harmonised mirror.
-#: Named because reaching it is the surprising route: Earth Search was believed to serve only
-#: its own harmonised COGs, so a correction owed on data from here is the case worth announcing.
-#: Other unharmonised producers (Planetary Computer, on Azure) are corrected as a matter of
-#: course and need no announcement.
-RAW_ARCHIVE_BUCKETS: frozenset[str] = frozenset({"sentinel-s2-l2a"})
-
 #: Buckets whose Sentinel-2 surface reflectance already has the post-baseline-04.00 offset
 #: subtracted. Membership is a determination about the PRODUCER, taken from the pixels and NOT
 #: from the catalogue's own account of itself.
@@ -268,16 +261,3 @@ def item_harmonisation(
     if sources.any_in(buckets) and sources.any_in(UNHARMONISED_ASSET_BUCKETS):
         return Harmonisation.MIXED
     return Harmonisation.UNKNOWN
-
-
-def item_is_from_raw_archive(
-    item: Any,  # noqa: ANN401 — any STAC-like item
-    buckets: frozenset[str] = RAW_ARCHIVE_BUCKETS,
-) -> bool:
-    """Whether this item's reflectance comes from the ESA archive named in ``buckets``.
-
-    Narrower than "not harmonised", and deliberately: every Planetary Computer item is
-    unharmonised too, and correcting those is routine rather than notable. Only the archive a
-    harmonised-COG catalogue has started pointing at is a surprise worth a warning.
-    """
-    return read_asset_sources(item, REFLECTANCE_ASSET_KEYS).any_in(buckets)
