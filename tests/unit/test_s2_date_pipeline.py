@@ -532,41 +532,69 @@ def test_a_coverage_gate_read_failure_reaches_the_duplicate_ladder(run_ingest, m
     assert "DATA LOSS" in caplog.text
 
 
-@pytest.mark.parametrize(
-    "n_dates, refuses",
-    [(s2_roi.MAX_UNREADABLE_DATES, False), (s2_roi.MAX_UNREADABLE_DATES + 1, True)],
-)
-def test_the_unreadable_skip_is_bounded_per_leg(run_ingest, monkeypatch, caplog, n_dates, refuses):
-    """One missing object costs its date; a run of them has to cost the run.
+def _missing_object_gate(*_a, **_k):
+    """A coverage gate whose object is not there.
 
-    Both are the same failure seen one date at a time, and no single date can tell them
-    apart: an object the provider never published and a prefix that has gone produce the
-    identical not-found. So the count is what separates them. Under the ceiling the leg
-    finishes and records each loss; over it the leg refuses, because the alternative is
-    committing a mosaic quietly short of those dates and reporting success — and every
-    date recorded excuses its whole month from the gate that would otherwise catch it.
+    Raises the form the Dask boundary actually delivers: a plain ``Exception`` carrying
+    rasterio's repr, because tblib cannot rebuild the GDAL-backed class on the driver. A test
+    raising a live rasterio error would pass against code that only handles live rasterio
+    errors, which is not the code that runs.
     """
+    raise Exception("RasterioIOError('ObjectNotFound: The specified key does not exist.')")
 
-    def gate_finds_no_object(*_a, **_k):
-        # The form the Dask boundary delivers: a plain exception carrying rasterio's repr.
-        raise Exception("RasterioIOError('ObjectNotFound: The specified key does not exist.')")
 
-    monkeypatch.setattr(s2_roi, "_coverage_from_scl", gate_finds_no_object)
+def test_a_handful_of_missing_objects_is_skipped_and_the_leg_completes(run_ingest, monkeypatch, caplog):
+    """The decision this fix exists to implement: lose the date, keep the zone-year.
+
+    An href the provider never published fails at open, so it reaches the same give-up path
+    a corrupt object does. The leg must finish, record each loss durably, and accept the
+    slight loss of depth — a few dates must NOT stop it, whatever the runaway cap is set to.
+    """
+    monkeypatch.setattr(s2_roi, "_coverage_from_scl", _missing_object_gate)
+    assessed: list[str] = []
+    monkeypatch.setattr(s2_roi, "record_assessed_window", lambda path, *_a, **_k: assessed.append(path))
+    dates = {"2024-01-01": True, "2024-01-02": True, "2024-01-03": True}
+
+    with caplog.at_level(logging.ERROR):
+        # Over an already-populated store, so the assessed-window record is reached: it is
+        # keyed on the store holding dates, not on what this invocation wrote.
+        run = run_ingest(dates, pipeline_dates=False, existing_dates={"2023-12-31"})
+
+    assert run.result.dates_filtered_coverage == 3
+    assert "DATA LOSS" in caplog.text
+    # The loss is durable, so the gate downstream sees it rather than inferring a gap.
+    assert assessed == ["memory://store/reflectance.zarr"]
+
+
+@pytest.mark.parametrize("n_dates, stops", [(2, False), (3, True)])
+def test_the_runaway_cap_stops_a_leg_that_is_losing_every_date(run_ingest, monkeypatch, caplog, n_dates, stops):
+    """The cap is a compute guard, not a data guard.
+
+    A leg losing dates at this rate will fail its coverage gate whatever it does next, so
+    every further date buys the same verdict at fleet prices. What keeps a thin year from
+    publishing is downstream and unaffected by this: an emptied month holding given-up dates
+    is one the coverage gate refuses to excuse, and the per-pixel observation floor refuses
+    a pixel too thin to describe its year.
+
+    The cap is monkeypatched rather than exercised at its shipped value: what needs pinning is
+    that the wiring fires exactly one date past whatever the value is, and standing up
+    ``MAX_UNREADABLE_DATES + 1`` real dates to see it would cost minutes to say the same thing.
+    """
+    monkeypatch.setattr(s2_roi, "_coverage_from_scl", _missing_object_gate)
+    monkeypatch.setattr(s2_roi, "MAX_UNREADABLE_DATES", 2)
     assessed: list[str] = []
     monkeypatch.setattr(s2_roi, "record_assessed_window", lambda path, *_a, **_k: assessed.append(path))
     dates = {f"2024-01-{day:02d}": True for day in range(1, n_dates + 1)}
-    # Over an already-populated store, so the assessed-window record is reached on the
-    # completing run — without that it is skipped either way and the assertion below on the
-    # refusing run would hold for the wrong reason.
     populated = {"2023-12-31"}
 
-    if refuses:
-        expected = rf"{n_dates} date\(s\).*ceiling of {s2_roi.MAX_UNREADABLE_DATES}"
-        with pytest.raises(s2_roi.TooManyUnreadableDatesError, match=expected):
+    if stops:
+        # The message has to name both numbers: an operator reading it decides whether the
+        # cap fired on a real outage or on a value set too low.
+        with pytest.raises(s2_roi.TooManyUnreadableDatesError, match=rf"{n_dates} date\(s\).*ceiling of 2"):
             run_ingest(dates, pipeline_dates=False, existing_dates=populated)
-        # And it refuses BEFORE the assessed window is recorded: that attribute says the
-        # range was examined and its holes accounted for, which a leg that stopped part-way
-        # has not done. Written anyway, it would excuse gaps nobody assessed.
+        # And it stops BEFORE the assessed window is recorded: that attribute excuses every
+        # absent month inside the range it names, and a leg that stopped part-way never
+        # reached most of that range. Written anyway, it would excuse months nobody examined.
         assert assessed == []
         return
 

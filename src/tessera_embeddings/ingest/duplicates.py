@@ -782,11 +782,14 @@ def is_unreadable_source(exc: BaseException) -> bool:
 
     A missing object qualifies, and the text that says so cannot say WHOSE object it was:
     a source href that was never published and a hole in the destination store report the
-    same not-found. Nothing narrower is available at this boundary, so the caller bounds how
-    many dates one run may give up this way — see
-    :data:`~tessera_embeddings.ingest.s2_roi.MAX_UNREADABLE_DATES`. Note what is NOT matched:
-    a whole bucket or prefix being gone, which is systemic by definition and must fail the run
-    on the first date rather than be skipped date by date.
+    same not-found. Nothing narrower is available at this boundary, and what catches a run
+    that skips its way into a thin year is DOWNSTREAM: the coverage gate declines to excuse an
+    emptied month whose dates the ingest recorded as given up. The caller also caps how many
+    dates one leg may give up, as a runaway guard on fleet time rather than a data check
+    (:data:`~tessera_embeddings.ingest.s2_roi.MAX_UNREADABLE_DATES`).
+
+    Note what is NOT matched: a whole bucket or prefix being gone, which is systemic by
+    definition and must fail the run on the first date rather than be skipped date by date.
     """
     seen: list[str] = []
     current: BaseException | None = exc

@@ -28,8 +28,10 @@ The algorithm is unchanged from the reference:
      object that will never read — corrupt, or never published — steps DOWN to the
      tile-date's next catalogue copy; when every copy has failed the date is skipped
      and recorded, so the loss is a finding on the store rather than an unexplained
-     gap. Only up to ``MAX_UNREADABLE_DATES`` of them: past that the leg refuses,
-     because losses at that scale are systemic rather than per-object.
+     gap. Up to ``MAX_UNREADABLE_DATES`` of them: past that the leg stops, not to
+     protect the data — the coverage gate downstream is what refuses a hollow year —
+     but because a leg losing dates at that rate will fail that gate whatever it does
+     next.
 
 Step 4 is split into a prepare half and a write half so ``pipeline_dates`` can
 overlap one date's preparation with the previous date's write, and so
@@ -131,24 +133,28 @@ logger = logging.getLogger(__name__)
 #: catalogue. Passing the same tuple to both is what makes the two agree.
 _LOADED_EXTRA_BANDS = ["scl"]
 
-#: The most dates one leg may give up as unreadable before it refuses the whole run.
+#: A RUNAWAY GUARD on how many dates one leg may give up as unreadable. Not a quality
+#: threshold, and not what keeps bad data out.
 #:
-#: Skipping a date whose every catalogue copy will not read is right in the small: one date's
-#: pixels are a smaller loss than the zone-year that raising would cost. It stops being right
-#: in the large, and a single date cannot tell the two apart — a handful of objects broken or
-#: unpublished at the provider, and a systemic failure taking out a prefix, a band, or a
-#: month's publications, look identical one date at a time. Unbounded, the second resolves as
-#: a mosaic quietly missing weeks that reports success, which is the outcome the skip exists
-#: to avoid, arrived at from the other side.
+#: Skipping a date whose every catalogue copy will not read is the intended outcome: the
+#: alternative is losing the zone-year, and the slight loss of depth a skip implies is
+#: accepted with it. Nothing about a few lost dates should stop a leg.
 #:
-#: The number is bounded from both directions. Below, by what a healthy leg loses: a source
-#: object that will never read is rare per granule, so a zone-year normally records none and
-#: occasionally one or two, and a ceiling near that would refuse legitimate runs. Above, by
-#: what the durable record DOES downstream: one recorded unreadable date excuses its whole
-#: month from the coverage gate (``inference.data_loading._months_holding_unreadable_dates``),
-#: so k recorded dates can excuse k of the twelve months a leg covers. Half the year is the
-#: most this path may ever excuse.
-MAX_UNREADABLE_DATES = 6
+#: What makes that safe sits DOWNSTREAM. A loss big enough to matter empties whole months, and
+#: an empty month holding unreadable dates is one the coverage gate refuses to excuse
+#: (``inference.data_loading._months_holding_unreadable_dates``, pinned by
+#: ``tests/unit/test_time_window.py``), so the cell fails before it publishes. Per pixel,
+#: :data:`~tessera_embeddings.config.inference.OPTICAL_MIN_OBS` refuses anything too thin to
+#: describe its year. Recording a loss makes both of those STRICTER, never more permissive.
+#:
+#: So this number answers a COMPUTE question, not a correctness one. A leg that has given up
+#: this many dates is going to fail that coverage gate whatever it does next, and every date
+#: after this one costs real fleet time to reach the same verdict. Stopping is cheaper than
+#: finishing. The value therefore sits an order of magnitude above what a healthy leg loses —
+#: a source object that will never read is rare per granule, so a zone-year records at most a
+#: couple — and around the scale at which the downstream gate would fire anyway, which is a
+#: month of the leg's year. Nothing between those two bounds should ever reach it.
+MAX_UNREADABLE_DATES = 30
 
 
 class TooManyUnreadableDatesError(RuntimeError):
@@ -164,29 +170,35 @@ def refuse_past_unreadable_ceiling(
     unreadable: Sequence[dict[str, str]],
     roi: str,
     *,
-    ceiling: int = MAX_UNREADABLE_DATES,
+    ceiling: int,
 ) -> None:
-    """Refuse the leg once ``unreadable`` holds more given-up dates than ``ceiling`` allows.
+    """Stop the leg once ``unreadable`` holds more given-up dates than ``ceiling`` allows.
 
-    Called each time a loss is recorded, so the refusal reports the whole set rather than the
-    last date, and a leg that stays under the ceiling pays nothing but a length check.
+    Called each time a loss is recorded, so the stop reports the whole set rather than the last
+    date, and a leg under the ceiling pays nothing but a length check. See
+    :data:`MAX_UNREADABLE_DATES` for what the ceiling is for: it is a runaway guard, and the
+    correctness of what a leg under it publishes is enforced downstream rather than here.
 
-    Refusing here leaves NO assessed-window record, deliberately. That attribute says a range
-    was examined and the holes inside it accounted for; a leg that stopped part-way has
-    accounted for nothing, and writing it anyway would hand the next run an excuse for gaps
-    nobody assessed. Failing before it is written is what makes the window re-examined instead.
+    ``ceiling`` has no default because one caller decides it, and a second copy of the value
+    living in this signature could disagree with the constant the module documents.
+
+    Stopping here leaves NO assessed-window record, deliberately. That attribute says a range
+    was examined in full, and it excuses every absent month inside it. A leg that stopped
+    part-way never reached most of its range, so writing the attribute anyway would excuse the
+    months it never looked at — not the ones it gave up on, which the record names and the gate
+    then refuses to excuse. Failing before it is written is what makes the window re-examined.
     """
     if len(unreadable) <= ceiling:
         return
     raise TooManyUnreadableDatesError(
-        f"REFUSING roi={roi}: {len(unreadable)} date(s) were given up because every catalogue "
-        f"copy of some object failed to read, past the ceiling of {ceiling}. A few such objects "
-        f"are ordinary and are skipped per date; this many says the cause is not per-object — a "
-        f"prefix, a band, or a period of publications is missing — and continuing would commit a "
-        f"mosaic quietly short of those dates, because each one recorded excuses its whole month "
-        f"from the downstream coverage gate. Dates: "
+        f"STOPPING roi={roi}: {len(unreadable)} date(s) were given up because every catalogue "
+        f"copy of some object failed to read, past the ceiling of {ceiling}. Skipping a date is "
+        f"the intended outcome and a few cost only a little depth; this many says the cause is "
+        f"not per-object — a prefix, a band, or a period of publications is missing — and a leg "
+        f"this far down will fail its coverage gate whatever it does next, so finishing it would "
+        f"spend fleet time reaching the same verdict. Dates: "
         f"{', '.join(str(u.get('date')) for u in unreadable)}. Establish what is missing at the "
-        f"provider before re-dispatching; a retry alone reaches the same refusal."
+        f"provider before re-dispatching; a retry alone reaches the same stop."
     )
 
 
@@ -954,8 +966,8 @@ def ingest_s2_roi_reflectance(
             re-stated at the end of the run and recorded on the store, because a log line
             alone is lost the moment nobody greps for it.
 
-            The trade holds only while the losses are FEW, so the count is capped: see
-            :data:`MAX_UNREADABLE_DATES` for what a leg crossing it is being told.
+            The count is capped, though not for the data's sake: see
+            :data:`MAX_UNREADABLE_DATES` for what a leg crossing the cap is being told.
 
             ``scope`` on the durable record says how precisely the loss is located.
             ``attributed`` means the named objects are the ones the loader actually gave up
@@ -991,9 +1003,10 @@ def ingest_s2_roi_reflectance(
                 exc,
                 exc_info=True,
             )
-            # Bounded, and checked AFTER the line above so the date that crossed the ceiling
-            # is described as fully as every date before it.
-            refuse_past_unreadable_ceiling(unreadable_tile_dates, roi_label)
+            # Checked AFTER the line above so the date that crossed the ceiling is described
+            # as fully as every date before it. The constant is resolved HERE, at the call
+            # site, so this module holds the operative value in one place.
+            refuse_past_unreadable_ceiling(unreadable_tile_dates, roi_label, ceiling=MAX_UNREADABLE_DATES)
 
         def _consume(prepared: _PreparedDate, stall_s: float) -> None:
             """Count or write one prepared date — the ONE consume path both modes take.

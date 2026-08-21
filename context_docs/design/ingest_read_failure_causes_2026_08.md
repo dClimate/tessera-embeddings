@@ -536,29 +536,82 @@ and the zone-year was classified deterministic and never re-dispatched. The clas
 right by accident — a retry would have read the same absent object — but nothing in the code knew
 that, and the collision is still live for any future S3 404 reaching that classifier.
 
-### Why the skip has to be bounded
+### The skip, and where its safety actually comes from
 
-Skipping the date is right for one missing object and wrong for a hundred, and **a single date
-cannot tell the two apart**: an unpublished granule and a vanished prefix produce the identical
-not-found. Two further reasons the unbounded version is worse than it looks:
+**Corrected in place 2026-08-20. The claim withdrawn:** this section previously said that "one
+recorded unreadable date **excuses its whole month** from the downstream coverage gate, so k
+recorded dates can excuse k months", and derived a ceiling of 6 as "half a calendar year, the most
+this path may ever excuse". **That reading was inverted, and the ceiling argument built on it is
+withdrawn.** Read `inference/data_loading.py` around the gate rather than the helper in isolation:
 
-- the marker cannot say WHOSE object was missing. A hole in the DESTINATION store reports the
-  same not-found as a missing source href, and nothing narrower is available at that boundary.
-- one recorded unreadable date **excuses its whole month** from the downstream coverage gate
-  (`inference.data_loading._months_holding_unreadable_dates`). The record that makes the loss
-  visible is also what stops the gate from catching it, so k recorded dates can excuse k months.
+```python
+_lost_months = _months_holding_unreadable_dates(_raw_unreadable)
+_explained   = _months_within_assessed(missing, _assessed) if missing else set()
+_explained   = (_explained - _lost_months) if _lost_months is not None else set()
+```
 
-So `s2_roi.MAX_UNREADABLE_DATES` caps it at **6**, bounded from both directions: a healthy
-zone-year records none, occasionally one or two (cause 2 above: only four distinct broken objects
-appeared in eight hours of fleet logs), so a tighter ceiling would refuse legitimate runs; and 6 of
-a calendar year's 12 months is the most this path may ever excuse. Crossing it raises
-`TooManyUnreadableDatesError`, which names the count and the ceiling, and which is refused BEFORE
-the assessed-window record is written — a leg that stopped part-way has accounted for nothing, and
-writing that attribute anyway would hand the next run an excuse for gaps nobody assessed.
+`_lost_months` is **subtracted** from the excused set. A given-up date therefore **disqualifies**
+its month from being excused, what remains in `missing` raises `InsufficientCoverageError`, and the
+comment above that code states the intent outright: "Excusing it would let a write-once year
+publish a whole-month data-loss hole labelled a legitimate absence." The record makes the gate
+**stricter**, never more permissive, and `tests/unit/test_time_window.py::
+test_a_month_lost_to_unreadable_imagery_is_not_excused` had pinned exactly that all along.
 
-`NoSuchBucket` is deliberately NOT matched. A bucket or prefix that has gone is systemic by
-construction and every remaining date fails identically, so it must fail the leg on the first date
-rather than spend the ceiling discovering it one date at a time.
+**So the skip is safe for a reason that owes nothing to the ingest-side cap.** Two cases, and the
+gate covers the one that matters:
+
+- **every date in a month lost** — the month is empty AND holds given-up dates, so it is not
+  excused, stays in `missing`, and the cell fails with `InsufficientCoverageError` before
+  publishing anything.
+- **some dates lost from a month that keeps others** — the month reads as present, and the gate
+  only ever inspects WHOLLY absent months (`missing = required_months - present_months`), so it
+  never looks. That month's depth is quietly reduced. The only rule that sees it is per pixel
+  rather than per month: `config.inference.OPTICAL_MIN_OBS` refuses a pixel with too few valid
+  optical observations in the year, rather than publishing it thin.
+
+A vanished bucket never reaches either case, because `NoSuchBucket` is deliberately NOT matched: a
+bucket or prefix that has gone is systemic by construction and every remaining date fails
+identically, so it fails the leg on the first date rather than being skipped date by date.
+
+**The owner's decision, 2026-08-20: skip the date, keep the leg, and accept the slight loss of
+depth the second case implies.** That is what the code does.
+
+### The cap, and what it is for
+
+`s2_roi.MAX_UNREADABLE_DATES` is a **runaway guard on fleet time, not a data check**. A leg that has
+given up this many dates is going to fail the coverage gate above whatever it does next, so every
+further date buys the same verdict at fleet prices — plus a log line each, which is unpleasant to
+operate. Crossing it raises `TooManyUnreadableDatesError`, which names the count and the ceiling,
+and which fires BEFORE the assessed-window record is written: that attribute excuses every absent
+month inside the range it names, and a leg that stopped part-way never reached most of that range,
+so writing it would excuse months nobody examined.
+
+**The value was not tuned, deliberately.** The observed rate does not justify the effort: see the
+rate below. It sits an order of magnitude above what a healthy leg loses and around the scale at
+which the downstream gate would fire anyway, and nothing between those bounds should reach it.
+
+### The observed rate — why this is low priority
+
+Measured 2026-08-20/21 on the live campaign, and the reason the fix is deferred rather than rushed:
+
+| measurement | value |
+|---|---|
+| zone-years abandoned by this defect | **1** |
+| zone-years attempted | ~244 |
+| recurrence in the 91 minutes after, at 60 concurrent cells | **none** |
+| required files probed across ten sample days | 100,320, of which **exactly one** missing |
+
+The existing shelf-and-second-wave machinery absorbs a failure at that rate, which is why the
+campaign was left to run and the fix left unmerged.
+
+### A docstring that is broader than its code
+
+`_months_holding_unreadable_dates`'s prose says "a month whose EVERY acquisition was skipped as
+unreadable", while the implementation adds the month of **ANY** given-up date. Recorded, not
+changed. The breadth is currently inert: the set is only ever intersected with, or subtracted from,
+months already known to be WHOLLY absent, so a month that kept a date is never in play. A future
+caller using the helper on its own would inherit the wider meaning without the docstring warning
+it.
 
 ## Coupling to the leg retry
 
