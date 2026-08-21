@@ -1,7 +1,10 @@
 # 020 — Removing the Sentinel-2 brightness offset, and choosing which copy to read
 
 **Status:** Accepted 2026-08-20. Built on `solutions/prefer-in-region-duplicate-assets` (PR #107).
-Three limits are live and unfixed, and they are one piece of follow-up work — see section 5.
+
+**One limit is a blocker, not a caveat.** In a region containing any ESA originals that need
+correcting, nearly every day of the year is refused — measured at 347 days of 2024 for one region.
+Read limit 1 in section 5 before deciding to merge.
 
 This document is written to be read by someone who has not seen the code. Terms are defined at
 first use, and there is a glossary at the end.
@@ -351,15 +354,51 @@ for full years:
 A single case was also found outside that region, in map zone 59 in 2019. So this is a recurring
 and increasing population, not a one-off in a single year.
 
-**How often, and how bad.** Measured on the live catalogue: 26 of 60 days in early 2024 refuse in
-zone 01N, and 5 of 60 even in Europe. A refused day used to fail the whole optical leg — the run
-that found this lost a whole zone-year to one day — so a refused day is now skipped alone and
-counted, so the loss is bounded to that day and is announced.
+**How often, and how bad — and this is much worse than a first estimate suggested.** Re-running
+zone 01N for 2024 on a build that skips refused days instead of failing, the pipeline skipped
+**347 days of the year.** Essentially the whole year: 25 days of January, 29 of February, 31 of
+March, and so on through every month. That zone produces almost no optical imagery at all.
+
+An earlier estimate here said 26 of 60 days, from sampling a box inside the zone. That was far too
+low, and the reason matters:
+
+```
+  A day refuses if the day contains BOTH
+      an ESA original needing correction   AND   an already-corrected copy.
+
+  Corrected copies are the overwhelming majority, so the second condition is
+  almost always met. The day therefore refuses if ANY tile in the whole region
+  has an ESA original needing correction that day.
+
+  A whole region covers hundreds of tiles. Roughly fifteen of them carry such
+  originals, and the satellite images each tile every two or three days.
+        ──►  on almost every day of the year, at least one of them appears
+        ──►  almost every day refuses
+```
+
+So the frequency is not a property of how many files need correcting — it is a property of whether
+the region contains **any** of them. A region with none loses nothing; a region with a handful loses
+nearly everything. Sampling a sub-box measures the wrong thing, because it sees fewer tiles than the
+real region does.
+
+**This makes the limit a blocker for affected regions rather than an accepted cost.** A refused day
+is now skipped alone and announced rather than failing the whole run, which is a real improvement —
+the run that found this lost a whole region-year to a single day — but skipping 347 days is not a
+usable outcome.
 
 **The fix** is to apply the correction to each image before they are combined, rather than to the
 combined result. That removes the conflict instead of isolating it, because different tiles occupy
 different ground: there is no pixel that is both corrected and uncorrected. It is a change to how
-imagery is loaded, and it is owed as separate work.
+imagery is loaded, and on this evidence it is a **prerequisite for ingesting affected regions**, not
+a follow-up.
+
+**A cheaper interim option, not implemented and offered for a decision.** On a day that would
+refuse, drop the ESA originals needing correction and load only the already-corrected copies. The
+day then has one consistent answer and loads. The cost is the handful of tiles whose *only* copy that
+day was an ESA original — so instead of losing the whole day, the region loses those tiles for that
+day. That is a large improvement over 347 lost days, but it is a deliberate choice to prefer
+corrected coverage over complete coverage, its cost in tiles has not been measured, and it should be
+decided rather than assumed.
 
 ### Limit 2 — The floor is applied after images are resized
 
