@@ -28,6 +28,7 @@ import icechunk
 import numpy as np
 import zarr
 
+from tessera_embeddings.config.inference import ModelVersion
 from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     GLOBAL,
@@ -220,7 +221,7 @@ def _root_attrs(
     layout: StoreLayout,
     model_version: str | None,
     optical_min_obs: int | None,
-    encoder_version: str | None = None,
+    encoder_version: ModelVersion | None = None,
 ) -> dict:
     """Root-group attrs for the multi-zone campaign store: geoemb: stated once.
 

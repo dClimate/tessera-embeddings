@@ -184,3 +184,19 @@ def test_an_explicitly_empty_norm_source_is_refused_not_defaulted() -> None:
         _minimal_config(norm_source="")  # type: ignore[arg-type]
     assert _minimal_config(norm_source=None).norm_source == "aws", "unset still defaults"
     assert _minimal_config(norm_source="mpc").norm_source == "mpc"
+
+
+def test_band_stats_refuses_an_empty_norm_source_too() -> None:
+    """The SAME defaulting trap, at a second site — and the validation just below it cannot
+    catch this one, because `""` has already become `"aws"` by the time the check runs.
+
+    Worth its own test rather than folding into the config test above: `band_stats` is called
+    directly by the actor with whatever the config resolved, so it is reachable independently.
+    """
+    from tessera_embeddings.config.inference import band_stats
+
+    with pytest.raises(ValueError, match="Invalid norm_source"):
+        band_stats("v1.1", norm_source="")
+    assert band_stats("v1.1", norm_source=None) == band_stats("v1.1", norm_source="aws")
+    # v2 hard-codes one set and ignores the argument entirely.
+    assert band_stats("v2-large", norm_source="") == band_stats("v2-large")

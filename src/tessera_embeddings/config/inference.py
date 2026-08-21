@@ -311,7 +311,11 @@ def band_stats(
     """
     if model_version == "v2-large":
         return _V2_NORM_STATS
-    source = norm_source or "aws"
+    # `is None`, not truthiness — the same trap as `InferenceConfig.__post_init__`, and the
+    # validation below cannot catch it: an explicit "" has already become "aws" by then, which
+    # IS valid. A caller passing an empty string from untyped YAML would silently get AWS
+    # statistics for a checkpoint trained on the other set.
+    source = "aws" if norm_source is None else norm_source
     if source not in _NORM_STATS:
         valid = ", ".join(repr(k) for k in _NORM_STATS)
         raise ValueError(f"Invalid norm_source: {source!r}. Must be one of {valid}.")
