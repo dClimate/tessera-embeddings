@@ -1511,6 +1511,58 @@ isolates first: an unreadable source anywhere in a batch re-runs the batch's dat
 time, each then getting the per-date recovery. That isolation is what stops one corrupt
 object from failing a zone-year identically on every retry.
 
+### When the provider refuses the read
+
+An authorization refusal, a throttle and a server error are a different finding again, and
+`is_provider_refusal` in `duplicates.py` is the predicate for them. What separates them from
+an unreadable object is that they say nothing about the imagery: the same object read minutes
+earlier and reads again once the service recovers. So no fallback copy helps and no catalogue
+change is called for — which is exactly why `is_unreadable_source` declines them and why this
+predicate sits beside it rather than inside it. The two questions have opposite answers.
+
+It fails closed in both directions. A credential fault on THIS side — an expired token, a
+signature mismatch — is excluded first, because it is repairable here and no amount of waiting
+fixes it; absorbing one would spend a bounded budget of given-up dates on a fault nobody was
+told about. And anything unrecognised is excluded too, so the caller re-raises.
+
+One asymmetry to know about: `is_unreadable_source` recognises refusals by NAME
+(`AccessDenied`, `SlowDown`), so a refusal reported as a bare status code carries none of the
+words it looks for, and the wrapper's own decode marker is all it sees. Both predicates then
+claim the same failure. Callers that can act on both resolve it by ORDER — asking about the
+refusal first, because that is the specific answer — and the radar loop below does exactly
+that.
+
+### The radar bounded skip (`s1_roi.py`)
+
+Every OPERA read on the radar path happens inside a date's write, so a failed read raises out
+of the per-date loop. Until the bounded skip, that meant one refused read cost every LATER
+date in the window as well: a source refusing reads for a few minutes emptied whole zone-years
+that had already committed months of sound data.
+
+The radar response is the tail of the optical one without the ladder, which radar has no use
+for — OPERA publishes one copy of a granule, so there is nothing to step down to:
+
+1. **Retry**, through the shared `store_write_retrying` policy, which covers a refusal that
+   clears inside a backoff.
+2. **Give up the date** once that retry is exhausted, if and only if the failure is one the
+   source is answerable for. `scope=provider-refused` and `scope=unreadable` are recorded
+   separately, because the first is recoverable by re-running the window and the second needs
+   a reprocessed copy at the provider.
+3. **Record it on the store** in the same `assessed_unreadable_dates` attribute the optical
+   path writes, so the coverage gate refuses to excuse a month that lost dates. A skip nobody
+   can read from the store is a gap, not a finding.
+4. **Stop past `MAX_GIVEN_UP_DATES`**, and stopping is a request to be RE-DISPATCHED rather
+   than a refusal to try again: `TooManyGivenUpDatesError` is deliberately absent from the
+   leg-retry classifier's non-retryable set, because most of what reaches that ceiling is a
+   provider refusal and a refusal clears. Declining to retry would turn a passing outage into
+   permanent data loss.
+
+A date offered by two consecutive batches is given up ONCE. Batch queries are padded a day
+either side so a solar day straddling a boundary is complete for whichever batch owns it,
+which means a boundary date comes back from two queries — and attempting it twice would list
+it twice on the store and spend two of the leg's bounded budget on one date, halving how long
+an outage a leg can absorb.
+
 ### S3 direct access for OPERA
 
 S3 direct access (`get_s3_credentials`) bypasses the 5-hop OAuth redirect chain for each
