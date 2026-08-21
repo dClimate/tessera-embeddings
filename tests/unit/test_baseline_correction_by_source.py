@@ -1069,10 +1069,32 @@ class TestTheThemesThatGeneratedTheReviewStayClosed:
 
     def test_there_is_one_definition_of_what_a_load_reads(self) -> None:
         """The driver and the generic path must not define their read set twice."""
-        from tessera_embeddings.ingest.s2_roi import _LOADED_EXTRA_BANDS, _READ_ASSET_KEYS
+        from tessera_embeddings.ingest.s2_roi import _LOADED_EXTRA_BANDS, _read_asset_keys
 
         config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
-        assert stac_module._requested_assets(config, _LOADED_EXTRA_BANDS) == _READ_ASSET_KEYS
+        assert stac_module._requested_assets(config, _LOADED_EXTRA_BANDS) == _read_asset_keys(
+            "earth-search", "sentinel-2-l2a"
+        )
+
+    def test_the_read_set_is_empty_where_the_names_are_not_the_asset_keys(self) -> None:
+        """Planetary Computer serves `B02`/`SCL` and relies on the loader's alias table, so looking
+        the configured names up directly reports every copy incomplete and remote. An empty set
+        makes both terms tie rather than mislead.
+        """
+        from tessera_embeddings.ingest.s2_roi import _read_asset_keys
+
+        config = PROVIDERS["planetary-computer"].collections["sentinel-2-l2a"]
+        assert config.band_names_are_asset_keys is False
+        assert _read_asset_keys("planetary-computer", "sentinel-2-l2a") == ()
+
+    def test_a_name_based_check_is_only_run_where_names_are_keys(self) -> None:
+        """Producer classification, completeness and locality all look an asset up BY NAME, so the
+        two flags cannot disagree in the direction that would run such a check blind.
+        """
+        for provider in ("earth-search", "planetary-computer"):
+            config = PROVIDERS[provider].collections["sentinel-2-l2a"]
+            if config.harmonisation_varies_by_item:
+                assert config.band_names_are_asset_keys, provider
 
     def test_the_reflectance_set_matches_the_collection_it_judges(self) -> None:
         """`item_harmonisation` defaults to a module constant while the decision is made for a

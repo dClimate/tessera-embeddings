@@ -34,7 +34,9 @@ class CollectionConfig:
         has_scl: whether this collection provides an SCL layer to use for cloudmask
         harmonisation_varies_by_item: whether items in this collection can disagree about
             whether the BOA offset has already been subtracted, so the decision has to be made
-            per item from where its assets live rather than once for the collection
+            per item from where its assets live
+        band_names_are_asset_keys: whether the names in ``bands`` are the item's asset keys rather
+            than common names resolved through the loader's alias table rather than once for the collection
     """
 
     collection_id: str
@@ -46,10 +48,15 @@ class CollectionConfig:
     tile_id_prefix: str = ""
     has_scl: bool = False
     #: Off by default, because a collection served by one producer has one answer. Turning it on
-    #: makes the producer decision read each item's asset LOCATIONS, which only works where the
-    #: assets are keyed by the names in `bands` — Planetary Computer serves the same imagery under
-    #: native keys (`B02`, `SCL`), where that read finds nothing and could refuse every date.
+    #: makes the producer decision read each item's asset LOCATIONS, which requires
+    #: `band_names_are_asset_keys`.
     harmonisation_varies_by_item: bool = False
+    #: Whether the names in `bands` are the item's actual asset KEYS, rather than common names the
+    #: loader resolves through an alias table. Earth Search keys its assets by these names;
+    #: Planetary Computer serves the same imagery under native keys (`B02`, `SCL`). Any check that
+    #: looks an asset up BY NAME — producer classification, read-set completeness, locality — is
+    #: uninformative where this is False, and reports every copy as incomplete and remote.
+    band_names_are_asset_keys: bool = False
 
     @property
     def requires_baseline_correction(self) -> bool:
@@ -108,6 +115,7 @@ PROVIDERS: dict[str, STACProvider] = {
                 tile_id_prefix="MGRS-",
                 has_scl=True,
                 harmonisation_varies_by_item=True,
+                band_names_are_asset_keys=True,
             ),
             "sentinel-2-l1c": CollectionConfig(
                 collection_id="sentinel-2-l1c",

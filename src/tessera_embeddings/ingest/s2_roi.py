@@ -126,12 +126,20 @@ logger = logging.getLogger(__name__)
 #: catalogue. Passing the same tuple to both is what makes the two agree.
 _LOADED_EXTRA_BANDS = ["scl"]
 
-#: The assets this driver's loads request, which is what duplicate selection judges a copy's
-#: readability over. Derived through the same helper the generic path uses, from the same
-#: extra-band list passed to the loads, so no second definition of "what this reads" can drift.
-_READ_ASSET_KEYS: tuple[str, ...] = _requested_assets(
-    PROVIDERS["earth-search"].collections["sentinel-2-l2a"], _LOADED_EXTRA_BANDS
-)
+
+def _read_asset_keys(provider: str, collection: str) -> tuple[str, ...]:
+    """The assets this driver's loads request, for duplicate selection to judge readability over.
+
+    Empty where the collection's configured names are not its asset keys — Planetary Computer
+    serves the same bands as `B02`, `SCL` and relies on the loader's alias table. Looking those
+    names up directly reports every copy incomplete and remote, which is worse than not asking:
+    an actually asset-incomplete copy could then win on the terms that remain. An empty set makes
+    both terms tie, so they decide nothing.
+    """
+    config = PROVIDERS[provider].collections[collection]
+    if not config.band_names_are_asset_keys:
+        return ()
+    return _requested_assets(config, _LOADED_EXTRA_BANDS)
 
 
 @final
@@ -779,8 +787,9 @@ def ingest_s2_roi_reflectance(
         # items a preparation actually loads — pruning here does not by itself make the two
         # agree, and an earlier version of this comment claimed it did.)
         supplied = items
-        items, alternates = select_preferred_duplicates(items, _READ_ASSET_KEYS)
-        log_duplicate_selection(log, roi_label, alternates, kept=items, read_keys=_READ_ASSET_KEYS, items=supplied)
+        read_keys = _read_asset_keys(provider, collection)
+        items, alternates = select_preferred_duplicates(items, read_keys)
+        log_duplicate_selection(log, roi_label, alternates, kept=items, read_keys=read_keys, items=supplied)
         date_alternates.update(alternates)
 
         def _record_unreadable(

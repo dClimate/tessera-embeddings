@@ -420,10 +420,13 @@ def log_duplicate_selection(
     supplied, survivors = list(items), list(kept)
     if supplied:
         pruned = len(supplied) - len(survivors)
-        # By MULTIPLICITY, not by set difference: a tile-date that loses a copy keeps its key in
-        # both sets, so a difference of cardinalities cannot see it.
-        seen = collections.Counter(k for it in supplied if (k := _contested_key(it)) is not None)
-        contested = sum(1 for n in seen.values() if n > 1)
+        # Keys whose multiplicity DECREASED. A tile-date that loses a copy keeps its key, so a
+        # difference of cardinalities cannot see it — and a tile-date holding several genuinely
+        # distinct same-day passes has multiplicity above one while losing nothing, so counting
+        # every multi-item key inflates the figure with dates no choice was made on.
+        before = collections.Counter(k for it in supplied if (k := _contested_key(it)) is not None)
+        after = collections.Counter(k for it in survivors if (k := _contested_key(it)) is not None)
+        contested = sum(1 for key, n in before.items() if after[key] < n)
     else:
         # Nothing to compare against, so report the ladder — what callers passing only
         # `alternates` have always received.

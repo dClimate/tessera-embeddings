@@ -46,10 +46,9 @@ UNHARMONISED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-s2-l2a"})
 RAW_ARCHIVE_BUCKETS: frozenset[str] = frozenset({"sentinel-s2-l2a"})
 
 #: Buckets whose Sentinel-2 surface reflectance already has the post-baseline-04.00 offset
-#: subtracted. An unrecognised bucket is treated as NOT harmonised, so the correction is
-#: applied: over-correcting harmonised data and under-correcting raw data are both wrong, but
-#: only one of them is discoverable — a doubled correction shifts values by a visible 1000,
-#: while a skipped one leaves plausible-looking pixels that are silently 1000 too high.
+#: subtracted. An unrecognised bucket is neither harmonised nor known-raw, so it is UNKNOWN and
+#: the caller refuses the date: over-correcting harmonised data and under-correcting raw data are
+#: both wrong and both silent, so neither is safe to default to.
 HARMONISED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-cogs", "e84-earth-search-sentinel-data"})
 
 #: Everything an S2 ingest actually reads: the configured bands plus the scene classification

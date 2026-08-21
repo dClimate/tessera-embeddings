@@ -392,15 +392,14 @@ decision are worth stating:
   whether *anything* in it is actually owed a correction. Mixed-producer days are real, and their
   survivors typically pair a harmonised COG with a raw item at an old baseline, which is owed
   nothing.
-- **Thresholded per item on its own declared baseline, with the caller's per-date map as the
-  fallback for items that declare none.** An absent or malformed `s2:processing_baseline` parses
-  as 0, which is under the threshold, so reading only the item exempted a date the caller had
-  correctly supplied a post-threshold baseline for. The map cannot simply replace the items
-  either: `extract_baselines` is last-wins, so it holds one arbitrary item's value, and applying
-  that to every item puts the decision back under the caller's sort order — a raw 05.00 item
-  beside a raw 02.06 one read as wholly pre-threshold and exempted the date, and with the
-  harmonised item sorted last the raw 02.06 one read as post-threshold and refused a date that
-  needed nothing.
+- **Thresholded per item on its own declared baseline, and an unreadable one refuses the date.**
+  An absent or malformed `s2:processing_baseline` parses as 0, which is under the threshold, so
+  reading it naively exempts a date whose pixels may carry the offset. A caller-supplied per-date
+  map is not a usable fallback: the production path builds it from these same items, so a lone
+  unreadable item is handed back the same parsed zero, and on a multi-item date `extract_baselines`
+  is last-wins and supplies an arbitrary item's value — which would put the decision back under
+  the caller's sort order. A figure derived from the items is not evidence about an item, so the
+  ambiguity is refused rather than guessed.
 
 **The per-item decision is scoped to the collections that need it**, via
 `CollectionConfig.harmonisation_varies_by_item`. It reads asset locations under the keys named in

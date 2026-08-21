@@ -1483,6 +1483,28 @@ class TestTheAuditReportsWhatSelectionDidNotWhatSurvivedTheFilter:
         msg = self._emit(caplog, supplied, kept, alternates)
         assert "1 rejected, 1 of those available as a fallback" in msg
 
+    def test_a_multi_pass_date_that_lost_nothing_is_not_counted_as_contested(self, caplog) -> None:
+        """A tile-date holding two genuinely distinct same-day passes has multiplicity above one
+        while losing nothing, so counting every multi-item key inflated the figure with dates no
+        choice was made on.
+        """
+        two_passes = [
+            _with_assets(
+                _Item(f"pass-{tag}", "MGRS-33TWA", "0", **{"s2:processing_baseline": "05.00", "datetime": acq}),
+                _bands_at(_IN_REGION),
+            )
+            for tag, acq in (("a", "2021-09-08T10:00:00Z"), ("b", "2021-09-08T14:00:00Z"))
+        ]
+        # ...and one real duplicate on a DIFFERENT tile, so the line is emitted at all.
+        win = self._copy("win", baseline="05.10")
+        spare = self._copy("spare", baseline="05.00")
+        supplied = [*two_passes, win, spare]
+        kept, alternates = select_preferred_duplicates(supplied)
+        assert len(kept) == 3, "both distinct passes must survive alongside the duplicate's winner"
+        msg = self._emit(caplog, supplied, kept, alternates)
+        assert "1 tile-date(s) had more than one copy" in msg, f"multi-pass date inflated it: {msg}"
+        assert "1 rejected" in msg
+
     def test_nothing_pruned_logs_nothing(self, caplog) -> None:
         only = self._copy("only", baseline="05.00")
         assert self._emit(caplog, [only], [only], {}) == ""
