@@ -30,7 +30,9 @@ context_docs/
 │   ├── 016-scripts-layout-and-shared-modules.md
 │   ├── 017-no-antarctic-coverage.md
 │   ├── 018-refuse-pixels-below-minimum-optical-depth.md
-│   └── 019-validation-modules-belong-in-the-library.md
+│   ├── 019-validation-modules-belong-in-the-library.md
+│   ├── 020-boa-offset-applies-to-every-valid-dn.md
+│   └── 021-correct-the-boa-offset-per-image.md
 └── design/           Long-form framing docs, grouped by what they answer
     │
     │  THE CAMPAIGN — start here

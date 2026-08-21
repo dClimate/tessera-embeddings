@@ -33,7 +33,19 @@ dependencies = [
     "zarr",
     "icechunk>=2.1.1",
     "fsspec",
-    "odc-stac",
+    # Bounded because `ingest/stac.py` subclasses `odc.stac._mdtools.StacMDParser` and
+    # `odc.loader.RioReader` to remove the Sentinel-2 BOA offset per image as it is read.
+    # The first is private and the second's `read` contract is what the subclass overrides,
+    # so a minor bump can move either without a deprecation. See
+    # context_docs/decisions/021-correct-the-boa-offset-per-image.md.
+    "odc-stac>=0.5.2,<0.6",
+    # Bounded SEPARATELY, because the line above bounds nothing here: `odc-stac` 0.5.2 requires
+    # only `odc-loader>=0.6.4`, so a fresh resolution can satisfy it with a breaking 0.7.
+    # `RioReader` and the `read` contract the subclass overrides are public — both are in
+    # `odc.loader.__all__`, and `read` matches the documented `RasterReader` protocol — but the
+    # subclass reaches `self._src` for the offset stamped onto the source, and that attribute is
+    # on no protocol. At 0.x the minor version is where breaking changes land either way.
+    "odc-loader>=0.6.4,<0.7",
     "odc-geo",
     "rasterio",
     "rioxarray",

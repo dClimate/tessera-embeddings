@@ -151,9 +151,12 @@ def mock_stac_item():
         baseline: str = "04.00",
         cloud_cover: float = 15.0,
         tile_id: str = "33UUP",
+        host_root: str = "s3://sentinel-s2-l2a/tiles/33/U/UP/2024/1",
     ):
         from datetime import datetime
         from unittest.mock import Mock
+
+        from tessera_embeddings.ingest.asset_locations import READ_ASSET_KEYS
 
         item = Mock()
         item.datetime = datetime.fromisoformat(date)
@@ -161,7 +164,23 @@ def mock_stac_item():
             "s2:processing_baseline": baseline,
             "eo:cloud_cover": cloud_cover,
             "grid:code": f"MGRS-{tile_id}",
+            # The ACQUISITION instant, which is where a real item keeps it and the only surviving
+            # record of it once normalize_to_solar_day has stamped `.datetime` with noon. Duplicate
+            # selection reads this to tell distinct same-day passes from reprocessings of one, so a
+            # fixture without it makes every scene of a day look like one acquisition.
+            # Timezone-aware, as every real STAC item's is. A naive stamp now reads as
+            # UNREADABLE, because one naive value among aware ones makes the acquisition sort
+            # raise and abort duplicate selection for a whole query.
+            "datetime": date if date.endswith("Z") or "+" in date else f"{date}Z",
         }
+        # REAL asset hrefs, because whether the BOA offset is corrected is decided from where
+        # the assets live. A bare Mock auto-creates `assets`, so an href read off it is a Mock
+        # rather than a string, and the item then classifies as "producer unknown" — which means
+        # "correct it", silently changing what a test measures without the test saying so.
+        # Defaults to ESA's originals, the case that DOES need correcting, so a test about
+        # baseline parsing sees its baseline flow through. Pass `host_root` pointing at
+        # sentinel-cogs to model Element 84's harmonised COGs instead.
+        item.assets = {key: {"href": f"{host_root}/{key}"} for key in READ_ASSET_KEYS}
         return item
 
     return _make_item

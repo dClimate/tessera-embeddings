@@ -12,7 +12,9 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 |---|---|
 | `stac.py` | STAC-based data loading via `odc.stac.load`. Handles multiple providers (Earth Search, Planetary Computer), S2 baseline correction, and date filtering. |
 | `opera_query.py` | OPERA RTC-S1 query utilities: spatial bbox construction, item construction from the native CMR Granule Search API (bypasses CMR-STAC search; orbit-direction filtered server-side), UTM EPSG derivation, and asset preparation. |
-| `duplicates.py` | Chooses between DUPLICATE catalogue items for one tile-date — Element 84 publishes more than one whenever a granule is reprocessed, distinguished by `s2:sequence`. Newest is preferred; the rejected copies are retained as a fallback the write steps down when a source object will never read. Reducing to one copy before the loader is what makes a fallback possible at all, since `odc.stac.load` FUSES a solar-day group — and it is also what makes the recorded baseline match the pixels written. |
+| `item_baselines.py` | The ONE reader of `s2:processing_baseline`. Reports an integer hundredth (`04.00` -> `400`), the same scale `S2_BASELINE_THRESHOLD` is expressed in, and `None` for every kind of unreadable. Exists because there were two readers on two scales with two notions of unreadable, so each numeric edge case had to be fixed twice — and they had drifted before anyone noticed. |
+| `asset_locations.py` | Answers the two questions asked of where an item's assets live, and keeps them apart: **is the read cheap** (a property of the bucket's REGION) and **has the reflectance offset already been removed** (a property of the PRODUCER). They have the same answer today and would not the first time anyone mirrors unharmonised data in region, so two bucket lists make that impossible to conflate. Also holds `AssetSources`, which reports the keys it could NOT resolve rather than dropping them — the primitive that generated the same defect three times when it returned only what it found. |
+| `duplicates.py` | Chooses between DUPLICATE catalogue items for one tile-date — Element 84 publishes more than one whenever a granule is reprocessed, distinguished by `s2:sequence`. Usable first, then the newest baseline, then the copy owing no offset correction; the rejected copies are retained as a fallback the write steps down when a source object will never read. Reducing to one copy before the loader is what makes a fallback possible at all, since `odc.stac.load` FUSES a solar-day group — and it is also what makes the recorded baseline match the pixels written. |
 | `loader_failures.py` | Names the source object a failed load could not read. `odc.stac.load` reports it in its OWN log record and raises an exception that does not carry it, so a logging handler on every reader process records each aborted href, and the caller collects them after a failure and maps them back to tile-dates. That name is what lets the duplicate ladder step down ONE copy instead of every duplicated tile in the date. Attribution is best effort by design: an empty answer means "attribute nothing", never "nothing was at fault", and the recovery it sharpens still works without it. |
 | `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary AWS credentials minted by ASF, ~1 hour) and legacy CloudFront signed URL resolution. Those credentials expire on their OWN clock, unrelated to any unit of work, so renewal must be driven by a timer and by the advertised expiry — never by the work loop, which can only renew between units and so cannot renew inside one that outlives the margin. |
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
@@ -365,24 +367,181 @@ These happen before `odc.stac.load` is called:
 
 #### Sentinel-2 Baseline Correction
 
-ESA changed the S2 L2A processing baseline at version 04.00, adding +1000 to all pixel values.
-The correction logic in `_apply_baseline_corrections_by_date` is enabled per-collection via
-the `requires_baseline_correction` flag in `CollectionConfig`. In practice, the Earth Search
-catalog (used by the Tessera ROI ingestion flow) already delivers pre-corrected values, so
-the correction is **not applied** in the current production flow.
+ESA changed the S2 L2A processing baseline at version 04.00 (January 2022), adding +1000 to all
+surface reflectance values. Whether that offset has to be subtracted is a property of **who
+served the pixels**, not of the collection: Element 84 harmonises its own COGs and subtracts it
+for you, while ESA's originals carry it.
 
-The code is retained for collections or catalog providers that still require it. When active,
-it builds a per-date correction mask vectorised across the time dimension. Two modes:
+Leaving `baseline_threshold` unset for Earth Search assumes every item is a harmonised COG, and
+that fails once the collection also indexes items whose assets point at ESA's archive. Reading the
+collection alone exempts or corrects both kinds together, and one of those is always wrong and
+always silent: a skipped correction leaves plausible pixels 1000 too high, a doubled one shifts
+every value by 1000.
 
-- **Default** (`preserve_low_values=False`) — subtracts the offset from all pixels. Values
-  below 1000 go negative, which acts as a nodata/dark-pixel signal in the cloud-mask model.
-- **Tessera mode** (`preserve_low_values=True`) — only subtracts from pixels where
-  `value >= abs(offset)`, leaving dark pixels unchanged. Matches Tessera's `harmonize_arr()`
-  behaviour for inference.
+So the threshold **is** set for Earth Search, and the exemption is decided per item from where
+its reflectance assets live (`asset_locations.item_harmonisation`). Three properties of that
+decision are worth stating:
 
-Values above `65535 + offset` (i.e. 64535) are clamped before subtraction to prevent uint16
-overflow. The correction is applied only to spectral bands; SCL and other extra bands are
-passed through unchanged.
+- **Judged over the reflectance bands only.** A real Element 84 item carries the original JP2s
+  as extra assets beside its COG bands, so judging every asset reports a straddle for an item
+  that is wholly harmonised where it matters. `scl` is excluded even though it *is* read: it is
+  categorical and never corrected, so its producer cannot make the reflectance ambiguous. This
+  is a different asset set from the one locality is judged over — see the duplicate selector,
+  which uses the full read set including `scl`.
+- **Decided per SOURCE, and applied as each image is read.** `odc.stac.load` fuses a solar day
+  into one time slice, so a correction applied to its OUTPUT is applied to every tile at once —
+  and a day whose tiles disagree then has no correct answer and was refused, at a measured cost of
+  347 days of one region-year. The decision is now made per reflectance asset
+  (`boa_offset.source_decision`), stamped onto each source at parse time (`stac.BoaOffsetParser`)
+  and applied inside the read (`stac._BoaCorrectingReader`), before anything is resampled together.
+  Different tiles occupy different ground, so no pixel is both corrected and uncorrected.
+
+  This is **purely additive**: the amount subtracted is a constant, so a day the pipeline loaded
+  before produces bit-identical pixels, and only previously-refused days change. See
+  [ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §3.
+- **Thresholded on the item's own declared baseline, and an unreadable one refuses.**
+  An absent or malformed `s2:processing_baseline` parses as nothing rather than as 0: reading it as
+  zero puts it under the threshold and exempts pixels that may carry the offset, while correcting
+  it takes 1000 off pre-04.00 pixels that never had it. Both are wrong by the same amount in
+  opposite directions and both are silent, so the source refuses. `item_baselines` is the only
+  reader of that property, on one scale, with one notion of unreadable.
+
+**The per-item decision is scoped to the collections that need it**, via
+`CollectionConfig.harmonisation_varies_by_item`. It reads asset locations under the keys named in
+`bands`, which is how Earth Search keys its assets and is NOT how every provider does: Planetary
+Computer serves the same imagery under native keys (`B02`, `SCL`) and relies on the loader
+resolving the common names, so that read finds nothing there. Running the per-item check on PC
+classified every modern item as undeterminable and refused every date at baseline 04.00 or above.
+
+So where the producer cannot vary between items, the **collection's own configuration supplies the
+answer**: a correction threshold on such a collection says every item is unharmonised, which is
+what the threshold is there to correct. `source_decision` takes that as `known_harmonisation` and
+does not consult the bucket at all — which is what lets a provider serving its bands under native
+asset keys be decided here, and is why every Planetary Computer source is corrected rather than
+refused. One decision then serves both providers, so they cannot disagree about a producer.
+
+Which assets carry the reflectance bands is resolved through **odc's own alias table**
+(`stac._reflectance_asset_keys`), not from the configured band names: Planetary Computer serves
+`blue` as an asset called `B02`, so deciding against the configured names would match none of its
+assets and correct nothing. `scl` is excluded structurally — it is simply not among the resolved
+keys — rather than by a list the corrector is told to skip.
+
+The correction VALUE is a **constant** — `S2_BASELINE_OFFSET`, `-1000`. The baseline decides only
+*whether* the offset is removed, never how much, which is what makes the move from a per-date to a
+per-source decision produce bit-identical pixels on every day the pipeline already loaded.
+`extract_baselines` remains separate and untouched: it records what each item declared, is what
+reaches the store's `baselines_applied`, and is **not** a correction input — one integer per date is
+provenance, and correcting from it left raw post-04.00 pixels uncorrected whenever it omitted a
+date, carried the zero an unreadable baseline collapses to, or named an arbitrary item's baseline on
+a multi-item date.
+
+Duplicate selection has **three owners, one per entry point**, and none of them is the shared
+query. `query_stac_items` deliberately does not prune: `s2_roi` runs its own selection over that
+output and keeps the rejected copies as the ladder `step_down_copies` walks when a source object
+will not read, so pruning upstream would leave it nothing to step down to. `ingest_tile` prunes
+before `extract_baselines`, because that map becomes the store's `baselines_applied` and must
+describe the copy that was kept. `load_stac_items` prunes as well, for the documented
+`query_stac_items` -> `load_stac_items` workflow that passes through neither of the others.
+
+Selecting over an already-selected set is a no-op, which is what makes more than one owner safe.
+
+**One ambiguous shape survives, and it refuses** (`HeterogeneousProducerError`): a reflectance
+source at or above the threshold whose producer cannot be determined — served from a bucket nobody
+has classified, or belonging to an unharmonised copy that declares no readable baseline. Correcting
+it and exempting it are wrong by the same amount in opposite directions and both are silent, so
+nothing guesses. The refusal is a property of that one source, and it is gated on the threshold:
+below it no producer changes a pixel, so there is nothing to decide.
+
+**The shapes that cost whole days are gone**, because a day is no longer decided as a whole. Tiles
+straddling the threshold, and a raw item owed the offset fused with an already-harmonised one, are
+each corrected on their own ground, so no pixel is both corrected and uncorrected — the 347 days a
+2024 region-year lost to that conflict now load. An item whose own bands are served from two
+different producers is likewise corrected band by band. See
+[ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md), and
+`context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md` for the frequency table the
+change was justified against.
+
+A refusal that does still happen is skipped alone and counted rather than failing the leg, and
+duplicate selection routes around it: a copy that would refuse is ranked last *and* withheld from
+the fallback ladder, because a refusal is not a read failure and nothing retries one.
+
+"Alone" is a property of `s2_roi`, which loads ONE solar day per call — not of the refusal, which
+is raised while `odc.stac.load` parses its item list synchronously and so abandons whatever list it
+was given. A caller pairing `query_stac_items` with `load_stac_items` over a multi-day list
+forfeits every day in it, so pass a day at a time wherever one undecidable day should not cost the
+window. Production does not reach this: the only `ingest_tile` caller is the S1 path, whose
+collections have no baseline threshold and therefore no offset decision to refuse.
+
+The surviving case is worth naming, because the safe direction inverts. An item that does not expose
+EVERY reflectance band under the configured names is `UNKNOWN`, not `RAW` — a non-empty subset is
+not enough, because `_prune_item_dict` specifically preserves PARTIALLY aliased items, and letting
+one visible harmonised band speak for a hidden native-keyed one corrupts the subset nothing here
+could see. Nothing in this module can
+see the alias table that maps a band name to an asset key, so a band absent under `blue` may be
+served under `B02` — `_prune_item_dict` exists for exactly that mismatch. Calling such an item
+raw would subtract 1000 from pixels that may already be harmonised, silently. The live Element 84
+catalogue keys its assets by the configured band names, so this does not arise there today; a
+catalogue that changed its naming would stop the ingest rather than halve a season's reflectance.
+
+**How far the decision reached is reported after every load**, from counters the parser keeps:
+how many reflectance sources it stamped, and how many of those were owed the offset. Reaching
+*none* of them is the one way this can still go wrong quietly — an empty or mistaken
+`reflectance_assets` set corrects nothing and produces plausible pixels 1000 too high — so a zero
+count is a WARNING naming the assets it resolved, and any other count is an INFO line. A warning
+rather than an error, because a caller that replaces the loader also reports zero; what makes that
+enough is that every other way of getting this wrong is loud, since an unclassifiable source
+refuses and an unresolvable band name fails the load.
+
+`extract_baselines` records the baseline of the item actually loaded and reaches the store's
+`baselines_applied` attribute. Nothing masks it, and nothing derives a correction from it.
+
+One integer per date is a **lossy** record of a day whose tiles declare different baselines, and
+those days now load — the three-tile day in ADR 021 is exactly that shape. The value is the last
+item's, the clearest tile, because the query sorts a date's items cloud-descending; the day's other
+vintages are recorded nowhere. Left that way deliberately: the attribute is written and merged
+forward on append, and nothing in this package reads a value from it, so widening its type would
+charge a future reader for a record nobody reads yet.
+
+`correct_boa_dn` does the arithmetic, once, on one source's pixels:
+
+**The offset applies to every valid DN, not only to bright ones.** ESA adds it across the whole
+reflectance range precisely so that negative surface reflectance — routine over water and deep
+shadow — is representable in an unsigned type. So the correction is `DN - 1000` for every DN from 1
+upward, floored at the lowest VALID code, which is **1**.
+
+Not zero: zero is the nodata code, so flooring a real dark observation there makes it
+indistinguishable from no observation and every downstream mask drops it. Element 84's harmonised
+COGs floor at 1 for the same reason, and reproducing them exactly is what makes a corrected raw copy
+comparable with a harmonised one. DN 0 itself never reaches the arithmetic — the reader applies the
+result only where the source was valid — so nodata survives as nodata.
+
+**That the nodata code IS 0 is hard-coded, and that is an unchecked assumption.** `_NODATA = 0` is
+a constant in `stac.py`, and the correction rests on it twice over: DN 0 is the value excluded from
+the arithmetic, and the floor of 1 is what stops a corrected pixel from *looking* like nodata. The
+real answer belongs to the catalogue — `odc` derives it per band from `raster:bands`, and the reader
+has the resolved `RasterLoadParams` in hand when it corrects — but the driver is installed on any
+collection whose config sets `requires_baseline_correction`, so nothing ties the constant to what
+the collection actually declares. Under a marker of, say, 65535 every gap pixel would test as
+valid: the correction shifts them to 64535, the fuser's `dst == fill_value` test stops recognising
+them as empty, and the mosaic gains data-looking pixels 1000 below the nodata code where there was
+no observation. Both Sentinel-2 providers declare 0 today, so this is latent rather than live — the
+fix is to resolve the marker from `cfg` and refuse anything else, and it is owed.
+
+The arithmetic widens to `int32` and casts back to the INPUT dtype, so nothing wraps and the store's
+unsigned arrays are unaffected: the offset is negative and the floor is positive, so an unsigned
+input stays representable. Adding a negative Python int to a `uint16` array raises under numpy 2,
+which is what the widening is for.
+
+**The floor still acts on resampled values, and that is a recorded limit.** `odc.stac.load` reads
+and resamples in one step, so the wrapped reader sees pixels that have already been warped — and six
+of the ten configured bands are natively 20 m on a 10 m grid. A pixel whose resampling kernel spans
+the DN-1000 boundary is floored where Element 84, flooring each source pixel first, would not have
+been. Fixing it means taking over the read-and-warp step, and unlike the per-source move it would
+**rewrite pixels in every existing store**, so it is owed separately. Measured in
+[ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §6.
+
+SCL is never corrected. It is not among the resolved reflectance asset keys, so it carries no
+decision at all — a stronger exclusion than a band list, which could go stale.
 
 #### OPERA RTC-S1 Amplitude-to-dB Conversion
 
@@ -1171,6 +1330,142 @@ The filter is an optimisation, not the guarantee. On S1 the queries are built on
 ahead of the writes, so the set they filter against is a snapshot frozen before the run
 began; the write loop tracks what it has actually written and is the authority, on the
 cropped and full-extent branches alike.
+
+### Choosing between duplicate copies of a tile-date
+
+A catalogue indexes the same tile-date more than once whenever a granule is reprocessed, and
+sometimes from more than one region. `duplicates.py` reduces each tile-date to one copy per
+*acquisition* before the loader sees it, because `odc.stac.load` fuses a solar-day group: two
+copies of one acquisition would be blended into one pixel stack at two different processing
+baselines, and the baseline recorded on the store would match neither.
+
+Preference is expressed as **one sort key** (`_preference_key`), and the property that makes it
+work is that it is **context-free**: no term means "best in my group", so the same tuple orders two
+copies of one acquisition and two copies from different ones. A term relative to the group's own
+best baseline makes a cross-acquisition comparison meaningless and forces a second key alongside
+this one, where a signal added to either is easily missed from the other. If you add a signal, add
+it here and nowhere else.
+
+The key reads these signals, in this order:
+
+1. **Read-set completeness**, judged over the assets *this* load will request — the configured
+   bands plus the caller's `extra_bands`, not a fixed list and not the broader pruning set, which
+   keeps `scl` whether or not the call asks for it. First, because a copy missing one of them
+   cannot deliver the tile-date at any baseline, and the generic paths have no recovery for it: a
+   missing band is not one of the read failures the fallback ladder recognises, so an incomplete
+   winner fails the acquisition outright.
+2. **Whether the producer is decidable**, where it would change a pixel. A copy whose producer
+   cannot be identified at all refuses its date at or above the correction threshold — and a
+   refusal is not something the fallback ladder can step down on. A copy whose reflectance bands
+   span a harmonised and a raw producer is *not* among them: each of its sources is decided on its
+   own bucket, so it is corrected band by band rather than refused. Below the threshold the term is
+   inert, because the producer changes no pixel there.
+3. **Whether the copy demonstrably belongs to the acquisition it is ranked in.** A copy naming
+   neither an observation nor an instant was attached to a cluster arbitrarily, so it must not
+   displace one that says which pass it came from — a known member at an older baseline still
+   represents that pass, while a possibly-unrelated newer one may duplicate another and drop this
+   one's coverage.
+4. **Whether the baseline is readable**, for producers whose correction depends on it, with
+   unknown sorting last. An absent baseline is an absence of evidence, and such a copy refuses its
+   whole date downstream, so an older reprocessing that can be corrected beats a newer one that
+   cannot be processed at all. Above every term below it because a refusal has no recovery. An
+   already-harmonised copy is exempt: its pixels need no correction whatever the baseline says.
+5. **Processing baseline, descending.** The signal that carries data vintage. Ordered by value
+   rather than by "is it the best", so every rung of the fallback ladder stays in descending
+   baseline order. Collapsing the non-best baselines into one tier lets a read failure skip a
+   04.00 copy and hand out a 03.00 one.
+6. **Whether the copy owes an offset correction at all**, where the producer is an item's own
+   property. **Below the baseline**, and there are two reasons to prefer a copy owing nothing —
+   both about the PIXEL rather than about coverage. An already-harmonised copy had its floor
+   applied by its producer *before* any resampling, where one we correct is floored *after*, so on
+   the very dark population the two disagree; and a copy owing nothing cannot be wrong by the
+   offset at all, while one we correct is right only if the bucket lists and the declared baseline
+   are both honest. Those are quality claims, and a quality-versus-quality preference must not buy
+   a better pixel with an older reprocessing — the same rule that keeps locality below the
+   baseline. It outranks locality only because a pixel argument beats a cost one. Inert below the
+   threshold, where no producer changes a pixel — which is most but NOT all ESA-hosted copies: zone
+   01N in 2017 carries 15 at baseline 05.00, so the term does fire on real data. Also inert where
+   the producer is the COLLECTION's answer: every copy then has the same producer, so a term that
+   compares producers would discriminate on the threshold alone, which is the baseline term ranked
+   above it, in the opposite direction.
+7. **Locality, among equal baselines only.** A copy whose read assets all sit in a preferred
+   bucket is cheaper to read, so it wins a baseline tie. Restricting locality to ties is what
+   stops it buying cheaper egress with an older pixel, and it is inert where the baseline is
+   unreadable, so it cannot decide a comparison the baseline could not enter. This is the
+   distinction the two bucket lists exist for: harmonisation is a **pixel** claim and locality is a
+   **cost** claim, so both sit below the baseline, harmonisation above locality. The lists name
+   the same buckets today, but the key sets differ by `scl`, so a copy can be harmonised without
+   being local and the terms are not interchangeable.
+8. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of catalogue
+   response order, so a rerun cannot silently produce a different mosaic — and it makes the key a
+   total order, so no comparison ever falls back to input order.
+
+Two properties of that ordering are easy to get wrong and are held by tests:
+
+- **Locality is judged over the read set, not over every asset.** A real Element 84 item
+  carries its COG bands *and* the original JP2s, across two buckets. Requiring all of them
+  disables the preference altogether. It is also judged over the *whole* read set: one local band among many remote
+  ones is not locality, and an item exposing none of them is remote, because absence of
+  evidence is not evidence of locality.
+- **An unreadable baseline sorts LAST, and makes locality inert for that copy.** A missing
+  baseline is an absence of evidence rather than a tie: treating it as a tie let a copy with no
+  baseline displace a raw copy at 05.00, selecting an older reprocessing *and* skipping the offset
+  correction. Such a copy also refuses its whole date downstream, and the read-failure ladder
+  recovers from a read error but not from a refusal, so a reprocessing that can be corrected beats
+  a newer one that cannot be processed at all. An already-harmonised copy is exempt: no offset
+  decision rests on its baseline, so penalising it there would hand the tile-date to an OLDER raw
+  reprocessing, which is the opposite of the usable-first rule the key starts with.
+
+**Which copies are the same acquisition is decided by identity, not by a timestamp.** Two
+reprocessings of one granule share a datatake — mission, sensing start and absolute orbit, in
+`s2:datatake_id` — and differ only in the processing-baseline suffix. They do **not** agree on the
+catalogue `datetime`, which is a per-copy field: on the committed 2017-12-19 cassette, the 02.06
+and 05.00 copies of one granule are timestamped more than three minutes apart. A tolerance around
+that timestamp therefore cannot separate "two reprocessings" from "two passes" without getting one
+of them wrong, and the pair was kept as two acquisitions and mosaicked together. Identity needs no
+tolerance: the timestamp window survives only as the fallback for a copy naming no datatake.
+Splitting on a real acquisition is what protects genuine same-day coverage — successive orbits
+revisit a high-latitude tile the same day, and keying on `(tile, solar day)` alone dropped 493 of
+2,733 items as duplicates when they were distinct acquisitions.
+
+A copy naming **no** datatake joins an identified acquisition its timestamp places it in, before it
+is allowed to start one, and it is matched against *any* member of that acquisition — members of
+one observation do not agree on the timestamp, which is the whole reason identity is primary, so
+closeness to any of them is the available evidence. Without that, one reprocessing declaring the
+datatake while its sibling omitted it were never compared however close their timestamps, and both
+survived to be fused.
+
+**The tile key is read from whichever property the catalogue populates**, `grid:code` or
+`s2:mgrs_tile`, then the item id — all canonicalised to one form, so two catalogues naming one
+tile produce one grouping key. Planetary Computer needs its own property: its ids carry the tile
+in a field the Element 84 pattern does not match, so without it every item was unkeyable and
+duplicate selection was a no-op for the whole provider.
+
+**Where the producer cannot be read from an item's assets, the collection supplies it**, through
+`known_harmonisation` on `select_preferred_duplicates` — the same value `stac.collection_harmonisation`
+gives the correction path, so the two cannot disagree. This is load-bearing rather than an
+optimisation, and the two changes above are why: making Planetary Computer items keyable gave that
+provider a fallback ladder for the first time, and deriving the correction from the items made its
+unreadable baselines refuse. A spare judged only on visible assets therefore looked harmless, would
+be offered to the ladder, and would abort the ingest when a read failure stepped down to it, since
+the recovery loop steps down on a read failure and not on a refusal.
+
+The **fallback ladder** — the rejected copies, in the order a read failure steps down them — is
+built by one global sort over the whole tile-date instead, using a key that has no notion of
+"best in my group". Two other constructions were wrong. Ranking the tile-date with the same
+function used for winners let one malformed item's suspension revert every acquisition's ladder
+to sequence order. Ranking each acquisition separately and concatenating them behind their
+sorted heads is wrong further down: with one acquisition holding 05.00 and 01.00 spares and
+another holding 04.00, it yields `[05, 01, 04]`, and the unattributed recovery consumes the head
+on each retry, so the second retry takes 01.00 and never tries the 04.00. In the global order an
+unreadable baseline sorts last rather than suspending anything, which is the same protection by a
+more direct route: a copy whose baseline cannot be read is the one whose correction will silently
+be skipped.
+
+Buckets are compared by parsing the href's host and path rather than by substring, so a
+lookalike host cannot be mistaken for a preferred one. The baseline is matched as a version
+string rather than parsed as a number, so `"NaN"`, `"Infinity"` and every other value that is
+numeric without being a version read as unknown — see `item_baselines.py`.
 
 ### When a source object will not read
 

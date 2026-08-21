@@ -2,7 +2,6 @@
 
 import numpy as np
 import pytest
-import xarray as xr
 
 from tessera_embeddings.config import (
     LANDSAT_C2_BANDS,
@@ -12,7 +11,6 @@ from tessera_embeddings.config import (
     STACProvider,
 )
 from tessera_embeddings.ingest.stac import (
-    _apply_baseline_corrections_by_date,
     _build_stac_query,
     _extract_baseline,
     _filter_existing_dates,
@@ -22,6 +20,7 @@ from tessera_embeddings.ingest.stac import (
     _loadable_assets,
     _prune_item_dict,
     _query_stac_items,
+    correct_boa_dn,
     extract_baselines,
     ingest_tile,
     split_antimeridian_bbox,
@@ -29,91 +28,64 @@ from tessera_embeddings.ingest.stac import (
 
 
 class TestBaselineCorrection:
-    """Tests for _apply_baseline_corrections_by_date function."""
+    """Tests for `correct_boa_dn` — the offset arithmetic, and nothing else.
 
-    def _make_dataset(self, bands_data, dates):
-        """Create a dataset with time dimension from {band: 2d_array} dict."""
-        coords = {
-            "time": [np.datetime64(d, "ns") for d in dates],
-            "northing": np.arange(bands_data[next(iter(bands_data))].shape[-2]),
-            "easting": np.arange(bands_data[next(iter(bands_data))].shape[-1]),
-        }
-        data_vars = {band: (["time", "northing", "easting"], arr) for band, arr in bands_data.items()}
-        return xr.Dataset(data_vars, coords=coords)
+    The DECISION of which pixels are owed the offset is no longer here. It is made per source, at
+    parse time, by `BoaOffsetParser`, and asserted against `source_decision` in
+    `test_boa_offset.py`. This class is only the arithmetic that runs once that decision is yes,
+    which is why it takes an array and an offset rather than a date and a baseline map.
+    """
 
-    def test_subtracts_offset_when_baseline_gte_400(self):
-        """Date with baseline>=400 should have 1000 subtracted."""
-        values = np.array([[[1500, 2000], [3000, 4000]]], dtype=np.uint16)
-        data = self._make_dataset(
-            {"B02": values.copy(), "B03": values.copy()},
-            ["2024-01-01"],
-        )
+    def test_subtracts_the_offset(self):
+        """The plain case: a bright pixel loses exactly the offset."""
+        values = np.array([[1500, 2000], [3000, 4000]], dtype=np.uint16)
+        result = correct_boa_dn(values, -1000)
+        np.testing.assert_array_equal(result, np.array([[500, 1000], [2000, 3000]], dtype=np.uint16))
 
-        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400})
+    def test_the_input_dtype_survives(self):
+        """The store's arrays are unsigned, and a signed result would be cast on the way in."""
+        for dtype in (np.uint16, np.int16, np.int32):
+            result = correct_boa_dn(np.array([[2000]], dtype=dtype), -1000)
+            assert result.dtype == dtype, dtype
 
-        expected = np.array([[[500, 1000], [2000, 3000]]], dtype=np.int16)
-        np.testing.assert_array_equal(result["B02"].values, expected)
-        np.testing.assert_array_equal(result["B03"].values, expected)
+    def test_a_dark_pixel_is_corrected_rather_than_left_alone(self):
+        """The offset applies to every valid DN, not only to those above it.
 
-    def test_low_values_go_negative_after_correction(self):
-        """Values below 1000 become negative after offset is applied."""
-        values = np.array([[[500, 800], [1000, 1500]]], dtype=np.uint16)
-        data = self._make_dataset({"B02": values}, ["2024-01-01"])
+        ESA adds it across the whole reflectance range precisely so that negative surface
+        reflectance is representable, so leaving DN 1-999 alone left them up to 999 too high.
+        """
+        result = correct_boa_dn(np.array([[500, 800, 999]], dtype=np.uint16), -1000)
+        np.testing.assert_array_equal(result, np.array([[1, 1, 1]], dtype=np.uint16))
 
-        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400})
+    def test_a_valid_dark_pixel_does_not_become_nodata(self):
+        """The floor is 1, not 0, and this is the part no amount of reading settles.
 
-        # 500-1000=-500, 800-1000=-200, 1000-1000=0, 1500-1000=500
-        np.testing.assert_array_equal(
-            result["B02"].values,
-            np.array([[[-500, -200], [0, 500]]], dtype=np.int16),
-        )
+        Zero means "no observation". Flooring a real dark measurement there turns it into a gap
+        and every downstream mask drops it. Element 84 floors at 1; established by measuring their
+        COGs rather than by argument.
+        """
+        result = correct_boa_dn(np.array([[1000]], dtype=np.uint16), -1000)
+        assert result[0, 0] == 1
 
-    def test_skips_correction_when_baseline_lt_400(self):
-        """Dates with baseline < 400 should not have any correction applied."""
-        original = np.array([[[1500, 2000], [3000, 4000]]], dtype=np.uint16)
-        data = self._make_dataset({"B02": original.copy()}, ["2024-01-01"])
+    def test_no_corrected_pixel_can_wrap(self):
+        """A uint16 input cannot underflow, which is what the int32 widening is for.
 
-        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 399})
+        Adding a negative Python int to a uint16 array raises under numpy 2, and doing the
+        arithmetic in the input dtype would wrap DN 500 to about 64536.
+        """
+        result = correct_boa_dn(np.zeros((1, 1), dtype=np.uint16), -1000)
+        assert result[0, 0] == 1, "even DN 0 floors rather than wrapping"
 
-        # Values should be unchanged (cast to int16 but same magnitude)
-        np.testing.assert_array_equal(
-            result["B02"].values,
-            original.astype(np.int16),
-        )
+    def test_the_brightest_codes_lose_exactly_the_offset(self):
+        """Nothing saturates at the top of the range either."""
+        result = correct_boa_dn(np.array([[65535, 65000]], dtype=np.uint16), -1000)
+        np.testing.assert_array_equal(result, np.array([[64535, 64000]], dtype=np.uint16))
 
-    def test_only_corrects_specified_bands(self):
-        """When bands parameter is provided, only those bands are corrected."""
-        values = np.array([[[2000]]], dtype=np.uint16)
-        data = self._make_dataset(
-            {"B02": values.copy(), "B03": values.copy()},
-            ["2024-01-01"],
-        )
-
-        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400}, bands=["B02"])
-
-        assert result["B02"].values[0, 0, 0] == 1000
-        assert result["B03"].values[0, 0, 0] == 2000
-
-    def test_corrects_only_dates_above_threshold(self):
-        """Only dates with baseline >= threshold get corrected."""
-        values = np.array([[[2000]], [[2000]], [[2000]]], dtype=np.uint16)
-        data = self._make_dataset(
-            {"B02": values.copy()},
-            ["2024-01-01", "2024-01-06", "2024-01-11"],
-        )
-
-        result = _apply_baseline_corrections_by_date(
-            data,
-            baselines={
-                "2024-01-01": 400,  # corrected
-                "2024-01-06": 399,  # not corrected
-                "2024-01-11": 510,  # corrected
-            },
-        )
-
-        assert result["B02"].values[0, 0, 0] == 1000  # corrected
-        assert result["B02"].values[1, 0, 0] == 2000  # unchanged
-        assert result["B02"].values[2, 0, 0] == 1000  # corrected
+    def test_an_empty_array_is_a_no_op(self):
+        """A zero-size array, which odc returns on a tolerated read failure, is untouched."""
+        result = correct_boa_dn(np.zeros((0, 0), dtype=np.uint16), -1000)
+        assert result.shape == (0, 0)
+        assert result.dtype == np.uint16
 
 
 class TestDateFiltering:
@@ -227,7 +199,7 @@ class TestProviderConfiguration:
         [
             # Earth Search S2 COGs are already BOA-corrected; its S1 threshold
             # constant is None — so both are False.
-            ("earth-search", "sentinel-2-l2a", False),
+            ("earth-search", "sentinel-2-l2a", True),
             ("earth-search", "sentinel-1-grd", False),
             ("earth-search", "landsat-c2-l2", False),
             # Planetary Computer S2 sets a baseline_threshold (=400) → True.
@@ -321,8 +293,10 @@ class TestIngestTile:
         raw_data = sample_reflectance_data(["2024-01-01"], height=32, width=32, seed=42)
         # Set known values for verification (use "blue" - common name for B02)
         raw_data["blue"].values[:] = 2000
+        captured: dict[str, object] = {}
 
         def mock_load(*args, **kwargs):
+            captured["driver"] = kwargs.get("driver")
             return raw_data
 
         monkeypatch.setattr("tessera_embeddings.ingest.stac._load_from_stac", mock_load)
@@ -340,9 +314,41 @@ class TestIngestTile:
         )
 
         assert result_data is not None
-        # blue (B02) values should stay same
-        assert result_data["blue"].values[0, 0, 0] == 2000
-        assert result_baselines == {"2024-01-01": 400}
+        # The DRIVER is the assertion now, not the pixel. The offset is removed inside the read,
+        # per image, before resampled sources are fused — so a test that replaces the loader can
+        # only check that the correction was handed to it. What the driver then does to real pixels
+        # is asserted in `TestTheOffsetIsRemovedPerImage`, which drives a real `odc.stac.load`.
+        assert captured["driver"] is not None, "a collection owed the offset must load through the corrector"
+        assert result_baselines == {"2024-01-01": 400}, "provenance still records what each item declared"
+
+    def test_ingest_tile_leaves_a_collection_owed_no_offset_alone(
+        self, mock_stac_item, sample_reflectance_data, monkeypatch
+    ):
+        """A collection with no correction threshold gets odc's own driver, not ours.
+
+        Sentinel-1 and Landsat carry no BOA offset, so wrapping their reads would add a decision
+        where there is no question — and `requires_baseline_correction` is the gate that keeps the
+        whole mechanism off those paths, including OPERA's, which shares this entry point.
+        """
+        items = [mock_stac_item("2024-01-01", baseline="04.00")]
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", lambda *a, **k: items)
+        captured: dict[str, object] = {}
+
+        def mock_load(*args, **kwargs):
+            captured["driver"] = kwargs.get("driver")
+            return sample_reflectance_data(["2024-01-01"], height=32, width=32, seed=42)
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._load_from_stac", mock_load)
+        ingest_tile(
+            provider="earth-search",
+            collection="landsat-c2-l2",
+            tile_id="33UUP",
+            start_date="2024-01-01",
+            end_date="2024-01-10",
+            existing_dates=None,
+            mid_longitude=15.0,
+        )
+        assert captured["driver"] is None
 
     def test_ingest_tile_does_not_correct_extra_bands(self, mock_stac_item, sample_reflectance_data, monkeypatch):
         """Extra bands (like SCL) should NOT have baseline correction applied."""
@@ -358,8 +364,11 @@ class TestIngestTile:
         raw_data["blue"].values[:] = 2000
         scl_values = np.full((1, 32, 32), 4, dtype=np.uint8)  # 4 = vegetation
         raw_data["scl"] = (["time", "northing", "easting"], scl_values)
+        captured: dict[str, object] = {}
 
         def mock_load(*args, **kwargs):
+            driver = kwargs.get("driver")
+            captured["reflectance_assets"] = driver.md_parser.reflectance_assets
             return raw_data
 
         monkeypatch.setattr("tessera_embeddings.ingest.stac._load_from_stac", mock_load)
@@ -378,9 +387,12 @@ class TestIngestTile:
         )
 
         assert result_data is not None
-        # blue doesn't need to be corrected
-        assert result_data["blue"].values[0, 0, 0] == 2000
-        # scl should NOT be corrected (still 4)
+        # `scl` is excluded STRUCTURALLY now, not by a list of band names the corrector was told to
+        # skip. The offset decision is stamped onto reflectance sources only, so the scene
+        # classification layer carries no decision at all and the reader has nothing to apply.
+        # Asserted on the resolved asset keys, because that is the thing that could go wrong.
+        assert "scl" not in captured["reflectance_assets"]
+        assert set(captured["reflectance_assets"]) == set(S2_L2A_BANDS)
         assert result_data["scl"].values[0, 0, 0] == 4
 
     def test_ingest_tile_applies_post_load_fn(self, mock_stac_item, sample_reflectance_data, monkeypatch):
@@ -511,10 +523,19 @@ class TestSolarDayPainterOrdering:
             ]
 
         monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", mock_query)
-        monkeypatch.setattr(
-            "tessera_embeddings.ingest.stac.normalize_to_solar_day",
-            lambda items, mid_longitude=None: items,
-        )
+
+        def stamp_noon(items, mid_longitude=None):
+            """What the real function does to `.datetime`, without the longitude offset.
+
+            A bare pass-through is no longer a faithful stub: every date derived downstream goes
+            through `solar_day_of`, which refuses an item that has not been stamped. The offset is
+            what this test is isolating away from, not the stamping.
+            """
+            for item in items:
+                item.datetime = item.datetime.replace(hour=12, minute=0, second=0, microsecond=0)
+            return items
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac.normalize_to_solar_day", stamp_noon)
 
         def fake_load(items, **kwargs):
             seen["order"] = [it.properties["eo:cloud_cover"] for it in items]
