@@ -499,8 +499,9 @@ differ only in what becomes of the values that were negative:
 **The correction runs after the load, so the floor acts on resampled values.** `odc.stac.load` reads
 and resamples in one step, and six of the ten configured bands are natively 20 m on a 10 m grid, so
 a pixel whose resampling kernel spans the DN-1000 boundary is floored where Element 84 — flooring
-each source pixel first — would not have been. The ordering is what `main` already ships, the affected pixels are the neighbourhood of a population that is well under 0.1%
-of a scene, and the parity it weakens has no live exposure today; see
+each source pixel first — would not have been. The ordering is what `main` already ships, and the affected pixels are the neighbourhood of a
+population well under 0.1% of a scene — but the parity it weakens **does** have live exposure, since
+raw items at or above the threshold occur on real Earth Search data. See
 `context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md` for the full accounting and
 what fixing it would cost.
 
@@ -1342,8 +1343,8 @@ The key reads these signals, in this order:
    at or above the threshold can refuse the whole day. A copy owing nothing removes that risk for
    the date rather than for itself, which is a coverage argument, so this is the one term allowed
    to cost a reprocessing. Inert below the threshold, where no producer changes a pixel — which is
-   every ESA-hosted copy in the archive as indexed, so the term is not observed to cost a baseline
-   at all. Also inert where the producer is the COLLECTION's answer: every copy then has the same
+   most but NOT all ESA-hosted copies: zone 01N in 2017 carries 15 at baseline 05.00, so the term
+   does fire on real data. Also inert where the producer is the COLLECTION's answer: every copy then has the same
    producer, so a term that compares producers would discriminate on the threshold alone, which is
    the baseline ranked below it and in the opposite direction.
 6. **Processing baseline, descending.** The signal that carries data vintage. Ordered by value

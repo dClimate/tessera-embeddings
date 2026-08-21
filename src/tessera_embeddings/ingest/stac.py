@@ -335,8 +335,14 @@ def dates_exempt_from_correction(
     So a date is exempt unless some item is BOTH raw and at or above the threshold. Only when
     such an item shares a date with a harmonised one is the answer genuinely ambiguous: the
     correction is date-wide, so exempting leaves raw tiles 1000 high while correcting drops 1000
-    from harmonised ones, and both are silent. That case refuses. It has never been observed,
-    which is why it is refused rather than engineered around.
+    from harmonised ones, and both are silent. That case refuses.
+
+    **It DOES occur.** Zone 01N in 2017 carries 15 items served complete from the ESA bucket at
+    baseline 05.00, and the two solar days holding them refuse. An earlier version of this
+    docstring said the combination had never been observed and was refused rather than engineered
+    around for that reason; that was an inference from a small sample and it was wrong. Refusing is
+    still the only correct date-wide answer, but it now costs real days — see the known limit
+    below.
 
     **Each item is judged on its OWN declared baseline, and an unreadable one refuses the date.**
     A missing or malformed ``s2:processing_baseline`` parses as 0, which is under the threshold,
@@ -353,15 +359,20 @@ def dates_exempt_from_correction(
             configuration already settles it. Asset locations are not consulted then, which is
             what lets a provider serving its bands under native asset keys be judged here at all.
 
-    **A known limit, measured and accepted.** The producers are judged over the items of one solar
-    day, which is the right scope — but duplicate selection chooses each tile's copy without seeing
-    its neighbours, so a tile whose only copy is raw-and-owed can refuse a day that another of its
-    tiles could have agreed with. Measured on multi-tile boxes: days whose tiles disagree about
-    producer are common in the early archive (11 of 25 in one 2017 window) and absent from modern
-    data, but NONE of them refuses, because a refusal also needs a raw copy at or above the
-    threshold and the raw backfill is entirely pre-04.00. Making selection day-aware is the fix if
-    that ever changes; refusing is correct in the meantime, and this docstring is the record of the
-    decision rather than an oversight.
+    **A LIVE limit, and the reason a whole day can be lost.** The producers are judged over the
+    items of one solar day, which is the right scope, and the correction carries ONE baseline per
+    date. So a day whose raw items sit on both sides of the threshold has no correct date-wide
+    answer and refuses — taking every harmonised tile on that day with it.
+
+    Duplicate selection cannot resolve it, because the straddle is across DIFFERENT TILES rather
+    than across copies of one acquisition. Measured on zone 01N in 2017: 2017-11-16 carries 18 raw
+    items, 9 at baseline 00.01 and 9 at 05.00, beside 27 harmonised ones; selection reduces 45
+    items to 33 and the day still refuses. 2017-12-21 behaves the same way.
+
+    The fix is a correction applied per ITEM before the mosaic rather than per date after it, which
+    is a change to the load path and not to this function. Refusing remains correct until then —
+    the alternative is shifting some tiles by 1000 in the wrong direction, silently — but this is a
+    live source of lost days, not a theoretical one.
 
     Raises:
         HeterogeneousProducerError: no single date-wide decision is correct for the date — it
@@ -451,8 +462,9 @@ def dates_exempt_from_correction(
         # A date carries ONE baseline (`extract_baselines` is last-wins by construction), so raw
         # items on opposite sides of the threshold cannot both be served: correcting shifts the
         # pre-threshold pixels down by the offset, not correcting leaves the post-threshold ones
-        # high. Unreachable while the backfill is entirely pre-04.00, and refused rather than
-        # resolved for exactly that reason.
+        # high. REACHED on real data — zone 01N 2017 has raw items at 00.01 and 05.00 on one solar
+        # day, on different tiles — so this refusal costs real days. Refusing is still the only
+        # correct date-wide answer; the fix is to correct per item before the mosaic.
         #
         under = [
             it
@@ -473,14 +485,13 @@ def dates_exempt_from_correction(
                 f"either choice is wrong for some of its pixels. Load the producers separately."
             )
         # Announced LAST, after every refusal above, so the line only ever describes a date that
-        # really will be corrected. Every raw item measured on the
-        # live catalogue reports a pre-04.00 baseline, so this branch has never been reached on
-        # real data — which means the correction path itself has never run in production. Say so
-        # at WARNING the first time it does, per date: sampling a catalogue cannot prove the
-        # combination never appears (a 100-item page of a 146-item year told me it did not), and
-        # a monitored fact beats an inference from a sample. Not an error: correcting a raw item
-        # over the threshold is exactly right, and this is the path doing its job.
-        # WARNING only for the ESA archive, which is the route believed impossible. Every
+        # really will be corrected. Kept at WARNING because it is rare and consequential, not
+        # because it is impossible: an earlier comment here said this branch had never been reached
+        # on real data, inferred from a sample of one tile-year. Zone 01N 2017 reaches it. A
+        # monitored fact beats an inference from a sample, which is the reason to log rather than to
+        # assume. Not an error: correcting a raw item over the threshold is exactly right, and this
+        # is the path doing its job.
+        # WARNING only for the ESA archive, which is the surprising route. Every
         # Planetary Computer item is unharmonised as well, and correcting those is routine — a
         # warning on each of them would fire on every date of an MPC ingest and would also be
         # saying something untrue, since for that provider it is not a new combination at all.

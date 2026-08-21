@@ -1,186 +1,362 @@
-# 020 — Correct the BOA offset on every valid DN, and decide it from the items
+# 020 — Removing the Sentinel-2 brightness offset, and choosing which copy to read
 
-**Status:** Accepted (measured 2026-08-20). Built, on
-`solutions/prefer-in-region-duplicate-assets`.
+**Status:** Accepted 2026-08-20. Built on `solutions/prefer-in-region-duplicate-assets` (PR #107).
+One limit found on 2026-08-21 is live and unfixed — see "What this costs", limit 1.
 
-## Context
+This document is written to be read by someone who has not seen the code. Terms are defined at
+first use, and there is a glossary at the end.
 
-ESA processing baseline 04.00 (January 2022) added a fixed `+1000` to Sentinel-2 L2A surface
-reflectance, so that negative reflectance — routine over water and deep shadow — is representable
-in an unsigned type. Reading such a product without removing the offset yields reflectance 1000 DN
-too high.
+---
 
-Earth Search indexes two things under one collection. Most items serve Element 84's own COGs from
-`sentinel-cogs`, which already have the offset removed. Some serve ESA's originals from
-`sentinel-s2-l2a`, which do not. So the correction cannot be a property of the collection there,
-and `main` set no threshold for Earth Search at all — it never corrected that collection.
+## 1. The problem
 
-This ADR records the decisions taken while making that correction right, and the measurement that
-settled the one nobody could settle by reading documentation.
+Sentinel-2 measures how much light each patch of ground reflects. That measurement is stored as a
+whole number — 0.15 reflectance becomes 1500, and so on.
 
-## Decision
+Reflectance can legitimately come out **negative** after the atmosphere is subtracted, which
+happens routinely over deep water and in shadow. Whole numbers in these files are unsigned, so
+negatives cannot be stored. In January 2022 ESA solved this by adding a fixed **+1000 to every
+value**, giving negative reflectance somewhere to live:
 
-**The offset applies to every valid DN, and the corrected value floors at the lowest VALID code
-rather than at zero.** DN 0 is the nodata code and is the one value carrying no offset. Everything
-from DN 1 upward loses 1000, and a result at or below zero becomes 1, not 0.
+```
+                  true reflectance      what ESA stores      what we must store
+                  ────────────────      ───────────────      ──────────────────
+  bright snow            0.90       ──►      10000       ──►       9000
+  vegetation             0.15       ──►       2500       ──►       1500
+  dark water             0.01       ──►       1100       ──►        100
+  darker water          -0.05       ──►        500       ──►          1   ← floored
+  no observation          --        ──►          0       ──►          0   ← untouched
+```
 
-That floor is the part that could only be measured. Flooring at 0 is the arithmetic the community's
-harmonisation snippets use, and it is wrong here: 0 is nodata, so it makes a real dark observation
-indistinguishable from no observation, and every downstream mask drops it. Element 84 floors at 1,
-and matching them is the whole point — a corrected raw copy has to be interchangeable with a
-harmonised one.
+If we store ESA's numbers without subtracting the 1000, every pixel is too bright by 1000 — a
+large error, and a silent one. Nothing crashes; the imagery just becomes wrong.
 
-**Element 84's COGs are harmonised, and the bucket is the signal.** Measured, not assumed: reading
-the same granule from both hosts, the COG is exactly the ESA original minus 1000, floored at 1,
-with nodata preserved. Two granules, two post-04.00 baselines, four bands, three resolutions,
-**274,609,800 pixels, every one identical.**
+---
 
-| granule | baseline | band | pixels | nodata | DN 1–1000 | ours | subtract only ≥1000 | floor at 0 |
+## 2. Why this isn't simple: one catalogue, two sources
+
+We find imagery through Earth Search, a search service run by Element 84. A single search of a
+single collection returns files from **two different places**:
+
+```
+                     Earth Search catalogue
+                  (one search, one collection)
+                              │
+              ┌───────────────┴────────────────┐
+              ▼                                ▼
+      s3://sentinel-cogs                s3://sentinel-s2-l2a
+      Element 84's own copies           ESA's original files
+      offset ALREADY REMOVED            offset STILL PRESENT
+      the large majority                a small minority
+              │                                │
+              └───────────────┬────────────────┘
+                              ▼
+                  These need OPPOSITE treatment,
+                  and the catalogue's own metadata
+                  does not reliably say which is which.
+```
+
+Get it backwards in either direction and the error is the same size and equally silent: subtract
+1000 from a file that already had it removed, or fail to subtract it from one that still has it.
+
+Before this change, the code did not distinguish them at all — it left the whole collection alone,
+which is right for the majority and wrong for the minority.
+
+---
+
+## 3. What we decided
+
+### Decision 1 — Subtract from every real measurement, and floor the result at 1
+
+The offset is on **every** value from 1 upward, not only on bright ones. The single exception is 0,
+which is the code for "no observation here"; it carries no offset and is left alone.
+
+Values that were negative before the offset was added come out at or below zero when we subtract
+it. Those are floored — and the floor is **1, not 0**:
+
+```
+  a real but very dark observation, stored as 500
+
+    floor at 0  ──►  0    now indistinguishable from "no observation".
+                          Every cloud and quality mask will throw it away.
+
+    floor at 1  ──►  1    still the darkest valid value, but visibly
+                          an observation.        ✓ this is what we do
+```
+
+This detail was not obvious and we got it wrong first. Flooring at zero is what the widely
+circulated code snippets for this correction do. We only found the difference by comparing our
+output against Element 84's, pixel by pixel.
+
+### Decision 2 — Tell the two sources apart by where the file is stored, not by the metadata
+
+Membership of a list of storage locations decides which treatment a file gets. The catalogue's own
+metadata is not usable for this, for three separate reasons:
+
+1. The field that should say whether the offset was removed is **missing on exactly the files where
+   the question matters** — present on Element 84's copies, absent on ESA's.
+2. A second metadata field states an offset that contradicts what is actually in the pixels.
+3. Some file locations listed in the metadata **do not exist**. Following one returns "no such
+   file"; the real file is in a different folder.
+
+Point 3 also explains a design choice that otherwise looks arbitrary. We judge a file's source by
+looking only at the colour bands we actually read, not at everything the catalogue lists alongside
+them. Those extra listings include the broken paths above — so judging everything would conclude
+"this file comes from both sources at once" for a file that is entirely from one, on the strength of
+paths that lead nowhere.
+
+The owner of this data has also confirmed from operational experience that every Element 84 copy is
+already corrected, and that Element 84's own documentation is misleading on the point.
+
+### Decision 3 — Work out the correction from the imagery, not from a table passed in
+
+There is a table of processing versions that travels alongside the imagery. It exists to record
+*what was used*, and it is unsuitable for *deciding what to do*, because it keeps only one entry per
+day and writes 0 for anything it could not read. Deciding from it meant a real correction could be
+skipped in three different ways, all silent.
+
+For providers where every file comes from the same source, the collection's own configuration
+supplies the answer instead. This is what lets Microsoft Planetary Computer be handled at all: it
+names its files differently, so inspecting individual files there finds nothing.
+
+### Decision 4 — Two copies are the same photograph when they name the same datatake
+
+The same photograph is often published more than once, reprocessed with a newer version. We must
+keep one, not blend both together. The obvious way to spot them — a shared timestamp — does not
+work:
+
+```
+  One photograph of tile 33TWM, 19 December 2017. Published twice.
+
+    copy A   processed 2017   catalogue time 09:54:10   version 02.06
+    copy B   processed 2023   catalogue time 09:57:39   version 05.00
+                              └──── 209 seconds apart ────┘
+
+  Grouping by timestamp (within 2 minutes) concludes: TWO photographs.
+    ──► both kept, both loaded, blended into one image.
+
+  But both carry the same "datatake" name — the satellite pass they came from:
+
+      GS2B_20171219T095409_004109_N02.06
+      GS2B_20171219T095409_004109_N05.00
+      └──────── identical ───────────┘└ differs ┘
+
+  Grouping by that concludes: ONE photograph, published twice.
+    ──► one kept, the other held in reserve as a fallback.
+```
+
+The timestamp is a per-copy field, so no tolerance around it can separate "two reprocessings" from
+"two genuinely different passes" without getting one of them wrong. The datatake name needs no
+tolerance at all. Timestamps remain the fallback for files that do not name one.
+
+### Decision 5 — Prefer a copy needing no correction, but never a copy that is merely cheaper to read
+
+When several copies of one photograph exist, they are ranked by asking questions in a fixed order.
+The first question that separates two copies decides between them:
+
+```
+   1  Can we read every band we need?                 ← unusable beats everything
+   2  Can we tell which source produced it?
+   3  Does it say which photograph it is?
+   4  Can we read its processing version?
+  ─────────────────────────────────────────────  above: "will this work at all?"
+   5  Does it avoid needing the offset removed?       ← may cost a newer version
+   6  Is its processing version newer?
+  ─────────────────────────────────────────────  below: "which is the better image?"
+   7  Is it cheaper for us to read?                   ← must never override 6
+   8  Publication sequence, then name (tie-break)
+```
+
+Questions 5 and 7 both come down to where a file is stored, and they sit on opposite sides of
+question 6 deliberately:
+
+- **Question 5 is about how much imagery survives.** The correction decision is made once per day
+  across every tile in that day, so one file needing correction can cost the whole day (see limit 1
+  below). Avoiding that is worth accepting an older processing version.
+- **Question 7 is only about our own costs.** Files in the same cloud region as our computers are
+  cheaper and faster to read. That must never buy us a worse image, so it ranks below version.
+
+### Decision 6 — Reduce duplicates for every collection that makes an offset decision
+
+Two entry points into the loader previously skipped duplicate reduction unless a collection's
+source could vary file by file. That excluded the one provider that most needed it. Measured on the
+live Planetary Computer catalogue across six tiles and 3,585 files: **1,000 redundant copies of the
+same photograph** were being loaded and blended together, and **12 days** would have been refused.
+
+This deliberately stops at collections that have no offset to remove. Landsat files can be grouped
+by the same machinery, so removing the condition entirely would start reducing Landsat imagery too —
+a change nothing here has measured.
+
+### Decision 7 — "Both sources at once" requires actually seeing both
+
+A file whose bands come from a known-corrected location and an unclassified one is reported as
+*unknown*, not as *mixed*. Nothing in it is known to be uncorrected, so the useful advice is
+"classify that location", which is what the unknown message says. The previous message told the
+operator to split the day apart, for a conflict that might not exist.
+
+---
+
+## 4. The evidence
+
+One Sentinel-2 product is published in both places at once: Element 84's corrected copy, and ESA's
+original, same processing version, same pixel grid. Element 84's copy is therefore a **reference
+answer** — whatever a correct correction produces, it should reproduce that file exactly.
+
+We ran the real correction code over whole bands read from both places and compared every pixel:
+
+| product | version | band | pixels | of which "no observation" | of which very dark | our result | if we floored at 0 | if we skipped dark values |
 |---|---|---|---|---|---|---|---|---|
-| `S2A_33TWM_20221128_0_L2A` | 04.00 | B02 @10m | 120,560,400 | 13,862,094 | 12,187 | 100.000000% | 99.989893% | 99.989891% |
-| `S2B_29SMC_20230919_0_L2A` | 05.09 | B02 @10m | 120,560,400 | 24,095,834 | 19,834 | 100.000000% | 99.987026% | 99.983548% |
-| `S2B_29SMC_20230919_0_L2A` | 05.09 | B12 @20m | 30,140,100 | 6,023,948 | 187 | 100.000000% | 99.999380% | 99.999380% |
-| `S2B_29SMC_20230919_0_L2A` | 05.09 | B01 @60m | 3,348,900 | 668,358 | 2,643 | 100.000000% | 99.921079% | 99.921079% |
+| `S2A_33TWM_20221128_0_L2A` | 04.00 | B02 @10 m | 120,560,400 | 13,862,094 | 12,187 | **100.000000%** | 99.989891% | 99.989893% |
+| `S2B_29SMC_20230919_0_L2A` | 05.09 | B02 @10 m | 120,560,400 | 24,095,834 | 19,834 | **100.000000%** | 99.983548% | 99.987026% |
+| `S2B_29SMC_20230919_0_L2A` | 05.09 | B12 @20 m | 30,140,100 | 6,023,948 | 187 | **100.000000%** | 99.999380% | 99.999380% |
+| `S2B_29SMC_20230919_0_L2A` | 05.09 | B01 @60 m | 3,348,900 | 668,358 | 2,643 | **100.000000%** | 99.921079% | 99.921079% |
 
-The last two columns are the point: both rejected variants score below 100% on exactly the dark
-population, so the 100% is falsifiable rather than the vacuous result of comparing something with
-itself. The magnitude is honest too — the DN 1–1000 band is 0.0006% to 0.079% of these scenes, so
-this is a correctness fix over dark surfaces and not a fix affecting most pixels.
+**274,609,800 pixels. Every one identical.** Two products, two processing versions, four bands,
+three resolutions.
 
-**Item-level metadata cannot substitute for the bucket, because it is missing or wrong exactly
-where a decision is needed.** `earthsearch:boa_offset_applied` is `True` on the COGs and **absent**
-on the ESA-hosted copies — present only where it is not needed. `raster:bands` carries an offset
-that contradicts the data (sertit/eoreader#120). And the `-jp2` extra assets on post-04.00 items
-point at keys that do not exist: `s3://sentinel-s2-l2a/tiles/33/T/WM/2022/11/28/0/B02.jp2` returns
-`NoSuchKey`, the real object being under `R10m/`. That dangling href is also why harmonisation is
-judged over the configured reflectance bands and not over every asset — judging all of them reports
-a straddle for a wholly harmonised item, on the strength of hrefs that do not resolve.
+The last two columns matter as much as the result. They are what the two rejected alternatives would
+have scored, and they are below 100% — so the agreement is a real test rather than a comparison of
+something with itself. Both alternatives fail on exactly the very dark pixels, which is the
+population the decision was about.
 
-**The correction is derived from the ITEMS on every provider; the caller's baseline map is
-provenance and decides no pixel.** `extract_baselines` is last-wins per date and reports 0 for any
-unreadable baseline, so correcting from it skipped raw post-04.00 pixels silently for three
-separate reasons: a missing entry, an unreadable baseline, or an arbitrary item's value on a
-multi-item date. A figure derived from the items is not evidence about the items.
+**How much does this affect?** The very dark pixels are between 0.0006% and 0.08% of these scenes.
+This is a correctness fix for water and shadow, not a change to most of the imagery.
 
-Where the producer cannot vary between items, the collection's own configuration supplies it: a
-correction threshold on such a collection says every item is unharmonised, which is what the
-threshold exists to correct. `dates_exempt_from_correction` and `correction_baselines_by_date` take
-that as `known_harmonisation` and skip the asset read, which is what lets a provider serving its
-bands under native asset keys (`B02`, `SCL`) be judged from its items at all. One derivation now
-serves both providers.
+---
 
-**Two copies are the same acquisition when they name the same datatake, not when their timestamps
-are close.** The catalogue `datetime` is a per-copy field and reprocessings do not agree on it: the
-committed 2017-12-19 pair — one granule, baselines 02.06 and 05.00, same sensing time, orbit and
-tile — is timestamped 208.6 seconds apart. A 120-second window therefore kept both as separate
-acquisitions and handed both to the loader to mosaic. `s2:datatake_id` names mission, sensing start
-and absolute orbit, and only its baseline suffix changes between reprocessings, so identity needs
-no tolerance at all. The timestamp window survives as the fallback for a copy naming no datatake.
+## 5. What this costs — three honest limits
 
-**A copy owing no offset correction outranks the baseline VALUE; locality does not.** These are two
-different claims about where an item's assets live, and they sit on opposite sides of the baseline
-deliberately. The correction is decided per solar day over every tile fused into it, so one raw
-copy at or above the threshold can refuse a whole day — avoiding that is a coverage argument and is
-allowed to cost a reprocessing. Locality is only about egress and must never buy a cheaper read
-with a worse pixel, so it stays below the baseline.
+### Limit 1 — A whole day of imagery can be refused, and this happens for real
 
-**The tile key reads whichever property the catalogue populates.** `grid:code`, then
-`s2:mgrs_tile`, then the item id, canonicalised to one form. Planetary Computer ids carry the tile
-in a field the Element 84 pattern does not match, so without its own property every PC item was
-unkeyable and duplicate selection was a no-op for the entire provider.
+This is the most serious consequence and it is currently unfixed.
 
-**`MIXED` requires both known producer classes to be present.** Harmonised bands beside a bucket
-nobody has classified is `UNKNOWN`: nothing there is known to be raw, so the actionable remedy is
-to classify the bucket, which is what the `UNKNOWN` message says. Both states still refuse the
-date; only the diagnostic changes.
+The correction is applied **once per day, with one value**. That is fine when everything in a day
+needs the same treatment. It breaks when a day contains ESA originals from two different processing
+eras:
 
-## Consequences
+```
+  One day, zone 01N, 16 November 2017 — 45 images across many tiles
 
-**Two new loud failures on the collection-wide raw path**, where the behaviour used to be silent.
-An unreadable baseline now raises `HeterogeneousProducerError` instead of reading as 0 and skipping
-the correction. And a solar day whose raw items straddle the threshold now refuses, which is the
-rule Earth Search already followed — previously the map's last-wins pick decided it and one side of
-the straddle was quietly wrong. Both are loud in place of silent, which is the trade being made.
+    27 images   Element 84 copies      already corrected        ✓ fine as they are
+     9 images   ESA originals, v00.01  no offset was ever added ✓ fine as they are
+     9 images   ESA originals, v05.00  offset IS present        ✗ needs -1000
 
-**The store's dtype is preserved by the default mode**, which is why it is the default. A ROI
-store's arrays are seeded from the first date's dataset, and a date that skips correction keeps its
-unsigned input dtype, so a mode returning signed values makes the store's dtype depend on which
-date landed first and casts every date of the other kind. `preserve_low_values` is renamed
-`clamp_negatives`, which is what the flag now selects.
+  Only one correction value can be applied to the whole day:
 
-**The ranking term that outranks the baseline is not observed to fire.** Every copy served from the
-ESA bucket in the archive as indexed reports a pre-04.00 baseline, and below the threshold the term
-is inert. So it engages only in the combination the ingest already logs at WARNING as unexpected —
-a raw ESA copy at or above the threshold — where preferring the harmonised copy is the conservative
-choice. It is recorded here because a reader will otherwise read it as buying cheaper egress with
-older imagery, which is the rule directly below it and the opposite of this one.
+    correct the day  ──►  the nine v00.01 images become 1000 too LOW
+    skip the day     ──►  the nine v05.00 images stay  1000 too HIGH
 
-**The floor is applied after resampling, and does not commute with it.** `odc.stac.load` reads and
-resamples in one step, so the correction acts on resampled values. Six of the ten configured bands
-are natively 20 m loaded onto a 10 m grid, so this is the normal case rather than an edge one. Two
-raw neighbours at DN 500 and 1500 average to 1000 and then floor to 1, where Element 84 — flooring
-each source pixel first — would average 1 and 500 to about 251.
+  Neither is right. So the day is refused — and the 27 perfectly good
+  Element 84 images are thrown away with it.
+```
 
-Not fixed here, for three reasons, and recorded so the trade is visible rather than implied. The
-ordering is **what already ships**: `main` corrects after the load too (`load_stac_items` calls
-`_load_from_stac`, then the corrector), as does `Arbol-Project/yield-modeling`, the repository these
-ingest modules were lifted from. Reordering is therefore a change to the pixels every existing store
-was written with, not a change confined to a new path — and it would have to be justified as an
-improvement over shipped behaviour rather than as a bug fix. (An earlier version of this paragraph
-called yield-modeling a downstream consumer of this store. It is not; it is the predecessor the code
-came from. The inheritance argument stands on `main`.) The affected
-pixels are the resampling neighbourhood of the DN-below-1000 population, which is 0.0006%–0.08% of a
-real scene. And the parity claim it weakens has no live exposure: the correction never fires on Earth
-Search data, because every ESA-hosted copy in the archive is pre-04.00, while on Planetary Computer
-it fires on most dates but there is no harmonised counterpart there to be in parity with.
+Choosing one copy per photograph does not help here: the conflict is between **different tiles**,
+not between duplicate copies of the same tile. We confirmed this — reducing that day from 45 images
+to 33 still leaves it refused. The same happens on 21 December 2017.
 
-It becomes real the day an ESA-hosted post-04.00 copy appears — the same case term 5 of the ranking
-key exists for. Fixing it means loading at native resolution, correcting, then resampling
-separately, which changes the graph shape and the memory profile of every ingest; that is separate
-work, not a side effect of this one.
+Refusing is still the right answer over silently shifting some tiles the wrong way by 1000. But this
+costs real days, and an earlier version of this document said the situation did not occur. That was
+an inference from a small sample and it was wrong.
 
-**The residual risk on the bucket list is real.** If an unharmonised post-04.00 COG ever appears in
-`sentinel-cogs`, it is exempted and stays 1000 DN high, silently. Nothing detects that today.
+**How common is it?** ESA originals at version 04.00 or above are concentrated near the
+antimeridian — the Bering Sea and Aleutians, map zones 1 and 60 — and the population is growing
+rather than shrinking. Counted over November and December of each year, so these are lower bounds
+for full years:
 
-## Rejected alternatives
+| year | ESA originals needing correction | tiles affected |
+|---|---:|---:|
+| 2017 | 15 | 10 |
+| 2018 | 10 | 10 |
+| 2019 | **210** | 15 |
 
-**Floor the corrected value at 0.** The arithmetic in the widely-circulated harmonisation snippets,
-and what this branch shipped first. Measurement rejected it: Element 84 floors at 1, and 0 is the
-nodata code, so flooring there converts valid dark observations into no-data. Wrong on 12,187 and
-19,834 pixels in the two 10 m arms above.
+A single case was also found outside that region, in map zone 59 in 2019. So this is a recurring
+and increasing population, not a one-off in a single year.
 
-**Leave DN 1–999 unchanged.** The behaviour on `main`, on the reasoning that dark pixels are
-"below the offset". They are not below anything — ESA applies the offset across the whole range
-precisely so that sub-zero reflectance survives the trip. Wrong on the same population.
+**The fix** is to apply the correction to each image before they are combined, rather than to the
+combined result. That is a change to how imagery is loaded, and it is owed as separate work. Until
+then, days of this shape are lost rather than corrupted — which is the right way round, but it is a
+loss.
 
-**Refuse on `earthsearch:boa_offset_applied: false`**, using the metadata only in the direction
-where a value is a positive claim and never treating absence as one. Not added: the same field is
-known to be wrong in that direction too, so a false `false` would refuse loadable data. This was
-considered because two HIGH review comments argued the bucket list is unsafe; the answer is the
-measurement above, and this alternative is recorded so the next reader sees it was weighed.
+### Limit 2 — The floor is applied after images are resized
 
-**Widen `_SAME_ACQUISITION_S` past the observed 209-second skew.** A tolerance around a per-copy
-timestamp cannot separate "two reprocessings" from "two passes" without getting one of them wrong —
-successive orbits revisit a high-latitude tile about 50 minutes apart, and keying on
-`(tile, solar day)` alone dropped 493 of 2,733 items that were distinct acquisitions. The field
-changed instead of the constant. The old comment claimed reprocessings agree to sub-second
-precision; that claim is now corrected in place rather than replaced by a new number.
+Images are read and resized to a common grid in a single step, and the correction runs afterwards.
+Six of the ten bands we use are natively half-resolution and get enlarged, so this is the normal
+case rather than an edge case.
 
-**Collapse the whole tile-date to one copy.** Would prevent the same fusion by discarding coverage
-from passes that identified themselves perfectly well.
+Flooring does not survive resizing intact:
 
-**Thread `CollectionConfig.tile_id_property` through to `item_tile`.** The configuration-driven
-option, and it needs the config at five call sites across three modules that do not carry it today.
-An ordered list of the two known MGRS properties, each validated lexically, closes the same defect
-without the plumbing.
+```
+  two neighbouring raw values:        500        1500
 
-**Keep the caller's map as the correction evidence for collection-wide raw providers.** The
-narrower fix the review asked for — refuse when a loaded item's baseline is unreadable — leaves two
-providers on two kinds of evidence and leaves the last-wins defect in place on one of them.
+  resize first, then correct:   average 1000 ──► 1000-1000 = 0 ──► floored to 1
+  correct first, then resize:   1 and 500     ──► average    ≈ 251
 
-## Related
+                                        1   vs   251
+```
 
-- [`ingest/README.md`](../../src/tessera_embeddings/ingest/README.md) — the duplicate ranking order,
-  the correction modes, and the three selection owners
-- [ADR 004](004-duck-typed-providers.md) — the provider abstraction whose per-collection
-  configuration carries `harmonisation_varies_by_item` and `band_names_are_asset_keys`
+Not changed here, for two reasons. It is the order `main` already uses, so changing it changes the
+pixels every existing store was written with, and would need justifying as an improvement rather
+than a bug fix. And the affected pixels are the immediate neighbourhood of the very dark population
+above — well under 0.1% of a scene. But this does have live exposure, because ESA originals needing
+correction do occur (limit 1), so it is a real if small error and not a theoretical one.
+
+### Limit 3 — If Element 84 ever publishes an uncorrected file, we will not notice
+
+Our rule is "files in these locations are already corrected". If an uncorrected file ever appears
+there, we will leave it alone and it will stay 1000 too bright, silently. Nothing detects this.
+
+We considered refusing whenever the metadata explicitly says the offset was *not* applied — using
+that field only in the direction where a value is a positive statement, never treating its absence
+as one. We did not add it, because the same field is known to be wrong in that direction too, and a
+false negative would refuse imagery that is perfectly good.
+
+---
+
+## 6. What we chose not to do
+
+**Floor at zero.** What the widely circulated snippets do, and what this branch shipped first.
+Measurement rejected it: zero means "no observation", so flooring there turns real dark
+observations into gaps. Wrong on 12,187 and 19,834 pixels in the two full-resolution comparisons
+above.
+
+**Leave dark values alone.** What `main` does, on the reasoning that they are "below the offset".
+They are not below anything — the offset was added to the whole range precisely so that
+below-zero reflectance survives.
+
+**Trust the metadata field about the offset.** Discussed under limit 3.
+
+**Widen the tolerance on timestamps** past the 209 seconds observed. A tolerance around a per-copy
+timestamp cannot separate two reprocessings from two genuinely different passes without getting one
+of them wrong — satellite passes over one tile are about fifty minutes apart, and collapsing them
+would discard real imagery. We changed which field is used instead.
+
+**Reduce every collection's duplicates.** Discussed under decision 6.
+
+**Pass the collection's configuration down through every call site** that needs the tile name.
+Five call sites across three modules do not carry it. A short list of the two known properties,
+each checked for the right shape, closes the same gap without the plumbing.
+
+---
+
+## 7. Glossary
+
+| term | meaning |
+|---|---|
+| **reflectance** | the fraction of light a patch of ground reflects; stored as a whole number, 1500 meaning 0.15 |
+| **the offset** | the fixed +1000 ESA added to every stored value from January 2022, so negative reflectance could be stored |
+| **processing version** | ESA's version number for how a product was generated, e.g. `05.00`. Same photograph, reprocessed, gets a newer one |
+| **the threshold** | version 04.00, the point at which the offset started being added |
+| **no-observation code** | the stored value 0, meaning nothing was measured. Carries no offset, and must not be confused with a real dark measurement |
+| **datatake** | one continuous strip of imaging by the satellite; names the photograph independently of how it was processed |
+| **tile** | a fixed square of ground, about 110 km across, that Sentinel-2 imagery is cut into |
+| **solar day** | the local day an image belongs to; imagery is combined one solar day at a time |
+| **Earth Search** | Element 84's search service, through which we find Sentinel-2 imagery |
+| **Planetary Computer** | Microsoft's equivalent service; serves the same imagery, uncorrected, under different file names |
+
+---
+
+## 8. Related
+
+- [`ingest/README.md`](../../src/tessera_embeddings/ingest/README.md) — how the code implements all
+  of the above
+- [ADR 004](004-duck-typed-providers.md) — the per-provider configuration this relies on
