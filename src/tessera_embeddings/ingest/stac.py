@@ -1253,7 +1253,8 @@ def load_stac_items(
         crs: Explicit CRS override for odc.stac.load
         resolution: Override pixel resolution in metres
         post_load_fn: Optional function applied after loading and correction
-        clamp_negatives: Whether corrected reflectance is floored at zero (see
+        clamp_negatives: Whether corrected reflectance is floored at the lowest VALID code —
+              which is 1, not 0, because 0 is the nodata code (see
               :func:`_apply_baseline_corrections_by_date`)
         groupby: How to group items into time slices. Must be "solar_day" —
               :func:`_load_from_stac` rejects anything else and says why.
@@ -1455,9 +1456,11 @@ def ingest_tile(
               bypassing CMR-STAC search entirely. Used by the OPERA RTC-S1
               path to build items from the native CMR granule API.
         clamp_negatives: When True (default), baseline correction floors corrected
-              reflectance at zero and returns the input dtype, matching the harmonised
-              Element 84 COGs. When False, negatives are kept and the result is int16 —
-              not compatible with the unsigned ROI store.
+              reflectance at the lowest VALID code — 1, not 0, since 0 is the nodata
+              code and a floored real observation must not become one — and returns the
+              input dtype, reproducing the harmonised Element 84 COGs exactly. When
+              False, negatives are kept and the result is int16 — not compatible with
+              the unsigned ROI store.
         groupby: How to group STAC items into time slices. Must be "solar_day",
               which merges same-day tiles into one mosaic; :func:`_load_from_stac`
               rejects anything else and says why.

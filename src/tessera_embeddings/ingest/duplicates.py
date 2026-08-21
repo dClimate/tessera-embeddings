@@ -186,6 +186,42 @@ def refuses_its_date(
     )
 
 
+def risks_refusing_its_date(
+    item: Any,  # noqa: ANN401
+    read_keys: tuple[str, ...] = READ_ASSET_KEYS,
+    known_harmonisation: Harmonisation | None = None,
+) -> bool:
+    """Whether OFFERING this copy as a fallback risks its date refusing rather than loading.
+
+    Wider than :func:`refuses_its_date`, which asks whether a copy refuses on its own account. A
+    copy that merely OWES the offset correction is fine by itself, and fine on a date where
+    everything owes it — but the date is fused from tiles this function cannot see, and most tiles
+    in the archive are already harmonised. Introducing a copy that owes a correction is therefore
+    very likely to make the date straddle the threshold, and a straddling date refuses.
+
+    That matters because nothing retries a refusal. The recovery ladder steps down on a READ
+    failure, so handing it a copy that refuses turns one unreadable object into an aborted ingest
+    rather than a recorded loss.
+
+    **The trade is deliberate and it is not free.** Excluding such a spare costs a fallback rung on
+    an all-raw date that would have recovered with it — which is why this is asked only of providers
+    whose copies can disagree about the producer in the first place. Offering it can abort a whole run. A lost
+    date is bounded and recorded; an aborted run is neither, so the exclusion is the cheaper
+    mistake. Validating the spare against the whole solar day would be better than either, and
+    needs the day-aware selection recorded as owed work in
+    :func:`~tessera_embeddings.ingest.stac.dates_exempt_from_correction`.
+    """
+    if refuses_its_date(item, read_keys, known_harmonisation):
+        return True
+    # Only where the producer VARIES between items. Where the collection settles it, every copy
+    # owes the same correction, so owing one is the norm rather than a risk — excluding on it would
+    # empty the ladder for a whole provider. Same reasoning as the matching ranking term.
+    if known_harmonisation is not None:
+        return False
+    harmonisation = _producer_of(item, read_keys, None)
+    return _owes_a_correction(item_processing_baseline(item), harmonisation)
+
+
 def _would_refuse_its_date(
     baseline: int | None,
     harmonisation: Harmonisation | None,
@@ -543,15 +579,16 @@ def select_preferred_duplicates(
             # ONE order over every rejected copy of the tile-date, not a concatenation of
             # per-acquisition ladders. The unattributed recovery consumes `copies[0]` on each
             # retry, so every position is a choice and the whole list has to be ranked.
-            # Copies that would REFUSE their date are dropped rather than offered. The ladder
-            # steps down on a read failure; a refusal is not one, so handing one over escapes as
+            # Copies that would REFUSE their date, or that would make it refuse once fused with
+            # tiles this function cannot see, are dropped rather than offered. The ladder steps
+            # down on a read failure; a refusal is not one, so handing one over escapes as
             # `HeterogeneousProducerError` instead of trying the next usable copy or recording the
             # date as lost.
-            usable = [it for it in rejected if not refuses_its_date(it, read_keys, known_harmonisation)]
+            usable = [it for it in rejected if not risks_refusing_its_date(it, read_keys, known_harmonisation)]
             if len(usable) != len(rejected):
                 logger.debug(
                     "%s: %d of %d spare copies excluded from the fallback ladder — they would "
-                    "refuse the date rather than fail to read",
+                    "refuse the date, or risk making it refuse, rather than fail to read",
                     key,
                     len(rejected) - len(usable),
                     len(rejected),
@@ -635,9 +672,13 @@ def log_duplicate_selection(
         local = sum(1 for it in winners if item_is_in_preferred_location(it, keys=read_keys))
         where = f"; winners by source: {local} in-region, {len(winners) - local} remote"
 
+    # Must name the terms in the ORDER `_preference_key` applies them. An operator reads this line
+    # to explain a selected pixel, so a stale order gives them the wrong explanation — and the
+    # already-harmonised term now outranks baseline freshness, which is the surprising one.
     how = (
-        "complete read set, then a decidable producer, then a known acquisition, then readable "
-        "and newest baseline, then in-region, then newest sequence"
+        "complete read set, then a decidable producer, then a known acquisition, then a readable "
+        "baseline, then owing no offset correction, then newest baseline, then in-region, then "
+        "newest sequence"
     )
     log.info(
         "Duplicate catalogue items pruned roi=%s: %d tile-date(s) had more than one copy, "

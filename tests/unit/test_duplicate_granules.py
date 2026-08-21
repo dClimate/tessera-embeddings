@@ -818,9 +818,10 @@ class TestInRegionPreference:
         raw_new = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="05.00", host_root=_REMOTE)
         kept, alternates = select_preferred_duplicates([harmonised_old, raw_new])
         assert [i.id for i in kept] == [harmonised_old.id]
-        assert [i.id for i in next(iter(alternates.values()))] == [raw_new.id], (
-            "the raw copy must stay on the ladder — it reads fine, it just costs a correction"
-        )
+        # And the raw copy is NOT offered as a fallback. It reads fine, but swapping it in beside
+        # the harmonised tiles of the same solar day makes that day refuse, and the recovery ladder
+        # steps down on a read failure rather than on a refusal — see `risks_refusing_its_date`.
+        assert alternates == {}, "a spare that risks refusing the date must not be on the ladder"
 
     def test_below_the_threshold_the_correction_term_is_inert(self) -> None:
         """The complement of the test above, and what stops it degrading the whole archive.
@@ -1023,7 +1024,10 @@ class TestTheDuplicateLogIsAnAuditTrail:
         remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
         msg = self._emit(caplog, [local], {("MGRS-33TWM", "2021-09-08"): [remote]})
         assert "complete read set, then a decidable producer, then a known acquisition" in msg
-        assert "then readable and newest baseline, then in-region, then newest sequence" in msg
+        assert (
+            "then a readable baseline, then owing no offset correction, then newest baseline, "
+            "then in-region, then newest sequence"
+        ) in msg
         assert "newest kept" not in msg, "the stale claim must not come back"
 
     def test_it_names_where_the_survivors_came_from(self, caplog) -> None:
@@ -1081,7 +1085,10 @@ class TestTheDuplicateLogIsAnAuditTrail:
         unreadable = _with_assets(_Item("b", "MGRS-33TWM", "0"), _bands_at(_REMOTE))
         msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [unreadable]})
         assert "complete read set, then a decidable producer, then a known acquisition" in msg
-        assert "then readable and newest baseline, then in-region, then newest sequence" in msg
+        assert (
+            "then a readable baseline, then owing no offset correction, then newest baseline, "
+            "then in-region, then newest sequence"
+        ) in msg
         assert "sequence alone" not in msg, "a mode that cannot happen must not be reported"
 
     def test_no_duplicates_logs_nothing(self, caplog) -> None:
@@ -1334,11 +1341,16 @@ class TestLocalityDoesNotDecideBetweenUnknownBaselines:
         assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["local-seq1"]
 
     def test_locality_still_decides_between_two_equal_known_baselines(self) -> None:
-        """The complement: neutralising locality everywhere would pass the test above."""
+        """The complement: neutralising locality everywhere would pass the test above.
+
+        Posed BELOW the correction threshold so that neither spare owes an offset — above it a raw
+        spare is kept off the ladder entirely (`risks_refusing_its_date`), which would empty the
+        ladder and prove nothing about locality.
+        """
         items = [
-            _copy_at("winner", acquired=self._A, sequence="3", baseline="05.00"),
-            _copy_at("remote", acquired=self._A, sequence="1", baseline="04.00", host_root=_REMOTE),
-            _copy_at("local", acquired=self._A, sequence="1", baseline="04.00", host_root=_IN_REGION),
+            _copy_at("winner", acquired=self._A, sequence="3", baseline="03.01"),
+            _copy_at("remote", acquired=self._A, sequence="1", baseline="02.06", host_root=_REMOTE),
+            _copy_at("local", acquired=self._A, sequence="1", baseline="02.06", host_root=_IN_REGION),
         ]
         _, alternates = select_preferred_duplicates(items)
         ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
