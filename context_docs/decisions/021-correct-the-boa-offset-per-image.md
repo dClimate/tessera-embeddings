@@ -43,12 +43,18 @@ the pipeline skipped **347 days of the year**.
 
 ## 2. The change
 
-Remove the offset from **each image as it is read**, before images are resized and merged.
+Remove the offset from **each image as it is read**, before the images are merged.
 
 ```
-  before:   read + resize + merge  ────►  correct once per day
-  now:      read ─► correct each image ─► resize + merge
+  before:   read+resize each image ─► merge ─► correct the merged day, once
+  now:      read+resize each image ─► correct each image ─► merge
+                                      └── each image decided on its own ──┘
 ```
+
+Note where "resize" sits: a source is read and reprojected onto the output grid in one step, and the
+correction is applied to what that returns. So the correction moves ahead of the **merge**, which is
+what dissolves the per-day conflict, but not ahead of the **resize**. That distinction is the whole
+of limit 2 in section 6, and it is why this change closes two limits and not three.
 
 Different tiles occupy different ground, so there is no pixel that is both corrected and
 uncorrected. The three-tile day above simply loads: A is corrected, B and C are not.
