@@ -1663,3 +1663,104 @@ class TestAttributedRecoveryOnlyUsesCopiesItCanPlace:
         if stepped is not None:
             swapped = [i.id for i in stepped[0]]
             assert "pass-a" in swapped, "the healthy acquisition was replaced by an unplaceable spare"
+
+
+class TestASequenceIsMatchedNotCoerced:
+    """`s2:sequence` is validated as a sequence, the same way a baseline is validated as a version.
+
+    `int()` accepted a long list of things a sequence is not: it truncates 1.9 to 1, and a numeric
+    type also takes `-1`, `1e3` and Unicode digits, while an infinity raised an uncaught
+    OverflowError. Any of those would order the copies instead of deferring to the sequence encoded
+    in the item id. Organised by category, so a newly found malformed input goes in the list rather
+    than into a new guard.
+    """
+
+    #: The id carries sequence 7, so anything unreadable must fall back to that.
+    _ID = "S2B_34WFA_20210908_7_L2A"
+
+    def _item(self, raw: object) -> _Item:
+        item = _Item(self._ID, "MGRS-34WFA")
+        if raw is not None:
+            item.properties["s2:sequence"] = raw
+        return item
+
+    @pytest.mark.parametrize(("raw", "expected"), [("0", 0), ("3", 3), ("12", 12), (3, 3)])
+    def test_a_real_sequence_parses(self, raw: object, expected: int) -> None:
+        assert item_sequence(self._item(raw)) == expected
+
+    @pytest.mark.parametrize(
+        ("label", "raw"),
+        [
+            ("truncating-float", 1.9),
+            ("truncating-string", "1.9"),
+            ("infinity", float("inf")),
+            ("nan", float("nan")),
+            ("negative", "-1"),
+            ("signed", "+1"),
+            ("exponent", "1e3"),
+            ("hex", "0x1"),
+            ("arabic-indic", chr(0x664)),
+            ("empty", ""),
+            ("spaces", "   "),
+            ("word", "one"),
+            ("list", []),
+            ("bool", True),
+        ],
+        ids=lambda v: v if isinstance(v, str) and v.replace("-", "").isalpha() else None,
+    )
+    def test_anything_else_defers_to_the_id(self, label: str, raw: object) -> None:
+        assert item_sequence(self._item(raw)) == 7, label
+
+    def test_an_absent_property_defers_to_the_id(self) -> None:
+        assert item_sequence(self._item(None)) == 7
+
+    def test_an_unreadable_sequence_with_no_id_sequence_is_none(self) -> None:
+        """Ordered below every known sequence, rather than guessed at."""
+        item = _Item("no-sequence-here", "MGRS-34WFA")
+        item.properties["s2:sequence"] = "1.9"
+        assert item_sequence(item) is None
+
+
+class TestTheSteppedSetNamesOnlyWhatWasStepped:
+    """The caller labels its retry from this set and records it as `copies_tried`.
+
+    Returning every tile-date considered claims a copy was tried on dates nothing touched — during
+    exactly the data-loss investigation that record exists for. Raised on PR #107.
+    """
+
+    _A = "2021-09-08T10:00:00Z"
+
+    def _at(self, ident: str, tile: str, acquired: str, sequence: str) -> _Item:
+        return _with_assets(
+            _Item(ident, tile, sequence, **{"s2:processing_baseline": "05.00", "datetime": acquired}),
+            _bands_at(_IN_REGION),
+        )
+
+    def test_only_the_tile_date_with_a_usable_spare_is_reported(self) -> None:
+        # Tile A: the failure has a spare of its own acquisition, so it steps.
+        a_bad = self._at("a-bad", "MGRS-33TWA", self._A, "1")
+        a_spare = self._at("a-spare", "MGRS-33TWA", self._A, "0")
+        # Tile B: also failed, but its only spare belongs to a DIFFERENT acquisition.
+        b_bad = self._at("b-bad", "MGRS-33TWB", self._A, "1")
+        b_other = self._at("b-other", "MGRS-33TWB", "2021-09-08T14:00:00Z", "1")
+        b_other_spare = self._at("b-other-spare", "MGRS-33TWB", "2021-09-08T14:00:00Z", "0")
+
+        kept, alternates = select_preferred_duplicates([a_bad, a_spare, b_bad, b_other, b_other_spare])
+        stepped = step_down_copies(alternates, kept, implicated=[a_bad, b_bad])
+        assert stepped is not None
+        _swapped, keys = stepped
+        assert keys == {("MGRS-33TWA", "2021-09-08")}, f"reported a tile-date it never stepped: {keys}"
+
+    def test_a_spare_is_not_consumed_from_a_tile_date_that_did_not_step(self) -> None:
+        """Removing it from the ladder before knowing it would be used loses a copy for nothing."""
+        b_bad = self._at("b-bad", "MGRS-33TWB", self._A, "1")
+        b_other = self._at("b-other", "MGRS-33TWB", "2021-09-08T14:00:00Z", "1")
+        b_other_spare = self._at("b-other-spare", "MGRS-33TWB", "2021-09-08T14:00:00Z", "0")
+        a_bad = self._at("a-bad", "MGRS-33TWA", self._A, "1")
+        a_spare = self._at("a-spare", "MGRS-33TWA", self._A, "0")
+
+        kept, alternates = select_preferred_duplicates([a_bad, a_spare, b_bad, b_other, b_other_spare])
+        before = [i.id for i in alternates[("MGRS-33TWB", "2021-09-08")]]
+        step_down_copies(alternates, kept, implicated=[a_bad, b_bad])
+        after = [i.id for i in alternates[("MGRS-33TWB", "2021-09-08")]]
+        assert after == before, "a spare was consumed from a tile-date nothing stepped"

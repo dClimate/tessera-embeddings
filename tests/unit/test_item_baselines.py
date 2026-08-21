@@ -1,9 +1,14 @@
-"""One reader of `s2:processing_baseline`, on one scale, with one notion of unreadable.
+"""One reader of `s2:processing_baseline`, validated as a VERSION rather than as a number.
 
-There used to be two — a float parser for ranking duplicates and a scaled-integer parser for the
-correction threshold — and each numeric edge case had to be found and fixed in both. They had
-already drifted when this was written: one still accepted `"1e308"` as a baseline while the other
-rejected it. These tests pin the properties that made the split dangerous.
+That distinction is the point of this module, and it was learned the hard way: seven separate review
+findings, each naming a different value a numeric parser accepts and a version never contains —
+not-a-number, infinity, negatives, excess decimal places, exponents that overflow when scaled,
+exponents that underflow to zero, and long fractions that round onto a valid-looking value under the
+ambient decimal context. Each was fixed as reported and the next arrived.
+
+Matching the shape closes all of them at once, so these tests are organised by CATEGORY rather than
+by reported value: anything outside the grammar is unreadable, whatever it is. A newly discovered
+malformed input belongs in `NOT_A_VERSION` below, not in a new guard.
 """
 
 from __future__ import annotations
@@ -23,127 +28,145 @@ def _item(raw: object, *, with_properties: bool = True) -> SimpleNamespace:
     return item
 
 
-class TestTheScale:
-    """Reported as an integer hundredth, which is the space the threshold is expressed in."""
+class _Opaque:
+    """An arbitrary object with a STABLE repr.
 
-    @pytest.mark.parametrize(("raw", "expected"), [("04.00", 400), ("05.10", 510), ("00.01", 1), ("00.00", 0)])
-    def test_a_baseline_is_scaled_by_a_hundred(self, raw: str, expected: int) -> None:
+    `object()`'s repr carries its memory address, which parallel test workers disagree about and
+    pytest then rejects as a collection mismatch.
+    """
+
+    def __repr__(self) -> str:
+        return "<opaque>"
+
+
+#: Every shape the catalogue emits, plus the lenient forms of the same versions.
+IS_A_VERSION = [
+    ("05.10", 510),
+    ("05.11", 511),
+    ("02.06", 206),
+    ("04.00", 400),
+    ("00.01", 1),
+    ("00.00", 0),
+    ("5.10", 510),
+    ("5.1", 510),
+    ("4", 400),
+    (4, 400),
+    (4.0, 400),
+    (5.1, 510),
+    ("  05.10  ", 510),
+]
+
+#: Anything a numeric parser accepts and a version never contains, grouped by WHY, and labelled so
+#: the parametrised ids are stable. Add to this list rather than adding a guard: the grammar already
+#: rejects the whole class.
+NOT_A_VERSION: list[tuple[str, object]] = [
+    # special values that float() and Decimal() both accept
+    ("nan-word", "NaN"),
+    ("nan-lower", "nan"),
+    ("inf-word", "Infinity"),
+    ("neg-inf-word", "-Infinity"),
+    ("inf-short", "inf"),
+    ("nan-float", float("nan")),
+    ("inf-float", float("inf")),
+    # signed, which reads as evidence the pixels predate the threshold
+    ("neg", "-1.00"),
+    ("neg-small", "-0.01"),
+    ("neg-int", "-4"),
+    ("plus", "+4.00"),
+    # more than two decimal places
+    ("three-dp", "3.999"),
+    ("milli", "0.001"),
+    ("four-dp", "4.0001"),
+    # long enough to round onto 400 under the ambient decimal precision
+    ("precision-rounds", "3.99999999999999999999999999999"),
+    # exponents: one overflows when scaled, one underflows to zero, none is a version
+    ("exp-ten", "1e10"),
+    ("exp-overflow", "1e308"),
+    ("exp-underflow", "1e-1000000000"),
+    ("exp-zero", "4e0"),
+    ("exp-caps", "5E1"),
+    # beyond any real version, which the digit limits bound without a range constant
+    ("hundred", "100.00"),
+    ("three-digits", "999"),
+    # other integer literals
+    ("hex", "0x10"),
+    ("binary", "0b1"),
+    # Unicode decimal digits, which a bare ``\\d`` and ``int()`` both accept
+    ("arabic-indic", chr(0x664)),
+    ("arabic-indic-dotted", chr(0x661) + "." + chr(0x660)),
+    ("fullwidth", chr(0xFF11)),
+    # malformed punctuation
+    ("trailing-dot", "4."),
+    ("leading-dot", ".4"),
+    ("dots", ".."),
+    ("three-parts", "4.0.0"),
+    ("comma", "5,1"),
+    # empty and whitespace
+    ("empty", ""),
+    ("spaces", "   "),
+    ("tab", "\t"),
+    # words and adornments
+    ("word", "four"),
+    ("v-prefix", "v4.00"),
+    ("suffix", "04.00-beta"),
+    # non-strings that are not numbers
+    ("none", None),
+    ("true", True),
+    ("object", _Opaque()),
+    ("list", []),
+    ("dict", {}),
+]
+
+
+class TestARealVersionParses:
+    """The forms the catalogue emits, and the lenient spellings of the same versions."""
+
+    @pytest.mark.parametrize(("raw", "expected"), IS_A_VERSION)
+    def test_every_known_form(self, raw: object, expected: int) -> None:
         assert processing_baseline(_item(raw)) == expected
 
     def test_the_scale_matches_the_threshold(self) -> None:
         """A conversion between scales is where a factor of a hundred goes missing, so there is
-        none: the parser's output is directly comparable to the threshold.
+        none: the output is directly comparable to the threshold.
         """
         assert BASELINE_SCALE == 100
-        assert S2_BASELINE_THRESHOLD == 400
         assert processing_baseline(_item("04.00")) == S2_BASELINE_THRESHOLD
         assert processing_baseline(_item("03.99")) < S2_BASELINE_THRESHOLD
-
-    def test_a_rounding_artefact_does_not_lose_a_step(self) -> None:
-        """5.10 * 100 is 509.999... in binary floating point."""
-        assert processing_baseline(_item("05.10")) == 510
-
-
-class TestUnreadableIsOneThing:
-    """`None` means the item does not tell us, whatever the reason."""
-
-    @pytest.mark.parametrize(
-        "raw", [None, "", "not-a-number", "NaN", "nan", "Infinity", "-Infinity", "inf", "1e308", "-1e308"]
-    )
-    def test_every_kind_of_unreadable_is_none(self, raw: object) -> None:
-        assert processing_baseline(_item(raw)) is None
-
-    def test_an_item_with_no_properties_at_all_is_unreadable(self) -> None:
-        assert processing_baseline(_item(None, with_properties=False)) is None
+        assert processing_baseline(_item("04.01")) > S2_BASELINE_THRESHOLD
 
     def test_a_declared_zero_is_not_unreadable(self) -> None:
-        """The distinction the old integer parser could not make. A baseline of 0 is below every
-        threshold, so conflating it with "unknown" hid a correctness question.
+        """The distinction callers depend on: 0 is below every threshold, so conflating it with
+        "declared nothing" hides a correctness question rather than raising one.
         """
         assert processing_baseline(_item("00.00")) == 0
         assert processing_baseline(_item(None)) is None
 
-    def test_a_non_string_value_is_handled(self) -> None:
-        assert processing_baseline(_item(5.1)) == 510
-        assert processing_baseline(_item(object())) is None
+    def test_a_one_digit_fraction_means_tenths(self) -> None:
+        """A one-digit fraction means TENTHS: 5.1 and 05.10 are the same version, so it is padded."""
+        assert processing_baseline(_item("5.1")) == processing_baseline(_item("05.10")) == 510
 
-    def test_an_overflowing_value_does_not_raise(self) -> None:
-        """`"1e308"` is finite on its own and becomes infinity scaled, where `round()` raises
-        OverflowError — which aborted a whole batch over one item's metadata.
+
+class TestAnythingElseIsUnreadable:
+    """The whole class, not the reported members of it."""
+
+    @pytest.mark.parametrize(("label", "raw"), NOT_A_VERSION, ids=[c[0] for c in NOT_A_VERSION])
+    def test_it_reads_as_nothing(self, label: str, raw: object) -> None:
+        assert processing_baseline(_item(raw)) is None, label
+
+    def test_an_item_with_no_properties_at_all(self) -> None:
+        assert processing_baseline(_item(None, with_properties=False)) is None
+
+    def test_nothing_in_the_list_raises(self) -> None:
+        """The other half of the contract. Several of these used to raise — OverflowError from
+        rounding an infinity, and from scaling a finite-but-enormous value — aborting a whole batch
+        over one item's metadata rather than treating that item as unreadable.
         """
-        assert processing_baseline(_item("1e308")) is None
+        for _label, raw in NOT_A_VERSION:
+            processing_baseline(_item(raw))
 
-    @pytest.mark.parametrize("raw", ["1e10", "1e308", "999.00", "100.01"])
-    def test_a_value_beyond_any_real_version_is_unreadable(self, raw: str) -> None:
-        """No processing version reaches these. Read as numbers they clear every threshold, so a
-        nonsense value would force a correction rather than being refused as ambiguous.
+    def test_the_grammar_bounds_the_value_without_a_range_check(self) -> None:
+        """Two digits for the whole part is what caps this at 99.99, so there is no range constant
+        to drift out of step with the pattern.
         """
-        assert processing_baseline(_item(raw)) is None
-
-    def test_a_high_but_plausible_version_still_parses(self) -> None:
-        """The bound must leave real headroom above ESA's 05.x rather than pinning today's value."""
         assert processing_baseline(_item("99.99")) == 9999
-
-
-class TestANegativeBaselineIsNotAVersion:
-    """A negative processing version is no evidence that pixels predate baseline 04.00.
-
-    Read as a real value it sits below every threshold, so an unharmonised item carrying one was
-    exempted from a correction it may well have been owed. Raised on PR #107.
-    """
-
-    @pytest.mark.parametrize("raw", ["-1.00", "-0.01", "-99", -4.0])
-    def test_a_negative_baseline_is_unreadable(self, raw: object) -> None:
-        assert processing_baseline(_item(raw)) is None
-
-    def test_zero_is_still_readable(self) -> None:
-        """The boundary: 0 is a real declared value, and distinguishable from "declared nothing"."""
-        assert processing_baseline(_item("00.00")) == 0
-        assert processing_baseline(_item(None)) is None
-
-
-class TestABaselineMustLandOnAHundredth:
-    """A processing baseline is a two-decimal version, so a value between hundredths is malformed.
-
-    `"03.999"` scaled by a hundred is 399.9, which rounds to 400 and crosses the correction
-    threshold — forcing a subtraction on metadata that should have been refused as ambiguous.
-    Raised on PR #107.
-    """
-
-    @pytest.mark.parametrize("raw", ["03.999", "04.001", "3.9999", "0.001"])
-    def test_a_value_between_hundredths_is_unreadable(self, raw: str) -> None:
-        assert processing_baseline(_item(raw)) is None
-
-    def test_the_specific_threshold_crossing_case(self) -> None:
-        """`"03.999"` must not become 400 and trigger a correction."""
-        assert processing_baseline(_item("03.999")) is None
-        assert processing_baseline(_item("04.00")) == 400
-
-    @pytest.mark.parametrize(("raw", "expected"), [("05.10", 510), ("00.01", 1), ("5.1", 510), ("4", 400)])
-    def test_exact_hundredths_still_parse_however_written(self, raw: str, expected: int) -> None:
-        """Trailing-zero and shorthand forms are the same value, and binary floating point is why
-        this is checked with Decimal: 5.10 * 100 is 509.999... as a float.
-        """
-        assert processing_baseline(_item(raw)) == expected
-
-
-class TestScalingCannotUnderflowToAConfidentZero:
-    """A tiny positive exponent underflows rather than overflowing.
-
-    `Decimal("1e-1000000000") * 100` becomes `0E-1000026`, which IS integral, so the parser
-    reported a confident baseline of 0 — read downstream as a real pre-threshold version, which
-    exempts the date instead of refusing ambiguous metadata. Raised on PR #107.
-    """
-
-    @pytest.mark.parametrize("raw", ["1e-1000000000", "1e-9", "0.001", "0.009"])
-    def test_a_value_below_one_hundredth_is_unreadable(self, raw: str) -> None:
-        assert processing_baseline(_item(raw)) is None
-
-    def test_one_hundredth_itself_still_parses(self) -> None:
-        """The boundary: 00.01 is a real version and the smallest representable one."""
-        assert processing_baseline(_item("00.01")) == 1
-
-    def test_a_declared_zero_stays_readable(self) -> None:
-        """Zero is a real declared value; only positive values BELOW a hundredth are rejected."""
-        assert processing_baseline(_item("00.00")) == 0
-        assert processing_baseline(_item("0")) == 0
+        assert processing_baseline(_item("100.00")) is None

@@ -7,17 +7,23 @@ defined once.
 the space :data:`~tessera_embeddings.config.satellites.S2_BASELINE_THRESHOLD` is expressed in, so a
 comparison against the threshold needs no conversion.
 
-**Unreadable.** ``None`` means the item does not declare a usable baseline — absent, empty,
-non-numeric, negative, not an exact hundredth, or beyond any real version. Callers substitute
-their own default explicitly,
-which keeps "declared 0" distinguishable from "declared nothing"; a baseline of 0 is below every
-threshold, so conflating them hides a correctness question.
+**Validated as a version, not as a number.** A baseline is a two-part version — the catalogue emits
+``"05.10"``, ``"02.06"`` — so this matches that shape and converts with integer arithmetic. Parsing
+it into a general numeric type instead accepts a long list of things no version contains, and each
+one becomes a *confident* answer rather than an admission of ignorance: ``"NaN"`` and ``"Infinity"``
+parse, so do negatives, so do exponents that overflow or underflow when scaled, and excess precision
+rounds onto a valid-looking value under the ambient decimal context. Matching the shape first makes
+every one of those unreadable by construction.
+
+**Unreadable.** ``None`` means the item does not declare a usable baseline. Callers substitute their
+own default explicitly, which keeps "declared 0" distinguishable from "declared nothing"; a baseline
+of 0 is below every threshold, so conflating them hides a correctness question.
 """
 
 from __future__ import annotations
 
-import decimal
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -25,49 +31,29 @@ logger = logging.getLogger(__name__)
 #: What one whole baseline step is worth on the reported scale, e.g. ``04.00`` -> ``400``.
 BASELINE_SCALE = 100
 
-#: Beyond this a declared value is not a processing version. ESA is on 05.x; a hundred whole
-#: versions of headroom is generous, and the bound is what keeps a nonsense value from being read
-#: as an enormous baseline that clears every threshold.
-MAX_BASELINE = 100 * BASELINE_SCALE
+#: A processing baseline: one or two ASCII digits, optionally a fractional part of one or two.
+#: Deliberately narrow. The digit limits are what bound the value — no version reaches 100 — so
+#: there is no separate range check to keep in step, and no sign, exponent or special value can
+#: reach the arithmetic below. ``[0-9]`` rather than ``\d``, which also matches Unicode decimal
+#: digits: an Arabic-Indic or fullwidth numeral is not a version, and ``int()`` would accept it.
+_BASELINE_RE = re.compile(r"([0-9]{1,2})(?:\.([0-9]{1,2}))?")
 
 
 def processing_baseline(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like item
     """The baseline an item declares, as an integer hundredth, or ``None`` if it declares none.
 
-    A baseline is a two-decimal version, so the declared value must land exactly on a hundredth.
-    Parsed as a :class:`~decimal.Decimal` to check that: ``"03.999"`` scaled by a hundred is 399.9,
-    which rounds to 400 and would cross the correction threshold on metadata that is malformed.
-
-    Also rejected, each for the same reason — none of them is a baseline, and reading one as a
-    number would let malformed metadata decide whether an offset is subtracted:
-
-    * ``"NaN"`` and ``"Infinity"``, which :func:`float` and :class:`~decimal.Decimal` both accept.
-    * negatives, which sit below every threshold and so read as positive evidence that the pixels
-      predate baseline 04.00.
-    * values beyond :data:`MAX_BASELINE`, which no processing version reaches.
+    Non-string values are accepted by their textual form, so an integer ``4`` or a float ``4.0``
+    read as ``400`` while an infinity reads as nothing.
     """
     properties = getattr(item, "properties", None)
     raw = properties.get("s2:processing_baseline") if isinstance(properties, dict) else None
-    if raw is None or raw == "":
+    if raw is None:
         return None
-    try:
-        value = decimal.Decimal(str(raw))
-    except (decimal.InvalidOperation, TypeError, ValueError):
-        logger.debug("Unparseable s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
+    match = _BASELINE_RE.fullmatch(str(raw).strip())
+    if match is None:
+        logger.debug("Not a processing baseline: %r on %s", raw, getattr(item, "id", "?"))
         return None
-    # Bounded BEFORE scaling: `Decimal("1e999999")` is finite and constructs happily, but
-    # multiplying it raises `decimal.Overflow`, which would abort a whole batch over one item.
-    if not value.is_finite() or value < 0 or value > MAX_BASELINE:
-        logger.debug("Not a baseline: s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
-        return None
-    # Below one hundredth is not a version, and scaling such a value UNDERFLOWS rather than
-    # overflowing — `Decimal("1e-1000000000") * 100` is `0E-1000026`, which passes the integral
-    # check below and would read as a confident baseline of 0. A declared zero stays readable.
-    if 0 < value < decimal.Decimal("0.01"):
-        logger.debug("Below one hundredth: s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
-        return None
-    scaled = value * BASELINE_SCALE
-    if scaled != scaled.to_integral_value() or scaled > MAX_BASELINE:
-        logger.debug("Not an integer hundredth: s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
-        return None
-    return int(scaled)
+    whole, fraction = match.group(1), (match.group(2) or "")
+    # Padded rather than scaled: "05.1" and "05.10" are the same version, and a one-digit fraction
+    # means tenths. Integer arithmetic throughout, so nothing can round.
+    return int(whole) * BASELINE_SCALE + int(fraction.ljust(2, "0") or "0")

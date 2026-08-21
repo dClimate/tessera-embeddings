@@ -62,7 +62,11 @@ from tessera_embeddings.ingest.solar_days import solar_day_of
 logger = logging.getLogger(__name__)
 
 #: Trailing ``_<sequence>_L2A`` of an Element 84 item id, e.g. ``S2B_34WFA_20210908_1_L2A``.
-_ID_SEQUENCE_RE = re.compile(r"_(\d+)_[A-Z0-9]+$")
+_ID_SEQUENCE_RE = re.compile(r"_([0-9]+)_[A-Z0-9]+$")
+
+#: A DECLARED sequence: ASCII digits, nothing else. Matched rather than coerced — see
+#: `item_baselines` for why validating the shape beats validating a parsed number.
+_SEQUENCE_VALUE_RE = re.compile(r"[0-9]+")
 
 #: The MGRS tile in an Element 84 item id — the second underscore-separated field.
 _ID_TILE_RE = re.compile(r"^[A-Z0-9]+_([0-9]{1,2}[A-Z]{3})_")
@@ -92,10 +96,13 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
     """
     raw = item.properties.get("s2:sequence")
     if raw is not None:
-        try:
+        # Matched as a sequence rather than coerced, for the reason set out in `item_baselines`:
+        # `int()` truncates 1.9 to 1, and a numeric type also accepts `-1`, `1e3` and Unicode
+        # digits — so something that is not a sequence would order the copies instead of deferring
+        # to the one encoded in the item id.
+        if _SEQUENCE_VALUE_RE.fullmatch(str(raw).strip()):
             return int(raw)
-        except (TypeError, ValueError):
-            logger.debug("Unparseable s2:sequence %r on %s", raw, getattr(item, "id", "?"))
+        logger.debug("Not a sequence: s2:sequence %r on %s", raw, getattr(item, "id", "?"))
     match = _ID_SEQUENCE_RE.search(str(getattr(item, "id", "")))
     return int(match.group(1)) if match else None
 
@@ -586,19 +593,27 @@ def step_down_copies(
             failed_by_key.setdefault((tile, solar_day_of(item)), []).append(item)
 
     swap: dict[int, Any] = {}
+    stepped: set[tuple[str, str]] = set()
     for key, copies in remaining.items():
         alternate = _first_for_failed_acquisition(copies, failed_by_key.get(key, ()))
         if alternate is None:
-            # The failed acquisition has no spare. Leave every copy available and step nothing:
-            # swapping a healthy acquisition here cannot fix the failure and costs a whole re-read.
+            # The failed acquisition has no placeable spare. Leave every copy available and step
+            # nothing: swapping a healthy acquisition cannot fix the failure and costs a re-read.
             continue
-        alternates[key] = [c for c in copies if c is not alternate]
         target = _alternate_for(alternate, survivors.get(key, ()), taken=swap)
-        if target is not None:
-            swap[id(target)] = alternate
+        if target is None:
+            continue
+        # Consumed from the ladder only once it is actually used. Removing it before knowing that
+        # would drop a copy from a tile-date nothing stepped.
+        alternates[key] = [c for c in copies if c is not alternate]
+        swap[id(target)] = alternate
+        stepped.add(key)
     if not swap:
         return None
-    return [swap.get(id(item), item) for item in items], set(remaining)
+    # The tile-dates actually STEPPED, not every one considered. The caller labels its attempt from
+    # this set and records it as `copies_tried`, so naming an untouched tile-date claims a copy was
+    # tried that never was — during exactly the investigation that record exists for.
+    return [swap.get(id(item), item) for item in items], stepped
 
 
 def _first_for_failed_acquisition(copies: list[Any], implicated: Sequence[Any]) -> Any | None:  # noqa: ANN401
