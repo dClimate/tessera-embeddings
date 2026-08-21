@@ -242,19 +242,27 @@ runs over a year of real imagery, so three zone-years were ingested on the devel
 | arm | zone | year | why this one | outcome |
 |---|---|---|---|---|
 | A | 01N | 2017 | densest ESA-original coverage found anywhere | ran clean |
-| B | 57S | 2017 | most duplicate copies of one photograph | ran clean |
-| C | 01N | 2024 | same ground, later year — do the dynamics hold? | **failed** |
+| B | 57S | 2017 | most duplicate copies of one photograph | **completed in 44 min** |
+| C | 01N | 2024 | same ground, later year — do the dynamics hold? | **optical leg failed** |
 
-**Arms A and B behaved as intended.** Duplicate reduction ran and reported itself: zone 01N pruned
-15 tile-days that had more than one copy, with 11 winners in our own cloud region and 4 elsewhere;
-zone 57S pruned 64 tile-days, 68 copies rejected and all 68 retained as fallbacks. No day was
-refused in either. One Sentinel-1 read failed with a permission error and its retry succeeded — an
-infrastructure hiccup, unrelated.
+**Arms A and B behaved as intended.** Duplicate reduction ran and reported itself in the durable
+audit line: zone 57S pruned **162 tile-days** that had more than one copy, 180 copies rejected and
+all 180 retained as fallbacks, every winner in our own cloud region; zone 01N pruned 14 tile-days,
+15 rejected, 12 winners in-region against 2 elsewhere. No day was refused in either, nothing was
+recorded as lost, and no traceback appeared anywhere in either subtree. One Sentinel-1 read returned
+a permission error and its retry succeeded — infrastructure noise, unrelated to this change.
 
-**Arm C failed, and that is the useful result.** The optical leg died three times, once per retry,
-every time on the same day, 2 January 2024, with: *"fuses a raw item owed the offset correction with
-an already harmonised one."* Because a refusal is deterministic, each retry reached the same day and
-failed identically, so the whole zone-year was lost to one day's metadata.
+Arm B is also the useful timing figure: a complete zone-year of a 267-live-tile zone, both radar
+orbits included, in **44 minutes**.
+
+**Arm C failed, and that is the useful result.** The optical leg died three times — attempts logged
+as 1 of 3, 2 of 3 and 3 of 3, each re-dispatched after a backoff — every time on the same day, 2
+January 2024, with the identical message: *"fuses a raw item owed the offset correction with an
+already harmonised one, and the correction is applied per date to the whole mosaic, so either choice
+is wrong for some of its pixels."* Because a refusal is deterministic, each retry reached the same
+day and failed identically, and after the third there was no fourth: the optical half of that
+zone-year is simply absent. Its radar legs completed normally, which is what makes the failure
+legible as a data-decision problem rather than an infrastructure one.
 
 **The later year is much worse than the early one**, which is the opposite of what we assumed:
 
