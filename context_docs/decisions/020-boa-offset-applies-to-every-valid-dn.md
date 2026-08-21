@@ -264,6 +264,12 @@ day and failed identically, and after the third there was no fourth: the optical
 zone-year is simply absent. Its radar legs completed normally, which is what makes the failure
 legible as a data-decision problem rather than an infrastructure one.
 
+Everything else in that arm worked. Before failing, it pruned **142 contested tile-days**, rejecting
+147 copies and keeping all of them as fallbacks, with 136 winners in our own cloud region and 6
+elsewhere — so duplicate reduction and the region preference both behaved correctly on 2024 data.
+The figures were identical on all three attempts, which is what a deterministic re-read of an
+unchanged catalogue should produce and a useful check in itself.
+
 **The later year is much worse than the early one**, which is the opposite of what we assumed:
 
 | zone | days refused, late 2017 | days refused, early 2024 |
