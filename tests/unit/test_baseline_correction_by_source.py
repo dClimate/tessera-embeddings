@@ -685,13 +685,12 @@ class TestCorrectedAndExemptDatesShareOneStorageDtype:
 
     def test_no_corrected_pixel_can_go_negative(self) -> None:
         """What makes the unsigned dtype safe: the offset is subtracted from every valid DN and
-        the result floored at zero, which is exactly what the harmonised COGs contain — they are
-        unsigned too, so the floor is forced there as well.
+        the result floored at the lowest valid code, which is what the harmonised COGs contain.
         """
         ds = self._dataset(np.array([[[0, 999], [1000, 1001]]], dtype=np.uint16), "2022-01-07")
         out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
-        # 0 is nodata and untouched. 999 encoded a reflectance of -1, which floors to 0.
-        np.testing.assert_array_equal(out["blue"].values, np.array([[[0, 0], [0, 1]]], dtype=np.uint16))
+        # 0 is nodata and untouched. 999 and 1000 encoded reflectance at or below zero.
+        np.testing.assert_array_equal(out["blue"].values, np.array([[[0, 1], [1, 1]]], dtype=np.uint16))
         assert out["blue"].values.min() >= 0
 
     def test_a_dark_pixel_is_corrected_rather_than_left_alone(self) -> None:
@@ -702,12 +701,22 @@ class TestCorrectedAndExemptDatesShareOneStorageDtype:
         """
         ds = self._dataset(np.array([[[1, 250], [500, 750]]], dtype=np.uint16), "2022-01-07")
         out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
-        np.testing.assert_array_equal(out["blue"].values, np.zeros((1, 2, 2), dtype=np.uint16))
+        np.testing.assert_array_equal(out["blue"].values, np.ones((1, 2, 2), dtype=np.uint16))
+
+    def test_a_valid_dark_pixel_does_not_become_nodata(self) -> None:
+        """The floor is the lowest VALID code, not zero, and the difference is not cosmetic:
+        flooring a real observation to the nodata code makes it indistinguishable from no
+        observation, and every downstream mask would drop it. Element 84's COGs floor at the same
+        place, measured across two granules.
+        """
+        ds = self._dataset(np.array([[[0, 1], [500, 1000]]], dtype=np.uint16), "2022-01-07")
+        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
+        got = out["blue"].values[0]
+        assert got[0][0] == 0, "nodata must stay nodata"
+        assert (got[0][1], got[1][0], got[1][1]) == (1, 1, 1), "a valid dark pixel must not become nodata"
 
     def test_nodata_is_the_one_code_the_offset_does_not_touch(self) -> None:
-        """DN 0 is nodata at every baseline, so it is not shifted — and because the floor is zero
-        it could not be distinguished from a floored dark pixel afterwards anyway.
-        """
+        """DN 0 is nodata at every baseline, so it is not shifted."""
         ds = self._dataset(np.array([[[0, 0], [0, 2000]]], dtype=np.uint16), "2022-01-07")
         out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
         np.testing.assert_array_equal(out["blue"].values, np.array([[[0, 0], [0, 1000]]], dtype=np.uint16))
@@ -1342,8 +1351,8 @@ class TestTheCorrectionDoesNotCorruptTheBrightestCodes:
         got = self._corrected(values)
         assert got.dtype == np.uint16
         assert got.min() >= 0
-        # Every valid DN loses exactly the offset and floors at zero; nodata 0 stays 0.
-        np.testing.assert_array_equal(got, np.array([[[64535, 59000, 0, 0, 0]]], dtype=np.uint16))
+        # Every valid DN loses exactly the offset and floors at 1; nodata 0 stays 0.
+        np.testing.assert_array_equal(got, np.array([[[64535, 59000, 1, 1, 0]]], dtype=np.uint16))
 
 
 class TestRawRequiresEveryBandFromAKnownProducer:

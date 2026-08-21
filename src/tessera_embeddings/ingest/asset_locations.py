@@ -56,8 +56,8 @@ RAW_ARCHIVE_BUCKETS: frozenset[str] = frozenset({"sentinel-s2-l2a"})
 #: item-level signal would therefore be read from fields that are missing or wrong precisely
 #: where a decision is needed. Every Element 84 COG measured against its ESA original is
 #: harmonised, so that is what this encodes — see
-#: ``context_docs/design/s2-boa-offset-and-duplicate-selection.md`` for the measurement and for
-#: what would have to change to revisit it.
+#: ``context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md`` for the measurement, the
+#: metadata that cannot substitute for it, and the residual risk this accepts.
 #:
 #: An unrecognised bucket is neither harmonised nor known-raw, so it is UNKNOWN and the caller
 #: refuses the date: over-correcting harmonised data and under-correcting raw data are

@@ -678,6 +678,16 @@ def _load_from_stac(
     return ds
 
 
+#: The Sentinel-2 nodata code. The one DN that carries no BOA offset, at any baseline.
+_NODATA = 0
+
+#: The lowest code a VALID corrected pixel may take. Not zero, because zero is nodata: flooring a
+#: real dark pixel there makes it indistinguishable from no observation at all, and every
+#: downstream mask would drop it. Measured against Element 84's harmonised COGs, which do the
+#: same — see ``context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md``.
+_MIN_VALID_REFLECTANCE = 1
+
+
 def _apply_baseline_corrections_by_date(
     ds: xr.Dataset,
     baselines: dict[str, int],
@@ -695,9 +705,9 @@ def _apply_baseline_corrections_by_date(
 
     Two modes, differing only in what happens to reflectance that was negative:
 
-    - ``clamp_negatives=True`` (default) floors it at zero and returns the INPUT dtype. This is
-      what the harmonised Element 84 COGs contain — they are unsigned, so the floor is forced —
-      which is what makes a corrected raw copy comparable with a harmonised one.
+    - ``clamp_negatives=True`` (default) floors it at :data:`_MIN_VALID_REFLECTANCE` and returns
+      the INPUT dtype. This reproduces the harmonised Element 84 COGs exactly, which is what
+      makes a corrected raw copy comparable with a harmonised one.
     - ``clamp_negatives=False`` keeps the negative values and returns ``int16``, for an in-memory
       consumer that wants true reflectance. Not compatible with an unsigned store.
 
@@ -712,8 +722,8 @@ def _apply_baseline_corrections_by_date(
         baseline_threshold: Minimum baseline requiring correction (default: S2 threshold)
         baseline_offset: Value to add to pixels (typically negative, default: S2 offset)
         bands: List of band names to correct. If None, corrects all data variables.
-        clamp_negatives: When True, floor corrected reflectance at zero and return the input
-            dtype. When False, keep negatives and return int16.
+        clamp_negatives: When True, floor corrected reflectance at the lowest valid code and
+            return the input dtype. When False, keep negatives and return int16.
 
     Returns:
         Corrected xarray Dataset
@@ -744,12 +754,16 @@ def _apply_baseline_corrections_by_date(
         widened = ds[var].astype(np.int32)
         shifted = widened + baseline_offset
         if clamp_negatives:
-            shifted = shifted.clip(min=0)
-        # DN 0 is the nodata code, and the only value the offset is not applied to.
-        corrected = xr.where(needs_correction, xr.where(widened > 0, shifted, widened), widened)
+            shifted = shifted.clip(min=_MIN_VALID_REFLECTANCE)
+        # `_NODATA` is the only value the offset is not applied to.
+        corrected = xr.where(
+            needs_correction,
+            xr.where(widened > _NODATA, shifted, widened),
+            widened,
+        )
         if clamp_negatives:
             # The input dtype. Nothing here exceeds the input's own range: the offset is
-            # negative and the floor is zero, so an unsigned input stays representable.
+            # negative and the floor is positive, so an unsigned input stays representable.
             result_vars[str(var)] = corrected.astype(ds[var].dtype)
         else:
             # Saturated once, at the end. `65535 - 1000` does not fit int16, and neither does a
