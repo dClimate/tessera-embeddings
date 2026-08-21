@@ -445,24 +445,27 @@ describe the copy that was kept. `load_stac_items` prunes as well, for the docum
 
 Selecting over an already-selected set is a no-op, which is what makes more than one owner safe.
 
-Genuinely ambiguous dates **refuse** (`HeterogeneousProducerError`) rather than picking a side,
-because no date-wide answer is right for them and both mistakes are silent: an item whose own
-bands straddle the two producers, raw items on opposite sides of the threshold, a raw item owed
-the offset fused with an already-harmonised one, and an item whose producer cannot be determined
-at all. Every refusal is gated on the date actually being owed a correction — where nothing is owed,
-which producer served the pixels cannot change any of them.
+**One ambiguous shape survives, and it refuses** (`HeterogeneousProducerError`): a reflectance
+source at or above the threshold whose producer cannot be determined — served from a bucket nobody
+has classified, or belonging to an unharmonised copy that declares no readable baseline. Correcting
+it and exempting it are wrong by the same amount in opposite directions and both are silent, so
+nothing guesses. The refusal is a property of that one source, and it is gated on the threshold:
+below it no producer changes a pixel, so there is nothing to decide.
 
-**Two of those four are OBSERVED, and they cost real days.** Raw items straddling the threshold
-refuse 2017-11-16 and 2017-12-21 in zone 01N, and a raw item owed the offset fused with a harmonised
-one refuses 26 of 60 days of early 2024 in the same zone and 5 of 60 in 33N. A refused day is
-skipped alone and counted rather than failing the leg, but the day is lost — and selection cannot
-resolve it, because the conflict is between different TILES rather than between copies of one. The
-remaining two shapes — an item straddling producers within its own bands, and an undeterminable
-producer — have not been observed. See
-`context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md` for the frequency table and the
-fix this is owed.
+**The shapes that cost whole days are gone**, because a day is no longer decided as a whole. Tiles
+straddling the threshold, and a raw item owed the offset fused with an already-harmonised one, are
+each corrected on their own ground, so no pixel is both corrected and uncorrected — the 347 days a
+2024 region-year lost to that conflict now load. An item whose own bands are served from two
+different producers is likewise corrected band by band. See
+[ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md), and
+`context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md` for the frequency table the
+change was justified against.
 
-That last case is worth naming, because the safe direction inverts. An item that does not expose
+A refusal that does still happen is skipped alone and counted rather than failing the leg, and
+duplicate selection routes around it: a copy that would refuse is ranked last *and* withheld from
+the fallback ladder, because a refusal is not a read failure and nothing retries one.
+
+The surviving case is worth naming, because the safe direction inverts. An item that does not expose
 EVERY reflectance band under the configured names is `UNKNOWN`, not `RAW` — a non-empty subset is
 not enough, because `_prune_item_dict` specifically preserves PARTIALLY aliased items, and letting
 one visible harmonised band speak for a hidden native-keyed one corrupts the subset nothing here
@@ -473,21 +476,14 @@ raw would subtract 1000 from pixels that may already be harmonised, silently. Th
 catalogue keys its assets by the configured band names, so this does not arise there today; a
 catalogue that changed its naming would stop the ingest rather than halve a season's reflectance.
 
-The dates are grouped by **solar day**, the same key `odc.stac.load` fuses on, and derived through
-`solar_day_of`, which raises on an item that has not passed `normalize_to_solar_day`. Grouping by
-UTC date checked different sets from the ones that get mosaicked: near a day boundary two UTC
-dates fuse into one time slice, so a raw item and a harmonised one could share an output pixel
-stack while being checked separately and passing.
-
-The correction path had never run in production, so it announces itself at WARNING the first
-time it does for a date — but only for items served from ESA's archive, since every Planetary
-Computer item is unharmonised too and correcting those is routine. The line is emitted after
-every refusal above, so it can only ever describe a date that really was corrected.
-
-The corrector is skipped outright when no date's baseline reaches the threshold, which since
-this collection's threshold was set is the common case rather than an unused branch. It is a
-no-op on such a date but not a free one: it clips, casts, adds and `xr.where`s every reflectance
-band into the graph before deciding to change nothing.
+**How far the decision reached is reported after every load**, from counters the parser keeps:
+how many reflectance sources it stamped, and how many of those were owed the offset. Reaching
+*none* of them is the one way this can still go wrong quietly — an empty or mistaken
+`reflectance_assets` set corrects nothing and produces plausible pixels 1000 too high — so a zero
+count is a WARNING naming the assets it resolved, and any other count is an INFO line. A warning
+rather than an error, because a caller that replaces the loader also reports zero; what makes that
+enough is that every other way of getting this wrong is loud, since an unclassifiable source
+refuses and an unresolvable band name fails the load.
 
 `extract_baselines` records the baseline of the item actually loaded and reaches the store's
 `baselines_applied` attribute. Nothing masks it, and nothing derives a correction from it.
@@ -504,6 +500,18 @@ indistinguishable from no observation and every downstream mask drops it. Elemen
 COGs floor at 1 for the same reason, and reproducing them exactly is what makes a corrected raw copy
 comparable with a harmonised one. DN 0 itself never reaches the arithmetic — the reader applies the
 result only where the source was valid — so nodata survives as nodata.
+
+**That the nodata code IS 0 is hard-coded, and that is an unchecked assumption.** `_NODATA = 0` is
+a constant in `stac.py`, and the correction rests on it twice over: DN 0 is the value excluded from
+the arithmetic, and the floor of 1 is what stops a corrected pixel from *looking* like nodata. The
+real answer belongs to the catalogue — `odc` derives it per band from `raster:bands`, and the reader
+has the resolved `RasterLoadParams` in hand when it corrects — but the driver is installed on any
+collection whose config sets `requires_baseline_correction`, so nothing ties the constant to what
+the collection actually declares. Under a marker of, say, 65535 every gap pixel would test as
+valid: the correction shifts them to 64535, the fuser's `dst == fill_value` test stops recognising
+them as empty, and the mosaic gains data-looking pixels 1000 below the nodata code where there was
+no observation. Both Sentinel-2 providers declare 0 today, so this is latent rather than live — the
+fix is to resolve the marker from `cfg` and refuse anything else, and it is owed.
 
 The arithmetic widens to `int32` and casts back to the INPUT dtype, so nothing wraps and the store's
 unsigned arrays are unaffected: the offset is negative and the floor is positive, so an unsigned
@@ -1332,41 +1340,48 @@ The key reads these signals, in this order:
    cannot deliver the tile-date at any baseline, and the generic paths have no recovery for it: a
    missing band is not one of the read failures the fallback ladder recognises, so an incomplete
    winner fails the acquisition outright.
-2. **Whether the producer is decidable**, where it would change a pixel. A copy whose reflectance
-   bands span a harmonised and a raw producer, or whose producer cannot be identified at all,
-   refuses its date at or above the correction threshold — and a refusal is not something the
-   fallback ladder can step down on. Below the threshold the term is inert, because the producer
-   changes no pixel there.
+2. **Whether the producer is decidable**, where it would change a pixel. A copy whose producer
+   cannot be identified at all refuses its date at or above the correction threshold — and a
+   refusal is not something the fallback ladder can step down on. A copy whose reflectance bands
+   span a harmonised and a raw producer is *not* among them: each of its sources is decided on its
+   own bucket, so it is corrected band by band rather than refused. Below the threshold the term is
+   inert, because the producer changes no pixel there.
 3. **Whether the copy demonstrably belongs to the acquisition it is ranked in.** A copy naming
    neither an observation nor an instant was attached to a cluster arbitrarily, so it must not
    displace one that says which pass it came from — a known member at an older baseline still
    represents that pass, while a possibly-unrelated newer one may duplicate another and drop this
    one's coverage.
-4. **Whether the baseline is readable at all**, with unknown sorting last. An absent baseline is
-   an absence of evidence, and such a copy refuses its whole date downstream, so an older
-   reprocessing that can be corrected beats a newer one that cannot be processed at all. Above the
-   next term because a refusal has no recovery while owing a correction merely gets one.
-5. **Whether the copy owes an offset correction at all**, where the producer is an item's own
-   property. The correction is decided per solar day over every tile fused into it, so one raw copy
-   at or above the threshold can refuse the whole day. A copy owing nothing removes that risk for
-   the date rather than for itself, which is a coverage argument, so this is the one term allowed
-   to cost a reprocessing. Inert below the threshold, where no producer changes a pixel — which is
-   most but NOT all ESA-hosted copies: zone 01N in 2017 carries 15 at baseline 05.00, so the term
-   does fire on real data. Also inert where the producer is the COLLECTION's answer: every copy then has the same
-   producer, so a term that compares producers would discriminate on the threshold alone, which is
-   the baseline ranked below it and in the opposite direction.
-6. **Processing baseline, descending.** The signal that carries data vintage. Ordered by value
+4. **Whether the baseline is readable**, for producers whose correction depends on it, with
+   unknown sorting last. An absent baseline is an absence of evidence, and such a copy refuses its
+   whole date downstream, so an older reprocessing that can be corrected beats a newer one that
+   cannot be processed at all. Above every term below it because a refusal has no recovery. An
+   already-harmonised copy is exempt: its pixels need no correction whatever the baseline says.
+5. **Processing baseline, descending.** The signal that carries data vintage. Ordered by value
    rather than by "is it the best", so every rung of the fallback ladder stays in descending
    baseline order. Collapsing the non-best baselines into one tier lets a read failure skip a
    04.00 copy and hand out a 03.00 one.
+6. **Whether the copy owes an offset correction at all**, where the producer is an item's own
+   property. **Below the baseline**, and there are two reasons to prefer a copy owing nothing —
+   both about the PIXEL rather than about coverage. An already-harmonised copy had its floor
+   applied by its producer *before* any resampling, where one we correct is floored *after*, so on
+   the very dark population the two disagree; and a copy owing nothing cannot be wrong by the
+   offset at all, while one we correct is right only if the bucket lists and the declared baseline
+   are both honest. Those are quality claims, and a quality-versus-quality preference must not buy
+   a better pixel with an older reprocessing — the same rule that keeps locality below the
+   baseline. It outranks locality only because a pixel argument beats a cost one. Inert below the
+   threshold, where no producer changes a pixel — which is most but NOT all ESA-hosted copies: zone
+   01N in 2017 carries 15 at baseline 05.00, so the term does fire on real data. Also inert where
+   the producer is the COLLECTION's answer: every copy then has the same producer, so a term that
+   compares producers would discriminate on the threshold alone, which is the baseline term ranked
+   above it, in the opposite direction.
 7. **Locality, among equal baselines only.** A copy whose read assets all sit in a preferred
    bucket is cheaper to read, so it wins a baseline tie. Restricting locality to ties is what
    stops it buying cheaper egress with an older pixel, and it is inert where the baseline is
    unreadable, so it cannot decide a comparison the baseline could not enter. This is the
-   distinction the two bucket lists exist for: locality is a **cost** claim and stays below the
-   baseline, harmonisation is a **coverage** claim and sits above it. The lists name the same
-   buckets today, but the key sets differ by `scl`, so a copy can be harmonised without being
-   local and the terms are not interchangeable.
+   distinction the two bucket lists exist for: harmonisation is a **pixel** claim and locality is a
+   **cost** claim, so both sit below the baseline, harmonisation above locality. The lists name
+   the same buckets today, but the key sets differ by `scl`, so a copy can be harmonised without
+   being local and the terms are not interchangeable.
 8. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of catalogue
    response order, so a rerun cannot silently produce a different mosaic — and it makes the key a
    total order, so no comparison ever falls back to input order.
@@ -1384,8 +1399,8 @@ Two properties of that ordering are easy to get wrong and are held by tests:
   correction. Such a copy also refuses its whole date downstream, and the read-failure ladder
   recovers from a read error but not from a refusal, so a reprocessing that can be corrected beats
   a newer one that cannot be processed at all. An already-harmonised copy is exempt: no offset
-  decision rests on its baseline, so penalising it there would hand the tile-date to a raw copy
-  whose date may then be refused outright.
+  decision rests on its baseline, so penalising it there would hand the tile-date to an OLDER raw
+  reprocessing, which is the opposite of the usable-first rule the key starts with.
 
 **Which copies are the same acquisition is decided by identity, not by a timestamp.** Two
 reprocessings of one granule share a datatake — mission, sensing start and absolute orbit, in
