@@ -1,7 +1,7 @@
 # 020 — Removing the Sentinel-2 brightness offset, and choosing which copy to read
 
 **Status:** Accepted 2026-08-20. Built on `solutions/prefer-in-region-duplicate-assets` (PR #107).
-One limit found on 2026-08-21 is live and unfixed — see "What this costs", limit 1.
+Three limits are live and unfixed, and they are one piece of follow-up work — see section 5.
 
 This document is written to be read by someone who has not seen the code. Terms are defined at
 first use, and there is a glossary at the end.
@@ -300,7 +300,20 @@ than a bug fix. And the affected pixels are the immediate neighbourhood of the v
 above — well under 0.1% of a scene. But this does have live exposure, because ESA originals needing
 correction do occur (limit 1), so it is a real if small error and not a theoretical one.
 
-### Limit 3 — If Element 84 ever publishes an uncorrected file, we will not notice
+### Limit 3 — A fallback copy may be withheld
+
+When the copy we chose cannot be read, we fall back to another copy of the same photograph. A
+fallback that itself needs the offset removed is now **withheld**, because swapping it in beside the
+already-corrected tiles of the same day would refuse that day (limit 1) — and the recovery machinery
+knows how to handle a file that will not read, not a day that refuses. One unreadable file would
+otherwise stop the whole run.
+
+The cost is real: on a day where everything needs correcting, that fallback would have worked, and
+withholding it loses the day instead. We accept that because a lost day is bounded and recorded,
+whereas a stopped run is neither. Checking the fallback against the whole day would be better than
+either, and is part of the same owed work as limits 1 and 2.
+
+### Limit 4 — If Element 84 ever publishes an uncorrected file, we will not notice
 
 Our rule is "files in these locations are already corrected". If an uncorrected file ever appears
 there, we will leave it alone and it will stay 1000 too bright, silently. Nothing detects this.
@@ -311,6 +324,26 @@ as one. We did not add it, because the same field is known to be wrong in that d
 false negative would refuse imagery that is perfectly good.
 
 ---
+
+### Limits 1, 2 and 3 are one piece of work
+
+Worth stating plainly, because they arrived as three separate review findings and read as three
+separate caveats. They are not. All three come from the same design choice — **the correction is
+applied to the combined day-image, after the individual images have been merged and resized** — and
+all three dissolve if it is applied to each image beforehand instead:
+
+```
+  today:     read + resize + merge  ────►  correct once per day
+                                              │
+             limit 1: one value for the whole day, so a day mixing eras refuses
+             limit 2: the floor lands on resized values, not original ones
+             limit 3: a fallback cannot be judged without the whole day
+
+  the fix:   read ─► correct each image ─► resize + merge
+```
+
+That is a change to how imagery is loaded, affecting the shape and memory profile of every ingest,
+so it is not a side effect of this change. It is the single most valuable follow-up here.
 
 ## 6. What we chose not to do
 
