@@ -47,7 +47,7 @@ single collection returns files from **two different places**:
       s3://sentinel-cogs                s3://sentinel-s2-l2a
       Element 84's own copies           ESA's original files
       offset ALREADY REMOVED            offset STILL PRESENT
-      the large majority                a small minority
+      most of what we get               a minority — see below
               │                                │
               └───────────────┬────────────────┘
                               ▼
@@ -59,8 +59,14 @@ single collection returns files from **two different places**:
 Get it backwards in either direction and the error is the same size and equally silent: subtract
 1000 from a file that already had it removed, or fail to subtract it from one that still has it.
 
+**How big is the minority? It depends enormously on where you look**, which is why a single figure
+would mislead. In most regions ESA originals are under 2% of what the catalogue returns. Near the
+antimeridian — the Bering Sea and Aleutians — they are **21% of a whole year** of one map zone. So
+this is a rounding error in most of the world and a routine occurrence in some of it, and code that
+handles it "usually" is not enough.
+
 Before this change, the code did not distinguish them at all — it left the whole collection alone,
-which is right for the majority and wrong for the minority.
+which is right for the majority and silently wrong for the rest.
 
 ---
 
