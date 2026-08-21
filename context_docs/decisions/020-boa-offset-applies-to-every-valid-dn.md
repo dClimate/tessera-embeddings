@@ -111,9 +111,13 @@ already corrected, and that Element 84's own documentation is misleading on the 
 ### Decision 3 — Work out the correction from the imagery, not from a table passed in
 
 There is a table of processing versions that travels alongside the imagery. It exists to record
-*what was used*, and it is unsuitable for *deciding what to do*, because it keeps only one entry per
-day and writes 0 for anything it could not read. Deciding from it meant a real correction could be
-skipped in three different ways, all silent.
+*what was used*, and it is unsuitable for *deciding what to do*. Deciding from it meant a needed
+correction could be skipped in three different ways, all silent:
+
+- the day has no entry in the table at all, and a missing entry reads as "nothing to do";
+- the version could not be read, which the table records as 0 — again "nothing to do";
+- the day has several images, and the table keeps only one entry, so it records whichever image
+  happened to be processed last.
 
 For providers where every file comes from the same source, the collection's own configuration
 supplies the answer instead. This is what lets Microsoft Planetary Computer be handled at all: it
@@ -224,7 +228,7 @@ This is a correctness fix for water and shadow, not a change to most of the imag
 
 ---
 
-## 5. What this costs — three honest limits
+## 5. What this costs — four honest limits, and three of them are one problem
 
 ### Limit 1 — A whole day of imagery can be refused, and this happens for real
 
