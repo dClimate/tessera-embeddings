@@ -241,19 +241,32 @@ runs over a year of real imagery, so three zone-years were ingested on the devel
 
 | arm | zone | year | why this one | outcome |
 |---|---|---|---|---|
-| A | 01N | 2017 | densest ESA-original coverage found anywhere | ran clean |
+| A | 01N | 2017 | densest ESA-original coverage found anywhere | **failed after 1 h 40 m** |
 | B | 57S | 2017 | most duplicate copies of one photograph | **completed in 44 min** |
-| C | 01N | 2024 | same ground, later year — do the dynamics hold? | **optical leg failed** |
+| C | 01N | 2024 | same ground, later year — do the dynamics hold? | **failed after 55 min** |
 
-**Arms A and B behaved as intended.** Duplicate reduction ran and reported itself in the durable
-audit line: zone 57S pruned **162 tile-days** that had more than one copy, 180 copies rejected and
-all 180 retained as fallbacks, every winner in our own cloud region; zone 01N pruned 14 tile-days,
-15 rejected, 12 winners in-region against 2 elsewhere. No day was refused in either, nothing was
-recorded as lost, and no traceback appeared anywhere in either subtree. One Sentinel-1 read returned
-a permission error and its retry succeeded — infrastructure noise, unrelated to this change.
+**Arm B is the clean result.** A complete zone-year of a 267-live-tile zone, both radar orbits
+included, in **44 minutes**. Duplicate reduction ran and reported itself in the durable audit line:
+**162 tile-days** with more than one copy, 180 copies rejected and all 180 retained as fallbacks,
+every winner in our own cloud region. No day refused, nothing recorded as lost, no traceback
+anywhere in its subtree.
 
-Arm B is also the useful timing figure: a complete zone-year of a 267-live-tile zone, both radar
-orbits included, in **44 minutes**.
+**Arms A and C both failed, on the two different refusal branches** — which between them exercise
+every way a day can be undecidable, and each failure took the whole zone-year with it:
+
+| arm | day | which refusal | what was on that day |
+|---|---|---|---|
+| A | 2017-11-16 | ESA originals span two processing eras | 8 items at version 00.01, **67 at 05.00** |
+| C | 2024-01-02 | an ESA original needing correction beside corrected copies | 11 raw at 05.10, 6 corrected |
+
+Arm A is worth dwelling on, because the day it died on was **predicted before the run**. Querying
+the catalogue for zone 01N in 2017 identified 2017-11-16 and 2017-12-21 as the two days whose ESA
+originals straddle the threshold, and confirmed that duplicate reduction could not resolve them
+because the conflict is between different tiles. The run then failed on 2017-11-16. The local
+analysis and the live pipeline agree.
+
+Arm A also ran for an hour and forty minutes before reaching that day, which is the cost of this
+failure mode: the work up to it is done and then discarded, because the leg has no partial success.
 
 **Arm C failed, and that is the useful result.** The optical leg died three times — attempts logged
 as 1 of 3, 2 of 3 and 3 of 3, each re-dispatched after a backoff — every time on the same day, 2
@@ -270,7 +283,8 @@ elsewhere — so duplicate reduction and the region preference both behaved corr
 The figures were identical on all three attempts, which is what a deterministic re-read of an
 unchanged catalogue should produce and a useful check in itself.
 
-**The later year is much worse than the early one**, which is the opposite of what we assumed:
+**Both years fail, and the later one fails far more often**, which is the opposite of what we
+assumed:
 
 | zone | days refused, late 2017 | days refused, early 2024 |
 |---|---|---|
