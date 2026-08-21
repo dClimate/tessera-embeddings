@@ -37,6 +37,7 @@ from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.inference import (
     DEFAULT_MODEL_VERSION,
     INFERENCE_CHUNK_SIZE,
+    V2_RUN_PREFIX,
     ModelVersion,
     checkpoint_filename,
 )
@@ -72,7 +73,6 @@ S2_ONLY_RUN_PREFIX = "s2only-"
 
 #: Staging-run prefix marking chunks produced by a v2 student. v1.1 keeps the
 #: historical bare-uuid run_id, so nothing about the existing path changes.
-V2_RUN_PREFIX = "v2-"
 
 
 class EmbeddingsDevParams(BaseModel):

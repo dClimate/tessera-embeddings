@@ -28,6 +28,7 @@ from prefect.states import StateType
 from pydantic import BaseModel
 
 from tessera_embeddings.config.dask import compute_pipeline_cluster_sizing
+from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.data_loading import _active_orbits
@@ -84,6 +85,7 @@ async def tessera_full_pipeline(
     num_actors: int | None = None,
     # Behaviour
     s1_orbit: str = "both",
+    model_version: ModelVersion = DEFAULT_MODEL_VERSION,
     allow_s2_only: bool = False,
     skip_coverage_check: bool = False,
     ami_ssm_name: str = "/tessera/ray/ami-id",
@@ -113,6 +115,11 @@ async def tessera_full_pipeline(
         num_actors: Override for Ray GPU actor count.
         s1_orbit: SAR orbit direction — ``"ascending"``, ``"descending"``,
             or ``"both"``. ``"both"`` ingests both orbits concurrently.
+        model_version: Forwarded to the embeddings stage: which Tessera model to run,
+            ``"v1.1"`` (default) or ``"v2-large"``. Threaded explicitly rather than left to
+            the child's default, because the child HAS a default: an end-to-end run that
+            omitted it silently produced v1.1 embeddings while the operator believed they
+            had selected the second model, and nothing downstream contradicted them.
         allow_s2_only: Forwarded to the embeddings stage: embed S2-valid pixels
             that have ZERO S1 observations (sub-zone SAR coverage gaps) via the
             upstream v1.1 missing-S1 convention instead of skipping them.
@@ -251,6 +258,7 @@ async def tessera_full_pipeline(
             "code_suffix": code_suffix,
             "num_actors": num_actors,
             "s1_orbit": s1_orbit,
+            "model_version": model_version,
             "allow_s2_only": allow_s2_only,
             "dev_params": {
                 "skip_coverage_check": skip_coverage_check,

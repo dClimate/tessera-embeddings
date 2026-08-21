@@ -27,6 +27,43 @@ ModelVersion = Literal["v1.1", "v2-large"]
 
 DEFAULT_MODEL_VERSION: ModelVersion = "v1.1"
 
+#: Prefix marking a staging run_id whose chunks were produced by a v2 student.
+#:
+#: Lives HERE rather than beside the flow that mints it, because the check it enables has to
+#: run in two layers. The Prefect flow composes the run_id; ``inference.runner`` is a
+#: documented public entry point that a caller can drive directly, with its own run_id and
+#: config, and it is the boundary staged chunks are actually reused at. The flow imports
+#: prefect, so the runner cannot reach the constant there without dragging the orchestration
+#: layer into the inference one — which is why the vocabulary moved down instead.
+V2_RUN_PREFIX = "v2-"
+
+
+def staged_by_v2(run_id: str | None) -> bool:
+    """Whether *run_id* names staging produced by a v2 student."""
+    return bool(run_id) and (run_id or "").startswith(V2_RUN_PREFIX)
+
+
+def assert_run_id_matches_model(run_id: str | None, model_version: ModelVersion) -> None:
+    """Raise if *run_id*'s encoder prefix contradicts *model_version*.
+
+    **A staged chunk does not record which student wrote it.** It is (H, W, 128) int8 either
+    way — v1.1 saves the first 128 of its 192-d representation, v2 emits 128 natively — so a
+    resume that reuses staging by run_id alone cannot tell the two apart by inspection, and a
+    mixed store is published with a single encoder stamped on all of it.
+
+    Enforced at every boundary that reuses staging rather than only where the run_id is minted:
+    the flow's guard protects the flow's callers, and this protects everyone else.
+    """
+    if run_id and staged_by_v2(run_id) != (model_version != "v1.1"):
+        staged = "v2" if staged_by_v2(run_id) else "v1.1"
+        raise ValueError(
+            f"Cannot resume run {run_id!r} (staged by {staged}) with model_version={model_version!r}: "
+            "its staged chunks came from the other encoder, and continuing would publish a mix of "
+            "both and stamp the store with one of them. Resume with the "
+            f"{staged} model, or start a fresh run."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Model checkpoints
 # ---------------------------------------------------------------------------

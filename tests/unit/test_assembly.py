@@ -433,6 +433,80 @@ class TestAssembly:
         np.testing.assert_array_equal(ds["embeddings"].values[0, ...], emb)
         np.testing.assert_array_almost_equal(ds["embedding_std"].values[0, ...], std, decimal=5)
 
+    def test_a_second_encoder_cannot_append_to_a_store_the_first_published(self, tmp_path):
+        """The relabelling this refuses is silent and total.
+
+        The manifest check cannot catch it: it compares the checkpoint filename STEM, which two
+        families can share, and it is skipped ENTIRELY for a legacy store carrying no
+        ``_manifest``. Without this guard a v2 run appends to a v1.1 store and the attrs write
+        then restamps ``geoemb:model`` for the WHOLE store — every v1.1 pixel in it now
+        advertising the wrong encoder, with nothing in the store recording that it happened.
+        """
+        staging = str(tmp_path / "staging")
+        output = str(tmp_path / "output.zarr")
+        writer = ZarrWriter(staging)
+        rng = np.random.default_rng(7)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
+        roi = _make_full_roi_mask(tmp_path, 5, 5)
+
+        emb, scales = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunk, emb, run_id="run1", scales=scales)
+        writer.assemble(
+            [chunk],
+            total_y=5,
+            total_x=5,
+            run_id="run1",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
+            n_workers=1,
+        )
+
+        emb2, scales2 = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2)
+        with pytest.raises(ValueError, match="Refusing to append"):
+            writer.assemble(
+                [chunk],
+                total_y=5,
+                total_x=5,
+                run_id="run2",
+                output_path=output,
+                roi_zarr_path=roi,
+                run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
+                encoder_version="v2-large",
+                n_workers=1,
+            )
+
+    def test_the_same_encoder_appends_normally(self, tmp_path):
+        """The guard must not cost the ordinary case: a second window from the SAME family
+        extends the store as before.
+        """
+        staging = str(tmp_path / "staging")
+        output = str(tmp_path / "output.zarr")
+        writer = ZarrWriter(staging)
+        rng = np.random.default_rng(8)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
+        roi = _make_full_roi_mask(tmp_path, 5, 5)
+
+        for run, day in (("runA", 2024), ("runB", 2025)):
+            e, sc = _quantized_embeddings(rng, 5, 5)
+            writer.write_chunk(chunk, e, run_id=run, scales=sc)
+            writer.assemble(
+                [chunk],
+                total_y=5,
+                total_x=5,
+                run_id=run,
+                output_path=output,
+                roi_zarr_path=roi,
+                run_started_at=datetime.datetime(day, 6, 1, tzinfo=datetime.UTC),
+                encoder_version="v1.1",
+                n_workers=1,
+            )
+
+        ds = open_store(output)
+        assert ds["embeddings"].shape[0] == 2, "both windows present"
+        ds.close()
+
     def test_assemble_appends_to_existing_store(self, tmp_path):
         """A second assemble at a NEW time value extends the time axis."""
         staging = str(tmp_path / "staging")

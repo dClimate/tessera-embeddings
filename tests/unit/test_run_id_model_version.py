@@ -73,3 +73,38 @@ def test_error_names_both_versions_so_the_fix_is_obvious():
     msg = str(exc.value)
     assert v2_run in msg
     assert "v1.1" in msg and "v2" in msg
+
+
+# ── the encoder identity is enforced at every boundary, not only where the id is minted ──
+
+
+def test_the_runner_refuses_a_run_id_from_the_other_encoder() -> None:
+    """``inference.runner`` is a documented public entry point, so the flow's guard is not
+    the only door. A caller arriving with a v2 staging id and a v1.1 config would otherwise
+    reuse those chunks and publish a mix stamped with one encoder.
+    """
+    from tessera_embeddings.config.inference import assert_run_id_matches_model
+
+    with pytest.raises(ValueError, match="came from the other encoder"):
+        assert_run_id_matches_model(f"{V2_RUN_PREFIX}abc123", "v1.1")
+    with pytest.raises(ValueError, match="came from the other encoder"):
+        assert_run_id_matches_model("abc123def456", "v2-large")
+
+
+def test_a_matching_run_id_and_a_fresh_run_both_pass() -> None:
+    from tessera_embeddings.config.inference import assert_run_id_matches_model
+
+    assert_run_id_matches_model(f"{V2_RUN_PREFIX}abc123", "v2-large")
+    assert_run_id_matches_model("abc123def456", "v1.1")
+    assert_run_id_matches_model(None, "v2-large")  # nothing staged yet
+
+
+def test_the_guard_sees_through_a_composed_prefix() -> None:
+    """The two prefixes compose (``v2-s2only-…``), so the encoder marker is not always the
+    whole prefix — only the front of it.
+    """
+    from tessera_embeddings.config.inference import assert_run_id_matches_model
+
+    assert_run_id_matches_model(f"{V2_RUN_PREFIX}s2only-abc123", "v2-large")
+    with pytest.raises(ValueError, match="came from the other encoder"):
+        assert_run_id_matches_model(f"{V2_RUN_PREFIX}s2only-abc123", "v1.1")

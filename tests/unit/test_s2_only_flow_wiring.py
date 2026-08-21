@@ -211,3 +211,21 @@ def test_an_assembly_only_resume_publishes_under_the_staged_mode() -> None:
     assert staged_s2_only_mode(f"{S2_ONLY_RUN_PREFIX}abc123") is True
     assert staged_s2_only_mode("plain-run-000") is False
     assert staged_s2_only_mode(None) is False
+
+
+# ── the master pipeline can actually select the second model ──
+
+
+def test_full_pipeline_forwards_model_version(monkeypatch) -> None:
+    """The child flow HAS a default, so an unforwarded selector fails silently: the run
+    produces v1.1 embeddings while the operator believes they chose v2.
+    """
+    calls = _run_master_pipeline(monkeypatch, model_version="v2-large")
+    emb_params = calls[fp_mod.PipelineDeployments().tessera_embeddings]
+    assert emb_params["model_version"] == "v2-large"
+
+
+def test_full_pipeline_model_version_defaults_to_v11(monkeypatch) -> None:
+    calls = _run_master_pipeline(monkeypatch)
+    emb_params = calls[fp_mod.PipelineDeployments().tessera_embeddings]
+    assert emb_params["model_version"] == "v1.1"

@@ -78,7 +78,7 @@ from tessera_embeddings.config.store_layout import (
     trailing_extent,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
-from tessera_embeddings.inference.conventions import build_convention_attrs
+from tessera_embeddings.inference.conventions import build_convention_attrs, expected_model_url
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
@@ -2063,6 +2063,28 @@ class ZarrWriter:
         else:
             if manifest:
                 manifest.validate_against(extract_manifest(root.attrs), output_path)
+            # A CROSS-FAMILY APPEND, refused here rather than discovered later. The manifest
+            # check above cannot catch it: it compares the checkpoint filename STEM, which two
+            # families can share, and it is skipped ENTIRELY for a legacy store that has no
+            # `_manifest` at all. A v2 run extending a v1.1 store therefore passed both doors —
+            # and the attrs write at the end of this method would then restamp `geoemb:model`
+            # for the WHOLE store, relabelling v1.1 pixels as v2 with nothing objecting.
+            #
+            # Compared against the published encoder URL specifically, because that is the field
+            # every downstream reader identifies the product by, and it is derived the same way
+            # on both sides (`expected_model_url`) so seed and fill cannot disagree by construction.
+            #
+            # A store with NO `geoemb:model` is not refused: there is no claim to contradict, and
+            # such a store predates the attr rather than disagreeing with it.
+            published_encoder = root.attrs.get("geoemb:model")
+            this_encoder = expected_model_url(model_version=encoder_version)
+            if published_encoder and published_encoder != this_encoder:
+                raise ValueError(
+                    f"Refusing to append to {output_path}: it was published by encoder "
+                    f"{published_encoder!r} and this run uses {this_encoder!r}. Appending would mix "
+                    "two model families in one store and restamp the whole thing with this run's "
+                    "encoder. Assemble into a store of the matching family, or a fresh path."
+                )
             # The store's own grid is authoritative: raw region writes would
             # silently land in a corner (or be clamp-truncated) on a mismatched
             # extent — the loud check xarray's append used to provide.
