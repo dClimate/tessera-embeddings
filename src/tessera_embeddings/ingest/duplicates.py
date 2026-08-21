@@ -749,23 +749,39 @@ def alternates_for(
 #: GDAL-backed exception classes. What arrives is a plain ``Exception`` carrying the original's
 #: repr, so an ``isinstance`` check matches nothing and the message is the only evidence left.
 _UNREADABLE_MARKERS = (
-    # The object is there and its bytes will not decode.
     "ZIPDecode",
     "TIFFReadEncodedTile",
     "IReadBlock failed",
     "Chunk and warp failed",
     "Read failed. See previous exception",
-    # The object is not there at all, which none of the markers above can see: those are
-    # emitted by a block read, and a missing object fails at open, before any block is
-    # requested. A catalogue item can name an href that was never published, and no retry
-    # publishes it. Three forms because three layers report the one condition — GDAL and
-    # rasterio raise ``ObjectNotFound``, the S3 API answers with the ``NoSuchKey`` code, and
-    # the response body carries the sentence — and which of them surfaces depends on the
-    # reader, so matching a single form leaves the other two as gaps.
+)
+
+#: Signatures of a source object that is NOT THERE — which none of the markers above can see,
+#: because every one of them is emitted by a BLOCK READ and a missing object fails at open,
+#: before any block is requested. A catalogue item can name an href the provider never
+#: published, and no retry publishes it.
+#:
+#: Three forms because three layers can be the one that surfaces the condition: GDAL and
+#: rasterio raise ``ObjectNotFound``, the S3 API answers with the ``NoSuchKey`` code, and the
+#: response body carries the sentence.
+_MISSING_OBJECT_MARKERS = (
     "ObjectNotFound",
     "NoSuchKey",
     "The specified key does not exist",
 )
+
+#: What makes a missing object one this predicate may claim: the SOURCE READER is the layer
+#: that could not find it.
+#:
+#: Every string above belongs to the S3 layer, and every S3 client in this process shares that
+#: layer — icechunk's error enum carries ``ObjectNotFound`` and ``NoSuchKey`` verbatim. Matched
+#: alone they would let a hole in the DESTINATION store, or in the ROI mask, read as source data
+#: loss: a wrong finding written durably onto the store, and a date given up for a fault that
+#: giving it up cannot route around. Requiring rasterio's name alongside separates the two,
+#: because GDAL is used here only to read source imagery — the destination is Zarr and Icechunk,
+#: which never goes through it. Unpaired, the exception is re-raised, which is what happened
+#: before this marker class existed and is the safe direction to fail in.
+_SOURCE_READER_MARKERS = ("RasterioIOError", "CPLE_")
 
 
 def is_unreadable_source(exc: BaseException) -> bool:
@@ -780,13 +796,10 @@ def is_unreadable_source(exc: BaseException) -> bool:
     An expired credential is explicitly excluded for that reason, even though it surfaces
     through the same wrapper.
 
-    A missing object qualifies, and the text that says so cannot say WHOSE object it was:
-    a source href that was never published and a hole in the destination store report the
-    same not-found. Nothing narrower is available at this boundary, and what catches a run
-    that skips its way into a thin year is DOWNSTREAM: the coverage gate declines to excuse an
-    emptied month whose dates the ingest recorded as given up. The caller also caps how many
-    dates one leg may give up, as a runaway guard on fleet time rather than a data check
-    (:data:`~tessera_embeddings.ingest.s2_roi.MAX_UNREADABLE_DATES`).
+    An object the provider never published qualifies too, and reads no differently from a
+    corrupt one: no retry produces it, and another copy of the tile-date may have it. It has to
+    be recognised as the SOURCE reader's failure, though, which the not-found text alone cannot
+    say — see :data:`_SOURCE_READER_MARKERS`.
 
     Note what is NOT matched: a whole bucket or prefix being gone, which is systemic by
     definition and must fail the run on the first date rather than be skipped date by date.
@@ -799,7 +812,9 @@ def is_unreadable_source(exc: BaseException) -> bool:
     text = " | ".join(seen)
     if any(m in text for m in ("ExpiredToken", "token has expired", "AccessDenied", "SlowDown")):
         return False
-    return any(m in text for m in _UNREADABLE_MARKERS)
+    if any(m in text for m in _UNREADABLE_MARKERS):
+        return True
+    return any(m in text for m in _MISSING_OBJECT_MARKERS) and any(m in text for m in _SOURCE_READER_MARKERS)
 
 
 def step_down_copies(

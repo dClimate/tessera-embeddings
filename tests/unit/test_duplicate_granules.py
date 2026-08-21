@@ -274,11 +274,11 @@ class TestWhenToStepDown:
             # so a plain `Exception` arrives carrying the original's repr, and no `isinstance`
             # check can see what it was. The message is the only surviving evidence.
             "RasterioIOError('ObjectNotFound: The specified key does not exist.')",
-            "An error occurred (NoSuchKey) when calling the GetObject operation",
-            "The specified key does not exist.",
+            "CPLE_OpenFailedError: An error occurred (NoSuchKey) when calling the GetObject operation",
+            "RasterioIOError('The specified key does not exist.')",
         ],
     )
-    def test_a_missing_object_means_step_down(self, message: str) -> None:
+    def test_a_missing_source_object_means_step_down(self, message: str) -> None:
         """An href the provider never published reads no differently from a corrupt one:
         no retry produces the object, and another copy of the tile-date might have it.
 
@@ -289,14 +289,36 @@ class TestWhenToStepDown:
         """
         assert is_unreadable_source(Exception(message))
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            # icechunk's error enum carries both of these words verbatim, so the destination
+            # store speaks the same not-found vocabulary the source does.
+            "IcechunkError: ObjectNotFound",
+            "An error occurred (NoSuchKey) when calling the GetObject operation",
+            "FileNotFoundError: The specified key does not exist.",
+        ],
+    )
+    def test_a_missing_object_nobody_attributes_to_the_source_does_not_step_down(self, message: str) -> None:
+        """Not-found is the S3 layer's word, and every S3 client in the process shares it.
+
+        Unpaired with the source reader's name it would let a hole in the DESTINATION store, or
+        in the ROI mask, be recorded as source data loss — a wrong finding written durably onto
+        the store, and a date given up for a fault that giving it up cannot route around.
+        Re-raising is what this did before the missing-object markers existed.
+        """
+        assert not is_unreadable_source(Exception(message))
+
     def test_a_bucket_or_prefix_that_is_gone_is_not_a_missing_object(self) -> None:
         """The skip is per DATE, so what it admits has to be per OBJECT.
 
-        A vanished bucket fails every remaining date identically. Admitting it would spend
-        the leg's whole loss allowance discovering that, one date at a time, when failing on
-        the first one says the same thing immediately and says it about the right subject.
+        A vanished bucket fails every remaining date identically. Admitting it would discover
+        that one date at a time, when failing on the first one says the same thing immediately
+        and says it about the right subject.
         """
-        assert not is_unreadable_source(Exception("An error occurred (NoSuchBucket) when calling GetObject"))
+        assert not is_unreadable_source(
+            Exception("RasterioIOError('An error occurred (NoSuchBucket) when calling GetObject')")
+        )
 
     def test_the_cause_chain_is_searched_not_just_the_message(self) -> None:
         """The exception that propagates is a wrapper that DISCARDS the reason.

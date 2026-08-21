@@ -527,6 +527,22 @@ only evidence that survives, which is why the fix is three markers — `ObjectNo
 rasterio), `NoSuchKey` (the S3 API error code), and `The specified key does not exist` (the
 response body) — covering the three layers that can be the one to surface it.
 
+### Not-found alone does not say whose object it was
+
+Those three strings belong to the S3 layer, and **every S3 client in the process shares that
+layer**. Checked against the installed wheel: `icechunk`'s error enum carries `ObjectNotFound` and
+`NoSuchKey` verbatim, so the DESTINATION store speaks the same vocabulary the source does. Matched
+on their own they would let a hole in the destination repository, or in the ROI-mask store, be
+classified as source data loss — recorded durably on the store as a finding about the provider, and
+a date given up for a fault that giving it up cannot route around.
+
+So the missing-object markers only count when the text ALSO names the source reader
+(`RasterioIOError`, or a `CPLE_` class). GDAL is used here only to read source imagery: the
+destination is Zarr and Icechunk, and the ROI mask is read through `da.from_zarr`, neither of which
+goes through it. Unpaired, the exception is re-raised — the behaviour that predates this marker
+class, and the safe direction to fail in. The decode markers above need no such pairing; only GDAL
+emits them at all.
+
 ### The leg was not even retried, for an unrelated reason
 
 `_NON_RETRYABLE_LEG_MARKERS` in `ingest_zone_year.py` already contained `ObjectNotFound`, listed
@@ -536,59 +552,54 @@ and the zone-year was classified deterministic and never re-dispatched. The clas
 right by accident — a retry would have read the same absent object — but nothing in the code knew
 that, and the collision is still live for any future S3 404 reaching that classifier.
 
-### The skip, and where its safety actually comes from
+### The skip, and what the downstream gate does and does not catch
 
-**Corrected in place 2026-08-20. The claim withdrawn:** this section previously said that "one
+**Corrected in place 2026-08-20/21. Two claims withdrawn.** This section previously said that "one
 recorded unreadable date **excuses its whole month** from the downstream coverage gate, so k
-recorded dates can excuse k months", and derived a ceiling of 6 as "half a calendar year, the most
-this path may ever excuse". **That reading was inverted, and the ceiling argument built on it is
-withdrawn.** Read `inference/data_loading.py` around the gate rather than the helper in isolation:
+recorded dates can excuse k months", and derived a ceiling of 6 from it. It then said the opposite
+overshoot: that a leg losing many dates **would inevitably fail** that gate. Neither is right, and
+the ceiling built on the first is gone from the code.
+
+Read `inference/data_loading.py` around the gate rather than the helper in isolation:
 
 ```python
+missing      = sorted(required_months - present_months)
 _lost_months = _months_holding_unreadable_dates(_raw_unreadable)
 _explained   = _months_within_assessed(missing, _assessed) if missing else set()
 _explained   = (_explained - _lost_months) if _lost_months is not None else set()
 ```
 
-`_lost_months` is **subtracted** from the excused set. A given-up date therefore **disqualifies**
-its month from being excused, what remains in `missing` raises `InsufficientCoverageError`, and the
-comment above that code states the intent outright: "Excusing it would let a write-once year
-publish a whole-month data-loss hole labelled a legitimate absence." The record makes the gate
-**stricter**, never more permissive, and `tests/unit/test_time_window.py::
-test_a_month_lost_to_unreadable_imagery_is_not_excused` had pinned exactly that all along.
+Two facts, and both matter:
 
-**So the skip is safe for a reason that owes nothing to the ingest-side cap.** Two cases, and the
-gate covers the one that matters:
+1. **The gate only ever looks at WHOLLY ABSENT months.** `missing` is
+   `required_months - present_months`. A month that keeps even one acquisition is never examined,
+   so dates lost from it are invisible to the gate — its depth is quietly reduced and nothing
+   downstream objects.
+2. **Where the gate does look, a recorded loss makes it STRICTER.** `_lost_months` is *subtracted*
+   from the excused set, so a given-up date disqualifies its month from being excused, what remains
+   in `missing` raises `InsufficientCoverageError`, and the comment above that code says why:
+   "Excusing it would let a write-once year publish a whole-month data-loss hole labelled a
+   legitimate absence." `tests/unit/test_time_window.py::test_a_month_lost_to_unreadable_imagery_is_not_excused`
+   had pinned that all along.
+
+So the two cases land differently:
 
 - **every date in a month lost** — the month is empty AND holds given-up dates, so it is not
   excused, stays in `missing`, and the cell fails with `InsufficientCoverageError` before
   publishing anything.
-- **some dates lost from a month that keeps others** — the month reads as present, and the gate
-  only ever inspects WHOLLY absent months (`missing = required_months - present_months`), so it
-  never looks. That month's depth is quietly reduced. The only rule that sees it is per pixel
-  rather than per month: `config.inference.OPTICAL_MIN_OBS` refuses a pixel with too few valid
-  optical observations in the year, rather than publishing it thin.
+- **some dates lost from a month that keeps others** — nothing per-month sees it. The only rule
+  that does is per pixel: `config.inference.OPTICAL_MIN_OBS` refuses a pixel with too few valid
+  optical observations in the year rather than publishing it thin.
 
-A vanished bucket never reaches either case, because `NoSuchBucket` is deliberately NOT matched: a
+A vanished bucket reaches neither case, because `NoSuchBucket` is deliberately NOT matched: a
 bucket or prefix that has gone is systemic by construction and every remaining date fails
 identically, so it fails the leg on the first date rather than being skipped date by date.
 
-**The owner's decision, 2026-08-20: skip the date, keep the leg, and accept the slight loss of
-depth the second case implies.** That is what the code does.
-
-### The cap, and what it is for
-
-`s2_roi.MAX_UNREADABLE_DATES` is a **runaway guard on fleet time, not a data check**. A leg that has
-given up this many dates is going to fail the coverage gate above whatever it does next, so every
-further date buys the same verdict at fleet prices — plus a log line each, which is unpleasant to
-operate. Crossing it raises `TooManyUnreadableDatesError`, which names the count and the ceiling,
-and which fires BEFORE the assessed-window record is written: that attribute excuses every absent
-month inside the range it names, and a leg that stopped part-way never reached most of that range,
-so writing it would excuse months nobody examined.
-
-**The value was not tuned, deliberately.** The observed rate does not justify the effort: see the
-rate below. It sits an order of magnitude above what a healthy leg loses and around the scale at
-which the downstream gate would fire anyway, and nothing between those bounds should reach it.
+**The owner's decision, 2026-08-20/21: skip the date, keep the leg, accept the loss of depth the
+second case implies, and add nothing else.** No count, no ceiling, no new failure mode. At the rate
+below, any bound would only ever fire on a fault of some other kind — and every date given up is
+already logged at error level and written to the store's `assessed_unreadable_dates`, so a leg that
+lost an implausible number of them says so on the record without a guard to announce it.
 
 ### The observed rate — why this is low priority
 

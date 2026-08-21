@@ -278,11 +278,6 @@ _NON_RETRYABLE_LEG_MARKERS = (
     # momentary open failure is re-raised as itself rather than routed into the create leg.
     # `scripts/audit_mosaic_prefixes.py` in the consumer repo finds these before a dispatch.
     "CorruptedStoreError",
-    # The optical leg gave up on more dates than its bounded skip permits. Deterministic in
-    # the input: every date it counted was given up only after all of that date's catalogue
-    # copies failed to read, so a re-dispatch reads the same objects and reaches the same
-    # refusal. The resolution is establishing what the provider is missing.
-    "TooManyUnreadableDatesError",
 )
 
 
