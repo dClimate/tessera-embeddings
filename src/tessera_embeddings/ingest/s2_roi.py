@@ -269,14 +269,20 @@ class _PreparedDate:
     correlating GDAL's own stderr by timestamp across every worker in the fleet.
     """
     baselines: dict[str, int] = field(default_factory=dict)
-    """The processing baselines of THESE items — the correction applied, and recorded.
+    """The processing baseline each of THESE items declares. Provenance, and nothing else.
 
     Derived where the items are known rather than once per query, because the two lists
     differ: the query's map is built before duplicate copies are pruned and before a read
     failure steps down to an older one, so it can name the baseline of a copy the loader
-    never opened. Sentinel-2's reflectance offset is keyed on that number and duplicate
-    copies straddle the threshold it tests, so the wrong entry silently shifts every pixel
-    of the date.
+    never opened. It reaches the store as the ``baselines_applied`` attribute, whose contract
+    is the vintage of the item actually loaded, so a wrong entry misreports what the store
+    holds.
+
+    **It decides no pixel.** The reflectance offset is decided per ASSET as each source is
+    read, from that source's own bucket and declared baseline
+    (:func:`~tessera_embeddings.ingest.boa_offset.source_decision`), so a date whose copies
+    straddle the threshold is corrected image by image while this map still names one baseline
+    for the date.
     """
     read_error: BaseException | None = None
     """Set when PREPARATION hit a source that would not read, instead of raising.
@@ -1061,8 +1067,10 @@ def ingest_s2_roi_reflectance(
                 return
             total_processed += len(batch)
 
-        # query_stac_items sorts by (date, cloud_cover ASC). Re-sort cloudiest-first so
-        # the clearest tile paints last (wins) in solar_day's painter's algorithm.
+        # Cloudiest-first, so the clearest tile paints LAST and wins in solar_day's
+        # painter's algorithm. `query_stac_items` applies the same key — cloud cover
+        # DESCENDING — and applying it again here covers a supply that did not come through
+        # it, since both suppliers are injectable.
         # group_items_by_date preserves this within-group order.
         #
         # Both the sort and the grouping key off the SOLAR day, not the UTC date, because

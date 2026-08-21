@@ -67,9 +67,9 @@ READ_ASSET_KEYS: tuple[str, ...] = (*S2_L2A_BANDS, "scl")
 #: The subset the BOA offset is applied to. Used for HARMONISATION, and deliberately EXCLUDES
 #: ``scl``: the scene classification layer is categorical and never baseline-corrected —
 #: subtracting 1000 from a class label is meaningless — so which producer served it cannot make
-#: the reflectance correction ambiguous. Including it let an item whose reflectance is uniformly
-#: harmonised be classified MIXED because of a layer that is never touched, and a MIXED item can
-#: refuse an entire date.
+#: the reflectance correction ambiguous. Including it classified an item whose reflectance is
+#: uniformly harmonised as MIXED on the strength of a layer that is never touched, which costs that
+#: copy its ranking position against duplicates that are no better.
 REFLECTANCE_ASSET_KEYS: tuple[str, ...] = tuple(S2_L2A_BANDS)
 
 
@@ -199,13 +199,20 @@ def item_is_in_preferred_location(
 
 
 class Harmonisation(enum.Enum):
-    """Whether an item's reflectance already has the baseline-04.00 offset removed.
+    """Which producer served an ITEM's reflectance, and so whether the offset is still present.
 
     Four states and not a boolean, because two of them need a response neither answer gives.
-    The correction is applied per DATE to every band at once, so an item whose bands straddle a
-    harmonised and a raw producer has no correct date-wide answer: exempting it leaves the raw
-    band 1000 high, correcting it drops 1000 from every harmonised band. ``UNKNOWN`` is the
-    same problem without even that much evidence. A boolean forces one of those silently.
+    ``MIXED`` is an item whose own reflectance bands span a harmonised and a raw producer, so no
+    single answer fits the item: exempting it leaves its raw bands 1000 high, correcting it drops
+    1000 from its harmonised ones. ``UNKNOWN`` is the same difficulty with less evidence — a bucket
+    nobody has classified. A boolean forces one of those silently.
+
+    **An item-level answer is a ranking input, not a correction input.** The offset is decided per
+    ASSET, from that asset's own bucket
+    (:func:`~tessera_embeddings.ingest.boa_offset.source_decision`), so an item straddling two
+    producers is corrected band by band rather than needing one answer. What these four states buy
+    is duplicate selection's ability to prefer a copy whose producer is settled over one whose is
+    not.
     """
 
     HARMONISED = "harmonised"
@@ -230,16 +237,22 @@ def item_harmonisation(
     **Absence of evidence buys neither a correction nor an exemption.** Both mistakes are silent
     and neither is safe to default to: a doubled correction takes 1000 off pixels that already had
     it removed, a skipped one leaves plausible pixels 1000 too high. So an item served from a
-    bucket nobody has listed is ``UNKNOWN``, and the caller refuses the date rather than guessing
-    — see the next paragraph for the two ways that state arises.
+    bucket nobody has listed is ``UNKNOWN`` rather than guessed at — see the next paragraph for the
+    two ways that state arises.
 
     An item is ``UNKNOWN`` rather than ``RAW`` or ``MIXED`` whenever a bucket serving it has not
     been classified: it does not expose every reflectance band under the configured names, or some
     band comes from a bucket in neither list. Nothing here can resolve the alias table mapping a
     band name to an asset key, so a band absent under the requested name may still be served under
     a native one — and either way, calling the item raw would subtract the offset from pixels that
-    may already be harmonised. The caller refuses on ``UNKNOWN`` rather than guessing, and its
-    message names classifying the bucket as the fix.
+    may already be harmonised.
+
+    **Nothing here refuses anything.** The one production caller is duplicate selection, which
+    ranks an ``UNKNOWN`` copy last and withholds it from the fallback ladder — a copy nobody can
+    classify refuses at load time rather than failing to read, and the ladder recovers from a read
+    failure and not from a refusal. The refusal itself is raised per asset by
+    :func:`~tessera_embeddings.ingest.boa_offset.source_decision`, and its message names
+    classifying the bucket as the fix.
     """
     sources = read_asset_sources(item, keys)
     if not sources.complete:

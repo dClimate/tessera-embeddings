@@ -100,8 +100,9 @@ PROVIDERS: dict[str, STACProvider] = {
             # Earth Search harmonises the BOA offset (subtracts 1000 from post-baseline
             # 04.00 data) in ITS OWN COGs, but this collection also indexes items whose
             # assets point at ESA's originals, which carry the offset. So the threshold is
-            # set and `harmonisation_varies_by_item` makes the exemption per item, from where
-            # the assets live. Leaving the threshold unset exempts the whole collection and is
+            # set, and `harmonisation_varies_by_item` sends the decision to the assets so it is
+            # made per ASSET, from where that asset lives. Leaving the threshold unset exempts the
+            # whole collection and is
             # only correct while every item is a harmonised COG.
             # The raster:bands offset=-0.1 and earthsearch:boa_offset_applied metadata are
             # unreliable (see sertit/eoreader#120), so the asset location is the signal.
