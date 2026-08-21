@@ -71,11 +71,20 @@ def assert_run_id_matches_model(run_id: str | None, model_version: ModelVersion)
     """
     if run_id and staged_by_v2(run_id) != (model_version != "v1.1"):
         staged = "v2" if staged_by_v2(run_id) else "v1.1"
+        # Both causes are named because they cannot be told apart from here, and that is the
+        # whole reason the prefix exists: an id carries the encoder or nothing does. Saying only
+        # "cannot resume" sent a caller who never resumed looking for staging that was not there.
+        remedy = (
+            f"mint it as run_id_prefix({model_version!r}) + <uuid> if this is a FRESH run"
+            if not staged_by_v2(run_id)
+            else "start a fresh run"
+        )
         raise ValueError(
-            f"Cannot resume run {run_id!r} (staged by {staged}) with model_version={model_version!r}: "
-            "its staged chunks came from the other encoder, and continuing would publish a mix of "
-            "both and stamp the store with one of them. Resume with the "
-            f"{staged} model, or start a fresh run."
+            f"run_id {run_id!r} names {staged} staging but model_version={model_version!r}. If this "
+            f"is a resume, its staged chunks came from the other encoder and continuing would "
+            f"publish a mix of both while stamping the store with one of them — resume with the "
+            f"{staged} model instead. If it is a new run, the id simply lacks the prefix that "
+            f"records the encoder: {remedy}."
         )
 
 

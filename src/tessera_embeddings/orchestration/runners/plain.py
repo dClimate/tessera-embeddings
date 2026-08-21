@@ -42,6 +42,7 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
 from tessera_embeddings.inference.data_loading import _active_orbits, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
+    assert_output_store_accepts,
     build_inference_config,
     checkpoint_to_version,
     enumerate_mosaic_chunks,
@@ -215,6 +216,19 @@ def _run_inference_and_assemble(
     # From the EFFECTIVE model on the config, not the raw parameter, so the id records what
     # will actually run. Unprefixed for v1.1, so nothing about the historical path changes.
     run_id = run_id_prefix(config.model_version) + uuid.uuid4().hex[:12]
+    # BEFORE the cluster and before a single chunk. The encoder mismatch is decided by the store
+    # and this config alone, so discovering it in `assemble` means every chunk was inferred and
+    # none of it can be published. The Prefect flow got this gate; this runner is the other way
+    # in and was left burning the work for the same deterministic answer.
+    assert_output_store_accepts(
+        output_bucket=output_bucket,
+        roi_name=roi_name,
+        output_name_suffix="",
+        config=config,
+        mosaic_base=mosaic_base,
+        log=log,
+    )
+
     t0 = time.monotonic()
 
     if num_gpus == 0:
