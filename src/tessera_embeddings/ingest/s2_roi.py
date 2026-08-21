@@ -165,13 +165,20 @@ class IngestResult:
             ``"skipped"``.
         dates_processed: Number of dates whose reflectance was written.
         dates_filtered_coverage: Number of dates rejected by the SCL-based
-            coverage filter.
+            coverage filter. ONLY that — a date lost for any other reason is
+            counted under its own field, or the two become indistinguishable
+            in the one place a caller looks.
+        dates_refused_producer_conflict: Number of dates refused because no
+            single BOA-offset decision fits the day. Deliberate losses, not
+            coverage rejections, and durably recorded on the store as
+            ``assessed_unreadable_dates`` with ``scope=producer-conflict``.
     """
 
     roi_path: str
     status: str
     dates_processed: int
     dates_filtered_coverage: int
+    dates_refused_producer_conflict: int = 0
 
 
 def _sum_over_windows(mask: da.Array, windows: list[tuple[int, int, int, int]]) -> da.Array:
@@ -464,10 +471,17 @@ def ingest_s2_roi_reflectance(
 
     total_processed = 0
     total_filtered = 0
+    total_refused = 0
     total_seen = 0
     #: Tile-dates whose every copy failed to read. Their pixels are absent from the mosaic,
     #: so this is the ONLY record of where the loss is; it is re-stated at the end of the run.
     unreadable_tile_dates: list[dict[str, str]] = []
+    # Days refused because no single offset decision fits them. Kept apart from
+    # `unreadable_tile_dates` in ORIGIN and joined to it at the end for STORAGE, because both are
+    # deliberate losses inside an assessed window and the store's record of "where the holes are"
+    # must name them all. Kept out of the coverage counter, whose contract is the SCL gate: a run
+    # that lost most of a year to metadata was reporting it as coverage filtering.
+    producer_conflict_dates: list[dict[str, str]] = []
 
     def _prepare_date(day_items: list) -> _PreparedDate:
         """Build one solar day's write-ready dataset, or the reason it has none.
@@ -836,6 +850,31 @@ def ingest_s2_roi_reflectance(
         log_duplicate_selection(log, roi_label, alternates, kept=items, read_keys=read_keys, items=supplied)
         date_alternates.update(alternates)
 
+        def _record_skip(prepared: _PreparedDate) -> None:
+            """Account for a date that produced nothing, under the reason it actually had.
+
+            A producer conflict is not a coverage rejection and must not be counted as one: the
+            coverage counter's contract is the SCL gate, and a run that lost most of a year to
+            catalogue metadata was reporting that as coverage filtering. It is also recorded
+            durably, for the same reason an unreadable date is — an assessed window makes absence
+            inside it a finding rather than a gap, so a hole nobody recorded is a hole no later run
+            revisits, and the warning explaining it does not outlive the log.
+            """
+            nonlocal total_filtered, total_refused
+            if prepared.skip_reason != "producer-conflict":
+                total_filtered += 1
+                return
+            total_refused += 1
+            producer_conflict_dates.append(
+                {
+                    "date": prepared.date,
+                    "tiles": ",".join(sorted({t for it in prepared.items if (t := item_tile(it)) is not None})),
+                    "tried": copies_label(prepared.items),
+                    "objects": "",
+                    "scope": "producer-conflict",
+                }
+            )
+
         def _record_unreadable(
             prepared: _PreparedDate,
             exc: BaseException,
@@ -909,7 +948,7 @@ def ingest_s2_roi_reflectance(
             """
             nonlocal total_processed, total_filtered
             if prepared.day_ds is None and prepared.read_error is None:
-                total_filtered += 1
+                _record_skip(prepared)
                 return
             attempt: _PreparedDate = prepared
             tried: list[str] = []
@@ -1077,7 +1116,7 @@ def ingest_s2_roi_reflectance(
                     _consume(prepared, stall_s)
                     continue
                 if prepared.day_ds is None:
-                    total_filtered += 1
+                    _record_skip(prepared)
                     continue
                 batch.append(prepared)
                 batch_stall += stall_s
@@ -1168,11 +1207,15 @@ def ingest_s2_roi_reflectance(
     # month as an unexplained gap and the zone-year can never complete. The extra probe
     # runs ONLY in the zero-write case, so a normal run pays nothing for it.
     if total_processed or get_existing_dates(reflectance_store, s3_region=s3_region):
+        # Both kinds of deliberate loss, in ONE durable list. The attr answers "where are the
+        # holes in this assessed window", and a hole is a hole whether the objects would not read
+        # or the day had no correct offset decision. `scope` distinguishes them for anyone acting
+        # on the record.
         record_assessed_window(
             reflectance_store,
             start_date,
             end_date,
-            unreadable=unreadable_tile_dates,
+            unreadable=[*unreadable_tile_dates, *producer_conflict_dates],
             s3_region=s3_region,
         )
 
@@ -1189,12 +1232,28 @@ def ingest_s2_roi_reflectance(
             "; ".join(f"{u['date']} objects={u['objects']} scope={u['scope']}" for u in unreadable_tile_dates),
         )
 
+    if producer_conflict_dates:
+        # Stated at the END for the same reason as the unreadable summary, and separately from it
+        # because the cause and the remedy differ: this one is not a read failure and no retry or
+        # fallback copy addresses it. It is the catalogue offering a day that cannot be corrected
+        # as a whole.
+        log.error(
+            "DATA LOSS SUMMARY roi=%s: %d date(s) refused because no single offset decision fits "
+            "the day — %s. Recorded on the store as assessed_unreadable_dates with "
+            "scope=producer-conflict. These are NOT coverage rejections and are counted "
+            "separately; they need the correction applied per item before the mosaic, not a retry.",
+            roi_label,
+            len(producer_conflict_dates),
+            "; ".join(f"{c['date']} tiles={c['tiles']}" for c in producer_conflict_dates[:20]),
+        )
+
     if total_processed == 0:
         return IngestResult(
             roi_path=roi_zarr_path,
             status="skipped",
             dates_processed=0,
             dates_filtered_coverage=total_filtered,
+            dates_refused_producer_conflict=total_refused,
         )
 
     return IngestResult(
@@ -1202,4 +1261,5 @@ def ingest_s2_roi_reflectance(
         status="success",
         dates_processed=total_processed,
         dates_filtered_coverage=total_filtered,
+        dates_refused_producer_conflict=total_refused,
     )

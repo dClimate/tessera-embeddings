@@ -149,9 +149,14 @@ class AssetSources:
     def all_in(self, buckets: frozenset[str]) -> bool:
         """Whether the complete requested set is served from ``buckets``.
 
-        False for an incomplete set: a claim about every asset cannot be made from a subset.
+        False for an incomplete set: a claim about every asset cannot be made from a subset. And
+        false for an EMPTY one, which `all()` would otherwise satisfy vacuously — nothing resolved
+        is "we did not look", not "everything is here". A caller asking about no keys at all was
+        being told yes: the duplicate audit reports locality over the requested read set, and where
+        that set is deliberately empty (a provider whose assets cannot be looked up by name) every
+        winner was reported as in-region while sitting in another cloud entirely.
         """
-        return self.complete and all(bucket in buckets for bucket in self.buckets.values())
+        return bool(self.buckets) and self.complete and all(bucket in buckets for bucket in self.buckets.values())
 
     def any_in(self, buckets: frozenset[str]) -> bool:
         """Whether any resolved key is served from ``buckets``."""

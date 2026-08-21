@@ -563,13 +563,24 @@ def test_a_producer_conflict_is_isolated_to_its_own_date(run_ingest, caplog):
         )
 
     # The leg COMPLETED — that is the change. Reaching this line at all is the assertion.
-    assert run.result.dates_filtered_coverage == 1
+    #
+    # And it is accounted under its OWN reason. The coverage counter's contract is the SCL gate, so
+    # folding a metadata refusal into it reported a run that lost most of a year to the catalogue
+    # as ordinary coverage filtering.
+    assert run.result.dates_refused_producer_conflict == 1
+    assert run.result.dates_filtered_coverage == 0, "a refusal is not a coverage rejection"
     assert "no single offset decision fits the day" in caplog.text
     assert "2024-01-01" in caplog.text
+    # Announced again at the end, because the per-date warning is thousands of lines back in a real
+    # leg, and named as a durable record rather than only a log line.
+    assert "DATA LOSS SUMMARY" in caplog.text
+    assert "scope=producer-conflict" in caplog.text
     # And it is not routed onto the duplicate-copy ladder. That ladder recovers from an object
     # that will not read; this conflict is between different TILES of the day, so no other copy
     # of any one tile resolves it and stepping down would refuse identically on every rung.
-    assert "DATA LOSS" not in caplog.text
+    # Matched on the ladder's OWN wording, not on "DATA LOSS" — the producer-conflict summary
+    # legitimately carries that prefix too, and a substring test conflated the two.
+    assert "every catalogue copy" not in caplog.text
 
 
 def test_an_asset_incomplete_item_reaches_the_duplicate_ladder(run_ingest, caplog):
