@@ -27,6 +27,7 @@ from odc.geo.geobox import GeoBox
 from pyproj import Transformer
 from rasterio.transform import from_origin
 
+from tessera_embeddings.config.providers import PROVIDERS, CollectionConfig
 from tessera_embeddings.config.satellites import S2_BASELINE_OFFSET, S2_BASELINE_THRESHOLD, S2_L2A_BANDS
 from tessera_embeddings.ingest.asset_locations import Harmonisation
 from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
@@ -35,6 +36,7 @@ from tessera_embeddings.ingest.stac import (
     HeterogeneousProducerError,
     _BoaCorrectingDriver,
     _reflectance_asset_keys,
+    collection_harmonisation,
     load_stac_items,
 )
 
@@ -102,6 +104,64 @@ class TestSourceDecision:
 
     def test_a_collection_known_harmonised_owes_nothing_anywhere(self) -> None:
         assert source_decision(_RAW_BUCKET, 510, _T, Harmonisation.HARMONISED) is OffsetDecision.EXEMPT
+
+    def test_a_collection_answer_naming_no_single_producer_refuses(self) -> None:
+        """MIXED and UNKNOWN settle nothing, so a source that needs an answer must not get a guess.
+
+        Correcting on an unresolved producer is wrong by exactly the offset and silent, which is
+        the one outcome this function exists to prevent. The bucket cannot rescue it either: a
+        collection answer replaces the asset's evidence rather than supplementing it, so neither a
+        harmonised nor a raw bucket changes the result.
+        """
+        for unsettled in (Harmonisation.MIXED, Harmonisation.UNKNOWN):
+            assert source_decision(_RAW_BUCKET, 510, _T, unsettled) is OffsetDecision.UNDECIDABLE, unsettled
+            assert source_decision(_HARMONISED_BUCKET, 510, _T, unsettled) is OffsetDecision.UNDECIDABLE, unsettled
+            assert source_decision(_UNLISTED_BUCKET, _T, _T, unsettled) is OffsetDecision.UNDECIDABLE, unsettled
+            assert source_decision(_RAW_BUCKET, None, _T, unsettled) is OffsetDecision.UNDECIDABLE, unsettled
+
+    def test_an_unsettled_producer_below_the_threshold_still_costs_nothing(self) -> None:
+        """No producer changes a pixel there, so there is no ambiguity worth refusing over."""
+        for unsettled in (Harmonisation.MIXED, Harmonisation.UNKNOWN):
+            assert source_decision(_RAW_BUCKET, 206, _T, unsettled) is OffsetDecision.EXEMPT, unsettled
+
+
+class TestNothingCanSupplyAnUnsettledProducer:
+    """The refusal above is a dormant guard. These pin that, rather than restating it.
+
+    ``known_harmonisation`` reaches :func:`source_decision` from exactly one place: the parser
+    :func:`load_stac_items` builds, which takes it from :func:`collection_harmonisation`. That
+    function can only answer ``RAW`` or ``None``, so no configured collection drives the
+    undecidable branch today. Should one ever be able to, these fail — which turns the guard into
+    a behaviour change somebody has to think about rather than one that ships silently.
+    """
+
+    def test_no_configured_collection_yields_an_unsettled_producer(self) -> None:
+        answers = {
+            (provider_name, alias): collection_harmonisation(config)
+            for provider_name, provider in PROVIDERS.items()
+            for alias, config in provider.collections.items()
+        }
+        assert answers, "no collections configured, so this census would pass vacuously"
+        unsettled = {key: value for key, value in answers.items() if value not in (None, Harmonisation.RAW)}
+        assert not unsettled, f"these collections would reach the undecidable branch: {unsettled}"
+
+    def test_the_collection_answer_is_settled_for_every_configuration(self) -> None:
+        """Exhaustive over the two fields :func:`collection_harmonisation` reads.
+
+        The census above covers the collections that exist; this covers the ones that could be
+        added, so a new entry cannot introduce an unsettled answer without failing here.
+        """
+        for varies in (False, True):
+            for threshold in (None, S2_BASELINE_THRESHOLD):
+                config = CollectionConfig(
+                    collection_id="probe",
+                    bands=S2_L2A_BANDS,
+                    resolution=10,
+                    baseline_threshold=threshold,
+                    harmonisation_varies_by_item=varies,
+                )
+                answer = collection_harmonisation(config)
+                assert answer in (None, Harmonisation.RAW), (varies, threshold, answer)
 
 
 def _item(
