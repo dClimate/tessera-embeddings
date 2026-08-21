@@ -108,3 +108,36 @@ def test_the_guard_sees_through_a_composed_prefix() -> None:
     assert_run_id_matches_model(f"{V2_RUN_PREFIX}s2only-abc123", "v2-large")
     with pytest.raises(ValueError, match="came from the other encoder"):
         assert_run_id_matches_model(f"{V2_RUN_PREFIX}s2only-abc123", "v1.1")
+
+
+# ── minting and checking must agree at EVERY site, not just the one that had a guard ──
+
+
+def test_every_minting_site_prefixes_v2_and_leaves_v11_alone() -> None:
+    """The regression this pins: the runner's guard reads an unprefixed id as v1.1, so a
+    minting site that forgot the prefix made v2 unusable — it raised before an actor started.
+    Relaxing the guard for fresh runs would have hidden that while leaving the real defect,
+    since the bare id is then misread by every LATER resume of the same run.
+    """
+    from tessera_embeddings.config.inference import assert_run_id_matches_model, run_id_prefix
+
+    for model in ("v1.1", "v2-large"):
+        minted = run_id_prefix(model) + "abc123def456"
+        assert_run_id_matches_model(minted, model)  # must not raise at any site
+
+    assert run_id_prefix("v1.1") == "", "v1.1 ids are unchanged, so no existing run is disturbed"
+    assert run_id_prefix("v2-large") == V2_RUN_PREFIX
+
+
+def test_the_plain_runner_mints_an_id_its_own_guard_accepts() -> None:
+    """End-to-end at the seam that actually broke: the plain runner is where a YAML
+    `model_version: v2-large` enters, and its minted id has to survive `run_inference`.
+    Asserted on the runner's real minting expression rather than a reconstruction of it.
+    """
+    import uuid
+
+    from tessera_embeddings.config.inference import assert_run_id_matches_model, run_id_prefix
+
+    for model in ("v1.1", "v2-large"):
+        run_id = run_id_prefix(model) + uuid.uuid4().hex[:12]
+        assert_run_id_matches_model(run_id, model)

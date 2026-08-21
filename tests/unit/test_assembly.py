@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import icechunk
 import numpy as np
 import pytest
 import xarray as xr
@@ -476,6 +477,71 @@ class TestAssembly:
                 encoder_version="v2-large",
                 n_workers=1,
             )
+
+    def test_a_store_with_no_recorded_encoder_is_read_as_v11_not_waved_through(self, tmp_path):
+        """Absence is not silence, and the permissive reading was the dangerous one.
+
+        `geoemb:model` postdates v1.1 and predates v2, so a store without it necessarily holds
+        v1.1 embeddings. An earlier guard skipped the check when the attr was missing — which
+        allowed precisely the append that then restamps a whole legacy store as v2. The stores
+        most likely to lack this attr are also the least likely to carry a `_manifest`, so both
+        doors stood open on the same store.
+        """
+        staging = str(tmp_path / "staging")
+        output = str(tmp_path / "output.zarr")
+        writer = ZarrWriter(staging)
+        rng = np.random.default_rng(11)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
+        roi = _make_full_roi_mask(tmp_path, 5, 5)
+
+        emb, scales = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunk, emb, run_id="legacy", scales=scales)
+        writer.assemble(
+            [chunk],
+            total_y=5,
+            total_x=5,
+            run_id="legacy",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
+            n_workers=1,
+        )
+
+        # Strip the encoder identity to reproduce a store written before the attr existed.
+        rep = icechunk.Repository.open(icechunk.local_filesystem_storage(output))
+        sess = rep.writable_session("main")
+        grp = zarr.open_group(sess.store, mode="a")
+        del grp.attrs["geoemb:model"]
+        sess.commit("drop encoder identity (simulate a legacy store)")
+
+        emb2, scales2 = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunk, emb2, run_id="v2run", scales=scales2)
+        with pytest.raises(ValueError, match="Refusing to append"):
+            writer.assemble(
+                [chunk],
+                total_y=5,
+                total_x=5,
+                run_id="v2run",
+                output_path=output,
+                roi_zarr_path=roi,
+                run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
+                encoder_version="v2-large",
+                n_workers=1,
+            )
+
+        # And the case that must KEEP working: v1.1 still appends to that same legacy store.
+        emb3, scales3 = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunk, emb3, run_id="v11run", scales=scales3)
+        writer.assemble(
+            [chunk],
+            total_y=5,
+            total_x=5,
+            run_id="v11run",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC),
+            n_workers=1,
+        )
 
     def test_the_same_encoder_appends_normally(self, tmp_path):
         """The guard must not cost the ordinary case: a second window from the SAME family

@@ -40,6 +40,7 @@ from tessera_embeddings.config.inference import (
     V2_RUN_PREFIX,
     ModelVersion,
     checkpoint_filename,
+    run_id_prefix,
 )
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
@@ -160,7 +161,9 @@ def _resolve_run_id(
                 f"tiles. Resume with allow_s2_only={staged_s2_only}, or start a fresh run."
             )
         return previous_run_id
-    prefix = (V2_RUN_PREFIX if model_version != "v1.1" else "") + (S2_ONLY_RUN_PREFIX if allow_s2_only else "")
+    # The encoder half comes from the shared helper every other minting site uses; the
+    # S2-only half is this layer's own and composes after it.
+    prefix = run_id_prefix(model_version) + (S2_ONLY_RUN_PREFIX if allow_s2_only else "")
     return prefix + uuid.uuid4().hex[:12]
 
 

@@ -33,6 +33,7 @@ from tessera_embeddings.config.inference import (
     INFERENCE_CHUNK_SIZE,
     ModelVersion,
     checkpoint_filename,
+    run_id_prefix,
 )
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.paths import BucketPaths
@@ -211,7 +212,9 @@ def _run_inference_and_assemble(
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_path)
     log.info("ROI filter: %d/%d chunks intersect the ROI", len(live_chunks), len(chunks))
 
-    run_id = uuid.uuid4().hex[:12]
+    # From the EFFECTIVE model on the config, not the raw parameter, so the id records what
+    # will actually run. Unprefixed for v1.1, so nothing about the historical path changes.
+    run_id = run_id_prefix(config.model_version) + uuid.uuid4().hex[:12]
     t0 = time.monotonic()
 
     if num_gpus == 0:

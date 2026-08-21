@@ -38,6 +38,21 @@ DEFAULT_MODEL_VERSION: ModelVersion = "v1.1"
 V2_RUN_PREFIX = "v2-"
 
 
+def run_id_prefix(model_version: ModelVersion) -> str:
+    """The run_id prefix that marks *model_version*'s staging, empty for v1.1.
+
+    **Minting and checking have to share this, or the check refuses correct runs.** The
+    encoder guard reads an unprefixed id as v1.1 — which is right for a resume, and fatal for
+    a fresh run if the minting site did not add the prefix: the plain runner minted a bare
+    uuid, so selecting v2 there raised before an actor started. Relaxing the guard for fresh
+    runs would have hidden that and kept the real defect, because the bare id it left behind
+    is then misread as v1.1 by every LATER resume of the same run.
+
+    v1.1 gets no prefix, so every existing id, staging path and resume is unchanged.
+    """
+    return V2_RUN_PREFIX if model_version != "v1.1" else ""
+
+
 def staged_by_v2(run_id: str | None) -> bool:
     """Whether *run_id* names staging produced by a v2 student."""
     return bool(run_id) and (run_id or "").startswith(V2_RUN_PREFIX)

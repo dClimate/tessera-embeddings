@@ -59,6 +59,7 @@ import zarr
 from tessera_embeddings.config.environment import code_identity
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
     EMBEDDING_DIM,
     OPTICAL_MIN_OBS,
     RADAR_THIN_MAX_OBS,
@@ -2074,16 +2075,26 @@ class ZarrWriter:
             # every downstream reader identifies the product by, and it is derived the same way
             # on both sides (`expected_model_url`) so seed and fill cannot disagree by construction.
             #
-            # A store with NO `geoemb:model` is not refused: there is no claim to contradict, and
-            # such a store predates the attr rather than disagreeing with it.
-            published_encoder = root.attrs.get("geoemb:model")
+            # A store with NO `geoemb:model` is read as v1.1, NOT waved through. An earlier
+            # version of this guard skipped the check when the attr was absent, reasoning there
+            # was "no claim to contradict" — which is tidy and wrong. Absence is not silence: the
+            # attr postdates v1.1 and predates v2, so a store without it necessarily holds v1.1
+            # embeddings, and the case the skip allowed was exactly the dangerous one — a v2
+            # append to a legacy store, which then restamps the whole thing v2. The stores most
+            # likely to lack the attr are also the ones least likely to have a `_manifest`, so
+            # both doors stood open together.
+            published_encoder = root.attrs.get("geoemb:model") or expected_model_url(
+                model_version=DEFAULT_MODEL_VERSION
+            )
             this_encoder = expected_model_url(model_version=encoder_version)
-            if published_encoder and published_encoder != this_encoder:
+            if published_encoder != this_encoder:
                 raise ValueError(
                     f"Refusing to append to {output_path}: it was published by encoder "
                     f"{published_encoder!r} and this run uses {this_encoder!r}. Appending would mix "
                     "two model families in one store and restamp the whole thing with this run's "
-                    "encoder. Assemble into a store of the matching family, or a fresh path."
+                    "encoder. Assemble into a store of the matching family, or a fresh path. "
+                    "(A store carrying no geoemb:model at all is read as v1.1 — the attr predates "
+                    "v2, so its absence dates the store rather than leaving the question open.)"
                 )
             # The store's own grid is authoritative: raw region writes would
             # silently land in a corner (or be clamp-truncated) on a mismatched
