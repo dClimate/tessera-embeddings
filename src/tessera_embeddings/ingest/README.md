@@ -440,9 +440,18 @@ Genuinely ambiguous dates **refuse** (`HeterogeneousProducerError`) rather than 
 because no date-wide answer is right for them and both mistakes are silent: an item whose own
 bands straddle the two producers, raw items on opposite sides of the threshold, a raw item owed
 the offset fused with an already-harmonised one, and an item whose producer cannot be determined
-at all. None has been observed on the live catalogue, which is why they are refused rather than
-engineered around. Every refusal is gated on the date actually being owed a correction — where
-nothing is owed, which producer served the pixels cannot change any of them.
+at all. Every refusal is gated on the date actually being owed a correction — where nothing is owed,
+which producer served the pixels cannot change any of them.
+
+**Two of those four are OBSERVED, and they cost real days.** Raw items straddling the threshold
+refuse 2017-11-16 and 2017-12-21 in zone 01N, and a raw item owed the offset fused with a harmonised
+one refuses 26 of 60 days of early 2024 in the same zone and 5 of 60 in 33N. A refused day is
+skipped alone and counted rather than failing the leg, but the day is lost — and selection cannot
+resolve it, because the conflict is between different TILES rather than between copies of one. The
+remaining two shapes — an item straddling producers within its own bands, and an undeterminable
+producer — have not been observed. See
+`context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md` for the frequency table and the
+fix this is owed.
 
 That last case is worth naming, because the safe direction inverts. An item that does not expose
 EVERY reflectance band under the configured names is `UNKNOWN`, not `RAW` — a non-empty subset is

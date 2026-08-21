@@ -649,6 +649,7 @@ def log_duplicate_selection(
     # Counted from what selection DID, not from the ladder: copies that would refuse their date are
     # excluded from `alternates`, so it does not answer "what was pruned".
     supplied, survivors = list(items), list(kept)
+    contested_keys: set[tuple[str, str]] | None = None
     if supplied:
         pruned = len(supplied) - len(survivors)
         # Keys whose multiplicity DECREASED. A tile-date that loses a copy keeps its key, so a
@@ -657,7 +658,9 @@ def log_duplicate_selection(
         # every multi-item key inflates the figure with dates no choice was made on.
         before = collections.Counter(k for it in supplied if (k := _contested_key(it)) is not None)
         after = collections.Counter(k for it in survivors if (k := _contested_key(it)) is not None)
-        contested = sum(1 for key, n in before.items() if after[key] < n)
+        decreased = {key for key, n in before.items() if after[key] < n}
+        contested_keys = decreased
+        contested = len(decreased)
     else:
         # Nothing to compare against, so report the ladder — what callers passing only
         # `alternates` have always received.
@@ -666,7 +669,12 @@ def log_duplicate_selection(
     if pruned <= 0:
         return
     recoverable = sum(len(v) for v in alternates.values())
-    winners = [it for it in kept if _contested_key(it) in alternates]
+    # Which tile-dates the source breakdown covers, taken from what pruning DID rather than from the
+    # recovery ladder. A tile-date whose every spare was excluded as a refusal risk has no entry in
+    # `alternates`, so keying off that dropped its winner and reported source totals for the
+    # recoverable subset alone — while still labelling them as the winners.
+    audited = set(alternates) if contested_keys is None else contested_keys
+    winners = [it for it in kept if _contested_key(it) in audited]
     where = ""
     if winners:
         local = sum(1 for it in winners if item_is_in_preferred_location(it, keys=read_keys))

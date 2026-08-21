@@ -1016,6 +1016,29 @@ class TestTheDuplicateLogIsAnAuditTrail:
             log_duplicate_selection(log, "roi-x", alternates, kept=kept)
         return " ".join(r.getMessage() for r in caplog.records)
 
+    def test_a_winner_is_audited_even_when_no_spare_survived(self, caplog) -> None:
+        """The source breakdown must describe every contested tile-date, not the recoverable ones.
+
+        A tile-date whose every spare is excluded as a refusal risk has no entry in `alternates`.
+        Keying the breakdown off that dropped its winner and reported totals for the recoverable
+        subset while still labelling them "winners by source" — a silently partial audit of the
+        very decision this line exists to record.
+        """
+        from tessera_embeddings.ingest.duplicates import log_duplicate_selection
+
+        winner = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="04.00", host_root=_IN_REGION)
+        raw_spare = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="05.00", host_root=_REMOTE)
+        kept, alternates = select_preferred_duplicates([winner, raw_spare])
+        assert [i.id for i in kept] == [winner.id]
+        assert alternates == {}, "the fixture must produce an empty ladder, or this proves nothing"
+
+        log = logging.getLogger("dup-audit-empty-ladder")
+        with caplog.at_level(logging.INFO, logger="dup-audit-empty-ladder"):
+            log_duplicate_selection(log, "roi-x", alternates, kept=kept, items=[winner, raw_spare])
+        msg = " ".join(r.getMessage() for r in caplog.records)
+        assert "1 tile-date(s) had more than one copy" in msg
+        assert "winners by source: 1 in-region, 0 remote" in msg, msg
+
     def test_it_states_the_actual_preference(self, caplog) -> None:
         """It said "newest kept" while the ranking preferred an in-region copy over a
         higher-sequence remote one — a line misreporting its own behaviour.

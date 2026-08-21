@@ -159,7 +159,7 @@ When several copies of one photograph exist, they are ranked by asking questions
 The first question that separates two copies decides between them:
 
 ```
-   1  Can we read every band we need?                 ← unusable beats everything
+   1  Can we read every band we need?                 ← if not, it loses to everything
    2  Can we tell which source produced it?
    3  Does it say which photograph it is?
    4  Can we read its processing version?
