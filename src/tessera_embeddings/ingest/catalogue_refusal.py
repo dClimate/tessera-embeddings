@@ -43,7 +43,7 @@ import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
-from typing import NoReturn, final
+from typing import Any, NoReturn, final
 
 from urllib3.exceptions import MaxRetryError, ResponseError
 
@@ -176,10 +176,15 @@ class CatalogueQueryError(RuntimeError):
     def __init__(self, request: CatalogueRequest, refusal: CatalogueRefusal, cause: BaseException) -> None:
         self.request = request
         self.refusal = refusal
+        self._cause_text = str(cause)
         super().__init__(
             f"{REFUSAL_TOKEN}={refusal.signature}|{request.signature} "
             f"catalogue refused {request.label} with {refusal.label}: {cause}"
         )
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Rebuild from picklable state, since pickle's default rebuilds as ``cls(*args)``."""
+        return (self.__class__, (self.request, self.refusal, RuntimeError(self._cause_text)))
 
 
 @final
