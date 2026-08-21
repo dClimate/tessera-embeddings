@@ -1478,6 +1478,24 @@ throttle markers explicitly. It fails CLOSED: anything unrecognised propagates r
 being treated as bad data, because responding to a bad minute by reading worse imagery is
 the one outcome the recovery must never produce.
 
+**An object that was never published counts too, and needs its own markers.** Every
+codec-level signature is emitted by a BLOCK READ, and a missing object fails at open, before
+any block is requested — so a catalogue item naming an href the provider never wrote used to
+match nothing and fail the whole leg. `ObjectNotFound`, `NoSuchKey` and `The specified key
+does not exist` cover the three layers that can surface it, and they are matched only
+alongside the source reader's own name (`RasterioIOError`, or a `CPLE_` class). That pairing
+is what makes them mean SOURCE: those strings belong to the S3 layer and every S3 client in
+the process shares it — `icechunk`'s error enum carries two of them verbatim — so unpaired
+they would let a hole in the destination store, or in the ROI mask, be recorded durably as
+provider data loss. GDAL is used here only to read source imagery, so its name beside the
+not-found text is the discriminator. `NoSuchBucket` is deliberately excluded: a vanished
+bucket is systemic and must fail the leg on its first date rather than be skipped date by
+date.
+
+Nothing counts or caps these skips. A source object that will never read is rare enough per
+granule that a ceiling would only ever fire on a fault of some other kind, and every date
+given up is already logged, restated in the end-of-run summary, and written to the store.
+
 Past that point the response is a ladder, in `s2_roi.py`'s consume path:
 
 1. **Attribute.** Ask the cluster which objects the loader gave up on
