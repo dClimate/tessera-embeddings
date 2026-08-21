@@ -118,7 +118,13 @@ def refuses_its_date(item: Any, read_keys: tuple[str, ...] = READ_ASSET_KEYS) ->
     A refusal is not a read failure, so the fallback ladder cannot recover from one — which is why
     such a copy is both ranked last and excluded from the ladder entirely.
     """
-    # Only asked of copies whose read set is complete, so this answers "we can see that it
+    # Inert without a read set to inspect. An empty one means the collection's configured names are
+    # not its asset keys, so `item_harmonisation` finds nothing and returns UNKNOWN for every copy —
+    # which would mark them all as refusing and hand a tile-date to an older pre-threshold copy. A
+    # collection whose producer is decided at collection level has nothing for this term to say.
+    if not read_keys:
+        return False
+    # Otherwise only asked of copies whose read set is complete, so this answers "we can see that it
     # refuses" rather than "we cannot see anything". An incomplete copy fails to READ, which the
     # ladder does handle, and it reports an undecidable producer only because it is incomplete.
     if not read_set_is_complete(item, read_keys):
@@ -155,7 +161,9 @@ def _would_refuse_its_date(
     """
     if baseline is None or baseline < S2_BASELINE_THRESHOLD:
         return False
-    if not read_set_is_complete(item, read_keys):
+    # Inert without a read set — see `refuses_its_date` for why an empty one means this term has
+    # nothing to say rather than everything to condemn.
+    if not read_keys or not read_set_is_complete(item, read_keys):
         return False
     return harmonisation in (Harmonisation.MIXED, Harmonisation.UNKNOWN)
 

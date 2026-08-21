@@ -35,6 +35,7 @@ from tessera_embeddings.ingest.duplicates import (
     item_processing_baseline,
     item_sequence,
     item_tile,
+    refuses_its_date,
     select_preferred_duplicates,
     step_down_copies,
 )
@@ -1764,3 +1765,45 @@ class TestTheSteppedSetNamesOnlyWhatWasStepped:
         step_down_copies(alternates, kept, implicated=[a_bad, b_bad])
         after = [i.id for i in alternates[("MGRS-33TWB", "2021-09-08")]]
         assert after == before, "a spare was consumed from a tile-date nothing stepped"
+
+
+class TestTheProducerTermIsInertWithoutAReadSet:
+    """An empty read set means the collection's configured names are not its asset keys.
+
+    `item_harmonisation` then finds nothing and reports UNKNOWN for every copy, so a term that
+    treats UNKNOWN as a refusal condemns them all — demoting every post-threshold copy and stripping
+    it from the fallback ladder, which hands the tile-date to an older pre-threshold one. Planetary
+    Computer is exactly that case: it serves `B02`/`SCL` and its correction is decided at collection
+    level, so this term has nothing to say there. Raised on PR #107.
+    """
+
+    def _native(self, ident: str, baseline: str, sequence: str) -> _Item:
+        item = _Item(ident, "MGRS-33TWM", sequence, **{"s2:processing_baseline": baseline})
+        item.properties["datetime"] = "2024-06-05T10:20:31.024000Z"
+        # Native keys, as Planetary Computer serves them — none of the configured names resolve.
+        return _with_assets(item, {k: {"href": f"https://x.blob.core.windows.net/{k}"} for k in ("B02", "B03")})
+
+    def test_a_post_threshold_copy_does_not_read_as_refusing(self) -> None:
+        assert refuses_its_date(self._native("new", "05.10", "1"), ()) is False
+
+    def test_the_newer_copy_still_wins(self) -> None:
+        """The consequence: without this, the older pre-threshold copy took the tile-date."""
+        newer = self._native("new-05.10", "05.10", "1")
+        older = self._native("old-03.00", "03.00", "0")
+        assert _preference_key(newer, ()) < _preference_key(older, ())
+
+    def test_the_spare_stays_on_the_fallback_ladder(self) -> None:
+        newer = self._native("new-05.10", "05.10", "1")
+        older = self._native("old-03.00", "03.00", "0")
+        kept, alternates = select_preferred_duplicates([newer, older], ())
+        assert [i.id for i in kept] == ["new-05.10"]
+        assert [i.id for i in alternates[("MGRS-33TWM", "2021-09-08")]] == ["old-03.00"]
+
+    def test_the_term_still_fires_where_the_names_are_the_keys(self) -> None:
+        """The complement, or gating it would have disabled the guard everywhere."""
+        mixed = _Item("mixed", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"})
+        mixed.properties["datetime"] = "2024-06-05T10:20:31.024000Z"
+        assets = _bands_at(_IN_REGION)
+        assets["red"] = {"href": f"{_REMOTE}/B04.jp2"}
+        _with_assets(mixed, assets)
+        assert refuses_its_date(mixed, READ_ASSET_KEYS) is True
