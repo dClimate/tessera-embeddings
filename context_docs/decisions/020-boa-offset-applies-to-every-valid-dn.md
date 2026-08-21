@@ -302,7 +302,26 @@ of the archive, and present in Europe as well as at the antimeridian.
 
 **What changed as a result.** A refused day is now skipped on its own, loudly, and counted, instead
 of failing the leg. The correction decision is untouched — a day that cannot be decided is still not
-corrected — but the loss is one day instead of a year. This is mitigation, not a fix; see limit 1.
+corrected — but the run continues past it.
+
+**Confirmed on a re-run**, from the pipeline's own logs:
+
+```
+  05:33:42  Skipping 2024-01-02 for roi=zone_01N: no single offset decision fits the day...
+  05:33:47  Skipping 2024-01-04 ...
+  05:33:48  Skipping 2024-01-05 ...
+     ... 347 days of 2024 in total, and the leg kept going after each one
+```
+
+Before the fix the leg died on the first of those. That is the fix working — and simultaneously the
+evidence that skipping is not a sufficient answer, because 347 skipped days is not a usable year.
+
+**What is not yet confirmed** is a complete clean run on the new code. Both re-runs stopped later,
+at the point of writing, with a store-identity mismatch: the stores from the earlier runs were
+written by the previous code, and the writer correctly refuses to append to a store whose ingest code
+identity differs. That guard is doing its job — it is what protects a store from being half-written
+by two different versions — but it means finishing this verification needs those development stores
+cleared first.
 
 ---
 
