@@ -12,12 +12,13 @@ the group, so both copies are read and one unreadable copy fails the whole date.
 one copy up front is what makes a fallback possible at all: while both are in the group
 there is nothing to fall back *to*.
 
-**Their baselines differ, and the correction is keyed by date.** One copy can sit either
-side of the reflectance-offset threshold from the other, so a fused date can hold pixels
-processed both ways while exactly one correction is applied to the result — decided by item
-order rather than by which copy supplied the pixels.
+**Their baselines differ.** One copy can sit either side of the reflectance-offset threshold
+from the other, so a fused date can hold pixels processed both ways. The offset itself is now
+removed from each image as it is read, before anything is fused, so a mixed date is no longer
+mis-corrected — but reading two copies of one photograph to blend them into one pixel stack is
+still waste, and still costs the egress of whichever copy sits in another region.
 
-The preference is **usable first, then already-harmonised, then newest baseline, then in-region,
+The preference is **usable first, then newest baseline, then already-harmonised, then in-region,
 then newest sequence**, and "usable" leads for a reason: a copy this ingest cannot read, or cannot
 decide a correction for, is no use however new it is. So a complete read set comes first, then a
 decidable producer and a known acquisition — a copy failing either of those refuses or fails its
@@ -29,18 +30,24 @@ losing copy is a *fallback*, never a default. Callers step down the alternates o
 demonstrated read failure. :func:`_preference_key` is the single statement of this order; add a
 term there and nowhere else.
 
-**Harmonisation outranks the baseline; locality does not.** These are two different claims about
-where an item's assets live and they sit on opposite sides of the baseline for a reason.
+**Neither harmonisation nor locality outranks the baseline.** These are two different claims about
+where an item's assets live — one about the pixel, one about the cost — and they now sit on the
+same side of the baseline, in that order.
 
-An already-harmonised copy needs no offset decision, and the offset decision is made per solar
-day: one raw copy at or above the threshold can refuse a whole day, taking every tile fused into
-it. Preferring the harmonised copy is therefore about how much coverage survives, and buying that
-with an older reprocessing is a trade worth making.
+Harmonisation used to outrank it, on a coverage argument: the offset was decided per solar day, so
+one raw copy at or above the threshold could refuse a whole day and take every tile fused into it
+with it. Avoiding that was worth an older reprocessing. The offset is now decided per image, so no
+copy can refuse another tile's pixels and that argument no longer exists. What remains is that an
+already-harmonised copy was floored by its producer *before* resampling where one we correct is
+floored after, and that a copy owing nothing cannot be wrong by the offset at all — both real, both
+claims about pixel quality rather than about coverage, and so both subject to the rule below.
 
 Locality is only about what the read costs — in-region assets go through the VPC's S3 gateway
 endpoint while anything else egresses through NAT — so it must never buy cheaper egress with a
 worse pixel, and it stays below the baseline. It is also inert where the baseline cannot be read,
-so it never decides a comparison the baseline could not enter.
+so it never decides a comparison the baseline could not enter. **The rule generalises:** nothing
+below "will this work at all" may buy its preference with an older reprocessing. Harmonisation is
+held to it now too.
 """
 
 from __future__ import annotations
@@ -160,10 +167,10 @@ def refuses_its_date(
 ) -> bool:
     """Whether loading this copy makes its date REFUSE rather than fail to read.
 
-    Two shapes, both raised by
-    :func:`~tessera_embeddings.ingest.stac.dates_exempt_from_correction` because no date-wide
-    offset decision is correct: an unharmonised copy declaring no readable baseline, and a copy
-    whose producer is undecidable at or above the correction threshold.
+    Two shapes, both raised by :class:`~tessera_embeddings.ingest.stac.BoaOffsetParser` because no
+    offset decision is correct for one of the copy's own sources: an unharmonised copy declaring no
+    readable baseline, and a copy served from a bucket nobody has classified, at or above the
+    correction threshold.
 
     A refusal is not a read failure, so the fallback ladder cannot recover from one — which is why
     such a copy is both ranked last and excluded from the ladder entirely. That makes
@@ -171,6 +178,11 @@ def refuses_its_date(
     producer it settles, the correction path refuses an unreadable baseline whatever the assets
     look like, so a spare judged only on visible assets would be offered to the ladder and abort
     the ingest when the ladder reached it.
+
+    **Narrower than it was.** A copy whose bands straddle a harmonised and a raw producer used to
+    refuse too, because one correction was applied to a whole fused date and no single answer fitted
+    such an item. The offset is now decided per SOURCE, so that copy is corrected band by band and
+    is perfectly loadable. What is left is the two cases where the evidence itself is missing.
     """
     # Answers "we can see that it refuses" and never "we cannot see anything" — an incomplete copy
     # fails to READ, which the ladder does handle.
@@ -178,57 +190,12 @@ def refuses_its_date(
     if harmonisation is None or harmonisation is Harmonisation.HARMONISED:
         return False
     baseline = item_processing_baseline(item)
+    # Ordered ABOVE the producer test on purpose: an unharmonised copy declaring no readable
+    # baseline refuses whatever its producer turns out to be, including a MIXED one. Folding this
+    # into the tuple below would let such a copy through.
     if baseline is None:
         return True
-    return baseline >= S2_BASELINE_THRESHOLD and harmonisation in (
-        Harmonisation.MIXED,
-        Harmonisation.UNKNOWN,
-    )
-
-
-def risks_refusing_its_date(
-    item: Any,  # noqa: ANN401
-    read_keys: tuple[str, ...] = READ_ASSET_KEYS,
-    known_harmonisation: Harmonisation | None = None,
-    *,
-    replacing_a_copy_that_owes: bool = False,
-) -> bool:
-    """Whether OFFERING this copy as a fallback risks its date refusing rather than loading.
-
-    Wider than :func:`refuses_its_date`, which asks whether a copy refuses on its own account. A
-    copy that merely OWES the offset correction is fine by itself, and fine on a date where
-    everything owes it — but the date is fused from tiles this function cannot see, and most tiles
-    in the archive are already harmonised. Introducing a copy that owes a correction is therefore
-    very likely to make the date straddle the threshold, and a straddling date refuses.
-
-    That matters because nothing retries a refusal. The recovery ladder steps down on a READ
-    failure, so handing it a copy that refuses turns one unreadable object into an aborted ingest
-    rather than a recorded loss.
-
-    **The trade is deliberate and it is not free**, which is why it is asked as narrowly as
-    possible: only of providers whose copies can disagree about the producer at all, and only where
-    the copy being replaced does NOT already owe the correction. Where it does, the swap cannot
-    change the day's decision and the spare is kept. Offering it can abort a whole run. A lost
-    date is bounded and recorded; an aborted run is neither, so the exclusion is the cheaper
-    mistake. Validating the spare against the whole solar day would be better than either, and
-    needs the day-aware selection recorded as owed work in
-    :func:`~tessera_embeddings.ingest.stac.dates_exempt_from_correction`.
-    """
-    if refuses_its_date(item, read_keys, known_harmonisation):
-        return True
-    # Only where the producer VARIES between items. Where the collection settles it, every copy
-    # owes the same correction, so owing one is the norm rather than a risk — excluding on it would
-    # empty the ladder for a whole provider. Same reasoning as the matching ranking term.
-    if known_harmonisation is not None:
-        return False
-    # And only where the swap would CHANGE the day's decision. If the copy being replaced already
-    # owes the correction, the day already contains one that does, so a spare that also owes it
-    # introduces nothing: the decision is whatever it already was. Withholding such a spare cost a
-    # recoverable date on an all-raw day for no gain.
-    if replacing_a_copy_that_owes:
-        return False
-    harmonisation = _producer_of(item, read_keys, None)
-    return _owes_a_correction(item_processing_baseline(item), harmonisation)
+    return baseline >= S2_BASELINE_THRESHOLD and harmonisation is Harmonisation.UNKNOWN
 
 
 def _would_refuse_its_date(
@@ -237,11 +204,13 @@ def _would_refuse_its_date(
 ) -> bool:
     """Whether choosing this otherwise-usable copy makes its date refuse rather than load.
 
-    :func:`~tessera_embeddings.ingest.stac.dates_exempt_from_correction` refuses a date at or above
-    the threshold whose item straddles two producers, or whose producer cannot be identified,
-    because no date-wide offset decision is correct for it. Nothing retries a refusal — the
-    read-failure ladder steps down on a read error, not on this — so a copy that causes one must
-    lose to a copy that does not, even an older one.
+    :class:`~tessera_embeddings.ingest.stac.BoaOffsetParser` refuses a source at or above the
+    threshold whose producer cannot be identified, because no offset decision is correct for it.
+    Nothing retries a refusal — the read-failure ladder steps down on a read error, not on this —
+    so a copy that causes one must lose to a copy that does not, even an older one.
+
+    A copy whose bands straddle two KNOWN producers is no longer among them: each of its sources is
+    decided on its own bucket, so it is corrected band by band rather than refused.
 
     Only asked of copies whose read set is complete. An incomplete copy is already ranked last, and
     it reports an undecidable producer *because* it is incomplete, so counting it here would say the
@@ -249,7 +218,7 @@ def _would_refuse_its_date(
     """
     if baseline is None or baseline < S2_BASELINE_THRESHOLD:
         return False
-    return harmonisation in (Harmonisation.MIXED, Harmonisation.UNKNOWN)
+    return harmonisation is Harmonisation.UNKNOWN
 
 
 def _owes_a_correction(
@@ -263,10 +232,15 @@ def _owes_a_correction(
     producer changes a pixel, and on the producer being known at all, because a copy nobody can
     judge must not be ranked as though it had been judged and found wanting.
 
+    Owing a correction is no longer a reason to withhold a copy from anything — it costs a
+    ranking position and nothing more. It ranks BELOW the baseline, because the two reasons to
+    prefer a copy owing nothing are both about pixel quality and this module does not let a quality
+    preference buy a better pixel with an older reprocessing. See :func:`_preference_key` term 6.
+
     **Asked only where the producer was determined per ITEM**, which is the caller's job to
     enforce: this term compares producers, and where the collection settles the producer there is
-    nothing to compare. It would then discriminate on the threshold alone, which is the baseline
-    ranked below it and in the opposite direction, and so would prefer older data.
+    nothing to compare — it would then discriminate on the threshold alone and, ranked below the
+    baseline, tie among every copy that reaches it.
     """
     if baseline is None or baseline < S2_BASELINE_THRESHOLD or harmonisation is None:
         return False
@@ -286,7 +260,7 @@ def _preference_key(
     item: Any,  # noqa: ANN401
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
     known_harmonisation: Harmonisation | None = None,
-) -> tuple[int, int, int, int, int, float, int, int, int, str]:
+) -> tuple[int, int, int, int, float, int, int, int, int, str]:
     """How much we would rather read this copy than another. Lower sorts first.
 
     **Context-free:** no term is relative to the set being sorted, so the same key orders copies
@@ -316,17 +290,33 @@ def _preference_key(
        An already-harmonised copy is the exception: its pixels need no correction whatever the
        baseline says, so penalising it here would hand a tile-date to an OLDER raw reprocessing,
        which is the opposite of the usable-first rule this key starts with.
-    5. **Whether the copy owes an offset correction at all**, where the producer is an item's own
-       property. A copy that does not removes a
-       whole class of failure rather than one copy's: the correction is date-wide, so a single raw
-       copy at or above the threshold can refuse the entire solar day and every tile fused into
-       it. Above the baseline VALUE, so it may cost a reprocessing — and unlike the locality term
-       below, that is deliberate. Locality is a cost decision and must never buy cheaper egress
-       with a worse pixel; this is a coverage decision and is allowed to. Inert below the
-       threshold, where no producer changes a pixel, and inert without a read set, where every
-       copy reports an undecidable producer and the term therefore ties.
-    6. **The baseline, descending, by value** — not by "is it the best", so every rung of the
+    5. **The baseline, descending, by value** — not by "is it the best", so every rung of the
        fallback ladder stays in descending baseline order.
+    6. **Whether the copy owes an offset correction at all**, where the producer is an item's own
+       property. **Below the baseline, and it did not used to be.** It ranked above, on the
+       argument that the correction was decided per solar day so one raw copy could refuse the
+       whole day — a coverage argument, which was the one thing allowed to cost a reprocessing.
+       The correction is now applied per image before the mosaic, so no copy can refuse another
+       tile's pixels and that argument is gone.
+
+       What survives is two reasons to prefer a copy owing nothing, and both are about the PIXEL
+       rather than about coverage:
+
+       - An already-harmonised copy had its floor applied by the producer *before* any resampling.
+         A copy we correct ourselves is floored *after*, because the read and the reprojection are
+         one step — so on the very dark population the two disagree, and the harmonised copy is the
+         better of the two. See the limit recorded in
+         ``context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md``.
+       - A copy owing nothing cannot be wrong by the offset. One we correct is right only if the
+         bucket lists and the item's declared baseline are both honest, and nothing detects it when
+         they are not.
+
+       Those are quality claims, and this module's rule is that a quality-versus-quality preference
+       must not buy a better pixel with an older reprocessing — which is exactly why locality sits
+       below the baseline too. So this now sits below it as well, and above locality only because a
+       pixel argument outranks a cost one. Inert below the threshold, where no producer changes a
+       pixel, and inert without a read set, where every copy reports an undecidable producer and
+       the term therefore ties.
     7. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
        cheaper egress with an older pixel, and inert for unreadable baselines so it cannot decide
        a comparison the baseline could not enter.
@@ -346,8 +336,8 @@ def _preference_key(
         1 if _would_refuse_its_date(baseline, harmonisation) else 0,
         0 if _acquisition_is_known(item) else 1,
         0 if baseline is not None or not baseline_matters else 1,
-        1 if owes else 0,
         -(baseline or 0.0),
+        1 if owes else 0,
         (0 if item_is_in_preferred_location(item, keys=read_keys) else 1) if baseline is not None else 0,
         0 if sequence is not None else 1,
         -(sequence or 0),
@@ -363,7 +353,7 @@ def _rank_copies(
     """Order copies of one acquisition, PREFERRED first.
 
     An unreadable baseline ranks last rather than suspending the comparison: such a copy refuses
-    its date in :func:`~tessera_embeddings.ingest.stac.dates_exempt_from_correction`, and the
+    its date in :class:`~tessera_embeddings.ingest.stac.BoaOffsetParser`, and the
     read-failure ladder recovers from a read error but not from a refusal. A reprocessing that can
     be corrected beats a newer one that cannot be processed at all.
     """
@@ -579,37 +569,33 @@ def select_preferred_duplicates(
     survivors: set[int] = {id(it) for it in ungrouped}
     alternates: dict[tuple[str, str], list[Any]] = {}
     for key, copies in groups.items():
-        # Each spare paired with whether the copy it would REPLACE already owes the correction.
-        # Paired per acquisition, because that is the copy a fallback actually stands in for.
-        rejected: list[tuple[Any, bool]] = []
+        rejected: list[Any] = []
         for acquisition in _by_acquisition(copies):
             ranked = _rank_copies(acquisition, read_keys, known_harmonisation)
             survivors.add(id(ranked[0]))
-            winner_owes = known_harmonisation is None and _owes_a_correction(
-                item_processing_baseline(ranked[0]),
-                _producer_of(ranked[0], read_keys, None),
-            )
-            rejected.extend((copy, winner_owes) for copy in ranked[1:])
+            rejected.extend(ranked[1:])
         if rejected:
             # ONE order over every rejected copy of the tile-date, not a concatenation of
             # per-acquisition ladders. The unattributed recovery consumes `copies[0]` on each
             # retry, so every position is a choice and the whole list has to be ranked.
-            # Copies that would REFUSE their date, or that would make it refuse once fused with
-            # tiles this function cannot see, are dropped rather than offered. The ladder steps
-            # down on a read failure; a refusal is not one, so handing one over escapes as
-            # `HeterogeneousProducerError` instead of trying the next usable copy or recording the
-            # date as lost.
-            usable = [
-                it
-                for it, winner_owes in rejected
-                if not risks_refusing_its_date(
-                    it, read_keys, known_harmonisation, replacing_a_copy_that_owes=winner_owes
-                )
-            ]
+            #
+            # Only copies that would REFUSE ON THEIR OWN ACCOUNT are dropped rather than offered.
+            # The ladder steps down on a read failure; a refusal is not one, so handing one over
+            # escapes as `HeterogeneousProducerError` instead of trying the next usable copy or
+            # recording the date as lost.
+            #
+            # A spare that merely OWES the correction is now offered. It used to be withheld,
+            # because the offset was decided per solar day and introducing a copy that owed one
+            # could make the whole day refuse — so a swap this function could not evaluate, over
+            # tiles it cannot see, was the cheaper mistake to avoid. The offset is decided per
+            # image now, so such a swap changes nothing beyond its own tile and the spare is simply
+            # usable. That returns the recoverable dates the exclusion was costing.
+            usable = [it for it in rejected if not refuses_its_date(it, read_keys, known_harmonisation)]
             if len(usable) != len(rejected):
                 logger.debug(
-                    "%s: %d of %d spare copies excluded from the fallback ladder — they would "
-                    "refuse the date, or risk making it refuse, rather than fail to read",
+                    "%s: %d of %d spare copies excluded from the fallback ladder — their own "
+                    "producer or baseline cannot be determined, so they would refuse rather than "
+                    "fail to read",
                     key,
                     len(rejected) - len(usable),
                     len(rejected),
@@ -706,7 +692,7 @@ def log_duplicate_selection(
     # already-harmonised term now outranks baseline freshness, which is the surprising one.
     how = (
         "complete read set, then a decidable producer, then a known acquisition, then a readable "
-        "baseline, then owing no offset correction, then newest baseline, then in-region, then "
+        "baseline, then newest baseline, then owing no offset correction, then in-region, then "
         "newest sequence"
     )
     log.info(

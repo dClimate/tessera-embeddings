@@ -23,8 +23,6 @@ from pystac_client.stac_api_io import StacApiIO
 
 from tessera_embeddings.config import (
     PROVIDERS,
-    S2_BASELINE_OFFSET,
-    S2_BASELINE_THRESHOLD,
     CollectionConfig,
     STACProvider,
 )
@@ -32,12 +30,11 @@ from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.asset_locations import (
-    REFLECTANCE_ASSET_KEYS,
     Harmonisation,
-    item_harmonisation,
-    item_is_from_raw_archive,
-    read_asset_sources,
+    asset_bucket,
+    asset_href,
 )
+from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.catalogue_refusal import (
     CatalogueRequest,
     bbox_area_label,
@@ -51,7 +48,6 @@ from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
     resolve_grouping_longitude,
-    solar_day_of,
 )
 
 # =============================================================================
@@ -63,6 +59,13 @@ from tessera_embeddings.ingest.solar_days import (
 configure_gdal_environment()
 
 import odc.stac  # noqa: E402
+from odc.loader import RioDriver, RioReader  # noqa: E402
+
+# Private, and the only private odc import here. `_resolve_driver` uses a driver's own `md_parser`
+# when it supplies one, so stamping the per-source offset at parse time means subclassing odc's
+# STAC parser. Paid for by a 48x reduction in graph size against the alternative — see
+# `BoaOffsetParser` — and the reason `odc-stac` is pinned rather than floating.
+from odc.stac._mdtools import StacMDParser  # noqa: E402
 
 # Dimension name mapping: the project uses northing/easting everywhere, but
 # odc.stac.load works with y/x internally. This dict is applied to the chunks
@@ -252,7 +255,9 @@ def extract_baselines(items: list[Any]) -> dict[str, int]:
     actually loaded. Encoding a correction decision here — writing 0 for an item that is
     already harmonised — made the store misreport its own vintage, which is worse than the
     error it was avoiding because it cannot be recovered afterwards. The decision lives in
-    :func:`dates_exempt_from_correction`.
+    :func:`~tessera_embeddings.ingest.boa_offset.source_decision`, per asset — so a date can hold
+    items handled differently while this map still names one baseline per date, which is exactly
+    the separation that keeps provenance honest.
 
     Args:
         items: STAC items, in the order they will be loaded.
@@ -301,254 +306,16 @@ def collection_harmonisation(config: CollectionConfig) -> Harmonisation | None:
 
 
 class HeterogeneousProducerError(RuntimeError):
-    """One solar day's tiles came from producers that disagree about the BOA offset.
+    """A source's producer or baseline cannot be determined, so its offset is unknowable.
 
-    Deterministic: re-dispatching cannot change which producers the catalogue names, so this is
-    not something a retry ladder should absorb.
+    Deterministic: re-dispatching cannot change what the catalogue says about an item, so this is
+    not something a retry ladder should absorb — and it is not a read failure, so the fallback
+    ladder must not be handed a copy that raises it.
+
+    Raised per SOURCE now rather than per solar day. The correction is applied to each image as it
+    is read, so a day mixing producers is decided tile by tile and no longer has to be refused as a
+    whole; what survives is a copy nobody can classify, which is a property of that copy alone.
     """
-
-
-def dates_exempt_from_correction(
-    items: list[Any],
-    threshold: int = S2_BASELINE_THRESHOLD,
-    known_harmonisation: Harmonisation | None = None,
-) -> set[str]:
-    """The solar days owed no BOA offset correction.
-
-    Kept apart from :func:`extract_baselines` because the two answer different questions — one
-    records what an item declares, the other decides what is owed — and collapsing them made a
-    correction decision overwrite the store's provenance.
-
-    **A date is judged over every item that will be fused into it, not over one.**
-    ``odc.stac.load`` mosaics a solar day's tiles into a single time slice, and duplicate
-    selection keeps one copy per *(tile, acquisition)* rather than one per date, so a date can
-    still carry several items — measured at 16 of 16 dates over a four-tile ROI. Reading one
-    item per date and letting the last win decided a whole mosaic by catalogue sort order.
-
-    **The question asked of a date is whether anything in it is actually OWED a correction**,
-    not whether its producers agree. That distinction matters because mixed-producer days are
-    real: a full census of four tile-years found 7 such days in 522, and after duplicate
-    selection the survivors pair a harmonised COG with a raw item at an OLD baseline. Nothing
-    there is owed a correction, so exempting the date is right; refusing it would lose real dates
-    for an ambiguity that is not present.
-
-    So a date is exempt unless some item is BOTH raw and at or above the threshold. Only when
-    such an item shares a date with a harmonised one is the answer genuinely ambiguous: the
-    correction is date-wide, so exempting leaves raw tiles 1000 high while correcting drops 1000
-    from harmonised ones, and both are silent. That case refuses.
-
-    **It DOES occur.** Zone 01N in 2017 carries 15 items served complete from the ESA bucket at
-    baseline 05.00, and the two solar days holding them refuse. An earlier version of this
-    docstring said the combination had never been observed and was refused rather than engineered
-    around for that reason; that was an inference from a small sample and it was wrong. Refusing is
-    still the only correct date-wide answer, but it now costs real days — see the known limit
-    below.
-
-    **Each item is judged on its OWN declared baseline, and an unreadable one refuses the date.**
-    A missing or malformed ``s2:processing_baseline`` parses as 0, which is under the threshold,
-    so reading it naively exempts a date whose pixels may carry the offset. Taking the answer
-    from a caller-supplied per-date map instead does not help and was tried: the production path
-    builds that map from these same items, so for a lone unreadable item it supplies the same
-    parsed zero, and on a multi-item date it supplies an arbitrary last item's value. A figure
-    derived from the items cannot be evidence about an item, so the ambiguity is refused.
-
-    Args:
-        items: the items a preparation will LOAD, after duplicate selection.
-        threshold: baselines at or above this are owed the offset (matches the collection's).
-        known_harmonisation: the producer state to assume for EVERY item, for a collection whose
-            configuration already settles it. Asset locations are not consulted then, which is
-            what lets a provider serving its bands under native asset keys be judged here at all.
-
-    **A LIVE limit, and the reason a whole day can be lost.** The producers are judged over the
-    items of one solar day, which is the right scope, and the correction carries ONE baseline per
-    date. So a day whose raw items sit on both sides of the threshold has no correct date-wide
-    answer and refuses — taking every harmonised tile on that day with it.
-
-    Duplicate selection cannot resolve it, because the straddle is across DIFFERENT TILES rather
-    than across copies of one acquisition. Measured on zone 01N in 2017: 2017-11-16 carries 18 raw
-    items, 9 at baseline 00.01 and 9 at 05.00, beside 27 harmonised ones; selection reduces 45
-    items to 33 and the day still refuses. 2017-12-21 behaves the same way.
-
-    The fix is a correction applied per ITEM before the mosaic rather than per date after it, which
-    is a change to the load path and not to this function. Refusing remains correct until then —
-    the alternative is shifting some tiles by 1000 in the wrong direction, silently — but this is a
-    live source of lost days, not a theoretical one.
-
-    Raises:
-        HeterogeneousProducerError: no single date-wide decision is correct for the date — it
-            fuses a raw item owed a correction with a harmonised one, carries an item whose own
-            bands straddle both, carries raw items on opposite sides of the threshold, or carries
-            an item whose producer or baseline cannot be determined.
-    """
-    # Grouped by the SOLAR day, which is what `odc.stac.load` fuses on. Grouping by the UTC date
-    # checked different sets from the ones that will be mosaicked: near a day boundary two UTC
-    # dates fuse into one slice, so a raw item and a harmonised one could sit in one output
-    # pixel stack while being checked separately and passing. `solar_day_of` raises on an item
-    # that has not been normalised rather than deriving a plausible-looking wrong day, which
-    # makes an unnormalised caller a loud error instead of a silent evasion of these guards.
-    by_date: dict[str, list[Any]] = {}
-    for item in items:
-        by_date.setdefault(solar_day_of(item), []).append(item)
-
-    exempt: set[str] = set()
-    for date_str, group in sorted(by_date.items()):
-        kinds = {
-            item: (known_harmonisation if known_harmonisation is not None else item_harmonisation(item))
-            for item in group
-        }
-
-        # Each item on its OWN declared baseline. A caller's per-date map is not consulted as a
-        # fallback: it is derived from these same items, so it cannot be evidence about them.
-        def _owed_baseline(item: Any) -> int:  # noqa: ANN401
-            own = _declared_baseline(item)
-            return 0 if own is None else own
-
-        # Unharmonised items whose baseline cannot be read. Correcting and exempting are both
-        # silently wrong in opposite directions, so the date refuses. A HARMONISED item is owed
-        # nothing whatever it declares, so an unreadable baseline there is harmless.
-        unreadable = [
-            it for it, k in kinds.items() if k is not Harmonisation.HARMONISED and _declared_baseline(it) is None
-        ]
-        if unreadable:
-            raise HeterogeneousProducerError(
-                f"{date_str}: {len(unreadable)} unharmonised item(s) declare no readable "
-                f"processing baseline, so whether their pixels already carry the offset cannot be "
-                f"determined. Correcting them would take {abs(S2_BASELINE_OFFSET)} off pre-04.00 "
-                f"pixels and exempting them would leave post-04.00 pixels that much too high. "
-                f"Fix the catalogue metadata rather than guessing."
-            )
-        owed = [it for it, k in kinds.items() if k is not Harmonisation.HARMONISED and _owed_baseline(it) >= threshold]
-        # Items whose PRODUCER cannot be determined, where it would change a pixel. Gated on the
-        # threshold: below it, which producer served the date changes nothing.
-        undetermined = [it for it, k in kinds.items() if k is Harmonisation.UNKNOWN and _owed_baseline(it) >= threshold]
-        if undetermined:
-            # Two different catalogue failures reach UNKNOWN and need different fixes, so the
-            # message has to say which: bands absent under the configured names (resolve the
-            # naming), or present but served from a bucket nobody has classified (classify it).
-            incomplete = [it for it in undetermined if not read_asset_sources(it, REFLECTANCE_ASSET_KEYS).complete]
-            unlisted = [it for it in undetermined if it not in incomplete]
-            causes = []
-            if incomplete:
-                causes.append(
-                    f"{len(incomplete)} expose only some of the reflectance bands under the "
-                    f"configured names, so they may be served under native asset keys — resolve "
-                    f"the naming rather than guessing the producer"
-                )
-            if unlisted:
-                buckets = sorted(
-                    str(b)
-                    for it in unlisted
-                    for b in set(read_asset_sources(it, REFLECTANCE_ASSET_KEYS).buckets.values())
-                )
-                causes.append(
-                    f"{len(unlisted)} are served complete from bucket(s) {buckets}, which are not "
-                    f"classified as harmonised or unharmonised — add them to the appropriate set"
-                )
-            raise HeterogeneousProducerError(
-                f"{date_str}: which producer served {len(undetermined)} item(s) cannot be "
-                f"determined, and at baseline >= {threshold} that decides whether "
-                f"{abs(S2_BASELINE_OFFSET)} is subtracted. " + "; ".join(causes) + "."
-            )
-        straddling = [it for it, k in kinds.items() if k is Harmonisation.MIXED and _owed_baseline(it) >= threshold]
-        if straddling:
-            raise HeterogeneousProducerError(
-                f"{date_str}: an item's read bands span a harmonised and a raw producer at "
-                f"baseline >= {threshold}, so no date-wide offset decision is correct for it. "
-                f"Load the producers separately."
-            )
-        if not owed:
-            exempt.add(date_str)
-            continue
-        # A date carries ONE baseline (`extract_baselines` is last-wins by construction), so raw
-        # items on opposite sides of the threshold cannot both be served: correcting shifts the
-        # pre-threshold pixels down by the offset, not correcting leaves the post-threshold ones
-        # high. REACHED on real data — zone 01N 2017 has raw items at 00.01 and 05.00 on one solar
-        # day, on different tiles — so this refusal costs real days. Refusing is still the only
-        # correct date-wide answer; the fix is to correct per item before the mosaic.
-        #
-        under = [
-            it
-            for it, k in kinds.items()
-            if k is not Harmonisation.HARMONISED and (own := _declared_baseline(it)) is not None and own < threshold
-        ]
-        if under:
-            raise HeterogeneousProducerError(
-                f"{date_str}: raw items straddle the correction threshold "
-                f"(baselines {sorted(_extract_baseline(it) for it in kinds)}), and the correction "
-                f"is applied per date from one baseline, so either choice is wrong for some of its "
-                f"pixels. Load the baselines as separate groups."
-            )
-        if any(k is Harmonisation.HARMONISED for k in kinds.values()):
-            raise HeterogeneousProducerError(
-                f"{date_str}: fuses a raw item owed the offset correction with an already "
-                f"harmonised one, and the correction is applied per date to the whole mosaic, so "
-                f"either choice is wrong for some of its pixels. Load the producers separately."
-            )
-        # Announced LAST, after every refusal above, so the line only ever describes a date that
-        # really will be corrected. Kept at WARNING because it is rare and consequential, not
-        # because it is impossible: an earlier comment here said this branch had never been reached
-        # on real data, inferred from a sample of one tile-year. Zone 01N 2017 reaches it. A
-        # monitored fact beats an inference from a sample, which is the reason to log rather than to
-        # assume. Not an error: correcting a raw item over the threshold is exactly right, and this
-        # is the path doing its job.
-        # WARNING only for the ESA archive, which is the surprising route. Every
-        # Planetary Computer item is unharmonised as well, and correcting those is routine — a
-        # warning on each of them would fire on every date of an MPC ingest and would also be
-        # saying something untrue, since for that provider it is not a new combination at all.
-        from_archive = [it for it in owed if item_is_from_raw_archive(it)]
-        if from_archive:
-            logger.warning(
-                "Baseline correction ACTIVE on ESA-archive data for %s: %d item(s) at baseline(s) "
-                "%s are owed the %d offset. A harmonised-COG catalogue is pointing at the raw "
-                "archive for data that needs correcting — verify the reflectance rather than "
-                "assuming it.",
-                date_str,
-                len(from_archive),
-                sorted({_extract_baseline(it) for it in from_archive}),
-                S2_BASELINE_OFFSET,
-            )
-        else:
-            logger.debug(
-                "Baseline correction applied for %s: %d unharmonised item(s) at baseline(s) %s.",
-                date_str,
-                len(owed),
-                sorted({_extract_baseline(it) for it in owed}),
-            )
-    return exempt
-
-
-def correction_baselines_by_date(
-    items: list[Any],
-    threshold: int = S2_BASELINE_THRESHOLD,
-    known_harmonisation: Harmonisation | None = None,
-) -> dict[str, int]:
-    """The baseline to CORRECT each solar day at, ``0`` where no correction is owed.
-
-    Derived from the same items :func:`dates_exempt_from_correction` decides on, so the decision
-    and the value cannot disagree. Masking a caller-supplied map instead puts them on separate
-    evidence, and a date the items show is owed the offset then keeps its pixels 1000 too high
-    whenever the map omits it (a missing entry reads as 0) or carries a stale lower value.
-
-    A non-exempt date takes the HIGHEST baseline declared by its unharmonised items. They cannot
-    meaningfully disagree: :func:`dates_exempt_from_correction` refuses a date whose raw items
-    straddle the threshold, so by the time a date is corrected they all sit above it.
-
-    Provenance is untouched by this. :func:`extract_baselines` records what each item declared and
-    is what reaches the store's ``baselines_applied``; this is only the correction input, so a
-    store cannot end up reporting baseline 0 for imagery processed at 05.10.
-    """
-    exempt = dates_exempt_from_correction(items, threshold, known_harmonisation)
-    owed: dict[str, int] = {}
-    for item in items:
-        date_str = solar_day_of(item)
-        owed.setdefault(date_str, 0)
-        kind = known_harmonisation if known_harmonisation is not None else item_harmonisation(item)
-        if date_str in exempt or kind is Harmonisation.HARMONISED:
-            continue
-        declared = _declared_baseline(item)
-        if declared is not None:
-            owed[date_str] = max(owed[date_str], declared)
-    return owed
 
 
 def _filter_existing_dates(
@@ -625,6 +392,7 @@ def _load_from_stac(
     groupby: str = "solar_day",
     resolution: int | None = None,
     geobox: GeoBox | None = None,
+    driver: Any = None,  # noqa: ANN401 — odc's ReaderDriverSpec
 ) -> xr.Dataset:
     """Load satellite data from STAC items using odc.stac.load.
 
@@ -661,6 +429,10 @@ def _load_from_stac(
         geobox: Optional odc.geo.geobox.GeoBox specifying the exact output
               grid (CRS, transform, shape). When provided, overrides bbox,
               crs, and resolution — the output will match this grid exactly.
+        driver: Optional odc reader driver. Used to remove the Sentinel-2 BOA offset from each
+              image AS IT IS READ, before resampled sources are fused into one solar-day
+              mosaic — see :class:`_BoaCorrectingDriver`. ``None`` leaves odc's default rio
+              driver in place, which is every collection owed no offset.
 
     Returns:
         xarray Dataset with bands as variables and (time, northing, easting) dimensions
@@ -713,6 +485,9 @@ def _load_from_stac(
         if crs is not None:
             load_kwargs["crs"] = crs
 
+    if driver is not None:
+        load_kwargs["driver"] = driver
+
     res_label = f"geobox {geobox.shape}" if geobox is not None else f"{load_kwargs.get('resolution')}m"
     logger.info(f"Loading {len(items)} items with odc.stac.load (bands={all_bands}, resolution={res_label})")
 
@@ -732,90 +507,250 @@ _NODATA = 0
 _MIN_VALID_REFLECTANCE = 1
 
 
-def _apply_baseline_corrections_by_date(
-    ds: xr.Dataset,
-    baselines: dict[str, int],
-    baseline_threshold: int = S2_BASELINE_THRESHOLD,
-    baseline_offset: int = S2_BASELINE_OFFSET,
-    bands: list[str] | None = None,
-    clamp_negatives: bool = True,
-) -> xr.Dataset:
-    """Remove the BOA offset from the dates that carry it, one baseline per date.
+def correct_boa_dn(pixels: np.ndarray, offset: int) -> np.ndarray:
+    """Remove the BOA offset from one source's pixels, returning the input dtype.
 
     **The offset applies to every valid DN, not only to bright ones.** ESA's baseline 04.00
-    products add it to the whole reflectance range precisely so that negative surface
-    reflectance — routine over water and deep shadow — can be encoded in an unsigned type. DN 0
-    is the nodata code and is the one value that carries no offset, so it is left alone.
+    products add it across the whole reflectance range precisely so that negative surface
+    reflectance — routine over water and deep shadow — can be encoded in an unsigned type. Leaving
+    DN 1-999 alone left those pixels up to 999 too high and made a corrected raw copy disagree with
+    a harmonised one across every dark surface.
 
-    Two modes, differing only in what happens to reflectance that was negative:
+    **The floor is 1, not 0**, and this is the part no amount of reading settles. Flooring at zero
+    is what the widely circulated harmonisation snippets do, and it is wrong here because zero is
+    the nodata code: it converts a real dark observation into no observation, and every downstream
+    mask then drops it. Element 84 floors at 1. Established by measuring their COGs, not by
+    argument — see ``context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md``.
 
-    - ``clamp_negatives=True`` (default) floors it at :data:`_MIN_VALID_REFLECTANCE` and returns
-      the INPUT dtype. This reproduces the harmonised Element 84 COGs exactly, which is what
-      makes a corrected raw copy comparable with a harmonised one.
-    - ``clamp_negatives=False`` keeps the negative values and returns ``int16``, for an in-memory
-      consumer that wants true reflectance. Not compatible with an unsigned store.
-
-    **The mode has to match the store's dtype.** A store's arrays are seeded from the first
-    date's dataset, and a date that skips correction keeps its unsigned input dtype — so a mode
-    that returns signed values makes the store's dtype depend on which date happened to land
-    first, and casts every date of the other kind.
+    Nodata is the caller's business, not this function's: the reader applies the result only where
+    the source was valid, so DN 0 never reaches the arithmetic.
 
     Args:
-        ds: xarray Dataset with time dimension
-        baselines: Dict mapping date strings (YYYY-MM-DD) to baseline integers
-        baseline_threshold: Minimum baseline requiring correction (default: S2 threshold)
-        baseline_offset: Value to add to pixels (typically negative, default: S2 offset)
-        bands: List of band names to correct. If None, corrects all data variables.
-        clamp_negatives: When True, floor corrected reflectance at the lowest valid code and
-            return the input dtype. When False, keep negatives and return int16.
+        pixels: one source's pixels, as read. Any integer dtype.
+        offset: the value to add, negative for a correction.
 
     Returns:
-        Corrected xarray Dataset
+        A new array of the input dtype. Nothing here can exceed the input's range: the offset is
+        negative and the floor is positive, so an unsigned input stays representable.
     """
-    bands_to_correct: list[str] = bands if bands is not None else list(ds.data_vars)  # type: ignore[arg-type]
+    # Widened for the arithmetic: adding a negative Python int to a uint16 array raises
+    # OverflowError under numpy 2.
+    shifted = pixels.astype(np.int32) + offset
+    return np.clip(shifted, _MIN_VALID_REFLECTANCE, None).astype(pixels.dtype)
 
-    # Build a boolean mask for which time slices need correction
-    dates = [str(t.values)[:10] for t in ds.time]
-    needs_correction = xr.DataArray(
-        [baselines.get(d, 0) >= baseline_threshold for d in dates],
-        dims=["time"],
-        coords={"time": ds.time},
-    )
 
-    corrected_count = sum(needs_correction.values)
-    if corrected_count > 0:
-        logger.info(
-            f"Applying baseline correction to {corrected_count}/{len(dates)} dates for bands: {bands_to_correct}"
-        )
+def _reflectance_asset_keys(items: list[Any], collection_config: CollectionConfig) -> frozenset[str]:
+    """The ASSET KEYS serving this collection's reflectance bands, through odc's alias table.
 
-    result_vars = {}
-    for var in ds.data_vars:
-        if var not in bands_to_correct:
-            result_vars[str(var)] = ds[str(var)]
+    Not the configured band names, and the difference decides whether the correction fires at all.
+    Earth Search names its assets after the bands (``blue``), so the two coincide; Planetary
+    Computer serves ``blue`` as an asset called ``B02`` and relies on odc resolving the ``eo:bands``
+    common name. Deciding the offset against configured names would therefore match none of that
+    provider's assets and correct nothing, silently — which is why the resolution is odc's own
+    rather than a mapping maintained here.
+
+    Resolved from ONE item rather than from all of them. ``extract_collection_metadata`` builds the
+    alias table from an item's assets, and the assumption that assets of one name share a structure
+    across a collection is odc's own — the same one the load itself relies on. Doing it per item
+    would pay a full parse twice over.
+
+    ``scl`` is excluded by construction: only ``collection_config.bands`` is resolved, and the
+    scene classification layer is not among them. It is read, and it counts for locality, but it is
+    categorical and never corrected.
+
+    Falls back to the configured band names when odc's own resolution yields nothing, which is
+    correct wherever ``band_names_are_asset_keys`` is set and is what every other asset lookup on
+    this path already assumes. Where that flag is NOT set the fallback is known to be wrong, so the
+    caller refuses instead of correcting nothing — see :func:`load_stac_items`.
+
+    Returns:
+        The resolved asset keys, or an empty set when nothing could be resolved.
+    """
+    for item in items:
+        try:
+            metadata = odc.stac.extract_collection_metadata(item)
+        except Exception as exc:
+            # Deliberately broad. This is a best-effort read of a third party's metadata over items
+            # from a catalogue, and every failure has the same answer: try the next item, then fall
+            # back. A narrower list would turn one unforeseen shape into a failed ingest.
+            logger.debug("Could not read collection metadata from %s: %s", getattr(item, "id", "?"), exc)
             continue
-        # Widened for the arithmetic: adding a negative Python int to a uint16 array raises
-        # OverflowError under numpy 2.
-        widened = ds[var].astype(np.int32)
-        shifted = widened + baseline_offset
-        if clamp_negatives:
-            shifted = shifted.clip(min=_MIN_VALID_REFLECTANCE)
-        # `_NODATA` is the only value the offset is not applied to.
-        corrected = xr.where(
-            needs_correction,
-            xr.where(widened > _NODATA, shifted, widened),
-            widened,
-        )
-        if clamp_negatives:
-            # The input dtype. Nothing here exceeds the input's own range: the offset is
-            # negative and the floor is positive, so an unsigned input stays representable.
-            result_vars[str(var)] = corrected.astype(ds[var].dtype)
-        else:
-            # Saturated once, at the end. `65535 - 1000` does not fit int16, and neither does a
-            # bright pixel on a date that skipped correction and so was never shifted at all.
-            limits = np.iinfo(np.int16)
-            result_vars[str(var)] = corrected.clip(min=limits.min, max=limits.max).astype(np.int16)
+        resolved: set[str] = set()
+        for band in collection_config.bands:
+            try:
+                asset_name, _ = metadata.band_key(band)
+            except ValueError:
+                # A band the items do not carry. Not fatal here: `odc.stac.load` resolves the same
+                # names and raises its own "No such band/alias" for an asset-incomplete item, which
+                # `s2_roi` recognises and recovers from by stepping down to another copy. Refusing
+                # here would pre-empt that recovery with an error it does not know.
+                logger.debug("Band %r resolves to no asset on %s", band, getattr(item, "id", "?"))
+                continue
+            resolved.add(asset_name)
+        if resolved:
+            return frozenset(resolved)
+    return frozenset()
 
-    return xr.Dataset(result_vars, coords=ds.coords, attrs=ds.attrs)
+
+#: Key under which the per-source offset rides on ``RasterSource.driver_data``.
+#:
+#: An explicit sentinel rather than a bare number, and its ABSENCE is meaningful: a reflectance
+#: source always carries this key — ``0`` where nothing is owed — while a source that is not
+#: reflectance carries no decision at all. That is what lets the reader tell "decided, owes
+#: nothing" apart from "never asked", and it is the difference between a correction that is
+#: correctly inert and one that silently never fired.
+_OFFSET_KEY = "boa_offset"
+
+
+class BoaOffsetParser(StacMDParser):
+    """Stamps every reflectance source with the offset it is owed, at parse time.
+
+    **Why the metadata parser and not a lookup table on the driver.** The driver is embedded in
+    every dask task, and ``distributed`` serialises tasks individually rather than sharing
+    references between them — so a ``(uri, band) -> offset`` table on the driver is duplicated
+    once per task. Measured at ROI scale: a 3,081-entry table cost **14.6 MB** of graph across 64
+    chunk tasks, where this parser costs **158 bytes** and does not grow with the item count. The
+    decision instead rides on ``RasterSource.driver_data``, which is part of the source object the
+    graph was already carrying.
+
+    **It also removes a whole class of bug.** A table has to be keyed on the uri odc will read,
+    and every way of getting that key wrong — href resolution, a signed url, a future
+    ``patch_url`` — produces a table that matches nothing, corrects nothing, and says nothing. Here
+    the decision is computed from the item odc is parsing, so there is no key to get wrong.
+
+    **Refusals happen here, before any graph exists.** ``odc.stac.load`` parses items
+    synchronously on the calling thread, so raising from :meth:`driver_data` surfaces as an
+    exception out of the load rather than as a task failure hours later.
+    """
+
+    def __init__(
+        self,
+        cfg: Any,  # noqa: ANN401 — odc's ConversionConfig
+        reflectance_assets: frozenset[str],
+        threshold: int,
+        offset: int,
+        known_harmonisation: Harmonisation | None,
+    ) -> None:
+        """Build a parser that decides the offset for ``reflectance_assets``.
+
+        Args:
+            cfg: odc's conversion config, passed through to :class:`StacMDParser`.
+            reflectance_assets: the ASSET KEYS of the reflectance bands, already resolved through
+                odc's alias table. Not the configured band names: Planetary Computer serves
+                ``blue`` as an asset called ``B02``, so a set of configured names would match none
+                of its assets and every correction would silently go missing.
+            threshold: baselines at or above this carry the offset.
+            offset: the value to add, negative for a correction.
+            known_harmonisation: the producer for every source, where the collection settles it.
+        """
+        super().__init__(cfg)
+        #: The asset keys this parser will decide for. Public because it is the thing that goes
+        #: wrong when a correction silently reaches nothing, so it is what a test asserts on.
+        self.reflectance_assets = reflectance_assets
+        self._threshold = threshold
+        self._offset = offset
+        self._known = known_harmonisation
+        #: How many reflectance sources were stamped, and how many were owed the offset. Read by
+        #: the caller AFTER the load, as the guard that this parser was wired to real assets at
+        #: all — the failure mode a table would have had is still reachable through an empty or
+        #: mistaken ``reflectance_assets``.
+        self.stamped = 0
+        self.owed = 0
+
+    def driver_data(self, md: Any, band_key: tuple[str, int]) -> Any:  # noqa: ANN401 — pystac Item
+        """The offset owed to one source, or the inherited value where none is owed.
+
+        Raises:
+            HeterogeneousProducerError: this source's producer or baseline cannot be determined
+                and it is at or above the threshold, so whether its pixels carry the offset is
+                unknowable. Correcting and exempting are wrong by the same amount in opposite
+                directions, and both silent.
+        """
+        asset_name, _ = band_key
+        if asset_name not in self.reflectance_assets:
+            # SCL and odc's own auxiliary bands. SCL is categorical and never corrected —
+            # subtracting the offset from a class label is meaningless — so it carries no decision
+            # rather than a decision of zero.
+            return super().driver_data(md, band_key)
+
+        asset = getattr(md, "assets", {}).get(asset_name)
+        href = asset_href(asset) if asset is not None else None
+        decision = source_decision(
+            asset_bucket(href) if href is not None else None,
+            _declared_baseline(md),
+            self._threshold,
+            self._known,
+        )
+        if decision is OffsetDecision.UNDECIDABLE:
+            raise HeterogeneousProducerError(
+                f"{getattr(md, 'id', '?')}: asset {asset_name!r} is at or above baseline "
+                f"{self._threshold} and its producer cannot be determined, so whether its pixels "
+                f"already carry the {abs(self._offset)} offset is unknowable. Either its bucket is "
+                f"classified as neither harmonised nor unharmonised — add it to the appropriate set "
+                f"in `asset_locations` — or the item declares no readable `s2:processing_baseline`, "
+                f"which is a catalogue defect to fix rather than to guess around."
+            )
+        self.stamped += 1
+        if decision is OffsetDecision.OWED:
+            self.owed += 1
+        return {_OFFSET_KEY: self._offset if decision is OffsetDecision.OWED else 0}
+
+
+class _BoaCorrectingReader(RioReader):
+    """One source's reader, with the BOA offset removed from what it returns.
+
+    Subclasses odc's rio reader and overrides ``read`` alone, so the read itself — the GDAL
+    environment, the credential session :mod:`tessera_embeddings.ingest.auth` injects per thread,
+    and the log records :mod:`tessera_embeddings.ingest.loader_failures` attributes back to an
+    object — is exactly the one odc would have performed.
+    """
+
+    def read(
+        self,
+        cfg: Any,  # noqa: ANN401 — odc's RasterLoadParams
+        dst_geobox: Any,  # noqa: ANN401 — odc.geo GeoBox
+        *,
+        dst: np.ndarray | None = None,
+        selection: Any = None,  # noqa: ANN401 — odc's ReaderSubsetSelection
+    ) -> tuple[tuple[slice, slice], np.ndarray]:
+        """Read this source and correct it, before anything fuses it with another."""
+        roi, pixels = super().read(cfg, dst_geobox, dst=dst, selection=selection)
+        driver_data = self._src.driver_data
+        offset = driver_data.get(_OFFSET_KEY) if isinstance(driver_data, dict) else None
+        if offset:
+            # In place, which is safe because odc never hands a reader a shared destination: the
+            # only caller passes no `dst`, so this buffer belongs to this source alone until the
+            # fuser copies out of it. A zero-size array from a tolerated read failure, and a
+            # wholly-nodata array from a source that does not overlap, are both no-ops here.
+            #
+            # `where` is what keeps nodata nodata. DN 0 is the one code carrying no offset, and
+            # correcting it would both invent a dark observation and destroy the gap marker.
+            np.copyto(pixels, correct_boa_dn(pixels, offset), where=pixels > _NODATA)
+        return roi, pixels
+
+
+class _BoaCorrectingDriver(RioDriver):
+    """The rio reader driver, correcting each image before the mosaic rather than after it.
+
+    This is the whole point of the class: ``odc.stac.load`` fuses a solar day's tiles into one
+    time slice, so a correction applied to its output is applied to every tile at once, and a day
+    whose imagery disagrees then has no correct single answer — which is why such days were
+    refused, at a measured cost of 347 days of one region-year. Applied here, each image answers
+    for itself and there is no pixel that is both corrected and uncorrected.
+
+    Overrides ``open`` and nothing else. ``restore_env`` and ``capture_env`` are inherited
+    deliberately: they are what put the read inside the GDAL environment and the per-thread
+    credential session that :mod:`tessera_embeddings.ingest.auth` patches, so overriding either
+    would silently take long-lived workers off credential refresh.
+    """
+
+    def __init__(self, parser: BoaOffsetParser) -> None:
+        """Build a driver whose sources were stamped by ``parser``."""
+        super().__init__(md_parser=parser)
+
+    def open(self, src: Any, ctx: Any) -> RioReader:  # noqa: ANN401 — odc's RasterSource/LocalContext
+        """Open ``src`` as a rio reader that corrects its own pixels."""
+        return _BoaCorrectingReader(src, ctx)
 
 
 # =============================================================================
@@ -1230,7 +1165,6 @@ def load_stac_items(
     crs: str | None = None,
     resolution: int | None = None,
     post_load_fn: Callable[[xr.Dataset], xr.Dataset] | None = None,
-    clamp_negatives: bool = True,
     groupby: str = "solar_day",
     geobox: GeoBox | None = None,
 ) -> xr.Dataset:
@@ -1253,9 +1187,6 @@ def load_stac_items(
         crs: Explicit CRS override for odc.stac.load
         resolution: Override pixel resolution in metres
         post_load_fn: Optional function applied after loading and correction
-        clamp_negatives: Whether corrected reflectance is floored at the lowest VALID code —
-              which is 1, not 0, because 0 is the nodata code (see
-              :func:`_apply_baseline_corrections_by_date`)
         groupby: How to group items into time slices. Must be "solar_day" —
               :func:`_load_from_stac` rejects anything else and says why.
         geobox: Optional output grid specification
@@ -1309,6 +1240,45 @@ def load_stac_items(
                 baselines.update(extract_baselines(pruned))
         items = pruned
 
+    # Built BEFORE the load, because the correction now happens inside it — per image, as each
+    # source is read and before anything fuses it with another. That is what dissolves the
+    # date-wide conflict: different tiles occupy different ground, so no pixel is both corrected
+    # and uncorrected, and a day mixing producers no longer has to be refused.
+    parser: BoaOffsetParser | None = None
+    reflectance_assets: frozenset[str] = frozenset()
+    if collection_config.requires_baseline_correction:
+        reflectance_assets = _reflectance_asset_keys(items, collection_config)
+        if not reflectance_assets:
+            # Fall back to the configured band names rather than refusing, and the reason is a
+            # trap this branch has already been caught by once.
+            #
+            # If these names really cannot be resolved, `odc.stac.load` fails on the SAME
+            # resolution a moment later with "No such band/alias" — a `ValueError` that `s2_roi`
+            # recognises as an asset-incomplete item and recovers from by stepping down to another
+            # copy. Raising here instead would replace that recoverable error with a refusal, which
+            # nothing retries: one unreadable item would abort a leg that used to survive it.
+            #
+            # Silent inertness is guarded from the other end instead. `driver_data` REFUSES a
+            # source it cannot classify rather than exempting it, so a wrong answer is loud; and
+            # the count below says how many sources were actually decided.
+            reflectance_assets = frozenset(collection_config.bands)
+            logger.warning(
+                "Could not resolve which assets carry the reflectance bands for %s; falling back to "
+                "the configured band names %s. If those are not this collection's asset keys the "
+                "load will fail on the same resolution and report which band is missing.",
+                collection,
+                sorted(reflectance_assets),
+            )
+        parser = BoaOffsetParser(
+            # `{}` and not `None`: odc's own resolver substitutes an empty dict for an absent
+            # config, and `MDParseConfig.from_dict` does a containment test on it.
+            {},
+            reflectance_assets,
+            collection_config.baseline_threshold,  # type: ignore[arg-type]
+            collection_config.baseline_offset,
+            collection_harmonisation(collection_config),
+        )
+
     data = _load_from_stac(
         items,
         collection_config,
@@ -1320,44 +1290,35 @@ def load_stac_items(
         groupby=groupby,
         resolution=resolution,
         geobox=geobox,
+        driver=None if parser is None else _BoaCorrectingDriver(parser),
     )
 
-    # Derived from the ITEMS, never from `baselines`, and not gated on `baselines` being truthy.
-    # The map is provenance — it is what reaches the store's `baselines_applied` — and it is
-    # last-wins per date, so on a multi-item date it names an arbitrary item's baseline and where
-    # an item's baseline could not be read at all it says 0. Correcting from it therefore left raw
-    # post-04.00 pixels uncorrected, the offset intact, with nothing said about it.
-    if collection_config.requires_baseline_correction:
-        loaded_dates = {str(t.values)[:10] for t in data.time}
-        threshold = collection_config.baseline_threshold
-        known_kind = collection_harmonisation(collection_config)
-        correction_baselines = {
-            d: b
-            for d, b in correction_baselines_by_date(items, threshold, known_kind).items()  # type: ignore[arg-type]
-            if d in loaded_dates
-        }
-        # Skipped when nothing reaches the threshold: the corrector changes no values there, but
-        # still clips, casts and builds an `xr.where` for every reflectance band.
+    if parser is not None and not parser.stamped:
+        # The no-silent-no-op check. A correction that reaches no source corrects nothing, produces
+        # plausible pixels 1000 too high, and says nothing about it — the defect `main` shipped.
         #
-        # Only in the dtype-preserving mode, though. The signed mode's contract IS the dtype, so
-        # skipping it made the result type depend on whether the loaded window happened to contain
-        # an owed date — two otherwise equivalent batches coming back `uint16` and `int16`, which
-        # any concatenation downstream then resolves by casting one of them.
-        owed = any(b >= threshold for b in correction_baselines.values())  # type: ignore[operator]
-        if owed or not clamp_negatives:
-            data = _apply_baseline_corrections_by_date(
-                data,
-                correction_baselines,
-                baseline_threshold=threshold,  # type: ignore[arg-type]
-                baseline_offset=collection_config.baseline_offset,
-                bands=list(collection_config.bands),
-                clamp_negatives=clamp_negatives,
-            )
-        else:
-            logger.debug(
-                "No baseline correction owed on any of %d loaded date(s); corrector skipped.",
-                len(correction_baselines),
-            )
+        # A warning rather than an error, because a caller that replaces the loader also reports
+        # zero and must not be failed for it. What makes this sufficient is that the failure it
+        # describes cannot be silent anywhere else: an unclassifiable source refuses, and an
+        # unresolvable band name fails the load.
+        logger.warning(
+            "BOA offset reached NO source for %s across %d item(s) — nothing was corrected. If any "
+            "of these items are ESA originals at baseline >= %s their pixels are still %d too high. "
+            "Reflectance assets were resolved as %s.",
+            collection,
+            len(items),
+            collection_config.baseline_threshold,
+            abs(collection_config.baseline_offset),
+            sorted(reflectance_assets),
+        )
+    elif parser is not None:
+        logger.info(
+            "BOA offset decided per source for %s: %d of %d reflectance source(s) owed the %d offset.",
+            collection,
+            parser.owed,
+            parser.stamped,
+            collection_config.baseline_offset,
+        )
 
     if post_load_fn is not None:
         data = post_load_fn(data)
@@ -1413,7 +1374,6 @@ def ingest_tile(
     post_load_fn: Callable[[xr.Dataset], xr.Dataset] | None = None,
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
     item_provider_fn: Callable[[], list[Any]] | None = None,
-    clamp_negatives: bool = True,
     groupby: str = "solar_day",
     geobox: GeoBox | None = None,
     mid_longitude: float | None = None,
@@ -1455,12 +1415,6 @@ def ingest_tile(
         item_provider_fn: Optional callable that returns ready-to-load items,
               bypassing CMR-STAC search entirely. Used by the OPERA RTC-S1
               path to build items from the native CMR granule API.
-        clamp_negatives: When True (default), baseline correction floors corrected
-              reflectance at the lowest VALID code — 1, not 0, since 0 is the nodata
-              code and a floored real observation must not become one — and returns the
-              input dtype, reproducing the harmonised Element 84 COGs exactly. When
-              False, negatives are kept and the result is int16 — not compatible with
-              the unsigned ROI store.
         groupby: How to group STAC items into time slices. Must be "solar_day",
               which merges same-day tiles into one mosaic; :func:`_load_from_stac`
               rejects anything else and says why.
@@ -1549,7 +1503,6 @@ def ingest_tile(
         crs=crs,
         resolution=resolution,
         post_load_fn=post_load_fn,
-        clamp_negatives=clamp_negatives,
         groupby=groupby,
         geobox=geobox,
     )

@@ -2,9 +2,12 @@
 
 **Status:** Accepted 2026-08-20. Built on `solutions/prefer-in-region-duplicate-assets` (PR #107).
 
-**One limit is a blocker, not a caveat.** In a region containing any ESA originals that need
-correcting, nearly every day of the year is refused — measured at 347 days of 2024 for one region.
-Read limit 1 in section 5 before deciding to merge.
+**Superseded in part by [ADR 021](021-correct-the-boa-offset-per-image.md).** The blocker this
+document recorded — nearly every day of the year refused in an affected region, measured at 347
+days of 2024 — is **fixed** there, by correcting each image before the images are merged. Decision
+5 below is reversed and limits 1 and 3 are closed. Limit 2 remains open. Everything else here still
+describes the shipped code: the arithmetic, how the two sources are told apart, and the
+274-million-pixel verification.
 
 This document is written to be read by someone who has not seen the code. Terms are defined at
 first use, and there is a glossary at the end.
@@ -163,6 +166,12 @@ The timestamp is a per-copy field, so no tolerance around it can separate "two r
 tolerance at all. Timestamps remain the fallback for files that do not name one.
 
 ### Decision 5 — Prefer a copy needing no correction, but never a copy that is merely cheaper to read
+
+> **REVERSED by [ADR 021](021-correct-the-boa-offset-per-image.md) §4.** Question 5 below ranked
+> *above* question 6 on a coverage argument — one file needing correction could refuse a whole day.
+> Correcting each image before the merge removes that argument, so the preference now sits *below*
+> the processing version. It was not deleted: two quality arguments for it survive, and ADR 021
+> gives them. The ordering shown here is the historical one.
 
 When several copies of one photograph exist, they are ranked by asking questions in a fixed order.
 The first question that separates two copies decides between them:
@@ -332,6 +341,8 @@ cleared first.
 
 ### Limit 1 — A whole day of imagery can be refused, and this happens for real
 
+> **CLOSED** by [ADR 021](021-correct-the-boa-offset-per-image.md). Kept for the measurements.
+
 This is the most serious consequence and it is currently unfixed.
 
 The correction is applied **once per day, with one value**. That is fine when everything in a day
@@ -424,6 +435,8 @@ decided rather than assumed.
 
 ### Limit 2 — The floor is applied after images are resized
 
+> **STILL OPEN**, and deliberately not bundled with the fix for limits 1 and 3 — see [ADR 021](021-correct-the-boa-offset-per-image.md) §6, which adds a measurement and the reason.
+
 Images are read and resized to a common grid in a single step, and the correction runs afterwards.
 Six of the ten bands we use are natively half-resolution and get enlarged, so this is the normal
 case rather than an edge case.
@@ -446,6 +459,8 @@ above — well under 0.1% of a scene. But this does have live exposure, because 
 correction do occur (limit 1), so it is a real if small error and not a theoretical one.
 
 ### Limit 3 — A fallback copy may be withheld, in one narrow case
+
+> **CLOSED** by [ADR 021](021-correct-the-boa-offset-per-image.md) §4: such a spare is offered again, because the swap can no longer change any other tile's decision.
 
 When the copy we chose cannot be read, we fall back to another copy of the same photograph. A
 fallback that itself needs the offset removed is **withheld** — but only when the copy it would
@@ -479,6 +494,14 @@ false negative would refuse imagery that is perfectly good.
 ---
 
 ### Limits 1, 2 and 3 are one piece of work
+
+> **This heading is wrong, and [ADR 021](021-correct-the-boa-offset-per-image.md) is the
+> correction.** Limits 1 and 3 dissolve *without changing a single pixel any existing store holds*,
+> because the amount subtracted is a fixed constant — the processing version decides only whether
+> it is subtracted. Limit 2 is a reordering that **rewrites** imagery in every existing store, on
+> the six bands that are natively half-resolution. They are two pieces of work, and bundling them
+> would have made a free fix depend on a re-processing decision. Limits 1 and 3 are now closed;
+> limit 2 is still open and is recorded in ADR 021 §6 with a measurement.
 
 Worth stating plainly, because they arrived as three separate review findings and read as three
 separate caveats. They are not. All three come from the same design choice — **the correction is

@@ -13,9 +13,11 @@ whose primary band keys point at ESA's archive. Two things make this window the 
   with a raw item at 02.06 — kept apart because their acquisition instants are 209 s apart, so
   duplicate selection treats them as distinct acquisitions and both reach the loader.
 
-That date is the regression this file most needs to pin. An earlier version of
-``dates_exempt_from_correction`` refused any mixed-producer date, which would have discarded it
-even though nothing in it is owed a correction.
+That date is the regression this file most needs to pin. An early version refused any
+mixed-producer date, which would have discarded it even though nothing in it is owed a correction.
+The offset is now decided per reflectance asset (``boa_offset.source_decision``), so a mixed day
+needs no date-wide answer at all — but the recorded items are still the only real evidence that
+the two producers are told apart correctly, which is what these assertions check.
 
 Run::
 
@@ -36,17 +38,22 @@ from typing import Any
 import pytest
 
 from tessera_embeddings.config.satellites import S2_BASELINE_THRESHOLD
-from tessera_embeddings.ingest.asset_locations import Harmonisation, item_harmonisation
+from tessera_embeddings.ingest.asset_locations import (
+    REFLECTANCE_ASSET_KEYS,
+    Harmonisation,
+    asset_bucket,
+    asset_href,
+    item_harmonisation,
+)
+from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.duplicates import (
     acquisition_identity,
     acquisition_instant,
     select_preferred_duplicates,
 )
+from tessera_embeddings.ingest.item_baselines import processing_baseline
 from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
-from tessera_embeddings.ingest.stac import (
-    dates_exempt_from_correction,
-    extract_baselines,
-)
+from tessera_embeddings.ingest.stac import extract_baselines
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CASSETTE_DIR = REPO_ROOT / "tests" / "fixtures" / "stac_cassettes"
@@ -97,7 +104,7 @@ TILE_MID_LONGITUDE = 15.0
 def _normalised() -> list[Any]:
     """The fixture's items, through the chokepoint the real pipeline puts them through.
 
-    `dates_exempt_from_correction` derives the solar day with `solar_day_of`, which refuses an
+    The correction path derives the solar day with `solar_day_of`, which refuses an
     item that has not been normalised rather than deriving a plausible-looking wrong day from its
     UTC stamp. The ingest normalises at the catalogue chokepoint, so a test that skips it is
     testing a call the pipeline never makes — and this guard is what caught these two doing it.
@@ -105,6 +112,17 @@ def _normalised() -> list[Any]:
     items = _items()
     normalize_to_solar_day(items, mid_longitude=TILE_MID_LONGITUDE)
     return items
+
+
+def _decisions(items: list) -> set[OffsetDecision]:
+    """What is owed to every reflectance source of these recorded items."""
+    out: set[OffsetDecision] = set()
+    for item in items:
+        baseline = processing_baseline(item)
+        for key in REFLECTANCE_ASSET_KEYS:
+            href = asset_href(item.assets.get(key))
+            out.add(source_decision(asset_bucket(href) if href else None, baseline, S2_BASELINE_THRESHOLD))
+    return out
 
 
 @pytest.mark.integration
@@ -148,12 +166,12 @@ class TestRecordedProducerSplit:
             f"correction path is live on real data and needs an end-to-end test"
         )
 
-    def test_the_real_mixed_day_is_exempt_and_not_refused(self) -> None:
-        """The regression. This day fuses a harmonised COG at 05.00 with a raw item at 02.06.
+    def test_the_real_mixed_day_costs_nothing_to_decide(self) -> None:
+        """The regression, on recorded items. A harmonised COG at 05.00 beside a raw item at 02.06.
 
-        Nothing in it is owed a correction, so it must be EXEMPT. An earlier version refused
-        every mixed-producer date and would have thrown this away — a real date lost to an
-        ambiguity that was not present.
+        Nothing on this day is owed a correction — the raw copy predates the offset — so every one
+        of its sources must decide EXEMPT. An early version refused every mixed-producer date and
+        would have thrown the day away for an ambiguity that was not present.
         """
         on_day = [it for it in _normalised() if it.datetime.strftime("%Y-%m-%d") == MIXED_DAY]
         assert len(on_day) > 1, f"{MIXED_DAY} no longer carries multiple items; re-pick the fixture day"
@@ -161,7 +179,7 @@ class TestRecordedProducerSplit:
             Harmonisation.HARMONISED,
             Harmonisation.RAW,
         }, "this day is supposed to be the mixed-producer case"
-        assert MIXED_DAY in dates_exempt_from_correction(on_day)
+        assert _decisions(on_day) == {OffsetDecision.EXEMPT}
 
     def test_the_real_reprocessing_pair_reduces_to_one_copy(self) -> None:
         """The reported MEDIUM, checked against the recorded catalogue rather than a fixture.
@@ -204,5 +222,5 @@ class TestRecordedProducerSplit:
         raw = next(it for it in _normalised() if item_harmonisation(it) is Harmonisation.RAW)
         raw.properties["s2:processing_baseline"] = "05.00"
         day = raw.datetime.strftime("%Y-%m-%d")
-        assert day not in dates_exempt_from_correction([raw]), "a raw item over the threshold is owed the offset"
+        assert _decisions([raw]) == {OffsetDecision.OWED}, "a raw item over the threshold is owed the offset"
         assert extract_baselines([raw])[day] == 500

@@ -14,7 +14,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `opera_query.py` | OPERA RTC-S1 query utilities: spatial bbox construction, item construction from the native CMR Granule Search API (bypasses CMR-STAC search; orbit-direction filtered server-side), UTM EPSG derivation, and asset preparation. |
 | `item_baselines.py` | The ONE reader of `s2:processing_baseline`. Reports an integer hundredth (`04.00` -> `400`), the same scale `S2_BASELINE_THRESHOLD` is expressed in, and `None` for every kind of unreadable. Exists because there were two readers on two scales with two notions of unreadable, so each numeric edge case had to be fixed twice — and they had drifted before anyone noticed. |
 | `asset_locations.py` | Answers the two questions asked of where an item's assets live, and keeps them apart: **is the read cheap** (a property of the bucket's REGION) and **has the reflectance offset already been removed** (a property of the PRODUCER). They have the same answer today and would not the first time anyone mirrors unharmonised data in region, so two bucket lists make that impossible to conflate. Also holds `AssetSources`, which reports the keys it could NOT resolve rather than dropping them — the primitive that generated the same defect three times when it returned only what it found. |
-| `duplicates.py` | Chooses between DUPLICATE catalogue items for one tile-date — Element 84 publishes more than one whenever a granule is reprocessed, distinguished by `s2:sequence`. Usable first, then the copy owing no offset correction, then the newest baseline; the rejected copies are retained as a fallback the write steps down when a source object will never read. Reducing to one copy before the loader is what makes a fallback possible at all, since `odc.stac.load` FUSES a solar-day group — and it is also what makes the recorded baseline match the pixels written. |
+| `duplicates.py` | Chooses between DUPLICATE catalogue items for one tile-date — Element 84 publishes more than one whenever a granule is reprocessed, distinguished by `s2:sequence`. Usable first, then the newest baseline, then the copy owing no offset correction; the rejected copies are retained as a fallback the write steps down when a source object will never read. Reducing to one copy before the loader is what makes a fallback possible at all, since `odc.stac.load` FUSES a solar-day group — and it is also what makes the recorded baseline match the pixels written. |
 | `loader_failures.py` | Names the source object a failed load could not read. `odc.stac.load` reports it in its OWN log record and raises an exception that does not carry it, so a logging handler on every reader process records each aborted href, and the caller collects them after a failure and maps them back to tile-dates. That name is what lets the duplicate ladder step down ONE copy instead of every duplicated tile in the date. Attribution is best effort by design: an empty answer means "attribute nothing", never "nothing was at fault", and the recovery it sharpens still works without it. |
 | `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary AWS credentials minted by ASF, ~1 hour) and legacy CloudFront signed URL resolution. Those credentials expire on their OWN clock, unrelated to any unit of work, so renewal must be driven by a timer and by the advertised expiry — never by the work loop, which can only renew between units and so cannot renew inside one that outlives the margin. |
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
@@ -388,21 +388,23 @@ decision are worth stating:
   categorical and never corrected, so its producer cannot make the reflectance ambiguous. This
   is a different asset set from the one locality is judged over — see the duplicate selector,
   which uses the full read set including `scl`.
-- **Decided per DATE, not per item.** `odc.stac.load` fuses a solar day into one time slice and
-  the correction is applied per date from one baseline, so the question asked of a date is
-  whether *anything* in it is actually owed a correction. Mixed-producer days are real, and their
-  survivors typically pair a harmonised COG with a raw item at an old baseline, which is owed
-  nothing.
-- **Thresholded per item on its own declared baseline, and an unreadable one refuses the date.**
-  An absent or malformed `s2:processing_baseline` parses as 0, which is under the threshold, so
-  reading it naively exempts a date whose pixels may carry the offset. A caller-supplied per-date
-  map is not a usable fallback: the production path builds it from these same items, so a lone
-  unreadable item is handed back the same parsed zero, and on a multi-item date `extract_baselines`
-  is last-wins and supplies an arbitrary item's value — which would put the decision back under
-  the caller's sort order. A figure derived from the items is not evidence about an item, so the
-  ambiguity is refused rather than guessed. This holds for every provider: the refusal used to be
-  reachable only where the producer varies per item, so a collection-wide raw provider read the
-  same zero and skipped the correction silently.
+- **Decided per SOURCE, and applied as each image is read.** `odc.stac.load` fuses a solar day
+  into one time slice, so a correction applied to its OUTPUT is applied to every tile at once —
+  and a day whose tiles disagree then has no correct answer and was refused, at a measured cost of
+  347 days of one region-year. The decision is now made per reflectance asset
+  (`boa_offset.source_decision`), stamped onto each source at parse time (`stac.BoaOffsetParser`)
+  and applied inside the read (`stac._BoaCorrectingReader`), before anything is resampled together.
+  Different tiles occupy different ground, so no pixel is both corrected and uncorrected.
+
+  This is **purely additive**: the amount subtracted is a constant, so a day the pipeline loaded
+  before produces bit-identical pixels, and only previously-refused days change. See
+  [ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §3.
+- **Thresholded on the item's own declared baseline, and an unreadable one refuses.**
+  An absent or malformed `s2:processing_baseline` parses as nothing rather than as 0: reading it as
+  zero puts it under the threshold and exempts pixels that may carry the offset, while correcting
+  it takes 1000 off pre-04.00 pixels that never had it. Both are wrong by the same amount in
+  opposite directions and both are silent, so the source refuses. `item_baselines` is the only
+  reader of that property, on one scale, with one notion of unreadable.
 
 **The per-item decision is scoped to the collections that need it**, via
 `CollectionConfig.harmonisation_varies_by_item`. It reads asset locations under the keys named in
@@ -413,18 +415,25 @@ classified every modern item as undeterminable and refused every date at baselin
 
 So where the producer cannot vary between items, the **collection's own configuration supplies the
 answer**: a correction threshold on such a collection says every item is unharmonised, which is
-what the threshold is there to correct. `dates_exempt_from_correction` and
-`correction_baselines_by_date` both take that as `known_harmonisation` and skip the asset read
-entirely. One derivation then serves both providers, which is what puts the unreadable-baseline
-refusal on the collection-wide path too.
+what the threshold is there to correct. `source_decision` takes that as `known_harmonisation` and
+does not consult the bucket at all — which is what lets a provider serving its bands under native
+asset keys be decided here, and is why every Planetary Computer source is corrected rather than
+refused. One decision then serves both providers, so they cannot disagree about a producer.
 
-The correction VALUE therefore comes from the same evidence as the decision, for every provider —
-`correction_baselines_by_date` returns the baseline to correct each solar day at, and `0` where
-nothing is owed. `extract_baselines` remains separate and untouched: it records what each item
-declared, is what reaches the store's `baselines_applied`, and is **not** a correction input.
-Correcting from it left raw post-04.00 pixels uncorrected whenever it omitted a date (a missing
-entry reads as `0`), carried the zero an unreadable baseline collapses to, or named an arbitrary
-item's baseline on a multi-item date.
+Which assets carry the reflectance bands is resolved through **odc's own alias table**
+(`stac._reflectance_asset_keys`), not from the configured band names: Planetary Computer serves
+`blue` as an asset called `B02`, so deciding against the configured names would match none of its
+assets and correct nothing. `scl` is excluded structurally — it is simply not among the resolved
+keys — rather than by a list the corrector is told to skip.
+
+The correction VALUE is a **constant** — `S2_BASELINE_OFFSET`, `-1000`. The baseline decides only
+*whether* the offset is removed, never how much, which is what makes the move from a per-date to a
+per-source decision produce bit-identical pixels on every day the pipeline already loaded.
+`extract_baselines` remains separate and untouched: it records what each item declared, is what
+reaches the store's `baselines_applied`, and is **not** a correction input — one integer per date is
+provenance, and correcting from it left raw post-04.00 pixels uncorrected whenever it omitted a
+date, carried the zero an unreadable baseline collapses to, or named an arbitrary item's baseline on
+a multi-item date.
 
 Duplicate selection has **three owners, one per entry point**, and none of them is the shared
 query. `query_stac_items` deliberately does not prune: `s2_roi` runs its own selection over that
@@ -480,47 +489,37 @@ this collection's threshold was set is the common case rather than an unused bra
 no-op on such a date but not a free one: it clips, casts, adds and `xr.where`s every reflectance
 band into the graph before deciding to change nothing.
 
-The provenance map is never masked in place. `extract_baselines` records the baseline of the item
-actually loaded and reaches the store's `baselines_applied` attribute; the exemption masks a
-local copy for the corrector, so a store cannot end up reporting baseline 0 for imagery that was
-processed at 05.10.
+`extract_baselines` records the baseline of the item actually loaded and reaches the store's
+`baselines_applied` attribute. Nothing masks it, and nothing derives a correction from it.
 
-When active, `_apply_baseline_corrections_by_date` builds a per-date correction mask vectorised
-across the time dimension. Two modes:
+`correct_boa_dn` does the arithmetic, once, on one source's pixels:
 
 **The offset applies to every valid DN, not only to bright ones.** ESA adds it across the whole
 reflectance range precisely so that negative surface reflectance — routine over water and deep
-shadow — is representable in an unsigned type. DN 0 is the nodata code and is the one value that
-carries no offset. So the correction is `DN - 1000` for every DN from 1 upward, and the two modes
-differ only in what becomes of the values that were negative:
+shadow — is representable in an unsigned type. So the correction is `DN - 1000` for every DN from 1
+upward, floored at the lowest VALID code, which is **1**.
 
-- **Default** (`clamp_negatives=True`) — floors the result at the lowest VALID code, which is
-  **1**, and returns the INPUT dtype. Not zero: zero is the nodata code, so flooring a real dark
-  observation there makes it indistinguishable from no observation and every downstream mask drops
-  it. Element 84's harmonised COGs floor at 1 for the same reason, and reproducing them exactly is
-  what makes a corrected raw copy comparable with a harmonised one. It is also the only mode that
-  round-trips into the unsigned store this repo writes.
-- **Signed mode** (`clamp_negatives=False`) — keeps the negative values and returns `int16`, for an
-  in-memory consumer that wants true reflectance. **Not compatible with the ROI store**, whose
-  arrays take their dtype from the first date: a negative value written to an unsigned store reads
-  as roughly 65535.
+Not zero: zero is the nodata code, so flooring a real dark observation there makes it
+indistinguishable from no observation and every downstream mask drops it. Element 84's harmonised
+COGs floor at 1 for the same reason, and reproducing them exactly is what makes a corrected raw copy
+comparable with a harmonised one. DN 0 itself never reaches the arithmetic — the reader applies the
+result only where the source was valid — so nodata survives as nodata.
 
-**The correction runs after the load, so the floor acts on resampled values.** `odc.stac.load` reads
-and resamples in one step, and six of the ten configured bands are natively 20 m on a 10 m grid, so
-a pixel whose resampling kernel spans the DN-1000 boundary is floored where Element 84 — flooring
-each source pixel first — would not have been. The ordering is what `main` already ships, and the affected pixels are the neighbourhood of a
-population well under 0.1% of a scene — but the parity it weakens **does** have live exposure, since
-raw items at or above the threshold occur on real Earth Search data. See
-`context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md` for the full accounting and
-what fixing it would cost.
+The arithmetic widens to `int32` and casts back to the INPUT dtype, so nothing wraps and the store's
+unsigned arrays are unaffected: the offset is negative and the floor is positive, so an unsigned
+input stays representable. Adding a negative Python int to a `uint16` array raises under numpy 2,
+which is what the widening is for.
 
-The arithmetic is done in `int32` and the result saturated once at the end, so nothing wraps. The
-default mode needs no upper bound at all — the offset is negative and the floor is positive, so an
-unsigned input stays representable — while the signed mode needs one because neither `65535 - 1000`
-nor an uncorrected bright pixel on a date that skipped correction fits `int16`. The signed mode also
-runs even when no date is owed a correction, because its contract IS the dtype: skipping it there
-would make the result type depend on whether the loaded window happened to contain an owed date. The correction is applied
-only to spectral bands; SCL and other extra bands are passed through unchanged.
+**The floor still acts on resampled values, and that is a recorded limit.** `odc.stac.load` reads
+and resamples in one step, so the wrapped reader sees pixels that have already been warped — and six
+of the ten configured bands are natively 20 m on a 10 m grid. A pixel whose resampling kernel spans
+the DN-1000 boundary is floored where Element 84, flooring each source pixel first, would not have
+been. Fixing it means taking over the read-and-warp step, and unlike the per-source move it would
+**rewrite pixels in every existing store**, so it is owed separately. Measured in
+[ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §6.
+
+SCL is never corrected. It is not among the resolved reflectance asset keys, so it carries no
+decision at all — a stronger exclusion than a band list, which could go stale.
 
 #### OPERA RTC-S1 Amplitude-to-dB Conversion
 

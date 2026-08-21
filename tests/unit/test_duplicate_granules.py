@@ -483,13 +483,23 @@ class TestASpareThatWillRefuseIsKeptOffTheLadderWithoutVisibleAssets:
             "both copies owe the correction, so swapping cannot change the day — keep the ladder"
         )
 
-    def test_a_spare_is_still_withheld_when_the_winner_owes_nothing(self) -> None:
-        """The complement, or the test above would pass with the exclusion deleted."""
+    def test_a_spare_that_merely_owes_the_offset_is_now_offered(self) -> None:
+        """REVERSED, and this is limit 3 of ADR 020 dissolving.
+
+        This asserted that a raw spare lost to a harmonised copy at an OLDER baseline, and was
+        withheld from the ladder as well. Both followed from the offset being decided per solar
+        day: introducing a copy that owed a correction could make the whole day refuse, over tiles
+        this function cannot see, and a refusal is not something the ladder can step down on.
+
+        The offset is decided per image now. Such a swap changes nothing beyond its own tile, so
+        the spare is simply usable — and the newer reprocessing wins outright, because owing a
+        correction no longer outranks the baseline. See ADR 021.
+        """
         harmonised = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="04.00", host_root=_IN_REGION)
         raw_spare = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="05.00", host_root=_REMOTE)
         kept, alternates = select_preferred_duplicates([raw_spare, harmonised])
-        assert [i.id for i in kept] == [harmonised.id]
-        assert alternates == {}, "swapping in a copy that owes the offset would refuse the day"
+        assert [i.id for i in kept] == [raw_spare.id], "the newer baseline wins now"
+        assert [i.id for i in alternates[("MGRS-33TWM", "2021-09-08")]] == [harmonised.id]
 
     def test_the_collection_answer_does_not_invert_the_baseline_preference(self) -> None:
         """The hole this must not reopen: with the producer known raw, every copy at or above the
@@ -827,25 +837,42 @@ class TestInRegionPreference:
         kept, _ = select_preferred_duplicates([local_old, remote_new])
         assert [i.id for i in kept] == [remote_new.id], "a newer baseline must win despite egress"
 
-    def test_a_copy_owing_no_correction_outranks_a_newer_one_that_does(self) -> None:
-        """The one term that IS allowed to cost a reprocessing, and the reason it may.
+    def test_owing_no_correction_no_longer_costs_a_reprocessing(self) -> None:
+        """REVERSED, and the position of the term is the whole point of the test.
 
-        The offset correction is decided per solar day over every tile fused into it, so a single
-        raw copy at or above the threshold can refuse the whole day. Avoiding that is a coverage
-        decision, not a cost one, so unlike locality it ranks above the baseline.
+        This used to be the one term allowed to cost a reprocessing, on a COVERAGE argument: the
+        offset was decided per solar day, so one raw copy at or above the threshold could refuse
+        the whole day and every tile fused into it. Buying that back with an older baseline was
+        worth it.
 
-        Unobservable on the archive as indexed — every copy served from the ESA bucket is at a
-        pre-04.00 baseline and so owes nothing either way — which is why the case this pins is
-        the one the ingest logs at WARNING as unexpected.
+        Per-image correction removes the argument entirely — no copy can refuse another tile's
+        pixels. Two reasons to prefer a harmonised copy survive, and both are about the pixel
+        rather than about coverage: it was floored by its producer BEFORE resampling where one we
+        correct is floored after, and it cannot be wrong by the offset at all. This module does not
+        let a quality preference buy a better pixel with an older reprocessing — the same rule that
+        keeps locality below the baseline — so the term now sits below the baseline too.
+
+        Still unobservable on the archive as indexed: every copy served from the ESA bucket is at a
+        pre-04.00 baseline and owes nothing either way.
         """
         harmonised_old = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="04.00", host_root=_IN_REGION)
         raw_new = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="05.00", host_root=_REMOTE)
         kept, alternates = select_preferred_duplicates([harmonised_old, raw_new])
-        assert [i.id for i in kept] == [harmonised_old.id]
-        # And the raw copy is NOT offered as a fallback. It reads fine, but swapping it in beside
-        # the harmonised tiles of the same solar day makes that day refuse, and the recovery ladder
-        # steps down on a read failure rather than on a refusal — see `risks_refusing_its_date`.
-        assert alternates == {}, "a spare that risks refusing the date must not be on the ladder"
+        assert [i.id for i in kept] == [raw_new.id], "the newer baseline decides above this term"
+        # And the loser is a usable fallback, because owing a correction is no longer a reason to
+        # withhold anything.
+        assert [i.id for i in alternates[("MGRS-33TWM", "2021-09-08")]] == [harmonised_old.id]
+
+    def test_it_still_decides_between_copies_at_one_baseline(self) -> None:
+        """Demoted, not deleted — the two pixel-quality reasons above still hold.
+
+        Among copies the baseline cannot separate, the one owing no correction is preferred: its
+        floor was applied before resampling, and it cannot be wrong by the offset.
+        """
+        harmonised = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="05.00", host_root=_IN_REGION)
+        raw = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="05.00", host_root=_REMOTE)
+        kept, _ = select_preferred_duplicates([raw, harmonised])
+        assert [i.id for i in kept] == [harmonised.id]
 
     def test_below_the_threshold_the_correction_term_is_inert(self) -> None:
         """The complement of the test above, and what stops it degrading the whole archive.
@@ -969,16 +996,24 @@ class TestUnknownBaselineSuspendsLocality:
         kept, _ = select_preferred_duplicates([raw_unknown, raw_best])
         assert [i.id for i in kept] == [raw_best.id], "a usable baseline must beat an unreadable one"
 
-    def test_a_harmonised_copy_needs_no_baseline_to_be_usable(self) -> None:
-        """The other side, and it does NOT reverse: an unreadable baseline costs a harmonised copy
-        nothing, because no offset decision rests on it. Penalising it here would hand the
-        tile-date to a raw copy whose date may then be refused outright.
+    def test_a_harmonised_copy_is_still_not_penalised_for_its_baseline(self) -> None:
+        """An unreadable baseline costs a harmonised copy nothing on the READABILITY term.
+
+        What it does cost is the baseline VALUE term, which is why the newer raw copy wins here
+        now. That is not the term under test misfiring: a raw copy at 05.00 declaring its baseline
+        is fully decidable and gets corrected per image, so preferring it is preferring a newer
+        reprocessing over an older one — exactly the rule. The fear this test used to encode, that
+        the raw copy's date would be refused outright, no longer applies to a copy like that.
+
+        The readability term itself is pinned below, where the baselines are equal.
         """
         harmonised_unknown = _Item("S2A_33TWM_20220107_0_L2A", "MGRS-33TWM", "0")
         _with_assets(harmonised_unknown, _bands_at(_IN_REGION))
         raw_best = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="05.00", host_root=_REMOTE)
-        kept, _ = select_preferred_duplicates([harmonised_unknown, raw_best])
-        assert [i.id for i in kept] == [harmonised_unknown.id]
+        kept, alternates = select_preferred_duplicates([harmonised_unknown, raw_best])
+        assert [i.id for i in kept] == [raw_best.id]
+        # And the harmonised copy stays available: it is owed nothing, so it cannot refuse.
+        assert [i.id for i in alternates[("MGRS-33TWM", "2021-09-08")]] == [harmonised_unknown.id]
 
     def test_a_usable_baseline_beats_a_higher_sequence_without_one(self) -> None:
         """REVERSED deliberately, and the reason is worth reading.
@@ -1050,8 +1085,11 @@ class TestTheDuplicateLogIsAnAuditTrail:
         """
         from tessera_embeddings.ingest.duplicates import log_duplicate_selection
 
+        # The spare has to be one the ladder genuinely cannot use, and "merely owes the offset" is
+        # no longer such a case — per-image correction made those usable again. What still refuses
+        # is a copy whose own evidence is missing: raw bands, no readable baseline.
         winner = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="04.00", host_root=_IN_REGION)
-        raw_spare = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="05.00", host_root=_REMOTE)
+        raw_spare = _with_assets(_Item("S2A_33TWM_20220107_1_L2A", "MGRS-33TWM", "1"), _bands_at(_REMOTE))
         kept, alternates = select_preferred_duplicates([winner, raw_spare])
         assert [i.id for i in kept] == [winner.id]
         assert alternates == {}, "the fixture must produce an empty ladder, or this proves nothing"
@@ -1072,7 +1110,7 @@ class TestTheDuplicateLogIsAnAuditTrail:
         msg = self._emit(caplog, [local], {("MGRS-33TWM", "2021-09-08"): [remote]})
         assert "complete read set, then a decidable producer, then a known acquisition" in msg
         assert (
-            "then a readable baseline, then owing no offset correction, then newest baseline, "
+            "then a readable baseline, then newest baseline, then owing no offset correction, "
             "then in-region, then newest sequence"
         ) in msg
         assert "newest kept" not in msg, "the stale claim must not come back"
@@ -1133,7 +1171,7 @@ class TestTheDuplicateLogIsAnAuditTrail:
         msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [unreadable]})
         assert "complete read set, then a decidable producer, then a known acquisition" in msg
         assert (
-            "then a readable baseline, then owing no offset correction, then newest baseline, "
+            "then a readable baseline, then newest baseline, then owing no offset correction, "
             "then in-region, then newest sequence"
         ) in msg
         assert "sequence alone" not in msg, "a mode that cannot happen must not be reported"
@@ -1391,7 +1429,7 @@ class TestLocalityDoesNotDecideBetweenUnknownBaselines:
         """The complement: neutralising locality everywhere would pass the test above.
 
         Posed BELOW the correction threshold so that neither spare owes an offset — above it a raw
-        spare is kept off the ladder entirely (`risks_refusing_its_date`), which would empty the
+        spare is kept off the ladder entirely (`refuses_its_date`), which would empty the
         ladder and prove nothing about locality.
         """
         items = [
@@ -1643,14 +1681,19 @@ class TestACopyThatWouldRefuseItsDateLosesToOneThatWouldNot:
             assets["red"] = {"href": f"{_REMOTE}/B04.jp2"}
         return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **{"s2:processing_baseline": baseline}), assets)
 
-    def test_a_homogeneous_older_copy_beats_a_mixed_newer_one(self) -> None:
+    def test_a_mixed_producer_copy_is_no_longer_a_problem_at_all(self) -> None:
+        """REVERSED: a copy whose bands span two KNOWN producers is corrected band by band.
+
+        It used to lose to an older homogeneous copy and be barred from the ladder, because one
+        offset decision was applied to a whole fused date and no single answer fitted such an item.
+        The decision is per SOURCE now — each band is judged on its own bucket — so the item is
+        ordinary, and the newer baseline wins.
+        """
         mixed_new = self._copy_at_baseline("mixed-05", "05.00", mixed=True)
         clean_old = self._copy_at_baseline("clean-04", "04.00", mixed=False)
         kept, alternates = select_preferred_duplicates([mixed_new, clean_old])
-        assert [it.id for it in kept] == ["clean-04"]
-        # The mixed copy is excluded from the ladder as well as losing the selection: offering it
-        # would raise `HeterogeneousProducerError`, which is not a read failure.
-        assert alternates == {}
+        assert [it.id for it in kept] == ["mixed-05"]
+        assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["clean-04"]
 
     def test_below_the_threshold_the_baseline_still_decides(self) -> None:
         """The term is inert there: a mixed producer changes no pixel that gets no offset."""
@@ -1683,7 +1726,7 @@ class TestTheLadderOnlyOffersCopiesItCanRecoverWith:
     """A refusal is not a read failure, so the ladder cannot step down on one.
 
     `step_down_copies` exists for a source object that will not read. Handing it a copy that makes
-    `dates_exempt_from_correction` raise means the exception escapes instead of the next usable
+    the correction path raise means the exception escapes instead of the next usable
     copy being tried or the date being recorded as lost. Raised on PR #107.
     """
 
@@ -1720,11 +1763,17 @@ class TestTheLadderOnlyOffersCopiesItCanRecoverWith:
         _, alternates = select_preferred_duplicates([winner, unusable])
         assert alternates == {}
 
-    def test_a_mixed_producer_spare_is_excluded_above_the_threshold(self) -> None:
+    def test_a_mixed_producer_spare_is_offered_at_every_baseline_now(self) -> None:
+        """REVERSED above the threshold, and it now agrees with the case below it.
+
+        A mixed-producer spare was excluded above the threshold because a date-wide offset decision
+        could not fit it. Per-source correction handles it, so it is a usable fallback at any
+        baseline and the two halves of this class stop disagreeing.
+        """
         winner = self._copy("win", baseline="05.00", sequence="9")
-        unusable = self._copy("mixed", baseline="05.00", sequence="1", mixed=True)
-        _, alternates = select_preferred_duplicates([winner, unusable])
-        assert alternates == {}
+        spare = self._copy("mixed", baseline="05.00", sequence="1", mixed=True)
+        _, alternates = select_preferred_duplicates([winner, spare])
+        assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["mixed"]
 
     def test_a_mixed_producer_spare_is_kept_below_the_threshold(self) -> None:
         """Nothing is owed there, so the date does not refuse and the copy is a usable fallback."""
@@ -2150,10 +2199,13 @@ class TestTheProducerTermIsInertWithoutAReadSet:
         assert [i.id for i in alternates[("MGRS-33TWM", "2021-09-08")]] == ["old-03.00"]
 
     def test_the_term_still_fires_where_the_names_are_the_keys(self) -> None:
-        """The complement, or gating it would have disabled the guard everywhere."""
-        mixed = _Item("mixed", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"})
-        mixed.properties["datetime"] = "2024-06-05T10:20:31.024000Z"
-        assets = _bands_at(_IN_REGION)
-        assets["red"] = {"href": f"{_REMOTE}/B04.jp2"}
-        _with_assets(mixed, assets)
-        assert refuses_its_date(mixed, READ_ASSET_KEYS) is True
+        """The complement, or gating it would have disabled the guard everywhere.
+
+        Posed on an UNCLASSIFIED bucket, which is the case that still refuses. A copy whose bands
+        span two KNOWN producers no longer does — each band is decided on its own bucket — so this
+        used to be posed on one of those and would now pass for the wrong reason.
+        """
+        unlisted = _Item("unlisted", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"})
+        unlisted.properties["datetime"] = "2024-06-05T10:20:31.024000Z"
+        _with_assets(unlisted, _bands_at("s3://nobody-has-classified-this/33/T/WM"))
+        assert refuses_its_date(unlisted, READ_ASSET_KEYS) is True

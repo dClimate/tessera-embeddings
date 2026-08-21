@@ -17,7 +17,6 @@ every value by 1000.
 
 from __future__ import annotations
 
-import logging
 from datetime import UTC, datetime
 
 import numpy as np
@@ -33,18 +32,16 @@ from tessera_embeddings.ingest.asset_locations import (
     READ_ASSET_KEYS,
     REFLECTANCE_ASSET_KEYS,
     Harmonisation,
+    asset_bucket,
     item_harmonisation,
     item_is_in_preferred_location,
     read_asset_sources,
 )
+from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.duplicates import select_preferred_duplicates
 from tessera_embeddings.ingest.stac import (
-    HeterogeneousProducerError,
-    _apply_baseline_corrections_by_date,
     _declared_baseline,
     _extract_baseline,
-    correction_baselines_by_date,
-    dates_exempt_from_correction,
     extract_baselines,
 )
 
@@ -65,6 +62,29 @@ class _Item:
         if host_root is not None:
             self.assets = {key: {"href": f"{host_root}/{key}"} for key in READ_ASSET_KEYS}
         self.assets.update(extra or {})
+
+
+def _decisions(item: object, keys: tuple[str, ...] = REFLECTANCE_ASSET_KEYS) -> set[OffsetDecision]:
+    """What is owed to each of an item's reflectance sources.
+
+    The date-scoped equivalents of these assertions are gone: the deleted date-wide check asked
+    whether a whole solar day was owed the offset, and per-image correction makes that question
+    unnecessary. What survives is the per-source decision, so these tests assert on the set of
+    answers an item's own bands produce.
+    """
+    assets = getattr(item, "assets", {})
+    baseline = _declared_baseline(item)
+    out: set[OffsetDecision] = set()
+    for key in keys:
+        asset = assets.get(key)
+        href = asset.get("href") if isinstance(asset, dict) else None
+        out.add(source_decision(asset_bucket(href) if href else None, baseline, S2_BASELINE_THRESHOLD))
+    return out
+
+
+def _is_exempt(item: object) -> bool:
+    """Whether nothing at all is owed to this item — the per-source form of "the date is exempt"."""
+    return _decisions(item) == {OffsetDecision.EXEMPT}
 
 
 class TestTheCollectionNowAsksForCorrection:
@@ -90,7 +110,7 @@ class TestPerItemExemption:
         """
         item = _Item(_RAW_ESA, "05.00")
         assert _extract_baseline(item) == 500
-        assert dates_exempt_from_correction([item]) == set(), "raw pixels are owed the correction"
+        assert _decisions(item) == {OffsetDecision.OWED}, "raw pixels are owed the correction"
 
     def test_a_harmonised_item_over_the_threshold_is_left_alone(self) -> None:
         """The safety direction, and the bug this change could introduce. Element 84's COGs
@@ -100,7 +120,7 @@ class TestPerItemExemption:
         item = _Item(_HARMONISED, "05.09")
         assert _extract_baseline(item) == 509, "the parser reports what the item declares"
         assert extract_baselines([item]) == {"2022-01-07": 509}, "provenance keeps the real baseline"
-        assert dates_exempt_from_correction([item]) == {"2022-01-07"}, "but no correction is owed"
+        assert _is_exempt(item), "but no correction is owed"
 
     def test_a_raw_esa_item_below_the_threshold_reports_its_baseline(self) -> None:
         """Reporting the real baseline is what lets the threshold decide. 301 is under 400, so
@@ -120,7 +140,8 @@ class TestPerItemExemption:
         harmonised.datetime = datetime(2022, 1, 8, 12, 0, 0, tzinfo=UTC)
         items = [raw, harmonised]
         assert extract_baselines(items) == {"2022-01-07": 500, "2022-01-08": 500}, "provenance is untouched"
-        assert dates_exempt_from_correction(items) == {"2022-01-08"}
+        assert _decisions(items[0]) == {OffsetDecision.OWED}, "the raw item is owed the offset"
+        assert _is_exempt(items[1]), "the harmonised one is not"
 
 
 class TestProvenanceIsNotOverwritten:
@@ -131,57 +152,6 @@ class TestProvenanceIsNotOverwritten:
         worse than the error it avoided, because it cannot be recovered after the fact.
         """
         assert extract_baselines([_Item(_HARMONISED, "05.10")]) == {"2022-01-07": 510}
-
-
-class TestMixedProducerDates:
-    """Mixed-producer days are REAL, so the question is what is owed — not who disagrees."""
-
-    def test_a_mixed_date_owing_nothing_is_exempt_not_refused(self) -> None:
-        """THE REAL CASE, and the one an earlier version of this got wrong by refusing.
-
-        A full census of four tile-years found 7 mixed days in 522. After duplicate selection
-        the survivors pair a harmonised COG with a raw item at an OLD baseline — measured on
-        33TWM 2017-12-19, a COG at 05.00 beside a raw item at 02.06, kept apart because their
-        instants are 209 s apart and so count as distinct acquisitions. Nothing there is owed a
-        correction, so exempting is right and refusing would lose a real date.
-        """
-        harmonised = _Item(_HARMONISED, "05.00")
-        raw_old = _Item(_RAW_ESA, "02.06")
-        assert dates_exempt_from_correction([harmonised, raw_old]) == {"2022-01-07"}
-
-    def test_a_mixed_date_that_genuinely_owes_a_correction_raises(self) -> None:
-        """The unobserved case that has no right answer: a raw item at or above the threshold
-        fused with a harmonised one. Exempting leaves the raw tiles 1000 high, correcting drops
-        1000 from the harmonised ones, and the correction is date-wide.
-        """
-        with pytest.raises(HeterogeneousProducerError, match="fuses a raw item"):
-            dates_exempt_from_correction([_Item(_HARMONISED, "05.00"), _Item(_RAW_ESA, "05.00")])
-
-    def test_an_all_raw_date_over_the_threshold_is_corrected(self) -> None:
-        """No ambiguity when every item is raw — correct the whole date."""
-        assert dates_exempt_from_correction([_Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "05.00")]) == set()
-
-    def test_a_mixed_band_item_below_the_threshold_is_not_refused(self) -> None:
-        """Straddling bands only matter if something is actually owed. Below the threshold there
-        is nothing to get wrong, so refusing would be gratuitous.
-        """
-        item = _Item(_HARMONISED, "02.06")
-        item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
-        assert dates_exempt_from_correction([item]) == {"2022-01-07"}
-
-    def test_a_mixed_band_item_over_the_threshold_raises(self) -> None:
-        """Same reasoning one level down: no date-wide answer is correct for a single item whose
-        own bands come from both producers.
-        """
-        item = _Item(_HARMONISED, "05.00")
-        item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
-        with pytest.raises(HeterogeneousProducerError, match="read bands span"):
-            dates_exempt_from_correction([item])
-
-    def test_a_homogeneous_multi_tile_date_is_fine(self) -> None:
-        """The common case must NOT refuse: many tiles per date is the norm, and they agree."""
-        tiles = [_Item(_HARMONISED, "05.00") for _ in range(4)]
-        assert dates_exempt_from_correction(tiles) == {"2022-01-07"}
 
 
 class TestHarmonisationPredicate:
@@ -284,169 +254,13 @@ class TestSclDoesNotDecideHarmonisation:
         item = _Item(_HARMONISED, "05.00")
         item.assets["scl"] = {"href": f"{_RAW_ESA}/scl"}
         assert item_harmonisation(item) is Harmonisation.HARMONISED
-        assert dates_exempt_from_correction([item]) == {"2022-01-07"}
+        assert _is_exempt(item)
 
     def test_a_raw_reflectance_band_still_makes_it_mixed(self) -> None:
         """The complement: excluding scl must not weaken the reflectance check itself."""
         item = _Item(_HARMONISED, "05.00")
         item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
         assert item_harmonisation(item) is Harmonisation.MIXED
-
-
-class TestRawDatesStraddlingTheThreshold:
-    """One date carries one baseline, so raw items on opposite sides cannot both be served."""
-
-    def test_raw_items_across_the_threshold_raise(self) -> None:
-        """`extract_baselines` is last-wins by construction, so the date-wide baseline serves one
-        side or the other: correcting shifts the pre-threshold pixels down 1000, not correcting
-        leaves the post-threshold ones 1000 high.
-        """
-        over, under = _Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "03.01")
-        with pytest.raises(HeterogeneousProducerError, match="straddle the correction threshold"):
-            dates_exempt_from_correction([over, under])
-
-    def test_raw_items_all_under_the_threshold_are_fine(self) -> None:
-        """The common case for the backfill, which is entirely pre-04.00: nothing owed, no
-        conflict, no refusal.
-        """
-        assert dates_exempt_from_correction([_Item(_RAW_ESA, "02.06"), _Item(_RAW_ESA, "03.01")]) == {"2022-01-07"}
-
-    def test_raw_items_all_over_the_threshold_are_corrected(self) -> None:
-        assert dates_exempt_from_correction([_Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "05.09")]) == set()
-
-
-class TestTheCorrectionPathAnnouncesItself:
-    """Tier 5: the assumption this change rests on, made observable at runtime.
-
-    Every raw item measured on the live catalogue reports a pre-04.00 baseline, so the
-    correction has never actually run on real data. Sampling cannot prove the combination never
-    appears — a 100-item page of a 146-item year said it did not — so the honest close is a
-    signal on the day it does, rather than an inference from a sample.
-    """
-
-    def test_a_routinely_unharmonised_producer_does_not_warn(self, caplog) -> None:
-        """FOUND BY THE REGRESSION SWEEP. Planetary Computer serves unharmonised data on Azure,
-        so every one of its dates is corrected as a matter of course. Warning on each would fire
-        on every date of an MPC ingest AND would assert something untrue — that the combination
-        had not been seen before. Narrowed to the ESA archive, which is the route a
-        harmonised-COG catalogue was not expected to take.
-        """
-        # An unidentified producer is UNDETERMINED, so it refuses rather than warning — the
-        # warning's claim is specifically about the ESA archive.
-        azure = _Item("https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/33/T/TG/x", "05.10")
-        assert item_harmonisation(azure) is Harmonisation.UNKNOWN
-        with caplog.at_level(logging.WARNING, logger="tessera_embeddings.ingest.stac"):
-            assert dates_exempt_from_correction([_Item(_RAW_ESA, "05.00")]) == set()
-        assert [r for r in caplog.records if "correction ACTIVE" in r.message], "the archive must warn"
-
-    def test_it_warns_when_a_raw_item_is_actually_corrected(self, caplog) -> None:
-        """Not an error: correcting a raw item over the threshold is exactly right. The warning
-        says the path has gone live, so its output gets verified instead of assumed.
-        """
-        with caplog.at_level(logging.WARNING, logger="tessera_embeddings.ingest.stac"):
-            assert dates_exempt_from_correction([_Item(_RAW_ESA, "05.00")]) == set()
-        assert any("correction ACTIVE on ESA-archive data" in r.message for r in caplog.records)
-        assert any("500" in str(r.args) for r in caplog.records), "the baseline must be named"
-
-    def test_it_stays_quiet_below_the_threshold(self, caplog) -> None:
-        """The entire backfill is pre-04.00, so this is the common path. A signal that fires on
-        every historical date is noise and would be filtered out before the day it matters.
-        """
-        with caplog.at_level(logging.WARNING, logger="tessera_embeddings.ingest.stac"):
-            dates_exempt_from_correction([_Item(_RAW_ESA, "02.06")])
-        assert not [r for r in caplog.records if "correction ACTIVE" in r.message]
-
-    def test_it_stays_quiet_for_harmonised_data(self, caplog) -> None:
-        """Harmonised items are exempt, so nothing is corrected and nothing is announced."""
-        with caplog.at_level(logging.WARNING, logger="tessera_embeddings.ingest.stac"):
-            dates_exempt_from_correction([_Item(_HARMONISED, "05.10")])
-        assert not [r for r in caplog.records if "correction ACTIVE" in r.message]
-
-
-class TestAnUnreadableBaselineRefusesRatherThanBeingGuessed:
-    """An unharmonised item that declares no readable baseline is ambiguous, and refused.
-
-    This went through three rounds of review. Reading the item naively exempted the date, because
-    a malformed `s2:processing_baseline` parses as 0 and 0 is under the threshold. Taking the
-    answer from the caller's per-date map instead was tried and is worse: the production path
-    builds that map with `extract_baselines(day_items)` from these very items, so a lone
-    unreadable item supplies the same parsed zero and is rescued from nothing, while on a
-    multi-item date it inherits an arbitrary last item's value — leaving post-04.00 pixels 1000
-    too high or taking 1000 off pre-04.00 ones. A figure derived from the items cannot be
-    evidence about an item.
-    """
-
-    def test_a_malformed_baseline_refuses_the_date(self) -> None:
-        item = _Item(_RAW_ESA, "not-a-number")
-        assert _extract_baseline(item) == 0, "the fixture must actually be unreadable"
-        with pytest.raises(HeterogeneousProducerError, match="no readable processing baseline"):
-            dates_exempt_from_correction([item])
-
-    def test_a_missing_baseline_property_refuses_the_date(self) -> None:
-        with pytest.raises(HeterogeneousProducerError, match="no readable processing baseline"):
-            dates_exempt_from_correction([_Item(_RAW_ESA, None)])
-
-    def test_a_harmonised_item_with_no_baseline_is_harmless(self) -> None:
-        """It is owed nothing whatever its baseline says, so the ambiguity cannot bite."""
-        assert dates_exempt_from_correction([_Item(_HARMONISED, None)]) == {"2022-01-07"}
-
-    def test_a_readable_item_is_judged_on_its_own_baseline(self) -> None:
-        assert dates_exempt_from_correction([_Item(_RAW_ESA, "05.00")]) == set()
-        assert dates_exempt_from_correction([_Item(_RAW_ESA, "03.00")]) == {"2022-01-07"}
-
-    def test_the_threshold_is_read_in_the_scaled_space(self) -> None:
-        """500 is baseline 05.00, not 500.00. A comparison at the wrong scale would exempt
-        everything, since 5.0 is under a threshold of 400.
-        """
-        assert S2_BASELINE_THRESHOLD == 400
-        assert dates_exempt_from_correction([_Item(_RAW_ESA, "04.00")]) == set(), "inclusive"
-        assert dates_exempt_from_correction([_Item(_RAW_ESA, "03.99")]) == {"2022-01-07"}
-
-    def test_the_decision_does_not_depend_on_item_order(self) -> None:
-        """The property the map-based version violated: a last-wins figure made the answer a
-        function of the caller's sort.
-        """
-        harmonised = _Item(_HARMONISED, "05.00")
-        raw_old = _Item(_RAW_ESA, "02.06")
-        assert dates_exempt_from_correction([harmonised, raw_old]) == {"2022-01-07"}
-        assert dates_exempt_from_correction([raw_old, harmonised]) == {"2022-01-07"}
-
-    def test_a_genuine_straddle_still_refuses(self) -> None:
-        with pytest.raises(HeterogeneousProducerError, match="straddle the correction threshold"):
-            dates_exempt_from_correction([_Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "03.00")])
-
-
-class TestTheActivationWarningDescribesWhatHappened:
-    """The warning must not claim a correction that a refusal then prevented. PR #108 review."""
-
-    def _records(self, caplog, items) -> list[logging.LogRecord]:
-        caplog.clear()
-        with caplog.at_level(logging.DEBUG, logger="tessera_embeddings.ingest.stac"):
-            try:
-                dates_exempt_from_correction(items)
-            except HeterogeneousProducerError:
-                pass
-        return [r for r in caplog.records if "Baseline correction" in r.getMessage()]
-
-    def test_a_date_that_refuses_logs_no_correction(self, caplog) -> None:
-        """Emitted before the checks, the line announced a correction on a date that then
-        raised and was never loaded at all.
-        """
-        raw_over = _Item(_RAW_ESA, "05.00")
-        harmonised = _Item(_HARMONISED, "05.00")
-        records = self._records(caplog, [raw_over, harmonised])
-        assert records == [], f"a refused date announced a correction: {[r.getMessage() for r in records]}"
-
-    def test_a_straddling_date_logs_no_correction(self, caplog) -> None:
-        raw_over = _Item(_RAW_ESA, "05.00")
-        raw_under = _Item(_RAW_ESA, "03.00")
-        assert self._records(caplog, [raw_over, raw_under]) == []
-
-    def test_a_date_that_is_actually_corrected_still_warns(self, caplog) -> None:
-        """The complement: silencing the warning entirely would pass every test above."""
-        records = self._records(caplog, [_Item(_RAW_ESA, "05.00")])
-        assert [r.levelno for r in records] == [logging.WARNING]
-        assert "ESA-archive" in records[0].getMessage()
 
 
 class TestTheBaselineParserReportsUnknown:
@@ -470,89 +284,6 @@ class TestTheBaselineParserReportsUnknown:
         assert _declared_baseline(_Item(_RAW_ESA, "00.00")) == 0
         assert _declared_baseline(_Item(_RAW_ESA, None)) is None
         assert _extract_baseline(_Item(_RAW_ESA, "00.00")) == _extract_baseline(_Item(_RAW_ESA, None)) == 0
-
-
-class TestTheCorrectorIsSkippedWhenNothingIsOwed:
-    """Setting the threshold for Earth Search made the already-harmonised path the COMMON case.
-
-    The corrector is a no-op on a date owed nothing, but not a free one: it clips, casts, adds
-    and `xr.where`s every reflectance band into the graph before deciding to change nothing.
-    Raised on PR #108 — before this change that branch was unreachable, so the cost never
-    landed on a real ingest.
-    """
-
-    @staticmethod
-    def _run(monkeypatch, items, baselines) -> list[dict]:
-
-        data = xr.Dataset(
-            {"B02": (("time", "y", "x"), np.ones((1, 2, 2), dtype="uint16"))},
-            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
-        )
-        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
-
-        calls: list[dict] = []
-
-        def _spy(_data, corrections, **kwargs):
-            calls.append({"corrections": corrections, **kwargs})
-            return _data
-
-        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", _spy)
-        stac_module.load_stac_items(items, "earth-search", "sentinel-2-l2a", baselines=baselines)
-        return calls
-
-    def test_an_all_harmonised_date_does_not_enter_the_corrector(self, monkeypatch) -> None:
-        calls = self._run(monkeypatch, [_Item(_HARMONISED, "05.10")], {"2022-01-07": 510})
-        assert calls == [], "the corrector ran for a date whose correction baseline is 0"
-
-    def test_a_pre_threshold_date_does_not_enter_the_corrector(self, monkeypatch) -> None:
-        calls = self._run(monkeypatch, [_Item(_RAW_ESA, "03.00")], {"2022-01-07": 300})
-        assert calls == []
-
-    def test_a_date_that_is_owed_the_offset_still_enters_the_corrector(self, monkeypatch) -> None:
-        """The complement. Skipping unconditionally would pass both tests above."""
-        calls = self._run(monkeypatch, [_Item(_RAW_ESA, "05.00")], {"2022-01-07": 500})
-        assert len(calls) == 1
-        assert calls[0]["corrections"] == {"2022-01-07": 500}
-
-    def test_the_provenance_map_is_untouched_by_the_skip(self, monkeypatch) -> None:
-        """The store's `baselines_applied` records the vintage of what was loaded, so the
-        harmonised item's real 510 must survive a load that corrected nothing.
-        """
-        baselines = {"2022-01-07": 510}
-        self._run(monkeypatch, [_Item(_HARMONISED, "05.10")], baselines)
-        assert baselines == {"2022-01-07": 510}
-
-
-class TestAnUndeterminedProducerRefusesRatherThanGuessing:
-    """UNKNOWN is refused where the answer matters, and ignored where it does not. PR #108."""
-
-    def test_a_post_threshold_undetermined_item_refuses_the_date(self) -> None:
-        item = _Item(None, "05.00")
-        with pytest.raises(HeterogeneousProducerError, match="cannot be determined"):
-            dates_exempt_from_correction([item])
-
-    def test_a_pre_threshold_undetermined_item_is_exempt_not_refused(self) -> None:
-        """Nothing is owed, so which producer served it cannot change any pixel."""
-        item = _Item(None, "03.00")
-        assert dates_exempt_from_correction([item]) == {"2022-01-07"}
-
-    def test_a_normal_harmonised_date_is_unaffected(self) -> None:
-        """The guard must not fire on the common path."""
-        assert dates_exempt_from_correction([_Item(_HARMONISED, "05.10")]) == {"2022-01-07"}
-
-
-class TestTheExemptionGroupsByTheDayTheLoaderFuses:
-    """`odc.stac.load` fuses a SOLAR day. Checking UTC dates checked different sets. PR #108."""
-
-    def test_an_unnormalised_item_is_refused_rather_than_grouped_by_utc_date(self) -> None:
-        item = _Item(_RAW_ESA, "05.00")
-        item.datetime = datetime(2022, 1, 7, 23, 40, 0, tzinfo=UTC)
-        with pytest.raises(ValueError, match=r"canonical\s+noon-UTC solar-day timestamp"):
-            dates_exempt_from_correction([item])
-
-    def test_a_normalised_item_groups_on_its_solar_day(self) -> None:
-        """The canonical noon stamp IS the solar day, so the common path is unchanged."""
-        assert dates_exempt_from_correction([_Item(_HARMONISED, "05.10")]) == {"2022-01-07"}
 
 
 class TestThePerItemCheckIsScopedToTheCollectionThatNeedsIt:
@@ -592,36 +323,34 @@ class TestThePerItemCheckIsScopedToTheCollectionThatNeedsIt:
         assert PROVIDERS["earth-search"].collections["sentinel-2-l2a"].harmonisation_varies_by_item is True
 
     def test_a_native_keyed_item_is_corrected_rather_than_refused(self, monkeypatch) -> None:
-        """End to end through the documented entry point: the PC path must reach the corrector
-        with its declared baseline, not raise.
-        """
-        data = xr.Dataset(
-            {"B02": (("time", "y", "x"), np.ones((1, 2, 2), dtype="uint16"))},
-            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
-        )
-        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
-        calls: list[dict] = []
-        monkeypatch.setattr(
-            stac_module,
-            "_apply_baseline_corrections_by_date",
-            lambda d, corrections, **kw: calls.append({"corrections": corrections}) or d,
-        )
-        stac_module.load_stac_items(
-            [self._pc_item()], "planetary-computer", "sentinel-2-l2a", baselines={"2022-01-07": 510}
-        )
-        assert calls == [{"corrections": {"2022-01-07": 510}}], "PC data must still be corrected"
+        """A native-keyed item is CORRECTED on the collection's answer, never refused for its bucket.
 
-    def test_the_earth_search_path_still_refuses_an_undetermined_item(self, monkeypatch) -> None:
-        """The guard must survive being scoped — it still fires where it is meant to."""
-        data = xr.Dataset(
-            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype="uint16"))},
-            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        Its assets sit in an Azure container that `asset_bucket` cannot name and nobody has
+        classified, so consulting the bucket would refuse every Planetary Computer date at baseline
+        >= 04.00 — a working provider broken by a guard meant for another one. The collection's own
+        answer replaces the bucket entirely.
+
+        Asserted on the decision rather than through a load, because these fixtures are plain
+        objects and odc's alias table needs real items. The load-level equivalent is in
+        `test_boa_offset.py`.
+        """
+        item = self._pc_item()
+        bucket = asset_bucket(item.assets["B02"]["href"])
+        assert bucket is None, "the fixture must be unclassifiable, or this proves nothing"
+        assert source_decision(bucket, _declared_baseline(item), 400, Harmonisation.RAW) is OffsetDecision.OWED, (
+            "the collection's answer decides it"
         )
-        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
-        with pytest.raises(HeterogeneousProducerError, match="cannot be determined"):
-            stac_module.load_stac_items(
-                [self._pc_item()], "earth-search", "sentinel-2-l2a", baselines={"2022-01-07": 510}
-            )
+
+    def test_the_same_item_is_undecidable_where_the_producer_varies(self) -> None:
+        """The complement, or scoping the guard would have disabled it everywhere.
+
+        The very same item, judged for a collection whose producer varies BETWEEN items, has to be
+        read from its assets — and they say nothing. Correcting and exempting are wrong by the same
+        amount in opposite directions, so it refuses.
+        """
+        item = self._pc_item()
+        bucket = asset_bucket(item.assets["B02"]["href"])
+        assert source_decision(bucket, _declared_baseline(item), 400, None) is OffsetDecision.UNDECIDABLE
 
 
 class TestTheTwoBucketSetsAreIndependent:
@@ -648,111 +377,6 @@ class TestTheTwoBucketSetsAreIndependent:
         """Adding it to either would silently reinstate a different bug."""
         assert "sentinel-s2-l2a" not in HARMONISED_ASSET_BUCKETS
         assert "sentinel-s2-l2a" not in PREFERRED_ASSET_BUCKETS
-
-
-class TestCorrectedAndExemptDatesShareOneStorageDtype:
-    """A ROI store's arrays take their dtype from the FIRST date's dataset
-    (`zarr_store.py`: `var_dtypes={v: day_ds[v].dtype ...}`), and existing production stores are
-    unsigned. So a corrected date and an exempt date must come out of the corrector with the same
-    dtype, or the store's dtype depends on which date happened to land first and every date of
-    the other kind is cast on the way in. Raised on PR #107.
-
-    The failure is silent and severe in both directions: a negative corrected pixel written to an
-    unsigned store reads as roughly 65535, and an uncorrected bright pixel written to a signed
-    store wraps negative. Either looks like extreme reflectance to inference.
-    """
-
-    @staticmethod
-    def _dataset(values: np.ndarray, date: str) -> xr.Dataset:
-
-        return xr.Dataset(
-            {"blue": (("time", "y", "x"), values)},
-            coords={"time": [np.datetime64(f"{date}T12:00:00")], "y": [0, 1], "x": [0, 1]},
-        )
-
-    def test_a_corrected_date_keeps_the_unsigned_dtype_it_arrived_with(self) -> None:
-
-        ds = self._dataset(np.array([[[1500, 2000], [3000, 4000]]], dtype=np.uint16), "2022-01-07")
-        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
-        assert out["blue"].dtype == np.uint16
-        np.testing.assert_array_equal(out["blue"].values, np.array([[[500, 1000], [2000, 3000]]], dtype=np.uint16))
-
-    def test_an_exempt_date_keeps_the_same_dtype(self) -> None:
-
-        ds = self._dataset(np.array([[[1500, 2000], [3000, 4000]]], dtype=np.uint16), "2022-01-07")
-        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 0}, bands=["blue"])
-        assert out["blue"].dtype == np.uint16
-
-    def test_no_corrected_pixel_can_go_negative(self) -> None:
-        """What makes the unsigned dtype safe: the offset is subtracted from every valid DN and
-        the result floored at the lowest valid code, which is what the harmonised COGs contain.
-        """
-        ds = self._dataset(np.array([[[0, 999], [1000, 1001]]], dtype=np.uint16), "2022-01-07")
-        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
-        # 0 is nodata and untouched. 999 and 1000 encoded reflectance at or below zero.
-        np.testing.assert_array_equal(out["blue"].values, np.array([[[0, 1], [1, 1]]], dtype=np.uint16))
-        assert out["blue"].values.min() >= 0
-
-    def test_a_dark_pixel_is_corrected_rather_than_left_alone(self) -> None:
-        """The reported HIGH, stated on its own. ESA adds the offset to every DN from 1 upward,
-        precisely so that negative surface reflectance over water and shadow is representable in
-        an unsigned type. Leaving DN 1-999 unchanged left those pixels up to 999 too high and made
-        a corrected raw copy disagree with a harmonised one across every dark surface.
-        """
-        ds = self._dataset(np.array([[[1, 250], [500, 750]]], dtype=np.uint16), "2022-01-07")
-        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
-        np.testing.assert_array_equal(out["blue"].values, np.ones((1, 2, 2), dtype=np.uint16))
-
-    def test_a_valid_dark_pixel_does_not_become_nodata(self) -> None:
-        """The floor is the lowest VALID code, not zero, and the difference is not cosmetic:
-        flooring a real observation to the nodata code makes it indistinguishable from no
-        observation, and every downstream mask would drop it. Element 84's COGs floor at the same
-        place, measured across two granules.
-        """
-        ds = self._dataset(np.array([[[0, 1], [500, 1000]]], dtype=np.uint16), "2022-01-07")
-        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
-        got = out["blue"].values[0]
-        assert got[0][0] == 0, "nodata must stay nodata"
-        assert (got[0][1], got[1][0], got[1][1]) == (1, 1, 1), "a valid dark pixel must not become nodata"
-
-    def test_nodata_is_the_one_code_the_offset_does_not_touch(self) -> None:
-        """DN 0 is nodata at every baseline, so it is not shifted."""
-        ds = self._dataset(np.array([[[0, 0], [0, 2000]]], dtype=np.uint16), "2022-01-07")
-        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
-        np.testing.assert_array_equal(out["blue"].values, np.array([[[0, 0], [0, 1000]]], dtype=np.uint16))
-
-    def test_a_bright_pixel_does_not_wrap(self) -> None:
-        """`clip(max=64535) - 1000` is 63535, which does not fit int16 — so the previous cast
-        wrapped bright pixels even without any dtype mixing.
-        """
-        ds = self._dataset(np.array([[[60000, 65535], [40000, 33000]]], dtype=np.uint16), "2022-01-07")
-        out = _apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
-        assert out["blue"].values.min() >= 0, f"a bright pixel wrapped: {out['blue'].values}"
-        np.testing.assert_array_equal(out["blue"].values, np.array([[[59000, 64535], [39000, 32000]]], dtype=np.uint16))
-
-    def test_the_signed_mode_is_opt_in(self) -> None:
-        """It is still available and still returns int16 — it is just not the default, since it
-        cannot round-trip into the unsigned store this repo writes. It keeps the negative
-        reflectance the floor discards, for a consumer that wants the true value.
-        """
-        ds = self._dataset(np.array([[[500, 800], [1000, 1500]]], dtype=np.uint16), "2022-01-07")
-        out = _apply_baseline_corrections_by_date(
-            ds, baselines={"2022-01-07": 500}, bands=["blue"], clamp_negatives=False
-        )
-        assert out["blue"].dtype == np.int16
-        np.testing.assert_array_equal(out["blue"].values, np.array([[[-500, -200], [0, 500]]], dtype=np.int16))
-
-    def test_the_signed_mode_cannot_wrap_a_bright_pixel(self) -> None:
-        """int16 holds neither `65535 - 1000` nor an uncorrected bright pixel on a date that
-        skipped correction, so the result saturates once at the end rather than wrapping. The
-        previous bound clamped the INPUT at 64535 and let 63535 wrap to a negative.
-        """
-        ds = self._dataset(np.array([[[65535, 40000], [33768, 0]]], dtype=np.uint16), "2022-01-07")
-        out = _apply_baseline_corrections_by_date(
-            ds, baselines={"2022-01-07": 500}, bands=["blue"], clamp_negatives=False
-        )
-        assert out["blue"].values.min() >= 0, f"a bright pixel wrapped: {out['blue'].values}"
-        np.testing.assert_array_equal(out["blue"].values, np.array([[[32767, 32767], [32767, 0]]], dtype=np.int16))
 
 
 class TestScalingCannotOverflowThePicker:
@@ -829,64 +453,6 @@ class TestAssetSourcesCannotLoseAKey:
         assert sources.complete is False
 
 
-class TestTheCorrectionValueComesFromTheSameEvidenceAsTheDecision:
-    """The exemption decided from the items while the value came from the caller's map, so where
-    they disagreed the correction quietly did nothing. Raised on PR #107.
-    """
-
-    def test_a_date_the_items_show_is_owed_gets_a_usable_correction_baseline(self) -> None:
-        assert correction_baselines_by_date([_Item(_RAW_ESA, "05.00")]) == {"2022-01-07": 500}
-
-    def test_an_exempt_date_is_reported_as_zero(self) -> None:
-        assert correction_baselines_by_date([_Item(_HARMONISED, "05.10")]) == {"2022-01-07": 0}
-
-    def test_a_pre_threshold_raw_date_is_reported_as_zero(self) -> None:
-        """It is exempt — nothing in it is owed the offset — and this map answers "correct at
-        what", not "what was declared". Provenance is `extract_baselines`' job and still reports
-        the real 300.
-        """
-        assert correction_baselines_by_date([_Item(_RAW_ESA, "03.00")]) == {"2022-01-07": 0}
-        assert extract_baselines([_Item(_RAW_ESA, "03.00")]) == {"2022-01-07": 300}
-
-    def test_the_highest_declared_baseline_of_a_date_is_used(self) -> None:
-        """They cannot meaningfully disagree — a straddling date refuses — so the max is only
-        ever picking between equals above the threshold.
-        """
-        items = [_Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "05.10")]
-        assert correction_baselines_by_date(items) == {"2022-01-07": 510}
-
-    def test_a_harmonised_item_does_not_contribute_a_correction_value(self) -> None:
-        """The mixed-producer day: the raw item is pre-threshold so nothing is owed, and the
-        harmonised item's 05.10 must not become the date's correction baseline.
-        """
-        items = [_Item(_HARMONISED, "05.10"), _Item(_RAW_ESA, "02.06")]
-        assert correction_baselines_by_date(items) == {"2022-01-07": 0}
-
-    def test_the_end_to_end_path_corrects_a_date_the_caller_map_omits(self, monkeypatch) -> None:
-        """THE FAILURE. The corrector reads a missing entry as 0, so an owed date was skipped."""
-        data = xr.Dataset(
-            {"blue": (("time", "y", "x"), np.full((1, 2, 2), 3000, dtype=np.uint16))},
-            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
-        )
-        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
-        calls: list[dict] = []
-        monkeypatch.setattr(
-            stac_module,
-            "_apply_baseline_corrections_by_date",
-            lambda d, corrections, **kw: calls.append({"corrections": corrections}) or d,
-        )
-        stac_module.load_stac_items(
-            [_Item(_RAW_ESA, "05.00")], "earth-search", "sentinel-2-l2a", baselines={"1999-01-01": 300}
-        )
-        assert calls == [{"corrections": {"2022-01-07": 500}}], "an owed date was skipped"
-
-    def test_provenance_is_not_touched(self) -> None:
-        """`extract_baselines` still reports what each item declared, including for exempt dates,
-        because it is what reaches the store's `baselines_applied`.
-        """
-        assert extract_baselines([_Item(_HARMONISED, "05.10")]) == {"2022-01-07": 510}
-
-
 class TestTheGenericEntryPointPrunesAndTheRoiLadderSurvives:
     """Duplicate selection belongs to the layer that owns the fallback ladder — and `ingest_tile`
     is the layer that has none.
@@ -944,7 +510,6 @@ class TestTheGenericEntryPointPrunesAndTheRoiLadderSurvives:
             return data
 
         monkeypatch.setattr(stac_module, "_load_from_stac", fake_load)
-        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
         _, baselines = stac_module.ingest_tile(
             provider="earth-search",
             collection="sentinel-2-l2a",
@@ -993,7 +558,6 @@ class TestEverySentinel2PathHasASelectionOwner:
             return data
 
         monkeypatch.setattr(stac_module, "_load_from_stac", fake_load)
-        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
         # Exactly the documented two-step: the query does not prune, so the loader must.
         items, baselines = stac_module.query_stac_items(
             provider="earth-search",
@@ -1161,17 +725,30 @@ class TestTheThemesThatGeneratedTheReviewStayClosed:
             [_Item(_RAW_ESA, "03.00"), _Item(_RAW_ESA, "02.06")],  # differing raw baselines
         ]
         for items in pre_threshold:
-            assert dates_exempt_from_correction(items) == {"2022-01-07"}, [i.assets for i in items]
+            for item in items:
+                assert _is_exempt(item), item.assets
 
-    def test_the_same_situations_refuse_once_the_date_is_owed_a_correction(self) -> None:
-        """The complement, or the test above would pass with the refusals deleted."""
-        for items in (
-            [_Item(_HARMONISED, "05.00"), _Item(_RAW_ESA, "05.00")],
-            [_Item(None, "05.00")],
-            [_Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "02.06")],
-        ):
-            with pytest.raises(HeterogeneousProducerError):
-                dates_exempt_from_correction(items)
+    def test_the_one_situation_that_still_refuses_once_a_correction_is_owed(self) -> None:
+        """The complement, NARROWED — and the narrowing is the substance of ADR 021.
+
+        Three situations used to refuse at or above the threshold. Two of them were consequences of
+        one correction being applied to a whole fused solar day, and per-image correction dissolves
+        both rather than isolating them:
+
+        - a harmonised copy beside a raw one owed the offset: each is now decided on its own bucket;
+        - raw copies on opposite sides of the threshold: each is now decided on its own baseline.
+
+        Both are asserted as LOADING in `test_boa_offset.py`, over real pixels, because "it no
+        longer refuses" is only worth anything if the pixels are also right.
+
+        What still refuses is the case where the evidence itself is missing — a source whose
+        producer cannot be determined at all. That is a property of one asset, not of a day, and no
+        rearrangement of the load fixes it. Kept here, so deleting the guard still fails a test.
+        """
+        undetermined = _Item(None, "05.00")
+        assert _decisions(undetermined) == {OffsetDecision.UNDECIDABLE}
+        # And it is still gated on a correction being owed at all.
+        assert _is_exempt(_Item(None, "02.06"))
 
     def test_provenance_is_never_the_correction_input(self) -> None:
         """Two maps, two purposes: what each item declared, and what to correct at. Collapsing
@@ -1179,83 +756,7 @@ class TestTheThemesThatGeneratedTheReviewStayClosed:
         """
         harmonised = [_Item(_HARMONISED, "05.10")]
         assert extract_baselines(harmonised) == {"2022-01-07": 510}
-        assert correction_baselines_by_date(harmonised) == {"2022-01-07": 0}
-
-
-class TestTheCorrectionDoesNotDependOnTheCallerSupplyingAMap:
-    """Where producers can disagree the correction is derived from the ITEMS, so gating the whole
-    block on the caller's map being truthy left a raw post-04.00 item uncorrected. Raised twice.
-    """
-
-    @staticmethod
-    def _run(monkeypatch, items, baselines) -> list[dict]:
-        data = xr.Dataset(
-            {"blue": (("time", "y", "x"), np.full((1, 2, 2), 3000, dtype=np.uint16))},
-            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
-        )
-        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
-        calls: list[dict] = []
-        monkeypatch.setattr(
-            stac_module,
-            "_apply_baseline_corrections_by_date",
-            lambda d, corrections, **kw: calls.append({"corrections": corrections}) or d,
-        )
-        stac_module.load_stac_items(items, "earth-search", "sentinel-2-l2a", baselines=baselines)
-        return calls
-
-    @pytest.mark.parametrize("baselines", [None, {}])
-    def test_a_raw_post_threshold_item_is_corrected_with_no_map(self, monkeypatch, baselines) -> None:
-        calls = self._run(monkeypatch, [_Item(_RAW_ESA, "05.00")], baselines)
-        assert calls == [{"corrections": {"2022-01-07": 500}}], "the offset was left in the pixels"
-
-    @pytest.mark.parametrize("baselines", [None, {}])
-    def test_a_harmonised_item_is_still_not_corrected(self, monkeypatch, baselines) -> None:
-        """The complement: running the block unconditionally must not correct what is exempt."""
-        assert self._run(monkeypatch, [_Item(_HARMONISED, "05.10")], baselines) == []
-
-    @staticmethod
-    def _pc_item(baseline: str | None) -> _Item:
-        """A Planetary Computer item: native asset keys, so its producer cannot be read from its
-        assets and comes from the collection's configuration instead.
-        """
-        item = _Item(None, baseline)
-        item.assets = {k: {"href": f"https://x.blob.core.windows.net/{k}"} for k in ("B02", "B03")}
-        return item
-
-    @staticmethod
-    def _run_pc(monkeypatch, items, baselines) -> list[dict]:
-        data = xr.Dataset(
-            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
-            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
-        )
-        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
-        calls: list[dict] = []
-        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, c, **kw: calls.append(c) or d)
-        stac_module.load_stac_items(items, "planetary-computer", "sentinel-2-l2a", baselines=baselines)
-        return calls
-
-    @pytest.mark.parametrize("baselines", [None, {}, {"2022-01-07": 0}])
-    def test_a_collection_wide_raw_provider_is_corrected_from_its_items(self, monkeypatch, baselines) -> None:
-        """The reported MEDIUM. Planetary Computer serves ESA's values unharmonised throughout, so
-        a threshold set on a collection whose producer cannot vary between items says every item
-        is raw — the configuration answers what the assets cannot. Taking the correction from the
-        caller's map instead meant a map that was absent, empty, or carrying the 0 that an
-        unreadable baseline collapses to left the offset in the pixels with nothing said.
-        """
-        calls = self._run_pc(monkeypatch, [self._pc_item("05.10")], baselines)
-        assert calls == [{"2022-01-07": 510}], "the offset was left in the pixels"
-
-    def test_an_unreadable_baseline_refuses_rather_than_reading_as_zero(self, monkeypatch) -> None:
-        """The other half of the same finding. A raw item declaring nothing readable cannot be
-        corrected or exempted on evidence, so its date is refused — the same rule the per-item
-        provider already followed, now reached by the collection-wide one too.
-        """
-        with pytest.raises(HeterogeneousProducerError, match="no readable"):
-            self._run_pc(monkeypatch, [self._pc_item("5.100")], None)
-
-    def test_a_pre_threshold_collection_wide_date_is_left_alone(self, monkeypatch) -> None:
-        """The complement, or the tests above would pass with the exemption deleted."""
-        assert self._run_pc(monkeypatch, [self._pc_item("03.00")], None) == []
+        assert _is_exempt(harmonised[0]), "and the correction input owes it nothing"
 
 
 class TestPruningReachesEveryCollectionThatMakesAnOffsetDecision:
@@ -1287,16 +788,23 @@ class TestPruningReachesEveryCollectionThatMakesAnOffsetDecision:
             copies.append(item)
         return copies
 
-    def test_the_unpruned_pair_really_refuses(self) -> None:
-        """The failure, asserted first so the fix below cannot pass vacuously."""
-        with pytest.raises(HeterogeneousProducerError, match="straddle"):
-            dates_exempt_from_correction(self._pc_pair(), 400, Harmonisation.RAW)
+    def test_the_unpruned_pair_straddles_the_threshold(self) -> None:
+        """The condition that used to refuse the date, asserted so the rest is not vacuous.
 
-    def test_selecting_one_copy_resolves_it(self) -> None:
-        """And the ambiguity is not real — one copy makes the date processable."""
+        Two copies of one acquisition on opposite sides of 04.00 were fused into a single pixel
+        stack and given ONE correction, so the date had no correct answer and was refused. Per
+        source, each copy is corrected on its own baseline — but reading both to blend them is
+        still waste, which is what pruning is for and what this class tests.
+        """
+        pair = self._pc_pair()
+        decisions = {source_decision(None, _declared_baseline(i), 400, Harmonisation.RAW) for i in pair}
+        assert decisions == {OffsetDecision.OWED, OffsetDecision.EXEMPT}, "the pair really does straddle"
+
+    def test_selecting_one_copy_leaves_one_answer(self) -> None:
+        """And pruning still reduces it to one copy, which is the point of the gate."""
         kept, _ = select_preferred_duplicates(self._pc_pair(), (), Harmonisation.RAW)
         assert len(kept) == 1
-        assert dates_exempt_from_correction(kept, 400, Harmonisation.RAW) == set()
+        assert source_decision(None, _declared_baseline(kept[0]), 400, Harmonisation.RAW) is OffsetDecision.OWED
 
     def test_the_loader_prunes_for_a_collection_wide_raw_provider(self, monkeypatch) -> None:
         loaded: list[str] = []
@@ -1310,7 +818,6 @@ class TestPruningReachesEveryCollectionThatMakesAnOffsetDecision:
             return data
 
         monkeypatch.setattr(stac_module, "_load_from_stac", fake_load)
-        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
         stac_module.load_stac_items(self._pc_pair(), "planetary-computer", "sentinel-2-l2a", baselines=None)
         assert len(loaded) == 1, f"the pair reached the loader unpruned: {loaded}"
 
@@ -1326,7 +833,6 @@ class TestPruningReachesEveryCollectionThatMakesAnOffsetDecision:
             return data
 
         monkeypatch.setattr(stac_module, "_load_from_stac", fake_load)
-        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
         stac_module.ingest_tile(
             provider="planetary-computer",
             collection="sentinel-2-l2a",
@@ -1361,40 +867,6 @@ class TestPruningReachesEveryCollectionThatMakesAnOffsetDecision:
             assert config.requires_baseline_correction is False, f"{provider}/{collection}"
 
 
-class TestTheSignedModeDtypeDoesNotDependOnTheWindow:
-    """The reported P2. The corrector is skipped when no date is owed a correction — but the signed
-    mode's contract IS the dtype, so skipping it made two otherwise equivalent loads come back as
-    `uint16` and `int16` depending on whether the window happened to contain an owed date.
-    """
-
-    @staticmethod
-    def _run(monkeypatch, baseline: str, *, clamp: bool) -> object:
-        data = xr.Dataset(
-            {"blue": (("time", "y", "x"), np.full((1, 2, 2), 3000, dtype=np.uint16))},
-            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
-        )
-        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
-        out = stac_module.load_stac_items(
-            [_Item(_RAW_ESA, baseline)],
-            "earth-search",
-            "sentinel-2-l2a",
-            baselines=None,
-            clamp_negatives=clamp,
-        )
-        return out["blue"].dtype
-
-    def test_signed_mode_is_int16_whether_or_not_a_date_is_owed(self, monkeypatch) -> None:
-        assert self._run(monkeypatch, "05.00", clamp=False) == np.int16, "an owed date"
-        assert self._run(monkeypatch, "03.00", clamp=False) == np.int16, "a pre-threshold date"
-
-    def test_the_default_mode_still_returns_the_input_dtype_either_way(self, monkeypatch) -> None:
-        """The complement, and the reason the skip exists at all: this mode's dtype is the
-        input's, so skipping the corrector cannot change it.
-        """
-        assert self._run(monkeypatch, "05.00", clamp=True) == np.uint16
-        assert self._run(monkeypatch, "03.00", clamp=True) == np.uint16
-
-
 class TestProvenanceKeepsTheDatesSelectionDidNotTouch:
     """`query_stac_items` returns entries for every queried date, including ones whose items were
     filtered out as already present. Replacing the map dropped those. Raised on PR #107.
@@ -1415,7 +887,6 @@ class TestProvenanceKeepsTheDatesSelectionDidNotTouch:
             coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
         )
         monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
-        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
         # An existing date whose items were filtered out keeps its provenance entry.
         monkeypatch.setattr(
             stac_module,
@@ -1455,41 +926,13 @@ class TestAnUnlistedBucketIsUndeterminedNotRaw:
     def test_an_unlisted_bucket_refuses_rather_than_double_correcting(self) -> None:
         item = _Item(None, "05.00")
         item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
-        with pytest.raises(HeterogeneousProducerError, match="cannot be determined"):
-            dates_exempt_from_correction([item])
+        assert _decisions(item) == {OffsetDecision.UNDECIDABLE}
 
     def test_a_pre_threshold_unlisted_bucket_is_exempt(self) -> None:
         """Gated on the date being owed a correction, like every other refusal."""
         item = _Item(None, "03.00")
         item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
-        assert dates_exempt_from_correction([item]) == {"2022-01-07"}
-
-
-class TestTheCorrectionDoesNotCorruptTheBrightestCodes:
-    """Clamping before subtraction cost the top `abs(offset)` input codes their range: 65535 was
-    clipped to 64535 and then reduced to 63535 rather than 64535. Raised on PR #107.
-    """
-
-    @staticmethod
-    def _corrected(values: np.ndarray) -> np.ndarray:
-        ds = xr.Dataset(
-            {"blue": (("time", "y", "x"), values)},
-            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0], "x": list(range(values.shape[2]))},
-        )
-        out = stac_module._apply_baseline_corrections_by_date(ds, baselines={"2022-01-07": 500}, bands=["blue"])
-        return out["blue"].values
-
-    def test_the_top_codes_lose_exactly_the_offset(self) -> None:
-        got = self._corrected(np.array([[[65535, 65000, 64535, 30000]]], dtype=np.uint16))
-        np.testing.assert_array_equal(got, np.array([[[64535, 64000, 63535, 29000]]], dtype=np.uint16))
-
-    def test_nothing_wraps_or_saturates(self) -> None:
-        values = np.array([[[65535, 60000, 1000, 999, 0]]], dtype=np.uint16)
-        got = self._corrected(values)
-        assert got.dtype == np.uint16
-        assert got.min() >= 0
-        # Every valid DN loses exactly the offset and floors at 1; nodata 0 stays 0.
-        np.testing.assert_array_equal(got, np.array([[[64535, 59000, 1, 1, 0]]], dtype=np.uint16))
+        assert _is_exempt(item)
 
 
 class TestRawRequiresEveryBandFromAKnownProducer:
@@ -1519,8 +962,9 @@ class TestRawRequiresEveryBandFromAKnownProducer:
         item = _Item(None, "05.00")
         item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
         item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
-        with pytest.raises(HeterogeneousProducerError):
-            dates_exempt_from_correction([item])
+        # The unlisted bands are undecidable; the one raw band is simply owed the offset. Per
+        # source, those coexist — where one date-wide answer had to cover both and could not.
+        assert _decisions(item) == {OffsetDecision.UNDECIDABLE, OffsetDecision.OWED}
 
 
 class TestMixedNeedsBothKnownProducers:
@@ -1542,60 +986,26 @@ class TestMixedNeedsBothKnownProducers:
     def test_harmonised_plus_unlisted_is_undetermined(self) -> None:
         assert item_harmonisation(self._harmonised_plus_unlisted()) is Harmonisation.UNKNOWN
 
-    def test_it_gets_the_message_that_names_the_bucket(self) -> None:
-        """The point of the change: the diagnostic an operator can act on."""
-        with pytest.raises(HeterogeneousProducerError, match=r"not\s+classified as harmonised") as exc:
-            dates_exempt_from_correction([self._harmonised_plus_unlisted()])
-        assert "some-new-mirror" in str(exc.value)
-        assert "separately" not in str(exc.value), "the wrong remedy must not be offered"
+    def test_the_unlisted_band_is_the_only_one_that_refuses(self) -> None:
+        """The remedy is to classify the bucket, and only that band is affected.
+
+        This used to assert the wording of a date-wide refusal. The refusal is per source now, so
+        what there is to assert is that the harmonised bands are unaffected by their neighbour —
+        which is the substance of the same point: nothing here needs the producers loaded
+        separately, it needs one bucket classified.
+        """
+        item = self._harmonised_plus_unlisted()
+        assert _decisions(item, ("red",)) == {OffsetDecision.UNDECIDABLE}
+        assert _decisions(item, ("blue", "green")) == {OffsetDecision.EXEMPT}
 
     def test_straddling_two_known_producers_is_still_mixed(self) -> None:
         """The complement, or this would pass with MIXED deleted."""
         item = _Item(_HARMONISED, "05.00")
         item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
         assert item_harmonisation(item) is Harmonisation.MIXED
-        with pytest.raises(HeterogeneousProducerError, match="separately"):
-            dates_exempt_from_correction([item])
-
-
-class TestTheRefusalNamesTheCatalogueFailureItActuallyFound:
-    """UNKNOWN has two causes needing different fixes, so the message must say which.
-
-    It read as "expose none of the reflectance bands ... resolve the naming", which is only true
-    for the incomplete case; an operator following it for a complete-but-unlisted bucket cannot fix
-    the refusal that way. Raised on PR #107.
-    """
-
-    @staticmethod
-    def _unlisted() -> _Item:
-        item = _Item(None, "05.00")
-        item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
-        return item
-
-    @staticmethod
-    def _partial() -> _Item:
-        item = _Item(_HARMONISED, "05.00")
-        for key in REFLECTANCE_ASSET_KEYS[1:]:
-            del item.assets[key]
-        return item
-
-    def test_an_unlisted_bucket_is_named_and_the_fix_is_classification(self) -> None:
-        with pytest.raises(HeterogeneousProducerError, match=r"not\s+classified as harmonised") as exc:
-            dates_exempt_from_correction([self._unlisted()])
-        assert "some-new-mirror" in str(exc.value), "the operator needs the bucket name"
-        assert "native asset keys" not in str(exc.value), "the wrong remedy must not be offered"
-
-    def test_missing_names_are_named_and_the_fix_is_the_naming(self) -> None:
-        with pytest.raises(HeterogeneousProducerError, match="native asset keys") as exc:
-            dates_exempt_from_correction([self._partial()])
-        assert "not classified" not in str(exc.value)
-
-    def test_a_date_with_both_causes_reports_both(self) -> None:
-        with pytest.raises(HeterogeneousProducerError) as exc:
-            dates_exempt_from_correction([self._unlisted(), self._partial()])
-        message = str(exc.value)
-        assert "native asset keys" in message
-        assert "some-new-mirror" in message
+        # And MIXED no longer refuses anything: each band is decided on its own bucket.
+        assert _decisions(item, ("red",)) == {OffsetDecision.OWED}
+        assert _decisions(item, ("blue",)) == {OffsetDecision.EXEMPT}
 
 
 class TestProvenanceRealignsWheneverSelectionPruned:
@@ -1634,7 +1044,6 @@ class TestProvenanceRealignsWheneverSelectionPruned:
             coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
         )
         monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
-        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
         items = self._pair()
         # What the split workflow hands over: last-wins over the UNPRUNED list, so the rejected
         # copy's absent baseline reads as 0.
