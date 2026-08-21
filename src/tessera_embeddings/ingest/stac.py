@@ -267,6 +267,20 @@ def extract_baselines(items: list[Any]) -> dict[str, int]:
     return baselines
 
 
+def selection_read_keys(config: CollectionConfig, extra_bands: "list[str] | None" = None) -> tuple[str, ...]:
+    """The asset set duplicate selection may judge readability and locality over.
+
+    Empty where the collection's configured names are not its asset keys: Planetary Computer serves
+    the same bands as ``B02`` and ``SCL`` and relies on the loader's alias table, so looking those
+    names up directly reports every copy incomplete and remote — worse than not asking, because an
+    actually asset-incomplete copy could then win on the terms that remain. An empty set makes both
+    terms tie, so they decide nothing.
+    """
+    if not config.band_names_are_asset_keys:
+        return ()
+    return _requested_assets(config, extra_bands)
+
+
 def collection_harmonisation(config: CollectionConfig) -> Harmonisation | None:
     """The producer state the COLLECTION settles, or ``None`` where it does not settle one.
 
@@ -1247,15 +1261,25 @@ def load_stac_items(
     """
     collection_config = _get_collection_config(provider, collection)
 
-    if collection_config.harmonisation_varies_by_item:
+    # Gated on there BEING an offset decision, not on the producer varying between items. Both are
+    # exposed to the same defect: `odc.stac.load` fuses a solar day, so two reprocessings of one
+    # acquisition are blended into one pixel stack, and where their baselines straddle the
+    # threshold the date is refused outright for an ambiguity that selecting one copy resolves.
+    # Measured on the live Planetary Computer catalogue over six tiles: 1,000 redundant copies of
+    # one observation fused, and 12 solar days that would refuse.
+    #
+    # NOT ungated further, though the same fusion argument reaches any collection with duplicates.
+    # Landsat items key perfectly well here (`grid:code` is `WRS2-190028`), so removing the gate
+    # would start reducing them too — a change nothing in this branch has measured. It is owed
+    # separately rather than taken as a side effect.
+    if collection_config.requires_baseline_correction:
         # Also here, and idempotently. `ingest_tile` prunes before extracting provenance and
         # `s2_roi` prunes before building its fallback ladder, but the documented
-        # `query_stac_items` -> `load_stac_items` workflow passes through neither, so an unpruned
-        # pair of producers for one acquisition would reach the correction decision as a genuine
-        # conflict. Selecting again over an already-selected set is a no-op, and this function
-        # already requires normalised items for that decision, so the precondition is unchanged.
-        read_keys = _requested_assets(collection_config, extra_bands)
-        pruned, alternates = select_preferred_duplicates(items, read_keys)
+        # `query_stac_items` -> `load_stac_items` workflow passes through neither. Selecting again
+        # over an already-selected set is a no-op, and this function already requires normalised
+        # items for the correction decision, so the precondition is unchanged.
+        read_keys = selection_read_keys(collection_config, extra_bands)
+        pruned, alternates = select_preferred_duplicates(items, read_keys, collection_harmonisation(collection_config))
         # Gated on whether SELECTION CHANGED THE ITEMS, not on whether any usable fallback
         # survived. `select_preferred_duplicates` drops rejected copies that would refuse their
         # date, so `alternates` can be empty on a tile-date that was still pruned — and gating on
@@ -1300,9 +1324,15 @@ def load_stac_items(
             for d, b in correction_baselines_by_date(items, threshold, known_kind).items()  # type: ignore[arg-type]
             if d in loaded_dates
         }
-        # Skip the corrector when nothing reaches the threshold: it changes no values there, but
+        # Skipped when nothing reaches the threshold: the corrector changes no values there, but
         # still clips, casts and builds an `xr.where` for every reflectance band.
-        if any(b >= threshold for b in correction_baselines.values()):  # type: ignore[operator]
+        #
+        # Only in the dtype-preserving mode, though. The signed mode's contract IS the dtype, so
+        # skipping it made the result type depend on whether the loaded window happened to contain
+        # an owed date — two otherwise equivalent batches coming back `uint16` and `int16`, which
+        # any concatenation downstream then resolves by casting one of them.
+        owed = any(b >= threshold for b in correction_baselines.values())  # type: ignore[operator]
+        if owed or not clamp_negatives:
             data = _apply_baseline_corrections_by_date(
                 data,
                 correction_baselines,
@@ -1461,7 +1491,9 @@ def ingest_tile(
         return None, baselines
 
     collection_config = _get_collection_config(provider, collection)
-    if collection_config.harmonisation_varies_by_item:
+    # Gated on there BEING an offset decision — see `load_stac_items` for why that is the line and
+    # why it is not removed altogether.
+    if collection_config.requires_baseline_correction:
         # Reduce to one copy per acquisition, HERE and not in `query_stac_items`.
         #
         # `odc.stac.load` fuses a solar day, so an unpruned harmonised COG beside a raw
@@ -1475,9 +1507,9 @@ def ingest_tile(
         # query left that driver with an empty ladder, so a single unreadable object lost the date
         # instead of stepping down to the copy sitting behind it. Selection belongs to the layer
         # that owns the fallback — which here is nobody, so the copies are genuinely spare.
-        read_keys = _requested_assets(collection_config, extra_bands)
+        read_keys = selection_read_keys(collection_config, extra_bands)
         supplied = items
-        items, alternates = select_preferred_duplicates(items, read_keys)
+        items, alternates = select_preferred_duplicates(items, read_keys, collection_harmonisation(collection_config))
         log_duplicate_selection(
             logger,
             f"tile {tile_id}" if tile_id else f"bbox {bbox}",

@@ -485,20 +485,23 @@ shadow — is representable in an unsigned type. DN 0 is the nodata code and is 
 carries no offset. So the correction is `DN - 1000` for every DN from 1 upward, and the two modes
 differ only in what becomes of the values that were negative:
 
-- **Default** (`clamp_negatives=True`) — floors the result at zero and returns the INPUT dtype.
-  This is what the harmonised Element 84 COGs contain: they are unsigned too, so the floor is
-  forced there as well, and matching it is what makes a corrected raw copy comparable with a
-  harmonised one. It is also the only mode that round-trips into the unsigned store this repo
-  writes.
+- **Default** (`clamp_negatives=True`) — floors the result at the lowest VALID code, which is
+  **1**, and returns the INPUT dtype. Not zero: zero is the nodata code, so flooring a real dark
+  observation there makes it indistinguishable from no observation and every downstream mask drops
+  it. Element 84's harmonised COGs floor at 1 for the same reason, and reproducing them exactly is
+  what makes a corrected raw copy comparable with a harmonised one. It is also the only mode that
+  round-trips into the unsigned store this repo writes.
 - **Signed mode** (`clamp_negatives=False`) — keeps the negative values and returns `int16`, for an
   in-memory consumer that wants true reflectance. **Not compatible with the ROI store**, whose
   arrays take their dtype from the first date: a negative value written to an unsigned store reads
   as roughly 65535.
 
 The arithmetic is done in `int32` and the result saturated once at the end, so nothing wraps. The
-default mode needs no bound at all — the offset is negative and the floor is zero, so an unsigned
-input stays representable — while the signed mode needs one because neither `65535 - 1000` nor an
-uncorrected bright pixel on a date that skipped correction fits `int16`. The correction is applied
+default mode needs no upper bound at all — the offset is negative and the floor is positive, so an
+unsigned input stays representable — while the signed mode needs one because neither `65535 - 1000`
+nor an uncorrected bright pixel on a date that skipped correction fits `int16`. The signed mode also
+runs even when no date is owed a correction, because its contract IS the dtype: skipping it there
+would make the result type depend on whether the loaded window happened to contain an owed date. The correction is applied
 only to spectral bands; SCL and other extra bands are passed through unchanged.
 
 #### OPERA RTC-S1 Amplitude-to-dB Conversion

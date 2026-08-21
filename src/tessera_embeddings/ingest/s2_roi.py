@@ -98,12 +98,12 @@ from tessera_embeddings.ingest.solar_days import (
     whole_window_range,
 )
 from tessera_embeddings.ingest.stac import (
-    _requested_assets,
     collection_harmonisation,
     extract_baselines,
     group_items_by_date,
     load_stac_items,
     query_stac_items,
+    selection_read_keys,
     stream_stac_months,
 )
 from tessera_embeddings.storage.manifest import IngestManifest
@@ -143,16 +143,10 @@ def _known_harmonisation(provider: str, collection: str) -> Harmonisation | None
 def _read_asset_keys(provider: str, collection: str) -> tuple[str, ...]:
     """The assets this driver's loads request, for duplicate selection to judge readability over.
 
-    Empty where the collection's configured names are not its asset keys — Planetary Computer
-    serves the same bands as `B02`, `SCL` and relies on the loader's alias table. Looking those
-    names up directly reports every copy incomplete and remote, which is worse than not asking:
-    an actually asset-incomplete copy could then win on the terms that remain. An empty set makes
-    both terms tie, so they decide nothing.
+    This driver's extra bands applied to the shared rule — see
+    :func:`~tessera_embeddings.ingest.stac.selection_read_keys` for why the answer can be empty.
     """
-    config = PROVIDERS[provider].collections[collection]
-    if not config.band_names_are_asset_keys:
-        return ()
-    return _requested_assets(config, _LOADED_EXTRA_BANDS)
+    return selection_read_keys(PROVIDERS[provider].collections[collection], _LOADED_EXTRA_BANDS)
 
 
 @final

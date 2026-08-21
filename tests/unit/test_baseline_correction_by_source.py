@@ -1258,6 +1258,143 @@ class TestTheCorrectionDoesNotDependOnTheCallerSupplyingAMap:
         assert self._run_pc(monkeypatch, [self._pc_item("03.00")], None) == []
 
 
+class TestPruningReachesEveryCollectionThatMakesAnOffsetDecision:
+    """The reported P2. Both generic entry points gated pruning on the producer VARYING by item,
+    so a collection-wide raw provider was never pruned — and once its items became keyable, two
+    reprocessings of one acquisition reached the correction decision together.
+
+    Measured on the live Planetary Computer catalogue over six tiles: 1,000 redundant copies of one
+    observation fused, and 12 solar days whose copies straddle the 04.00 threshold and would refuse
+    outright for an ambiguity that selecting one copy resolves.
+    """
+
+    @staticmethod
+    def _pc_pair() -> list[_Item]:
+        """One acquisition, two reprocessings straddling the threshold, natively keyed assets."""
+        copies = []
+        for sequence, baseline in (("1", "04.00"), ("0", "03.00")):
+            item = _Item(None, baseline)
+            item.id = f"S2A_MSIL2A_20220107T100411_R122_T33TWM_2022010{sequence}T060906"
+            item.assets = {k: {"href": f"https://x.blob.core.windows.net/{k}"} for k in ("B02", "SCL")}
+            item.properties.update(
+                {
+                    "s2:mgrs_tile": "33TWM",
+                    "s2:sequence": sequence,
+                    "s2:datatake_id": f"GS2A_20220107T100411_039301_N{baseline}",
+                    "datetime": "2022-01-07T10:04:11.024000Z",
+                }
+            )
+            copies.append(item)
+        return copies
+
+    def test_the_unpruned_pair_really_refuses(self) -> None:
+        """The failure, asserted first so the fix below cannot pass vacuously."""
+        with pytest.raises(HeterogeneousProducerError, match="straddle"):
+            dates_exempt_from_correction(self._pc_pair(), 400, Harmonisation.RAW)
+
+    def test_selecting_one_copy_resolves_it(self) -> None:
+        """And the ambiguity is not real — one copy makes the date processable."""
+        kept, _ = select_preferred_duplicates(self._pc_pair(), (), Harmonisation.RAW)
+        assert len(kept) == 1
+        assert dates_exempt_from_correction(kept, 400, Harmonisation.RAW) == set()
+
+    def test_the_loader_prunes_for_a_collection_wide_raw_provider(self, monkeypatch) -> None:
+        loaded: list[str] = []
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+
+        def fake_load(items, *a, **k):
+            loaded.extend(i.id for i in items)
+            return data
+
+        monkeypatch.setattr(stac_module, "_load_from_stac", fake_load)
+        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
+        stac_module.load_stac_items(self._pc_pair(), "planetary-computer", "sentinel-2-l2a", baselines=None)
+        assert len(loaded) == 1, f"the pair reached the loader unpruned: {loaded}"
+
+    def test_the_generic_entry_point_prunes_too(self, monkeypatch) -> None:
+        loaded: list[str] = []
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+
+        def fake_load(items, *a, **k):
+            loaded.extend(i.id for i in items)
+            return data
+
+        monkeypatch.setattr(stac_module, "_load_from_stac", fake_load)
+        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
+        stac_module.ingest_tile(
+            provider="planetary-computer",
+            collection="sentinel-2-l2a",
+            tile_id="33TWM",
+            start_date="2022-01-01",
+            end_date="2022-01-31",
+            mid_longitude=15.0,
+            item_provider_fn=lambda **_: self._pc_pair(),
+        )
+        assert len(loaded) == 1, f"the pair reached the loader unpruned: {loaded}"
+
+    def test_the_read_set_rule_has_one_definition(self) -> None:
+        """The driver's read set and the generic path's must not be derived twice."""
+        from tessera_embeddings.ingest.s2_roi import _LOADED_EXTRA_BANDS, _read_asset_keys
+
+        for provider in ("earth-search", "planetary-computer"):
+            config = PROVIDERS[provider].collections["sentinel-2-l2a"]
+            assert stac_module.selection_read_keys(config, _LOADED_EXTRA_BANDS) == _read_asset_keys(
+                provider, "sentinel-2-l2a"
+            )
+
+    def test_the_gate_stops_at_collections_owed_no_offset(self) -> None:
+        """The scope of the change, asserted because it was chosen rather than assumed.
+
+        Removing the gate entirely would reach any collection with duplicates — but Landsat items
+        key perfectly well here (`grid:code` is of the form `WRS2-190028`), so it would start
+        reducing those too. That is a change nothing in this branch has measured, so it is owed
+        separately rather than taken as a side effect of this one.
+        """
+        for provider, collection in (("earth-search", "landsat-c2-l2"), ("earth-search", "sentinel-1-grd")):
+            config = PROVIDERS[provider].collections[collection]
+            assert config.requires_baseline_correction is False, f"{provider}/{collection}"
+
+
+class TestTheSignedModeDtypeDoesNotDependOnTheWindow:
+    """The reported P2. The corrector is skipped when no date is owed a correction — but the signed
+    mode's contract IS the dtype, so skipping it made two otherwise equivalent loads come back as
+    `uint16` and `int16` depending on whether the window happened to contain an owed date.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, baseline: str, *, clamp: bool) -> object:
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.full((1, 2, 2), 3000, dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
+        out = stac_module.load_stac_items(
+            [_Item(_RAW_ESA, baseline)],
+            "earth-search",
+            "sentinel-2-l2a",
+            baselines=None,
+            clamp_negatives=clamp,
+        )
+        return out["blue"].dtype
+
+    def test_signed_mode_is_int16_whether_or_not_a_date_is_owed(self, monkeypatch) -> None:
+        assert self._run(monkeypatch, "05.00", clamp=False) == np.int16, "an owed date"
+        assert self._run(monkeypatch, "03.00", clamp=False) == np.int16, "a pre-threshold date"
+
+    def test_the_default_mode_still_returns_the_input_dtype_either_way(self, monkeypatch) -> None:
+        """The complement, and the reason the skip exists at all: this mode's dtype is the
+        input's, so skipping the corrector cannot change it.
+        """
+        assert self._run(monkeypatch, "05.00", clamp=True) == np.uint16
+        assert self._run(monkeypatch, "03.00", clamp=True) == np.uint16
+
+
 class TestProvenanceKeepsTheDatesSelectionDidNotTouch:
     """`query_stac_items` returns entries for every queried date, including ones whose items were
     filtered out as already present. Replacing the map dropped those. Raised on PR #107.
