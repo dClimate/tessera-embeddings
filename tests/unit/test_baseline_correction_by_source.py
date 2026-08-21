@@ -526,12 +526,13 @@ class TestTheGenericEntryPointPrunesAndTheRoiLadderSurvives:
 
 
 class TestEverySentinel2PathHasASelectionOwner:
-    """Three entry points, three reasons to select, and one path that had none.
+    """Two entry points, two reasons to select, and one path that had none.
 
-    `s2_roi` selects to build its fallback ladder, `ingest_tile` selects before extracting
-    provenance — and the documented `query_stac_items` -> `load_stac_items` workflow passed through
-    neither, so an unpruned pair of producers for one acquisition reached the correction decision as
-    a genuine conflict. The loader selects too, idempotently.
+    `s2_roi` selects to build its fallback ladder, and the loader selects because the documented
+    `query_stac_items` -> `load_stac_items` workflow passed through neither — an unpruned pair of
+    producers for one acquisition reached the correction decision as a genuine conflict.
+    `ingest_tile` leaves it to the loader: same gate, same read keys, same collection answer, and
+    the loader realigns provenance in the very dict `ingest_tile` returns.
     """
 
     @staticmethod

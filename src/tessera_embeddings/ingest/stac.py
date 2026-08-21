@@ -1476,39 +1476,11 @@ def ingest_tile(
             logger.info("All dates already exist in store - nothing to load")
         return None, baselines
 
-    collection_config = _get_collection_config(provider, collection)
-    # Gated on there BEING an offset decision — see `load_stac_items` for why that is the line and
-    # why it is not removed altogether.
-    if collection_config.requires_baseline_correction:
-        # Reduce to one copy per acquisition, HERE and not in `query_stac_items`.
-        #
-        # `odc.stac.load` fuses a solar day, so an unpruned harmonised COG beside a raw
-        # reprocessing of one acquisition reaches the producer check as a genuine conflict and
-        # refuses a date that selecting one copy resolves. Refusing what we can decide is the one
-        # outcome those refusals are not for.
-        #
-        # But this belongs to THIS entry point, not to the shared query. `s2_roi` calls
-        # `query_stac_items` and then runs its own selection, KEEPING the rejected copies as the
-        # ladder `step_down_copies` walks when a source object will not read. Pruning in the shared
-        # query left that driver with an empty ladder, so a single unreadable object lost the date
-        # instead of stepping down to the copy sitting behind it. Selection belongs to the layer
-        # that owns the fallback — which here is nobody, so the copies are genuinely spare.
-        read_keys = selection_read_keys(collection_config, extra_bands)
-        supplied = items
-        items, alternates = select_preferred_duplicates(items, read_keys, collection_harmonisation(collection_config))
-        log_duplicate_selection(
-            logger,
-            f"tile {tile_id}" if tile_id else f"bbox {bbox}",
-            alternates,
-            kept=items,
-            read_keys=read_keys,
-            items=supplied,
-        )
-        # Provenance must describe what was KEPT, for the dates selection touched — UPDATED and
-        # not replaced. `query_stac_items` returns entries for every queried date, including ones
-        # whose items were filtered out as already present, and replacing the map dropped those.
-        baselines = {**baselines, **extract_baselines(items)}
-
+    # Duplicates are selected by `load_stac_items`, not here. It prunes on the same gate, with the
+    # same read keys and the same collection answer, and it realigns `baselines` IN PLACE — the
+    # dict this function returns — so the provenance reaches the return value without a second
+    # pass. Selecting here as well changed nothing: selection is deterministic, and
+    # `log_duplicate_selection` returns early when nothing was pruned.
     data = load_stac_items(
         items,
         provider=provider,

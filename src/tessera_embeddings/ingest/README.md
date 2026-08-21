@@ -434,13 +434,14 @@ provenance, and correcting from it left raw post-04.00 pixels uncorrected whenev
 date, carried the zero an unreadable baseline collapses to, or named an arbitrary item's baseline on
 a multi-item date.
 
-Duplicate selection has **three owners, one per entry point**, and none of them is the shared
-query. `query_stac_items` deliberately does not prune: `s2_roi` runs its own selection over that
-output and keeps the rejected copies as the ladder `step_down_copies` walks when a source object
-will not read, so pruning upstream would leave it nothing to step down to. `ingest_tile` prunes
-before `extract_baselines`, because that map becomes the store's `baselines_applied` and must
-describe the copy that was kept. `load_stac_items` prunes as well, for the documented
-`query_stac_items` -> `load_stac_items` workflow that passes through neither of the others.
+Duplicate selection has **two owners**, and neither is the shared query. `query_stac_items`
+deliberately does not prune: `s2_roi` runs its own selection over that output and keeps the
+rejected copies as the ladder `step_down_copies` walks when a source object will not read, so
+pruning upstream would leave it nothing to step down to. `load_stac_items` prunes for everyone
+else — both the documented `query_stac_items` -> `load_stac_items` workflow, which passes through
+neither of the others, and `ingest_tile`, which leaves it to the loader: the loader realigns
+`baselines` in place and that is the same dict `ingest_tile` returns, so the map still describes
+the copy that was kept.
 
 Selecting over an already-selected set is a no-op, which is what makes more than one owner safe.
 
