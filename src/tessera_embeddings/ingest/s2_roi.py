@@ -98,6 +98,7 @@ from tessera_embeddings.ingest.solar_days import (
     whole_window_range,
 )
 from tessera_embeddings.ingest.stac import (
+    HeterogeneousProducerError,
     collection_harmonisation,
     extract_baselines,
     group_items_by_date,
@@ -524,6 +525,41 @@ def ingest_s2_roi_reflectance(
                 resampling="bilinear",
                 groupby="solar_day",
                 geobox=roi.geobox,
+            )
+        except HeterogeneousProducerError as exc:
+            # The day has no correct offset decision, so it is SKIPPED — loudly, and alone.
+            #
+            # Not carried back as a read failure. The duplicate-copy ladder recovers from an
+            # object that will not read, and this is not that: the conflict is between different
+            # TILES of the day, so no other copy of any one tile resolves it. Stepping down would
+            # burn every rung and refuse identically.
+            #
+            # And not raised, which is what it used to do. A refusal is deterministic and belongs
+            # to ONE day, so propagating it failed the whole leg — every retry of the leg then
+            # reached the same day and died the same way, losing a whole zone-year to one day's
+            # metadata. Measured on zone 01N: 26 of 60 days in early 2024 refuse, so propagating
+            # made that cell unfillable rather than merely incomplete.
+            #
+            # The correction stays refused either way: nothing here corrects a day it cannot
+            # decide. This changes only how much is lost when it cannot — one day instead of the
+            # year. The real fix removes the conflict rather than isolating it, by correcting each
+            # item before the mosaic; see
+            # `context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md`.
+            log.warning(
+                "Skipping %s for roi=%s: no single offset decision fits the day. %s",
+                date,
+                roi_label,
+                exc,
+            )
+            return _PreparedDate(
+                date,
+                None,
+                [],
+                time.monotonic() - stage_started,
+                0.0,
+                "producer-conflict",
+                items=day_items,
+                baselines=baselines,
             )
         except ValueError as exc:
             # Earth-search occasionally publishes asset-incomplete items (missing SCL
