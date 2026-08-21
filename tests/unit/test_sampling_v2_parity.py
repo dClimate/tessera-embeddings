@@ -24,12 +24,24 @@ from tests.fixtures.upstream.v2_pad_pattern import pad_pattern
 _CASES = [(n, b) for b in DEFAULT_NUM_OBS_CHECKPOINTS for n in range(1, 2 * b + 1)]
 
 
-@pytest.mark.parametrize(("n", "bucket"), _CASES)
-def test_v2_matches_upstream_for_every_reachable_count(n: int, bucket: int) -> None:
-    """Exhaustive, because the two rules agree on only the exact-fit counts — testing a
-    handful of examples would land on an agreeing pair often enough to look fine.
+def test_v2_matches_upstream_for_every_reachable_count() -> None:
+    """Exhaustive over every (count, bucket) this pipeline can produce.
+
+    Checked in ONE test rather than parametrised into thousands. The coverage is identical —
+    every pair is compared — but a suite total that jumps by 8,451 reports a number nobody can
+    read, and that total is a signal worth keeping legible. The diagnostic parametrising would
+    have given is reproduced by hand: the failure says how many pairs diverged and shows the
+    first few, which is more useful than one arbitrary pair surfacing as its own test id.
     """
-    np.testing.assert_array_equal(build_resample_indices_v2(n, bucket), pad_pattern(n, bucket))
+    mismatches = [
+        (n, bucket, build_resample_indices_v2(n, bucket).tolist(), pad_pattern(n, bucket).tolist())
+        for n, bucket in _CASES
+        if not np.array_equal(build_resample_indices_v2(n, bucket), pad_pattern(n, bucket))
+    ]
+    assert not mismatches, (
+        f"{len(mismatches)} of {len(_CASES)} (count, bucket) pairs diverge from upstream. First: "
+        + "; ".join(f"n={n} B={b}: ours {o} vs upstream {u}" for n, b, o, u in mismatches[:3])
+    )
 
 
 def test_the_two_rules_really_do_disagree() -> None:
