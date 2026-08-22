@@ -183,6 +183,47 @@ that records and announces a refused day is untouched.
 **Correcting and exempting are wrong by the same amount in opposite directions, and both are
 silent**, which is why neither is chosen as a default.
 
+### The branch changes no decision at all, and that is checked rather than argued
+
+The measurement above says the refusal does not fire. A stronger and cheaper statement is available:
+**this branch reaches the same verdict as `main` on every asset of every item.**
+
+Three real zone-months were fetched once and cached — 33N for January 2018, February 2022 and June
+2024, chosen because between them they carry every producer and version combination the catalogue
+actually contains. The same cached items were then classified twice, under `main` and under this
+branch, recording for each the duplicate-selection survivors and, for every reflectance asset, its
+bucket, its declared version and its verdict:
+
+```
+main    lines=172243 sha256=aeaaab45546edf61fd434853f73e1fe26cd3396dde71747e36fbbb4032dec783
+branch  lines=172243 sha256=aeaaab45546edf61fd434853f73e1fe26cd3396dde71747e36fbbb4032dec783
+```
+
+Byte-identical. 171,560 exempt, 680 owed, none refused. So the branch cannot change a pixel, and
+the question of whether it refuses dates the campaign is currently ingesting is answered by
+construction rather than by sampling.
+
+That holds because the one behavioural change — MIXED/UNKNOWN falling to a refusal instead of to
+"correction owed" — is unreachable, which is now pinned by
+`test_no_collection_can_reach_the_mixed_or_unknown_refusal` rather than asserted in prose.
+
+### The owed case, named
+
+The 680 owed assets are **68 real items**, all served from `sentinel-s2-l2a` inside otherwise
+Element 84 items, at versions 04.00 and 05.10:
+
+| item | version |
+|---|---|
+| `S2B_33NVB_20220207_0_L2A`, `S2B_33NVB_20220217_0_L2A`, `S2B_33UVA_20220218_0_L2A` | 04.00 |
+| `S2A_33MUV_20240618_0_L2A` and 60 others on 2024-06-18, plus four scattered June days | 05.10 |
+
+Worth recording because the cassette in `tests/integration/test_baseline_producer_cassette.py`
+proves the owed path by taking a real raw item and *forcing* its version above the threshold, with a
+comment saying that combination "does not exist upstream". **It does.** Re-recording that cassette
+against one of the days above would replace a synthetic mutation with the genuine article. Not a
+merge blocker — the arithmetic under test is identical either way — but it is the one place where a
+fixture is weaker than the catalogue it stands for.
+
 ## 6. Limit 2 stays open, and this is deliberate
 
 The floor is still applied *after* resizing. Six of the ten bands we use are natively
