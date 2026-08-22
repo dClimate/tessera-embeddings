@@ -21,7 +21,7 @@ import dataclasses
 import enum
 import logging
 import urllib.parse
-from typing import Any
+from typing import Any, Literal
 
 from tessera_embeddings.config.providers import S2_L2A_BANDS
 
@@ -219,6 +219,16 @@ class Harmonisation(enum.Enum):
     RAW = "raw"
     MIXED = "mixed"
     UNKNOWN = "unknown"
+
+
+#: A producer that is actually SETTLED — the two states that name one producer.
+#:
+#: ``MIXED`` and ``UNKNOWN`` are deliberately excluded, and this type is why
+#: :func:`~tessera_embeddings.ingest.boa_offset.source_decision` has no case for them: a correction
+#: cannot be decided from an answer that names no producer, so rather than detect that at runtime
+#: and refuse, the value cannot be handed over in the first place. Ranking a duplicate copy is a
+#: different question with a use for all four states, and takes the full enum.
+SettledProducer = Literal[Harmonisation.HARMONISED, Harmonisation.RAW]
 
 
 def item_harmonisation(

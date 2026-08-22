@@ -31,6 +31,7 @@ from tessera_embeddings.ingest.asset_locations import (
     HARMONISED_ASSET_BUCKETS,
     UNHARMONISED_ASSET_BUCKETS,
     Harmonisation,
+    SettledProducer,
 )
 
 
@@ -55,7 +56,7 @@ def source_decision(
     bucket: str | None,
     baseline: int | None,
     threshold: int,
-    known_harmonisation: Harmonisation | None = None,
+    known_harmonisation: SettledProducer | None = None,
 ) -> OffsetDecision:
     """What is owed to the source served from ``bucket`` by an item declaring ``baseline``.
 
@@ -77,9 +78,10 @@ def source_decision(
             settles it and the assets have nothing to add. Planetary Computer serves the whole
             archive unharmonised and keys its assets natively, so ``bucket`` there describes a
             location nobody has classified and must not be consulted — see
-            :func:`~tessera_embeddings.ingest.stac.collection_harmonisation`. A value naming no
-            single producer, ``MIXED`` or ``UNKNOWN``, settles nothing and leaves the source
-            undecidable.
+            :func:`~tessera_embeddings.ingest.stac.collection_harmonisation`. Typed
+            :data:`~tessera_embeddings.ingest.asset_locations.SettledProducer`, so ``MIXED`` and
+            ``UNKNOWN`` cannot be passed: an answer naming no producer cannot decide a correction,
+            and making it unrepresentable is cheaper than detecting it.
 
     Returns:
         The decision for this one source.
@@ -125,10 +127,7 @@ def source_decision(
     if baseline is None:
         return OffsetDecision.UNDECIDABLE
 
-    if producer is Harmonisation.RAW:
-        return OffsetDecision.OWED
-
-    # MIXED and UNKNOWN name no single producer for this source, so neither is evidence that the
-    # offset is present. Refusing rather than falling through to OWED is what keeps the never-guess
-    # rule whole: correcting on an unresolved answer is wrong by exactly the offset, and silent.
-    return OffsetDecision.UNDECIDABLE
+    # Unharmonised and at or above the threshold: the offset is there and comes off. Nothing else
+    # can reach this line — a harmonised producer returned above, an unclassified one refused, and
+    # `SettledProducer` is what stops an answer naming no producer from arriving at all.
+    return OffsetDecision.OWED

@@ -29,7 +29,7 @@ from rasterio.transform import from_origin
 
 from tessera_embeddings.config.providers import PROVIDERS, CollectionConfig
 from tessera_embeddings.config.satellites import S2_BASELINE_OFFSET, S2_BASELINE_THRESHOLD, S2_L2A_BANDS
-from tessera_embeddings.ingest.asset_locations import Harmonisation
+from tessera_embeddings.ingest.asset_locations import Harmonisation, SettledProducer
 from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.stac import (
     BoaOffsetParser,
@@ -105,24 +105,24 @@ class TestSourceDecision:
     def test_a_collection_known_harmonised_owes_nothing_anywhere(self) -> None:
         assert source_decision(_RAW_BUCKET, 510, _T, Harmonisation.HARMONISED) is OffsetDecision.EXEMPT
 
-    def test_a_collection_answer_naming_no_single_producer_refuses(self) -> None:
-        """MIXED and UNKNOWN settle nothing, so a source that needs an answer must not get a guess.
+    def test_an_answer_naming_no_producer_cannot_be_passed_at_all(self) -> None:
+        """MIXED and UNKNOWN used to reach here and be refused. Now they cannot arrive.
 
-        Correcting on an unresolved producer is wrong by exactly the offset and silent, which is
-        the one outcome this function exists to prevent. The bucket cannot rescue it either: a
-        collection answer replaces the asset's evidence rather than supplementing it, so neither a
-        harmonised nor a raw bucket changes the result.
+        ``known_harmonisation`` is typed :data:`SettledProducer`, which is the two states that name
+        a producer — so an answer that names none is rejected by the type checker at the call site
+        rather than detected here and turned into a refusal. That is why this function has no case
+        for them: correcting on an unresolved producer is wrong by exactly the offset and silent,
+        and the cheapest way to prevent it is to make it unsayable.
+
+        Asserted on the TYPE rather than on behaviour, because there is no behaviour left to
+        assert. This fails if someone widens the parameter back.
         """
-        for unsettled in (Harmonisation.MIXED, Harmonisation.UNKNOWN):
-            assert source_decision(_RAW_BUCKET, 510, _T, unsettled) is OffsetDecision.UNDECIDABLE, unsettled
-            assert source_decision(_HARMONISED_BUCKET, 510, _T, unsettled) is OffsetDecision.UNDECIDABLE, unsettled
-            assert source_decision(_UNLISTED_BUCKET, _T, _T, unsettled) is OffsetDecision.UNDECIDABLE, unsettled
-            assert source_decision(_RAW_BUCKET, None, _T, unsettled) is OffsetDecision.UNDECIDABLE, unsettled
+        import typing
 
-    def test_an_unsettled_producer_below_the_threshold_still_costs_nothing(self) -> None:
-        """No producer changes a pixel there, so there is no ambiguity worth refusing over."""
-        for unsettled in (Harmonisation.MIXED, Harmonisation.UNKNOWN):
-            assert source_decision(_RAW_BUCKET, 206, _T, unsettled) is OffsetDecision.EXEMPT, unsettled
+        settled = typing.get_args(SettledProducer)
+        assert set(settled) == {Harmonisation.HARMONISED, Harmonisation.RAW}
+        assert Harmonisation.MIXED not in settled
+        assert Harmonisation.UNKNOWN not in settled
 
 
 class TestNothingCanSupplyAnUnsettledProducer:

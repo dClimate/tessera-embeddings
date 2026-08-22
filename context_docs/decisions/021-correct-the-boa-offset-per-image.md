@@ -127,13 +127,15 @@ exclusion was costing.
 
 ## 5. What still refuses, and it is not a day
 
-Three situations remain where no answer can be justified, and all are properties of a **single
+Two situations remain where no answer can be justified, and both are properties of a **single
 file** rather than of a day:
 
 - its file lives somewhere nobody has classified as either corrected or uncorrected, and it is at
   version 04.00 or later;
-- it is uncorrected and declares no readable processing version;
-- the collection's own configuration names no single producer for it (`MIXED` or `UNKNOWN`).
+- it is uncorrected and declares no readable processing version.
+
+A third was proposed and withdrawn: a collection answer naming no single producer. It could not
+fire, so instead of refusing at runtime the value is now unrepresentable — see below.
 
 **Measured on the live catalogue, 2026-08-22: none of them fires.** Seven real zone-months, chosen
 to span the campaign's years and four continents — 33N for June 2017, January 2018, February 2022
@@ -153,7 +155,6 @@ verdict asserted to agree:
 | 51 | 0.015% | EXEMPT — version below the threshold |
 | 0 | — | UNDECIDABLE — unrecognised bucket |
 | 0 | — | UNDECIDABLE — unreadable processing version |
-| 0 | — | UNDECIDABLE — collection answer of MIXED/UNKNOWN |
 
 So the useful claims are the narrow ones, not "no asset was undecidable":
 
@@ -170,15 +171,8 @@ the below-threshold arm barely runs at all (51 assets): the harmonised-bucket ar
 version is consulted, so choosing pre-04.00 months does NOT exercise it the way one might expect.
 Only an ESA href in a pre-04.00 month reaches it.
 
-The third situation is **unreachable from any caller today**, and that is structural rather than
-lucky. `source_decision` is asked only by the loader's parser, which passes
-`collection_harmonisation(config)`, and that returns `RAW` or nothing — never `MIXED`, never
-`UNKNOWN`. Those two values are produced by `item_harmonisation`, which feeds duplicate *ranking*
-and never the correction. Closing the enum is defensive: it stops a future caller falling through
-to "correction owed" on an answer nobody resolved.
-
-All three still refuse their day rather than guessing, which is unchanged behaviour — the machinery
-that records and announces a refused day is untouched.
+Both still refuse their day rather than guessing, which is unchanged behaviour — the machinery that
+records and announces a refused day is untouched.
 
 **Correcting and exempting are wrong by the same amount in opposite directions, and both are
 silent**, which is why neither is chosen as a default.
@@ -203,9 +197,13 @@ Byte-identical. 171,560 exempt, 680 owed, none refused. So the branch cannot cha
 the question of whether it refuses dates the campaign is currently ingesting is answered by
 construction rather than by sampling.
 
-That holds because the one behavioural change — MIXED/UNKNOWN falling to a refusal instead of to
-"correction owed" — is unreachable, which is now pinned by
-`test_no_collection_can_reach_the_mixed_or_unknown_refusal` rather than asserted in prose.
+That holds because there is no behavioural change left to reach. An earlier revision of this branch
+added a third refusal for a collection answer naming no single producer, and it could not fire — the
+only caller passes `collection_harmonisation`, which returns `RAW` or nothing. Rather than keep an
+unreachable case and a test asserting it stays unreachable, **the value is now unrepresentable**:
+`known_harmonisation` is typed `SettledProducer`, the two states that name a producer, so `MIXED`
+and `UNKNOWN` are rejected at the call site by the type checker. The case, and the test guarding it,
+are both gone.
 
 ### The owed case, named
 

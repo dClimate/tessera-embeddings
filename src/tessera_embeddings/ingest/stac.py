@@ -37,6 +37,7 @@ from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.asset_locations import (
     Harmonisation,
+    SettledProducer,
     asset_bucket,
     asset_href,
 )
@@ -419,7 +420,7 @@ def selection_read_keys(config: CollectionConfig, extra_bands: "list[str] | None
     return _requested_assets(config, extra_bands)
 
 
-def collection_harmonisation(config: CollectionConfig) -> Harmonisation | None:
+def collection_harmonisation(config: CollectionConfig) -> SettledProducer | None:
     """The producer state the COLLECTION settles, or ``None`` where it does not settle one.
 
     ``None`` for two different reasons that need the same handling. A collection whose
@@ -762,7 +763,7 @@ class BoaOffsetParser(StacMDParser):
         reflectance_assets: frozenset[str],
         threshold: int,
         offset: int,
-        known_harmonisation: Harmonisation | None,
+        known_harmonisation: SettledProducer | None,
     ) -> None:
         """Build a parser that decides the offset for ``reflectance_assets``.
 

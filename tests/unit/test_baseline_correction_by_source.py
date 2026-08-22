@@ -42,7 +42,6 @@ from tessera_embeddings.ingest.duplicates import select_preferred_duplicates
 from tessera_embeddings.ingest.stac import (
     _declared_baseline,
     _extract_baseline,
-    collection_harmonisation,
     extract_baselines,
 )
 
@@ -674,28 +673,6 @@ class TestTheThemesThatGeneratedTheReviewStayClosed:
     load-bearing but incidental. These assert the invariants that keep each shape closed, so an
     unreported instance fails here rather than in a later review.
     """
-
-    def test_no_collection_can_reach_the_mixed_or_unknown_refusal(self) -> None:
-        """The MIXED/UNKNOWN arm of `source_decision` is UNREACHABLE, and this is what says so.
-
-        That arm refuses a source whose producer the COLLECTION could not settle. It cannot fire
-        today: the only production caller passes `collection_harmonisation(config)`, and that
-        returns `Harmonisation.RAW` or `None` by construction. `MIXED` and `UNKNOWN` come from
-        `item_harmonisation`, which feeds duplicate RANKING and never the correction.
-
-        Pinned rather than deleted. Removing the arm would send an unresolved answer to OWED — a
-        silent 1000 DN error — the first time a caller supplies one. Asserting it is unreachable
-        is what lets the arm stay without being an untested branch: it is closed by the type of
-        its only input, and this fails the moment that stops being true.
-        """
-        reachable = {
-            collection_harmonisation(cfg) for provider in PROVIDERS.values() for cfg in provider.collections.values()
-        }
-        assert reachable <= {Harmonisation.RAW, None}, (
-            f"a collection now reports {reachable - {Harmonisation.RAW, None}} to `source_decision`, "
-            "which makes its MIXED/UNKNOWN refusal live. It has never run: decide deliberately "
-            "whether refusing is right for that collection before this ships."
-        )
 
     def test_there_is_one_definition_of_what_a_load_reads(self) -> None:
         """The driver and the generic path must not define their read set twice."""
