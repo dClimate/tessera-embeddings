@@ -373,7 +373,8 @@ def extract_baselines(items: list[Any]) -> dict[str, int]:
     loads: the correction is decided per source, so a day holding 00.01 and 05.00 imagery needs no
     single answer for its pixels. This map still holds one integer per date, and it is the last
     item's — the CLEAREST tile on both ingest paths, because the query sorts a date's items
-    cloud-descending. The day's other vintages are recorded nowhere.
+    cloud-descending. That is the last item, not necessarily the one that supplied the pixels; see
+    the sort in :func:`query_stac_items`. The day's other vintages are recorded nowhere.
 
     Documented rather than widened because nothing reads this. It is written to the store's root
     attrs and merged forward on append; no code here consumes a value, and no correction, mask or
@@ -1061,8 +1062,9 @@ class _WindowWalk:
     tree explicit is what lets the fetching run concurrently while the output stays in the
     order the serial walk produced — and the order is load-bearing, because
     :func:`query_stac_items` sorts the result on keys items can TIE on, Python's sort is
-    stable, and the surviving input order therefore decides which scene the loader paints
-    last for a pixel. The item list is inside the mosaic fingerprint as well.
+    stable, and the surviving input order therefore decides which scene supplies a pixel:
+    odc-loader's fuser fills only where the destination is still nodata, so the FIRST valid
+    source of a group wins. The item list is inside the mosaic fingerprint as well.
 
     Attributes:
         bbox: Spatial term this window is asked with — one antimeridian half, the whole
@@ -1585,13 +1587,12 @@ def query_stac_items(
             logger.info("No items remaining after item_filter_fn")
             return [], {}
 
-    # THE single solar-offset application for this path. Everything below — the
-    # painter's-algorithm sort, the baseline map, the existing-date dedup, and every
-    # consumer of the returned items — then reads the solar day straight off
-    # `item.datetime` with no offset of its own. Before this, the sort and the baseline
-    # map keyed on the UTC date while the loader grouped by solar day, so on a day
-    # straddling UTC midnight the group was not actually sorted clearest-last and half
-    # its baseline entries never matched.
+    # THE single solar-offset application for this path. Everything below — the cloud sort,
+    # the baseline map, the existing-date dedup, and every consumer of the returned items —
+    # then reads the solar day straight off `item.datetime` with no offset of its own. Before
+    # this, the sort and the baseline map keyed on the UTC date while the loader grouped by
+    # solar day, so on a day straddling UTC midnight the group was not sorted as intended and
+    # half its baseline entries never matched.
     # Same rule as the date probe above, and it matters more here: this is THE single
     # solar-offset application for the path, so a UTC-day stamp taken by default would be
     # read as the solar day by the sort, the baseline map, the dedup and every consumer.
@@ -1600,13 +1601,21 @@ def query_stac_items(
     # Sort by (solar date, cloud_cover DESCENDING) so same-day tiles are adjacent and the
     # CLEAREST tile comes LAST.
     #
-    # Last, not first, because `load_kwargs` below sets `preserve_original_order=True` with
-    # `groupby="solar_day"`, and odc.stac's painter keeps the last item written for a pixel. Sorting
-    # clearest-first therefore let the CLOUDIEST scene win wherever two scenes of one solar day
-    # overlap — the opposite of the intent, and silent, because the output has the right shape and
-    # the right dates. The campaign's own S2 path in `s2_roi` already reverses the order for
-    # exactly this reason and says so; the two orderings disagreed, and this generic API was the
-    # one that was wrong.
+    # **The stated intent of that ordering is not what the loader does, and this is a live
+    # defect rather than a comment to tidy.** It was written believing odc mosaics by a
+    # painter's algorithm, so that the last item of a group overwrites the ones before it. It
+    # does not. `odc.loader`'s default fuser is `nodata_fuser`, which is
+    # `np.copyto(dst, src, where=dst_is_nodata)` — it fills only pixels the destination still
+    # holds as nodata, and no custom `fuser_fqn` is configured anywhere in this package. So the
+    # FIRST valid source of a group wins and later ones can only fill its gaps, which means this
+    # ordering hands an overlap to the CLOUDIEST scene of the solar day. Verified against the
+    # installed odc-loader 0.6.4 by fusing two full-coverage sources in both orders.
+    #
+    # NOT reversed here. The overlap between two same-day scenes is real ground, so changing
+    # which one supplies it changes published pixels — and the campaign is mid-flight, where a
+    # pixel change splits the imagery across cells written before and after. Owed as its own
+    # change, measured and landed between campaigns; see `ingest/README.md`, "Cloud cover is
+    # intentionally not used as a filter".
     #
     # Keyed on the SOLAR day, matching `normalize_to_solar_day` just above and the loader's own
     # grouping. Keying on the UTC date instead splits a group the loader treats as one, in the
@@ -1615,7 +1624,7 @@ def query_stac_items(
     # `sentinel-2-l2a` alone. Every other collection keeps the assembly order, and that order
     # follows the window tree rather than a single catalogue walk — parent prefix first, then
     # children oldest-first, against the catalogue's newest-first. So for a non-SCL collection
-    # the painted result would depend on how the query was partitioned. Not reachable today:
+    # the fused result would depend on how the query was partitioned. Not reachable today:
     # the only paged caller is `s2_roi`, which asks for `sentinel-2-l2a`, and the radar path
     # returns its items from a provider function before any window exists. Left alone because
     # imposing an order on Landsat, which currently has none, is a change to that collection's
@@ -1626,7 +1635,7 @@ def query_stac_items(
         # walk happened to produce. That order depends on how the query was partitioned: a
         # solar day near the antimeridian can straddle an interior window seam, so the two
         # halves arrive in a different order than an unsplit walk would give them. Since the
-        # loader paints the LAST item of a group over the others, an untied sort would let
+        # loader takes the FIRST valid source of a group, an untied sort would let
         # crossing an item ceiling, or hitting a refusal, change output pixels for the same
         # requested range. A third key removes the tie, so the sequence is a function of the
         # items alone.
@@ -1729,9 +1738,12 @@ def load_stac_items(
         # date, so `alternates` can be empty on a tile-date that was still pruned — and gating on
         # it left the caller's map describing a copy that is not being loaded.
         if len(pruned) != len(items):
-            log_duplicate_selection(
-                logger, f"load {collection}", alternates, kept=pruned, read_keys=read_keys, items=items
-            )
+            # Labelled with the AREA, not just the collection. This log is the only record of
+            # which copy supplied a pixel, and a fleet runs sixty cells of one collection at
+            # once — `load sentinel-2-l2a` on every one of them names none of them. The bbox is
+            # what this function has of the caller's identity, and it is per cell.
+            where = f"bbox {bbox}" if bbox is not None else f"load {collection}"
+            log_duplicate_selection(logger, where, alternates, kept=pruned, read_keys=read_keys, items=items)
             # Realign the caller's provenance with what is about to be loaded. `baselines` becomes
             # the store's `baselines_applied`, and on the split workflow it was built by
             # `query_stac_items` from the UNPRUNED list — so a rejected copy that sorted last could
@@ -1842,8 +1854,9 @@ def group_items_by_date(items: list[Any]) -> dict[str, list[Any]]:
     that names the cause.
 
     Within-group order is the caller's. ``query_stac_items`` sorts a date CLOUD-DESCENDING, so the
-    cloudiest tile comes first and the clearest last — which is what the loader's painter needs,
-    since it keeps the LAST item written for a pixel.
+    cloudiest tile comes first — and the loader's fuser fills only where the destination is still
+    nodata, so that first tile is the one that supplies an overlap. See the sort's own comment:
+    the ordering was written for a painter's algorithm the loader does not implement.
 
     Returns:
         Dict mapping ``YYYY-MM-DD`` to lists of items, preserving insertion order and

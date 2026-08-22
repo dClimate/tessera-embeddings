@@ -14,8 +14,8 @@ The algorithm is unchanged from the reference:
    materialised.
 2. Query STAC for the full date range; reduce duplicate items to one copy per
    tile-date (newest reprocessing preferred — see ``ingest.duplicates``), then
-   sort cloudiest-first so the painter's-algorithm mosaic picks the clearest
-   tile last.
+   sort cloudiest-first (see the sort itself: that ordering does not do what
+   it was written to do, and is left alone deliberately).
 3. Group items by ``solar_day``.
 4. For each day:
 
@@ -523,7 +523,7 @@ def ingest_s2_roi_reflectance(
         #
         # Deliberately NOT taken from the loaded dataset's own time coordinate. odc stamps
         # each group with `group[0].nominal_datetime`, and `preserve_original_order=True`
-        # (needed so the clearest tile paints last) makes group[0] the CLOUDIEST item, whose
+        # with a cloud-descending sort makes group[0] the CLOUDIEST item, whose
         # acquisition time is arbitrary within the day. Where the solar offset is large
         # enough to cross UTC midnight, that timestamp's calendar date can be the day
         # BEFORE the solar day — so two consecutive solar days can normalise onto the same
@@ -1074,11 +1074,16 @@ def ingest_s2_roi_reflectance(
                 return
             total_processed += len(batch)
 
-        # Cloudiest-first, so the clearest tile paints LAST and wins in solar_day's
-        # painter's algorithm. `query_stac_items` applies the same key — cloud cover
-        # DESCENDING — and applying it again here covers a supply that did not come through
-        # it, since both suppliers are injectable.
-        # group_items_by_date preserves this within-group order.
+        # Cloudiest-first. `query_stac_items` applies the same key — cloud cover DESCENDING —
+        # and applying it again here covers a supply that did not come through it, since both
+        # suppliers are injectable. `group_items_by_date` preserves this within-group order.
+        #
+        # The ordering was written believing solar_day mosaics by a painter's algorithm, with
+        # the last item of a group overwriting the ones before it. It does not: odc's default
+        # fuser fills only where the destination is still nodata, so the FIRST valid source
+        # wins and this hands an overlap to the CLOUDIEST scene. Left alone here for the same
+        # reason as in `query_stac_items` — reversing it changes published pixels, which is not
+        # something to do mid-campaign. See that sort's comment for the evidence.
         #
         # Both the sort and the grouping key off the SOLAR day, not the UTC date, because
         # that is what the loader groups by. Using UTC here let a group the loader saw as

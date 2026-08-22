@@ -127,18 +127,44 @@ exclusion was costing.
 
 ## 5. What still refuses, and it is not a day
 
-Two situations remain where no answer can be justified, and both are properties of a **single
+Three situations remain where no answer can be justified, and all are properties of a **single
 file** rather than of a day:
 
 - its file lives somewhere nobody has classified as either corrected or uncorrected, and it is at
   version 04.00 or later;
-- it is uncorrected and declares no readable processing version.
+- it is uncorrected and declares no readable processing version;
+- the collection's own configuration names no single producer for it (`MIXED` or `UNKNOWN`).
 
-Neither has been observed in the archive: a survey of 220 real files found every version readable,
-and an unclassified location only appears if someone stands up a new mirror. Both still refuse
-their day rather than guessing, which is unchanged behaviour — the machinery that records and
-announces a refused day is untouched. What changed is that the *situations* that reach it are now
-ones no rearrangement of the load can fix.
+**Measured on the live catalogue, 2026-08-22: none of them fires.** Seven real zone-months, chosen
+to span the campaign's years and four continents — 33N for June 2017, January 2018, February 2022
+and June 2024; 15S and 45N for June 2024; 10N for June 2025 — queried through the production path
+and put through the production duplicate selection, then every reflectance asset of every surviving
+item classified by the same call the loader makes:
+
+| | |
+|---|---|
+| items returned | 36,183 |
+| items after duplicate selection | 34,307 |
+| reflectance assets classified | 343,070 |
+| assets whose bucket was unclassified | **0** |
+| items declaring no readable processing version | **0** |
+| assets refused | **0** |
+| items refused | **0** |
+
+Every href resolved to `sentinel-cogs` or `sentinel-s2-l2a`, and the mixed case is genuinely
+exercised rather than absent: 741 assets across four of the seven months are served from ESA's
+bucket inside an otherwise-Element-84 item, and each is decided from its own location — exempt
+below version 04.00, owed at or above it.
+
+The third situation is **unreachable from any caller today**, and that is structural rather than
+lucky. `source_decision` is asked only by the loader's parser, which passes
+`collection_harmonisation(config)`, and that returns `RAW` or nothing — never `MIXED`, never
+`UNKNOWN`. Those two values are produced by `item_harmonisation`, which feeds duplicate *ranking*
+and never the correction. Closing the enum is defensive: it stops a future caller falling through
+to "correction owed" on an answer nobody resolved.
+
+All three still refuse their day rather than guessing, which is unchanged behaviour — the machinery
+that records and announces a refused day is untouched.
 
 **Correcting and exempting are wrong by the same amount in opposite directions, and both are
 silent**, which is why neither is chosen as a default.
