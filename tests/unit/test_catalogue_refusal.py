@@ -15,6 +15,7 @@ sides are disjoint by construction can only ever pass.
 from __future__ import annotations
 
 import logging
+import pickle
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -230,6 +231,18 @@ class TestSignature:
         assert recovered is not None
         assert recovered.kind is RefusalKind.UPSTREAM_ERROR
         assert recovered.token == _token(error)
+
+    def test_the_token_survives_a_boundary_that_carries_pickled_objects(self) -> None:
+        """The querying leg runs on a Dask worker, which returns the exception itself.
+
+        An exception pickle cannot rebuild is replaced in transit by the TypeError raised
+        while rebuilding it, so the token never reaches the attempt-budget layer and the
+        repeat check sees no refusals at all.
+        """
+        error = CatalogueQueryError(_request(), classify_refusal(_refused(502)), _refused(502))
+        restored = pickle.loads(pickle.dumps(error))
+        assert str(restored) == str(error)
+        assert _token(restored) == _token(error)
 
     def test_text_carrying_no_token_is_not_classified_as_a_refusal(self) -> None:
         """A failure that is not a catalogue refusal must not be read as one."""
