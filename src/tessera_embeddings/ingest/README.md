@@ -322,10 +322,10 @@ antimeridian overlap alike.
 
 **Item order.** The re-partition does change the order items are *walked* in — one walk returns
 the window newest-first, the worklist returns window by window in date order — and that matters
-because `query_stac_items` sorts by `(solar date, cloud cover DESC)` with a stable sort, so ties
-keep their input order, and the loader's fuser keeps the first valid source. The sort restores the
-single-walk order, because each solar date's items land in exactly one window in catalogue
-order. Verified against an unsplit walk at several part counts; see
+because `query_stac_items` sorts with `solar_day_sort_key`, which orders a solar day's items
+clearest-first and settles equal-cloud ties on `id` — so the sequence is a function of the items
+rather than of the order the walk produced, and the loader's fuser keeps the first valid source of
+each group. Verified against an unsplit walk at several part counts; see
 [the ingest campaign record](../../../context_docs/design/ingest_optimization_campaign_2026_07.md),
 which also records the measurements and the two optimisations that are closed (a larger page,
 and server-side field selection).

@@ -393,16 +393,16 @@ def extract_baselines(items: list[Any]) -> dict[str, int]:
     later ones only fill its gaps. Keeping the LAST item instead named the CLOUDIEST scene, the one
     contributing least. Where a date's tiles disagree the pick is a property of the caller's sort
     order either way, which is why this is derived from the items being LOADED rather than computed
-    once per query: a map built over a wider list can name a baseline belonging to an item the
-    loader never sees, and the reflectance offset it selects is applied to the pixels of the items
-    it does.
+    once per query: a map built over a wider list records a baseline belonging to an item the loader
+    never sees, so the provenance would describe imagery that is not there. It selects nothing —
+    the correction is decided per source as each source is read.
 
     **A date whose tiles declare DIFFERENT baselines is described by one of them.** Such a date
     loads: the correction is decided per source, so a day holding 00.01 and 05.00 imagery needs no
-    single answer for its pixels. This map still holds one integer per date, and it is the last
-    item's — the CLEAREST tile on both ingest paths, because the query sorts a date's items
-    cloud-descending. That is the last item, not necessarily the one that supplied the pixels; see
-    the sort in :func:`query_stac_items`. The day's other vintages are recorded nowhere.
+    single answer for its pixels. This map still holds one integer per date, and it is the FIRST
+    item's — the clearest tile on both ingest paths, because the query sorts a date's items
+    cloud-ascending, and so the scene that supplied most of the day's pixels. The day's other
+    vintages are recorded nowhere.
 
     Documented rather than widened because nothing reads this. It is written to the store's root
     attrs and merged forward on append; no code here consumes a value, and no correction, mask or
@@ -638,6 +638,12 @@ def _load_from_stac(
         # source, so that order has to survive into the loader. Nothing here sorts any other
         # collection, and for those odc's own default — `(time, id)` within a group — is what makes
         # the fused result a function of the items rather than of the order the provider returned.
+        #
+        # TODO: Planetary Computer's `sentinel-2-l2a` config does not set `has_scl`, so this reads
+        # False there and odc reorders the group by `(time, id)` — and because normalisation gives a
+        # group one shared timestamp, `id` rather than cloud cover then decides an overlap, losing
+        # `s2_roi`'s clearest-first sort. OUT OF SCOPE: the campaign reads Earth Search only. The
+        # fix is to key this on whether the CALLER imposed an order, not on a collection capability.
         "preserve_original_order": collection_config.has_scl,
     }
 

@@ -130,10 +130,12 @@ reads `item.datetime`, so that join key never depended on the order.
 
 ## Trade-offs accepted
 
-**An item with no `eo:cloud_cover` reads as 100 and sorts last.** Under first-wins that means it can
-only fill gaps: unknown never displaces measured. This is the cautious end, and it is a change in
-kind from the previous order, where an unknown-cloud item sorted first and won everything it
-covered.
+**An item with no `eo:cloud_cover` sorts after every measured value.** `solar_day_sort_key` gives
+it infinity rather than 100, because 100 is itself a real reading the two would otherwise tie on,
+and the `id` term would then decide — letting an unmeasured scene take ground from one known to be
+fully clouded. Under first-wins the sentinel means an unknown scene can only fill gaps: unknown
+never displaces measured. That is a change in kind from the previous order, where an unknown-cloud
+item sorted first and won everything it covered.
 
 **Clearest-first plus first-wins is the cheapest pairing that keeps coverage, not the only one.**
 A custom valid-aware last-wins fuser — one that overwrites the destination only where the later
