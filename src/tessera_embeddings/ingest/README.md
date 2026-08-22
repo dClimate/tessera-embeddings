@@ -426,8 +426,10 @@ supplies a pixel and later ones fill the gaps it left, which is the behaviour wa
 scene covering a pixel wins it, and a hole in the clearest scene falls through to the next-clearest
 rather than to nothing.
 
-An item declaring no `eo:cloud_cover` reads as 100 and so sorts last, where it can only fill gaps:
-unknown never displaces measured.
+An item declaring no `eo:cloud_cover` sorts after every measured value, where it can only fill
+gaps: unknown never displaces measured. `solar_day_sort_key` gives it infinity rather than 100 —
+100 is itself a real reading, and the two would otherwise tie and be reordered by `id`, letting an
+unmeasured scene take ground from one known to be fully clouded.
 
 #### Streaming the query month by month (S2)
 
