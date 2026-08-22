@@ -87,12 +87,9 @@ corrected order the first item is the clearest, the scene that actually supplied
 pixels, so the stored provenance names the scene that contributed. Keeping last-wins would have
 named the cloudiest scene, the one contributing least.
 
-`s2_roi`'s sort gained the `id` key that `query_stac_items` already had. Two scenes of one solar day
-can tie on cloud cover — `0.0` is a common value — and a stable sort then preserves whatever order
-the supplier produced. With a first-wins fuser that lets the supplier decide published pixels. The
-third key makes the sequence a function of the items alone. On the production path this changes
-nothing, because the items arrive already tie-broken on `id` and the re-sort is stable; it closes
-the case where a different supplier is injected.
+Both paths now sort on one function, `solar_day_sort_key`, which owns the key and its reasoning.
+They each built their own before, and the defect that replaced was those two disagreeing about the
+direction.
 
 ## What now pins it
 
