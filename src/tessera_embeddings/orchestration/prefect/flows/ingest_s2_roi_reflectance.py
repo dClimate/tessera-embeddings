@@ -84,6 +84,7 @@ def _ingest_s2_roi_impl(
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
     batch_dates: int | None = None,
+    allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Inner flow: submits the S2 ingestion task to the configured Dask runner."""
@@ -100,6 +101,7 @@ def _ingest_s2_roi_impl(
         overlap_window_writes=overlap_window_writes,
         pipeline_dates=pipeline_dates,
         batch_dates=batch_dates,
+        allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         s3_region=s3_region,
     )
     return future.result()
@@ -133,6 +135,7 @@ def ingest_s2_roi_reflectance(
     pipeline_dates: bool = False,
     batch_dates: int | None = None,
     worker_env_overrides: dict[str, str] | None = None,
+    allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Ingest S2 L2A reflectance for an ROI using Dask workers.
@@ -198,6 +201,7 @@ def ingest_s2_roi_reflectance(
             behaviour) one arm at a time. Not a configuration channel: anything
             meant to hold for every run belongs in ``FargateConfig``. Ignored on
             the ``use_local`` path, which provisions no Fargate workers.
+        allow_ingest_code_mismatch: Resume a store built by different ingest code (off by default).
 
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
             storage layer's default (us-west-2); set it when the input bucket
@@ -238,6 +242,7 @@ def ingest_s2_roi_reflectance(
                 overlap_window_writes=overlap_window_writes,
                 pipeline_dates=pipeline_dates,
                 batch_dates=batch_dates,
+                allow_ingest_code_mismatch=allow_ingest_code_mismatch,
                 s3_region=s3_region,
             )
 
@@ -272,5 +277,6 @@ def ingest_s2_roi_reflectance(
                 overlap_window_writes=overlap_window_writes,
                 pipeline_dates=pipeline_dates,
                 batch_dates=batch_dates,
+                allow_ingest_code_mismatch=allow_ingest_code_mismatch,
                 s3_region=s3_region,
             )

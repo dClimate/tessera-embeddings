@@ -549,3 +549,39 @@ class TestAbsenceIsAValueForAPolicyField:
         """
         legacy = {"manifest_type": "IngestManifest"}
         IngestManifest(roi_manifest_hash="abc123").validate_against(legacy, "legacy.zarr")
+
+
+class TestIngestCodeMismatchOverride:
+    """``allow_ingest_code_mismatch``: resume a store built by different ingest code."""
+
+    OLD = "ingcode-0000000000000000"
+    NEW = "ingcode-1111111111111111"
+    BASE: ClassVar[dict] = {"roi_manifest_hash": "roi", "coverage_sha256": "cov", "min_valid_coverage": 30.0}
+
+    def _stored(self) -> dict:
+        return IngestManifest(**self.BASE, ingest_code_identity=self.OLD).to_dict()
+
+    def _run(self, *, allow: bool, **overrides) -> IngestManifest:
+        return IngestManifest(
+            **(self.BASE | {"ingest_code_identity": self.NEW} | overrides), allow_ingest_code_mismatch=allow
+        )
+
+    def test_off_by_default_a_code_mismatch_still_refuses(self):
+        assert IngestManifest().allow_ingest_code_mismatch is False
+        with pytest.raises(ConfigMismatchError, match="ingest_code_identity"):
+            self._run(allow=False).validate_against(self._stored(), "s3://m/reflectance.zarr")
+
+    def test_the_override_permits_the_append_and_names_both_identities(self, caplog):
+        with caplog.at_level("WARNING"):
+            mixed = self._run(allow=True).validate_against(self._stored(), "s3://m/reflectance.zarr")
+        assert mixed == [self.OLD, self.NEW]
+        assert self.OLD in caplog.text and self.NEW in caplog.text
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("roi_manifest_hash", "OTHER"), ("coverage_sha256", "OTHER"), ("min_valid_coverage", 10.0)],
+    )
+    def test_it_does_not_excuse_any_other_structural_mismatch(self, field, value):
+        """Chunk size and resolution reach this manifest through ``roi_manifest_hash``."""
+        with pytest.raises(ConfigMismatchError, match=field):
+            self._run(allow=True, **{field: value}).validate_against(self._stored(), "s3://m/reflectance.zarr")

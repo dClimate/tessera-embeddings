@@ -1,7 +1,12 @@
 """Unit tests for ingest/stac.py - STAC ingestion with provider/collection config."""
 
+import threading
+import time
+
 import numpy as np
 import pytest
+from pystac import Item
+from pystac_client.item_search import ItemSearch
 
 from tessera_embeddings.config import (
     LANDSAT_C2_BANDS,
@@ -10,6 +15,7 @@ from tessera_embeddings.config import (
     CollectionConfig,
     STACProvider,
 )
+from tessera_embeddings.ingest import stac as stac_module
 from tessera_embeddings.ingest.stac import (
     _build_stac_query,
     _extract_baseline,
@@ -24,6 +30,7 @@ from tessera_embeddings.ingest.stac import (
     extract_baselines,
     ingest_tile,
     split_antimeridian_bbox,
+    split_query_window,
 )
 
 
@@ -871,3 +878,418 @@ def test_the_loader_refuses_a_grouping_it_cannot_honour():
     config = _get_collection_config("earth-search", "sentinel-2-l2a")
     with pytest.raises(ValueError, match="groupby='time' is not supported"):
         _load_from_stac([object()], config, groupby="time")
+
+
+class _FakeCatalogue:
+    """A catalogue that honours a date window, pages, reports its match count, and counts serves.
+
+    Built as an ORACLE rather than a stub: the same fake, asked for one window or for
+    several covering the same days, must hand back the same items. A stub replaying a
+    fixed page list could not tell those two apart, so it could not fail.
+    """
+
+    def __init__(self, per_day: dict[str, list[str]], page_size: int):
+        self.per_day = per_day
+        self.page_size = page_size
+        self.windows: list[str] = []
+        self.served_by_window: dict[str, set[str]] = {}
+
+    def raw(self, item_id: str, day: str) -> dict:
+        return {
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": item_id,
+            "geometry": {"type": "Point", "coordinates": [5.0, 45.0]},
+            "bbox": [5.0, 45.0, 5.0, 45.0],
+            "properties": {"datetime": f"{day}T10:00:00Z"},
+            "links": [],
+            "assets": {"blue": {"href": f"s3://b/{item_id}.tif"}},
+        }
+
+    def search(self, **kw):
+        start, end = kw["datetime"].split("/")
+        self.windows.append(kw["datetime"])
+        matched = [
+            (item_id, day) for day, ids in sorted(self.per_day.items()) if start <= day <= end for item_id in ids
+        ]
+        return _FakeSearch(self, kw["datetime"], matched)
+
+
+class _FakeSearch:
+    def __init__(self, catalogue: _FakeCatalogue, window: str, matched: list[tuple[str, str]]):
+        self.catalogue = catalogue
+        self.window = window
+        self.matched = matched
+
+    def pages_as_dicts(self):
+        size = self.catalogue.page_size
+        for offset in range(0, max(len(self.matched), 1), size):
+            chunk = self.matched[offset : offset + size]
+            served = self.catalogue.served_by_window.setdefault(self.window, set())
+            served.update(item_id for item_id, _ in chunk)
+            yield {
+                "numberMatched": len(self.matched),
+                "features": [self.catalogue.raw(item_id, day) for item_id, day in chunk],
+            }
+
+
+def _catalogue_over(days: int, per_day_count: int, page_size: int):
+    per_day = {f"2024-03-{day:02d}": [f"S2_{day:02d}_{n}" for n in range(per_day_count)] for day in range(1, days + 1)}
+    every_id = {item_id for ids in per_day.values() for item_id in ids}
+    return _FakeCatalogue(per_day, page_size), every_id
+
+
+class TestADeepWindowIsQueriedAsShorterOnes:
+    """A window the catalogue will not page to the end of is re-cut, not failed.
+
+    Earth Search refuses certain individual page requests deterministically, as a function
+    of the request rather than of how deep the walk has got, so retrying the same window
+    cannot succeed. The only thing re-cutting may change is how many searches run — never
+    which items come back, because this module is inside the mosaic content fingerprint.
+    """
+
+    @staticmethod
+    def _run(catalogue, monkeypatch, ceiling, start="2024-03-01", end="2024-03-30"):
+        provider = _get_provider_config("earth-search")
+        collection = _get_collection_config("earth-search", "sentinel-2-l2a")
+        monkeypatch.setattr(stac_module, "_MAX_QUERY_ITEMS", ceiling)
+        monkeypatch.setattr(stac_module.Client, "open", lambda *a, **k: catalogue)
+        return _query_stac_items(provider, collection, None, start, end, bbox=(4.0, 44.0, 6.0, 46.0))
+
+    def test_the_item_set_is_what_an_unsliced_query_would_have_returned(self, monkeypatch):
+        """The comparison that matters: sliced against unsliced, one fake catalogue."""
+        page = _get_provider_config("earth-search").max_page_size
+        whole, every_id = _catalogue_over(days=30, per_day_count=20, page_size=page)
+        sliced, _ = _catalogue_over(days=30, per_day_count=20, page_size=page)
+
+        unsliced_items = self._run(whole, monkeypatch, ceiling=10_000_000)
+        sliced_items = self._run(sliced, monkeypatch, ceiling=250)
+
+        assert len(whole.windows) == 1, "the control must NOT have been sliced, or it proves nothing"
+        assert len(sliced.windows) > 1, "the subject must have been sliced, or it proves nothing"
+        assert {i.id for i in sliced_items} == {i.id for i in unsliced_items} == every_id
+        assert len(sliced_items) == len(every_id), "a re-partition must not duplicate an item"
+
+    def test_an_item_on_a_boundary_day_shared_by_two_windows_is_returned_once(self, monkeypatch):
+        """Adjacent windows share their boundary day on purpose; the dedupe keeps it single.
+
+        The shorter windows are identified by EXCLUDING the input window, so a re-serve by
+        the abandoned parent walk cannot be mistaken for the sibling overlap this is about.
+        """
+        page = _get_provider_config("earth-search").max_page_size
+        catalogue, every_id = _catalogue_over(days=8, per_day_count=5, page_size=page)
+
+        items = self._run(catalogue, monkeypatch, ceiling=20, start="2024-03-01", end="2024-03-08")
+
+        shorter = [ids for w, ids in catalogue.served_by_window.items() if w != "2024-03-01/2024-03-08"]
+        overlaps = [a & b for i, a in enumerate(shorter) for b in shorter[i + 1 :] if a & b]
+        assert overlaps, f"no two shorter windows shared an item, so the overlap was never exercised: {shorter}"
+        assert len(items) == len(every_id), "an item two windows both matched was returned twice"
+        assert {i.id for i in items} == every_id
+
+
+class TestSplitQueryWindow:
+    """The re-partition itself: it must cover the input, and it must terminate."""
+
+    @staticmethod
+    def _sent(start: str, end: str) -> tuple[str, str]:
+        """The instants the catalogue is actually asked for, per the client's own expansion.
+
+        Read out of ``pystac_client`` rather than restated here, because the whole point of
+        an instant boundary is what the client does to a bare date: expand it to
+        ``T23:59:59Z`` and leave the last second of that day unasked for. A change to that
+        expansion upstream must fail this, not be agreed with by a local copy of it.
+        """
+        expanded = ItemSearch(url="http://example.invalid/search", datetime=f"{start}/{end}")
+        low, _, high = expanded.get_parameters()["datetime"].partition("/")
+        return low, high
+
+    def test_the_parts_cover_every_day_of_the_input(self):
+        parts = split_query_window("2024-03-01", "2024-03-30", 4)
+        assert parts[0][0] == "2024-03-01"
+        assert parts[-1][1] == "2024-03-30"
+        # Each window picks up where the last left off, SHARING that boundary, so no
+        # acquisition can fall between them.
+        assert [later[0] for later in parts[1:]] == [earlier[1] for earlier in parts[:-1]]
+
+    def test_the_union_is_the_input_exactly_with_no_gap_and_no_overhang(self):
+        """The property the whole re-partition rests on, checked on the wire form.
+
+        Two failures are possible and both are silent. A GAP drops items the unsplit window
+        would have returned, which reads downstream as missing data. An OVERHANG returns
+        items it would not have, which changes a mosaic's content for the same request. The
+        interior boundaries must therefore be shared instants, and the outer bounds must be
+        the caller's own strings.
+        """
+        for start, end, parts in [
+            ("2024-03-01", "2024-03-30", 4),
+            ("2019-02-28", "2019-04-01", 6),
+            ("2019-03-21", "2019-03-22", 2),
+            ("2019-03-16", "2019-03-19T00:00:00Z", 2),
+        ]:
+            windows = split_query_window(start, end, parts)
+            assert windows, (start, end, parts)
+            asked = [self._sent(*w) for w in windows]
+            whole_low, whole_high = self._sent(start, end)
+            assert asked[0][0] == whole_low
+            assert asked[-1][1] == whole_high
+            # Consecutive requests must meet on the SAME instant: earlier means a gap,
+            # later means the seam was covered twice by a whole day.
+            assert [low for low, _ in asked[1:]] == [high for _, high in asked[:-1]]
+
+    def test_a_single_day_cannot_be_cut(self):
+        assert split_query_window("2024-03-01", "2024-03-01", 2) == []
+
+    def test_a_window_ending_on_a_boundary_instant_can_still_be_cut(self):
+        """The recursion re-cuts its OWN output, so it has to parse the instants it emits.
+
+        A window whose end is a boundary instant is exclusive of that instant's day, so a
+        one-day window in that form is at the floor and must stop rather than emit a part
+        it cannot shorten again.
+        """
+        assert split_query_window("2019-03-16", "2019-03-19T00:00:00Z", 2) == [
+            ("2019-03-16", "2019-03-17T00:00:00Z"),
+            ("2019-03-17T00:00:00Z", "2019-03-19T00:00:00Z"),
+        ]
+        assert split_query_window("2019-03-21", "2019-03-22T00:00:00Z", 2) == []
+
+    def test_two_days_split_into_one_day_each(self):
+        """The floor of the recursion, and it must not stall there.
+
+        Stopping here would leave a refused window with nothing to try, which is exactly
+        where the live failure ended up. An instant boundary costs no length, so a two-day
+        window cuts cleanly without the shared-day fallback the first fix needed.
+        """
+        assert split_query_window("2019-03-21", "2019-03-22", 2) == [
+            ("2019-03-21", "2019-03-22T00:00:00Z"),
+            ("2019-03-22T00:00:00Z", "2019-03-22"),
+        ]
+
+    def test_a_seam_does_not_repeat_a_whole_day(self):
+        """What the instant boundary buys: adjacent windows share an instant, not a date.
+
+        A shared boundary DAY made every seam re-fetch that day in full — measured at
+        Earth Search as roughly 1,250 items and 13 page requests per seam, all of them
+        discarded by the id dedupe.
+        """
+        windows = split_query_window("2024-03-01", "2024-03-03", 2)
+        assert windows == [
+            ("2024-03-01", "2024-03-02T00:00:00Z"),
+            ("2024-03-02T00:00:00Z", "2024-03-03"),
+        ]
+        assert windows[0][1][:10] == windows[1][0][:10], "the seam is one instant, on one day"
+        assert "T" in windows[0][1], "a bare date here would drop that day's last second"
+
+    def test_fewer_than_two_parts_is_no_split(self):
+        assert split_query_window("2024-03-01", "2024-03-30", 1) == []
+
+
+class TestTheWindowTreeIsFilledConcurrentlyAndReadBackInOrder:
+    """`_fill_window_tree` runs windows at once; what it returns must not depend on that.
+
+    The scheduler is the one piece of this query that can be wrong in a way no item count
+    reveals: a different interleaving that still returns every item, in a different
+    sequence. So these tests fix the tree and vary only the width and the timing, and
+    assert the output is identical every time.
+
+    Delays are derived from each node's label rather than drawn at random, so a failure
+    here reproduces instead of appearing once in a hundred runs.
+    """
+
+    @staticmethod
+    def _tree(depth: int, breadth: int, prefix: str = "r") -> stac_module._WindowWalk:
+        """A synthetic tree whose nodes are labelled by their path from the root."""
+        node = stac_module._WindowWalk(None, (prefix, prefix))
+        if depth > 1:
+            node.children = [
+                TestTheWindowTreeIsFilledConcurrentlyAndReadBackInOrder._tree(depth - 1, breadth, f"{prefix}.{i}")
+                for i in range(breadth)
+            ]
+        return node
+
+    @staticmethod
+    def _plan(node: stac_module._WindowWalk) -> dict[str, list[str]]:
+        """The tree flattened to label -> child labels, so it can be rebuilt lazily.
+
+        The real walk DISCOVERS children while running, so the test must too: handing
+        `_fill_window_tree` a tree that already has its children would not exercise the
+        part where a finished window feeds the worklist.
+        """
+        plan = {node.window[0]: [c.window[0] for c in node.children]}
+        for child in node.children:
+            plan.update(TestTheWindowTreeIsFilledConcurrentlyAndReadBackInOrder._plan(child))
+        return plan
+
+    def _run(self, plan, roots, workers, *, fail: set[str] = frozenset()):
+        """Fill the tree, returning the visit order and whatever was raised."""
+        walked: list[str] = []
+        lock = threading.Lock()
+
+        def walk(node):
+            label = node.window[0]
+            # A label-derived pause, so siblings finish out of submission order and the
+            # ordering assertions are actually tested rather than trivially satisfied.
+            time.sleep((hash(label) % 7) / 1000)
+            with lock:
+                walked.append(label)
+            if label in fail:
+                raise RuntimeError(f"refused {label}")
+            node.children = [stac_module._WindowWalk(None, (c, c)) for c in plan[label]]
+
+        raised = None
+        try:
+            stac_module._fill_window_tree(walk, roots, workers)
+        except BaseException as exc:
+            raised = exc
+        return walked, raised
+
+    @pytest.mark.parametrize("workers", [1, 2, 3, 6, 8, 64])
+    def test_every_window_is_walked_and_read_back_depth_first(self, workers):
+        """Width changes when a window runs, never the sequence the result is read in."""
+        shape = self._tree(4, 3)
+        plan = self._plan(shape)
+        roots = [stac_module._WindowWalk(None, ("r", "r"))]
+
+        walked, raised = self._run(plan, roots, workers)
+
+        assert raised is None
+        assert sorted(walked) == sorted(plan), "every window in the tree must be walked exactly once"
+        assert len(walked) == len(plan)
+        assert [n.window[0] for n in roots[0].preorder()] == [n.window[0] for n in shape.preorder()]
+
+    def test_the_read_back_order_is_identical_at_every_width(self):
+        """The property that matters: one canonical sequence, whatever the interleaving."""
+        plan = self._plan(self._tree(4, 3))
+        orders = []
+        for workers in (1, 2, 3, 6, 8, 64):
+            roots = [stac_module._WindowWalk(None, ("r", "r"))]
+            self._run(plan, roots, workers)
+            orders.append([n.window[0] for n in roots[0].preorder()])
+        assert all(order == orders[0] for order in orders), "read-back order must not depend on width"
+
+    @pytest.mark.parametrize("workers", [1, 2, 6, 8])
+    def test_two_siblings_failing_at_once_raise_the_earlier_one(self, workers):
+        """Which failure surfaces must be a function of the tree, never of a race.
+
+        The attempt-budget layer above decides a refusal is deterministic by seeing the
+        IDENTICAL signature again on a later attempt. If the failure raised depended on
+        which task finished first, that comparison would be against a coin flip.
+        """
+        plan = self._plan(self._tree(3, 3))
+        roots = [stac_module._WindowWalk(None, ("r", "r"))]
+
+        walked, raised = self._run(plan, roots, workers, fail={"r.2", "r.0"})
+
+        assert isinstance(raised, RuntimeError)
+        assert str(raised) == "refused r.0", "the depth-first-earliest failure is the one raised"
+        # Both failures still ran, and neither failed window contributed children.
+        assert {"r.0", "r.2"} <= set(walked)
+        assert [c.window[0] for c in roots[0].children] == ["r.0", "r.1", "r.2"]
+        assert roots[0].children[0].children == []
+        assert roots[0].children[2].children == []
+        assert [c.window[0] for c in roots[0].children[1].children] == ["r.1.0", "r.1.1", "r.1.2"]
+
+    def test_a_failure_does_not_stop_the_other_windows(self):
+        """Every window is walked even after one fails, so the tree is always complete."""
+        plan = self._plan(self._tree(3, 3))
+        roots = [stac_module._WindowWalk(None, ("r", "r"))]
+
+        walked, raised = self._run(plan, roots, 6, fail={"r.0"})
+
+        assert isinstance(raised, RuntimeError)
+        # 1 root + 3 children + 3x3 grandchildren, less the 3 the failed window never had.
+        assert len(walked) == 1 + 3 + 3 * 3 - 3
+        assert "r.1.0" in walked and "r.2.2" in walked
+
+    def test_a_single_root_with_no_children_is_walked_once(self):
+        roots = [stac_module._WindowWalk(None, ("only", "only"))]
+
+        walked, raised = self._run({"only": []}, roots, 6)
+
+        assert raised is None
+        assert walked == ["only"]
+
+    def test_several_roots_are_read_back_in_their_own_order(self):
+        """The antimeridian split gives two roots; they must not interleave in the output."""
+        plan = {"a": ["a.0"], "a.0": [], "b": ["b.0"], "b.0": []}
+        roots = [stac_module._WindowWalk(None, ("a", "a")), stac_module._WindowWalk(None, ("b", "b"))]
+
+        _, raised = self._run(plan, roots, 6)
+
+        assert raised is None
+        assert [n.window[0] for r in roots for n in r.preorder()] == ["a", "a.0", "b", "b.0"]
+
+
+class TestTheSortIsTotalSoOrderCannotDependOnThePartition:
+    """Items tying on solar day AND cloud cover must still land in a fixed order.
+
+    `query_stac_items` sorts on those two keys and Python's sort is stable, so a tie used to
+    keep whatever order the walk produced. That order depends on how the query was cut up: a
+    solar day near the antimeridian can straddle an interior window seam, and the two halves
+    then arrive in a different order than an unsplit walk gives them. Since the loader paints
+    the LAST item of a group over the others, crossing an item ceiling or hitting a refusal
+    could change output pixels for the same requested range. A third key on `id` removes the
+    tie, so the sequence is a function of the items alone.
+    """
+
+    @staticmethod
+    def _item(item_id: str, date: str, cloud: float):
+        return Item.from_dict(
+            {
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": item_id,
+                "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]},
+                "bbox": [0, 0, 1, 1],
+                "properties": {"datetime": f"{date}T10:00:00Z", "eo:cloud_cover": cloud},
+                "links": [],
+                "assets": {},
+            }
+        )
+
+    def _sorted_ids(self, items):
+        got, _ = stac_module.query_stac_items(
+            "earth-search",
+            "sentinel-2-l2a",
+            None,
+            "2019-03-05",
+            "2019-03-06",
+            item_provider_fn=lambda: list(items),
+            mid_longitude=0.5,
+        )
+        return [i.id for i in got]
+
+    def test_a_tie_is_broken_by_id_rather_than_by_arrival_order(self) -> None:
+        tied = [
+            self._item("S2B_zzz", "2019-03-05", 10.0),
+            self._item("S2A_aaa", "2019-03-05", 10.0),
+        ]
+
+        assert self._sorted_ids(tied) == ["S2A_aaa", "S2B_zzz"]
+        assert self._sorted_ids(list(reversed(tied))) == ["S2A_aaa", "S2B_zzz"]
+
+    def test_the_same_items_in_any_arrival_order_come_out_the_same(self) -> None:
+        """The property the re-partition needs: output is a function of the items, not the walk."""
+        items = [
+            self._item("S2A_ddd", "2019-03-05", 10.0),
+            self._item("S2A_ccc", "2019-03-05", 10.0),
+            self._item("S2A_bbb", "2019-03-05", 80.0),
+            self._item("S2A_aaa", "2019-03-06", 10.0),
+        ]
+
+        forward = self._sorted_ids(items)
+        backward = self._sorted_ids(list(reversed(items)))
+        rotated = self._sorted_ids(items[2:] + items[:2])
+
+        assert forward == backward == rotated
+        # Cloudiest first within a day, so the clearest is painted last.
+        assert forward[:3] == ["S2A_bbb", "S2A_ccc", "S2A_ddd"]
+
+    def test_the_cloud_ordering_still_wins_over_the_tie_breaker(self) -> None:
+        """The new key is a LAST resort; it must not reorder anything the first two decide."""
+        items = [
+            self._item("S2A_aaa", "2019-03-05", 5.0),
+            self._item("S2A_zzz", "2019-03-05", 90.0),
+        ]
+
+        assert self._sorted_ids(items) == ["S2A_zzz", "S2A_aaa"]

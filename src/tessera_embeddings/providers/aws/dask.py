@@ -99,9 +99,11 @@ from tornado.ioloop import PeriodicCallback
 #
 # A larger limit is a WEAK lever against that, per the 72% rule above — most of the
 # extra space becomes cache rather than margin. Pruning the retained items is what
-# actually moved the demand, and it moved it far enough that a smaller limit became
-# affordable: memory costs nothing in quota terms but it is not free in dollars, and
-# every worker in a cell pays it to accommodate one of them.
+# actually moved the demand, but not far enough to make a smaller limit safe. The size
+# follows the asymptote of a LONG run over the DENSEST dates: the overlapped write holds
+# every window of a date concurrently, so demand scales with a date's window count, and
+# that count varies by year. Memory costs nothing in quota terms but it is not free in
+# dollars, and every worker in a cell pays it to accommodate one of them.
 #
 # See context_docs/design/ingest_optimization_campaign_2026_07.md for the measured
 # peaks and the margin this size was chosen against — deliberately not inlined here,
@@ -110,8 +112,16 @@ from tornado.ioloop import PeriodicCallback
 # The vCPU stays at 4 deliberately: the Fargate quota is counted in vCPU, so doubling
 # the CPU would halve the workers a cell can run. Valid pairings for 4 vCPU are
 # 8192-30720 MiB in 1024 steps.
+#
+# WHERE THESE ACTUALLY LAND depends on ``scheduler/worker_task_definition_arn``. Unset,
+# they size the definition this provider registers. SET — the campaign's configuration —
+# they reach only Dask's ``--memory-limit``, because dask_cloudprovider sends container
+# overrides alone and no task-level cpu/memory: the CONTAINER's size is whatever the
+# pinned definition registered. Raising this without raising that definition moves the
+# pause threshold ABOVE the container's hard limit, replacing a pause with an OOM kill.
+# The two must change together.
 DEFAULT_INGEST_WORKER_CPU = 4096
-DEFAULT_INGEST_WORKER_MEM = 16384
+DEFAULT_INGEST_WORKER_MEM = 24576
 
 # Schedulers don't need much memory but benefit from a few cores so
 # graph construction and dashboard responsiveness stay smooth.

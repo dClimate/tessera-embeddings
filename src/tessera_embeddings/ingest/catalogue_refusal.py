@@ -8,14 +8,18 @@ cannot be outwaited — every further attempt re-runs a query whose answer is al
 known, and the only thing more patience buys is spending the cell's attempt budget more
 slowly while a fleet idles against it.
 
-**Our layer sits ABOVE a retry ladder, not next to one.** ``_http.make_logging_retry``
-mounts a ``urllib3`` ``Retry`` on the catalogue session, so every individual page fetch
-is already retried with exponential backoff before anything here is reached. The
-exception that escapes is therefore not one refusal: it is the ladder reporting that it
-exhausted itself, which is a much stronger statement than a single error response and
-must not be treated as a first attempt.
+**Our layer sits ABOVE a retry ladder, and only partly behind it.**
+``_http.make_logging_retry`` mounts a ``urllib3`` ``Retry`` on the catalogue session, so a
+page fetch that fails on a status in that ladder's list is already retried with exponential
+backoff before anything here is reached; what escapes is the ladder reporting its own
+exhaustion, a much stronger statement than a single error response. A status kept OUT of
+that list arrives here on its first refusal instead — which is the right shape when the
+remedy is to ask a different request rather than the same one again, and is why
+:mod:`~tessera_embeddings.ingest.stac` excludes the 502 it re-cuts date windows for.
+:attr:`CatalogueRefusal.exhausted` records which of the two happened, so a reader can tell
+whether patience has already been spent, and no caller has to assume it was.
 
-**What distinguishes the two, and what does not.** The status the ladder exhausted on
+**What distinguishes the two, and what does not.** The status the refusal rests on
 separates a stated overload (the upstream naming itself as the constraint) from a
 backend failure (the upstream failing to produce an answer). That is a necessary
 signal, not a sufficient one: a gateway can fail for minutes and recover. What settles
@@ -43,7 +47,7 @@ import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
-from typing import NoReturn, final
+from typing import Any, NoReturn, final
 
 from urllib3.exceptions import MaxRetryError, ResponseError
 
@@ -59,6 +63,14 @@ LOAD_REFUSAL_STATUSES = frozenset({429, 503})
 #: a gateway can fail transiently; deterministic in the request once the identical
 #: request has been refused this way again.
 UPSTREAM_ERROR_STATUSES = frozenset({500, 502, 504})
+
+#: The subset that means "the answer you asked for was too big", as opposed to "I broke".
+#: Only these are worth re-asking as a SMALLER request, and the distinction is about cost,
+#: not taste: 500 and 504 are still force-listed, so one reaches us only after the ladder has
+#: spent its whole backoff, and re-cutting it hands that same ladder to every child. A
+#: persistent 500 would then multiply minutes of backoff across a recursion instead of failing
+#: the leg once and letting the attempt budget decide.
+OVERSIZED_RESPONSE_STATUSES = frozenset({502})
 
 #: Name under which the signature is emitted into the failure text. Matched by NAME —
 #: never by position within the message — so the human-readable detail around it can
@@ -176,10 +188,15 @@ class CatalogueQueryError(RuntimeError):
     def __init__(self, request: CatalogueRequest, refusal: CatalogueRefusal, cause: BaseException) -> None:
         self.request = request
         self.refusal = refusal
+        self._cause_text = str(cause)
         super().__init__(
             f"{REFUSAL_TOKEN}={refusal.signature}|{request.signature} "
             f"catalogue refused {request.label} with {refusal.label}: {cause}"
         )
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Rebuild from picklable state, since pickle's default rebuilds as ``cls(*args)``."""
+        return (self.__class__, (self.request, self.refusal, RuntimeError(self._cause_text)))
 
 
 @final
@@ -256,6 +273,16 @@ def _kind_for(status: int) -> RefusalKind:
     if status in UPSTREAM_ERROR_STATUSES:
         return RefusalKind.UPSTREAM_ERROR
     return RefusalKind.UNKNOWN
+
+
+def is_oversized_response(refusal: CatalogueRefusal) -> bool:
+    """Whether asking for a SMALLER answer is a sensible response to this refusal.
+
+    True only for the status a catalogue uses to refuse an over-large response. A backend
+    that merely failed is not made likelier to succeed by being asked for less, and it has
+    already cost a full retry ladder by the time we see it.
+    """
+    return refusal.status in OVERSIZED_RESPONSE_STATUSES
 
 
 def repeat_is_deterministic(kind: RefusalKind) -> bool:

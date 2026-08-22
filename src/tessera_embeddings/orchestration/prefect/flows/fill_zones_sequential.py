@@ -606,6 +606,7 @@ def fill_zones_sequential_flow(
     allow_partial_window: bool = False,
     allow_s2_only: bool = False,
     allow_model_mismatch: bool = False,
+    allow_ingest_code_mismatch: bool = False,
     s3_concurrency: int | None = None,
     idle_timeout_minutes: int = 10,
     ingest: bool = True,
@@ -682,6 +683,7 @@ def fill_zones_sequential_flow(
             ADR. Default False (historical behaviour).
         allow_model_mismatch: Fill even when the seeded store advertises a
             different encoder/checkpoint than this build (default rejects).
+        allow_ingest_code_mismatch: Resume a store built by different ingest code (off by default).
         s3_concurrency: Each trailing assembly's slice of the fleet S3-PUT
             budget. ``None`` = the aggregate target halved, leaving headroom
             for the live cell's concurrent staging writes.
@@ -1026,6 +1028,7 @@ def fill_zones_sequential_flow(
         s1_orbit=s1_orbit,
         ingest_settings=ingest_settings,
         allow_partial_window=allow_partial_window,
+        allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         s3_region=s3_region,
         branch=branch,
     )
