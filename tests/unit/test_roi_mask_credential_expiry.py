@@ -125,19 +125,22 @@ def role_only_s3(moto_server, monkeypatch, tmp_path):
     different key: what a read presents says exactly when it resolved.
     """
     issuer = tmp_path / "issue_role_credential.py"
+    # UNIQUE BY CONSTRUCTION, not by a counter file. This process can run concurrently —
+    # several dask threads reading blocks each ask for a credential — and a shared
+    # read-modify-write counter races: one invocation creates the file, another reads it
+    # empty and dies on `int('')`. A nanosecond clock needs no shared state and is still
+    # monotonic, which is all the rotation assertions want.
     issuer.write_text(
-        "import json, pathlib, sys\n"
+        "import json, time\n"
         "from datetime import UTC, datetime, timedelta\n"
-        "counter = pathlib.Path(sys.argv[1])\n"
-        "n = int(counter.read_text()) + 1 if counter.exists() else 1\n"
-        "counter.write_text(str(n))\n"
+        "n = time.time_ns() % 10**12\n"
         "print(json.dumps({'Version': 1, 'AccessKeyId': f'AKIAROLE{n:012d}',\n"
         "                  'SecretAccessKey': 'role-secret', 'SessionToken': f'role-token-{n}',\n"
         "                  'Expiration': (datetime.now(UTC) + timedelta(seconds=2))\n"
         "                                .isoformat().replace('+00:00', 'Z')}))\n"
     )
     config = tmp_path / "aws-config"
-    config.write_text(f"[default]\ncredential_process = {sys.executable} {issuer} {tmp_path / 'issued'}\n")
+    config.write_text(f"[default]\ncredential_process = {sys.executable} {issuer}\n")
 
     # The moto server is module-scoped, so this runs against a bucket a sibling test may
     # already have made; both steps are written to be repeatable.
@@ -320,7 +323,11 @@ def test_a_second_compute_of_one_graph_re_resolves_again(role_only_s3) -> None:
 
     for date in range(3):
         _expire_everything_resolved_so_far(door)
-        _resolve_iam_credentials.cache_clear()  # the role's key rotates, as it does per refresh
+        # NO cache_clear here, deliberately. Botocore refreshes the cached credential
+        # underneath — the issuer's two-second expiry puts every read inside the mandatory
+        # refresh window — which is what production does, and it serialises the refresh
+        # behind botocore's own lock. Clearing the cache instead forces a COLD resolve in
+        # every dask thread at once, which is a property of the test, not of the code.
         assert mask.sum().compute() == 64, f"date {date} read the wrong pixels"
         assert door.signed_by, f"date {date} made no S3 request"
         assert not door.expired & set(door.signed_by), f"date {date} presented an expired credential"
