@@ -18,36 +18,23 @@ removed from each image as it is read, before anything is fused, so a mixed date
 mis-corrected — but reading two copies of one photograph to blend them into one pixel stack is
 still waste, and still costs the egress of whichever copy sits in another region.
 
-The preference is **usable first, then newest baseline, then already-harmonised, then in-region,
-then newest sequence**, and "usable" leads for a reason: a copy this ingest cannot read, or cannot
-decide a correction for, is no use however new it is. So a complete read set comes first, then a
-decidable producer and a known acquisition — a copy failing either of those refuses or fails its
-date, and neither outcome is something the fallback ladder can recover from. Only among copies that
-are all usable does the baseline decide, and there a newer reprocessing is the better data in the
-overwhelming majority of cases. Corruption in a newer copy is rare — sampling duplicate pairs
-chosen independently of failure found every copy intact — and not a property of being newer, so the
-losing copy is a *fallback*, never a default. Callers step down the alternates only on a
-demonstrated read failure. :func:`_preference_key` is the single statement of this order; add a
-term there and nowhere else.
+**The order lives in one place.** :func:`_preference_key` states it term by term, with the reason
+for each position; add a term there and nowhere else. Two invariants govern where a new term may
+sit, and neither is recoverable from the list itself.
 
-**Neither harmonisation nor locality outranks the baseline.** These are two different claims about
-where an item's assets live — one about the pixel, one about the cost — and they now sit on the
-same side of the baseline, in that order.
+**The losing copy is a fallback, never a default.** Among copies that are all usable, a newer
+reprocessing is the better data in the overwhelming majority of cases; corruption in one is rare and
+is not a property of being newer, since sampling duplicate pairs chosen independently of failure
+found every copy intact. So callers step down to an alternate only on a demonstrated read failure,
+never pre-emptively.
 
-Harmonisation used to outrank it, on a coverage argument: the offset was decided per solar day, so
-one raw copy at or above the threshold could refuse a whole day and take every tile fused into it
-with it. Avoiding that was worth an older reprocessing. The offset is now decided per image, so no
-copy can refuse another tile's pixels and that argument no longer exists. What remains is that an
-already-harmonised copy was floored by its producer *before* resampling where one we correct is
-floored after, and that a copy owing nothing cannot be wrong by the offset at all — both real, both
-claims about pixel quality rather than about coverage, and so both subject to the rule below.
-
-Locality is only about what the read costs — in-region assets go through the VPC's S3 gateway
-endpoint while anything else egresses through NAT — so it must never buy cheaper egress with a
-worse pixel, and it stays below the baseline. It is also inert where the baseline cannot be read,
-so it never decides a comparison the baseline could not enter. **The rule generalises:** nothing
-below "will this work at all" may buy its preference with an older reprocessing. Harmonisation is
-held to it now too.
+**Nothing below "will this work at all" may buy its preference with an older reprocessing.** Only
+the terms deciding whether a copy can be read, and whether its correction can be decided, outrank
+the baseline. Everything under it is either a claim about the PIXEL — an already-harmonised copy is
+floored by its producer before resampling where one we correct is floored after, and a copy owing
+nothing cannot be wrong by the offset at all — or a claim about COST, since in-region assets reach
+the VPC's S3 gateway endpoint while anything else egresses through NAT. Neither kind may buy what it
+wants with an older pixel, so both sit below the baseline, the pixel claim above the cost one.
 """
 
 from __future__ import annotations
@@ -263,6 +250,10 @@ def _preference_key(
 ) -> tuple[int, int, int, int, float, int, int, int, int, str]:
     """How much we would rather read this copy than another. Lower sorts first.
 
+    **The canonical statement of the ranking order.** The module docstring holds the two invariants
+    that constrain it, and the operator-facing summary in :func:`log_duplicate_selection` must track
+    this list. Nothing else states the order.
+
     **Context-free:** no term is relative to the set being sorted, so the same key orders copies
     of one acquisition and copies from different acquisitions. That is what lets one key serve
     both, and it must hold for any term added here.
@@ -273,11 +264,12 @@ def _preference_key(
        because a copy missing one of them cannot deliver the tile-date at any baseline, and the
        generic paths have no recovery for it: a missing band is not one of the read failures the
        fallback ladder recognises, so an incomplete winner fails the acquisition outright.
-    2. **Whether the producer is decidable**, where it would matter. A copy whose own reflectance
-       bands span a harmonised and a raw producer, or whose producer cannot be identified at all,
-       refuses its date at or above the correction threshold — and neither the generic path nor the
-       read-failure ladder retries a refusal. Below the threshold the term is inert, because there
-       the producer changes no pixel.
+    2. **Whether the producer is decidable**, where it would matter. A copy served from a bucket
+       nobody has classified cannot have its correction decided, so it refuses its date at or above
+       the correction threshold — and neither the generic path nor the read-failure ladder retries a
+       refusal. A copy whose own bands span a harmonised and a raw producer is NOT one of these:
+       each of its sources is decided on its own bucket, so it is corrected band by band. Below the
+       threshold the term is inert, because there the producer changes no pixel.
     3. **Whether this copy demonstrably belongs to the acquisition it is ranked in.** A copy that
        names neither an observation nor an instant was attached to a cluster arbitrarily — nothing
        says which pass it came from — so it must not displace one that does say, whatever its
@@ -293,14 +285,8 @@ def _preference_key(
     5. **The baseline, descending, by value** — not by "is it the best", so every rung of the
        fallback ladder stays in descending baseline order.
     6. **Whether the copy owes an offset correction at all**, where the producer is an item's own
-       property. **Below the baseline, and it did not used to be.** It ranked above, on the
-       argument that the correction was decided per solar day so one raw copy could refuse the
-       whole day — a coverage argument, which was the one thing allowed to cost a reprocessing.
-       The correction is now applied per image before the mosaic, so no copy can refuse another
-       tile's pixels and that argument is gone.
-
-       What survives is two reasons to prefer a copy owing nothing, and both are about the PIXEL
-       rather than about coverage:
+       property. Below the baseline, because the two reasons to prefer a copy owing nothing are both
+       about the PIXEL rather than about coverage:
 
        - An already-harmonised copy had its floor applied by the producer *before* any resampling.
          A copy we correct ourselves is floored *after*, because the read and the reprojection are
@@ -311,12 +297,11 @@ def _preference_key(
          bucket lists and the item's declared baseline are both honest, and nothing detects it when
          they are not.
 
-       Those are quality claims, and this module's rule is that a quality-versus-quality preference
-       must not buy a better pixel with an older reprocessing — which is exactly why locality sits
-       below the baseline too. So this now sits below it as well, and above locality only because a
-       pixel argument outranks a cost one. Inert below the threshold, where no producer changes a
-       pixel, and inert without a read set, where every copy reports an undecidable producer and
-       the term therefore ties.
+       Those are quality claims, and the module's rule is that a quality preference must not buy a
+       better pixel with an older reprocessing — which is why locality sits below the baseline too.
+       This sits above locality only because a pixel argument outranks a cost one. Inert below the
+       threshold, where no producer changes a pixel, and inert without a read set, where every copy
+       reports an undecidable producer and the term therefore ties.
     7. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
        cheaper egress with an older pixel, and inert for unreadable baselines so it cannot decide
        a comparison the baseline could not enter.
@@ -687,10 +672,9 @@ def log_duplicate_selection(
         local = sum(1 for it in winners if item_is_in_preferred_location(it, keys=read_keys))
         where = f"; winners by source: {local} in-region, {len(winners) - local} remote"
 
-    # Must name the terms in the ORDER `_preference_key` applies them. An operator reads this line
-    # to explain a selected pixel, so a stale order gives them the wrong explanation. Note where
-    # `owing no offset correction` sits: BELOW newest baseline, because the correction is applied
-    # per source and so owing one is no longer a reason to pass over a newer reprocessing.
+    # Must track `_preference_key`'s docstring, which is the canonical statement of this order. An
+    # operator reads this line to explain a selected pixel, so a stale order gives them the wrong
+    # explanation.
     how = (
         "complete read set, then a decidable producer, then a known acquisition, then a readable "
         "baseline, then newest baseline, then owing no offset correction, then in-region, then "

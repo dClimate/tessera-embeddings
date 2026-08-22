@@ -14,8 +14,8 @@ The algorithm is unchanged from the reference:
    materialised.
 2. Query STAC for the full date range; reduce duplicate items to one copy per
    tile-date (newest reprocessing preferred — see ``ingest.duplicates``), then
-   sort cloudiest-first so the painter's-algorithm mosaic picks the clearest
-   tile last.
+   sort cloudiest-first (see the sort itself: that ordering does not do what
+   it was written to do, and is left alone deliberately).
 3. Group items by ``solar_day``.
 4. For each day:
 
@@ -270,14 +270,20 @@ class _PreparedDate:
     correlating GDAL's own stderr by timestamp across every worker in the fleet.
     """
     baselines: dict[str, int] = field(default_factory=dict)
-    """The processing baselines of THESE items — the correction applied, and recorded.
+    """The processing baseline each of THESE items declares. Provenance, and nothing else.
 
     Derived where the items are known rather than once per query, because the two lists
     differ: the query's map is built before duplicate copies are pruned and before a read
     failure steps down to an older one, so it can name the baseline of a copy the loader
-    never opened. Sentinel-2's reflectance offset is keyed on that number and duplicate
-    copies straddle the threshold it tests, so the wrong entry silently shifts every pixel
-    of the date.
+    never opened. It reaches the store as the ``baselines_applied`` attribute, whose contract
+    is the vintage of the item actually loaded, so a wrong entry misreports what the store
+    holds.
+
+    **It decides no pixel.** The reflectance offset is decided per ASSET as each source is
+    read, from that source's own bucket and declared baseline
+    (:func:`~tessera_embeddings.ingest.boa_offset.source_decision`), so a date whose copies
+    straddle the threshold is corrected image by image while this map still names one baseline
+    for the date.
     """
     read_error: BaseException | None = None
     """Set when PREPARATION hit a source that would not read, instead of raising.
@@ -517,7 +523,7 @@ def ingest_s2_roi_reflectance(
         #
         # Deliberately NOT taken from the loaded dataset's own time coordinate. odc stamps
         # each group with `group[0].nominal_datetime`, and `preserve_original_order=True`
-        # (needed so the clearest tile paints last) makes group[0] the CLOUDIEST item, whose
+        # with a cloud-descending sort makes group[0] the CLOUDIEST item, whose
         # acquisition time is arbitrary within the day. Where the solar offset is large
         # enough to cross UTC midnight, that timestamp's calendar date can be the day
         # BEFORE the solar day — so two consecutive solar days can normalise onto the same
@@ -1068,9 +1074,16 @@ def ingest_s2_roi_reflectance(
                 return
             total_processed += len(batch)
 
-        # query_stac_items sorts by (date, cloud_cover ASC). Re-sort cloudiest-first so
-        # the clearest tile paints last (wins) in solar_day's painter's algorithm.
-        # group_items_by_date preserves this within-group order.
+        # Cloudiest-first. `query_stac_items` applies the same key — cloud cover DESCENDING —
+        # and applying it again here covers a supply that did not come through it, since both
+        # suppliers are injectable. `group_items_by_date` preserves this within-group order.
+        #
+        # The ordering was written believing solar_day mosaics by a painter's algorithm, with
+        # the last item of a group overwriting the ones before it. It does not: odc's default
+        # fuser fills only where the destination is still nodata, so the FIRST valid source
+        # wins and this hands an overlap to the CLOUDIEST scene. Left alone here for the same
+        # reason as in `query_stac_items` — reversing it changes published pixels, which is not
+        # something to do mid-campaign. See that sort's comment for the evidence.
         #
         # Both the sort and the grouping key off the SOLAR day, not the UTC date, because
         # that is what the loader groups by. Using UTC here let a group the loader saw as

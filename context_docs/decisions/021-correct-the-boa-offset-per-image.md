@@ -134,14 +134,93 @@ file** rather than of a day:
   version 04.00 or later;
 - it is uncorrected and declares no readable processing version.
 
-Neither has been observed in the archive: a survey of 220 real files found every version readable,
-and an unclassified location only appears if someone stands up a new mirror. Both still refuse
-their day rather than guessing, which is unchanged behaviour — the machinery that records and
-announces a refused day is untouched. What changed is that the *situations* that reach it are now
-ones no rearrangement of the load can fix.
+A third was proposed and withdrawn: a collection answer naming no single producer. It could not
+fire, so instead of refusing at runtime the value is now unrepresentable — see below.
+
+**Measured on the live catalogue, 2026-08-22: none of them fires.** Seven real zone-months, chosen
+to span the campaign's years and four continents — 33N for June 2017, January 2018, February 2022
+and June 2024; 15S and 45N for June 2024; 10N for June 2025 — queried through the production path
+and put through the production duplicate selection, then every reflectance asset of every surviving
+item classified by the same call the loader makes: **36,183 items returned, 34,307 after selection,
+343,070 reflectance assets.**
+
+**What the zero actually claims, stated narrowly.** A verdict count would hide which code ran, so
+every asset was also attributed to the ARM of `source_decision` it took, with the arm and the
+verdict asserted to agree:
+
+| assets | share | arm taken |
+|---|---:|---|
+| 342,329 | 99.784% | EXEMPT — served from a harmonised bucket |
+| 690 | 0.201% | **OWED** — unharmonised bucket, at or above version 04.00 |
+| 51 | 0.015% | EXEMPT — version below the threshold |
+| 0 | — | UNDECIDABLE — unrecognised bucket |
+| 0 | — | UNDECIDABLE — unreadable processing version |
+
+So the useful claims are the narrow ones, not "no asset was undecidable":
+
+- **Exactly two distinct buckets appeared across 343,070 asset locations** — `sentinel-cogs` and
+  `sentinel-s2-l2a`. The unrecognised-bucket refusal exists for a mirror nobody has classified, and
+  no such mirror is in the catalogue today.
+- **Zero of 34,307 items declared an unreadable processing version.** This one is the stronger of
+  the two: unlike the bucket test it is evaluated on every item whatever arm it lands in.
+
+**The distribution is lopsided, and worth saying so.** 99.78% of assets take one arm. The OWED arm
+fires 690 times, in three of the seven months, entirely from `sentinel-s2-l2a` hrefs appearing
+inside otherwise-Element-84 items — the mixed case is exercised rather than absent, but thinly. And
+the below-threshold arm barely runs at all (51 assets): the harmonised-bucket arm returns before the
+version is consulted, so choosing pre-04.00 months does NOT exercise it the way one might expect.
+Only an ESA href in a pre-04.00 month reaches it.
+
+Both still refuse their day rather than guessing, which is unchanged behaviour — the machinery that
+records and announces a refused day is untouched.
 
 **Correcting and exempting are wrong by the same amount in opposite directions, and both are
 silent**, which is why neither is chosen as a default.
+
+### The branch changes no decision at all, and that is checked rather than argued
+
+The measurement above says the refusal does not fire. A stronger and cheaper statement is available:
+**this branch reaches the same verdict as `main` on every asset of every item.**
+
+Three real zone-months were fetched once and cached — 33N for January 2018, February 2022 and June
+2024, chosen because between them they carry every producer and version combination the catalogue
+actually contains. The same cached items were then classified twice, under `main` and under this
+branch, recording for each the duplicate-selection survivors and, for every reflectance asset, its
+bucket, its declared version and its verdict:
+
+```
+main    lines=172243 sha256=aeaaab45546edf61fd434853f73e1fe26cd3396dde71747e36fbbb4032dec783
+branch  lines=172243 sha256=aeaaab45546edf61fd434853f73e1fe26cd3396dde71747e36fbbb4032dec783
+```
+
+Byte-identical. 171,560 exempt, 680 owed, none refused. So the branch cannot change a pixel, and
+the question of whether it refuses dates the campaign is currently ingesting is answered by
+construction rather than by sampling.
+
+That holds because there is no behavioural change left to reach. An earlier revision of this branch
+added a third refusal for a collection answer naming no single producer, and it could not fire — the
+only caller passes `collection_harmonisation`, which returns `RAW` or nothing. Rather than keep an
+unreachable case and a test asserting it stays unreachable, **the value is now unrepresentable**:
+`known_harmonisation` is typed `SettledProducer`, the two states that name a producer, so `MIXED`
+and `UNKNOWN` are rejected at the call site by the type checker. The case, and the test guarding it,
+are both gone.
+
+### The owed case, named
+
+The 680 owed assets are **68 real items**, all served from `sentinel-s2-l2a` inside otherwise
+Element 84 items, at versions 04.00 and 05.10:
+
+| item | version |
+|---|---|
+| `S2B_33NVB_20220207_0_L2A`, `S2B_33NVB_20220217_0_L2A`, `S2B_33UVA_20220218_0_L2A` | 04.00 |
+| `S2A_33MUV_20240618_0_L2A` and 60 others on 2024-06-18, plus four scattered June days | 05.10 |
+
+Worth recording because the cassette in `tests/integration/test_baseline_producer_cassette.py`
+proves the owed path by taking a real raw item and *forcing* its version above the threshold, with a
+comment saying that combination "does not exist upstream". **It does.** Re-recording that cassette
+against one of the days above would replace a synthetic mutation with the genuine article. Not a
+merge blocker — the arithmetic under test is identical either way — but it is the one place where a
+fixture is weaker than the catalogue it stands for.
 
 ## 6. Limit 2 stays open, and this is deliberate
 

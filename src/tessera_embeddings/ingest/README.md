@@ -10,10 +10,11 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 
 | Module | Purpose |
 |---|---|
-| `stac.py` | STAC-based data loading via `odc.stac.load`. Handles multiple providers (Earth Search, Planetary Computer), S2 baseline correction, and date filtering. |
+| `stac.py` | STAC-based data loading via `odc.stac.load`. Handles multiple providers (Earth Search, Planetary Computer), date filtering, and the load-time machinery that applies the BOA offset: `BoaOffsetParser` stamps each source with its decision and `_BoaCorrectingReader` applies it inside the read. |
 | `opera_query.py` | OPERA RTC-S1 query utilities: spatial bbox construction, item construction from the native CMR Granule Search API (bypasses CMR-STAC search; orbit-direction filtered server-side), UTM EPSG derivation, and asset preparation. |
+| `boa_offset.py` | The ONE place the BOA offset question is answered. `source_decision` takes a bucket and a declared baseline and returns owed, exempt, or undecidable. Asked per ASSET, which is what lets an item whose bands straddle two producers be corrected band by band instead of refused. Imports no odc on purpose: the GDAL environment has to be configured before `odc.stac` is imported, so the module holding the decision must not be the one that pulls odc in. |
 | `item_baselines.py` | The ONE reader of `s2:processing_baseline`. Reports an integer hundredth (`04.00` -> `400`), the same scale `S2_BASELINE_THRESHOLD` is expressed in, and `None` for every kind of unreadable. Exists because there were two readers on two scales with two notions of unreadable, so each numeric edge case had to be fixed twice — and they had drifted before anyone noticed. |
-| `asset_locations.py` | Answers the two questions asked of where an item's assets live, and keeps them apart: **is the read cheap** (a property of the bucket's REGION) and **has the reflectance offset already been removed** (a property of the PRODUCER). They have the same answer today and would not the first time anyone mirrors unharmonised data in region, so two bucket lists make that impossible to conflate. Also holds `AssetSources`, which reports the keys it could NOT resolve rather than dropping them — the primitive that generated the same defect three times when it returned only what it found. |
+| `asset_locations.py` | Answers the two questions asked of where an item's assets live, and keeps them apart: **is the read cheap** (a property of the bucket's REGION) and **has the reflectance offset already been removed** (a property of the PRODUCER). They have the same answer today and would not the first time anyone mirrors unharmonised data in region, so two bucket lists make that impossible to conflate. Also holds `AssetSources`, which reports the keys it could NOT resolve rather than dropping them — the primitive that generated the same defect three times when it returned only what it found. Its item-level harmonisation answer feeds duplicate RANKING; the correction itself is decided per asset in `boa_offset.py`. |
 | `duplicates.py` | Chooses between DUPLICATE catalogue items for one tile-date — Element 84 publishes more than one whenever a granule is reprocessed, distinguished by `s2:sequence`. Usable first, then the newest baseline, then the copy owing no offset correction; the rejected copies are retained as a fallback the write steps down when a source object will never read. Reducing to one copy before the loader is what makes a fallback possible at all, since `odc.stac.load` FUSES a solar-day group — and it is also what makes the recorded baseline match the pixels written. |
 | `loader_failures.py` | Names the source object a failed load could not read. `odc.stac.load` reports it in its OWN log record and raises an exception that does not carry it, so a logging handler on every reader process records each aborted href, and the caller collects them after a failure and maps them back to tile-dates. That name is what lets the duplicate ladder step down ONE copy instead of every duplicated tile in the date. Attribution is best effort by design: an empty answer means "attribute nothing", never "nothing was at fault", and the recovery it sharpens still works without it. |
 | `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary AWS credentials minted by ASF, ~1 hour) and legacy CloudFront signed URL resolution. Those credentials expire on their OWN clock, unrelated to any unit of work, so renewal must be driven by a timer and by the advertised expiry — never by the work loop, which can only renew between units and so cannot renew inside one that outlives the margin. |
@@ -36,8 +37,9 @@ The high-level entry point is `ingest_tile()` in `stac.py`. It runs five stages 
                        granule query, orbit-filtered server-side)
 2. Item filtering    — optional item_filter_fn pre-filter hook
 3. Date dedup        — drop items whose dates are already in the Zarr store
-4. odc.stac.load     — lazy-load COGs into a Dask-backed xarray Dataset
-5. Corrections       — baseline correction (S2) or dB conversion (S1)
+4. odc.stac.load     — lazy-load COGs into a Dask-backed xarray Dataset. The S2
+                       baseline correction happens here, per source, inside the read
+5. Corrections       — dB conversion (S1)
 ```
 
 `query_stac_items` and `load_stac_items` expose these stages separately so a flow could
@@ -151,7 +153,7 @@ HOW THE QUERY IS SHAPED AROUND IT
 Two properties are load-bearing and both are tested. The jobs must add up to exactly the window
 asked for, no day missed and no day added. And the results must come back in the same **order**, not
 merely the same set — two scenes taken on the same day with the same cloud cover are separated only
-by which arrived first, and that decides which is painted on top.
+by which arrived first, and that decides which one supplies an overlapping pixel.
 
 The rest of this section is the mechanism behind that picture.
 
@@ -321,7 +323,7 @@ antimeridian overlap alike.
 **Item order.** The re-partition does change the order items are *walked* in — one walk returns
 the window newest-first, the worklist returns window by window in date order — and that matters
 because `query_stac_items` sorts by `(solar date, cloud cover DESC)` with a stable sort, so ties
-keep their input order and the painter writes the last one for a pixel. The sort restores the
+keep their input order, and the loader's fuser takes the first valid source. The sort restores the
 single-walk order, because each solar date's items land in exactly one window in catalogue
 order. Verified against an unsplit walk at several part counts; see
 [the ingest campaign record](../../../context_docs/design/ingest_optimization_campaign_2026_07.md),
@@ -415,8 +417,21 @@ refusals at once, and the module sits outside the mosaic-content fingerprint clo
 
 Cloud cover is intentionally **not** used as a filter at the STAC query stage — pixel-level
 cloud classification is handled later (SCL for S2, ML model for inference). For S2, items
-are sorted by `(date, eo:cloud_cover)` so that within a solar-day mosaic the clearest tile
-is placed first, which is what `odc.stac.load`'s groupby mosaicking relies on.
+are sorted by `(date, eo:cloud_cover DESCENDING)`, which places the clearest tile LAST.
+
+**That ordering does not do what it was written to do.** It assumes `odc.stac.load` mosaics by a
+painter's algorithm, with the last item of a group overwriting the ones before it. It does not.
+`odc.loader`'s default fuser is `nodata_fuser` — `np.copyto(dst, src, where=dst_is_nodata)` — so it
+fills only pixels the destination still holds as nodata, and this package configures no fuser of its
+own. **The first valid source of a group wins, and later ones can only fill its gaps**, so where two
+scenes of one solar day both cover the same ground the CLOUDIEST supplies it. Verified against the
+installed odc-loader 0.6.4 by fusing two full-coverage sources in both orders.
+
+The sort is left alone here, deliberately. That overlap is real ground, so reversing the order
+changes published pixels — and doing that mid-campaign splits the imagery across cells written
+before and after the change. It is owed as its own change: measure how much ground two same-day
+scenes actually contest (cross-orbit same-day overlap, which is a high-latitude phenomenon), then
+land the reversal between campaigns.
 
 #### Streaming the query month by month (S2)
 
@@ -578,7 +593,7 @@ These happen before `odc.stac.load` is called:
 | Transform | Where | What |
 |---|---|---|
 | **Date dedup** | `stac._filter_existing_dates` | Drops STAC items whose date is already written to the store. Keyed on the SOLAR day when the caller passes `mid_longitude`, matching how the store was written. |
-| **Item sort** | `stac.query_stac_items` | For S2: sorts by `(date, cloud_cover)` so mosaicking picks the clearest tile. |
+| **Item sort** | `stac.query_stac_items` | For S2: sorts by `(date, cloud_cover DESCENDING)`, placing the clearest tile LAST. The loader's fuser takes the FIRST valid source, so this ordering does not do what it intends — see "Cloud cover is intentionally not used as a filter". |
 | **Item provider** | `opera_query.make_s1_item_provider` | Builds orbit-filtered OPERA items directly from the native CMR granule API (bypasses CMR-STAC search). |
 | **URL rewriting** | `auth.rewrite_assets_to_s3` | Rewrites HTTPS datapool/earthdatacloud URLs to `s3://` URIs. |
 | **Timestamp normalisation** | `solar_days.normalize_to_solar_day` | Stamps every item with noon UTC of its **solar day**. The single place the solar offset is applied; also what makes `odc.stac.load` mosaic OPERA's per-burst granules into one time slice. |
@@ -599,17 +614,15 @@ These happen before `odc.stac.load` is called:
   output grid matches the ROI exactly (same CRS, transform, shape). This overrides bbox,
   CRS, and resolution.
 - **groupby** — `"solar_day"` merges items from adjacent MGRS tiles that were acquired on
-  the same local calendar day into a single mosaic using the painter's algorithm: items are
-  rendered in order and later items overwrite earlier ones where they overlap. Items are
-  sorted cloudiest-first so the clearest tile paints last and wins. This is the standard
-  approach for multi-tile STAC mosaicking and is required for ROI queries that cross tile
-  boundaries.
+  the same local calendar day into a single mosaic. The default fuser fills only pixels the
+  destination still holds as nodata, so the FIRST valid source of a group supplies the pixel
+  and later ones fill its gaps. Required for ROI queries that cross tile boundaries. Items are
+  sorted cloudiest-first, which was written for an overwriting painter and therefore hands an
+  overlap to the cloudiest scene — a recorded defect, not the intent.
 - **Dimension rename** — `normalize_odc_dims` maps `odc.stac.load`'s `y`/`x` output
   dimensions to the project-wide `northing`/`easting` convention and drops `spatial_ref`.
 
-### Post-load
-
-#### Sentinel-2 Baseline Correction
+### Sentinel-2 Baseline Correction (load-time)
 
 ESA changed the S2 L2A processing baseline at version 04.00 (January 2022), adding +1000 to all
 surface reflectance values. Whether that offset has to be subtracted is a property of **who
@@ -622,9 +635,8 @@ collection alone exempts or corrects both kinds together, and one of those is al
 always silent: a skipped correction leaves plausible pixels 1000 too high, a doubled one shifts
 every value by 1000.
 
-So the threshold **is** set for Earth Search, and the exemption is decided per item from where
-its reflectance assets live (`asset_locations.item_harmonisation`). Three properties of that
-decision are worth stating:
+So the threshold **is** set for Earth Search, and the decision is made per ASSET from where that
+asset lives (`boa_offset.source_decision`). Three properties of it are worth stating:
 
 - **Judged over the reflectance bands only.** A real Element 84 item carries the original JP2s
   as extra assets beside its COG bands, so judging every asset reports a straddle for an item
@@ -650,11 +662,11 @@ decision are worth stating:
   opposite directions and both are silent, so the source refuses. `item_baselines` is the only
   reader of that property, on one scale, with one notion of unreadable.
 
-**The per-item decision is scoped to the collections that need it**, via
-`CollectionConfig.harmonisation_varies_by_item`. It reads asset locations under the keys named in
+**Consulting the assets at all is scoped to the collections that need it**, via
+`CollectionConfig.harmonisation_varies_by_item`. That read looks assets up under the keys named in
 `bands`, which is how Earth Search keys its assets and is NOT how every provider does: Planetary
 Computer serves the same imagery under native keys (`B02`, `SCL`) and relies on the loader
-resolving the common names, so that read finds nothing there. Running the per-item check on PC
+resolving the common names, so the read finds nothing there. On Planetary Computer it therefore
 classified every modern item as undeterminable and refused every date at baseline 04.00 or above.
 
 So where the producer cannot vary between items, the **collection's own configuration supplies the
@@ -679,13 +691,14 @@ provenance, and correcting from it left raw post-04.00 pixels uncorrected whenev
 date, carried the zero an unreadable baseline collapses to, or named an arbitrary item's baseline on
 a multi-item date.
 
-Duplicate selection has **three owners, one per entry point**, and none of them is the shared
-query. `query_stac_items` deliberately does not prune: `s2_roi` runs its own selection over that
-output and keeps the rejected copies as the ladder `step_down_copies` walks when a source object
-will not read, so pruning upstream would leave it nothing to step down to. `ingest_tile` prunes
-before `extract_baselines`, because that map becomes the store's `baselines_applied` and must
-describe the copy that was kept. `load_stac_items` prunes as well, for the documented
-`query_stac_items` -> `load_stac_items` workflow that passes through neither of the others.
+Duplicate selection has **two owners**, and neither is the shared query. `query_stac_items`
+deliberately does not prune: `s2_roi` runs its own selection over that output and keeps the
+rejected copies as the ladder `step_down_copies` walks when a source object will not read, so
+pruning upstream would leave it nothing to step down to. `load_stac_items` prunes for everyone
+else — both the documented `query_stac_items` -> `load_stac_items` workflow, which passes through
+neither of the others, and `ingest_tile`, which leaves it to the loader: the loader realigns
+`baselines` in place and that is the same dict `ingest_tile` returns, so the map still describes
+the copy that was kept.
 
 Selecting over an already-selected set is a no-op, which is what makes more than one owner safe.
 
@@ -717,13 +730,11 @@ window. Production does not reach this: the only `ingest_tile` caller is the S1 
 collections have no baseline threshold and therefore no offset decision to refuse.
 
 The surviving case is worth naming, because the safe direction inverts. An item that does not expose
-EVERY reflectance band under the configured names is `UNKNOWN`, not `RAW` — a non-empty subset is
-not enough, because `_prune_item_dict` specifically preserves PARTIALLY aliased items, and letting
-one visible harmonised band speak for a hidden native-keyed one corrupts the subset nothing here
-could see. Nothing in this module can
-see the alias table that maps a band name to an asset key, so a band absent under `blue` may be
-served under `B02` — `_prune_item_dict` exists for exactly that mismatch. Calling such an item
-raw would subtract 1000 from pixels that may already be harmonised, silently. The live Element 84
+EVERY reflectance band under the configured names is `UNKNOWN`, not `RAW`. A non-empty subset is not
+enough: nothing in this module can see the alias table that maps a band name to an asset key, so a
+band absent under `blue` may be served under `B02`, and `_prune_item_dict` preserves exactly those
+partially aliased items. Letting one visible harmonised band speak for a hidden native-keyed one
+would subtract 1000 from pixels that may already be harmonised, silently. The live Element 84
 catalogue keys its assets by the configured band names, so this does not arise there today; a
 catalogue that changed its naming would stop the ingest rather than halve a season's reflectance.
 
@@ -736,13 +747,10 @@ rather than an error, because a caller that replaces the loader also reports zer
 enough is that every other way of getting this wrong is loud, since an unclassifiable source
 refuses and an unresolvable band name fails the load.
 
-`extract_baselines` records the baseline of the item actually loaded and reaches the store's
-`baselines_applied` attribute. Nothing masks it, and nothing derives a correction from it.
-
 One integer per date is a **lossy** record of a day whose tiles declare different baselines, and
 those days now load — the three-tile day in ADR 021 is exactly that shape. The value is the last
-item's, the clearest tile, because the query sorts a date's items cloud-descending; the day's other
-vintages are recorded nowhere. Left that way deliberately: the attribute is written and merged
+item's, the clearest tile, because the query sorts a date's items cloud-descending — the last item,
+not necessarily the one that supplied the pixels. The day's other vintages are recorded nowhere. Left that way deliberately: the attribute is written and merged
 forward on append, and nothing in this package reads a value from it, so widening its type would
 charge a future reader for a record nobody reads yet.
 
@@ -786,6 +794,10 @@ been. Fixing it means taking over the read-and-warp step, and unlike the per-sou
 
 SCL is never corrected. It is not among the resolved reflectance asset keys, so it carries no
 decision at all — a stronger exclusion than a band list, which could go stale.
+
+### Post-load
+
+These happen after `odc.stac.load` returns:
 
 #### OPERA RTC-S1 Amplitude-to-dB Conversion
 
@@ -1154,9 +1166,9 @@ its solar day (at noon UTC), and every date derivation downstream is a plain
 
 That rule exists because the alternative was tried and drifted. The offset used to be
 applied independently at six sites, and two of them disagreed with the rest: the
-painter's-algorithm pre-sort and the baseline map both keyed on the UTC date while the
-loader grouped by solar day. On a day straddling UTC midnight that meant the group was not
-actually sorted clearest-last, and half its baseline entries never matched. A seventh
+cloud pre-sort and the baseline map both keyed on the UTC date while the loader grouped by
+solar day. On a day straddling UTC midnight that meant the group was not sorted as intended,
+and half its baseline entries never matched. A seventh
 application would have been one more chance to disagree; applying it once cannot.
 
 **Every date modality in the pipeline, and which convention it uses.** The whole point of
@@ -1257,8 +1269,8 @@ entirely. `solar_day_offset_seconds` is the single definition, and it is the rea
 `solar_grouping_longitude` prefers the geobox centroid over a bbox midpoint.
 
 That is why `group_items_by_date` takes a `mid_longitude`, and why the pre-sort uses the same key —
-the sort carries the painter's-algorithm contract (clearest tile last within a group), so sorting on
-a different notion of "day" than the grouping would silently let a cloudier pixel win. Central
+the sort carries the group's cloud ordering, so sorting on a different notion of "day" than the
+grouping would silently change which scene supplies an overlapping pixel. Central
 longitudes image far from UTC midnight and are unaffected, which is what kept this latent.
 Each iteration builds a single-date Dask graph, calls `odc.stac.load` for that day, filters
 coverage, and writes before moving to the next date:
@@ -1334,8 +1346,8 @@ A mosaic slice represents one **solar day**, and it is labelled with that day �
 grouping key, not from the loaded dataset's own time coordinate.
 
 That distinction is load-bearing. `odc.stac.load` stamps each group with
-`group[0].nominal_datetime`, and because `preserve_original_order=True` (so the clearest tile
-paints last and wins) `group[0]` is the CLOUDIEST item, whose acquisition time is arbitrary
+`group[0].nominal_datetime`, and because `preserve_original_order=True` with a
+cloud-descending sort, `group[0]` is the CLOUDIEST item, whose acquisition time is arbitrary
 within the day. Where the solar offset crosses UTC midnight, that timestamp's calendar date can
 be the day BEFORE the solar day — so two consecutive solar days normalise onto one date. That
 blocked far-eastern zones from ingesting at all: the batched write rejected the dates as not
@@ -1544,10 +1556,10 @@ that day twice, wasteful at CONUS scale where each day is many pages of bursts. 
 
 ### Lazy evaluation throughout
 
-`odc.stac.load` returns a Dask-backed xarray Dataset with no raster data read yet. All
-post-load transformations (baseline correction, dB conversion, ROI masking) chain additional
-Dask operations without computing. Data is read and written in a single Dask graph execution
-triggered by the Zarr write step.
+`odc.stac.load` returns a Dask-backed xarray Dataset with no raster data read yet. The BOA offset
+is applied inside the read itself; the post-load transformations (dB conversion, ROI masking) chain
+further Dask operations without computing. Data is read and written in a single Dask graph
+execution triggered by the Zarr write step.
 
 ### Coverage pre-filtering before compute
 
