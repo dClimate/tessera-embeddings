@@ -25,9 +25,10 @@ The algorithm is unchanged from the reference:
      ``any_valid`` mask, apply ROI mask, write the date's live windows via
      :func:`tessera_embeddings.storage.zarr_store.write_day_windows` with a
      narrow tenacity retry on transient GDAL errors. Past that retry, a source
-     object that will never read steps DOWN to the tile-date's next catalogue
-     copy; when every copy has failed the date is skipped and recorded, so the
-     loss is a finding on the store rather than an unexplained gap.
+     object that will never read — corrupt, or never published — steps DOWN to the
+     tile-date's next catalogue copy; when every copy has failed the date is skipped
+     and recorded, so the loss is a finding on the store rather than an unexplained
+     gap.
 
 Step 4 is split into a prepare half and a write half so ``pipeline_dates`` can
 overlap one date's preparation with the previous date's write, and so

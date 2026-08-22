@@ -743,6 +743,11 @@ def alternates_for(
 #: rasterio's ``WarpOperationError('Chunk and warp failed')`` is a wrapper that discards the
 #: reason, and the reason — a codec that cannot inflate a tile — is what says the object is
 #: broken rather than briefly unavailable.
+#:
+#: Matched as TEXT, and that is forced rather than chosen: the read runs on a Dask worker and
+#: the failure is re-raised on the driver through tblib, which cannot reconstruct rasterio's
+#: GDAL-backed exception classes. What arrives is a plain ``Exception`` carrying the original's
+#: repr, so an ``isinstance`` check matches nothing and the message is the only evidence left.
 _UNREADABLE_MARKERS = (
     "ZIPDecode",
     "TIFFReadEncodedTile",
@@ -751,6 +756,19 @@ _UNREADABLE_MARKERS = (
     "Read failed. See previous exception",
 )
 
+#: Signatures of a source object that is NOT THERE — which none of the markers above can see,
+#: because every one of them is emitted by a BLOCK READ and a missing object fails at open,
+#: before any block is requested. A catalogue item can name an href the provider never
+#: published, and no retry publishes it.
+#:
+#: Three forms because three layers can be the one that surfaces the condition: GDAL and
+#: rasterio raise ``ObjectNotFound``, the S3 API answers with the ``NoSuchKey`` code, and the
+#: response body carries the sentence.
+_MISSING_OBJECT_MARKERS = (
+    "ObjectNotFound",
+    "NoSuchKey",
+    "The specified key does not exist",
+)
 
 def is_unreadable_source(exc: BaseException) -> bool:
     """Whether ``exc`` says a source object could not be read.
@@ -763,11 +781,23 @@ def is_unreadable_source(exc: BaseException) -> bool:
 
     An expired credential is explicitly excluded for that reason, even though it surfaces
     through the same wrapper.
+
+    An object the provider never published qualifies too, and reads no differently from a
+    corrupt one: no retry produces it, and another copy of the tile-date may have it. It has to
+    be recognised as the SOURCE reader's failure, though, which the not-found text alone cannot
+    say — see :data:`_SOURCE_READER_MARKERS`.
+
+    Note what is NOT matched: a whole bucket or prefix being gone, which is systemic by
+    definition and must fail the run on the first date rather than be skipped date by date.
     """
     text = _exception_chain_text(exc)
     if any(m in text for m in ("ExpiredToken", "token has expired", "AccessDenied", "SlowDown")):
         return False
-    return any(m in text for m in _UNREADABLE_MARKERS)
+    if any(m in text for m in _UNREADABLE_MARKERS):
+        return True
+    return any(m in text for m in _MISSING_OBJECT_MARKERS) and any(
+        m in text for m in _SOURCE_READER_MARKERS
+    )
 
 
 def _exception_chain_text(exc: BaseException) -> str:
@@ -802,17 +832,24 @@ _PROVIDER_REFUSAL_MARKERS = (
     "HTTP response code: 503",
 )
 
-#: What makes a refusal the SOURCE's: the source reader is the layer that was refused.
+#: What makes a failure the SOURCE reader's: GDAL is the layer that reported it.
 #:
-#: The names above belong to S3, and every S3 client in the process shares them — our own store
-#: write answers ``AccessDenied`` when icechunk picks up the OPERA-scoped token instead of the
-#: role (``storage/zarr_store.py`` documents exactly that), and a throttle on the destination
-#: bucket says ``SlowDown`` in the same words the source does. Since the read and the write both
-#: happen inside ``write_day_windows``, the text is all there is to separate them. Requiring
-#: GDAL's own vocabulary alongside does it: GDAL reads source imagery here and nothing else —
-#: the destination is Icechunk and the ROI mask is read through ``da.from_zarr``. Unpaired, the
-#: exception is re-raised, so a destination fault fails the leg on its first date instead of
-#: being absorbed as somebody else's outage, one date at a time.
+#: Required alongside :data:`_MISSING_OBJECT_MARKERS` by :func:`is_unreadable_source`, and
+#: alongside :data:`_PROVIDER_REFUSAL_MARKERS` by :func:`is_provider_refusal`, for one reason
+#: shared by both. Every string in those two tuples belongs to S3, and every S3 client in this
+#: process speaks S3 — icechunk's error enum carries ``ObjectNotFound`` and ``NoSuchKey``
+#: verbatim, our own store write answers ``AccessDenied`` when icechunk picks up the
+#: OPERA-scoped token instead of the role (``storage/zarr_store.py`` documents exactly that),
+#: and a throttle on the DESTINATION bucket says ``SlowDown`` in the same words the source does.
+#: The read and the write both happen inside ``write_day_windows``, so the text is all there is
+#: to separate them.
+#:
+#: GDAL's own vocabulary separates them, because GDAL reads source imagery here and nothing
+#: else — the destination is Zarr and Icechunk, and the ROI mask is read through
+#: ``da.from_zarr``. Neither goes through GDAL. Unpaired, the exception is re-raised: a hole or
+#: a fault on the destination fails the leg on its FIRST date, instead of being written onto the
+#: store as source data loss or absorbed as somebody else's outage one date at a time. That is
+#: what happened before these marker classes existed, and it is the safe direction to fail in.
 _SOURCE_READER_MARKERS = ("RasterioIOError", "WarpOperationError", "CPLE_", "HTTP response code:")
 
 #: Refusals that are NOT the provider's to answer for, though they surface identically. Our own

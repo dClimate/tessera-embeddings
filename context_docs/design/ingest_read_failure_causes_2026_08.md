@@ -1,7 +1,9 @@
-# Ingest source-read failures: four causes, and the retry budget they share
+# Ingest source-read failures: five causes, and the retry budget they share
 
 Investigation record. Causes 1 and 2 traced 2026-08-04/05 on `global-tessera-dev`; cause 3 absorbed
-2026-08-18 from its own document, for the reason given at that section. Traces
+2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20
+and cause 5 on 2026-08-21, both from live campaign legs. **Corrected in place: this document said
+"three causes" until cause 4 was added, and "four causes" until cause 5 joined it.** Traces
 `WarpOperationError('Chunk and warp failed')` and `PermissionError: The provided token has
 expired` to their exact causes, so the guards can be aimed at the right terms.
 
@@ -12,7 +14,7 @@ Companion to `ingest_optimization_campaign_2026_07.md` (the authoritative ingest
 
 `WarpOperationError('Chunk and warp failed')` is **not a cause**. It is rasterio's wrapper around
 whatever GDAL failed at, and it **discards the reason**. Behind it are **two unrelated causes**
-that need opposite responses — and a third joined them on 2026-08-21, see Cause 4:
+that need opposite responses — and a third joined them on 2026-08-21, see Cause 5:
 
 | | source | preceded by | retryable? |
 |---|---|---|---|
@@ -481,10 +483,158 @@ the bbox and the page ordinal, which is a complete reproduction. Until then the 
 symptom without a repro, and should be sent as such rather than with a guessed query.
 
 ---
+## Cause 4 — the object was never published (optical), 2026-08-20
 
-## Cause 4 — the provider refuses reads for a while (radar), 2026-08-21
+Traced 2026-08-20 from a live campaign leg. A separate cause rather than a variant of cause 2
+because the two differ in exactly the way the guard reads: cause 2 is an object whose BYTES will
+not decode, and this is an object that is not there at all. The remedy is the same (step down to
+another catalogue copy, and give the date up if there is none); the detection is not.
 
-Absorbed here rather than given its own document, because it is a fourth thing the same
+### The failure
+
+One optical leg abandoned an entire zone-year because **one object out of the 6,424 that day
+needed did not exist**:
+
+```
+s3://sentinel-s2-l2a/tiles/33/P/WM/2018/1/24/0/B02.jp2
+item S2A_33PWM_20180124_0_L2A, zone 33N, 2018-01-24
+```
+
+Upstream mechanism, and it is not our bug: Element 84 published no B01/B02 COG for that granule,
+so earth-search fills those asset slots with ESA JPEG-2000 hrefs — and those hrefs omit the
+`R10m/` path segment, so the href names a key one level above the file that exists. The date is
+recoverable by the ladder; the leg was not, because the failure never reached the ladder.
+
+### Why the existing markers missed it
+
+Every marker in `_UNREADABLE_MARKERS` before this change is emitted by a BLOCK READ:
+`ZIPDecode`, `TIFFReadEncodedTile`, `IReadBlock failed`, and the two wrappers around them. A
+missing object fails at `rasterio.open`, before any block is requested, so none of them appears.
+`is_unreadable_source` therefore answered no, `s2_roi` re-raised, and the whole zone-year died
+where one date should have been skipped.
+
+What the driver receives is:
+
+```
+Exception("RasterioIOError('ObjectNotFound: The specified key does not exist.')")
+```
+
+A plain `Exception` carrying a repr — the read runs on a Dask worker and tblib cannot reconstruct
+rasterio's GDAL-backed classes across the boundary. **An `isinstance` check against a rasterio or
+GDAL type is therefore not available here**, however much it would be the better test. Text is the
+only evidence that survives, which is why the fix is three markers — `ObjectNotFound` (GDAL and
+rasterio), `NoSuchKey` (the S3 API error code), and `The specified key does not exist` (the
+response body) — covering the three layers that can be the one to surface it.
+
+### Not-found alone does not say whose object it was
+
+Those three strings belong to the S3 layer, and **every S3 client in the process shares that
+layer**. Checked against the installed wheel: `icechunk`'s error enum carries `ObjectNotFound` and
+`NoSuchKey` verbatim, so the DESTINATION store speaks the same vocabulary the source does. Matched
+on their own they would let a hole in the destination repository, or in the ROI-mask store, be
+classified as source data loss — recorded durably on the store as a finding about the provider, and
+a date given up for a fault that giving it up cannot route around.
+
+So the missing-object markers only count when the text ALSO names the source reader
+(`RasterioIOError`, or a `CPLE_` class). GDAL is used here only to read source imagery: the
+destination is Zarr and Icechunk, and the ROI mask is read through `da.from_zarr`, neither of which
+goes through it. Unpaired, the exception is re-raised — the behaviour that predates this marker
+class, and the safe direction to fail in. The decode markers above need no such pairing; only GDAL
+emits them at all.
+
+**Corrected in place on integration.** This section described the pairing set as `RasterioIOError`
+and `CPLE_`; cause 5 needed the same pairing for a different marker class and described it as those
+two plus `WarpOperationError` and `HTTP response code:`. They are now **one**
+`_SOURCE_READER_MARKERS` tuple holding the union, shared by both predicates. Neither section's
+reasoning changes — every added string is GDAL's own vocabulary, which is the whole basis of the
+pairing — but a missing object reported as `HTTP response code: 404` now pairs too, where the
+narrower tuple would have re-raised it.
+
+### The leg was not even retried, for an unrelated reason
+
+`_NON_RETRYABLE_LEG_MARKERS` in `ingest_zone_year.py` already contained `ObjectNotFound`, listed
+there for a completely different meaning: **Prefect's** `ObjectNotFound`, raised when a child
+deployment is not registered. The two names collide, so a source object's 404 matched the marker
+and the zone-year was classified deterministic and never re-dispatched. The classification was
+right by accident — a retry would have read the same absent object — but nothing in the code knew
+that, and the collision is still live for any future S3 404 reaching that classifier.
+
+### The skip, and what the downstream gate does and does not catch
+
+**Corrected in place 2026-08-20/21. Two claims withdrawn.** This section previously said that "one
+recorded unreadable date **excuses its whole month** from the downstream coverage gate, so k
+recorded dates can excuse k months", and derived a ceiling of 6 from it. It then said the opposite
+overshoot: that a leg losing many dates **would inevitably fail** that gate. Neither is right, and
+the ceiling built on the first is gone from the code.
+
+Read `inference/data_loading.py` around the gate rather than the helper in isolation:
+
+```python
+missing      = sorted(required_months - present_months)
+_lost_months = _months_holding_unreadable_dates(_raw_unreadable)
+_explained   = _months_within_assessed(missing, _assessed) if missing else set()
+_explained   = (_explained - _lost_months) if _lost_months is not None else set()
+```
+
+Two facts, and both matter:
+
+1. **The gate only ever looks at WHOLLY ABSENT months.** `missing` is
+   `required_months - present_months`. A month that keeps even one acquisition is never examined,
+   so dates lost from it are invisible to the gate — its depth is quietly reduced and nothing
+   downstream objects.
+2. **Where the gate does look, a recorded loss makes it STRICTER.** `_lost_months` is *subtracted*
+   from the excused set, so a given-up date disqualifies its month from being excused, what remains
+   in `missing` raises `InsufficientCoverageError`, and the comment above that code says why:
+   "Excusing it would let a write-once year publish a whole-month data-loss hole labelled a
+   legitimate absence." `tests/unit/test_time_window.py::test_a_month_lost_to_unreadable_imagery_is_not_excused`
+   had pinned that all along.
+
+So the two cases land differently:
+
+- **every date in a month lost** — the month is empty AND holds given-up dates, so it is not
+  excused, stays in `missing`, and the cell fails with `InsufficientCoverageError` before
+  publishing anything.
+- **some dates lost from a month that keeps others** — nothing per-month sees it. The only rule
+  that does is per pixel: `config.inference.OPTICAL_MIN_OBS` refuses a pixel with too few valid
+  optical observations in the year rather than publishing it thin.
+
+A vanished bucket reaches neither case, because `NoSuchBucket` is deliberately NOT matched: a
+bucket or prefix that has gone is systemic by construction and every remaining date fails
+identically, so it fails the leg on the first date rather than being skipped date by date.
+
+**The owner's decision, 2026-08-20/21: skip the date, keep the leg, accept the loss of depth the
+second case implies, and add nothing else.** No count, no ceiling, no new failure mode. At the rate
+below, any bound would only ever fire on a fault of some other kind — and every date given up is
+already logged at error level and written to the store's `assessed_unreadable_dates`, so a leg that
+lost an implausible number of them says so on the record without a guard to announce it.
+
+### The observed rate — why this is low priority
+
+Measured 2026-08-20/21 on the live campaign, and the reason the fix is deferred rather than rushed:
+
+| measurement | value |
+|---|---|
+| zone-years abandoned by this defect | **1** |
+| zone-years attempted | ~244 |
+| recurrence in the 91 minutes after, at 60 concurrent cells | **none** |
+| required files probed across ten sample days | 100,320, of which **exactly one** missing |
+
+The existing shelf-and-second-wave machinery absorbs a failure at that rate, which is why the
+campaign was left to run rather than stopped for it, and why this fix waited for a batch rather
+than going in on its own.
+
+### A docstring that is broader than its code
+
+`_months_holding_unreadable_dates`'s prose says "a month whose EVERY acquisition was skipped as
+unreadable", while the implementation adds the month of **ANY** given-up date. Recorded, not
+changed. The breadth is currently inert: the set is only ever intersected with, or subtracted from,
+months already known to be WHOLLY absent, so a month that kept a date is never in play. A future
+caller using the helper on its own would inherit the wider meaning without the docstring warning
+it.
+
+## Cause 5 — the provider refuses reads for a while (radar), 2026-08-21
+
+Absorbed here rather than given its own document, because it is a fifth thing the same
 `WarpOperationError('Chunk and warp failed')` text hides.
 
 | | source | preceded by | retryable? |
@@ -564,7 +714,7 @@ Left alone because widening that tuple changes optical behaviour during a live c
 direction is not obviously safe: a 403 that currently steps down and succeeds would instead
 propagate. It wants its own change with the optical ladder's blast radius measured first.
 
-### A credential refresh strips its own task's GDAL configuration — measured, NOT fixed here
+### A credential refresh strips its own task's GDAL configuration — measured, and FIXED here
 
 Reproduced deterministically against the installed `odc.loader` and `rasterio`.
 `auth._patch_odc_thread_session_for_env_drift` responds to a credential change by calling
@@ -577,9 +727,18 @@ outermost and on exit restores a freshly-defaulted option set.
 authorization failure. The cost is the lost GDAL configuration: **a task that has been through a
 refresh has no GDAL HTTP retries (`GDAL_HTTP_MAX_RETRY=10`) for the rest of its life**, and
 re-lists a directory on every open. Losing ten GDAL retries is directly relevant to surviving a
-source that is briefly refusing. The fix is to install the new credential by assigning the
-thread's session rather than resetting the cache. Its own change: the credential path was out of
-scope here.
+source that is briefly refusing.
+
+**Corrected in place on integration.** This section said "NOT fixed here", because the fix was a
+separate change on a separate branch. Both are in this branch now, so read the paragraph above as
+the measurement and this as the resolution: the drift branch in
+`auth._patch_odc_thread_session_for_env_drift` clears the cached session directly
+(`self._session = None`, `self._aws = None`) instead of calling `ThreadSession.reset()`, so
+`rasterio.env.delenv()` is never reached from inside `rio_env()` and the outer environment's
+options — the HTTP retry ladder among them — survive the refresh. `reset()` is unchanged at its
+other two call sites, neither of which is nested inside `rio_env()`. A task that has been through a
+refresh therefore keeps its ten GDAL retries, which is the containment this cause's bounded skip
+sits on top of.
 
 ## Coupling to the leg retry
 
@@ -612,7 +771,7 @@ failure happens, carry the request identity into the failure detail, and let the
 budget act on a REPEAT of it. Note that the "Caveat on the sample" 502s above are the first
 recorded observation of that same upstream defect.
 
-**A third instance, resolved for the radar read itself:** Cause 4 above. The prescription is the
+**A third instance, resolved for the radar read itself:** Cause 5 above. The prescription is the
 same and was followed literally — `is_provider_refusal` classifies at the point the read fails,
 the verdict is carried into the store's own record as `scope`, and the layer holding the budget
 acts on the count rather than on the message. What is new is the direction of the verdict: the

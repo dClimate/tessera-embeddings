@@ -532,6 +532,42 @@ def test_a_coverage_gate_read_failure_reaches_the_duplicate_ladder(run_ingest, m
     assert "DATA LOSS" in caplog.text
 
 
+def _missing_object_gate(*_a, **_k):
+    """A coverage gate whose object is not there.
+
+    Raises the form the Dask boundary actually delivers: a plain ``Exception`` carrying
+    rasterio's repr, because tblib cannot rebuild the GDAL-backed class on the driver. A test
+    raising a live rasterio error would pass against code that only handles live rasterio
+    errors, which is not the code that runs.
+    """
+    raise Exception("RasterioIOError('ObjectNotFound: The specified key does not exist.')")
+
+
+def test_a_handful_of_missing_objects_is_skipped_and_the_leg_completes(run_ingest, monkeypatch, caplog):
+    """The decision this fix exists to implement: lose the date, keep the zone-year.
+
+    An href the provider never published fails at open, so it reaches the same give-up path
+    a corrupt object does. The leg must finish, record each loss durably, and accept the
+    slight loss of depth. Nothing counts these skips or stops the leg over them: the condition
+    is rare enough per granule that a bound would only ever fire on a fault of some other kind,
+    and the store carries a durable record of every date given up either way.
+    """
+    monkeypatch.setattr(s2_roi, "_coverage_from_scl", _missing_object_gate)
+    assessed: list[str] = []
+    monkeypatch.setattr(s2_roi, "record_assessed_window", lambda path, *_a, **_k: assessed.append(path))
+    dates = {"2024-01-01": True, "2024-01-02": True, "2024-01-03": True}
+
+    with caplog.at_level(logging.ERROR):
+        # Over an already-populated store, so the assessed-window record is reached: it is
+        # keyed on the store holding dates, not on what this invocation wrote.
+        run = run_ingest(dates, pipeline_dates=False, existing_dates={"2023-12-31"})
+
+    assert run.result.dates_filtered_coverage == 3
+    assert "DATA LOSS" in caplog.text
+    # The loss is durable, so the gate downstream sees it rather than inferring a gap.
+    assert assessed == ["memory://store/reflectance.zarr"]
+
+
 def test_a_non_read_failure_in_preparation_still_fails_the_leg(run_ingest, monkeypatch):
     """Only an unreadable SOURCE is turned into a per-date outcome. Anything else is a
     fault in the run, and swallowing it per date would hide it behind a coverage figure.
