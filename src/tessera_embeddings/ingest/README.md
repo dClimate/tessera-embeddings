@@ -71,13 +71,19 @@ property, so queries use a bbox derived from the MGRS tile via `mgrs_tile_to_bbo
 
 `_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry`
 built by `make_logging_retry()` (`_http.py`, shared with the CMR Granule query) and passed
-into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504)`).
+into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 503, 504)`).
 The subclass logs each retry attempt at WARNING — urllib3 otherwise retries silently inside
 the `HTTPAdapter`, making a slow query indistinguishable from a hang. Because
 `search.items()` paginates lazily, each page fetch is a separate HTTP call — configuring
 retries on the underlying `HTTPAdapter` means a transient 5xx on page N is retried in
-place, instead of throwing away prior pages and restarting the whole query. This matters
-most for CMR-STAC, which returns 502/503 under load on large date-range queries. Note that
+place, instead of throwing away prior pages and restarting the whole query.
+
+**502 is deliberately absent from that force-list**, so an Earth Search page refusal
+arrives unretried and the date-window re-cut below can start immediately instead of after
+the ladder's backoff. A 502 that really was transient is absorbed by the attempt budget
+that owns the leg, which is where a refusal is settled anyway — it takes an identical
+repeat to prove one deterministic. The CMR Granule query keeps its own ladder
+(`opera_query._CMR_RETRY`), 502 included, and is unaffected. Note that
 `StacApiIO`'s default `max_retries=5` passes a bare int to urllib3, which has an empty
 `status_forcelist` and therefore does **not** retry 5xx responses — the explicit `Retry`
 object is required.
@@ -92,11 +98,11 @@ CMR-STAC search entirely and queries the native CMR Granule API. See
 individual page requests are refused with a 502 while the rest of the same walk is served,
 and the refusal is deterministic in the *request* — pagination cursor and date window
 together — not in how deep the walk has got. The same refusal has been seen at page 289 of
-one window and page 14 of a shorter one sharing its late bound. So the retry ladder above
-cannot absorb it (it has already exhausted itself on that request), and a smaller page is
-not the lever either: page size changes neither the items walked nor which requests are
-refused. **It is emphatically not the page-size refusal above** — that one fails on the
-*first* page and is what `max_page_size` was lowered for.
+one window and page 14 of a shorter one sharing its late bound. So waiting cannot absorb
+it — which is why 502 is kept out of the retry ladder above — and a smaller page is not the
+lever either: page size changes neither the items walked nor which requests are refused.
+**It is emphatically not the page-size refusal above** — that one fails on the *first* page
+and is what `max_page_size` was lowered for.
 
 What clears it is a window with a different **end** date; shortening only the start does
 not, because the catalogue pages newest-first and the late bound fixes the whole cursor
@@ -107,6 +113,32 @@ beside the first page and cuts a window matching more than `_MAX_QUERY_ITEMS` to
 bounds *cost*, keeping a refusal from discarding a long walk, and is not what fixes the
 defect. A refusal that shortening cannot route around — a first page, a stated overload, or
 a single day — still raises the classified `CatalogueQueryError` with its token.
+
+```text
+one query = a WORKLIST of date windows, not one cursor walk
+
+  2019-02-28 ------------------------------------------------- 2019-04-01
+      |   page 1 reports numberMatched > _MAX_QUERY_ITEMS, so cut before walking deep
+      v
+   +--------+--------+--------+--------+--------+--------+
+   | 02-28  | 03-05  | 03-11  | 03-16  | 03-22  | 03-27  |   consecutive windows SHARE
+   |  ..    |  ..    |  ..    |  ..    |  ..    |  ..    |   their boundary day; the id
+   | 03-05  | 03-11  | 03-16  | 03-22  | 03-27  | 04-01  |   dedupe absorbs the repeat
+   +--------+--------+--------+--------+--------+--------+
+      OK       OK       OK      502!      OK       OK
+                                 |
+                                 v   refused past page 1 -> re-cut this window only
+                        03-16 .. 03-22
+                          +-- 03-16 .. 03-19   OK
+                          +-- 03-19 .. 03-22   502!
+                                +-- 03-19 .. 03-21   OK
+                                +-- 03-21 .. 03-22   502!
+                                      +-- 03-21 .. 03-21   OK  <- one day: recursion floor,
+                                      +-- 03-22 .. 03-22   OK     and the only place the
+                                                                  windows abut
+
+  union of the windows == the input window;  items keyed by id across all of them
+```
 
 The re-partition is a pure re-cut of the window, never a narrowing: the shorter windows'
 union is exactly the input window, and consecutive windows deliberately **share** their
@@ -128,10 +160,11 @@ client stack make that necessary:
   path; a STAC search is a request **body**, so the collection, the window, the bbox and the
   page are all gone. Without them a refusal cannot be narrowed to a month or a page,
   reproduced, or reported to whoever runs the archive.
-- **Our layer sits ABOVE a retry ladder, not next to one.** The `urllib3.Retry` above
-  retries each page fetch with exponential backoff, so what escapes is the ladder reporting
-  its own exhaustion — a much stronger statement than one error response, and one that must
-  not be mistaken for a first attempt.
+- **Our layer sits ABOVE a retry ladder, and only partly behind it.** For a status the
+  `urllib3.Retry` above force-lists, what escapes is the ladder reporting its own
+  exhaustion — a much stronger statement than one error response, and one that must not be
+  mistaken for a first attempt. For a status kept out of that list (502) the first refusal
+  arrives directly. `CatalogueRefusal.exhausted` records which, so no caller has to assume.
 
 So `_query_stac_items` pages explicitly (`pages_as_dicts`, which is what `items_as_dicts`
 iterates internally) and wraps **only the page fetch** in a `CatalogueQueryError` carrying a
@@ -142,7 +175,7 @@ root outage is not attributed to a window that was never asked for.
 ```text
 CATALOGUE REFUSED collection=sentinel-2-l2a window=2021-09-01/2021-10-02
                   bbox=-3.0000,50.0000,-2.0000,51.0000 page 3
-                  with HTTP 502 after exhausting the retry ladder after 500 item(s)
+                  with HTTP 502 without being retried after 500 item(s)
                   — classified upstream-error:502
 ```
 
@@ -157,7 +190,10 @@ endpoint and need opposite responses:
 
 The two named sets must jointly cover the ladder's `status_forcelist` — a status the ladder
 retries but the taxonomy does not name falls to `UNKNOWN` and keeps its expansive retry
-forever. A unit test asserts that containment rather than leaving it to care.
+forever. A unit test asserts that containment rather than leaving it to care. The converse
+is allowed and deliberate: the taxonomy names 502, which the ladder does **not** retry, and
+a second test pins that exclusion so re-adding it cannot quietly restore the backoff the
+window re-cut exists to avoid.
 
 The status is read from the exception **chain**, not the message: `pystac_client` re-raises
 without `from`, so the evidence sits under `__context__` on urllib3's own exception, and the

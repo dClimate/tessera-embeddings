@@ -76,6 +76,17 @@ def _refused(status: int) -> APIError:
     raise AssertionError("the ladder did not refuse")  # pragma: no cover
 
 
+def _unretried(status: int) -> APIError:
+    """The exception the client raises for a status the ladder does NOT force-list.
+
+    ``StacApiIO.request`` calls ``APIError.from_response`` on any non-200 it was handed, so
+    the status arrives as a structured attribute with no ladder in the chain. This is the
+    shape a 502 has in production, since 502 is excluded from the force-list precisely so
+    the window re-cut is reached on the first refusal.
+    """
+    return APIError.from_response(SimpleNamespace(status_code=status, text=f"HTTP {status}"))
+
+
 def _request(page: int = 3) -> CatalogueRequest:
     return CatalogueRequest("sentinel-2-l2a", "2021-09-01/2021-10-02", "bbox=-3.0000,50.0000,-2.0000,51.0000", page)
 
@@ -164,6 +175,21 @@ class TestClassification:
         assert forcelist, "the STAC ladder must force-list statuses for this invariant to mean anything"
         assert forcelist <= (LOAD_REFUSAL_STATUSES | UPSTREAM_ERROR_STATUSES)
         assert not (LOAD_REFUSAL_STATUSES & UPSTREAM_ERROR_STATUSES), "a status cannot be both refusals"
+
+    def test_the_ladder_does_not_retry_the_status_the_window_re_cut_answers(self) -> None:
+        """502 must reach the re-cut on the FIRST refusal, so the ladder must not hold it.
+
+        Force-listing it costs the ladder's whole backoff — measured in minutes per refused
+        window — before a single shorter window can be tried, and buys nothing: the refusal
+        is deterministic in the request, so every one of those attempts re-asks a question
+        whose answer is already known. Re-adding it would be silent, hence this test.
+
+        The complement is asserted deliberately: 429 and 503 are refusals where waiting IS
+        the remedy, and they must keep the ladder.
+        """
+        forcelist = set(stac._STAC_RETRY.status_forcelist or ())
+        assert 502 not in forcelist
+        assert forcelist >= LOAD_REFUSAL_STATUSES, "a stated overload must still be waited out"
 
 
 class TestSignature:
@@ -439,9 +465,13 @@ class TestADeepRefusalIsRePartitioned:
     """A 502 at a deep cursor becomes more, smaller searches — not a failed leg.
 
     The counterpart to ``TestTheFailingRequestIsNamed``: that pins what still propagates,
-    this pins what no longer does. Waiting cannot clear this refusal — the ladder
-    underneath has already exhausted itself on the identical cursor — so the only remedy
-    is to ask for the window in shorter pieces.
+    this pins what no longer does. Waiting cannot clear this refusal, so the only remedy is
+    to ask for the window in shorter pieces.
+
+    Both arrival shapes are exercised. 502 is kept out of the ladder's force-list, so what
+    production sees is a single unretried response — but a 502 can still reach us wrapped in
+    an exhausted ladder (a redirect chain, a force-list someone widens later), and the
+    re-partition must not depend on which one it is.
     """
 
     @staticmethod
@@ -458,8 +488,15 @@ class TestADeepRefusalIsRePartitioned:
             stac._query_stac_items(provider, collection, None, start, end, bbox=(-3.0, 50.0, -2.0, 51.0))
             return search.call_count
 
-    def test_a_month_refused_at_depth_is_re_queried_in_pieces(self, caplog) -> None:
-        pages = _pages_then_refusal([{"features": [_item("a")]}], _refused(502))
+    @pytest.mark.parametrize(
+        "refusal",
+        [
+            pytest.param(_unretried(502), id="unretried-response"),
+            pytest.param(_refused(502), id="exhausted-ladder"),
+        ],
+    )
+    def test_a_month_refused_at_depth_is_re_queried_in_pieces(self, refusal, caplog) -> None:
+        pages = _pages_then_refusal([{"features": [_item("a")]}], refusal)
 
         searches = self._query(pages, caplog, "2021-09-01", "2021-10-02")
 

@@ -90,11 +90,20 @@ def chunks_to_odc(chunks: dict[str, int]) -> dict[str, int]:
 logger = logging.getLogger(__name__)
 
 
+# 502 is deliberately NOT retried here. Earth Search refuses individual page requests with
+# one, deterministically in the request, and the remedy is to ask a different request — which
+# `_query_stac_items` does by re-cutting the date window. Retrying the same one first buys
+# nothing and costs the ladder's whole backoff before the re-cut can start. The statuses that
+# stay are the ones where waiting IS the remedy (429, 503) and the ones not measured to behave
+# this way (500, 504); connection and read failures keep the full ladder either way, since they
+# carry no status. A 502 that really was transient is then absorbed one layer up, by the
+# attempt budget that owns the leg — which is where `catalogue_refusal` puts the decision
+# anyway, since it takes an identical REPEAT to prove a refusal deterministic.
 _STAC_RETRY = make_logging_retry(
     "STAC",
     total=8,
     backoff_factor=2,
-    status_forcelist=(429, 500, 502, 503, 504),
+    status_forcelist=(429, 500, 503, 504),
     allowed_methods=frozenset(["GET", "POST"]),
     respect_retry_after_header=True,
 )
@@ -1033,11 +1042,11 @@ def _query_stac_items(
                     #
                     # THIS is the fix for the Earth Search 502: a page request the catalogue
                     # will not serve is re-asked as shorter windows, which pose it as
-                    # different requests. Waiting cannot help — the refusal is deterministic
-                    # in the request, and the ladder underneath has already exhausted itself
-                    # on it. Shortening the window's END is what clears it; shortening only
-                    # its start does not, so this recurses until a window completes or is
-                    # down to a single day.
+                    # different requests. Waiting cannot help, so 502 is kept out of the
+                    # retry ladder above and arrives here on the first refusal. Shortening
+                    # the window's END is what clears it; shortening only its start does
+                    # not, so this recurses until a window completes or is down to a
+                    # single day.
                     #
                     # Not on the first page, which a shorter window asks the same way; and
                     # not on a stated overload, which is what the ladder above is for and

@@ -141,16 +141,16 @@ PROVIDERS: dict[str, STACProvider] = {
                 tile_id_prefix="",
             ),
         },
-        # BELOW the class default, and measured rather than guessed. This catalogue's search
-        # returns 502 for some (area, date-window) pairs at 250 items per page while
-        # answering the SAME query at 100 in under two seconds, and answering an adjacent
-        # year at 250 without trouble — so it is a page-size sensitivity in the service, not
-        # our load and not missing data. It also defeats the nine attempts of backoff
-        # underneath us, so the retry ladder cannot absorb it and only a smaller page can.
-        # Roughly twice the page requests for a query that answers at all is a good trade:
-        # search calls are a rounding error against the per-scene COG reads that dominate an
-        # ingest. Set per provider rather than on the class default, because nothing implicates
-        # the other catalogues. Reproduction: `scripts/e84_search_502_probe.py` (yield-embeddings).
+        # BELOW the class default: this catalogue answers some (area, date-window) pairs with
+        # a 502 at 250 items per page and the SAME query at 100, so the page size is what
+        # keeps a FIRST page servable. Per provider rather than on the class default, because
+        # nothing implicates the other catalogues.
+        #
+        # Do not read this as a remedy for the OTHER Earth Search 502, where one page request
+        # deep in a walk is refused and the rest of the walk is served. That one is a function
+        # of the request as a whole — cursor and date window together — and page size moves
+        # neither the items walked nor which requests are refused; re-cutting the date window
+        # is what clears it. See `_MAX_QUERY_ITEMS` and the refusal handler in `ingest/stac.py`.
         max_page_size=100,
     ),
     "cmr-asf": STACProvider(

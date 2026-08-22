@@ -914,6 +914,95 @@ conflate. Both are live and each needs its own remedy:
 items walked nor which requests get refused, and the `urllib3` ladder underneath has already
 exhausted itself by the time the failure reaches us.
 
+### The shape of it
+
+```text
+BEFORE — one search, one cursor chain, walked to the end
+
+  sentinel-2-l2a | bbox = zone 34N envelope | 2019-02-28 .. 2019-04-01 | 56,558 items
+
+   p1 --cur--> p2 --cur--> ... --> p288 --cur--> p289          ...      p566
+  200         200                  200            502     (never reached)
+                                                   |
+                              every page's cursor comes from the page before it, so a
+                              refusal is not a gap to skip -- there is no cursor for p290
+                              and no offset to jump to. The walk is over, and so is the leg.
+
+
+HOW IT FAILED — the remedies that look obvious, and what each one actually did
+
+  re-ask the same page   502 502 502 502 502 502 502 502     <- urllib3 ladder, 8 deep
+                          |_____ ~4 min of backoff _____|       then the leg dies
+                         deterministic in the request: 6 of 6 repeats refused, 1.3 s each
+
+  use a smaller page     no effect. Item 27,600 is item 27,600 whether that is p111 at
+                         size 250 or p276 at size 100. This is the OTHER 502's remedy.
+
+  wait longer            no effect. Latency was flat 0.6-1.6 s to the failure and the 502
+                         itself returned in 1.3 s -- nothing was timing out.
+
+  ask a shorter window   works, but ONLY if the window's LATE bound moves. See below.
+
+
+WHY RE-CUTTING WORKS AT ALL — the catalogue pages newest-first, so a window's late
+bound fixes its whole cursor sequence and its early bound changes nothing reached first
+
+  03-16 ........... 03-22   refused p14  -+
+  03-19 ....... 03-22       refused p14   +- same late bound, same cursors, same refusal
+  03-21 ..... 03-22         refused p14  -+
+  03-16 ..... 03-19         OK  53 pages -+
+  03-21 . 03-21             OK  16 pages  +- different late bound, different cursors
+  03-22 . 03-22             OK  15 pages -+
+
+  So halving alone is not sufficient: the half that KEEPS the parent's late bound
+  retraces the parent's cursors page for page. Measured -- 2019-02-28/2019-03-16
+  completes in 213 pages while 2019-03-16/2019-04-01 is refused at p289, the same
+  page and the same cursor as the whole month.
+
+
+AFTER — a worklist of date windows. A refused window is RE-CUT, never re-asked.
+
+  2019-02-28 ------------------------------------------------------- 2019-04-01
+      |
+      |  (1) numberMatched = 56,558 > _MAX_QUERY_ITEMS on page 1, so cut up front.
+      |      Denominated in ITEMS, so a denser year yields more pieces, not deeper pages.
+      v
+   +---------+---------+---------+---------+---------+---------+
+   | 02-28   | 03-05   | 03-11   | 03-16   | 03-22   | 03-27   |   each walked as its
+   |   ..    |   ..    |   ..    |   ..    |   ..    |   ..    |   own cursor chain
+   | 03-05   | 03-11   | 03-16   | 03-22   | 03-27   | 04-01   |
+   +---------+---------+---------+---------+---------+---------+
+       OK        OK        OK       502!       OK        OK
+        ^                            |
+        |  consecutive windows SHARE their boundary day -- 03-05 ends the first and starts
+        |  the second -- so no acquisition can fall between them, and the id dedupe
+        |  absorbs the one repeated day
+                                     |
+                                     |  (2) refused past page 1 -> re-cut THIS window and
+                                     |      leave the other five alone. 502 is kept out of
+                                     v      the retry ladder, so this starts immediately.
+                        2019-03-16 .. 03-22   refused p14
+                          |
+                          +-- 03-16 .. 03-19   OK    53 pages   5,179 items
+                          +-- 03-19 .. 03-22   refused p14
+                                |
+                                +-- 03-19 .. 03-21   OK   41 pages   3,944 items
+                                +-- 03-21 .. 03-22   refused p14
+                                      |
+                                      +-- 03-21 .. 03-21  OK  16 pages  1,414 items
+                                      +-- 03-22 .. 03-22  OK  15 pages  1,318 items
+                                                                 ^
+                                    a two-day window cannot be shortened while its halves
+                                    share a boundary day, so AT THAT FLOOR ONLY they abut.
+                                    Without it the recursion stalls here and the leg fails.
+
+  The invariant that lets any of this touch a fingerprinted query:
+
+    union of every window   ==   the input window     (a re-partition, never a narrowing)
+    items keyed by id       across every search one query runs
+    ==>  56,558 of 56,558 items, zero duplicates, on the query that fails in production
+```
+
 ### The measurement that killed the depth hypothesis
 
 The refusals seen during the campaign clustered at pages 276–307, which reads as a depth
@@ -982,10 +1071,22 @@ Two consequences, both of which cost a design iteration to learn:
 
 ### What shipped
 
-`_MAX_QUERY_ITEMS = 10_000`, read against `numberMatched` on each window's first page, plus a
-re-partition on any upstream-error refusal past page 1. Denominated in **items**, so a denser
-year is cut into more pieces rather than walked further — 2019 roughly doubled 2017–18 and
-2020–2025 will be denser, and that changes the part count and nothing else.
+Three things. `_MAX_QUERY_ITEMS = 10_000`, read against `numberMatched` on each window's
+first page. A re-partition on any upstream-error refusal past page 1. And **502 removed from
+the STAC retry ladder's `status_forcelist`**.
+
+The ceiling is denominated in **items**, so a denser year is cut into more pieces rather than
+walked further — 2019 roughly doubled 2017–18 and 2020–2025 will be denser, and that changes
+the part count and nothing else.
+
+Taking 502 out of the ladder is what makes the re-cut prompt rather than merely correct. The
+ladder was pure cost on this refusal: it is deterministic in the request, so all eight
+attempts re-ask a question whose answer is already known, and the re-cut that does clear it
+cannot start until they are spent. 429 and 503 keep the ladder — those are the refusals where
+waiting IS the remedy — and the CMR Granule query has its own ladder
+(`opera_query._CMR_RETRY`), 502 included, untouched. Excluding a status the taxonomy still
+classifies is deliberate and asymmetric, so a test pins the exclusion rather than only the
+old containment invariant; re-adding 502 would otherwise quietly restore the backoff.
 
 The ceiling bounds **cost, not correctness**: it is the re-partition-on-refusal that fixes the
 defect, and the ceiling is what keeps a refusal from throwing away hundreds of pages of walk.
@@ -1007,8 +1108,38 @@ nothing duplicated. The sub-tree under the one refused part recovers as:
 The whole month costs **19 searches and 821 page requests**, against 566 pages for the single
 walk that cannot complete — **1.45x** the page requests for a query that currently returns
 nothing at all. The overhead is the pages re-walked after a proactive cut and the shared
-boundary days; §8 records STAC search as a rounding error against the per-scene COG reads that
-dominate an ingest, so this is affordable.
+boundary days.
+
+### Wall clock, and where it goes
+
+Two runs of the benchmark query from a laptop, item set identical in both
+(56,558 of 56,558, zero duplicates), refusal tree identical (three refusals, each at page 14):
+
+| | wall clock | ms/item | ladder retry lines |
+|---|---|---|---|
+| re-partition, 502 still force-listed | **2,360.7 s** (39.3 min) | 41.7 | 24 (8 per refusal) |
+| re-partition, 502 excluded | **1,099.6 s** (18.3 min) | 19.4 | **0** |
+| §8 reference rate, for scale | (316 s at this item count) | 5.58 | — |
+
+The 1,261 s recovered is the ladder: `total=8, backoff_factor=2` against urllib3's default
+`backoff_max=120` sleeps 0+4+8+16+32+64+120+120 = **364 s per refused page request**, and there
+are three. Predicted 1,092 s, measured 1,261 s; the difference is per-page variance between runs.
+
+**What remains is per-page latency, not the algorithm.** 1,099.6 s over 821 page requests is
+1.34 s/page from a laptop, where the §8 reference rate implies 0.56 s/page. Whether that gap is
+network round-trip — in which case an in-region worker closes it — or Earth Search's own think
+time is **UNMEASURED as of 2026-08-22** and is the thing to establish before optimising further.
+Note that §8's "164 s/month" is a ~29,390-item month; this query is 56,558 items, so the
+comparable target is the **rate**, 5.58 ms/item, not the duration.
+
+**A second, smaller inefficiency is visible in that run and is NOT fixed.** The proactive cut
+CASCADES: `_parts_for_depth` sizes parts as `ceil(matched / _MAX_QUERY_ITEMS)` and cuts by equal
+day count, so where density is uneven a child can still exceed the ceiling and be cut again.
+The run cut the month into 6, then re-cut 03-22/03-27, 03-27/04-01 and 03-27/03-30. Each cascade
+wastes a page-1 fetch. Sizing parts from density rather than day count would fix it — but note
+that changing the part count changes the window boundaries and therefore the ORDER of the
+returned item list, which the solar-day painter's stable sort can turn into different pixels on
+a cloud-cover tie. It is a fingerprint-relevant change, not a free one.
 
 **Cost note.** Consecutive windows share their boundary day rather than abutting it, so no
 acquisition can fall between them — the catalogue is asked for whole days and expands them to
@@ -1058,6 +1189,9 @@ defect fix.
 | per-search item ceiling | **10,000** items (`_MAX_QUERY_ITEMS`), from `numberMatched` on the first page | shipped; bounds cost, not correctness (§7c) |
 | re-partition item-set check | union of parts = **56,558 of 56,558** on the failing query | live catalogue, end to end (§7c) |
 | re-partition cost | **19 searches, 821 page requests** vs 566 for the single walk that cannot complete (**1.45x**) | same run (§7c) |
+| 502 in the retry ladder | **364 s of backoff per refused page request** (`total=8`, `backoff_factor=2`, urllib3 `backoff_max=120`), bought nothing — the refusal is deterministic. Removed from `_STAC_RETRY`; `_CMR_RETRY` keeps it | arithmetic + measured, 24 retry lines to 0 (§7c) |
+| benchmark query wall clock | **2,360.7 s -> 1,099.6 s** (39.3 -> 18.3 min) for an identical item set, from a laptop. **41.7 -> 19.4 ms/item** against a 5.58 ms/item reference rate | two live runs, 2026-08-22 (§7c) |
+| what still costs | **1.34 s per page request** from a laptop vs 0.56 s implied by the reference rate. Network round-trip versus Earth Search think time is **UNMEASURED** | open (§7c) |
 | worker RSS per retained item | ~80 KB → ~27–30 GB/year vs 16 GiB worker | 3-point slope |
 | unsharded manifest cost | ~1.1 MB refs/date → ~35 GB per zone-year | fitted, N²/2 |
 | time-sharded manifest cost | ~1.2 GB per zone-year (~28× less) | predicted 34.7 MB at 9 dates, measured 34.6 |

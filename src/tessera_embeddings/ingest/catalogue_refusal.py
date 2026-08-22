@@ -8,14 +8,18 @@ cannot be outwaited — every further attempt re-runs a query whose answer is al
 known, and the only thing more patience buys is spending the cell's attempt budget more
 slowly while a fleet idles against it.
 
-**Our layer sits ABOVE a retry ladder, not next to one.** ``_http.make_logging_retry``
-mounts a ``urllib3`` ``Retry`` on the catalogue session, so every individual page fetch
-is already retried with exponential backoff before anything here is reached. The
-exception that escapes is therefore not one refusal: it is the ladder reporting that it
-exhausted itself, which is a much stronger statement than a single error response and
-must not be treated as a first attempt.
+**Our layer sits ABOVE a retry ladder, and only partly behind it.**
+``_http.make_logging_retry`` mounts a ``urllib3`` ``Retry`` on the catalogue session, so a
+page fetch that fails on a status in that ladder's list is already retried with exponential
+backoff before anything here is reached; what escapes is the ladder reporting its own
+exhaustion, a much stronger statement than a single error response. A status kept OUT of
+that list arrives here on its first refusal instead — which is the right shape when the
+remedy is to ask a different request rather than the same one again, and is why
+:mod:`~tessera_embeddings.ingest.stac` excludes the 502 it re-cuts date windows for.
+:attr:`CatalogueRefusal.exhausted` records which of the two happened, so a reader can tell
+whether patience has already been spent, and no caller has to assume it was.
 
-**What distinguishes the two, and what does not.** The status the ladder exhausted on
+**What distinguishes the two, and what does not.** The status the refusal rests on
 separates a stated overload (the upstream naming itself as the constraint) from a
 backend failure (the upstream failing to produce an answer). That is a necessary
 signal, not a sufficient one: a gateway can fail for minutes and recover. What settles
