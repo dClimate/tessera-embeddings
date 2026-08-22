@@ -183,8 +183,11 @@ CMR-STAC search entirely and queries the native CMR Granule API. See
 **Why 100 for Earth Search, and what to watch.** It is not a throughput choice — it is the
 response cap. Earth Search refuses any request whose response would exceed roughly **6 MB**,
 AWS Lambda's synchronous response limit, and 250 items of `sentinel-2-l2a` is always over it.
-At 100 items a page averages **4.6 MB** and the largest measured was **5.32 MB**, so the
-headroom is about 30%. The cap tracks **bytes, not the `limit` value**: measured directly, 130
+At 100 items a page averages 4.6 MB, but the largest measured **served** page was **5.73 MB —
+96% of the cap**, so the real headroom is a few percent rather than the 30% an average implies.
+Item size follows footprint geometry, not assets: items from November 2018 to April 2019 carry
+polygons of some 2,600 vertices where a 2024 item carries a quadrilateral, so a 100-item page is
+about 2.2 MB outside that band and at or over the cap inside it. The cap tracks **bytes, not the `limit` value**: measured directly, 130
 items are served at 5.99 MB and 150 refused, while 150 are served at 4.77 MB once unneeded
 assets are excluded server-side. If first pages ever start returning 502, this margin is the
 first thing to check and lowering this number is the lever — a first-page refusal is the one

@@ -153,9 +153,14 @@ PROVIDERS: dict[str, STACProvider] = {
         # of `sentinel-2-l2a` is over it. Per provider rather than on the class default,
         # because nothing implicates the other catalogues.
         #
-        # 100 items averages 4.6 MB against that cap and the largest measured was 5.32 MB, so
-        # the margin is roughly 30% and it is the thing to check first if first pages ever
-        # start refusing again. Item size, not the `limit` value, is what the cap tracks.
+        # Item size, not the `limit` value, is what the cap tracks — and item size is dominated
+        # by FOOTPRINT GEOMETRY rather than assets. Items from November 2018 to April 2019 carry
+        # polygons of ~2,600 vertices, about 30 KB of coordinates; a 2024 item carries a
+        # quadrilateral of ~0.3 KB, with the assets block about 18 KB either way. So a 100-item
+        # page is ~2.2 MB outside that band and at or over the cap inside it, and the largest
+        # page measured served was 5.73 MB — **96%** of the cap, not the comfortable margin an
+        # average suggests. Dropping to 75 is the lever if first pages start refusing; the
+        # measured cost is in the campaign record.
         #
         # The same cap is why one page deep in a walk is sometimes refused while every other
         # page is served: item sizes vary, so whether a given hundred clears 6 MB depends on

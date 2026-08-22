@@ -1075,8 +1075,13 @@ reject on size" looks like from outside.
 
 ### Why this is a standing risk, not just an explanation
 
-A 100-item page averages **4.6 MB against a ~6 MB cap**, largest observed 5.32 MB — roughly
-**30% headroom**. Anything that makes items fatter closes it: more assets on a newer processing
+**CORRECTED 2026-08-22:** this section previously said "largest observed 5.32 MB — roughly 30%
+headroom". That 5.32 MB was the largest page in one two-day window, quoted as though it were the
+ceiling. Measured across the month, the largest page actually **served** is **5.73 MB, 96% of the
+cap**, and the refused page reconstructs to 5.96 MB — so the served/refused boundary sits between
+5.73 and 5.96 MB and the real headroom at `limit=100` is about **4%**, not 30%.
+
+A 100-item page averages 4.6 MB against a ~6 MB cap. Anything that makes items fatter closes it: more assets on a newer processing
 baseline, or a collection change at the provider. When it closes, **first pages** start refusing,
 and a first-page refusal is the one case no date-window re-cut can route around — a shorter
 window asks its first page exactly the same way. `max_page_size` is the lever, and this margin is
@@ -1376,6 +1381,46 @@ would have produced. What remains unverified is a solar day that straddles UTC m
 the far-eastern and far-western zones, where one solar day CAN fall in two windows. That case
 is not covered by this measurement.
 
+### Why `max_page_size` stays at 100
+
+Measured 2026-08-22 on the window that reproduces the refusal, `2019-03-16/2019-03-22`, holding
+window concurrency at its shipped 6. Item counts are identical at every page size, as they must be.
+
+| `limit` | refused | requests | largest page | worst case, any alignment |
+|---|---|---|---|---|
+| 100 | **yes, page 14, 6 of 6** | 141 | 5.73 MB (96%) | 6.20 MB (103%) |
+| 90 | no | 103 | 5.11 MB (85%) | **5.66 MB (94%)** |
+| 75 | no | 124 | 4.56 MB (76%) | 4.73 MB (79%) |
+| 60 | no | 154 | 3.84 MB (64%) | 4.00 MB (67%) |
+
+The "worst case" column is the fattest run of that many CONSECUTIVE items anywhere in the window,
+derived from an independent walk at `limit=5` that agrees with the measured 100-item pages to
+within 0.07%. It is the column that matters: **`limit=90` makes zero refusals and is still 94% of
+the cap**, so a clean run there is where the page boundaries happened to fall, not evidence of
+margin. On the whole month, 75 costs **+32% requests and +14% wall clock** — about 30 s on a 208 s
+query — and 60 doubles the extra requests to buy 1.4 s.
+
+**And yet 100 stays.** The reason is that the page-size fallback shipped in this branch makes the
+remedy ADAPTIVE, and a global reduction is not. A first page refused at 100 is now re-asked at 50,
+so the one failure a shorter window cannot route around already recovers — that was the argument
+for lowering it, and it no longer holds. The fallback pays two extra requests and one re-walk for
+the windows that actually refuse; `max_page_size=75` pays 32% more requests on **every** query in
+**every** year to protect a band of about six months.
+
+Because that is what the band is. Item size follows footprint geometry, not assets: November 2018
+to April 2019 carries ~2,600-vertex polygons, about 30 KB of coordinates, where a 2024 item carries
+a quadrilateral of ~0.3 KB and the assets block is ~18 KB either way. Outside the band a 100-item
+page is **2.2 MB, 36% of the cap**. So 100 is comfortable for the overwhelming majority of the
+campaign's timeline and marginal for six months of it, which is exactly the shape an adaptive
+remedy suits and a global constant does not.
+
+**What would change the decision.** If first-page refusals turn out to be frequent inside the band
+rather than occasional, the fallback's re-walks stop being cheaper than just running smaller, and
+75 becomes right. That is a count to watch in the logs — the step-down warning names itself — not
+something to predict from here. Note also that editing `config/providers.py` at all moves the
+mosaic-content fingerprint (measured: `ingcode-1739cd669dec92a2` to `ingcode-f75448a6d8841d0a`), so
+an in-flight store cannot be appended to across the change.
+
 ### Levers that look obvious and are closed
 
 Both measured 2026-08-22 against the live catalogue, so nobody has to test them again.
@@ -1475,7 +1520,10 @@ defect fix.
 | STAC page size ceiling | 250 (500 and 1000 both fail) | measured |
 | Earth Search page-1 refusal | 502 at `limit=250`; 200 at `limit=100`, same window | measured (§7c) |
 | Earth Search 502, BOTH kinds | **one mechanism: a response-size cap of ~6 MB** (Lambda's synchronous limit). The byte-identical cursor and window is refused at `limit=100` and served at `limit=90`, returning 5.60 MB where the hundred would have been ~6.2 MB. Item sizes vary, so which hundred the cursor and window select decides it — which is why it looked deterministic in the (cursor, window) pair, and why it appeared at page **289** of one window and page **14** of another. NOT depth, NOT patience, NOT a bad cursor | measured (§7c); supersedes the earlier "not a page size either" reading |
-| Earth Search page-size margin | 100 items averages **4.6 MB** against the ~6 MB cap, largest observed 5.32 MB — roughly **30%** headroom. Check this first if first pages start refusing | measured (§7c) |
+| Earth Search page-size margin | largest page **served** is **5.73 MB — 96%** of the ~6 MB cap; the refused one reconstructs to 5.96 MB. Real headroom at `limit=100` is about **4%**. CORRECTS an earlier "5.32 MB, roughly 30%", which was one window's maximum quoted as the ceiling | measured (§7c) |
+| why items are fat, and when | footprint GEOMETRY, not assets. Nov 2018 – Apr 2019 items carry ~2,600-vertex polygons (~30 KB of coordinates) against a 2024 item's quadrilateral (~0.3 KB); the assets block is ~18 KB either way. Outside that band a 100-item page is **2.2 MB (36%)**; inside it, at or over the cap. Peak is March 2019 | measured, quarterly 2017–2026 then monthly across the transition (§7c) |
+| smaller page sizes, measured | `limit=90` makes zero refusals but its worst 90 consecutive items are **94%** of the cap — clean by luck. `limit=75` leaves **21%** margin against the fattest 75 anywhere in the worst week. Costs **+32% requests, +14% wall clock**. `limit=60` doubles the extra requests for 1.4 s | measured (§7c) |
+| page size changes the WALK order | a window re-cut for depth appends its first page BEFORE deciding to re-cut, so each such parent hoists exactly `max_page_size` items to the head of the output — 300 items at 100, 225 at 75. Harmless ONLY because the sort key is total; it would have changed painted pixels before the `item.id` tie-breaker | measured, three hashes (§7c) |
 | refusal levers, in cost order | **shorter window** first, then **smaller page** halving to `_MIN_PAGE_SIZE = 10`. The page lever covers the two refusals shortening cannot reach — a FIRST page, and a single day — both of which failed a leg outright before it | shipped (§7c) |
 | page-lever live proof | `limit=250` is refused on the first request; recovery stepped 250 → 125 → 62, interleaved with a window cut, and returned 2,512 of 2,512 items with **identical post-sort order and baselines** (`ecf847e086277035`), for 59 requests against 29 | measured (§7c) |
 | what clears it | a window with a different END date; shortening the START does not | 8 windows tabulated (§7c) |
