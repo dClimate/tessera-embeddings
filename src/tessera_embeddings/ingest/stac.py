@@ -25,6 +25,7 @@ from odc.geo.geobox import GeoBox
 from pystac import Item
 from pystac_client import Client
 from pystac_client.stac_api_io import StacApiIO
+from urllib3.util.retry import Retry
 
 from tessera_embeddings.config import (
     PROVIDERS,
@@ -42,9 +43,9 @@ from tessera_embeddings.ingest.asset_locations import (
 from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.catalogue_refusal import (
     CatalogueRequest,
-    RefusalKind,
     bbox_area_label,
     classify_refusal,
+    is_oversized_response,
     raise_catalogue_query_error,
 )
 from tessera_embeddings.ingest.duplicates import log_duplicate_selection, select_preferred_duplicates
@@ -93,16 +94,26 @@ def chunks_to_odc(chunks: dict[str, int]) -> dict[str, int]:
 logger = logging.getLogger(__name__)
 
 
-# 502 is deliberately NOT retried here. Earth Search refuses individual page requests with
-# one, deterministically in the request, and the remedy is to ask a different request — which
-# `_query_stac_items` does by re-cutting the date window. Retrying the same one first buys
-# nothing and costs the ladder's whole backoff before the re-cut can start. The statuses that
-# stay are the ones where waiting IS the remedy (429, 503) and the ones not measured to behave
-# this way (500, 504); connection and read failures keep the full ladder either way, since they
-# carry no status. A 502 that really was transient is then absorbed one layer up, by the
-# attempt budget that owns the leg — which is where `catalogue_refusal` puts the decision
-# anyway, since it takes an identical REPEAT to prove a refusal deterministic.
 _STAC_RETRY = make_logging_retry(
+    "STAC",
+    total=8,
+    backoff_factor=2,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET", "POST"]),
+    respect_retry_after_header=True,
+)
+
+# The same ladder without 502, for a provider that refuses an oversized response with one.
+#
+# There the remedy is to ask a DIFFERENT request — a shorter date window, or fewer items per
+# page — so retrying the same one first buys nothing and costs the ladder's whole backoff
+# before the remedy can start. Measured at 364 s per refused request.
+#
+# Scoped to that provider rather than applied to the session, because nothing was measured
+# about anyone else's 502 and a catalogue with no such remedy wants its retries. 429 and 503
+# stay in both, since those are the refusals where waiting IS the remedy, and connection and
+# read failures keep the full ladder either way because they carry no status.
+_STAC_RETRY_NO_502 = make_logging_retry(
     "STAC",
     total=8,
     backoff_factor=2,
@@ -110,6 +121,13 @@ _STAC_RETRY = make_logging_retry(
     allowed_methods=frozenset(["GET", "POST"]),
     respect_retry_after_header=True,
 )
+
+
+def _retry_for(provider: STACProvider) -> Retry:
+    """The retry ladder this provider's requests should sit behind."""
+    return _STAC_RETRY_NO_502 if provider.refuses_oversized_pages else _STAC_RETRY
+
+
 # (connect_timeout, read_timeout) in seconds. Without an explicit timeout,
 # a stalled TCP connection blocks indefinitely and the retry logic never fires.
 _STAC_TIMEOUT = (10, 60)
@@ -1056,7 +1074,7 @@ class _PerThreadClient:
         """This thread's client, opening it on first use."""
         client: Client | None = getattr(self._local, "client", None)
         if client is None:
-            stac_io = StacApiIO(max_retries=_STAC_RETRY, timeout=_STAC_TIMEOUT)
+            stac_io = StacApiIO(max_retries=_retry_for(self._provider), timeout=_STAC_TIMEOUT)
             try:
                 client = Client.open(self._provider.catalog_url, stac_io=stac_io)
             except Exception as exc:
@@ -1150,7 +1168,11 @@ def _walk_query_window(
             # outright before this, and a smaller page is the only lever left for them.
             shorter = split_query_window(win_start, win_end, 2)
             smaller = page_size // 2
-            if classify_refusal(exc).kind is RefusalKind.UPSTREAM_ERROR:
+            # Only a size refusal, not every backend failure. 500 and 504 are still
+            # force-listed, so one arrives here having already spent the ladder's whole
+            # backoff — and re-cutting it would hand that same ladder to each child, turning
+            # a persistent outage into minutes of backoff multiplied across a recursion.
+            if is_oversized_response(classify_refusal(exc)):
                 if page_no > 1 and shorter:
                     logger.warning(
                         "Catalogue refused %s — retrying it as %d shorter window(s)",
@@ -1518,11 +1540,30 @@ def query_stac_items(
     # Keyed on the SOLAR day, matching `normalize_to_solar_day` just above and the loader's own
     # grouping. Keying on the UTC date instead splits a group the loader treats as one, in the
     # far-eastern and far-western zones where the solar offset crosses midnight.
+    # TODO: this sort runs only for a collection WITH an SCL band, which today means
+    # `sentinel-2-l2a` alone. Every other collection keeps the assembly order, and that order
+    # follows the window tree rather than a single catalogue walk — parent prefix first, then
+    # children oldest-first, against the catalogue's newest-first. So for a non-SCL collection
+    # the painted result would depend on how the query was partitioned. Not reachable today:
+    # the only paged caller is `s2_roi`, which asks for `sentinel-2-l2a`, and the radar path
+    # returns its items from a provider function before any window exists. Left alone because
+    # imposing an order on Landsat, which currently has none, is a change to that collection's
+    # output that nothing here can verify. Fix it alongside the first paged non-SCL caller.
     if collection_config.has_scl:
+        # `id` last, and it is not decoration. The first two keys can TIE — two scenes of one
+        # solar day with equal cloud cover — and a stable sort then keeps whatever order the
+        # walk happened to produce. That order depends on how the query was partitioned: a
+        # solar day near the antimeridian can straddle an interior window seam, so the two
+        # halves arrive in a different order than an unsplit walk would give them. Since the
+        # loader paints the LAST item of a group over the others, an untied sort would let
+        # crossing an item ceiling, or hitting a refusal, change output pixels for the same
+        # requested range. A third key removes the tie, so the sequence is a function of the
+        # items alone.
         items.sort(
             key=lambda item: (
                 item.datetime.strftime("%Y-%m-%d"),
                 -float(item.properties.get("eo:cloud_cover", 100)),
+                item.id,
             )
         )
 

@@ -64,6 +64,14 @@ LOAD_REFUSAL_STATUSES = frozenset({429, 503})
 #: request has been refused this way again.
 UPSTREAM_ERROR_STATUSES = frozenset({500, 502, 504})
 
+#: The subset that means "the answer you asked for was too big", as opposed to "I broke".
+#: Only these are worth re-asking as a SMALLER request, and the distinction is about cost,
+#: not taste: 500 and 504 are still force-listed, so one reaches us only after the ladder has
+#: spent its whole backoff, and re-cutting it hands that same ladder to every child. A
+#: persistent 500 would then multiply minutes of backoff across a recursion instead of failing
+#: the leg once and letting the attempt budget decide.
+OVERSIZED_RESPONSE_STATUSES = frozenset({502})
+
 #: Name under which the signature is emitted into the failure text. Matched by NAME —
 #: never by position within the message — so the human-readable detail around it can
 #: change without breaking the parse.
@@ -265,6 +273,16 @@ def _kind_for(status: int) -> RefusalKind:
     if status in UPSTREAM_ERROR_STATUSES:
         return RefusalKind.UPSTREAM_ERROR
     return RefusalKind.UNKNOWN
+
+
+def is_oversized_response(refusal: CatalogueRefusal) -> bool:
+    """Whether asking for a SMALLER answer is a sensible response to this refusal.
+
+    True only for the status a catalogue uses to refuse an over-large response. A backend
+    that merely failed is not made likelier to succeed by being asked for less, and it has
+    already cost a full retry ladder by the time we see it.
+    """
+    return refusal.status in OVERSIZED_RESPONSE_STATUSES
 
 
 def repeat_is_deterministic(kind: RefusalKind) -> bool:

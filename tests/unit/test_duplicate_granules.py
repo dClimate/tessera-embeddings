@@ -2361,3 +2361,41 @@ class TestTheProducerTermIsInertWithoutAReadSet:
         unlisted.properties["datetime"] = "2024-06-05T10:20:31.024000Z"
         _with_assets(unlisted, _bands_at("s3://nobody-has-classified-this/33/T/WM"))
         assert refuses_its_date(unlisted, READ_ASSET_KEYS) is True
+
+
+class TestAMessageMayNotBeItsOwnCorroboration:
+    """Attribution and refusal must come from DIFFERENT evidence in the same text.
+
+    Both predicates require two things: that the source READER is what failed, and what it
+    failed with. If one marker can supply both, a failure from anywhere else in the pipeline
+    carrying the same words is claimed by the source and its dates are skipped.
+    """
+
+    def test_an_http_status_alone_does_not_prove_the_source_reader_failed(self) -> None:
+        """`HTTP response code: 503` used to be both halves of the answer at once.
+
+        It is a refusal marker, and it was also in the reader's own marker list, so any
+        component raising that text was attributed to the source reader.
+        """
+        assert is_provider_refusal(Exception("HTTP response code: 503")) is False
+
+    def test_the_readers_own_vocabulary_still_attributes_a_refusal(self) -> None:
+        """The narrowing must not stop the real case being recognised."""
+        assert is_provider_refusal(Exception("RasterioIOError: HTTP response code: 503")) is True
+        assert is_provider_refusal(Exception("CPLE_AppDefined: HTTP response code: 403")) is True
+
+    @pytest.mark.parametrize("credential", ["InvalidAccessKeyId", "SignatureDoesNotMatch"])
+    def test_a_credential_fault_is_not_unreadable_data_on_either_predicate(self, credential: str) -> None:
+        """The two predicates kept separate exclusion lists, and the lists disagreed.
+
+        `is_provider_refusal` refused these and `is_unreadable_source` accepted them, so the
+        same credential fault was skipped as bad data on one path and raised on the other.
+        Skipping is the dangerous direction: it steps down to an older copy to work around a
+        fault a retry fixes.
+        """
+        exc = Exception(f"Chunk and warp failed: {credential}")
+        assert is_unreadable_source(exc) is False
+        assert is_provider_refusal(exc) is False
+
+    def test_genuinely_corrupt_data_is_still_unreadable(self) -> None:
+        assert is_unreadable_source(Exception("Chunk and warp failed: ZIPDecode error")) is True

@@ -935,6 +935,10 @@ def ingest_s1_roi_sar(
             start_date,
             end_date,
             empty_dates=empty_dates,
+            # A given-up date exists ONLY here. Everything else about it is a log line, and a
+            # log line is not read by the coverage gate or by a later resume, so losing this
+            # write loses the fact that the date was ever examined.
+            required=bool(given_up_dates),
             # Written unconditionally, so a clean re-run clears an earlier run's list rather
             # than leaving dates advertised as lost that are now present.
             unreadable=given_up_dates,
@@ -987,6 +991,19 @@ def ingest_s1_roi_sar(
             len(given_up_dates),
             already_held,
         )
+        if given_up_dates and not already_held:
+            # The WARNING above is not enough on its own. `status="skipped"` reads to the
+            # parent as "the source does not cover this orbit", and for `s1_orbit="both"`
+            # that lets the cell finish with an orbit missing and inference run on optical
+            # alone. A leg that gave up EVERY date it had, onto a store that holds nothing,
+            # is data loss wearing the same clothes as absence — and the two must not be
+            # returned identically. Retryable, so a re-dispatch writes what this leg refused.
+            raise TooManyGivenUpDatesError(
+                f"[{orbit}] roi={roi_label} window={start_date}..{end_date} gave up every one "
+                f"of its {len(given_up_dates)} date(s) and committed none, so no store exists "
+                f"to record the loss on. Re-dispatch: a refusal that clears will write them. "
+                f"Given up: {'; '.join(f'{g["date"]} scope={g["scope"]}' for g in given_up_dates)}"
+            )
         return SarIngestResult(
             roi_path=roi_zarr_path,
             status="skipped",

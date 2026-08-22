@@ -72,12 +72,19 @@ class STACProvider:
         name: Human-readable provider name
         catalog_url: STAC API endpoint URL
         collections: Mapping of collection aliases to configurations
+        refuses_oversized_pages: True where this catalogue answers a request whose response is
+            too large with a 5xx rather than a smaller answer. The query layer then handles it
+            by asking a DIFFERENT request -- a shorter date window, or fewer items -- and so
+            skips retrying it in place, which buys nothing and costs the whole retry backoff.
+            Only set it for a provider actually measured to behave this way: a catalogue with
+            no such remedy wants its retries, and a 502 there is ordinarily transient.
     """
 
     name: str
     catalog_url: str
     collections: dict[str, CollectionConfig] = field(default_factory=dict)
     max_page_size: int = 250
+    refuses_oversized_pages: bool = False
     """STAC search page size (the ``limit`` per page request).
 
     Used only by providers queried through ``client.search()`` (Earth Search,
@@ -155,6 +162,7 @@ PROVIDERS: dict[str, STACProvider] = {
         # which hundred the cursor and date window select. `ingest/stac.py` answers that by
         # re-cutting the date window, which regroups the items into smaller responses.
         max_page_size=100,
+        refuses_oversized_pages=True,
     ),
     "cmr-asf": STACProvider(
         name="NASA CMR-STAC (ASF)",

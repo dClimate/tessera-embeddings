@@ -59,6 +59,14 @@ _CODE_IDENTITY = "ingest_code_identity"
 _OVERRIDE_FIELD = "allow_ingest_code_mismatch"
 #: Root attr: the ingest code identities a store's dates were produced under. Not in
 #: ``_manifest``, which is written once at create time — the mixture becomes true later.
+#:
+#: TODO: this attr is not read by anything downstream. ``read_upstream_manifests`` extracts
+#: only ``_manifest``, so an embedding store's upstream identity is the same whether its input
+#: was single-code or mixed, and the zone-year completion marker does not carry it either — so a
+#: later strict run can short-circuit on the marker and accept a mixed mosaic it would
+#: otherwise refuse. Deliberately out of scope here: the override is a one-off for a mid-campaign
+#: resume, and folding mixed state into downstream identity changes what every embedding
+#: manifest hashes. Decide it when the override stops being temporary.
 MIXED_CODE_IDENTITIES_ATTR = "mixed_ingest_code_identities"
 
 
@@ -291,7 +299,16 @@ class IngestManifest(StoreManifest):
     def validate_against(self, existing: dict[str, Any] | None, store_path: str) -> list[str]:
         """Validate, excusing an ``ingest_code_identity`` mismatch when this run opted in."""
         stored = (existing or {}).get(_CODE_IDENTITY)
-        if existing is None or not self.allow_ingest_code_mismatch or stored == self.ingest_code_identity:
+        # `stored is None` keeps the ordinary refusal. The override excuses a DIFFERENT known
+        # identity, not a missing one: substituting this run's identity for an absent field
+        # would satisfy `REQUIRED_TO_APPEND` without anything having been compared, and would
+        # then record the literal string "None" as though it were a second producer.
+        if (
+            existing is None
+            or stored is None
+            or not self.allow_ingest_code_mismatch
+            or stored == self.ingest_code_identity
+        ):
             return super().validate_against(existing, store_path)
         logger.warning(
             "%s: appending under allow_ingest_code_mismatch — store built by %s, this run is %s; both recorded.",

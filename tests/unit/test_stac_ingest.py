@@ -5,6 +5,7 @@ import time
 
 import numpy as np
 import pytest
+from pystac import Item
 from pystac_client.item_search import ItemSearch
 
 from tessera_embeddings.config import (
@@ -1217,3 +1218,78 @@ class TestTheWindowTreeIsFilledConcurrentlyAndReadBackInOrder:
 
         assert raised is None
         assert [n.window[0] for r in roots for n in r.preorder()] == ["a", "a.0", "b", "b.0"]
+
+
+class TestTheSortIsTotalSoOrderCannotDependOnThePartition:
+    """Items tying on solar day AND cloud cover must still land in a fixed order.
+
+    `query_stac_items` sorts on those two keys and Python's sort is stable, so a tie used to
+    keep whatever order the walk produced. That order depends on how the query was cut up: a
+    solar day near the antimeridian can straddle an interior window seam, and the two halves
+    then arrive in a different order than an unsplit walk gives them. Since the loader paints
+    the LAST item of a group over the others, crossing an item ceiling or hitting a refusal
+    could change output pixels for the same requested range. A third key on `id` removes the
+    tie, so the sequence is a function of the items alone.
+    """
+
+    @staticmethod
+    def _item(item_id: str, date: str, cloud: float):
+        return Item.from_dict(
+            {
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": item_id,
+                "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]},
+                "bbox": [0, 0, 1, 1],
+                "properties": {"datetime": f"{date}T10:00:00Z", "eo:cloud_cover": cloud},
+                "links": [],
+                "assets": {},
+            }
+        )
+
+    def _sorted_ids(self, items):
+        got, _ = stac_module.query_stac_items(
+            "earth-search",
+            "sentinel-2-l2a",
+            None,
+            "2019-03-05",
+            "2019-03-06",
+            item_provider_fn=lambda: list(items),
+            mid_longitude=0.5,
+        )
+        return [i.id for i in got]
+
+    def test_a_tie_is_broken_by_id_rather_than_by_arrival_order(self) -> None:
+        tied = [
+            self._item("S2B_zzz", "2019-03-05", 10.0),
+            self._item("S2A_aaa", "2019-03-05", 10.0),
+        ]
+
+        assert self._sorted_ids(tied) == ["S2A_aaa", "S2B_zzz"]
+        assert self._sorted_ids(list(reversed(tied))) == ["S2A_aaa", "S2B_zzz"]
+
+    def test_the_same_items_in_any_arrival_order_come_out_the_same(self) -> None:
+        """The property the re-partition needs: output is a function of the items, not the walk."""
+        items = [
+            self._item("S2A_ddd", "2019-03-05", 10.0),
+            self._item("S2A_ccc", "2019-03-05", 10.0),
+            self._item("S2A_bbb", "2019-03-05", 80.0),
+            self._item("S2A_aaa", "2019-03-06", 10.0),
+        ]
+
+        forward = self._sorted_ids(items)
+        backward = self._sorted_ids(list(reversed(items)))
+        rotated = self._sorted_ids(items[2:] + items[:2])
+
+        assert forward == backward == rotated
+        # Cloudiest first within a day, so the clearest is painted last.
+        assert forward[:3] == ["S2A_bbb", "S2A_ccc", "S2A_ddd"]
+
+    def test_the_cloud_ordering_still_wins_over_the_tie_breaker(self) -> None:
+        """The new key is a LAST resort; it must not reorder anything the first two decide."""
+        items = [
+            self._item("S2A_aaa", "2019-03-05", 5.0),
+            self._item("S2A_zzz", "2019-03-05", 90.0),
+        ]
+
+        assert self._sorted_ids(items) == ["S2A_zzz", "S2A_aaa"]

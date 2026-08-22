@@ -1176,6 +1176,7 @@ def record_assessed_window(
     *,
     empty_dates: int = 0,
     unreadable: list[dict[str, str]] | None = None,
+    required: bool = False,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
 ) -> None:
@@ -1224,6 +1225,12 @@ def record_assessed_window(
         )
         logger.info(f"Recorded assessed window {start_date}..{end_date} on {store_path}")
     except Exception as exc:
+        if required:
+            # The caller says this record is the only durable trace of something. Warning and
+            # continuing would let the leg succeed, collect a completion marker, and be
+            # short-circuited by every later run — leaving a hole nothing names. Raise so the
+            # leg is retried instead of finalised.
+            raise
         logger.warning(f"Could not record assessed window on {store_path}: {exc}")
 
 

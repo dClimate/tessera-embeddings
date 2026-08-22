@@ -178,20 +178,34 @@ class TestClassification:
         assert forcelist <= (LOAD_REFUSAL_STATUSES | UPSTREAM_ERROR_STATUSES)
         assert not (LOAD_REFUSAL_STATUSES & UPSTREAM_ERROR_STATUSES), "a status cannot be both refusals"
 
-    def test_the_ladder_does_not_retry_the_status_the_window_re_cut_answers(self) -> None:
-        """502 must reach the re-cut on the FIRST refusal, so the ladder must not hold it.
+    def test_only_the_provider_that_refuses_oversized_pages_skips_the_502_retry(self) -> None:
+        """502 must reach the remedy on the FIRST refusal — but only where a remedy exists.
 
-        Force-listing it costs the ladder's whole backoff — measured in minutes per refused
-        window — before a single shorter window can be tried, and buys nothing: the refusal
-        is deterministic in the request, so every one of those attempts re-asks a question
-        whose answer is already known. Re-adding it would be silent, hence this test.
+        Force-listing it costs the ladder's whole backoff, measured at 364 s per refused
+        request, before a shorter window or a smaller page can be tried, and buys nothing:
+        the refusal is a function of the request, so every attempt re-asks a question whose
+        answer is already known.
 
-        The complement is asserted deliberately: 429 and 503 are refusals where waiting IS
-        the remedy, and they must keep the ladder.
+        Scoped, though. A provider with no such remedy wants its retries, and nothing was
+        measured about anyone else's 502 — so this pins BOTH directions, since a change in
+        either would be silent.
         """
-        forcelist = set(stac._STAC_RETRY.status_forcelist or ())
-        assert 502 not in forcelist
-        assert forcelist >= LOAD_REFUSAL_STATUSES, "a stated overload must still be waited out"
+        reduced = set(stac._STAC_RETRY_NO_502.status_forcelist or ())
+        full = set(stac._STAC_RETRY.status_forcelist or ())
+        assert 502 not in reduced
+        assert 502 in full, "a provider with no re-cut to fall back on keeps its 502 retries"
+        assert reduced >= LOAD_REFUSAL_STATUSES, "a stated overload must still be waited out"
+        assert full >= LOAD_REFUSAL_STATUSES
+
+    def test_the_ladder_is_chosen_by_the_providers_own_flag(self) -> None:
+        """Which ladder a request sits behind must follow the provider, not the call site."""
+        earth_search = stac._get_provider_config("earth-search")
+        assert earth_search.refuses_oversized_pages is True
+        assert stac._retry_for(earth_search) is stac._STAC_RETRY_NO_502
+
+        cmr = stac._get_provider_config("cmr-asf")
+        assert cmr.refuses_oversized_pages is False
+        assert stac._retry_for(cmr) is stac._STAC_RETRY
 
 
 class TestSignature:
@@ -637,6 +651,23 @@ class TestARefusalNoShorterWindowCanReachAsksForASmallerPage:
         asked = [int(m) for m in re.findall(r"at (\d+) items per page", caplog.text)]
         assert asked == [50, 25, 12], f"expected halving to the floor, got {asked}"
         assert all(size >= stac._MIN_PAGE_SIZE for size in asked)
+
+    @pytest.mark.parametrize("status", [500, 504])
+    def test_a_backend_failure_is_not_re_asked_as_a_smaller_request(self, status: int, caplog) -> None:
+        """Only a SIZE refusal is worth asking again for less. 500 and 504 mean "I broke".
+
+        Both are still force-listed, so one reaches the handler having already spent the
+        ladder's whole backoff. Re-cutting it would hand that same ladder to every child and
+        turn a persistent outage into minutes of backoff multiplied across a recursion, so it
+        propagates once and lets the attempt budget decide instead.
+        """
+        with pytest.raises(CatalogueQueryError) as caught:
+            self._query([self._refuses_at(4, _refused(status))], caplog, "2021-09-01", "2021-10-02")
+
+        assert caught.value.refusal.kind is RefusalKind.UPSTREAM_ERROR
+        assert caught.value.refusal.status == status
+        assert "shorter window" not in caplog.text
+        assert "items per page" not in caplog.text
 
     def test_a_stated_overload_on_the_first_page_is_not_answered_with_a_smaller_page(self, caplog) -> None:
         """A 503 means BUSY. A smaller page is MORE requests, which is the wrong direction.

@@ -18,6 +18,7 @@ import logging
 import pytest
 from tenacity import Retrying, retry_if_not_exception_type, stop_after_attempt
 
+from tessera_embeddings.ingest import s1_roi
 from tessera_embeddings.storage.zarr_store import CONCURRENT_WRITER_ERRORS, STORE_WRITE_ATTEMPTS
 
 _CATALOGUE = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
@@ -216,18 +217,59 @@ def test_past_the_ceiling_the_leg_stops_and_asks_to_be_re_dispatched(monkeypatch
     assert "roi=zone_35N" in message
 
 
-def test_a_leg_that_gave_up_everything_says_so_at_warning(monkeypatch, caplog) -> None:
-    """A leg that writes nothing returns a status the parent reads as success.
+def test_a_leg_that_gave_up_everything_fails_instead_of_reporting_skipped(monkeypatch, caplog) -> None:
+    """Giving up every date is data LOSS, and must not be returned as absence.
 
-    So the count has to reach the log, or a cell finishes green with an orbit absent from the
-    store and no line saying the source refused every read.
+    ``status="skipped"`` reads to the parent as "the source does not cover this orbit". For
+    ``s1_orbit="both"`` that lets the cell finish with an orbit missing and inference run on
+    optical alone, which is the outcome this whole path exists to prevent. A warning in the log
+    is not a guard: nothing downstream reads it.
+
+    The bar is deliberately narrow. Giving up SOME dates while committing others still
+    succeeds -- that is the bounded skip working, and the store carries the record. Only a leg
+    that committed nothing at all, so that no store exists to record the loss on, fails here.
     """
-    with caplog.at_level(logging.WARNING):
-        result, written, _recorded, _attempts = _run(
-            monkeypatch, failures={d: _raise("RasterioIOError: HTTP response code: 403") for d in _CATALOGUE}
-        )
-    assert written == []
-    assert result.status == "skipped"
+    with caplog.at_level(logging.WARNING), pytest.raises(s1_roi.TooManyGivenUpDatesError) as caught:
+        _run(monkeypatch, failures={d: _raise("RasterioIOError: HTTP response code: 403") for d in _CATALOGUE})
+
+    assert "gave up every one" in str(caught.value)
+    assert "date(s) and committed none" in str(caught.value)
+    # The diagnostic still has to be emitted before it raises, or the reason is lost.
     lines = [r.getMessage() for r in caplog.records if "WROTE NO DATES" in str(r.msg)]
-    assert lines, "a leg that wrote nothing must say so"
+    assert lines, "a leg that wrote nothing must still say so"
     assert "given_up=4" in lines[0]
+
+
+def test_a_leg_that_gave_up_some_dates_and_committed_others_still_succeeds(monkeypatch) -> None:
+    """The complement, so the fix above cannot quietly widen into failing the bounded skip."""
+    result, written, recorded, _attempts = _run(
+        monkeypatch, failures={_CATALOGUE[0]: _raise("RasterioIOError: HTTP response code: 403")}
+    )
+
+    assert result.status == "success"
+    assert written == _CATALOGUE[1:]
+    assert recorded, "the store must carry the record of what was given up"
+
+
+def test_the_record_of_a_given_up_date_is_marked_load_bearing(monkeypatch) -> None:
+    """`record_assessed_window` warns and continues on failure, which is wrong when it is
+    the only durable trace of a lost date.
+
+    A swallowed failure there lets the leg succeed, collect a completion marker, and be
+    short-circuited by every later run, leaving a hole nothing names. The caller therefore
+    has to say the write is required, and only when there is something to lose.
+    """
+    _result, _written, recorded, _attempts = _run(
+        monkeypatch, failures={_CATALOGUE[0]: _raise("RasterioIOError: HTTP response code: 403")}
+    )
+
+    assert recorded, "the window must be recorded"
+    assert recorded[-1]["required"] is True
+
+
+def test_a_clean_leg_does_not_make_the_record_load_bearing(monkeypatch) -> None:
+    """Nothing was lost, so a failed metadata write must stay a warning rather than fail a leg."""
+    _result, _written, recorded, _attempts = _run(monkeypatch, failures={})
+
+    assert recorded
+    assert recorded[-1]["required"] is False

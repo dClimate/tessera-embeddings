@@ -792,7 +792,7 @@ def is_unreadable_source(exc: BaseException) -> bool:
     definition and must fail the run on the first date rather than be skipped date by date.
     """
     text = _exception_chain_text(exc)
-    if any(m in text for m in ("ExpiredToken", "token has expired", "AccessDenied", "SlowDown")):
+    if any(m in text for m in _NOT_THE_DATAS_FAULT):
         return False
     if any(m in text for m in _UNREADABLE_MARKERS):
         return True
@@ -849,7 +849,11 @@ _PROVIDER_REFUSAL_MARKERS = (
 #: a fault on the destination fails the leg on its FIRST date, instead of being written onto the
 #: store as source data loss or absorbed as somebody else's outage one date at a time. That is
 #: what happened before these marker classes existed, and it is the safe direction to fail in.
-_SOURCE_READER_MARKERS = ("RasterioIOError", "WarpOperationError", "CPLE_", "HTTP response code:")
+#: Names that say the SOURCE READER is what failed, as opposed to anything else in the pipeline
+#: that can raise the same words. Deliberately only the reader's own vocabulary: a marker that
+#: also appears in :data:`_PROVIDER_REFUSAL_MARKERS` would let one message be its own
+#: corroboration, and `HTTP response code: 503` did exactly that until it was removed here.
+_SOURCE_READER_MARKERS = ("RasterioIOError", "WarpOperationError", "CPLE_")
 
 #: Refusals that are NOT the provider's to answer for, though they surface identically. Our own
 #: credential is repairable here and no waiting fixes it, so these are matched FIRST and the
@@ -860,6 +864,13 @@ _OWN_CREDENTIAL_MARKERS = (
     "InvalidAccessKeyId",
     "SignatureDoesNotMatch",
 )
+
+#: Everything neither predicate may claim, because none of it is the DATA being at fault: our
+#: own credential, and a throttle. One list, used by both, because two lists drifted — a chain
+#: carrying `InvalidAccessKeyId` was refused by `is_provider_refusal` and accepted by
+#: `is_unreadable_source`, so the same credential fault was skipped as bad data on one path and
+#: raised on the other.
+_NOT_THE_DATAS_FAULT = (*_OWN_CREDENTIAL_MARKERS, "AccessDenied", "SlowDown")
 
 
 def is_provider_refusal(exc: BaseException) -> bool:
