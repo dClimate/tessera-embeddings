@@ -31,6 +31,7 @@ import fsspec
 import numpy as np
 import zarr
 from affine import Affine
+from dask.array.core import normalize_chunks
 from odc.geo.geobox import GeoBox
 from pyproj import Transformer
 from rasterio.crs import CRS
@@ -152,19 +153,33 @@ def read_roi_mask(
         roi_path: Path to the Zarr ROI store (local or s3:// or any fsspec URI).
         chunks: Dict with ``"northing"`` and ``"easting"`` chunk sizes.
         storage_options: fsspec storage options, or a callable returning them.
-            Prefer the callable for S3: it is re-invoked per read, so the credential
-            cannot be older than this call. When ``None``, fsspec infers credentials
-            from the environment — which on the radar path holds the SOURCE's
-            short-lived token rather than our own role, so ``None`` is only safe
-            locally.
+            Prefer the callable for S3: it is re-invoked per block read, so the
+            credential cannot be older than that read. When ``None``, fsspec infers
+            credentials from the environment — which on the radar path holds the
+            SOURCE's short-lived token rather than our own role, so ``None`` is only
+            safe locally.
 
     Returns:
         Chunked dask boolean array aligned to the target grid (True = inside ROI).
     """
-    return da.from_zarr(
-        roi_path,
-        chunks=(chunks["northing"], chunks["easting"]),
-        storage_options=resolve_storage_options(storage_options),
+
+    def _open() -> zarr.Array:
+        opts = resolve_storage_options(storage_options)
+        return cast("zarr.Array", zarr.open_array(roi_path, mode="r", storage_options=opts))
+
+    def _read_block(block_info: dict) -> np.ndarray:
+        (y0, y1), (x0, x1) = block_info[None]["array-location"]
+        return np.asarray(_open()[y0:y1, x0:x1])
+
+    # Each block opens the store itself, so the provider resolves when the read HAPPENS.
+    # Handing a store to ``da.from_zarr`` bakes ONE resolution into the graph, and the
+    # write that computes it can outlive that credential.
+    z = _open()
+    return da.map_blocks(
+        _read_block,
+        dtype=z.dtype,
+        chunks=normalize_chunks((chunks["northing"], chunks["easting"]), shape=z.shape, dtype=z.dtype),
+        meta=np.empty((0, 0), dtype=z.dtype),
     )
 
 

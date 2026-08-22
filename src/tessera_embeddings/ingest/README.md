@@ -1642,6 +1642,20 @@ credentials, bypassing the env vars. The mechanism:
   Dask task runner the domain function (and its store writes) execute in a *worker* process,
   so a provider registered in the flow-runner process would never reach them.
 
+The plain-Zarr side needs the same identity, and one property beyond it. An ROI mask is not an
+Icechunk store, so it is read through fsspec, and
+`providers/aws/credentials.py::iam_s3_storage_options` is the fsspec counterpart: the same
+env-stripped chain, returned in the shape fsspec takes as `storage_options`. The ingest is handed
+the **callable**, not its result — and `read_roi_mask` then resolves it inside each block read
+rather than once when it builds the graph.
+
+That last part is load-bearing, because the mask array is LAZY. Its block reads happen inside a
+later `write_day_windows` compute, which on the radar path is the whole of a batch's writes. Giving
+`da.from_zarr` one already-resolved store bakes a single credential into the graph, so a write that
+outlives that credential fails with `ExpiredToken` on a bucket the role can always read — the
+failure looks like a permissions problem and is a lifetime problem. Opening the store per block
+makes the credential no older than the read that uses it.
+
 **IMDS throttling — why `_resolve_iam_credentials` is `lru_cache`d (gotcha).** The credential
 machinery has two distinct TTLs, and conflating them overwhelms the EC2 Instance Metadata
 Service (IMDS):
