@@ -321,7 +321,7 @@ antimeridian overlap alike.
 **Item order.** The re-partition does change the order items are *walked* in — one walk returns
 the window newest-first, the worklist returns window by window in date order — and that matters
 because `query_stac_items` sorts by `(solar date, cloud cover DESC)` with a stable sort, so ties
-keep their input order and the painter writes the last one for a pixel. The sort restores the
+keep their input order, and the loader's fuser keeps the first valid source. The sort restores the
 single-walk order, because each solar date's items land in exactly one window in catalogue
 order. Verified against an unsplit walk at several part counts; see
 [the ingest campaign record](../../../context_docs/design/ingest_optimization_campaign_2026_07.md),
@@ -415,8 +415,24 @@ refusals at once, and the module sits outside the mosaic-content fingerprint clo
 
 Cloud cover is intentionally **not** used as a filter at the STAC query stage — pixel-level
 cloud classification is handled later (SCL for S2, ML model for inference). For S2, items
-are sorted by `(date, eo:cloud_cover)` so that within a solar-day mosaic the clearest tile
-is placed first, which is what `odc.stac.load`'s groupby mosaicking relies on.
+are sorted by `(date, eo:cloud_cover)` ASCENDING, so the clearest tile of a solar day comes FIRST.
+
+First, because that is the one the loader keeps. `odc.loader`'s default fuser is `nodata_fuser` —
+`np.copyto(dst, src, where=dst_is_nodata)` — so it writes only where the destination is still empty,
+and this package configures no fuser of its own. The first valid source of a group therefore
+supplies a pixel and later ones fill the gaps it left, which is the behaviour wanted: the clearest
+scene covering a pixel wins it, and a hole in the clearest scene falls through to the next-clearest
+rather than to nothing.
+
+> **This was backwards until 2026-08-22.** The sort was cloudiest-first, written on the belief that
+> odc mosaics by a painter's algorithm with the last item overwriting the ones before it. It does
+> not, so the **cloudiest** scene of every solar day won every overlap — silently, since the output
+> had the right shape, the right dates and plausible pixels. Nothing caught it because every test in
+> the area asserted the *order handed to the loader* and none asserted the *pixels that came out*.
+> `tests/unit/test_solar_day_fusion.py` now does, against real rasters through the real loader.
+
+An item declaring no `eo:cloud_cover` reads as 100 and so sorts last, where it can only fill gaps:
+unknown never displaces measured.
 
 #### Streaming the query month by month (S2)
 
@@ -578,7 +594,7 @@ These happen before `odc.stac.load` is called:
 | Transform | Where | What |
 |---|---|---|
 | **Date dedup** | `stac._filter_existing_dates` | Drops STAC items whose date is already written to the store. Keyed on the SOLAR day when the caller passes `mid_longitude`, matching how the store was written. |
-| **Item sort** | `stac.query_stac_items` | For S2: sorts by `(date, cloud_cover)` so mosaicking picks the clearest tile. |
+| **Item sort** | `stac.query_stac_items` | For S2: sorts by `(date, cloud_cover)` ascending, so the clearest tile comes FIRST and the loader's first-valid-source fuser keeps it. |
 | **Item provider** | `opera_query.make_s1_item_provider` | Builds orbit-filtered OPERA items directly from the native CMR granule API (bypasses CMR-STAC search). |
 | **URL rewriting** | `auth.rewrite_assets_to_s3` | Rewrites HTTPS datapool/earthdatacloud URLs to `s3://` URIs. |
 | **Timestamp normalisation** | `solar_days.normalize_to_solar_day` | Stamps every item with noon UTC of its **solar day**. The single place the solar offset is applied; also what makes `odc.stac.load` mosaic OPERA's per-burst granules into one time slice. |
@@ -599,11 +615,11 @@ These happen before `odc.stac.load` is called:
   output grid matches the ROI exactly (same CRS, transform, shape). This overrides bbox,
   CRS, and resolution.
 - **groupby** — `"solar_day"` merges items from adjacent MGRS tiles that were acquired on
-  the same local calendar day into a single mosaic using the painter's algorithm: items are
-  rendered in order and later items overwrite earlier ones where they overlap. Items are
-  sorted cloudiest-first so the clearest tile paints last and wins. This is the standard
-  approach for multi-tile STAC mosaicking and is required for ROI queries that cross tile
-  boundaries.
+  the same local calendar day into a single mosaic. `odc.loader`'s default fuser writes only
+  where the destination is still empty, so the FIRST valid source of a group supplies a pixel
+  and later ones fill its gaps. Items are therefore sorted clearest-first: the clearest scene
+  wins the ground it covers, and its holes fall through to the next-clearest rather than to
+  nothing. Required for ROI queries that cross tile boundaries.
 - **Dimension rename** — `normalize_odc_dims` maps `odc.stac.load`'s `y`/`x` output
   dimensions to the project-wide `northing`/`easting` convention and drops `spatial_ref`.
 
@@ -741,7 +757,7 @@ refuses and an unresolvable band name fails the load.
 
 One integer per date is a **lossy** record of a day whose tiles declare different baselines, and
 those days now load — the three-tile day in ADR 021 is exactly that shape. The value is the last
-item's, the clearest tile, because the query sorts a date's items cloud-descending; the day's other
+item's, the clearest tile, because the query sorts a date's items cloud-ascending; the day's other
 vintages are recorded nowhere. Left that way deliberately: the attribute is written and merged
 forward on append, and nothing in this package reads a value from it, so widening its type would
 charge a future reader for a record nobody reads yet.
@@ -1154,9 +1170,9 @@ its solar day (at noon UTC), and every date derivation downstream is a plain
 
 That rule exists because the alternative was tried and drifted. The offset used to be
 applied independently at six sites, and two of them disagreed with the rest: the
-painter's-algorithm pre-sort and the baseline map both keyed on the UTC date while the
+cloud pre-sort and the baseline map both keyed on the UTC date while the
 loader grouped by solar day. On a day straddling UTC midnight that meant the group was not
-actually sorted clearest-last, and half its baseline entries never matched. A seventh
+sorted as intended, and half its baseline entries never matched. A seventh
 application would have been one more chance to disagree; applying it once cannot.
 
 **Every date modality in the pipeline, and which convention it uses.** The whole point of
@@ -1257,7 +1273,7 @@ entirely. `solar_day_offset_seconds` is the single definition, and it is the rea
 `solar_grouping_longitude` prefers the geobox centroid over a bbox midpoint.
 
 That is why `group_items_by_date` takes a `mid_longitude`, and why the pre-sort uses the same key —
-the sort carries the painter's-algorithm contract (clearest tile last within a group), so sorting on
+the sort carries the fusion contract (clearest tile FIRST within a group), so sorting on
 a different notion of "day" than the grouping would silently let a cloudier pixel win. Central
 longitudes image far from UTC midnight and are unaffected, which is what kept this latent.
 Each iteration builds a single-date Dask graph, calls `odc.stac.load` for that day, filters
@@ -1334,8 +1350,8 @@ A mosaic slice represents one **solar day**, and it is labelled with that day �
 grouping key, not from the loaded dataset's own time coordinate.
 
 That distinction is load-bearing. `odc.stac.load` stamps each group with
-`group[0].nominal_datetime`, and because `preserve_original_order=True` (so the clearest tile
-paints last and wins) `group[0]` is the CLOUDIEST item, whose acquisition time is arbitrary
+`group[0].nominal_datetime`, and because `preserve_original_order=True` with a clearest-first
+sort, `group[0]` is the CLEAREST item, whose acquisition time is arbitrary
 within the day. Where the solar offset crosses UTC midnight, that timestamp's calendar date can
 be the day BEFORE the solar day — so two consecutive solar days normalise onto one date. That
 blocked far-eastern zones from ingesting at all: the batched write rejected the dates as not

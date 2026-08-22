@@ -208,7 +208,7 @@ def normalize_to_solar_day(items: list[Any], *, mid_longitude: float | None) -> 
     item's ``datetime`` *is* its solar day: every downstream date derivation is a plain
     ``strftime("%Y-%m-%d")`` with no offset. That invariant is the point. When the offset
     was applied independently at six sites, two of them disagreed with the rest (the
-    painter's-algorithm pre-sort and the baseline map both keyed on the UTC date while the
+    cloud pre-sort and the baseline map both keyed on the UTC date while the
     loader grouped by solar day), and adding a seventh application would have been one more
     chance to disagree. Applying it once and then never again cannot drift.
 

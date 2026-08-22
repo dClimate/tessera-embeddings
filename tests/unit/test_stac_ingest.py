@@ -507,18 +507,21 @@ class TestIngestTile:
         assert result_baselines == {}
 
 
-class TestSolarDayPainterOrdering:
+class TestSolarDayFusionOrdering:
     """Which of two overlapping same-day scenes wins a pixel, and it is decided by ORDER.
 
-    `ingest_tile` loads with `preserve_original_order=True` and `groupby="solar_day"`, and odc.stac's
-    painter keeps the LAST item written. So the list handed to the loader must end with the clearest
-    scene. It used to be sorted clearest-FIRST, with a comment saying that was for SCL mosaicking, so
-    the cloudiest scene won every overlap — silently, because the output has the right shape and the
-    right dates. The campaign's own S2 path reverses the order and says why; this generic API
-    disagreed with it.
+    `ingest_tile` loads with `preserve_original_order=True` and `groupby="solar_day"`, and odc fuses
+    a group with `nodata_fuser`, which writes only where the destination is still empty. So the FIRST
+    valid source of a group supplies a pixel and later ones fill its gaps — the list handed to the
+    loader must therefore START with the clearest scene.
+
+    This asserted the opposite until 2026-08-22, on the belief that odc mosaics by a painter's
+    algorithm with the last item overwriting the rest. It does not, and the consequence was that the
+    CLOUDIEST scene won every same-day overlap. `test_solar_day_fusion.py` pins the mechanism itself
+    against real rasters; this pins the order handed to the loader.
     """
 
-    def test_the_clearest_scene_of_a_solar_day_is_loaded_last(self, mock_stac_item, monkeypatch):
+    def test_the_clearest_scene_of_a_solar_day_is_loaded_first(self, mock_stac_item, monkeypatch):
         seen: dict = {}
 
         def mock_query(*args, **kwargs):
@@ -568,7 +571,7 @@ class TestSolarDayPainterOrdering:
 
         assert seen["preserve"] is True, "the premise: order decides, so order must be correct"
         assert seen["groupby"] == "solar_day"
-        assert seen["order"] == [90.0, 55.0, 2.0], "cloudiest first, so the clearest paints last"
+        assert seen["order"] == [2.0, 55.0, 90.0], "clearest first, because the fuser keeps the first"
 
 
 class _StopLoadError(Exception):
@@ -1226,10 +1229,10 @@ class TestTheSortIsTotalSoOrderCannotDependOnThePartition:
     `query_stac_items` sorts on those two keys and Python's sort is stable, so a tie used to
     keep whatever order the walk produced. That order depends on how the query was cut up: a
     solar day near the antimeridian can straddle an interior window seam, and the two halves
-    then arrive in a different order than an unsplit walk gives them. Since the loader paints
-    the LAST item of a group over the others, crossing an item ceiling or hitting a refusal
-    could change output pixels for the same requested range. A third key on `id` removes the
-    tie, so the sequence is a function of the items alone.
+    then arrive in a different order than an unsplit walk gives them. Since the loader keeps
+    the FIRST valid source of a group, crossing an item ceiling or hitting a refusal could
+    change output pixels for the same requested range. A third key on `id` removes the tie, so
+    the sequence is a function of the items alone.
     """
 
     @staticmethod
@@ -1282,8 +1285,8 @@ class TestTheSortIsTotalSoOrderCannotDependOnThePartition:
         rotated = self._sorted_ids(items[2:] + items[:2])
 
         assert forward == backward == rotated
-        # Cloudiest first within a day, so the clearest is painted last.
-        assert forward[:3] == ["S2A_bbb", "S2A_ccc", "S2A_ddd"]
+        # Clearest first within a day, because the fuser keeps the first valid source.
+        assert forward[:3] == ["S2A_ccc", "S2A_ddd", "S2A_bbb"]
 
     def test_the_cloud_ordering_still_wins_over_the_tie_breaker(self) -> None:
         """The new key is a LAST resort; it must not reorder anything the first two decide."""
@@ -1292,4 +1295,4 @@ class TestTheSortIsTotalSoOrderCannotDependOnThePartition:
             self._item("S2A_zzz", "2019-03-05", 90.0),
         ]
 
-        assert self._sorted_ids(items) == ["S2A_zzz", "S2A_aaa"]
+        assert self._sorted_ids(items) == ["S2A_aaa", "S2A_zzz"]

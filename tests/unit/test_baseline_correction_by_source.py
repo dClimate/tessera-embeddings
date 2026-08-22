@@ -625,7 +625,12 @@ class TestTheSplitWorkflowProvenanceFollowsTheSelectedCopy:
 
     @staticmethod
     def _pair() -> list[_Item]:
-        """Different baselines, and the copy that will be REJECTED sorts last."""
+        """Different baselines, and the copy that will be REJECTED sorts FIRST.
+
+        First, because `extract_baselines` keeps the first item of a date — the one the loader's
+        fuser keeps. A rejected copy in that position is what makes the supplied map describe
+        pixels the selected copy provided, which is the condition this class exists to close.
+        """
         winner = _Item(_HARMONISED, "05.10")
         winner.id = "S2A_33TWM_20220107_1_L2A"
         winner.properties["s2:sequence"] = "1"
@@ -635,7 +640,7 @@ class TestTheSplitWorkflowProvenanceFollowsTheSelectedCopy:
         for item in (winner, loser):
             item.properties["grid:code"] = "MGRS-33TWM"
             item.properties["datetime"] = "2022-01-07T10:20:31.024000Z"
-        return [winner, loser]
+        return [loser, winner]
 
     def test_the_supplied_map_is_realigned_with_the_survivor(self, monkeypatch) -> None:
         data = xr.Dataset(
@@ -644,7 +649,7 @@ class TestTheSplitWorkflowProvenanceFollowsTheSelectedCopy:
         )
         monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
         items = self._pair()
-        # What `query_stac_items` hands back: last-wins over the UNPRUNED list.
+        # What `query_stac_items` hands back: first-wins over the UNPRUNED list.
         baselines = extract_baselines(items)
         assert baselines == {"2022-01-07": 206}, "the fixture must start with the rejected copy's value"
 
@@ -1030,7 +1035,8 @@ class TestProvenanceRealignsWheneverSelectionPruned:
         for item in (winner, loser):
             item.properties["grid:code"] = "MGRS-33TWM"
             item.properties["datetime"] = "2022-01-07T10:20:31.024000Z"
-        return [winner, loser]
+        # Rejected copy first: `extract_baselines` keeps the first item of a date.
+        return [loser, winner]
 
     def test_the_fixture_really_yields_no_alternates(self) -> None:
         """Otherwise this would pass through the old gate and prove nothing."""
@@ -1045,7 +1051,7 @@ class TestProvenanceRealignsWheneverSelectionPruned:
         )
         monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
         items = self._pair()
-        # What the split workflow hands over: last-wins over the UNPRUNED list, so the rejected
+        # What the split workflow hands over: first-wins over the UNPRUNED list, so the rejected
         # copy's absent baseline reads as 0.
         baselines = extract_baselines(items)
         assert baselines == {"2022-01-07": 0}, "the fixture must start describing the rejected copy"

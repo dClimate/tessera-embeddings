@@ -363,11 +363,14 @@ def _extract_baseline(item: Item) -> int:
 def extract_baselines(items: list[Any]) -> dict[str, int]:
     """The processing baseline to apply per date, over exactly ``items``.
 
-    Last item of a date wins. Where a date's tiles disagree, that makes the pick a
-    property of the caller's sort order, which is why this is derived from the items
-    being LOADED rather than computed once per query: a map built over a wider list can
-    name a baseline belonging to an item the loader never sees, and the reflectance
-    offset it selects is applied to the pixels of the items it does.
+    FIRST item of a date wins, which under both ingest paths' clearest-first sort is the scene
+    that actually supplied most of the day's pixels — odc's fuser keeps the first valid source and
+    later ones only fill its gaps. Keeping the LAST item instead named the CLOUDIEST scene, the one
+    contributing least. Where a date's tiles disagree the pick is a property of the caller's sort
+    order either way, which is why this is derived from the items being LOADED rather than computed
+    once per query: a map built over a wider list can name a baseline belonging to an item the
+    loader never sees, and the reflectance offset it selects is applied to the pixels of the items
+    it does.
 
     **A date whose tiles declare DIFFERENT baselines is described by one of them.** Such a date
     loads: the correction is decided per source, so a day holding 00.01 and 05.00 imagery needs no
@@ -397,10 +400,10 @@ def extract_baselines(items: list[Any]) -> dict[str, int]:
     Returns:
         Dict mapping date strings (YYYY-MM-DD) to the baseline each date's item REPORTS.
     """
-    baselines = {}
+    baselines: dict[str, int] = {}
     for item in items:
-        date_str = item.datetime.strftime("%Y-%m-%d")
-        baselines[date_str] = _extract_baseline(item)
+        # `setdefault`, not assignment: the FIRST item of a date is the one to keep. See above.
+        baselines.setdefault(item.datetime.strftime("%Y-%m-%d"), _extract_baseline(item))
     return baselines
 
 
@@ -1586,27 +1589,37 @@ def query_stac_items(
             return [], {}
 
     # THE single solar-offset application for this path. Everything below — the
-    # painter's-algorithm sort, the baseline map, the existing-date dedup, and every
+    # cloud sort, the baseline map, the existing-date dedup, and every
     # consumer of the returned items — then reads the solar day straight off
     # `item.datetime` with no offset of its own. Before this, the sort and the baseline
     # map keyed on the UTC date while the loader grouped by solar day, so on a day
-    # straddling UTC midnight the group was not actually sorted clearest-last and half
+    # straddling UTC midnight the group was not sorted as intended and half
     # its baseline entries never matched.
     # Same rule as the date probe above, and it matters more here: this is THE single
     # solar-offset application for the path, so a UTC-day stamp taken by default would be
     # read as the solar day by the sort, the baseline map, the dedup and every consumer.
     items = normalize_to_solar_day(items, mid_longitude=resolve_grouping_longitude(mid_longitude, bbox))
 
-    # Sort by (solar date, cloud_cover DESCENDING) so same-day tiles are adjacent and the
-    # CLEAREST tile comes LAST.
+    # Sort by (solar date, cloud_cover ASCENDING) so same-day tiles are adjacent and the
+    # CLEAREST tile comes FIRST.
     #
-    # Last, not first, because `load_kwargs` below sets `preserve_original_order=True` with
-    # `groupby="solar_day"`, and odc.stac's painter keeps the last item written for a pixel. Sorting
-    # clearest-first therefore let the CLOUDIEST scene win wherever two scenes of one solar day
-    # overlap — the opposite of the intent, and silent, because the output has the right shape and
-    # the right dates. The campaign's own S2 path in `s2_roi` already reverses the order for
-    # exactly this reason and says so; the two orderings disagreed, and this generic API was the
-    # one that was wrong.
+    # First, because that is the one the loader keeps. `load_kwargs` below sets
+    # `preserve_original_order=True` with `groupby="solar_day"`, and odc fuses a group with
+    # `nodata_fuser` — `np.copyto(dst, src, where=dst_is_nodata)` — which writes only where the
+    # destination is still empty. So the FIRST valid source of a group supplies a pixel and later
+    # ones can only fill the gaps it left, which is exactly the behaviour wanted: the clearest
+    # scene that covers a pixel wins it, and a hole in the clearest scene falls through to the
+    # next-clearest rather than to nothing.
+    #
+    # **This ordering was reversed until 2026-08-22, on the belief that odc mosaics by a painter's
+    # algorithm with the last item overwriting the others. It does not, and the consequence was
+    # that the CLOUDIEST scene of a solar day won every overlap** — silently, because the output
+    # had the right shape, the right dates and plausible pixels. Pinned end to end by
+    # `tests/unit/test_solar_day_fusion.py`, which loads two real single-pixel-value scenes of one
+    # solar day through this path and asserts which one survives.
+    #
+    # An item declaring no cloud cover reads as 100, so it sorts last and can only fill gaps. That
+    # is the cautious end under this ordering: unknown never displaces measured.
     #
     # Keyed on the SOLAR day, matching `normalize_to_solar_day` just above and the loader's own
     # grouping. Keying on the UTC date instead splits a group the loader treats as one, in the
@@ -1626,14 +1639,14 @@ def query_stac_items(
         # walk happened to produce. That order depends on how the query was partitioned: a
         # solar day near the antimeridian can straddle an interior window seam, so the two
         # halves arrive in a different order than an unsplit walk would give them. Since the
-        # loader paints the LAST item of a group over the others, an untied sort would let
+        # loader keeps the FIRST valid source of a group, an untied sort would let
         # crossing an item ceiling, or hitting a refusal, change output pixels for the same
         # requested range. A third key removes the tie, so the sequence is a function of the
         # items alone.
         items.sort(
             key=lambda item: (
                 item.datetime.strftime("%Y-%m-%d"),
-                -float(item.properties.get("eo:cloud_cover", 100)),
+                float(item.properties.get("eo:cloud_cover", 100)),
                 item.id,
             )
         )
@@ -1842,8 +1855,8 @@ def group_items_by_date(items: list[Any]) -> dict[str, list[Any]]:
     that names the cause.
 
     Within-group order is the caller's. ``query_stac_items`` sorts a date CLOUD-DESCENDING, so the
-    cloudiest tile comes first and the clearest last — which is what the loader's painter needs,
-    since it keeps the LAST item written for a pixel.
+    clearest tile comes first — which is what the loader's fuser needs, since it writes only where
+    the destination is still empty and so keeps the FIRST valid source of a group.
 
     Returns:
         Dict mapping ``YYYY-MM-DD`` to lists of items, preserving insertion order and

@@ -67,10 +67,10 @@ DEFAULT_RULES: tuple[Rule, ...] = (
         #
         # This rule exists because the alternative was tried and drifted. The offset used
         # to be applied independently at six sites and two of them disagreed with the
-        # rest: the painter's-algorithm pre-sort and the baseline map both keyed on the
-        # UTC date while the loader grouped by solar day, so on a day straddling UTC
-        # midnight the group was not sorted clearest-last and half its baseline entries
-        # never matched. Both failures are invisible in the output.
+        # rest: the cloud pre-sort and the baseline map both keyed on the UTC date while
+        # the loader grouped by solar day, so on a day straddling UTC midnight the group
+        # was not sorted as intended and half its baseline entries never matched. Both
+        # failures are invisible in the output.
         #
         # A second application is also a bug in the other direction — it shifts an
         # already-shifted timestamp. Confining the call to the one module that owns the
