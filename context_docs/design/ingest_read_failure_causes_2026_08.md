@@ -452,12 +452,21 @@ before `max_leg_wall_clock_s` was added to `config/ingest.py`, which is itself i
 closure and moved the identity again. Both changes land together on this branch, so the pair
 above is the only before/after any store will ever observe.)
 
+**Corrected in place on integration.** The claim just above — that this pair "is the only
+before/after any store will ever observe" — held only for the branch that wrote it. Every later
+change inside the closure moves the identity again, and two have: `main` now computes
+`ingcode-48e673cac9b274c3`, and the combined campaign-night branch (causes 4 and 5, the
+re-partitioning query, the identity override) computes `ingcode-54f78c9283c72ae3`. Read the pair
+above as what THAT change cost, not as a standing value.
+
 That check is validated on **append**, not on the completion marker, so:
 
 - **Finished mosaics are unaffected.** Nothing re-ingests.
 - **A mosaic that is mid-ingest right now will refuse its next append** with
-  `ConfigMismatchError`, which is a non-retryable leg marker; the resolution is a human deleting
-  the interrupted store.
+  `ConfigMismatchError`, which is a non-retryable leg marker; the resolution is either
+  `allow_ingest_code_mismatch` on the resuming run — off by default, and it relaxes only the
+  code-identity term — or a human deleting the interrupted store. See
+  `staging-identity-and-resume.md` section 5.
 
 There is no way to add request naming to the catalogue query without this, because the query is
 inside the closure. It is the cost every ingest change pays.

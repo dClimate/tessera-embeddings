@@ -770,6 +770,7 @@ _MISSING_OBJECT_MARKERS = (
     "The specified key does not exist",
 )
 
+
 def is_unreadable_source(exc: BaseException) -> bool:
     """Whether ``exc`` says a source object could not be read.
 
@@ -795,9 +796,7 @@ def is_unreadable_source(exc: BaseException) -> bool:
         return False
     if any(m in text for m in _UNREADABLE_MARKERS):
         return True
-    return any(m in text for m in _MISSING_OBJECT_MARKERS) and any(
-        m in text for m in _SOURCE_READER_MARKERS
-    )
+    return any(m in text for m in _MISSING_OBJECT_MARKERS) and any(m in text for m in _SOURCE_READER_MARKERS)
 
 
 def _exception_chain_text(exc: BaseException) -> str:
