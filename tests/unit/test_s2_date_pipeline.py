@@ -76,8 +76,14 @@ class _FakeClient:
         return SimpleNamespace(result=obj.compute)
 
 
-def _item(date: str):
-    return SimpleNamespace(datetime=datetime.fromisoformat(f"{date}T10:00:00"), properties={"eo:cloud_cover": 0.0})
+def _item(date: str, item_id: str | None = None):
+    # `id` is carried because the ingest sort breaks cloud-cover ties on it, so an item without
+    # one is not a stand-in for a real item.
+    return SimpleNamespace(
+        id=item_id or f"S2A_T13TDE_{date.replace('-', '')}_0_L2A",
+        datetime=datetime.fromisoformat(f"{date}T10:00:00"),
+        properties={"eo:cloud_cover": 0.0},
+    )
 
 
 def _day_ds(date: str, *, valid: bool) -> xr.Dataset:

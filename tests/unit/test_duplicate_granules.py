@@ -198,8 +198,8 @@ class TestChoosingBetweenCopies:
         assert alternates == {}
 
     def test_input_order_is_preserved_among_survivors(self) -> None:
-        """The caller sorts cloudiest-first for the painter's-algorithm mosaic; the selector
-        must not reorder that or the clearest tile stops painting last.
+        """The caller sorts clearest-first for the fusion order; the selector must not reorder
+        that or the clearest tile stops winning the overlap.
         """
         first = _Item("S2B_11VPD_20210908_0_L2A", "MGRS-11VPD", "0")
         old, new = _pair()

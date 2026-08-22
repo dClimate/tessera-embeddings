@@ -87,10 +87,10 @@ def test_omitting_longitude_keeps_utc_behaviour() -> None:
 
 
 def test_within_group_order_is_preserved() -> None:
-    """Order carries the painter's-algorithm contract: the clearest tile must land LAST.
+    """Order carries the fusion contract: the clearest tile must come FIRST.
 
     Grouping must not reorder, or the mosaic silently takes the cloudier pixel.
     """
-    items = [_item("2026-01-06T00:30:00", cloud=90.0), _item("2026-01-06T00:40:00", cloud=5.0)]
+    items = [_item("2026-01-06T00:30:00", cloud=5.0), _item("2026-01-06T00:40:00", cloud=90.0)]
     (group,) = group_items_by_date(normalize_to_solar_day(items, mid_longitude=FAR_EAST_LON)).values()
-    assert [i.properties["eo:cloud_cover"] for i in group] == [90.0, 5.0]
+    assert [i.properties["eo:cloud_cover"] for i in group] == [5.0, 90.0]

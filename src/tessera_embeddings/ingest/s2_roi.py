@@ -14,8 +14,7 @@ The algorithm is unchanged from the reference:
    materialised.
 2. Query STAC for the full date range; reduce duplicate items to one copy per
    tile-date (newest reprocessing preferred — see ``ingest.duplicates``), then
-   sort cloudiest-first (see the sort itself: that ordering does not do what
-   it was written to do, and is left alone deliberately).
+   sort clearest-first, which is the order the loader's fuser keeps.
 3. Group items by ``solar_day``.
 4. For each day:
 
@@ -106,6 +105,7 @@ from tessera_embeddings.ingest.stac import (
     load_stac_items,
     query_stac_items,
     selection_read_keys,
+    solar_day_sort_key,
     stream_stac_months,
 )
 from tessera_embeddings.storage.manifest import IngestManifest
@@ -521,17 +521,11 @@ def ingest_s2_roi_reflectance(
         # the group shares it by construction — it is the grouping key — so any item yields
         # it, and shifting one item is cheaper than threading the key through the pipeline.
         #
-        # Deliberately NOT taken from the loaded dataset's own time coordinate. odc stamps
-        # each group with `group[0].nominal_datetime`, and `preserve_original_order=True`
-        # with a cloud-descending sort makes group[0] the CLOUDIEST item, whose
-        # acquisition time is arbitrary within the day. Where the solar offset is large
-        # enough to cross UTC midnight, that timestamp's calendar date can be the day
-        # BEFORE the solar day — so two consecutive solar days can normalise onto the same
-        # date and collide. Measured on 56N (+10 h): six of twenty-two days landed on the
-        # previous date, and which six depended on cloud cover, not geography.
-        # Items are solar-day-normalised at the query chokepoint, so every item in the
-        # group carries the same canonical timestamp and this is the solar day itself —
-        # no offset here, and no dependence on WHICH item the sort left first.
+        # Deliberately NOT taken from the loaded dataset's own time coordinate, which odc stamps
+        # from `group[0]` and which therefore depends on whichever item the sort left first.
+        # Items are solar-day-normalised at the query chokepoint, so every item in the group
+        # carries the same canonical timestamp and this is the solar day itself — no offset
+        # here, and no dependence on order.
         date = day_items[0].datetime.strftime("%Y-%m-%d")
 
         # ONE load per date, serving both the coverage gate and the write. SCL is
@@ -1074,28 +1068,16 @@ def ingest_s2_roi_reflectance(
                 return
             total_processed += len(batch)
 
-        # Cloudiest-first. `query_stac_items` applies the same key — cloud cover DESCENDING —
-        # and applying it again here covers a supply that did not come through it, since both
-        # suppliers are injectable. `group_items_by_date` preserves this within-group order.
-        #
-        # The ordering was written believing solar_day mosaics by a painter's algorithm, with
-        # the last item of a group overwriting the ones before it. It does not: odc's default
-        # fuser fills only where the destination is still nodata, so the FIRST valid source
-        # wins and this hands an overlap to the CLOUDIEST scene. Left alone here for the same
-        # reason as in `query_stac_items` — reversing it changes published pixels, which is not
-        # something to do mid-campaign. See that sort's comment for the evidence.
+        # `solar_day_sort_key` owns the order and the reasoning. `query_stac_items` already
+        # applies it; applying it again covers a supply that did not come through there, since
+        # both suppliers are injectable. `group_items_by_date` preserves this order.
         #
         # Both the sort and the grouping key off the SOLAR day, not the UTC date, because
         # that is what the loader groups by. Using UTC here let a group the loader saw as
         # two solar days arrive as two time slices, against a cloud mask reduced to one —
         # a dimension conflict, and one that fires only where the solar offset is large
         # enough to cross UTC midnight (the far-eastern and far-western zones).
-        items.sort(
-            key=lambda it: (
-                it.datetime.strftime("%Y-%m-%d"),
-                -float(it.properties.get("eo:cloud_cover", 100)),
-            )
-        )
+        items.sort(key=solar_day_sort_key)
         by_date = group_items_by_date(items)
         total_seen += len(by_date)
         prepare = _prepare_date

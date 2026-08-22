@@ -3,6 +3,7 @@
 import threading
 import time
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -31,6 +32,7 @@ from tessera_embeddings.ingest.stac import (
     correct_boa_dn,
     extract_baselines,
     ingest_tile,
+    solar_day_sort_key,
     split_antimeridian_bbox,
     split_query_window,
 )
@@ -509,18 +511,39 @@ class TestIngestTile:
         assert result_baselines == {}
 
 
-class TestSolarDayPainterOrdering:
+class TestTheSolarDaySortKey:
+    """The one key both ingest paths sort on."""
+
+    @staticmethod
+    def _item(cloud, item_id="S2A_T13TDE_20240615_0_L2A"):
+        props = {} if cloud is None else {"eo:cloud_cover": cloud}
+        return SimpleNamespace(id=item_id, datetime=datetime(2024, 6, 15, 12, 0), properties=props)
+
+    def test_a_missing_reading_sorts_after_a_measured_full_cloud(self):
+        """100 is a real reading, so a missing value must not tie with it.
+
+        On a tie the `id` term decides, which would let an unmeasured scene take ground from one
+        known to be fully clouded — the opposite of the documented guarantee.
+        """
+        assert solar_day_sort_key(self._item(None)) > solar_day_sort_key(self._item(100))
+
+    def test_an_equal_cloud_tie_is_settled_by_id_not_by_input_order(self):
+        assert solar_day_sort_key(self._item(5.0, "AAA")) < solar_day_sort_key(self._item(5.0, "BBB"))
+
+
+class TestSolarDayFusionOrdering:
     """Which of two overlapping same-day scenes wins a pixel, and it is decided by ORDER.
 
-    `ingest_tile` loads with `preserve_original_order=True` and `groupby="solar_day"`, and odc.stac's
-    painter keeps the LAST item written. So the list handed to the loader must end with the clearest
-    scene. It used to be sorted clearest-FIRST, with a comment saying that was for SCL mosaicking, so
-    the cloudiest scene won every overlap — silently, because the output has the right shape and the
-    right dates. The campaign's own S2 path reverses the order and says why; this generic API
-    disagreed with it.
+    `ingest_tile` loads with `preserve_original_order=True` and `groupby="solar_day"`, and odc fuses
+    a group with `nodata_fuser`, which writes only where the destination is still empty. So the FIRST
+    valid source of a group supplies a pixel and later ones fill its gaps — the list handed to the
+    loader must therefore START with the clearest scene.
+
+    `test_solar_day_fusion.py` pins the mechanism itself against real rasters; this pins the order
+    handed to the loader.
     """
 
-    def test_the_clearest_scene_of_a_solar_day_is_loaded_last(self, mock_stac_item, monkeypatch):
+    def test_the_clearest_scene_of_a_solar_day_is_loaded_first(self, mock_stac_item, monkeypatch):
         seen: dict = {}
 
         def mock_query(*args, **kwargs):
@@ -570,7 +593,7 @@ class TestSolarDayPainterOrdering:
 
         assert seen["preserve"] is True, "the premise: order decides, so order must be correct"
         assert seen["groupby"] == "solar_day"
-        assert seen["order"] == [90.0, 55.0, 2.0], "cloudiest first, so the clearest paints last"
+        assert seen["order"] == [2.0, 55.0, 90.0], "clearest first, because the fuser keeps the first"
 
 
 class _StopLoadError(Exception):
@@ -1272,10 +1295,10 @@ class TestTheSortIsTotalSoOrderCannotDependOnThePartition:
     `query_stac_items` sorts on those two keys and Python's sort is stable, so a tie used to
     keep whatever order the walk produced. That order depends on how the query was cut up: a
     solar day near the antimeridian can straddle an interior window seam, and the two halves
-    then arrive in a different order than an unsplit walk gives them. Since the loader paints
-    the LAST item of a group over the others, crossing an item ceiling or hitting a refusal
-    could change output pixels for the same requested range. A third key on `id` removes the
-    tie, so the sequence is a function of the items alone.
+    then arrive in a different order than an unsplit walk gives them. Since the loader keeps
+    the FIRST valid source of a group, crossing an item ceiling or hitting a refusal could
+    change output pixels for the same requested range. A third key on `id` removes the tie, so
+    the sequence is a function of the items alone.
     """
 
     @staticmethod
@@ -1328,8 +1351,8 @@ class TestTheSortIsTotalSoOrderCannotDependOnThePartition:
         rotated = self._sorted_ids(items[2:] + items[:2])
 
         assert forward == backward == rotated
-        # Cloudiest first within a day, so the clearest is painted last.
-        assert forward[:3] == ["S2A_bbb", "S2A_ccc", "S2A_ddd"]
+        # Clearest first within a day, because the fuser keeps the first valid source.
+        assert forward[:3] == ["S2A_ccc", "S2A_ddd", "S2A_bbb"]
 
     def test_the_cloud_ordering_still_wins_over_the_tie_breaker(self) -> None:
         """The new key is a LAST resort; it must not reorder anything the first two decide."""
@@ -1338,4 +1361,4 @@ class TestTheSortIsTotalSoOrderCannotDependOnThePartition:
             self._item("S2A_zzz", "2019-03-05", 90.0),
         ]
 
-        assert self._sorted_ids(items) == ["S2A_zzz", "S2A_aaa"]
+        assert self._sorted_ids(items) == ["S2A_aaa", "S2A_zzz"]

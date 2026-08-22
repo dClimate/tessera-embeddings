@@ -55,6 +55,7 @@ context_docs/
     ├── ingest_optimization_campaign_2026_07.md   every ingest measurement
     ├── ingest_concurrency_investigation_2026_08.md
     ├── ingest_read_failure_causes_2026_08.md     five source-read failure causes, and the retry budget they share
+    ├── solar_day_fusion_order_2026_08.md         which scene wins a contested pixel, and why it was inverted
     ├── ingest-live-tile-cropping.md              + appendix A, the multi-write-per-commit test
     ├── ingest-graph-and-stac-budget.md
     ├── region-writes.md

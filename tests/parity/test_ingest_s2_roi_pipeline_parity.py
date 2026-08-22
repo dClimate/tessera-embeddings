@@ -89,9 +89,16 @@ def _toy_day(date: str) -> xr.Dataset:
     )
 
 
-def _item(date: str):
-    """The minimum of a STAC item the date loop touches: its datetime and cloud cover."""
-    return SimpleNamespace(datetime=datetime.fromisoformat(f"{date}T10:00:00"), properties={"eo:cloud_cover": 0.0})
+def _item(date: str, item_id: str | None = None):
+    """The minimum of a STAC item the date loop touches: datetime, cloud cover and id.
+
+    `id` is among them because the ingest sort breaks cloud-cover ties on it.
+    """
+    return SimpleNamespace(
+        id=item_id or f"S2A_T13TDE_{date.replace('-', '')}_0_L2A",
+        datetime=datetime.fromisoformat(f"{date}T10:00:00"),
+        properties={"eo:cloud_cover": 0.0},
+    )
 
 
 def _ingest(
