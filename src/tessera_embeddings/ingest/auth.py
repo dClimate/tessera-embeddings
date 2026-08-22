@@ -376,7 +376,13 @@ def _patch_odc_thread_session_for_env_drift() -> None:
     Resetting _local from the plugin setup() only clears the worker's main
     thread, not the task pool threads. Patching session() itself pushes the
     check into every thread: on each call, if the cached session's access key
-    differs from AWS_ACCESS_KEY_ID in env, reset and rebuild from current env.
+    differs from AWS_ACCESS_KEY_ID in env, drop it and rebuild from current env.
+
+    Dropping it must not go through ``ThreadSession.reset()``: that also calls
+    ``rasterio.env.delenv()``, and ``session()`` is called from inside
+    ``rio_env()`` — nested in the environment odc wraps around a whole Dask
+    chunk task. Tearing that down loses the task's GDAL options (the HTTP retry
+    ladder among them) for every read after the refresh.
 
     Idempotent — safe to call multiple times.
     """
@@ -394,7 +400,9 @@ def _patch_odc_thread_session_for_env_drift() -> None:
             except Exception:
                 cached_key = None
             if current_key and cached_key and current_key != cached_key:
-                self.reset()  # type: ignore[attr-defined]
+                # Drop the session only; leave rasterio's env stack alone.
+                self._session = None  # type: ignore[attr-defined]
+                self._aws = None  # type: ignore[attr-defined]
         return original_session(self, session)  # type: ignore[arg-type]
 
     session_with_env_check._env_drift_patched = True  # type: ignore[attr-defined]
@@ -429,7 +437,7 @@ class _S3CredentialPlugin(WorkerPlugin):
     def setup(self, worker: object) -> None:  # noqa: ARG002
         os.environ.update(self.env)
         # Reset the main-thread AWSSession cache. Task pool threads handle
-        # their own reset via the module-level env-drift patch, which detects
+        # their own refresh via the module-level env-drift patch, which detects
         # the env mismatch on the next session() call and rebuilds. Together
         # they ensure rasterio.env.Env (used by odc.loader on every /vsis3/
         # open) signs with the new key — making gdal.SetConfigOption and

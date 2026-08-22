@@ -69,24 +69,264 @@ S2 and Landsat are queried by tile ID property (e.g., `grid:code = T33UUP`), whi
 only items for that specific MGRS tile. OPERA RTC-S1 on CMR-STAC lacks an equivalent
 property, so queries use a bbox derived from the MGRS tile via `mgrs_tile_to_bbox()`.
 
+#### How one query runs, in plain terms
+
+Four words do all the work in this section. A **page** is one request and the hundred results it
+returns; the catalogue will not hand over more at once. A **cursor** is a bookmark — the catalogue
+returns a slip of paper meaning "you got as far as here", and the next request must carry it. It is
+not a page number: there is no way to ask for the twentieth page directly, and a refused request
+leaves no slip for the one after it, so a walk cannot step over a gap. A **date window** is a
+from-date and a to-date. A **worklist** is a to-do list of jobs, one job per date window; when a job
+turns out to be impossible it is crossed off and two shorter jobs are written in its place.
+
+The problem this shape exists for: Earth Search refuses **a request whose answer would be bigger
+than about 6 MB** — AWS Lambda's synchronous response limit. Item sizes vary, so whether a given
+hundred scenes clears the cap depends on which hundred the bookmark and date window select, which is
+why one request out of hundreds is refused every time while all the others are served. It is not
+overloaded — the refusal comes back in 1.3 seconds, as fast as a success — and it is not the
+bookmark's fault: the identical bookmark is answered when the date window is shorter, and answered
+when only ninety results are asked for instead of a hundred. So the remedy is to ask for a *smaller
+answer*, never the same one again.
+
+```text
+WHY A REQUEST GETS REFUSED -- the whole mechanism, in one line
+
+   Earth Search will not return more than about 6 MB in one answer.
+   That is AWS Lambda's limit on a single synchronous response, and the search API
+   sits behind one.
+
+   scenes are not all the same size, so a hundred of them is 4.6 MB on average
+   but anywhere from 4.2 to 5.3 MB in practice -- and sometimes over the line:
+
+      100 scenes from this bookmark  ->  would be ~6.2 MB  ->  REFUSED
+       90 scenes from this bookmark  ->            5.6 MB  ->  answered
+       75 scenes from this bookmark  ->            4.6 MB  ->  answered
+
+   Same bookmark, same dates, character for character. Only the number asked for
+   changed. So nothing is wrong with the bookmark, the depth, or the service --
+   the reply was simply too big to send.
+
+   Which hundred scenes you land on is decided by your bookmark and your date
+   window, which is why it looks like the service has taken against one specific
+   request. It hasn't. It is doing arithmetic on the size of the answer.
+
+   THE MARGIN IS THE RISK: 4.6 MB average against a 6 MB ceiling is ~30% of room.
+   Fatter scenes -- a newer processing baseline, a provider-side change -- push
+   FIRST pages over the line, and a first page is the one refusal that shortening
+   the dates cannot fix. `max_page_size` is the lever if that ever happens.
+
+
+HOW THE QUERY IS SHAPED AROUND IT
+
+   28 Feb ---------------------------------------------------------------- 1 Apr
+       |  the catalogue reports the total beside the first page, so a window too big to
+       |  walk is cut before the walk starts rather than hundreds of requests in
+       v
+    +--------+--------+--------+--------+--------+--------+
+    |  job 1 |  job 2 |  job 3 |  job 4 |  job 5 |  job 6 |   jobs meet on a shared
+    +--------+--------+--------+--------+--------+--------+   INSTANT, so nothing falls
+        ok       ok       ok    refused     ok       ok       between them and nothing
+                                  |                          is asked for twice
+                                  |  cross it off, write two shorter jobs. Shorter dates
+                                  |  regroup the scenes into different hundreds, so the
+                                  |  fat group is split and every answer fits. The other
+                                  v  five jobs are untouched and still running.
+                                     If the dates cannot be shortened -- a single day, or
+                                     a FIRST request, which a shorter window asks the same
+                                     way -- ask for fewer scenes at a time instead.
+                            16-22 March
+                              +-- 16-19 March   ok
+                              +-- 19-22 March   refused
+                                    +-- 19-21 March   ok
+                                    +-- 21-22 March   refused
+                                          +-- 21 March   ok   <- one day is as far
+                                          +-- 22 March   ok      as this can go
+
+   Up to six jobs run at once. Almost all of a request is spent waiting for the catalogue
+   to think -- 86% of it, before a single byte arrives -- so overlapping the waits is the
+   only thing that moves the clock. Same query, same scenes, same order: 39 minutes as
+   first written, 3.5 minutes now.
+```
+
+Two properties are load-bearing and both are tested. The jobs must add up to exactly the window
+asked for, no day missed and no day added. And the results must come back in the same **order**, not
+merely the same set — two scenes taken on the same day with the same cloud cover are separated only
+by which arrived first, and that decides which is painted on top.
+
+The rest of this section is the mechanism behind that picture.
+
+#### The months where the catalogue entries are heavy
+
+Late 2018 and early 2019 are the awkward part of the archive, and it is worth knowing why before
+it surprises you somewhere else.
+
+Every scene's catalogue entry includes the shape of the ground it covers. Normally that is a
+rectangle — four corners, a couple of hundred bytes. But entries from roughly **November 2018 to
+March 2019** give the shape of where the imagery *actually* is instead, tracing the edge of the
+data rather than the tile boundary. Sentinel-2 builds each image from twelve separate detectors,
+so that edge is a fine sawtooth, and drawing it takes thousands of points. One entry we measured
+runs to 2,497 points and 98 KB, against 0.2 KB for an ordinary one. The list of files attached to
+the scene is about 18 KB either way, so it is the outline, not the imagery, that makes these
+entries heavy.
+
+The band exists because of a gap in reprocessing rather than anything about that season. ESA
+reprocessed most of the archive to a later version whose entries carry the simple rectangle, and
+the catalogue serves that version when it exists. For those few months it does not exist, so the
+original products are what you get. Sampling one day a month across the boundary:
+
+| month | typical points per entry | heavy entries | versions available |
+|---|---|---|---|
+| Oct 2018 | 6 | 0 of 50 | 02.09 |
+| **Nov 2018** | **580** | **31 of 50** | **02.11 only** |
+| **Dec 2018** | **531** | **33 of 50** | **02.11 only** |
+| **Feb 2019** | **579** | **30 of 50** | **02.11 only** |
+| Apr 2019 | 6 | 0 of 50 | 02.11, 05.00 |
+| Jun 2023 | 5 | 0 of 50 | 05.09 |
+
+The heavy months are exactly the ones where version 02.11 is the only one on offer. Why that
+version drew outlines this way when the versions either side did not is an ESA processing decision
+and not something we have chased.
+
+Two things follow. It **cannot spread** — no current processing version produces these outlines,
+so no future data brings the problem back. And it **could disappear on its own**, if that stretch
+is ever reprocessed.
+
+What it presses against, in this code:
+
+- **The response cap.** A hundred entries is about 2.2 MB outside the band and at or over the
+  ~6 MB ceiling inside it, which is what makes a page refusal a 2019 phenomenon. See the page-size
+  discussion below.
+- **What a query holds in memory.** A month's worth of these entries is an order of magnitude
+  more bytes than the same month in 2024, which is part of why the query streams month by month
+  rather than fetching a year at once.
+
+Anything that measures per-item cost — page sizes, retained bytes, query timings — will read
+differently in these months than anywhere else in the archive, so a figure taken here is not a
+figure about the campaign generally, and vice versa.
+
 `_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry`
 built by `make_logging_retry()` (`_http.py`, shared with the CMR Granule query) and passed
-into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504)`).
+into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 503, 504)`).
 The subclass logs each retry attempt at WARNING — urllib3 otherwise retries silently inside
 the `HTTPAdapter`, making a slow query indistinguishable from a hang. Because
 `search.items()` paginates lazily, each page fetch is a separate HTTP call — configuring
 retries on the underlying `HTTPAdapter` means a transient 5xx on page N is retried in
-place, instead of throwing away prior pages and restarting the whole query. This matters
-most for CMR-STAC, which returns 502/503 under load on large date-range queries. Note that
+place, instead of throwing away prior pages and restarting the whole query.
+
+**502 is deliberately absent from that force-list**, so an Earth Search page refusal
+arrives unretried and the date-window re-cut below can start immediately instead of after
+the ladder's backoff. A 502 that really was transient is absorbed by the attempt budget
+that owns the leg, which is where a refusal is settled anyway — it takes an identical
+repeat to prove one deterministic. The CMR Granule query keeps its own ladder
+(`opera_query._CMR_RETRY`), 502 included, and is unaffected. Note that
 `StacApiIO`'s default `max_retries=5` passes a bare int to urllib3, which has an empty
 `status_forcelist` and therefore does **not** retry 5xx responses — the explicit `Retry`
 object is required.
 
 The page size is `STACProvider.max_page_size` (the `limit` per page request), defaulting
-to 250. This applies only to providers queried through `client.search()` (Earth Search,
-Planetary Computer) — the OPERA `cmr-asf` path bypasses CMR-STAC search entirely and queries
-the native CMR Granule API. See
+to 250 and set to 100 for Earth Search. This applies only to providers queried through
+`client.search()` (Earth Search, Planetary Computer) — the OPERA `cmr-asf` path bypasses
+CMR-STAC search entirely and queries the native CMR Granule API. See
 [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md) for the full rationale.
+
+**Why 100 for Earth Search, and what to watch.** It is not a throughput choice — it is the
+response cap. Earth Search refuses any request whose response would exceed roughly **6 MB**,
+AWS Lambda's synchronous response limit, and 250 items of `sentinel-2-l2a` is always over it.
+A hundred items averages 4.6 MB, but the biggest page ever **served** was **5.73 MB — 96% of the
+cap** — and the refused one works out to 5.96 MB. So the gap between fine and refused is about a
+quarter of a megabyte, and the average is the wrong number to reason from.
+
+What makes an item heavy is the shape of the ground it covers rather than the files attached to
+it, and the heavy items are confined to a few months of 2018 and 2019 — see *The months where the
+catalogue entries are heavy* above. Outside that band a hundred items is about 2.2 MB, a third of
+the cap.
+
+Lowering this number is therefore not the answer — see the campaign record for the measurements.
+Six months of a ten-year archive is a concentrated problem, and the page-size fallback below handles
+it where it happens rather than taxing every query in every year. The cap tracks **bytes, not the `limit` value**: measured directly, 130
+items are served at 5.99 MB and 150 refused, while 150 are served at 4.77 MB once unneeded
+assets are excluded server-side. If first pages ever start returning 502, this margin is the
+first thing to check and lowering this number is the lever — a first-page refusal is the one
+case no date-window re-cut can route around.
+
+**A page request deep in a walk is refused by the SAME ~6 MB response cap, and there are two
+levers for it.** Some individual page requests are refused with a 502 while
+the rest of the same walk is served, which looks like a separate defect and is not: item sizes
+vary, so whether a given hundred items clears the cap depends on which hundred the cursor and
+date window select. That is why the refusal is deterministic in the *request* — cursor and date
+window together — rather than in how deep the walk has got, and why it has been seen at page 289
+of one window and page 14 of a shorter one sharing its late bound. Re-sending the byte-identical
+cursor and window at `limit=90` is served, returning 5.60 MB where the hundred would have been
+about 6.2 MB. So waiting cannot absorb
+it — which is why 502 is kept out of the retry ladder above. **It is the same cap
+`max_page_size` was lowered for**, reached from the other direction: that one refuses a first
+page because 250 items are always too many, this one refuses a later page because those
+particular hundred items happen to be. A smaller page from the refused cursor IS served, and
+is the most direct remedy; it is not used here only because `pystac_client` bakes the limit
+into a search and cannot resume from a cursor at a different size.
+
+What clears it is either a smaller response or a regrouping that produces one. `stac.py` tries
+them in cost order.
+
+**A shorter window first.** Its halves between them walk about as many pages as the parent
+would have, where a smaller page re-walks the whole window at twice the requests. What matters
+is the window's **end** date; shortening only the start does not help, because the catalogue
+pages newest-first and the late bound fixes the whole cursor sequence. So `_query_stac_items` re-queries the window as shorter windows on any
+upstream-error refusal past the first page, recursing until a window completes or is down to
+a single day. Separately and proactively, it reads the match count the catalogue reports
+beside the first page and cuts a window matching more than `_MAX_QUERY_ITEMS` to size — that
+bounds *cost*, keeping a refusal from discarding a long walk, and is not what fixes the
+defect. **A smaller page as the fallback**, halved each time down to `_MIN_PAGE_SIZE`. Shortening
+cannot reach two refusals, and both failed a leg outright before this existed: a **first page**,
+which a shorter window asks identically, and a **single day**, which is the re-cut's own floor.
+Verified live — a 250-item page is over the cap and refused outright, and the recovery stepped
+250 → 125 → 62, interleaving with a window cut, and returned all 2,512 items with the post-sort
+order and the extracted baselines unchanged, for twice the requests.
+
+A stated overload (429, 503) is never answered with a smaller page: that means the provider is
+busy, and more requests is the wrong direction. A refusal neither lever can route around still
+raises the classified `CatalogueQueryError` with its token.
+
+**Concurrency.** The windows are independent searches, so `_fill_window_tree` walks up to
+`_QUERY_WINDOW_WORKERS` (6) of them at once. The worklist is driven from the calling thread and
+tasks only ever walk — they never submit and never wait — which is what makes deadlock
+structurally impossible rather than merely unobserved. Each thread gets its own `Client`, because
+`StacApiIO` wraps a `requests.Session` that is not documented thread-safe. Output order comes
+from `_WindowWalk.preorder()` on the finished tree, and the `id` dedupe runs at that assembly step
+rather than as pages arrive, so first-occurrence-wins means first in the **walk** and not first
+off the wire.
+
+Six rather than eight, even though eight is faster: the campaign runs tens of cells against this
+one provider at once, so the setting is a multiplier on the concurrent search streams Element 84
+sees, and measured per-page latency degrades with width. A failure no longer stops the other
+windows either — every window is walked, all failures are collected, and the depth-first-earliest
+is raised, because which failure surfaces must be a function of the query rather than of which
+task finished first. The attempt-budget layer above decides a refusal is deterministic by seeing
+the identical signature again.
+
+The re-partition is a pure re-cut of the window, never a narrowing, and it is exact in both
+directions: the outer bounds are the caller's own date strings handed straight back, and every
+interior boundary is a single **instant** (`T00:00:00Z`) shared by the window that ends there
+and the window that starts there. The catalogue's range is inclusive at both ends, so the union
+is the input window with no gap and no overhang, and the only overlap is that one instant.
+
+The boundary is an instant rather than a date because the client expands a bare date end to
+`T23:59:59Z`: windows abutting on consecutive DATES would leave the last second of each seam's
+earlier day unasked for, a second the unsplit window covers. Sharing the whole boundary DAY
+also closes that gap, and was how this first shipped, but it makes every seam re-fetch a full
+day for the dedupe to discard — about 13 page requests each at Earth Search. Items are still
+deduped by `id` across every search a query runs, which absorbs the boundary instant and the
+antimeridian overlap alike.
+
+**Item order.** The re-partition does change the order items are *walked* in — one walk returns
+the window newest-first, the worklist returns window by window in date order — and that matters
+because `query_stac_items` sorts by `(solar date, cloud cover DESC)` with a stable sort, so ties
+keep their input order and the painter writes the last one for a pixel. The sort restores the
+single-walk order, because each solar date's items land in exactly one window in catalogue
+order. Verified against an unsplit walk at several part counts; see
+[the ingest campaign record](../../../context_docs/design/ingest_optimization_campaign_2026_07.md),
+which also records the measurements and the two optimisations that are closed (a larger page,
+and server-side field selection).
 
 #### When the catalogue refuses: naming the request, and telling the two refusals apart
 
@@ -98,10 +338,11 @@ client stack make that necessary:
   path; a STAC search is a request **body**, so the collection, the window, the bbox and the
   page are all gone. Without them a refusal cannot be narrowed to a month or a page,
   reproduced, or reported to whoever runs the archive.
-- **Our layer sits ABOVE a retry ladder, not next to one.** The `urllib3.Retry` above
-  retries each page fetch with exponential backoff, so what escapes is the ladder reporting
-  its own exhaustion — a much stronger statement than one error response, and one that must
-  not be mistaken for a first attempt.
+- **Our layer sits ABOVE a retry ladder, and only partly behind it.** For a status the
+  `urllib3.Retry` above force-lists, what escapes is the ladder reporting its own
+  exhaustion — a much stronger statement than one error response, and one that must not be
+  mistaken for a first attempt. For a status kept out of that list (502) the first refusal
+  arrives directly. `CatalogueRefusal.exhausted` records which, so no caller has to assume.
 
 So `_query_stac_items` pages explicitly (`pages_as_dicts`, which is what `items_as_dicts`
 iterates internally) and wraps **only the page fetch** in a `CatalogueQueryError` carrying a
@@ -112,7 +353,7 @@ root outage is not attributed to a window that was never asked for.
 ```text
 CATALOGUE REFUSED collection=sentinel-2-l2a window=2021-09-01/2021-10-02
                   bbox=-3.0000,50.0000,-2.0000,51.0000 page 3
-                  with HTTP 502 after exhausting the retry ladder after 500 item(s)
+                  with HTTP 502 without being retried after 500 item(s)
                   — classified upstream-error:502
 ```
 
@@ -127,7 +368,10 @@ endpoint and need opposite responses:
 
 The two named sets must jointly cover the ladder's `status_forcelist` — a status the ladder
 retries but the taxonomy does not name falls to `UNKNOWN` and keeps its expansive retry
-forever. A unit test asserts that containment rather than leaving it to care.
+forever. A unit test asserts that containment rather than leaving it to care. The converse
+is allowed and deliberate: the taxonomy names 502, which the ladder does **not** retry, and
+a second test pins that exclusion so re-adding it cannot quietly restore the backoff the
+window re-cut exists to avoid.
 
 The status is read from the exception **chain**, not the message: `pystac_client` re-raises
 without `from`, so the evidence sits under `__context__` on urllib3's own exception, and the
@@ -1478,6 +1722,27 @@ throttle markers explicitly. It fails CLOSED: anything unrecognised propagates r
 being treated as bad data, because responding to a bad minute by reading worse imagery is
 the one outcome the recovery must never produce.
 
+**An object that was never published counts too, and needs its own markers.** Every
+codec-level signature is emitted by a BLOCK READ, and a missing object fails at open, before
+any block is requested — so a catalogue item naming an href the provider never wrote used to
+match nothing and fail the whole leg. `ObjectNotFound`, `NoSuchKey` and `The specified key
+does not exist` cover the three layers that can surface it, and they are matched only
+alongside the source reader's own vocabulary (`RasterioIOError`, `WarpOperationError`, `CPLE_`,
+`HTTP response code:` — the same set the refusal predicate below pairs against). That pairing
+is what makes them mean SOURCE: those strings belong to the S3 layer and every S3 client in
+the process shares it — `icechunk`'s error enum carries two of them verbatim — so unpaired
+they would let a hole in the destination store, or in the ROI mask, be recorded durably as
+provider data loss. GDAL is used here only to read source imagery, so its name beside the
+not-found text is the discriminator. `NoSuchBucket` is deliberately excluded: a vanished
+bucket is systemic and must fail the leg on its first date rather than be skipped date by
+date.
+
+Nothing counts or caps these skips on the OPTICAL path. A source object that will never read
+is rare enough per granule that a ceiling would only ever fire on a fault of some other kind,
+and every date given up is already logged, restated in the end-of-run summary, and written to
+the store. The radar skip below does carry a ceiling, for the different reason given there: it
+answers a provider refusal, which arrives fleet-wide and all at once.
+
 Past that point the response is a ladder, in `s2_roi.py`'s consume path:
 
 1. **Attribute.** Ask the cluster which objects the loader gave up on
@@ -1510,6 +1775,52 @@ The batched write path cannot reach the ladder — a batch is one graph and one 
 isolates first: an unreadable source anywhere in a batch re-runs the batch's dates one at a
 time, each then getting the per-date recovery. That isolation is what stops one corrupt
 object from failing a zone-year identically on every retry.
+
+### When the provider refuses the read
+
+An authorization refusal, a throttle and a server error are a different finding again, and
+`is_provider_refusal` in `duplicates.py` is the predicate for them. They say nothing about the
+imagery — the same object read minutes earlier and reads again once the service recovers — so no
+fallback copy helps, which is why `is_unreadable_source` declines them and why this predicate
+sits beside it rather than inside it.
+
+It fails closed three ways. A credential fault on THIS side is excluded first, because it is
+repairable here and no waiting fixes it. A refusal nothing attributes to the source reader is
+excluded too: `AccessDenied`, `SlowDown` and `InternalError` are S3's words and every S3 client
+shares them, so those markers only count alongside GDAL's own vocabulary (`RasterioIOError`,
+`WarpOperationError`, `CPLE_`, `HTTP response code:`) — GDAL reads source imagery here and
+nothing else. And anything unrecognised is excluded, so the caller re-raises.
+
+One asymmetry to know about: `is_unreadable_source` recognises refusals by NAME, so a refusal
+reported as a bare status code carries none of the words it looks for and both predicates claim
+it. Callers that can act on both resolve it by ORDER, asking about the refusal first.
+
+### The radar bounded skip (`s1_roi.py`)
+
+Every OPERA read on the radar path happens inside a date's write, so a failed read raises out of
+the per-date loop. Until this skip, one refused read cost every LATER date in the window too: a
+source refusing reads for thirteen minutes emptied 178 zone-years that had already committed
+months of sound data.
+
+The radar response is the tail of the optical one without the copy ladder, which radar has no use
+for — OPERA publishes one copy of a granule:
+
+1. **Retry**, through the shared `store_write_retrying` policy, which covers a refusal that
+   clears inside a backoff.
+2. **Give up the date** once that retry is exhausted, if and only if the failure is one the
+   source is answerable for. `scope=provider-refused` and `scope=unreadable` are recorded
+   separately: the first is recoverable by re-running the window, the second needs a reprocessed
+   copy at the provider.
+3. **Record it on the store** in the same `assessed_unreadable_dates` attribute the optical path
+   writes, so the coverage gate refuses to excuse a month that lost dates.
+4. **Stop past `MAX_GIVEN_UP_DATES`**, and stopping is a request to be RE-DISPATCHED rather than
+   a refusal to try again: `TooManyGivenUpDatesError` is deliberately absent from the leg-retry
+   classifier's non-retryable set. A refusal clears, and a leg that *finishes* returns success so
+   nothing comes back for it — declining to retry would turn a passing outage into permanent loss.
+
+A date offered by two consecutive batches is given up ONCE. Batch queries are padded a day either
+side, so a boundary solar day comes back from two queries and would otherwise be listed twice and
+cost twice.
 
 ### S3 direct access for OPERA
 
