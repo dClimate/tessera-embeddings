@@ -347,3 +347,56 @@ def test_odc_thread_session_explicit_reset_picks_up_env(monkeypatch: pytest.Monk
 
     assert out["initial"] == "INITIAL_KEY_AAAAAA"
     assert out["after_reset"] == "REFRESHED_KEY_BBBBBB"
+
+
+def test_credential_drift_keeps_the_tasks_gdal_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A refresh noticed mid-task leaves the task's GDAL options in force.
+
+    ``rio_env`` is entered twice over: once by ``RioDriver.restore_env`` around a
+    whole Dask chunk task, and again inside every read. The drift check fires on
+    the inner entry, so whatever it does to rasterio's env stack is done while
+    the task's own options are the ones installed.
+    """
+    pytest.importorskip("odc.loader._rio")
+    import threading
+
+    import rasterio.env
+    from odc.loader._rio import _local, rio_env
+
+    from tessera_embeddings.ingest import auth  # noqa: F401
+
+    for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+        monkeypatch.setenv(k, os.environ.get(k, ""))
+
+    out: dict[str, str | None] = {}
+
+    def body() -> None:
+        os.environ["AWS_ACCESS_KEY_ID"] = "INITIAL_KEY_AAAAAA"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "INITIAL_SECRET"
+        os.environ["AWS_SESSION_TOKEN"] = "INITIAL_TOKEN"
+
+        with rio_env(GDAL_HTTP_MAX_RETRY="10", GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR"):
+            out["task"] = rasterio.env.getenv().get("GDAL_HTTP_MAX_RETRY")
+
+            os.environ["AWS_ACCESS_KEY_ID"] = "REFRESHED_KEY_BBBBBB"
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "REFRESHED_SECRET"
+            os.environ["AWS_SESSION_TOKEN"] = "REFRESHED_TOKEN"
+
+            with rio_env(VSI_CACHE=False):  # the read that notices the refresh
+                out["refresh_read"] = rasterio.env.getenv().get("GDAL_HTTP_MAX_RETRY")
+            with rio_env(VSI_CACHE=False):  # every read after it
+                opts = rasterio.env.getenv()
+                out["later_read"] = opts.get("GDAL_HTTP_MAX_RETRY")
+                out["later_readdir"] = opts.get("GDAL_DISABLE_READDIR_ON_OPEN")
+            out["key"] = _frozen_access_key(_local.session())
+
+    t = threading.Thread(target=body)
+    t.start()
+    t.join()
+
+    assert out["task"] == "10"
+    assert out["refresh_read"] == "10"
+    assert out["later_read"] == "10"
+    assert out["later_readdir"] == "EMPTY_DIR"
+    # The refresh still has to land, or the options were kept by not refreshing.
+    assert out["key"] == "REFRESHED_KEY_BBBBBB"
