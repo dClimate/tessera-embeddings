@@ -899,64 +899,18 @@ month ahead is enough to hide the query entirely.
 needed alongside it rather than instead of it: streaming bounds *how many* items are held, pruning
 bounds *how large each one is*, and the driver needed both to stay under the pause threshold.
 
-## 7c. The Earth Search 502 is ONE mechanism: a response-size cap of about 6 MB
+## 7c. The Earth Search 502: one mechanism, a response-size cap of about 6 MB
 
-**CORRECTED 2026-08-22.** This section previously described two unrelated Earth Search 502s
-and asserted that "neither page size nor patience touches the second". The two are the same
-refusal, and page size does touch it. The correction is at the end of this heading; the
-sections below it were written under the old reading and are marked where they still assume it.
+**Earth Search refuses any request whose response would exceed roughly 6 MB.** That is AWS
+Lambda's limit on a single synchronous response, and the search API sits behind one. Every 502
+this campaign has seen from that provider is this, and nothing else.
 
-There appeared to be two refusals:
-
-- **On the first request**, when a page is asked for at `limit=250`. Remedied by
-  `max_page_size=100` for this provider.
-- **On one request deep in a walk** at `limit=100`, while every other request in the same
-  walk is served. This looked unrelated: it is not the first page, and the same page size
-  works everywhere else.
-
-They are one mechanism. **Earth Search refuses a request whose RESPONSE would exceed roughly
-6 MB**, which is AWS Lambda's synchronous response limit. What made the second look different
-is only that item sizes vary, so whether a given hundred items clears the cap depends on which
-hundred they are — and that is decided by the cursor and the date window together, which is
-exactly the "deterministic in the (cursor, window) pair" behaviour measured below.
-
-The measurement that settles it. Walk the two-day window to its refusal at page 14, then
-re-send **the byte-identical cursor with the identical window** and only the page size changed:
-
-| `limit` | result | bytes returned | implied at 100 items |
-|---|---|---|---|
-| 100 | **502** | — | — |
-| 90 | **200** | 5.60 MB | 6.22 MB |
-| 75 | **200** | 4.58 MB | 6.11 MB |
-| 50 | **200** | 3.33 MB | 6.67 MB |
-| 25 | **200** | 1.80 MB | 7.22 MB |
-| 10 | **200** | 0.66 MB | 6.59 MB |
-
-The thirteen pages that WERE served in that same walk ran 4.17 to 5.32 MB. The refused page's
-hundred items would have been 6.1 to 7.2 MB. Nothing about depth, patience or the cursor is
-implicated: that page was simply too big, and ninety of the same items are not.
-
-Combined with the earlier bisection — 130 items served at 5.99 MB, 150 refused, and 150 served
-at 4.77 MB once assets were excluded server-side — the cap sits just above 5.99 MB and tracks
-**bytes, not the `limit` value**.
-
-**What this does and does not change.** The shipped fix still works and is still correct: a
-shorter date window regroups the items, so the fat page is split and every request lands under
-the cap. It is no longer the only conceivable remedy, and the honest ranking is now:
-
-- Asking for the refused page again at a **smaller size** is the most direct remedy, since it
-  targets the mechanism, keeps the item order, and re-walks nothing. It is awkward through
-  `pystac_client`, which bakes the limit into a search and offers no clean way to resume from
-  a cursor at a different size — which is why the window re-cut was reachable and this was not.
-- **Lowering `max_page_size`** moves every page further below the cap and makes refusals rare
-  rather than handled. It costs proportionally more requests, which concurrency largely hides.
-- The **window re-cut** stays as the backstop, because no page size can be low enough to
-  guarantee the cap is never hit if items get fatter.
-
-**The margin is the real finding.** A 100-item page averages 4.6 MB against a ~6 MB cap, and
-the largest observed was 5.32 MB. That is thin. Fatter items — more assets on a newer baseline,
-a collection change at the provider — move first pages over the line, and a first-page refusal
-is the one no window re-cut can route around.
+The reason it did not look like one thing is that **items are not all the same size**. A page of
+100 `sentinel-2-l2a` items averages 4.63 MB, but ranges 4.17 to 5.32 MB in practice, and
+sometimes over the line. Whether a given hundred clears the cap therefore depends on WHICH
+hundred, and that is selected by the pagination cursor and the date window together — which is
+exactly the "deterministic in the (cursor, window) pair" behaviour §7c goes on to measure, and
+why the same refusal appeared at page 289 of one window and page 14 of another.
 
 ### In plain terms, before any of the detail
 
@@ -1017,7 +971,7 @@ WHAT WAS ACTUALLY HAPPENING
   hundred scenes you happen to land on decides it.
 
 
-WHAT DOES NOT WORK, ALL MEASURED
+WHAT WE TRIED, AND WHAT EACH ONE ACTUALLY DID -- all measured
 
   ask again, and again     the same request is refused every time; the retry machinery
                            underneath spent six minutes doing this before giving up
@@ -1027,6 +981,20 @@ WHAT DOES NOT WORK, ALL MEASURED
                            answer, not on where we are in the walk
   wait longer              nothing was timing out; every request took about 1.3 s
   ask for fewer dates      WORKS -- regrouping the results makes each answer smaller
+
+
+THE PART TO WORRY ABOUT
+
+  A hundred scenes is 4.6 MB on average against a 6 MB ceiling. That is about 30% of room,
+  and it is all that stands between us and a refusal nothing in our code can route around.
+
+  Shortening the dates works because it regroups the scenes. But the FIRST request of any
+  window asks for the same first hundred however short the window is -- so if a hundred
+  scenes ever averages over 6 MB, first requests start failing and there is no shorter
+  window to fall back on. Anything that fattens a scene closes the gap: more files attached
+  on a newer processing baseline, or a change at the provider.
+
+  If first requests ever start failing, ask for fewer results at a time. That is the lever.
 
 
 THE NEW WAY -- a to-do list of shorter date windows
@@ -1076,6 +1044,67 @@ AND THEN IT WAS MADE FAST
 ```
 
 Everything below is the evidence for those claims, in increasing detail.
+
+### The measurement that settles it
+
+Walk the two-day window to its refusal at page 14, then re-send **the byte-identical cursor with
+the identical date window** and change only the page size:
+
+| `limit` | result | bytes returned | implied at 100 items |
+|---|---|---|---|
+| 100 | **502** | — | — |
+| 90 | **200** | 5.60 MB | 6.22 MB |
+| 75 | **200** | 4.58 MB | 6.11 MB |
+| 50 | **200** | 3.33 MB | 6.67 MB |
+| 25 | **200** | 1.80 MB | 7.22 MB |
+| 10 | **200** | 0.66 MB | 6.59 MB |
+
+The thirteen pages that WERE served in that same walk carried 4.17 to 5.32 MB. The refused
+page's hundred items would have been 6.1 to 7.2 MB. Ninety of the same items, from the same
+cursor, in the same window, are 5.60 MB and are served.
+
+Bisected from the other direction: 130 items are served at 5.99 MB and 150 refused; with
+unneeded assets excluded server-side the per-item cost drops from 46.3 to 33.2 KB and 150 items
+are served at 4.77 MB, while 200 at a predicted 6.64 MB are refused. So the cap sits just above
+5.99 MB and tracks **bytes, not the `limit` value**.
+
+Two corroborating details. The refusal returns in **1.3 s**, as fast as a success, because the
+service assembles the answer, measures it and gives up — nothing times out. And refusal latency
+**rises with the requested limit** (1.24 s at 150, 3.55 s at 400), which is what "assemble, then
+reject on size" looks like from outside.
+
+### Why this is a standing risk, not just an explanation
+
+A 100-item page averages **4.6 MB against a ~6 MB cap**, largest observed 5.32 MB — roughly
+**30% headroom**. Anything that makes items fatter closes it: more assets on a newer processing
+baseline, or a collection change at the provider. When it closes, **first pages** start refusing,
+and a first-page refusal is the one case no date-window re-cut can route around — a shorter
+window asks its first page exactly the same way. `max_page_size` is the lever, and this margin is
+the first thing to measure if a first-page 502 ever reappears.
+
+### What it means for the fix
+
+The shipped fix is correct and unaffected: a shorter date window regroups the items into
+different hundreds, so the fat group is split and every response lands under the cap. What
+changes is the ranking of remedies:
+
+- Re-asking the refused page at a **smaller size** is the most direct remedy, since it targets
+  the mechanism, preserves item order and re-walks nothing. It is not used here because
+  `pystac_client` bakes the limit into a search and offers no clean way to resume from a cursor
+  at a different size — which is why the window re-cut was reachable and this was not.
+- **Lowering `max_page_size`** moves every page further below the cap, making refusals rare
+  rather than handled. It costs proportionally more requests, which the concurrency in §7c
+  largely hides.
+- The **window re-cut** stays as the backstop, because no page size can guarantee the cap is
+  never reached if items get fatter.
+
+> **CORRECTED 2026-08-22.** This section previously described two unrelated Earth Search 502s —
+> a first-page refusal at `limit=250` remedied by page size, and a deep-page refusal at
+> `limit=100` which it said "neither page size nor patience touches". Both readings were wrong:
+> they are one refusal, and a smaller page from the refused cursor IS served. Sections below
+> this one were written under the old reading; where they still assume it, they say so. The
+> claim was also carried in `ingest/stac.py`, `config/providers.py` and the ingest README, and
+> has been swept from all three.
 
 ### The measurement that killed the depth hypothesis
 

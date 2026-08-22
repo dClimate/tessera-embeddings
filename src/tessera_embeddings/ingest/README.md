@@ -89,6 +89,35 @@ when only ninety results are asked for instead of a hundred. So the remedy is to
 answer*, never the same one again.
 
 ```text
+WHY A REQUEST GETS REFUSED -- the whole mechanism, in one line
+
+   Earth Search will not return more than about 6 MB in one answer.
+   That is AWS Lambda's limit on a single synchronous response, and the search API
+   sits behind one.
+
+   scenes are not all the same size, so a hundred of them is 4.6 MB on average
+   but anywhere from 4.2 to 5.3 MB in practice -- and sometimes over the line:
+
+      100 scenes from this bookmark  ->  would be ~6.2 MB  ->  REFUSED
+       90 scenes from this bookmark  ->            5.6 MB  ->  answered
+       75 scenes from this bookmark  ->            4.6 MB  ->  answered
+
+   Same bookmark, same dates, character for character. Only the number asked for
+   changed. So nothing is wrong with the bookmark, the depth, or the service --
+   the reply was simply too big to send.
+
+   Which hundred scenes you land on is decided by your bookmark and your date
+   window, which is why it looks like the service has taken against one specific
+   request. It hasn't. It is doing arithmetic on the size of the answer.
+
+   THE MARGIN IS THE RISK: 4.6 MB average against a 6 MB ceiling is ~30% of room.
+   Fatter scenes -- a newer processing baseline, a provider-side change -- push
+   FIRST pages over the line, and a first page is the one refusal that shortening
+   the dates cannot fix. `max_page_size` is the lever if that ever happens.
+
+
+HOW THE QUERY IS SHAPED AROUND IT
+
    28 Feb ---------------------------------------------------------------- 1 Apr
        |  the catalogue reports the total beside the first page, so a window too big to
        |  walk is cut before the walk starts rather than hundreds of requests in
@@ -98,8 +127,10 @@ answer*, never the same one again.
     +--------+--------+--------+--------+--------+--------+   INSTANT, so nothing falls
         ok       ok       ok    refused     ok       ok       between them and nothing
                                   |                          is asked for twice
-                                  |  cross it off, write two shorter jobs; the other
-                                  v  five are untouched and still running
+                                  |  cross it off, write two shorter jobs. Shorter dates
+                                  |  regroup the scenes into different hundreds, so the
+                                  |  fat group is split and every answer fits. The other
+                                  v  five jobs are untouched and still running
                             16-22 March
                               +-- 16-19 March   ok
                               +-- 19-22 March   refused
@@ -146,11 +177,25 @@ to 250 and set to 100 for Earth Search. This applies only to providers queried t
 CMR-STAC search entirely and queries the native CMR Granule API. See
 [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md) for the full rationale.
 
-**A second, unrelated Earth Search 502 is handled by re-cutting the date window.** Some
-individual page requests are refused with a 502 while the rest of the same walk is served,
-and the refusal is deterministic in the *request* — pagination cursor and date window
-together — not in how deep the walk has got. The same refusal has been seen at page 289 of
-one window and page 14 of a shorter one sharing its late bound. So waiting cannot absorb
+**Why 100 for Earth Search, and what to watch.** It is not a throughput choice — it is the
+response cap. Earth Search refuses any request whose response would exceed roughly **6 MB**,
+AWS Lambda's synchronous response limit, and 250 items of `sentinel-2-l2a` is always over it.
+At 100 items a page averages **4.6 MB** and the largest measured was **5.32 MB**, so the
+headroom is about 30%. The cap tracks **bytes, not the `limit` value**: measured directly, 130
+items are served at 5.99 MB and 150 refused, while 150 are served at 4.77 MB once unneeded
+assets are excluded server-side. If first pages ever start returning 502, this margin is the
+first thing to check and lowering this number is the lever — a first-page refusal is the one
+case no date-window re-cut can route around.
+
+**A page request deep in a walk is refused by the SAME ~6 MB response cap, and re-cutting the
+date window is what answers it.** Some individual page requests are refused with a 502 while
+the rest of the same walk is served, which looks like a separate defect and is not: item sizes
+vary, so whether a given hundred items clears the cap depends on which hundred the cursor and
+date window select. That is why the refusal is deterministic in the *request* — cursor and date
+window together — rather than in how deep the walk has got, and why it has been seen at page 289
+of one window and page 14 of a shorter one sharing its late bound. Re-sending the byte-identical
+cursor and window at `limit=90` is served, returning 5.60 MB where the hundred would have been
+about 6.2 MB. So waiting cannot absorb
 it — which is why 502 is kept out of the retry ladder above. **It is the same cap
 `max_page_size` was lowered for**, reached from the other direction: that one refuses a first
 page because 250 items are always too many, this one refuses a later page because those
