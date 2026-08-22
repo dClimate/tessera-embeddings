@@ -1669,6 +1669,7 @@ def load_stac_items(
     post_load_fn: Callable[[xr.Dataset], xr.Dataset] | None = None,
     groupby: str = "solar_day",
     geobox: GeoBox | None = None,
+    selection_label: str | None = None,
 ) -> xr.Dataset:
     """Load STAC items into an xarray Dataset with corrections applied.
 
@@ -1692,6 +1693,10 @@ def load_stac_items(
         groupby: How to group items into time slices. Must be "solar_day" —
               :func:`_load_from_stac` rejects anything else and says why.
         geobox: Optional output grid specification
+        selection_label: What to call this call's area in the duplicate-selection audit log.
+              For a caller that queried by TILE: the tile id never reaches this function, and
+              without it concurrent same-collection tile ingests log identical lines. Defaults
+              to the bbox, which is per region of interest.
 
     Returns:
         Corrected xarray Dataset
@@ -1739,10 +1744,11 @@ def load_stac_items(
         # it left the caller's map describing a copy that is not being loaded.
         if len(pruned) != len(items):
             # Labelled with the AREA, not just the collection. This log is the only record of
-            # which copy supplied a pixel, and a fleet runs sixty cells of one collection at
-            # once — `load sentinel-2-l2a` on every one of them names none of them. The bbox is
-            # what this function has of the caller's identity, and it is per cell.
-            where = f"bbox {bbox}" if bbox is not None else f"load {collection}"
+            # which copy supplied a pixel, and a fleet runs sixty cells or tiles of one
+            # collection at once — `load sentinel-2-l2a` on every one of them names none of
+            # them. `selection_label` is what a caller that queried by TILE passes down, since a
+            # tile id never reaches this function otherwise; the bbox covers everyone else.
+            where = selection_label or (f"bbox {bbox}" if bbox is not None else f"load {collection}")
             log_duplicate_selection(logger, where, alternates, kept=pruned, read_keys=read_keys, items=items)
             # Realign the caller's provenance with what is about to be loaded. `baselines` becomes
             # the store's `baselines_applied`, and on the split workflow it was built by
@@ -1988,6 +1994,9 @@ def ingest_tile(
         post_load_fn=post_load_fn,
         groupby=groupby,
         geobox=geobox,
+        # The tile is this function's alone — `load_stac_items` never sees `tile_id` — and it is
+        # what distinguishes concurrent same-collection tile ingests in the selection audit log.
+        selection_label=f"tile {tile_id}" if tile_id else None,
     )
 
     return data, baselines
