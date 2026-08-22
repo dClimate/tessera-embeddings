@@ -44,6 +44,7 @@ def _ingest_s1_roi_impl(
     overlap_window_writes: bool,
     pipeline_batches: bool,
     narrow_windows_per_date: bool,
+    allow_ingest_code_mismatch: bool,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Inner flow: submits the S1 ingestion task to the configured Dask runner."""
@@ -61,6 +62,7 @@ def _ingest_s1_roi_impl(
         overlap_window_writes=overlap_window_writes,
         pipeline_batches=pipeline_batches,
         narrow_windows_per_date=narrow_windows_per_date,
+        allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         s3_region=s3_region,
     )
     return future.result()
@@ -108,6 +110,7 @@ def ingest_s1_roi_sar(
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
     narrow_windows_per_date: bool = True,
+    allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Ingest OPERA RTC-S1 SAR for an ROI using Dask workers.
@@ -152,6 +155,7 @@ def ingest_s1_roi_sar(
             write is one long consume, so depth 1 covers it, and deeper retention is
             what once deadlocked the S2 driver. Set False for a strictly serial
             query-then-write loop.
+        allow_ingest_code_mismatch: Resume a store built by different ingest code (off by default).
 
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
             storage layer's default (us-west-2); set it when the input bucket
@@ -203,6 +207,7 @@ def ingest_s1_roi_sar(
                 overlap_window_writes=overlap_window_writes,
                 pipeline_batches=pipeline_batches,
                 narrow_windows_per_date=narrow_windows_per_date,
+                allow_ingest_code_mismatch=allow_ingest_code_mismatch,
                 s3_region=s3_region,
             )
 
@@ -239,5 +244,6 @@ def ingest_s1_roi_sar(
                 overlap_window_writes=overlap_window_writes,
                 pipeline_batches=pipeline_batches,
                 narrow_windows_per_date=narrow_windows_per_date,
+                allow_ingest_code_mismatch=allow_ingest_code_mismatch,
                 s3_region=s3_region,
             )

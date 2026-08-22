@@ -278,6 +278,7 @@ def ingest_s1_roi_sar(
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
     narrow_windows_per_date: bool = True,
+    allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
 ) -> SarIngestResult:
     """Ingest OPERA RTC-S1 SAR for an ROI using batched time windows.
@@ -342,6 +343,8 @@ def ingest_s1_roi_sar(
             — and that converts to 7-20% of per-date wall clock. Dates reaching NO live
             window are skipped unconditionally, independent of this flag: writing one
             builds a full graph to store nothing, since all-fill chunks never persist.
+        allow_ingest_code_mismatch: Off by default. See the field of the same name on
+            :class:`~tessera_embeddings.storage.manifest.IngestManifest`.
 
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
             storage layer's default; set it when the bucket lives elsewhere, or
@@ -360,7 +363,9 @@ def ingest_s1_roi_sar(
     roi = read_roi_metadata(roi_zarr_path, storage_options=storage_options)
 
     ingest_manifest = IngestManifest.from_roi_store(
-        roi_zarr_path, storage_options=resolve_storage_options(storage_options)
+        roi_zarr_path,
+        storage_options=resolve_storage_options(storage_options),
+        allow_ingest_code_mismatch=allow_ingest_code_mismatch,
     )
 
     # Load blocks match the store's chunks: one read task per (chunk, band), and the

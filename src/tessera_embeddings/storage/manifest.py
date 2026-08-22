@@ -55,6 +55,13 @@ def extract_manifest(attrs: Mapping[str, Any]) -> dict[str, Any] | None:
     return dict(val) if val is not None else None
 
 
+_CODE_IDENTITY = "ingest_code_identity"
+_OVERRIDE_FIELD = "allow_ingest_code_mismatch"
+#: Root attr: the ingest code identities a store's dates were produced under. Not in
+#: ``_manifest``, which is written once at create time — the mixture becomes true later.
+MIXED_CODE_IDENTITIES_ATTR = "mixed_ingest_code_identities"
+
+
 # ── Base class ──
 
 
@@ -105,8 +112,10 @@ class StoreManifest:
 
         Tuples are normalized to lists so that round-tripping through JSON
         (zarr attrs) doesn't cause equality mismatches during validation.
+        ``allow_ingest_code_mismatch`` is a run's decision, not the store's identity, so it
+        is dropped: never stored, never hashed.
         """
-        d = {k: _normalize(v) for k, v in asdict(self).items() if v is not None}
+        d = {k: _normalize(v) for k, v in asdict(self).items() if v is not None and k != _OVERRIDE_FIELD}
         d["manifest_type"] = type(self).__name__
         return d
 
@@ -129,13 +138,17 @@ class StoreManifest:
         field_names = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in d.items() if k in field_names})
 
-    def validate_against(self, existing: dict[str, Any] | None, store_path: str) -> None:
+    def validate_against(self, existing: dict[str, Any] | None, store_path: str) -> list[str]:
         """Validate that this manifest matches an existing store's manifest.
 
         Args:
             existing: The ``_manifest`` dict from the existing store's root
                 attrs, or ``None`` if the store has no manifest (legacy store).
             store_path: Store path (for error messages only).
+
+        Returns:
+            Identities the caller must record under :data:`MIXED_CODE_IDENTITIES_ATTR`;
+            empty unless :meth:`IngestManifest.validate_against` excused a mismatch.
 
         Raises:
             ConfigMismatchError: If any structural parameter differs.
@@ -155,7 +168,7 @@ class StoreManifest:
                 "manifest-based safety checks.",
                 store_path,
             )
-            return
+            return []
 
         # Compare keys present in current against existing (value changed?),
         # and also flag known fields that the store has but current dropped
@@ -195,6 +208,7 @@ class StoreManifest:
                 lines.append(f"  {key}: store has {old!r}, current config has {new!r}")
             lines.append("Delete the existing store or use a different name.")
             raise ConfigMismatchError("\n".join(lines))
+        return []
 
 
 # ── Concrete manifests ──
@@ -270,6 +284,24 @@ class IngestManifest(StoreManifest):
     coverage_sha256: str | None = None
     min_valid_coverage: float | None = None
     ingest_code_identity: str | None = None
+    #: Opt-in: resume a store whose recorded ``ingest_code_identity`` is not this run's.
+    #: Relaxes only that term; the append is recorded under :data:`MIXED_CODE_IDENTITIES_ATTR`.
+    allow_ingest_code_mismatch: bool = False
+
+    def validate_against(self, existing: dict[str, Any] | None, store_path: str) -> list[str]:
+        """Validate, excusing an ``ingest_code_identity`` mismatch when this run opted in."""
+        stored = (existing or {}).get(_CODE_IDENTITY)
+        if existing is None or not self.allow_ingest_code_mismatch or stored == self.ingest_code_identity:
+            return super().validate_against(existing, store_path)
+        logger.warning(
+            "%s: appending under allow_ingest_code_mismatch — store built by %s, this run is %s; both recorded.",
+            store_path,
+            stored,
+            self.ingest_code_identity,
+        )
+        # Substituting this ONE term is what keeps it narrow: every other key still compared.
+        super().validate_against({**existing, _CODE_IDENTITY: self.ingest_code_identity}, store_path)
+        return sorted([str(stored), str(self.ingest_code_identity)])
 
     @classmethod
     def from_roi_store(
@@ -278,6 +310,7 @@ class IngestManifest(StoreManifest):
         *,
         min_valid_coverage: float | None = None,
         storage_options: dict | None = None,
+        allow_ingest_code_mismatch: bool = False,
     ) -> IngestManifest:
         """Build from an ROI store, chaining the upstream ROI manifest hash.
 
@@ -292,6 +325,7 @@ class IngestManifest(StoreManifest):
                 such gate) is dropped from the manifest by ``to_dict``, so it neither
                 appears in the store nor moves the hash — which is what keeps this
                 field from invalidating manifests written before it existed.
+            allow_ingest_code_mismatch: See the field of the same name.
         """
         coverage_sha: str | None = None
         try:
@@ -313,6 +347,7 @@ class IngestManifest(StoreManifest):
             # cannot disagree about what code they are — a value each computed for itself
             # is how they would drift.
             ingest_code_identity=ingest_code_identity(),
+            allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         )
 
 

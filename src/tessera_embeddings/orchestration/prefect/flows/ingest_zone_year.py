@@ -150,6 +150,7 @@ def _assert_store_manifest_matches(
     roi_zarr_path: str,
     *,
     min_valid_coverage: float | None,
+    allow_ingest_code_mismatch: bool,
     get_credentials: _Creds,
     s3_region: str | None,
 ) -> None:
@@ -166,11 +167,14 @@ def _assert_store_manifest_matches(
 
     So the same check runs HERE too, on the zero-write path the append cannot cover. A
     store with no manifest at all is a legacy store and passes with a warning, exactly as
-    it does on the append path — the two must not disagree about what is acceptable.
+    it does on the append path — the two must not disagree about what is acceptable. So is
+    ``allow_ingest_code_mismatch``: an override the appends were given but this check was not
+    would refuse to mark the store it just wrote.
     """
     expected = IngestManifest.from_roi_store(
         roi_zarr_path,
         min_valid_coverage=min_valid_coverage,
+        allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         # The ROI is a plain zarr, so it does not travel on the Icechunk callback. Without
         # this the check itself fails on a callback-only deployment — leaving the stores
         # UNMARKED after a successful ingest, so every retry re-reads a finished mosaic as
@@ -338,6 +342,7 @@ async def ingest_zone_year(
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     time_window_end: str | None = None,
     allow_partial_window: bool = False,
+    allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
     use_local: bool = False,
 ) -> dict[str, Any]:
@@ -357,6 +362,9 @@ async def ingest_zone_year(
         time_window_end: ``"Month Year"`` override; defaults to ``"December {year}"``.
         allow_partial_window: Relax the coverage gate to "non-empty" (escape
             hatch for a legitimately partial edge zone).
+        allow_ingest_code_mismatch: Resume interrupted stores built by different ingest code.
+            Deliberately NOT in the fingerprint below — a mosaic completed under it must
+            still satisfy a later strict run.
         s3_region: Optional S3 region for this flow's Icechunk metadata opens
             (mask liveness, coverage sha, marker probe/write, coverage gate) and
             the zone-ROI synthesis — mirrors the campaign/fill region threading so
@@ -544,6 +552,7 @@ async def ingest_zone_year(
         "min_workers": ingest_settings.floor_for(max_workers),
         "max_workers": max_workers,
         "use_local": use_local,
+        "allow_ingest_code_mismatch": allow_ingest_code_mismatch,
         # The children open and CREATE the mosaic repos; without this they sign
         # against the storage default while this flow's own probes use s3_region,
         # so a non-default-region campaign fails inside the costly S1/S2 jobs
@@ -837,6 +846,7 @@ async def ingest_zone_year(
             # Optical only. The SAR legs apply no admission threshold, so their manifests
             # carry none and expecting one would fail every radar store.
             min_valid_coverage=ingest_settings.min_valid_coverage if store.endswith("reflectance.zarr") else None,
+            allow_ingest_code_mismatch=allow_ingest_code_mismatch,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
         )
