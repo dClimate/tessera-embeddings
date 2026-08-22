@@ -33,6 +33,8 @@ from affine import Affine
 from odc.geo.geobox import GeoBox
 
 from tessera_embeddings.ingest.roi import read_roi_mask
+from tessera_embeddings.ingest.roi_processing import apply_roi_mask
+from tessera_embeddings.ingest.s2_roi import _sum_over_windows
 from tessera_embeddings.providers.aws.credentials import (
     _resolve_iam_credentials,
     iam_s3_storage_options,
@@ -251,3 +253,74 @@ def test_the_issuer_really_rotates(role_only_s3) -> None:
     _resolve_iam_credentials.cache_clear()
     second = iam_s3_storage_options()["key"]
     assert first != second, "the role credential is not rotating; the expiry tests cannot fail"
+
+
+# ---------------------------------------------------------------------------
+# One test per sensor: both paths read through this function, so both must survive
+# a credential that died after their graph was built. The consumers below are the
+# real ones — the radar path's masking step and the optical path's window total.
+# ---------------------------------------------------------------------------
+
+
+def _expire_everything_resolved_so_far(door: _FrontDoor) -> None:
+    """Kill every credential the graph build presented, then start recording afresh."""
+    assert door.signed_by, "building the graph must have read the store's metadata"
+    door.expired.update(door.signed_by)
+    door.signed_by.clear()
+
+
+def test_the_radar_masking_step_survives_a_credential_that_expired_after_graph_build(role_only_s3) -> None:
+    """SENTINEL-1. ``apply_roi_mask`` is what the radar leg does with ``batch_mask``.
+
+    ``s1_roi._prepare_batch`` builds one mask per 30-day batch and hands it to
+    ``apply_roi_mask``, whose output is computed once per date for as long as the batch's
+    writes take. This is that shape: build, expire, compute.
+    """
+    door = role_only_s3
+    mask = read_roi_mask("s3://test-bucket/roi.zarr", {"northing": 4, "easting": 4}, iam_s3_storage_options)
+    day = xr.Dataset(
+        {"band": (("time", "northing", "easting"), da.full((1, 8, 8), 7, dtype=np.uint16, chunks=(1, 4, 4)))},
+        coords={"time": np.array([np.datetime64("2024-06-01", "ns")])},
+    )
+    masked = apply_roi_mask(day, "s3://test-bucket/roi.zarr", {"northing": 4, "easting": 4}, roi_mask=mask)
+
+    _expire_everything_resolved_so_far(door)
+    assert int(masked["band"].sum().compute()) == 7 * 64, "the mask read returned the wrong pixels"
+    assert door.signed_by, "the compute made no S3 request; the test proves nothing"
+    assert not door.expired & set(door.signed_by), "the radar masking step presented a graph-build credential"
+
+
+def test_the_optical_window_total_survives_a_credential_that_expired_after_graph_build(role_only_s3) -> None:
+    """SENTINEL-2. ``_sum_over_windows`` is the optical leg's own mask consumer.
+
+    The optical path rebuilds its mask per date and reduces it over the live windows for
+    the coverage gate — the first compute of every date, and the one that failed on the
+    radar side for the same reason.
+    """
+    door = role_only_s3
+    mask = read_roi_mask("s3://test-bucket/roi.zarr", {"northing": 4, "easting": 4}, iam_s3_storage_options)
+    total = _sum_over_windows(mask, [(0, 4, 0, 8), (4, 8, 0, 8)])
+
+    _expire_everything_resolved_so_far(door)
+    assert int(total.compute()) == 64, "the window total read the wrong pixels"
+    assert door.signed_by, "the compute made no S3 request; the test proves nothing"
+    assert not door.expired & set(door.signed_by), "the optical window total presented a graph-build credential"
+
+
+def test_a_second_compute_of_one_graph_re_resolves_again(role_only_s3) -> None:
+    """The radar shape exactly: ONE graph, computed date after date, expiring in between.
+
+    The batch mask is not rebuilt between dates, so it is not enough that the first
+    compute after expiry works — every later one must re-resolve too. A closure that
+    cached its opened store would pass the single-compute tests above and still die on
+    date two.
+    """
+    door = role_only_s3
+    mask = read_roi_mask("s3://test-bucket/roi.zarr", {"northing": 4, "easting": 4}, iam_s3_storage_options)
+
+    for date in range(3):
+        _expire_everything_resolved_so_far(door)
+        _resolve_iam_credentials.cache_clear()  # the role's key rotates, as it does per refresh
+        assert mask.sum().compute() == 64, f"date {date} read the wrong pixels"
+        assert door.signed_by, f"date {date} made no S3 request"
+        assert not door.expired & set(door.signed_by), f"date {date} presented an expired credential"

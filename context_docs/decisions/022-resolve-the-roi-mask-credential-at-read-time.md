@@ -75,10 +75,40 @@ cannot be defeated that way.
 
 ## Cost
 
-One `zarr.open_array` per mask block, which is one or two metadata GETs. fsspec caches filesystem
+**MEASURED 2026-08-22, and it corrects the figure this section first carried.** The original claim
+was "one or two metadata GETs" per block. It is **four**, and the request count for a whole mask
+read **triples**. Measured against a real S3 (moto) by counting every call at `s3fs`' own
+`_call_s3` choke point, for a 12-block mask:
+
+| | old (`da.from_zarr`) | new (`da.map_blocks`) |
+|---|---|---|
+| store opens, graph build | 1 | 1 |
+| S3 requests, graph build | 4 (metadata only) | 4 (metadata only) |
+| store opens, full read | 0 | 12 — one per block |
+| S3 requests, full read | 24 | 72 |
+| ...of which chunk bytes | 24 | 24 — unchanged |
+| ...of which metadata | 0 | 48 |
+
+Six requests per block against the old two, so a flat **3x** whatever the block count. The reason it
+is four rather than one is that zarr 3 probes both layouts on every open — `zarr.json` twice, plus
+the v2 `.zarray` and `.zattrs`. Passing `zarr_format=3` to the closure's `open_array` would cut it,
+and is deliberately NOT done here: it would refuse a v2 store that the old path read fine, and the
+absolute cost does not justify narrowing what the reader accepts.
+
+Absolutely, this stays small. Metadata GETs are a few hundred bytes; fsspec caches filesystem
 instances by their options, so blocks sharing a credential — every block of a date, and every date
-between botocore's ~6-hourly refreshes — share one client. Negligible against the imagery reads
-beside them.
+between botocore's refreshes — share one client and one connection pool; and every production
+consumer slices the mask to live windows, so dask culls the opens along with the blocks (measured: a
+one-block read opens the store once, not 3,876 times). It is negligible against the imagery reads
+beside it. The figures are pinned by
+`tests/unit/test_roi_mask_construction.py::test_the_store_is_opened_once_per_block_where_it_used_to_be_once`,
+which asserts the table exactly so that making it worse requires editing the table.
+
+**A second measured consequence: the graph is no longer plain-picklable.** `pickle.dumps` on the
+returned array raises `Can't get local object 'read_roi_mask.<locals>._read_block'`, where the old
+`da.from_zarr` graph pickled fine. It is safe because distributed falls back to cloudpickle and
+nothing in `src` plain-pickles a graph, but it is a real narrowing of where this array may be sent —
+the same constraint `AssumedRoleIcechunkCredentials` exists to document for icechunk's callback.
 
 ## Left standing
 

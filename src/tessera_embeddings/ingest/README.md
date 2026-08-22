@@ -1656,6 +1656,14 @@ outlives that credential fails with `ExpiredToken` on a bucket the role can alwa
 failure looks like a permissions problem and is a lifetime problem. Opening the store per block
 makes the credential no older than the read that uses it.
 
+That costs one store open — and its metadata round trip — per block read, where the old
+construction paid one for the whole array, and it makes the returned array cloudpickle-only rather
+than plain-picklable. Both are measured in
+`context_docs/decisions/022-resolve-the-roi-mask-credential-at-read-time.md`, and pinned by
+`tests/unit/test_roi_mask_construction.py`. Neither is a reason to avoid the change; both are
+reasons not to hand this array to a plain-pickle boundary or to read a whole zone grid you do not
+need.
+
 **IMDS throttling — why `_resolve_iam_credentials` is `lru_cache`d (gotcha).** The credential
 machinery has two distinct TTLs, and conflating them overwhelms the EC2 Instance Metadata
 Service (IMDS):
