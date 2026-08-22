@@ -93,8 +93,9 @@ to set. A parameter describes an intention; the prefix describes what is on disk
 ## 5. A change inside the fingerprint closure has a landing window
 
 Such a change moves the fingerprint, so a mosaic caught **mid-append** refuses its next append and
-needs its interrupted store deleted by hand. Finished mosaics are unaffected. `config/providers.py`
-and the ingest query modules are inside that closure, so **anything touching the query, the
-collections or the provider settings is a between-campaigns change, not a mid-flight one.** Land one
-only after confirming nothing is mid-ingest: no ingest runner and no fleet up, only the Prefect
-worker service.
+needs either `allow_ingest_code_mismatch` (off by default; relaxes only the code-identity term and
+records both identities on the store) or its interrupted store deleted by hand. Finished mosaics are
+unaffected. `config/providers.py` and the ingest query modules are inside that closure, so
+**anything touching the query, the collections or the provider settings is a between-campaigns
+change unless the override is used.** Land one otherwise only after confirming nothing is
+mid-ingest: no ingest runner and no fleet up, only the Prefect worker service.

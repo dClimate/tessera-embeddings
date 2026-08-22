@@ -17,7 +17,7 @@ from odc.geo.geobox import GeoBox
 
 from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.storage.empty_store import create_empty_store
-from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
+from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
 from tessera_embeddings.storage.zarr_store import (
     get_existing_dates,
     open_repo,
@@ -48,13 +48,13 @@ def _day_ds(date: str, band_val: int) -> xr.Dataset:
     )
 
 
-def _write(store: str, date: str, band_val: int, windows=((0, 4, 0, 8),)) -> None:
+def _write(store: str, date: str, band_val: int, windows=((0, 4, 0, 8),), manifest=MANIFEST) -> None:
     write_day_windows(
         store,
         _day_ds(date, band_val),
         list(windows),
         roi=_Roi(),
-        manifest=MANIFEST,
+        manifest=manifest,
         baselines={date: 5},
         tile_id="roi.zarr",
         crs="EPSG:32601",
@@ -112,6 +112,24 @@ def test_manifest_mismatch_fails_before_any_write(tmp_path):
             chunks=CHUNKS,
         )
     assert get_existing_dates(store) == {"2024-06-01"}  # nothing committed
+
+
+def test_an_override_append_records_both_code_identities_on_the_store(tmp_path):
+    """The safety argument for permitting the append: the store says, durably, that it happened."""
+    store = str(tmp_path / "reflectance.zarr")
+    old = IngestManifest(roi_manifest_hash="abc", ingest_code_identity="ing-A")
+    new = IngestManifest(roi_manifest_hash="abc", ingest_code_identity="ing-B")
+    forced = IngestManifest(roi_manifest_hash="abc", ingest_code_identity="ing-B", allow_ingest_code_mismatch=True)
+
+    _write(store, "2024-06-01", 7, manifest=old)
+    with pytest.raises(ConfigMismatchError):
+        _write(store, "2024-06-11", 9, manifest=new)  # off by default
+    assert MIXED_CODE_IDENTITIES_ATTR not in dict(open_store_as_zarr_group(store).attrs)
+
+    _write(store, "2024-06-11", 9, manifest=forced)
+
+    assert get_existing_dates(store) == {"2024-06-01", "2024-06-11"}
+    assert dict(open_store_as_zarr_group(store).attrs)[MIXED_CODE_IDENTITIES_ATTR] == ["ing-A", "ing-B"]
 
 
 def test_multi_date_dataset_refused(tmp_path):

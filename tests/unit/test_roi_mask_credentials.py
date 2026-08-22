@@ -9,9 +9,12 @@ That mitigation was correct and still failed, because its result was handed over
 **frozen strings, once, at leg entry**. A role credential expires in hours and a leg can
 run longer, so every mask read past expiry failed on a bucket that was never inaccessible.
 
-Passing a *provider* instead moves resolution to each read. These tests assert that
-property where it can regress: that the reader calls a callable rather than storing it,
-and that the per-date consumers re-resolve rather than reusing one graph.
+Passing a *provider* instead moves resolution to each CALL, which is what these tests
+assert: that the reader calls a callable rather than storing it, and that the per-date
+consumers re-resolve rather than reusing one graph.
+
+Per call is NOT per read — the mask array is lazy, and its reads happen inside a later
+write's compute. ``test_roi_mask_credential_expiry.py`` covers the read itself.
 """
 
 from __future__ import annotations

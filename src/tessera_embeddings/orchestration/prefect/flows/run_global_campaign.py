@@ -337,6 +337,7 @@ def _ingest_dispatch_params(
     s1_orbit: str,
     ingest_settings: IngestSettings,
     allow_partial_window: bool,
+    allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
     branch: str | None = None,
 ) -> dict[str, Any]:
@@ -361,6 +362,7 @@ def _ingest_dispatch_params(
         "s1_orbit": s1_orbit,
         "ingest_settings": ingest_settings.model_dump(),
         "allow_partial_window": allow_partial_window,
+        "allow_ingest_code_mismatch": allow_ingest_code_mismatch,
         "s3_region": s3_region,
         # Grandchild routing: the S1/S2 ingest deployments dispatched BY
         # ingest_zone_year. Without this key its IngestDeployments() defaults
@@ -535,6 +537,7 @@ async def run_global_campaign(
     allow_partial_window: bool = False,
     allow_s2_only: bool = False,
     allow_model_mismatch: bool = False,
+    allow_ingest_code_mismatch: bool = False,
     sweep_orphan_mosaics: bool = False,
     validation_deployment: str | None = None,
 ) -> dict[str, Any]:
@@ -743,6 +746,8 @@ async def run_global_campaign(
             ONCE up front, before any ingest is dispatched, so a mismatch costs a
             metadata read rather than a mosaic per in-flight zone. Deliberate
             override only — mixing encoders under one store is permanent.
+        allow_ingest_code_mismatch: Forwarded to every ingest: resume interrupted mosaics
+            built by different ingest code, instead of demanding they be deleted.
         sweep_orphan_mosaics: Before the run, delete mosaics for cells that are
             already complete+tagged in scope — recovering orphans left by a
             per-cell cleanup that failed after tagging (that cell is no longer in
@@ -1087,6 +1092,7 @@ async def run_global_campaign(
         s1_orbit=s1_orbit,
         ingest_settings=ingest_settings,
         allow_partial_window=allow_partial_window,
+        allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         s3_region=s3_region,
         branch=branch,
     )
@@ -1315,6 +1321,7 @@ async def run_global_campaign(
                         "s3_region": s3_region,
                         "commit_limit_name": commit_limit_name,
                         "allow_partial_window": allow_partial_window,
+                        "allow_ingest_code_mismatch": allow_ingest_code_mismatch,
                         "allow_s2_only": allow_s2_only,
                         # As in _fill_params: the chained child must not demand radar either.
                         "require_s1": False,

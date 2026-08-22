@@ -32,7 +32,8 @@ context_docs/
 │   ├── 018-refuse-pixels-below-minimum-optical-depth.md
 │   ├── 019-validation-modules-belong-in-the-library.md
 │   ├── 020-boa-offset-applies-to-every-valid-dn.md
-│   └── 021-correct-the-boa-offset-per-image.md
+│   ├── 021-correct-the-boa-offset-per-image.md
+│   └── 022-resolve-the-roi-mask-credential-at-read-time.md
 └── design/           Long-form framing docs, grouped by what they answer
     │
     │  THE CAMPAIGN — start here
@@ -53,7 +54,7 @@ context_docs/
     │  INGEST
     ├── ingest_optimization_campaign_2026_07.md   every ingest measurement
     ├── ingest_concurrency_investigation_2026_08.md
-    ├── ingest_read_failure_causes_2026_08.md     three source-read failure causes, and the retry budget they share
+    ├── ingest_read_failure_causes_2026_08.md     five source-read failure causes, and the retry budget they share
     ├── ingest-live-tile-cropping.md              + appendix A, the multi-write-per-commit test
     ├── ingest-graph-and-stac-budget.md
     ├── region-writes.md
