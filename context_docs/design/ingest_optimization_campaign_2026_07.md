@@ -899,6 +899,147 @@ month ahead is enough to hide the query entirely.
 needed alongside it rather than instead of it: streaming bounds *how many* items are held, pruning
 bounds *how large each one is*, and the driver needed both to stay under the pause threshold.
 
+## 7c. The Earth Search 502 that is NOT a depth limit, and not a page size either
+
+Two distinct Earth Search 502s on `sentinel-2-l2a` are now on record, and they are easy to
+conflate. Both are live and each needs its own remedy:
+
+- **Response size.** A page of 250 items is refused on the FIRST request. Reproduced again
+  here: the same window at `limit=250` returns 502 at page 1. Already remedied by
+  `max_page_size=100` for this provider (see the comment in `config/providers.py`).
+- **Individual page requests.** At `limit=100` some page requests are refused while the
+  rest of the same walk is served. This section is about that one.
+
+**Neither page size nor patience touches the second.** Halving the page halves neither the
+items walked nor which requests get refused, and the `urllib3` ladder underneath has already
+exhausted itself by the time the failure reaches us.
+
+### The measurement that killed the depth hypothesis
+
+The refusals seen during the campaign clustered at pages 276–307, which reads as a depth
+ceiling. It is not one. Reproducing the exact failing query — one month of `sentinel-2-l2a`
+over `bbox=2.4648,0.0000,39.7160,80.9758`, window `2019-02-28/2019-04-01`, `numberMatched`
+**56,558** items i.e. **566 pages** at 100:
+
+| observation | result |
+|---|---|
+| where the walk dies | page **289**, reproduced from a laptop |
+| depth at failure | **51%** of the query — not the tail |
+| per-page latency to failure | flat **0.60–1.57 s**; no page over 2 s; no growth with depth |
+| the 502 itself | returned in **1.3 s** |
+| the refused cursor, re-asked in 6 fresh sessions | **502 six times of six**, 1.2–1.4 s each |
+| a shallow cursor of the same search, same minute | **200** |
+
+Then the same query cut to `2019-03-16/2019-03-22` — a **6-day** window — was refused at
+**page 14**, four times out of four. Same refusal, one twentieth of the depth.
+
+Both refused cursors sit at the same instant:
+
+    page 289 of the month : 2019-03-22T08:30:08.394000Z,S2A_37TCE_20190322_0_L2A,sentinel-2-l2a
+    page 14 of the 6 days : 2019-03-22T08:30:27.109000Z,S2A_37TEM_20190322_0_L2A,sentinel-2-l2a
+
+**So depth is not the variable.** The `next` token is a `search_after` cursor —
+`(datetime, id, collection)` — with no `from`/`size` offset anywhere in the request, so the
+service is not told how deep the walk has got and cannot be counting. A flat latency curve
+and a 1.3-second 502 also rule out a gateway timeout and progressive deep-paging cost; a
+fixed result-window limit would refuse at one page with an explicit 400.
+
+What is left is that the refusal is **deterministic in the whole request** — cursor and date
+window together. It is not the data and not the moment either: the day holding the refused
+cursor queries clean on its own (15 pages, 1,318 items), and the refusal repeats identically
+from fresh sessions minutes apart.
+
+### The property that decides the fix: only the window's END matters
+
+Walking the recursion by hand, every window that **ends** on 2019-03-22 is refused at page
+14 on the identical cursor, however late it starts:
+
+| window | days | outcome |
+|---|---|---|
+| 2019-03-16 .. 2019-03-22 | 6 | refused, p14 |
+| 2019-03-19 .. 2019-03-22 | 4 | refused, p14 |
+| 2019-03-21 .. 2019-03-22 | 2 | refused, p14 |
+| 2019-03-16 .. 2019-03-19 | 3 | **OK**, 53 pages, 5,179 items |
+| 2019-03-19 .. 2019-03-21 | 3 | **OK**, 41 pages, 3,944 items |
+| 2019-03-21 .. 2019-03-21 | 1 | **OK**, 16 pages, 1,414 items |
+| 2019-03-22 .. 2019-03-22 | 1 | **OK**, 15 pages, 1,318 items |
+| 2019-03-21 .. 2019-03-23 | 3 | **OK**, 56 pages, 5,479 items |
+
+The catalogue pages **newest-first**, so a window's late bound fixes its whole cursor
+sequence; moving the early bound changes nothing the walk reaches first. **Shortening the
+start does not clear the refusal — shortening the end does.**
+
+Two consequences, both of which cost a design iteration to learn:
+
+- **Halving a window is not sufficient.** The half that keeps the parent's late bound
+  retraces the parent's cursors page for page. Measured: `2019-02-28/2019-03-16` completes
+  (213 pages, 21,198 items) while `2019-03-16/2019-04-01` is refused at page **289** on the
+  same cursor as the whole month.
+- **The recursion must be able to reach a single day.** Splitting into windows that SHARE a
+  boundary day cannot shorten a two-day window, so a naive overlap-only splitter stalls at
+  `2019-03-21/2019-03-22` with a refused window and nothing left to try — verified, it fails
+  the leg. At that floor only, `split_query_window` abuts instead.
+
+### What shipped
+
+`_MAX_QUERY_ITEMS = 10_000`, read against `numberMatched` on each window's first page, plus a
+re-partition on any upstream-error refusal past page 1. Denominated in **items**, so a denser
+year is cut into more pieces rather than walked further — 2019 roughly doubled 2017–18 and
+2020–2025 will be denser, and that changes the part count and nothing else.
+
+The ceiling bounds **cost, not correctness**: it is the re-partition-on-refusal that fixes the
+defect, and the ceiling is what keeps a refusal from throwing away hundreds of pages of walk.
+
+Validated end to end against the live catalogue on the query that fails in production
+(`2019-02-28/2019-04-01`, 56,558 items). Every window is served, and the union of item ids
+equals the whole window's `numberMatched` exactly — **56,558 of 56,558**, nothing lost and
+nothing duplicated. The sub-tree under the one refused part recovers as:
+
+    2019-03-16..03-22  refused p14
+      2019-03-16..03-19  OK
+      2019-03-19..03-22  refused p14
+        2019-03-19..03-21  OK
+        2019-03-21..03-22  refused p14
+          2019-03-21..03-21  OK
+          2019-03-22..03-22  OK
+    => 9,166 of 9,166 items
+
+The whole month costs **19 searches and 821 page requests**, against 566 pages for the single
+walk that cannot complete — **1.45x** the page requests for a query that currently returns
+nothing at all. The overhead is the pages re-walked after a proactive cut and the shared
+boundary days; §8 records STAC search as a rounding error against the per-scene COG reads that
+dominate an ingest, so this is affordable.
+
+**Cost note.** Consecutive windows share their boundary day rather than abutting it, so no
+acquisition can fall between them — the catalogue is asked for whole days and expands them to
+instants itself, and abutting would leave the sub-second gap at midnight. The overlap costs
+one repeated day per seam and the query's existing id dedupe absorbs it. The two-day floor
+described above is the one place that trade is reversed, and it is taken because the
+alternative there is a failed leg.
+
+### Rejected: subdividing the bounding box instead
+
+Considered, because the query boxes are enclosing rectangles over scattered live tiles and
+`land_mask.live_tile_block_bboxes_wgs84` already cuts a zone's grid into per-block boxes.
+Rejected for this fix on three grounds:
+
+- **It would not have fixed it.** The refusal is a function of the date window and cursor.
+  Nothing measured here implicates the bbox, and every clearing change was a change of end
+  date.
+- **It is a narrowing, not a re-partition.** Each block box is tight to that block's own live
+  rows and columns, so the union of the boxes is a strict subset of the envelope. Items
+  intersecting the envelope but no block would stop being returned, which changes the item
+  set — and the item set is what a mosaic's content identity rests on.
+- **It is not reachable from the query.** `RoiMetadata` carries `bbox_wgs84` and nothing
+  tile-shaped, while `live_tile_block_bboxes_wgs84` needs the `ZoneSpec` and the live-tile
+  bitmap, which exist only at coverage-build time. Adopting it means writing a block list
+  into the ROI attrs, re-delivering coverage for every zone, and plumbing it to the query.
+
+Block boxes remain worth doing as a **separate** change: they would cut items genuinely
+fetched and then discarded, which date slicing does not. That is an efficiency change with an
+item-set consequence, and it should be priced and gated on its own rather than folded into a
+defect fix.
+
 ## 8. Numbers of record
 
 | quantity | value | provenance |
@@ -911,6 +1052,12 @@ bounds *how large each one is*, and the driver needed both to stay under the pau
 | per-date client graph build | 7.2 s (3.47 gate + 3.74 bands), one now removed | measured |
 | STAC query | 5.58 ms/item; 164 s/month; ~34 min/year; 368,248 items/year | measured, linear 3→14 days |
 | STAC page size ceiling | 250 (500 and 1000 both fail) | measured |
+| Earth Search page-1 refusal | 502 at `limit=250`; 200 at `limit=100`, same window | measured (§7c) |
+| Earth Search page-request refusal | deterministic in (cursor, window); seen at page **289** of a 566-page window and page **14** of a 6-day one, on cursors at the same instant. NOT a depth limit — flat 0.6-1.6 s/page throughout, 502 returned in 1.3 s | measured, 6/6 and 4/4 repeats (§7c) |
+| what clears it | a window with a different END date; shortening the START does not | 8 windows tabulated (§7c) |
+| per-search item ceiling | **10,000** items (`_MAX_QUERY_ITEMS`), from `numberMatched` on the first page | shipped; bounds cost, not correctness (§7c) |
+| re-partition item-set check | union of parts = **56,558 of 56,558** on the failing query | live catalogue, end to end (§7c) |
+| re-partition cost | **19 searches, 821 page requests** vs 566 for the single walk that cannot complete (**1.45x**) | same run (§7c) |
 | worker RSS per retained item | ~80 KB → ~27–30 GB/year vs 16 GiB worker | 3-point slope |
 | unsharded manifest cost | ~1.1 MB refs/date → ~35 GB per zone-year | fitted, N²/2 |
 | time-sharded manifest cost | ~1.2 GB per zone-year (~28× less) | predicted 34.7 MB at 9 dates, measured 34.6 |

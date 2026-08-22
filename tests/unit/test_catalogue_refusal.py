@@ -300,7 +300,7 @@ class TestTheFailingRequestIsNamed:
     """
 
     @staticmethod
-    def _query(pages, caplog, **kwargs):
+    def _query(pages, caplog, start="2021-09-01", end="2021-10-02", **kwargs):
         provider = stac._get_provider_config("earth-search")
         collection = stac._get_collection_config("earth-search", "sentinel-2-l2a")
         with (
@@ -313,8 +313,8 @@ class TestTheFailingRequestIsNamed:
                 provider,
                 collection,
                 None,
-                "2021-09-01",
-                "2021-10-02",
+                start,
+                end,
                 bbox=(-3.0, 50.0, -2.0, 51.0),
                 **kwargs,
             )
@@ -324,22 +324,26 @@ class TestTheFailingRequestIsNamed:
 
         "The catalogue cannot answer at all" and "one deep cursor breaks" are different
         defects with different reproductions, and an item count cannot tell them apart.
+
+        A one-day window, because a longer one is re-partitioned instead of refused — see
+        ``TestADeepRefusalIsRePartitioned``. One day is the case where re-partitioning has
+        nothing left to try, so the refusal is reported exactly as it always was.
         """
         pages = _pages_then_refusal([{"features": [_item("a"), _item("b")]}], _refused(502))
 
         with pytest.raises(CatalogueQueryError) as caught:
-            self._query(pages, caplog)
+            self._query(pages, caplog, start="2021-09-01", end="2021-09-01")
 
         error = caught.value
         assert error.request.page == 2, "the ordinal must count pages, not report a constant"
         assert error.request.collection == "sentinel-2-l2a"
-        assert error.request.window == "2021-09-01/2021-10-02"
+        assert error.request.window == "2021-09-01/2021-09-01"
         assert error.request.area == "bbox=-3.0000,50.0000,-2.0000,51.0000"
         assert error.refusal.kind is RefusalKind.UPSTREAM_ERROR
 
         logged = caplog.text
         assert "sentinel-2-l2a" in logged
-        assert "2021-09-01/2021-10-02" in logged
+        assert "2021-09-01/2021-09-01" in logged
         assert "bbox=-3.0000,50.0000,-2.0000,51.0000" in logged
         assert "page 2" in logged
         # The volatile context belongs in the log and nowhere else, because a signature
@@ -429,3 +433,53 @@ class TestRefusalLabels:
 
     def test_the_root_request_label_says_it_precedes_the_search(self) -> None:
         assert "before any search" in CatalogueRequest("c", "w", "catalogue-root", 0).label
+
+
+class TestADeepRefusalIsRePartitioned:
+    """A 502 at a deep cursor becomes more, smaller searches — not a failed leg.
+
+    The counterpart to ``TestTheFailingRequestIsNamed``: that pins what still propagates,
+    this pins what no longer does. Waiting cannot clear this refusal — the ladder
+    underneath has already exhausted itself on the identical cursor — so the only remedy
+    is to ask for the window in shorter pieces.
+    """
+
+    @staticmethod
+    def _query(pages, caplog, start, end):
+        provider = stac._get_provider_config("earth-search")
+        collection = stac._get_collection_config("earth-search", "sentinel-2-l2a")
+        with (
+            patch.object(stac, "StacApiIO"),
+            patch.object(stac, "Client") as client,
+            caplog.at_level(logging.WARNING, logger=stac.__name__),
+        ):
+            search = client.open.return_value.search
+            search.return_value.pages_as_dicts.return_value = pages
+            stac._query_stac_items(provider, collection, None, start, end, bbox=(-3.0, 50.0, -2.0, 51.0))
+            return search.call_count
+
+    def test_a_month_refused_at_depth_is_re_queried_in_pieces(self, caplog) -> None:
+        pages = _pages_then_refusal([{"features": [_item("a")]}], _refused(502))
+
+        searches = self._query(pages, caplog, "2021-09-01", "2021-10-02")
+
+        assert searches > 1, "the refusal must have produced further, shorter searches"
+        assert "shorter window" in caplog.text
+
+    def test_a_load_refusal_is_left_to_the_retry_ladder(self, caplog) -> None:
+        """A 503 says the upstream is BUSY. Slicing it multiplies the load that caused it."""
+        pages = _pages_then_refusal([{"features": [_item("a")]}], _refused(503))
+
+        with pytest.raises(CatalogueQueryError) as caught:
+            self._query(pages, caplog, "2021-09-01", "2021-10-02")
+
+        assert caught.value.refusal.kind is RefusalKind.LOAD
+
+    def test_a_first_page_refusal_is_not_a_depth_problem(self, caplog) -> None:
+        """Shortening the window asks the first page the same way, so it still propagates."""
+        pages = _pages_then_refusal([], _refused(502))
+
+        with pytest.raises(CatalogueQueryError) as caught:
+            self._query(pages, caplog, "2021-09-01", "2021-10-02")
+
+        assert caught.value.request.page == 1

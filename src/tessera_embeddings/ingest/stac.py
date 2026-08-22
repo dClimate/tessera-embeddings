@@ -8,8 +8,10 @@ Supports multiple providers (Earth Search, Planetary Computer) and collections
 (Sentinel-2 L2A, Sentinel-1 GRD, Landsat).
 """
 
+import datetime
 import logging
 import time
+from collections import deque
 from collections.abc import Callable, Iterator
 from itertools import count
 from typing import Any
@@ -37,7 +39,9 @@ from tessera_embeddings.ingest.asset_locations import (
 from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.catalogue_refusal import (
     CatalogueRequest,
+    RefusalKind,
     bbox_area_label,
+    classify_refusal,
     raise_catalogue_query_error,
 )
 from tessera_embeddings.ingest.duplicates import log_duplicate_selection, select_preferred_duplicates
@@ -97,6 +101,26 @@ _STAC_RETRY = make_logging_retry(
 # (connect_timeout, read_timeout) in seconds. Without an explicit timeout,
 # a stalled TCP connection blocks indefinitely and the retry logic never fires.
 _STAC_TIMEOUT = (10, 60)
+
+# Items one paginated search is walked for before its window is asked for in shorter
+# pieces.
+#
+# This bounds COST, not correctness, and the distinction matters because the refusal it
+# was written for is not a depth limit. Earth Search refuses certain individual page
+# requests with a 502, deterministically, as a function of the whole request — pagination
+# cursor and date window together — and not of how deep the walk has got: the same refusal
+# was observed at page 289 of one window and page 14 of a shorter one sharing its late
+# bound. What clears it is a window with a different END, which re-partitioning produces
+# and which `_query_stac_items` retries on; see the refusal handler there. What this
+# ceiling buys is that a refusal throws away a bounded walk instead of hundreds of pages.
+#
+# In ITEMS rather than pages, so it keeps its meaning when a provider's page size changes
+# and so a denser year is cut into more pieces rather than walked further. A smaller page
+# is NOT an alternative: it changes neither the items walked nor which windows are refused,
+# and it addresses a different failure — the one `max_page_size` in config/providers.py was
+# lowered for, where a single fat page is refused outright.
+# Measurements in context_docs/design/ingest_optimization_campaign_2026_07.md.
+_MAX_QUERY_ITEMS = 10_000
 
 
 def _get_provider_config(provider_name: str) -> STACProvider:
@@ -850,6 +874,53 @@ def _area_label(query_params: dict[str, Any], tile_id: str | None) -> str:
     return "area=unspecified"
 
 
+def split_query_window(start_date: str, end_date: str, parts: int) -> list[tuple[str, str]]:
+    """``[start_date, end_date]`` as ``parts`` shorter windows whose union is the input.
+
+    A re-partition, never a narrowing: the windows match exactly the items the input
+    matched. Consecutive windows normally SHARE their boundary day rather than abutting it,
+    so no acquisition can fall between them, and the caller's id dedupe absorbs the repeat.
+
+    Sharing a day costs a day of length, so it cannot shorten a two-day window — and a
+    window that cannot be shortened is one a refusal has nothing left to try on. At that
+    floor only, the windows ABUT instead. That leaves the sub-second gap between one day's
+    last instant and the next day's first, which is a real if remote risk, taken because
+    the alternative is a leg that fails outright.
+
+    Returns ``[]`` for fewer than two parts and for a single day — the caller's signal to
+    stop rather than re-partition again, and what makes re-partitioning terminate.
+    """
+    start = datetime.date.fromisoformat(start_date)
+    end = datetime.date.fromisoformat(end_date)
+    days = (end - start).days + 1
+    parts = min(parts, days)
+    if parts < 2:
+        return []
+    edges = [start + datetime.timedelta(days=days * i // parts) for i in range(parts)]
+    edges.append(end + datetime.timedelta(days=1))
+    for trailing_edge in (datetime.timedelta(0), datetime.timedelta(days=-1)):
+        windows = [(edges[i], min(edges[i + 1] + trailing_edge, end)) for i in range(parts)]
+        windows = [(w_start, w_end) for w_start, w_end in windows if w_start <= w_end]
+        shortened = len(windows) > 1 and all((w_end - w_start).days + 1 < days for w_start, w_end in windows)
+        if shortened:
+            return [(w_start.isoformat(), w_end.isoformat()) for w_start, w_end in windows]
+    return []
+
+
+def _parts_for_depth(page: dict[str, Any]) -> int:
+    """Shorter windows this window needs, from the match count beside its first page.
+
+    1 when it needs none, or when the catalogue reports no count — the walk is then
+    bounded only by a refusal, as it was before.
+    """
+    matched = page.get("numberMatched")
+    if matched is None:
+        matched = (page.get("context") or {}).get("matched")
+    if not isinstance(matched, int) or matched <= _MAX_QUERY_ITEMS:
+        return 1
+    return -(-matched // _MAX_QUERY_ITEMS)
+
+
 def _query_stac_items(
     provider: STACProvider,
     collection_config: CollectionConfig,
@@ -887,7 +958,10 @@ def _query_stac_items(
         CatalogueQueryError: The catalogue refused a request, classified and naming the
             request that was refused. The client library reports transport failures with
             the search discarded, so this is where a refusal becomes identifiable at all —
-            see :mod:`~tessera_embeddings.ingest.catalogue_refusal`.
+            see :mod:`~tessera_embeddings.ingest.catalogue_refusal`. An upstream error past
+            the first page is NOT reported here while the window can still be shortened:
+            it is re-queried as shorter windows (:func:`split_query_window`), which returns
+            the same items. One that shortening cannot route around still raises.
         ValueError: A returned item carries no ``id``, so it cannot be deduplicated.
             Deliberately NOT wrapped as a refusal: it is a defect in what the catalogue
             returned rather than a refusal to answer, and the retry policy keyed on
@@ -914,53 +988,95 @@ def _query_stac_items(
     seen: set[str] = set()
     keep_assets = _loadable_assets(collection_config, extra_bands)
     for sub_bbox in split_antimeridian_bbox(bbox):
-        query_params = _build_stac_query(collection_config, tile_id, start_date, end_date, bbox=sub_bbox)
-        # Read off the query that was BUILT rather than re-deciding property-versus-bbox
-        # here: a second copy of that branch could disagree with the one that ran, and
-        # then the log would name a request the catalogue was never asked. Tolerant of a
-        # query carrying neither term, because a diagnostic must never be the thing that
-        # raises — an unnamed area still leaves the collection, window and page named.
-        area = _area_label(query_params, tile_id)
-        search = client.search(**query_params, limit=provider.max_page_size, max_items=None)
-        # Paged EXPLICITLY (`pages_as_dicts`, which is what `items_as_dicts` iterates
-        # internally) so a failure can name the page ordinal it died on. Each page is a
-        # separate HTTP request behind its own retry ladder, so "the whole year fails" and
-        # "one deep cursor fails" are different defects with different reproductions, and
-        # an item count cannot tell them apart.
-        #
-        # Dicts rather than Items so a full item is never hydrated: pruning first and
-        # hydrating second is both smaller to retain and ~3x cheaper to build, because most
-        # of an item's construction cost is the assets that get dropped.
-        #
-        # `iter()` rather than trusting the return: advancing by hand needs an ITERATOR, and
-        # this seam is injectable, so a search that returns an iterable which is not one
-        # (a list of pages, a stub) would otherwise be a TypeError — or, for a stub that
-        # answers every call, an unbounded loop. Asking for an iterator costs nothing on the
-        # real generator, which is its own iterator.
-        pages = iter(search.pages_as_dicts())
-        for page_no in count(1):
-            request = CatalogueRequest(collection_config.collection_id, window, area, page_no)
-            try:
-                page = next(pages)
-            except StopIteration:
-                break
-            except Exception as exc:
-                # Scoped to the FETCH alone. Wrapping the body below as well would
-                # classify our own validation failure as a catalogue refusal, which the
-                # retry policy would then act on.
-                raise_catalogue_query_error(request, exc, log=logger, items_so_far=len(items))
-            for raw in page.get("features", []):
-                # Dedupe across the two halves: a granule straddling +/-180 is returned by
-                # both searches, and loading it twice would double-count the solar day.
-                # `id` is required by the STAC spec; an item without one cannot be deduped,
-                # and defaulting it would collapse EVERY such item into a single entry —
-                # so say so rather than silently drop data.
-                if raw.get("id") is None:
-                    raise ValueError(f"STAC item without an 'id' from {provider.catalog_url} — cannot dedupe it")
-                item_id = str(raw["id"])
-                if item_id not in seen:
-                    seen.add(item_id)
-                    items.append(Item.from_dict(_prune_item_dict(raw, keep_assets)))
+        # A worklist of date windows, not one walk: a window the catalogue will not page to
+        # the end of is replaced by shorter ones covering the same days. Depth-first and in
+        # date order, so an attempt runs the same searches as the last one — the layer above
+        # decides a refusal is deterministic by seeing the identical signature twice.
+        pending: deque[tuple[str, str]] = deque([(start_date, end_date)])
+        while pending:
+            win_start, win_end = pending.popleft()
+            window = f"{win_start}/{win_end}"
+            query_params = _build_stac_query(collection_config, tile_id, win_start, win_end, bbox=sub_bbox)
+            # Read off the query that was BUILT rather than re-deciding property-versus-bbox
+            # here: a second copy of that branch could disagree with the one that ran, and
+            # then the log would name a request the catalogue was never asked. Tolerant of a
+            # query carrying neither term, because a diagnostic must never be the thing that
+            # raises — an unnamed area still leaves the collection, window and page named.
+            area = _area_label(query_params, tile_id)
+            search = client.search(**query_params, limit=provider.max_page_size, max_items=None)
+            # Paged EXPLICITLY (`pages_as_dicts`, which is what `items_as_dicts` iterates
+            # internally) so a failure can name the page ordinal it died on. Each page is a
+            # separate HTTP request behind its own retry ladder, so "the whole year fails" and
+            # "one deep cursor fails" are different defects with different reproductions, and
+            # an item count cannot tell them apart.
+            #
+            # Dicts rather than Items so a full item is never hydrated: pruning first and
+            # hydrating second is both smaller to retain and ~3x cheaper to build, because most
+            # of an item's construction cost is the assets that get dropped.
+            #
+            # `iter()` rather than trusting the return: advancing by hand needs an ITERATOR, and
+            # this seam is injectable, so a search that returns an iterable which is not one
+            # (a list of pages, a stub) would otherwise be a TypeError — or, for a stub that
+            # answers every call, an unbounded loop. Asking for an iterator costs nothing on the
+            # real generator, which is its own iterator.
+            pages = iter(search.pages_as_dicts())
+            for page_no in count(1):
+                request = CatalogueRequest(collection_config.collection_id, window, area, page_no)
+                try:
+                    page = next(pages)
+                except StopIteration:
+                    break
+                except Exception as exc:
+                    # Scoped to the FETCH alone. Wrapping the body below as well would
+                    # classify our own validation failure as a catalogue refusal, which the
+                    # retry policy would then act on.
+                    #
+                    # THIS is the fix for the Earth Search 502: a page request the catalogue
+                    # will not serve is re-asked as shorter windows, which pose it as
+                    # different requests. Waiting cannot help — the refusal is deterministic
+                    # in the request, and the ladder underneath has already exhausted itself
+                    # on it. Shortening the window's END is what clears it; shortening only
+                    # its start does not, so this recurses until a window completes or is
+                    # down to a single day.
+                    #
+                    # Not on the first page, which a shorter window asks the same way; and
+                    # not on a stated overload, which is what the ladder above is for and
+                    # which slicing would only multiply.
+                    shorter = split_query_window(win_start, win_end, 2)
+                    if page_no > 1 and shorter and classify_refusal(exc).kind is RefusalKind.UPSTREAM_ERROR:
+                        logger.warning(
+                            "Catalogue refused %s — retrying it as %d shorter window(s)",
+                            request.label,
+                            len(shorter),
+                        )
+                        pending.extendleft(reversed(shorter))
+                        break
+                    raise_catalogue_query_error(request, exc, log=logger, items_so_far=len(items))
+                for raw in page.get("features", []):
+                    # Dedupe across every search this query runs: a granule straddling +/-180
+                    # is returned by both antimeridian halves, and one dated on a boundary day
+                    # by both windows sharing it. Loading it twice would double-count the
+                    # solar day. `id` is required by the STAC spec; an item without one cannot
+                    # be deduped, and defaulting it would collapse EVERY such item into a
+                    # single entry — so say so rather than silently drop data.
+                    if raw.get("id") is None:
+                        raise ValueError(f"STAC item without an 'id' from {provider.catalog_url} — cannot dedupe it")
+                    item_id = str(raw["id"])
+                    if item_id not in seen:
+                        seen.add(item_id)
+                        items.append(Item.from_dict(_prune_item_dict(raw, keep_assets)))
+                # Sized off the first page's match count, so a window too deep to walk is
+                # re-cut before any deep cursor is requested rather than after one is refused.
+                if page_no == 1 and (shorter := split_query_window(win_start, win_end, _parts_for_depth(page))):
+                    logger.info(
+                        "Window %s %s matches over %d items — querying it as %d shorter window(s)",
+                        window,
+                        area,
+                        _MAX_QUERY_ITEMS,
+                        len(shorter),
+                    )
+                    pending.extendleft(reversed(shorter))
+                    break
     logger.info(f"STAC query returned {len(items)} items in {time.monotonic() - t0:.1f}s total")
 
     return items

@@ -10,6 +10,7 @@ from tessera_embeddings.config import (
     CollectionConfig,
     STACProvider,
 )
+from tessera_embeddings.ingest import stac as stac_module
 from tessera_embeddings.ingest.stac import (
     _build_stac_query,
     _extract_baseline,
@@ -24,6 +25,7 @@ from tessera_embeddings.ingest.stac import (
     extract_baselines,
     ingest_tile,
     split_antimeridian_bbox,
+    split_query_window,
 )
 
 
@@ -871,3 +873,148 @@ def test_the_loader_refuses_a_grouping_it_cannot_honour():
     config = _get_collection_config("earth-search", "sentinel-2-l2a")
     with pytest.raises(ValueError, match="groupby='time' is not supported"):
         _load_from_stac([object()], config, groupby="time")
+
+
+class _FakeCatalogue:
+    """A catalogue that honours a date window, pages, reports its match count, and counts serves.
+
+    Built as an ORACLE rather than a stub: the same fake, asked for one window or for
+    several covering the same days, must hand back the same items. A stub replaying a
+    fixed page list could not tell those two apart, so it could not fail.
+    """
+
+    def __init__(self, per_day: dict[str, list[str]], page_size: int):
+        self.per_day = per_day
+        self.page_size = page_size
+        self.windows: list[str] = []
+        self.served_by_window: dict[str, set[str]] = {}
+
+    def raw(self, item_id: str, day: str) -> dict:
+        return {
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": item_id,
+            "geometry": {"type": "Point", "coordinates": [5.0, 45.0]},
+            "bbox": [5.0, 45.0, 5.0, 45.0],
+            "properties": {"datetime": f"{day}T10:00:00Z"},
+            "links": [],
+            "assets": {"blue": {"href": f"s3://b/{item_id}.tif"}},
+        }
+
+    def search(self, **kw):
+        start, end = kw["datetime"].split("/")
+        self.windows.append(kw["datetime"])
+        matched = [
+            (item_id, day) for day, ids in sorted(self.per_day.items()) if start <= day <= end for item_id in ids
+        ]
+        return _FakeSearch(self, kw["datetime"], matched)
+
+
+class _FakeSearch:
+    def __init__(self, catalogue: _FakeCatalogue, window: str, matched: list[tuple[str, str]]):
+        self.catalogue = catalogue
+        self.window = window
+        self.matched = matched
+
+    def pages_as_dicts(self):
+        size = self.catalogue.page_size
+        for offset in range(0, max(len(self.matched), 1), size):
+            chunk = self.matched[offset : offset + size]
+            served = self.catalogue.served_by_window.setdefault(self.window, set())
+            served.update(item_id for item_id, _ in chunk)
+            yield {
+                "numberMatched": len(self.matched),
+                "features": [self.catalogue.raw(item_id, day) for item_id, day in chunk],
+            }
+
+
+def _catalogue_over(days: int, per_day_count: int, page_size: int):
+    per_day = {f"2024-03-{day:02d}": [f"S2_{day:02d}_{n}" for n in range(per_day_count)] for day in range(1, days + 1)}
+    every_id = {item_id for ids in per_day.values() for item_id in ids}
+    return _FakeCatalogue(per_day, page_size), every_id
+
+
+class TestADeepWindowIsQueriedAsShorterOnes:
+    """A window the catalogue will not page to the end of is re-cut, not failed.
+
+    Earth Search refuses certain individual page requests deterministically, as a function
+    of the request rather than of how deep the walk has got, so retrying the same window
+    cannot succeed. The only thing re-cutting may change is how many searches run — never
+    which items come back, because this module is inside the mosaic content fingerprint.
+    """
+
+    @staticmethod
+    def _run(catalogue, monkeypatch, ceiling, start="2024-03-01", end="2024-03-30"):
+        provider = _get_provider_config("earth-search")
+        collection = _get_collection_config("earth-search", "sentinel-2-l2a")
+        monkeypatch.setattr(stac_module, "_MAX_QUERY_ITEMS", ceiling)
+        monkeypatch.setattr(stac_module.Client, "open", lambda *a, **k: catalogue)
+        return _query_stac_items(provider, collection, None, start, end, bbox=(4.0, 44.0, 6.0, 46.0))
+
+    def test_the_item_set_is_what_an_unsliced_query_would_have_returned(self, monkeypatch):
+        """The comparison that matters: sliced against unsliced, one fake catalogue."""
+        page = _get_provider_config("earth-search").max_page_size
+        whole, every_id = _catalogue_over(days=30, per_day_count=20, page_size=page)
+        sliced, _ = _catalogue_over(days=30, per_day_count=20, page_size=page)
+
+        unsliced_items = self._run(whole, monkeypatch, ceiling=10_000_000)
+        sliced_items = self._run(sliced, monkeypatch, ceiling=250)
+
+        assert len(whole.windows) == 1, "the control must NOT have been sliced, or it proves nothing"
+        assert len(sliced.windows) > 1, "the subject must have been sliced, or it proves nothing"
+        assert {i.id for i in sliced_items} == {i.id for i in unsliced_items} == every_id
+        assert len(sliced_items) == len(every_id), "a re-partition must not duplicate an item"
+
+    def test_an_item_on_a_boundary_day_shared_by_two_windows_is_returned_once(self, monkeypatch):
+        """Adjacent windows share their boundary day on purpose; the dedupe keeps it single.
+
+        The shorter windows are identified by EXCLUDING the input window, so a re-serve by
+        the abandoned parent walk cannot be mistaken for the sibling overlap this is about.
+        """
+        page = _get_provider_config("earth-search").max_page_size
+        catalogue, every_id = _catalogue_over(days=8, per_day_count=5, page_size=page)
+
+        items = self._run(catalogue, monkeypatch, ceiling=20, start="2024-03-01", end="2024-03-08")
+
+        shorter = [ids for w, ids in catalogue.served_by_window.items() if w != "2024-03-01/2024-03-08"]
+        overlaps = [a & b for i, a in enumerate(shorter) for b in shorter[i + 1 :] if a & b]
+        assert overlaps, f"no two shorter windows shared an item, so the overlap was never exercised: {shorter}"
+        assert len(items) == len(every_id), "an item two windows both matched was returned twice"
+        assert {i.id for i in items} == every_id
+
+
+class TestSplitQueryWindow:
+    """The re-partition itself: it must cover the input, and it must terminate."""
+
+    def test_the_parts_cover_every_day_of_the_input(self):
+        parts = split_query_window("2024-03-01", "2024-03-30", 4)
+        assert parts[0][0] == "2024-03-01"
+        assert parts[-1][1] == "2024-03-30"
+        # Each window picks up where the last left off, SHARING that day rather than
+        # skipping it — an abutting cut would leave a gap no caller could see.
+        assert [later[0] for later in parts[1:]] == [earlier[1] for earlier in parts[:-1]]
+
+    def test_a_single_day_cannot_be_cut(self):
+        assert split_query_window("2024-03-01", "2024-03-01", 2) == []
+
+    def test_two_days_split_into_one_day_each(self):
+        """The floor of the recursion, and it must not stall there.
+
+        A shared boundary day costs a day of length, so it cannot shorten a two-day
+        window — and stopping here would leave a refused window with nothing to try, which
+        is exactly where the live failure ended up. At this floor only, the windows abut.
+        """
+        assert split_query_window("2019-03-21", "2019-03-22", 2) == [
+            ("2019-03-21", "2019-03-21"),
+            ("2019-03-22", "2019-03-22"),
+        ]
+
+    def test_three_days_still_share_a_boundary_day(self):
+        """The abutting fallback is the floor ONLY — anything longer keeps the overlap."""
+        assert split_query_window("2024-03-01", "2024-03-03", 2) == [
+            ("2024-03-01", "2024-03-02"),
+            ("2024-03-02", "2024-03-03"),
+        ]
+
+    def test_fewer_than_two_parts_is_no_split(self):
+        assert split_query_window("2024-03-01", "2024-03-30", 1) == []
