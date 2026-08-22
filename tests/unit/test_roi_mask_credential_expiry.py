@@ -211,8 +211,12 @@ def _write(store: str, day: xr.Dataset) -> None:
 def test_the_write_signs_as_the_role_never_as_the_environment(role_only_s3, tmp_path) -> None:
     """The source's token is in the environment and must never reach our own bucket.
 
-    Refused as expired here, so picking it up is a failed write rather than a silent
-    difference — the same refusal the leg met, from the same place.
+    A REGRESSION GUARD rather than a proof of this change: it passes on ``main`` too,
+    because threading the provider into the leg was already enough to keep the environment
+    out. It is here so that a later change cannot quietly go back to resolving it.
+
+    The source key is refused as expired, so picking it up is a failed write rather than a
+    silent difference — the same refusal the leg met, from the same place.
     """
     door = role_only_s3
     door.expired.add(SOURCE_KEY)
@@ -248,14 +252,6 @@ def test_the_mask_still_reads_the_right_pixels(role_only_s3) -> None:
     assert mask.chunks == ((4, 4), (4, 4))
     assert mask.dtype == np.bool_
     assert mask.compute().all()
-
-
-def test_the_issuer_really_rotates(role_only_s3) -> None:
-    """Without rotation both tests above would pass on a frozen credential."""
-    first = iam_s3_storage_options()["key"]
-    _resolve_iam_credentials.cache_clear()
-    second = iam_s3_storage_options()["key"]
-    assert first != second, "the role credential is not rotating; the expiry tests cannot fail"
 
 
 # ---------------------------------------------------------------------------

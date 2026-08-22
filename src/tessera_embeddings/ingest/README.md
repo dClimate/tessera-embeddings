@@ -1646,23 +1646,21 @@ The plain-Zarr side needs the same identity, and one property beyond it. An ROI 
 Icechunk store, so it is read through fsspec, and
 `providers/aws/credentials.py::iam_s3_storage_options` is the fsspec counterpart: the same
 env-stripped chain, returned in the shape fsspec takes as `storage_options`. The ingest is handed
-the **callable**, not its result — and `read_roi_mask` then resolves it inside each block read
-rather than once when it builds the graph.
+the **callable**, not its result — and `read_roi_mask` resolves it inside each block read rather
+than once when it builds the graph.
 
-That last part is load-bearing, because the mask array is LAZY. Its block reads happen inside a
-later `write_day_windows` compute, which on the radar path is the whole of a batch's writes. Giving
-`da.from_zarr` one already-resolved store bakes a single credential into the graph, so a write that
-outlives that credential fails with `ExpiredToken` on a bucket the role can always read — the
-failure looks like a permissions problem and is a lifetime problem. Opening the store per block
-makes the credential no older than the read that uses it.
+That last part is load-bearing, because the mask array is LAZY: its block reads happen inside a
+later `write_day_windows` compute, which on the radar path spans a whole 30-day batch's writes. One
+credential resolved at graph-build time would be presented by every one of those reads, and once it
+expired the read would fail with `ExpiredToken` on a bucket the role can always read — a lifetime
+problem wearing a permissions problem's error message. Opening the store per block keeps the
+credential no older than the read that uses it.
 
-That costs one store open — and its metadata round trip — per block read, where the old
-construction paid one for the whole array, and it makes the returned array cloudpickle-only rather
-than plain-picklable. Both are measured in
-`context_docs/decisions/022-resolve-the-roi-mask-credential-at-read-time.md`, and pinned by
-`tests/unit/test_roi_mask_construction.py`. Neither is a reason to avoid the change; both are
-reasons not to hand this array to a plain-pickle boundary or to read a whole zone grid you do not
-need.
+Two consequences. Each block read costs its own store open, so its own metadata round trip, where
+the old construction paid one for the whole array; and the returned array is cloudpickle-only,
+because the closure is a nested function. Both are measured in
+`context_docs/decisions/022-resolve-the-roi-mask-credential-at-read-time.md`, and both are reasons
+not to hand this array to a plain-pickle boundary, or to read a whole zone grid you do not need.
 
 **IMDS throttling — why `_resolve_iam_credentials` is `lru_cache`d (gotcha).** The credential
 machinery has two distinct TTLs, and conflating them overwhelms the EC2 Instance Metadata
