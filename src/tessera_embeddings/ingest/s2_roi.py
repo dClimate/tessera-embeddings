@@ -306,6 +306,7 @@ def ingest_s2_roi_reflectance(
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
     batch_dates: int | None = None,
+    allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
 ) -> IngestResult:
     """Ingest S2 L2A reflectance for an ROI defined by a Zarr mask.
@@ -366,6 +367,8 @@ def ingest_s2_roi_reflectance(
             :func:`~tessera_embeddings.config.ingest.auto_batch_dates`, because the
             benefit is not monotonic in ROI size; 1 forces the one-commit-per-date
             path.
+        allow_ingest_code_mismatch: Off by default. See the field of the same name on
+            :class:`~tessera_embeddings.storage.manifest.IngestManifest`.
 
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
             storage layer's default; set it when the bucket lives elsewhere, or
@@ -397,7 +400,10 @@ def ingest_s2_roi_reflectance(
     # under the new rule. Validated on every write, so that refusal lands before the
     # resumed run commits a date.
     ingest_manifest = IngestManifest.from_roi_store(
-        roi_zarr_path, min_valid_coverage=min_valid_coverage, storage_options=resolve_storage_options(storage_options)
+        roi_zarr_path,
+        min_valid_coverage=min_valid_coverage,
+        storage_options=resolve_storage_options(storage_options),
+        allow_ingest_code_mismatch=allow_ingest_code_mismatch,
     )
 
     mid_longitude = solar_grouping_longitude(roi)

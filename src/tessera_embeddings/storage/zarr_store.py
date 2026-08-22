@@ -70,7 +70,7 @@ from tessera_embeddings.errors import (
     NonMonotonicDateError,
     StoreHoldsCommittedDataError,
 )
-from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
+from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
 from tessera_embeddings.storage.region_writes import (
     _drop_region_coords,
     _pad_region_to_chunks,
@@ -1807,8 +1807,7 @@ def write_days_windows(
         get_credentials=get_credentials,
         s3_region=s3_region,
     ) as batch:
-        if manifest:
-            manifest.validate_against(extract_manifest(dict(batch.group.attrs)), store_path)
+        mixed = manifest.validate_against(extract_manifest(dict(batch.group.attrs)), store_path) if manifest else []
         # Slots are appended for every date up front — the session sees its own
         # uncommitted resizes, so each date's windows write into its own index. The
         # appends and the windows land in the ONE commit together, preserving the
@@ -1824,6 +1823,10 @@ def write_days_windows(
         attrs["baselines_applied"] = merged
         attrs["doy"] = list(cast("list", attrs.get("doy", []))) + compute_doy(np.array(whens)).tolist()
         attrs["last_appended"] = utcnow_iso()
+        if mixed:
+            # Same commit as the dates it describes; a union, since one resume writes many.
+            prior = cast("list", attrs.get(MIXED_CODE_IDENTITIES_ATTR, []))
+            attrs[MIXED_CODE_IDENTITIES_ATTR] = sorted(set(prior) | set(mixed))
         if parallel_windows and _write_windows_overlapped(batch.session, writes):
             return  # normal context exit: the batched commit below still runs
         for one_ds, one_windows, t, drop in writes:
