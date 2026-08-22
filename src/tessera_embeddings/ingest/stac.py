@@ -361,7 +361,7 @@ def _extract_baseline(item: Item) -> int:
     return 0 if declared is None else declared
 
 
-def solar_day_sort_key(item: Item) -> tuple[str, float, str]:
+def solar_day_sort_key(item: Any) -> tuple[str, float, str]:  # noqa: ANN401 — any STAC-like item
     """The order a solar day's items must be handed to the loader in.
 
     The loader's fuser keeps the FIRST valid source of a group and later sources only fill the
@@ -633,7 +633,12 @@ def _load_from_stac(
         "resampling": effective_resampling,
         "chunks": load_chunks,
         "groupby": groupby,
-        "preserve_original_order": True,
+        # True only where THIS package decided the order. `query_stac_items` sorts a collection
+        # carrying an SCL band with `solar_day_sort_key`, and the fuser keeps the first valid
+        # source, so that order has to survive into the loader. Nothing here sorts any other
+        # collection, and for those odc's own default — `(time, id)` within a group — is what makes
+        # the fused result a function of the items rather than of the order the provider returned.
+        "preserve_original_order": collection_config.has_scl,
     }
 
     if geobox is not None:

@@ -90,12 +90,14 @@ def _item(item_id: str, href: str, cloud: float) -> Item:
     )
 
 
-def _load(items: list[Item]) -> np.ndarray:
+def _load(items: list[Item], *, has_scl: bool = True) -> np.ndarray:
     gbox = GeoBox.from_bbox(
         BoundingBox(EAST0, NORTH1 - SIZE * RES, EAST0 + SIZE * RES, NORTH1, crs=f"EPSG:{EPSG}"),
         resolution=RES,
     )
-    cfg = CollectionConfig(collection_id="test", bands=["blue"], resolution=int(RES))
+    # `has_scl` marks the collection whose order THIS package decides, which is what
+    # `_load_from_stac` keys `preserve_original_order` on.
+    cfg = CollectionConfig(collection_id="test", bands=["blue"], resolution=int(RES), has_scl=has_scl)
     ds = _load_from_stac(items, cfg, geobox=gbox, chunks={"northing": SIZE, "easting": SIZE})
     assert ds.sizes["time"] == 1, "both items must land in ONE solar-day slice or this proves nothing"
     return np.asarray(ds["blue"].compute().values[0])
@@ -137,3 +139,15 @@ def test_a_hole_in_the_clearest_scene_falls_through_to_the_next(scenes, tmp_path
 
     assert np.unique(fused[:, : SIZE // 2]).tolist() == [CLEAR_DN], "the clear scene keeps what it covers"
     assert np.unique(fused[:, SIZE // 2 :]).tolist() == [CLOUDY_DN], "its hole is filled, not left empty"
+
+
+def test_a_collection_this_package_does_not_sort_fuses_the_same_either_way(scenes) -> None:
+    """Where no sort is imposed, odc's own `(time, id)` order decides — and that is the point.
+
+    Radar is that case: nothing here orders those items, so without odc's default the provider's
+    return order would pick the winner of every overlap.
+    """
+    cloudy, clear = scenes
+    assert np.array_equal(
+        _load([cloudy, clear], has_scl=False), _load([clear, cloudy], has_scl=False)
+    ), "the fused result must not depend on the order the items were supplied in"

@@ -109,13 +109,24 @@ answers it computes the overlap area between different acquisitions in an equal-
 with the cloud gap across each contesting pair. No count of multi-acquisition days is a substitute,
 and none should be quoted as the impact.
 
-## The radar path is not covered by this fix
+## Why the loader flag is now conditional
 
-`preserve_original_order=True` is set for every collection, and the cloud sort runs only for
-collections with an SCL band. So for radar the library's deterministic `(time, id)` default is
-switched off and nothing replaces it. That is a reproducibility exposure rather than this defect —
-radar has no quality ordering, so nothing is being silently degraded — and it is owed its own
-change.
+The cloud sort runs only for collections carrying an SCL band, but `preserve_original_order` was
+set for every collection. Radar therefore had the flag's effect without the sort's benefit: odc's
+deterministic `(time, id)` ordering was switched off and nothing replaced it, leaving the winner of
+an overlap to whatever order the CMR granule query happened to return.
+
+Keying the flag on `has_scl` matches the condition that gates the sort, so the flag and the sort
+cannot disagree. **This is not the optical defect repeated.** Radar has no quality ordering, so
+neither of two overlapping bursts is the worse observation and nothing was being silently degraded;
+what this buys is reproducibility. And it *removes* an override rather than adding a mechanism —
+writing a radar sort to mirror the optical one would cost more and buy nothing the library does not
+already give.
+
+It does change which burst supplies a contested pixel, which is why it belongs in a window where
+the store is being rebuilt. The radar footprint join is unaffected either way:
+`normalize_to_solar_day` gives every item in a group the same canonical noon timestamp and odc
+reads `item.datetime`, so that join key never depended on the order.
 
 ## Trade-offs accepted
 
