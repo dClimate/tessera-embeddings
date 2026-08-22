@@ -711,7 +711,16 @@ class TestAntimeridianBboxSplit:
             provider, config, None, "2024-01-01", "2024-01-31", bbox=(179.5, -18.0, -179.5, -16.0)
         )
 
-        assert searched == [(179.5, -18.0, 180.0, -16.0), (-180.0, -18.0, -179.5, -16.0)]
+        # BOTH halves are searched, once each. Asserted as a SET, because the walk is
+        # concurrent (`ThreadPoolExecutor`, `stac-window`) and the order two worker threads
+        # reach `search` in is a race. This was a list comparison and it flaked in CI on
+        # 3.12 while passing on 3.13 — a real race the assertion was hiding, not a fluke.
+        assert sorted(searched) == sorted([(179.5, -18.0, 180.0, -16.0), (-180.0, -18.0, -179.5, -16.0)])
+        assert len(searched) == 2, "each half searched exactly once"
+        # The OUTPUT order is deterministic, and that is the property the concurrent walk was
+        # built to preserve: the window tree is read back depth-first in the order a serial
+        # walk produced, so the same request always yields the same item sequence. Straddling
+        # item "S" is deduped to one copy and keeps the position its first sighting gave it.
         assert [i.id for i in items] == ["S", "E", "W"]
 
 
