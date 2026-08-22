@@ -153,14 +153,17 @@ PROVIDERS: dict[str, STACProvider] = {
         # of `sentinel-2-l2a` is over it. Per provider rather than on the class default,
         # because nothing implicates the other catalogues.
         #
-        # Item size, not the `limit` value, is what the cap tracks — and item size is dominated
-        # by FOOTPRINT GEOMETRY rather than assets. Items from November 2018 to April 2019 carry
-        # polygons of ~2,600 vertices, about 30 KB of coordinates; a 2024 item carries a
-        # quadrilateral of ~0.3 KB, with the assets block about 18 KB either way. So a 100-item
-        # page is ~2.2 MB outside that band and at or over the cap inside it, and the largest
-        # page measured served was 5.73 MB — **96%** of the cap, not the comfortable margin an
-        # average suggests. Dropping to 75 is the lever if first pages start refusing; the
-        # measured cost is in the campaign record.
+        # Item size is what the cap tracks, not the `limit` value, and what makes an item big is
+        # the SHAPE OF THE GROUND it covers rather than the files attached to it. Most items give
+        # a rectangle; some trace the edge of where the imagery actually is, which for Sentinel-2
+        # is a twelve-detector sawtooth running to thousands of points and 98 KB against an
+        # ordinary 0.2 KB. Those are confined to roughly Nov 2018 - Mar 2019, a stretch never
+        # reprocessed. Outside it a 100-item page is ~2.2 MB; inside it, at or over the cap.
+        #
+        # 100 averages 4.6 MB but the largest page SERVED was 5.73 MB, 96% of the cap, so do not
+        # reason from the average. Lowering this is deliberately NOT the answer: it taxes every
+        # query in every year for six months of a ten-year archive, and `ingest/stac.py` already
+        # re-asks a refused page at half the size. Measurements in the campaign record.
         #
         # The same cap is why one page deep in a walk is sometimes refused while every other
         # page is served: item sizes vary, so whether a given hundred clears 6 MB depends on

@@ -366,13 +366,17 @@ async def ingest_zone_year(
             Deliberately NOT in the fingerprint below — a mosaic completed under it must
             still satisfy a later strict run.
 
-            TODO: it does not, quite. The completion marker carries neither the code identity
-            nor this flag, so a later strict run matches the same fingerprint and returns
-            ``already_ingested`` from the marker fast path without reaching manifest
-            validation. The mixed mosaic is therefore accepted rather than refused. Left as a
-            known limit while the override is a one-off for a mid-campaign resume; closing it
-            means putting code state into completion eligibility, which changes when every
-            cell is considered done. See ``MIXED_CODE_IDENTITIES_ATTR`` in storage/manifest.py.
+            Note what that does NOT mean. The completion marker carries neither the code
+            identity nor this flag, so a later strict run matches the same fingerprint and
+            returns ``already_ingested`` from the marker fast path without reaching manifest
+            validation — it accepts the mixed mosaic rather than refusing it. Intended: an
+            operator chose the mixture knowingly, and a store that may never be embedded is
+            not worth ingesting. The store records which identities contributed, under
+            ``MIXED_CODE_IDENTITIES_ATTR`` in storage/manifest.py, for anyone asking later.
+
+            The override is a permanent, manually-invoked capability rather than a one-off,
+            so treat it as part of the interface: off by default, chosen per run, and never
+            reached automatically.
         s3_region: Optional S3 region for this flow's Icechunk metadata opens
             (mask liveness, coverage sha, marker probe/write, coverage gate) and
             the zone-ROI synthesis — mirrors the campaign/fill region threading so

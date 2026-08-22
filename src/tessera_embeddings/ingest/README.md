@@ -155,6 +155,55 @@ by which arrived first, and that decides which is painted on top.
 
 The rest of this section is the mechanism behind that picture.
 
+#### The months where the catalogue entries are heavy
+
+Late 2018 and early 2019 are the awkward part of the archive, and it is worth knowing why before
+it surprises you somewhere else.
+
+Every scene's catalogue entry includes the shape of the ground it covers. Normally that is a
+rectangle — four corners, a couple of hundred bytes. But entries from roughly **November 2018 to
+March 2019** give the shape of where the imagery *actually* is instead, tracing the edge of the
+data rather than the tile boundary. Sentinel-2 builds each image from twelve separate detectors,
+so that edge is a fine sawtooth, and drawing it takes thousands of points. One entry we measured
+runs to 2,497 points and 98 KB, against 0.2 KB for an ordinary one. The list of files attached to
+the scene is about 18 KB either way, so it is the outline, not the imagery, that makes these
+entries heavy.
+
+The band exists because of a gap in reprocessing rather than anything about that season. ESA
+reprocessed most of the archive to a later version whose entries carry the simple rectangle, and
+the catalogue serves that version when it exists. For those few months it does not exist, so the
+original products are what you get. Sampling one day a month across the boundary:
+
+| month | typical points per entry | heavy entries | versions available |
+|---|---|---|---|
+| Oct 2018 | 6 | 0 of 50 | 02.09 |
+| **Nov 2018** | **580** | **31 of 50** | **02.11 only** |
+| **Dec 2018** | **531** | **33 of 50** | **02.11 only** |
+| **Feb 2019** | **579** | **30 of 50** | **02.11 only** |
+| Apr 2019 | 6 | 0 of 50 | 02.11, 05.00 |
+| Jun 2023 | 5 | 0 of 50 | 05.09 |
+
+The heavy months are exactly the ones where version 02.11 is the only one on offer. Why that
+version drew outlines this way when the versions either side did not is an ESA processing decision
+and not something we have chased.
+
+Two things follow. It **cannot spread** — no current processing version produces these outlines,
+so no future data brings the problem back. And it **could disappear on its own**, if that stretch
+is ever reprocessed.
+
+What it presses against, in this code:
+
+- **The response cap.** A hundred entries is about 2.2 MB outside the band and at or over the
+  ~6 MB ceiling inside it, which is what makes a page refusal a 2019 phenomenon. See the page-size
+  discussion below.
+- **What a query holds in memory.** A month's worth of these entries is an order of magnitude
+  more bytes than the same month in 2024, which is part of why the query streams month by month
+  rather than fetching a year at once.
+
+Anything that measures per-item cost — page sizes, retained bytes, query timings — will read
+differently in these months than anywhere else in the archive, so a figure taken here is not a
+figure about the campaign generally, and vice versa.
+
 `_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry`
 built by `make_logging_retry()` (`_http.py`, shared with the CMR Granule query) and passed
 into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 503, 504)`).
@@ -183,11 +232,18 @@ CMR-STAC search entirely and queries the native CMR Granule API. See
 **Why 100 for Earth Search, and what to watch.** It is not a throughput choice — it is the
 response cap. Earth Search refuses any request whose response would exceed roughly **6 MB**,
 AWS Lambda's synchronous response limit, and 250 items of `sentinel-2-l2a` is always over it.
-At 100 items a page averages 4.6 MB, but the largest measured **served** page was **5.73 MB —
-96% of the cap**, so the real headroom is a few percent rather than the 30% an average implies.
-Item size follows footprint geometry, not assets: items from November 2018 to April 2019 carry
-polygons of some 2,600 vertices where a 2024 item carries a quadrilateral, so a 100-item page is
-about 2.2 MB outside that band and at or over the cap inside it. The cap tracks **bytes, not the `limit` value**: measured directly, 130
+A hundred items averages 4.6 MB, but the biggest page ever **served** was **5.73 MB — 96% of the
+cap** — and the refused one works out to 5.96 MB. So the gap between fine and refused is about a
+quarter of a megabyte, and the average is the wrong number to reason from.
+
+What makes an item heavy is the shape of the ground it covers rather than the files attached to
+it, and the heavy items are confined to a few months of 2018 and 2019 — see *The months where the
+catalogue entries are heavy* above. Outside that band a hundred items is about 2.2 MB, a third of
+the cap.
+
+Lowering this number is therefore not the answer — see the campaign record for the measurements.
+Six months of a ten-year archive is a concentrated problem, and the page-size fallback below handles
+it where it happens rather than taxing every query in every year. The cap tracks **bytes, not the `limit` value**: measured directly, 130
 items are served at 5.99 MB and 150 refused, while 150 are served at 4.77 MB once unneeded
 assets are excluded server-side. If first pages ever start returning 502, this margin is the
 first thing to check and lowering this number is the lever — a first-page refusal is the one

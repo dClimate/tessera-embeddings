@@ -60,13 +60,18 @@ _OVERRIDE_FIELD = "allow_ingest_code_mismatch"
 #: Root attr: the ingest code identities a store's dates were produced under. Not in
 #: ``_manifest``, which is written once at create time — the mixture becomes true later.
 #:
-#: TODO: this attr is not read by anything downstream. ``read_upstream_manifests`` extracts
-#: only ``_manifest``, so an embedding store's upstream identity is the same whether its input
-#: was single-code or mixed, and the zone-year completion marker does not carry it either — so a
-#: later strict run can short-circuit on the marker and accept a mixed mosaic it would
-#: otherwise refuse. Deliberately out of scope here: the override is a one-off for a mid-campaign
-#: resume, and folding mixed state into downstream identity changes what every embedding
-#: manifest hashes. Decide it when the override stops being temporary.
+#: **An audit trail, and deliberately nothing more.** Nothing reads this attr to make a decision.
+#: ``read_upstream_manifests`` extracts only ``_manifest``, so an embedding store's upstream
+#: identity is the same whether its input was single-code or mixed, and the zone-year completion
+#: marker does not carry it either — so a later strict run short-circuits on the marker and
+#: accepts a mixed mosaic.
+#:
+#: That is the intended behaviour, not an omission. The override is never automatic: an operator
+#: chooses it, per run, knowing the store will hold data from two versions of the ingest code.
+#: Choosing that and then refusing to embed the result would mean ingesting imagery that can
+#: never be inferred on, which is no use to anyone. So a mixed mosaic is a first-class input, and
+#: the mixture is recorded here for anyone asking later WHICH versions contributed rather than
+#: to gate anything.
 MIXED_CODE_IDENTITIES_ATTR = "mixed_ingest_code_identities"
 
 

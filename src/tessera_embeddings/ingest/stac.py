@@ -42,6 +42,7 @@ from tessera_embeddings.ingest.asset_locations import (
 )
 from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.catalogue_refusal import (
+    OVERSIZED_RESPONSE_STATUSES,
     CatalogueRequest,
     bbox_area_label,
     classify_refusal,
@@ -176,6 +177,22 @@ _MAX_QUERY_ITEMS = 10_000
 # context_docs/design/ingest_optimization_campaign_2026_07.md.
 _QUERY_WINDOW_WORKERS = 6
 
+# Times one query may answer a refusal by replacing a window before it gives up.
+#
+# Bounds AMPLIFICATION, and the bound is the point. Each lever is individually terminating —
+# windows bottom out at a day, pages at `_MIN_PAGE_SIZE` — but a refusal that keeps arriving,
+# a real gateway outage rather than the size cap, makes both recurse across the whole window.
+# Measured against a stub that refuses every walk past page 1: a one-month query fires 328
+# requests before giving up, a one-year query 3,648, and nine years 32,868. That is a lot of
+# traffic aimed at a service already answering with 5xx.
+#
+# Counts refusal responses ONLY, not the proactive cut off `numberMatched`, which is bounded by
+# the item count and is the ordinary path. Twenty is roughly six times the most any real query
+# has needed — the benchmark month uses three — so this cannot refuse legitimate work while it
+# holds a month to about twenty extra searches instead of a hundred and sixty.
+_MAX_REFUSAL_RE_PARTITIONS = 20
+
+
 # Smallest page a refused window is re-asked with before the refusal is reported.
 #
 # Earth Search refuses a request whose RESPONSE would exceed about 6 MB, so asking for fewer
@@ -188,6 +205,17 @@ _QUERY_WINDOW_WORKERS = 6
 # served at any size is reported rather than retried forever; it is not a size anything is
 # expected to need. A page this small is ~0.7 MB against the cap.
 _MIN_PAGE_SIZE = 10
+
+# Attempts, and the pause between them, for the catalogue ROOT.
+#
+# The root is a small static document. It cannot be made smaller, so neither a shorter window nor
+# a smaller page is any use to it, and taking 502 out of this provider's ladder therefore left the
+# root with no retry at all. Worse than one wasted attempt: the leg-retry layer above declares a
+# refusal deterministic once it sees the identical signature twice, so a gateway blip on the root
+# could END a leg rather than delay it. This restores exactly what the ladder stopped giving —
+# nothing else is retried here, because everything else has a remedy of its own.
+_ROOT_OPEN_ATTEMPTS = 3
+_ROOT_OPEN_BACKOFF_S = 2.0
 
 
 def _get_provider_config(provider_name: str) -> STACProvider:
@@ -1002,6 +1030,27 @@ def _parts_for_depth(page: dict[str, Any]) -> int:
 
 
 @final
+class _RePartitionBudget:
+    """How many more times this query may replace a refused window.
+
+    One per query, shared by every window walked for it, so the bound is on the QUERY rather
+    than on any one branch of its tree. Thread-safe because the windows are walked at once.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._left = limit
+        self._lock = threading.Lock()
+
+    def take(self) -> bool:
+        """Claim one replacement, or False when the query has spent them all."""
+        with self._lock:
+            if self._left <= 0:
+                return False
+            self._left -= 1
+            return True
+
+
+@final
 @dataclass
 class _WindowWalk:
     """One date window of the worklist, what it returned, and what replaced it.
@@ -1074,18 +1123,35 @@ class _PerThreadClient:
         """This thread's client, opening it on first use."""
         client: Client | None = getattr(self._local, "client", None)
         if client is None:
-            stac_io = StacApiIO(max_retries=_retry_for(self._provider), timeout=_STAC_TIMEOUT)
-            try:
-                client = Client.open(self._provider.catalog_url, stac_io=stac_io)
-            except Exception as exc:
-                # Page 0: the catalogue root, fetched before any search exists. Named
-                # separately so a refusal here is not read as a refusal of the search it
-                # precedes.
-                raise_catalogue_query_error(
-                    CatalogueRequest(self._collection_id, self._window, "catalogue-root", 0), exc, log=logger
-                )
-            self._local.client = client
+            self._local.client = client = self._open()
         return client
+
+    def _open(self) -> Client:
+        """Open the catalogue root, retrying the one status its ladder no longer holds.
+
+        Page 0 for reporting: the root is fetched before any search exists, so a refusal here
+        is named separately rather than read as a refusal of the search it precedes.
+        """
+        stac_io = StacApiIO(max_retries=_retry_for(self._provider), timeout=_STAC_TIMEOUT)
+        request = CatalogueRequest(self._collection_id, self._window, "catalogue-root", 0)
+        for attempt in range(1, _ROOT_OPEN_ATTEMPTS + 1):
+            try:
+                return Client.open(self._provider.catalog_url, stac_io=stac_io)
+            except Exception as exc:
+                # Read off the same set the ladder drops, so the two cannot fall out of step.
+                dropped_by_the_ladder = classify_refusal(exc).status in OVERSIZED_RESPONSE_STATUSES
+                if attempt < _ROOT_OPEN_ATTEMPTS and dropped_by_the_ladder:
+                    logger.warning(
+                        "Catalogue root refused (%s), attempt %d of %d — retrying in %.0fs",
+                        self._provider.catalog_url,
+                        attempt,
+                        _ROOT_OPEN_ATTEMPTS,
+                        _ROOT_OPEN_BACKOFF_S * attempt,
+                    )
+                    time.sleep(_ROOT_OPEN_BACKOFF_S * attempt)
+                    continue
+                raise_catalogue_query_error(request, exc, log=logger)
+        raise AssertionError("unreachable: the loop either returns or raises")  # pragma: no cover
 
 
 def _walk_query_window(
@@ -1094,6 +1160,7 @@ def _walk_query_window(
     collection_config: CollectionConfig,
     tile_id: str | None,
     keep_assets: frozenset[str],
+    budget: _RePartitionBudget,
     node: _WindowWalk,
 ) -> None:
     """Walk one window's pages, filling ``node.items`` and ``node.children`` in place.
@@ -1172,8 +1239,8 @@ def _walk_query_window(
             # force-listed, so one arrives here having already spent the ladder's whole
             # backoff — and re-cutting it would hand that same ladder to each child, turning
             # a persistent outage into minutes of backoff multiplied across a recursion.
-            if is_oversized_response(classify_refusal(exc)):
-                if page_no > 1 and shorter:
+            if provider.refuses_oversized_pages and is_oversized_response(classify_refusal(exc)):
+                if page_no > 1 and shorter and budget.take():
                     logger.warning(
                         "Catalogue refused %s — retrying it as %d shorter window(s)",
                         request.label,
@@ -1181,7 +1248,7 @@ def _walk_query_window(
                     )
                     node.children = [_WindowWalk(node.bbox, w, node.page_size) for w in shorter]
                     return
-                if smaller >= _MIN_PAGE_SIZE:
+                if smaller >= _MIN_PAGE_SIZE and budget.take():
                     # Same window, same items, same order — only the response is smaller,
                     # which is what the cap is measured against. The pages already walked
                     # are re-fetched and the assembly step dedupes them away.
@@ -1331,8 +1398,9 @@ def _query_stac_items(
     # walk produced. The same searches run on every attempt, so the layer above can still
     # decide a refusal is deterministic by seeing the identical signature twice.
     roots = [_WindowWalk(sub_bbox, (start_date, end_date)) for sub_bbox in split_antimeridian_bbox(bbox)]
+    budget = _RePartitionBudget(_MAX_REFUSAL_RE_PARTITIONS)
     _fill_window_tree(
-        lambda node: _walk_query_window(clients.get(), provider, collection_config, tile_id, keep_assets, node),
+        lambda node: _walk_query_window(clients.get(), provider, collection_config, tile_id, keep_assets, budget, node),
         roots,
         _QUERY_WINDOW_WORKERS,
     )

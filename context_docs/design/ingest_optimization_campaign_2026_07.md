@@ -1381,45 +1381,83 @@ would have produced. What remains unverified is a solar day that straddles UTC m
 the far-eastern and far-western zones, where one solar day CAN fall in two windows. That case
 is not covered by this measurement.
 
-### Why `max_page_size` stays at 100
+### Why we ask for 100 scenes at a time and not fewer
 
-Measured 2026-08-22 on the window that reproduces the refusal, `2019-03-16/2019-03-22`, holding
-window concurrency at its shipped 6. Item counts are identical at every page size, as they must be.
+The obvious safety move, once you know there is a 6 MB ceiling on any answer, is to ask for less
+per request. We measured it and decided not to. This section is why, because the reasoning depends
+on a fact about the archive that is worth knowing on its own.
 
-| `limit` | refused | requests | largest page | worst case, any alignment |
-|---|---|---|---|---|
-| 100 | **yes, page 14, 6 of 6** | 141 | 5.73 MB (96%) | 6.20 MB (103%) |
-| 90 | no | 103 | 5.11 MB (85%) | **5.66 MB (94%)** |
-| 75 | no | 124 | 4.56 MB (76%) | 4.73 MB (79%) |
-| 60 | no | 154 | 3.84 MB (64%) | 4.00 MB (67%) |
+**The 6 MB ceiling is closer than an average suggests.** A hundred scenes averages 4.6 MB, which
+sounds like plenty of room. But the biggest single request we have seen ANSWERED carried 5.73 MB,
+and the one that was refused works out to 5.96 MB. So the real gap between "fine" and "refused" is
+about a quarter of a megabyte. An average is the wrong number to look at here; the biggest page is.
 
-The "worst case" column is the fattest run of that many CONSECUTIVE items anywhere in the window,
-derived from an independent walk at `limit=5` that agrees with the measured 100-item pages to
-within 0.07%. It is the column that matters: **`limit=90` makes zero refusals and is still 94% of
-the cap**, so a clean run there is where the page boundaries happened to fall, not evidence of
-margin. On the whole month, 75 costs **+32% requests and +14% wall clock** — about 30 s on a 208 s
-query — and 60 doubles the extra requests to buy 1.4 s.
+**Asking for fewer scenes does work.** On the window that reliably refuses:
 
-**And yet 100 stays.** The reason is that the page-size fallback shipped in this branch makes the
-remedy ADAPTIVE, and a global reduction is not. A first page refused at 100 is now re-asked at 50,
-so the one failure a shorter window cannot route around already recovers — that was the argument
-for lowering it, and it no longer holds. The fallback pays two extra requests and one re-walk for
-the windows that actually refuse; `max_page_size=75` pays 32% more requests on **every** query in
-**every** year to protect a band of about six months.
+| scenes per request | refused? | biggest request | worst case anywhere in the window |
+|---|---|---|---|
+| 100 | **yes, every time** | 5.73 MB (96% of the ceiling) | 6.20 MB (over it) |
+| 90 | no | 5.11 MB (85%) | **5.66 MB (94%)** |
+| 75 | no | 4.56 MB (76%) | 4.73 MB (79%) |
+| 60 | no | 3.84 MB (64%) | 4.00 MB (67%) |
 
-Because that is what the band is. Item size follows footprint geometry, not assets: November 2018
-to April 2019 carries ~2,600-vertex polygons, about 30 KB of coordinates, where a 2024 item carries
-a quadrilateral of ~0.3 KB and the assets block is ~18 KB either way. Outside the band a 100-item
-page is **2.2 MB, 36% of the cap**. So 100 is comfortable for the overwhelming majority of the
-campaign's timeline and marginal for six months of it, which is exactly the shape an adaptive
-remedy suits and a global constant does not.
+Read the last column, not the middle one. **Ninety scenes never got refused and is still 94% of the
+ceiling** — it survived because of where the page boundaries happened to fall, not because it had
+room. That is the difference between "we saw no failures" and "this is safe", and it is why 90 was
+never a candidate.
 
-**What would change the decision.** If first-page refusals turn out to be frequent inside the band
-rather than occasional, the fallback's re-walks stop being cheaper than just running smaller, and
-75 becomes right. That is a count to watch in the logs — the step-down warning names itself — not
-something to predict from here. Note also that editing `config/providers.py` at all moves the
-mosaic-content fingerprint (measured: `ingcode-1739cd669dec92a2` to `ingcode-f75448a6d8841d0a`), so
-an in-flight store cannot be appended to across the change.
+**Why the scenes are fat, which turns out to be the whole story.** A scene's entry in the catalogue
+includes the shape of the ground it covers. Usually that is a rectangle: four corners, a couple of
+hundred bytes. But some entries carry the shape of where the imagery ACTUALLY is — tracing the edge
+of the data instead of the tile boundary. Sentinel-2 builds each image from twelve separate
+detectors, so that edge is a fine sawtooth, and drawing it takes thousands of points. One such
+entry we measured runs to 2,497 points and 98 KB, against 0.2 KB for an ordinary one. The list of
+files attached to the scene is about 18 KB either way, so it is the shape, not the imagery, that
+makes these entries heavy.
+
+Those entries are not scattered through the archive. They are confined to roughly **November 2018
+to March 2019**, and the reason is a gap in reprocessing. Sampling one day a month across the
+boundary:
+
+| month | typical points per entry | heavy entries | processing versions available |
+|---|---|---|---|
+| Aug 2018 | 5 | 0 of 50 | 00.01, 02.08, 05.00 |
+| Oct 2018 | 6 | 0 of 50 | 02.09 |
+| **Nov 2018** | **580** | **31 of 50** | **02.11 only** |
+| **Dec 2018** | **531** | **33 of 50** | **02.11 only** |
+| **Feb 2019** | **579** | **30 of 50** | **02.11 only** |
+| Apr 2019 | 6 | 0 of 50 | 02.11, 05.00 |
+| May 2019 | 7 | 0 of 50 | 02.12, 05.00 |
+| Jun 2023 | 5 | 0 of 50 | 05.09 |
+
+The heavy months are exactly the ones where version 02.11 is the ONLY version on offer. Everywhere
+else a later reprocessing exists alongside it and the catalogue serves that instead, with a simple
+rectangle. So this is not something about that season, or about the satellite. It is a stretch of
+the archive that was never reprocessed, and the original products happen to draw their outlines the
+hard way. What we have not established is why version 02.11 in particular did that; the versions
+either side of it did not, and that is an ESA processing decision we cannot see into.
+
+Two consequences follow, and both point the same way. It cannot spread — no current processing
+version produces these outlines, so no future data will bring the problem back. And it could vanish
+on its own, if that stretch is ever reprocessed.
+
+Outside the band a hundred scenes is about **2.2 MB**, roughly a third of the ceiling.
+
+**So the problem is six months of a ten-year archive**, and that is what settles it. Asking for 75
+scenes instead of 100 costs **32% more requests and 14% more time on every query in every year** —
+about half a minute on a three-and-a-half-minute query — to protect a band that is a twentieth of
+the timeline. Meanwhile the page-size fallback in this branch already handles a refusal by re-asking
+that window at half the size, so the failure a shorter date window cannot fix now recovers by
+itself, and it only pays where a refusal actually happens.
+
+An adaptive remedy fits a concentrated problem. A global setting does not.
+
+**What would change the decision.** If refusals inside the band turn out to be frequent rather than
+occasional, the re-walks stop being cheaper than simply asking for less, and 75 becomes right. The
+fallback names itself in the log every time it fires, so this is a count to read during the restart
+rather than a guess to make now. Note also that editing `config/providers.py` at all moves the
+mosaic fingerprint — measured, `ingcode-1739cd669dec92a2` to `ingcode-f75448a6d8841d0a` — so an
+in-flight store cannot be appended to across the change.
 
 ### Levers that look obvious and are closed
 
@@ -1521,7 +1559,7 @@ defect fix.
 | Earth Search page-1 refusal | 502 at `limit=250`; 200 at `limit=100`, same window | measured (§7c) |
 | Earth Search 502, BOTH kinds | **one mechanism: a response-size cap of ~6 MB** (Lambda's synchronous limit). The byte-identical cursor and window is refused at `limit=100` and served at `limit=90`, returning 5.60 MB where the hundred would have been ~6.2 MB. Item sizes vary, so which hundred the cursor and window select decides it — which is why it looked deterministic in the (cursor, window) pair, and why it appeared at page **289** of one window and page **14** of another. NOT depth, NOT patience, NOT a bad cursor | measured (§7c); supersedes the earlier "not a page size either" reading |
 | Earth Search page-size margin | largest page **served** is **5.73 MB — 96%** of the ~6 MB cap; the refused one reconstructs to 5.96 MB. Real headroom at `limit=100` is about **4%**. CORRECTS an earlier "5.32 MB, roughly 30%", which was one window's maximum quoted as the ceiling | measured (§7c) |
-| why items are fat, and when | footprint GEOMETRY, not assets. Nov 2018 – Apr 2019 items carry ~2,600-vertex polygons (~30 KB of coordinates) against a 2024 item's quadrilateral (~0.3 KB); the assets block is ~18 KB either way. Outside that band a 100-item page is **2.2 MB (36%)**; inside it, at or over the cap. Peak is March 2019 | measured, quarterly 2017–2026 then monthly across the transition (§7c) |
+| why items are fat, and when | the FOOTPRINT SHAPE, not the assets. Some items trace the edge of the actual imagery — a twelve-detector sawtooth, up to 2,497 points and 98 KB, against 0.2 KB for a plain rectangle; the assets block is ~18 KB either way. Confined to roughly **Nov 2018 – Mar 2019**, which is the stretch where processing version **02.11 is the only one on offer**: elsewhere a later reprocessing exists and the catalogue serves its rectangle instead. So it is a reprocessing GAP, not a season. Cannot spread, and could vanish if that stretch is reprocessed. Outside the band a 100-item page is **2.2 MB (36%)** | measured, one day per month across the boundary (§7c). Why 02.11 in particular did this is NOT established |
 | smaller page sizes, measured | `limit=90` makes zero refusals but its worst 90 consecutive items are **94%** of the cap — clean by luck. `limit=75` leaves **21%** margin against the fattest 75 anywhere in the worst week. Costs **+32% requests, +14% wall clock**. `limit=60` doubles the extra requests for 1.4 s | measured (§7c) |
 | page size changes the WALK order | a window re-cut for depth appends its first page BEFORE deciding to re-cut, so each such parent hoists exactly `max_page_size` items to the head of the output — 300 items at 100, 225 at 75. Harmless ONLY because the sort key is total; it would have changed painted pixels before the `item.id` tie-breaker | measured, three hashes (§7c) |
 | refusal levers, in cost order | **shorter window** first, then **smaller page** halving to `_MIN_PAGE_SIZE = 10`. The page lever covers the two refusals shortening cannot reach — a FIRST page, and a single day — both of which failed a leg outright before it | shipped (§7c) |

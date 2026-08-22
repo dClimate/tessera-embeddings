@@ -553,11 +553,21 @@ emits them at all.
 
 **Corrected in place on integration.** This section described the pairing set as `RasterioIOError`
 and `CPLE_`; cause 5 needed the same pairing for a different marker class and described it as those
-two plus `WarpOperationError` and `HTTP response code:`. They are now **one**
-`_SOURCE_READER_MARKERS` tuple holding the union, shared by both predicates. Neither section's
-reasoning changes — every added string is GDAL's own vocabulary, which is the whole basis of the
-pairing — but a missing object reported as `HTTP response code: 404` now pairs too, where the
-narrower tuple would have re-raised it.
+two plus `WarpOperationError`. They are now **one** `_SOURCE_READER_MARKERS` tuple, shared by
+both predicates, holding only the reader's own vocabulary: `RasterioIOError`,
+`WarpOperationError`, `CPLE_`.
+
+**CORRECTED 2026-08-22.** That tuple briefly also held `HTTP response code:`, and this paragraph
+claimed the benefit was that a missing object reported as `HTTP response code: 404` would then
+pair. It was a defect, not a benefit: the refusal markers spell 403, 500, 502, 503 and 504 with
+that same prefix, so one message became both the refusal and its own corroboration, and a fault
+from the destination store carrying that text was attributed to the source. The prefix is out of
+the reader markers. The 404 case it was reaching for is handled where it belongs instead —
+`HTTP response code: 404` is now one of the MISSING-OBJECT markers, which still needs an
+independent reader marker beside it. That matters more than it sounds: the optical assets are
+plain `https://` hrefs, so GDAL reads them through its HTTP driver and reports a missing object
+as a bare status rather than as `ObjectNotFound`, and without the 404 form the optical step-down
+would not have fired on the shape that path actually produces.
 
 ### The leg was not even retried, for an unrelated reason
 

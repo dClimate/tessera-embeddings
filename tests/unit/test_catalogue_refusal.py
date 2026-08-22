@@ -14,6 +14,7 @@ sides are disjoint by construction can only ever pass.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import pickle
 import re
@@ -709,3 +710,153 @@ class TestARefusalNoShorterWindowCanReachAsksForASmallerPage:
         ids = [i.id for i in items]
         assert ids == ["p1", "p2", "later"], f"expected each item once, in walk order, got {ids}"
         assert len(ids) == len(set(ids))
+
+
+class TestARefusalThatKeepsArrivingCannotAmplify:
+    """Both levers terminate on their own; together, across a window, they multiplied.
+
+    Each is individually bounded — windows bottom out at a single day, pages at
+    `_MIN_PAGE_SIZE` — so nothing hangs. But a refusal that keeps arriving, a real gateway
+    outage rather than the size cap, makes both recurse across the whole window. Measured
+    against a stub refusing every walk past page 1 before this bound existed: a one-month
+    query fired 328 requests, a year 3,648, and nine years 32,868 — all aimed at a service
+    already answering with 5xx.
+    """
+
+    @staticmethod
+    def _always_refuses_past_page_one(start: str, end: str) -> tuple[int, BaseException | None]:
+        """Walk a window whose every search serves one page and then 502s. Returns the count."""
+        provider = stac._get_provider_config("earth-search")
+        collection = stac._get_collection_config("earth-search", "sentinel-2-l2a")
+        searches = 0
+        guard = threading.Lock()
+
+        def search(**_kwargs):
+            nonlocal searches
+            with guard:
+                searches += 1
+            result = MagicMock()
+
+            def pages():
+                yield {"features": [_item("a")]}
+                raise _unretried(502)
+
+            result.pages_as_dicts.return_value = pages()
+            return result
+
+        with patch.object(stac, "StacApiIO"), patch.object(stac, "Client") as client:
+            client.open.return_value.search.side_effect = search
+            try:
+                stac._query_stac_items(provider, collection, None, start, end, bbox=(-3.0, 50.0, -2.0, 51.0))
+            except BaseException as exc:
+                return searches, exc
+        return searches, None
+
+    def test_it_gives_up_after_a_bounded_number_of_replacements(self) -> None:
+        searches, raised = self._always_refuses_past_page_one("2019-02-28", "2019-04-01")
+
+        assert isinstance(raised, CatalogueQueryError), "it must still report the refusal"
+        assert searches <= 4 * stac._MAX_REFUSAL_RE_PARTITIONS, (
+            f"{searches} searches for one month is amplification, not recovery"
+        )
+
+    def test_the_bound_does_not_grow_with_the_window(self) -> None:
+        """The property that matters: a year must not cost ten times a month.
+
+        Before the budget the cost scaled with the days in the window, because every branch
+        of the recursion had its own independent stopping condition.
+        """
+        month, _ = self._always_refuses_past_page_one("2019-02-28", "2019-04-01")
+        year, _ = self._always_refuses_past_page_one("2019-01-01", "2019-12-31")
+        nine_years, _ = self._always_refuses_past_page_one("2017-01-01", "2025-12-31")
+
+        # Not exactly equal: how a window spends the budget depends a little on how many pieces
+        # it can be cut into. What must not happen is the cost SCALING with the days, which is
+        # what it did before — 328 for a month against 32,868 for nine years.
+        assert nine_years <= month + 4, f"{month}, {year}, {nine_years} — the cost must not grow"
+        assert year <= month + 4
+
+
+class TestTheCatalogueRootKeepsTheRetryTheLadderStoppedGiving:
+    """The root is a small static document, so no remedy in this module applies to it.
+
+    A shorter window and a smaller page both work by making the ANSWER smaller. The catalogue
+    root cannot be made smaller, so taking 502 out of this provider's ladder left the root with
+    no retry at all — and that is worse than one wasted attempt, because the leg-retry layer
+    declares a refusal deterministic once it sees the identical signature twice. A gateway blip
+    on the root could therefore end a leg rather than delay it.
+    """
+
+    @staticmethod
+    def _open(monkeypatch, failures: list[BaseException]):
+        """Open the root, failing the first ``len(failures)`` attempts. Returns the count."""
+        monkeypatch.setattr(stac, "_ROOT_OPEN_BACKOFF_S", 0.0)
+        provider = stac._get_provider_config("earth-search")
+        attempts = 0
+
+        def opener(*_a, **_k):
+            nonlocal attempts
+            attempts += 1
+            if attempts <= len(failures):
+                raise failures[attempts - 1]
+            return MagicMock()
+
+        with patch.object(stac, "StacApiIO"), patch.object(stac, "Client") as client:
+            client.open.side_effect = opener
+            clients = stac._PerThreadClient(provider, "sentinel-2-l2a", "2021-09-01/2021-10-02")
+            try:
+                clients.get()
+            except CatalogueQueryError as exc:
+                return attempts, exc
+        return attempts, None
+
+    def test_a_transient_root_502_is_retried_rather_than_ending_the_leg(self, monkeypatch) -> None:
+        attempts, raised = self._open(monkeypatch, [_unretried(502), _unretried(502)])
+
+        assert raised is None, "a root 502 that clears must not surface at all"
+        assert attempts == 3
+
+    def test_a_root_502_that_never_clears_is_reported_as_page_zero(self, monkeypatch) -> None:
+        """It must still give up, and still be named as the root rather than as a search."""
+        attempts, raised = self._open(monkeypatch, [_unretried(502)] * 10)
+
+        assert attempts == stac._ROOT_OPEN_ATTEMPTS
+        assert isinstance(raised, CatalogueQueryError)
+        assert raised.request.page == 0
+        assert raised.request.area == "catalogue-root"
+
+    def test_only_the_status_the_ladder_dropped_is_retried_here(self, monkeypatch) -> None:
+        """503 still has its full ladder underneath, so retrying it again here would double it."""
+        attempts, raised = self._open(monkeypatch, [_refused(503)])
+
+        assert attempts == 1, "a status the ladder still holds must not be retried a second time"
+        assert isinstance(raised, CatalogueQueryError)
+
+
+class TestTheRemedyFollowsTheProviderNotJustTheStatus:
+    """A 502 from a provider we never measured must not be answered with this workaround.
+
+    Re-cutting is measured for one catalogue's response-size cap. Elsewhere a 502 keeps its full
+    ladder, so it reaches us having already spent the backoff — and re-cutting it would hand
+    that same ladder to every child window, multiplying an outage instead of recovering from it.
+    """
+
+    def test_a_provider_without_the_flag_is_not_re_cut(self, caplog) -> None:
+        provider = dataclasses.replace(stac._get_provider_config("earth-search"), refuses_oversized_pages=False)
+        collection = stac._get_collection_config("earth-search", "sentinel-2-l2a")
+        pages = _pages_then_refusal([{"features": [_item("a")]}], _refused(502))
+
+        with (
+            patch.object(stac, "StacApiIO"),
+            patch.object(stac, "Client") as client,
+            caplog.at_level(logging.WARNING, logger=stac.__name__),
+            pytest.raises(CatalogueQueryError),
+        ):
+            search = client.open.return_value.search
+            search.return_value.pages_as_dicts.return_value = pages
+            stac._query_stac_items(
+                provider, collection, None, "2021-09-01", "2021-10-02", bbox=(-3.0, 50.0, -2.0, 51.0)
+            )
+
+        assert "shorter window" not in caplog.text
+        assert "items per page" not in caplog.text

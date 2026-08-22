@@ -764,10 +764,17 @@ _UNREADABLE_MARKERS = (
 #: Three forms because three layers can be the one that surfaces the condition: GDAL and
 #: rasterio raise ``ObjectNotFound``, the S3 API answers with the ``NoSuchKey`` code, and the
 #: response body carries the sentence.
+#: How a source object that was never published READS. Two vocabularies, because two GDAL drivers
+#: are in play: an `s3://` href goes through the S3 driver and says `ObjectNotFound`, while the
+#: plain `https://` hrefs the optical assets actually carry go through the HTTP driver and say
+#: only `HTTP response code: 404`. Matching one form and not the other is why the optical
+#: step-down would not have fired on the path it was written for. Each still needs an independent
+#: :data:`_SOURCE_READER_MARKERS` corroboration, so the status alone claims nothing.
 _MISSING_OBJECT_MARKERS = (
     "ObjectNotFound",
     "NoSuchKey",
     "The specified key does not exist",
+    "HTTP response code: 404",
 )
 
 
@@ -828,7 +835,14 @@ _PROVIDER_REFUSAL_MARKERS = (
     "InternalError",
     "HTTP response code: 403",
     "HTTP response code: 500",
+    # 502 and 504 for the same reason 404 is in the missing-object list: the optical assets are
+    # plain `https://` hrefs, so a gateway failure reaches us as a bare status from GDAL's HTTP
+    # driver. Without these it is claimed by neither predicate, and a source outage wrapped in
+    # `Chunk and warp failed` is then recorded as permanently unreadable DATA — which tells an
+    # operator to look for corruption when they should be waiting for the provider.
+    "HTTP response code: 502",
     "HTTP response code: 503",
+    "HTTP response code: 504",
 )
 
 #: What makes a failure the SOURCE reader's: GDAL is the layer that reported it.
