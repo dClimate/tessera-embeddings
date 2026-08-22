@@ -32,7 +32,7 @@ from tests.parity.helpers import assert_zarr_equivalent
 CASSETTE_NAME = "test_s2_roi_parity"
 
 # Denver, CO. The fixture covers July 2024 — non-trivial S2
-# cloud coverage that exercises the painter's-algorithm sort.
+# cloud coverage that exercises the cloud sort.
 DENVER_DATES = ("2024-07-01", "2024-07-31")
 FORCE_CRS = "EPSG:32613"  # UTM zone 13N covers Denver
 

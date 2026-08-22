@@ -157,6 +157,14 @@ needs enough points to show it is monotonic before one of them becomes a recomme
   the document says so rather than proposing a third story.
 - **"Looks like a production backlog."** It was a satellite failure — Sentinel-1B, December
   2021. (`radar_source_coverage_2026_08.md`)
+- **"`odc` mosaics by a painter's algorithm, so the last item wins a pixel."** Asserted for the
+  whole life of the code and never measured. `odc.loader`'s default fuser writes only where the
+  destination is still empty, so the FIRST valid source wins. Both ingest paths sorted
+  cloudiest-first on the strength of it, handing every same-day overlap to the CLOUDIEST scene
+  available. Two things kept it alive: the library's own docstring says "only fill where **src** is
+  nodata" where the code masks on **dst**, so checking the docstring confirmed the error; and every
+  test in the area asserted the order handed *to* the loader, never the pixels that came *out*.
+  (`solar_day_fusion_order_2026_08.md`)
 
 **The cure:** an unexplained result is a publishable state. Recording "the effect is real
 and the mechanism is unknown" costs nothing and blocks nothing; a mechanism invented to
@@ -167,6 +175,12 @@ close the gap becomes load-bearing for later decisions and then has to be dug ou
 The only class here that is a process failure rather than a measurement failure — and the
 one most likely to recur, because it is invisible to whoever makes it.
 
+- **The fix for the fusion ordering swept "descending" to "ascending" and left "last" standing.**
+  `group_items_by_date`'s docstring claimed a CLOUD-DESCENDING sort one line above "the clearest
+  tile comes first", and the ingest README described the per-date baseline as "the last item's, the
+  clearest tile, because the query sorts cloud-ascending" — wrong twice over, since under ascending
+  the last item is the cloudiest and the code now keeps the first. Both caught in review of the
+  correcting change itself. (`solar_day_fusion_order_2026_08.md`)
 - **A profile section contradicted its own radar finding for a day**: it restated "cost per
   chunk tracks `t_kept`" as a surviving conclusion *two sections after* the finding that
   showed the range mixes two populations, then used the restatement to rule out re-basing

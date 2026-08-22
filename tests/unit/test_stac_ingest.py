@@ -515,10 +515,8 @@ class TestSolarDayFusionOrdering:
     valid source of a group supplies a pixel and later ones fill its gaps — the list handed to the
     loader must therefore START with the clearest scene.
 
-    This asserted the opposite until 2026-08-22, on the belief that odc mosaics by a painter's
-    algorithm with the last item overwriting the rest. It does not, and the consequence was that the
-    CLOUDIEST scene won every same-day overlap. `test_solar_day_fusion.py` pins the mechanism itself
-    against real rasters; this pins the order handed to the loader.
+    `test_solar_day_fusion.py` pins the mechanism itself against real rasters; this pins the order
+    handed to the loader.
     """
 
     def test_the_clearest_scene_of_a_solar_day_is_loaded_first(self, mock_stac_item, monkeypatch):

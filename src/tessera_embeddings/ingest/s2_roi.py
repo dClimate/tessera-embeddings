@@ -514,17 +514,11 @@ def ingest_s2_roi_reflectance(
         # the group shares it by construction — it is the grouping key — so any item yields
         # it, and shifting one item is cheaper than threading the key through the pipeline.
         #
-        # Deliberately NOT taken from the loaded dataset's own time coordinate. odc stamps
-        # each group with `group[0].nominal_datetime`, and `preserve_original_order=True`
-        # makes group[0] the CLEAREST item, whose acquisition time is arbitrary within the
-        # day. Where the solar offset is large
-        # enough to cross UTC midnight, that timestamp's calendar date can be the day
-        # BEFORE the solar day — so two consecutive solar days can normalise onto the same
-        # date and collide. Measured on 56N (+10 h): six of twenty-two days landed on the
-        # previous date, and which six depended on cloud cover, not geography.
-        # Items are solar-day-normalised at the query chokepoint, so every item in the
-        # group carries the same canonical timestamp and this is the solar day itself —
-        # no offset here, and no dependence on WHICH item the sort left first.
+        # Deliberately NOT taken from the loaded dataset's own time coordinate, which odc stamps
+        # from `group[0]` and which therefore depends on whichever item the sort left first.
+        # Items are solar-day-normalised at the query chokepoint, so every item in the group
+        # carries the same canonical timestamp and this is the solar day itself — no offset
+        # here, and no dependence on order.
         date = day_items[0].datetime.strftime("%Y-%m-%d")
 
         # ONE load per date, serving both the coverage gate and the write. SCL is
@@ -1073,8 +1067,10 @@ def ingest_s2_roi_reflectance(
         # cover ASCENDING — and applying it again here covers a supply that did not come through
         # it, since both suppliers are injectable. `group_items_by_date` preserves this order.
         #
-        # Reversed on 2026-08-22. It had been cloudiest-first, written for a painter's algorithm
-        # odc does not implement, which handed every same-day overlap to the CLOUDIEST scene.
+        # `id` last, and not decoration: the first two keys can TIE — two scenes of one solar day
+        # with equal cloud cover — and a stable sort then keeps whatever order the supplier
+        # produced. Since the fuser keeps the first valid source, an untied sort would let the
+        # supplier decide output pixels. A third key makes the sequence a function of the items.
         #
         # Both the sort and the grouping key off the SOLAR day, not the UTC date, because
         # that is what the loader groups by. Using UTC here let a group the loader saw as
@@ -1085,6 +1081,7 @@ def ingest_s2_roi_reflectance(
             key=lambda it: (
                 it.datetime.strftime("%Y-%m-%d"),
                 float(it.properties.get("eo:cloud_cover", 100)),
+                it.id,
             )
         )
         by_date = group_items_by_date(items)

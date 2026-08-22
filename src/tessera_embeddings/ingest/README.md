@@ -424,13 +424,6 @@ supplies a pixel and later ones fill the gaps it left, which is the behaviour wa
 scene covering a pixel wins it, and a hole in the clearest scene falls through to the next-clearest
 rather than to nothing.
 
-> **This was backwards until 2026-08-22.** The sort was cloudiest-first, written on the belief that
-> odc mosaics by a painter's algorithm with the last item overwriting the ones before it. It does
-> not, so the **cloudiest** scene of every solar day won every overlap — silently, since the output
-> had the right shape, the right dates and plausible pixels. Nothing caught it because every test in
-> the area asserted the *order handed to the loader* and none asserted the *pixels that came out*.
-> `tests/unit/test_solar_day_fusion.py` now does, against real rasters through the real loader.
-
 An item declaring no `eo:cloud_cover` reads as 100 and so sorts last, where it can only fill gaps:
 unknown never displaces measured.
 
@@ -756,7 +749,7 @@ refuses and an unresolvable band name fails the load.
 `baselines_applied` attribute. Nothing masks it, and nothing derives a correction from it.
 
 One integer per date is a **lossy** record of a day whose tiles declare different baselines, and
-those days now load — the three-tile day in ADR 021 is exactly that shape. The value is the last
+those days now load — the three-tile day in ADR 021 is exactly that shape. The value is the first
 item's, the clearest tile, because the query sorts a date's items cloud-ascending; the day's other
 vintages are recorded nowhere. Left that way deliberately: the attribute is written and merged
 forward on append, and nothing in this package reads a value from it, so widening its type would
@@ -1349,13 +1342,12 @@ the widths measured. The campaign record's §4.9 has each refutation.
 A mosaic slice represents one **solar day**, and it is labelled with that day — taken from the
 grouping key, not from the loaded dataset's own time coordinate.
 
-That distinction is load-bearing. `odc.stac.load` stamps each group with
-`group[0].nominal_datetime`, and because `preserve_original_order=True` with a clearest-first
-sort, `group[0]` is the CLEAREST item, whose acquisition time is arbitrary
-within the day. Where the solar offset crosses UTC midnight, that timestamp's calendar date can
-be the day BEFORE the solar day — so two consecutive solar days normalise onto one date. That
-blocked far-eastern zones from ingesting at all: the batched write rejected the dates as not
-strictly increasing, the unbatched write rejected the second as a duplicate time slot.
+That distinction is load-bearing. `odc.stac.load` stamps each group from `group[0]`, which ties the
+label to whichever item the sort left first. A label taken that way can disagree with the solar day
+wherever the solar offset crosses UTC midnight, and two consecutive solar days then collide on the
+time axis — the batched write rejects the dates as not strictly increasing, the unbatched write
+rejects the second as a duplicate time slot. Taking the day from the grouping key removes the
+dependence on order entirely.
 
 Taking the day from the grouping makes three things true by construction rather than by care:
 labels are unique per slice, monotonic across them (consecutive solar days differ by exactly one

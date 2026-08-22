@@ -1,16 +1,13 @@
 """Which of two overlapping scenes of one solar day actually supplies a pixel.
 
-**This is the test that was missing, and its absence let the answer be wrong for the whole life of
-the code.** Every other test in this area asserts the ORDER handed to `odc.stac.load`, which is
-only half the question — the other half is what odc does with that order, and that was assumed
-rather than checked. It was assumed to be a painter's algorithm, with the last item overwriting the
-ones before it. It is not: `odc.loader`'s default fuser is `nodata_fuser`, which writes only where
-the destination is still empty, so the FIRST valid source wins. The sort was therefore backwards,
-and the CLOUDIEST scene of every solar day won every overlap.
+Asserting the ORDER handed to `odc.stac.load` is only half the question. The other half is what odc
+does with that order: its default fuser is `nodata_fuser`, which writes only where the destination
+is still empty, so the FIRST valid source of a group supplies a pixel and later ones fill its gaps.
 
-So this test refuses to mock the loader. Two real single-band GeoTIFFs on one grid, two real STAC
-items on one solar day, through the production `_load_from_stac` with the production load kwargs.
-The assertion is on the PIXELS that come out.
+**This test therefore refuses to mock the loader**, because a mock would assert the half that was
+never in doubt. Two real single-band GeoTIFFs on one grid, two real STAC items on one solar day,
+through the production `_load_from_stac` with the production load kwargs. The assertion is on the
+PIXELS that come out.
 """
 
 from __future__ import annotations
@@ -119,8 +116,8 @@ def scenes(tmp_path: pathlib.Path):
 def test_the_clearest_scene_supplies_the_overlap(scenes) -> None:
     """THE rule. Clearest first, and the clearest is what comes out.
 
-    Handed the other way round the cloudy scene wins, which is what the code did before
-    2026-08-22 — see the sort in `query_stac_items`.
+    Handed the other way round the cloudy scene wins, which is what makes the sort in
+    `query_stac_items` load-bearing rather than cosmetic.
     """
     cloudy, clear = scenes
     assert np.unique(_load([clear, cloudy])).tolist() == [CLEAR_DN]
@@ -129,9 +126,8 @@ def test_the_clearest_scene_supplies_the_overlap(scenes) -> None:
 def test_the_first_source_wins_rather_than_the_last(scenes) -> None:
     """The mechanism, stated as the thing it is: position decides, and it is the FIRST position.
 
-    This is the assertion the code was missing. It says nothing about clouds — it pins that odc
-    fuses first-wins, so that reversing the sort is known to reverse the outcome rather than
-    assumed to.
+    Says nothing about clouds — it pins that odc fuses first-wins, so reversing the sort is known
+    to reverse the outcome rather than assumed to.
     """
     cloudy, clear = scenes
     assert np.unique(_load([cloudy, clear])).tolist() == [CLOUDY_DN]
@@ -139,7 +135,7 @@ def test_the_first_source_wins_rather_than_the_last(scenes) -> None:
 
 
 def test_a_hole_in_the_clearest_scene_falls_through_to_the_next(scenes, tmp_path) -> None:
-    """Why first-wins plus clearest-first is the RIGHT pairing, not merely a corrected one.
+    """Why first-wins plus clearest-first is the RIGHT pairing, not merely a self-consistent one.
 
     The clear scene wins the ground it covers, and where it has no observation the cloudier scene
     still fills the gap — so the day keeps its coverage instead of trading it for clarity.

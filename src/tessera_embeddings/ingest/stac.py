@@ -1611,12 +1611,8 @@ def query_stac_items(
     # scene that covers a pixel wins it, and a hole in the clearest scene falls through to the
     # next-clearest rather than to nothing.
     #
-    # **This ordering was reversed until 2026-08-22, on the belief that odc mosaics by a painter's
-    # algorithm with the last item overwriting the others. It does not, and the consequence was
-    # that the CLOUDIEST scene of a solar day won every overlap** — silently, because the output
-    # had the right shape, the right dates and plausible pixels. Pinned end to end by
-    # `tests/unit/test_solar_day_fusion.py`, which loads two real single-pixel-value scenes of one
-    # solar day through this path and asserts which one survives.
+    # Pinned end to end by `tests/unit/test_solar_day_fusion.py`, which loads two real scenes of
+    # one solar day through this path and asserts which one survives.
     #
     # An item declaring no cloud cover reads as 100, so it sorts last and can only fill gaps. That
     # is the cautious end under this ordering: unknown never displaces measured.
@@ -1854,7 +1850,7 @@ def group_items_by_date(items: list[Any]) -> dict[str, list[Any]]:
     single 2-D slice), so the mismatch surfaces as a dimension conflict rather than as anything
     that names the cause.
 
-    Within-group order is the caller's. ``query_stac_items`` sorts a date CLOUD-DESCENDING, so the
+    Within-group order is the caller's. ``query_stac_items`` sorts a date CLOUD-ASCENDING, so the
     clearest tile comes first — which is what the loader's fuser needs, since it writes only where
     the destination is still empty and so keeps the FIRST valid source of a group.
 
