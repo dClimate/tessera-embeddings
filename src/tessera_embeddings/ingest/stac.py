@@ -1108,9 +1108,14 @@ class _PerThreadClient:
     it also gives each thread its own HTTP connection, which is what a concurrent walk
     wants anyway.
 
-    The first client is opened on the CALLING thread, before any pool exists, so an
-    unreachable catalogue is still reported as the catalogue root it is rather than as a
-    task failure inside some window's walk.
+    One root fetch per worker thread is the cost, and it is the whole cost: the root is a small
+    static document behind a CDN, and a thread opens it once for the life of the query. There
+    was briefly an extra one — the calling thread opened a client eagerly so an unreachable
+    catalogue would be named as the root rather than surfacing from inside a window's walk — but
+    that client was never used to search, because the walks all run on pool threads. It was
+    removed once it was clear the naming does not depend on where the failure happens: this class
+    builds the page-0 `catalogue-root` error itself, and `_fill_window_tree` re-raises it
+    unchanged, so a root failure reads identically from a worker.
     """
 
     def __init__(self, provider: STACProvider, collection_id: str, window: str) -> None:
@@ -1387,8 +1392,6 @@ def _query_stac_items(
     t0 = time.monotonic()
     logger.info(f"Opening STAC catalog: {provider.catalog_url}")
     clients = _PerThreadClient(provider, collection_config.collection_id, window)
-    clients.get()
-    logger.info(f"STAC catalog opened in {time.monotonic() - t0:.1f}s, executing search")
 
     keep_assets = _loadable_assets(collection_config, extra_bands)
     # A worklist of date windows, not one walk: a window the catalogue will not page to the
