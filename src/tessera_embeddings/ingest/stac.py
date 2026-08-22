@@ -883,37 +883,50 @@ def _area_label(query_params: dict[str, Any], tile_id: str | None) -> str:
     return "area=unspecified"
 
 
+#: Instant a window's interior boundary is rendered at. Consecutive windows abut on the
+#: SAME instant and the catalogue's range is inclusive at both ends, so their union has no
+#: gap and their only overlap is that one instant, which the caller's id dedupe absorbs.
+_BOUNDARY_INSTANT = "T00:00:00Z"
+
+
+def _window_days(start_date: str, end_date: str) -> tuple[datetime.date, int]:
+    """A window's first day and its length in days, whichever form its bounds take.
+
+    Bounds arrive either as a bare ``YYYY-MM-DD`` — which the catalogue client expands to
+    that whole day — or as one of the boundary instants this function's own output carries.
+    An instant end is EXCLUSIVE of its own day for length purposes: a window ending
+    ``2019-03-06T00:00:00Z`` covers through the 5th plus a single instant of the 6th.
+    """
+    first = datetime.date.fromisoformat(start_date[:10])
+    last_day = datetime.date.fromisoformat(end_date[:10])
+    last_exclusive = last_day if len(end_date) > 10 else last_day + datetime.timedelta(days=1)
+    return first, (last_exclusive - first).days
+
+
 def split_query_window(start_date: str, end_date: str, parts: int) -> list[tuple[str, str]]:
     """``[start_date, end_date]`` as ``parts`` shorter windows whose union is the input.
 
-    A re-partition, never a narrowing: the windows match exactly the items the input
-    matched. Consecutive windows normally SHARE their boundary day rather than abutting it,
-    so no acquisition can fall between them, and the caller's id dedupe absorbs the repeat.
+    A re-partition, never a narrowing, and exact in both directions: the outer bounds are
+    the caller's own strings passed straight back, and every interior boundary is one
+    instant shared by the window that ends there and the window that starts there. The
+    union is therefore the input window with no gap, and the overlap is a single instant per
+    seam rather than a whole repeated day.
 
-    Sharing a day costs a day of length, so it cannot shorten a two-day window — and a
-    window that cannot be shortened is one a refusal has nothing left to try on. At that
-    floor only, the windows ABUT instead. That leaves the sub-second gap between one day's
-    last instant and the next day's first, which is a real if remote risk, taken because
-    the alternative is a leg that fails outright.
+    That exactness is why the boundary is an instant and not a date. A bare date end is
+    expanded by the client to ``T23:59:59Z``, so windows that abut on consecutive DATES
+    leave the last second of each seam's earlier day unasked for — a second the unsplit
+    window would have covered.
 
     Returns ``[]`` for fewer than two parts and for a single day — the caller's signal to
     stop rather than re-partition again, and what makes re-partitioning terminate.
     """
-    start = datetime.date.fromisoformat(start_date)
-    end = datetime.date.fromisoformat(end_date)
-    days = (end - start).days + 1
+    first, days = _window_days(start_date, end_date)
     parts = min(parts, days)
     if parts < 2:
         return []
-    edges = [start + datetime.timedelta(days=days * i // parts) for i in range(parts)]
-    edges.append(end + datetime.timedelta(days=1))
-    for trailing_edge in (datetime.timedelta(0), datetime.timedelta(days=-1)):
-        windows = [(edges[i], min(edges[i + 1] + trailing_edge, end)) for i in range(parts)]
-        windows = [(w_start, w_end) for w_start, w_end in windows if w_start <= w_end]
-        shortened = len(windows) > 1 and all((w_end - w_start).days + 1 < days for w_start, w_end in windows)
-        if shortened:
-            return [(w_start.isoformat(), w_end.isoformat()) for w_start, w_end in windows]
-    return []
+    edges = [first + datetime.timedelta(days=days * i // parts) for i in range(parts)]
+    bounds = [start_date] + [f"{edge}{_BOUNDARY_INSTANT}" for edge in edges[1:]] + [end_date]
+    return [(bounds[i], bounds[i + 1]) for i in range(parts)]
 
 
 def _parts_for_depth(page: dict[str, Any]) -> int:
@@ -1063,8 +1076,9 @@ def _query_stac_items(
                     raise_catalogue_query_error(request, exc, log=logger, items_so_far=len(items))
                 for raw in page.get("features", []):
                     # Dedupe across every search this query runs: a granule straddling +/-180
-                    # is returned by both antimeridian halves, and one dated on a boundary day
-                    # by both windows sharing it. Loading it twice would double-count the
+                    # is returned by both antimeridian halves, and one acquired exactly on a
+                    # boundary instant by both windows meeting there. Loading it twice would
+                    # double-count the
                     # solar day. `id` is required by the STAC spec; an item without one cannot
                     # be deduped, and defaulting it would collapse EVERY such item into a
                     # single entry — so say so rather than silently drop data.

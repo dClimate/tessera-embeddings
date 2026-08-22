@@ -121,10 +121,11 @@ one query = a WORKLIST of date windows, not one cursor walk
       |   page 1 reports numberMatched > _MAX_QUERY_ITEMS, so cut before walking deep
       v
    +--------+--------+--------+--------+--------+--------+
-   | 02-28  | 03-05  | 03-11  | 03-16  | 03-22  | 03-27  |   consecutive windows SHARE
-   |  ..    |  ..    |  ..    |  ..    |  ..    |  ..    |   their boundary day; the id
-   | 03-05  | 03-11  | 03-16  | 03-22  | 03-27  | 04-01  |   dedupe absorbs the repeat
-   +--------+--------+--------+--------+--------+--------+
+   | 02-28  | 03-05T | 03-11T | 03-16T | 03-22T | 03-27T |   consecutive windows meet on
+   |  ..    |  ..    |  ..    |  ..    |  ..    |  ..    |   one shared INSTANT, so their
+   | 03-05T | 03-11T | 03-16T | 03-22T | 03-27T | 04-01  |   union has no gap and repeats
+   +--------+--------+--------+--------+--------+--------+   nothing but that instant
+                                                             (T = T00:00:00Z)
       OK       OK       OK      502!      OK       OK
                                  |
                                  v   refused past page 1 -> re-cut this window only
@@ -133,22 +134,35 @@ one query = a WORKLIST of date windows, not one cursor walk
                           +-- 03-19 .. 03-22   502!
                                 +-- 03-19 .. 03-21   OK
                                 +-- 03-21 .. 03-22   502!
-                                      +-- 03-21 .. 03-21   OK  <- one day: recursion floor,
-                                      +-- 03-22 .. 03-22   OK     and the only place the
-                                                                  windows abut
+                                      +-- 03-21 .. 03-22T  OK  <- one day each: the
+                                      +-- 03-22T .. 03-22  OK     recursion floor
 
   union of the windows == the input window;  items keyed by id across all of them
 ```
 
-The re-partition is a pure re-cut of the window, never a narrowing: the shorter windows'
-union is exactly the input window, and consecutive windows deliberately **share** their
-boundary day rather than abutting it, so no acquisition can fall between them (the catalogue
-is asked for whole days and expands them to instants itself, so abutting would leave a
-sub-second gap at midnight). Items are deduped by `id` across every search a query runs,
-which is what absorbs both that overlap and the antimeridian one. The one exception is a
-two-day window, which sharing a day cannot shorten: there the windows abut, because the
-alternative is a refused window with nothing left to try. Measurements are in
-[the ingest campaign record](../../../context_docs/design/ingest_optimization_campaign_2026_07.md).
+The re-partition is a pure re-cut of the window, never a narrowing, and it is exact in both
+directions: the outer bounds are the caller's own date strings handed straight back, and every
+interior boundary is a single **instant** (`T00:00:00Z`) shared by the window that ends there
+and the window that starts there. The catalogue's range is inclusive at both ends, so the union
+is the input window with no gap and no overhang, and the only overlap is that one instant.
+
+The boundary is an instant rather than a date because the client expands a bare date end to
+`T23:59:59Z`: windows abutting on consecutive DATES would leave the last second of each seam's
+earlier day unasked for, a second the unsplit window covers. Sharing the whole boundary DAY
+also closes that gap, and was how this first shipped, but it makes every seam re-fetch a full
+day for the dedupe to discard — about 13 page requests each at Earth Search. Items are still
+deduped by `id` across every search a query runs, which absorbs the boundary instant and the
+antimeridian overlap alike.
+
+**Item order.** The re-partition does change the order items are *walked* in — one walk returns
+the window newest-first, the worklist returns window by window in date order — and that matters
+because `query_stac_items` sorts by `(solar date, cloud cover DESC)` with a stable sort, so ties
+keep their input order and the painter writes the last one for a pixel. The sort restores the
+single-walk order, because each solar date's items land in exactly one window in catalogue
+order. Verified against an unsplit walk at several part counts; see
+[the ingest campaign record](../../../context_docs/design/ingest_optimization_campaign_2026_07.md),
+which also records the measurements and the two optimisations that are closed (a larger page,
+and server-side field selection).
 
 #### When the catalogue refuses: naming the request, and telling the two refusals apart
 

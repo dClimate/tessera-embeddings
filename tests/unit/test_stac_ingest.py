@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from pystac_client.item_search import ItemSearch
 
 from tessera_embeddings.config import (
     LANDSAT_C2_BANDS,
@@ -986,35 +987,94 @@ class TestADeepWindowIsQueriedAsShorterOnes:
 class TestSplitQueryWindow:
     """The re-partition itself: it must cover the input, and it must terminate."""
 
+    @staticmethod
+    def _sent(start: str, end: str) -> tuple[str, str]:
+        """The instants the catalogue is actually asked for, per the client's own expansion.
+
+        Read out of ``pystac_client`` rather than restated here, because the whole point of
+        an instant boundary is what the client does to a bare date: expand it to
+        ``T23:59:59Z`` and leave the last second of that day unasked for. A change to that
+        expansion upstream must fail this, not be agreed with by a local copy of it.
+        """
+        expanded = ItemSearch(url="http://example.invalid/search", datetime=f"{start}/{end}")
+        low, _, high = expanded.get_parameters()["datetime"].partition("/")
+        return low, high
+
     def test_the_parts_cover_every_day_of_the_input(self):
         parts = split_query_window("2024-03-01", "2024-03-30", 4)
         assert parts[0][0] == "2024-03-01"
         assert parts[-1][1] == "2024-03-30"
-        # Each window picks up where the last left off, SHARING that day rather than
-        # skipping it — an abutting cut would leave a gap no caller could see.
+        # Each window picks up where the last left off, SHARING that boundary, so no
+        # acquisition can fall between them.
         assert [later[0] for later in parts[1:]] == [earlier[1] for earlier in parts[:-1]]
+
+    def test_the_union_is_the_input_exactly_with_no_gap_and_no_overhang(self):
+        """The property the whole re-partition rests on, checked on the wire form.
+
+        Two failures are possible and both are silent. A GAP drops items the unsplit window
+        would have returned, which reads downstream as missing data. An OVERHANG returns
+        items it would not have, which changes a mosaic's content for the same request. The
+        interior boundaries must therefore be shared instants, and the outer bounds must be
+        the caller's own strings.
+        """
+        for start, end, parts in [
+            ("2024-03-01", "2024-03-30", 4),
+            ("2019-02-28", "2019-04-01", 6),
+            ("2019-03-21", "2019-03-22", 2),
+            ("2019-03-16", "2019-03-19T00:00:00Z", 2),
+        ]:
+            windows = split_query_window(start, end, parts)
+            assert windows, (start, end, parts)
+            asked = [self._sent(*w) for w in windows]
+            whole_low, whole_high = self._sent(start, end)
+            assert asked[0][0] == whole_low
+            assert asked[-1][1] == whole_high
+            # Consecutive requests must meet on the SAME instant: earlier means a gap,
+            # later means the seam was covered twice by a whole day.
+            assert [low for low, _ in asked[1:]] == [high for _, high in asked[:-1]]
 
     def test_a_single_day_cannot_be_cut(self):
         assert split_query_window("2024-03-01", "2024-03-01", 2) == []
 
+    def test_a_window_ending_on_a_boundary_instant_can_still_be_cut(self):
+        """The recursion re-cuts its OWN output, so it has to parse the instants it emits.
+
+        A window whose end is a boundary instant is exclusive of that instant's day, so a
+        one-day window in that form is at the floor and must stop rather than emit a part
+        it cannot shorten again.
+        """
+        assert split_query_window("2019-03-16", "2019-03-19T00:00:00Z", 2) == [
+            ("2019-03-16", "2019-03-17T00:00:00Z"),
+            ("2019-03-17T00:00:00Z", "2019-03-19T00:00:00Z"),
+        ]
+        assert split_query_window("2019-03-21", "2019-03-22T00:00:00Z", 2) == []
+
     def test_two_days_split_into_one_day_each(self):
         """The floor of the recursion, and it must not stall there.
 
-        A shared boundary day costs a day of length, so it cannot shorten a two-day
-        window — and stopping here would leave a refused window with nothing to try, which
-        is exactly where the live failure ended up. At this floor only, the windows abut.
+        Stopping here would leave a refused window with nothing to try, which is exactly
+        where the live failure ended up. An instant boundary costs no length, so a two-day
+        window cuts cleanly without the shared-day fallback the first fix needed.
         """
         assert split_query_window("2019-03-21", "2019-03-22", 2) == [
-            ("2019-03-21", "2019-03-21"),
-            ("2019-03-22", "2019-03-22"),
+            ("2019-03-21", "2019-03-22T00:00:00Z"),
+            ("2019-03-22T00:00:00Z", "2019-03-22"),
         ]
 
-    def test_three_days_still_share_a_boundary_day(self):
-        """The abutting fallback is the floor ONLY — anything longer keeps the overlap."""
-        assert split_query_window("2024-03-01", "2024-03-03", 2) == [
-            ("2024-03-01", "2024-03-02"),
-            ("2024-03-02", "2024-03-03"),
+    def test_a_seam_does_not_repeat_a_whole_day(self):
+        """What the instant boundary buys: adjacent windows share an instant, not a date.
+
+        A shared boundary DAY made every seam re-fetch that day in full — measured at
+        Earth Search as roughly 1,250 items and 13 page requests per seam, all of them
+        discarded by the id dedupe.
+        """
+        windows = split_query_window("2024-03-01", "2024-03-03", 2)
+        assert windows == [
+            ("2024-03-01", "2024-03-02T00:00:00Z"),
+            ("2024-03-02T00:00:00Z", "2024-03-03"),
         ]
+        assert windows[0][1][:10] == windows[1][0][:10], "the seam is one instant, on one day"
+        assert "T" in windows[0][1], "a bare date here would drop that day's last second"
 
     def test_fewer_than_two_parts_is_no_split(self):
         assert split_query_window("2024-03-01", "2024-03-30", 1) == []

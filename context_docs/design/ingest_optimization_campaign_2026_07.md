@@ -1115,31 +1115,50 @@ boundary days.
 Two runs of the benchmark query from a laptop, item set identical in both
 (56,558 of 56,558, zero duplicates), refusal tree identical (three refusals, each at page 14):
 
-| | wall clock | ms/item | ladder retry lines |
-|---|---|---|---|
-| re-partition, 502 still force-listed | **2,360.7 s** (39.3 min) | 41.7 | 24 (8 per refusal) |
-| re-partition, 502 excluded | **1,099.6 s** (18.3 min) | 19.4 | **0** |
-| §8 reference rate, for scale | (316 s at this item count) | 5.58 | — |
+Three runs of the benchmark query from one laptop, all returning the same item set
+(56,558 of 56,558, zero duplicates):
 
-The 1,261 s recovered is the ladder: `total=8, backoff_factor=2` against urllib3's default
-`backoff_max=120` sleeps 0+4+8+16+32+64+120+120 = **364 s per refused page request**, and there
-are three. Predicted 1,092 s, measured 1,261 s; the difference is per-page variance between runs.
+| | wall clock | HTTP requests | ms/item | ladder retry lines |
+|---|---|---|---|---|
+| re-partition as first shipped | **2,360.7 s** (39.3 min) | 821 | 41.7 | 24 (8 per refusal) |
+| + 502 out of the retry ladder | **1,099.6 s** (18.3 min) | 821 | 19.4 | **0** |
+| + instant boundaries | **795.2 s** (13.3 min) | **583** | 14.1 | 0 |
+| a single unsplit walk, if it worked | — | 566 | — | — |
+| §8 reference RATE, for scale | (316 s at this item count) | 566 | 5.58 | — |
 
-**What remains is per-page latency, not the algorithm.** 1,099.6 s over 821 page requests is
-1.34 s/page from a laptop, where the §8 reference rate implies 0.56 s/page. Whether that gap is
-network round-trip — in which case an in-region worker closes it — or Earth Search's own think
-time is **UNMEASURED as of 2026-08-22** and is the thing to establish before optimising further.
-Note that §8's "164 s/month" is a ~29,390-item month; this query is 56,558 items, so the
-comparable target is the **rate**, 5.58 ms/item, not the duration.
+**The request overhead is now 1.03x**, down from 1.45x. That is the whole
+code-attributable regression: 583 requests against the 566 a single walk would make, the
+excess being one partial last page per window plus a page-1 refetch per cascaded cut.
 
-**A second, smaller inefficiency is visible in that run and is NOT fixed.** The proactive cut
-CASCADES: `_parts_for_depth` sizes parts as `ceil(matched / _MAX_QUERY_ITEMS)` and cuts by equal
-day count, so where density is uneven a child can still exceed the ceiling and be cut again.
-The run cut the month into 6, then re-cut 03-22/03-27, 03-27/04-01 and 03-27/03-30. Each cascade
-wastes a page-1 fetch. Sizing parts from density rather than day count would fix it — but note
-that changing the part count changes the window boundaries and therefore the ORDER of the
-returned item list, which the solar-day painter's stable sort can turn into different pixels on
-a cloud-cover tie. It is a fingerprint-relevant change, not a free one.
+**The 1,261 s the ladder cost.** `total=8, backoff_factor=2` against urllib3's default
+`backoff_max=120` sleeps 0+4+8+16+32+64+120+120 = **364 s per refused page request**, three
+times over. Predicted 1,092 s, measured 1,261 s; the rest is per-page variance.
+
+**The 304 s the shared boundary day cost**, and a caveat about how it was recovered. The
+instant-boundary run made **zero** refusals — moving a window's end from `2019-03-22T23:59:59Z`
+to `2019-03-22T00:00:00Z` changed its cursor sequence and missed the position that refuses. That
+is consistent with the end-date property but it is **luck on this query, not a fix**: a different
+window will land on a refusing cursor again, and the recursion is still what handles it. Do not
+read "zero refusals" as "the 502 is gone".
+
+**What remains is bandwidth, not the algorithm.** A page of 100 items is 4.5 MB, so 583 requests
+move about **2.6 GB**; 795.2 s over 583 requests is 1.36 s/page, or roughly 3.3 MB/s, which is a
+laptop's link and not a property of the code. The §8 reference rate implies 0.56 s/page — 8 MB/s,
+which an in-region worker has. At that rate this query costs **327 s against a single walk's
+316 s**, so on campaign infrastructure the re-partition should be within a few percent of the
+walk it replaces. That in-region figure is a PROJECTION from §8's rate and has not been measured
+on a worker.
+
+Note that §8's "164 s/month" is a ~29,390-item month while this query is 56,558 items, so the
+comparable quantity is the **rate**, 5.58 ms/item, never the duration.
+
+**One inefficiency remains and is NOT fixed.** The proactive cut CASCADES: `_parts_for_depth`
+sizes parts as `ceil(matched / _MAX_QUERY_ITEMS)` and cuts by equal day count, so where density
+is uneven a child can still exceed the ceiling and be cut again — the run cut the month into 6,
+then re-cut 03-22..03-27 and 03-27..04-01. Each cascade wastes one page-1 fetch, which is why it
+is worth only a few requests out of 583. Sizing parts by density would fix it, but changing the
+part count moves the window boundaries and therefore the walk order, so it needs the order check
+above re-run rather than being treated as free.
 
 **Cost note.** Consecutive windows share their boundary day rather than abutting it, so no
 acquisition can fall between them — the catalogue is asked for whole days and expands them to
@@ -1147,6 +1166,83 @@ instants itself, and abutting would leave the sub-second gap at midnight. The ov
 one repeated day per seam and the query's existing id dedupe absorbs it. The two-day floor
 described above is the one place that trade is reversed, and it is taken because the
 alternative there is a failed leg.
+
+### What the item ORDER does, which the first verification did not check
+
+The 56,558-of-56,558 check above is a check on the item **set**. The order is a separate
+property and it matters: `query_stac_items` sorts by `(solar date, cloud cover DESCENDING)`
+with Python's stable sort, so items tying on both keys keep their **input** order, and that
+order is what the `odc.stac` painter consumes last-write-wins per pixel.
+
+**The walk order does change, and always did.** A single walk returns the whole window
+newest-first; the worklist returns window by window in DATE order. Measured on
+2019-03-05/2019-03-08 (5,034 items), the unsplit walk and every split of it diverge from
+index 100 — the first page boundary. This is a property of the re-partition as first
+shipped, not of the instant boundary.
+
+**The post-sort order does not change.** Same window, through `query_stac_items` rather than
+the private walk, at part counts 1 (unsplit ground truth), 2, 3 and 4:
+
+| | item set | walk order | post-sort order | baselines |
+|---|---|---|---|---|
+| split 2, 3, 4 vs unsplit | identical | **differs** | **identical** | identical |
+
+The mechanism is that each solar date's items land in exactly ONE window, in catalogue
+order — a shared boundary day is deduped whole into the earlier window, and an instant
+boundary does not divide a day at all — so the sort restores the same sequence a single walk
+would have produced. What remains unverified is a solar day that straddles UTC midnight, in
+the far-eastern and far-western zones, where one solar day CAN fall in two windows. That case
+is not covered by this measurement.
+
+### Levers that look obvious and are closed
+
+Both measured 2026-08-22 against the live catalogue, so nobody has to test them again.
+
+**A bigger page is refused.** The pages are the cost — a page of 100 items is **4.5 MB**, so
+the benchmark query moves roughly **2.5 GB**. Halving the request count by doubling the page
+would be the obvious win, and Earth Search will not serve it:
+
+| `limit` | page 1 | median latency |
+|---|---|---|
+| 100 | **200**, 4,524 KB | 1.59 s |
+| 150 | **502** | 1.24 s |
+| 200 | **502** | 1.64 s |
+| 250 | **502** | 2.22 s |
+| 400 | **502** | 3.55 s |
+
+100 is already at the ceiling; there is no headroom above it. Note that the refusal latency
+RISES with the requested limit, which is what a response-size ceiling looks like — the service
+assembles the answer, finds it too large, and fails. This is the same first-page refusal
+`max_page_size` was lowered for, and it is why that setting cannot also be the remedy for the
+deep-page refusal.
+
+**Server-side field selection saves 4%.** Earth Search advertises
+`https://api.stacspec.org/v1.0.0/item-search#fields`, and it honours it for `properties` —
+asking for six properties returns exactly those six. It does **not** honour it for `assets`:
+all 35 assets come back regardless, including every `-jp2` duplicate, and `exclude: [links]`
+leaves `links` in place. Since the assets are what make an item 45 KB, the measured saving is
+45.2 -> 43.3 KB/item. Item ids and their order are unaffected. Not worth the change.
+
+### The seam costs a day, and an instant boundary removes it
+
+Consecutive windows originally SHARED their boundary day, because a bare date end is expanded
+by the client to `T23:59:59Z` — verified on the wire, `2019-03-05/2019-03-06` is sent as
+`2019-03-05T00:00:00Z/2019-03-06T23:59:59Z` — so windows abutting on consecutive DATES leave
+the last second of each seam's earlier day unasked for. That gap is real and the sharing was
+the right call against it.
+
+But the shared day is fetched twice and thrown away once. Adjacent days share **no** items at
+all (measured: 2019-03-05 has 1,214, 2019-03-06 has 1,298, the two-day window has exactly
+2,512, overlap zero), so every seam re-walked a full day — about **13 page requests** — for the
+dedupe to discard.
+
+The fix is to abut on an **instant** instead: interior boundaries are rendered
+`T00:00:00Z`, shared by the window that ends there and the one that starts there, while the
+outer bounds are the caller's own strings passed straight back. The catalogue's range is
+inclusive at both ends, so the union is the input window exactly — no gap and no overhang —
+and the overlap is one instant per seam rather than one day. It also removes the special case:
+a shared day cost a day of length and so could not shorten a two-day window, which is why the
+first version had to abut at that floor and accept the gap there.
 
 ### Rejected: subdividing the bounding box instead
 
@@ -1190,8 +1286,11 @@ defect fix.
 | re-partition item-set check | union of parts = **56,558 of 56,558** on the failing query | live catalogue, end to end (§7c) |
 | re-partition cost | **19 searches, 821 page requests** vs 566 for the single walk that cannot complete (**1.45x**) | same run (§7c) |
 | 502 in the retry ladder | **364 s of backoff per refused page request** (`total=8`, `backoff_factor=2`, urllib3 `backoff_max=120`), bought nothing — the refusal is deterministic. Removed from `_STAC_RETRY`; `_CMR_RETRY` keeps it | arithmetic + measured, 24 retry lines to 0 (§7c) |
-| benchmark query wall clock | **2,360.7 s -> 1,099.6 s** (39.3 -> 18.3 min) for an identical item set, from a laptop. **41.7 -> 19.4 ms/item** against a 5.58 ms/item reference rate | two live runs, 2026-08-22 (§7c) |
-| what still costs | **1.34 s per page request** from a laptop vs 0.56 s implied by the reference rate. Network round-trip versus Earth Search think time is **UNMEASURED** | open (§7c) |
+| benchmark query wall clock | **2,360.7 -> 1,099.6 -> 795.2 s** (39.3 -> 18.3 -> 13.3 min) for an identical item set, from a laptop. **41.7 -> 19.4 -> 14.1 ms/item** against a 5.58 ms/item reference rate | three live runs, 2026-08-22 (§7c) |
+| re-partition request overhead | **821 -> 583** requests against 566 for a single unsplit walk: **1.45x -> 1.03x** | same runs (§7c) |
+| page payload | **4.5 MB per 100 items** (45 KB/item); the benchmark query moves ~2.6 GB. `limit` above 100 is refused 502 on page 1, and server-side `fields` selection saves 4% because assets are not selectable | measured (§7c) |
+| in-region projection | 583 requests at the reference rate is **327 s vs a single walk's 316 s**. A PROJECTION from §8's rate, never measured on a worker | open (§7c) |
+| item ORDER under re-partition | walk order **differs** from an unsplit walk (from index 100); post-sort order and baselines **identical** at part counts 2, 3, 4 | measured on a 5,034-item window (§7c) |
 | worker RSS per retained item | ~80 KB → ~27–30 GB/year vs 16 GiB worker | 3-point slope |
 | unsharded manifest cost | ~1.1 MB refs/date → ~35 GB per zone-year | fitted, N²/2 |
 | time-sharded manifest cost | ~1.2 GB per zone-year (~28× less) | predicted 34.7 MB at 9 dates, measured 34.6 |
