@@ -37,6 +37,7 @@ from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.asset_locations import (
     Harmonisation,
+    SettledProducer,
     asset_bucket,
     asset_href,
 )
@@ -400,7 +401,8 @@ def extract_baselines(items: list[Any]) -> dict[str, int]:
     loads: the correction is decided per source, so a day holding 00.01 and 05.00 imagery needs no
     single answer for its pixels. This map still holds one integer per date, and it is the last
     item's — the CLEAREST tile on both ingest paths, because the query sorts a date's items
-    cloud-descending. The day's other vintages are recorded nowhere.
+    cloud-descending. That is the last item, not necessarily the one that supplied the pixels; see
+    the sort in :func:`query_stac_items`. The day's other vintages are recorded nowhere.
 
     Documented rather than widened because nothing reads this. It is written to the store's root
     attrs and merged forward on append; no code here consumes a value, and no correction, mask or
@@ -445,7 +447,7 @@ def selection_read_keys(config: CollectionConfig, extra_bands: "list[str] | None
     return _requested_assets(config, extra_bands)
 
 
-def collection_harmonisation(config: CollectionConfig) -> Harmonisation | None:
+def collection_harmonisation(config: CollectionConfig) -> SettledProducer | None:
     """The producer state the COLLECTION settles, or ``None`` where it does not settle one.
 
     ``None`` for two different reasons that need the same handling. A collection whose
@@ -788,7 +790,7 @@ class BoaOffsetParser(StacMDParser):
         reflectance_assets: frozenset[str],
         threshold: int,
         offset: int,
-        known_harmonisation: Harmonisation | None,
+        known_harmonisation: SettledProducer | None,
     ) -> None:
         """Build a parser that decides the offset for ``reflectance_assets``.
 
@@ -1088,8 +1090,9 @@ class _WindowWalk:
     tree explicit is what lets the fetching run concurrently while the output stays in the
     order the serial walk produced — and the order is load-bearing, because
     :func:`query_stac_items` sorts the result on keys items can TIE on, Python's sort is
-    stable, and the surviving input order therefore decides which scene the loader paints
-    last for a pixel. The item list is inside the mosaic fingerprint as well.
+    stable, and the surviving input order therefore decides which scene supplies a pixel:
+    odc-loader's fuser fills only where the destination is still nodata, so the FIRST valid
+    source of a group wins. The item list is inside the mosaic fingerprint as well.
 
     Attributes:
         bbox: Spatial term this window is asked with — one antimeridian half, the whole
@@ -1612,13 +1615,12 @@ def query_stac_items(
             logger.info("No items remaining after item_filter_fn")
             return [], {}
 
-    # THE single solar-offset application for this path. Everything below — the
-    # cloud sort, the baseline map, the existing-date dedup, and every
-    # consumer of the returned items — then reads the solar day straight off
-    # `item.datetime` with no offset of its own. Before this, the sort and the baseline
-    # map keyed on the UTC date while the loader grouped by solar day, so on a day
-    # straddling UTC midnight the group was not sorted as intended and half
-    # its baseline entries never matched.
+    # THE single solar-offset application for this path. Everything below — the cloud sort,
+    # the baseline map, the existing-date dedup, and every consumer of the returned items —
+    # then reads the solar day straight off `item.datetime` with no offset of its own. Before
+    # this, the sort and the baseline map keyed on the UTC date while the loader grouped by
+    # solar day, so on a day straddling UTC midnight the group was not sorted as intended and
+    # half its baseline entries never matched.
     # Same rule as the date probe above, and it matters more here: this is THE single
     # solar-offset application for the path, so a UTC-day stamp taken by default would be
     # read as the solar day by the sort, the baseline map, the dedup and every consumer.
@@ -1636,21 +1638,12 @@ def query_stac_items(
     # `sentinel-2-l2a` alone. Every other collection keeps the assembly order, and that order
     # follows the window tree rather than a single catalogue walk — parent prefix first, then
     # children oldest-first, against the catalogue's newest-first. So for a non-SCL collection
-    # the painted result would depend on how the query was partitioned. Not reachable today:
+    # the fused result would depend on how the query was partitioned. Not reachable today:
     # the only paged caller is `s2_roi`, which asks for `sentinel-2-l2a`, and the radar path
     # returns its items from a provider function before any window exists. Left alone because
     # imposing an order on Landsat, which currently has none, is a change to that collection's
     # output that nothing here can verify. Fix it alongside the first paged non-SCL caller.
     if collection_config.has_scl:
-        # `id` last, and it is not decoration. The first two keys can TIE — two scenes of one
-        # solar day with equal cloud cover — and a stable sort then keeps whatever order the
-        # walk happened to produce. That order depends on how the query was partitioned: a
-        # solar day near the antimeridian can straddle an interior window seam, so the two
-        # halves arrive in a different order than an unsplit walk would give them. Since the
-        # loader keeps the FIRST valid source of a group, an untied sort would let
-        # crossing an item ceiling, or hitting a refusal, change output pixels for the same
-        # requested range. A third key removes the tie, so the sequence is a function of the
-        # items alone.
         items.sort(key=solar_day_sort_key)
 
     baselines = extract_baselines(items)
@@ -1675,6 +1668,7 @@ def load_stac_items(
     post_load_fn: Callable[[xr.Dataset], xr.Dataset] | None = None,
     groupby: str = "solar_day",
     geobox: GeoBox | None = None,
+    selection_label: str | None = None,
 ) -> xr.Dataset:
     """Load STAC items into an xarray Dataset with corrections applied.
 
@@ -1698,6 +1692,10 @@ def load_stac_items(
         groupby: How to group items into time slices. Must be "solar_day" —
               :func:`_load_from_stac` rejects anything else and says why.
         geobox: Optional output grid specification
+        selection_label: What to call this call's area in the duplicate-selection audit log.
+              For a caller that queried by TILE: the tile id never reaches this function, and
+              without it concurrent same-collection tile ingests log identical lines. Defaults
+              to the bbox, which is per region of interest.
 
     Returns:
         Corrected xarray Dataset
@@ -1744,9 +1742,13 @@ def load_stac_items(
         # date, so `alternates` can be empty on a tile-date that was still pruned — and gating on
         # it left the caller's map describing a copy that is not being loaded.
         if len(pruned) != len(items):
-            log_duplicate_selection(
-                logger, f"load {collection}", alternates, kept=pruned, read_keys=read_keys, items=items
-            )
+            # Labelled with the AREA, not just the collection. This log is the only record of
+            # which copy supplied a pixel, and a fleet runs sixty cells or tiles of one
+            # collection at once — `load sentinel-2-l2a` on every one of them names none of
+            # them. `selection_label` is what a caller that queried by TILE passes down, since a
+            # tile id never reaches this function otherwise; the bbox covers everyone else.
+            where = selection_label or (f"bbox {bbox}" if bbox is not None else f"load {collection}")
+            log_duplicate_selection(logger, where, alternates, kept=pruned, read_keys=read_keys, items=items)
             # Realign the caller's provenance with what is about to be loaded. `baselines` becomes
             # the store's `baselines_applied`, and on the split workflow it was built by
             # `query_stac_items` from the UNPRUNED list — so a rejected copy that sorted last could
@@ -1971,39 +1973,11 @@ def ingest_tile(
             logger.info("All dates already exist in store - nothing to load")
         return None, baselines
 
-    collection_config = _get_collection_config(provider, collection)
-    # Gated on there BEING an offset decision — see `load_stac_items` for why that is the line and
-    # why it is not removed altogether.
-    if collection_config.requires_baseline_correction:
-        # Reduce to one copy per acquisition, HERE and not in `query_stac_items`.
-        #
-        # `odc.stac.load` fuses a solar day, so an unpruned harmonised COG beside a raw
-        # reprocessing of one acquisition reaches the producer check as a genuine conflict and
-        # refuses a date that selecting one copy resolves. Refusing what we can decide is the one
-        # outcome those refusals are not for.
-        #
-        # But this belongs to THIS entry point, not to the shared query. `s2_roi` calls
-        # `query_stac_items` and then runs its own selection, KEEPING the rejected copies as the
-        # ladder `step_down_copies` walks when a source object will not read. Pruning in the shared
-        # query left that driver with an empty ladder, so a single unreadable object lost the date
-        # instead of stepping down to the copy sitting behind it. Selection belongs to the layer
-        # that owns the fallback — which here is nobody, so the copies are genuinely spare.
-        read_keys = selection_read_keys(collection_config, extra_bands)
-        supplied = items
-        items, alternates = select_preferred_duplicates(items, read_keys, collection_harmonisation(collection_config))
-        log_duplicate_selection(
-            logger,
-            f"tile {tile_id}" if tile_id else f"bbox {bbox}",
-            alternates,
-            kept=items,
-            read_keys=read_keys,
-            items=supplied,
-        )
-        # Provenance must describe what was KEPT, for the dates selection touched — UPDATED and
-        # not replaced. `query_stac_items` returns entries for every queried date, including ones
-        # whose items were filtered out as already present, and replacing the map dropped those.
-        baselines = {**baselines, **extract_baselines(items)}
-
+    # Duplicates are selected by `load_stac_items`, not here. It prunes on the same gate, with the
+    # same read keys and the same collection answer, and it realigns `baselines` IN PLACE — the
+    # dict this function returns — so the provenance reaches the return value without a second
+    # pass. Selecting here as well changed nothing: selection is deterministic, and
+    # `log_duplicate_selection` returns early when nothing was pruned.
     data = load_stac_items(
         items,
         provider=provider,
@@ -2018,6 +1992,9 @@ def ingest_tile(
         post_load_fn=post_load_fn,
         groupby=groupby,
         geobox=geobox,
+        # The tile is this function's alone — `load_stac_items` never sees `tile_id` — and it is
+        # what distinguishes concurrent same-collection tile ingests in the selection audit log.
+        selection_label=f"tile {tile_id}" if tile_id else None,
     )
 
     return data, baselines

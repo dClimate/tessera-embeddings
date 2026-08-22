@@ -27,14 +27,16 @@ from odc.geo.geobox import GeoBox
 from pyproj import Transformer
 from rasterio.transform import from_origin
 
+from tessera_embeddings.config.providers import PROVIDERS, CollectionConfig
 from tessera_embeddings.config.satellites import S2_BASELINE_OFFSET, S2_BASELINE_THRESHOLD, S2_L2A_BANDS
-from tessera_embeddings.ingest.asset_locations import Harmonisation
+from tessera_embeddings.ingest.asset_locations import Harmonisation, SettledProducer
 from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.stac import (
     BoaOffsetParser,
     HeterogeneousProducerError,
     _BoaCorrectingDriver,
     _reflectance_asset_keys,
+    collection_harmonisation,
     load_stac_items,
 )
 
@@ -102,6 +104,64 @@ class TestSourceDecision:
 
     def test_a_collection_known_harmonised_owes_nothing_anywhere(self) -> None:
         assert source_decision(_RAW_BUCKET, 510, _T, Harmonisation.HARMONISED) is OffsetDecision.EXEMPT
+
+    def test_an_answer_naming_no_producer_cannot_be_passed_at_all(self) -> None:
+        """MIXED and UNKNOWN used to reach here and be refused. Now they cannot arrive.
+
+        ``known_harmonisation`` is typed :data:`SettledProducer`, which is the two states that name
+        a producer — so an answer that names none is rejected by the type checker at the call site
+        rather than detected here and turned into a refusal. That is why this function has no case
+        for them: correcting on an unresolved producer is wrong by exactly the offset and silent,
+        and the cheapest way to prevent it is to make it unsayable.
+
+        Asserted on the TYPE rather than on behaviour, because there is no behaviour left to
+        assert. This fails if someone widens the parameter back.
+        """
+        import typing
+
+        settled = typing.get_args(SettledProducer)
+        assert set(settled) == {Harmonisation.HARMONISED, Harmonisation.RAW}
+        assert Harmonisation.MIXED not in settled
+        assert Harmonisation.UNKNOWN not in settled
+
+
+class TestNothingCanSupplyAnUnsettledProducer:
+    """The refusal above is a dormant guard. These pin that, rather than restating it.
+
+    ``known_harmonisation`` reaches :func:`source_decision` from exactly one place: the parser
+    :func:`load_stac_items` builds, which takes it from :func:`collection_harmonisation`. That
+    function can only answer ``RAW`` or ``None``, so no configured collection drives the
+    undecidable branch today. Should one ever be able to, these fail — which turns the guard into
+    a behaviour change somebody has to think about rather than one that ships silently.
+    """
+
+    def test_no_configured_collection_yields_an_unsettled_producer(self) -> None:
+        answers = {
+            (provider_name, alias): collection_harmonisation(config)
+            for provider_name, provider in PROVIDERS.items()
+            for alias, config in provider.collections.items()
+        }
+        assert answers, "no collections configured, so this census would pass vacuously"
+        unsettled = {key: value for key, value in answers.items() if value not in (None, Harmonisation.RAW)}
+        assert not unsettled, f"these collections would reach the undecidable branch: {unsettled}"
+
+    def test_the_collection_answer_is_settled_for_every_configuration(self) -> None:
+        """Exhaustive over the two fields :func:`collection_harmonisation` reads.
+
+        The census above covers the collections that exist; this covers the ones that could be
+        added, so a new entry cannot introduce an unsettled answer without failing here.
+        """
+        for varies in (False, True):
+            for threshold in (None, S2_BASELINE_THRESHOLD):
+                config = CollectionConfig(
+                    collection_id="probe",
+                    bands=S2_L2A_BANDS,
+                    resolution=10,
+                    baseline_threshold=threshold,
+                    harmonisation_varies_by_item=varies,
+                )
+                answer = collection_harmonisation(config)
+                assert answer in (None, Harmonisation.RAW), (varies, threshold, answer)
 
 
 def _item(

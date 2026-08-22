@@ -171,9 +171,10 @@ class TestHarmonisationPredicate:
         assert item_harmonisation(item) is Harmonisation.HARMONISED
 
     def test_bands_straddling_two_producers_are_not_harmonised(self) -> None:
-        """The correction is applied per DATE to every band at once, so a partly-harmonised
-        item has no single right answer. Under-correcting one band beats over-correcting the
-        rest.
+        """No single ITEM-level answer fits a partly-harmonised item, so neither may be reported.
+
+        The correction is decided per asset, which is what gives such an item a right answer band
+        by band. This function's only job is to refuse to flatten it to one.
         """
         item = _Item(_HARMONISED, "05.00")
         item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
@@ -525,12 +526,13 @@ class TestTheGenericEntryPointPrunesAndTheRoiLadderSurvives:
 
 
 class TestEverySentinel2PathHasASelectionOwner:
-    """Three entry points, three reasons to select, and one path that had none.
+    """Two entry points, two reasons to select, and one path that had none.
 
-    `s2_roi` selects to build its fallback ladder, `ingest_tile` selects before extracting
-    provenance — and the documented `query_stac_items` -> `load_stac_items` workflow passed through
-    neither, so an unpruned pair of producers for one acquisition reached the correction decision as
-    a genuine conflict. The loader selects too, idempotently.
+    `s2_roi` selects to build its fallback ladder, and the loader selects because the documented
+    `query_stac_items` -> `load_stac_items` workflow passed through neither — an unpruned pair of
+    producers for one acquisition reached the correction decision as a genuine conflict.
+    `ingest_tile` leaves it to the loader: same gate, same read keys, same collection answer, and
+    the loader realigns provenance in the very dict `ingest_tile` returns.
     """
 
     @staticmethod
@@ -720,9 +722,9 @@ class TestTheThemesThatGeneratedTheReviewStayClosed:
         """The two key sets differ by exactly `scl`, and that difference is the point."""
         assert set(READ_ASSET_KEYS) - set(REFLECTANCE_ASSET_KEYS) == {"scl"}
 
-    def test_every_refusal_is_gated_on_the_date_being_owed_a_correction(self) -> None:
-        """A pre-threshold date must never refuse, whatever else is wrong with it: which producer
-        served it, or whether they disagree, cannot change a pixel that gets no offset.
+    def test_every_refusal_is_gated_on_the_source_being_owed_a_correction(self) -> None:
+        """A pre-threshold item must never refuse, whatever else is wrong with it: which producer
+        served it, or whether its bands disagree, cannot change a pixel that gets no offset.
         """
         pre_threshold = [
             [_Item(_HARMONISED, "03.00"), _Item(_RAW_ESA, "03.00")],  # mixed producers
@@ -934,7 +936,7 @@ class TestAnUnlistedBucketIsUndeterminedNotRaw:
         assert _decisions(item) == {OffsetDecision.UNDECIDABLE}
 
     def test_a_pre_threshold_unlisted_bucket_is_exempt(self) -> None:
-        """Gated on the date being owed a correction, like every other refusal."""
+        """Gated on the source being owed a correction, like every other refusal."""
         item = _Item(None, "03.00")
         item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
         assert _is_exempt(item)
@@ -973,13 +975,13 @@ class TestRawRequiresEveryBandFromAKnownProducer:
 
 
 class TestMixedNeedsBothKnownProducers:
-    """MIXED is the state no date-wide decision fits, so it must not be reported for a state that
-    only needs a bucket classified. Raised on PR #107.
+    """MIXED means both known producers are present, so it must not be reported where one of them
+    is only an unclassified bucket. Raised on PR #107.
 
-    A harmonised band beside a band from an unlisted bucket returned MIXED, whose message directs
-    an operator to load the producers separately — for an ambiguity that may not exist. Nothing in
-    such an item is known to be raw, so the actionable remedy is to classify the bucket, and
-    classifying it as harmonised may remove the refusal altogether.
+    A harmonised band beside a band from an unlisted bucket is UNKNOWN, not MIXED. Nothing in such
+    an item is known to be raw, so the actionable remedy is to classify the bucket — and
+    classifying it as harmonised may remove the refusal altogether. Reporting MIXED sends the
+    operator after a disagreement between producers that may not exist.
     """
 
     @staticmethod

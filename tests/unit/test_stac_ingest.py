@@ -2,11 +2,12 @@
 
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import xarray as xr
 from pystac import Item
 from pystac_client.item_search import ItemSearch
 
@@ -736,7 +737,16 @@ class TestAntimeridianBboxSplit:
             provider, config, None, "2024-01-01", "2024-01-31", bbox=(179.5, -18.0, -179.5, -16.0)
         )
 
-        assert searched == [(179.5, -18.0, 180.0, -16.0), (-180.0, -18.0, -179.5, -16.0)]
+        # BOTH halves are searched, once each. Asserted as a SET, because the walk is
+        # concurrent (`ThreadPoolExecutor`, `stac-window`) and the order two worker threads
+        # reach `search` in is a race. This was a list comparison and it flaked in CI on
+        # 3.12 while passing on 3.13 — a real race the assertion was hiding, not a fluke.
+        assert sorted(searched) == sorted([(179.5, -18.0, 180.0, -16.0), (-180.0, -18.0, -179.5, -16.0)])
+        assert len(searched) == 2, "each half searched exactly once"
+        # The OUTPUT order is deterministic, and that is the property the concurrent walk was
+        # built to preserve: the window tree is read back depth-first in the order a serial
+        # walk produced, so the same request always yields the same item sequence. Straddling
+        # item "S" is deduped to one copy and keeps the position its first sighting gave it.
         assert [i.id for i in items] == ["S", "E", "W"]
 
 
@@ -891,6 +901,41 @@ def test_requested_extra_bands_survive_item_pruning(monkeypatch):
         mid_longitude=15.0,
     )
     assert seen["extra_bands"] == ["aot"]
+
+
+def test_the_duplicate_audit_log_names_the_area_it_selected_for(monkeypatch):
+    """That log is the ONLY record of which duplicate copy supplied a pixel.
+
+    Where two copies carry the same baseline their pixels are identical, so nothing downstream can
+    show which was read — and a fleet runs sixty cells or tiles of one collection at once. A label
+    of `load sentinel-2-l2a` on every one of them identifies none of them, which is what happened
+    when selection moved into `load_stac_items`: the tile id lives on the query and never reaches
+    the loader.
+    """
+    from tessera_embeddings.ingest import stac as stac_mod
+
+    labels: list[str] = []
+    monkeypatch.setattr(stac_mod, "log_duplicate_selection", lambda _log, roi, *_a, **_k: labels.append(roi))
+    # Two items in, one out: the log fires only when selection CHANGED the list.
+    monkeypatch.setattr(stac_mod, "select_preferred_duplicates", lambda items, *_a, **_k: (items[:1], {}))
+    stub = type("Item", (), {"datetime": datetime(2024, 1, 2, 12, tzinfo=UTC), "id": "i", "properties": {}})
+    monkeypatch.setattr(stac_mod, "query_stac_items", lambda **_k: ([stub(), stub()], {}))
+    monkeypatch.setattr(stac_mod, "_load_from_stac", lambda *_a, **_k: xr.Dataset())
+    monkeypatch.setattr(stac_mod, "_reflectance_asset_keys", lambda *_a, **_k: frozenset({"blue"}))
+
+    for kwargs, expected in (
+        ({"tile_id": "33UUP"}, "tile 33UUP"),
+        ({"tile_id": None, "bbox": (12.0, 45.0, 13.0, 46.0)}, "bbox (12.0, 45.0, 13.0, 46.0)"),
+    ):
+        stac_mod.ingest_tile(
+            provider="earth-search",
+            collection="sentinel-2-l2a",
+            start_date="2024-01-01",
+            end_date="2024-01-10",
+            mid_longitude=15.0,
+            **kwargs,
+        )
+        assert labels[-1] == expected
 
 
 def test_the_loader_refuses_a_grouping_it_cannot_honour():

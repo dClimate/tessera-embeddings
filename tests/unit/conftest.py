@@ -176,8 +176,10 @@ def mock_stac_item():
         # REAL asset hrefs, because whether the BOA offset is corrected is decided from where
         # the assets live. A bare Mock auto-creates `assets`, so an href read off it is a Mock
         # rather than a string, and the item then classifies as "producer unknown" — which means
-        # "correct it", silently changing what a test measures without the test saying so.
-        # Defaults to ESA's originals, the case that DOES need correcting, so a test about
+        # REFUSE, not "correct it": at or above the threshold the load raises
+        # `HeterogeneousProducerError` before a pixel is read, and duplicate selection withholds
+        # such a copy from the fallback ladder. Either way the test stops measuring what it meant
+        # to. Defaults to ESA's originals at 04.00, which ARE owed the offset, so a test about
         # baseline parsing sees its baseline flow through. Pass `host_root` pointing at
         # sentinel-cogs to model Element 84's harmonised COGs instead.
         item.assets = {key: {"href": f"{host_root}/{key}"} for key in READ_ASSET_KEYS}

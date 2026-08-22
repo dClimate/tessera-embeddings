@@ -31,6 +31,7 @@ from tessera_embeddings.ingest.asset_locations import (
     HARMONISED_ASSET_BUCKETS,
     UNHARMONISED_ASSET_BUCKETS,
     Harmonisation,
+    SettledProducer,
 )
 
 
@@ -55,7 +56,7 @@ def source_decision(
     bucket: str | None,
     baseline: int | None,
     threshold: int,
-    known_harmonisation: Harmonisation | None = None,
+    known_harmonisation: SettledProducer | None = None,
 ) -> OffsetDecision:
     """What is owed to the source served from ``bucket`` by an item declaring ``baseline``.
 
@@ -77,7 +78,10 @@ def source_decision(
             settles it and the assets have nothing to add. Planetary Computer serves the whole
             archive unharmonised and keys its assets natively, so ``bucket`` there describes a
             location nobody has classified and must not be consulted — see
-            :func:`~tessera_embeddings.ingest.stac.collection_harmonisation`.
+            :func:`~tessera_embeddings.ingest.stac.collection_harmonisation`. Typed
+            :data:`~tessera_embeddings.ingest.asset_locations.SettledProducer`, so ``MIXED`` and
+            ``UNKNOWN`` cannot be passed: an answer naming no producer cannot decide a correction,
+            and making it unrepresentable is cheaper than detecting it.
 
     Returns:
         The decision for this one source.
@@ -123,4 +127,7 @@ def source_decision(
     if baseline is None:
         return OffsetDecision.UNDECIDABLE
 
+    # Unharmonised and at or above the threshold: the offset is there and comes off. Nothing else
+    # can reach this line — a harmonised producer returned above, an unclassified one refused, and
+    # `SettledProducer` is what stops an answer naming no producer from arriving at all.
     return OffsetDecision.OWED
