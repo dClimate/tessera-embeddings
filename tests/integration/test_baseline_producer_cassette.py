@@ -5,7 +5,9 @@ Every item in ``test_s2_roi_parity.yaml`` has its read bands in Element 84's COG
 416 ESA references in it are *extra* assets — so the parity suite can exercise the exemption
 and not the correction. That asymmetry is exactly how a dead code path survives a green suite.
 
-Recorded over MGRS-33TWM in December 2017, where Element 84's 2026-08 backfill indexed items
+**Two windows are recorded, because no single one carries every case.**
+
+The first is MGRS-33TWM in December 2017, where Element 84's 2026-08 backfill indexed items
 whose primary band keys point at ESA's archive. Two things make this window the right choice:
 
 * it contains items from **both** producers, which is the coverage that was missing, and
@@ -18,6 +20,17 @@ mixed-producer date, which would have discarded it even though nothing in it is 
 The offset is now decided per reflectance asset (``boa_offset.source_decision``), so a mixed day
 needs no date-wide answer at all — but the recorded items are still the only real evidence that
 the two producers are told apart correctly, which is what these assertions check.
+
+The second window is MGRS-33NVB in February 2022, four days of it, and it closes a gap this file
+used to admit in a docstring. Every raw item in the 2017 window predates version 04.00, so all of
+them are exempt on version alone and **the subtraction was never exercised on a real image** — it
+was covered by rewriting the version on an otherwise real one, with a note saying the combination
+"does not exist upstream".
+
+**It does.** A census of seven zone-months on 2026-08-22 found 680 reflectance sources served from
+ESA's bucket at version 04.00 or later, across 68 real images. This window holds one of them beside
+one of Element 84's, **both declaring 04.00 exactly** — so the version cannot be what separates
+them, and the pair pins the threshold as inclusive at the same time.
 
 Run::
 
@@ -57,7 +70,6 @@ from tessera_embeddings.ingest.stac import extract_baselines
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CASSETTE_DIR = REPO_ROOT / "tests" / "fixtures" / "stac_cassettes"
-CASSETTE_NAME = "test_s2_producer_split_33twm_2017.yaml"
 
 CATALOGUE = "https://earth-search.aws.element84.com/v1"
 TILE = "MGRS-33TWM"
@@ -66,6 +78,14 @@ TILE = "MGRS-33TWM"
 WINDOW = ("2017-12-01T00:00:00Z", "2018-01-01T00:00:00Z")
 #: The mixed-producer day this fixture exists to pin. Real, and owed no correction.
 MIXED_DAY = "2017-12-19"
+
+#: The second window, and the two real items in it whose pixels still carry the +1000 offset.
+TILE_AT_THRESHOLD = "MGRS-33NVB"
+#: Four days, which is the whole month's worth of evidence: it returns exactly one image from
+#: each producer, both at 04.00. A wider window adds five more harmonised images that say the
+#: same thing and triples the recording.
+WINDOW_AT_THRESHOLD = ("2022-02-06T00:00:00Z", "2022-02-10T00:00:00Z")
+NEEDS_SUBTRACTION_IDS = frozenset({"S2B_33NVB_20220207_0_L2A"})
 
 
 @pytest.fixture(scope="module")
@@ -84,16 +104,21 @@ def vcr_config() -> dict:
     }
 
 
-def _items() -> list[Any]:
-    """Every 2017 item for the tile, from the catalogue or the cassette."""
+def _search(tile: str, window: tuple[str, str]) -> list[Any]:
+    """Every item for one tile in one window, from the catalogue or the cassette."""
     pystac_client = pytest.importorskip("pystac_client")
     client = pystac_client.Client.open(CATALOGUE)
     search = client.search(
         collections=["sentinel-2-l2a"],
-        query={"grid:code": {"eq": TILE}},
-        datetime=f"{WINDOW[0]}/{WINDOW[1]}",
+        query={"grid:code": {"eq": tile}},
+        datetime=f"{window[0]}/{window[1]}",
     )
     return list(search.items())
+
+
+def _items() -> list[Any]:
+    """Every 2017 item for the tile, from the catalogue or the cassette."""
+    return _search(TILE, WINDOW)
 
 
 #: UTM zone 33's central meridian. `normalize_to_solar_day` needs the ROI's longitude, and every
@@ -126,7 +151,7 @@ def _decisions(items: list) -> set[OffsetDecision]:
 
 
 @pytest.mark.integration
-@pytest.mark.vcr(CASSETTE_NAME)
+@pytest.mark.vcr
 class TestRecordedProducerSplit:
     """Assertions against real recorded items, not hand-built fakes."""
 
@@ -213,14 +238,55 @@ class TestRecordedProducerSplit:
         declared = {float(it.properties["s2:processing_baseline"]) * 100 for it in on_day}
         assert extract_baselines(on_day)[MIXED_DAY] in declared, "provenance must be a real reported baseline"
 
-    def test_a_raw_item_over_the_threshold_would_be_corrected(self) -> None:
-        """The combination the change was built for, which **does not exist upstream**: a raw
-        item at baseline >= 04.00. Reached by rewriting the baseline on an otherwise real item,
-        which is the only way to exercise it — stated plainly because a synthetic property on
-        real structure is evidence about the routing and not about the archive.
+
+@pytest.mark.integration
+# No cassette name: pytest-recording writes one file per TEST, named for it, which is the
+# convention every recording in this directory follows. Each test here costs a full copy of the
+# same 7-item response, so there are deliberately only two.
+@pytest.mark.vcr
+class TestARealItemIsOwedTheCorrection:
+    """A raw item at the version threshold, recorded rather than synthesised.
+
+    This class replaces a test that rewrote the version on an otherwise real item and said so,
+    because the combination was believed not to exist upstream. It does — see the module docstring
+    for the census — and a fixture standing in for a case the archive actually has proves the
+    routing and nothing about the data.
+    """
+
+    @staticmethod
+    def _at_threshold() -> list[Any]:
+        items = _search(TILE_AT_THRESHOLD, WINDOW_AT_THRESHOLD)
+        normalize_to_solar_day(items, mid_longitude=TILE_MID_LONGITUDE)
+        return items
+
+    def test_the_version_does_not_decide_which_images_keep_the_offset(self) -> None:
+        """THE case this file could not previously reach with real data, and its contrast.
+
+        Both images here declare **04.00 exactly**, so the version cannot be what tells them
+        apart — only where their bands are served from. One is ESA's and still carries the +1000
+        offset; one is Element 84's and has already had it removed. That is the whole claim of
+        `source_decision`, made against real images on both sides of it at once.
+
+        Declaring 04.00 exactly pins the comparison as INCLUSIVE at the same time: one version
+        lower and the ESA image would read as exempt, keeping an offset its pixels do carry.
+
+        The identity assertion is the coverage guard. If a re-record finds Element 84 has
+        re-pointed that href at its own COG, this fails loudly rather than passing while measuring
+        nothing — the failure mode that let the subtraction go untested against real data in the
+        first place.
         """
-        raw = next(it for it in _normalised() if item_harmonisation(it) is Harmonisation.RAW)
-        raw.properties["s2:processing_baseline"] = "05.00"
-        day = raw.datetime.strftime("%Y-%m-%d")
-        assert _decisions([raw]) == {OffsetDecision.OWED}, "a raw item over the threshold is owed the offset"
-        assert extract_baselines([raw])[day] == 500
+        items = self._at_threshold()
+        by_producer = collections.defaultdict(set)
+        for item in items:
+            by_producer[item_harmonisation(item)].add(item.id)
+
+        assert by_producer[Harmonisation.RAW] == NEEDS_SUBTRACTION_IDS, (
+            f"the recorded raw items changed: {sorted(by_producer[Harmonisation.RAW])}"
+        )
+        assert by_producer[Harmonisation.HARMONISED], "the fixture must keep both producers"
+        assert len(items) == 2, "the window is deliberately the smallest that carries the contrast"
+
+        for item in items:
+            assert processing_baseline(item) == S2_BASELINE_THRESHOLD, f"{item.id} is not at the threshold"
+            expected = OffsetDecision.OWED if item.id in NEEDS_SUBTRACTION_IDS else OffsetDecision.EXEMPT
+            assert _decisions([item]) == {expected}, f"{item.id} should be {expected.value}"
