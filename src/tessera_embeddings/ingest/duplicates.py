@@ -764,15 +764,92 @@ def is_unreadable_source(exc: BaseException) -> bool:
     An expired credential is explicitly excluded for that reason, even though it surfaces
     through the same wrapper.
     """
+    text = _exception_chain_text(exc)
+    if any(m in text for m in ("ExpiredToken", "token has expired", "AccessDenied", "SlowDown")):
+        return False
+    return any(m in text for m in _UNREADABLE_MARKERS)
+
+
+def _exception_chain_text(exc: BaseException) -> str:
+    """The chain's type names and messages, joined, for text classification.
+
+    Text rather than ``isinstance`` because the read runs on a Dask worker and is re-raised on
+    the driver through tblib, which cannot rebuild rasterio's GDAL-backed classes — what arrives
+    is a plain exception carrying the original's repr. The whole chain, because the wrapper
+    discards the reason: ``WarpOperationError('Chunk and warp failed')`` says nothing on its own.
+    """
     seen: list[str] = []
     current: BaseException | None = exc
     while current is not None and len(seen) < 20:
         seen.append(f"{type(current).__name__}: {current}")
         current = current.__cause__ or current.__context__
-    text = " | ".join(seen)
-    if any(m in text for m in ("ExpiredToken", "token has expired", "AccessDenied", "SlowDown")):
+    return " | ".join(seen)
+
+
+#: Signatures of the PROVIDER refusing a read — an authorization refusal, a throttle, a server
+#: error. All statements about the SERVICE rather than the bytes: the same object read moments
+#: before and reads again once the service recovers. So no fallback copy helps, which is why
+#: :func:`is_unreadable_source` declines every one of them and why this predicate sits beside it
+#: rather than inside it. The two need opposite responses: one gives up on the data, the other
+#: waits.
+_PROVIDER_REFUSAL_MARKERS = (
+    "AccessDenied",
+    "SlowDown",
+    "ServiceUnavailable",
+    "InternalError",
+    "HTTP response code: 403",
+    "HTTP response code: 500",
+    "HTTP response code: 503",
+)
+
+#: What makes a refusal the SOURCE's: the source reader is the layer that was refused.
+#:
+#: The names above belong to S3, and every S3 client in the process shares them — our own store
+#: write answers ``AccessDenied`` when icechunk picks up the OPERA-scoped token instead of the
+#: role (``storage/zarr_store.py`` documents exactly that), and a throttle on the destination
+#: bucket says ``SlowDown`` in the same words the source does. Since the read and the write both
+#: happen inside ``write_day_windows``, the text is all there is to separate them. Requiring
+#: GDAL's own vocabulary alongside does it: GDAL reads source imagery here and nothing else —
+#: the destination is Icechunk and the ROI mask is read through ``da.from_zarr``. Unpaired, the
+#: exception is re-raised, so a destination fault fails the leg on its first date instead of
+#: being absorbed as somebody else's outage, one date at a time.
+_SOURCE_READER_MARKERS = ("RasterioIOError", "WarpOperationError", "CPLE_", "HTTP response code:")
+
+#: Refusals that are NOT the provider's to answer for, though they surface identically. Our own
+#: credential is repairable here and no waiting fixes it, so these are matched FIRST and the
+#: caller re-raises — failing a leg on its first date rather than its tenth.
+_OWN_CREDENTIAL_MARKERS = (
+    "ExpiredToken",
+    "token has expired",
+    "InvalidAccessKeyId",
+    "SignatureDoesNotMatch",
+)
+
+
+def is_provider_refusal(exc: BaseException) -> bool:
+    """Whether ``exc`` says the source PROVIDER refused the read.
+
+    A refusal is transient and clears on its own, so the useful response is to give up the one
+    date, record it, and keep the run — never to substitute a different copy of the imagery,
+    which is what :func:`is_unreadable_source` gates and why that predicate excludes everything
+    matched here.
+
+    Fails closed three ways: our own credential fault is excluded, a refusal nothing attributes
+    to the source reader is excluded (see :data:`_SOURCE_READER_MARKERS`), and anything
+    unrecognised is excluded. In each case the caller re-raises.
+
+    Args:
+        exc: The exception a source read failed with.
+
+    Returns:
+        ``True`` when the chain names a refusal the provider owns.
+    """
+    text = _exception_chain_text(exc)
+    if any(m in text for m in _OWN_CREDENTIAL_MARKERS):
         return False
-    return any(m in text for m in _UNREADABLE_MARKERS)
+    if not any(m in text for m in _SOURCE_READER_MARKERS):
+        return False
+    return any(m in text for m in _PROVIDER_REFUSAL_MARKERS)
 
 
 def step_down_copies(

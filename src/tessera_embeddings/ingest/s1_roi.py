@@ -26,7 +26,10 @@ Algorithm (unchanged from the reference):
    * Call :func:`ingest_tile` to produce a per-batch ``xarray.Dataset``.
    * Apply the ROI mask, then write each date's live windows via
      :func:`tessera_embeddings.storage.zarr_store.write_day_windows` with a
-     narrow tenacity retry on transient GDAL errors.
+     narrow tenacity retry on transient GDAL errors. Past that retry the date
+     is GIVEN UP rather than allowed to fail the leg, and recorded on the
+     store. Up to :data:`MAX_GIVEN_UP_DATES`; past that the leg stops and asks
+     to be re-dispatched.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ import xarray as xr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
 from tessera_embeddings.ingest._pipeline import pipelined
+from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreadable_source
 from tessera_embeddings.ingest.live_windows import (
     WINDOW_COST_IN_CHUNKS,
     WINDOW_COST_IN_CHUNKS_OVERLAPPED,
@@ -100,6 +104,25 @@ spend an HTTP call, so a short interval is nearly free.
 """
 
 S1Orbit = Literal["ascending", "descending"]
+
+
+MAX_GIVEN_UP_DATES = 10
+"""How many dates one radar leg may give up before it stops and asks to come back.
+
+Small on purpose, because a provider refusal CLEARS. Every date given up while one lasts is a
+date a later run would have written, so grinding through an outage converts recoverable imagery
+into a durable hole — and a leg that finishes returns success, so nothing comes back for it.
+Stopping instead is a request to be re-dispatched, and the dates listed are then written rather
+than lost. Ten is a small fraction of a radar year's couple of hundred dates per orbit.
+"""
+
+
+class TooManyGivenUpDatesError(RuntimeError):
+    """A radar leg gave up more dates than the bounded skip permits.
+
+    Deliberately RETRYABLE — absent from ``ingest_zone_year._NON_RETRYABLE_LEG_MARKERS`` —
+    because a refusal goes away and a re-dispatch writes the dates this leg gave up.
+    """
 
 
 @contextmanager
@@ -520,11 +543,76 @@ def ingest_s1_roi_sar(
     # Counted for the assessed-window record: it separates "sparse region" from
     # "the footprints are wrong", which look identical in a date count alone.
     empty_dates = 0
+    #: Dates given up because their source reads failed, recorded on the store rather than only
+    #: logged: without the record a lost date and a day with no imagery look the same, and
+    #: nothing downstream revisits either.
+    given_up_dates: list[dict[str, str]] = []
+    #: The same dates as a membership test. Batch queries are padded a day either side, so a
+    #: boundary solar day comes back from two consecutive batches — without this it would be
+    #: given up twice, listed twice, and cost two of the leg's budget.
+    given_up: set[str] = set()
     #: Owned items across every batch — the number that distinguishes "the source does not
     #: cover this ROI for this orbit" from "we found items and committed none of them".
     total_items_seen = 0
     # Frozen at the start so the background thread reads an object nothing mutates.
     already_present = frozenset(written_dates)
+
+    def _give_up_date(date_str: str, exc: BaseException) -> bool:
+        """Accept the loss of one date, or decline to.
+
+        Returns ``False`` when the failure is not one the source is answerable for, and the
+        caller then re-raises — the fail-closed direction, so an unexamined cause stops the leg
+        instead of quietly thinning its year.
+
+        The two accepted causes are recorded under different ``scope`` values because they need
+        different responses: ``provider-refused`` means a later run over this window gets the
+        imagery, ``unreadable`` means the catalogue is what to check.
+
+        Raises:
+            TooManyGivenUpDatesError: Past :data:`MAX_GIVEN_UP_DATES`.
+        """
+        if is_provider_refusal(exc):
+            scope = "provider-refused"
+        elif is_unreadable_source(exc):
+            scope = "unreadable"
+        else:
+            return False
+        given_up.add(date_str)
+        given_up_dates.append(
+            {
+                "date": date_str,
+                "scope": scope,
+                # Truncated: this lands in the store's metadata, which every reader of the
+                # attribute pays for, and the first line is what identifies the cause.
+                "error": f"{type(exc).__name__}: {exc}"[:300],
+            }
+        )
+        log.error(
+            "[%s] DATA LOSS roi=%s date=%s: the source read failed and this date is SKIPPED, so "
+            "its pixels are absent from the mosaic. scope=%s error=%s — recorded on the store as "
+            "assessed_unreadable_dates.",
+            orbit,
+            roi_label,
+            date_str,
+            scope,
+            exc,
+            exc_info=True,
+        )
+        # After the line above, so the date that crossed the ceiling is described as fully as
+        # every date before it. No assessed window is written by a leg that stops here: that
+        # attribute says the range was examined in full, and this one never reached most of it.
+        if len(given_up_dates) > MAX_GIVEN_UP_DATES:
+            listed = ", ".join(f"{g['date']}({g['scope']})" for g in given_up_dates)
+            raise TooManyGivenUpDatesError(
+                f"STOPPING [{orbit}] roi={roi_label}: {len(given_up_dates)} date(s) given up, past "
+                f"the ceiling of {MAX_GIVEN_UP_DATES}. This many says the source is refusing reads "
+                f"rather than holding one bad object, and every further date attempted while that "
+                f"lasts becomes a durable hole for nothing. Dates: {listed}. RE-DISPATCH once the "
+                f"provider is answering again — these dates are written by the retry rather than "
+                f"lost. If they survive a retry the objects themselves are unreadable, and the "
+                f"catalogue is what to check."
+            )
+        return True
 
     def _prepare_batch(rng: SolarDayRange) -> _PreparedBatch:
         """Catalogue query plus lazy graph build for one batch. No cluster reads.
@@ -707,6 +795,13 @@ def ingest_s1_roi_sar(
                     log.debug("[%s] Skipping date %s: already written", orbit, date_str)
                     continue
 
+                # Given up by an EARLIER batch: the padded query offers a boundary solar day to
+                # both batches that touch it. DEBUG because the loss was reported where it
+                # happened.
+                if date_str in given_up:
+                    log.debug("[%s] Skipping date %s: already given up", orbit, date_str)
+                    continue
+
                 if footprint is not None and not footprint:
                     # Reaches no live window at all. Writing it would build a full graph
                     # to store nothing, since all-fill chunks are never persisted.
@@ -733,22 +828,32 @@ def ingest_s1_roi_sar(
                 # was S2's, whose read fires in its coverage gate, outside any retry. What
                 # this path lacked is attribution: once the retry is exhausted the exception
                 # names neither the zone nor the date.
-                with read_failure_context(log, roi=roi_label, date=date_str):
-                    for attempt in store_write_retrying(log):
-                        with attempt:
-                            write_day_windows(
-                                orbit_store,
-                                day_slice,
-                                date_windows,
-                                roi=roi,
-                                manifest=ingest_manifest,
-                                baselines=_baselines_for(baselines, [date_str]),
-                                tile_id=roi_zarr_path,
-                                crs=roi.native_crs,
-                                chunks=INGEST_CHUNKS,
-                                parallel_windows=overlap_window_writes,
-                                s3_region=s3_region,
-                            )
+                try:
+                    with read_failure_context(log, roi=roi_label, date=date_str):
+                        for attempt in store_write_retrying(log):
+                            with attempt:
+                                write_day_windows(
+                                    orbit_store,
+                                    day_slice,
+                                    date_windows,
+                                    roi=roi,
+                                    manifest=ingest_manifest,
+                                    baselines=_baselines_for(baselines, [date_str]),
+                                    tile_id=roi_zarr_path,
+                                    crs=roi.native_crs,
+                                    chunks=INGEST_CHUNKS,
+                                    parallel_windows=overlap_window_writes,
+                                    s3_region=s3_region,
+                                )
+                except Exception as exc:
+                    # The retry is exhausted. THIS is why one refused read used to take the
+                    # zone-year: the exception left the loop, so a date the source would not hand
+                    # over cost every LATER date too. Only a failure the source is answerable for
+                    # is absorbed — anything else repeats on every date and is repairable here,
+                    # so giving up dates one at a time would be the wrong response to it.
+                    if not _give_up_date(date_str, exc):
+                        raise
+                    continue
                 date_s = time.monotonic() - date_started
                 write_total_s += date_s
                 written_dates.add(date_str)
@@ -825,8 +930,25 @@ def ingest_s1_roi_sar(
             start_date,
             end_date,
             empty_dates=empty_dates,
+            # Written unconditionally, so a clean re-run clears an earlier run's list rather
+            # than leaving dates advertised as lost that are now present.
+            unreadable=given_up_dates,
             get_credentials=None,
             s3_region=s3_region,
+        )
+
+    if given_up_dates:
+        # Re-stated at the END: the per-date line is hundreds of lines back, and this is the one
+        # that says a green leg is nonetheless missing pixels, and where.
+        log.error(
+            "[%s] DATA LOSS SUMMARY roi=%s: %d date(s) skipped because their source reads "
+            "failed — %s. Recorded on the store as assessed_unreadable_dates. A "
+            "provider-refused date is recoverable by re-running this window; an unreadable one "
+            "needs a reprocessed copy at the provider.",
+            orbit,
+            roi_label,
+            len(given_up_dates),
+            "; ".join(f"{g['date']} scope={g['scope']}" for g in given_up_dates),
         )
 
     if total_processed == 0:
@@ -842,18 +964,22 @@ def ingest_s1_roi_sar(
         # failure as the empty-commit warning this file's assessed-window record used to emit.
         already_held = len(written_dates)
         log.log(
-            logging.INFO if already_held else logging.WARNING,
+            # A resume with nothing left to add is routine; one that GAVE UP dates is not,
+            # whatever it already held.
+            logging.INFO if already_held and not given_up_dates else logging.WARNING,
             "[%s] WROTE NO DATES roi=%s window=%s..%s: items_seen=%d empty_dates=%d "
-            "already_held=%d — items_seen=0 means the source covers this ROI for this orbit "
-            "not at all; items_seen>0 with already_held>0 is a resume that had nothing left to "
-            "add; items_seen>0 with already_held=0 means items were found and none survived to "
-            "a commit",
+            "given_up=%d already_held=%d — items_seen=0 means the source covers this ROI for "
+            "this orbit not at all; items_seen>0 with already_held>0 is a resume that had "
+            "nothing left to add; items_seen>0 with already_held=0 means items were found and "
+            "none survived to a commit; given_up>0 names how many of those the source refused "
+            "or could not read",
             orbit,
             roi_label,
             start_date,
             end_date,
             total_items_seen,
             empty_dates,
+            len(given_up_dates),
             already_held,
         )
         return SarIngestResult(
