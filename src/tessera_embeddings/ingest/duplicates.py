@@ -764,34 +764,19 @@ def is_unreadable_source(exc: BaseException) -> bool:
     An expired credential is explicitly excluded for that reason, even though it surfaces
     through the same wrapper.
     """
-    seen: list[str] = []
-    current: BaseException | None = exc
-    while current is not None and len(seen) < 20:
-        seen.append(f"{type(current).__name__}: {current}")
-        current = current.__cause__ or current.__context__
-    text = " | ".join(seen)
+    text = _exception_chain_text(exc)
     if any(m in text for m in ("ExpiredToken", "token has expired", "AccessDenied", "SlowDown")):
         return False
     return any(m in text for m in _UNREADABLE_MARKERS)
 
 
 def _exception_chain_text(exc: BaseException) -> str:
-    """The whole chain's type names and messages, joined, for text classification.
+    """The chain's type names and messages, joined, for text classification.
 
-    Matched as TEXT, and that is forced rather than chosen: the read runs on a Dask worker and
-    the failure is re-raised on the driver through tblib, which cannot reconstruct rasterio's
-    GDAL-backed exception classes. What arrives is a plain exception carrying the original's
-    repr, so an ``isinstance`` check matches nothing and the message is the only evidence left.
-
-    The chain matters as much as its head, because the informative part is usually the cause:
-    rasterio's ``WarpOperationError('Chunk and warp failed')`` is a wrapper that discards the
-    reason, and the reason is what says whether the object is broken or the service is.
-
-    Args:
-        exc: The exception a source read failed with.
-
-    Returns:
-        One string holding up to twenty links of the chain.
+    Text rather than ``isinstance`` because the read runs on a Dask worker and is re-raised on
+    the driver through tblib, which cannot rebuild rasterio's GDAL-backed classes — what arrives
+    is a plain exception carrying the original's repr. The whole chain, because the wrapper
+    discards the reason: ``WarpOperationError('Chunk and warp failed')`` says nothing on its own.
     """
     seen: list[str] = []
     current: BaseException | None = exc
@@ -801,38 +786,38 @@ def _exception_chain_text(exc: BaseException) -> str:
     return " | ".join(seen)
 
 
-#: Signatures of the PROVIDER refusing a read, as distinct from the object being unreadable.
-#:
-#: An authorization refusal, a throttle and a server error are all statements about the
-#: SERVICE, not about the bytes: the same object read moments before and reads again once the
-#: service recovers. So no fallback copy helps and no catalogue change is called for, which is
-#: exactly why :func:`is_unreadable_source` declines all of these — stepping a copy ladder for
-#: a bad minute swaps in worse imagery — and why this predicate exists beside it rather than
-#: inside it. The two need opposite responses: one gives up on the data, the other waits.
-#:
-#: The 403 form is here for the same reason the others are. An authorization refusal reads like
-#: a permissions fault, but a permissions fault is systemic and immediate rather than partial
-#: and self-clearing, and a service can answer 403 to a request whose credential is perfectly
-#: sound. The message alone cannot separate them. What does is
-#: :data:`_OWN_CREDENTIAL_MARKERS`, checked first so a fault on THIS side is never absorbed as
-#: somebody else's outage, and the ceiling the caller applies, which stops a leg whose refusals
-#: are not clearing.
+#: Signatures of the PROVIDER refusing a read — an authorization refusal, a throttle, a server
+#: error. All statements about the SERVICE rather than the bytes: the same object read moments
+#: before and reads again once the service recovers. So no fallback copy helps, which is why
+#: :func:`is_unreadable_source` declines every one of them and why this predicate sits beside it
+#: rather than inside it. The two need opposite responses: one gives up on the data, the other
+#: waits.
 _PROVIDER_REFUSAL_MARKERS = (
     "AccessDenied",
-    "HTTP response code: 403",
     "SlowDown",
     "ServiceUnavailable",
     "InternalError",
+    "HTTP response code: 403",
     "HTTP response code: 500",
     "HTTP response code: 503",
 )
 
-#: Refusals that are NOT the provider's to answer for, though they surface identically.
+#: What makes a refusal the SOURCE's: the source reader is the layer that was refused.
 #:
-#: An expired or malformed credential is this side's own and the remedy is renewal here.
-#: Treating one as somebody else's outage would spend a bounded date budget hiding a fault that
-#: no amount of waiting repairs, and would do it quietly — so these are matched FIRST and the
-#: exception is re-raised, which fails a leg on its first date rather than its tenth.
+#: The names above belong to S3, and every S3 client in the process shares them — our own store
+#: write answers ``AccessDenied`` when icechunk picks up the OPERA-scoped token instead of the
+#: role (``storage/zarr_store.py`` documents exactly that), and a throttle on the destination
+#: bucket says ``SlowDown`` in the same words the source does. Since the read and the write both
+#: happen inside ``write_day_windows``, the text is all there is to separate them. Requiring
+#: GDAL's own vocabulary alongside does it: GDAL reads source imagery here and nothing else —
+#: the destination is Icechunk and the ROI mask is read through ``da.from_zarr``. Unpaired, the
+#: exception is re-raised, so a destination fault fails the leg on its first date instead of
+#: being absorbed as somebody else's outage, one date at a time.
+_SOURCE_READER_MARKERS = ("RasterioIOError", "WarpOperationError", "CPLE_", "HTTP response code:")
+
+#: Refusals that are NOT the provider's to answer for, though they surface identically. Our own
+#: credential is repairable here and no waiting fixes it, so these are matched FIRST and the
+#: caller re-raises — failing a leg on its first date rather than its tenth.
 _OWN_CREDENTIAL_MARKERS = (
     "ExpiredToken",
     "token has expired",
@@ -844,14 +829,14 @@ _OWN_CREDENTIAL_MARKERS = (
 def is_provider_refusal(exc: BaseException) -> bool:
     """Whether ``exc`` says the source PROVIDER refused the read.
 
-    A refusal is transient by nature and clears on its own, so the useful response is to give up
-    the one date, record the loss durably, and keep the run — never to substitute a different
-    copy of the imagery, which is what :func:`is_unreadable_source` gates and why that predicate
-    deliberately excludes everything matched here.
+    A refusal is transient and clears on its own, so the useful response is to give up the one
+    date, record it, and keep the run — never to substitute a different copy of the imagery,
+    which is what :func:`is_unreadable_source` gates and why that predicate excludes everything
+    matched here.
 
-    Fails closed in both directions. A credential fault on this side is excluded, because it is
-    repairable here and absorbing it would hide it. Anything unrecognised is excluded too, so
-    the caller re-raises rather than giving up a date for a reason nobody has examined.
+    Fails closed three ways: our own credential fault is excluded, a refusal nothing attributes
+    to the source reader is excluded (see :data:`_SOURCE_READER_MARKERS`), and anything
+    unrecognised is excluded. In each case the caller re-raises.
 
     Args:
         exc: The exception a source read failed with.
@@ -861,6 +846,8 @@ def is_provider_refusal(exc: BaseException) -> bool:
     """
     text = _exception_chain_text(exc)
     if any(m in text for m in _OWN_CREDENTIAL_MARKERS):
+        return False
+    if not any(m in text for m in _SOURCE_READER_MARKERS):
         return False
     return any(m in text for m in _PROVIDER_REFUSAL_MARKERS)
 

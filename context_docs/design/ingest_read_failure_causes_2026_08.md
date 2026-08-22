@@ -484,177 +484,102 @@ symptom without a repro, and should be sent as such rather than with a guessed q
 
 ## Cause 4 — the provider refuses reads for a while (radar), 2026-08-21
 
-Absorbed into this document rather than given its own, because it is a fourth thing the same
-`WarpOperationError('Chunk and warp failed')` text hides, and the headline table above was
-incomplete without it.
+Absorbed here rather than given its own document, because it is a fourth thing the same
+`WarpOperationError('Chunk and warp failed')` text hides.
 
 | | source | preceded by | retryable? |
 |---|---|---|---|
-| **Provider refusing reads** | `asf-cumulus-prod-opera-products` (radar) | `HTTP response code: 403` / `AccessDenied`, fleet-wide and simultaneous | **yes** — and by waiting, not by trying harder |
+| **Provider refusing reads** | `asf-cumulus-prod-opera-products` (radar) | `HTTP response code: 403` / `AccessDenied`, fleet-wide and simultaneous | **yes** — by waiting, not by trying harder |
 
 ### The failure
 
-Every Sentinel-1 leg in the global campaign failed: **178 failed, zero completed.** Sentinel-2
-was unaffected throughout. The authorization refusals were a wave, not a trickle — 1,565 403 /
-AccessDenied exceptions landed in a single ten-minute bin (22:50 UTC), with zero in the bins
-before and after, and 83 `READ FAILED` lines against 1–2 per bin at baseline.
+Every Sentinel-1 leg in the global campaign failed: **178 failed, zero completed**, Sentinel-2
+unaffected throughout. 1,565 403 / AccessDenied exceptions landed in a single ten-minute bin
+(22:50 UTC) with zero in the bins either side. ASF refused reads for about six minutes at full
+rate and roughly seven more decaying, then recovered on its own. Of the 178, 86 died inside the
+window and 92 in its aftermath — re-dispatches walking back into a source still refusing.
 
-ASF refused reads for about **six minutes at full rate and roughly seven more decaying**, then
-recovered on its own. Nothing was done to it and nothing needed to be.
+**The refusal is not the defect. The absence of any containment around it is.** Every OPERA read
+on the radar path happens inside a date's write, so an exhausted read raises out of the per-date
+loop and out of the leg: a leg ninety dates into its year, holding sound committed data, lost
+every remaining date because one date's read was refused. The optical path had had this
+containment since the corrupt-object work; radar had none of it (`is_unreadable_source`: four
+occurrences in `s2_roi.py`, zero in `s1_roi.py`).
 
-Of the 178 dead legs, **86 died inside the outage window and 92 in its aftermath** — the second
-group being re-dispatches that walked back into a source still refusing, or into the tail.
+Nothing was corrupted. All 120 radar stores: time axis strictly monotonic, zero duplicate
+instants, median gap 1 day, 10,840 committed dates, each stopping cleanly at day 60–125. Every
+one of those dates was resumable. The legs simply stopped.
 
-The failure mix across 167 sampled legs:
+### Two traps worth not re-hitting
 
-| exception | count |
-|---|---|
-| `WarpOperationError('Chunk and warp failed')` | 119 |
-| `RasterioIOError('HTTP response code: 403')` | 24 |
-| `AccessDenied` | 22 |
-| `ObjectNotFound` | 2 |
+- **Counting GDAL's `HTTP error code for ...: NNN.` warning finds zero 403s.** GDAL
+  logs-and-retries a 503 but raises immediately on a 403 *without emitting that line*. Count
+  `HTTP response code: 403` and `AccessDenied` instead.
+- **The Prefect flow-run logs hold only cluster setup.** The work logs are in CloudWatch log
+  group `/ecs/global-tessera-prod`. Sampling Prefect logs for 403s finds nothing, and the nothing
+  means nothing.
 
-### What made a thirteen-minute outage cost 178 zone-years
-
-Not the refusal. **The absence of any containment around it.**
-
-Every OPERA read on the radar path happens inside a date's write, so an exhausted read raises
-out of the per-date loop and out of the leg. A leg 90 dates into its year, holding sound
-committed data, lost every remaining date in its window because one date's read was refused.
-
-The committed data was never in question, and that is the measurement that isolates the defect
-to containment rather than to correctness. All 120 radar stores: time axis strictly monotonic,
-**zero** duplicate instants, first date 1 January, median gap between dates 1 day, **10,840
-committed dates** in total, each store stopping cleanly at day 60–125 of its year. Every one of
-those dates was resumable. The legs did not corrupt anything; they simply stopped.
-
-The optical path already had the containment — a date whose objects will not read is skipped,
-recorded, and the leg continues. Radar had none of it: `is_unreadable_source` appeared four
-times in `s2_roi.py` and zero times in `s1_roi.py`.
-
-### A correction, in place: this was NOT credential pinning
-
-The first hypothesis, held for several hours, was that `auth.py`'s drift check was pinning a
-stale credential to long-lived Dask task threads, and that the 22:50 wave was a refresh
-colliding with in-flight reads. **That was wrong**, and the evidence that overturned it:
-
-- The credential in force across the whole wave was valid, with a wide margin either side. The
-  refresh cadence held throughout — `refresh_credentials_if_stale` renews at
-  `CRED_EXPIRY_MARGIN_SEC` (15 min) ahead of expiry, re-checked by a 5-minute ticker, so the
-  credential a worker holds is never within 10 minutes of spent.
-- The wave's shape is wrong for a refresh. A refresh is per leg and the legs are not
-  synchronised; the refusals were simultaneous across the whole fleet, which is the signature of
-  one upstream service, not of 178 independent credential events.
-- ASF recovering on its own, with no credential action taken, is not something a pinning defect
-  can explain.
-
-The reason the credential hypothesis was available at all is that a refusal from ASF and an
-expired credential surface through the same wrapper and the same 403 — which is the same
-wrapper problem this whole document is about.
-
-### A measurement trap that inverted the first reading
-
-Counting GDAL's `HTTP error code for ...: NNN.` warning lines finds **zero** 403s. GDAL
-logs-and-retries a 503 but **raises immediately on a 403 without emitting that line**, so the
-warning-line census reports the absence of exactly the thing being looked for. The strings that
-do count are `HTTP response code: 403` and `AccessDenied`.
-
-A second trap: the Prefect flow-run logs for these legs hold only cluster setup. The work logs
-are in CloudWatch log group `/ecs/global-tessera-prod`. Sampling Prefect logs for 403s finds
-nothing, and the nothing means nothing.
+It was also **not credential pinning**, which was the first hypothesis: the credential in force
+across the wave was valid with a wide margin, the refusals were simultaneous fleet-wide (one
+upstream service, not 178 independent credential events), and ASF recovering unaided is not
+something a pinning defect explains.
 
 ### The change
 
-`ingest/duplicates.py` gains `is_provider_refusal`, beside `is_unreadable_source` and
-deliberately not inside it. The two questions have opposite answers: an unreadable object wants
-a different copy of the imagery or a give-up, a refusal wants only to be waited out. Both fail
-closed, and a credential fault on our own side (`ExpiredToken`, `SignatureDoesNotMatch`,
-`InvalidAccessKeyId`) is excluded from the refusal set first — it is repairable here, no waiting
-fixes it, and absorbing one would spend a bounded budget hiding it.
+`ingest/duplicates.py` gains `is_provider_refusal`, beside `is_unreadable_source` rather than
+inside it — an unreadable object wants a different copy or a give-up, a refusal wants only to be
+waited out. `ingest/s1_roi.py` gains the bounded skip: retry, then give up the one date, record
+it on the store as `assessed_unreadable_dates` with `scope=provider-refused` or
+`scope=unreadable`, and stop past `MAX_GIVEN_UP_DATES = 10`.
 
-`ingest/s1_roi.py` gains the bounded skip: retry, then give up the one date, record it on the
-store as `assessed_unreadable_dates` with `scope=provider-refused` or `scope=unreadable`, and
-stop past `MAX_GIVEN_UP_DATES = 10`.
+Two properties carry the design:
 
-**Why 10, and why lower than the optical path's ceiling.** The two losses differ in one decisive
-way. An unreadable object stays unreadable, so a date given up to one is a date no re-dispatch
-recovers and finishing the rest of the window is the best remaining outcome — a generous ceiling
-is right. A refusal *clears*. Every date given up while one lasts is a date that would have been
-written before it or after it, so grinding on converts recoverable imagery into a durable hole
-and keeps doing so for as long as the source stays down. A radar zone-year holds a couple of
-hundred dates per orbit, so ten is a small fraction of a leg's depth — enough to absorb a
-refusal of the length measured here without ceremony — and past ten the losses are no longer
-brief. Stopping then is strictly better than continuing, because the stop is a request to come
-back: `TooManyGivenUpDatesError` is **deliberately absent** from
-`ingest_zone_year._NON_RETRYABLE_LEG_MARKERS`, so the leg is re-dispatched and the dates it gave
-up are written rather than lost.
-
-That absence is the whole point, and it is the opposite verdict from the one an unreadable
-object deserves. Marking this error non-retryable would turn a passing outage into permanent
-data loss.
+- **A refusal is only the provider's if the SOURCE READER was refused.** `AccessDenied`,
+  `SlowDown` and `InternalError` are S3's words and every S3 client shares them — our own store
+  answers `AccessDenied` when icechunk picks up the OPERA-scoped token instead of the role, which
+  `storage/zarr_store.py` documents. Since the read and the write both happen inside
+  `write_day_windows`, the text is all there is to separate them, so the refusal markers only
+  count alongside GDAL's own vocabulary (`RasterioIOError`, `WarpOperationError`, `CPLE_`,
+  `HTTP response code:`). GDAL reads source imagery here and nothing else. Unpaired, the
+  exception is re-raised, so a destination fault fails the leg on its first date rather than
+  being absorbed one date at a time.
+- **The ceiling is RETRYABLE**, and deliberately absent from
+  `ingest_zone_year._NON_RETRYABLE_LEG_MARKERS`. This is the opposite verdict from the one an
+  unreadable object deserves. A refusal clears, so every date given up while one lasts is a date
+  a later run would have written — and a leg that *finishes* returns success, so nothing comes
+  back for it. Stopping is a request to be re-dispatched, and the dates it names are then
+  written rather than lost. That is also why ten is small: a radar zone-year holds a couple of
+  hundred dates per orbit.
 
 ### An asymmetry in `is_unreadable_source`, found while testing and NOT fixed here
 
-`is_unreadable_source` excludes refusals by matching their NAMES — `AccessDenied`, `SlowDown`,
-`ExpiredToken`, `token has expired`. A refusal reported as a bare status code carries none of
-those words, so for a `WarpOperationError('Chunk and warp failed')` whose cause is
-`HTTP response code: 403`, the exclusion does not fire and the predicate returns **True**.
+It excludes refusals by NAME (`AccessDenied`, `SlowDown`), so a refusal reported as a bare status
+code carries none of those words and the wrapper's decode marker decides — a
+`WarpOperationError('Chunk and warp failed')` caused by `HTTP response code: 403` returns
+**True**. On the optical path that predicate gates the copy ladder, so a transient numeric 403
+can step a tile-date down to an older baseline: exactly what the predicate documents itself as
+preventing. The radar path resolves it by ORDER — `_give_up_date` asks about the refusal first.
 
-Two consequences, measured by test rather than in production:
+Left alone because widening that tuple changes optical behaviour during a live campaign and the
+direction is not obviously safe: a 403 that currently steps down and succeeds would instead
+propagate. It wants its own change with the optical ladder's blast radius measured first.
 
-- On the **optical** path, that predicate gates the duplicate-copy ladder. A transient numeric
-  403 can therefore step a tile-date down to an older reprocessing baseline — permanently
-  substituting worse imagery to work around a bad minute, which is precisely the outcome the
-  predicate documents itself as preventing.
-- On the **radar** path it is resolved by ORDER: `_give_up_date` asks `is_provider_refusal`
-  first, so a numeric refusal is scoped `provider-refused` and not mis-recorded as imagery that
-  will never read. `scope` is the field an operator acts on, and the two verdicts send them to
-  different places.
+### A credential refresh strips its own task's GDAL configuration — measured, NOT fixed here
 
-Left alone deliberately. Widening that exclusion tuple changes optical behaviour during a live
-campaign, and the direction is not obviously safe: a 403 that currently steps down and succeeds
-would instead propagate. It wants its own change, with the optical ladder's blast radius
-measured first.
+Reproduced deterministically against the installed `odc.loader` and `rasterio`.
+`auth._patch_odc_thread_session_for_env_drift` responds to a credential change by calling
+`ThreadSession.reset()`, which calls `rasterio.env.delenv()` — from inside `rio_env()`, which
+`_rio_read` enters *while a dataset is open*, inside the outer `rio_env` that
+`RioDriver.restore_env` wraps around a whole Dask chunk task. The inner `Env` then believes it is
+outermost and on exit restores a freshly-defaulted option set.
 
-### A credential-refresh defect, measured and NOT fixed here
-
-Reproduced deterministically against the installed `odc.loader` and `rasterio`, and unrelated to
-the outage above except that it weakens the fleet's tolerance of one.
-
-`auth._patch_odc_thread_session_for_env_drift` detects a credential change inside
-`ThreadSession.session()` and responds by calling `ThreadSession.reset()`. That method calls
-`rasterio.env.delenv()` — and `session()` is invoked from `odc.loader._rio.rio_env()`, which
-`_rio_read` enters **while a dataset is open**, inside the outer `rio_env` that
-`RioDriver.restore_env` wraps around an entire Dask chunk task.
-
-Tearing down the thread's GDAL environment there desynchronises rasterio's env bookkeeping: the
-inner `Env` believes it is outermost, and on exit restores a freshly-defaulted option set. For
-every remaining read in that task the ambient environment has lost its credentials **and the
-cloud GDAL defaults** — `GDAL_DISABLE_READDIR_ON_OPEN=EMPTY_DIR`, `GDAL_HTTP_MAX_RETRY=10`,
-`GDAL_HTTP_RETRY_DELAY=0.5`.
-
-Observed, four sequential reads inside one chunk task, with a credential refresh landing after
-the first:
-
-```
-read 1  at open: key=GEN1 readdir=EMPTY_DIR retry=10      inner: key=GEN1 readdir=EMPTY_DIR retry=10
-*** refresh ***
-read 2  at open: key=GEN1 readdir=EMPTY_DIR retry=10      inner: key=GEN2 readdir=None      retry=None
-read 3  at open: key=None readdir=None      retry=None    inner: key=GEN2 readdir=None      retry=None
-read 4  at open: key=None readdir=None      retry=None    inner: key=GEN2 readdir=None      retry=None
-```
-
-`rasterio.open` self-heals its credentials from `os.environ` via
-`ensure_env_with_credentials`, so this is not by itself an authorization failure. The cost is the
-lost GDAL configuration: **a task that has been through a refresh has no GDAL HTTP retries for
-the rest of its life**, and re-acquires a directory listing on every open. Losing GDAL's ten
-retries is directly relevant to surviving a source that is briefly refusing or throttling.
-
-The fix is to install the new credential by assigning the thread's session rather than by
-resetting the cache — the thread's GDAL environment is then left intact, and the refreshed
-credential takes effect at the next `Env.__enter__`, which is where it should. Not done here:
-the credential path was explicitly out of scope for this change, and the reproduction above is
-enough to act on later.
+`rasterio.open` self-heals its credentials from `os.environ`, so this is not itself an
+authorization failure. The cost is the lost GDAL configuration: **a task that has been through a
+refresh has no GDAL HTTP retries (`GDAL_HTTP_MAX_RETRY=10`) for the rest of its life**, and
+re-lists a directory on every open. Losing ten GDAL retries is directly relevant to surviving a
+source that is briefly refusing. The fix is to install the new credential by assigning the
+thread's session rather than resetting the cache. Its own change: the credential path was out of
+scope here.
 
 ## Coupling to the leg retry
 
