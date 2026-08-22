@@ -105,6 +105,7 @@ from tessera_embeddings.ingest.stac import (
     load_stac_items,
     query_stac_items,
     selection_read_keys,
+    solar_day_sort_key,
     stream_stac_months,
 )
 from tessera_embeddings.storage.manifest import IngestManifest
@@ -1061,29 +1062,16 @@ def ingest_s2_roi_reflectance(
                 return
             total_processed += len(batch)
 
-        # CLEAREST-FIRST, because that is the order odc's fuser keeps: it writes only where
-        # the destination is still empty, so the first valid source of a solar day supplies a
-        # pixel and later ones fill its gaps. `query_stac_items` applies the same key — cloud
-        # cover ASCENDING — and applying it again here covers a supply that did not come through
-        # it, since both suppliers are injectable. `group_items_by_date` preserves this order.
-        #
-        # `id` last, and not decoration: the first two keys can TIE — two scenes of one solar day
-        # with equal cloud cover — and a stable sort then keeps whatever order the supplier
-        # produced. Since the fuser keeps the first valid source, an untied sort would let the
-        # supplier decide output pixels. A third key makes the sequence a function of the items.
+        # `solar_day_sort_key` owns the order and the reasoning. `query_stac_items` already
+        # applies it; applying it again covers a supply that did not come through there, since
+        # both suppliers are injectable. `group_items_by_date` preserves this order.
         #
         # Both the sort and the grouping key off the SOLAR day, not the UTC date, because
         # that is what the loader groups by. Using UTC here let a group the loader saw as
         # two solar days arrive as two time slices, against a cloud mask reduced to one —
         # a dimension conflict, and one that fires only where the solar offset is large
         # enough to cross UTC midnight (the far-eastern and far-western zones).
-        items.sort(
-            key=lambda it: (
-                it.datetime.strftime("%Y-%m-%d"),
-                float(it.properties.get("eo:cloud_cover", 100)),
-                it.id,
-            )
-        )
+        items.sort(key=solar_day_sort_key)
         by_date = group_items_by_date(items)
         total_seen += len(by_date)
         prepare = _prepare_date

@@ -360,6 +360,30 @@ def _extract_baseline(item: Item) -> int:
     return 0 if declared is None else declared
 
 
+def solar_day_sort_key(item: Item) -> tuple[str, float, str]:
+    """The order a solar day's items must be handed to the loader in.
+
+    The loader's fuser keeps the FIRST valid source of a group and later sources only fill the
+    gaps it left, so this order decides which scene supplies a contested pixel. Clearest first:
+    the clearest scene wins the ground it covers, and its holes fall through to the next-clearest
+    rather than to nothing.
+
+    ``100`` is a real cloud reading, so a missing one sorts after every measured value instead of
+    borrowing it — unknown never displaces measured. ``id`` settles what is left, which would
+    otherwise be settled by whatever order the supplier happened to produce, making output pixels
+    a function of how the query was partitioned.
+
+    **Both ingest paths sort on this function.** They each built their own key once, and the defect
+    that replaced was the two of them disagreeing about the direction.
+    """
+    cloud = item.properties.get("eo:cloud_cover")
+    return (
+        item.datetime.strftime("%Y-%m-%d"),
+        float("inf") if cloud is None else float(cloud),
+        item.id,
+    )
+
+
 def extract_baselines(items: list[Any]) -> dict[str, int]:
     """The processing baseline to apply per date, over exactly ``items``.
 
@@ -1600,22 +1624,10 @@ def query_stac_items(
     # read as the solar day by the sort, the baseline map, the dedup and every consumer.
     items = normalize_to_solar_day(items, mid_longitude=resolve_grouping_longitude(mid_longitude, bbox))
 
-    # Sort by (solar date, cloud_cover ASCENDING) so same-day tiles are adjacent and the
-    # CLEAREST tile comes FIRST.
-    #
-    # First, because that is the one the loader keeps. `load_kwargs` below sets
-    # `preserve_original_order=True` with `groupby="solar_day"`, and odc fuses a group with
-    # `nodata_fuser` — `np.copyto(dst, src, where=dst_is_nodata)` — which writes only where the
-    # destination is still empty. So the FIRST valid source of a group supplies a pixel and later
-    # ones can only fill the gaps it left, which is exactly the behaviour wanted: the clearest
-    # scene that covers a pixel wins it, and a hole in the clearest scene falls through to the
-    # next-clearest rather than to nothing.
-    #
-    # Pinned end to end by `tests/unit/test_solar_day_fusion.py`, which loads two real scenes of
-    # one solar day through this path and asserts which one survives.
-    #
-    # An item declaring no cloud cover reads as 100, so it sorts last and can only fill gaps. That
-    # is the cautious end under this ordering: unknown never displaces measured.
+    # `solar_day_sort_key` owns the order and the reasoning; `load_kwargs` below sets
+    # `preserve_original_order=True` so it is that order the loader fuses in. Pinned end to end by
+    # `tests/unit/test_solar_day_fusion.py`, which loads two real scenes of one solar day through
+    # this path and asserts which one survives.
     #
     # Keyed on the SOLAR day, matching `normalize_to_solar_day` just above and the loader's own
     # grouping. Keying on the UTC date instead splits a group the loader treats as one, in the
@@ -1639,13 +1651,7 @@ def query_stac_items(
         # crossing an item ceiling, or hitting a refusal, change output pixels for the same
         # requested range. A third key removes the tie, so the sequence is a function of the
         # items alone.
-        items.sort(
-            key=lambda item: (
-                item.datetime.strftime("%Y-%m-%d"),
-                float(item.properties.get("eo:cloud_cover", 100)),
-                item.id,
-            )
-        )
+        items.sort(key=solar_day_sort_key)
 
     baselines = extract_baselines(items)
 

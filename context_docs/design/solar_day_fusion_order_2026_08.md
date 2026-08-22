@@ -80,10 +80,12 @@ could have been ground. There is no error, no warning, and no shape mismatch —
 | `stac.extract_baselines` | last item of a date wins | first item of a date wins |
 
 The baseline map moved with the sort for a reason that is easy to miss. It records one processing
-baseline per date, and that baseline selects a radiometric offset applied to that date's pixels.
-Under the corrected order the first item is the clearest — the scene that actually supplied most of
-the day's pixels — so the recorded baseline now describes the scene that contributed. Keeping
-last-wins would have named the cloudiest scene, the one contributing least.
+baseline per date and is persisted as the store's `baselines_applied`. That is **provenance only**:
+the radiometric correction is decided per source as each source is read, and nothing derives a
+correction from this map. What the move fixes is therefore the honesty of the record — under the
+corrected order the first item is the clearest, the scene that actually supplied most of the day's
+pixels, so the stored provenance names the scene that contributed. Keeping last-wins would have
+named the cloudiest scene, the one contributing least.
 
 `s2_roi`'s sort gained the `id` key that `query_stac_items` already had. Two scenes of one solar day
 can tie on cloud cover — `0.0` is a common value — and a stable sort then preserves whatever order
@@ -151,11 +153,13 @@ only fill gaps: unknown never displaces measured. This is the cautious end, and 
 kind from the previous order, where an unknown-cloud item sorted first and won everything it
 covered.
 
-**Clearest-first plus first-wins keeps coverage.** The alternative pairing that also selects the
-clearest scene — cloudiest-first with a last-wins fuser — would have to be built by supplying a
-custom fuser, and it loses the gap-filling property: a hole in the clearest scene would stay a hole.
-The corrected pairing is better than the one that was intended, not merely consistent with the
-library.
+**Clearest-first plus first-wins is the cheapest pairing that keeps coverage, not the only one.**
+A custom valid-aware last-wins fuser — one that overwrites the destination only where the later
+source is valid — reaches the same result from the opposite order, and keeps gap-filling too. So
+coverage is not an argument against that design and should not be quoted as one. The arguments
+are cost and blast radius: it means writing and configuring a fuser where the library's default
+already suffices, and the fuser applies to every collection the loader serves rather than only
+this one.
 
 **One integer per date remains a lossy record** of a day whose tiles declare different baselines.
 That is unchanged by this fix and is deliberate; nothing in the package reads the attribute yet.

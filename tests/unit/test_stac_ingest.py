@@ -2,6 +2,8 @@
 
 import threading
 import time
+from datetime import datetime
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -29,6 +31,7 @@ from tessera_embeddings.ingest.stac import (
     correct_boa_dn,
     extract_baselines,
     ingest_tile,
+    solar_day_sort_key,
     split_antimeridian_bbox,
     split_query_window,
 )
@@ -505,6 +508,29 @@ class TestIngestTile:
 
         assert result_data is None
         assert result_baselines == {}
+
+
+class TestTheSolarDaySortKey:
+    """The one key both ingest paths sort on."""
+
+    @staticmethod
+    def _item(cloud, item_id="S2A_T13TDE_20240615_0_L2A"):
+        props = {} if cloud is None else {"eo:cloud_cover": cloud}
+        return SimpleNamespace(id=item_id, datetime=datetime(2024, 6, 15, 12, 0), properties=props)
+
+    def test_a_missing_reading_sorts_after_a_measured_full_cloud(self):
+        """100 is a real reading, so a missing value must not tie with it.
+
+        On a tie the `id` term decides, which would let an unmeasured scene take ground from one
+        known to be fully clouded — the opposite of the documented guarantee.
+        """
+        assert solar_day_sort_key(self._item(None)) > solar_day_sort_key(self._item(100))
+
+    def test_the_clearest_scene_of_a_day_sorts_first(self):
+        assert solar_day_sort_key(self._item(2.0)) < solar_day_sort_key(self._item(90.0))
+
+    def test_an_equal_cloud_tie_is_settled_by_id_not_by_input_order(self):
+        assert solar_day_sort_key(self._item(5.0, "AAA")) < solar_day_sort_key(self._item(5.0, "BBB"))
 
 
 class TestSolarDayFusionOrdering:
