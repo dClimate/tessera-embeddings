@@ -10,11 +10,14 @@ Supports multiple providers (Earth Search, Planetary Computer) and collections
 
 import datetime
 import logging
+import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from itertools import count
-from typing import Any
+from typing import Any, final
 
 import numpy as np
 import xarray as xr
@@ -124,12 +127,36 @@ _STAC_TIMEOUT = (10, 60)
 # ceiling buys is that a refusal throws away a bounded walk instead of hundreds of pages.
 #
 # In ITEMS rather than pages, so it keeps its meaning when a provider's page size changes
-# and so a denser year is cut into more pieces rather than walked further. A smaller page
-# is NOT an alternative: it changes neither the items walked nor which windows are refused,
-# and it addresses a different failure — the one `max_page_size` in config/providers.py was
-# lowered for, where a single fat page is refused outright.
+# and so a denser year is cut into more pieces rather than walked further.
+#
+# A smaller page IS a real alternative, and the same refusal `max_page_size` was lowered
+# for: Earth Search refuses a request whose response would exceed ~6 MB, so whether a given
+# hundred items is served depends on how fat those particular hundred are. Re-asking the
+# refused page at a smaller size is the most direct remedy and is not used here only because
+# `pystac_client` bakes the limit into a search and offers no way to resume from a cursor at
+# a different size. Re-cutting the window reaches the same end through the library's own API:
+# it regroups the items so no page is fat enough to be refused.
 # Measurements in context_docs/design/ingest_optimization_campaign_2026_07.md.
 _MAX_QUERY_ITEMS = 10_000
+
+# Date windows of ONE query walked at the same time.
+#
+# The worklist's windows are INDEPENDENT searches — each its own paginated walk with its
+# own cursor — so the only thing that serialised them was the loop. What they spend their
+# time on is the catalogue thinking, not the wire: a 100-item page of `sentinel-2-l2a`
+# takes ~1.2 s from the end of the request to the first byte of the response, against a
+# 12-36 ms round-trip to the same host and ~0.2 s to stream the gzipped body — and ~0.8 s
+# of that 1.2 s is the catalogue's own per-item work, measured as a 7.8 ms/item slope
+# against page size. So a walk is idle for almost all of its wall clock, overlapping walks
+# is the only lever that moves it, and moving the client into the catalogue's own region is
+# NOT one: the round-trip it removes is a few percent of a page.
+#
+# Bounded, and deliberately low. The campaign runs tens of cells against this one provider
+# at once, so this is a MULTIPLIER on the concurrent search streams Element 84 sees, and
+# what they answer an overload with — 429, 503 — is a load refusal the whole leg then waits
+# out. Measurements, including per-page latency against concurrency, are in
+# context_docs/design/ingest_optimization_campaign_2026_07.md.
+_QUERY_WINDOW_WORKERS = 6
 
 
 def _get_provider_config(provider_name: str) -> STACProvider:
@@ -943,6 +970,243 @@ def _parts_for_depth(page: dict[str, Any]) -> int:
     return -(-matched // _MAX_QUERY_ITEMS)
 
 
+@final
+@dataclass
+class _WindowWalk:
+    """One date window of the worklist, what it returned, and what replaced it.
+
+    A node of the tree the worklist walk describes. The serial walk WAS a depth-first
+    traversal of exactly this tree: it appended a window's items, then descended into the
+    shorter windows that window asked for instead of the rest of its own pages. Making the
+    tree explicit is what lets the fetching run concurrently while the output stays in the
+    order the serial walk produced — and the order is load-bearing, because
+    :func:`query_stac_items` sorts the result on keys items can TIE on, Python's sort is
+    stable, and the surviving input order therefore decides which scene the loader paints
+    last for a pixel. The item list is inside the mosaic fingerprint as well.
+
+    Attributes:
+        bbox: Spatial term this window is asked with — one antimeridian half, the whole
+            box, or None for a property-based query.
+        window: ``(start, end)`` as the catalogue is asked for it. Either bound may be a
+            bare date or one of :func:`split_query_window`'s boundary instants.
+        items: What this window's OWN pages returned, in page order, hydrated and pruned
+            but not deduplicated — assembly dedupes across the whole tree at once.
+
+            Hydrated HERE rather than at assembly, even though that hydrates duplicates a
+            re-cut window's children will return again. Hydration is ~1.1 ms/item of pure
+            Python, so deferring it moves ~60 s of a zone-month query out of the walks,
+            where it overlaps network waiting, and into the single-threaded assembly, where
+            nothing hides it. The cost is holding duplicate items until assembly: about 4%
+            of a clean query, and ~30% more peak memory on a refusal-heavy one.
+        children: Shorter windows that must be walked after this one, in date order.
+            Non-empty exactly when this window's own walk stopped early.
+    """
+
+    bbox: tuple[float, float, float, float] | None
+    window: tuple[str, str]
+    items: list[Any] = field(default_factory=list)
+    children: list["_WindowWalk"] = field(default_factory=list)
+
+    def preorder(self) -> Iterator["_WindowWalk"]:
+        """This node, then each child's subtree in order — the serial walk's visit order."""
+        yield self
+        for child in self.children:
+            yield from child.preorder()
+
+
+@final
+class _PerThreadClient:
+    """One :class:`~pystac_client.Client` per thread that asks for one.
+
+    ``StacApiIO`` holds a ``requests.Session``, which is not documented thread-safe, and
+    the windows are now walked concurrently. A client per worker thread costs one GET of
+    the catalogue root per thread and removes the question rather than reasoning about it;
+    it also gives each thread its own HTTP connection, which is what a concurrent walk
+    wants anyway.
+
+    The first client is opened on the CALLING thread, before any pool exists, so an
+    unreachable catalogue is still reported as the catalogue root it is rather than as a
+    task failure inside some window's walk.
+    """
+
+    def __init__(self, provider: STACProvider, collection_id: str, window: str) -> None:
+        self._provider = provider
+        self._collection_id = collection_id
+        self._window = window
+        self._local = threading.local()
+
+    def get(self) -> Client:
+        """This thread's client, opening it on first use."""
+        client: Client | None = getattr(self._local, "client", None)
+        if client is None:
+            stac_io = StacApiIO(max_retries=_STAC_RETRY, timeout=_STAC_TIMEOUT)
+            try:
+                client = Client.open(self._provider.catalog_url, stac_io=stac_io)
+            except Exception as exc:
+                # Page 0: the catalogue root, fetched before any search exists. Named
+                # separately so a refusal here is not read as a refusal of the search it
+                # precedes.
+                raise_catalogue_query_error(
+                    CatalogueRequest(self._collection_id, self._window, "catalogue-root", 0), exc, log=logger
+                )
+            self._local.client = client
+        return client
+
+
+def _walk_query_window(
+    client: Client,
+    provider: STACProvider,
+    collection_config: CollectionConfig,
+    tile_id: str | None,
+    keep_assets: frozenset[str],
+    node: _WindowWalk,
+) -> None:
+    """Walk one window's pages, filling ``node.items`` and ``node.children`` in place.
+
+    Everything the serial loop did for a SINGLE window, with the worklist decision handed
+    back as ``node.children`` instead of taken. Serial within the window — every page's
+    cursor comes from the page before it — and self-contained, refusal handling included,
+    which is what lets a caller run many of these at once without any task ever waiting on
+    another task.
+
+    Raises:
+        CatalogueQueryError: The catalogue refused a request that shortening the window
+            cannot route around. The item count in that log line is now THIS window's own:
+            with windows in flight concurrently there is no whole-query total to report at
+            the moment one of them fails.
+        ValueError: A returned item carries no ``id``, so it cannot be deduplicated.
+    """
+    win_start, win_end = node.window
+    window = f"{win_start}/{win_end}"
+    query_params = _build_stac_query(collection_config, tile_id, win_start, win_end, bbox=node.bbox)
+    # Read off the query that was BUILT rather than re-deciding property-versus-bbox
+    # here: a second copy of that branch could disagree with the one that ran, and
+    # then the log would name a request the catalogue was never asked. Tolerant of a
+    # query carrying neither term, because a diagnostic must never be the thing that
+    # raises — an unnamed area still leaves the collection, window and page named.
+    area = _area_label(query_params, tile_id)
+    search = client.search(**query_params, limit=provider.max_page_size, max_items=None)
+    # Paged EXPLICITLY (`pages_as_dicts`, which is what `items_as_dicts` iterates
+    # internally) so a failure can name the page ordinal it died on. Each page is a
+    # separate HTTP request behind its own retry ladder, so "the whole year fails" and
+    # "one deep cursor fails" are different defects with different reproductions, and
+    # an item count cannot tell them apart.
+    #
+    # Dicts rather than Items so a full item is never hydrated: pruning first and
+    # hydrating second is both smaller to retain and ~3x cheaper to build, because most
+    # of an item's construction cost is the assets that get dropped.
+    #
+    # `iter()` rather than trusting the return: advancing by hand needs an ITERATOR, and
+    # this seam is injectable, so a search that returns an iterable which is not one
+    # (a list of pages, a stub) would otherwise be a TypeError — or, for a stub that
+    # answers every call, an unbounded loop. Asking for an iterator costs nothing on the
+    # real generator, which is its own iterator.
+    pages = iter(search.pages_as_dicts())
+    for page_no in count(1):
+        request = CatalogueRequest(collection_config.collection_id, window, area, page_no)
+        try:
+            page = next(pages)
+        except StopIteration:
+            return
+        except Exception as exc:
+            # Scoped to the FETCH alone. Wrapping the body below as well would
+            # classify our own validation failure as a catalogue refusal, which the
+            # retry policy would then act on.
+            #
+            # THIS is the fix for the Earth Search 502: a page request the catalogue
+            # will not serve is re-asked as shorter windows, which pose it as
+            # different requests. Waiting cannot help, so 502 is kept out of the
+            # retry ladder above and arrives here on the first refusal. Shortening
+            # the window's END is what clears it; shortening only its start does
+            # not, so this recurses until a window completes or is down to a
+            # single day.
+            #
+            # Not on the first page, which a shorter window asks the same way; and
+            # not on a stated overload, which is what the ladder above is for and
+            # which slicing would only multiply.
+            shorter = split_query_window(win_start, win_end, 2)
+            if page_no > 1 and shorter and classify_refusal(exc).kind is RefusalKind.UPSTREAM_ERROR:
+                logger.warning(
+                    "Catalogue refused %s — retrying it as %d shorter window(s)",
+                    request.label,
+                    len(shorter),
+                )
+                node.children = [_WindowWalk(node.bbox, w) for w in shorter]
+                return
+            raise_catalogue_query_error(request, exc, log=logger, items_so_far=len(node.items))
+        for raw in page.get("features", []):
+            # `id` is required by the STAC spec; an item without one cannot be deduped by
+            # the assembly step, and defaulting it would collapse EVERY such item into a
+            # single entry — so say so rather than silently drop data.
+            if raw.get("id") is None:
+                raise ValueError(f"STAC item without an 'id' from {provider.catalog_url} — cannot dedupe it")
+            node.items.append(Item.from_dict(_prune_item_dict(raw, keep_assets)))
+        # Sized off the first page's match count, so a window too deep to walk is
+        # re-cut before any deep cursor is requested rather than after one is refused.
+        if page_no == 1 and (shorter := split_query_window(win_start, win_end, _parts_for_depth(page))):
+            logger.info(
+                "Window %s %s matches over %d items — querying it as %d shorter window(s)",
+                window,
+                area,
+                _MAX_QUERY_ITEMS,
+                len(shorter),
+            )
+            node.children = [_WindowWalk(node.bbox, w) for w in shorter]
+            return
+
+
+def _fill_window_tree(
+    walk: Callable[[_WindowWalk], None],
+    roots: list[_WindowWalk],
+    workers: int,
+) -> None:
+    """Fill every node of every root's tree, walking up to ``workers`` windows at once.
+
+    A worklist driven from THIS thread, never from inside the pool. Tasks only walk: they
+    neither submit nor wait, so no arrangement of them can deadlock — which is the failure
+    mode of the obvious recursive shape, where a task waits on a child queued behind it in
+    a saturated pool. Whenever a window finishes, the shorter windows it asked for instead
+    join the worklist and the freed worker takes whatever is next, so the narrow tail of a
+    refusal chain — two windows wide at every step — overlaps the wide walks still running
+    instead of queueing behind them.
+
+    Scheduling changes WHEN a window is walked, never the order of what it returned: the
+    output order is read back off the finished tree, depth-first, by
+    :meth:`_WindowWalk.preorder`.
+
+    Every window the tree contains is walked even once one of them has failed, and the
+    failure re-raised is the one whose window comes FIRST in that same depth-first order.
+    Both halves are deliberate. Stopping early would make WHICH failure is raised depend on
+    which task happened to finish first, and the layer that owns the attempt budget decides
+    a refusal is deterministic by seeing the identical signature again on a later attempt —
+    so that signature has to be a function of the query, not of a race. Continuing cannot
+    enlarge the work either: a window that fails contributes no children.
+    """
+    failures: dict[int, BaseException] = {}
+
+    def sequenced(node: _WindowWalk) -> _WindowWalk:
+        """Walk one window, recording a failure instead of raising it."""
+        try:
+            walk(node)
+        except BaseException as exc:  # re-raised below, in a fixed order
+            failures[id(node)] = exc
+        return node
+
+    pending: deque[_WindowWalk] = deque(roots)
+    with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="stac-window") as pool:
+        running: set[Future[_WindowWalk]] = set()
+        while pending or running:
+            while pending and len(running) < max(1, workers):
+                running.add(pool.submit(sequenced, pending.popleft()))
+            done, running = wait(running, return_when=FIRST_COMPLETED)
+            for finished in done:
+                pending.extend(finished.result().children)
+
+    if failures:
+        depth_first = {id(node): rank for rank, node in enumerate(n for r in roots for n in r.preorder())}
+        raise failures[min(failures, key=lambda node_id: depth_first[node_id])]
+
+
 def _query_stac_items(
     provider: STACProvider,
     collection_config: CollectionConfig,
@@ -995,111 +1259,38 @@ def _query_stac_items(
     window = f"{start_date}/{end_date}"
     t0 = time.monotonic()
     logger.info(f"Opening STAC catalog: {provider.catalog_url}")
-    stac_io = StacApiIO(max_retries=_STAC_RETRY, timeout=_STAC_TIMEOUT)
-    try:
-        client = Client.open(provider.catalog_url, stac_io=stac_io)
-    except Exception as exc:
-        # Page 0: the catalogue root, fetched before any search exists. Named separately
-        # so a refusal here is not read as a refusal of the search it precedes.
-        raise_catalogue_query_error(
-            CatalogueRequest(collection_config.collection_id, window, "catalogue-root", 0), exc, log=logger
-        )
+    clients = _PerThreadClient(provider, collection_config.collection_id, window)
+    clients.get()
     logger.info(f"STAC catalog opened in {time.monotonic() - t0:.1f}s, executing search")
 
+    keep_assets = _loadable_assets(collection_config, extra_bands)
+    # A worklist of date windows, not one walk: a window the catalogue will not page to the
+    # end of is replaced by shorter ones covering the same days. The worklist is a TREE —
+    # see :class:`_WindowWalk` — and its windows are independent searches, so it is filled
+    # concurrently and read back depth-first, in date order, which is the order the serial
+    # walk produced. The same searches run on every attempt, so the layer above can still
+    # decide a refusal is deterministic by seeing the identical signature twice.
+    roots = [_WindowWalk(sub_bbox, (start_date, end_date)) for sub_bbox in split_antimeridian_bbox(bbox)]
+    _fill_window_tree(
+        lambda node: _walk_query_window(clients.get(), provider, collection_config, tile_id, keep_assets, node),
+        roots,
+        _QUERY_WINDOW_WORKERS,
+    )
+
+    # Dedupe across every search this query ran, first occurrence winning, in tree order.
+    # A granule straddling +/-180 is returned by both antimeridian halves, one acquired on
+    # a seam instant by both windows that share it, and every item of a re-cut window's
+    # first page by the shorter windows that replaced it. Done HERE rather than as pages
+    # arrive because which page arrives first is now a matter of timing, and
+    # first-occurrence-wins has to mean first in the WALK, not first off the wire.
     items: list[Any] = []
     seen: set[str] = set()
-    keep_assets = _loadable_assets(collection_config, extra_bands)
-    for sub_bbox in split_antimeridian_bbox(bbox):
-        # A worklist of date windows, not one walk: a window the catalogue will not page to
-        # the end of is replaced by shorter ones covering the same days. Depth-first and in
-        # date order, so an attempt runs the same searches as the last one — the layer above
-        # decides a refusal is deterministic by seeing the identical signature twice.
-        pending: deque[tuple[str, str]] = deque([(start_date, end_date)])
-        while pending:
-            win_start, win_end = pending.popleft()
-            window = f"{win_start}/{win_end}"
-            query_params = _build_stac_query(collection_config, tile_id, win_start, win_end, bbox=sub_bbox)
-            # Read off the query that was BUILT rather than re-deciding property-versus-bbox
-            # here: a second copy of that branch could disagree with the one that ran, and
-            # then the log would name a request the catalogue was never asked. Tolerant of a
-            # query carrying neither term, because a diagnostic must never be the thing that
-            # raises — an unnamed area still leaves the collection, window and page named.
-            area = _area_label(query_params, tile_id)
-            search = client.search(**query_params, limit=provider.max_page_size, max_items=None)
-            # Paged EXPLICITLY (`pages_as_dicts`, which is what `items_as_dicts` iterates
-            # internally) so a failure can name the page ordinal it died on. Each page is a
-            # separate HTTP request behind its own retry ladder, so "the whole year fails" and
-            # "one deep cursor fails" are different defects with different reproductions, and
-            # an item count cannot tell them apart.
-            #
-            # Dicts rather than Items so a full item is never hydrated: pruning first and
-            # hydrating second is both smaller to retain and ~3x cheaper to build, because most
-            # of an item's construction cost is the assets that get dropped.
-            #
-            # `iter()` rather than trusting the return: advancing by hand needs an ITERATOR, and
-            # this seam is injectable, so a search that returns an iterable which is not one
-            # (a list of pages, a stub) would otherwise be a TypeError — or, for a stub that
-            # answers every call, an unbounded loop. Asking for an iterator costs nothing on the
-            # real generator, which is its own iterator.
-            pages = iter(search.pages_as_dicts())
-            for page_no in count(1):
-                request = CatalogueRequest(collection_config.collection_id, window, area, page_no)
-                try:
-                    page = next(pages)
-                except StopIteration:
-                    break
-                except Exception as exc:
-                    # Scoped to the FETCH alone. Wrapping the body below as well would
-                    # classify our own validation failure as a catalogue refusal, which the
-                    # retry policy would then act on.
-                    #
-                    # THIS is the fix for the Earth Search 502: a page request the catalogue
-                    # will not serve is re-asked as shorter windows, which pose it as
-                    # different requests. Waiting cannot help, so 502 is kept out of the
-                    # retry ladder above and arrives here on the first refusal. Shortening
-                    # the window's END is what clears it; shortening only its start does
-                    # not, so this recurses until a window completes or is down to a
-                    # single day.
-                    #
-                    # Not on the first page, which a shorter window asks the same way; and
-                    # not on a stated overload, which is what the ladder above is for and
-                    # which slicing would only multiply.
-                    shorter = split_query_window(win_start, win_end, 2)
-                    if page_no > 1 and shorter and classify_refusal(exc).kind is RefusalKind.UPSTREAM_ERROR:
-                        logger.warning(
-                            "Catalogue refused %s — retrying it as %d shorter window(s)",
-                            request.label,
-                            len(shorter),
-                        )
-                        pending.extendleft(reversed(shorter))
-                        break
-                    raise_catalogue_query_error(request, exc, log=logger, items_so_far=len(items))
-                for raw in page.get("features", []):
-                    # Dedupe across every search this query runs: a granule straddling +/-180
-                    # is returned by both antimeridian halves, and one acquired exactly on a
-                    # boundary instant by both windows meeting there. Loading it twice would
-                    # double-count the
-                    # solar day. `id` is required by the STAC spec; an item without one cannot
-                    # be deduped, and defaulting it would collapse EVERY such item into a
-                    # single entry — so say so rather than silently drop data.
-                    if raw.get("id") is None:
-                        raise ValueError(f"STAC item without an 'id' from {provider.catalog_url} — cannot dedupe it")
-                    item_id = str(raw["id"])
-                    if item_id not in seen:
-                        seen.add(item_id)
-                        items.append(Item.from_dict(_prune_item_dict(raw, keep_assets)))
-                # Sized off the first page's match count, so a window too deep to walk is
-                # re-cut before any deep cursor is requested rather than after one is refused.
-                if page_no == 1 and (shorter := split_query_window(win_start, win_end, _parts_for_depth(page))):
-                    logger.info(
-                        "Window %s %s matches over %d items — querying it as %d shorter window(s)",
-                        window,
-                        area,
-                        _MAX_QUERY_ITEMS,
-                        len(shorter),
-                    )
-                    pending.extendleft(reversed(shorter))
-                    break
+    for root in roots:
+        for node in root.preorder():
+            for item in node.items:
+                if item.id not in seen:
+                    seen.add(item.id)
+                    items.append(item)
     logger.info(f"STAC query returned {len(items)} items in {time.monotonic() - t0:.1f}s total")
 
     return items

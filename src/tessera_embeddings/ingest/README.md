@@ -69,6 +69,58 @@ S2 and Landsat are queried by tile ID property (e.g., `grid:code = T33UUP`), whi
 only items for that specific MGRS tile. OPERA RTC-S1 on CMR-STAC lacks an equivalent
 property, so queries use a bbox derived from the MGRS tile via `mgrs_tile_to_bbox()`.
 
+#### How one query runs, in plain terms
+
+Four words do all the work in this section. A **page** is one request and the hundred results it
+returns; the catalogue will not hand over more at once. A **cursor** is a bookmark — the catalogue
+returns a slip of paper meaning "you got as far as here", and the next request must carry it. It is
+not a page number: there is no way to ask for the twentieth page directly, and a refused request
+leaves no slip for the one after it, so a walk cannot step over a gap. A **date window** is a
+from-date and a to-date. A **worklist** is a to-do list of jobs, one job per date window; when a job
+turns out to be impossible it is crossed off and two shorter jobs are written in its place.
+
+The problem this shape exists for: Earth Search refuses **a request whose answer would be bigger
+than about 6 MB** — AWS Lambda's synchronous response limit. Item sizes vary, so whether a given
+hundred scenes clears the cap depends on which hundred the bookmark and date window select, which is
+why one request out of hundreds is refused every time while all the others are served. It is not
+overloaded — the refusal comes back in 1.3 seconds, as fast as a success — and it is not the
+bookmark's fault: the identical bookmark is answered when the date window is shorter, and answered
+when only ninety results are asked for instead of a hundred. So the remedy is to ask for a *smaller
+answer*, never the same one again.
+
+```text
+   28 Feb ---------------------------------------------------------------- 1 Apr
+       |  the catalogue reports the total beside the first page, so a window too big to
+       |  walk is cut before the walk starts rather than hundreds of requests in
+       v
+    +--------+--------+--------+--------+--------+--------+
+    |  job 1 |  job 2 |  job 3 |  job 4 |  job 5 |  job 6 |   jobs meet on a shared
+    +--------+--------+--------+--------+--------+--------+   INSTANT, so nothing falls
+        ok       ok       ok    refused     ok       ok       between them and nothing
+                                  |                          is asked for twice
+                                  |  cross it off, write two shorter jobs; the other
+                                  v  five are untouched and still running
+                            16-22 March
+                              +-- 16-19 March   ok
+                              +-- 19-22 March   refused
+                                    +-- 19-21 March   ok
+                                    +-- 21-22 March   refused
+                                          +-- 21 March   ok   <- one day is as far
+                                          +-- 22 March   ok      as this can go
+
+   Up to six jobs run at once. Almost all of a request is spent waiting for the catalogue
+   to think -- 86% of it, before a single byte arrives -- so overlapping the waits is the
+   only thing that moves the clock. Same query, same scenes, same order: 39 minutes as
+   first written, 3.5 minutes now.
+```
+
+Two properties are load-bearing and both are tested. The jobs must add up to exactly the window
+asked for, no day missed and no day added. And the results must come back in the same **order**, not
+merely the same set — two scenes taken on the same day with the same cloud cover are separated only
+by which arrived first, and that decides which is painted on top.
+
+The rest of this section is the mechanism behind that picture.
+
 `_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry`
 built by `make_logging_retry()` (`_http.py`, shared with the CMR Granule query) and passed
 into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 503, 504)`).
@@ -99,10 +151,12 @@ individual page requests are refused with a 502 while the rest of the same walk 
 and the refusal is deterministic in the *request* — pagination cursor and date window
 together — not in how deep the walk has got. The same refusal has been seen at page 289 of
 one window and page 14 of a shorter one sharing its late bound. So waiting cannot absorb
-it — which is why 502 is kept out of the retry ladder above — and a smaller page is not the
-lever either: page size changes neither the items walked nor which requests are refused.
-**It is emphatically not the page-size refusal above** — that one fails on the *first* page
-and is what `max_page_size` was lowered for.
+it — which is why 502 is kept out of the retry ladder above. **It is the same cap
+`max_page_size` was lowered for**, reached from the other direction: that one refuses a first
+page because 250 items are always too many, this one refuses a later page because those
+particular hundred items happen to be. A smaller page from the refused cursor IS served, and
+is the most direct remedy; it is not used here only because `pystac_client` bakes the limit
+into a search and cannot resume from a cursor at a different size.
 
 What clears it is a window with a different **end** date; shortening only the start does
 not, because the catalogue pages newest-first and the late bound fixes the whole cursor
@@ -114,31 +168,22 @@ bounds *cost*, keeping a refusal from discarding a long walk, and is not what fi
 defect. A refusal that shortening cannot route around — a first page, a stated overload, or
 a single day — still raises the classified `CatalogueQueryError` with its token.
 
-```text
-one query = a WORKLIST of date windows, not one cursor walk
+**Concurrency.** The windows are independent searches, so `_fill_window_tree` walks up to
+`_QUERY_WINDOW_WORKERS` (6) of them at once. The worklist is driven from the calling thread and
+tasks only ever walk — they never submit and never wait — which is what makes deadlock
+structurally impossible rather than merely unobserved. Each thread gets its own `Client`, because
+`StacApiIO` wraps a `requests.Session` that is not documented thread-safe. Output order comes
+from `_WindowWalk.preorder()` on the finished tree, and the `id` dedupe runs at that assembly step
+rather than as pages arrive, so first-occurrence-wins means first in the **walk** and not first
+off the wire.
 
-  2019-02-28 ------------------------------------------------- 2019-04-01
-      |   page 1 reports numberMatched > _MAX_QUERY_ITEMS, so cut before walking deep
-      v
-   +--------+--------+--------+--------+--------+--------+
-   | 02-28  | 03-05T | 03-11T | 03-16T | 03-22T | 03-27T |   consecutive windows meet on
-   |  ..    |  ..    |  ..    |  ..    |  ..    |  ..    |   one shared INSTANT, so their
-   | 03-05T | 03-11T | 03-16T | 03-22T | 03-27T | 04-01  |   union has no gap and repeats
-   +--------+--------+--------+--------+--------+--------+   nothing but that instant
-                                                             (T = T00:00:00Z)
-      OK       OK       OK      502!      OK       OK
-                                 |
-                                 v   refused past page 1 -> re-cut this window only
-                        03-16 .. 03-22
-                          +-- 03-16 .. 03-19   OK
-                          +-- 03-19 .. 03-22   502!
-                                +-- 03-19 .. 03-21   OK
-                                +-- 03-21 .. 03-22   502!
-                                      +-- 03-21 .. 03-22T  OK  <- one day each: the
-                                      +-- 03-22T .. 03-22  OK     recursion floor
-
-  union of the windows == the input window;  items keyed by id across all of them
-```
+Six rather than eight, even though eight is faster: the campaign runs tens of cells against this
+one provider at once, so the setting is a multiplier on the concurrent search streams Element 84
+sees, and measured per-page latency degrades with width. A failure no longer stops the other
+windows either — every window is walked, all failures are collected, and the depth-first-earliest
+is raised, because which failure surfaces must be a function of the query rather than of which
+task finished first. The attempt-budget layer above decides a refusal is deterministic by seeing
+the identical signature again.
 
 The re-partition is a pure re-cut of the window, never a narrowing, and it is exact in both
 directions: the outer bounds are the caller's own date strings handed straight back, and every

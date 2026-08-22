@@ -899,109 +899,183 @@ month ahead is enough to hide the query entirely.
 needed alongside it rather than instead of it: streaming bounds *how many* items are held, pruning
 bounds *how large each one is*, and the driver needed both to stay under the pause threshold.
 
-## 7c. The Earth Search 502 that is NOT a depth limit, and not a page size either
+## 7c. The Earth Search 502 is ONE mechanism: a response-size cap of about 6 MB
 
-Two distinct Earth Search 502s on `sentinel-2-l2a` are now on record, and they are easy to
-conflate. Both are live and each needs its own remedy:
+**CORRECTED 2026-08-22.** This section previously described two unrelated Earth Search 502s
+and asserted that "neither page size nor patience touches the second". The two are the same
+refusal, and page size does touch it. The correction is at the end of this heading; the
+sections below it were written under the old reading and are marked where they still assume it.
 
-- **Response size.** A page of 250 items is refused on the FIRST request. Reproduced again
-  here: the same window at `limit=250` returns 502 at page 1. Already remedied by
-  `max_page_size=100` for this provider (see the comment in `config/providers.py`).
-- **Individual page requests.** At `limit=100` some page requests are refused while the
-  rest of the same walk is served. This section is about that one.
+There appeared to be two refusals:
 
-**Neither page size nor patience touches the second.** Halving the page halves neither the
-items walked nor which requests get refused, and the `urllib3` ladder underneath has already
-exhausted itself by the time the failure reaches us.
+- **On the first request**, when a page is asked for at `limit=250`. Remedied by
+  `max_page_size=100` for this provider.
+- **On one request deep in a walk** at `limit=100`, while every other request in the same
+  walk is served. This looked unrelated: it is not the first page, and the same page size
+  works everywhere else.
 
-### The shape of it
+They are one mechanism. **Earth Search refuses a request whose RESPONSE would exceed roughly
+6 MB**, which is AWS Lambda's synchronous response limit. What made the second look different
+is only that item sizes vary, so whether a given hundred items clears the cap depends on which
+hundred they are — and that is decided by the cursor and the date window together, which is
+exactly the "deterministic in the (cursor, window) pair" behaviour measured below.
+
+The measurement that settles it. Walk the two-day window to its refusal at page 14, then
+re-send **the byte-identical cursor with the identical window** and only the page size changed:
+
+| `limit` | result | bytes returned | implied at 100 items |
+|---|---|---|---|
+| 100 | **502** | — | — |
+| 90 | **200** | 5.60 MB | 6.22 MB |
+| 75 | **200** | 4.58 MB | 6.11 MB |
+| 50 | **200** | 3.33 MB | 6.67 MB |
+| 25 | **200** | 1.80 MB | 7.22 MB |
+| 10 | **200** | 0.66 MB | 6.59 MB |
+
+The thirteen pages that WERE served in that same walk ran 4.17 to 5.32 MB. The refused page's
+hundred items would have been 6.1 to 7.2 MB. Nothing about depth, patience or the cursor is
+implicated: that page was simply too big, and ninety of the same items are not.
+
+Combined with the earlier bisection — 130 items served at 5.99 MB, 150 refused, and 150 served
+at 4.77 MB once assets were excluded server-side — the cap sits just above 5.99 MB and tracks
+**bytes, not the `limit` value**.
+
+**What this does and does not change.** The shipped fix still works and is still correct: a
+shorter date window regroups the items, so the fat page is split and every request lands under
+the cap. It is no longer the only conceivable remedy, and the honest ranking is now:
+
+- Asking for the refused page again at a **smaller size** is the most direct remedy, since it
+  targets the mechanism, keeps the item order, and re-walks nothing. It is awkward through
+  `pystac_client`, which bakes the limit into a search and offers no clean way to resume from
+  a cursor at a different size — which is why the window re-cut was reachable and this was not.
+- **Lowering `max_page_size`** moves every page further below the cap and makes refusals rare
+  rather than handled. It costs proportionally more requests, which concurrency largely hides.
+- The **window re-cut** stays as the backstop, because no page size can be low enough to
+  guarantee the cap is never hit if items get fatter.
+
+**The margin is the real finding.** A 100-item page averages 4.6 MB against a ~6 MB cap, and
+the largest observed was 5.32 MB. That is thin. Fatter items — more assets on a newer baseline,
+a collection change at the provider — move first pages over the line, and a first-page refusal
+is the one no window re-cut can route around.
+
+### In plain terms, before any of the detail
+
+Four words carry all the jargon in this section, so they are worth spending a paragraph on.
+
+A **page** is one request and the results it returns. The catalogue will not hand over 56,000
+results at once; it gives a hundred at a time. Nothing more exotic than that.
+
+A **cursor** is a bookmark. When the catalogue hands back a page it also hands back a slip of paper
+meaning "you got as far as here", and the next request has to include that slip. The important part
+is what it is *not*: it is not a page number. There is no way to ask for the twentieth page directly,
+and if a request fails there is no slip for the one after it, so the walk cannot step over a gap. In
+this catalogue the slip is literally a timestamp and a scene name, for example
+`2019-03-22T08:30:27.109000Z,S2A_37TEM_20190322_0_L2A,sentinel-2-l2a`.
+
+A **date window** is a from-date and a to-date: everything between the 16th and the 22nd of March.
+
+A **worklist** is a to-do list of jobs, each job being one date window. One request used to be
+followed to its end. Now there is a list, and when a job turns out to be impossible it is crossed off
+and two shorter jobs are written in its place. The list is what lets one date window be given up
+without losing the others.
 
 ```text
-BEFORE — one search, one cursor chain, walked to the end
-
-  sentinel-2-l2a | bbox = zone 34N envelope | 2019-02-28 .. 2019-04-01 | 56,558 items
-
-   p1 --cur--> p2 --cur--> ... --> p288 --cur--> p289          ...      p566
-  200         200                  200            502     (never reached)
-                                                   |
-                              every page's cursor comes from the page before it, so a
-                              refusal is not a gap to skip -- there is no cursor for p290
-                              and no offset to jump to. The walk is over, and so is the leg.
+WHAT WE ASK FOR
+   Every Sentinel-2 scene over the UTM zone 34N envelope, 28 Feb to 1 Apr 2019.
+   The catalogue answers: I have 56,558 of those.
+   At a hundred per request, that is 566 requests.
 
 
-HOW IT FAILED — the remedies that look obvious, and what each one actually did
+THE OLD WAY -- one long chain, where the bookmark is the only way forward
 
-  re-ask the same page   502 502 502 502 502 502 502 502     <- urllib3 ladder, 8 deep
-                          |_____ ~4 min of backoff _____|       then the leg dies
-                         deterministic in the request: 6 of 6 repeats refused, 1.3 s each
-
-  use a smaller page     no effect. Item 27,600 is item 27,600 whether that is p111 at
-                         size 250 or p276 at size 100. This is the OTHER 502's remedy.
-
-  wait longer            no effect. Latency was flat 0.6-1.6 s to the failure and the 502
-                         itself returned in 1.3 s -- nothing was timing out.
-
-  ask a shorter window   works, but ONLY if the window's LATE bound moves. See below.
+  request 1 --slip--> request 2 --slip--> ... --> 288 --slip--> 289
+   100 items          100 items                  100 items      REFUSED
+                                                                   |
+                        Each slip comes from the request before it, so when one request
+                        is refused there is no slip for the next one and no page number
+                        to skip to. Everything already collected is thrown away, and the
+                        leg fails.
 
 
-WHY RE-CUTTING WORKS AT ALL — the catalogue pages newest-first, so a window's late
-bound fixes its whole cursor sequence and its early bound changes nothing reached first
+WHAT WAS ACTUALLY HAPPENING
 
-  03-16 ........... 03-22   refused p14  -+
-  03-19 ....... 03-22       refused p14   +- same late bound, same cursors, same refusal
-  03-21 ..... 03-22         refused p14  -+
-  03-16 ..... 03-19         OK  53 pages -+
-  03-21 . 03-21             OK  16 pages  +- different late bound, different cursors
-  03-22 . 03-22             OK  15 pages -+
+  The catalogue refuses one specific request out of the 566, every single time, and answers
+  all the others. It is not tired and it is not overloaded -- the refusal comes back in
+  1.3 seconds, as fast as a successful request.
 
-  So halving alone is not sufficient: the half that KEEPS the parent's late bound
-  retraces the parent's cursors page for page. Measured -- 2019-02-28/2019-03-16
-  completes in 213 pages while 2019-03-16/2019-04-01 is refused at p289, the same
-  page and the same cursor as the whole month.
+  It is not the bookmark's fault either. Take the exact bookmark it refused and hand it back
+  with a SHORTER date window, or with a smaller number of results asked for:
+
+     bookmark X + "21-22 March" + 100 results  ->  refused, 3 times out of 3
+     bookmark X + "22 March"    + 100 results  ->  answered, 3 times out of 3
+     bookmark X + "21-22 March" +  90 results  ->  answered, 5.60 MB of data
+
+  The same bookmark, character for character, in all three. What the service will not serve
+  is an ANSWER THAT IS TOO BIG -- about 6 MB is the ceiling. A hundred of those particular
+  scenes would have been 6.2 MB; ninety of them are 5.6 MB and fit. Every request that
+  succeeded in this walk carried between 4.2 and 5.3 MB, so the margin is thin and which
+  hundred scenes you happen to land on decides it.
 
 
-AFTER — a worklist of date windows. A refused window is RE-CUT, never re-asked.
+WHAT DOES NOT WORK, ALL MEASURED
 
-  2019-02-28 ------------------------------------------------------- 2019-04-01
-      |
-      |  (1) numberMatched = 56,558 > _MAX_QUERY_ITEMS on page 1, so cut up front.
-      |      Denominated in ITEMS, so a denser year yields more pieces, not deeper pages.
+  ask again, and again     the same request is refused every time; the retry machinery
+                           underneath spent six minutes doing this before giving up
+  ask for 200 at a time    refused outright -- a bigger response is exactly the problem
+  ask for 50 at a time     WORKS. The same bookmark, the same dates, half the results: served.
+                           This is the tell -- the service is refusing on the SIZE of the
+                           answer, not on where we are in the walk
+  wait longer              nothing was timing out; every request took about 1.3 s
+  ask for fewer dates      WORKS -- regrouping the results makes each answer smaller
+
+
+THE NEW WAY -- a to-do list of shorter date windows
+
+  28 Feb ------------------------------------------------------------------- 1 Apr
+      |  the catalogue reports the total alongside the first page, so the window is cut
+      |  before the walk starts rather than 289 requests in
       v
-   +---------+---------+---------+---------+---------+---------+
-   | 02-28   | 03-05   | 03-11   | 03-16   | 03-22   | 03-27   |   each walked as its
-   |   ..    |   ..    |   ..    |   ..    |   ..    |   ..    |   own cursor chain
-   | 03-05   | 03-11   | 03-16   | 03-22   | 03-27   | 04-01   |
-   +---------+---------+---------+---------+---------+---------+
-       OK        OK        OK       502!       OK        OK
-        ^                            |
-        |  consecutive windows SHARE their boundary day -- 03-05 ends the first and starts
-        |  the second -- so no acquisition can fall between them, and the id dedupe
-        |  absorbs the one repeated day
-                                     |
-                                     |  (2) refused past page 1 -> re-cut THIS window and
-                                     |      leave the other five alone. 502 is kept out of
-                                     v      the retry ladder, so this starts immediately.
-                        2019-03-16 .. 03-22   refused p14
-                          |
-                          +-- 03-16 .. 03-19   OK    53 pages   5,179 items
-                          +-- 03-19 .. 03-22   refused p14
-                                |
-                                +-- 03-19 .. 03-21   OK   41 pages   3,944 items
-                                +-- 03-21 .. 03-22   refused p14
-                                      |
-                                      +-- 03-21 .. 03-21  OK  16 pages  1,414 items
-                                      +-- 03-22 .. 03-22  OK  15 pages  1,318 items
-                                                                 ^
-                                    a two-day window cannot be shortened while its halves
-                                    share a boundary day, so AT THAT FLOOR ONLY they abut.
-                                    Without it the recursion stalls here and the leg fails.
+   +--------+--------+--------+--------+--------+--------+
+   |  job 1 |  job 2 |  job 3 |  job 4 |  job 5 |  job 6 |
+   +--------+--------+--------+--------+--------+--------+
+       ok       ok       ok    refused     ok       ok
+                                  |
+                                  |  cross it off, write two shorter jobs. The other five
+                                  |  are untouched -- and they are still running while
+                                  v  this happens.
+                            16-22 March
+                              +-- 16-19 March   ok
+                              +-- 19-22 March   refused
+                                    +-- 19-21 March   ok
+                                    +-- 21-22 March   refused
+                                          +-- 21 March   ok   <- a single day is as far
+                                          +-- 22 March   ok      as this can go
 
-  The invariant that lets any of this touch a fingerprinted query:
+  Two things had to be true for this to be safe.
 
-    union of every window   ==   the input window     (a re-partition, never a narrowing)
-    items keyed by id       across every search one query runs
-    ==>  56,558 of 56,558 items, zero duplicates, on the query that fails in production
+  The jobs must add up to exactly what was asked for -- no day missed, no day added. They
+  meet on a shared instant, so there is no crack between them and nothing outside them.
+
+  The results must come back in the same ORDER as before, not merely the same set. Two
+  scenes photographed on the same day with the same cloud cover are separated only by which
+  one arrived first, and that decides which one is painted on top in the final image.
+
+
+AND THEN IT WAS MADE FAST
+
+  Almost all of a request is spent waiting for the catalogue to think -- 86% of it, before a
+  single byte comes back. Moving our own machine closer to theirs would save almost nothing.
+  But the six jobs do not depend on each other, so they can wait in parallel.
+
+  the same query, the same 56,558 scenes, the same order, measured four times:
+
+     as first written                    39 minutes
+     stop re-asking a refused request    18 minutes
+     stop re-fetching the shared day     13 minutes
+     run six jobs at once                3.5 minutes
 ```
+
+Everything below is the evidence for those claims, in increasing detail.
 
 ### The measurement that killed the depth hypothesis
 
@@ -1050,13 +1124,14 @@ then re-send **the byte-identical cursor** with only the `datetime` field narrow
 So no cursor value is defective. A cursor the service refuses under one window it serves under
 another, and the only thing that changed was the date range beside it.
 
-**A sharper hypothesis, not yet confirmed.** In the one-day window that cursor is the LAST page
-— 18 items, since the day holds 1,318 — while in the two-day window the same cursor must return
-100 items, 18 from the 22nd and 82 from the 21st. The request that fails is one whose result
-would cross a date boundary. That would explain the end-date property, it fits the month window
-refusing on a cursor at the same instant, and it predicts that windows ending ON a date boundary
-refuse less often — which the instant-boundary run's zero refusals is consistent with. It is a
-hypothesis about a service we cannot see inside, on one seam, and the fix does not rest on it.
+**CONFIRMED, and it is simpler than a hypothesis about boundaries.** The reason the one-day
+window serves that cursor is that it returns only 18 items there — the day holds 1,318, so the
+cursor sits on its last, partial page — while the two-day window must return a full hundred. It
+is the SIZE of the response, not the position. Re-sending the same cursor and the same two-day
+window at `limit=90` is served, at 5.60 MB; the hundred would have been about 6.2 MB, over the
+~6 MB cap. An earlier draft of this section guessed that the failing request was one whose page
+crossed a date boundary; that was a coincidence of this example, and the correction at the head
+of §7c has the mechanism.
 
 It is not the data and not the moment either: the day holding the refused cursor queries clean
 on its own (15 pages, 1,318 items), and the refusal repeats identically from fresh sessions
@@ -1136,60 +1211,91 @@ boundary days.
 
 ### Wall clock, and where it goes
 
-Two runs of the benchmark query from a laptop, item set identical in both
-(56,558 of 56,558, zero duplicates), refusal tree identical (three refusals, each at page 14):
+Four runs of the benchmark query from one laptop, every one returning the same item set
+(56,558 of 56,558, zero duplicates) and the last two returning the same ORDERED sequence
+(SHA-256 of the comma-joined ids, `efcfdf7b6d69974c`):
 
-Three runs of the benchmark query from one laptop, all returning the same item set
-(56,558 of 56,558, zero duplicates):
+| | wall clock | HTTP requests | ms/item |
+|---|---|---|---|
+| re-partition as first shipped | **2,360.7 s** (39.3 min) | 821 | 41.7 |
+| + 502 out of the retry ladder | **1,099.6 s** (18.3 min) | 821 | 19.4 |
+| + instant window seams | **795.2 s** (13.3 min) | 583 | 14.1 |
+| + 6 windows walked at once | **207.6 s** (3.5 min) | 589 | **3.67** |
+| a single unsplit walk, if it worked | — | 566 | — |
+| §8 reference RATE, for scale | (316 s at this item count) | 566 | 5.58 |
 
-| | wall clock | HTTP requests | ms/item | ladder retry lines |
-|---|---|---|---|---|
-| re-partition as first shipped | **2,360.7 s** (39.3 min) | 821 | 41.7 | 24 (8 per refusal) |
-| + 502 out of the retry ladder | **1,099.6 s** (18.3 min) | 821 | 19.4 | **0** |
-| + instant boundaries | **795.2 s** (13.3 min) | **583** | 14.1 | 0 |
-| a single unsplit walk, if it worked | — | 566 | — | — |
-| §8 reference RATE, for scale | (316 s at this item count) | 566 | 5.58 | — |
-
-**The request overhead is now 1.03x**, down from 1.45x. That is the whole
-code-attributable regression: 583 requests against the 566 a single walk would make, the
-excess being one partial last page per window plus a page-1 refetch per cascaded cut.
+**11.4x end to end, and the rate now BEATS the reference.** Request count is 589 against the
+566 a single walk would make — 1.04x, the excess being one partial last page per window, a
+page-1 refetch per cascaded cut, and one catalogue-root GET per worker thread.
 
 **The 1,261 s the ladder cost.** `total=8, backoff_factor=2` against urllib3's default
 `backoff_max=120` sleeps 0+4+8+16+32+64+120+120 = **364 s per refused page request**, three
 times over. Predicted 1,092 s, measured 1,261 s; the rest is per-page variance.
 
 **The 304 s the shared boundary day cost**, and a caveat about how it was recovered. The
-instant-boundary run made **zero** refusals — moving a window's end from `2019-03-22T23:59:59Z`
+instant-boundary runs make **zero** refusals — moving a window's end from `2019-03-22T23:59:59Z`
 to `2019-03-22T00:00:00Z` changed its cursor sequence and missed the position that refuses. That
 is consistent with the end-date property but it is **luck on this query, not a fix**: a different
-window will land on a refusing cursor again, and the recursion is still what handles it. Do not
-read "zero refusals" as "the 502 is gone".
+window will land on a refusing cursor again, and the recursion is still what handles it. The
+refusal path was therefore exercised separately, on the raw `2019-03-16/2019-03-22` window, which
+refuses at page 14 three times over.
 
-**What remains is bandwidth, not the algorithm.** A page of 100 items is 4.5 MB, so 583 requests
-move about **2.6 GB**; 795.2 s over 583 requests is 1.36 s/page, or roughly 3.3 MB/s, which is a
-laptop's link and not a property of the code. The §8 reference rate implies 0.56 s/page — 8 MB/s,
-which an in-region worker has. At that rate this query costs **327 s against a single walk's
-316 s**, so on campaign infrastructure the re-partition should be within a few percent of the
-walk it replaces. That in-region figure is a PROJECTION from §8's rate and has not been measured
-on a worker.
+**The 588 s concurrency recovered, and why it was available.** A page request spends almost all
+of its wall clock waiting on the catalogue to think:
 
-Note that §8's "164 s/month" is a ~29,390-item month while this query is 56,558 items, so the
-comparable quantity is the **rate**, 5.58 ms/item, never the duration.
+| quantity | measured |
+|---|---|
+| TCP handshake to the CloudFront edge | 12-36 ms |
+| TLS handshake | 25-43 ms, once per connection |
+| **server think time** (`starttransfer − pretransfer`, reused connection) | **~1,150-1,240 ms** |
+| body transfer | 402 ms uncompressed, **188 ms gzipped** |
+| response body | 4.63 MB of JSON, **1.25 MB gzipped** (3.7x) |
+| an empty-result search | 197 ms |
+
+About **86%** of a page elapses before the first response byte. Think time scales with page
+size at a fitted **7.75-7.79 ms per item** over a ~380-510 ms fixed cost, so at 100 items roughly
+0.78 s of the 1.2 s is the catalogue's own per-item work.
+
+**This retracts an earlier projection in this document.** It previously said the residual was
+this laptop's bandwidth and that an in-region worker would close it, quoting 327 s. Both were
+wrong. The round-trip an in-region client removes is a few percent of a page, so relocating the
+client recovers **at most ~15%**, and the bytes were never the constraint either — production
+negotiates gzip, so a page is 1.25 MB and the whole query moves about **740 MB**, not the 2.6 GB
+an ungzipped probe suggested. Overlapping the walks is the only lever that moves this, which is
+what `_QUERY_WINDOW_WORKERS` is.
+
+**Concurrency is a threshold, not a curve, and 8 is the ceiling for this query.** At most eight
+windows are ever runnable at once — four long level-one windows plus four level-two children —
+and the floor is the longest single window's serial walk, about 93 pages or 128 s. Measured
+speedups, drift-corrected against a ten-request canary run before and after each: 3.3x at four
+workers, 3.8x at six, 6.0x at eight. Past eight there is nothing left to overlap.
+
+**Six is shipped, not eight, because the campaign multiplies it.** Per-page latency does degrade
+with width: median moved 1,272 -> 1,366 ms and p90 1,504 -> 1,840 ms (+22%) between serial and
+eight-way, and total server-seconds for the identical 582 requests rose from 707.8 serial to
+726.8 at four, 745.2 at six and 805.9 at eight — so eight-way costs Element 84 about 14% more of
+their time for the same work, six-way about 5%. No 429, 503 or 502 was seen in over 3,500
+requests across the matrix. The month streamer keeps a depth-one prefetch, so one query per cell
+is in flight; at sixty cells this takes the peak from at most 60 concurrent page requests to at
+most 360. Total requests and bytes are unchanged, and each query finishes about four times
+sooner, so average concurrent streams rise only about 1.5x while the peak rises sixfold.
+
+**What concurrency costs in memory.** Items are hydrated inside each window's walk, so a re-cut
+window's already-walked pages are held as `Item` objects until the assembly step dedupes them.
+On the whole query that is about 4%; on the refusal-heavy `2019-03-16/2019-03-22` sub-window,
+where 39 of 141 pages are re-walks, peak resident memory went from 1,852 to 2,439 MB — **+32%**.
+Deferring hydration to assembly was tried and REJECTED: it saves that memory but costs **208 s**
+of the 207.6 s query, because hydration at ~1.1 ms/item overlaps network waiting when it happens
+in the walk threads and is a bare serial tail when it does not. The cheaper fix, not taken here,
+is that a re-cut window's own items are entirely redundant — its children re-fetch every one of
+them — so such a node could discard them outright. That changes the walk order and so needs the
+order check below re-run before it ships.
 
 **One inefficiency remains and is NOT fixed.** The proactive cut CASCADES: `_parts_for_depth`
 sizes parts as `ceil(matched / _MAX_QUERY_ITEMS)` and cuts by equal day count, so where density
-is uneven a child can still exceed the ceiling and be cut again — the run cut the month into 6,
-then re-cut 03-22..03-27 and 03-27..04-01. Each cascade wastes one page-1 fetch, which is why it
-is worth only a few requests out of 583. Sizing parts by density would fix it, but changing the
-part count moves the window boundaries and therefore the walk order, so it needs the order check
-above re-run rather than being treated as free.
-
-**Cost note.** Consecutive windows share their boundary day rather than abutting it, so no
-acquisition can fall between them — the catalogue is asked for whole days and expands them to
-instants itself, and abutting would leave the sub-second gap at midnight. The overlap costs
-one repeated day per seam and the query's existing id dedupe absorbs it. The two-day floor
-described above is the one place that trade is reversed, and it is taken because the
-alternative there is a failed leg.
+is uneven a child can still exceed the ceiling and be cut again. Each cascade wastes one page-1
+fetch, which is why it is worth only a few requests out of 589. Sizing parts by density would fix
+it, but changing the part count moves the window boundaries and therefore the walk order.
 
 ### What the item ORDER does, which the first verification did not check
 
@@ -1222,9 +1328,10 @@ is not covered by this measurement.
 
 Both measured 2026-08-22 against the live catalogue, so nobody has to test them again.
 
-**A bigger page is refused.** The pages are the cost — a page of 100 items is **4.5 MB**, so
-the benchmark query moves roughly **2.5 GB**. Halving the request count by doubling the page
-would be the obvious win, and Earth Search will not serve it:
+**A bigger page is refused, because the response cap is the whole mechanism** (see the
+correction at the head of §7c — a SMALLER page from the refused cursor IS served, so page size
+is a lever here, not a non-lever). Doubling the page to halve the request count is the obvious
+win, and Earth Search will not serve it:
 
 | `limit` | page 1 | median latency |
 |---|---|---|
@@ -1234,18 +1341,29 @@ would be the obvious win, and Earth Search will not serve it:
 | 250 | **502** | 2.22 s |
 | 400 | **502** | 3.55 s |
 
-100 is already at the ceiling; there is no headroom above it. Note that the refusal latency
-RISES with the requested limit, which is what a response-size ceiling looks like — the service
-assembles the answer, finds it too large, and fails. This is the same first-page refusal
-`max_page_size` was lowered for, and it is why that setting cannot also be the remedy for the
-deep-page refusal.
+The refusal latency RISES with the requested limit, which is what a response-size ceiling looks
+like — the service assembles the answer, finds it too large, and fails.
 
-**Server-side field selection saves 4%.** Earth Search advertises
-`https://api.stacspec.org/v1.0.0/item-search#fields`, and it honours it for `properties` —
-asking for six properties returns exactly those six. It does **not** honour it for `assets`:
-all 35 assets come back regardless, including every `-jp2` duplicate, and `exclude: [links]`
-leaves `links` in place. Since the assets are what make an item 45 KB, the measured saving is
-45.2 -> 43.3 KB/item. Item ids and their order are unaffected. Not worth the change.
+**Bisected, it is a payload cap of roughly 6 MB, and `max_page_size=100` runs at 77% of it.**
+Plain requests serve 130 items at 5.99 MB and refuse 150. With unneeded assets excluded
+server-side the per-item cost drops to 33.2 KB and 150 items at 4.77 MB is *served*, while 200
+items at a predicted 6.64 MB is refused. So the cap tracks bytes, not the `limit` value, and sits
+between 5.99 and 6.64 MB — consistent with AWS Lambda's 6 MB synchronous response limit.
+
+**That margin is a standing campaign risk, not just a curiosity.** A 100-item page of
+`sentinel-2-l2a` is 4.63 MB against a ~6 MB cap. If items get fatter — more assets on a newer
+baseline, a collection change at the provider — page one starts refusing, and that refusal is the
+one no window re-cut can route around. The comment in `config/providers.py` is right about the
+mechanism; this is the number, and it should be re-measured if a first-page 502 ever reappears.
+
+**Server-side field selection is unusable, and the first reading of why was wrong.** Earth
+Search advertises `https://api.stacspec.org/v1.0.0/item-search#fields`. Excluding assets **does**
+work — it removes them and cuts the payload 1.40x, from 46.3 to 33.2 KB/item. What kills it is
+that supplying ANY `fields` object collapses `properties` to `datetime` alone and drops
+`stac_extensions`, so the pruned item is no longer equivalent: it loses `eo:cloud_cover`,
+`proj:epsg` and the processing baseline, all of which the pipeline reads. The pruned dictionaries
+were compared directly and they differ. (An earlier note here said `fields` did not reach assets
+at all, from an include-list trial where the returned assets were unchanged. That was wrong.)
 
 ### The seam costs a day, and an instant boundary removes it
 
@@ -1304,17 +1422,22 @@ defect fix.
 | STAC query | 5.58 ms/item; 164 s/month; ~34 min/year; 368,248 items/year | measured, linear 3→14 days |
 | STAC page size ceiling | 250 (500 and 1000 both fail) | measured |
 | Earth Search page-1 refusal | 502 at `limit=250`; 200 at `limit=100`, same window | measured (§7c) |
-| Earth Search page-request refusal | deterministic in the **(cursor, window) pair** — the byte-identical cursor is refused with a 2-day window and served with a 1-day one, 3 of 3 each way. Seen at page **289** of a 566-page window and page **14** of a 6-day one. NOT a depth limit and NOT a bad cursor — flat 0.6-1.6 s/page throughout, 502 returned in 1.3 s | measured, 6/6, 4/4 and 3/3 (§7c) |
+| Earth Search 502, BOTH kinds | **one mechanism: a response-size cap of ~6 MB** (Lambda's synchronous limit). The byte-identical cursor and window is refused at `limit=100` and served at `limit=90`, returning 5.60 MB where the hundred would have been ~6.2 MB. Item sizes vary, so which hundred the cursor and window select decides it — which is why it looked deterministic in the (cursor, window) pair, and why it appeared at page **289** of one window and page **14** of another. NOT depth, NOT patience, NOT a bad cursor | measured (§7c); supersedes the earlier "not a page size either" reading |
+| Earth Search page-size margin | 100 items averages **4.6 MB** against the ~6 MB cap, largest observed 5.32 MB — roughly **30%** headroom. Check this first if first pages start refusing | measured (§7c) |
 | what clears it | a window with a different END date; shortening the START does not | 8 windows tabulated (§7c) |
 | per-search item ceiling | **10,000** items (`_MAX_QUERY_ITEMS`), from `numberMatched` on the first page | shipped; bounds cost, not correctness (§7c) |
 | re-partition item-set check | union of parts = **56,558 of 56,558** on the failing query | live catalogue, end to end (§7c) |
-| re-partition cost | **19 searches, 821 page requests** vs 566 for the single walk that cannot complete (**1.45x**) | same run (§7c) |
+| re-partition cost | **11 searches, 589 page requests** vs 566 for the single walk that cannot complete (**1.04x**). Was 19 searches and 821 requests before instant seams | measured (§7c) |
+| query window concurrency | `_QUERY_WINDOW_WORKERS` = **6**. Ceiling is 8 for this query's tree; floor is the longest single window, ~93 pages. Drift-corrected 3.3x at 4, 3.8x at 6, 6.0x at 8 | measured (§7c) |
+| page latency breakdown | **86% is server think time** before the first byte; 7.75-7.79 ms/item slope on a ~380-510 ms fixed cost. Round-trip is 12-36 ms, so an in-region client recovers **at most ~15%** — this RETRACTS an earlier 327 s in-region projection | measured (§7c) |
+| page payload | 4.63 MB of JSON, **1.25 MB gzipped**, which is what production sends. The whole query moves ~740 MB, not the 2.6 GB an ungzipped probe suggested | measured (§7c) |
+| Earth Search response cap | roughly **6 MB**, bisected: 130 items served at 5.99 MB, 150 refused; with assets excluded 150 served at 4.77 MB. `max_page_size=100` runs at **77%** of the cap — a standing risk if items get fatter | measured (§7c) |
 | 502 in the retry ladder | **364 s of backoff per refused page request** (`total=8`, `backoff_factor=2`, urllib3 `backoff_max=120`), bought nothing — the refusal is deterministic. Removed from `_STAC_RETRY`; `_CMR_RETRY` keeps it | arithmetic + measured, 24 retry lines to 0 (§7c) |
-| benchmark query wall clock | **2,360.7 -> 1,099.6 -> 795.2 s** (39.3 -> 18.3 -> 13.3 min) for an identical item set, from a laptop. **41.7 -> 19.4 -> 14.1 ms/item** against a 5.58 ms/item reference rate | three live runs, 2026-08-22 (§7c) |
-| re-partition request overhead | **821 -> 583** requests against 566 for a single unsplit walk: **1.45x -> 1.03x** | same runs (§7c) |
-| page payload | **4.5 MB per 100 items** (45 KB/item); the benchmark query moves ~2.6 GB. `limit` above 100 is refused 502 on page 1, and server-side `fields` selection saves 4% because assets are not selectable | measured (§7c) |
-| in-region projection | 583 requests at the reference rate is **327 s vs a single walk's 316 s**. A PROJECTION from §8's rate, never measured on a worker | open (§7c) |
+| benchmark query wall clock | **2,360.7 -> 1,099.6 -> 795.2 -> 207.6 s** for an identical item set, from a laptop: **41.7 -> 19.4 -> 14.1 -> 3.67 ms/item**, which BEATS the 5.58 ms/item reference rate. **11.4x** end to end | four live runs, 2026-08-22 (§7c) |
+| serial vs concurrent item ORDER | byte-identical ordered id sequence, `efcfdf7b6d69974c` (SHA-256 of the comma-joined ids) | measured both ways (§7c) |
 | item ORDER under re-partition | walk order **differs** from an unsplit walk (from index 100); post-sort order and baselines **identical** at part counts 2, 3, 4 | measured on a 5,034-item window (§7c) |
+| concurrency memory cost | +4% peak RSS on the whole query, **+32%** on a refusal-heavy sub-window (1,852 -> 2,439 MB), because a re-cut window's items are held hydrated until assembly. Deferring hydration was tried and rejected: it costs 208 s | measured (§7c) |
+| `fields` extension | unusable: any `fields` object collapses `properties` to `datetime` and drops `stac_extensions`, losing cloud cover, EPSG and baseline. Excluding assets DOES work and cuts payload 1.40x | measured (§7c) |
 | worker RSS per retained item | ~80 KB → ~27–30 GB/year vs 16 GiB worker | 3-point slope |
 | unsharded manifest cost | ~1.1 MB refs/date → ~35 GB per zone-year | fitted, N²/2 |
 | time-sharded manifest cost | ~1.2 GB per zone-year (~28× less) | predicted 34.7 MB at 9 dates, measured 34.6 |

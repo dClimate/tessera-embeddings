@@ -1,5 +1,8 @@
 """Unit tests for ingest/stac.py - STAC ingestion with provider/collection config."""
 
+import threading
+import time
+
 import numpy as np
 import pytest
 from pystac_client.item_search import ItemSearch
@@ -1078,3 +1081,139 @@ class TestSplitQueryWindow:
 
     def test_fewer_than_two_parts_is_no_split(self):
         assert split_query_window("2024-03-01", "2024-03-30", 1) == []
+
+
+class TestTheWindowTreeIsFilledConcurrentlyAndReadBackInOrder:
+    """`_fill_window_tree` runs windows at once; what it returns must not depend on that.
+
+    The scheduler is the one piece of this query that can be wrong in a way no item count
+    reveals: a different interleaving that still returns every item, in a different
+    sequence. So these tests fix the tree and vary only the width and the timing, and
+    assert the output is identical every time.
+
+    Delays are derived from each node's label rather than drawn at random, so a failure
+    here reproduces instead of appearing once in a hundred runs.
+    """
+
+    @staticmethod
+    def _tree(depth: int, breadth: int, prefix: str = "r") -> stac_module._WindowWalk:
+        """A synthetic tree whose nodes are labelled by their path from the root."""
+        node = stac_module._WindowWalk(None, (prefix, prefix))
+        if depth > 1:
+            node.children = [
+                TestTheWindowTreeIsFilledConcurrentlyAndReadBackInOrder._tree(depth - 1, breadth, f"{prefix}.{i}")
+                for i in range(breadth)
+            ]
+        return node
+
+    @staticmethod
+    def _plan(node: stac_module._WindowWalk) -> dict[str, list[str]]:
+        """The tree flattened to label -> child labels, so it can be rebuilt lazily.
+
+        The real walk DISCOVERS children while running, so the test must too: handing
+        `_fill_window_tree` a tree that already has its children would not exercise the
+        part where a finished window feeds the worklist.
+        """
+        plan = {node.window[0]: [c.window[0] for c in node.children]}
+        for child in node.children:
+            plan.update(TestTheWindowTreeIsFilledConcurrentlyAndReadBackInOrder._plan(child))
+        return plan
+
+    def _run(self, plan, roots, workers, *, fail: set[str] = frozenset()):
+        """Fill the tree, returning the visit order and whatever was raised."""
+        walked: list[str] = []
+        lock = threading.Lock()
+
+        def walk(node):
+            label = node.window[0]
+            # A label-derived pause, so siblings finish out of submission order and the
+            # ordering assertions are actually tested rather than trivially satisfied.
+            time.sleep((hash(label) % 7) / 1000)
+            with lock:
+                walked.append(label)
+            if label in fail:
+                raise RuntimeError(f"refused {label}")
+            node.children = [stac_module._WindowWalk(None, (c, c)) for c in plan[label]]
+
+        raised = None
+        try:
+            stac_module._fill_window_tree(walk, roots, workers)
+        except BaseException as exc:
+            raised = exc
+        return walked, raised
+
+    @pytest.mark.parametrize("workers", [1, 2, 3, 6, 8, 64])
+    def test_every_window_is_walked_and_read_back_depth_first(self, workers):
+        """Width changes when a window runs, never the sequence the result is read in."""
+        shape = self._tree(4, 3)
+        plan = self._plan(shape)
+        roots = [stac_module._WindowWalk(None, ("r", "r"))]
+
+        walked, raised = self._run(plan, roots, workers)
+
+        assert raised is None
+        assert sorted(walked) == sorted(plan), "every window in the tree must be walked exactly once"
+        assert len(walked) == len(plan)
+        assert [n.window[0] for n in roots[0].preorder()] == [n.window[0] for n in shape.preorder()]
+
+    def test_the_read_back_order_is_identical_at_every_width(self):
+        """The property that matters: one canonical sequence, whatever the interleaving."""
+        plan = self._plan(self._tree(4, 3))
+        orders = []
+        for workers in (1, 2, 3, 6, 8, 64):
+            roots = [stac_module._WindowWalk(None, ("r", "r"))]
+            self._run(plan, roots, workers)
+            orders.append([n.window[0] for n in roots[0].preorder()])
+        assert all(order == orders[0] for order in orders), "read-back order must not depend on width"
+
+    @pytest.mark.parametrize("workers", [1, 2, 6, 8])
+    def test_two_siblings_failing_at_once_raise_the_earlier_one(self, workers):
+        """Which failure surfaces must be a function of the tree, never of a race.
+
+        The attempt-budget layer above decides a refusal is deterministic by seeing the
+        IDENTICAL signature again on a later attempt. If the failure raised depended on
+        which task finished first, that comparison would be against a coin flip.
+        """
+        plan = self._plan(self._tree(3, 3))
+        roots = [stac_module._WindowWalk(None, ("r", "r"))]
+
+        walked, raised = self._run(plan, roots, workers, fail={"r.2", "r.0"})
+
+        assert isinstance(raised, RuntimeError)
+        assert str(raised) == "refused r.0", "the depth-first-earliest failure is the one raised"
+        # Both failures still ran, and neither failed window contributed children.
+        assert {"r.0", "r.2"} <= set(walked)
+        assert [c.window[0] for c in roots[0].children] == ["r.0", "r.1", "r.2"]
+        assert roots[0].children[0].children == []
+        assert roots[0].children[2].children == []
+        assert [c.window[0] for c in roots[0].children[1].children] == ["r.1.0", "r.1.1", "r.1.2"]
+
+    def test_a_failure_does_not_stop_the_other_windows(self):
+        """Every window is walked even after one fails, so the tree is always complete."""
+        plan = self._plan(self._tree(3, 3))
+        roots = [stac_module._WindowWalk(None, ("r", "r"))]
+
+        walked, raised = self._run(plan, roots, 6, fail={"r.0"})
+
+        assert isinstance(raised, RuntimeError)
+        # 1 root + 3 children + 3x3 grandchildren, less the 3 the failed window never had.
+        assert len(walked) == 1 + 3 + 3 * 3 - 3
+        assert "r.1.0" in walked and "r.2.2" in walked
+
+    def test_a_single_root_with_no_children_is_walked_once(self):
+        roots = [stac_module._WindowWalk(None, ("only", "only"))]
+
+        walked, raised = self._run({"only": []}, roots, 6)
+
+        assert raised is None
+        assert walked == ["only"]
+
+    def test_several_roots_are_read_back_in_their_own_order(self):
+        """The antimeridian split gives two roots; they must not interleave in the output."""
+        plan = {"a": ["a.0"], "a.0": [], "b": ["b.0"], "b.0": []}
+        roots = [stac_module._WindowWalk(None, ("a", "a")), stac_module._WindowWalk(None, ("b", "b"))]
+
+        _, raised = self._run(plan, roots, 6)
+
+        assert raised is None
+        assert [n.window[0] for r in roots for n in r.preorder()] == ["a", "a.0", "b", "b.0"]

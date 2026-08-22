@@ -141,16 +141,19 @@ PROVIDERS: dict[str, STACProvider] = {
                 tile_id_prefix="",
             ),
         },
-        # BELOW the class default: this catalogue answers some (area, date-window) pairs with
-        # a 502 at 250 items per page and the SAME query at 100, so the page size is what
-        # keeps a FIRST page servable. Per provider rather than on the class default, because
-        # nothing implicates the other catalogues.
+        # BELOW the class default, because this catalogue refuses a request whose RESPONSE
+        # would exceed about 6 MB — AWS Lambda's synchronous response limit — and 250 items
+        # of `sentinel-2-l2a` is over it. Per provider rather than on the class default,
+        # because nothing implicates the other catalogues.
         #
-        # Do not read this as a remedy for the OTHER Earth Search 502, where one page request
-        # deep in a walk is refused and the rest of the walk is served. That one is a function
-        # of the request as a whole — cursor and date window together — and page size moves
-        # neither the items walked nor which requests are refused; re-cutting the date window
-        # is what clears it. See `_MAX_QUERY_ITEMS` and the refusal handler in `ingest/stac.py`.
+        # 100 items averages 4.6 MB against that cap and the largest measured was 5.32 MB, so
+        # the margin is roughly 30% and it is the thing to check first if first pages ever
+        # start refusing again. Item size, not the `limit` value, is what the cap tracks.
+        #
+        # The same cap is why one page deep in a walk is sometimes refused while every other
+        # page is served: item sizes vary, so whether a given hundred clears 6 MB depends on
+        # which hundred the cursor and date window select. `ingest/stac.py` answers that by
+        # re-cutting the date window, which regroups the items into smaller responses.
         max_page_size=100,
     ),
     "cmr-asf": STACProvider(
