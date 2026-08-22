@@ -30,17 +30,22 @@ is reprocessed upstream.
 
 ## File naming
 
-``<provider>_<collection>_<aoi-tag>_<date-range>.yaml``
+**pytest-recording names the file for the test that recorded it**, so most
+files here are ``<ClassName>.<test_name>.yaml`` and there is nothing to
+choose. That is the naming to expect, and it means each test costs its own
+full copy of the response — a reason to keep the number of tests sharing a
+window small.
 
-Examples that the parity-test skeletons reference:
+A test may additionally load a SHARED cassette by name with
+``@pytest.mark.vcr("<name>")``, which is how the parity tests reuse
+``test_s1_roi_parity.yaml`` and ``test_s2_roi_parity.yaml``. Only name a
+cassette that exists: the mark is silently inert against a missing file, so a
+stale name reads like coverage and provides none.
 
-* ``s2_l2a_story_county_jul2024.yaml``
-* ``opera_rtc_story_county_jul2024.yaml``
-* ``cmr_granule_orbit_story_county_jul2024.yaml``
-
-The AOI tag should be enough to look up the ROI in ``examples/``. The
-date range establishes which STAC response shape is captured (item
-counts vary by month).
+The examples this section used to list — ``s2_l2a_story_county_jul2024.yaml``
+and two siblings — were never recorded, and the ``<provider>_<collection>_
+<aoi-tag>_<date-range>`` convention they illustrated is not what any file here
+uses.
 
 ## Filtering credentials
 
