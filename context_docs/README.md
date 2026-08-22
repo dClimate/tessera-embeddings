@@ -32,7 +32,8 @@ context_docs/
 │   ├── 018-refuse-pixels-below-minimum-optical-depth.md
 │   ├── 019-validation-modules-belong-in-the-library.md
 │   ├── 020-boa-offset-applies-to-every-valid-dn.md
-│   └── 021-correct-the-boa-offset-per-image.md
+│   ├── 021-correct-the-boa-offset-per-image.md
+│   └── 022-resolve-the-roi-mask-credential-at-read-time.md
 └── design/           Long-form framing docs, grouped by what they answer
     │
     │  THE CAMPAIGN — start here
