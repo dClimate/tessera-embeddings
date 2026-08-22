@@ -148,6 +148,6 @@ def test_a_collection_this_package_does_not_sort_fuses_the_same_either_way(scene
     return order would pick the winner of every overlap.
     """
     cloudy, clear = scenes
-    assert np.array_equal(
-        _load([cloudy, clear], has_scl=False), _load([clear, cloudy], has_scl=False)
-    ), "the fused result must not depend on the order the items were supplied in"
+    assert np.array_equal(_load([cloudy, clear], has_scl=False), _load([clear, cloudy], has_scl=False)), (
+        "the fused result must not depend on the order the items were supplied in"
+    )
