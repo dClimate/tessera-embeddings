@@ -1027,16 +1027,40 @@ Both refused cursors sit at the same instant:
     page 289 of the month : 2019-03-22T08:30:08.394000Z,S2A_37TCE_20190322_0_L2A,sentinel-2-l2a
     page 14 of the 6 days : 2019-03-22T08:30:27.109000Z,S2A_37TEM_20190322_0_L2A,sentinel-2-l2a
 
-**So depth is not the variable.** The `next` token is a `search_after` cursor —
-`(datetime, id, collection)` — with no `from`/`size` offset anywhere in the request, so the
-service is not told how deep the walk has got and cannot be counting. A flat latency curve
-and a 1.3-second 502 also rule out a gateway timeout and progressive deep-paging cost; a
-fixed result-window limit would refuse at one page with an explicit 400.
+**So depth is not the variable.** The pagination token is a cursor, carried in the `next`
+link's body under the key `next`, whose value is the triple
+`(datetime, id, collection)` — for example
+`2019-03-22T08:30:27.109000Z,S2A_37TEM_20190322_0_L2A,sentinel-2-l2a`. It has
+`search_after` semantics and there is no `from`/`size` offset anywhere in the request, so the
+service is not told how deep the walk has got and cannot be counting. A flat latency curve and
+a 1.3-second 502 also rule out a gateway timeout and progressive deep-paging cost; a fixed
+result-window limit would refuse at one page with an explicit 400.
 
-What is left is that the refusal is **deterministic in the whole request** — cursor and date
-window together. It is not the data and not the moment either: the day holding the refused
-cursor queries clean on its own (15 pages, 1,318 items), and the refusal repeats identically
-from fresh sessions minutes apart.
+### The cursor is not the poison: it is the (cursor, window) PAIR
+
+Measured directly on 2026-08-22, and this supersedes the weaker "deterministic in the whole
+request" framing. Walk `2019-03-21T00:00:00Z/2019-03-22T23:59:59Z` to its refusal at page 14,
+then re-send **the byte-identical cursor** with only the `datetime` field narrowed:
+
+| request | cursor | window | result |
+|---|---|---|---|
+| the refusal | `…08:30:27.109000Z,S2A_37TEM_20190322_0_L2A,…` | the 2-day window | **502**, 3 of 3, ~1.3 s |
+| same cursor, narrowed | *identical* | the single day 03-22 | **200**, 18 items, 3 of 3, ~0.8 s |
+
+So no cursor value is defective. A cursor the service refuses under one window it serves under
+another, and the only thing that changed was the date range beside it.
+
+**A sharper hypothesis, not yet confirmed.** In the one-day window that cursor is the LAST page
+— 18 items, since the day holds 1,318 — while in the two-day window the same cursor must return
+100 items, 18 from the 22nd and 82 from the 21st. The request that fails is one whose result
+would cross a date boundary. That would explain the end-date property, it fits the month window
+refusing on a cursor at the same instant, and it predicts that windows ending ON a date boundary
+refuse less often — which the instant-boundary run's zero refusals is consistent with. It is a
+hypothesis about a service we cannot see inside, on one seam, and the fix does not rest on it.
+
+It is not the data and not the moment either: the day holding the refused cursor queries clean
+on its own (15 pages, 1,318 items), and the refusal repeats identically from fresh sessions
+minutes apart.
 
 ### The property that decides the fix: only the window's END matters
 
@@ -1280,7 +1304,7 @@ defect fix.
 | STAC query | 5.58 ms/item; 164 s/month; ~34 min/year; 368,248 items/year | measured, linear 3→14 days |
 | STAC page size ceiling | 250 (500 and 1000 both fail) | measured |
 | Earth Search page-1 refusal | 502 at `limit=250`; 200 at `limit=100`, same window | measured (§7c) |
-| Earth Search page-request refusal | deterministic in (cursor, window); seen at page **289** of a 566-page window and page **14** of a 6-day one, on cursors at the same instant. NOT a depth limit — flat 0.6-1.6 s/page throughout, 502 returned in 1.3 s | measured, 6/6 and 4/4 repeats (§7c) |
+| Earth Search page-request refusal | deterministic in the **(cursor, window) pair** — the byte-identical cursor is refused with a 2-day window and served with a 1-day one, 3 of 3 each way. Seen at page **289** of a 566-page window and page **14** of a 6-day one. NOT a depth limit and NOT a bad cursor — flat 0.6-1.6 s/page throughout, 502 returned in 1.3 s | measured, 6/6, 4/4 and 3/3 (§7c) |
 | what clears it | a window with a different END date; shortening the START does not | 8 windows tabulated (§7c) |
 | per-search item ceiling | **10,000** items (`_MAX_QUERY_ITEMS`), from `numberMatched` on the first page | shipped; bounds cost, not correctness (§7c) |
 | re-partition item-set check | union of parts = **56,558 of 56,558** on the failing query | live catalogue, end to end (§7c) |
