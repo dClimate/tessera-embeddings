@@ -83,10 +83,40 @@ most for CMR-STAC, which returns 502/503 under load on large date-range queries.
 object is required.
 
 The page size is `STACProvider.max_page_size` (the `limit` per page request), defaulting
-to 250. This applies only to providers queried through `client.search()` (Earth Search,
-Planetary Computer) — the OPERA `cmr-asf` path bypasses CMR-STAC search entirely and queries
-the native CMR Granule API. See
+to 250 and set to 100 for Earth Search. This applies only to providers queried through
+`client.search()` (Earth Search, Planetary Computer) — the OPERA `cmr-asf` path bypasses
+CMR-STAC search entirely and queries the native CMR Granule API. See
 [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md) for the full rationale.
+
+**A second, unrelated Earth Search 502 is handled by re-cutting the date window.** Some
+individual page requests are refused with a 502 while the rest of the same walk is served,
+and the refusal is deterministic in the *request* — pagination cursor and date window
+together — not in how deep the walk has got. The same refusal has been seen at page 289 of
+one window and page 14 of a shorter one sharing its late bound. So the retry ladder above
+cannot absorb it (it has already exhausted itself on that request), and a smaller page is
+not the lever either: page size changes neither the items walked nor which requests are
+refused. **It is emphatically not the page-size refusal above** — that one fails on the
+*first* page and is what `max_page_size` was lowered for.
+
+What clears it is a window with a different **end** date; shortening only the start does
+not, because the catalogue pages newest-first and the late bound fixes the whole cursor
+sequence. So `_query_stac_items` re-queries the window as shorter windows on any
+upstream-error refusal past the first page, recursing until a window completes or is down to
+a single day. Separately and proactively, it reads the match count the catalogue reports
+beside the first page and cuts a window matching more than `_MAX_QUERY_ITEMS` to size — that
+bounds *cost*, keeping a refusal from discarding a long walk, and is not what fixes the
+defect. A refusal that shortening cannot route around — a first page, a stated overload, or
+a single day — still raises the classified `CatalogueQueryError` with its token.
+
+The re-partition is a pure re-cut of the window, never a narrowing: the shorter windows'
+union is exactly the input window, and consecutive windows deliberately **share** their
+boundary day rather than abutting it, so no acquisition can fall between them (the catalogue
+is asked for whole days and expands them to instants itself, so abutting would leave a
+sub-second gap at midnight). Items are deduped by `id` across every search a query runs,
+which is what absorbs both that overlap and the antimeridian one. The one exception is a
+two-day window, which sharing a day cannot shorten: there the windows abut, because the
+alternative is a refused window with nothing left to try. Measurements are in
+[the ingest campaign record](../../../context_docs/design/ingest_optimization_campaign_2026_07.md).
 
 #### When the catalogue refuses: naming the request, and telling the two refusals apart
 
