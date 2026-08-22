@@ -96,55 +96,29 @@ the case where a different supplier is injected.
 
 ## What now pins it
 
-`tests/unit/test_solar_day_fusion.py` refuses to mock the loader. It writes two real single-band
-GeoTIFFs on one grid, builds two real STAC items on one solar day, and loads them through the
-production path with the production load kwargs. The assertions are on the pixels that come out.
+`tests/unit/test_solar_day_fusion.py` refuses to mock the loader: two real GeoTIFFs, two real STAC
+items on one solar day, through the production path, asserting the pixels that come out.
 
-Three properties are pinned, and the second is the one that matters most:
-
-1. Handed clearest-first, the clear scene's values are what survive.
-2. **Handed either way round, the first source wins** — asserted in both directions, so the
-   mechanism itself is pinned rather than today's outcome. A future reversal of the sort cannot
-   pass this test.
-3. A hole in the clearest scene falls through to the next-clearest rather than to nothing, so the
-   day keeps its coverage instead of trading coverage for clarity.
-
-The test also asserts `ds.sizes["time"] == 1`, because two items landing in two separate slices
-would make the whole test vacuous.
+It asserts first-wins **in both directions**, which pins the mechanism rather than today's outcome —
+a future reversal of the sort cannot pass it. It also asserts a hole in the clearest scene falls
+through to the next-clearest, so the day keeps its coverage instead of trading coverage for clarity.
 
 ## Blast radius
 
-Being wrong on overlaps only matters where scenes actually contest ground. First figures, zone 33N,
-June 2024: all 30 days carry more than one distinct acquisition, and the median cloud-cover gap
-between acquisitions on a day is 70 percentage points. Zone 15S has none — 207 items in the month,
-a sparse tropical strip.
-
-**That overstates contested ground and must not be quoted as the impact.** Two passes over a 6°
-strip at different latitudes never touch, so a day with two acquisitions need not have a single
-contested pixel. The measurement that answers the question computes the actual overlap *area*
-between different acquisitions in an equal-area projection, and the cloud gap across each
-contesting pair. Until that lands, the honest statement is that the defect is confirmed and its
-extent is unmeasured.
+Being wrong on overlaps only matters where scenes actually contest ground, and a day carrying two
+acquisitions need not have a single contested pixel — two passes over a 6° strip at different
+latitudes never touch. **The defect is confirmed; its extent is unmeasured.** The measurement that
+answers it computes the overlap area between different acquisitions in an equal-area projection,
+with the cloud gap across each contesting pair. No count of multi-acquisition days is a substitute,
+and none should be quoted as the impact.
 
 ## The radar path is not covered by this fix
 
-`preserve_original_order=True` is set unconditionally in `_load_from_stac`, and the cloud sort runs
-only for collections with an SCL band. So for radar the library's deterministic `(time, id)` default
-is switched off and nothing replaces it: the winner of an overlap is whatever order the CMR granule
-query returned.
-
-This is not the same defect. Radar has no quality ordering analogous to cloud cover — two
-overlapping bursts are both valid observations at comparable geometry, so there is no worse one to
-prefer by mistake and nothing is being silently degraded. The exposure is **reproducibility**: which
-burst wins depends on an external service's return order that nothing here pins.
-
-The asymmetry is what makes it worth fixing. Setting the flag globally to serve the one collection
-that has its own sort removes the library's determinism guarantee from every collection that does
-not. Setting it only where a deliberate order exists would restore that for free. Verified safe for
-the footprint join: `normalize_to_solar_day` assigns every item in a group the same canonical noon
-timestamp and `odc` reads `item.datetime`, so the join key is order-independent either way. It would
-change which burst wins an overlap, which is a pixel change — so it belongs in a window where the
-store is being rebuilt, or not for a long time.
+`preserve_original_order=True` is set for every collection, and the cloud sort runs only for
+collections with an SCL band. So for radar the library's deterministic `(time, id)` default is
+switched off and nothing replaces it. That is a reproducibility exposure rather than this defect —
+radar has no quality ordering, so nothing is being silently degraded — and it is owed its own
+change.
 
 ## Trade-offs accepted
 
@@ -160,6 +134,3 @@ coverage is not an argument against that design and should not be quoted as one.
 are cost and blast radius: it means writing and configuring a fuser where the library's default
 already suffices, and the fuser applies to every collection the loader serves rather than only
 this one.
-
-**One integer per date remains a lossy record** of a day whose tiles declare different baselines.
-That is unchanged by this fix and is deliberate; nothing in the package reads the attribute yet.

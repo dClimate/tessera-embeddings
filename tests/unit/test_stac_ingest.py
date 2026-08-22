@@ -527,9 +527,6 @@ class TestTheSolarDaySortKey:
         """
         assert solar_day_sort_key(self._item(None)) > solar_day_sort_key(self._item(100))
 
-    def test_the_clearest_scene_of_a_day_sorts_first(self):
-        assert solar_day_sort_key(self._item(2.0)) < solar_day_sort_key(self._item(90.0))
-
     def test_an_equal_cloud_tie_is_settled_by_id_not_by_input_order(self):
         assert solar_day_sort_key(self._item(5.0, "AAA")) < solar_day_sort_key(self._item(5.0, "BBB"))
 

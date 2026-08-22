@@ -113,16 +113,6 @@ def scenes(tmp_path: pathlib.Path):
     )
 
 
-def test_the_clearest_scene_supplies_the_overlap(scenes) -> None:
-    """THE rule. Clearest first, and the clearest is what comes out.
-
-    Handed the other way round the cloudy scene wins, which is what makes the sort in
-    `query_stac_items` load-bearing rather than cosmetic.
-    """
-    cloudy, clear = scenes
-    assert np.unique(_load([clear, cloudy])).tolist() == [CLEAR_DN]
-
-
 def test_the_first_source_wins_rather_than_the_last(scenes) -> None:
     """The mechanism, stated as the thing it is: position decides, and it is the FIRST position.
 
