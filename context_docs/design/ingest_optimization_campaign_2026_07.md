@@ -597,7 +597,7 @@ verdict and the reason, because the cost of losing these is someone re-running t
 | **several rejected without testing** | defensible | each contradicted a measured constraint already in hand; the section records which, so "untested" is not read as "unconsidered" |
 | **remove the realignment** | reverted | projected 3.85× and ~5% materialised, because the census modelled the write layer instead of measuring it — and the memory claim came from the first twelve heartbeats of a run that later spilled |
 | **narrow window geometry further** | rejected | three variants, all worse. The best any rectangle strategy achieves is 0.50× current area; the shipped one already achieves 0.75× |
-| **worker memory back to 16 GiB** | ADOPTED, late | rejected while the driver held unpruned catalogue items, and affordable once §3.13's pruning landed — a rejected size that another change made viable |
+| **worker memory back to 16 GiB** | ADOPTED, then WITHDRAWN (§8) | rejected while the driver held unpruned catalogue items, and it looked affordable once §3.13's pruning landed — but the peak it was sized against came from dates carrying half the windows of a 2019 optical date, and those denser dates paused workers at this size. Now **24576 MiB** |
 
 **The transferable one is the realignment revert**: a projection built by modelling a layer rather
 than measuring it, and a memory figure taken from the opening minutes of a run that later spilled.
@@ -919,7 +919,7 @@ bounds *how large each one is*, and the driver needed both to stay under the pau
 | memory per band-block | 4096: 34 MB · 8192: 134 MB · 16384: 537 MB | arithmetic |
 | hottest worker | 10.16 GiB of 16 at 8192 blocks; spill 0 throughout | run telemetry |
 | inference baseline (do not regress) | GPU util 99% in-phase, VRAM 97% peak, host RAM 46% of a 60% ceiling, GPU-idle ~6 s/chunk | 2,352 RESOURCES samples |
-| **ingest worker size (CURRENT)** | 4 vCPU / **16384 MiB** | §4.8. Peak 7.91 GiB over 91 dates and three rollovers, plateauing by hour three, zero spill → 1.6× margin to the pause threshold. Superseding, in order: 16384 → 30720 → 20480 → 24576 → **16384**; pruning the retained catalogue (§3.13) is what made the original size affordable again. vCPU stays at 4 — the quota counts vCPU. |
+| **ingest worker size (CURRENT)** | 4 vCPU / **24576 MiB** | Superseding, in order: 16384 → 30720 → 20480 → 24576 → 16384 → **24576**. **16384 is WITHDRAWN**, and with it §4.8's claim that pruning made the original size affordable: its 7.91 GiB peak over 91 dates was measured on 2017–18 optical at ~8 windows per date, and 2019 carries 14–16. The overlapped write (§3.11) holds a date's windows concurrently, so demand scales with that count — six workers on 2019 optical paused at **11.92 GiB**, 80% of the 14.90 GiB limit this size gives Dask, and never resumed, stalling four zone-years. 20480 was not chosen instead because §3.13 already records it as short: it was itself sized against a ~12.4 GiB short-run peak against a true ceiling of ~15. Whether 24576 holds at 60 concurrent cells on 2019-density data is **UNMEASURED**. With Dask task definitions PINNED the constant sets only Dask's `--memory-limit`, so the consumer's registered definition must be raised to match or the pause threshold lands above the container's hard limit. vCPU stays at 4 — the quota counts vCPU. |
 | streaming retention cost | +1 month of items on the ingest worker; 1.25 GiB spill at 16 GiB | run telemetry |
 | items deferred across a month boundary | 1,084 of 31,507 (one day's worth) | live cluster |
 | write floor | graph ≈ store_chunks × bands; 2,992 covered vs 2,415 live (19% dead) | measured, all 7 windows |
@@ -983,10 +983,10 @@ answer.
   one frozen ROI mask. Figures from other zones, widths or dates say so, and cross-zone timings do
   **not** compare — a date's cost tracks its rectangle count, which varies several-fold between
   zones.
-- **Worker memory is not constant across rows**: 16 GiB up to 2026-07-25, 20 GiB after, and back
-  to **16 GiB from 2026-07-27** (§4.8). Memory size barely moves wall clock, so the timing rows
-  still compare — but a peak-memory figure only means something beside the limit it was measured
-  against.
+- **Worker memory is not constant across rows**: 16 GiB up to 2026-07-25, 20 GiB after, back to
+  16 GiB from 2026-07-27 (§4.8), and **24 GiB from 2026-08-21** (§8). Memory size barely moves wall
+  clock, so the timing rows still compare — but a peak-memory figure only means something beside
+  the limit it was measured against.
 - **Graph-task counts** come from local census runs over a fixed pixel window. They compare within
   a series, not across series, and are labelled accordingly.
 - **Two independent instruments** appear throughout: wall clock from logs, and packed task work
