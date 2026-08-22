@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import pickle
+import re
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -345,16 +347,20 @@ class TestTheFailingRequestIsNamed:
                 **kwargs,
             )
 
-    def test_the_page_that_failed_is_named_not_just_the_query(self, caplog) -> None:
+    def test_the_page_that_failed_is_named_not_just_the_query(self, caplog, monkeypatch) -> None:
         """Which PAGE the refusal died on, not merely that the query failed.
 
         "The catalogue cannot answer at all" and "one deep cursor breaks" are different
         defects with different reproductions, and an item count cannot tell them apart.
 
-        A one-day window, because a longer one is re-partitioned instead of refused — see
-        ``TestADeepRefusalIsRePartitioned``. One day is the case where re-partitioning has
-        nothing left to try, so the refusal is reported exactly as it always was.
+        A one-day window at the page-size FLOOR, which is the state where no lever remains:
+        the window cannot be shortened further and the page cannot be halved further. A
+        one-day window alone is no longer enough — it is answered by asking for a smaller
+        page (see ``TestARefusalNoShorterWindowCanReachAsksForASmallerPage``) — so the floor
+        is raised here to reach exhaustion in a single search rather than by driving the
+        ladder down through four of them.
         """
+        monkeypatch.setattr(stac, "_MIN_PAGE_SIZE", 10**9)
         pages = _pages_then_refusal([{"features": [_item("a"), _item("b")]}], _refused(502))
 
         with pytest.raises(CatalogueQueryError) as caught:
@@ -376,10 +382,14 @@ class TestTheFailingRequestIsNamed:
         # that moved with progress could never repeat.
         assert "2 item(s)" in logged
 
-    def test_the_transport_cause_is_preserved_under_the_wrapper(self, caplog) -> None:
+    def test_the_transport_cause_is_preserved_under_the_wrapper(self, caplog, monkeypatch) -> None:
         """The wrapper adds the request; it must not become a second wrapper that
         discards a cause.
+
+        At the page-size floor, so the refusal propagates rather than being answered by a
+        smaller page.
         """
+        monkeypatch.setattr(stac, "_MIN_PAGE_SIZE", 10**9)
         with pytest.raises(CatalogueQueryError) as caught:
             self._query(_pages_then_refusal([], _refused(502)), caplog)
         assert isinstance(caught.value.__cause__, APIError)
@@ -512,11 +522,159 @@ class TestADeepRefusalIsRePartitioned:
 
         assert caught.value.refusal.kind is RefusalKind.LOAD
 
-    def test_a_first_page_refusal_is_not_a_depth_problem(self, caplog) -> None:
-        """Shortening the window asks the first page the same way, so it still propagates."""
-        pages = _pages_then_refusal([], _refused(502))
 
+class TestARefusalNoShorterWindowCanReachAsksForASmallerPage:
+    """The two refusals the window re-cut cannot answer, and the lever that can.
+
+    Earth Search refuses a request whose RESPONSE would exceed about 6 MB, so asking for
+    fewer items is the direct remedy. The re-cut reaches it indirectly, by regrouping items
+    into smaller responses -- but it cannot reach a FIRST page, which a shorter window asks
+    identically, nor a single day, which is the re-cut's own floor. Both of those failed the
+    leg outright before this, so every test here covers a path that previously raised.
+
+    Five of these eight FAIL when the step-down is removed and are therefore proofs. The
+    remaining three pass either way and say so in their own docstrings: they guard the
+    preference order, the termination, and the refusal class the step-down is gated on.
+    """
+
+    @staticmethod
+    def _query(page_sets, caplog, start, end):
+        """Drive one query, giving each successive search its own page iterator.
+
+        Returns the ``limit`` each search was asked with, in call order, and the items. A
+        per-search iterator is the point: one shared iterator is exhausted by the first
+        search, so a retry would appear to succeed by returning nothing at all.
+        """
+        provider = stac._get_provider_config("earth-search")
+        collection = stac._get_collection_config("earth-search", "sentinel-2-l2a")
+        limits: list[int] = []
+        guard = threading.Lock()
+
+        def search(**kwargs):
+            with guard:
+                limits.append(kwargs["limit"])
+                index = len(limits) - 1
+            chosen = page_sets[index] if index < len(page_sets) else page_sets[-1]
+            result = MagicMock()
+            result.pages_as_dicts.return_value = chosen()
+            return result
+
+        with (
+            patch.object(stac, "StacApiIO"),
+            patch.object(stac, "Client") as client,
+            caplog.at_level(logging.WARNING, logger=stac.__name__),
+        ):
+            client.open.return_value.search.side_effect = search
+            items = stac._query_stac_items(provider, collection, None, start, end, bbox=(-3.0, 50.0, -2.0, 51.0))
+        return limits, items
+
+    @staticmethod
+    def _refuses_at(page_no: int, refusal=None):
+        """A page iterator serving ``page_no - 1`` pages and then refusing."""
+        refusal = refusal or _unretried(502)
+        served = [{"features": [_item(f"p{i}")]} for i in range(1, page_no)]
+        return lambda: _pages_then_refusal(served, refusal)
+
+    @staticmethod
+    def _serves(ids):
+        return lambda: iter([{"features": [_item(i) for i in ids]}])
+
+    def test_a_first_page_refusal_is_retried_at_half_the_page(self, caplog) -> None:
+        """The case with no shorter window to fall back on: a shorter one asks page 1 too."""
+        limits, items = self._query([self._refuses_at(1), self._serves(["a", "b"])], caplog, "2021-09-01", "2021-10-02")
+
+        assert limits == [100, 50], "the refused window must be re-asked at half the page"
+        assert [i.id for i in items] == ["a", "b"]
+        assert "items per page" in caplog.text
+        # And NOT by shortening the window, which would ask the first page identically.
+        assert "shorter window" not in caplog.text
+
+    def test_a_single_day_refused_past_page_one_is_retried_at_half_the_page(self, caplog) -> None:
+        """The re-cut's floor. A single day cannot be shortened, so the page must shrink."""
+        limits, items = self._query([self._refuses_at(4), self._serves(["a"])], caplog, "2021-09-01", "2021-09-01")
+
+        assert limits == [100, 50]
+        assert "items per page" in caplog.text
+        assert [i.id for i in items] == ["p1", "p2", "p3", "a"], (
+            "the pages walked before the refusal are kept, and the re-walk's are appended"
+        )
+
+    def test_shortening_the_window_is_preferred_over_shrinking_the_page(self, caplog) -> None:
+        """Two halves walk about as many pages as the parent; a smaller page walks twice as many.
+
+        A GUARD, not a proof: this passes with the page step-down removed, because without it
+        no search asks for a smaller page anyway. It exists to catch the preference being
+        inverted later, which would make every deep refusal twice as expensive as it needs
+        to be without failing anything else.
+        """
+        limits, _ = self._query(
+            [self._refuses_at(4), self._serves(["a"]), self._serves(["b"])], caplog, "2021-09-01", "2021-10-02"
+        )
+
+        assert set(limits) == {100}, "no search should have asked for a smaller page"
+        assert "shorter window" in caplog.text
+        assert "items per page" not in caplog.text
+
+    def test_the_page_halves_to_a_floor_and_then_the_refusal_is_reported(self, caplog) -> None:
+        """It must give up. A window nothing can serve is a refusal, not an infinite retry.
+
+        A GUARD, not a proof: the refusal propagates with or without the step-down, so this
+        does not distinguish them. What it does catch is the step-down failing to terminate,
+        which would hang a leg rather than fail it -- the worse of the two outcomes, and the
+        one no other test here would notice.
+        """
         with pytest.raises(CatalogueQueryError) as caught:
-            self._query(pages, caplog, "2021-09-01", "2021-10-02")
+            self._query([self._refuses_at(1)], caplog, "2021-09-01", "2021-09-01")
 
+        assert caught.value.refusal.kind is RefusalKind.UPSTREAM_ERROR
         assert caught.value.request.page == 1
+
+    def test_the_floor_is_reached_by_halving_and_nothing_below_it_is_asked(self, caplog) -> None:
+        """The ladder is pinned, so a change to the step or the floor is visible here."""
+        with pytest.raises(CatalogueQueryError):
+            self._query([self._refuses_at(1)], caplog, "2021-09-01", "2021-09-01")
+
+        asked = [int(m) for m in re.findall(r"at (\d+) items per page", caplog.text)]
+        assert asked == [50, 25, 12], f"expected halving to the floor, got {asked}"
+        assert all(size >= stac._MIN_PAGE_SIZE for size in asked)
+
+    def test_a_stated_overload_on_the_first_page_is_not_answered_with_a_smaller_page(self, caplog) -> None:
+        """A 503 means BUSY. A smaller page is MORE requests, which is the wrong direction.
+
+        A GUARD, not a proof: a 503 propagates either way. It pins the classification the
+        step-down is gated on, so widening that gate to every refusal -- which would answer
+        an overload by multiplying the requests causing it -- fails here.
+        """
+        with pytest.raises(CatalogueQueryError) as caught:
+            self._query([self._refuses_at(1, _refused(503))], caplog, "2021-09-01", "2021-10-02")
+
+        assert caught.value.refusal.kind is RefusalKind.LOAD
+        assert "items per page" not in caplog.text
+
+    def test_a_reduced_page_is_inherited_by_the_windows_cut_from_it(self, caplog) -> None:
+        """A window must never return to a size that was already refused."""
+        limits, _ = self._query(
+            [
+                self._refuses_at(1),  # page 1 refused at 100 -> retry the whole window at 50
+                self._refuses_at(4),  # at 50 it refuses at depth -> cut into shorter windows
+                self._serves(["a"]),
+                self._serves(["b"]),
+            ],
+            caplog,
+            "2021-09-01",
+            "2021-10-02",
+        )
+
+        assert limits[:2] == [100, 50]
+        assert set(limits[2:]) == {50}, "the shorter windows must keep the reduced page size"
+
+    def test_the_re_walk_does_not_double_count_the_pages_it_repeats(self, caplog) -> None:
+        """The whole window is asked again, so every item before the refusal comes back."""
+        limits, items = self._query(
+            [self._refuses_at(3), self._serves(["p1", "p2", "later"])], caplog, "2021-09-01", "2021-09-01"
+        )
+
+        assert limits == [100, 50]
+        ids = [i.id for i in items]
+        assert ids == ["p1", "p2", "later"], f"expected each item once, in walk order, got {ids}"
+        assert len(ids) == len(set(ids))

@@ -158,6 +158,19 @@ _MAX_QUERY_ITEMS = 10_000
 # context_docs/design/ingest_optimization_campaign_2026_07.md.
 _QUERY_WINDOW_WORKERS = 6
 
+# Smallest page a refused window is re-asked with before the refusal is reported.
+#
+# Earth Search refuses a request whose RESPONSE would exceed about 6 MB, so asking for fewer
+# items per page is the direct remedy — and the only one for the two cases the window re-cut
+# cannot reach: a FIRST page, which a shorter window asks identically, and a single-day
+# window, which is the re-cut's floor. Both of those fail a leg outright without this.
+#
+# Halved each time rather than eased down, because a threshold converges and a curve invites
+# tuning: 100 -> 50 -> 25 -> 12 stops here. The floor exists so a window that cannot be
+# served at any size is reported rather than retried forever; it is not a size anything is
+# expected to need. A page this small is ~0.7 MB against the cap.
+_MIN_PAGE_SIZE = 10
+
 
 def _get_provider_config(provider_name: str) -> STACProvider:
     """Get a provider configuration by name.
@@ -989,6 +1002,9 @@ class _WindowWalk:
             box, or None for a property-based query.
         window: ``(start, end)`` as the catalogue is asked for it. Either bound may be a
             bare date or one of :func:`split_query_window`'s boundary instants.
+        page_size: Items per page request, or None for the provider's own. Set only when a
+            refusal has already been answered by asking for a smaller response, and
+            inherited by children so a window never returns to a size that was refused.
         items: What this window's OWN pages returned, in page order, hydrated and pruned
             but not deduplicated — assembly dedupes across the whole tree at once.
 
@@ -1004,6 +1020,7 @@ class _WindowWalk:
 
     bbox: tuple[float, float, float, float] | None
     window: tuple[str, str]
+    page_size: int | None = None
     items: list[Any] = field(default_factory=list)
     children: list["_WindowWalk"] = field(default_factory=list)
 
@@ -1085,7 +1102,8 @@ def _walk_query_window(
     # query carrying neither term, because a diagnostic must never be the thing that
     # raises — an unnamed area still leaves the collection, window and page named.
     area = _area_label(query_params, tile_id)
-    search = client.search(**query_params, limit=provider.max_page_size, max_items=None)
+    page_size = node.page_size or provider.max_page_size
+    search = client.search(**query_params, limit=page_size, max_items=None)
     # Paged EXPLICITLY (`pages_as_dicts`, which is what `items_as_dicts` iterates
     # internally) so a failure can name the page ordinal it died on. Each page is a
     # separate HTTP request behind its own retry ladder, so "the whole year fails" and
@@ -1121,18 +1139,38 @@ def _walk_query_window(
             # not, so this recurses until a window completes or is down to a
             # single day.
             #
-            # Not on the first page, which a shorter window asks the same way; and
-            # not on a stated overload, which is what the ladder above is for and
-            # which slicing would only multiply.
+            # Not on a stated overload, which is what the ladder above is for and which
+            # slicing would only multiply.
+            #
+            # Two levers, tried in that order. A shorter WINDOW is preferred because its
+            # halves between them walk about as many pages as this window would have, while
+            # a smaller PAGE re-walks the whole window at twice the requests. But shortening
+            # cannot reach every refusal: a FIRST page is asked identically by a shorter
+            # window, and a single day is the re-cut's floor. Those two both failed the leg
+            # outright before this, and a smaller page is the only lever left for them.
             shorter = split_query_window(win_start, win_end, 2)
-            if page_no > 1 and shorter and classify_refusal(exc).kind is RefusalKind.UPSTREAM_ERROR:
-                logger.warning(
-                    "Catalogue refused %s — retrying it as %d shorter window(s)",
-                    request.label,
-                    len(shorter),
-                )
-                node.children = [_WindowWalk(node.bbox, w) for w in shorter]
-                return
+            smaller = page_size // 2
+            if classify_refusal(exc).kind is RefusalKind.UPSTREAM_ERROR:
+                if page_no > 1 and shorter:
+                    logger.warning(
+                        "Catalogue refused %s — retrying it as %d shorter window(s)",
+                        request.label,
+                        len(shorter),
+                    )
+                    node.children = [_WindowWalk(node.bbox, w, node.page_size) for w in shorter]
+                    return
+                if smaller >= _MIN_PAGE_SIZE:
+                    # Same window, same items, same order — only the response is smaller,
+                    # which is what the cap is measured against. The pages already walked
+                    # are re-fetched and the assembly step dedupes them away.
+                    logger.warning(
+                        "Catalogue refused %s — retrying the whole window at %d items per page (was %d)",
+                        request.label,
+                        smaller,
+                        page_size,
+                    )
+                    node.children = [_WindowWalk(node.bbox, node.window, smaller)]
+                    return
             raise_catalogue_query_error(request, exc, log=logger, items_so_far=len(node.items))
         for raw in page.get("features", []):
             # `id` is required by the STAC spec; an item without one cannot be deduped by
@@ -1151,7 +1189,7 @@ def _walk_query_window(
                 _MAX_QUERY_ITEMS,
                 len(shorter),
             )
-            node.children = [_WindowWalk(node.bbox, w) for w in shorter]
+            node.children = [_WindowWalk(node.bbox, w, node.page_size) for w in shorter]
             return
 
 

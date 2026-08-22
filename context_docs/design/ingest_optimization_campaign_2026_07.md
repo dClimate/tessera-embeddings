@@ -1084,19 +1084,42 @@ the first thing to measure if a first-page 502 ever reappears.
 
 ### What it means for the fix
 
-The shipped fix is correct and unaffected: a shorter date window regroups the items into
-different hundreds, so the fat group is split and every response lands under the cap. What
-changes is the ranking of remedies:
+**Two levers now ship, tried in that order.**
 
-- Re-asking the refused page at a **smaller size** is the most direct remedy, since it targets
-  the mechanism, preserves item order and re-walks nothing. It is not used here because
-  `pystac_client` bakes the limit into a search and offers no clean way to resume from a cursor
-  at a different size — which is why the window re-cut was reachable and this was not.
-- **Lowering `max_page_size`** moves every page further below the cap, making refusals rare
-  rather than handled. It costs proportionally more requests, which the concurrency in §7c
-  largely hides.
-- The **window re-cut** stays as the backstop, because no page size can guarantee the cap is
-  never reached if items get fatter.
+A shorter **window** is preferred, because its halves between them walk about as many pages as
+the parent would have, while a smaller page re-walks the whole window at twice the requests.
+
+A smaller **page** is the fallback, halving to a floor of `_MIN_PAGE_SIZE = 10`. It exists
+because window shortening cannot reach two refusals, and **both of them failed a leg outright
+before this**:
+
+- A **first page**. A shorter window asks its first page identically, so shortening is not a
+  remedy at all. This is the failure the ~6 MB margin will eventually produce, and it is the
+  one that had no answer.
+- A **single day**, which is the re-cut's own floor. A day refused past page 1 had nothing
+  left to try.
+
+The friction that made this look hard is real but narrower than it appeared: `pystac_client`
+bakes the limit into a search, so it cannot resume from a cursor at a different size. Neither
+of the two cases above needs to. A first page has no cursor, and a single day is cheap to
+re-walk from the start.
+
+**Verified live, on the refusal class it exists for.** Asking for 250 items is over the cap, so
+it is refused on the first request. The recovery stepped 250 -> 125, hit a deeper refusal at
+125 and shortened the window, then stepped both halves to 62, and returned every item:
+
+| | requests | items | distinct | post-sort id hash | baselines |
+|---|---|---|---|---|---|
+| `limit=100`, no refusals | 29 | 2,512 | 2,512 | `ecf847e086277035` | 2 |
+| `limit=250`, recovered | 59 | 2,512 | 2,512 | `ecf847e086277035` | 2 |
+
+Twice the requests for a query that previously failed. Note which invariant is checked: the
+**post-sort** sequence, not the walk order. The walk order does differ, because the recovery
+shortened windows as well as shrinking pages — and as §7c records below, the walk order changes
+under any re-partition while the sequence the painter consumes does not.
+
+**Lowering `max_page_size`** remains the separate lever for making refusals rare rather than
+handled. It costs proportionally more requests, which the concurrency above largely hides.
 
 > **CORRECTED 2026-08-22.** This section previously described two unrelated Earth Search 502s —
 > a first-page refusal at `limit=250` remedied by page size, and a deep-page refusal at
@@ -1453,6 +1476,8 @@ defect fix.
 | Earth Search page-1 refusal | 502 at `limit=250`; 200 at `limit=100`, same window | measured (§7c) |
 | Earth Search 502, BOTH kinds | **one mechanism: a response-size cap of ~6 MB** (Lambda's synchronous limit). The byte-identical cursor and window is refused at `limit=100` and served at `limit=90`, returning 5.60 MB where the hundred would have been ~6.2 MB. Item sizes vary, so which hundred the cursor and window select decides it — which is why it looked deterministic in the (cursor, window) pair, and why it appeared at page **289** of one window and page **14** of another. NOT depth, NOT patience, NOT a bad cursor | measured (§7c); supersedes the earlier "not a page size either" reading |
 | Earth Search page-size margin | 100 items averages **4.6 MB** against the ~6 MB cap, largest observed 5.32 MB — roughly **30%** headroom. Check this first if first pages start refusing | measured (§7c) |
+| refusal levers, in cost order | **shorter window** first, then **smaller page** halving to `_MIN_PAGE_SIZE = 10`. The page lever covers the two refusals shortening cannot reach — a FIRST page, and a single day — both of which failed a leg outright before it | shipped (§7c) |
+| page-lever live proof | `limit=250` is refused on the first request; recovery stepped 250 → 125 → 62, interleaved with a window cut, and returned 2,512 of 2,512 items with **identical post-sort order and baselines** (`ecf847e086277035`), for 59 requests against 29 | measured (§7c) |
 | what clears it | a window with a different END date; shortening the START does not | 8 windows tabulated (§7c) |
 | per-search item ceiling | **10,000** items (`_MAX_QUERY_ITEMS`), from `numberMatched` on the first page | shipped; bounds cost, not correctness (§7c) |
 | re-partition item-set check | union of parts = **56,558 of 56,558** on the failing query | live catalogue, end to end (§7c) |

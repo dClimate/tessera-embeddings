@@ -130,7 +130,10 @@ HOW THE QUERY IS SHAPED AROUND IT
                                   |  cross it off, write two shorter jobs. Shorter dates
                                   |  regroup the scenes into different hundreds, so the
                                   |  fat group is split and every answer fits. The other
-                                  v  five jobs are untouched and still running
+                                  v  five jobs are untouched and still running.
+                                     If the dates cannot be shortened -- a single day, or
+                                     a FIRST request, which a shorter window asks the same
+                                     way -- ask for fewer scenes at a time instead.
                             16-22 March
                               +-- 16-19 March   ok
                               +-- 19-22 March   refused
@@ -187,8 +190,8 @@ assets are excluded server-side. If first pages ever start returning 502, this m
 first thing to check and lowering this number is the lever — a first-page refusal is the one
 case no date-window re-cut can route around.
 
-**A page request deep in a walk is refused by the SAME ~6 MB response cap, and re-cutting the
-date window is what answers it.** Some individual page requests are refused with a 502 while
+**A page request deep in a walk is refused by the SAME ~6 MB response cap, and there are two
+levers for it.** Some individual page requests are refused with a 502 while
 the rest of the same walk is served, which looks like a separate defect and is not: item sizes
 vary, so whether a given hundred items clears the cap depends on which hundred the cursor and
 date window select. That is why the refusal is deterministic in the *request* — cursor and date
@@ -203,15 +206,27 @@ particular hundred items happen to be. A smaller page from the refused cursor IS
 is the most direct remedy; it is not used here only because `pystac_client` bakes the limit
 into a search and cannot resume from a cursor at a different size.
 
-What clears it is a window with a different **end** date; shortening only the start does
-not, because the catalogue pages newest-first and the late bound fixes the whole cursor
-sequence. So `_query_stac_items` re-queries the window as shorter windows on any
+What clears it is either a smaller response or a regrouping that produces one. `stac.py` tries
+them in cost order.
+
+**A shorter window first.** Its halves between them walk about as many pages as the parent
+would have, where a smaller page re-walks the whole window at twice the requests. What matters
+is the window's **end** date; shortening only the start does not help, because the catalogue
+pages newest-first and the late bound fixes the whole cursor sequence. So `_query_stac_items` re-queries the window as shorter windows on any
 upstream-error refusal past the first page, recursing until a window completes or is down to
 a single day. Separately and proactively, it reads the match count the catalogue reports
 beside the first page and cuts a window matching more than `_MAX_QUERY_ITEMS` to size — that
 bounds *cost*, keeping a refusal from discarding a long walk, and is not what fixes the
-defect. A refusal that shortening cannot route around — a first page, a stated overload, or
-a single day — still raises the classified `CatalogueQueryError` with its token.
+defect. **A smaller page as the fallback**, halved each time down to `_MIN_PAGE_SIZE`. Shortening
+cannot reach two refusals, and both failed a leg outright before this existed: a **first page**,
+which a shorter window asks identically, and a **single day**, which is the re-cut's own floor.
+Verified live — a 250-item page is over the cap and refused outright, and the recovery stepped
+250 → 125 → 62, interleaving with a window cut, and returned all 2,512 items with the post-sort
+order and the extracted baselines unchanged, for twice the requests.
+
+A stated overload (429, 503) is never answered with a smaller page: that means the provider is
+busy, and more requests is the wrong direction. A refusal neither lever can route around still
+raises the classified `CatalogueQueryError` with its token.
 
 **Concurrency.** The windows are independent searches, so `_fill_window_tree` walks up to
 `_QUERY_WINDOW_WORKERS` (6) of them at once. The worklist is driven from the calling thread and
