@@ -139,22 +139,36 @@ file** rather than of a day:
 to span the campaign's years and four continents — 33N for June 2017, January 2018, February 2022
 and June 2024; 15S and 45N for June 2024; 10N for June 2025 — queried through the production path
 and put through the production duplicate selection, then every reflectance asset of every surviving
-item classified by the same call the loader makes:
+item classified by the same call the loader makes: **36,183 items returned, 34,307 after selection,
+343,070 reflectance assets.**
 
-| | |
-|---|---|
-| items returned | 36,183 |
-| items after duplicate selection | 34,307 |
-| reflectance assets classified | 343,070 |
-| assets whose bucket was unclassified | **0** |
-| items declaring no readable processing version | **0** |
-| assets refused | **0** |
-| items refused | **0** |
+**What the zero actually claims, stated narrowly.** A verdict count would hide which code ran, so
+every asset was also attributed to the ARM of `source_decision` it took, with the arm and the
+verdict asserted to agree:
 
-Every href resolved to `sentinel-cogs` or `sentinel-s2-l2a`, and the mixed case is genuinely
-exercised rather than absent: 741 assets across four of the seven months are served from ESA's
-bucket inside an otherwise-Element-84 item, and each is decided from its own location — exempt
-below version 04.00, owed at or above it.
+| assets | share | arm taken |
+|---|---:|---|
+| 342,329 | 99.784% | EXEMPT — served from a harmonised bucket |
+| 690 | 0.201% | **OWED** — unharmonised bucket, at or above version 04.00 |
+| 51 | 0.015% | EXEMPT — version below the threshold |
+| 0 | — | UNDECIDABLE — unrecognised bucket |
+| 0 | — | UNDECIDABLE — unreadable processing version |
+| 0 | — | UNDECIDABLE — collection answer of MIXED/UNKNOWN |
+
+So the useful claims are the narrow ones, not "no asset was undecidable":
+
+- **Exactly two distinct buckets appeared across 343,070 asset locations** — `sentinel-cogs` and
+  `sentinel-s2-l2a`. The unrecognised-bucket refusal exists for a mirror nobody has classified, and
+  no such mirror is in the catalogue today.
+- **Zero of 34,307 items declared an unreadable processing version.** This one is the stronger of
+  the two: unlike the bucket test it is evaluated on every item whatever arm it lands in.
+
+**The distribution is lopsided, and worth saying so.** 99.78% of assets take one arm. The OWED arm
+fires 690 times, in three of the seven months, entirely from `sentinel-s2-l2a` hrefs appearing
+inside otherwise-Element-84 items — the mixed case is exercised rather than absent, but thinly. And
+the below-threshold arm barely runs at all (51 assets): the harmonised-bucket arm returns before the
+version is consulted, so choosing pre-04.00 months does NOT exercise it the way one might expect.
+Only an ESA href in a pre-04.00 month reaches it.
 
 The third situation is **unreachable from any caller today**, and that is structural rather than
 lucky. `source_decision` is asked only by the loader's parser, which passes
