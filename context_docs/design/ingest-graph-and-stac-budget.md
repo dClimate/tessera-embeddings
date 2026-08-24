@@ -308,6 +308,66 @@ at 8192 blocks, so 16384 is expected to press it. Raising the worker size is an 
 if the task-count gain is real — the extra instance cost is small against the fleet time saved
 — but the gain must be demonstrated by task count first, and spill must be zero.
 
+## 11. The optical query bbox asks for far more ground than the zone occupies — measured, NOT yet fixed
+
+The Sentinel-2 query area is `roi.bbox_wgs84`, the axis-aligned WGS84 envelope of a UTM zone
+raster. A UTM zone is 6° of longitude, but meridians converge, so the envelope of a zone running
+from the equator to ~84°N is **54.4° wide**. Most of what that box returns is discarded: measured
+on one January window, the as-run 34.6° x 80.2° envelope walked 95 pages for 9,383 items, of which
+**81% lay outside the zone's own longitude band**.
+
+**The safe fix is latitude banding**, one box per band asking for the longitude the zone actually
+occupies at that latitude. A fixed 6° box is NOT valid — the zone's raster genuinely widens
+toward the pole, which is what inflates the envelope in the first place, so a fixed box silently
+drops polar land.
+
+Measured offline on the real zone specs, via `zone_grid.tile_range_bbox_wgs84` (whose densified
+perimeter already carries a containment guarantee), as the ratio of the single envelope's area to
+the summed area of N banded boxes:
+
+| bands | 33N / 47N / 23N / 01N | 33S |
+|---|---|---|
+| 2 | 1.74x | 1.63x |
+| 4 | 2.63x | 2.25x |
+| 8 | **3.38x** | 2.68x |
+| 16 | 3.81x | 2.90x |
+| 32 | 3.91x | 2.94x |
+
+It saturates by 16, so **8 bands captures most of the available saving** and is the sensible
+default. This is a ground-area ratio, not an item-count claim: item density is not uniform, and
+the 2.5x page saving measured on one January window had two polar bands empty from polar night —
+a summer window would put data in those wide bands and save less.
+
+**Safety verified, offline, at 8 bands on zones 33N, 01N, 33S, 47N.** 175,600 sampled points per
+zone across the projected rectangle, with band seams and their immediate neighbourhoods sampled
+explicitly: the count uncovered by the banded union equals the count uncovered by today's single
+envelope exactly (12, 12, 20, 12 — the documented ~9.8 m densification residue at the top edge).
+**Banding therefore introduces no additional loss.** Every band box is a subset of the envelope,
+no band is degenerate, and the antimeridian zones are fine — `tile_range_bbox_wgs84` returns a
+west>east wrapped box for 01N/60N and each band inherits that convention.
+
+**The query layer needs almost nothing.** `stac._query_stac_items` already seeds a LIST of root
+boxes (`roots = [_WindowWalk(sub_bbox, ...) for sub_bbox in split_antimeridian_bbox(bbox)]`) and
+already dedupes by `item.id` across every root and node, first-occurrence-wins in tree order —
+put there precisely because the antimeridian halves return overlapping items. Latitude bands
+overlap only at their shared seam, which that dedupe absorbs for free.
+
+**What blocks it is provenance, not plumbing.** The bands must come from the LIVE TILE range, the
+same range that produced `bbox_wgs84`. `roi.geobox` cannot supply it: `land_mask.export_zone_roi`
+writes the ROI at `shape=(spec.height, spec.width)` — the **whole zone**, ocean left as fill —
+and crops only the `bbox_wgs84` attr. Banding a geobox-derived rectangle would ask for a LARGER
+latitude range than today, i.e. a regression.
+
+So it needs an ROI schema addition (`bbox_wgs84_bands` written beside `bbox_wgs84`, read with a
+fallback to `[bbox_wgs84]` so existing ROIs keep working), its validator, and the boxes threaded
+from the three `s2_roi.py` call sites. Note also that `_roi_is_current` short-circuits the export
+when the coverage sha is unchanged, so **already-exported ROIs would not gain the attr** without
+forcing a re-export — decide that before building it.
+
+Deliberately left out of the 403/stagger/polarisation PR: it is efficiency rather than
+survivability, it changes which items a query returns, and it touches an on-disk schema. It wants
+its own review.
+
 ## Changelog
 
 - **2026-07-25** — Created. Graph anatomy measured (4 tasks per chunk-band); linear cost

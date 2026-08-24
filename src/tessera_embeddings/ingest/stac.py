@@ -1469,6 +1469,13 @@ def _query_stac_items(
     # concurrently and read back depth-first, in date order, which is the order the serial
     # walk produced. The same searches run on every attempt, so the layer above can still
     # decide a refusal is deterministic by seeing the identical signature twice.
+    # TODO: seed one root per LATITUDE BAND rather than one for the whole bbox. A UTM zone is
+    # 6 deg wide but its WGS84 envelope is over 54 deg at the pole, and most of what that box
+    # returns is discarded. Banding is safe where a fixed 6 deg box is not, and this seam already
+    # takes a list of boxes and already dedupes by item id across them. What it needs is the
+    # bands' provenance: they must derive from the LIVE TILE range, which `roi.geobox` does not
+    # carry. Measurements and the schema addition required are in
+    # context_docs/design/ingest-graph-and-stac-budget.md section 11.
     roots = [_WindowWalk(sub_bbox, (start_date, end_date)) for sub_bbox in split_antimeridian_bbox(bbox)]
     budget = _RePartitionBudget(_MAX_REFUSAL_RE_PARTITIONS)
     _fill_window_tree(
