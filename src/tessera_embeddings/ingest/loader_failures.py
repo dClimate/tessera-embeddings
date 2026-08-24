@@ -202,9 +202,8 @@ def keep_causes_picklable() -> None:
 def rescues_are_installed() -> bool:
     """Whether THIS process can let a read failure's cause survive serialisation.
 
-    Asked of a worker to verify what the plugin claims, rather than trusting the registration
-    call's return. Checks the reducer rather than the capture because only the reducer decides
-    whether a verdict is reachable.
+    The reducer only: the capture sharpens attribution, but the reducer decides whether a verdict
+    is reachable at all.
     """
     return all(getattr(cls, "__reduce__", None) is _reduce_by_args for cls in _CAUSES_THAT_DO_NOT_TRAVEL)
 
@@ -212,10 +211,8 @@ def rescues_are_installed() -> bool:
 class ReadRescuesNotInstalledError(RuntimeError):
     """A leg refused to start because its fleet cannot classify read failures.
 
-    Not retryable by widening anything: every read on an unrescued worker arrives with its cause
-    destroyed, so a corrupt object strands the whole zone-year instead of costing one date. The
-    leg's own retry is the right response, since a scheduler that refused the plugin once will
-    usually accept it on the next dispatch.
+    Left retryable on purpose: a scheduler that refused the plugin once usually accepts it on the
+    next dispatch.
     """
 
 
@@ -235,26 +232,19 @@ class AbortedReadCapture(WorkerPlugin):
         keep_causes_picklable()
 
 
-#: How many times to try registering before refusing the leg. A scheduler is briefly
-#: unreachable often enough that one attempt would fail cells for nothing; it is unreachable
-#: for a whole leg's dispatch rarely enough that a handful of tries settles the question.
+#: Tries before refusing the leg — enough that a briefly unreachable scheduler costs seconds
+#: rather than a cell.
 _REGISTRATION_ATTEMPTS = 3
 
 
 def install_capture_everywhere(client: dask.distributed.Client | None) -> None:
     """Install both rescues locally and across the cluster, and VERIFY they took.
 
-    Raises :class:`ReadRescuesNotInstalledError` if any worker is reading without the reducer.
-    That is a deliberate change of policy. Tolerating a failed registration was right while
-    these rescues only sharpened attribution; the reducer now decides whether a read failure is
-    decidable at all, and an undecidable failure does not cost precision — it strands the whole
-    zone-year on one bad object. Failing at dispatch is far cheaper than discovering that after
-    an hour of work.
-
-    Verified rather than assumed, because registration returning is not the worker having run
-    ``setup``: the call can succeed while a worker's setup throws, and tasks submitted before
-    setup completes would read unrescued. Asking every worker closes both, and the ask is also
-    the barrier that removes the race.
+    Raises :class:`ReadRescuesNotInstalledError` if any worker is reading without the reducer: an
+    undecidable read failure strands a whole zone-year, so a fleet that cannot classify refuses to
+    start. Verified rather than assumed, because registration returning is not the worker having
+    run ``setup``, and the ask doubles as the barrier against reading before it has. See
+    ``context_docs/design/ingest_read_failure_causes_2026_08.md``.
     """
     install_capture()
     keep_causes_picklable()

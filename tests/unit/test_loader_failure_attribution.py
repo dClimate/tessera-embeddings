@@ -551,52 +551,41 @@ class TestBothRescuesReachTheWorker:
         arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
         assert type(arrived.__cause__) is CPLE_AppDefinedError
 
-    def test_a_cluster_that_refuses_the_plugin_fails_the_leg(self) -> None:
-        """USED TO BE TOLERATED, and that was right when these rescues only sharpened attribution.
+    @pytest.mark.parametrize(
+        ("registers", "answers", "expected"),
+        [
+            pytest.param(
+                OSError("scheduler unreachable"), None, "cannot classify read failures", id="registration-refused"
+            ),
+            pytest.param(
+                None, {"tcp://a": True, "tcp://b": False}, "reported it missing", id="a-worker-says-it-is-missing"
+            ),
+            pytest.param(None, {"tcp://a": True, "tcp://b": True}, None, id="every-worker-confirms"),
+        ],
+    )
+    def test_a_fleet_that_cannot_classify_refuses_to_start(
+        self, registers: Exception | None, answers: dict[str, bool] | None, expected: str | None
+    ) -> None:
+        """USED TO BE TOLERATED, and that was right while these rescues only sharpened attribution.
 
-        The reducer now decides whether a read failure is decidable, and an undecidable failure
-        strands the whole zone-year on one bad object rather than costing a date. So a fleet that
-        cannot classify refuses to start, and the leg's own retry gets a fresh dispatch.
+        The reducer now decides whether a read failure is decidable at all, and an undecidable
+        failure strands the whole zone-year on one bad object rather than costing a date. Verified
+        rather than assumed, because registration returning is not the worker having run setup.
         """
 
-        class _RefusingClient:
-            def register_plugin(self, *_args: object, **_kwargs: object) -> None:
-                raise OSError("scheduler unreachable")
+        class _Client:
+            def register_plugin(self, *_a: object, **_k: object) -> None:
+                if registers is not None:
+                    raise registers
 
-            def run(self, *_args: object, **_kwargs: object) -> dict[str, bool]:
-                raise AssertionError("must not be reached when registration itself failed")
+            def run(self, *_a: object, **_k: object) -> dict[str, bool]:
+                assert answers is not None, "must not be reached when registration itself failed"
+                return answers
 
-        with pytest.raises(ReadRescuesNotInstalledError, match="cannot classify read failures"):
-            install_capture_everywhere(_RefusingClient())  # type: ignore[arg-type]
-
-    def test_a_worker_that_reports_it_missing_fails_the_leg(self) -> None:
-        """Registration returning is not the worker having run setup.
-
-        The call can succeed while a worker's setup throws, and tasks submitted before setup
-        completes would read unrescued. Verifying with every worker is what catches that, and the
-        ask doubles as the barrier that removes the race.
-        """
-
-        class _LyingClient:
-            def register_plugin(self, *_args: object, **_kwargs: object) -> None:
-                return None
-
-            def run(self, *_args: object, **_kwargs: object) -> dict[str, bool]:
-                return {"tcp://a": True, "tcp://b": False}
-
-        with pytest.raises(ReadRescuesNotInstalledError, match="reported it missing"):
-            install_capture_everywhere(_LyingClient())  # type: ignore[arg-type]
-
-    def test_a_fleet_that_confirms_it_proceeds(self) -> None:
-        """The ordinary path: every worker answers yes, so nothing is raised."""
-
-        class _HonestClient:
-            def register_plugin(self, *_args: object, **_kwargs: object) -> None:
-                return None
-
-            def run(self, *_args: object, **_kwargs: object) -> dict[str, bool]:
-                return {"tcp://a": True, "tcp://b": True}
-
-        install_capture_everywhere(_HonestClient())  # type: ignore[arg-type]
-        arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
-        assert type(arrived.__cause__) is CPLE_AppDefinedError
+        if expected is None:
+            install_capture_everywhere(_Client())  # type: ignore[arg-type]
+            arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
+            assert type(arrived.__cause__) is CPLE_AppDefinedError
+            return
+        with pytest.raises(ReadRescuesNotInstalledError, match=expected):
+            install_capture_everywhere(_Client())  # type: ignore[arg-type]
