@@ -710,7 +710,14 @@ async def ingest_zone_year(
                 stagger,
                 ingest_settings.leg_stagger_window_s,
             )
-            await asyncio.sleep(stagger)
+            # Raced against `doomed`, not slept through. A sibling can fail terminally seconds
+            # after this leg starts waiting, and with the window at its default a leg near the top
+            # of the spread would otherwise hold its cell's slot — and the campaign's ingest slot
+            # behind it — for most of ten minutes to learn something already decided.
+            try:
+                await asyncio.wait_for(doomed.wait(), timeout=stagger)
+            except TimeoutError:
+                pass  # the stagger elapsed with the cell still viable, which is the ordinary path
             if doomed.is_set():
                 # Re-checked after the wait, for the reason the retry backoff re-checks after
                 # its own: a sibling can reach its terminal failure while this leg is waiting,

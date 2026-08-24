@@ -382,6 +382,8 @@ class TestWhenTheProviderRefused:
         "refusal",
         [
             "HTTP response code: 403",
+            "HTTP response code: 429",
+            "TooManyRequests",
             "HTTP response code: 500",
             "HTTP response code: 502",
             "HTTP response code: 503",
@@ -405,6 +407,33 @@ class TestWhenTheProviderRefused:
         """
         wrapper = Exception("RasterioIOError: Read failed. See previous exception for details.")
         wrapper.__cause__ = Exception(f"CPLE_AppDefinedError: {refusal}")
+        assert not is_unreadable_source(wrapper)
+
+    @pytest.mark.parametrize("status", [500, 502, 503, 504, 507, 509, 599])
+    def test_any_5xx_is_declined_without_being_enumerated(self, status: int) -> None:
+        """A 5xx is a statement about the SERVER, never about the bytes — all of them, not the
+        four somebody remembered. Enumeration is what let 429 through: the list held 403 and
+        500/502/503/504 and missed the most explicit "slow down" a provider can send.
+        """
+        wrapper = Exception("WarpOperationError: Chunk and warp failed")
+        wrapper.__cause__ = Exception(f"CPLE_AppDefinedError: HTTP response code: {status}")
+        assert not is_unreadable_source(wrapper)
+
+    @pytest.mark.parametrize("status", [408, 429])
+    def test_the_two_transient_4xx_are_declined(self, status: int) -> None:
+        """408 and 429 mean "not now", where the rest of the 4xx range means "not you"."""
+        wrapper = Exception("RasterioIOError: Read failed. See previous exception for details.")
+        wrapper.__cause__ = Exception(f"CPLE_AppDefinedError: HTTP response code: {status}")
+        assert not is_unreadable_source(wrapper)
+
+    @pytest.mark.parametrize("status", [400, 401, 405, 416])
+    def test_a_client_side_4xx_is_not_bad_data_either(self, status: int) -> None:
+        """A malformed request or a rejected credential is not the data's fault and no amount of
+        waiting fixes it, so it must re-raise and fail the leg on its FIRST date. Claiming it here
+        would skip dates one at a time for a cause that repeats on every one of them.
+        """
+        wrapper = Exception("WarpOperationError: Chunk and warp failed")
+        wrapper.__cause__ = Exception(f"CPLE_AppDefinedError: HTTP response code: {status}")
         assert not is_unreadable_source(wrapper)
 
     @pytest.mark.parametrize(

@@ -757,6 +757,9 @@ _UNREADABLE_MARKERS = (
 _MISSING_OBJECT_MARKERS = (
     "ObjectNotFound",
     "NoSuchKey",
+    # 410 Gone alongside 404: both say the object is not there and no retry publishes it. Named
+    # here so the un-wrapped form gets the same corroboration 404 gets.
+    "HTTP response code: 410",
     "The specified key does not exist",
     "HTTP response code: 404",
 )
@@ -794,6 +797,13 @@ def is_unreadable_source(exc: BaseException) -> bool:
     # construction, so neither call order nor a caller that knows only one predicate can
     # misclassify. See context_docs/monitoring/incident-2026-08-24-nonmonotonic-append.md.
     if any(m in text for m in _PROVIDER_REFUSAL_MARKERS):
+        return False
+    statuses = _http_statuses(text)
+    # Ranged, so a status nobody enumerated cannot be read as bad data. See the note on
+    # `_HTTP_STATUS_RE` for why each range is decidable.
+    if any(s >= 500 or s in _TRANSIENT_4XX for s in statuses):
+        return False
+    if any(400 <= s < 500 and s not in _ABSENT_4XX and s != 403 for s in statuses):
         return False
     if any(m in text for m in _UNREADABLE_MARKERS):
         return True
@@ -835,16 +845,14 @@ _PROVIDER_REFUSAL_MARKERS = (
     "SlowDown",
     "ServiceUnavailable",
     "InternalError",
-    "HTTP response code: 403",
+    "HTTP response code: 403",  # see the range note below: a provider judgement, not an HTTP one
     "HTTP response code: 500",
     # 502 and 504 for the same reason 404 is in the missing-object list: the optical assets are
     # plain `https://` hrefs, so a gateway failure reaches us as a bare status from GDAL's HTTP
     # driver. Without these it is claimed by neither predicate, and a source outage wrapped in
     # `Chunk and warp failed` is then recorded as permanently unreadable DATA — which tells an
     # operator to look for corruption when they should be waiting for the provider.
-    "HTTP response code: 502",
-    "HTTP response code: 503",
-    "HTTP response code: 504",
+    "TooManyRequests",
     # Transport-level failures, which carry no status at all. A connection dropped mid-transfer
     # is a statement about the link, never about the bytes — the same object reads on the next
     # attempt. Without these a throttling provider's dropped reads are claimed by
@@ -856,6 +864,34 @@ _PROVIDER_REFUSAL_MARKERS = (
     "Connection aborted",
     "RequestTimeout",
 )
+
+#: GDAL's HTTP driver reports a bare status, so the numeric forms are classified by RANGE rather
+#: than enumerated. Enumeration is what let 429 — the single most explicit "slow down" a provider
+#: can send — be read as unreadable data: the list held 403 and 500/502/503/504 and simply missed
+#: it, and a list that must be complete to be correct will be incomplete again.
+#:
+#: The ranges are exhaustive and each is decidable without knowing the provider:
+#:
+#: * **Any 5xx is transient.** It is a statement about the server, never about the bytes. That
+#:   covers 507 and 509 (a CDN bandwidth throttle) without either being named.
+#: * **408 and 429 are transient** — the two 4xx that mean "not now" rather than "not you".
+#: * **404 and 410 are absence**, and are corroborated separately by
+#:   :data:`_MISSING_OBJECT_MARKERS`.
+#: * **403 is transient HERE, deliberately**, and is the one entry that is a judgement about a
+#:   provider rather than about HTTP: Earth Search answers a rate block with it. Elsewhere a 403
+#:   is about who is asking, which is why the catalogue layer treats it per provider too.
+#: * **Every other 4xx is neither** — a malformed request or a rejected credential is not the
+#:   data's fault and is not fixed by waiting, so it re-raises and fails the leg on its first
+#:   date instead of being skipped date by date.
+_HTTP_STATUS_RE = re.compile(r"HTTP response code:\s*(\d{3})")
+_TRANSIENT_4XX = frozenset({408, 429})
+_ABSENT_4XX = frozenset({404, 410})
+
+
+def _http_statuses(text: str) -> set[int]:
+    """Every HTTP status the exception chain names."""
+    return {int(m) for m in _HTTP_STATUS_RE.findall(text)}
+
 
 #: What makes a failure the SOURCE reader's: GDAL is the layer that reported it.
 #:
