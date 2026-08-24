@@ -785,11 +785,20 @@ def should_try_another_copy(exc: BaseException) -> bool:
     the ladder exists for. Nothing here decides that a date is lost — that stays with
     :func:`is_unreadable_source`, once the ladder is actually exhausted.
 
-    Only a failure that is not about the source at all is declined: bad credentials or a missing
-    region reproduce identically on every copy, so stepping down burns reads to reach the same
-    error.
+    Permissive about the REASON, strict about the ORIGIN. The callers wrap the coverage compute and
+    ``write_day_windows``, so a destination fault or an ordinary bug arrives here too — and those
+    have no alternate copy to find. Admitting them would burn a read per spare, could commit an
+    older reprocessing when the preferred source never failed, and would defer the real error
+    behind the ladder. :data:`_SOURCE_READER_MARKERS` is the evidence that separates them, and it
+    survives the worker hop because the flattened repr still names the class.
+
+    Declined for the same reason: a failure that is not about the source at all. Bad credentials
+    or a missing region reproduce identically on every copy.
     """
-    return not any(m in _exception_chain_text(exc) for m in _NOT_THE_DATAS_FAULT)
+    text = _exception_chain_text(exc)
+    if any(m in text for m in _NOT_THE_DATAS_FAULT):
+        return False
+    return any(m in text for m in _SOURCE_READER_MARKERS)
 
 
 def is_unreadable_source(exc: BaseException) -> bool:

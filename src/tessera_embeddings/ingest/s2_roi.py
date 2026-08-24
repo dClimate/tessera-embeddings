@@ -143,6 +143,17 @@ def _known_harmonisation(provider: str, collection: str) -> Harmonisation | None
     return collection_harmonisation(PROVIDERS[provider].collections[collection])
 
 
+def _undecidable(failures: Sequence[BaseException]) -> BaseException | None:
+    """The first failure that is NOT positive evidence of bad bytes, if any rung had one.
+
+    The ladder's verdict has to cover every copy it abandoned, not just the last. A cause-free
+    wrapper on the preferred copy followed by a codec error on a fallback is not grounds to give
+    up the date: the first failure may have been transient, and skipping on the second one's
+    evidence holes the store for a date that would have read.
+    """
+    return next((e for e in failures if not is_unreadable_source(e)), None)
+
+
 def _read_asset_keys(provider: str, collection: str) -> tuple[str, ...]:
     """The assets this driver's loads request, for duplicate selection to judge readability over.
 
@@ -982,6 +993,9 @@ def ingest_s2_roi_reflectance(
                 return
             attempt: _PreparedDate = prepared
             tried: list[str] = []
+            # Every rung's failure, because the give-up decision below must answer for all of
+            # them and not merely for the copy that happened to fail last.
+            failures: list[BaseException] = []
             while True:
                 # A date can arrive here ALREADY failed: the coverage gate is the first
                 # compute, so an unreadable SCL object fails during preparation, one stage
@@ -999,6 +1013,8 @@ def ingest_s2_roi_reflectance(
                     if not should_try_another_copy(write_exc):
                         raise
                     exc = write_exc
+                if exc is not None:
+                    failures.append(exc)
 
                 hrefs = collect_aborted_hrefs(client)
                 # An href that matches nothing in THIS date is another date's, or a stale
@@ -1015,12 +1031,14 @@ def ingest_s2_roi_reflectance(
                 bad_items = implicated_items(attempt.items, hrefs) if hrefs else []
                 stepped = step_down_copies(date_alternates, attempt.items, only=blamed, implicated=bad_items)
                 if stepped is None:
-                    # Copies exhausted. Giving up the date is the only irreversible thing
-                    # this loop does, so it needs positive evidence that the BYTES are bad.
-                    # A cause-free wrapper — all a stripped GDAL error leaves behind — is
-                    # not that, and is re-raised so the leg fails and retries in order.
-                    if not is_unreadable_source(exc):
-                        raise exc
+                    # Copies exhausted. Giving up the date is the only irreversible thing this
+                    # loop does, so it needs positive evidence that the BYTES are bad — from
+                    # every copy it abandoned. A cause-free wrapper, all a stripped GDAL error
+                    # leaves behind, is not that, and is re-raised so the leg fails and retries
+                    # in order.
+                    undecided = _undecidable(failures)
+                    if undecided is not None:
+                        raise undecided
                     _record_unreadable(attempt, exc, tried, blamed, hrefs)
                     total_filtered += 1
                     return
@@ -1049,6 +1067,13 @@ def ingest_s2_roi_reflectance(
                     # failed coverage, or reaches no live window). That is a legitimate
                     # skip, not a read failure, and must not be recorded as data loss.
                     # A fallback that ALSO failed to read keeps its place in the ladder.
+                    #
+                    # But an earlier rung may have failed undecidably, and filtering here would
+                    # bury it: the preferred copy could read on a retry and pass coverage, so
+                    # this return would lose a date that was never actually unusable.
+                    undecided = _undecidable(failures)
+                    if undecided is not None:
+                        raise undecided
                     total_filtered += 1
                     return
 

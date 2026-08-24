@@ -669,3 +669,21 @@ def test_an_asset_incomplete_item_reaches_the_duplicate_ladder(run_ingest, caplo
     # of these, and leaves the date indistinguishable from one the coverage gate rejected.
     assert "DATA LOSS" in caplog.text
     assert "2024-01-01" in caplog.text
+
+
+def test_the_ladder_answers_for_every_rung_not_just_the_last() -> None:
+    """A decidable failure on a fallback cannot license giving up a date an ambiguous rung touched.
+
+    The preferred copy failing with a cause-free wrapper may have been transient. Recording the
+    date on the strength of a later rung's codec error would hole the store for a date that would
+    have read, so the ladder re-raises the undecided failure instead.
+    """
+    from tessera_embeddings.ingest.s2_roi import _undecidable
+
+    ambiguous = Exception("RasterioIOError('Read failed. See previous exception for details.')")
+    decidable = Exception("RasterioIOError('ZIPDecode:Decoding error at scanline 0')")
+
+    assert _undecidable([decidable]) is None
+    assert _undecidable([ambiguous, decidable]) is ambiguous
+    assert _undecidable([decidable, ambiguous]) is ambiguous
+    assert _undecidable([]) is None

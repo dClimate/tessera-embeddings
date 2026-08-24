@@ -284,21 +284,42 @@ class TestWhenToStepDown:
         assert not is_unreadable_source(RuntimeError(message))
 
     @pytest.mark.parametrize(
-        "message",
+        "flattened",
         [
-            "Read failed. See previous exception for details.",
-            "rasterio.errors.WarpOperationError: Chunk and warp failed",
-            "B02.tif, band 1: IReadBlock failed at X offset 6, Y offset 9",
+            "RasterioIOError('Read failed. See previous exception for details.')",
+            "WarpOperationError('Chunk and warp failed')",
+            "RasterioIOError('B02.tif, band 1: IReadBlock failed at X offset 6, Y offset 9')",
         ],
     )
-    def test_a_bare_wrapper_still_tries_another_copy(self, message: str) -> None:
+    def test_a_bare_wrapper_still_tries_another_copy(self, flattened: str) -> None:
         """...but it must still reach the copy ladder, which is the non-destructive half.
 
         One predicate used to answer both questions and could not: strict enough to protect the
         skip meant strict enough to disable the fallback, and one bad copy then failed a whole
         zone-year while a good duplicate sat unused.
+
+        Note the inputs name the exception CLASS. That is not decoration: the flattened form is
+        the outer exception's repr, so the class name is what survives the hop and is the evidence
+        that the failure came from the source reader at all.
         """
-        assert should_try_another_copy(RuntimeError(message))
+        assert should_try_another_copy(Exception(flattened))
+
+    @pytest.mark.parametrize(
+        "destination",
+        [
+            "NonMonotonicDateError: refusing an out-of-order append",
+            "IcechunkError: conflict detected on commit",
+            "TypeError: unsupported operand type(s)",
+        ],
+    )
+    def test_a_destination_failure_never_enters_the_ladder(self, destination: str) -> None:
+        """The callers wrap the coverage compute and the write, not only the read.
+
+        A destination fault or an ordinary bug has no alternate copy to find, so admitting it
+        would burn a read per spare, could commit an older reprocessing when the preferred source
+        never failed, and would defer the real error behind the ladder.
+        """
+        assert not should_try_another_copy(RuntimeError(destination))
 
     def test_the_shape_dask_actually_delivers(self) -> None:
         """The regression in the exact form it arrives — not a hand-made wrapper.
