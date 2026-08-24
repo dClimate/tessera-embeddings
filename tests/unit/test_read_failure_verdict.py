@@ -23,6 +23,7 @@ from tessera_embeddings.ingest.duplicates import (
     classify_read_failure,
     is_provider_refusal,
     is_unreadable_source,
+    unreadable_source_in,
 )
 
 
@@ -101,6 +102,31 @@ def test_no_cause_earns_both_verdicts(cause: str, opening: bool) -> None:
     """
     failure = _chained(cause, opening=opening)
     assert not (is_unreadable_source(failure) and is_provider_refusal(failure))
+
+
+@pytest.mark.parametrize(("cause", "gives_up"), [(c, g) for c, _, g, _ in TABLE], ids=[c[:38] for c, *_ in TABLE])
+def test_the_words_alone_reach_the_same_verdict(cause: str, gives_up: bool) -> None:
+    """One taxonomy, whichever side of a boundary the caller stands on.
+
+    Not every caller holds an exception. A leg that runs as its own deployment reports through a
+    state message, and its parent decides from that whether to re-dispatch — so it asks
+    :func:`unreadable_source_in` where a worker asks :func:`is_unreadable_source`. Two answers to
+    "will these bytes ever read" is how a leg comes to give up a date the parent then keeps
+    retrying, so the same words must produce the same verdict on both paths.
+    """
+    assert unreadable_source_in(f"RasterioIOError: Read failed. | CPLE_AppDefinedError: {cause}") is gives_up
+
+
+def test_words_that_lost_their_cause_claim_nothing() -> None:
+    """The boundary degrades in the SAFE direction, and this is what that looks like.
+
+    A Prefect state message carries the outermost exception only, so a rasterio wrapper arrives
+    with the GDAL cause stripped — and the wrapper's own sentence names no bytes. That is an
+    absence of evidence, not evidence of transience, and it earns the retry rather than the
+    permanent verdict: retrying a permanent failure costs one leg's fleet, refusing to retry a
+    transient one strands the cell.
+    """
+    assert unreadable_source_in("RasterioIOError: Read failed. See previous exception for details.") is False
 
 
 def test_the_flattened_shape_earns_nothing() -> None:
