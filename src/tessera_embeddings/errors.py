@@ -67,3 +67,22 @@ class StoreHoldsCommittedDataError(Exception):
     Deleting it would turn a refusal to overwrite data into the deletion of that same
     data — the guard destroying what it exists to protect.
     """
+
+
+class ProviderRefusedReadsError(RuntimeError):
+    """Raised when the source provider refused a read for longer than one write may wait.
+
+    NOTHING is lost and NOTHING is skipped when this is raised — the store's time axis is
+    unmoved and a re-dispatch resumes from the dates already committed. It exists to make the
+    verdict visible to the layer that decides WHEN to re-dispatch, which is the only layer that
+    can wait on a timescale longer than a leg.
+
+    Named rather than absorbed because the two waits cost different things. Waiting inside a leg
+    holds that leg's Dask fleet idle; failing the leg releases the fleet, so the cell's own retry
+    can wait far longer for almost nothing. A refusal is the one failure class where the cheap
+    wait is the right one, and a leg-failure message that does not say so cannot be told apart
+    from a crash — which is why this is a TYPE rather than a log line.
+
+    Deliberately absent from the leg classifier's non-retryable set: waiting is the remedy for
+    this class, so a re-dispatch is exactly what it is asking for.
+    """

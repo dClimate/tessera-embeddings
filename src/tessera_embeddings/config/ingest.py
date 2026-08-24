@@ -256,6 +256,24 @@ class IngestSettings(BaseModel):
     # take minutes to establish; a failure that is deterministic in the input is excluded by
     # CLASS (``_NON_RETRYABLE_LEG_MARKERS``) and never waits at all.
     leg_retry_backoff_s: int = Field(default=30, ge=0)
+    # Delay before re-dispatching a leg the SOURCE PROVIDER refused reads to, in seconds. 0 falls
+    # back to `leg_retry_backoff_s`. Doubled and capped exactly as that one is.
+    #
+    # **Corrected in place.** The comment above says the difference between a momentary source
+    # refusal and a structural one "does not take minutes to establish". For a catalogue query it
+    # does not. For object reads it does: ASF refused radar reads for about six minutes on
+    # 2026-08-24 and roughly thirteen on 2026-08-21, and both times the re-dispatches walked
+    # straight back into a source still refusing and spent the whole attempt budget in two
+    # minutes. Deciding structural-versus-momentary for a read takes longer than the leg backoff
+    # was ever willing to wait.
+    #
+    # LONG deliberately, where the other is short deliberately, and the difference is who is
+    # holding a fleet. A failed leg has released its Dask fleet, so waiting here costs latency
+    # and nothing else — where the same patience spent inside the leg holds hundreds of vCPU
+    # idle. This is the cheap place to be patient, so it is where the patience goes. It applies
+    # to ONE class, recognised by `errors.ProviderRefusedReadsError` reaching the leg's failure
+    # detail, and every other failure keeps the short backoff.
+    leg_refusal_backoff_s: int = Field(default=600, ge=0)
     # Width, in seconds, of the window each ingest leg spreads its FIRST dispatch over. 0 is off.
     #
     # A cell's legs are dispatched the moment the cell is, and a campaign starts every cell it

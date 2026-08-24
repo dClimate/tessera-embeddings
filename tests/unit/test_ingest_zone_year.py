@@ -304,6 +304,30 @@ def test_coverage_failure_leaves_no_marker(wired, monkeypatch):
     assert wired["markers_written"] == []  # not marked complete on a coverage gap
 
 
+def test_a_backoff_that_does_not_fit_the_budget_is_terminal_not_capped() -> None:
+    """Capping the wait to the remainder was the wrong fix, and instructively so.
+
+    Waiting exactly the remaining budget makes the next dispatch land ON the deadline every time,
+    which converts a race into a guarantee of the thing the budget forbids. A backoff that does not
+    fit is a verdict: there is no time to both wait and start an attempt, so waiting only delays a
+    decision already made.
+    """
+    budget = 300.0
+    # (elapsed, backoff) -> may the leg still wait and then dispatch inside the budget?
+    for elapsed, backoff, may_retry in (
+        (0.0, 1200.0, False),  # validation permits a budget below the backoff
+        (299.0, 1200.0, False),
+        (299.0, 30.0, False),  # fits neither: 1 s left, 30 s wanted
+        (120.0, 600.0, False),
+        (0.0, 30.0, True),  # room to wait and still start inside the budget
+        (200.0, 30.0, True),
+    ):
+        fits = backoff < budget - elapsed
+        assert fits is may_retry, f"elapsed={elapsed} backoff={backoff}"
+        if fits:
+            assert elapsed + backoff < budget
+
+
 class TestChunkScaledWorkers:
     """Cropped cells size their Dask fleet from live chunks, not zone extent.
 
@@ -1149,6 +1173,62 @@ class TestLegsRetryIndependently:
             )
 
         assert waited == [10, 20, 40, 40], "doubling from the base, capped at four times it"
+
+    def test_a_refused_source_is_retryable_however_its_message_is_worded(self):
+        """The marker list is matched as SUBSTRINGS of the whole detail, message included.
+
+        So a refusal whose sentence happened to contain another class's marker would be classified
+        unfixable and never re-dispatched — which for the one class whose remedy IS a re-dispatch
+        is the worst possible verdict. Asserted against the message the code actually raises, so a
+        reworded message or a newly added marker fails here rather than in a campaign.
+        """
+        raised = mod.ProviderRefusedReadsError(
+            "[ascending] roi=zone_35N date=2024-01-02: the source provider refused this read for "
+            "longer than one write may wait for it. No date is skipped and the time axis is "
+            "unmoved, so a re-dispatch resumes from the dates already committed. Waiting is the "
+            "remedy for this class: the cell re-dispatches this leg after a delay far longer than "
+            "a write may spend, with no fleet held while it waits."
+        )
+        detail = f"radar: {raised!r}"
+        assert mod._is_retryable_leg_failure(detail)
+        assert mod.ProviderRefusedReadsError.__name__ in detail, "the long backoff keys on this name"
+
+    def test_a_refused_source_gets_the_long_backoff_and_others_do_not(self, wired, monkeypatch, waited):
+        """The two timescales, in one test because the pair is the point.
+
+        Waiting inside a leg holds its Dask fleet idle; waiting here does not, because the failed
+        leg has released it. So the patience belongs here — but only for the class that asks for
+        it. A crash or an expired credential still gets the short backoff: for those a re-dispatch
+        can succeed at once, and a long delay would be pure latency.
+        """
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        refused = f"{mod.ProviderRefusedReadsError.__name__}: the source provider refused this read"
+
+        def _failing(detail):
+            async def fake_arun(dep, parameters=None, tags=None):
+                if (parameters.get("orbit") or "s2") == "s2":
+                    return _completed_run()
+                return SimpleNamespace(
+                    id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=detail)
+                )
+
+            return fake_arun
+
+        settings = mod.IngestSettings(
+            max_leg_attempts=3, leg_retry_backoff_s=10, leg_refusal_backoff_s=600, leg_stagger_window_s=0
+        )
+
+        monkeypatch.setattr(mod, "arun_deployment", _failing(refused))
+        with pytest.raises(RuntimeError, match="refused this read"):
+            _run(s1_orbit="ascending", ingest_settings=settings)
+        assert waited == [600, 1200], "a refused source waits on the refusal schedule"
+
+        waited.clear()
+        monkeypatch.setattr(mod, "arun_deployment", _failing(_TRANSIENT_DETAIL))
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(s1_orbit="ascending", ingest_settings=settings)
+        assert waited == [10, 20], "every other failure keeps the short schedule"
 
     def test_a_terminal_failure_stops_a_siblings_remaining_attempts(self, wired, monkeypatch):
         """The property the barrier gave for free: once a leg has failed in a way no re-dispatch

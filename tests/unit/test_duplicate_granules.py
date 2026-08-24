@@ -37,6 +37,7 @@ from tessera_embeddings.ingest.duplicates import (
     alternates_for,
     cause_was_flattened,
     copies_label,
+    is_provider_refusal,
     is_unreadable_source,
     item_processing_baseline,
     item_sequence,
@@ -2491,6 +2492,48 @@ class TestAMessageMayNotBeItsOwnCorroboration:
         assert is_unreadable_source(_read_failure("ZIPDecode:Decoding error at scanline 0")) is True
 
 
+class TestTheTwoVerdictsCannotDisagree:
+    """One classifier, read by both predicates, so no status is a refusal to one and bad data to
+    the other. Two lists kept in step is what failed: the markers named 403 and 500 as strings
+    while the ranges covered every 5xx, so a 503 was claimed by neither and radar drew the
+    ordinary attempt limit for the commonest shape of outage there is.
+    """
+
+    @pytest.mark.parametrize("status", [500, 502, 503, 504, 507, 599, 408, 429])
+    def test_every_transient_status_is_a_refusal(self, status: int) -> None:
+        """Ranged, so a status nobody enumerated still earns the wait."""
+        failure = _read_failure(f"HTTP response code: {status}")
+        assert is_provider_refusal(failure) is True
+        assert is_unreadable_source(failure) is False
+
+    @pytest.mark.parametrize(
+        ("cause", "refusal", "unreadable"),
+        [
+            ("ZIPDecode:Decoding error at scanline 0", False, True),
+            ("HTTP response code: 404", False, True),
+            ("HTTP response code: 401", False, False),
+            ("InvalidAccessKeyId", False, False),
+            ("AccessDenied: not authorized to perform: s3:GetObject", True, False),
+        ],
+    )
+    def test_the_two_predicates_never_both_claim_a_failure(self, cause: str, refusal: bool, unreadable: bool) -> None:
+        """The property the docstrings assert, tested rather than believed.
+
+        An overlap is not a cosmetic problem: it is the original defect, where whichever predicate
+        a caller happened to ask first decided whether a date was skipped or a leg was retried.
+        """
+        failure = _read_failure(cause)
+        assert is_provider_refusal(failure) is refusal
+        assert is_unreadable_source(failure) is unreadable
+        assert not (refusal and unreadable)
+
+    def test_a_stripped_cause_earns_neither_verdict(self) -> None:
+        """The fail-closed direction: no long wait on suspicion, and no date given up either."""
+        flattened = Exception("RasterioIOError('Read failed. See previous exception for details.')")
+        assert is_provider_refusal(flattened) is False
+        assert is_unreadable_source(flattened) is False
+
+
 class TestANamedTransportFailureIsNotBadData:
     """A link that failed says nothing about the bytes, and carries no HTTP status to say so with.
 
@@ -2509,8 +2552,17 @@ class TestANamedTransportFailureIsNotBadData:
             "Connection reset by peer",
         ],
     )
-    def test_it_is_never_grounds_to_give_up_a_date(self, transport: str) -> None:
-        assert is_unreadable_source(_read_failure(transport)) is False
+    def test_it_takes_precedence_over_a_bad_data_marker_in_the_same_chain(self, transport: str) -> None:
+        """Written to fail if the markers are removed, which the first version of it did not.
+
+        Every message here lacks a codec name, so `is_unreadable_source` already declined them for
+        want of one and the test passed whether or not these entries existed. Putting a real codec
+        marker in the same chain is what exercises the branch they change: without them the chain
+        reads as bad data, with them the link failure wins and no date is given up.
+        """
+        chain = _read_failure(f"{transport}: ZIPDecode:Decoding error at scanline 0")
+        assert is_unreadable_source(chain) is False
+        assert is_provider_refusal(chain) is True
 
 
 class TestRecognisingAFailureThatArrivedWithNoEvidence:

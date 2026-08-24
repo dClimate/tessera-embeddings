@@ -1802,17 +1802,54 @@ recovers — so no fallback copy helps and no date should be given up for one. T
 reached inside `is_unreadable_source` in `duplicates.py`, which declines them before any
 bad-data marker is consulted; there is no separate predicate to ask.
 
-It fails closed three ways. A credential fault on THIS side is excluded first, because it is
-repairable here and no waiting fixes it. A refusal nothing attributes to the source reader is
-excluded too: `AccessDenied`, `SlowDown` and `InternalError` are S3's words and every S3 client
-shares them, so those markers only count alongside GDAL's own vocabulary (`RasterioIOError`,
-`WarpOperationError`, `CPLE_`, `HTTP response code:`) — GDAL reads source imagery here and
-nothing else. And anything unrecognised is excluded, so the caller re-raises.
+**What a positive verdict buys is TIME, and nothing else.** It is passed to the shared write
+retry as `wait_out`, and the policy then keeps re-attempting that one failure until it has spent
+`WAIT_OUT_BACKOFF_S` of backoff. It may never be spent on giving up a date: a date given up and a
+later date committed puts the earlier one permanently below the store's append-only maximum, so
+the re-run meant to recover it is refused instead. If the wait is not enough, the write fails, the
+leg fails with its time axis unmoved, and the leg's own retry re-offers the date in order.
 
-One limit to know about: refusals are recognised by NAME and by status RANGE, so a refusal that
-carries neither — a transport failure with no status, or a cause destroyed in transit — is
-declined for want of evidence rather than named as a refusal. That is the fail-closed direction,
-and `cause_was_flattened` is what says which of the two happened.
+**How much time depends on WHERE the waiting happens**, and the two places cost very different
+things. A write waits with its leg's whole Dask fleet held idle behind it, so the in-leg budget is
+minutes. A leg that has FAILED has released its fleet, so waiting before re-dispatching it costs
+latency and nothing else — that budget is `leg_refusal_backoff_s`, and it is tens of minutes. The
+patience goes where it is cheap, and the in-leg wait covers only the ordinary wobble.
+
+Carrying the verdict from one place to the other takes a type. The leg-retry layer sees a failure
+DETAIL string, and no marker on that string can separate a refused read from a crash — the wrapper
+discarded the cause long before. So a radar write that exhausts its in-leg budget on a refusal
+raises `errors.ProviderRefusedReadsError`, whose name reaches the detail and is what
+`_leg_backoff_s` keys the long delay on. Nothing about the failure changes: it fails the leg
+exactly as it did, and skips exactly as much, which is nothing.
+
+**And only a refusal that arrives AFTER a successful read earns the expensive wait.** An
+authorization verdict on a valid credential is either the provider misbehaving or our permissions
+being genuinely wrong, in the same words. What separates them is not the message but when it
+arrives: a permissions fault is total and deterministic, so it refuses the leg's FIRST date, where
+a provider wobble arrives after the leg has already been served. `s1_roi` keeps one per-leg flag,
+set on the first committed date, and withholds the long wait until it is set — so a leg whose
+access is genuinely wrong fails promptly and releases its fleet instead of idling on it.
+
+It fails closed three ways, and each closed door costs only the ordinary attempt limit. A
+credential fault on THIS side is excluded first, because it is repairable here and no waiting
+fixes it. A refusal nothing attributes to the source reader is excluded too: `AccessDenied`,
+`SlowDown` and `InternalError` are S3's words and every S3 client shares them, so those markers
+only count alongside GDAL's own vocabulary (`RasterioIOError`, `WarpOperationError`, `CPLE_`) —
+GDAL reads source imagery here and nothing else. And anything unrecognised is excluded, which is
+what a failure whose cause was stripped crossing the worker boundary looks like: it draws no long
+wait on suspicion, and it is not given up either.
+
+The two predicates were once overlapping, and a caller's ORDER of asking decided the verdict.
+They are now disjoint by construction, and by sharing one classification rather than keeping two
+lists in step: both read the same markers and the same HTTP status RANGES, so a status nobody
+enumerated cannot be a refusal to one predicate and bad data to the other. A caller that knows
+only one of them cannot misclassify.
+
+That leaves one honest gap, and it is the fail-closed direction. A refusal carrying neither a
+name nor a status — a transport failure with no code, or a cause destroyed crossing the worker
+boundary — is declined for want of evidence rather than named as a refusal. It draws no long wait
+on suspicion and is not given up either. `cause_was_flattened` is what says which of those two
+happened, so a leg reading without a decidable cause is visible rather than silent.
 
 ### The radar bounded skip (`s1_roi.py`)
 
@@ -1824,8 +1861,14 @@ months of sound data.
 The radar response is the tail of the optical one without the copy ladder, which radar has no use
 for — OPERA publishes one copy of a granule:
 
-1. **Retry**, through the shared `store_write_retrying` policy, which covers a refusal that
-   clears inside a backoff.
+1. **Retry**, through the shared `store_write_retrying` policy — and for a provider refusal that
+   arrived after a successful read, retry past the attempt limit, because waiting is the only
+   response a refusal has. Radar is the one caller that asks for this: OPERA publishes one copy of
+   a granule, so there is nothing to step down to, and the optical path's answer is the copy ladder
+   instead. A long wait per rung of that ladder would multiply with it.
+1. **Fail the leg under a name the cell can act on** if that wait was not enough
+   (`ProviderRefusedReadsError`), so the re-dispatch waits on the long schedule rather than the
+   short one. No date is skipped and the time axis does not move.
 2. **Give up the date** once that retry is exhausted, if and only if the failure is one the
    source is answerable for AND recomputes. There is one scope, `unreadable`, and one remedy: a
    reprocessed copy at the provider. A refusal used to be a second, recoverable scope
