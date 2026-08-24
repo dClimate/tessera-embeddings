@@ -47,7 +47,7 @@ import logging
 import re
 from collections.abc import Iterable, Sequence
 from enum import StrEnum
-from typing import Any
+from typing import Any, assert_never
 
 from tessera_embeddings.config.satellites import S2_BASELINE_THRESHOLD
 from tessera_embeddings.ingest.asset_locations import (
@@ -813,9 +813,26 @@ class ReadFailure(StrEnum):
     UNDECIDABLE = "undecidable"
 
 
-#: The verdicts that mean THIS COPY will not yield its bytes, so another copy is worth trying and,
-#: once none is left, the date may be given up. The one place that mapping is written down.
-_MEANS_THE_COPY_IS_LOST = frozenset({ReadFailure.UNREADABLE, ReadFailure.ABSENT})
+def _means_the_copy_is_lost(verdict: ReadFailure) -> bool:
+    """Whether ``verdict`` says THIS COPY will not yield its bytes.
+
+    Written as an exhaustive match rather than a set so the type checker enforces what the closed
+    set is for: add a member and mypy reports this function as reachable past its cases, naming the
+    member it does not handle. A set would silently answer ``False`` for anything new, which is the
+    quiet-wrong-answer this whole design exists to remove — and the direction that costs a store.
+    """
+    match verdict:
+        case ReadFailure.UNREADABLE | ReadFailure.ABSENT:
+            return True
+        case (
+            ReadFailure.OUR_CREDENTIAL
+            | ReadFailure.PROVIDER_REFUSED
+            | ReadFailure.REFUSAL_UNATTRIBUTED
+            | ReadFailure.CLIENT_ERROR
+            | ReadFailure.UNDECIDABLE
+        ):
+            return False
+    assert_never(verdict)
 
 
 def classify_read_failure(exc: BaseException) -> ReadFailure:
@@ -882,7 +899,7 @@ def is_unreadable_source(exc: BaseException) -> bool:
     """
     # Derived, so this cannot disagree with `is_provider_refusal`: one classifier assigns one
     # verdict and each predicate reports which verdicts it owns.
-    return classify_read_failure(exc) in _MEANS_THE_COPY_IS_LOST
+    return _means_the_copy_is_lost(classify_read_failure(exc))
 
 
 def cause_was_flattened(exc: BaseException) -> bool:
