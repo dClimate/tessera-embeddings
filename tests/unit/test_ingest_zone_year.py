@@ -12,13 +12,14 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from prefect.states import StateType
+from prefect.client.schemas.objects import State
+from prefect.states import StateType, exception_to_failed_state
 from pystac_client.exceptions import APIError
 from urllib3.exceptions import ResponseError
 
 import tessera_embeddings.orchestration.prefect.flows.ingest_zone_year as mod
 from tessera_embeddings.config.paths import BucketPaths
-from tessera_embeddings.errors import ConfigMismatchError, InsufficientCoverageError
+from tessera_embeddings.errors import ConfigMismatchError, InsufficientCoverageError, NonMonotonicDateError
 from tessera_embeddings.ingest import land_mask
 from tessera_embeddings.ingest.catalogue_refusal import (
     CatalogueQueryError,
@@ -578,6 +579,15 @@ class TestLegRetryClassification:
             "ClientError: An error occurred (ThrottlingException) when calling ListTasks",
             "KilledWorker: worker died",
             "TimeoutError",
+            # A read failure the taxonomy declines to call permanent. Every one of these reaches
+            # the lost-data test and is turned down by it, which is the half of that rule that
+            # keeps a bad minute at the source from stranding a cell.
+            "RasterioIOError: HTTP response code: 503 on /vsicurl/https://x/B08.tif",  # the service
+            "RasterioIOError: HTTP response code: 403 on /vsicurl/https://x/B08.tif",  # a rate block
+            "RasterioIOError: CPLE_AWSError ExpiredToken reading /vsis3/x/B08.tif",  # ours to fix
+            # Absence words with nothing tying them to the SOURCE reader: our own destination
+            # bucket speaks the same S3, so unattributed they claim nothing.
+            "RuntimeError: the campaign index answered HTTP response code: 404",
         ],
     )
     def test_transient_failures_are_retried(self, detail: str) -> None:
@@ -591,6 +601,13 @@ class TestLegRetryClassification:
             "ValidationError: 3 validation errors for IngestSettings",
             "rejected by the calendar-year gate",
             "zone has no live tiles in the campaign coverage mask",
+            # The store's time axis is append-only, so a date below its maximum is refused
+            # identically on every attempt and no dispatch moves the axis.
+            "NonMonotonicDateError: 2018-03-05 is older than the latest date 2018-06-20",
+            # The two read-failure verdicts that mean THIS COPY is gone. Neither matches a marker;
+            # both are turned down by the taxonomy, which is the point of reusing it.
+            "RasterioIOError: IReadBlock failed at Y offset 3: TIFFReadEncodedTile() failed.",
+            "RasterioIOError: HTTP response code: 404 on /vsicurl/https://x/B08.tif",
         ],
     )
     def test_deterministic_failures_are_not_retried(self, detail: str) -> None:
@@ -1336,3 +1353,124 @@ class TestLegsRetryIndependently:
             _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
 
         assert dispatched.count("ascending") == 1, "a dirty prefix must not be retried at all"
+
+
+class TestAPermanentLegFailureSkipsTheLadder:
+    """A verdict that recomputes must be reported at once, not re-dispatched.
+
+    The ladder exists for failures a later attempt can survive. A leg that offered its store a
+    date below the store's append-only maximum is not one: the identical date is refused
+    identically every time, and each attempt provisions and tears down a whole Dask fleet to
+    reach it. So the attempts after the first buy nothing and cost a fleet each.
+    """
+
+    def _failed_state(self, exc: BaseException) -> State:
+        """The state a FAILED leg is read back with — built by Prefect, not by hand.
+
+        Hand-written messages are how a classifier comes to match a string the runtime never
+        produces. This one goes through the same call the flow engine makes, so the format under
+        test is the format in production.
+        """
+        return asyncio.run(exception_to_failed_state(exc, message="Flow run encountered an exception:"))
+
+    def test_only_the_words_cross_the_deployment_boundary(self) -> None:
+        """What the parent can match on, established rather than assumed.
+
+        A leg is a separate deployment run and ``arun_deployment`` returns it by reading it back
+        over the API, so the parent holds an API object. Three consequences, all asserted here:
+        the exception object does not come with it (Prefect attaches it for in-process use, and
+        it will not serialise at all), the ``__cause__`` chain does not survive either, and what
+        does survive is the class NAME followed by ``str(exc)``.
+
+        That is why classification matches a class name. ``isinstance`` is unavailable here at
+        any price, and the chain-reading the worker-side taxonomy does has nothing to read.
+        """
+        cause = ValueError("the axis maximum is 2018-06-20")
+        exc = NonMonotonicDateError("date 2018-03-05 is older than the latest date on the axis")
+        exc.__cause__ = cause
+        state = self._failed_state(exc)
+        message = state.message
+        assert message is not None, "a FAILED state with no message would leave nothing to classify"
+
+        assert message.startswith("Flow run encountered an exception: NonMonotonicDateError: ")
+        assert "the axis maximum" not in message, "the cause chain does not cross the boundary"
+        assert "Traceback" not in message, "nor does the traceback"
+
+        # The live object is on the state for in-process use only. It cannot be encoded for the
+        # API, so no reader on the far side can ever be handed it — which is the whole reason
+        # this classification is textual. If this ever stops raising, re-read the design.
+        with pytest.raises(Exception, match="serialize"):
+            state.model_dump_json()
+
+    def test_the_class_name_is_what_carries_the_verdict(self) -> None:
+        """Matched on a STABLE identifying substring: the exception's class name.
+
+        Asserted by removing just that name from an otherwise identical message and watching the
+        verdict flip back to retry — so a test that passed on some incidental word would fail.
+        """
+        exc = NonMonotonicDateError("date 2018-03-05 is older than the latest date on the axis")
+        detail = mod._leg_failure_detail(SimpleNamespace(state=self._failed_state(exc)), "s2")
+
+        assert detail is not None
+        assert mod._is_retryable_leg_failure(detail) is False
+        without_the_name = detail.replace(type(exc).__name__, "SomeOtherError")
+        assert mod._is_retryable_leg_failure(without_the_name) is True
+
+    def test_a_non_monotonic_date_is_dispatched_once(self, wired, monkeypatch, waited) -> None:
+        """The fix, at the level it is meant to act: one fleet, not three."""
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        dispatched: list[str] = []
+        message = self._failed_state(
+            NonMonotonicDateError("date 2018-03-05 is older than the latest date 2018-06-20")
+        ).message
+
+        async def fake_arun(dep, parameters=None, tags=None):
+            leg = parameters.get("orbit") or "s2"
+            dispatched.append(leg)
+            if leg == "s2":
+                return _completed_run()
+            return SimpleNamespace(id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=message))
+
+        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+
+        with pytest.raises(RuntimeError, match="NonMonotonicDateError"):
+            _run(
+                s1_orbit="ascending",
+                # Stagger off: it delays a FIRST dispatch, and would both add a recorded wait
+                # this assertion does not describe and doom the sibling before it ever starts.
+                ingest_settings=mod.IngestSettings(max_leg_attempts=3, leg_stagger_window_s=0),
+            )
+
+        assert dispatched.count("ascending") == 1, "a date the axis cannot take was re-offered to it"
+        assert waited == [], "no backoff was served, because no further attempt was scheduled"
+
+    def test_an_unrecognised_failure_still_spends_its_attempts(self, wired, monkeypatch) -> None:
+        """The polarity, asserted where it costs the most to get wrong.
+
+        Being wrong in this direction strands the cell until a human notices it, where being
+        wrong in the other wastes one resumable leg's fleet. So an exception nobody has
+        classified must reach the ladder unchanged, and a permanent verdict has to be positively
+        identified before it may skip anything.
+        """
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        dispatched: list[str] = []
+        message = self._failed_state(RuntimeError("nobody has ever seen this one")).message
+
+        async def fake_arun(dep, parameters=None, tags=None):
+            leg = parameters.get("orbit") or "s2"
+            dispatched.append(leg)
+            if leg == "s2":
+                return _completed_run()
+            return SimpleNamespace(id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=message))
+
+        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+
+        with pytest.raises(RuntimeError, match="nobody has ever seen this one"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(max_leg_attempts=3, leg_stagger_window_s=0),
+            )
+
+        assert dispatched.count("ascending") == 3, "an unclassified failure was denied its retries"

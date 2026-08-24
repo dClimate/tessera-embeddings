@@ -838,13 +838,27 @@ def _means_the_copy_is_lost(verdict: ReadFailure) -> bool:
 def classify_read_failure(exc: BaseException) -> ReadFailure:
     """The single verdict for ``exc``, from which both public predicates are derived.
 
-    Text over ``isinstance`` for the reason :func:`_exception_chain_text` gives. The ORDER is the
-    policy and each step is a claim about what outranks what: our own fault first, because no
-    amount of waiting or stepping down repairs it; then the service refusing, because that outranks
-    every statement about bytes made in the same chain; then the request being wrong, since no copy
-    is fetched differently; and only then anything about the data itself.
+    Text over ``isinstance`` for the reason :func:`_exception_chain_text` gives. So this is the
+    READING of the chain, and :func:`classify_read_failure_in` is the whole of the judgement.
     """
-    text = _exception_chain_text(exc)
+    return classify_read_failure_in(_exception_chain_text(exc))
+
+
+def classify_read_failure_in(text: str) -> ReadFailure:
+    """The single verdict named by ``text``, whatever produced those words.
+
+    Takes the WORDS rather than an exception, because not every caller has one. A leg that runs
+    as its own deployment reports through a state message, and the exception object does not
+    cross that boundary at all — see the leg retry ladder in
+    ``orchestration/prefect/flows/ingest_zone_year.py``. One classifier reads both, so the
+    verdict a caller acts on cannot depend on which side of a boundary it stands.
+
+    The ORDER is the policy and each step is a claim about what outranks what: our own fault
+    first, because no amount of waiting or stepping down repairs it; then the service refusing,
+    because that outranks every statement about bytes made in the same chain; then the request
+    being wrong, since no copy is fetched differently; and only then anything about the data
+    itself.
+    """
     if any(m in text for m in _OWN_CREDENTIAL_MARKERS):
         return ReadFailure.OUR_CREDENTIAL
     if _names_a_transient_refusal(text):
@@ -899,7 +913,19 @@ def is_unreadable_source(exc: BaseException) -> bool:
     """
     # Derived, so this cannot disagree with `is_provider_refusal`: one classifier assigns one
     # verdict and each predicate reports which verdicts it owns.
-    return _means_the_copy_is_lost(classify_read_failure(exc))
+    return unreadable_source_in(_exception_chain_text(exc))
+
+
+def unreadable_source_in(text: str) -> bool:
+    """Whether ``text`` says a source object could not be read.
+
+    :func:`is_unreadable_source` for a caller holding words instead of an exception: same
+    verdicts, same closed set, same fail-closed direction. Only ``UNREADABLE`` and ``ABSENT``
+    answer ``True``; a refusal, a credential fault and a chain carrying no evidence all answer
+    ``False``. Read the docstring above for what each of those means and why the exclusions are
+    the load-bearing part.
+    """
+    return _means_the_copy_is_lost(classify_read_failure_in(text))
 
 
 def cause_was_flattened(exc: BaseException) -> bool:

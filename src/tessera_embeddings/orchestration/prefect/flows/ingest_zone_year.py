@@ -76,6 +76,7 @@ from tessera_embeddings.inference.data_loading import (
     resolve_s1_orbit,
 )
 from tessera_embeddings.ingest.catalogue_refusal import RefusalKind, refusal_in, repeat_is_deterministic
+from tessera_embeddings.ingest.duplicates import unreadable_source_in
 from tessera_embeddings.ingest.land_mask import export_zone_roi, live_chunk_count
 from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
@@ -289,6 +290,12 @@ _NON_RETRYABLE_LEG_MARKERS = (
     # counted is one whose bytes will not read: the re-dispatch re-reads the same objects, spends
     # the per-read retry ladder on each, and holds a fleet to reach the identical answer.
     "TooManyGivenUpDatesError",
+    # The leg offered the store a date OLDER than its time axis already holds. The axis is
+    # append-only, so the identical date is refused identically on every attempt and the only
+    # remedy is a human deleting the store — a re-dispatch provisions and tears down a whole
+    # Dask fleet to reach the same date and die there. Deterministic in the input in the
+    # strictest sense available: the store's own contents decide it, and no attempt moves them.
+    "NonMonotonicDateError",
 )
 
 
@@ -298,6 +305,18 @@ def _leg_failure_detail(run: object, label: str) -> str | None:
     Prefers the child's own state MESSAGE over the state name, because the name
     ("FAILED") cannot be classified and the message carries the exception text that
     :data:`_NON_RETRYABLE_LEG_MARKERS` is matched against.
+
+    **What crosses the deployment boundary is a STRING, and only a string.** A leg is a separate
+    deployment run, read back over the API, so ``isinstance`` is not available here at any price:
+    Prefect attaches the exception to the state for in-process use only — it is not serialisable
+    to the API at all — and what the API stores is ``f"{type(exc).__name__}: {exc}"`` behind a
+    fixed prefix. No traceback, and no ``__cause__`` chain: the OUTERMOST exception is the whole
+    of it.
+
+    So classification matches the exception's class NAME, which survives that boundary intact,
+    and never a field position or a formatted number, which do not. The coupling is to Prefect's
+    message format; the class name sits immediately after its prefix, so a reworded prefix cannot
+    move it.
     """
     if isinstance(run, BaseException):
         return f"{label}: {run!r}"
@@ -330,12 +349,26 @@ def _leg_stagger_s(zone: str, year: int, label: str, window_s: int) -> float:
 def _is_retryable_leg_failure(detail: str) -> bool:
     """Whether re-dispatching this leg could plausibly succeed.
 
-    Default TRUE. The ingest resumes — committed dates are skipped, not rewritten — so a
-    retry is cheap and the failure modes actually observed are transient. Only a failure
-    that is deterministic in the input is excluded.
+    **Default TRUE, and the polarity is the load-bearing part.** The ingest resumes —
+    committed dates are skipped, not rewritten — so retrying a failure that turns out to be
+    permanent costs one leg's fleet, while declining to retry a genuine transient strands the
+    cell until a human notices. Only a POSITIVELY IDENTIFIED permanent verdict may return
+    ``False``; anything unrecognised enters the ladder.
+
+    Two independent grounds for that verdict, and a failure matching neither is retried:
+
+    * a marker in :data:`_NON_RETRYABLE_LEG_MARKERS`, naming a class whose answer is fixed by
+      the input;
+    * the read-failure taxonomy saying the DATA is gone — reused rather than restated, so
+      "these bytes will not read" means one thing in this repository. It reports ``True`` for
+      exactly ``UNREADABLE`` and ``ABSENT``. A provider refusal, our own expired credential and
+      a chain carrying no evidence are all left retryable, which is precisely what the ladder
+      and its long refusal backoff exist for.
     """
     lowered = detail.lower()
-    return not any(marker.lower() in lowered for marker in _NON_RETRYABLE_LEG_MARKERS)
+    if any(marker.lower() in lowered for marker in _NON_RETRYABLE_LEG_MARKERS):
+        return False
+    return not unreadable_source_in(detail)
 
 
 _CHILD_TAG_PREFIX = "ingest-zone-year"
