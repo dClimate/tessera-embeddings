@@ -268,7 +268,7 @@ Three nested budgets, none of which knew anything about the failure's class:
 
 | layer | knob | default | how a catalogue 502 is treated |
 |---|---|---|---|
-| leg | `IngestSettings.max_leg_attempts` | 3 | retryable — no marker matches an exhausted-ladder `APIError`, and the default is TRUE. **Corrected in place:** this row said "`_NON_RETRYABLE_LEG_MARKERS` names no HTTP failure", which stopped being the whole test when the read-failure taxonomy joined the classifier (see "When the words DO carry the verdict"). The verdict is unchanged: the taxonomy reads a status only in GDAL's `HTTP response code: NNN` form, which this text does not carry |
+| leg | `IngestSettings.max_leg_attempts` | 3 | retried, because nothing marks it permanent and retrying is the default. **Corrected in place:** this row used to say the permanent-failure list "names no HTTP failure", which stopped being the whole test once the parent also began asking whether the bytes are gone (see "Some failures say enough to be judged"). The answer does not change: that check recognises a status code only in the specific form GDAL writes it, and this text is not in that form |
 | cell | `attempts_per_cell_in_cluster` (`sequential_fill` / `fill_zones_sequential`) | 2 | eligible — retry eligibility is by **phase**, and this is `inputs/prepare`, which additionally gets `discard()` + `start()`, re-dispatching the whole ingest |
 | zone round | `max_dispatch_rounds` (`run_global_campaign`) | 2 | re-dispatched; the zero-progress guard only breaks *after* a whole round has made none |
 
@@ -1264,47 +1264,59 @@ acts on the count rather than on the message. What is new is the direction of th
 error the ceiling raises is left OUT of `_NON_RETRYABLE_LEG_MARKERS` on purpose, because a
 refusal clears and the retry is what recovers the dates.
 
-### When the words DO carry the verdict, the parent acts on them
+### Some failures say enough to be judged, and those skip the retries
 
-The prescription above is about failures whose cause the wrapper destroyed, and it was read more
-broadly than it should have been — as "the leg retry can never classify". That reading is wrong
-for the failures whose OUTERMOST exception is itself the whole verdict, and it cost fleets.
+The advice above concerns failures whose real cause was thrown away in transit. It got read more
+broadly than intended — as "the parent can never tell why a leg failed" — and that reading is wrong
+for failures where the last exception raised is itself the complete answer. Reading it too broadly
+cost fleets.
 
-`NonMonotonicDateError` is the clearest of them. A store's time axis is append-only, so a date
-below its maximum is refused identically on every attempt and no dispatch moves the axis; the
-remedy is a human deleting the store. Re-dispatching it provisions and tears down a whole Dask
-fleet to reach the same date and die there, once per remaining attempt. Its class name reaches the
-parent intact, so it joins `_NON_RETRYABLE_LEG_MARKERS`.
+**The clearest example is a date offered out of order.** Dates can only be added to a store newest
+last, so a date older than the newest one already stored is refused. It will be refused identically
+every time, and no amount of re-running moves anything — the only way forward is a person deleting
+the store. Yet a failed leg was re-dispatched up to three times, and each attempt builds a
+sixty-worker cluster, walks to the same date, and dies there. Three clusters to learn what the first
+failure already established.
 
-Alongside it, `_is_retryable_leg_failure` now asks the read-failure taxonomy directly, through
-`duplicates.unreadable_source_in` — the text form of `is_unreadable_source`, reading the same
-markers in the same order. One taxonomy, so the parent deciding whether to re-dispatch and the
-worker deciding whether to step down cannot reach two verdicts from the same words. Only
-`UNREADABLE` and `ABSENT` skip the ladder. `PROVIDER_REFUSED`, `OUR_CREDENTIAL`,
-`REFUSAL_UNATTRIBUTED`, `CLIENT_ERROR` and `UNDECIDABLE` all keep their attempts, which is exactly
-what the ladder and its long refusal backoff exist for.
+So `NonMonotonicDateError` is now in the list of failures the parent will not re-dispatch. Its class
+name survives the trip to the parent intact, which is what makes this possible at all.
 
-**The polarity is unchanged, and it is the load-bearing part.** Default TRUE: only a positively
-identified permanent verdict may skip anything, and a failure nobody has classified enters the
-ladder untouched. Retrying a permanent failure costs one resumable leg's fleet; declining to retry
-a transient one strands the cell until a human notices.
+**Alongside it, the parent now asks the same question the worker asks: are these bytes gone?** It
+calls `duplicates.unreadable_source_in`, a text-reading form of the check the worker already uses,
+looking at the same markers in the same order. Deliberately the same one, so the parent deciding
+whether to re-dispatch and the worker deciding whether to try another copy cannot reach opposite
+conclusions from identical words.
 
-### What crosses the deployment boundary
+Only two answers skip the retries: the data could not be read, and the data is not there. Every
+other answer — the provider refused us, our credentials failed, a refusal we could not attribute, a
+client error, or no idea — keeps all its attempts. Those are the situations retrying exists for.
 
-A leg is a separate deployment run, and `arun_deployment` returns it by reading it back over the
-API. The parent therefore holds an API object, never the live exception:
+**The default is still to retry, and that is the part to protect.** Only a failure positively
+identified as permanent may skip anything; a failure nobody recognises goes through the retries
+untouched. The asymmetry is what settles it. Retrying something permanent wastes one cluster.
+Failing to retry something temporary strands a cell until a person notices.
 
-- Prefect attaches the exception to the state for in-process use only. It is not serialisable to
-  the API at all, so `isinstance` is unavailable here at any price.
-- What the API stores is `f"{type(exc).__name__}: {exc}"` behind a fixed prefix. No traceback, and
-  no `__cause__` chain — the outermost exception is the whole of it.
+### What actually reaches the parent when a leg fails
 
-Two consequences. The class NAME is the one stable thing to match, which is why both the marker
-list and the taxonomy key on names rather than on field order or a formatted number. And a chained
-rasterio failure degrades across this boundary to `UNDECIDABLE`, because the GDAL cause is stripped
-and the wrapper's own sentence names no bytes — the safe direction, since it earns the retry. This
-is the same loss the Dask boundary inflicts by a different mechanism, and the rescue in
-`ingest/loader_failures.py` does not reach it.
+A leg runs as its own separate deployment, and the parent finds out how it went by reading the
+record back from the Prefect server over HTTP. So the parent never holds the failure itself, only a
+description of it:
+
+- The exception object exists only inside the process that raised it. It cannot be sent to the
+  server at all, so the parent cannot ask "what type of error was this?" in the normal way, at any
+  price.
+- What the server keeps is one line: the exception's class name, a colon, and its message. No stack
+  trace, and none of the chain of underlying causes — the last exception raised is all that is left.
+
+That leads to two things worth knowing. **The class name is the only reliable thing to match on**,
+which is why both the list of permanent failures and the bytes-are-gone check key on names rather
+than on the position of a word or a number in a message.
+
+And **a failure that began as a file that would not open arrives here looking unrecognisable**. The
+underlying cause has been stripped, and the surviving wrapper mentions no filenames, so the check
+answers "no idea" — which earns a retry. That is the safe direction. It is the same loss of
+information the Dask worker boundary causes, arriving by a different route, and the repair in
+`ingest/loader_failures.py` does not reach this one.
 
 ## Why the object was hard to identify — an attribution gap, now closed
 
