@@ -1,4 +1,4 @@
-# Ingest source-read failures: seven causes, and the retry budget they share
+# Ingest source-read failures: eight causes, and the retry budget they share
 
 Investigation record. Causes 1 and 2 traced 2026-08-04/05 on `global-tessera-dev`; cause 3 absorbed
 2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20,
@@ -729,7 +729,29 @@ Two properties carry the design:
   written rather than lost. That is also why ten is small: a radar zone-year holds a couple of
   hundred dates per orbit.
 
-### An asymmetry in `is_unreadable_source`, found while testing and NOT fixed here
+### An asymmetry in `is_unreadable_source` — deferred here, and it cost eleven stores
+
+> **FIXED in Cause 8, 2026-08-24.** Read the deferral below as written, because the diagnosis was
+> complete and correct and the decision not to act on it is the most instructive thing in this
+> document. Three days later the same asymmetry — a numeric refusal claimed by
+> `is_unreadable_source` on a path that never asks about refusals — made **eleven optical stores
+> unfillable** and stopped the campaign. All 120 radar stores were sound, exactly as the paragraph
+> below predicts, because radar resolves it by order.
+>
+> The deferral reasoning was not unreasonable: widening a classification during a live campaign is a
+> real risk, and the direction genuinely was not obviously safe. What was missing is the other half
+> of the trade. The cost of ACTING was estimated ("changes optical behaviour during a live
+> campaign"); the cost of NOT acting was never estimated, and it was a stopped campaign, eleven
+> deleted stores and a day of remediation.
+>
+> **The habit to take from it:** when a known defect is deferred, write down what it costs to leave
+> it, not only what it costs to fix it. And note this was the THIRD written record of the same
+> asymmetry — the marker tuple's own comment and
+> `test_a_numeric_refusal_is_claimed_by_both_predicates`'s docstring were the other two. A defect
+> documented three times and fixed zero times is not a known risk being managed; it is a decision
+> nobody re-opened.
+
+
 
 It excludes refusals by NAME (`AccessDenied`, `SlowDown`), so a refusal reported as a bare status
 code carries none of those words and the wrapper's decode marker decides — a
@@ -942,6 +964,86 @@ and cannot wedge anything."* That was right, and became wrong only because trans
 into the skip path. So the record is gone, and `record_assessed_window` at end-of-leg is unchanged —
 it serves the other purpose, telling the coverage gate a window was examined, and a leg that dies
 leaving no assessment correctly reads as never having got there.
+
+## Cause 8 — a provider's refusal read as unreadable DATA, 2026-08-24
+
+**The root cause of the eleven unfillable stores.** Cause 7 above describes how a hole forms once a
+date is skipped; this is why the date was skipped at all, and it is the defect that was actually
+fixed.
+
+### The mechanism
+
+Two predicates in `ingest/duplicates.py` decided a read failure and they OVERLAPPED.
+`is_provider_refusal` recognised statements about the SERVICE — `AccessDenied`, `SlowDown`,
+`ServiceUnavailable`, `InternalError`, HTTP 403/500/502/503/504. `is_unreadable_source` recognised
+statements about the BYTES. A refusal reaches the reader through a block-read wrapper, so its chain
+carries **both kinds of signature**, and `is_unreadable_source` excluded only credentials plus
+`AccessDenied` and `SlowDown` — not the numeric statuses.
+
+So the verdict came down to which predicate a caller asked first. `s1_roi.py` asks about refusals
+first. **`s2_roi.py` never called `is_provider_refusal` at all** — it does not import it; all three
+of its sites are `if not is_unreadable_source(exc): raise`. The optical path therefore had no
+concept of "the provider refused, wait", only "the data is broken, give up this date".
+
+That is precisely the damage pattern: **all eleven unfillable stores are `reflectance.zarr`, and all
+120 radar stores were sound.**
+
+### Scale, and the patience
+
+The campaign window logged **5,687 occurrences of `503`, 785 `Connection reset`, 80 `Broken pipe`** —
+the provider was throttling object reads as well as searches. Against that, `SOURCE_READ_ATTEMPTS`
+was 3 with backoff of 2 s then 4 s: **about six seconds of patience** before a failure at that layer
+decided a date was permanently lost.
+
+### It was known, and pinned as the contract
+
+`test_a_numeric_refusal_is_claimed_by_both_predicates` asserted the overlap, with the docstring:
+*"Not fixed here: widening that exclusion changes the optical copy ladder mid-campaign. The radar
+caller resolves it by ORDER, asking about the refusal first."* The defect was identified, not fixed
+because fixing it would change the optical path mid-campaign, and locked in by a passing test.
+
+### The change, and the shape that mattered more than the fix
+
+The immediate fix was to make the predicates disjoint by construction rather than by call order.
+What followed was three more findings of the SAME shape, and they are the reason this cause is worth
+reading rather than skimming:
+
+1. **429 was missing** from the refusal markers — the most explicit "slow down" a provider can send.
+2. **Every non-enumerated status** was unmatched: 400, 401, 507, 509. A malformed request or a
+   rejected credential was recorded as corrupt imagery.
+3. **Statusless transport failures** — DNS failure, refused connection, empty reply, TLS error —
+   carried no status and were in no list.
+
+Patching each would have been four patches of one shape. **The defect was the POLARITY.**
+`is_unreadable_source` returning True means "give up this date", and it was the FALLBACK for
+anything the transient lists did not recognise — so every gap in those lists became a silent
+data-loss verdict, by construction.
+
+So the resolution was two deletions and a re-shape:
+
+- **Statuses by RANGE, not enumeration.** Any 5xx is transient; 408 and 429 are the transient 4xx;
+  404 and 410 are absence; every other 4xx is neither and re-raises. 403 stays named — the one
+  judgement about a provider rather than about HTTP.
+- **The generic wrappers came out of the unreadable set.** `Chunk and warp failed`,
+  `Read failed. See previous exception` and `IReadBlock failed` are what GDAL raises when a block
+  read fails FOR ANY REASON. What remains names a codec: `ZIPDecode`, `TIFFReadEncodedTile`. An
+  unrecognised failure now re-raises and the leg retries in order.
+- `SOURCE_READ_ATTEMPTS` 3 to 8 — about 61 s of backoff, so a bad minute is outlasted.
+- **Radar aligned to optical.** It accepted a refusal as grounds to give up a date under
+  `scope="provider-refused"`. Same hole, reached by accepting the refusal instead of misclassifying
+  it. `is_provider_refusal` is deleted; it had no caller left.
+
+The invariant this restores, and the one to hold the design to: **any missing data is
+deterministically missing.** A skip is legitimate only when it recomputes to the same verdict on
+every attempt. That is what makes an absence explainable rather than a function of when the leg
+happened to run — and it is why Cause 7's durable record turned out to be unnecessary.
+
+### Verified
+
+Reproduced deliberately on `global-tessera-dev`, cell 43N/2017: a leg killed mid-run with three
+interior gaps below its axis maximum, resumed, re-offered all three, skipped them again, and
+advanced past the old maximum with zero `NonMonotonicDateError`. The polarisation filter ran 134 CMR
+queries with zero skip warnings, against 115,276 in 45 minutes of the production run.
 
 ## Coupling to the leg retry
 
