@@ -798,6 +798,15 @@ def should_try_another_copy(exc: BaseException) -> bool:
     text = _exception_chain_text(exc)
     if any(m in text for m in _NOT_THE_DATAS_FAULT):
         return False
+    # A client error is a statement about the REQUEST, and every copy is fetched by the same kind
+    # of request — a rejected or malformed credential is not remedied by a different object, so
+    # walking the ladder only spends a read per rung before the same error re-raises anyway. Named
+    # by RANGE for the reason the ranges exist: a status nobody enumerated must not change the
+    # verdict. Absence and the transient 4xx are deliberately excluded, because a different copy
+    # may exist where this one does not, or may simply succeed.
+    statuses = _http_statuses(text)
+    if any(400 <= s < 500 and s not in _ABSENT_4XX and s not in _TRANSIENT_4XX for s in statuses):
+        return False
     return any(m in text for m in _SOURCE_READER_MARKERS)
 
 

@@ -305,6 +305,29 @@ class TestWhenToStepDown:
         assert should_try_another_copy(Exception(flattened))
 
     @pytest.mark.parametrize(
+        "status",
+        [401, 400, 403, 405, 416],
+    )
+    def test_a_client_error_never_enters_the_ladder(self, status: int) -> None:
+        """A rejected credential is systemic: no other copy is fetched by a different request.
+
+        The flattened form carries a source-reader marker, so without the status check a 401 would
+        walk every rung — and could commit an older reprocessing if one happened to read — before
+        re-raising the same error the first date should have failed on.
+        """
+        flattened = Exception(f"RasterioIOError('HTTP response code: {status}')")
+        assert not should_try_another_copy(flattened)
+
+    @pytest.mark.parametrize(
+        "status",
+        [404, 410, 408, 429],
+    )
+    def test_absence_and_transients_still_reach_the_ladder(self, status: int) -> None:
+        """A different copy may exist where this one does not, or may simply succeed."""
+        flattened = Exception(f"RasterioIOError('HTTP response code: {status}')")
+        assert should_try_another_copy(flattened)
+
+    @pytest.mark.parametrize(
         "destination",
         [
             "NonMonotonicDateError: refusing an out-of-order append",
