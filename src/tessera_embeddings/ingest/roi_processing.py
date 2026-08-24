@@ -14,6 +14,7 @@ import numpy as np
 import xarray as xr
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
+from tessera_embeddings.ingest.duplicates import cause_was_flattened
 from tessera_embeddings.ingest.roi import read_roi_mask
 
 logger = logging.getLogger(__name__)
@@ -90,14 +91,27 @@ def read_failure_context(
     ``log.exception`` is what preserves it, and without it the message names a detail the
     reader has no way to reach.
 
+    And a chain that never crossed the worker boundary cannot be logged at all, which is the
+    second line here: it fires only for a failure that arrived already flattened, and it is the
+    only warning that a verdict about to be taken has no evidence under it. Anything it reports
+    is a worker ``ingest/loader_failures.py`` did not reach.
+
     Emitted only on failure, so it costs nothing on the success path and does not scale
     with worker count the way a per-date INFO line does.
     """
     try:
         yield
-    except Exception:
+    except Exception as exc:
         ids = ", ".join(str(getattr(i, "id", "?")) for i in items[:4]) or "none"
         log.exception("READ FAILED roi=%s date=%s items=%d first=%s", roi, date, len(items), ids)
+        if cause_was_flattened(exc):
+            log.error(
+                "READ CAUSE LOST roi=%s date=%s: the failure arrived without its cause, so nothing "
+                "can say WHY the read failed and this leg's read verdicts are undecidable. The "
+                "reading worker did not have the cause-preserving reducer installed.",
+                roi,
+                date,
+            )
         raise
 
 
