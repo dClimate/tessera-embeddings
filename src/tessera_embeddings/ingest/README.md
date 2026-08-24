@@ -1445,53 +1445,74 @@ the solar day IS the UTC date there.
 
 ### Resuming over a store that already holds dates
 
-A store's time axis is append-only and strictly increasing, because it is sampled
-**positionally** downstream. The latest date on it — the store's **frontier** — is therefore a
-floor: nothing at or below it can ever be written, and `RegionWriteBatch.append_time_slot`
-refuses to try (`NonMonotonicDateError`).
+**The rule this whole section exists for: dates can only ever be added to a store in order,
+newest last. Once a store holds a date, no earlier date can ever be added to it again.**
 
-That matters because skipping a date is a designed outcome, not a fault. A date can fail the
-coverage gate, reach no live window, or have no copy of some source object that reads. Every
-skip leaves a hole; a later date then commits above it; and the hole is permanent. What made it
-dangerous is that a skip verdict is **not stable across attempts** — a change to how source
-reads are classified changes what reads — so a resume could offer a date an earlier attempt
-skipped, succeed at reading it, and be refused by the axis. The refusal is fatal and the store's
-only remedy is deletion, so one recovered date cost a whole cell.
+That is not a limitation we could lift by trying harder. Readers downstream fetch observations
+by their POSITION in the list rather than by their date, so quietly inserting an older date in
+the middle would change what every reader gets back, with nothing about the store looking wrong.
+The write is refused instead (`NonMonotonicDateError`).
 
-Three things, per store, close it. The three child stores of a cell (reflectance and both radar
-orbits) advance independently, so each computes its own frontier; a shared one would skip months
-a lagging store never reached.
+Call the newest date a store holds its **frontier**. Everything at or below it is closed.
 
-1. **A window floor.** The leg starts at the first day of the frontier's **month**
-   (`solar_days.resume_window_start`), not at the leg's configured start. Below that month there
-   is nothing this store can accept, so walking it is pure cost. The floor is a month boundary
-   rather than `frontier + 1 day` because a solar day straddles the UTC boundary and its query is
-   padded either side — starting mid-month would query the first owned day on an unpadded bound
-   and write it short, which is the defect the chunk padding exists to prevent.
-2. **A per-date check the floor cannot reach.** Dates below the frontier *inside its own month*
-   are still offered, and each ingest drops them before preparation. This is the correctness
-   half; the floor is only the cost half.
-3. **A recorded loss, not an exception.** Such a date can never enter the store, so raising
-   destroys the cell and changes nothing else. It is recorded under
-   `assessed_unreadable_dates` with `scope=unfillable`, logged as `DATA LOSS`, and the leg
-   carries on.
+```
+       already stored                  can still be added
+  |=============================|-------------------------->
+  Jan                       frontier                      Dec
+                            (Jun 14)
+        ^
+        a day skipped back here can NEVER be added now
+```
 
-Above the frontier nothing is suppressed. A date an earlier attempt gave up on is **deliberately
-re-offered**: it is still appendable, so a re-offer is exactly how a recovered source is
-recovered, and the cost of failing again is one re-evaluation.
+**Why any of this comes up: skipping a day is normal, not a fault.** A day gets skipped when it
+was too cloudy, when its imagery misses the land we care about, or when every copy of a file we
+need refuses to open. Each skip leaves a hole. Later days then get written above that hole, and
+at that moment the hole is sealed for good.
 
-**A skip is recorded by the commit that seals it.** The end-of-leg record runs once, after the
-whole loop, so a leg killed before it reaches that line leaves committed dates, holes, and
-nothing saying why — which is indistinguishable from a window the leg had yet to reach. Pending
-losses are therefore handed to the **write** (`write_days_windows(losses=...)`) and merged into
-the attribute in the same commit as the date. That commit is the one that puts the skipped date
-below the frontier, so no kill can land one without the other, and a skip costs no commit of its
-own — where a commit per skip would cost one per skipped date.
+That was survivable until you notice the catch: **whether a day gets skipped is not fixed
+forever.** Improve how we handle unreadable files and a day we once gave up on may now read
+perfectly well. So a resumed run would find that old day, succeed at reading it, try to write
+it — and be refused. The refusal killed the entire run, and the only cure was deleting the whole
+store and starting the year again. One recovered day cost a year of work.
 
-Months *below* the floor are deliberately left alone: their holes are never rediscovered, and
-the assessed window below is what says so. Three states have to stay distinguishable — assessed
-and empty, assessed and lost, and **not assessed** — and a month the leg never queried is the
-third.
+Three things prevent it. Each is worked out separately for each of a cell's three stores
+(optical, and each of the two radar orbits), because they fill at different speeds and a shared
+answer would skip months a slower store never got to.
+
+1. **Start where the store left off.** Rather than beginning at January, a run resumes at the
+   start of the month its frontier falls in (`solar_days.resume_window_start`). Nothing earlier
+   can be accepted, so looking there is pure wasted time — and it is a lot of wasted time, since
+   the catalogue search is most of what a run does.
+
+   It resumes at the start of that *month*, not the day after the frontier, because a satellite
+   "day" does not line up with a calendar day — we search a day either side to catch the edges.
+   Starting mid-month would clip that margin and write the first day short.
+
+2. **Refuse the days that slip through anyway.** Days below the frontier that fall inside its own
+   month still get offered by step 1, so each ingest drops them before doing any work. Step 1
+   saves time; this step is what actually prevents the crash.
+
+3. **Write down the loss instead of crashing.** Such a day can never be stored no matter what we
+   do, so failing the run destroys a year's work and changes nothing else. It is recorded on the
+   store as a known loss and the run carries on.
+
+**Above the frontier, nothing is suppressed.** A day an earlier run gave up on is offered again
+on purpose — it can still be written, so re-offering is exactly how a day recovers once the
+underlying problem is fixed. Failing again costs one re-check.
+
+**A loss is written down by the same commit that seals it.** This used to be recorded once, at
+the very end of a run. A run killed before reaching that line left behind stored dates, holes,
+and nothing explaining them — which looks identical to a run that simply had not got there yet.
+That is the state that wedged real stores. Now a pending loss travels with the next date written
+(`write_days_windows(losses=...)`) and lands in the same commit. That commit is the one that
+seals the skipped day, so nothing can record one without the other. It costs no extra commits;
+recording each skip on its own would cost one per skipped day, which is why an earlier attempt
+at this was abandoned.
+
+**Months below the resume point are deliberately left alone.** Their holes are not re-examined
+and not claimed. Three situations have to stay tellable apart — a month examined and genuinely
+empty, a month examined that lost days, and a month never looked at — and a month a run skipped
+is the third.
 
 ### Recording the window an ingest examined
 
@@ -1500,20 +1521,22 @@ absent from the time axis but wholly inside that range was **examined and found 
 reachable**, which is a finding; a month outside it is a gap. Without the record those are
 indistinguishable, and the coverage gate has to fail on both.
 
-**The range recorded is the FLOORED one** — what the leg walked, not what it was asked for — and
-both records **union** with what the store already holds:
+**What gets recorded is what the run actually looked at**, not the range it was asked for — a
+resumed run starts partway through the year, so those are different. And both records are
+**added to** what the store already holds rather than replacing it:
 
-- The window's stored **start is kept** and only its end extends. A resume begins at its
-  frontier's month, so stamping its own start would retract months an earlier leg did examine;
-  widening backwards to the leg's configured start would claim months this one skipped. Only the
-  second direction can turn a real gap into a clean bill of health, so it is the one refused.
-  With nothing stored — the interrupted-leg case — the window simply starts where this run
-  started, and the earlier months stay outside it, which reads as *not assessed*.
-- The loss list is a **union**, minus any date now back on the time axis
-  (`zarr_store.merge_recorded_losses`). A resume re-derives only the losses of the months it
-  walked, so an unconditional write would erase the rest; dropping a date that has since been
-  filled is what the unconditional write was protecting, and it is kept. The prior entry wins on
-  a repeated date, so a record placed by hand — a repair's account of a hole — is not overwritten.
+- **The recorded start date never moves earlier or later.** Only the end date extends. If a
+  resumed run stamped its own start, it would erase months an earlier run genuinely did examine.
+  If it stretched the start back to January, it would claim months it skipped were examined and
+  clean — and that is the dangerous direction, because it turns a real gap into a false all-clear.
+  So that one is refused. When the store has no record at all, the range simply begins where this
+  run began, leaving earlier months outside it, which correctly reads as *never looked at*.
+- **The list of lost days is added to, not replaced** (`zarr_store.merge_recorded_losses`), with
+  one exception: a day that has since been successfully stored drops off, because it is no longer
+  lost. A resumed run only knows about the months it walked, so overwriting the list with its own
+  findings would erase everything earlier runs recorded. Where the same day appears twice, the
+  existing entry wins — which means a record written by hand during a repair survives later runs
+  rather than being wiped by them.
 
 The attribute belongs on the repo the gate opens — `reflectance.zarr` or `sar_<orbit>.zarr` —
 not on the mosaic directory that contains them.
