@@ -903,6 +903,29 @@ async def ingest_zone_year(
                 await asyncio.wait_for(doomed.wait(), timeout=wait)
             except TimeoutError:
                 pass  # the backoff elapsed with the cell still viable, which is the ordinary path
+            # Re-read the clock rather than trusting the fit guard's arithmetic. That guard is a
+            # PREDICTION — elapsed plus the scheduled wait — and `wait_for` returns when the event
+            # loop gets to it, so a wait chosen as just inside the budget can land just outside
+            # it. Only a reading taken after the await observes what actually happened.
+            elapsed = monotonic() - started
+            if elapsed >= ingest_settings.max_leg_wall_clock_s:
+                log.error(
+                    "Zone %s year %s: %s — the backoff ended %.0f s after this leg's first "
+                    "attempt, at or past the wall-clock budget for starting another "
+                    "(max_leg_wall_clock_s=%d), so attempt %d/%d is refused. No running leg was "
+                    "interrupted and a later dispatch RESUMES from the dates already committed. "
+                    "Detail: %s",
+                    zone,
+                    year,
+                    label,
+                    elapsed,
+                    ingest_settings.max_leg_wall_clock_s,
+                    attempt + 1,
+                    ingest_settings.max_leg_attempts,
+                    detail,
+                )
+                doomed.set()
+                return detail
             if doomed.is_set():
                 # Re-checked after the wait: a sibling can reach its terminal failure while this
                 # leg is backing off, and the point of the gate is to not start the attempt.
