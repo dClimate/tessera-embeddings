@@ -196,7 +196,21 @@ _MAX_QUERY_ITEMS = 10_000
 # what they answer an overload with — 429, 503 — is a load refusal the whole leg then waits
 # out. Measurements, including per-page latency against concurrency, are in
 # context_docs/design/ingest_optimization_campaign_2026_07.md.
-_QUERY_WINDOW_WORKERS = 6
+#
+# LOWERED FROM 6, which was measured to trip a provider block: Earth Search answered the
+# fleet with 403 at that multiplier, having refused nothing at all in the campaign that
+# preceded this setting existing. The paragraph above predicted exactly that, so the number
+# was the error and not the reasoning.
+#
+# NOT 1. A walk is idle for almost all of its wall clock — see the latency split above — so
+# overlap is the only lever on a leg's query time, and serialising it would be a large
+# throughput regression for a problem a small overlap solves. 2 keeps the fleet's stream
+# count in the range that ran clean for a whole campaign.
+#
+# A module constant rather than a setting: nothing in `ingest/` reads `IngestSettings`, and
+# the query is reached from three call sites that would each have to carry one. If an
+# incident needs this tuned rather than released, that is the diff to accept.
+_QUERY_WINDOW_WORKERS = 2
 
 # Times one query may answer a refusal by replacing a window before it gives up.
 #

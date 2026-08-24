@@ -847,6 +847,18 @@ class TestTheCatalogueRootKeepsTheRetryTheLadderStoppedGiving:
         assert isinstance(raised, CatalogueQueryError)
 
 
+def test_the_window_walk_concurrency_stays_low() -> None:
+    """This is a MULTIPLIER on the streams one provider sees, not a per-leg setting.
+
+    The campaign runs tens of cells at once, so the fleet's concurrent search count is this
+    times the cell count. At 6 that was measured tripping a provider block; the campaign
+    before this concurrency existed refused nothing at all. Bounded, not pinned: raising it is
+    a decision about a shared service, and lowering it to 1 would give up the only lever on a
+    leg's query time, since a walk is idle for almost all of its wall clock.
+    """
+    assert 2 <= stac._QUERY_WINDOW_WORKERS <= 3
+
+
 class TestForbiddenIsAThrottleOnlyWhereItCannotBeAVerdict:
     """403 means "slow down" from a public catalogue and "you may not" from an authorizing one.
 
