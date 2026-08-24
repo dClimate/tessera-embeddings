@@ -1082,6 +1082,11 @@ Three explanations were ruled out rather than argued away:
 | `store_write_retrying`, 3 attempts, `wait_exponential(min=2, max=8)` | **~6 s of backoff** |
 | the leg retry, 3 attempts at 30 s then 60 s | **90 s**, and each attempt walks back into the refusal |
 
+**Credentials were ruled out a second way, independently of the log counts.** Radar legs dispatched
+at 10:29 local were still Running at 1 h 18 m elapsed — past the one-hour credential TTL — so the
+ticker was refreshing and reads were working on refreshed credentials. The credential path is
+sound and is not where any of this belongs.
+
 Radar's source read happens *inside* the write's compute, so `store_write_retrying` is the ladder
 that covers it — `source_read_retrying` is optical-only. A refusal therefore walked through all
 three layers and killed the cell, with every date the leg had already committed still in the store
@@ -1091,63 +1096,112 @@ The 2026-08-21 event in Cause 5 sets the target: **about six minutes at full rat
 seven more decaying.** Six seconds against six minutes is not a budget that needs raising, it is
 the wrong instrument.
 
-### The change
+### The change: two timescales, because WHERE you wait decides what it costs
 
-`store_write_retrying` gains an optional `wait_out` predicate. A failure the predicate recognises
-keeps retrying until `WAIT_OUT_BACKOFF_S` (600 s) of accumulated backoff is spent; every other
-failure keeps `STORE_WRITE_ATTEMPTS`. `is_provider_refusal` is restored in `ingest/duplicates.py`
-— deleted in Cause 8 as having no caller, and this is the caller — and radar's per-date write is
-the one site that passes it.
+The obvious fix — one long in-leg wait — is the expensive one. A write waits with its leg's whole
+Dask fleet held idle behind it, and a campaign cell is roughly 356 vCPU: on the order of a quarter
+of a dollar per minute per cell, about fourteen dollars a minute across sixty. **Failing the leg
+releases the fleet**, and the cell's own retry then waits for nothing. So the patience is split:
 
-Three properties are load-bearing:
+| | where | fleet held? | budget |
+|---|---|---|---|
+| **in-leg** | `storage/zarr_store.store_write_retrying`, via a new `wait_out` predicate | **yes** | `WAIT_OUT_BACKOFF_S` = 300 s |
+| **between legs** | `ingest_zone_year._leg_backoff_s`, via a new `leg_refusal_backoff_s` | no | 600 s then 1,200 s |
 
-- **The budget is accumulated BACKOFF, not wall clock.** The bound is then a property of the
-  policy alone, since the work each attempt does belongs to the caller and is unmeasurable from
-  the policy. It also makes the tolerance testable at zero wall clock: a no-op sleep still spends
-  the budget, where a wall-clock budget would spin until the clock caught up.
-- **The stop refuses the sleep that would CROSS the budget**, not the one after it, so 600 s is
-  the real ceiling rather than the ceiling plus one full sleep.
+`is_provider_refusal` is restored in `ingest/duplicates.py` — deleted in Cause 8 as having no
+caller, and this is the caller. Radar's per-date write is the one site that passes it.
+
+Three properties of the in-leg budget are load-bearing:
+
+- **It is accumulated BACKOFF, not wall clock.** The bound is then a property of the policy alone,
+  since the work each attempt does belongs to the caller and is unmeasurable from the policy. It
+  also makes the tolerance testable at zero wall clock: a no-op sleep still spends the budget,
+  where a wall-clock budget would spin until the clock caught up.
+- **The stop refuses the sleep that would CROSS the budget**, not the one after it, so 300 s is the
+  real ceiling rather than the ceiling plus one full sleep.
 - **Jitter is unconditional.** 5,532 tasks were in flight. Thousands of writes fail in the same
   second when a shared source falters, and an undithered ladder re-issues all of them in the same
   second too.
 
-Measured over 400 runs of a permanently-refusing write: **15 attempts, 563–594 s of backoff**,
-never above 600. Recovery is cheap — a refusal that clears on the sixth attempt costs about 52 s
-and the date is written.
+Measured over 500 runs of a permanently-refusing write: **10 attempts, 255–280 s of backoff**,
+never above 300. Recovery is cheap: a refusal that clears on the fifth attempt costs about 20 s.
+
+### The leg-level delay needed a prerequisite, and it is the same one as always
+
+"Coupling to the leg retry" below states the rule this hit: **the classification has to live where
+the read fails, not where the leg is retried**, because the leg sees only a failure DETAIL string
+and the wrapper discards the cause. A refused write raised `WarpOperationError('Chunk and warp
+failed')`, which is what a crash and a codec error also look like from there.
+
+So the verdict is carried rather than re-derived. A radar write that exhausts the in-leg budget on
+a refusal raises `errors.ProviderRefusedReadsError`, which reaches the leg's failure detail as a
+type name, and `_leg_backoff_s` keys the long delay on it. Nothing else about that failure changed:
+it fails the leg exactly as before and skips exactly as much, which is nothing.
+
+The retry backoff is now RACED against the `doomed` gate rather than slept through, for the reason
+the first-dispatch stagger already races its own wait — at ten minutes, a leg that sleeps through a
+sibling's terminal failure holds its cell's slot, and the campaign's ingest slot behind it, to
+learn something already decided.
+
+### Only a refusal that arrives AFTER a successful read
+
+`AccessDenied: ... is not authorized to perform: s3:GetObject` on a valid credential is either the
+provider misbehaving or our permissions being genuinely wrong, and it is the same sentence either
+way. Authentication faults are already separable by code — `ExpiredToken`, `InvalidAccessKeyId`,
+`SignatureDoesNotMatch`, all in `_OWN_CREDENTIAL_MARKERS` and all excluded — but an authorization
+verdict is not.
+
+What separates them is WHEN it arrives. **A permissions fault is total and deterministic, so it
+refuses the leg's FIRST date; a provider wobble arrives after the leg has already been served.** So
+`s1_roi` carries one per-leg flag, set on the first committed date, and withholds the expensive
+wait until it is set. Necessary rather than sufficient, which is all it needs to be: it gates only
+the costly response, and the ordinary attempt limit applies either way.
+
+Deliberately not `written_dates`, which a resume pre-seeds from the store: those dates were read by
+an earlier leg, under a credential and a permission set that need not still apply.
+
+The consequence worth knowing: **a re-dispatched leg whose first date is the refused one withholds
+patience too**, so it fails in seconds rather than minutes. That is the intended direction — it
+shifts the waiting onto the cheap lever — but it does mean each escalation step pays a fleet
+provisioning to learn the source is still refusing.
 
 ### Bounding the PAIR, not each lever
 
-The lever this multiplies with is the leg retry, and the multiplication is bounded by an
-already-existing decision rather than by a new one: **a refusal is not a give-up.** When the
-budget is spent the write fails, `_give_up_date` declines it, and the exception leaves the date
-loop and the leg. So **at most ONE date per leg attempt pays the full budget** — the loop does not
-carry on to spend it again on the next date.
+The multiplication is bounded by a decision that already existed rather than a new one: **a refusal
+is not a give-up.** When the budget is spent the write fails, `_give_up_date` declines it, and the
+exception leaves the date loop and the leg. So **at most ONE date per leg attempt pays the in-leg
+budget** — the loop does not carry on to spend it again on the next date.
 
-| | per date | per leg attempt | per leg |
+| | per date | per leg attempt | per cell (3 attempts) |
 |---|---|---|---|
-| write attempts on a permanent refusal | 15 | 15 | **45** |
-| backoff | ≤ 600 s | ≤ 600 s | **≤ 1,800 s** |
-| leg backoff | — | — | 90 s |
+| write attempts on a permanent refusal | 10 | 10 | **≤ 30** |
+| in-leg backoff, fleet HELD | ≤ 300 s | ≤ 300 s | **≤ 900 s** |
+| between-leg delay, fleet RELEASED | — | — | 1,800 s |
 
-So a cell tolerates **about 31 minutes** of provider refusal before failing, in three
-independently-recovering windows, and spends at most **45 write attempts** doing it. That covers
-the 2026-08-24 event (~6 min) with a wide margin and the longer 2026-08-21 one (~13 min including
-its decaying tail) inside two leg attempts.
+So a cell tolerates **about 45 minutes** of provider refusal before failing, of which **at most 15
+minutes holds a fleet**, and it spends at most **30 write attempts** doing it. In practice both
+figures are lower, because the first-date gate makes the second and third attempts fail in seconds.
+Against that, the pre-change behaviour was 9 write attempts inside about two minutes and then a
+lost cell — so the change roughly doubles the requests aimed at a struggling provider while
+spreading them over twenty times the wall clock, which is the direction that matters.
 
-An INTERMITTENT refusal is the case that does not collapse to one date, and it is the case worth
-paying for: each affected date can spend up to the budget, but every date that spends it and then
-succeeds is a date saved rather than a cell lost. The dangerous shape — a long wait per rung of a
-fallback ladder — is why radar alone passes `wait_out`. The optical path answers a refusal with the
-copy ladder, and a 600 s wait per copy would multiply with it.
+A refusal outlasting 45 minutes fails the cell back to the campaign work list, which is the outer
+loop and re-dispatches it later. Nothing is lost at any point: the time axis never moves.
 
-### Why ten minutes
+An INTERMITTENT refusal is the case that does not collapse to one date per leg, and it is the case
+worth paying for: each affected date can spend up to the in-leg budget, but every date that spends
+it and then succeeds is a date saved rather than a cell lost. The dangerous shape — a long wait per
+rung of a fallback ladder — is why radar alone passes `wait_out`. The optical path answers a refusal
+with the copy ladder, and a 300 s wait per copy would multiply with it.
 
-A campaign cell holds roughly 356 vCPU, so ten idle minutes is a few dollars of Fargate against
-losing the cell and every date it had committed. The number that actually constrains it is the
-other side: at three leg attempts, ten minutes per attempt is half an hour of tolerance per cell,
-which is comfortably longer than the two refusals on record and short enough that a genuinely
-broken source still fails a leg the same day. A materially larger budget would start to trade the
-fleet's throughput for events nobody has observed.
+### Corrected in place
+
+`leg_retry_backoff_s`'s comment said the difference between a momentary source refusal and a
+structural one "does not take minutes to establish". For a catalogue query it does not. **For
+object reads it does** — six minutes on 2026-08-24 and roughly thirteen on 2026-08-21 — and that
+claim is why re-dispatches walked straight back into a refusing source and spent a cell's whole
+attempt budget in two minutes. The comment now says so, and the short backoff it defends is still
+the default for every other class.
 
 ### Dependence on the cause surviving the worker boundary
 

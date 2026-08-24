@@ -131,7 +131,14 @@ STORE_WRITE_ATTEMPTS = 3
 #: touching to change it, and the ladder's cap below is what turns it into an attempt count.
 #: Budgeted as accumulated BACKOFF rather than as wall clock so the bound is a property of the
 #: policy alone — the work each attempt does is the caller's, and unmeasurable from here.
-WAIT_OUT_BACKOFF_S = 600.0
+#:
+#: **Minutes, not tens of minutes, and the ceiling is a COST not a guess.** A write waits with
+#: its leg's whole Dask fleet held idle behind it, so this is the expensive place to be patient.
+#: The cheap place is between leg attempts, where the fleet has been released — so this budget
+#: covers the ordinary wobble and a source that stays down is escalated to the leg, which waits
+#: far longer for almost nothing. Raising this trades fleet-hours for events the cheap wait
+#: already covers.
+WAIT_OUT_BACKOFF_S = 300.0
 
 #: Ceiling on ONE sleep in the ladder. Reached only by a write that is waiting something out:
 #: :data:`STORE_WRITE_ATTEMPTS` attempts sleep twice and never approach it, so the ordinary

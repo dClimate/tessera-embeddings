@@ -1150,6 +1150,43 @@ class TestLegsRetryIndependently:
 
         assert waited == [10, 20, 40, 40], "doubling from the base, capped at four times it"
 
+    def test_a_refused_source_gets_the_long_backoff_and_others_do_not(self, wired, monkeypatch, waited):
+        """The two timescales, in one test because the pair is the point.
+
+        Waiting inside a leg holds its Dask fleet idle; waiting here does not, because the failed
+        leg has released it. So the patience belongs here — but only for the class that asks for
+        it. A crash or an expired credential still gets the short backoff: for those a re-dispatch
+        can succeed at once, and a long delay would be pure latency.
+        """
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        refused = f"{mod.ProviderRefusedReadsError.__name__}: the source provider refused this read"
+
+        def _failing(detail):
+            async def fake_arun(dep, parameters=None, tags=None):
+                if (parameters.get("orbit") or "s2") == "s2":
+                    return _completed_run()
+                return SimpleNamespace(
+                    id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=detail)
+                )
+
+            return fake_arun
+
+        settings = mod.IngestSettings(
+            max_leg_attempts=3, leg_retry_backoff_s=10, leg_refusal_backoff_s=600, leg_stagger_window_s=0
+        )
+
+        monkeypatch.setattr(mod, "arun_deployment", _failing(refused))
+        with pytest.raises(RuntimeError, match="refused this read"):
+            _run(s1_orbit="ascending", ingest_settings=settings)
+        assert waited == [600, 1200], "a refused source waits on the refusal schedule"
+
+        waited.clear()
+        monkeypatch.setattr(mod, "arun_deployment", _failing(_TRANSIENT_DETAIL))
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(s1_orbit="ascending", ingest_settings=settings)
+        assert waited == [10, 20], "every other failure keeps the short schedule"
+
     def test_a_terminal_failure_stops_a_siblings_remaining_attempts(self, wired, monkeypatch):
         """The property the barrier gave for free: once a leg has failed in a way no re-dispatch
         can fix, the cell cannot succeed, so a sibling's remaining retries would hold a Dask fleet

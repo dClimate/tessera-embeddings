@@ -1800,6 +1800,27 @@ later date committed puts the earlier one permanently below the store's append-o
 the re-run meant to recover it is refused instead. If the wait is not enough, the write fails, the
 leg fails with its time axis unmoved, and the leg's own retry re-offers the date in order.
 
+**How much time depends on WHERE the waiting happens**, and the two places cost very different
+things. A write waits with its leg's whole Dask fleet held idle behind it, so the in-leg budget is
+minutes. A leg that has FAILED has released its fleet, so waiting before re-dispatching it costs
+latency and nothing else — that budget is `leg_refusal_backoff_s`, and it is tens of minutes. The
+patience goes where it is cheap, and the in-leg wait covers only the ordinary wobble.
+
+Carrying the verdict from one place to the other takes a type. The leg-retry layer sees a failure
+DETAIL string, and no marker on that string can separate a refused read from a crash — the wrapper
+discarded the cause long before. So a radar write that exhausts its in-leg budget on a refusal
+raises `errors.ProviderRefusedReadsError`, whose name reaches the detail and is what
+`_leg_backoff_s` keys the long delay on. Nothing about the failure changes: it fails the leg
+exactly as it did, and skips exactly as much, which is nothing.
+
+**And only a refusal that arrives AFTER a successful read earns the expensive wait.** An
+authorization verdict on a valid credential is either the provider misbehaving or our permissions
+being genuinely wrong, in the same words. What separates them is not the message but when it
+arrives: a permissions fault is total and deterministic, so it refuses the leg's FIRST date, where
+a provider wobble arrives after the leg has already been served. `s1_roi` keeps one per-leg flag,
+set on the first committed date, and withholds the long wait until it is set — so a leg whose
+access is genuinely wrong fails promptly and releases its fleet instead of idling on it.
+
 It fails closed three ways, and each closed door costs only the ordinary attempt limit. A
 credential fault on THIS side is excluded first, because it is repairable here and no waiting
 fixes it. A refusal nothing attributes to the source reader is excluded too: `AccessDenied`,
@@ -1823,11 +1844,14 @@ months of sound data.
 The radar response is the tail of the optical one without the copy ladder, which radar has no use
 for — OPERA publishes one copy of a granule:
 
-1. **Retry**, through the shared `store_write_retrying` policy — and for a provider refusal,
-   retry for far longer than the attempt limit, because that is the only response a refusal has.
-   Radar is the one caller that asks for this: OPERA publishes one copy of a granule, so there is
-   nothing to step down to, and the optical path's answer is the copy ladder instead. A long wait
-   per rung of that ladder would multiply with it.
+1. **Retry**, through the shared `store_write_retrying` policy — and for a provider refusal that
+   arrived after a successful read, retry past the attempt limit, because waiting is the only
+   response a refusal has. Radar is the one caller that asks for this: OPERA publishes one copy of
+   a granule, so there is nothing to step down to, and the optical path's answer is the copy ladder
+   instead. A long wait per rung of that ladder would multiply with it.
+1. **Fail the leg under a name the cell can act on** if that wait was not enough
+   (`ProviderRefusedReadsError`), so the re-dispatch waits on the long schedule rather than the
+   short one. No date is skipped and the time axis does not move.
 2. **Give up the date** once that retry is exhausted, if and only if the failure is one the
    source is answerable for AND recomputes. There is one scope, `unreadable`, and one remedy: a
    reprocessed copy at the provider. A refusal used to be a second, recoverable scope

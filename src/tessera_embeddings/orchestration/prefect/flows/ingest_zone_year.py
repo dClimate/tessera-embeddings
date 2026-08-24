@@ -68,7 +68,7 @@ from pydantic import BaseModel
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.errors import ConfigMismatchError, InsufficientCoverageError
+from tessera_embeddings.errors import ConfigMismatchError, InsufficientCoverageError, ProviderRefusedReadsError
 from tessera_embeddings.inference.data_loading import (
     S1_ORBIT_NONE,
     _active_orbits,
@@ -680,15 +680,24 @@ async def ingest_zone_year(
     # wall-clock bound gates, and for the same reason: a leg already running is never interrupted.
     doomed = asyncio.Event()
 
-    def _leg_backoff_s(attempt: int) -> float:
+    def _leg_backoff_s(attempt: int, detail: str) -> float:
         """Delay before a leg's next attempt: doubling from the base, capped at four times it.
 
-        Deliberately short. The ingest resumes, so a retry costs only the work actually lost, and
-        the campaign's throughput is bounded by legs landing — a long backoff idles a GPU fleet
-        waiting on a mosaic. What the delay buys is the difference between a momentary source
-        refusal and a structural one, and that does not take minutes to establish.
+        Deliberately short for the ordinary failure. The ingest resumes, so a retry costs only the
+        work actually lost, and the campaign's throughput is bounded by legs landing — a long
+        backoff idles a GPU fleet waiting on a mosaic.
+
+        **Long for one class, and the reason is where the fleet is.** A source provider that has
+        stopped serving reads is not distinguishable from one that has stopped for good inside a
+        short delay — *that* is the claim this used to make and it is wrong for object reads, which
+        is how re-dispatches came to walk straight back into a refusing source and spend a cell's
+        whole attempt budget in two minutes. A failed leg has already released its Dask fleet, so
+        waiting here costs latency and nothing else, where the same patience inside the leg holds
+        hundreds of vCPU idle. So the patience goes here, and only for the class that asks for it.
         """
         base = ingest_settings.leg_retry_backoff_s
+        if ProviderRefusedReadsError.__name__ in detail and ingest_settings.leg_refusal_backoff_s > 0:
+            base = ingest_settings.leg_refusal_backoff_s
         return min(base * (2 ** (attempt - 1)), base * 4)
 
     async def _run_leg(label: str, dep: str, params: dict) -> str | None:
@@ -845,7 +854,7 @@ async def ingest_zone_year(
                 # leg will start nothing further, so no sibling should either.
                 doomed.set()
                 return detail
-            wait = _leg_backoff_s(attempt)
+            wait = _leg_backoff_s(attempt, detail)
             # A re-dispatch RESUMES: already-committed dates are skipped, not rewritten, so the
             # retry costs only the work that was actually lost. That idempotency is what makes
             # retrying the default rather than the exception.
@@ -860,7 +869,14 @@ async def ingest_zone_year(
                 wait,
                 detail,
             )
-            await asyncio.sleep(wait)
+            # RACED against `doomed`, not slept through, for the reason the stagger races its own
+            # wait: a refusal's backoff is minutes rather than seconds, and a leg that sleeps
+            # through a sibling's terminal failure holds its cell's slot — and the campaign's
+            # ingest slot behind it — for all of that time to learn something already decided.
+            try:
+                await asyncio.wait_for(doomed.wait(), timeout=wait)
+            except TimeoutError:
+                pass  # the backoff elapsed with the cell still viable, which is the ordinary path
             if doomed.is_set():
                 # Re-checked after the wait: a sibling can reach its terminal failure while this
                 # leg is backing off, and the point of the gate is to not start the attempt.

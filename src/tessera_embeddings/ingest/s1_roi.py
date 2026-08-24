@@ -49,6 +49,7 @@ import numpy as np
 import xarray as xr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
+from tessera_embeddings.errors import ProviderRefusedReadsError
 from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreadable_source
 from tessera_embeddings.ingest.live_windows import (
@@ -574,6 +575,22 @@ def ingest_s1_roi_sar(
     #: Owned items across every batch — the number that distinguishes "the source does not
     #: cover this ROI for this orbit" from "we found items and committed none of them".
     total_items_seen = 0
+    #: Whether THIS leg has read the source successfully at least once, which is the local
+    #: evidence that our access to it is sound.
+    #:
+    #: An authorization refusal on a valid credential is either the provider misbehaving or our
+    #: permissions being genuinely wrong, and the two are the same `AccessDenied` sentence. What
+    #: separates them is not the message but WHEN it arrives: a permissions fault is total and
+    #: deterministic, so it refuses the FIRST date; a provider wobble arrives after this leg has
+    #: already been served. So a refusal before any successful read buys no patience — it fails
+    #: the leg promptly, releasing the fleet — while one after a successful read is waited out.
+    #: Necessary rather than sufficient, which is all it needs to be: it gates only the
+    #: EXPENSIVE response, and the cheap one is unconditional either way.
+    #:
+    #: Deliberately not `written_dates`, which a resume pre-seeds from the store: those dates
+    #: were read by an earlier leg, possibly with a credential and a permission set that no
+    #: longer apply, so they say nothing about this leg's access.
+    read_at_least_once = False
     # Frozen at the start so the background thread reads an object nothing mutates.
     already_present = frozenset(written_dates)
 
@@ -863,9 +880,16 @@ def ingest_s1_roi_sar(
                 # granule, so there is nothing to step down to, and giving the date up would
                 # hole the store. Radar alone asks for it — the optical path's response is the
                 # copy ladder, and a long wait per rung would multiply with it.
+                #
+                # Withheld until a read has SUCCEEDED, per `read_at_least_once`: before that a
+                # refusal is as likely to be our own permissions as the provider's wobble, and
+                # holding a fleet idle for minutes is the wrong response to a fault no waiting
+                # fixes. Re-evaluated per date rather than captured, so the leg starts spending
+                # patience the moment it has earned the right to.
                 try:
                     with read_failure_context(log, roi=roi_label, date=date_str):
-                        for attempt in store_write_retrying(log, wait_out=is_provider_refusal):
+                        wait_out = is_provider_refusal if read_at_least_once else None
+                        for attempt in store_write_retrying(log, wait_out=wait_out):
                             with attempt:
                                 write_day_windows(
                                     orbit_store,
@@ -886,12 +910,28 @@ def ingest_s1_roi_sar(
                     # over cost every LATER date too. Only a failure the source is answerable for
                     # is absorbed — anything else repeats on every date and is repairable here,
                     # so giving up dates one at a time would be the wrong response to it.
+                    if is_provider_refusal(exc):
+                        # Fails the leg exactly as it did before, and skips exactly as much:
+                        # nothing. What the type adds is a verdict the CELL can read, because
+                        # the layer that re-dispatches is the only one that can wait longer than
+                        # a leg — and it can only wait longer for a class it can recognise.
+                        raise ProviderRefusedReadsError(
+                            f"[{orbit}] roi={roi_label} date={date_str}: the source provider "
+                            f"refused this read for longer than one write may wait for it. No "
+                            f"date is skipped and the time axis is unmoved, so a re-dispatch "
+                            f"resumes from the dates already committed. Waiting is the remedy "
+                            f"for this class: the cell re-dispatches this leg after a delay far "
+                            f"longer than a write may spend, with no fleet held while it waits."
+                        ) from exc
                     if not _give_up_date(date_str, exc):
                         raise
                     continue
                 date_s = time.monotonic() - date_started
                 write_total_s += date_s
                 written_dates.add(date_str)
+                # Set on the WRITE, which is where radar's source read happens — the read and the
+                # commit are one compute here, so a committed date is proof the source served us.
+                read_at_least_once = True
                 written_this_batch += 1
                 # ``mode`` is the load-bearing field: sequential means this date
                 # cost the SUM of its windows' critical paths rather than their

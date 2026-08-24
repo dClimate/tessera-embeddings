@@ -18,6 +18,7 @@ import logging
 
 import pytest
 
+from tessera_embeddings.errors import ProviderRefusedReadsError
 from tessera_embeddings.ingest import s1_roi
 from tessera_embeddings.storage.zarr_store import STORE_WRITE_ATTEMPTS, store_write_retrying
 
@@ -246,6 +247,43 @@ def test_a_refusal_outlasting_the_attempt_limit_is_waited_out(monkeypatch) -> No
     assert attempts["2024-01-02"] == STORE_WRITE_ATTEMPTS + 3
     assert written == _CATALOGUE
     assert recorded[0]["unreadable"] == [], "a refusal that was waited out must cost no date at all"
+
+
+def test_a_refusal_before_any_successful_read_is_not_waited_out(monkeypatch) -> None:
+    """The discriminator, and it is about WHEN rather than what.
+
+    `AccessDenied: not authorized to perform s3:GetObject` on a valid credential is either the
+    provider misbehaving or our permissions being genuinely wrong, and the sentence is identical.
+    What separates them is that a permissions fault is total and deterministic, so it refuses the
+    FIRST date — where a provider wobble arrives after the leg has already been served.
+
+    Nothing is waited out before a read has succeeded, and the identical refusal on a LATER date
+    is waited out — the test above pins that half. The failure here clears after more attempts
+    than the limit allows, so a policy that waited would have written the date: the assertion is
+    that patience was withheld, not that the failure was permanent.
+    """
+    with pytest.raises(RuntimeError):
+        _run(
+            monkeypatch,
+            failures={
+                "2024-01-01": _raise("WarpOperationError: Chunk and warp failed", "RasterioIOError: AccessDenied"),
+            },
+            clears_after={"2024-01-01": STORE_WRITE_ATTEMPTS + 2},
+        )
+
+
+def test_a_refusal_that_will_not_clear_names_itself_for_the_cell(monkeypatch) -> None:
+    """The leg fails, as it always did, but under a name the CELL can act on.
+
+    The layer that re-dispatches is the only one that can wait longer than a leg, and it reads a
+    failure DETAIL rather than an exception — so a verdict that stays inside the leg cannot buy
+    the long re-dispatch delay. Nothing about what is skipped changes: nothing is.
+    """
+    with pytest.raises(ProviderRefusedReadsError, match="refused this read"):
+        _run(
+            monkeypatch,
+            failures={"2024-01-02": _raise("RasterioIOError: AccessDenied on the OPERA bucket")},
+        )
 
 
 @pytest.mark.parametrize(
