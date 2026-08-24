@@ -818,10 +818,18 @@ def _exception_chain_text(exc: BaseException) -> str:
 
 #: Signatures of the PROVIDER refusing a read — an authorization refusal, a throttle, a server
 #: error. All statements about the SERVICE rather than the bytes: the same object read moments
-#: before and reads again once the service recovers. So no fallback copy helps, which is why
-#: :func:`is_unreadable_source` declines every one of them and why this predicate sits beside it
-#: rather than inside it. The two need opposite responses: one gives up on the data, the other
-#: waits.
+#: before and reads again once the service recovers.
+#:
+#: Consumed as an EXCLUSION by :func:`is_unreadable_source`, which is the only reader. There was
+#: once a companion predicate answering "is this a refusal?" positively, so a caller could give up
+#: the date and record it; nothing does that any more, because giving up a date and then
+#: committing a later one puts the earlier date permanently below the store's append-only
+#: maximum. A refusal is transient, so the response is to retry and — if it will not clear — to
+#: fail the leg with the axis unmoved.
+#:
+#: The exclusion needs no :data:`_SOURCE_READER_MARKERS` corroboration, unlike the positive
+#: verdict it replaced: declining is the safe direction, and a failure nothing claims is
+#: re-raised either way.
 _PROVIDER_REFUSAL_MARKERS = (
     "AccessDenied",
     "SlowDown",
@@ -889,32 +897,6 @@ _OWN_CREDENTIAL_MARKERS = (
 #: `is_unreadable_source`, so the same credential fault was skipped as bad data on one path and
 #: raised on the other.
 _NOT_THE_DATAS_FAULT = (*_OWN_CREDENTIAL_MARKERS, "AccessDenied", "SlowDown")
-
-
-def is_provider_refusal(exc: BaseException) -> bool:
-    """Whether ``exc`` says the source PROVIDER refused the read.
-
-    A refusal is transient and clears on its own, so the useful response is to give up the one
-    date, record it, and keep the run — never to substitute a different copy of the imagery,
-    which is what :func:`is_unreadable_source` gates and why that predicate excludes everything
-    matched here.
-
-    Fails closed three ways: our own credential fault is excluded, a refusal nothing attributes
-    to the source reader is excluded (see :data:`_SOURCE_READER_MARKERS`), and anything
-    unrecognised is excluded. In each case the caller re-raises.
-
-    Args:
-        exc: The exception a source read failed with.
-
-    Returns:
-        ``True`` when the chain names a refusal the provider owns.
-    """
-    text = _exception_chain_text(exc)
-    if any(m in text for m in _OWN_CREDENTIAL_MARKERS):
-        return False
-    if not any(m in text for m in _SOURCE_READER_MARKERS):
-        return False
-    return any(m in text for m in _PROVIDER_REFUSAL_MARKERS)
 
 
 def step_down_copies(

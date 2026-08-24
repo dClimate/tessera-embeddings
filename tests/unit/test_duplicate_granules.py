@@ -34,7 +34,6 @@ from tessera_embeddings.ingest.duplicates import (
     acquisition_instant,
     alternates_for,
     copies_label,
-    is_provider_refusal,
     is_unreadable_source,
     item_processing_baseline,
     item_sequence,
@@ -374,40 +373,10 @@ class TestWhenTheProviderRefused:
     An object that will not decode will not decode next time either, so the move is a different
     copy or a give-up. A provider refusing reads says nothing about the imagery — the same object
     read minutes earlier and reads again once the service recovers — so the move is to wait.
-    ``is_unreadable_source`` declines every refusal for that reason; ``is_provider_refusal``
-    claims them.
+    ``is_unreadable_source`` declines every refusal for that reason, which is the whole of the
+    distinction now: a companion predicate used to answer "is this a refusal?" positively so a
+    caller could give up the date, and nothing does that any more.
     """
-
-    @pytest.mark.parametrize(
-        "message",
-        [
-            "RasterioIOError: HTTP response code: 403",
-            "RasterioIOError: HTTP response code: 503",
-            "CPLE_AWSAccessDeniedError: AccessDenied",
-            "RasterioIOError: SlowDown, please reduce your request rate",
-        ],
-    )
-    def test_a_refused_source_read_is_the_providers(self, message: str) -> None:
-        assert is_provider_refusal(Exception(message))
-
-    @pytest.mark.parametrize(
-        "message",
-        [
-            # Our own store answers AccessDenied when icechunk picks up the OPERA-scoped token
-            # instead of the role — `storage/zarr_store.py` documents exactly that — and a
-            # throttle on the destination bucket says SlowDown in the same words the source does.
-            "IcechunkError: AccessDenied",
-            "An error occurred (SlowDown) when calling the PutObject operation",
-            "ClientError: An error occurred (InternalError) when calling the PutObject operation",
-        ],
-    )
-    def test_a_refusal_nothing_attributes_to_the_source_reader_is_not_claimed(self, message: str) -> None:
-        """The read and the write both happen inside ``write_day_windows``, so the text is all
-        there is to separate them. Absorbing a destination fault would give up dates one at a
-        time for a cause that repeats on every one of them, and record the loss against the
-        imagery provider. Re-raising fails the leg on its first date instead.
-        """
-        assert not is_provider_refusal(Exception(message))
 
     @pytest.mark.parametrize(
         "refusal",
@@ -450,7 +419,7 @@ class TestWhenTheProviderRefused:
         """
         wrapper = Exception("WarpOperationError: Chunk and warp failed")
         wrapper.__cause__ = Exception(f"RasterioIOError: {refusal}")
-        assert not (is_unreadable_source(wrapper) and is_provider_refusal(wrapper))
+        assert not is_unreadable_source(wrapper)
 
     @pytest.mark.parametrize(
         "message",
@@ -474,12 +443,9 @@ class TestWhenTheProviderRefused:
         """
         wrapper = Exception("WarpOperationError: Chunk and warp failed")
         wrapper.__cause__ = Exception("AccessDenied: when calling the GetObject operation")
-        assert is_provider_refusal(wrapper)
+        assert not is_unreadable_source(wrapper)
         # And the copy ladder still declines it, so a bad minute never swaps in worse imagery.
         assert not is_unreadable_source(wrapper)
-
-    def test_a_bare_warp_failure_is_not_attributed_to_the_provider(self) -> None:
-        assert not is_provider_refusal(Exception("WarpOperationError: Chunk and warp failed"))
 
     def test_a_numeric_refusal_is_claimed_only_by_the_refusal_predicate(self) -> None:
         """REPLACES a test that asserted the opposite, and the replacement is the point.
@@ -495,33 +461,11 @@ class TestWhenTheProviderRefused:
         """
         exc = Exception("WarpOperationError: Chunk and warp failed")
         exc.__cause__ = Exception("RasterioIOError: HTTP response code: 403")
-        assert is_provider_refusal(exc)
         assert not is_unreadable_source(exc)
-
-    @pytest.mark.parametrize(
-        "message",
-        [
-            "RasterioIOError: ExpiredToken: The provided token has expired",
-            "RasterioIOError: InvalidAccessKeyId: The AWS Access Key Id does not exist",
-            "RasterioIOError: SignatureDoesNotMatch: the request signature does not match",
-        ],
-    )
-    def test_our_own_credential_fault_is_never_the_providers(self, message: str) -> None:
-        """Repairable here, and no amount of waiting fixes it — so absorbing one would spend a
-        bounded budget of given-up dates hiding a fault nobody was told about.
-        """
-        assert not is_provider_refusal(Exception(message))
-
-    def test_a_credential_fault_wins_over_a_refusal_in_the_same_chain(self) -> None:
-        """An expired token often surfaces AS a 403, so the order of the checks decides."""
-        exc = Exception("RasterioIOError: HTTP response code: 403")
-        exc.__cause__ = Exception("ExpiredToken: The provided token has expired")
-        assert not is_provider_refusal(exc)
 
     def test_an_unrecognised_failure_belongs_to_neither(self) -> None:
         """Fails closed: the caller re-raises rather than giving up a date for an unexamined cause."""
         exc = ValueError("time axis is not monotonic")
-        assert not is_provider_refusal(exc)
         assert not is_unreadable_source(exc)
 
 
@@ -2435,31 +2379,15 @@ class TestAMessageMayNotBeItsOwnCorroboration:
     carrying the same words is claimed by the source and its dates are skipped.
     """
 
-    def test_an_http_status_alone_does_not_prove_the_source_reader_failed(self) -> None:
-        """`HTTP response code: 503` used to be both halves of the answer at once.
-
-        It is a refusal marker, and it was also in the reader's own marker list, so any
-        component raising that text was attributed to the source reader.
-        """
-        assert is_provider_refusal(Exception("HTTP response code: 503")) is False
-
-    def test_the_readers_own_vocabulary_still_attributes_a_refusal(self) -> None:
-        """The narrowing must not stop the real case being recognised."""
-        assert is_provider_refusal(Exception("RasterioIOError: HTTP response code: 503")) is True
-        assert is_provider_refusal(Exception("CPLE_AppDefined: HTTP response code: 403")) is True
-
     @pytest.mark.parametrize("credential", ["InvalidAccessKeyId", "SignatureDoesNotMatch"])
-    def test_a_credential_fault_is_not_unreadable_data_on_either_predicate(self, credential: str) -> None:
-        """The two predicates kept separate exclusion lists, and the lists disagreed.
-
-        `is_provider_refusal` refused these and `is_unreadable_source` accepted them, so the
-        same credential fault was skipped as bad data on one path and raised on the other.
-        Skipping is the dangerous direction: it steps down to an older copy to work around a
-        fault a retry fixes.
+    def test_a_credential_fault_is_not_unreadable_data(self, credential: str) -> None:
+        """Two predicates once kept separate exclusion lists and the lists disagreed, so the same
+        credential fault was skipped as bad data on one path and raised on the other. Skipping is
+        the dangerous direction: it steps down to an older copy to work around a fault a retry
+        fixes.
         """
         exc = Exception(f"Chunk and warp failed: {credential}")
         assert is_unreadable_source(exc) is False
-        assert is_provider_refusal(exc) is False
 
     def test_genuinely_corrupt_data_is_still_unreadable(self) -> None:
         assert is_unreadable_source(Exception("Chunk and warp failed: ZIPDecode error")) is True

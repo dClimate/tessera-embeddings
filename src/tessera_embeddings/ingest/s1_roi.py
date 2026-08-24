@@ -49,7 +49,7 @@ import xarray as xr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
 from tessera_embeddings.ingest._pipeline import pipelined
-from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreadable_source
+from tessera_embeddings.ingest.duplicates import is_unreadable_source
 from tessera_embeddings.ingest.live_windows import (
     WINDOW_COST_IN_CHUNKS,
     WINDOW_COST_IN_CHUNKS_OVERLAPPED,
@@ -584,16 +584,24 @@ def ingest_s1_roi_sar(
         caller then re-raises — the fail-closed direction, so an unexamined cause stops the leg
         instead of quietly thinning its year.
 
-        The two accepted causes are recorded under different ``scope`` values because they need
-        different responses: ``provider-refused`` means a later run over this window gets the
-        imagery, ``unreadable`` means the catalogue is what to check.
+        **A PROVIDER REFUSAL IS NOT ACCEPTED HERE, and that is a change.** It used to be, under
+        ``scope="provider-refused"``, on the reasoning that a later run over the window would get
+        the imagery. It would not: giving up a date and then committing a LATER one puts the
+        earlier date permanently below the store's append-only maximum, so the re-run that was
+        supposed to recover it is refused instead. A refusal is also transient by definition, so
+        accepting it converts a bad minute at the source into a hole — the mirror of the defect
+        that cost eleven optical stores, where the same refusal was misread as unreadable data.
+
+        So the only accepted cause is data that will never read, which is DETERMINISTIC: it
+        recomputes to the same verdict on every attempt, which is what makes the absence
+        explainable rather than a matter of when the leg happened to run. Everything else returns
+        ``False`` and the caller re-raises, failing the leg with the time axis unmoved — and the
+        leg's own retry re-offers the date in order.
 
         Raises:
             TooManyGivenUpDatesError: Past :data:`MAX_GIVEN_UP_DATES`.
         """
-        if is_provider_refusal(exc):
-            scope = "provider-refused"
-        elif is_unreadable_source(exc):
+        if is_unreadable_source(exc):
             scope = "unreadable"
         else:
             return False
@@ -608,10 +616,9 @@ def ingest_s1_roi_sar(
         given_up_dates.append(entry)
         # DURABLE NOW. `record_assessed_window` below is the authoritative record but runs once,
         # after the loop — so a leg killed before it reaches that line leaves no trace of what it
-        # gave up, and the next attempt offers the date again. Only `unreadable` is then treated
-        # as settled (`PERMANENT_SKIP_SCOPES`); a `provider-refused` date is recorded but still
-        # re-offered, because that refusal is transient and blocking it would turn a recoverable
-        # outage into permanent loss.
+        # gave up, and the next attempt offers the date again. Every entry reaching here is now
+        # `unreadable`, i.e. deterministic, so the record is a description of the data rather than
+        # of when the leg ran.
         if not record_skipped_date(orbit_store, entry, s3_region=s3_region):
             # Held, not dropped: a skip taken before the first write has no store to land on,
             # and discarding it leaves exactly the unfillable store the record prevents. Flushed

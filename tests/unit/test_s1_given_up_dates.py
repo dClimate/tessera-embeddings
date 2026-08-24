@@ -116,22 +116,47 @@ def _run(monkeypatch, *, failures: dict[str, Exception], catalogue: list[str] = 
     ("message", "cause"),
     [
         pytest.param(
-            "WarpOperationError: Chunk and warp failed", "RasterioIOError: HTTP response code: 403", id="warp"
+            "WarpOperationError: Chunk and warp failed", "ZIPDecode: error at scanline 0", id="undecodable-in-warp"
         ),
-        pytest.param("RasterioIOError: HTTP response code: 403", None, id="403-at-open"),
-        pytest.param("WarpOperationError: Chunk and warp failed", "ZIPDecode: error at scanline 0", id="undecodable"),
+        pytest.param("RasterioIOError: TIFFReadEncodedTile() failed", None, id="undecodable-at-open"),
     ],
 )
 def test_a_failed_date_costs_only_itself(monkeypatch, message: str, cause: str | None) -> None:
     """THE containment rule. Every date after the failed one must still be written.
 
     Without the skip the loop stopped at 2024-01-02 and the two dates after it were never
-    attempted — a whole window lost to one refused read.
+    attempted — a whole window lost to one unreadable object.
+
+    Both causes here are DETERMINISTIC: they recompute to the same verdict on every attempt, so
+    skipping is a description of the data. A transient refusal is not, and is covered below.
     """
     result, written, _recorded, _attempts = _run(monkeypatch, failures={"2024-01-02": _raise(message, cause)})
     assert written == ["2024-01-01", "2024-01-03", "2024-01-04"]
     assert result.status == "success"
     assert result.dates_processed == {"ascending": 3}
+
+
+@pytest.mark.parametrize(
+    ("message", "cause"),
+    [
+        pytest.param(
+            "WarpOperationError: Chunk and warp failed", "RasterioIOError: HTTP response code: 403", id="warp"
+        ),
+        pytest.param("RasterioIOError: HTTP response code: 403", None, id="403-at-open"),
+        pytest.param("RasterioIOError: Connection reset by peer", None, id="transport"),
+    ],
+)
+def test_a_refusal_fails_the_leg_rather_than_being_given_up(monkeypatch, message: str, cause: str | None) -> None:
+    """A TRANSIENT failure must never cost a date. This is the case that used to.
+
+    These were once accepted under ``scope="provider-refused"``, on the reasoning that a later run
+    over the window would recover the imagery. It would not: giving up a date and then committing a
+    LATER one puts the earlier date permanently below the store's append-only maximum, so the
+    recovering run is refused instead. Failing here leaves the axis unmoved, and the leg's own
+    retry re-offers the date in order.
+    """
+    with pytest.raises(RuntimeError):
+        _run(monkeypatch, failures={"2024-01-02": _raise(message, cause)})
 
 
 def test_the_loss_is_recorded_on_the_store_and_scoped_by_cause(monkeypatch) -> None:
@@ -144,31 +169,29 @@ def test_the_loss_is_recorded_on_the_store_and_scoped_by_cause(monkeypatch) -> N
     _r, _w, recorded, _a = _run(
         monkeypatch,
         failures={
-            "2024-01-02": _raise("RasterioIOError: HTTP response code: 403"),
             "2024-01-03": _raise("WarpOperationError: Chunk and warp failed", "ZIPDecode: error at scanline 0"),
         },
     )
     given_up = recorded[0]["unreadable"]
-    assert [(g["date"], g["scope"]) for g in given_up] == [
-        ("2024-01-02", "provider-refused"),
-        ("2024-01-03", "unreadable"),
-    ]
-    assert "403" in given_up[0]["error"]
+    assert [(g["date"], g["scope"]) for g in given_up] == [("2024-01-03", "unreadable")]
+    assert "Chunk and warp failed" in given_up[0]["error"]
 
 
-def test_a_refusal_inside_a_warp_failure_is_scoped_as_a_refusal(monkeypatch) -> None:
-    """A numeric refusal wrapped in a warp failure is scoped as a refusal, not as bad data.
+def test_a_refusal_wrapped_in_a_warp_failure_is_still_a_refusal(monkeypatch) -> None:
+    """The wrapper must not decide the verdict, and it used to.
 
-    This asked about the refusal FIRST because the two predicates used to overlap and order was
-    the only thing separating them. It no longer is: ``is_unreadable_source`` now declines every
-    refusal, so the scope is correct however the caller asks. The order here is kept because it
-    still reads as the intent, not because the answer depends on it.
+    A refusal reaches the reader through whichever block-read wrapper GDAL raises, so the chain
+    carries a refusal signature AND an unreadable one. The two predicates overlapped, and order
+    was the only thing separating them — this path asked about the refusal first, the optical path
+    never asked at all, so the identical failure was transient for one sensor and permanent data
+    loss for the other. ``is_unreadable_source`` now declines every refusal, so the verdict no
+    longer depends on the caller asking twice.
     """
-    _r, _w, recorded, _a = _run(
-        monkeypatch,
-        failures={"2024-01-02": _raise("WarpOperationError: Chunk and warp failed", "HTTP response code: 403")},
-    )
-    assert recorded[0]["unreadable"][0]["scope"] == "provider-refused"
+    with pytest.raises(RuntimeError):
+        _run(
+            monkeypatch,
+            failures={"2024-01-02": _raise("WarpOperationError: Chunk and warp failed", "HTTP response code: 403")},
+        )
 
 
 def test_the_retry_is_exhausted_before_a_date_is_given_up(monkeypatch) -> None:
@@ -179,9 +202,7 @@ def test_the_retry_is_exhausted_before_a_date_is_given_up(monkeypatch) -> None:
     2024-01-02 also ends the first batch and is offered again by the second batch's padded
     query, so this pins the boundary case too: attempted once, listed once.
     """
-    _r, _w, recorded, attempts = _run(
-        monkeypatch, failures={"2024-01-02": _raise("RasterioIOError: HTTP response code: 503")}
-    )
+    _r, _w, recorded, attempts = _run(monkeypatch, failures={"2024-01-02": _raise("RasterioIOError: ZIPDecode: error")})
     assert attempts["2024-01-02"] == STORE_WRITE_ATTEMPTS
     assert [g["date"] for g in recorded[0]["unreadable"]] == ["2024-01-02"]
 
@@ -213,10 +234,10 @@ def test_past_the_ceiling_the_leg_stops_and_asks_to_be_re_dispatched(monkeypatch
 
     monkeypatch.setattr(s1_roi, "MAX_GIVEN_UP_DATES", 1)
     with pytest.raises(s1_roi.TooManyGivenUpDatesError, match=r"2 date\(s\).*ceiling of 1") as caught:
-        _run(monkeypatch, failures={d: _raise("RasterioIOError: HTTP response code: 403") for d in _CATALOGUE})
+        _run(monkeypatch, failures={d: _raise("RasterioIOError: ZIPDecode: error") for d in _CATALOGUE})
     message = str(caught.value)
     assert "RE-DISPATCH" in message
-    assert "2024-01-01(provider-refused)" in message
+    assert "2024-01-01(unreadable)" in message
     assert "roi=zone_35N" in message
 
 
@@ -233,7 +254,7 @@ def test_a_leg_that_gave_up_everything_fails_instead_of_reporting_skipped(monkey
     that committed nothing at all, so that no store exists to record the loss on, fails here.
     """
     with caplog.at_level(logging.WARNING), pytest.raises(s1_roi.TooManyGivenUpDatesError) as caught:
-        _run(monkeypatch, failures={d: _raise("RasterioIOError: HTTP response code: 403") for d in _CATALOGUE})
+        _run(monkeypatch, failures={d: _raise("RasterioIOError: ZIPDecode: error") for d in _CATALOGUE})
 
     assert "gave up every one" in str(caught.value)
     assert "date(s) and committed none" in str(caught.value)
@@ -246,7 +267,7 @@ def test_a_leg_that_gave_up_everything_fails_instead_of_reporting_skipped(monkey
 def test_a_leg_that_gave_up_some_dates_and_committed_others_still_succeeds(monkeypatch) -> None:
     """The complement, so the fix above cannot quietly widen into failing the bounded skip."""
     result, written, recorded, _attempts = _run(
-        monkeypatch, failures={_CATALOGUE[0]: _raise("RasterioIOError: HTTP response code: 403")}
+        monkeypatch, failures={_CATALOGUE[0]: _raise("RasterioIOError: ZIPDecode: error")}
     )
 
     assert result.status == "success"
@@ -263,7 +284,7 @@ def test_the_record_of_a_given_up_date_is_marked_load_bearing(monkeypatch) -> No
     has to say the write is required, and only when there is something to lose.
     """
     _result, _written, recorded, _attempts = _run(
-        monkeypatch, failures={_CATALOGUE[0]: _raise("RasterioIOError: HTTP response code: 403")}
+        monkeypatch, failures={_CATALOGUE[0]: _raise("RasterioIOError: ZIPDecode: error")}
     )
 
     assert recorded, "the window must be recorded"
