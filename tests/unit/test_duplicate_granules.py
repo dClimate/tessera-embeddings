@@ -273,21 +273,29 @@ class TestWhenToStepDown:
             "B02.tif, band 1: IReadBlock failed at X offset 6, Y offset 9",
         ],
     )
-    def test_a_bare_wrapper_is_not_a_decode_failure(self, message: str) -> None:
-        """USED TO STEP DOWN, and that was the bug behind a whole class of findings.
+    def test_a_bare_wrapper_still_steps_down(self, message: str) -> None:
+        """The wrapper is all that survives the Dask hop, so declining it strands the cell.
 
-        These are what GDAL raises when a block read fails FOR ANY REASON — a codec, yes, but
-        equally a DNS failure, a refused connection, a TLS error, a throttle nobody enumerated.
-        Claiming them made "give up this date" the DEFAULT verdict for every cause the transient
-        lists did not recognise, so each gap in those lists became silent data loss. This class's
-        own docstring already promised the opposite: "narrow and fails closed: anything
-        unrecognised is re-raised by the caller rather than treated as bad data."
-
-        The wrapped case is unaffected — a chain whose cause names a codec still steps down,
-        because the whole chain is matched. Only the bare wrapper changes, and it now re-raises so
-        the leg retries in order.
+        These wrappers are ambiguous, and were briefly declined for that reason. But tblib cannot
+        rebuild rasterio's GDAL classes, so the orchestrating worker receives the outer exception's
+        repr with no cause attached: in prod the codec name appeared only in the reading worker's
+        log. Declining the wrapper therefore did not make bad bytes fail loudly, it stopped
+        :func:`step_down_copies` ever being reached, and one bad copy failed the whole zone-year
+        while a good duplicate sat unused.
         """
-        assert not is_unreadable_source(RuntimeError(message))
+        assert is_unreadable_source(RuntimeError(message))
+
+    def test_the_shape_dask_actually_delivers_steps_down(self) -> None:
+        """The regression, in the exact form it arrives — not a hand-made wrapper.
+
+        The previous test for this used ``RuntimeError(message)``. Production delivers a plain
+        ``Exception`` whose message is the *repr* of the wrapper and whose ``__cause__`` is None,
+        because the chain did not survive serialisation. That shape was never exercised, which is
+        why a change that looked safe against the fake broke the real thing.
+        """
+        flattened = Exception("RasterioIOError('Read failed. See previous exception for details.')")
+        assert flattened.__cause__ is None
+        assert is_unreadable_source(flattened)
 
     @pytest.mark.parametrize(
         "transport",

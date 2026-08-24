@@ -723,35 +723,31 @@ def alternates_for(
 
 #: Signatures of a source object that cannot be READ, as distinct from a transient failure.
 #:
-#: Matched on the whole exception chain's text because the informative part is the cause:
-#: rasterio's ``WarpOperationError('Chunk and warp failed')`` is a wrapper that discards the
-#: reason, and the reason — a codec that cannot inflate a tile — is what says the object is
-#: broken rather than briefly unavailable.
+#: Matched as TEXT on the whole chain, because the read runs on a Dask worker and the failure
+#: reaches the orchestrating worker through tblib, which cannot reconstruct rasterio's GDAL-backed
+#: classes. What arrives is a plain ``Exception`` carrying the outer exception's **repr**.
 #:
-#: Matched as TEXT, and that is forced rather than chosen: the read runs on a Dask worker and
-#: the failure is re-raised on the driver through tblib, which cannot reconstruct rasterio's
-#: GDAL-backed exception classes. What arrives is a plain ``Exception`` carrying the original's
-#: repr, so an ``isinstance`` check matches nothing and the message is the only evidence left.
-#: Only signatures that name a CODEC OR FORMAT OPERATION failing. Deliberately minimal, and the
-#: minimality is the point: this predicate's `True` means "give up this date", and it is reached as
-#: the DEFAULT for anything the transient lists above do not recognise. Every gap in those lists
-#: therefore used to become a silent data-loss verdict — that is how a 429, and separately a DNS
-#: failure, a refused connection and a TLS error, each came to be recorded as permanently bad
-#: imagery.
+#: That repr does not include the cause, and the generic wrappers were once removed from this list
+#: on the assumption that it did. It does not: measured in prod on 2026-08-24, `ZIPDecode:Decoding
+#: error at scanline 0` appeared only in `dask/dask-worker` logs while the orchestrator saw exactly
+#: `Exception: RasterioIOError('Read failed. See previous exception for details.')`. So the wrapper
+#: is the ONLY evidence that survives the hop, and declining it did not make an unreadable object
+#: fail loudly — it disabled the alternate-copy step-down that :func:`step_down_copies` exists for,
+#: stranding the whole zone-year on one bad copy that a good duplicate could have replaced.
 #:
-#: So the generic wrappers are gone: `Chunk and warp failed`, `Read failed. See previous exception`
-#: and `IReadBlock failed` are what GDAL raises when a block read fails FOR ANY REASON, including
-#: every transport failure nobody has enumerated. They say a read failed, never that the bytes are
-#: bad, and matching them made the dangerous verdict the fallback for the unknown.
-#:
-#: A refusal wrapped in one of them is still caught, because the CAUSE carries the codec name and
-#: the whole chain is matched. What changes is the unrecognised case: it now re-raises and the leg
-#: retries in order, rather than costing a date. A genuinely truncated object that names no codec
-#: therefore fails the leg loudly instead of quietly holing the store, which is the direction to
-#: fail in.
+#: The safety that made removing them attractive is still here, and it sits EARLIER: every refusal
+#: marker and every HTTP status range is tested before this list, so a cause that IS visible still
+#: decides the verdict. What remains is the genuinely blind case, and two things bound it — the
+#: read has already failed :data:`SOURCE_READ_ATTEMPTS` times across about 61 s, so a transient is
+#: mostly gone by here, and this `True` first tries another copy rather than giving up a date.
 _UNREADABLE_MARKERS = (
     "ZIPDecode",
     "TIFFReadEncodedTile",
+    # Generic block-read wrappers. Ambiguous by nature, but see above: after the hop they are all
+    # that is left, and treating them as transient costs the whole cell instead of one date.
+    "Chunk and warp failed",
+    "Read failed. See previous exception",
+    "IReadBlock failed",
 )
 
 #: Signatures of a source object that is NOT THERE — which none of the markers above can see,
@@ -877,6 +873,12 @@ _PROVIDER_REFUSAL_MARKERS = (
     "timed out",
     "Connection aborted",
     "RequestTimeout",
+    # The statusless rest of that class. These matter more now the block-read wrappers are claimed
+    # again: a named transport failure has to be declined HERE, before the wrapper can speak for it.
+    "Could not resolve host",
+    "Connection refused",
+    "Empty reply from server",
+    "handshake failed",
 )
 
 #: GDAL's HTTP driver reports a bare status, so the numeric forms are classified by RANGE rather
