@@ -1,9 +1,12 @@
-# Ingest source-read failures: five causes, and the retry budget they share
+# Ingest source-read failures: eight causes, and the retry budget they share
 
 Investigation record. Causes 1 and 2 traced 2026-08-04/05 on `global-tessera-dev`; cause 3 absorbed
-2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20
-and cause 5 on 2026-08-21, both from live campaign legs. **Corrected in place: this document said
-"three causes" until cause 4 was added, and "four causes" until cause 5 joined it.** Traces
+2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20,
+cause 5 on 2026-08-21, and causes 6 and 7 on 2026-08-22/23, all from live campaign legs. **Corrected
+in place: this document said "three causes" until cause 4 was added, "four causes" until cause 5
+joined it, "five causes" until cause 6 did, and "six causes" until cause 7 did.** Cause 7 is the
+only one here that is not a source failure — it is our own bookkeeping, and the only one that left
+holes nothing can fill. Traces
 `WarpOperationError('Chunk and warp failed')` and `PermissionError: The provided token has
 expired` to their exact causes, so the guards can be aimed at the right terms.
 
@@ -433,8 +436,14 @@ failure mode that survives a green CI run.
 `400` and other client errors classify as `UNKNOWN` and keep today's expansive retry. They are
 deterministic in the request by definition, so this is arguably wrong — but no observed failure
 has that shape, and a general-purpose HTTP classifier was explicitly out of scope. A unit test
-asserts the two named sets jointly cover `_STAC_RETRY.status_forcelist`, which is the set that
-can actually reach us as an exhaustion.
+asserts the named sets jointly cover the ladder's force-list, which is the set that can actually
+reach us as an exhaustion.
+
+**Corrected in place, 2026-08-23.** That test read a module-level `_STAC_RETRY` constant, and
+`403` has since become a fourth case: named for one provider and deliberately unnamed for the
+rest (cause 6). There is no longer one ladder to read, so the invariant is checked per provider
+against `stac._retry_for(provider)` — a status a catalogue is waited out for and the taxonomy
+cannot name is the same silent failure whether the retry is global or scoped.
 
 ### Fingerprint consequence — a real cost, paid once
 
@@ -720,7 +729,29 @@ Two properties carry the design:
   written rather than lost. That is also why ten is small: a radar zone-year holds a couple of
   hundred dates per orbit.
 
-### An asymmetry in `is_unreadable_source`, found while testing and NOT fixed here
+### An asymmetry in `is_unreadable_source` — deferred here, and it cost eleven stores
+
+> **FIXED in Cause 8, 2026-08-24.** Read the deferral below as written, because the diagnosis was
+> complete and correct and the decision not to act on it is the most instructive thing in this
+> document. Three days later the same asymmetry — a numeric refusal claimed by
+> `is_unreadable_source` on a path that never asks about refusals — made **eleven optical stores
+> unfillable** and stopped the campaign. All 120 radar stores were sound, exactly as the paragraph
+> below predicts, because radar resolves it by order.
+>
+> The deferral reasoning was not unreasonable: widening a classification during a live campaign is a
+> real risk, and the direction genuinely was not obviously safe. What was missing is the other half
+> of the trade. The cost of ACTING was estimated ("changes optical behaviour during a live
+> campaign"); the cost of NOT acting was never estimated, and it was a stopped campaign, eleven
+> deleted stores and a day of remediation.
+>
+> **The habit to take from it:** when a known defect is deferred, write down what it costs to leave
+> it, not only what it costs to fix it. And note this was the THIRD written record of the same
+> asymmetry — the marker tuple's own comment and
+> `test_a_numeric_refusal_is_claimed_by_both_predicates`'s docstring were the other two. A defect
+> documented three times and fixed zero times is not a known risk being managed; it is a decision
+> nobody re-opened.
+
+
 
 It excludes refusals by NAME (`AccessDenied`, `SlowDown`), so a refusal reported as a bare status
 code carries none of those words and the wrapper's decode marker decides — a
@@ -758,6 +789,261 @@ options — the HTTP retry ladder among them — survive the refresh. `reset()` 
 other two call sites, neither of which is nested inside `rio_env()`. A task that has been through a
 refresh therefore keeps its ten GDAL retries, which is the containment this cause's bounded skip
 sits on top of.
+
+## Cause 6 — the catalogue refuses the RATE (optical), 2026-08-22/23
+
+The catalogue analogue of cause 5. Same status, opposite end of the pipeline: cause 5 is a
+provider refusing OBJECT READS on the radar path, this is a catalogue refusing SEARCH REQUESTS on
+the optical one.
+
+| | source | preceded by | retryable? |
+|---|---|---|---|
+| **Catalogue refusing the rate** | Earth Search (Element 84), `sentinel-2-l2a` | `HTTP 403 {"message":"Forbidden"}` on `POST /v1/search` | **yes** — by waiting, not by asking differently |
+
+### The failure
+
+16 flow runs failed in a 2.5-minute burst about fifteen minutes after the campaign started from a
+freshly wiped store, every one a Sentinel-2 catalogue query refused with 403. Sentinel-1 was
+entirely spared: 13,764 CMR query lines, zero refusals — so this is one catalogue's constraint,
+not a network fault. Nine leg failures in total, every one re-dispatched, no cell lost. Survivable
+but degrading.
+
+**The request is not the problem; the aggregate instantaneous rate is.** One of the exact failing
+requests — same bbox, same date window, same page size of 100 — replayed from a single sequential
+client walked **95 pages, every one HTTP 200, in 68 seconds** at 2.1 MB per page. Page depth is
+not the mechanism either: the fleet's 403s span pages 1 through 94.
+
+### Corrected in place: it is not a cold-start phenomenon
+
+This was first read as a single burst caused by phase alignment — 60 cells started at one instant,
+each spending about as long provisioning, all arriving at the catalogue together, where previous
+campaigns at the same 60-cell width had been resumed runs whose cells sat at random phases. **That
+was measured on the wrong needle.** Counting the `CATALOGUE REFUSED` log line found one episode;
+counting `CATALOGUE_REFUSAL=` — the `REFUSAL_TOKEN` the code says to match by name — finds three:
+
+| bin (UTC) | events | pages |
+|---|---|---|
+| 23:20 | 96 | 40–93 |
+| 23:35 | 6 | 43 |
+| 23:40 | 6 | 43 |
+
+And zone 47N failed **24 minutes into a healthy leg**: it had committed 2017-01-25 through
+2017-01-31 normally, then died querying the next window (`2017-01-31/2017-03-01`, page 43). Phase
+alignment explains the opening peak and nothing after it.
+
+**The two needles disagree in both directions, and that is a measurement hazard, not a code
+defect.** The ERROR line yielded 446 events where the token yielded 96, and zero for the 23:35 and
+23:40 episodes the token found. They read different populations: the line is emitted once per
+refusal reaching `raise_catalogue_query_error` and lands in the application log, while the token
+travels inside the exception MESSAGE and is re-logged by the leg loop at up to five sites per
+attempt (`_run_leg`'s re-dispatch, load-refusal, doomed, wall-clock and terminal branches all
+interpolate the failure detail). Neither count is the number of refusals. **Use the token for
+existence and the line for per-request forensics, and do not compare their totals.** Not fixed
+here — it needs the log lines restructured, which is not a mid-incident change.
+
+### Why no lever engaged
+
+`403` was in none of the three status sets in `ingest/catalogue_refusal.py`, so `_kind_for(403)`
+returned `UNKNOWN`, `is_oversized_response` was False, and neither recovery lever ran. It was also
+absent from the urllib3 force-list, so it arrived on the FIRST refusal with no backoff at all and
+raised straight out of the leg. That is the literal content of "without being retried" in the
+failure text: a leg representing hours of work and a live Dask fleet, ended by a refusal that
+clears on its own in seconds.
+
+### The change, and why it is provider-scoped
+
+`THROTTLE_STATUSES = frozenset({403})`, deliberately NOT added to `LOAD_REFUSAL_STATUSES`.
+`STACProvider` gains `throttles_with_forbidden`, set only on `earth-search`; `stac._retry_statuses`
+builds each provider's force-list from its flags, and `stac._throttle_statuses` feeds the same flag
+into the classification so the ladder and the taxonomy cannot fall out of step.
+
+The scoping is the whole point. Earth Search is public and unauthenticated — we send it no
+credential — so a 403 from it cannot be a statement about who is asking. Everywhere else it is
+exactly that, and an authorization verdict on a backoff ladder is pure cost: **364 s of measured
+backoff** per refused request (`total=8`, `backoff_factor=2`, urllib3's `DEFAULT_BACKOFF_MAX` of
+120 capping the tail at 2, 4, 8, 16, 32, 64, 120, 120), spent to learn something already known.
+This mirrors `refuses_oversized_pages`, which scopes the 502 exclusion the same way.
+
+**Bounding the pair rather than each lever.** The two existing recovery levers — window re-cut and
+page-size halving — both gate on `is_oversized_response`, which is `status in {502}`. A 403
+therefore cannot reach either, so it cannot hand a ladder to a recursion of child windows the way
+a force-listed 500 would. Its worst case is the ladder's own 364 s per page request, and
+`max_leg_wall_clock_s` (6 h) bounds the leg above that. A unit test pins the non-interaction, since
+adding 403 to `OVERSIZED_RESPONSE_STATUSES` later would be a silent multiplication.
+
+### Corrected in place, again: the mechanism is the WINDOW-WALK CONCURRENCY
+
+The section above blamed phase alignment, and phase alignment is real but it is not what
+made this campaign different. `stac._QUERY_WINDOW_WORKERS` walks each leg's catalogue date
+windows **six at a time**. At 60 cells that is roughly **360 concurrent search streams**
+against one provider for the same total request volume, and **221 were measured in flight**
+at the moment Earth Search began refusing. The campaign of 19 August, which ran at the same
+fleet width before this concurrency existed, refused nothing of any kind.
+
+The setting's own comment predicted exactly this — it calls itself "a MULTIPLIER on the
+concurrent search streams Element 84 sees, and what they answer an overload with ... is a load
+refusal the whole leg then waits out". The number was the error, not the reasoning.
+
+**Lowered to 2.** Not to 1: a walk is idle for almost all of its wall clock (the latency split
+is in the setting's comment), so overlap is the only lever on a leg's query time and
+serialising it would be a large throughput regression for a problem a small overlap solves.
+It stays a module constant rather than a setting because nothing in `ingest/` reads
+`IngestSettings` and the query is reached from three call sites that would each have to carry
+one; tuning it in an incident means a release, and that is the trade accepted.
+
+### The stagger, and what it does not fix
+
+`leg_stagger_window_s` (default 600 s) delays each leg's first dispatch by an offset derived from
+`sha256(zone/year/label)` — deterministic so a test can assert it, and not `random` or `hash`,
+neither of which is reproducible inside a worker. At the campaign's width that puts legs roughly
+5–10 s apart, which is the separation the fleet needed.
+
+**It addresses the opening peak only.** It cannot help a leg that starts a new window mid-run,
+which is what zone 47N did, and it should not be described as the fix for this cause — the ladder
+is. It is also paid as latency on every leg's first dispatch, not only on a cold start.
+
+## Cause 7 — a skipped date whose record died with the process, 2026-08-23
+
+Not a source failure at all, and the only cause here that produced **unfillable holes in
+committed stores**. Independent of the 403s; found while investigating them.
+
+| | source | preceded by | retryable? |
+|---|---|---|---|
+| **A lost date offered twice** | our own bookkeeping | `DATA LOSS roi=... date=...: every catalogue copy failed to read` | **no** — the store can no longer be completed |
+
+### The mechanism
+
+When every catalogue copy of a date fails to read, `s2_roi._record_unreadable` skips the date
+deliberately — losing one date beats losing every later date — and later dates commit normally.
+The loss went into an in-memory list that reached durability only at the single
+`record_assessed_window` call **after the whole drive loop**, at the very end of the leg.
+
+If the leg died before that line, for any reason, **the record was gone.** The next attempt
+rebuilds its outstanding work from what was WRITTEN, finds the date absent, and offers it
+again. If a copy reads that time, the append is refused by the monotonic guard — later dates
+are already on the axis, and the axis is sampled positionally so it cannot be inserted into.
+The cell can then never progress and the date can never be filled in place.
+
+`_record_skip`'s own docstring anticipated it: *"a hole nobody recorded is a hole no later run
+revisits."* The record it protects simply did not survive a mid-leg death. The coverage path
+was weaker still — it incremented an in-memory counter and left no trace anywhere.
+
+### Evidence
+
+Four `DATA LOSS` events. **Five stores hold an unfillable hole**: 34N/2017 and 32N/2017
+(2017-01-18), 35N/2017 (2017-02-01), 43N/2017 (2017-02-11), 33N/2018 (2018-01-24). Only two of
+the five had actually raised the error — the campaign was stopped before the rest were retried
+— so the error count understates the damage, and that silence is what makes it dangerous.
+
+### The change — and the durable record was BUILT, then REMOVED
+
+**The append refusal stays FATAL.** Softening it was considered and rejected: a leg that reported
+the refusal and carried on would complete the cell with a hole, and the parent reads a completed
+cell as success, so a silently degraded store would ship. A log line is not a guard, because
+nothing downstream reads one. There is also a cost argument — a date that cannot be appended in
+place means the store must be wiped and re-ingested anyway, so continuing spends compute on a
+store already destined for deletion. It now names the store as well as the date, because the
+remedy is per store.
+
+**A crash-durable skip record was built for this, and then deleted.** It wrote the loss onto the
+store at the moment of the skip so a resume would not re-offer the date. Two independent reviewers
+found five root causes in it across three review rounds, and three were new defects it had
+introduced — including two fresh ways to wedge a store permanently: an attribute-only root created
+in a rootless repository, and coverage rejections carried into the unreadable-dates attribute,
+which the inference layer reads as imagery loss.
+
+**It kept failing because it was compensating for Cause 8.** Its purpose was to remember a skip
+decision *because that decision might not recompute* — and that was only possible because transient
+failures were being classified as skips. Once a refusal can no longer be read as unreadable data,
+every remaining skip cause is deterministic: unreadable bytes, a coverage rejection, no live
+window, a corroborated absent object. A resume that re-offers such a date simply skips it again.
+**There is nothing to remember.**
+
+The original design said so before any of this was added: *"re-offering it costs one re-evaluation
+and cannot wedge anything."* That was right, and became wrong only because transients were leaking
+into the skip path. So the record is gone, and `record_assessed_window` at end-of-leg is unchanged —
+it serves the other purpose, telling the coverage gate a window was examined, and a leg that dies
+leaving no assessment correctly reads as never having got there.
+
+## Cause 8 — a provider's refusal read as unreadable DATA, 2026-08-24
+
+**The root cause of the eleven unfillable stores.** Cause 7 above describes how a hole forms once a
+date is skipped; this is why the date was skipped at all, and it is the defect that was actually
+fixed.
+
+### The mechanism
+
+Two predicates in `ingest/duplicates.py` decided a read failure and they OVERLAPPED.
+`is_provider_refusal` recognised statements about the SERVICE — `AccessDenied`, `SlowDown`,
+`ServiceUnavailable`, `InternalError`, HTTP 403/500/502/503/504. `is_unreadable_source` recognised
+statements about the BYTES. A refusal reaches the reader through a block-read wrapper, so its chain
+carries **both kinds of signature**, and `is_unreadable_source` excluded only credentials plus
+`AccessDenied` and `SlowDown` — not the numeric statuses.
+
+So the verdict came down to which predicate a caller asked first. `s1_roi.py` asks about refusals
+first. **`s2_roi.py` never called `is_provider_refusal` at all** — it does not import it; all three
+of its sites are `if not is_unreadable_source(exc): raise`. The optical path therefore had no
+concept of "the provider refused, wait", only "the data is broken, give up this date".
+
+That is precisely the damage pattern: **all eleven unfillable stores are `reflectance.zarr`, and all
+120 radar stores were sound.**
+
+### Scale, and the patience
+
+The campaign window logged **5,687 occurrences of `503`, 785 `Connection reset`, 80 `Broken pipe`** —
+the provider was throttling object reads as well as searches. Against that, `SOURCE_READ_ATTEMPTS`
+was 3 with backoff of 2 s then 4 s: **about six seconds of patience** before a failure at that layer
+decided a date was permanently lost.
+
+### It was known, and pinned as the contract
+
+`test_a_numeric_refusal_is_claimed_by_both_predicates` asserted the overlap, with the docstring:
+*"Not fixed here: widening that exclusion changes the optical copy ladder mid-campaign. The radar
+caller resolves it by ORDER, asking about the refusal first."* The defect was identified, not fixed
+because fixing it would change the optical path mid-campaign, and locked in by a passing test.
+
+### The change, and the shape that mattered more than the fix
+
+The immediate fix was to make the predicates disjoint by construction rather than by call order.
+What followed was three more findings of the SAME shape, and they are the reason this cause is worth
+reading rather than skimming:
+
+1. **429 was missing** from the refusal markers — the most explicit "slow down" a provider can send.
+2. **Every non-enumerated status** was unmatched: 400, 401, 507, 509. A malformed request or a
+   rejected credential was recorded as corrupt imagery.
+3. **Statusless transport failures** — DNS failure, refused connection, empty reply, TLS error —
+   carried no status and were in no list.
+
+Patching each would have been four patches of one shape. **The defect was the POLARITY.**
+`is_unreadable_source` returning True means "give up this date", and it was the FALLBACK for
+anything the transient lists did not recognise — so every gap in those lists became a silent
+data-loss verdict, by construction.
+
+So the resolution was two deletions and a re-shape:
+
+- **Statuses by RANGE, not enumeration.** Any 5xx is transient; 408 and 429 are the transient 4xx;
+  404 and 410 are absence; every other 4xx is neither and re-raises. 403 stays named — the one
+  judgement about a provider rather than about HTTP.
+- **The generic wrappers came out of the unreadable set.** `Chunk and warp failed`,
+  `Read failed. See previous exception` and `IReadBlock failed` are what GDAL raises when a block
+  read fails FOR ANY REASON. What remains names a codec: `ZIPDecode`, `TIFFReadEncodedTile`. An
+  unrecognised failure now re-raises and the leg retries in order.
+- `SOURCE_READ_ATTEMPTS` 3 to 8 — about 61 s of backoff, so a bad minute is outlasted.
+- **Radar aligned to optical.** It accepted a refusal as grounds to give up a date under
+  `scope="provider-refused"`. Same hole, reached by accepting the refusal instead of misclassifying
+  it. `is_provider_refusal` is deleted; it had no caller left.
+
+The invariant this restores, and the one to hold the design to: **any missing data is
+deterministically missing.** A skip is legitimate only when it recomputes to the same verdict on
+every attempt. That is what makes an absence explainable rather than a function of when the leg
+happened to run — and it is why Cause 7's durable record turned out to be unnecessary.
+
+### Verified
+
+Reproduced deliberately on `global-tessera-dev`, cell 43N/2017: a leg killed mid-run with three
+interior gaps below its axis maximum, resumed, re-offered all three, skipped them again, and
+advanced past the old maximum with zero `NonMonotonicDateError`. The polarisation filter ran 134 CMR
+queries with zero skip warnings, against 115,276 in 45 minutes of the production run.
 
 ## Coupling to the leg retry
 

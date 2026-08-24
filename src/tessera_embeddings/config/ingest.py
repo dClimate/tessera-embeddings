@@ -256,6 +256,28 @@ class IngestSettings(BaseModel):
     # take minutes to establish; a failure that is deterministic in the input is excluded by
     # CLASS (``_NON_RETRYABLE_LEG_MARKERS``) and never waits at all.
     leg_retry_backoff_s: int = Field(default=30, ge=0)
+    # Width, in seconds, of the window each ingest leg spreads its FIRST dispatch over. 0 is off.
+    #
+    # A cell's legs are dispatched the moment the cell is, and a campaign starts every cell it
+    # has slots for at once. Each leg then spends about the same time provisioning before its
+    # first catalogue request, so the fleet arrives at the catalogue in phase — a burst whose
+    # instantaneous rate a source can refuse even though every individual request is one it
+    # serves happily. A campaign resuming from committed dates never showed this, because its
+    # cells were already at random phases; a run from a clean store has no such spread and has
+    # to be given one.
+    #
+    # The offset is DERIVED from the leg's identity rather than drawn at random, so a leg's
+    # delay is reproducible and a test can assert it. Legs are staggered, not serialised: they
+    # all still run concurrently, each merely starting at its own point in the window, and only
+    # the first attempt is offset — a retry is already spread by `leg_retry_backoff_s` and by
+    # whenever the failure happened to land.
+    #
+    # The window is what is configured, rather than the spacing, because a leg cannot know how
+    # many other legs are running. Spacing follows: legs sharing the window land roughly
+    # `leg_stagger_window_s / n` apart. The default is sized for the campaign's ordinary width;
+    # widen it if the fleet grows, and note it is paid as latency on every leg's first dispatch,
+    # not only on a cold start.
+    leg_stagger_window_s: int = Field(default=600, ge=0)
     # Optional base URI (an fsspec target, e.g. s3://.../perf/) for capturing a
     # Dask ``distributed.performance_report`` per child ingest. Default None =
     # off (normal runs pay nothing); set it only on a probe rung — ingest-zone-year

@@ -78,6 +78,12 @@ class STACProvider:
             skips retrying it in place, which buys nothing and costs the whole retry backoff.
             Only set it for a provider actually measured to behave this way: a catalogue with
             no such remedy wants its retries, and a 502 there is ordinarily transient.
+        throttles_with_forbidden: True where this catalogue answers a request it is unwilling
+            to serve RIGHT NOW with a 403, rather than reserving that status for a request it
+            will never serve. Waiting is then the remedy, so the query layer gives it the same
+            backoff ladder it gives a 429. Only set it for a public, unauthenticated catalogue
+            measured to behave this way: everywhere else a 403 is a verdict about who is
+            asking, which no amount of patience changes.
     """
 
     name: str
@@ -93,6 +99,8 @@ class STACProvider:
     ``opera_query.make_s1_item_provider``), so this value does not apply there.
     Raising it for CMR-STAC made the 500s worse, not better — see
     context_docs/decisions/009-native-cmr-granule-query.md."""
+
+    throttles_with_forbidden: bool = False
 
 
 # =============================================================================
@@ -172,6 +180,12 @@ PROVIDERS: dict[str, STACProvider] = {
         # re-cutting the date window, which regroups the items into smaller responses.
         max_page_size=100,
         refuses_oversized_pages=True,
+        # This catalogue is public and unauthenticated — we send it no credential — so a 403
+        # from it cannot be a statement about who is asking. It is the aggregate request rate
+        # being refused, which is what a 429 says elsewhere, so it is waited out the same way.
+        # Per provider, because a 403 from a catalogue that DOES authorize is permanent and
+        # must keep failing the leg on the first refusal.
+        throttles_with_forbidden=True,
     ),
     "cmr-asf": STACProvider(
         name="NASA CMR-STAC (ASF)",

@@ -1157,6 +1157,7 @@ def open_store_group_and_tip(
 
 
 ASSESSED_WINDOW_ATTR = "assessed_window"
+
 """Root attribute naming the date range an ingest examined in full.
 
 The distinction it exists to draw: a month absent from a mosaic's time axis means either
@@ -1399,7 +1400,11 @@ class RegionWriteBatch:
     are unsupported.
     """
 
-    def __init__(self, session: "icechunk.Session") -> None:
+    def __init__(self, session: "icechunk.Session", store_path: str | None = None) -> None:
+        #: Which store this is, for the refusals below. A session does not carry its own
+        #: path, and a refusal that names only a date tells an operator nothing they can act
+        #: on: the remedy is to wipe and re-ingest ONE store, so the message has to say which.
+        self.store_path = store_path
         #: The batch's session. Exposed because window PIXEL data at volume should
         #: be written as ``to_icechunk(win, batch.session, mode="r+", region=...)``
         #: — placement stays on the Dask workers that computed the pixels instead
@@ -1433,10 +1438,10 @@ class RegionWriteBatch:
         existing = read_time_values(self.group)
         if (existing == when_ns).any():
             raise DuplicateDateError(
-                f"date {when_ns} is already on the time axis; refusing a duplicate slot. "
-                "Another writer has almost certainly committed this date to this store — "
-                "check for a second run ingesting the same zone/year/orbit before looking "
-                "for a date-derivation bug."
+                f"date {when_ns} is already on the time axis of {self.store_path or '<unknown store>'}; "
+                "refusing a duplicate slot. Another writer has almost certainly committed this date "
+                "to this store — check for a second run ingesting the same zone/year/orbit before "
+                "looking for a date-derivation bug."
             )
         # The axis is read POSITIONALLY downstream (the resampler samples by position, not by
         # timestamp), so appending an older date than one already stored silently changes which
@@ -1448,10 +1453,16 @@ class RegionWriteBatch:
         if len(existing) and when_ns < existing.max():
             raise NonMonotonicDateError(
                 f"date {when_ns} is older than the latest date already on the time axis "
-                f"({existing.max()}); refusing to append it out of order. The axis is sampled "
-                "positionally, so an out-of-order slot changes which observations this store "
-                "yields without changing anything a reader can check. Ingest the missing date "
-                "into a fresh store for the window, or re-ingest the window in order."
+                f"({existing.max()}) of {self.store_path or '<unknown store>'}; refusing to append "
+                "it out of order. The axis is sampled positionally, so an out-of-order slot changes "
+                "which observations this store yields without changing anything a reader can check, "
+                "and it cannot be inserted in place without moving every array's data. "
+                "ACTION: this store cannot be completed — delete it and re-ingest its window in "
+                "order. Reaching here means an earlier attempt gave up on this date and then "
+                "committed a later one, so the date is now unreachable. Every cause a leg may give "
+                "up for is meant to be DETERMINISTIC — it recomputes to the same verdict, so a "
+                "re-offer skips again harmlessly. This firing means one was not: find which "
+                "transient failure is being read as a permanent one."
             )
         t_index = len(existing)
         time_arr = self.group["time"]
@@ -1496,7 +1507,7 @@ def batched_region_writes(
     """
     repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
-    yield RegionWriteBatch(session)
+    yield RegionWriteBatch(session, store_path)
     # Timed because the commit (manifest + snapshot writes) is serial per-date work
     # no fleet width can compress — the pipeline instrumentation needs it separable
     # from the window computes it follows.

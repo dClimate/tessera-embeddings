@@ -46,12 +46,31 @@ def waited(monkeypatch):
     """
     seen: list[float] = []
     real_sleep = mod.asyncio.sleep
+    real_wait_for = mod.asyncio.wait_for
 
     async def fake_sleep(seconds, *args, **kwargs):
         seen.append(seconds)
         await real_sleep(0)
 
+    async def fake_wait_for(awaitable, timeout=None, **kwargs):
+        """The first-dispatch stagger waits HERE, not in ``sleep``, so intercept both.
+
+        It races the offset against the doomed gate rather than sleeping through it, which put a
+        real multi-minute wait back into every flow invocation — the exact cost this fixture's
+        docstring was written about, reintroduced by a change that moved the wait to a different
+        primitive. Patching only ``sleep`` also left ``seen`` empty, so the test asserting the
+        stagger is on by default had nothing to assert against.
+
+        The RACE is preserved and only the wall clock is collapsed: a cell already doomed still
+        returns immediately, and a viable one still takes the timeout path.
+        """
+        if timeout is not None:
+            seen.append(timeout)
+            timeout = 0.01
+        return await real_wait_for(awaitable, timeout=timeout, **kwargs)
+
     monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(mod.asyncio, "wait_for", fake_wait_for)
     return seen
 
 
@@ -602,6 +621,58 @@ class TestLegFailureDetail:
         assert "did not complete successfully" in detail
 
 
+class TestTheLegStaggerDecorrelatesTheColdStart:
+    """Every cell starts at once and each leg then spends about as long provisioning, so the
+    fleet reaches the catalogue in phase and a source can refuse the instantaneous rate even
+    though it serves each request happily on its own. The offset breaks that phase alignment.
+    """
+
+    def test_offsets_are_deterministic_spread_and_inside_the_window(self) -> None:
+        """Deterministic so it is assertable at all; spread so the fleet is not still in phase.
+
+        `random` would be neither, and randomness drawn inside a worker is not reproducible
+        even in principle.
+        """
+        legs = [(f"{z}N", 2017, label) for z in range(10, 40) for label in ("s2", "s1-asc", "s1-desc")]
+        offsets = [mod._leg_stagger_s(*leg, 600) for leg in legs]
+
+        assert offsets == [mod._leg_stagger_s(*leg, 600) for leg in legs], "must not vary run to run"
+        assert all(0 <= o < 600 for o in offsets)
+        assert len(set(offsets)) > 0.95 * len(offsets), "near-collisions would leave the fleet in phase"
+        # Spread over the whole window, not bunched in one part of it: a stagger that puts
+        # every leg in the first minute of a ten-minute window has not staggered anything.
+        assert min(offsets) < 60 and max(offsets) > 540
+        assert 240 < sum(offsets) / len(offsets) < 360
+
+    def test_the_two_legs_of_one_cell_do_not_share_an_offset(self) -> None:
+        """A cell's legs are dispatched together, so identity has to include the leg."""
+        assert mod._leg_stagger_s("33N", 2017, "s2", 600) != mod._leg_stagger_s("33N", 2017, "s1-asc", 600)
+
+    def test_a_zero_window_turns_it_off(self) -> None:
+        assert mod._leg_stagger_s("33N", 2017, "s2", 0) == 0.0
+
+    def test_it_is_on_by_default_and_only_delays_the_first_dispatch(self, wired, monkeypatch, waited) -> None:
+        """A default nobody sets has never run, so it must ship enabled.
+
+        And it must be paid ONCE per leg: a retry is already spread by the retry backoff and by
+        whenever the failure landed, so staggering it again would only add latency.
+        """
+        from tessera_embeddings.config.ingest import IngestSettings
+
+        assert IngestSettings().leg_stagger_window_s > 0
+
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        _run(s1_orbit="ascending", ingest_settings=IngestSettings(leg_stagger_window_s=600))
+
+        # One offset per leg (optical + one orbit) and nothing else: no retries happened, and
+        # the retry backoff is the only other thing in this flow that sleeps.
+        assert sorted(waited) == sorted(
+            mod._leg_stagger_s("33N", 2025, label, 600)
+            for label in ("ingest_s1_roi_sar (ascending)", "ingest_s2_roi_reflectance")
+        )
+
+
 def test_max_leg_attempts_defaults_to_retrying() -> None:
     """Off by default would leave the behaviour that cost three zones a day."""
     from tessera_embeddings.config.ingest import IngestSettings
@@ -658,7 +729,14 @@ def test_a_terminal_leg_failure_is_not_forgotten_when_a_sibling_retries(wired, m
     monkeypatch.setattr(mod, "arun_deployment", fake_arun)
 
     with pytest.raises(RuntimeError, match="ObjectNotFound"):
-        _run(s1_orbit="both", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+        # Stagger off, so all three legs reach their FIRST dispatch and the assertion below is
+        # about retrying. With it on, the terminal failure lands while the siblings are still
+        # waiting out their offsets and the `doomed` gate stops them ever dispatching — which is
+        # the point of that gate, and is covered by its own test.
+        _run(
+            s1_orbit="both",
+            ingest_settings=mod.IngestSettings(max_leg_attempts=3, leg_stagger_window_s=0),
+        )
 
     # Aborted on the first attempt rather than retrying the recoverable legs around a
     # failure that a re-dispatch cannot fix.
@@ -1065,7 +1143,9 @@ class TestLegsRetryIndependently:
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(
                 s1_orbit="ascending",
-                ingest_settings=mod.IngestSettings(max_leg_attempts=5, leg_retry_backoff_s=10),
+                # Stagger off: this test is about the retry SCHEDULE, and a first-dispatch
+                # offset would sit in front of it as a delay this assertion does not describe.
+                ingest_settings=mod.IngestSettings(max_leg_attempts=5, leg_retry_backoff_s=10, leg_stagger_window_s=0),
             )
 
         assert waited == [10, 20, 40, 40], "doubling from the base, capped at four times it"
@@ -1102,6 +1182,45 @@ class TestLegsRetryIndependently:
             _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
 
         assert dispatched.count("ascending") == 1, "the retryable leg did not spend attempts on a doomed cell"
+
+    def test_a_leg_doomed_during_its_stagger_never_dispatches_and_is_not_a_success(self, wired, monkeypatch):
+        """The stagger opened a window the gate did not cover.
+
+        `doomed` was checked only where the loop decides to start ANOTHER attempt, which was
+        every decision to start work while the first attempt began immediately. A leg that
+        waits out an offset can wake into a cell a sibling has already doomed, and provisioning
+        a Dask fleet for it delays the cell's failure report by however long that child runs.
+
+        Its detail must not be None either: None is this function's "the leg ran", so a leg
+        that never dispatched would be gathered as a success.
+        """
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        dispatched: list[str] = []
+        cell_is_doomed = asyncio.Event()
+
+        async def fake_arun(dep, parameters=None, tags=None):
+            dispatched.append(parameters.get("orbit") or "s2")
+            cell_is_doomed.set()
+            # Terminal: no re-dispatch can register a missing deployment.
+            return SimpleNamespace(
+                id="r",
+                state=SimpleNamespace(
+                    type=StateType.FAILED, name="Failed", message="ObjectNotFound: no such deployment"
+                ),
+            )
+
+        # Only the radar leg staggers, and its wait outlives the optical leg's terminal failure —
+        # so the race this test is about happens every run rather than on a timing accident.
+        monkeypatch.setattr(mod, "_leg_stagger_s", lambda z, y, label, w: 30.0 if "s1" in label else 0.0)
+        monkeypatch.setattr(mod.asyncio, "sleep", lambda *a, **k: cell_is_doomed.wait())
+        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+
+        with pytest.raises(RuntimeError, match="not dispatched") as raised:
+            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+
+        assert dispatched == ["s2"], "the staggered leg held a fleet for a cell that cannot succeed"
+        assert "another leg of this cell failed terminally" in str(raised.value)
 
     def test_a_dirty_mosaic_prefix_is_terminal_on_the_first_failure(self, wired, monkeypatch):
         """A prefix holding objects but no repository fails ``Repository.create`` identically every

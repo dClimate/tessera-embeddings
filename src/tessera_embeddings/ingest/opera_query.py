@@ -41,12 +41,17 @@ _CMR_OPERA_SHORT_NAME = "OPERA_L2_RTC-S1_V1"
 _CMR_PROVIDER = "ASF"
 _CMR_PAGE_SIZE = 2000
 
-#: Polarisation required of every granule, filtered server-side.
+#: Polarisations required of every granule, filtered server-side. BOTH of them.
 #:
-#: Co-pol only: CMR matches a multi-valued attribute if ANY value matches, so requiring VV
-#: admits every VV+VH granule while excluding the HH/HV ones outright. Requiring VH as well
-#: would be redundant, and requiring it INSTEAD would admit nothing that VV does not.
-_REQUIRED_POLARIZATION = "VV"
+#: CMR matches a multi-valued attribute if ANY of its values matches, and ANDs repeated
+#: ``attribute[]`` entries on the same attribute name. Requiring VV alone was therefore not
+#: equivalent to requiring the pair: besides the dual VV+VH granules we want and the cross-pol
+#: HH/HV ones we do not, the archive holds genuinely single-polarisation VV-only granules,
+#: which include VV and so passed. Ingest cannot use half a pair, so every one of them was
+#: paged and then rejected by the client-side check in `_granule_to_item` — which is a filter
+#: the server can apply for free. Requiring both is EXACT, not merely tighter: it admits no
+#: single-pol granule and drops no dual-pol one.
+_REQUIRED_POLARIZATIONS = ("VV", "VH")
 
 # Granule data links carry the per-band COG download URLs. The ``rel`` ends
 # in ``/data#`` and the HTTPS href ends in ``_<BAND>.tif``. HH/HV are matched
@@ -162,10 +167,12 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
 
     Only dual-pol VV+VH granules are accepted — a partial-pol granule would
     otherwise ingest a fabricated all-nodata band that the encoder reads as a
-    confident physical signal (see the optional-S1 ADR). The skip log names
-    what WAS found (``VV-only``, EW-mode ``HH/HV``, …) so regional data loss
-    is quantifiable; ``skip_counts`` (optional) accumulates the same
-    categories for a per-query summary.
+    confident physical signal (see the optional-S1 ADR). The query already
+    requires both polarisations server-side, so this is the safety net rather
+    than the filter: it catches a granule whose metadata claims the pair and
+    whose data links do not carry it. The skip log names what WAS found
+    (``VV-only``, cross-pol ``HH/HV``, …); ``skip_counts`` (optional)
+    accumulates the same categories for a per-query summary.
 
     Args:
         entry: One element of ``feed.entry`` from the CMR granule search JSON.
@@ -208,17 +215,21 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
             category = "no data links"
         if skip_counts is not None:
             skip_counts[category] += 1
-        # A SAFETY NET now, not the primary filter: the query already excludes granules whose
-        # POLARIZATION lacks VV, so reaching here means one advertised VV in its metadata and
-        # then did not publish the band pair. That is a catalogue inconsistency worth seeing,
-        # which is why it stays at WARNING — but it should now be rare, and a burst of these
-        # means something changed upstream rather than that this region is cross-pol.
+        # A SAFETY NET, not the primary filter: the query requires POLARIZATION to name BOTH
+        # polarisations, so reaching here means a granule whose metadata claims the pair and
+        # whose data links do not carry it. A catalogue inconsistency worth seeing, so WARNING —
+        # and now genuinely rare. It was not while the query required VV alone: single-pol
+        # VV-only granules passed and arrived here in bulk, which is a fixed property of the
+        # early archive rather than the upstream change an earlier comment here claimed.
+        #
+        # The granule response carries no polarisation field at all, so this names what the
+        # QUERY required and must not claim to quote the catalogue. See ADR-009.
         logger.warning(
-            "Skipping granule %s: CMR reported %s but the published bands are %s — needs "
-            "both VV and VH, so this granule is inconsistent with its own metadata",
+            "Skipping granule %s: published bands are %s, but it matched a query requiring "
+            "POLARIZATION to include %s — its metadata and its data links disagree",
             entry.get("title", "<unknown>"),
-            _REQUIRED_POLARIZATION,
             pols or "none",
+            "+".join(_REQUIRED_POLARIZATIONS),
         )
         return None
 
@@ -311,13 +322,12 @@ def _query_cmr_granules_one(
     using the ``CMR-Search-After`` header for pagination and ``attribute[]``
     for server-side orbit-direction filtering.
     """
-    # BOTH filters server-side. The polarisation one is what stops us paying to page
-    # granules we will always reject: ingest needs dual-pol VV+VH, so a granule whose
-    # POLARIZATION does not include VV can never qualify, and asking CMR to exclude them
-    # discards nothing reachable. Measured on zone 23N, whose land is all Greenland: 138,276
-    # granules paged over ~160 s per orbit-year, every one rejected client-side, become 0
-    # returned immediately. A list value is how requests encodes a repeated query parameter —
-    # a dict cannot hold two "attribute[]" keys.
+    # BOTH filters server-side. The polarisation one is what stops us paying to page granules
+    # we will always reject: ingest needs dual-pol VV+VH, so a granule whose POLARIZATION does
+    # not name both can never qualify, and asking CMR to exclude them discards nothing
+    # reachable. A list value is how requests encodes a repeated query parameter — a dict
+    # cannot hold two "attribute[]" keys — and repeating the polarisation name is what makes
+    # CMR require both rather than either.
     params: dict[str, str | int | list[str]] = {
         "short_name": _CMR_OPERA_SHORT_NAME,
         "provider": _CMR_PROVIDER,
@@ -326,7 +336,7 @@ def _query_cmr_granules_one(
         "page_size": _CMR_PAGE_SIZE,
         "attribute[]": [
             f"string,ASCENDING_DESCENDING,{orbit_direction.upper()}",
-            f"string,POLARIZATION,{_REQUIRED_POLARIZATION}",
+            *(f"string,POLARIZATION,{pol}" for pol in _REQUIRED_POLARIZATIONS),
         ],
     }
 
@@ -365,16 +375,17 @@ def _query_cmr_granules_one(
         f"in {time.monotonic() - t0:.1f}s"
     )
     if skip_counts:
-        # These SURVIVED the server-side VV filter and were still unusable, so the count is no
-        # longer a measure of how cross-pol a region is — it is a measure of catalogue
-        # inconsistency. Before the filter this line routinely reported six figures over polar
-        # land and read as normal; a non-trivial count here now is a genuine anomaly.
+        # These SURVIVED the server-side polarisation filter and were still unusable, so the
+        # count is no longer a measure of how cross-pol a region is — it is a measure of
+        # catalogue inconsistency. While the filter required VV alone, single-pol VV-only
+        # granules landed here too and this line read as normal over polar land; requiring both
+        # excludes them at the server, so a non-trivial count here is now a genuine anomaly.
         logger.warning(
             "CMR granule query (%s): %d granule(s) passed the %s filter but published no "
             "VV+VH pair: %s — inconsistent metadata upstream, not a regional coverage fact",
             orbit_direction,
             sum(skip_counts.values()),
-            _REQUIRED_POLARIZATION,
+            "+".join(_REQUIRED_POLARIZATIONS),
             dict(sorted(skip_counts.items())),
         )
     return items

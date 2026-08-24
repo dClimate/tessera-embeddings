@@ -44,6 +44,7 @@ from tessera_embeddings.ingest.asset_locations import (
 from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.catalogue_refusal import (
     OVERSIZED_RESPONSE_STATUSES,
+    THROTTLE_STATUSES,
     CatalogueRequest,
     bbox_area_label,
     classify_refusal,
@@ -96,38 +97,57 @@ def chunks_to_odc(chunks: dict[str, int]) -> dict[str, int]:
 logger = logging.getLogger(__name__)
 
 
-_STAC_RETRY = make_logging_retry(
-    "STAC",
-    total=8,
-    backoff_factor=2,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset(["GET", "POST"]),
-    respect_retry_after_header=True,
-)
+#: Statuses every catalogue's page fetches are retried in place for. Provider flags add to
+#: and subtract from this — see :func:`_retry_statuses`.
+_STAC_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
-# The same ladder without 502, for a provider that refuses an oversized response with one.
-#
-# There the remedy is to ask a DIFFERENT request — a shorter date window, or fewer items per
-# page — so retrying the same one first buys nothing and costs the ladder's whole backoff
-# before the remedy can start. Measured at 364 s per refused request.
-#
-# Scoped to that provider rather than applied to the session, because nothing was measured
-# about anyone else's 502 and a catalogue with no such remedy wants its retries. 429 and 503
-# stay in both, since those are the refusals where waiting IS the remedy, and connection and
-# read failures keep the full ladder either way because they carry no status.
-_STAC_RETRY_NO_502 = make_logging_retry(
-    "STAC",
-    total=8,
-    backoff_factor=2,
-    status_forcelist=(429, 500, 503, 504),
-    allowed_methods=frozenset(["GET", "POST"]),
-    respect_retry_after_header=True,
-)
+
+def _retry_statuses(provider: STACProvider) -> frozenset[int]:
+    """Which statuses this provider's requests are retried IN PLACE for.
+
+    Both adjustments are per provider rather than applied to the session, because each rests
+    on a measurement of one catalogue and a catalogue that does not behave that way wants the
+    default. 429 and 503 are in every ladder, since those are the refusals where waiting is
+    unambiguously the remedy, and connection and read failures keep the ladder either way
+    because they carry no status at all.
+
+    **502 comes OUT for a provider that refuses an oversized response with one.** There the
+    remedy is to ask a DIFFERENT request — a shorter date window, or fewer items per page — so
+    retrying the same one first buys nothing and costs the ladder's whole backoff before the
+    remedy can start.
+
+    **403 goes IN for a provider that throttles with it.** Otherwise it reaches the query
+    layer on the first refusal, finds no remedy there — asking for less does not help a
+    catalogue that is refusing the rate — and fails the whole leg. A leg is hours of work and
+    a fleet, so a momentary refusal costs both; the ladder absorbs it instead.
+    """
+    statuses = _STAC_RETRY_STATUSES
+    if provider.refuses_oversized_pages:
+        statuses -= OVERSIZED_RESPONSE_STATUSES
+    if provider.throttles_with_forbidden:
+        statuses |= THROTTLE_STATUSES
+    return statuses
+
+
+def _throttle_statuses(provider: STACProvider) -> frozenset[int]:
+    """The statuses that mean "slow down" from THIS provider, for classifying its refusals.
+
+    Read off the same flag the ladder is built from, so a status the ladder waits out cannot
+    be classified as something patience does not fix.
+    """
+    return THROTTLE_STATUSES if provider.throttles_with_forbidden else frozenset()
 
 
 def _retry_for(provider: STACProvider) -> Retry:
     """The retry ladder this provider's requests should sit behind."""
-    return _STAC_RETRY_NO_502 if provider.refuses_oversized_pages else _STAC_RETRY
+    return make_logging_retry(
+        "STAC",
+        total=8,
+        backoff_factor=2,
+        status_forcelist=tuple(sorted(_retry_statuses(provider))),
+        allowed_methods=frozenset(["GET", "POST"]),
+        respect_retry_after_header=True,
+    )
 
 
 # (connect_timeout, read_timeout) in seconds. Without an explicit timeout,
@@ -176,7 +196,21 @@ _MAX_QUERY_ITEMS = 10_000
 # what they answer an overload with — 429, 503 — is a load refusal the whole leg then waits
 # out. Measurements, including per-page latency against concurrency, are in
 # context_docs/design/ingest_optimization_campaign_2026_07.md.
-_QUERY_WINDOW_WORKERS = 6
+#
+# LOWERED FROM 6, which was measured to trip a provider block: Earth Search answered the
+# fleet with 403 at that multiplier, having refused nothing at all in the campaign that
+# preceded this setting existing. The paragraph above predicted exactly that, so the number
+# was the error and not the reasoning.
+#
+# NOT 1. A walk is idle for almost all of its wall clock — see the latency split above — so
+# overlap is the only lever on a leg's query time, and serialising it would be a large
+# throughput regression for a problem a small overlap solves. 2 keeps the fleet's stream
+# count in the range that ran clean for a whole campaign.
+#
+# A module constant rather than a setting: nothing in `ingest/` reads `IngestSettings`, and
+# the query is reached from three call sites that would each have to carry one. If an
+# incident needs this tuned rather than released, that is the diff to accept.
+_QUERY_WINDOW_WORKERS = 2
 
 # Times one query may answer a refusal by replacing a window before it gives up.
 #
@@ -1196,7 +1230,9 @@ class _PerThreadClient:
                     )
                     time.sleep(_ROOT_OPEN_BACKOFF_S * attempt)
                     continue
-                raise_catalogue_query_error(request, exc, log=logger)
+                raise_catalogue_query_error(
+                    request, exc, log=logger, throttle_statuses=_throttle_statuses(self._provider)
+                )
         raise AssertionError("unreachable: the loop either returns or raises")  # pragma: no cover
 
 
@@ -1306,7 +1342,13 @@ def _walk_query_window(
                     )
                     node.children = [_WindowWalk(node.bbox, node.window, smaller)]
                     return
-            raise_catalogue_query_error(request, exc, log=logger, items_so_far=len(node.items))
+            raise_catalogue_query_error(
+                request,
+                exc,
+                log=logger,
+                items_so_far=len(node.items),
+                throttle_statuses=_throttle_statuses(provider),
+            )
         for raw in page.get("features", []):
             # `id` is required by the STAC spec; an item without one cannot be deduped by
             # the assembly step, and defaulting it would collapse EVERY such item into a
@@ -1441,6 +1483,13 @@ def _query_stac_items(
     # concurrently and read back depth-first, in date order, which is the order the serial
     # walk produced. The same searches run on every attempt, so the layer above can still
     # decide a refusal is deterministic by seeing the identical signature twice.
+    # TODO: seed one root per LATITUDE BAND rather than one for the whole bbox. A UTM zone is
+    # 6 deg wide but its WGS84 envelope is over 54 deg at the pole, and most of what that box
+    # returns is discarded. Banding is safe where a fixed 6 deg box is not, and this seam already
+    # takes a list of boxes and already dedupes by item id across them. What it needs is the
+    # bands' provenance: they must derive from the LIVE TILE range, which `roi.geobox` does not
+    # carry. Measurements and the schema addition required are in
+    # context_docs/design/ingest-graph-and-stac-budget.md section 11.
     roots = [_WindowWalk(sub_bbox, (start_date, end_date)) for sub_bbox in split_antimeridian_bbox(bbox)]
     budget = _RePartitionBudget(_MAX_REFUSAL_RE_PARTITIONS)
     _fill_window_tree(

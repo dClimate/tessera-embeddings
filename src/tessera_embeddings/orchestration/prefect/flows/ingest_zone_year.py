@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from hashlib import sha256
 from time import monotonic
 from typing import Any, cast
 
@@ -282,6 +283,12 @@ _NON_RETRYABLE_LEG_MARKERS = (
     # momentary open failure is re-raised as itself rather than routed into the create leg.
     # `scripts/audit_mosaic_prefixes.py` in the consumer repo finds these before a dispatch.
     "CorruptedStoreError",
+    # A radar leg past `MAX_GIVEN_UP_DATES`. This was deliberately RETRYABLE while a provider
+    # refusal could count toward that ceiling — a refusal clears, so a re-dispatch wrote the dates
+    # the previous leg gave up. A refusal is no longer a reason to give up a date, so every date
+    # counted is one whose bytes will not read: the re-dispatch re-reads the same objects, spends
+    # the per-read retry ladder on each, and holds a fleet to reach the identical answer.
+    "TooManyGivenUpDatesError",
 )
 
 
@@ -301,6 +308,23 @@ def _leg_failure_detail(run: object, label: str) -> str | None:
         message = getattr(state, "message", None) or ""
         return f"{exc}{f': {message}' if message else ''}"
     return None
+
+
+def _leg_stagger_s(zone: str, year: int, label: str, window_s: int) -> float:
+    """Seconds this leg delays its FIRST dispatch by, to decorrelate the fleet's cold start.
+
+    Derived from the leg's identity rather than drawn at random, so a leg's delay is the same
+    on every run and a test can assert it. ``hash`` would not do: it is salted per process, so
+    two workers would not agree on the spread. Spread across the whole window instead of by a
+    fixed step because a leg cannot know how many others are running — identical identities
+    collide, but a collision leaves two legs in phase, not the whole fleet.
+
+    Returns 0 for a window of 0, which is how the stagger is turned off.
+    """
+    if window_s <= 0:
+        return 0.0
+    digest = sha256(f"{zone}/{year}/{label}".encode()).digest()
+    return window_s * int.from_bytes(digest[:8], "big") / 2**64
 
 
 def _is_retryable_leg_failure(detail: str) -> bool:
@@ -674,6 +698,50 @@ async def ingest_zone_year(
         the source catalogue, a marker meaning a re-dispatch cannot help, a load refusal that is
         evidence FOR patience — read per leg instead of per round.
         """
+        # Before the wall-clock anchor, so a leg's stagger is not charged to the budget that
+        # decides whether it may attempt again.
+        if (stagger := _leg_stagger_s(zone, year, label, ingest_settings.leg_stagger_window_s)) > 0:
+            log.info(
+                "Zone %s year %s: %s — waiting %.0f s before its first dispatch so the fleet "
+                "does not reach the catalogue in phase (leg_stagger_window_s=%d).",
+                zone,
+                year,
+                label,
+                stagger,
+                ingest_settings.leg_stagger_window_s,
+            )
+            # Raced against `doomed`, not slept through. A sibling can fail terminally seconds
+            # after this leg starts waiting, and with the window at its default a leg near the top
+            # of the spread would otherwise hold its cell's slot — and the campaign's ingest slot
+            # behind it — for most of ten minutes to learn something already decided.
+            try:
+                await asyncio.wait_for(doomed.wait(), timeout=stagger)
+            except TimeoutError:
+                pass  # the stagger elapsed with the cell still viable, which is the ordinary path
+            if doomed.is_set():
+                # Re-checked after the wait, for the reason the retry backoff re-checks after
+                # its own: a sibling can reach its terminal failure while this leg is waiting,
+                # and the gate exists to not START work for a cell that cannot succeed. The
+                # stagger is what makes this reachable — the first attempt used to begin
+                # immediately, so there was no window here to lose the race in.
+                #
+                # Returns a DETAIL, not None. None is this function's "the leg ran", so a leg
+                # that never dispatched would be gathered as a success and the cell would be
+                # finalised on two legs' worth of work. It has no failure of its own to report,
+                # so it reports not having started.
+                never_started = (
+                    "not dispatched: another leg of this cell failed terminally before this "
+                    "leg's stagger elapsed, so the cell cannot succeed"
+                )
+                log.warning(
+                    "Zone %s year %s: %s was never dispatched — another leg failed terminally "
+                    "while this one was waiting out its stagger. Detail: %s",
+                    zone,
+                    year,
+                    label,
+                    never_started,
+                )
+                return never_started
         started = monotonic()
         last_token: str | None = None
         detail: str | None = None

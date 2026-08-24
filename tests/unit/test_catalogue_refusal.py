@@ -28,10 +28,12 @@ from requests.exceptions import RetryError
 from urllib3.exceptions import MaxRetryError
 from urllib3.util.retry import Retry
 
+from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.ingest import stac
 from tessera_embeddings.ingest.catalogue_refusal import (
     LOAD_REFUSAL_STATUSES,
     REFUSAL_TOKEN,
+    THROTTLE_STATUSES,
     UPSTREAM_ERROR_STATUSES,
     CatalogueQueryError,
     CatalogueRefusal,
@@ -88,6 +90,10 @@ def _unretried(status: int) -> APIError:
     the window re-cut is reached on the first refusal.
     """
     return APIError.from_response(SimpleNamespace(status_code=status, text=f"HTTP {status}"))
+
+
+def _earth_search():
+    return stac._get_provider_config("earth-search")
 
 
 def _request(page: int = 3) -> CatalogueRequest:
@@ -173,11 +179,17 @@ class TestClassification:
         forever and no repeat can ever end it. The two sets must therefore cover the
         ladder's own force-list, which is the list that decides what reaches us as an
         exhaustion in the first place.
+
+        Checked per PROVIDER, because a provider flag can add a status to that force-list. A
+        status one catalogue is waited out for and the taxonomy cannot name is the same silent
+        failure as a globally-retried one.
         """
-        forcelist = set(stac._STAC_RETRY.status_forcelist or ())
-        assert forcelist, "the STAC ladder must force-list statuses for this invariant to mean anything"
-        assert forcelist <= (LOAD_REFUSAL_STATUSES | UPSTREAM_ERROR_STATUSES)
         assert not (LOAD_REFUSAL_STATUSES & UPSTREAM_ERROR_STATUSES), "a status cannot be both refusals"
+        for name, provider in PROVIDERS.items():
+            forcelist = set(stac._retry_for(provider).status_forcelist or ())
+            assert forcelist, f"{name} must force-list statuses for this invariant to mean anything"
+            named = LOAD_REFUSAL_STATUSES | UPSTREAM_ERROR_STATUSES | stac._throttle_statuses(provider)
+            assert forcelist <= named, f"{name} retries {sorted(forcelist - named)} but cannot classify it"
 
     def test_only_the_provider_that_refuses_oversized_pages_skips_the_502_retry(self) -> None:
         """502 must reach the remedy on the FIRST refusal — but only where a remedy exists.
@@ -191,22 +203,24 @@ class TestClassification:
         measured about anyone else's 502 — so this pins BOTH directions, since a change in
         either would be silent.
         """
-        reduced = set(stac._STAC_RETRY_NO_502.status_forcelist or ())
-        full = set(stac._STAC_RETRY.status_forcelist or ())
+        reduced = stac._retry_statuses(dataclasses.replace(_earth_search(), refuses_oversized_pages=True))
+        full = stac._retry_statuses(dataclasses.replace(_earth_search(), refuses_oversized_pages=False))
         assert 502 not in reduced
         assert 502 in full, "a provider with no re-cut to fall back on keeps its 502 retries"
         assert reduced >= LOAD_REFUSAL_STATUSES, "a stated overload must still be waited out"
         assert full >= LOAD_REFUSAL_STATUSES
 
-    def test_the_ladder_is_chosen_by_the_providers_own_flag(self) -> None:
-        """Which ladder a request sits behind must follow the provider, not the call site."""
-        earth_search = stac._get_provider_config("earth-search")
+    def test_the_ladder_is_chosen_by_the_providers_own_flags(self) -> None:
+        """Which statuses a request is retried for must follow the provider, not the call site."""
+        earth_search = _earth_search()
         assert earth_search.refuses_oversized_pages is True
-        assert stac._retry_for(earth_search) is stac._STAC_RETRY_NO_502
+        assert earth_search.throttles_with_forbidden is True
+        assert stac._retry_statuses(earth_search) == {403, 429, 500, 503, 504}
 
         cmr = stac._get_provider_config("cmr-asf")
         assert cmr.refuses_oversized_pages is False
-        assert stac._retry_for(cmr) is stac._STAC_RETRY
+        assert cmr.throttles_with_forbidden is False
+        assert stac._retry_statuses(cmr) == {429, 500, 502, 503, 504}
 
 
 class TestSignature:
@@ -831,6 +845,83 @@ class TestTheCatalogueRootKeepsTheRetryTheLadderStoppedGiving:
 
         assert attempts == 1, "a status the ladder still holds must not be retried a second time"
         assert isinstance(raised, CatalogueQueryError)
+
+
+def test_the_window_walk_concurrency_stays_low() -> None:
+    """This is a MULTIPLIER on the streams one provider sees, not a per-leg setting.
+
+    The campaign runs tens of cells at once, so the fleet's concurrent search count is this
+    times the cell count. At 6 that was measured tripping a provider block; the campaign
+    before this concurrency existed refused nothing at all. Bounded, not pinned: raising it is
+    a decision about a shared service, and lowering it to 1 would give up the only lever on a
+    leg's query time, since a walk is idle for almost all of its wall clock.
+    """
+    assert 2 <= stac._QUERY_WINDOW_WORKERS <= 3
+
+
+class TestForbiddenIsAThrottleOnlyWhereItCannotBeAVerdict:
+    """403 means "slow down" from a public catalogue and "you may not" from an authorizing one.
+
+    The two need opposite responses and the status alone cannot tell them apart, so the answer
+    comes from the provider. Both directions are pinned: making it retryable everywhere puts an
+    authorization refusal on a ladder that can never clear it, and making it retryable nowhere
+    fails a leg — hours of work and a live fleet — on a refusal that waiting fixes.
+    """
+
+    def test_it_is_not_classified_as_load_without_provider_knowledge(self) -> None:
+        """The default must not assume, since a bare 403 is ordinarily a verdict."""
+        assert THROTTLE_STATUSES.isdisjoint(LOAD_REFUSAL_STATUSES | UPSTREAM_ERROR_STATUSES)
+        refusal = classify_refusal(_unretried(403))
+        assert refusal.kind is RefusalKind.UNKNOWN
+        assert refusal.status == 403
+
+    @pytest.mark.parametrize("build", [_unretried, _refused], ids=["unretried", "ladder-exhausted"])
+    def test_a_throttling_providers_403_is_a_load_refusal(self, build) -> None:
+        """Waiting is the remedy, which is what LOAD means — the same answer 429 gets."""
+        refusal = classify_refusal(build(403), throttle_statuses=THROTTLE_STATUSES)
+        assert refusal.kind is RefusalKind.LOAD
+        assert refusal.status == 403
+        # A repeat of it is evidence FOR patience, so it must never doom the cell.
+        assert repeat_is_deterministic(refusal.kind) is False
+
+    def test_the_leg_reads_load_from_the_token_a_throttled_refusal_raises(self) -> None:
+        """The only thing crossing to the attempt-budget layer is text, so the token must carry it."""
+        throttled = CatalogueQueryError(
+            _request(), classify_refusal(_unretried(403), throttle_statuses=THROTTLE_STATUSES), _unretried(403)
+        )
+        assert _token(throttled).startswith("load:403")
+
+        bare = CatalogueQueryError(_request(), classify_refusal(_unretried(403)), _unretried(403))
+        assert _token(bare).startswith("unknown:403")
+
+    def test_403_does_not_reach_the_oversized_remedies(self, caplog) -> None:
+        """The two recovery levers must not compound with the ladder 403 now sits behind.
+
+        Each lever terminates on its own, but a ladder underneath a re-cut hands its whole
+        backoff to every child window. Asking for a SMALLER answer is no remedy for a rate
+        refusal anyway, so 403 must be waited out and never re-cut — which bounds the pair
+        rather than each one.
+        """
+        provider = _earth_search()
+        collection = stac._get_collection_config("earth-search", "sentinel-2-l2a")
+        pages = _pages_then_refusal([{"features": [_item("a")]}], _unretried(403))
+
+        with (
+            patch.object(stac, "StacApiIO"),
+            patch.object(stac, "Client") as client,
+            caplog.at_level(logging.WARNING, logger=stac.__name__),
+            pytest.raises(CatalogueQueryError) as raised,
+        ):
+            search = client.open.return_value.search
+            search.return_value.pages_as_dicts.return_value = pages
+            stac._query_stac_items(
+                provider, collection, None, "2021-09-01", "2021-10-02", bbox=(-3.0, 50.0, -2.0, 51.0)
+            )
+
+        assert "shorter window" not in caplog.text
+        assert "items per page" not in caplog.text
+        # Still named a load refusal, so the leg above keeps retrying it rather than dooming.
+        assert _token(raised.value).startswith("load:403")
 
 
 class TestTheRemedyFollowsTheProviderNotJustTheStatus:

@@ -482,6 +482,18 @@ def ingest_s2_roi_reflectance(
         # failing coverage: an ROI with no live pixel can only ever produce a skip.
         log.warning("ROI has no live pixels — every date will fail the coverage gate")
 
+    def _settled_dates() -> set[str]:
+        """Dates this leg must not offer: the ones already written.
+
+        A date an earlier attempt gave up on is re-offered and gives up again for the same
+        reason, because every accepted cause is DETERMINISTIC — unreadable bytes, a coverage
+        rejection, no live window — and so recomputes to the same verdict. Re-offering costs one
+        re-evaluation and cannot wedge anything. A durable record of the skip would only be
+        needed if the verdict could change between attempts, which is what treating a transient
+        failure as a skip used to allow.
+        """
+        return get_existing_dates(reflectance_store, s3_region=s3_region)
+
     total_processed = 0
     total_filtered = 0
     total_refused = 0
@@ -873,17 +885,24 @@ def ingest_s2_roi_reflectance(
             nonlocal total_filtered, total_refused
             if prepared.skip_reason != "producer-conflict":
                 total_filtered += 1
+                # A COVERAGE rejection, which left no trace at all before — not on the store,
+                # nowhere but a counter that died with the process — so a finished leg could
+                # say how many dates the gate dropped but never which.
+                #
+                # Not recorded anywhere, and it does not need to be. The gate is decided during
+                # preparation from the same items and the same pixels, so a later attempt reaches
+                # the same verdict — which is also the only way a raised threshold or a newly
+                # published copy ever recovers the date.
                 return
             total_refused += 1
-            producer_conflict_dates.append(
-                {
-                    "date": prepared.date,
-                    "tiles": ",".join(sorted({t for it in prepared.items if (t := item_tile(it)) is not None})),
-                    "tried": copies_label(prepared.items),
-                    "objects": "",
-                    "scope": "producer-conflict",
-                }
-            )
+            entry = {
+                "date": prepared.date,
+                "tiles": ",".join(sorted({t for it in prepared.items if (t := item_tile(it)) is not None})),
+                "tried": copies_label(prepared.items),
+                "objects": "",
+                "scope": "producer-conflict",
+            }
+            producer_conflict_dates.append(entry)
 
         def _record_unreadable(
             prepared: _PreparedDate,
@@ -911,15 +930,15 @@ def ingest_s2_roi_reflectance(
             all_tiles = sorted({t for it in prepared.items if (t := item_tile(it)) is not None})
             attributed = bool(blamed)
             tiles = sorted({tile for tile, _ in blamed}) if blamed else all_tiles
-            unreadable_tile_dates.append(
-                {
-                    "date": prepared.date,
-                    "tiles": ",".join(tiles),
-                    "tried": ",".join(tried) or copies_label(prepared.items, only=blamed),
-                    "objects": label_objects(hrefs),
-                    "scope": "attributed" if attributed else "whole-date",
-                }
-            )
+            entry = {
+                "date": prepared.date,
+                "tiles": ",".join(tiles),
+                "tried": ",".join(tried) or copies_label(prepared.items, only=blamed),
+                "objects": label_objects(hrefs),
+                "scope": "attributed" if attributed else "whole-date",
+            }
+            unreadable_tile_dates.append(entry)
+            # DURABLE NOW, not at the end of the leg. This is the date the wedge is built
             log.error(
                 "DATA LOSS roi=%s date=%s: every catalogue copy failed to read, so this date "
                 "is SKIPPED and its pixels are absent from the mosaic. objects=%s scope=%s "
@@ -1155,7 +1174,7 @@ def ingest_s2_roi_reflectance(
             start_date=start_date,
             end_date=end_date,
             bbox=roi.bbox_wgs84,
-            existing_dates_fn=lambda: get_existing_dates(reflectance_store, s3_region=s3_region),
+            existing_dates_fn=lambda: _settled_dates(),
             # Same assets _drive will load: pruning happens in the query, so a band
             # named only at load time is already gone by then.
             extra_bands=_LOADED_EXTRA_BANDS,
@@ -1179,7 +1198,7 @@ def ingest_s2_roi_reflectance(
             tile_id=None,
             start_date=window.query_start,
             end_date=window.query_end,
-            existing_dates=get_existing_dates(reflectance_store, s3_region=s3_region),
+            existing_dates=_settled_dates(),
             bbox=roi.bbox_wgs84,
             # As in the streamed branch: the query prunes, so it must be told.
             extra_bands=_LOADED_EXTRA_BANDS,

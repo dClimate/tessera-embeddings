@@ -62,6 +62,8 @@ the pystac `Item`s directly from that response.**
   parameter, so the response already contains only the desired orbit.
   `_granule_to_item` maps each granule's data download links onto the
   `S1_OPERA_BANDS` asset keys (`0_VV`, `0_VH`).
+- **Polarisation is filtered server-side too, on BOTH values.** See
+  "Requiring one polarisation is not requiring the pair" below.
 - `make_s1_item_provider` returns an `item_provider_fn` (a zero-arg
   callable); `stac._query_stac_items` short-circuits to it and never
   calls `client.search()` for this provider.
@@ -89,6 +91,61 @@ Validated implementation notes:
   page retries in place via the urllib3 retry on the granule session.
   Per-batch checkpointing (`get_existing_dates` + the per-batch write)
   bounds the blast radius of any failure to one `batch_days` window.
+
+### Requiring one polarisation is not requiring the pair — corrected 2026-08-23
+
+The polarisation filter shipped as a single `attribute[]=string,POLARIZATION,VV`, and its comment
+argued that adding VH "would be redundant" because requiring VH instead "would admit nothing that
+VV does not". **That reasoning was wrong, and measurably so.** It considered exactly two
+populations — dual VV+VH granules (wanted) and cross-pol HH/HV ones (excluded) — and missed a
+third: genuinely single-polarisation VV-only granules. Those include VV, so they passed the
+server-side filter, were paged in full, and were then rejected one at a time by the client-side
+band check in `_granule_to_item`.
+
+The cost was almost entirely logging. In one 45-minute window of the global campaign the skip
+WARNING produced **115,276 lines, 94% of all application log output**. Separately measured:
+211,786 skip events over only 49,629 distinct granules — a multiplicity of 4.27, from overlapping
+monthly windows, both orbit directions, and overlapping zone boxes.
+
+**The fix rests on CMR's own semantics: repeated `attribute[]` entries on one attribute name are
+ANDed, while a multi-valued attribute matches if ANY value matches.** So `VV` alone is a strictly
+weaker filter than `VV` and `VH` together. Verified directly against the granule API:
+
+| query | result | what it shows |
+|---|---|---|
+| Greenland, Feb 2017, `HH` alone | 979 | HH is universal there |
+| same box, `VV` alone | 0 | VV is absent there |
+| same box, `VV` + `HH` | 0 | ANDed — an OR would return 979 |
+| same box, `HH` + `HV` | 372 | equals `HV` alone, the true cross-pol count |
+
+And the two-value filter is **exact**, not merely tighter. Three complete censuses — every entry
+walked, no sampling, published band links classified per granule:
+
+| box, window | passes `VV` | passes `VV`+`VH` | publishes both bands | filter == dual set |
+|---|---|---|---|---|
+| Alaska + BC, Jun 2016 | 2,483 | 0 | 0 | yes |
+| N. Europe, Feb 2017 | 27,976 | 27,976 | 27,976 | yes |
+| S. America, Sep 2016 | 10,487 | 7,279 | 7,279 | yes |
+
+The S. America box is the discriminating one: genuinely mixed, and the filter admits no
+single-pol granule and drops no dual-pol one. Alaska/BC is the clean demonstration of the missed
+population — 2,483 granules passed `VV` and not one of them published a VH band.
+
+**This recovers no data.** A single-polarisation granule is unusable either way; ingesting half a
+pair would write a fabricated all-nodata band the encoder reads as a confident physical signal
+(ADR-013). It stops us paging and logging them, and it restores the client-side WARNING to being
+a real alarm.
+
+Two defects in that WARNING were fixed with it. It interpolated **our own** required-polarisation
+constant into a "CMR reported %s" slot, so it could only ever print that constant back — and
+`granules.json` carries no polarisation field of any kind (verified: the entry keys are
+title/links/polygons/times/ids and nothing else), so the line cannot quote the catalogue at all
+and now names what the *query* required instead. Its verdict was also wrong for this population:
+a granule reporting VV and publishing `['VV']` is self-consistent and single-polarisation, not
+"inconsistent with its own metadata". Its comment additionally told the reader that a burst of
+these "means something changed upstream rather than that this region is cross-pol" — nothing had
+changed upstream; single-pol VV-only granules are a fixed property of the 2016 and early-2017
+archive. That claim only holds now that both polarisations are required server-side.
 
 ## Rejected alternatives
 

@@ -732,12 +732,26 @@ def alternates_for(
 #: the failure is re-raised on the driver through tblib, which cannot reconstruct rasterio's
 #: GDAL-backed exception classes. What arrives is a plain ``Exception`` carrying the original's
 #: repr, so an ``isinstance`` check matches nothing and the message is the only evidence left.
+#: Only signatures that name a CODEC OR FORMAT OPERATION failing. Deliberately minimal, and the
+#: minimality is the point: this predicate's `True` means "give up this date", and it is reached as
+#: the DEFAULT for anything the transient lists above do not recognise. Every gap in those lists
+#: therefore used to become a silent data-loss verdict — that is how a 429, and separately a DNS
+#: failure, a refused connection and a TLS error, each came to be recorded as permanently bad
+#: imagery.
+#:
+#: So the generic wrappers are gone: `Chunk and warp failed`, `Read failed. See previous exception`
+#: and `IReadBlock failed` are what GDAL raises when a block read fails FOR ANY REASON, including
+#: every transport failure nobody has enumerated. They say a read failed, never that the bytes are
+#: bad, and matching them made the dangerous verdict the fallback for the unknown.
+#:
+#: A refusal wrapped in one of them is still caught, because the CAUSE carries the codec name and
+#: the whole chain is matched. What changes is the unrecognised case: it now re-raises and the leg
+#: retries in order, rather than costing a date. A genuinely truncated object that names no codec
+#: therefore fails the leg loudly instead of quietly holing the store, which is the direction to
+#: fail in.
 _UNREADABLE_MARKERS = (
     "ZIPDecode",
     "TIFFReadEncodedTile",
-    "IReadBlock failed",
-    "Chunk and warp failed",
-    "Read failed. See previous exception",
 )
 
 #: Signatures of a source object that is NOT THERE — which none of the markers above can see,
@@ -757,6 +771,9 @@ _UNREADABLE_MARKERS = (
 _MISSING_OBJECT_MARKERS = (
     "ObjectNotFound",
     "NoSuchKey",
+    # 410 Gone alongside 404: both say the object is not there and no retry publishes it. Named
+    # here so the un-wrapped form gets the same corroboration 404 gets.
+    "HTTP response code: 410",
     "The specified key does not exist",
     "HTTP response code: 404",
 )
@@ -785,6 +802,23 @@ def is_unreadable_source(exc: BaseException) -> bool:
     text = _exception_chain_text(exc)
     if any(m in text for m in _NOT_THE_DATAS_FAULT):
         return False
+    # A PROVIDER REFUSAL IS NEVER BAD DATA, whatever wrapper it arrives in. This predicate and
+    # `is_provider_refusal` overlap otherwise: a refusal reaches us through a block-read wrapper,
+    # so the chain carries a refusal marker AND an unreadable one, and whichever predicate the
+    # caller happens to ask first decides. The radar path asks about refusals first and the
+    # optical path never asks at all, so the same failure was transient for one sensor and
+    # permanent data loss for the other. Excluding them here makes the two disjoint by
+    # construction, so neither call order nor a caller that knows only one predicate can
+    # misclassify. See context_docs/monitoring/incident-2026-08-24-nonmonotonic-append.md.
+    if any(m in text for m in _PROVIDER_REFUSAL_MARKERS):
+        return False
+    statuses = _http_statuses(text)
+    # Ranged, so a status nobody enumerated cannot be read as bad data. See the note on
+    # `_HTTP_STATUS_RE` for why each range is decidable.
+    if any(s >= 500 or s in _TRANSIENT_4XX for s in statuses):
+        return False
+    if any(400 <= s < 500 and s not in _ABSENT_4XX and s != 403 for s in statuses):
+        return False
     if any(m in text for m in _UNREADABLE_MARKERS):
         return True
     return any(m in text for m in _MISSING_OBJECT_MARKERS) and any(m in text for m in _SOURCE_READER_MARKERS)
@@ -808,26 +842,70 @@ def _exception_chain_text(exc: BaseException) -> str:
 
 #: Signatures of the PROVIDER refusing a read — an authorization refusal, a throttle, a server
 #: error. All statements about the SERVICE rather than the bytes: the same object read moments
-#: before and reads again once the service recovers. So no fallback copy helps, which is why
-#: :func:`is_unreadable_source` declines every one of them and why this predicate sits beside it
-#: rather than inside it. The two need opposite responses: one gives up on the data, the other
-#: waits.
+#: before and reads again once the service recovers.
+#:
+#: Consumed as an EXCLUSION by :func:`is_unreadable_source`, which is the only reader. There was
+#: once a companion predicate answering "is this a refusal?" positively, so a caller could give up
+#: the date and record it; nothing does that any more, because giving up a date and then
+#: committing a later one puts the earlier date permanently below the store's append-only
+#: maximum. A refusal is transient, so the response is to retry and — if it will not clear — to
+#: fail the leg with the axis unmoved.
+#:
+#: The exclusion needs no :data:`_SOURCE_READER_MARKERS` corroboration, unlike the positive
+#: verdict it replaced: declining is the safe direction, and a failure nothing claims is
+#: re-raised either way.
 _PROVIDER_REFUSAL_MARKERS = (
     "AccessDenied",
     "SlowDown",
     "ServiceUnavailable",
     "InternalError",
-    "HTTP response code: 403",
+    "HTTP response code: 403",  # see the range note below: a provider judgement, not an HTTP one
     "HTTP response code: 500",
     # 502 and 504 for the same reason 404 is in the missing-object list: the optical assets are
     # plain `https://` hrefs, so a gateway failure reaches us as a bare status from GDAL's HTTP
     # driver. Without these it is claimed by neither predicate, and a source outage wrapped in
     # `Chunk and warp failed` is then recorded as permanently unreadable DATA — which tells an
     # operator to look for corruption when they should be waiting for the provider.
-    "HTTP response code: 502",
-    "HTTP response code: 503",
-    "HTTP response code: 504",
+    "TooManyRequests",
+    # Transport-level failures, which carry no status at all. A connection dropped mid-transfer
+    # is a statement about the link, never about the bytes — the same object reads on the next
+    # attempt. Without these a throttling provider's dropped reads are claimed by
+    # `is_unreadable_source` through whichever block-read wrapper GDAL happens to raise, and a
+    # recoverable date is recorded as permanent loss.
+    "Connection reset",
+    "Broken pipe",
+    "timed out",
+    "Connection aborted",
+    "RequestTimeout",
 )
+
+#: GDAL's HTTP driver reports a bare status, so the numeric forms are classified by RANGE rather
+#: than enumerated. Enumeration is what let 429 — the single most explicit "slow down" a provider
+#: can send — be read as unreadable data: the list held 403 and 500/502/503/504 and simply missed
+#: it, and a list that must be complete to be correct will be incomplete again.
+#:
+#: The ranges are exhaustive and each is decidable without knowing the provider:
+#:
+#: * **Any 5xx is transient.** It is a statement about the server, never about the bytes. That
+#:   covers 507 and 509 (a CDN bandwidth throttle) without either being named.
+#: * **408 and 429 are transient** — the two 4xx that mean "not now" rather than "not you".
+#: * **404 and 410 are absence**, and are corroborated separately by
+#:   :data:`_MISSING_OBJECT_MARKERS`.
+#: * **403 is transient HERE, deliberately**, and is the one entry that is a judgement about a
+#:   provider rather than about HTTP: Earth Search answers a rate block with it. Elsewhere a 403
+#:   is about who is asking, which is why the catalogue layer treats it per provider too.
+#: * **Every other 4xx is neither** — a malformed request or a rejected credential is not the
+#:   data's fault and is not fixed by waiting, so it re-raises and fails the leg on its first
+#:   date instead of being skipped date by date.
+_HTTP_STATUS_RE = re.compile(r"HTTP response code:\s*(\d{3})")
+_TRANSIENT_4XX = frozenset({408, 429})
+_ABSENT_4XX = frozenset({404, 410})
+
+
+def _http_statuses(text: str) -> set[int]:
+    """Every HTTP status the exception chain names."""
+    return {int(m) for m in _HTTP_STATUS_RE.findall(text)}
+
 
 #: What makes a failure the SOURCE reader's: GDAL is the layer that reported it.
 #:
@@ -869,32 +947,6 @@ _OWN_CREDENTIAL_MARKERS = (
 #: `is_unreadable_source`, so the same credential fault was skipped as bad data on one path and
 #: raised on the other.
 _NOT_THE_DATAS_FAULT = (*_OWN_CREDENTIAL_MARKERS, "AccessDenied", "SlowDown")
-
-
-def is_provider_refusal(exc: BaseException) -> bool:
-    """Whether ``exc`` says the source PROVIDER refused the read.
-
-    A refusal is transient and clears on its own, so the useful response is to give up the one
-    date, record it, and keep the run — never to substitute a different copy of the imagery,
-    which is what :func:`is_unreadable_source` gates and why that predicate excludes everything
-    matched here.
-
-    Fails closed three ways: our own credential fault is excluded, a refusal nothing attributes
-    to the source reader is excluded (see :data:`_SOURCE_READER_MARKERS`), and anything
-    unrecognised is excluded. In each case the caller re-raises.
-
-    Args:
-        exc: The exception a source read failed with.
-
-    Returns:
-        ``True`` when the chain names a refusal the provider owns.
-    """
-    text = _exception_chain_text(exc)
-    if any(m in text for m in _OWN_CREDENTIAL_MARKERS):
-        return False
-    if not any(m in text for m in _SOURCE_READER_MARKERS):
-        return False
-    return any(m in text for m in _PROVIDER_REFUSAL_MARKERS)
 
 
 def step_down_copies(

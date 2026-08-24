@@ -27,9 +27,10 @@ Algorithm (unchanged from the reference):
    * Apply the ROI mask, then write each date's live windows via
      :func:`tessera_embeddings.storage.zarr_store.write_day_windows` with a
      narrow tenacity retry on transient GDAL errors. Past that retry the date
-     is GIVEN UP rather than allowed to fail the leg, and recorded on the
-     store. Up to :data:`MAX_GIVEN_UP_DATES`; past that the leg stops and asks
-     to be re-dispatched.
+     is GIVEN UP rather than allowed to fail the leg — but ONLY when the cause
+     recomputes, so a provider refusing reads re-raises and the leg retries in
+     order instead. Up to :data:`MAX_GIVEN_UP_DATES`; past that the leg stops
+     terminally, because nothing counted toward that ceiling can clear.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ import xarray as xr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
 from tessera_embeddings.ingest._pipeline import pipelined
-from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreadable_source
+from tessera_embeddings.ingest.duplicates import is_unreadable_source
 from tessera_embeddings.ingest.live_windows import (
     WINDOW_COST_IN_CHUNKS,
     WINDOW_COST_IN_CHUNKS_OVERLAPPED,
@@ -107,21 +108,30 @@ S1Orbit = Literal["ascending", "descending"]
 
 
 MAX_GIVEN_UP_DATES = 10
-"""How many dates one radar leg may give up before it stops and asks to come back.
+"""How many dates one radar leg may give up before it stops and refuses the year.
 
-Small on purpose, because a provider refusal CLEARS. Every date given up while one lasts is a
-date a later run would have written, so grinding through an outage converts recoverable imagery
-into a durable hole — and a leg that finishes returns success, so nothing comes back for it.
-Stopping instead is a request to be re-dispatched, and the dates listed are then written rather
-than lost. Ten is a small fraction of a radar year's couple of hundred dates per orbit.
+**Its original reasoning no longer holds and the ceiling means something else now.** It was
+"small on purpose, because a provider refusal CLEARS" — a refusal used to be countable here, so
+grinding through an outage converted recoverable imagery into a durable hole and the leg still
+returned success. A refusal is no longer a reason to give up a date at all: it re-raises and the
+leg retries in order.
+
+So every date counted here is now one whose bytes will not read, whatever we do. The ceiling is
+therefore a statement about the DATA — past ten, this orbit-year is too damaged to be worth a
+mosaic — rather than a request to come back when a service recovers. Ten is a small fraction of a
+radar year's couple of hundred dates per orbit.
 """
 
 
 class TooManyGivenUpDatesError(RuntimeError):
     """A radar leg gave up more dates than the bounded skip permits.
 
-    Deliberately RETRYABLE — absent from ``ingest_zone_year._NON_RETRYABLE_LEG_MARKERS`` —
-    because a refusal goes away and a re-dispatch writes the dates this leg gave up.
+    **NOT retryable, and it used to be.** It was deliberately absent from
+    ``ingest_zone_year._NON_RETRYABLE_LEG_MARKERS`` "because a refusal goes away and a re-dispatch
+    writes the dates this leg gave up". Nothing counted toward the ceiling goes away any more:
+    every one of those dates failed for a cause that recomputes, so a re-dispatch re-reads the
+    same unreadable objects, spends the per-read retry ladder on each of them again, and holds a
+    Dask fleet to reach the identical answer.
     """
 
 
@@ -544,6 +554,11 @@ def ingest_s1_roi_sar(
     # split, so nothing rules it out — and the cost of being wrong is a duplicate-date
     # commit. The consume side below is therefore the authority on what has been written,
     # and the query filter is only an optimisation.
+    # Written dates only. A date given up on is re-offered by the next attempt and gives up
+    # again for the same reason: every accepted cause is DETERMINISTIC, so the verdict recomputes
+    # and re-offering costs one re-evaluation rather than risking anything. A record of the skip
+    # would only be needed if the verdict could change between attempts, which is what treating a
+    # transient failure as a skip used to allow.
     written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region)
     # Counted for the assessed-window record: it separates "sparse region" from
     # "the footprints are wrong", which look identical in a date count alone.
@@ -569,29 +584,36 @@ def ingest_s1_roi_sar(
         caller then re-raises — the fail-closed direction, so an unexamined cause stops the leg
         instead of quietly thinning its year.
 
-        The two accepted causes are recorded under different ``scope`` values because they need
-        different responses: ``provider-refused`` means a later run over this window gets the
-        imagery, ``unreadable`` means the catalogue is what to check.
+        **A PROVIDER REFUSAL IS NOT ACCEPTED HERE, and that is a change.** It used to be, under
+        ``scope="provider-refused"``, on the reasoning that a later run over the window would get
+        the imagery. It would not: giving up a date and then committing a LATER one puts the
+        earlier date permanently below the store's append-only maximum, so the re-run that was
+        supposed to recover it is refused instead. A refusal is also transient by definition, so
+        accepting it converts a bad minute at the source into a hole — the mirror of the defect
+        that cost eleven optical stores, where the same refusal was misread as unreadable data.
+
+        So the only accepted cause is data that will never read, which is DETERMINISTIC: it
+        recomputes to the same verdict on every attempt, which is what makes the absence
+        explainable rather than a matter of when the leg happened to run. Everything else returns
+        ``False`` and the caller re-raises, failing the leg with the time axis unmoved — and the
+        leg's own retry re-offers the date in order.
 
         Raises:
             TooManyGivenUpDatesError: Past :data:`MAX_GIVEN_UP_DATES`.
         """
-        if is_provider_refusal(exc):
-            scope = "provider-refused"
-        elif is_unreadable_source(exc):
+        if is_unreadable_source(exc):
             scope = "unreadable"
         else:
             return False
         given_up.add(date_str)
-        given_up_dates.append(
-            {
-                "date": date_str,
-                "scope": scope,
-                # Truncated: this lands in the store's metadata, which every reader of the
-                # attribute pays for, and the first line is what identifies the cause.
-                "error": f"{type(exc).__name__}: {exc}"[:300],
-            }
-        )
+        entry = {
+            "date": date_str,
+            "scope": scope,
+            # Truncated: this lands in the store's metadata, which every reader of the
+            # attribute pays for, and the first line is what identifies the cause.
+            "error": f"{type(exc).__name__}: {exc}"[:300],
+        }
+        given_up_dates.append(entry)
         log.error(
             "[%s] DATA LOSS roi=%s date=%s: the source read failed and this date is SKIPPED, so "
             "its pixels are absent from the mosaic. scope=%s error=%s — recorded on the store as "
@@ -610,12 +632,14 @@ def ingest_s1_roi_sar(
             listed = ", ".join(f"{g['date']}({g['scope']})" for g in given_up_dates)
             raise TooManyGivenUpDatesError(
                 f"STOPPING [{orbit}] roi={roi_label}: {len(given_up_dates)} date(s) given up, past "
-                f"the ceiling of {MAX_GIVEN_UP_DATES}. This many says the source is refusing reads "
-                f"rather than holding one bad object, and every further date attempted while that "
-                f"lasts becomes a durable hole for nothing. Dates: {listed}. RE-DISPATCH once the "
-                f"provider is answering again — these dates are written by the retry rather than "
-                f"lost. If they survive a retry the objects themselves are unreadable, and the "
-                f"catalogue is what to check."
+                f"the ceiling of {MAX_GIVEN_UP_DATES}. Every one of them failed to read for a cause "
+                f"that RECOMPUTES — a provider refusing reads is retried in order and never counted "
+                f"here — so this many says the objects themselves are bad, not that the service is "
+                f"having a bad minute. Dates: {listed}. This error is TERMINAL: re-dispatching "
+                f"re-reads the same objects, spends the per-read retry ladder on each, and holds a "
+                f"fleet to reach the identical answer. ACTION: check the catalogue for reprocessed "
+                f"copies of these dates; until they exist this orbit-year is too damaged to be "
+                f"worth a mosaic."
             )
         return True
 
@@ -951,9 +975,9 @@ def ingest_s1_roi_sar(
         # that says a green leg is nonetheless missing pixels, and where.
         log.error(
             "[%s] DATA LOSS SUMMARY roi=%s: %d date(s) skipped because their source reads "
-            "failed — %s. Recorded on the store as assessed_unreadable_dates. A "
-            "provider-refused date is recoverable by re-running this window; an unreadable one "
-            "needs a reprocessed copy at the provider.",
+            "failed — %s. Recorded on the store as assessed_unreadable_dates. Every one of them "
+            "failed for a cause that RECOMPUTES, so re-running this window will not recover any "
+            "of them: what they need is a reprocessed copy at the provider.",
             orbit,
             roi_label,
             len(given_up_dates),
@@ -997,11 +1021,15 @@ def ingest_s1_roi_sar(
             # that lets the cell finish with an orbit missing and inference run on optical
             # alone. A leg that gave up EVERY date it had, onto a store that holds nothing,
             # is data loss wearing the same clothes as absence — and the two must not be
-            # returned identically. Retryable, so a re-dispatch writes what this leg refused.
+            # returned identically. TERMINAL: every date here failed for a cause that
+            # recomputes, so a re-dispatch reads the same objects to the same answer.
             raise TooManyGivenUpDatesError(
                 f"[{orbit}] roi={roi_label} window={start_date}..{end_date} gave up every one "
                 f"of its {len(given_up_dates)} date(s) and committed none, so no store exists "
-                f"to record the loss on. Re-dispatch: a refusal that clears will write them. "
+                f"to record the loss on. This is TERMINAL, not a request to come back: each of "
+                f"these failed for a cause that recomputes, so re-reading them costs the "
+                f"per-read ladder and a fleet to reach the identical answer. ACTION: check the "
+                f"catalogue for reprocessed copies. "
                 f"Given up: {'; '.join(f'{g["date"]} scope={g["scope"]}' for g in given_up_dates)}"
             )
         return SarIngestResult(

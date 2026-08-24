@@ -135,3 +135,23 @@ def test_an_out_of_order_date_is_refused(store):
     # Forward in time still works, so the guard is on ORDER and not on appending at all.
     with batched_region_writes(store, message="forward") as batch:
         batch.append_time_slot(np.datetime64("2024-07-01", "ns"))
+
+
+def test_the_refusals_name_the_store_and_the_date(store):
+    """Both refusals end a leg, and the remedy is per STORE — so the message must name one.
+
+    A refusal that gives only a date tells an operator nothing they can act on: there are
+    1,008 cells and the fix is to delete and re-ingest exactly one of them. A session does not
+    carry its own path, so this is the thing most easily left out.
+    """
+    for date, expected in ((np.datetime64("2024-05-15", "ns"), NonMonotonicDateError), (D1, DuplicateDateError)):
+        with pytest.raises(expected) as raised, batched_region_writes(store, message="m") as batch:
+            batch.append_time_slot(date)
+        assert store in str(raised.value)
+        assert str(date)[:10] in str(raised.value)
+    # And it says what to DO, since the store can no longer be completed.
+    with (
+        pytest.raises(NonMonotonicDateError, match="delete it and re-ingest"),
+        batched_region_writes(store, message="m") as batch,
+    ):
+        batch.append_time_slot(np.datetime64("2024-05-15", "ns"))

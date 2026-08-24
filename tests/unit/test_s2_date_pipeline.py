@@ -31,6 +31,28 @@ from tessera_embeddings.ingest import s2_roi
 from tessera_embeddings.ingest.stac import HeterogeneousProducerError
 from tessera_embeddings.storage.zarr_store import store_write_retrying
 
+
+@pytest.fixture(autouse=True)
+def _read_ladder_without_the_waiting(monkeypatch):
+    """Keep the read retry's ATTEMPT count, drop its backoff.
+
+    This file drives read failures deliberately and repeatedly, and the per-read ladder is sized to
+    outlast a provider having a bad minute — about a minute of backoff per failing date. Served
+    literally that is minutes per test for a delay none of them assert on.
+
+    The attempt count is preserved rather than reduced to one, because the tests about the
+    duplicate-copy ladder depend on the read being retried before the step-down is reached.
+    """
+    from tenacity import Retrying, stop_after_attempt
+
+    from tessera_embeddings.ingest import roi_processing
+
+    def no_wait(_log):
+        return Retrying(stop=stop_after_attempt(roi_processing.SOURCE_READ_ATTEMPTS), reraise=True)
+
+    monkeypatch.setattr(s2_roi, "source_read_retrying", no_wait)
+
+
 BOTH_MODES = pytest.mark.parametrize("pipeline_dates", [False, True], ids=["serial", "pipelined"])
 
 SIZE = 8
@@ -464,7 +486,7 @@ def test_a_batch_isolates_an_unreadable_source_instead_of_failing_the_leg(run_in
             dates,
             pipeline_dates=False,
             fail_on="2024-01-02",
-            fail_with="rasterio.errors.WarpOperationError: Chunk and warp failed",
+            fail_with="rasterio.errors.WarpOperationError: Chunk and warp failed: ZIPDecode error",
             batch_dates=2,
         )
 
@@ -525,7 +547,7 @@ def test_a_coverage_gate_read_failure_reaches_the_duplicate_ladder(run_ingest, m
     """
 
     def gate_cannot_read(*_a, **_k):
-        raise RuntimeError("rasterio.errors.WarpOperationError: Chunk and warp failed")
+        raise RuntimeError("rasterio.errors.WarpOperationError: Chunk and warp failed: ZIPDecode error")
 
     monkeypatch.setattr(s2_roi, "_coverage_from_scl", gate_cannot_read)
     with caplog.at_level(logging.ERROR):
