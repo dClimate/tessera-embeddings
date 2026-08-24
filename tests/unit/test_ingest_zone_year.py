@@ -1150,6 +1150,25 @@ class TestLegsRetryIndependently:
 
         assert waited == [10, 20, 40, 40], "doubling from the base, capped at four times it"
 
+    def test_a_refused_source_is_retryable_however_its_message_is_worded(self):
+        """The marker list is matched as SUBSTRINGS of the whole detail, message included.
+
+        So a refusal whose sentence happened to contain another class's marker would be classified
+        unfixable and never re-dispatched — which for the one class whose remedy IS a re-dispatch
+        is the worst possible verdict. Asserted against the message the code actually raises, so a
+        reworded message or a newly added marker fails here rather than in a campaign.
+        """
+        raised = mod.ProviderRefusedReadsError(
+            "[ascending] roi=zone_35N date=2024-01-02: the source provider refused this read for "
+            "longer than one write may wait for it. No date is skipped and the time axis is "
+            "unmoved, so a re-dispatch resumes from the dates already committed. Waiting is the "
+            "remedy for this class: the cell re-dispatches this leg after a delay far longer than "
+            "a write may spend, with no fleet held while it waits."
+        )
+        detail = f"radar: {raised!r}"
+        assert mod._is_retryable_leg_failure(detail)
+        assert mod.ProviderRefusedReadsError.__name__ in detail, "the long backoff keys on this name"
+
     def test_a_refused_source_gets_the_long_backoff_and_others_do_not(self, wired, monkeypatch, waited):
         """The two timescales, in one test because the pair is the point.
 
