@@ -23,7 +23,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `source_coverage.py` | Optical-source preflight: whether the catalogue publishes ANYTHING reaching a zone's live land in a window, answered by limit-1 existence probes over live-tile block envelopes (window padded per the solar-day convention) before any cluster is provisioned. The verdict is three-valued — only a positive finding of absence refuses; inconclusive and provisional-present both pass the cell through, because a wrong refusal loses campaign coverage while a pass-through only costs the late failure it would have hit anyway. Deliberately OUTSIDE the mosaic-content fingerprint closure (its probe is built here, not in `stac.py`), so shipping preflight changes never invalidates in-flight mosaics. Called by the chained fill driver's pre-cluster triage. |
 | `catalogue_refusal.py` | Tells a catalogue that is BUSY apart from one that cannot serve a given REQUEST, and names the request either way. The client stack discards the search body when it wraps a transport failure, so a refusal arrives identifying the host and the endpoint path and nothing about what was asked. Both refusals are one exception type from one endpoint and need opposite responses: waiting is the entire remedy for a stated overload and pure waste against a request that is refused every time. The status separates them but does not settle it — what settles it is an identical REPEAT, which only the layer holding the attempt budget can observe, so this module classifies and that layer supplies the repeat. |
 | `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
-| `_http.py` | Shared HTTP helpers for catalogue and granule queries: `make_logging_retry` (a `urllib3.Retry` that logs each attempt, since urllib3 otherwise retries silently and a stalled query looks like a hang), `spawn_abandonable` (a daemon-thread waiter for calls bounded by a deadline the caller owns), and `json_or_raise` — the guard for a provider that answers 2xx with a body that is not JSON, which no status-based retry ladder can see. |
+| `_http.py` | Shared HTTP helpers for catalogue and granule queries: `make_logging_retry` (retries a failed request, logging each attempt — the library retries silently otherwise, and a query quietly retrying looks exactly like one that has hung), `spawn_abandonable` (waits for a call the caller wants to be able to give up on), and `json_or_raise` (catches a reply that claims success but is not JSON — see below). |
 | `_pipeline.py` | A prepare/consume pipeline with a configurable look-ahead `depth`: overlaps the preparation of the next item with the consumption of the current one on one background thread, and reports the preparation time the consumer had to wait for. Used by the S2 date loop (`pipeline_dates`), with `depth` sized to `batch_dates` so a batch's whole preparation can hide behind the previous batch's write. Depth buys BUFFERING, never concurrency — preparation stays on one thread in order, so the side-effect-free contract holds at any depth. |
 | `live_windows.py` | (Merge exchange rate is caller-owned: pass `WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows share one graph, the higher `WINDOW_COST_IN_CHUNKS` when each is a blocking write. Both S2 and S1 select it from how the run writes, so the rate cannot drift from the write strategy it prices.) Derives the chunk-aligned live windows every ingest loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
 
@@ -2211,24 +2211,48 @@ pagination is handled via the `CMR-Search-After` response header, which pages cl
 2000 against the same host. See
 [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md) for the full rationale.
 
-#### A page that answers 2xx with a body that is not JSON
+#### When the archive says "success" but sends something that is not JSON
 
-A granule page can arrive with a success status and a body that does not parse. It is the one
-catalogue failure `_CMR_RETRY` cannot act on — that ladder keys on status, and this response's
-status is fine — and `raise_for_status` passes it for the same reason.
+Asking the archive for a page of radar granules normally returns a success code and a JSON
+document. Occasionally it returns a success code and a body that is not JSON at all — an error
+page, or a document cut off partway through.
 
-`_fetch_granule_page` re-asks such a page, up to `_NON_JSON_PAGE_ATTEMPTS`. Scoped to that case
-alone: every other failure still reaches `_CMR_RETRY` unchanged, and a 5xx is not re-asked here
-because that ladder has already spent its backoff on it. The re-ask replays the archive's own
-cursor, so it names the identical page and cannot skip granules.
+**This slips past every defence we have, and the reason is worth understanding.** Everything that
+decides whether to retry a request looks at the response's status code. Here the status code is
+fine. It says success, and by the only measure those checks apply, it *was* a success. Only the
+body is wrong, and nothing was inspecting the body. So the request sails through the retry logic
+untouched and fails later, when something tries to read it as JSON, with a message that says only:
 
-`json_or_raise` (`_http.py`) raises `NonJsonResponseError`, naming the endpoint, status, content-type
-and body size. **The body itself is logged, never put in the message:**
-`ingest_zone_year._is_retryable_leg_failure` substring-matches the failure text against
-`_NON_RETRYABLE_LEG_MARKERS`, so a provider error page containing one of those words would turn a
-retryable leg permanently dead. The three EDL calls in `auth.py` pass `log_body=False` — a
-credential document truncated mid-write is exactly the body that fails to parse, and its leading
-bytes are the credential.
+```
+Expecting value: line 1 column 1 (char 0)
+```
+
+That line names no address, no status, and nothing about what actually arrived. It does not even
+say which of the several services we query was the one that broke. In production it ended a radar
+run that had been working for about half an hour, and the whole of what we were told about it was
+that one sentence.
+
+**So the page is simply asked for again**, a small fixed number of times. This is deliberately
+narrow: every other kind of failure is left exactly as it was, and a server error is not re-asked
+here, because the ordinary retry logic has already waited and tried for that one. The re-ask uses
+the position marker the archive itself gave us, so it asks for the same page rather than the next
+one — it cannot accidentally step over granules.
+
+If the retries are used up, the failure now describes itself: which address answered, what status
+it gave, what kind of document it claimed to be sending, and how big it was. A document claiming
+to be JSON alongside a body that will not parse means it was cut off; one claiming to be a web
+page means an error page was substituted.
+
+**The body that arrived is written to the log, and deliberately kept out of the error message.**
+That distinction matters more than it looks. When a leg fails, the decision about whether to run it
+again is made by searching the failure's text for certain words. The body is text the provider
+chose, not us — so an error page that happened to contain one of those words could flip a leg that
+should have been retried into one treated as permanently dead, costing a whole zone-year. In the
+log it is just as readable and steers nothing.
+
+**The credential requests never log their body at all.** They use the same helper, because they can
+fail the same way, but with the body capture switched off: a credential document cut off partway
+through is precisely the one that fails to parse, and its opening characters are the credential.
 
 ### Burst Timestamp Normalisation
 
