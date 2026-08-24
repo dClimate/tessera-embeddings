@@ -1457,14 +1457,13 @@ It is removable because of one rule about how stores are written:
 **Dates can only ever be added to a store in order, newest last. Once a store holds a date, no
 earlier date can ever be added to it again.**
 
-That is not a limitation we could lift by trying harder. Readers downstream fetch observations by
-their POSITION in the list rather than by their date, so quietly inserting an older date in the
-middle would change what every reader gets back, with nothing about the store looking wrong. The
-write is refused instead (`NonMonotonicDateError`).
+Slotting one into the middle would mean shifting every chunk after it along by one, and a Zarr
+store's chunks sit at fixed positions — there is nowhere to shift them to. The write is refused
+(`NonMonotonicDateError`) rather than attempted.
 
-So everything at or before the newest date a store already holds is closed to it for good, and
-searching the catalogue back there cannot write anything — not "rarely writes anything", but
-cannot. (In the code that newest-held date is called the store's `frontier`.)
+So everything at or before the newest date a store holds is closed to it for good, and searching
+the catalogue back there cannot write anything. (The code calls that newest-held date the store's
+`frontier`.)
 
 ```
        already stored                  can still be added
