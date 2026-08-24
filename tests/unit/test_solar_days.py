@@ -30,6 +30,7 @@ from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
     resolve_grouping_longitude,
+    resume_window_start,
     solar_day_of,
     solar_day_offset_seconds,
     whole_window_range,
@@ -371,3 +372,26 @@ def test_owned_items_inherits_the_guard() -> None:
     rng = whole_window_range("2024-01-01", "2024-01-31")
     with pytest.raises(ValueError, match="normalize_to_solar_day"):
         owned_items([_Item(datetime.datetime(2024, 1, 15, 23, 30))], rng)
+
+
+def test_a_resume_starts_on_the_frontiers_month_boundary() -> None:
+    """The floor is the frontier's MONTH, and the reason is the query padding.
+
+    A solar day straddles the UTC boundary, so a day's query is padded either side. Starting a
+    resume at ``frontier + 1 day`` would query the first owned day on an unpadded bound and
+    write it short — the same defect the batch slicing exists to prevent, reintroduced by the
+    resume. A month boundary keeps every owned day's padding inside the query.
+    """
+    assert resume_window_start("2018-01-01", "2018-05-27") == "2018-05-01"
+    assert resume_window_start("2018-01-01", "2018-05-01") == "2018-05-01"
+    assert resume_window_start("2018-01-01", "2018-12-31") == "2018-12-01"
+
+
+def test_a_floor_never_moves_a_window_start_backwards() -> None:
+    """A frontier below the window says nothing about months the window never asked for.
+
+    An empty store has no frontier at all, and a store whose frontier predates the window is
+    being extended forwards — in both cases the leg starts where it was told to.
+    """
+    assert resume_window_start("2018-06-01", None) == "2018-06-01"
+    assert resume_window_start("2018-06-01", "2018-03-14") == "2018-06-01"

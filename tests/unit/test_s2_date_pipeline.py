@@ -148,6 +148,8 @@ class _Run:
         self.load_started: dict[str, float] = {}
         self.write_ended: dict[str, float] = {}
         self.attempts: list[str] = []
+        #: What each write was handed to record durably in its own commit, in write order.
+        self.losses_at_write: list[list[dict[str, str]]] = []
 
 
 @pytest.fixture
@@ -223,12 +225,16 @@ def run_ingest(monkeypatch):
             run.written.append(date)
             run.write_ended[date] = time.monotonic()
 
-        def write_day_windows(_store, day_ds, _windows, **_kwargs):
+        def write_day_windows(_store, day_ds, _windows, losses=None, **_kwargs):
+            # Snapshotted, because the caller clears its pending list after the call — and
+            # what this asserts on is precisely what rode THIS commit.
+            run.losses_at_write.append([dict(entry) for entry in losses or ()])
             _record_write(day_ds)
 
-        def write_days_windows(_store, days, **_kwargs):
+        def write_days_windows(_store, days, losses=None, **_kwargs):
             # The batched writer takes (day_ds, windows) pairs; each still counts as its
             # own write, which is what the one-commit-per-date accounting assumes.
+            run.losses_at_write.append([dict(entry) for entry in losses or ()])
             for day_ds, _windows in days:
                 _record_write(day_ds)
 
@@ -686,3 +692,107 @@ def test_an_asset_incomplete_item_reaches_the_duplicate_ladder(run_ingest, caplo
     # of these, and leaves the date indistinguishable from one the coverage gate rejected.
     assert "DATA LOSS" in caplog.text
     assert "2024-01-01" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Resuming over a store that already holds dates.
+#
+# The time axis is append-only and strictly increasing, so a date at or below the store's
+# latest committed date can never be written. A leg that offers one raises and the store's
+# only remedy is deletion, so these three tests pin the three things that stop it: the
+# window floor, the per-date check the floor cannot reach, and the record surviving a kill.
+# ---------------------------------------------------------------------------
+
+#: A store stopped at 2018-05-27 with a hole at 2018-05-10 behind it, and imagery on both
+#: sides. 2018-05-27 itself is absent from the catalogue because the real query filters the
+#: committed dates out; this fake does not, and re-offering it would test the dedupe instead.
+RESUME_CATALOGUE = {"2018-01-24": True, "2018-05-10": True, "2018-06-05": True}
+FRONTIER = "2018-05-27"
+
+
+@pytest.fixture
+def assessed(monkeypatch):
+    """Capture the assessed-window record, which no other stub in this module intercepts."""
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        s2_roi,
+        "record_assessed_window",
+        lambda path, start, end, **kw: calls.append({"path": path, "start": start, "end": end, **kw}),
+    )
+    return calls
+
+
+@BOTH_MODES
+def test_a_resume_assesses_from_the_frontiers_month_and_says_so(run_ingest, assessed, pipeline_dates):
+    """The window this leg walked starts at the frontier's MONTH, and the record says that.
+
+    Two things at once, because they are the same decision. The months below the frontier hold
+    nothing this store can accept, so walking them is pure cost on a year-long window. And the
+    record of what was assessed must not claim them: a month absent from an assessed window is
+    a gap, a month absent inside one is a finding, and a leg that never queried January must
+    not certify it.
+    """
+    run = run_ingest(RESUME_CATALOGUE, pipeline_dates=pipeline_dates, existing_dates={FRONTIER})
+
+    assert [c["start"] for c in assessed] == ["2018-05-01"], "not the leg's configured start"
+    assert [c["end"] for c in assessed] == ["2018-06-05"], "and the end is still the window's"
+    assert "2018-01-24" not in run.loaded, "a month below the frontier is never queried"
+    # And, because it was never queried, its hole is not claimed either way. Three states have
+    # to stay distinguishable — assessed and empty, assessed and lost, not assessed — and this
+    # month is the third. Recording it as a loss would assert an examination that did not happen.
+    assert "2018-01-24" not in [entry["date"] for c in assessed for entry in c["unreadable"]]
+
+
+@BOTH_MODES
+@pytest.mark.parametrize("batch_dates", [1, 2], ids=["per-date", "batched"])
+def test_a_date_below_the_frontier_is_recorded_as_lost_rather_than_raised(
+    run_ingest, assessed, pipeline_dates, batch_dates, caplog
+):
+    """The floor is not sufficient, and this is the case it cannot reach.
+
+    2018-05-10 lies inside the frontier's own month, so the floor still offers it. Preparing it
+    would succeed and the append would then be refused, which is fatal and unrepairable — so it
+    is dropped before preparation and recorded as the deliberate loss it is. Recording rather
+    than raising is the whole point: the store cannot hold the date either way, and raising
+    additionally costs every later date.
+    """
+    with caplog.at_level(logging.ERROR):
+        run = run_ingest(
+            RESUME_CATALOGUE,
+            pipeline_dates=pipeline_dates,
+            existing_dates={FRONTIER},
+            batch_dates=batch_dates,
+        )
+
+    assert run.written == ["2018-06-05"], "the unfillable date is never offered to the writer"
+    assert "2018-05-10" not in run.loaded, "and never even prepared"
+    lost = [entry for c in assessed for entry in c["unreadable"]]
+    assert lost == [{"date": "2018-05-10", "tiles": "", "tried": "", "objects": "", "scope": "unfillable"}]
+    assert "DATA LOSS" in caplog.text and "2018-05-10" in caplog.text
+
+
+@BOTH_MODES
+def test_the_loss_record_rides_the_write_that_makes_the_date_unfillable(run_ingest, assessed, pipeline_dates):
+    """A leg killed mid-run must still leave the truthful record. This is what makes it true.
+
+    The end-of-leg record is written once, after the whole loop, so a leg killed before it
+    reaches that line leaves committed dates, holes, and nothing saying why — the state that
+    produced the wedged stores. Handing the pending losses to the WRITE closes it by
+    construction: the commit that seals a date below the frontier is the same commit that
+    records it, so no kill can land one without the other, and a skip costs no commit of
+    its own.
+    """
+    with pytest.raises(RuntimeError, match="write of 2018-06-20 failed"):
+        run_ingest(
+            RESUME_CATALOGUE | {"2018-06-20": True},
+            pipeline_dates=pipeline_dates,
+            existing_dates={FRONTIER},
+            fail_on="2018-06-20",
+        )
+    run = run_ingest.runs[-1]
+
+    assert not assessed, "the leg died before the end-of-leg record — as a killed leg does"
+    assert run.losses_at_write[0] == [
+        {"date": "2018-05-10", "tiles": "", "tried": "", "objects": "", "scope": "unfillable"}
+    ], "the first write after the skip carried it"
+    assert run.losses_at_write[1] == [], "and did not carry it twice"

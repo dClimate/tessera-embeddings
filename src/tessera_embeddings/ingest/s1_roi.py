@@ -72,6 +72,7 @@ from tessera_embeddings.ingest.solar_days import (
     fixed_day_ranges,
     normalize_to_solar_day,
     owned_items,
+    resume_window_start,
     solar_grouping_longitude,
 )
 from tessera_embeddings.ingest.stac import ingest_tile
@@ -544,8 +545,8 @@ def ingest_s1_roi_sar(
     # the S2 month slicing uses the same mechanism.
     #
     # Materialised as a list rather than advanced in the loop because the look-ahead has
-    # to know what comes next before the current batch is done with.
-    batch_ranges: list[SolarDayRange] = fixed_day_ranges(start_date, end_date, batch_days)
+    # to know what comes next before the current batch is done with. Built AFTER the frontier
+    # below, because the frontier is what decides where the FIRST batch starts.
 
     # Read ONCE, then maintained in-process as dates are written.
     #
@@ -564,12 +565,42 @@ def ingest_s1_roi_sar(
     # split, so nothing rules it out — and the cost of being wrong is a duplicate-date
     # commit. The consume side below is therefore the authority on what has been written,
     # and the query filter is only an optimisation.
-    # Written dates only. A date given up on is re-offered by the next attempt and gives up
-    # again for the same reason: every accepted cause is DETERMINISTIC, so the verdict recomputes
-    # and re-offering costs one re-evaluation rather than risking anything. A record of the skip
-    # would only be needed if the verdict could change between attempts, which is what treating a
-    # transient failure as a skip used to allow.
+    # Written dates only. A date given up on IS re-offered by the next attempt, deliberately: a
+    # skip verdict is not stable across attempts, because a change to how sources are read
+    # changes what reads. Above the frontier that re-offer is how a recovered date is recovered;
+    # below it the date is unreachable whatever it would read, and `_unfillable` is what keeps it
+    # from being offered.
     written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region)
+    # THE FRONTIER of THIS orbit store: the latest date it holds, and the line below which this
+    # leg can write nothing. The time axis is append-only and strictly increasing because it is
+    # sampled POSITIONALLY downstream. Per store, never shared: a cell's three child stores
+    # advance independently, so one orbit's frontier says nothing about the other's.
+    committed_at_start = frozenset(written_dates)
+    frontier: str | None = max(committed_at_start, default=None)
+    # Rebound, so nothing downstream can use the unfloored window by accident — including the
+    # assessed-window record, which must describe the months this leg actually walked.
+    start_date = resume_window_start(start_date, frontier)
+    if frontier is not None:
+        log.info(
+            "[%s] Resuming roi=%s above the frontier %s: querying %s..%s",
+            orbit,
+            roi_label,
+            frontier,
+            start_date,
+            end_date,
+        )
+
+    def _unfillable(date_str: str) -> bool:
+        """Whether ``date_str`` is one the axis can no longer accept.
+
+        Below the frontier and absent from the axis means an earlier attempt skipped it and then
+        committed a later date. The imagery may well read now — a change to how reads are
+        classified changes verdicts between attempts — but there is nowhere to put it, so
+        offering it can only raise and destroy the store.
+        """
+        return frontier is not None and date_str <= frontier and date_str not in committed_at_start
+
+    batch_ranges: list[SolarDayRange] = fixed_day_ranges(start_date, end_date, batch_days)
     # Counted for the assessed-window record: it separates "sparse region" from
     # "the footprints are wrong", which look identical in a date count alone.
     empty_dates = 0
@@ -581,6 +612,15 @@ def ingest_s1_roi_sar(
     #: boundary solar day comes back from two consecutive batches — without this it would be
     #: given up twice, listed twice, and cost two of the leg's budget.
     given_up: set[str] = set()
+    #: Dates the catalogue still offers that this store can never hold, because an earlier
+    #: attempt skipped them and then committed a later date. A loss like any other: the pixels
+    #: exist at the provider and are absent from the mosaic.
+    unfillable_dates: list[dict[str, str]] = []
+    #: Losses decided but not yet on the store. They ride the NEXT date write's commit (see
+    #: ``write_day_windows(losses=...)``), which is the same commit that puts the skipped date
+    #: below the frontier — so no kill can land one without the other, and no skip costs a
+    #: commit of its own. Cleared once written.
+    pending_losses: list[dict[str, str]] = []
     #: Owned items across every batch — the number that distinguishes "the source does not
     #: cover this ROI for this orbit" from "we found items and committed none of them".
     total_items_seen = 0
@@ -601,7 +641,7 @@ def ingest_s1_roi_sar(
     #: longer apply, so they say nothing about this leg's access.
     read_at_least_once = False
     # Frozen at the start so the background thread reads an object nothing mutates.
-    already_present = frozenset(written_dates)
+    already_present = committed_at_start
 
     def _give_up_date(date_str: str, exc: BaseException) -> bool:
         """Accept the loss of one date, or decline to.
@@ -640,6 +680,7 @@ def ingest_s1_roi_sar(
             "error": f"{type(exc).__name__}: {exc}"[:300],
         }
         given_up_dates.append(entry)
+        pending_losses.append(entry)
         log.error(
             "[%s] DATA LOSS roi=%s date=%s: the source read failed and this date is SKIPPED, so "
             "its pixels are absent from the mosaic. scope=%s error=%s — recorded on the store as "
@@ -857,6 +898,29 @@ def ingest_s1_roi_sar(
                     log.debug("[%s] Skipping date %s: already given up", orbit, date_str)
                     continue
 
+                # The month floor cannot reach these: the first batch starts at the frontier's
+                # MONTH, so the dates below the frontier inside that month are still offered.
+                # Dropped here rather than at the writer, where they raise and the store's only
+                # remedy is deletion.
+                if _unfillable(date_str):
+                    given_up.add(date_str)
+                    loss = {"date": date_str, "scope": "unfillable", "error": ""}
+                    unfillable_dates.append(loss)
+                    pending_losses.append(loss)
+                    log.error(
+                        "[%s] DATA LOSS roi=%s date=%s: the source offers this date and the "
+                        "store's time axis already holds %s, so it can never be appended and its "
+                        "pixels are absent from the mosaic. An earlier attempt skipped it and then "
+                        "committed a later date. Recorded on the store as "
+                        "assessed_unreadable_dates with scope=unfillable — the only remedy is to "
+                        "re-ingest this store's window from empty.",
+                        orbit,
+                        roi_label,
+                        date_str,
+                        frontier,
+                    )
+                    continue
+
                 if footprint is not None and not footprint:
                     # Reaches no live window at all. Writing it would build a full graph
                     # to store nothing, since all-fill chunks are never persisted.
@@ -912,6 +976,11 @@ def ingest_s1_roi_sar(
                                     chunks=INGEST_CHUNKS,
                                     parallel_windows=overlap_window_writes,
                                     s3_region=s3_region,
+                                    # THIS commit is what puts every pending loss out of reach,
+                                    # so it is the one that must carry them. Re-sent on a retry
+                                    # and merged as a union, so a partially-applied attempt
+                                    # cannot duplicate or drop one.
+                                    losses=pending_losses,
                                 )
                 except Exception as exc:
                     # The retry is exhausted. THIS is why one refused read used to take the
@@ -935,6 +1004,7 @@ def ingest_s1_roi_sar(
                     if not _give_up_date(date_str, exc):
                         raise
                     continue
+                pending_losses.clear()  # committed with the date above
                 date_s = time.monotonic() - date_started
                 write_total_s += date_s
                 written_dates.add(date_str)
@@ -1016,13 +1086,29 @@ def ingest_s1_roi_sar(
             empty_dates=empty_dates,
             # A given-up date exists ONLY here. Everything else about it is a log line, and a
             # log line is not read by the coverage gate or by a later resume, so losing this
-            # write loses the fact that the date was ever examined.
-            required=bool(given_up_dates),
-            # Written unconditionally, so a clean re-run clears an earlier run's list rather
-            # than leaving dates advertised as lost that are now present.
-            unreadable=given_up_dates,
+            # write loses the fact that the date was ever examined. An unfillable date counts
+            # for the same reason: a leg that only refused dates wrote nothing to carry them.
+            required=bool(given_up_dates or unfillable_dates),
+            # Merged with what the store already records, minus any date now back on the axis —
+            # see storage.zarr_store.merge_recorded_losses. A resume re-derives only the losses
+            # of the months it walked, so an unconditional write would erase the rest.
+            unreadable=[*given_up_dates, *unfillable_dates],
             get_credentials=None,
             s3_region=s3_region,
+        )
+
+    if unfillable_dates:
+        # First of the two summaries, because it is the one that says the STORE is finished
+        # rather than that a date is: nothing can fill these holes in place.
+        log.error(
+            "[%s] DATA LOSS SUMMARY roi=%s: %d date(s) below the store's committed maximum %s "
+            "and absent from it — %s. The imagery exists and this store can never hold it. "
+            "ACTION: re-ingest this store's window from empty.",
+            orbit,
+            roi_label,
+            len(unfillable_dates),
+            frontier,
+            ", ".join(u["date"] for u in unfillable_dates[:20]),
         )
 
     if given_up_dates:

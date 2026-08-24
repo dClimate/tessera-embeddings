@@ -48,7 +48,7 @@ builds no graph at all.
 import itertools
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Container, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -1232,6 +1232,48 @@ Written by the ingest paths themselves rather than by the completion marker, bec
 gate runs BEFORE the marker on a first ingest, and again later from the fill.
 """
 
+UNREADABLE_DATES_ATTR = "assessed_unreadable_dates"
+
+"""Root attribute listing the dates inside the assessed window that were LOST.
+
+A month absent from the axis inside the assessed window is a finding; a date absent from a
+month is invisible to a month-granular gate, so this is the only place a per-date loss is
+named. Written both by :func:`record_assessed_window` at the end of a leg and, one entry at
+a time, by :func:`write_days_windows` — see ``losses`` there for why the second exists.
+"""
+
+
+def merge_recorded_losses(
+    prior: object,
+    new: "Iterable[dict[str, str]]",
+    *,
+    present: "Container[str]" = (),
+) -> list[Any]:
+    """``prior`` loss records plus ``new`` ones, minus any date now on the time axis.
+
+    A UNION rather than a replacement. A resumed leg re-derives only the losses of the
+    window it actually walked, so writing its own list alone erases what an earlier attempt
+    recorded and the store's holes end up advertised nowhere. The PRIOR entry wins on a
+    repeated date, so a record placed by hand — a repair's account of a hole — survives a
+    later leg rediscovering the same date.
+
+    ``present`` is what keeps the union from advertising a hole that has since been filled:
+    a date back on the time axis is not a loss, whoever recorded it. That is the case the
+    unconditional overwrite this replaced was protecting, and it is the only case it was
+    protecting.
+
+    Entries are carried through VERBATIM, including shapes this does not understand, because
+    the readers of the attribute tolerate a bare date string and a hand-written record is not
+    ours to normalise.
+    """
+    merged: dict[str, Any] = {}
+    for entry in (*(prior if isinstance(prior, (list, tuple)) else ()), *new):
+        date = str(entry.get("date", "")) if isinstance(entry, dict) else str(entry)
+        if date in present or date in merged:
+            continue
+        merged[date] = entry
+    return list(merged.values())
+
 
 def record_assessed_window(
     store_path: str,
@@ -1249,6 +1291,12 @@ def record_assessed_window(
     Absence of a month INSIDE this range is then a finding — the imagery for it either did
     not exist or reached no live window — rather than a gap. Absence outside it remains a
     gap, so widening a window later cannot be excused by an older, narrower assessment.
+
+    Both records UNION with what the store already holds, and the window unions in ONE
+    direction: an already-recorded start is kept and only the end extends. The caller passes
+    the range IT assessed, which on a resume begins at the store's frontier rather than at
+    the leg's configured start — so a backwards widening here would assert that months this
+    run never queried were examined and clean.
 
     ``empty_dates`` is recorded for observability only; the gate does not read it. It says
     how many dates were examined and skipped as reaching no live window, which is the
@@ -1268,14 +1316,32 @@ def record_assessed_window(
         repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
         session = repo.writable_session("main")
         root = zarr.open_group(session.store, mode="a")
-        root.attrs[ASSESSED_WINDOW_ATTR] = [start_date, end_date]
+        try:
+            present = {str(t)[:10] for t in read_time_values(root)}
+        except (KeyError, ValueError):
+            # An axis this cannot read means no recorded loss can be shown to be filled, so
+            # every one is kept. Keeping a loss that is actually present costs a false alarm;
+            # dropping one that is real costs the only record of a hole.
+            present = set()
+        prior_window = root.attrs.get(ASSESSED_WINDOW_ATTR)
+        start, end = start_date, end_date
+        if isinstance(prior_window, (list, tuple)) and len(prior_window) == 2:
+            # The stored START is preserved and only the end extends. A resumed leg begins at
+            # its frontier's month, so stamping its own start would claim the months before it
+            # were examined in full — and an assessed window is precisely the statement that a
+            # month absent inside it is a finding rather than a gap. Widening backwards is the
+            # one direction that can turn a real gap into a clean bill of health, so it is the
+            # one direction refused. Widening forwards only ever adds what this run did assess.
+            start, end = str(prior_window[0]), max(end, str(prior_window[1]))
+        root.attrs[ASSESSED_WINDOW_ATTR] = [start, end]
         root.attrs["assessed_empty_dates"] = int(empty_dates)
-        # Written UNCONDITIONALLY, so a clean re-assessment clears an earlier one's list.
-        # Guarded on truthiness, a repair run that recovered every date left the old dates
-        # advertised on the store, and an audit reading this attr would report pixels
-        # missing that are now present — the assessment describes THIS assessment, so an
-        # empty answer has to overwrite a previous non-empty one.
-        root.attrs["assessed_unreadable_dates"] = list(unreadable or ())
+        # A UNION, minus the dates now on the axis — see merge_recorded_losses. An
+        # unconditional write was correct only while one leg assessed the whole window: once a
+        # resume starts at its frontier's month it never re-derives the earlier months' losses,
+        # so writing its own list alone would erase them.
+        root.attrs[UNREADABLE_DATES_ATTR] = merge_recorded_losses(
+            root.attrs.get(UNREADABLE_DATES_ATTR), unreadable or (), present=present
+        )
         # ``allow_empty`` because re-recording the SAME window writes no bytes, and icechunk
         # refuses a commit with no changes ("cannot commit, no changes made to the session").
         # That refusal surfaced as a WARNING on healthy stores — every resumed leg that had
@@ -1283,11 +1349,11 @@ def record_assessed_window(
         # fires routinely teaches the reader to skip the whole line, including the times it
         # means something. The record is idempotent, so committing it again is harmless.
         session.commit(
-            f"assessed window {start_date}..{end_date} ({empty_dates} empty date(s)"
+            f"assessed window {start}..{end} ({empty_dates} empty date(s)"
             f"{f', {len(unreadable)} unreadable' if unreadable else ''})",
             allow_empty=True,
         )
-        logger.info(f"Recorded assessed window {start_date}..{end_date} on {store_path}")
+        logger.info(f"Recorded assessed window {start}..{end} on {store_path}")
     except Exception as exc:
         if required:
             # The caller says this record is the only durable trace of something. Warning and
@@ -1521,11 +1587,11 @@ class RegionWriteBatch:
                 "which observations this store yields without changing anything a reader can check, "
                 "and it cannot be inserted in place without moving every array's data. "
                 "ACTION: this store cannot be completed — delete it and re-ingest its window in "
-                "order. Reaching here means an earlier attempt gave up on this date and then "
-                "committed a later one, so the date is now unreachable. Every cause a leg may give "
-                "up for is meant to be DETERMINISTIC — it recomputes to the same verdict, so a "
-                "re-offer skips again harmlessly. This firing means one was not: find which "
-                "transient failure is being read as a permanent one."
+                "order. A date left behind by an EARLIER leg no longer reaches here: an ingest "
+                "starts at the store's frontier and drops any candidate at or below it, recording "
+                "it as a deliberate loss instead (ingest.solar_days.resume_window_start). So this "
+                "firing means one run offered its own dates out of order — a date-derivation or "
+                "batch-ordering bug in the leg that is running, not a hole inherited from before."
             )
         t_index = len(existing)
         time_arr = self.group["time"]
@@ -1716,6 +1782,7 @@ def write_day_windows(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
     parallel_windows: bool = False,
+    losses: "list[dict[str, str]] | None" = None,
 ) -> None:
     """Write ONE date's live windows into a mosaic store, one commit for the date.
 
@@ -1741,6 +1808,7 @@ def write_day_windows(
         get_credentials=get_credentials,
         s3_region=s3_region,
         parallel_windows=parallel_windows,
+        losses=losses,
     )
 
 
@@ -1757,6 +1825,7 @@ def write_days_windows(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
     parallel_windows: bool = False,
+    losses: "list[dict[str, str]] | None" = None,
 ) -> None:
     """Write one or more dates' live windows into a mosaic store, ONE commit for the batch.
 
@@ -1792,6 +1861,14 @@ def write_days_windows(
     ``last_appended`` bump). The manifest is validated against the store BEFORE
     anything is written — the per-append structural gate must not be lost to
     batching.
+
+    ``losses`` rides in this commit: dates the caller has DELIBERATELY given up on, merged
+    into :data:`UNREADABLE_DATES_ATTR`. Handed here rather than written when the caller
+    decides them, because this commit is the moment a skipped date becomes unfillable — the
+    axis refuses anything older than its maximum, so the loss and the write that seals it
+    have to be one atomic act. A leg killed between them would otherwise leave a hole nothing
+    names, which is the state a resume cannot tell from a date it has yet to reach. It also
+    costs no commit of its own, where a commit per skip would cost one per skipped date.
     """
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 
@@ -1908,6 +1985,12 @@ def write_days_windows(
             # Same commit as the dates it describes; a union, since one resume writes many.
             prior = cast("list", attrs.get(MIXED_CODE_IDENTITIES_ATTR, []))
             attrs[MIXED_CODE_IDENTITIES_ATTR] = sorted(set(prior) | set(mixed))
+        if losses:
+            # ``present`` is this batch's own dates: a date being written is not a loss,
+            # whatever a caller still holds pending for it.
+            attrs[UNREADABLE_DATES_ATTR] = merge_recorded_losses(
+                attrs.get(UNREADABLE_DATES_ATTR), losses, present={str(w)[:10] for w in whens}
+            )
         if parallel_windows and _write_windows_overlapped(batch.session, writes):
             return  # normal context exit: the batched commit below still runs
         for one_ds, one_windows, t, drop in writes:

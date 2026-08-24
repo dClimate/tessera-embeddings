@@ -1443,12 +1443,77 @@ estimates. The store's axis is day-granular either way, so this only decides WHI
 ordering and which tile wins are untouched, and at mid longitudes the value is unchanged because
 the solar day IS the UTC date there.
 
+### Resuming over a store that already holds dates
+
+A store's time axis is append-only and strictly increasing, because it is sampled
+**positionally** downstream. The latest date on it — the store's **frontier** — is therefore a
+floor: nothing at or below it can ever be written, and `RegionWriteBatch.append_time_slot`
+refuses to try (`NonMonotonicDateError`).
+
+That matters because skipping a date is a designed outcome, not a fault. A date can fail the
+coverage gate, reach no live window, or have no copy of some source object that reads. Every
+skip leaves a hole; a later date then commits above it; and the hole is permanent. What made it
+dangerous is that a skip verdict is **not stable across attempts** — a change to how source
+reads are classified changes what reads — so a resume could offer a date an earlier attempt
+skipped, succeed at reading it, and be refused by the axis. The refusal is fatal and the store's
+only remedy is deletion, so one recovered date cost a whole cell.
+
+Three things, per store, close it. The three child stores of a cell (reflectance and both radar
+orbits) advance independently, so each computes its own frontier; a shared one would skip months
+a lagging store never reached.
+
+1. **A window floor.** The leg starts at the first day of the frontier's **month**
+   (`solar_days.resume_window_start`), not at the leg's configured start. Below that month there
+   is nothing this store can accept, so walking it is pure cost. The floor is a month boundary
+   rather than `frontier + 1 day` because a solar day straddles the UTC boundary and its query is
+   padded either side — starting mid-month would query the first owned day on an unpadded bound
+   and write it short, which is the defect the chunk padding exists to prevent.
+2. **A per-date check the floor cannot reach.** Dates below the frontier *inside its own month*
+   are still offered, and each ingest drops them before preparation. This is the correctness
+   half; the floor is only the cost half.
+3. **A recorded loss, not an exception.** Such a date can never enter the store, so raising
+   destroys the cell and changes nothing else. It is recorded under
+   `assessed_unreadable_dates` with `scope=unfillable`, logged as `DATA LOSS`, and the leg
+   carries on.
+
+Above the frontier nothing is suppressed. A date an earlier attempt gave up on is **deliberately
+re-offered**: it is still appendable, so a re-offer is exactly how a recovered source is
+recovered, and the cost of failing again is one re-evaluation.
+
+**A skip is recorded by the commit that seals it.** The end-of-leg record runs once, after the
+whole loop, so a leg killed before it reaches that line leaves committed dates, holes, and
+nothing saying why — which is indistinguishable from a window the leg had yet to reach. Pending
+losses are therefore handed to the **write** (`write_days_windows(losses=...)`) and merged into
+the attribute in the same commit as the date. That commit is the one that puts the skipped date
+below the frontier, so no kill can land one without the other, and a skip costs no commit of its
+own — where a commit per skip would cost one per skipped date.
+
+Months *below* the floor are deliberately left alone: their holes are never rediscovered, and
+the assessed window below is what says so. Three states have to stay distinguishable — assessed
+and empty, assessed and lost, and **not assessed** — and a month the leg never queried is the
+third.
+
 ### Recording the window an ingest examined
 
 Both paths write `assessed_window` — the date range processed in full — onto the store. A month
 absent from the time axis but wholly inside that range was **examined and found to hold nothing
 reachable**, which is a finding; a month outside it is a gap. Without the record those are
 indistinguishable, and the coverage gate has to fail on both.
+
+**The range recorded is the FLOORED one** — what the leg walked, not what it was asked for — and
+both records **union** with what the store already holds:
+
+- The window's stored **start is kept** and only its end extends. A resume begins at its
+  frontier's month, so stamping its own start would retract months an earlier leg did examine;
+  widening backwards to the leg's configured start would claim months this one skipped. Only the
+  second direction can turn a real gap into a clean bill of health, so it is the one refused.
+  With nothing stored — the interrupted-leg case — the window simply starts where this run
+  started, and the earlier months stay outside it, which reads as *not assessed*.
+- The loss list is a **union**, minus any date now back on the time axis
+  (`zarr_store.merge_recorded_losses`). A resume re-derives only the losses of the months it
+  walked, so an unconditional write would erase the rest; dropping a date that has since been
+  filled is what the unconditional write was protecting, and it is kept. The prior entry wins on
+  a repeated date, so a record placed by hand — a repair's account of a hole — is not overwritten.
 
 The attribute belongs on the repo the gate opens — `reflectance.zarr` or `sar_<orbit>.zarr` —
 not on the mosaic directory that contains them.
@@ -1856,7 +1921,8 @@ Past that point the response is a ladder, in `s2_roi.py`'s consume path:
 3. **Give up, loudly,** when the implicated tile-dates have no copies left: the date is
    skipped rather than the leg failed, and it is recorded on the store as
    `assessed_unreadable_dates` so the absence reads as a finding rather than an unexamined
-   gap.
+   gap. That record rides the NEXT date's commit, so a leg killed mid-run still leaves it —
+   see *Resuming over a store that already holds dates*.
 
 Two properties are worth stating because they are what the attribution step buys, and they
 are held by tests rather than by comment:
@@ -1962,7 +2028,10 @@ for — OPERA publishes one copy of a granule:
    the earlier one permanently below the append-only maximum, so the re-run meant to recover it is
    refused instead.
 3. **Record it on the store** in the same `assessed_unreadable_dates` attribute the optical path
-   writes, so the coverage gate refuses to excuse a month that lost dates.
+   writes, so the coverage gate refuses to excuse a month that lost dates. The record rides the
+   NEXT date's commit rather than waiting for the end of the leg — see *Resuming over a store
+   that already holds dates* — because that commit is the one that puts the skipped date below
+   the frontier.
 4. **Stop past `MAX_GIVEN_UP_DATES`**, and stopping is TERMINAL.
    `TooManyGivenUpDatesError` is IN the leg-retry classifier's non-retryable set, because nothing
    counted toward the ceiling can clear: a provider refusal re-raises and is retried in order, so

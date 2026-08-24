@@ -48,6 +48,7 @@ from tessera_embeddings.storage.zarr_store import (
     open_repo,
     open_store,
     open_store_as_zarr_group,
+    record_assessed_window,
     resolve_region,
     rollback_commits,
     set_s3_config,
@@ -1098,3 +1099,68 @@ class TestEmptyChunkElision:
         assert red.shape == (1, 8, 8)
         # 2x2 spatial chunks; the three all-zero (fill) chunks are elided.
         assert red.nchunks_initialized == 1
+
+
+class TestAssessedWindowRecord:
+    """The store's account of what was examined, and of the holes inside it.
+
+    Both records are UNIONS with what the store already holds, because a resumed leg re-derives
+    only the part of the window it walked. Writing its own answer alone would erase the rest —
+    and the assessed window is what makes an absent month a finding rather than a gap, so an
+    erased or over-wide one turns a real gap into a clean bill of health.
+    """
+
+    def _store(self, local_zarr_path, sample_reflectance_data, dates):
+        path = str(local_zarr_path / "assessed" / "reflectance.zarr")
+        for i, date in enumerate(dates):
+            data = sample_reflectance_data([date], height=64, width=64, seed=i)
+            _write_reflectance(path, data, tile_id="33UUP", baselines={date: 400})
+        return path
+
+    def _attrs(self, path):
+        return dict(open_store_as_zarr_group(path).attrs)
+
+    def test_the_stored_start_is_kept_and_only_the_end_extends(self, local_zarr_path, sample_reflectance_data):
+        """A resume begins at its frontier's month, so its own start is LATER than what was
+        assessed before. Taking it would retract months an earlier leg did examine; taking the
+        earliest start either leg mentions would claim months this one skipped. Keeping the
+        stored start does neither.
+        """
+        path = self._store(local_zarr_path, sample_reflectance_data, ["2018-01-01"])
+
+        record_assessed_window(path, "2018-01-01", "2018-06-30")
+        record_assessed_window(path, "2018-05-01", "2018-12-31")
+
+        assert self._attrs(path)["assessed_window"] == ["2018-01-01", "2018-12-31"]
+
+    def test_a_first_record_starts_where_the_run_started(self, local_zarr_path, sample_reflectance_data):
+        """The interrupted-leg case. A leg killed before it recorded anything leaves dates on the
+        axis and no window at all, so the resume's own start is all there is — and the months
+        below it stay OUTSIDE the window, which reads as not assessed rather than as assessed and
+        clean. That is the truthful answer: nothing on this store says they were examined.
+        """
+        path = self._store(local_zarr_path, sample_reflectance_data, ["2018-01-01"])
+
+        record_assessed_window(path, "2018-05-01", "2018-12-31")
+
+        assert self._attrs(path)["assessed_window"] == ["2018-05-01", "2018-12-31"]
+
+    def test_losses_union_across_runs_and_drop_once_the_date_arrives(self, local_zarr_path, sample_reflectance_data):
+        """Two runs, two holes, one list — and an entry disappears when the date is filled.
+
+        The union is what keeps a resume from erasing the earlier months' losses it never
+        re-derives. Dropping a date that is now on the axis is what the unconditional overwrite
+        this replaced was protecting: an audit must not be told pixels are missing that are
+        present.
+        """
+        path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"])
+
+        record_assessed_window(path, "2024-01-01", "2024-01-31", unreadable=[{"date": "2024-01-06"}])
+        record_assessed_window(path, "2024-02-01", "2024-02-28", unreadable=[{"date": "2024-02-14"}])
+        assert [e["date"] for e in self._attrs(path)["assessed_unreadable_dates"]] == ["2024-01-06", "2024-02-14"]
+
+        data = sample_reflectance_data(["2024-01-06"], height=64, width=64, seed=9)
+        _write_reflectance(path, data, tile_id="33UUP", baselines={"2024-01-06": 400})
+        record_assessed_window(path, "2024-01-01", "2024-02-28")
+
+        assert [e["date"] for e in self._attrs(path)["assessed_unreadable_dates"]] == ["2024-02-14"]

@@ -55,6 +55,7 @@ __all__ = [
     "normalize_to_solar_day",
     "owned_items",
     "resolve_grouping_longitude",
+    "resume_window_start",
     "solar_day_of",
     "solar_day_offset_seconds",
     "solar_grouping_longitude",
@@ -375,6 +376,34 @@ def fixed_day_ranges(start_date: str, end_date: str, days: int) -> list[SolarDay
         spans.append((span_start, span_end))
         span_start = span_end + datetime.timedelta(days=1)
     return _padded(spans)
+
+
+def resume_window_start(start_date: str, frontier: str | None) -> str:
+    """Where a leg resuming over a store must begin: the first day of ``frontier``'s MONTH.
+
+    ``frontier`` is the latest date already on that store's time axis, and the axis is
+    append-only in order — so every date at or below it is unreachable and re-walking the
+    months below it is pure cost. On a year-long window a resume near the end was re-querying
+    and re-evaluating the whole year to write a handful of dates.
+
+    The floor is the frontier's MONTH, not the frontier itself and not the day after it. A
+    solar day straddles the UTC boundary, so the query for a day is padded either side
+    (:func:`whole_window_range`, :func:`owned_items`) — start at ``frontier + 1 day`` and the
+    first owned solar day is queried on a bound that excludes part of its imagery, and it is
+    written short. Starting on a month boundary keeps the padding intact and costs at most
+    the re-evaluation of the frontier's own month.
+
+    Dropping the earlier months does NOT by itself make the resume safe: dates below the
+    frontier inside its own month are still offered. The caller must drop those per date —
+    the floor bounds the cost, the per-date check is the correctness.
+
+    Each store has its OWN frontier. A cell's three child stores (reflectance and both radar
+    orbits) advance independently, so a floor computed once and shared would silently skip
+    months a lagging store never reached.
+    """
+    if frontier is None:
+        return start_date
+    return max(start_date, f"{frontier[:7]}-01")
 
 
 def whole_window_range(start_date: str, end_date: str) -> SolarDayRange:

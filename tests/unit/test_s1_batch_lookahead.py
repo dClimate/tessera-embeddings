@@ -23,6 +23,7 @@ were checked to fail when the skip is removed, so they are not passing vacuously
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -120,7 +121,16 @@ def test_prepare_exceptions_surface_when_the_batch_is_consumed() -> None:
     assert consumed == [0], f"batch 0 should have been consumed before the failure: {consumed}"
 
 
-def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs) -> list[str]:
+def _run_ingest(
+    monkeypatch,
+    catalogue: list[str],
+    existing: set[str],
+    *,
+    start_date: str = "2024-01-01",
+    end_date: str = "2024-01-04",
+    losses_seen: list[list[dict[str, str]]] | None = None,
+    **kwargs,
+) -> list[str]:
     """Drive ``ingest_s1_roi_sar`` against a faked catalogue and store.
 
     ``catalogue`` is every solar date the catalogue holds; the fake returns the ones
@@ -156,7 +166,11 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
         )
         return ds, {}
 
-    def fake_write_day_windows(_store, data, *_args, **_kwargs):
+    def fake_write_day_windows(_store, data, *_args, losses=None, **_kwargs):
+        # Snapshotted: the caller clears its pending list after the call, and what a test
+        # asserts on is precisely what rode THIS commit.
+        if losses_seen is not None:
+            losses_seen.append([dict(entry) for entry in losses or ()])
         written.append(str(data["time"].values[0])[:10])
 
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
@@ -178,13 +192,12 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
 
     s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/roi.zarr",
-        start_date="2024-01-01",
-        end_date="2024-01-04",
+        start_date=start_date,
+        end_date=end_date,
         store_path="s3://bucket/mosaics",
         client=_fake_client(),
         orbit="ascending",
-        batch_days=2,
-        **kwargs,
+        **{"batch_days": 2, **kwargs},
     )
     return written
 
@@ -512,3 +525,43 @@ def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
     assert result.dates_processed == {"ascending": 0}
     assert written == [], "no date may be committed when nothing can be stored"
     assert queried == [], "and the catalogue need not be queried at all"
+
+
+def test_a_date_below_the_frontier_is_recorded_as_lost_rather_than_raised(monkeypatch, caplog) -> None:
+    """Each orbit store has its OWN frontier, and its own dates below it to refuse.
+
+    Radar is the same defect with a different loop: a date at or under the store's latest
+    committed date can never be appended, so offering it can only raise and leave the store
+    unrepairable. The first batch starts at the frontier's MONTH — the query padding needs a
+    month boundary — which leaves the dates below the frontier inside that month still
+    offered, and those are what this drops and records.
+    """
+    from tessera_embeddings.ingest import s1_roi
+
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        s1_roi,
+        "record_assessed_window",
+        lambda path, start, end, **kw: recorded.append({"start": start, "end": end, **kw}),
+    )
+    losses_seen: list[list[dict[str, str]]] = []
+
+    with caplog.at_level(logging.ERROR):
+        written = _run_ingest(
+            monkeypatch,
+            catalogue=["2018-01-24", "2018-05-10", "2018-06-05"],
+            existing={"2018-05-27"},
+            start_date="2018-01-01",
+            end_date="2018-06-30",
+            batch_days=31,
+            losses_seen=losses_seen,
+        )
+
+    assert written == ["2018-06-05"], "the unfillable date is never offered to the writer"
+    assert recorded[0]["start"] == "2018-05-01", "the leg assessed from the frontier's month"
+    assert recorded[0]["required"] is True, "the record is load-bearing when something was lost"
+    assert [entry["date"] for entry in recorded[0]["unreadable"]] == ["2018-05-10"]
+    assert losses_seen[0] == [{"date": "2018-05-10", "scope": "unfillable", "error": ""}], (
+        "the loss rides the commit that seals it, so a killed leg still leaves the record"
+    )
+    assert "DATA LOSS" in caplog.text and "2018-05-10" in caplog.text
