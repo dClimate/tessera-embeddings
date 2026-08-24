@@ -283,6 +283,12 @@ _NON_RETRYABLE_LEG_MARKERS = (
     # momentary open failure is re-raised as itself rather than routed into the create leg.
     # `scripts/audit_mosaic_prefixes.py` in the consumer repo finds these before a dispatch.
     "CorruptedStoreError",
+    # A radar leg past `MAX_GIVEN_UP_DATES`. This was deliberately RETRYABLE while a provider
+    # refusal could count toward that ceiling — a refusal clears, so a re-dispatch wrote the dates
+    # the previous leg gave up. A refusal is no longer a reason to give up a date, so every date
+    # counted is one whose bytes will not read: the re-dispatch re-reads the same objects, spends
+    # the per-read retry ladder on each, and holds a fleet to reach the identical answer.
+    "TooManyGivenUpDatesError",
 )
 
 

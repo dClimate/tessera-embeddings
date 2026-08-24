@@ -107,21 +107,30 @@ S1Orbit = Literal["ascending", "descending"]
 
 
 MAX_GIVEN_UP_DATES = 10
-"""How many dates one radar leg may give up before it stops and asks to come back.
+"""How many dates one radar leg may give up before it stops and refuses the year.
 
-Small on purpose, because a provider refusal CLEARS. Every date given up while one lasts is a
-date a later run would have written, so grinding through an outage converts recoverable imagery
-into a durable hole — and a leg that finishes returns success, so nothing comes back for it.
-Stopping instead is a request to be re-dispatched, and the dates listed are then written rather
-than lost. Ten is a small fraction of a radar year's couple of hundred dates per orbit.
+**Its original reasoning no longer holds and the ceiling means something else now.** It was
+"small on purpose, because a provider refusal CLEARS" — a refusal used to be countable here, so
+grinding through an outage converted recoverable imagery into a durable hole and the leg still
+returned success. A refusal is no longer a reason to give up a date at all: it re-raises and the
+leg retries in order.
+
+So every date counted here is now one whose bytes will not read, whatever we do. The ceiling is
+therefore a statement about the DATA — past ten, this orbit-year is too damaged to be worth a
+mosaic — rather than a request to come back when a service recovers. Ten is a small fraction of a
+radar year's couple of hundred dates per orbit.
 """
 
 
 class TooManyGivenUpDatesError(RuntimeError):
     """A radar leg gave up more dates than the bounded skip permits.
 
-    Deliberately RETRYABLE — absent from ``ingest_zone_year._NON_RETRYABLE_LEG_MARKERS`` —
-    because a refusal goes away and a re-dispatch writes the dates this leg gave up.
+    **NOT retryable, and it used to be.** It was deliberately absent from
+    ``ingest_zone_year._NON_RETRYABLE_LEG_MARKERS`` "because a refusal goes away and a re-dispatch
+    writes the dates this leg gave up". Nothing counted toward the ceiling goes away any more:
+    every one of those dates failed for a cause that recomputes, so a re-dispatch re-reads the
+    same unreadable objects, spends the per-read retry ladder on each of them again, and holds a
+    Dask fleet to reach the identical answer.
     """
 
 
