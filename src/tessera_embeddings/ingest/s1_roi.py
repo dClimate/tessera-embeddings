@@ -77,6 +77,8 @@ from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
     get_existing_dates,
     record_assessed_window,
+    record_skipped_date,
+    skipped_dates,
     store_write_retrying,
     write_day_windows,
 )
@@ -544,7 +546,12 @@ def ingest_s1_roi_sar(
     # split, so nothing rules it out — and the cost of being wrong is a duplicate-date
     # commit. The consume side below is therefore the authority on what has been written,
     # and the query filter is only an optimisation.
-    written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region)
+    # Written, plus given up on for a reason that cannot change: both are settled, and both are
+    # absent from the store, so filtering on written dates alone re-offers a lost date — which
+    # the time axis then refuses fatally, because later dates are already on it.
+    written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region) | skipped_dates(
+        orbit_store, s3_region=s3_region
+    )
     # Counted for the assessed-window record: it separates "sparse region" from
     # "the footprints are wrong", which look identical in a date count alone.
     empty_dates = 0
@@ -583,15 +590,21 @@ def ingest_s1_roi_sar(
         else:
             return False
         given_up.add(date_str)
-        given_up_dates.append(
-            {
-                "date": date_str,
-                "scope": scope,
-                # Truncated: this lands in the store's metadata, which every reader of the
-                # attribute pays for, and the first line is what identifies the cause.
-                "error": f"{type(exc).__name__}: {exc}"[:300],
-            }
-        )
+        entry = {
+            "date": date_str,
+            "scope": scope,
+            # Truncated: this lands in the store's metadata, which every reader of the
+            # attribute pays for, and the first line is what identifies the cause.
+            "error": f"{type(exc).__name__}: {exc}"[:300],
+        }
+        given_up_dates.append(entry)
+        # DURABLE NOW. `record_assessed_window` below is the authoritative record but runs once,
+        # after the loop — so a leg killed before it reaches that line leaves no trace of what it
+        # gave up, and the next attempt offers the date again. Only `unreadable` is then treated
+        # as settled (`PERMANENT_SKIP_SCOPES`); a `provider-refused` date is recorded but still
+        # re-offered, because that refusal is transient and blocking it would turn a recoverable
+        # outage into permanent loss.
+        record_skipped_date(orbit_store, entry, s3_region=s3_region)
         log.error(
             "[%s] DATA LOSS roi=%s date=%s: the source read failed and this date is SKIPPED, so "
             "its pixels are absent from the mosaic. scope=%s error=%s — recorded on the store as "

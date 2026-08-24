@@ -1157,6 +1157,35 @@ def open_store_group_and_tip(
 
 
 ASSESSED_WINDOW_ATTR = "assessed_window"
+
+#: Dates a leg deliberately gave up on, written AS IT GIVES UP rather than at the end.
+#:
+#: :func:`record_assessed_window` is the authoritative record of where a window's holes are,
+#: but it runs once, after the whole drive loop. A leg killed before it reaches that line
+#: leaves no trace of anything it skipped — and the next attempt then rebuilds its work from
+#: what was WRITTEN, finds the date absent, and offers it again. If the date reads this time
+#: the append is refused, because later dates are already on the axis and the axis is
+#: append-only in order. The cell cannot progress and the date cannot be filled in place.
+#:
+#: So this is the crash-durable half: appended one date at a time, and cleared by
+#: :func:`record_assessed_window` once the authoritative list supersedes it. A run that
+#: recovers every date therefore ends with both empty, which is what lets the authoritative
+#: record stay a description of THIS assessment.
+SKIPPED_DATES_ATTR = "pending_skipped_dates"
+
+#: The ``scope`` values a later attempt must NOT offer again — and only these.
+#:
+#: The discriminator is whether the failure can FLIP. These three are read failures: the
+#: objects would not read, and the same objects can read on the next attempt. That is the one
+#: shape that reaches the writer with a date the store can no longer accept, because later
+#: dates are on the axis by then and the axis cannot be inserted into.
+#:
+#: Every other skip — a coverage rejection, a producer conflict — is decided during
+#: PREPARATION and never reaches the writer at all, so re-offering it costs one re-evaluation
+#: and cannot wedge anything. Those are still recorded, because a leg that dropped dates should
+#: be able to say which; they are simply not treated as settled. The distinction matters most
+#: for a provider outage, where blocking would turn a recoverable refusal into permanent loss.
+PERMANENT_SKIP_SCOPES = frozenset({"attributed", "whole-date", "unreadable"})
 """Root attribute naming the date range an ingest examined in full.
 
 The distinction it exists to draw: a month absent from a mosaic's time axis means either
@@ -1212,6 +1241,10 @@ def record_assessed_window(
         # missing that are now present — the assessment describes THIS assessment, so an
         # empty answer has to overwrite a previous non-empty one.
         root.attrs["assessed_unreadable_dates"] = list(unreadable or ())
+        # The authoritative list now covers everything the per-skip record was holding on
+        # its behalf, so clear it. Leaving it would make a recovered date look skipped
+        # forever, since `skipped_dates` reads both.
+        root.attrs[SKIPPED_DATES_ATTR] = []
         # ``allow_empty`` because re-recording the SAME window writes no bytes, and icechunk
         # refuses a commit with no changes ("cannot commit, no changes made to the session").
         # That refusal surfaced as a WARNING on healthy stores — every resumed leg that had
@@ -1232,6 +1265,78 @@ def record_assessed_window(
             # leg is retried instead of finalised.
             raise
         logger.warning(f"Could not record assessed window on {store_path}: {exc}")
+
+
+def record_skipped_date(
+    store_path: str,
+    entry: dict[str, str],
+    *,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
+) -> None:
+    """Append ONE deliberately-skipped date to :data:`SKIPPED_DATES_ATTR`, immediately.
+
+    Called at the moment a date is given up on, so the record survives the leg dying before
+    the end-of-leg assessment. See :data:`SKIPPED_DATES_ATTR` for what that protects against.
+
+    **Best effort, never fatal.** A skip can happen before any date has been written, and
+    then there is no store to annotate — but that is also the one case where nothing can go
+    wrong, because the wedge this prevents needs a LATER date already on the axis, and an
+    absent store has no axis. So failing to record is exactly harmless where it is possible,
+    and giving up the whole leg over a bookkeeping write would be the worse trade.
+
+    Idempotent per date: re-recording a date already listed rewrites nothing.
+    """
+    try:
+        repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
+        session = repo.writable_session("main")
+        root = zarr.open_group(session.store, mode="a")
+        held = root.attrs.get(SKIPPED_DATES_ATTR)
+        recorded = list(held) if isinstance(held, (list, tuple)) else []
+        if any(isinstance(e, dict) and e.get("date") == entry.get("date") for e in recorded):
+            return
+        root.attrs[SKIPPED_DATES_ATTR] = [*recorded, entry]
+        session.commit(f"skipped date {entry.get('date')} ({entry.get('scope')})")
+        logger.info("Recorded skipped date %s on %s", entry.get("date"), store_path)
+    except Exception as exc:
+        logger.warning("Could not record skipped date %s on %s: %s", entry.get("date"), store_path, exc)
+
+
+def skipped_dates(
+    store_path: str,
+    *,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
+) -> set[str]:
+    """Dates an earlier attempt on this store recorded as deliberately skipped.
+
+    Read alongside :func:`get_existing_dates` to decide what is still outstanding: a date
+    that was given up on for a reason that cannot change is as settled as one that was
+    written, and re-offering it is what wedges the store. Reads BOTH the crash-durable list
+    and the authoritative one, so the answer does not depend on whether the previous attempt
+    reached its own ending, and filters to :data:`PERMANENT_SKIP_SCOPES` — see there for why
+    that is narrower than "everything that was skipped".
+
+    **Fails open, unlike :func:`get_existing_dates`.** An unreadable attr here means dates
+    get re-offered — the behaviour before this existed — whereas failing closed would skip
+    dates that were never skipped. Only one of those loses data.
+    """
+    dates: set[str] = set()
+    try:
+        repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
+        root = zarr.open_group(repo.readonly_session("main").store, mode="r")
+        for attr in (SKIPPED_DATES_ATTR, "assessed_unreadable_dates"):
+            recorded = root.attrs.get(attr)
+            if not isinstance(recorded, (list, tuple)):
+                continue
+            for entry in recorded:
+                if not isinstance(entry, dict) or entry.get("scope") not in PERMANENT_SKIP_SCOPES:
+                    continue
+                if date := entry.get("date"):
+                    dates.add(str(date))
+    except Exception as exc:
+        logger.debug("No skipped-date record on %s: %s", store_path, exc)
+    return dates
 
 
 def get_existing_dates(
@@ -1399,7 +1504,11 @@ class RegionWriteBatch:
     are unsupported.
     """
 
-    def __init__(self, session: "icechunk.Session") -> None:
+    def __init__(self, session: "icechunk.Session", store_path: str | None = None) -> None:
+        #: Which store this is, for the refusals below. A session does not carry its own
+        #: path, and a refusal that names only a date tells an operator nothing they can act
+        #: on: the remedy is to wipe and re-ingest ONE store, so the message has to say which.
+        self.store_path = store_path
         #: The batch's session. Exposed because window PIXEL data at volume should
         #: be written as ``to_icechunk(win, batch.session, mode="r+", region=...)``
         #: — placement stays on the Dask workers that computed the pixels instead
@@ -1433,10 +1542,10 @@ class RegionWriteBatch:
         existing = read_time_values(self.group)
         if (existing == when_ns).any():
             raise DuplicateDateError(
-                f"date {when_ns} is already on the time axis; refusing a duplicate slot. "
-                "Another writer has almost certainly committed this date to this store — "
-                "check for a second run ingesting the same zone/year/orbit before looking "
-                "for a date-derivation bug."
+                f"date {when_ns} is already on the time axis of {self.store_path or '<unknown store>'}; "
+                "refusing a duplicate slot. Another writer has almost certainly committed this date "
+                "to this store — check for a second run ingesting the same zone/year/orbit before "
+                "looking for a date-derivation bug."
             )
         # The axis is read POSITIONALLY downstream (the resampler samples by position, not by
         # timestamp), so appending an older date than one already stored silently changes which
@@ -1448,10 +1557,14 @@ class RegionWriteBatch:
         if len(existing) and when_ns < existing.max():
             raise NonMonotonicDateError(
                 f"date {when_ns} is older than the latest date already on the time axis "
-                f"({existing.max()}); refusing to append it out of order. The axis is sampled "
-                "positionally, so an out-of-order slot changes which observations this store "
-                "yields without changing anything a reader can check. Ingest the missing date "
-                "into a fresh store for the window, or re-ingest the window in order."
+                f"({existing.max()}) of {self.store_path or '<unknown store>'}; refusing to append "
+                "it out of order. The axis is sampled positionally, so an out-of-order slot changes "
+                "which observations this store yields without changing anything a reader can check, "
+                "and it cannot be inserted in place without moving every array's data. "
+                "ACTION: this store cannot be completed — delete it and re-ingest its window in "
+                "order. Reaching here means an earlier attempt gave up on this date without leaving "
+                "a record of it, so it was offered again; the record is what prevents a repeat "
+                "(storage.zarr_store.record_skipped_date)."
             )
         t_index = len(existing)
         time_arr = self.group["time"]
@@ -1496,7 +1609,7 @@ def batched_region_writes(
     """
     repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
-    yield RegionWriteBatch(session)
+    yield RegionWriteBatch(session, store_path)
     # Timed because the commit (manifest + snapshot writes) is serial per-date work
     # no fleet width can compress — the pipeline instrumentation needs it separable
     # from the window computes it follows.

@@ -9,6 +9,8 @@ what dedupes the next run's STAC query.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import numpy as np
 import pytest
 
@@ -16,11 +18,15 @@ from tessera_embeddings.errors import DuplicateDateError, NonMonotonicDateError
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
 from tessera_embeddings.storage.zarr_store import (
     CONCURRENT_WRITER_ERRORS,
+    PERMANENT_SKIP_SCOPES,
     batched_region_writes,
     get_existing_dates,
     open_repo,
     open_store_as_zarr_group,
     read_time_values,
+    record_assessed_window,
+    record_skipped_date,
+    skipped_dates,
 )
 
 D1, D2 = np.datetime64("2024-06-01", "ns"), np.datetime64("2024-06-11", "ns")
@@ -135,3 +141,86 @@ def test_an_out_of_order_date_is_refused(store):
     # Forward in time still works, so the guard is on ORDER and not on appending at all.
     with batched_region_writes(store, message="forward") as batch:
         batch.append_time_slot(np.datetime64("2024-07-01", "ns"))
+
+
+def test_the_refusals_name_the_store_and_the_date(store):
+    """Both refusals end a leg, and the remedy is per STORE — so the message must name one.
+
+    A refusal that gives only a date tells an operator nothing they can act on: there are
+    1,008 cells and the fix is to delete and re-ingest exactly one of them. A session does not
+    carry its own path, so this is the thing most easily left out.
+    """
+    for date, expected in ((np.datetime64("2024-05-15", "ns"), NonMonotonicDateError), (D1, DuplicateDateError)):
+        with pytest.raises(expected) as raised, batched_region_writes(store, message="m") as batch:
+            batch.append_time_slot(date)
+        assert store in str(raised.value)
+        assert str(date)[:10] in str(raised.value)
+    # And it says what to DO, since the store can no longer be completed.
+    with (
+        pytest.raises(NonMonotonicDateError, match="delete it and re-ingest"),
+        batched_region_writes(store, message="m") as batch,
+    ):
+        batch.append_time_slot(np.datetime64("2024-05-15", "ns"))
+
+
+class TestASkipIsDurableBeforeTheLegEnds:
+    """The record that stops a lost date being offered again — and it has to survive a crash.
+
+    The authoritative list is written once, after the whole drive loop. A leg killed before it
+    gets there leaves no trace of anything it gave up, so the next attempt rebuilds its work
+    from what was WRITTEN, finds the date absent, and offers it again. If the objects read that
+    time the append is refused, fatally, because later dates are already on the axis. Five
+    stores were left unfillable that way. So the record has to exist from the moment of the
+    skip, which is what these pin.
+    """
+
+    _LOST: ClassVar[dict[str, str]] = {"date": "2024-05-20", "scope": "whole-date", "tiles": "T01ABC"}
+
+    def test_one_skip_is_readable_with_no_end_of_leg_call(self, store):
+        """The whole point: nothing else runs between the skip and the crash."""
+        record_skipped_date(store, self._LOST)
+        assert skipped_dates(store) == {"2024-05-20"}
+
+    def test_recording_the_same_date_twice_does_not_duplicate_it(self, store):
+        """A resumed leg can re-derive a skip it already recorded."""
+        record_skipped_date(store, self._LOST)
+        record_skipped_date(store, self._LOST)
+        assert skipped_dates(store) == {"2024-05-20"}
+
+    def test_an_absent_store_is_not_fatal(self, tmp_path):
+        """A skip can precede the first write, and then there is nothing to annotate.
+
+        Also the one case where failing to record is harmless: the refusal it prevents needs a
+        LATER date already on the axis, and a store that does not exist has no axis. Giving up
+        a leg over a bookkeeping write would be the worse trade.
+        """
+        missing = str(tmp_path / "never-written.zarr")
+        record_skipped_date(missing, self._LOST)
+        assert skipped_dates(missing) == set()
+
+    def test_only_a_read_failure_settles_a_date(self, store):
+        """Recorded is not the same as settled, and conflating them loses recoverable dates.
+
+        A coverage rejection and a producer conflict are decided during preparation and never
+        reach the writer, so they cannot wedge anything and must stay re-offerable — blocking a
+        transient provider refusal would turn a recoverable outage into permanent loss.
+        """
+        for scope in ("coverage", "producer-conflict", "provider-refused"):
+            record_skipped_date(store, {"date": f"2024-05-{scope[:2]}", "scope": scope})
+        assert skipped_dates(store) == set(), "a preparation-time skip must not settle a date"
+        assert set(PERMANENT_SKIP_SCOPES) == {"attributed", "whole-date", "unreadable"}
+
+    def test_the_end_of_leg_record_supersedes_and_clears_the_crash_durable_one(self, store):
+        """Otherwise a date a repair run recovered would read as skipped forever."""
+        record_skipped_date(store, self._LOST)
+        record_assessed_window(store, "2024-01-01", "2024-12-31", unreadable=[self._LOST])
+        assert dict(open_store_as_zarr_group(store).attrs)["pending_skipped_dates"] == []
+        # Still settled — `skipped_dates` reads the authoritative list too, so clearing the
+        # crash-durable half does not un-settle the date it was holding.
+        assert skipped_dates(store) == {"2024-05-20"}
+
+    def test_a_recovered_date_stops_being_settled(self, store):
+        """A run that lost nothing must leave nothing behind, or it fences off its own dates."""
+        record_skipped_date(store, self._LOST)
+        record_assessed_window(store, "2024-01-01", "2024-12-31", unreadable=[])
+        assert skipped_dates(store) == set()
