@@ -324,23 +324,33 @@ CODEC_FAILURE = "ZIPDecode:Decoding error at scanline 0, unknown compression met
 READ_FAILED = "Read failed. See previous exception for details."
 
 
+def _as_rasterio_ships() -> None:
+    """Drop any reducer already installed, leaving the class as the installed wheel defines it."""
+    if "__reduce__" in CPLE_BaseError.__dict__:
+        del CPLE_BaseError.__reduce__
+
+
 @pytest.fixture
 def gdal_errors_travel_as_shipped() -> Iterator[None]:
-    """Undo whatever a test installed on rasterio's classes, and on ``copyreg``.
+    """Start every test from rasterio as shipped, and put back whatever was installed.
 
-    Both are process-global: the reducer is an attribute on a third-party class, and tblib
-    registers itself in ``copyreg`` for every class in a chain it serialises. Left in place,
-    the first test to install either decides the answer for every test after it in the same
-    process — so a test asserting the loss would pass or fail on ordering.
+    The reducer is an attribute on a third-party class and tblib registers itself in
+    ``copyreg``, so both are process-global for the rest of the session. Any earlier test that
+    starts an ingest installs the reducer, and a test asserting the loss would then observe a
+    rescue it never asked for — which is order-dependent, and which is what happened: the same
+    three tests passed alone and failed after a radar leg test in the same worker.
+
+    So establishing the precondition matters as much as restoring afterwards. Restoring alone
+    leaves the assertion at the mercy of what ran before it.
     """
     installed = CPLE_BaseError.__dict__.get("__reduce__")
     dispatch = dict(copyreg.dispatch_table)
+    _as_rasterio_ships()
     try:
         yield
     finally:
         if installed is None:
-            CPLE_BaseError.__reduce__ = BaseException.__reduce__  # type: ignore[method-assign]
-            del CPLE_BaseError.__reduce__
+            _as_rasterio_ships()
         else:
             CPLE_BaseError.__reduce__ = installed  # type: ignore[method-assign]
         copyreg.dispatch_table.clear()
