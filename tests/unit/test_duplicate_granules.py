@@ -409,6 +409,63 @@ class TestWhenTheProviderRefused:
         """
         assert not is_provider_refusal(Exception(message))
 
+    @pytest.mark.parametrize(
+        "refusal",
+        [
+            "HTTP response code: 403",
+            "HTTP response code: 500",
+            "HTTP response code: 502",
+            "HTTP response code: 503",
+            "HTTP response code: 504",
+            "ServiceUnavailable",
+            "InternalError",
+            "SlowDown",
+            "Connection reset by peer",
+            "Broken pipe",
+            "Read timed out",
+        ],
+    )
+    def test_a_refusal_is_declined_even_inside_a_block_read_wrapper(self, refusal: str) -> None:
+        """The class docstring's promise, tested: this predicate declines EVERY refusal.
+
+        A refusal reaches us through whichever wrapper GDAL raises, so the chain carries a
+        refusal signature AND a block-read one. Claiming it here is how a provider having a bad
+        minute gets recorded as imagery that will never read — and the two predicates then
+        disagree about the same exception, leaving the verdict to whichever the caller asks
+        first.
+        """
+        wrapper = Exception("RasterioIOError: Read failed. See previous exception for details.")
+        wrapper.__cause__ = Exception(f"CPLE_AppDefinedError: {refusal}")
+        assert not is_unreadable_source(wrapper)
+
+    @pytest.mark.parametrize(
+        "refusal",
+        ["HTTP response code: 503", "Connection reset by peer", "SlowDown"],
+    )
+    def test_the_two_predicates_never_claim_the_same_failure(self, refusal: str) -> None:
+        """Disjoint by construction, so neither call order nor a caller that knows only one of
+        them can misclassify. The radar path asks about refusals first; the optical path asks
+        only about unreadable data. Overlapping, that made one sensor wait and the other record
+        permanent loss for the identical failure.
+        """
+        wrapper = Exception("WarpOperationError: Chunk and warp failed")
+        wrapper.__cause__ = Exception(f"RasterioIOError: {refusal}")
+        assert not (is_unreadable_source(wrapper) and is_provider_refusal(wrapper))
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "RasterioIOError: ZIPDecode: Decoding error at scanline 0",
+            "CPLE_AppDefinedError: TIFFReadEncodedTile() failed",
+            "RasterioIOError: IReadBlock failed at X offset 0, Y offset 0",
+        ],
+    )
+    def test_data_that_will_never_decode_is_still_claimed(self, message: str) -> None:
+        """The regression guard on the exclusion above: narrowing this predicate must not stop
+        it recognising a genuinely broken object, which is the case the copy ladder exists for.
+        """
+        assert is_unreadable_source(Exception(message))
+
     def test_the_warp_wrapper_is_looked_through_to_find_the_refusal(self) -> None:
         """The exception that propagates DISCARDS the reason; the refusal is its cause.
 
@@ -424,18 +481,22 @@ class TestWhenTheProviderRefused:
     def test_a_bare_warp_failure_is_not_attributed_to_the_provider(self) -> None:
         assert not is_provider_refusal(Exception("WarpOperationError: Chunk and warp failed"))
 
-    def test_a_numeric_refusal_is_claimed_by_both_predicates(self) -> None:
-        """``is_unreadable_source`` excludes refusals by NAME, and a status code carries none of
-        those words — so the wrapper's decode marker is all it sees.
+    def test_a_numeric_refusal_is_claimed_only_by_the_refusal_predicate(self) -> None:
+        """REPLACES a test that asserted the opposite, and the replacement is the point.
 
-        Not fixed here: widening that exclusion changes the optical copy ladder mid-campaign. The
-        radar caller resolves it by ORDER, asking about the refusal first, which is pinned in
-        ``test_s1_given_up_dates``.
+        That test pinned a numeric refusal as claimed by BOTH predicates, and its docstring said
+        the overlap was "not fixed here" because widening the exclusion would change the optical
+        copy ladder — leaving the verdict to whichever predicate a caller asked first. The radar
+        path asks about the refusal first. The optical path never asks at all, so for that sensor
+        a provider's numeric refusal was the same finding as data that will never decode.
+
+        Excluding refusals here is what makes the two predicates disjoint, so the answer no longer
+        depends on the caller knowing to ask twice, or in which order.
         """
         exc = Exception("WarpOperationError: Chunk and warp failed")
         exc.__cause__ = Exception("RasterioIOError: HTTP response code: 403")
         assert is_provider_refusal(exc)
-        assert is_unreadable_source(exc)
+        assert not is_unreadable_source(exc)
 
     @pytest.mark.parametrize(
         "message",

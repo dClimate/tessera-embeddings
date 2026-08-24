@@ -785,6 +785,16 @@ def is_unreadable_source(exc: BaseException) -> bool:
     text = _exception_chain_text(exc)
     if any(m in text for m in _NOT_THE_DATAS_FAULT):
         return False
+    # A PROVIDER REFUSAL IS NEVER BAD DATA, whatever wrapper it arrives in. This predicate and
+    # `is_provider_refusal` overlap otherwise: a refusal reaches us through a block-read wrapper,
+    # so the chain carries a refusal marker AND an unreadable one, and whichever predicate the
+    # caller happens to ask first decides. The radar path asks about refusals first and the
+    # optical path never asks at all, so the same failure was transient for one sensor and
+    # permanent data loss for the other. Excluding them here makes the two disjoint by
+    # construction, so neither call order nor a caller that knows only one predicate can
+    # misclassify. See context_docs/monitoring/incident-2026-08-24-nonmonotonic-append.md.
+    if any(m in text for m in _PROVIDER_REFUSAL_MARKERS):
+        return False
     if any(m in text for m in _UNREADABLE_MARKERS):
         return True
     return any(m in text for m in _MISSING_OBJECT_MARKERS) and any(m in text for m in _SOURCE_READER_MARKERS)
@@ -827,6 +837,16 @@ _PROVIDER_REFUSAL_MARKERS = (
     "HTTP response code: 502",
     "HTTP response code: 503",
     "HTTP response code: 504",
+    # Transport-level failures, which carry no status at all. A connection dropped mid-transfer
+    # is a statement about the link, never about the bytes — the same object reads on the next
+    # attempt. Without these a throttling provider's dropped reads are claimed by
+    # `is_unreadable_source` through whichever block-read wrapper GDAL happens to raise, and a
+    # recoverable date is recorded as permanent loss.
+    "Connection reset",
+    "Broken pipe",
+    "timed out",
+    "Connection aborted",
+    "RequestTimeout",
 )
 
 #: What makes a failure the SOURCE reader's: GDAL is the layer that reported it.

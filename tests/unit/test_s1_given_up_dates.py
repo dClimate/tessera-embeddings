@@ -157,11 +157,12 @@ def test_the_loss_is_recorded_on_the_store_and_scoped_by_cause(monkeypatch) -> N
 
 
 def test_a_refusal_inside_a_warp_failure_is_scoped_as_a_refusal(monkeypatch) -> None:
-    """Both predicates claim a numeric refusal wrapped in a warp failure, so ORDER decides.
+    """A numeric refusal wrapped in a warp failure is scoped as a refusal, not as bad data.
 
-    ``is_unreadable_source`` recognises refusals by name, and a status code carries none of those
-    words. Asking about the refusal first is what stops a transient 403 being recorded as imagery
-    that will never read — the field an operator acts on, and the wrong action.
+    This asked about the refusal FIRST because the two predicates used to overlap and order was
+    the only thing separating them. It no longer is: ``is_unreadable_source`` now declines every
+    refusal, so the scope is correct however the caller asks. The order here is kept because it
+    still reads as the intent, not because the answer depends on it.
     """
     _r, _w, recorded, _a = _run(
         monkeypatch,

@@ -22,7 +22,22 @@ logger = logging.getLogger(__name__)
 DEFAULT_MIN_VALID_COVERAGE = 5.0
 
 #: Attempts for ONE date's source read.
-SOURCE_READ_ATTEMPTS = 3
+#:
+#: Sized to OUTLAST a provider having a bad minute, not merely to survive a single dropped
+#: packet. Three attempts on the ladder below spend about six seconds of patience, which is
+#: nothing against a source that is throttling: the read then fails, and a failure at this
+#: layer is what decides whether a date is dropped. So the depth of this number is the
+#: difference between waiting out a refusal and recording recoverable imagery as lost.
+#:
+#: The cost is bounded and falls entirely on the failing path: a transient read succeeds on its
+#: second or third attempt and pays only the backoff, while a genuinely dead object pays the
+#: full ladder once and then fails the leg — which is the intended outcome, because the leg
+#: retries from the dates it already committed.
+#:
+#: Read alongside the two levers this multiplies with: the alternate-copy step-down per date,
+#: and the leg's own attempts. The product is what a struggling provider sees, so raising this
+#: is not free and the other two are the reason it is not raised further.
+SOURCE_READ_ATTEMPTS = 8
 
 
 def source_read_retrying(log: logging.Logger | logging.LoggerAdapter[logging.Logger]) -> Retrying:
