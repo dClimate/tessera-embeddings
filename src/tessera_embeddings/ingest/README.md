@@ -1445,71 +1445,71 @@ the solar day IS the UTC date there.
 
 ### Resuming over a store that already holds dates
 
-**The rule this whole section exists for: dates can only ever be added to a store in order,
-newest last. Once a store holds a date, no earlier date can ever be added to it again.**
+**A run that resumes over a store which is already mostly full used to search the catalogue for
+the whole year again, and nearly all of that search could not have produced a single write.**
+Catalogue searching is most of what a resumed run does — the writing is comparatively quick — so
+a store needing one more month paid almost the same search cost as one starting from nothing. On
+an already-complete store the run did nothing else at all: it searched every month, wrote
+nothing, and finished. That is the cost this section removes.
 
-That is not a limitation we could lift by trying harder. Readers downstream fetch observations
-by their POSITION in the list rather than by their date, so quietly inserting an older date in
-the middle would change what every reader gets back, with nothing about the store looking wrong.
-The write is refused instead (`NonMonotonicDateError`).
+It is removable because of one rule about how stores are written:
 
-Call the newest date a store holds its **frontier**. Everything at or below it is closed.
+**Dates can only ever be added to a store in order, newest last. Once a store holds a date, no
+earlier date can ever be added to it again.**
+
+That is not a limitation we could lift by trying harder. Readers downstream fetch observations by
+their POSITION in the list rather than by their date, so quietly inserting an older date in the
+middle would change what every reader gets back, with nothing about the store looking wrong. The
+write is refused instead (`NonMonotonicDateError`).
+
+So everything at or before the newest date a store already holds is closed to it for good, and
+searching the catalogue back there cannot write anything — not "rarely writes anything", but
+cannot. (In the code that newest-held date is called the store's `frontier`.)
 
 ```
        already stored                  can still be added
   |=============================|-------------------------->
-  Jan                       frontier                      Dec
+  Jan                    newest date held                 Dec
                             (Jun 14)
-        ^
-        a day skipped back here can NEVER be added now
+   \_____ searching here can never write anything _____/
 ```
 
-**Why any of this comes up: skipping a day is normal, not a fault.** A day gets skipped when it
-was too cloudy, when its imagery misses the land we care about, or when every copy of a file we
-need refuses to open. Each skip leaves a hole. Later days then get written above that hole, and
-at that moment the hole is sealed for good.
+A resumed run therefore starts at the beginning of the month containing that newest date
+(`solar_days.resume_window_start`) rather than at the year's start. It starts at the beginning of
+that *month*, not the day after, because a satellite "day" does not line up with a calendar day —
+we search a day either side to catch the edges, and starting mid-month would clip that margin and
+write the first day short.
 
-That was survivable until you notice the catch: **whether a day gets skipped is not fixed
-forever.** Improve how we handle unreadable files and a day we once gave up on may now read
-perfectly well. So a resumed run would find that old day, succeed at reading it, try to write
-it — and be refused. The refusal killed the entire run, and the only cure was deleting the whole
-store and starting the year again. One recovered day cost a year of work.
+Two smaller pieces come with it, because skipping the search is not by itself enough.
 
-Three things prevent it. Each is worked out separately for each of a cell's three stores
-(optical, and each of the two radar orbits), because they fill at different speeds and a shared
-answer would skip months a slower store never got to.
+**Days at or before the newest held date can still be offered** when they fall inside that same
+month, so each ingest drops them before doing any work.
 
-1. **Start where the store left off.** Rather than beginning at January, a run resumes at the
-   start of the month its frontier falls in (`solar_days.resume_window_start`). Nothing earlier
-   can be accepted, so looking there is pure wasted time — and it is a lot of wasted time, since
-   the catalogue search is most of what a run does.
+**And such a day is written down as a loss rather than stopping the run.** It can never be stored
+no matter what we do, so failing destroys the rest of the year and changes nothing else. This
+matters because days do get skipped in normal running — too cloudy, imagery missing the land we
+care about, a file that will not open — and a skipped day leaves a hole that later writes seal
+permanently. Whether a day gets skipped is not settled forever either: improve how unreadable
+files are handled and a day once given up on may read perfectly well, so a resumed run can find
+an old hole, succeed at reading it, and be refused. Before this change that refusal stopped the
+run, and the only cure was deleting the store and re-ingesting the year.
 
-   It resumes at the start of that *month*, not the day after the frontier, because a satellite
-   "day" does not line up with a calendar day — we search a day either side to catch the edges.
-   Starting mid-month would clip that margin and write the first day short.
+**Later dates are never suppressed.** A day an earlier run gave up on is offered again on purpose
+— it can still be written, so re-offering is exactly how a day recovers once the underlying
+problem is fixed. Failing again costs one re-check.
 
-2. **Refuse the days that slip through anyway.** Days below the frontier that fall inside its own
-   month still get offered by step 1, so each ingest drops them before doing any work. Step 1
-   saves time; this step is what actually prevents the crash.
+Each of a cell's three stores (optical, and each of the two radar orbits) works this out
+separately, because they fill at different speeds and a shared answer would skip months a slower
+store never reached.
 
-3. **Write down the loss instead of crashing.** Such a day can never be stored no matter what we
-   do, so failing the run destroys a year's work and changes nothing else. It is recorded on the
-   store as a known loss and the run carries on.
+**A lost day is written down by the same commit that seals it.** This used to be recorded once,
+at the very end of a run. A run killed before reaching that line left behind stored dates, holes,
+and nothing explaining them — indistinguishable from a run that simply had not got there yet. Now
+a pending loss travels with the next date written (`write_days_windows(losses=...)`) and lands in
+the same commit. That commit is the one that seals the skipped day, so nothing can record one
+without the other, and it costs no extra commits.
 
-**Above the frontier, nothing is suppressed.** A day an earlier run gave up on is offered again
-on purpose — it can still be written, so re-offering is exactly how a day recovers once the
-underlying problem is fixed. Failing again costs one re-check.
-
-**A loss is written down by the same commit that seals it.** This used to be recorded once, at
-the very end of a run. A run killed before reaching that line left behind stored dates, holes,
-and nothing explaining them — which looks identical to a run that simply had not got there yet.
-That is the state that wedged real stores. Now a pending loss travels with the next date written
-(`write_days_windows(losses=...)`) and lands in the same commit. That commit is the one that
-seals the skipped day, so nothing can record one without the other. It costs no extra commits;
-recording each skip on its own would cost one per skipped day, which is why an earlier attempt
-at this was abandoned.
-
-**Months below the resume point are deliberately left alone.** Their holes are not re-examined
+**Months before the resume point are deliberately left alone.** Their holes are not re-examined
 and not claimed. Three situations have to stay tellable apart — a month examined and genuinely
 empty, a month examined that lost days, and a month never looked at — and a month a run skipped
 is the third.
