@@ -1,13 +1,17 @@
 """Unit tests for opera_query.py - OPERA RTC-S1 query utilities."""
 
+import json
 import logging
 from collections import Counter
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
+from tessera_embeddings.ingest._http import NonJsonResponseError
 from tessera_embeddings.ingest.opera_query import (
+    _NON_JSON_PAGE_ATTEMPTS,
     _granule_to_item,
     _query_cmr_granules,
     make_s1_item_provider,
@@ -383,3 +387,87 @@ class TestMakeS1ItemProvider:
         assert mock_rewrite.call_count == 2
         # Same-date bursts share the canonical noon-UTC timestamp.
         assert all(item.datetime == datetime(2024, 6, 2, 12, 0, 0, tzinfo=UTC) for item in result)
+
+
+# ---------------------------------------------------------------------------
+# A page that answers 2xx with a body that is not JSON
+# ---------------------------------------------------------------------------
+
+
+def _raw_response(body: bytes, *, status: int = 200, content_type: str = "application/json", search_after=None):
+    """A REAL response, so an unparseable body fails the way CMR makes it fail."""
+    resp = requests.Response()
+    resp.status_code = status
+    resp._content = body
+    resp.url = "https://cmr.earthdata.nasa.gov/search/granules.json"
+    resp.headers["Content-Type"] = content_type
+    if search_after:
+        resp.headers["CMR-Search-After"] = search_after
+    return resp
+
+
+def _good_page(entries, search_after=None):
+    return _raw_response(json.dumps({"feed": {"entry": entries}}).encode(), search_after=search_after)
+
+
+class TestUnparseableGranulePage:
+    """A success status carrying a non-JSON body is the one failure the ladder cannot see."""
+
+    BBOX = (-122.0, 37.0, -121.0, 38.0)
+
+    def test_unparseable_page_is_re_asked_and_the_query_succeeds(self):
+        patcher, mock_get = _patch_cmr_session(
+            side_effect=[_raw_response(b"", content_type="text/html"), _good_page([_granule_entry("g-1")])]
+        )
+        with patcher, patch("tessera_embeddings.ingest.opera_query.time.sleep"):
+            items = _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
+
+        assert {item.id for item in items} == {"g-1"}
+        assert mock_get.call_count == 2
+
+    def test_a_re_asked_page_repeats_the_same_cursor(self):
+        """Re-asking must name the same page, or the retry silently skips granules."""
+        page1 = _good_page([_granule_entry(f"g-{i}") for i in range(2000)], search_after="token123")
+        patcher, mock_get = _patch_cmr_session(
+            side_effect=[page1, _raw_response(b""), _good_page([_granule_entry("g-final")])]
+        )
+        with patcher, patch("tessera_embeddings.ingest.opera_query.time.sleep"):
+            items = _query_cmr_granules(self.BBOX, "2024-01-01", "2024-12-31", "ascending")
+
+        assert any(item.id == "g-final" for item in items)
+        assert mock_get.call_args_list[1].kwargs["headers"]["CMR-Search-After"] == "token123"
+        assert mock_get.call_args_list[2].kwargs["headers"]["CMR-Search-After"] == "token123"
+
+    def test_the_body_reaches_the_log_but_never_the_message(self, caplog):
+        """A failed leg's retry decision substring-matches the message.
+
+        A provider error page carrying a marker word would otherwise turn a retryable leg
+        permanently dead — see ``ingest_zone_year._NON_RETRYABLE_LEG_MARKERS``.
+        """
+        pages = [_raw_response(b"<html>ValidationError</html>", content_type="text/html")] * 8
+        patcher, mock_get = _patch_cmr_session(side_effect=pages)
+        with (
+            patcher,
+            patch("tessera_embeddings.ingest.opera_query.time.sleep"),
+            caplog.at_level(logging.ERROR),
+            pytest.raises(NonJsonResponseError) as exc_info,
+        ):
+            _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
+
+        message = str(exc_info.value)
+        assert "granules.json" in message and "200" in message and "text/html" in message
+        assert "ValidationError" not in message
+        assert "ValidationError" in caplog.text
+        assert mock_get.call_count == _NON_JSON_PAGE_ATTEMPTS
+
+    def test_a_server_error_is_not_re_asked_by_this_path(self):
+        """Scope check: a 5xx belongs to the session ladder, which has already backed off."""
+        patcher, mock_get = _patch_cmr_session(side_effect=[_raw_response(b"nope", status=500)])
+        with (
+            patcher,
+            patch("tessera_embeddings.ingest.opera_query.time.sleep"),
+            pytest.raises(requests.HTTPError),
+        ):
+            _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
+
+        assert mock_get.call_count == 1

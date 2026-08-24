@@ -6,12 +6,47 @@ import logging
 import threading
 from collections.abc import Callable
 from types import TracebackType
+from typing import Any
 
+import requests
 from urllib3.connectionpool import ConnectionPool
 from urllib3.response import BaseHTTPResponse
 from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
+
+#: How much of an unparseable body to log. Enough to tell an error page from a truncated
+#: document from an empty one.
+_EXCERPT_CHARS = 300
+
+
+class NonJsonResponseError(RuntimeError):
+    """A provider answered with a success status and a body that is not JSON.
+
+    Invisible to a status-based retry ladder and to ``raise_for_status`` alike: the status
+    is fine and only the body is wrong.
+    """
+
+
+def json_or_raise(resp: requests.Response, *, log_body: bool) -> Any:  # noqa: ANN401 — whatever the JSON holds
+    """Parse ``resp`` as JSON, or raise :class:`NonJsonResponseError` naming the endpoint.
+
+    The body never enters the MESSAGE: a failed leg's retry decision substring-matches the
+    failure text against ``ingest_zone_year._NON_RETRYABLE_LEG_MARKERS``, so provider-chosen
+    bytes there could turn a retryable leg permanently dead. It is logged instead — except
+    from a credential endpoint, whose truncated body IS the credential, so pass
+    ``log_body=False`` there.
+    """
+    try:
+        return resp.json()
+    except ValueError as exc:
+        detail = (
+            f"{resp.url} answered HTTP {resp.status_code} with a body that is not JSON "
+            f"(content-type {resp.headers.get('Content-Type', '<absent>')!r}, {len(resp.content)} bytes)"
+        )
+        if log_body:
+            logger.error("%s. Body began: %r", detail, resp.content[:_EXCERPT_CHARS])
+        raise NonJsonResponseError(detail) from exc
 
 
 def make_logging_retry(label: str, **kwargs: object) -> Retry:

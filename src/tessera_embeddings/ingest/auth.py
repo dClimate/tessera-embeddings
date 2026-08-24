@@ -29,6 +29,8 @@ from odc.loader._rio import _local as _odc_thread_session  # type: ignore[attr-d
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from tessera_embeddings.ingest._http import json_or_raise
+
 if TYPE_CHECKING:
     import pystac
 
@@ -249,14 +251,16 @@ def _get_edl_token(session: _EDLSession) -> str:
         raise RuntimeError("EDL authentication failed — check username/password")
     list_resp.raise_for_status()
 
-    tokens = list_resp.json()
+    # log_body=False on all three EDL calls: the body that fails to parse is a truncated
+    # credential document, and its leading bytes are the credential.
+    tokens = json_or_raise(list_resp, log_body=False)
     if tokens:
         return tokens[0]["access_token"]
 
     # No existing tokens — create one
     create_resp = session.post(_EDL_TOKEN_URL, timeout=30)
     create_resp.raise_for_status()
-    token = create_resp.json().get("access_token")
+    token = json_or_raise(create_resp, log_body=False).get("access_token")
     if not token:
         raise RuntimeError(f"Unexpected EDL token response: {create_resp.text[:200]}")
     return token
@@ -302,7 +306,7 @@ def get_s3_credentials(
         timeout=60,
     )
     s3_resp.raise_for_status()
-    creds = s3_resp.json()
+    creds = json_or_raise(s3_resp, log_body=False)
 
     required_keys = {"accessKeyId", "secretAccessKey", "sessionToken"}
     if not required_keys.issubset(creds):
