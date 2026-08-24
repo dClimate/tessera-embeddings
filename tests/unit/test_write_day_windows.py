@@ -321,3 +321,28 @@ def test_a_re_sent_loss_is_merged_and_a_written_date_is_never_one(tmp_path):
     _write(store, "2024-06-21", 9, losses=[{"date": "2024-06-21", "scope": "unfillable"}])
     recorded = dict(open_store_as_zarr_group(store).attrs)["assessed_unreadable_dates"]
     assert [entry["date"] for entry in recorded] == ["2024-05-30"]
+
+
+def test_a_recovered_date_stops_being_advertised_as_lost_at_its_own_commit(tmp_path):
+    """A recovery brings NO new loss, and the reconciliation must still run.
+
+    A date given up at the tail of an earlier leg is still appendable, so a later leg can read
+    it and write it — arriving here with nothing to add. Skipping the merge on that path commits
+    the pixels while the store goes on advertising the date as lost, and a leg that dies before
+    its end-of-leg record leaves it that way for good.
+    """
+    store = str(tmp_path / "reflectance.zarr")
+    _write(store, "2024-06-01", 7, losses=[{"date": "2024-06-11", "scope": "unreadable"}])
+    assert dict(open_store_as_zarr_group(store).attrs)["assessed_unreadable_dates"]
+
+    _write(store, "2024-06-11", 8)  # the recovery: no losses passed at all
+
+    assert dict(open_store_as_zarr_group(store).attrs)["assessed_unreadable_dates"] == []
+
+
+def test_a_store_that_records_no_loss_gains_no_attribute(tmp_path):
+    """The complement, so the reconciliation cannot become an attribute every store carries."""
+    store = str(tmp_path / "reflectance.zarr")
+    _write(store, "2024-06-01", 7)
+
+    assert "assessed_unreadable_dates" not in dict(open_store_as_zarr_group(store).attrs)

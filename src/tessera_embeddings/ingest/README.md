@@ -1501,6 +1501,13 @@ Each of a cell's three stores (optical, and each of the two radar orbits) works 
 separately, because they fill at different speeds and a shared answer would skip months a slower
 store never reached.
 
+**A store already past the window it was asked for has nothing to do.** The resume point is not
+clamped to the window's end, because every day it could be clamped to is one the run must not
+search. So each ingest checks for the empty window itself and returns, before building any search
+range — the range builders refuse a backwards one, and a store that has run ahead of its window is
+a no-op rather than a failure. Nothing is recorded in that case: the run looked at none of the
+window it was given.
+
 **A lost day is written down by the same commit that seals it.** This used to be recorded once,
 at the very end of a run. A run killed before reaching that line left behind stored dates, holes,
 and nothing explaining them — indistinguishable from a run that simply had not got there yet. Now
@@ -1524,18 +1531,29 @@ indistinguishable, and the coverage gate has to fail on both.
 resumed run starts partway through the year, so those are different. And both records are
 **added to** what the store already holds rather than replacing it:
 
-- **The recorded start date never moves earlier or later.** Only the end date extends. If a
-  resumed run stamped its own start, it would erase months an earlier run genuinely did examine.
-  If it stretched the start back to January, it would claim months it skipped were examined and
-  clean — and that is the dangerous direction, because it turns a real gap into a false all-clear.
-  So that one is refused. When the store has no record at all, the range simply begins where this
-  run began, leaving earlier months outside it, which correctly reads as *never looked at*.
-- **The list of lost days is added to, not replaced** (`zarr_store.merge_recorded_losses`), with
-  one exception: a day that has since been successfully stored drops off, because it is no longer
-  lost. A resumed run only knows about the months it walked, so overwriting the list with its own
-  findings would erase everything earlier runs recorded. Where the same day appears twice, the
-  existing entry wins — which means a record written by hand during a repair survives later runs
-  rather than being wiped by them.
+- **The two ranges are joined only if they touch.** When the new range overlaps the stored one or
+  begins the day after it, the pair describes one unbroken stretch and the join is safe — which is
+  what lets a resumed run keep the months an earlier run genuinely examined instead of erasing
+  them. When there is a gap between the two, joining would certify the days in the gap, which
+  nobody looked at, and the coverage gate would then excuse months that are missing because nobody
+  searched for them. The attribute holds one range and cannot describe two, so the join is refused,
+  a warning names the range being dropped, and the range this run can vouch for is what is
+  written. Both choices only make the gate stricter, which is the safe direction; the stored range
+  may be arbitrarily old, while this one was just verified. When the store has no record at all,
+  the range simply begins where this run began, leaving earlier months outside it, which correctly
+  reads as *never looked at*.
+- **The list of lost days is added to, not replaced** (`zarr_store.merge_recorded_losses`). A
+  resumed run only knows about the months it walked, so overwriting the list with its own findings
+  would erase everything earlier runs recorded. Two things do change an entry:
+  - **A day that has since been stored drops off**, because it is no longer lost. That happens at
+    the commit that stores it, not only at the end of a run, so a run killed in between cannot
+    leave a stored day still advertised as missing.
+  - **A day found to be below the newest stored date replaces whatever was recorded before**
+    (`scope=unfillable`). That verdict is read off the store itself rather than from the imagery,
+    so nothing known about the source can correct it, and it carries the opposite instruction:
+    every other reason says wait for a republished file, this one says the store has to be rebuilt.
+  Otherwise the existing entry wins, which means a record written by hand during a repair survives
+  later runs rather than being wiped by them.
 
 The attribute belongs on the repo the gate opens — `reflectance.zarr` or `sar_<orbit>.zarr` —
 not on the mosaic directory that contains them.

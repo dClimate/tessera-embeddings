@@ -45,6 +45,7 @@ from tessera_embeddings.storage.zarr_store import (
     _write_new,
     compute_doy,
     get_existing_dates,
+    merge_recorded_losses,
     open_repo,
     open_store,
     open_store_as_zarr_group,
@@ -1145,6 +1146,34 @@ class TestAssessedWindowRecord:
 
         assert self._attrs(path)["assessed_window"] == ["2018-05-01", "2018-12-31"]
 
+    def test_a_gap_between_the_ranges_refuses_the_join(self, local_zarr_path, sample_reflectance_data):
+        """The failure the union itself can cause, from the other side.
+
+        January-March assessed, then June-December assessed, and a single range spanning both
+        would certify April and May — which neither run queried. The coverage gate reads that as
+        permission to excuse two absent months and publish an incomplete mosaic, which is the
+        one thing this record must never say.
+        """
+        path = self._store(local_zarr_path, sample_reflectance_data, ["2018-01-01"])
+
+        record_assessed_window(path, "2018-01-01", "2018-03-31")
+        record_assessed_window(path, "2018-06-01", "2018-12-31")
+
+        assert self._attrs(path)["assessed_window"] == ["2018-06-01", "2018-12-31"]
+
+    def test_ranges_that_meet_end_to_end_still_join(self, local_zarr_path, sample_reflectance_data):
+        """No day lies between them, so the two describe one examined stretch.
+
+        Refusing this would discard half of any window split across two legs, which is the
+        ordinary shape of a resume.
+        """
+        path = self._store(local_zarr_path, sample_reflectance_data, ["2018-01-01"])
+
+        record_assessed_window(path, "2018-01-01", "2018-06-30")
+        record_assessed_window(path, "2018-07-01", "2018-12-31")
+
+        assert self._attrs(path)["assessed_window"] == ["2018-01-01", "2018-12-31"]
+
     def test_losses_union_across_runs_and_drop_once_the_date_arrives(self, local_zarr_path, sample_reflectance_data):
         """Two runs, two holes, one list — and an entry disappears when the date is filled.
 
@@ -1164,3 +1193,34 @@ class TestAssessedWindowRecord:
         record_assessed_window(path, "2024-01-01", "2024-02-28")
 
         assert [e["date"] for e in self._attrs(path)["assessed_unreadable_dates"]] == ["2024-02-14"]
+
+
+def test_unfillable_supersedes_an_earlier_verdict_for_the_same_date():
+    """One scope overrides prior-wins, and only one.
+
+    ``unfillable`` is read off the store's own time axis, not from the source, so no better
+    knowledge of the imagery can correct it — and it carries the opposite remedy to every other
+    scope. Keeping the older verdict would leave the store telling an operator to wait for a
+    reprocessed copy when the only remedy left is deleting the store.
+    """
+    prior = [{"date": "2018-02-03", "scope": "unreadable", "error": "RasterioIOError"}]
+
+    upgraded = merge_recorded_losses(prior, [{"date": "2018-02-03", "scope": "unfillable"}])
+    assert upgraded == [{"date": "2018-02-03", "scope": "unfillable"}]
+
+    # And the protection prior-wins exists for is intact: an ordinary rediscovery does not
+    # overwrite a record that may have been placed by hand.
+    kept = merge_recorded_losses(prior, [{"date": "2018-02-03", "scope": "whole-date"}])
+    assert kept == prior
+
+
+def test_an_upgrade_keeps_its_position_in_the_list():
+    """A superseded entry is replaced in place, so the attribute stays comparable run to run."""
+    prior = [{"date": "2018-01-05", "scope": "unreadable"}, {"date": "2018-03-09", "scope": "unreadable"}]
+
+    merged = merge_recorded_losses(prior, [{"date": "2018-01-05", "scope": "unfillable"}])
+
+    assert merged == [
+        {"date": "2018-01-05", "scope": "unfillable"},
+        {"date": "2018-03-09", "scope": "unreadable"},
+    ]

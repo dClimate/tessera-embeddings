@@ -397,6 +397,12 @@ def resume_window_start(start_date: str, frontier: str | None) -> str:
     frontier inside its own month are still offered. The caller must drop those per date —
     the floor bounds the cost, the per-date check is the correctness.
 
+    The result can land AFTER the caller's ``end_date``, when the store has already advanced
+    past the window it was asked for. That is an empty window, not an error, and the caller
+    must recognise it before building any range: :func:`fixed_day_ranges` and
+    :func:`whole_window_range` both refuse a reversed one. No clamp is applied here, because
+    every value this could clamp to would name a day the caller must not walk.
+
     Each store has its OWN frontier. A cell's three child stores (reflectance and both radar
     orbits) advance independently, so a floor computed once and shared would silently skip
     months a lagging store never reached.

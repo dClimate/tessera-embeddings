@@ -45,6 +45,7 @@ was removed as unused; the windowed per-date batch is NOT its return, since it
 builds no graph at all.
 """
 
+import datetime
 import itertools
 import logging
 import time
@@ -1243,6 +1244,17 @@ a time, by :func:`write_days_windows` — see ``losses`` there for why the secon
 """
 
 
+UNFILLABLE_SCOPE = "unfillable"
+
+"""The ``scope`` of a loss caused by the store's own time axis rather than by the source.
+
+The date is below the newest date the store holds and absent from it, so no re-read reaches it
+and no reprocessed copy helps: the store has to be rebuilt. Distinguished from every other
+scope because the remedy is different and because it is derived from the axis, which is why
+:func:`merge_recorded_losses` lets it override a record it would otherwise keep.
+"""
+
+
 def merge_recorded_losses(
     prior: object,
     new: "Iterable[dict[str, str]]",
@@ -1262,6 +1274,13 @@ def merge_recorded_losses(
     unconditional overwrite this replaced was protecting, and it is the only case it was
     protecting.
 
+    :data:`UNFILLABLE_SCOPE` is the ONE verdict that overrides prior-wins, because it is not a
+    claim about the source at all — it says this store's axis has moved past the date, which is
+    read from the axis and cannot be corrected by better knowledge of the imagery. Every other
+    scope explains why a source did not yield, and a hand-written record may know that better
+    than a leg does. Keeping the older scope here would leave the store prescribing a wait for a
+    reprocessed copy when the only remedy left is deleting the store.
+
     Entries are carried through VERBATIM, including shapes this does not understand, because
     the readers of the attribute tolerate a bare date string and a hand-written record is not
     ours to normalise.
@@ -1269,10 +1288,31 @@ def merge_recorded_losses(
     merged: dict[str, Any] = {}
     for entry in (*(prior if isinstance(prior, (list, tuple)) else ()), *new):
         date = str(entry.get("date", "")) if isinstance(entry, dict) else str(entry)
-        if date in present or date in merged:
+        if date in present:
             continue
+        if date in merged and not (isinstance(entry, dict) and entry.get("scope") == UNFILLABLE_SCOPE):
+            continue
+        # Reassignment keeps the original insertion position, so an upgrade does not reorder
+        # the list — the attribute stays comparable across runs.
         merged[date] = entry
     return list(merged.values())
+
+
+def _ranges_touch(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
+    """Whether two inclusive ``YYYY-MM-DD`` ranges overlap or sit end to end.
+
+    End to end counts — 01-01..06-30 and 07-01..12-31 describe one examined stretch with no day
+    between them, and refusing to join those would discard half of a window split across two
+    legs. A genuine gap does not count, and that is the whole point: joining across one turns
+    days nobody queried into days certified as examined.
+    """
+    try:
+        one_day = datetime.timedelta(days=1)
+        a0, a1 = datetime.date.fromisoformat(a_start), datetime.date.fromisoformat(a_end)
+        b0, b1 = datetime.date.fromisoformat(b_start), datetime.date.fromisoformat(b_end)
+    except ValueError:
+        return False  # an unparseable bound cannot be shown to touch anything
+    return b0 <= a1 + one_day and a0 <= b1 + one_day
 
 
 def record_assessed_window(
@@ -1292,11 +1332,12 @@ def record_assessed_window(
     not exist or reached no live window — rather than a gap. Absence outside it remains a
     gap, so widening a window later cannot be excused by an older, narrower assessment.
 
-    Both records UNION with what the store already holds, and the window unions in ONE
-    direction: an already-recorded start is kept and only the end extends. The caller passes
-    the range IT assessed, which on a resume begins at the store's frontier rather than at
-    the leg's configured start — so a backwards widening here would assert that months this
-    run never queried were examined and clean.
+    Both records UNION with what the store already holds. The caller passes the range IT
+    assessed, which on a resume begins at the store's frontier rather than at the leg's
+    configured start, so this run's range alone would retract the months an earlier leg did
+    examine. The two are joined only when they OVERLAP OR MEET; across a gap the attribute's
+    single range cannot describe both without certifying the days between them, so the join is
+    refused and this run's range is what is written.
 
     ``empty_dates`` is recorded for observability only; the gate does not read it. It says
     how many dates were examined and skipped as reaching no live window, which is the
@@ -1326,13 +1367,29 @@ def record_assessed_window(
         prior_window = root.attrs.get(ASSESSED_WINDOW_ATTR)
         start, end = start_date, end_date
         if isinstance(prior_window, (list, tuple)) and len(prior_window) == 2:
-            # The stored START is preserved and only the end extends. A resumed leg begins at
-            # its frontier's month, so stamping its own start would claim the months before it
-            # were examined in full — and an assessed window is precisely the statement that a
-            # month absent inside it is a finding rather than a gap. Widening backwards is the
-            # one direction that can turn a real gap into a clean bill of health, so it is the
-            # one direction refused. Widening forwards only ever adds what this run did assess.
-            start, end = str(prior_window[0]), max(end, str(prior_window[1]))
+            prior_start, prior_end = str(prior_window[0]), str(prior_window[1])
+            if _ranges_touch(prior_start, prior_end, start, end):
+                # ONE stretch, so the union of the two is itself examined in full. This is what
+                # lets a resume keep the months an earlier leg assessed: it begins at its
+                # frontier's month, and stamping only its own start would retract them.
+                start, end = min(start, prior_start), max(end, prior_end)
+            else:
+                # A GAP between them, and the attribute holds one range — so spanning it would
+                # certify days neither run queried, and the gate would then excuse a month that
+                # is missing because nobody looked. That is the one failure this record must
+                # never produce, so the span is refused and the range this run can vouch for is
+                # what gets written. Both choices only make the gate stricter, and the stored
+                # range may be arbitrarily old while this one was just verified.
+                logger.warning(
+                    "Assessed window %s..%s on %s does not meet %s..%s; recording the range this "
+                    "run examined and dropping the stored one rather than certifying the days "
+                    "between them.",
+                    prior_start,
+                    prior_end,
+                    store_path,
+                    start,
+                    end,
+                )
         root.attrs[ASSESSED_WINDOW_ATTR] = [start, end]
         root.attrs["assessed_empty_dates"] = int(empty_dates)
         # A UNION, minus the dates now on the axis — see merge_recorded_losses. An
@@ -1869,6 +1926,10 @@ def write_days_windows(
     have to be one atomic act. A leg killed between them would otherwise leave a hole nothing
     names, which is the state a resume cannot tell from a date it has yet to reach. It also
     costs no commit of its own, where a commit per skip would cost one per skipped date.
+
+    The merge also runs with ``losses`` empty whenever the store already records one, because
+    the dates written HERE are struck from that record: a date recovered by a later leg must
+    stop being advertised as lost at the commit that brings it back, not only at end of leg.
     """
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 
@@ -1985,11 +2046,17 @@ def write_days_windows(
             # Same commit as the dates it describes; a union, since one resume writes many.
             prior = cast("list", attrs.get(MIXED_CODE_IDENTITIES_ATTR, []))
             attrs[MIXED_CODE_IDENTITIES_ATTR] = sorted(set(prior) | set(mixed))
-        if losses:
-            # ``present`` is this batch's own dates: a date being written is not a loss,
-            # whatever a caller still holds pending for it.
+        prior_losses = attrs.get(UNREADABLE_DATES_ATTR)
+        if losses or prior_losses:
+            # Run whenever the store records ANY loss, not only when this call brings new ones.
+            # A date recorded as lost at the tail of an earlier leg is still appendable, so a
+            # later leg can recover it — and that recovery arrives here with nothing new to add.
+            # Skipping the merge then commits the pixels while leaving the date advertised as
+            # lost, and a leg that dies before its end-of-leg record leaves it that way for good.
+            #
+            # ``present`` is this batch's own dates: a date being written is not a loss.
             attrs[UNREADABLE_DATES_ATTR] = merge_recorded_losses(
-                attrs.get(UNREADABLE_DATES_ATTR), losses, present={str(w)[:10] for w in whens}
+                prior_losses, losses or (), present={str(w)[:10] for w in whens}
             )
         if parallel_windows and _write_windows_overlapped(batch.session, writes):
             return  # normal context exit: the batched commit below still runs

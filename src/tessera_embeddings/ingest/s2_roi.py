@@ -111,6 +111,7 @@ from tessera_embeddings.ingest.stac import (
 )
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
+    UNFILLABLE_SCOPE,
     get_existing_dates,
     record_assessed_window,
     store_write_retrying,
@@ -496,6 +497,21 @@ def ingest_s2_roi_reflectance(
     # Rebound, so nothing downstream can use the unfloored window by accident — including the
     # assessed-window record, which must describe the months this leg actually walked.
     start_date = resume_window_start(start_date, frontier)
+    if start_date > end_date:
+        # The store already holds a date past this window, so the window is empty and there is
+        # nothing to walk. Returned BEFORE any range is built: the range constructors refuse a
+        # reversed window, and an already-advanced store is a no-op rather than an error. No
+        # assessed window is recorded either — this leg examined none of the range it was given,
+        # and saying otherwise is the one thing that record must never do.
+        log.warning(
+            "NOTHING TO DO roi=%s window=%s: the store's newest date %s is past it, so no date "
+            "in this window can be written. The window and the store disagree — check which was "
+            "intended before re-dispatching.",
+            roi_label,
+            end_date,
+            frontier,
+        )
+        return IngestResult(roi_path=roi_zarr_path, status="skipped", dates_processed=0, dates_filtered_coverage=0)
     if frontier is not None:
         log.info("Resuming roi=%s above the frontier %s: querying %s..%s", roi_label, frontier, start_date, end_date)
 
@@ -1149,7 +1165,7 @@ def ingest_s2_roi_reflectance(
         # than at the writer, where they raise and the store's only remedy is deletion.
         for date in [d for d in by_date if _unfillable(d)]:
             del by_date[date]
-            entry = {"date": date, "tiles": "", "tried": "", "objects": "", "scope": "unfillable"}
+            entry = {"date": date, "tiles": "", "tried": "", "objects": "", "scope": UNFILLABLE_SCOPE}
             unfillable_dates.append(entry)
             log.error(
                 "DATA LOSS roi=%s date=%s: the catalogue offers this date and the store's time "
@@ -1307,6 +1323,11 @@ def ingest_s2_roi_reflectance(
             start_date,
             end_date,
             unreadable=_losses_so_far(),
+            # Load-bearing exactly when there is something to lose, as the radar path already
+            # was. A leg whose only finding is a date it cannot fill writes nothing, so no
+            # commit carries the record and this call is its sole durable trace; swallowing a
+            # failure here would finish the leg green with the loss named nowhere.
+            required=bool(_losses_so_far()),
             s3_region=s3_region,
         )
 

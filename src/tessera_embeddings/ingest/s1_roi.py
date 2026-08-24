@@ -79,6 +79,7 @@ from tessera_embeddings.ingest.stac import ingest_tile
 from tessera_embeddings.ingest.transforms import amplitude_to_db
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
+    UNFILLABLE_SCOPE,
     get_existing_dates,
     record_assessed_window,
     store_write_retrying,
@@ -580,6 +581,22 @@ def ingest_s1_roi_sar(
     # Rebound, so nothing downstream can use the unfloored window by accident — including the
     # assessed-window record, which must describe the months this leg actually walked.
     start_date = resume_window_start(start_date, frontier)
+    if start_date > end_date:
+        # The store already holds a date past this window, so the window is empty and there is
+        # nothing to walk. Returned BEFORE any range is built: `fixed_day_ranges` refuses a
+        # reversed window, and an already-advanced store is a no-op rather than an error. No
+        # assessed window is recorded either — this leg examined none of the range it was given,
+        # and saying otherwise is the one thing that record must never do.
+        log.warning(
+            "[%s] NOTHING TO DO roi=%s window=%s: the store's newest date %s is past it, so no "
+            "date in this window can be written. The window and the store disagree — check which "
+            "was intended before re-dispatching.",
+            orbit,
+            roi_label,
+            end_date,
+            frontier,
+        )
+        return SarIngestResult(roi_path=roi_zarr_path, status="skipped", dates_processed={orbit: 0})
     if frontier is not None:
         log.info(
             "[%s] Resuming roi=%s above the frontier %s: querying %s..%s",
@@ -910,7 +927,7 @@ def ingest_s1_roi_sar(
                 # remedy is deletion.
                 if _unfillable(date_str):
                     given_up.add(date_str)
-                    loss = {"date": date_str, "scope": "unfillable", "error": ""}
+                    loss = {"date": date_str, "scope": UNFILLABLE_SCOPE, "error": ""}
                     unfillable_dates.append(loss)
                     log.error(
                         "[%s] DATA LOSS roi=%s date=%s: the source offers this date and the "

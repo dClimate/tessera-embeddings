@@ -769,6 +769,8 @@ def test_a_date_below_the_frontier_is_recorded_as_lost_rather_than_raised(
     lost = [entry for c in assessed for entry in c["unreadable"]]
     assert lost == [{"date": "2018-05-10", "tiles": "", "tried": "", "objects": "", "scope": "unfillable"}]
     assert "DATA LOSS" in caplog.text and "2018-05-10" in caplog.text
+    # No date was written, so no commit carried the loss and this record is its only trace.
+    assert assessed[-1]["required"] is True
 
 
 @BOTH_MODES
@@ -800,3 +802,35 @@ def test_the_loss_record_rides_the_write_that_makes_the_date_unfillable(run_inge
     # and kept in step with the lists it mirrors — when what actually has to hold is that no
     # commit sealing a date can fail to carry it.
     assert all(loss in w for w in run.losses_at_write), "and every later write carries it too"
+
+
+@BOTH_MODES
+def test_a_store_already_past_the_window_is_a_no_op_rather_than_an_error(run_ingest, assessed, pipeline_dates):
+    """A frontier beyond `end_date` empties the window, and an empty window is not a failure.
+
+    The floor is not clamped, because every day it could be clamped to is one the leg must not
+    walk. So the leg has to recognise the empty window itself, BEFORE it builds a range — the
+    range constructors refuse a reversed one, and a store that has already advanced past its
+    window would fail the leg instead of finishing it.
+    """
+    run = run_ingest(
+        {"2024-01-15": True, "2024-02-15": True},
+        pipeline_dates=pipeline_dates,
+        existing_dates={"2024-12-20"},
+    )
+
+    assert run.result.status == "skipped" and run.written == []
+    assert not assessed, "this leg examined none of the window it was given, so it certifies none of it"
+
+
+@BOTH_MODES
+def test_a_clean_leg_does_not_make_its_assessment_load_bearing(run_ingest, assessed, pipeline_dates):
+    """Nothing was lost, so a failed metadata write must stay a warning rather than fail a leg.
+
+    The complement of the rule above, and the reason it is keyed on the losses rather than set
+    always: a record that fails a leg whenever it cannot commit turns a metadata wobble into a
+    re-dispatch on every healthy cell.
+    """
+    run_ingest({"2024-01-01": True, "2024-01-02": True}, pipeline_dates=pipeline_dates)
+
+    assert assessed and assessed[-1]["required"] is False

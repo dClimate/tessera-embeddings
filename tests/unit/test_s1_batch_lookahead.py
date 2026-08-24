@@ -565,3 +565,27 @@ def test_a_date_below_the_frontier_is_recorded_as_lost_rather_than_raised(monkey
         "the loss rides the commit that seals it, so a killed leg still leaves the record"
     )
     assert "DATA LOSS" in caplog.text and "2018-05-10" in caplog.text
+
+
+def test_a_store_already_past_the_window_is_a_no_op_rather_than_an_error(monkeypatch) -> None:
+    """The radar half of the empty-window case.
+
+    The floor is not clamped, because every day it could be clamped to is one the leg must not
+    walk. `fixed_day_ranges` refuses a reversed window, so a store that has already advanced
+    past the window it was asked for would fail the leg rather than finish it.
+    """
+    from tessera_embeddings.ingest import s1_roi
+
+    recorded: list[str] = []
+    monkeypatch.setattr(s1_roi, "record_assessed_window", lambda path, *_a, **_k: recorded.append(path))
+
+    written = _run_ingest(
+        monkeypatch,
+        catalogue=["2024-01-15", "2024-02-15"],
+        existing={"2024-12-20"},
+        start_date="2024-01-01",
+        end_date="2024-06-30",
+    )
+
+    assert written == []
+    assert recorded == [], "this leg examined none of the window it was given, so it certifies none of it"
