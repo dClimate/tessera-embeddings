@@ -84,8 +84,6 @@ def _run(monkeypatch, *, failures: dict[str, Exception], catalogue: list[str] = 
     monkeypatch.setattr(s1_roi, "store_write_retrying", no_wait_retrying)
     monkeypatch.setattr(s1_roi, "record_assessed_window", lambda *a, **kw: recorded.append(kw))
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _s, **_k: set())
-    monkeypatch.setattr(s1_roi, "skipped_dates", lambda _s, **_k: set())
-    monkeypatch.setattr(s1_roi, "record_skipped_date", lambda *_a, **_k: True)
     monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
     monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
     monkeypatch.setattr(

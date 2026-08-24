@@ -913,64 +913,35 @@ Four `DATA LOSS` events. **Five stores hold an unfillable hole**: 34N/2017 and 3
 the five had actually raised the error — the campaign was stopped before the rest were retried
 — so the error count understates the damage, and that silence is what makes it dangerous.
 
-### The change
+### The change — and the durable record was BUILT, then REMOVED
 
-**The append refusal stays FATAL.** Softening it was considered and rejected: a leg that
-reported the refusal and carried on would complete the cell with a hole, and the parent reads
-a completed cell as success, so we would ship a silently degraded store. A log line is not a
-guard, because nothing downstream reads one. There is also a cost argument — a date that
-cannot be appended in place means the store must be wiped and re-ingested anyway, so
-continuing past the refusal spends compute on a store already destined for deletion. It now
-names the store and the date and states the action, because the remedy is per store and there
-are 1,008 cells.
+**The append refusal stays FATAL.** Softening it was considered and rejected: a leg that reported
+the refusal and carried on would complete the cell with a hole, and the parent reads a completed
+cell as success, so a silently degraded store would ship. A log line is not a guard, because
+nothing downstream reads one. There is also a cost argument — a date that cannot be appended in
+place means the store must be wiped and re-ingested anyway, so continuing spends compute on a
+store already destined for deletion. It now names the store as well as the date, because the
+remedy is per store.
 
-**Not re-offering the date is the fix.** `storage.zarr_store.record_skipped_date` writes the
-loss on the store at the moment of the skip, one date per commit, and `skipped_dates` is read
-alongside `get_existing_dates` so a settled date is not outstanding. It is best-effort: a skip
-can precede the first write, and that is also the only case where failing to record is
-harmless, since the refusal needs a later date already on the axis.
+**A crash-durable skip record was built for this, and then deleted.** It wrote the loss onto the
+store at the moment of the skip so a resume would not re-offer the date. Two independent reviewers
+found five root causes in it across three review rounds, and three were new defects it had
+introduced — including two fresh ways to wedge a store permanently: an attribute-only root created
+in a rootless repository, and coverage rejections carried into the unreadable-dates attribute,
+which the inference layer reads as imagery loss.
 
-**THE TIME AXIS DECIDES what is settled, not the skip's reason.** A date at or below the
-store's committed maximum can never be appended, so re-offering it can only end in the fatal
-refusal, whatever it was skipped for. Above the maximum it is still appendable, so it is worth
-one more attempt however permanent the earlier failure looked — if the source has recovered the
-hole is filled, and if not the cost is one read attempt. `scope` is provenance and reporting.
+**It kept failing because it was compensating for Cause 8.** Its purpose was to remember a skip
+decision *because that decision might not recompute* — and that was only possible because transient
+failures were being classified as skips. Once a refusal can no longer be read as unreadable data,
+every remaining skip cause is deterministic: unreadable bytes, a coverage rejection, no live
+window, a corroborated absent object. A resume that re-offers such a date simply skips it again.
+**There is nothing to remember.**
 
-**Corrected in place.** This first keyed settlement on a set of "permanent" scopes, on the
-reasoning that only a read failure can flip while a coverage rejection or producer conflict is
-decided during preparation and never reaches the writer. **That was wrong in both directions at
-once, and two independent reviewers found one direction each.** It was too permissive: a
-`coverage` or `provider-refused` date was re-offered, and if the condition had cleared it then
-produced data, reached the writer below the maximum, and raised — the exact failure this
-mechanism exists to close, reachable through the scopes that looked safest. And too strict: a
-read failure at the TAIL, with nothing later committed, is still appendable, so suppressing it
-made a recovered source unreachable and the hole permanent for no reason.
-
-**Two further holes in the same mechanism, from the same reviews.** A record whose write can
-fail silently is not durable: only a genuinely absent repository is recoverable (the caller
-holds the entry and flushes it after the next write, which is when a store starts existing);
-everything else raises. And reading the record no longer answers "nothing is settled" on a
-transient failure, which would have re-offered every settled date at once — the fatal path for
-all of them. The general rule both violated: never convert an unknown into a permissive answer.
-
-**And the end-of-leg record carries forward** what earlier attempts settled, dropping only
-dates now present on the axis. Writing it from the current invocation's list alone erased the
-earlier losses, because a resumed leg does not re-offer a settled date and so never re-derives
-its record — after which a parent could stamp a completion marker over a mosaic whose holes
-were recorded nowhere.
-
-The radar path had the same end-of-leg-only record and gets the same treatment.
-
-**Cost, and a correction in place.** One attrs-only icechunk commit per skipped date. Coverage
-rejections were briefly recorded this way too and **that was wrong on two counts**, both caught
-by the batched-versus-serial parity test rather than by reasoning: the record needs the store to
-exist, and a rejection can precede the first write, so a store's snapshot history came to depend
-on write ordering; and rejections are the ordinary path, so it cost hundreds of commits a leg.
-A gate rejection also needs no crash durability at all — it is decided during preparation, the
-date never reaches the writer, and it was already excluded from the settled set for exactly that
-reason. Those dates now ride in the end-of-leg assessment's own commit as
-`assessed_filtered_dates`: a trace where there was none, at no extra commit. Only the scopes that
-can FLIP pay for a commit of their own, and they are rare.
+The original design said so before any of this was added: *"re-offering it costs one re-evaluation
+and cannot wedge anything."* That was right, and became wrong only because transients were leaking
+into the skip path. So the record is gone, and `record_assessed_window` at end-of-leg is unchanged —
+it serves the other purpose, telling the coverage gate a window was examined, and a leg that dies
+leaving no assessment correctly reads as never having got there.
 
 ## Coupling to the leg retry
 

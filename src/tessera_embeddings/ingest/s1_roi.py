@@ -77,8 +77,6 @@ from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
     get_existing_dates,
     record_assessed_window,
-    record_skipped_date,
-    skipped_dates,
     store_write_retrying,
     write_day_windows,
 )
@@ -546,12 +544,12 @@ def ingest_s1_roi_sar(
     # split, so nothing rules it out — and the cost of being wrong is a duplicate-date
     # commit. The consume side below is therefore the authority on what has been written,
     # and the query filter is only an optimisation.
-    # Written, plus given up on for a reason that cannot change: both are settled, and both are
-    # absent from the store, so filtering on written dates alone re-offers a lost date — which
-    # the time axis then refuses fatally, because later dates are already on it.
-    written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region) | skipped_dates(
-        orbit_store, s3_region=s3_region
-    )
+    # Written dates only. A date given up on is re-offered by the next attempt and gives up
+    # again for the same reason: every accepted cause is DETERMINISTIC, so the verdict recomputes
+    # and re-offering costs one re-evaluation rather than risking anything. A record of the skip
+    # would only be needed if the verdict could change between attempts, which is what treating a
+    # transient failure as a skip used to allow.
+    written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region)
     # Counted for the assessed-window record: it separates "sparse region" from
     # "the footprints are wrong", which look identical in a date count alone.
     empty_dates = 0
@@ -563,14 +561,6 @@ def ingest_s1_roi_sar(
     #: boundary solar day comes back from two consecutive batches — without this it would be
     #: given up twice, listed twice, and cost two of the leg's budget.
     given_up: set[str] = set()
-    #: Skips whose durable write did not land, retried after the next write. See `_give_up_date`.
-    undelivered_skips: list[dict[str, str]] = []
-
-    def _flush_skips() -> None:
-        for entry in list(undelivered_skips):
-            if record_skipped_date(orbit_store, entry, s3_region=s3_region):
-                undelivered_skips.remove(entry)
-
     #: Owned items across every batch — the number that distinguishes "the source does not
     #: cover this ROI for this orbit" from "we found items and committed none of them".
     total_items_seen = 0
@@ -614,16 +604,6 @@ def ingest_s1_roi_sar(
             "error": f"{type(exc).__name__}: {exc}"[:300],
         }
         given_up_dates.append(entry)
-        # DURABLE NOW. `record_assessed_window` below is the authoritative record but runs once,
-        # after the loop — so a leg killed before it reaches that line leaves no trace of what it
-        # gave up, and the next attempt offers the date again. Every entry reaching here is now
-        # `unreadable`, i.e. deterministic, so the record is a description of the data rather than
-        # of when the leg ran.
-        if not record_skipped_date(orbit_store, entry, s3_region=s3_region):
-            # Held, not dropped: a skip taken before the first write has no store to land on,
-            # and discarding it leaves exactly the unfillable store the record prevents. Flushed
-            # after the next successful write, which is when a store starts existing.
-            undelivered_skips.append(entry)
         log.error(
             "[%s] DATA LOSS roi=%s date=%s: the source read failed and this date is SKIPPED, so "
             "its pixels are absent from the mosaic. scope=%s error=%s — recorded on the store as "
@@ -920,9 +900,6 @@ def ingest_s1_roi_sar(
             # reporting it as processed would overstate a resumed run's progress.
             n = written_this_batch
             total_processed += n
-            if n and undelivered_skips:
-                # A store exists now, so a skip taken before the first write can finally land.
-                _flush_skips()
             log.info(
                 "[%s] Batch %s..%s roi=%s: wrote %d dates (total: %d)",
                 orbit,

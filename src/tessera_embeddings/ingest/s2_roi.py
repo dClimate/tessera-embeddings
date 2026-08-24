@@ -112,8 +112,6 @@ from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
     get_existing_dates,
     record_assessed_window,
-    record_skipped_date,
-    skipped_dates,
     store_write_retrying,
     write_day_windows,
     write_days_windows,
@@ -485,17 +483,16 @@ def ingest_s2_roi_reflectance(
         log.warning("ROI has no live pixels — every date will fail the coverage gate")
 
     def _settled_dates() -> set[str]:
-        """Dates this leg must not offer: already written, or already given up on.
+        """Dates this leg must not offer: the ones already written.
 
-        A date an earlier attempt gave up on is as settled as one it wrote. It is absent from
-        the store either way, so filtering on written dates alone offers it again — and if the
-        objects read this time, the append is REFUSED, because later dates are already on the
-        time axis and it cannot be inserted in place. That refusal is fatal and correct: the
-        store can no longer be completed. Not re-offering the date is what keeps it from firing.
+        A date an earlier attempt gave up on is re-offered and gives up again for the same
+        reason, because every accepted cause is DETERMINISTIC — unreadable bytes, a coverage
+        rejection, no live window — and so recomputes to the same verdict. Re-offering costs one
+        re-evaluation and cannot wedge anything. A durable record of the skip would only be
+        needed if the verdict could change between attempts, which is what treating a transient
+        failure as a skip used to allow.
         """
-        return get_existing_dates(reflectance_store, s3_region=s3_region) | skipped_dates(
-            reflectance_store, s3_region=s3_region
-        )
+        return get_existing_dates(reflectance_store, s3_region=s3_region)
 
     total_processed = 0
     total_filtered = 0
@@ -510,27 +507,6 @@ def ingest_s2_roi_reflectance(
     # must name them all. Kept out of the coverage counter, whose contract is the SCL gate: a run
     # that lost most of a year to metadata was reporting it as coverage filtering.
     producer_conflict_dates: list[dict[str, str]] = []
-    #: Skips whose durable write did not land — in practice, ones taken before the store
-    #: existed. Retained and retried, because discarding them is NOT harmless: a skip before the
-    #: first write, a later date that creates the store, and a crash leaves exactly the
-    #: unfillable store the record exists to prevent.
-    undelivered_skips: list[dict[str, str]] = []
-
-    def _remember_skip(entry: dict[str, str]) -> None:
-        """Record one skip durably now, or hold it until a store exists to record it on."""
-        if not record_skipped_date(reflectance_store, entry, s3_region=s3_region):
-            undelivered_skips.append(entry)
-
-    def _flush_skips() -> None:
-        """Retry the held skips. Called after a write, which is when the store starts existing."""
-        for entry in list(undelivered_skips):
-            if record_skipped_date(reflectance_store, entry, s3_region=s3_region):
-                undelivered_skips.remove(entry)
-
-    #: Dates the coverage gate rejected. Not a loss — the gate working is the ordinary path —
-    #: so these are recorded for observability in the end-of-leg commit rather than one at a
-    #: time, and are deliberately still re-offerable.
-    coverage_filtered_dates: list[dict[str, str]] = []
 
     def _prepare_date(day_items: list) -> _PreparedDate:
         """Build one solar day's write-ready dataset, or the reason it has none.
@@ -913,14 +889,10 @@ def ingest_s2_roi_reflectance(
                 # nowhere but a counter that died with the process — so a finished leg could
                 # say how many dates the gate dropped but never which.
                 #
-                # Collected, not committed. It needs no crash durability: the gate is decided
-                # during preparation, so the date never reaches the writer and re-offering it
-                # cannot wedge the store. `skipped_dates` therefore excludes this scope, and a
-                # later attempt re-evaluates the date — which is the only way a raised
-                # threshold or a newly published copy ever recovers it. Committing each one
-                # would also cost hundreds of commits a leg and make the store's history
-                # depend on whether a write happened before the first rejection.
-                coverage_filtered_dates.append({"date": prepared.date, "scope": "coverage"})
+                # Not recorded anywhere, and it does not need to be. The gate is decided during
+                # preparation from the same items and the same pixels, so a later attempt reaches
+                # the same verdict — which is also the only way a raised threshold or a newly
+                # published copy ever recovers the date.
                 return
             total_refused += 1
             entry = {
@@ -931,7 +903,6 @@ def ingest_s2_roi_reflectance(
                 "scope": "producer-conflict",
             }
             producer_conflict_dates.append(entry)
-            _remember_skip(entry)
 
         def _record_unreadable(
             prepared: _PreparedDate,
@@ -968,11 +939,6 @@ def ingest_s2_roi_reflectance(
             }
             unreadable_tile_dates.append(entry)
             # DURABLE NOW, not at the end of the leg. This is the date the wedge is built
-            # from: it is absent from the store, so a resume offers it again, and if it reads
-            # that time the append is refused because later dates are already on the axis.
-            # The end-of-leg record cannot protect it — a leg killed between here and there
-            # leaves no trace, which is exactly the case that produced unfillable holes.
-            _remember_skip(entry)
             log.error(
                 "DATA LOSS roi=%s date=%s: every catalogue copy failed to read, so this date "
                 "is SKIPPED and its pixels are absent from the mosaic. objects=%s scope=%s "
@@ -1027,9 +993,6 @@ def ingest_s2_roi_reflectance(
                     if exc is None:
                         _write_date(attempt, stall_s)
                         total_processed += 1
-                        # The store exists now, so any skip taken before the first write can
-                        # finally be recorded. This is the moment that closes that window.
-                        _flush_skips()
                         return
                 except Exception as write_exc:
                     if not is_unreadable_source(write_exc):
@@ -1123,7 +1086,6 @@ def ingest_s2_roi_reflectance(
                     _consume(prepared, 0.0)
                 return
             total_processed += len(batch)
-            _flush_skips()
 
         # `solar_day_sort_key` owns the order and the reasoning. `query_stac_items` already
         # applies it; applying it again covers a supply that did not come through there, since
@@ -1278,7 +1240,6 @@ def ingest_s2_roi_reflectance(
             start_date,
             end_date,
             unreadable=[*unreadable_tile_dates, *producer_conflict_dates],
-            filtered=coverage_filtered_dates,
             s3_region=s3_region,
         )
 
