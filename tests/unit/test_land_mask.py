@@ -364,6 +364,127 @@ def test_export_zone_roi_bbox_handles_antimeridian(tmp_path) -> None:
     assert span < 30.0
 
 
+def _sample_live_tiles_wgs84(spec, tile_live, per_edge: int = 5):
+    """WGS84 lon/lat of a grid of points over every live tile, tile edges included."""
+    rows, cols = np.where(tile_live)
+    frac = np.linspace(0.0, 1.0, per_edge)
+    de, dn = (a.ravel() for a in np.meshgrid(frac, frac, indexing="ij"))
+    east = np.concatenate([spec.easting[0] + (c + de) * zone_grid.PITCH_M for c in cols])
+    north = np.concatenate([spec.northing[1] - (r + dn) * zone_grid.PITCH_M for r in rows])
+    lon, lat = zone_grid.to_wgs84(int(spec.epsg)).transform(east, north)
+    return np.asarray(lon), np.asarray(lat)
+
+
+def _shortfall_deg(bbox, lon, lat) -> np.ndarray:
+    """Per point, how far outside ``bbox`` it lies, in degrees; 0 for a point inside."""
+    west, south, east, north = bbox
+    if west <= east:
+        d_lon = np.maximum(west - lon, lon - east)
+    else:  # antimeridian crossing: inside means east of west OR west of east
+        d_lon = np.minimum(west - lon, lon - east)
+    return np.maximum(0.0, d_lon) + np.maximum(0.0, np.maximum(south - lat, lat - north))
+
+
+def _lat_spanning_land(spec) -> np.ndarray:
+    """A live-tile bitmap whose land runs the zone's whole latitude range."""
+    nty, ntx = spec.height // SHARD_PX, spec.width // SHARD_PX
+    tl = np.zeros((nty, ntx), dtype=bool)
+    for r in range(0, nty, 4):
+        tl[r, (r // 4) % (ntx - 3) : (r // 4) % (ntx - 3) + 3] = True
+    return tl
+
+
+@pytest.mark.parametrize("zone", ["33N", "01N", "33S"])
+def test_band_boxes_cover_the_live_tiles_to_within_a_pixel(zone) -> None:
+    """The whole safety argument: banding may ask for less ground, never for less LAND.
+
+    A fixed 6-degree box would be smaller still and would silently drop polar land, because
+    the zone's raster genuinely widens toward the pole. These boxes do not: each band asks
+    for the width the zone has at its own latitudes, so their union contains every live tile
+    the single box does. 01N is included because its boxes are written in the antimeridian
+    crossing convention.
+
+    To within a pixel, not exactly, and the tolerance is the SAME one the single box already
+    carries: ``tile_range_bbox_wgs84`` densifies a rectangle's perimeter with a finite number
+    of samples, so a box can fall short of its own rectangle mid-edge by well under one pixel.
+    Banding moves that residue from one top edge to one per band; it does not enlarge it.
+    """
+    spec = zone_grid.zone(zone)
+    tile_live = _lat_spanning_land(spec)
+    lon, lat = _sample_live_tiles_wgs84(spec, tile_live)
+    boxes = land_mask.live_tile_band_bboxes_wgs84(spec, tile_live, bands=8)
+    shortfall = np.min([_shortfall_deg(box, lon, lat) for box in boxes], axis=0)
+    metres = float(shortfall.max()) * 111_320.0
+    assert metres < land_mask.PIXEL_M, f"a live tile falls {metres:.1f} m outside every band box"
+
+
+def test_band_boxes_ask_for_less_ground_than_the_single_box() -> None:
+    """The point of the change: a zone-spanning ROI asks for a fraction of the envelope."""
+    spec = zone_grid.zone("33N")
+    tile_live = _lat_spanning_land(spec)
+    boxes = land_mask.live_tile_band_bboxes_wgs84(spec, tile_live, bands=8)
+    single = land_mask._live_tile_bbox_wgs84(spec, tile_live)
+    assert len(boxes) == 8
+    assert sum(land_mask._bbox_area_deg2(b) for b in boxes) < land_mask._bbox_area_deg2(single)
+
+
+def test_banding_is_declined_where_it_would_not_ask_for_less() -> None:
+    """Land inside a narrow latitude range already has a tight envelope.
+
+    Cutting it up there costs one request per band for slightly MORE ground in total, so
+    the single box is returned instead and the caller can ask with the result either way.
+    """
+    spec = zone_grid.zone("33N")
+    nty = spec.height // SHARD_PX
+    tile_live = np.zeros((nty, spec.width // SHARD_PX), dtype=bool)
+    tile_live[nty // 2 : nty // 2 + 3, 4:9] = True
+    assert land_mask.live_tile_band_bboxes_wgs84(spec, tile_live, bands=8) == [
+        land_mask._live_tile_bbox_wgs84(spec, tile_live)
+    ]
+
+
+def test_export_zone_roi_writes_the_band_query_boxes(tmp_path) -> None:
+    zone = "31N"
+    cov = make_coverage(tmp_path, zone, [(10, 5), (200, 6), (400, 7)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    bands = zarr.open(dest, mode="r").attrs["bbox_wgs84_bands"]
+    assert bands, "no per-band query boxes written"
+    assert all(len(b) == 4 for b in bands)
+    assert read_roi_metadata(dest).query_bboxes == tuple(tuple(b) for b in bands)
+
+
+def test_export_zone_roi_rebuilds_a_mask_written_without_band_boxes(tmp_path) -> None:
+    """An ROI from before the band attr must not stay on the single-box query forever.
+
+    The export skips a mask it considers current, so the attr is part of what "current"
+    means — otherwise every already-exported zone would need a manual re-export.
+    """
+    zone = "31N"
+    cov = make_coverage(tmp_path, zone, [(10, 5), (400, 7)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    z = zarr.open(dest, mode="a")
+    del z.attrs["bbox_wgs84_bands"]
+
+    assert land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest) == dest
+    assert zarr.open(dest, mode="r").attrs["bbox_wgs84_bands"]
+
+
+def test_validate_zone_roi_rejects_band_boxes_that_are_not_the_coverages(tmp_path) -> None:
+    """These boxes decide which imagery is asked for, so a wrong set loses data silently."""
+    zone = "31N"
+    cov = make_coverage(tmp_path, zone, [(10, 5), (400, 7)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    assert land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest) == []
+
+    z = zarr.open(dest, mode="a")
+    z.attrs["bbox_wgs84_bands"] = [list(z.attrs["bbox_wgs84"])]
+    problems = land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest)
+    assert any("bbox_wgs84_bands" in p for p in problems)
+
+
 # --------------------------------------------------------------------------- #
 # Pre-generation gate (live_chunk_count / validate_zone_roi)
 # --------------------------------------------------------------------------- #

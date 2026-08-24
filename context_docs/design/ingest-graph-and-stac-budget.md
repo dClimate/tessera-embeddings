@@ -308,8 +308,102 @@ at 8192 blocks, so 16384 is expected to press it. Raising the worker size is an 
 if the task-count gain is real — the extra instance cost is small against the fleet time saved
 — but the gain must be demonstrated by task count first, and spill must be zero.
 
+## 11. The optical query asks per latitude band, not per zone envelope
+
+**Implemented.** Before this, the Sentinel-2 query used `roi.bbox_wgs84`, the axis-aligned
+WGS84 envelope of the zone's live tiles. A UTM zone is 6 degrees of longitude wide, but the
+meridians bounding it converge toward the pole, so the envelope of a zone reaching 84 deg N is
+**54.4 deg wide**. Most of what a query with that box returns is discarded.
+
+A fixed 6-degree box is NOT a valid substitute: the zone's raster genuinely widens toward the
+pole, which is what inflates the envelope in the first place, so a fixed box drops polar land.
+The safe form is one box per latitude band, each asking for the longitude the zone occupies at
+that band's latitudes. `land_mask.live_tile_band_bboxes_wgs84` builds them, tight to each
+band's own live rows and live columns, and the boxes are stored on the ROI as
+`bbox_wgs84_bands`.
+
+### Ground area asked for, 8 bands
+
+Ratio of the single envelope's area in square degrees to the summed area of the band boxes,
+measured over four live-tile patterns per zone on ten zones:
+
+| live-tile pattern | northern zones | southern zones |
+|---|---|---|
+| every tile live | 3.38x | 2.68x |
+| a contiguous, latitude-spanning landmass | 3.39x | 2.69x |
+| one tile row in four, three columns wide | 5.66x | 4.18x |
+| 2% of tiles at random | 3.62x | 2.82x |
+
+Saving by band count was measured earlier at 1.74x (2 bands), 2.63x (4), 3.38x (8), 3.81x (16),
+3.91x (32) on the northern zones — it saturates by 16, so 8 captures most of it, and each extra
+band costs at least one more first-page request.
+
+### Items returned, measured live
+
+Earth Search `numberMatched` for `sentinel-2-l2a`, zone 33N with every tile live (envelope
+54.4 deg x 84.1 deg), one request per box:
+
+| window | envelope | 8 bands | ratio |
+|---|---|---|---|
+| 2024-01-01..05 | 7,015 | 1,344 | 5.2x |
+| 2024-07-01..05 | 10,341 | 3,949 | 2.6x |
+
+**The saving is season-dependent and January overstates it.** The widest band is the polar one,
+and in January polar night leaves it empty; in July it alone holds 1,931 of the 3,949 items.
+Quote the July figure, not the January one.
+
+### Safety
+
+6,508,728 points sampled: ten zones x four live-tile patterns, a 6x6 grid of points over every
+live tile with tile edges included, and the band seams therefore sampled explicitly. Measured as
+the distance from each point to the nearest band box.
+
+- Worst shortfall of the banded union: **9.73 m**. Worst shortfall of the single envelope on the
+  same sample: **9.73 m**. Banding never falls further short than the box it replaces.
+- Where the envelope's shortfall is 0 the banded union's is at most **1.27 m**.
+- Both are under the 10 m pixel, and both are the documented residue of
+  `zone_grid.tile_range_bbox_wgs84`'s 64-samples-per-edge perimeter densification.
+
+**Correction to the earlier record.** The deferred investigation reported that the count of
+points uncovered by the banded union equals the count uncovered by the single envelope
+*exactly*. At the sampling density above that is not true: banding moves the top-edge residue
+from one edge to one per band, so a few points fall short where the envelope does not. The
+magnitude is sub-metre, i.e. one-twentieth of a pixel and eleven thousand times finer than a
+Sentinel-2 granule, so no imagery can be missed by it — but the claim as stated does not hold.
+
+**Banding is declined where it would not help.** A zone whose land sits inside a narrow
+latitude range already has a tight envelope; cutting it into 8 boxes there asks for about 7%
+MORE ground in total, because each box carries its own share of the curvature slack and
+adjacent boxes overlap. `live_tile_band_bboxes_wgs84` returns the single box in that case, so
+its result is never wider than the envelope and a caller can ask with it unconditionally.
+
+### Where the boxes come from, and what happens to masks already written
+
+The bands cannot be derived from `roi.geobox`: `export_zone_roi` writes the ROI at the whole
+zone's shape with ocean left as fill and crops only the `bbox_wgs84` attr, so banding a
+geobox-derived rectangle would ask for a LARGER latitude range than today. They therefore come
+from the coverage bitmap at export time and are stored on the mask.
+
+`read_roi_metadata` exposes `ROIMetadata.query_bboxes`, which is the stored bands or, for a mask
+written before they existed, the single envelope — the envelope over-queries rather than
+under-queries, which is the safe direction for a spatial term. Masks are not left there
+indefinitely: `_roi_is_current` counts the attr's presence as part of being current, so the next
+export rebuilds a mask that lacks it, with no operator step. Presence only, not the band count,
+so changing `ROI_QUERY_BANDS` does not trigger a whole-artifact rewrite of every zone.
+
+`validate_zone_roi` re-derives the boxes from the coverage bitmap and compares them with a
+tolerance, because these boxes decide which imagery is asked for and a wrong set would lose data
+without failing any other check. The tolerance exists because the values are inverse
+projections: a PROJ-data update can move them in the last few digits without moving any box the
+width of a pixel.
+
+**Radar is unchanged.** The S1/OPERA path still queries with the single envelope.
+
 ## Changelog
 
+- **2026-08-23** — Section 11 added: the optical query now asks one box per latitude band
+  instead of one zone envelope. Ground area and item counts measured; the earlier claim that
+  banding uncovers exactly what the single envelope uncovers is corrected.
 - **2026-07-25** — Created. Graph anatomy measured (4 tasks per chunk-band); linear cost
   model superseded by the dispatch-floor model; scheduler shown single-core-bound; chunk-size
   variants measured (1.41× load-only vs 3.88× full); STAC query characterised including the

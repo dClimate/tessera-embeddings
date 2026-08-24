@@ -63,6 +63,10 @@ class ROIMetadata:
         geobox: odc GeoBox matching the ROI's exact grid (CRS, transform, shape).
         width: Raster width in pixels.
         height: Raster height in pixels.
+        bbox_wgs84_bands: Per-latitude-band boxes covering the same ground as
+            ``bbox_wgs84``, written by
+            :func:`~tessera_embeddings.ingest.land_mask.export_zone_roi`. Empty when the
+            store predates that attr — read :attr:`query_bboxes` rather than this.
     """
 
     bbox_wgs84: tuple[float, float, float, float]
@@ -70,6 +74,19 @@ class ROIMetadata:
     geobox: GeoBox
     width: int
     height: int
+    bbox_wgs84_bands: tuple[tuple[float, float, float, float], ...] = ()
+
+    @property
+    def query_bboxes(self) -> tuple[tuple[float, float, float, float], ...]:
+        """The boxes a catalogue query should be asked with.
+
+        The per-band boxes when the store carries them, and otherwise the single envelope.
+        An ROI written before ``bbox_wgs84_bands`` existed therefore keeps working, on the
+        query it already ran: the envelope asks for more ground than the zone occupies, so
+        the fallback over-queries rather than under-queries, which is the safe direction
+        for a spatial term.
+        """
+        return self.bbox_wgs84_bands or (self.bbox_wgs84,)
 
 
 @dataclass
@@ -111,8 +128,14 @@ def read_roi_metadata(roi_path: str, *, storage_options: StorageOptions = None) 
     geobox = GeoBox(shape=(height, width), affine=transform, crs=native_crs)
 
     bbox_wgs84 = cast(tuple[float, float, float, float], tuple(cast(list, z.attrs["bbox_wgs84"])))
+    bands = tuple(
+        cast(tuple[float, float, float, float], tuple(box)) for box in cast(list, z.attrs.get("bbox_wgs84_bands") or [])
+    )
 
-    logger.info(f"ROI metadata (zarr): crs={native_crs}, {width}x{height}px, geobox={geobox}, bbox_wgs84={bbox_wgs84}")
+    logger.info(
+        f"ROI metadata (zarr): crs={native_crs}, {width}x{height}px, geobox={geobox}, "
+        f"bbox_wgs84={bbox_wgs84}, query bands={len(bands)}"
+    )
 
     return ROIMetadata(
         bbox_wgs84=bbox_wgs84,
@@ -120,6 +143,7 @@ def read_roi_metadata(roi_path: str, *, storage_options: StorageOptions = None) 
         geobox=geobox,
         width=width,
         height=height,
+        bbox_wgs84_bands=bands,
     )
 
 

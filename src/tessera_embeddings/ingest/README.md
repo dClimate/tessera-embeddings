@@ -483,15 +483,22 @@ define the area of interest for all downstream ingestion and inference.
    blocks, calling `rasterio.features.rasterize` per chunk with a chunk-local transform.
    The full boolean grid is never held in memory.
 6. **Zarr attrs** — `crs`, `transform` (6-element Affine list), `resolution`, `bbox_wgs84`,
-   and a `_manifest` written atomically after all chunks succeed.
+   and a `_manifest` written atomically after all chunks succeed. Zone masks
+   (`export_zone_roi`) additionally carry `bbox_wgs84_bands`, the per-latitude-band boxes the
+   optical catalogue query is asked with.
 
 ### Reading an ROI
 
 Ingestion flows call:
 
-- `read_roi_metadata(roi_path)` — returns `ROIMetadata`: WGS84 bbox (for STAC queries),
-  native CRS string, `odc.geo.GeoBox` (for `geobox=` kwarg to `odc.stac.load` so output
-  grids align exactly), width/height.
+- `read_roi_metadata(roi_path)` — returns `ROIMetadata`: WGS84 bbox, native CRS string,
+  `odc.geo.GeoBox` (for `geobox=` kwarg to `odc.stac.load` so output grids align exactly),
+  width/height, and `query_bboxes` — the boxes to ask the catalogue with.
+  `query_bboxes` is the per-latitude-band boxes where the mask carries them, and otherwise the
+  single WGS84 bbox. A UTM zone's envelope is several times wider than the zone, because the
+  meridians bounding it converge toward the pole, so banding asks the catalogue for far less
+  ground and returns far fewer items to discard. A mask written before the bands existed falls
+  back to the envelope, which over-queries rather than under-queries.
 - `read_roi_mask(roi_path, chunks)` — returns a lazy Dask boolean array for masking.
 
 ### Applying the ROI Mask
@@ -549,7 +556,7 @@ export-zone-rois  (one task per zone, max_parallel_zones in flight, no barrier)
    └─ per zone ─► live_chunk_count(zone)        coverage bitmap, one ~KB GET
                   ├─ 0 live chunks ⇒ all_ocean (no mask by design; nothing written)
                   ├─ export_zone_roi(zone)      skipped when already current
-                  └─ validate_zone_roi(zone)    grid · completion · placement · layout
+                  └─ validate_zone_roi(zone)    grid · query bands · completion · placement · layout
 ```
 
 `validate_zone_roi` is the reason to run this early. Its load-bearing check is **placement**:
@@ -562,11 +569,15 @@ on (see `live_windows.live_chunk_grid_from_keys`). Alongside that: shape/CRS/aff
 zone's `ZoneSpec` (a wrong origin otherwise surfaces hours later, as data on the wrong ground
 position), and `coverage_sha256` matches the coverage group's `registry_sha256` — stamped last
 by the writer, so it is the only evidence every pixel landed and that the mask is current for
-*this* land-mask delivery.
+*this* land-mask delivery. It also re-derives `bbox_wgs84_bands` from the coverage bitmap and
+compares: those boxes decide which imagery the optical query asks for, so a wrong set would
+lose data without failing any other check.
 
 Safe to run before, or alongside, campaign work. `export_zone_roi` is idempotent on that same
 sha, so a pre-generated mask is what the campaign would have written and the campaign skips it;
-a new delivery changes the sha and both paths rebuild. `validate_only=true` re-checks without
+a new delivery changes the sha and both paths rebuild. A mask written before `bbox_wgs84_bands`
+existed is not considered current, so the next export rebuilds it and it gains the attr with no
+operator step. `validate_only=true` re-checks without
 writing. Any invalid zone **fails the run**, so a green run — not a log line — is the evidence
 that every mask is right.
 

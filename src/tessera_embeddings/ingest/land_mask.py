@@ -40,6 +40,7 @@ via fsspec / the icechunk helpers (no boto3).
 from __future__ import annotations
 
 import hashlib
+import itertools
 import logging
 import math
 from collections import defaultdict
@@ -658,6 +659,84 @@ def _live_tile_bbox_wgs84(spec: ZoneSpec, tile_live: np.ndarray) -> tuple[float,
     return _tile_range_bbox_wgs84(spec, int(rows.min()), int(rows.max()) + 1, int(cols.min()), int(cols.max()) + 1)
 
 
+#: Latitude bands a zone's catalogue query is cut into. A zone is 6 degrees of longitude
+#: wide, but the WGS84 envelope of its raster is many times that, because the meridians
+#: bounding it converge toward the pole. One box per band asks for the longitude the zone
+#: occupies at that latitude instead of the widest longitude it reaches anywhere. Ground
+#: area asked for falls steeply over the first few bands and then flattens; the chosen
+#: value and the measurements behind it are in
+#: ``context_docs/design/ingest-graph-and-stac-budget.md``.
+ROI_QUERY_BANDS = 8
+
+
+def live_tile_band_bboxes_wgs84(
+    spec: ZoneSpec, tile_live: np.ndarray, *, bands: int
+) -> list[tuple[float, float, float, float]]:
+    """WGS84 boxes covering the zone's live tiles, one per latitude band.
+
+    The live tile ROWS are cut into ``bands`` groups of equal row height, and every group
+    holding a live tile yields one box tight to that group's own live rows and columns.
+    Each live tile falls in exactly one group, and that group's box contains it under the same
+    perimeter-densified guarantee :func:`~tessera_embeddings.storage.zone_grid.tile_range_bbox_wgs84`
+    gives the single box — so the union reaches the same live tiles the single box does, to
+    within the sub-pixel residue densification leaves either way, while asking for far less
+    ground.
+
+    Banding is what makes the saving safe. The zone's raster genuinely widens toward the
+    pole, so a fixed 6-degree box would drop polar land; a band box asks for the width the
+    zone actually has at that band's latitudes and nothing more.
+
+    A group that is empty, or that a small live-row span leaves with no rows at all, is
+    skipped: a box is emitted only where there is land to ask about. Bands overlap only
+    where two boxes' longitude ranges do, and the query layer dedupes items across boxes.
+
+    Returns the single box alone where banding would not ask for less ground. A zone whose
+    land sits inside a narrow latitude range has an envelope that is already tight, and
+    cutting it up then costs one extra request per band while asking for slightly MORE
+    ground in total, because each band box carries its own share of the curvature slack and
+    adjacent boxes overlap. So the result is never wider than the single box, and a caller
+    can ask with it unconditionally.
+    """
+    if bands < 1:
+        raise ValueError(f"bands must be >= 1, got {bands}")
+    live_rows = np.where(tile_live.any(axis=1))[0]
+    if live_rows.size == 0:
+        return []
+    edges = np.linspace(int(live_rows.min()), int(live_rows.max()) + 1, bands + 1).round().astype(int)
+    boxes: list[tuple[float, float, float, float]] = []
+    for lo, hi in itertools.pairwise(edges):
+        band = tile_live[lo:hi]
+        if not band.any():
+            continue
+        rows = np.where(band.any(axis=1))[0]
+        cols = np.where(band.any(axis=0))[0]
+        boxes.append(
+            _tile_range_bbox_wgs84(
+                spec,
+                int(lo) + int(rows.min()),
+                int(lo) + int(rows.max()) + 1,
+                int(cols.min()),
+                int(cols.max()) + 1,
+            )
+        )
+    single = _live_tile_bbox_wgs84(spec, tile_live)
+    if sum(_bbox_area_deg2(b) for b in boxes) >= _bbox_area_deg2(single):
+        return [single]
+    return boxes
+
+
+def _bbox_area_deg2(bbox: tuple[float, float, float, float]) -> float:
+    """A WGS84 box's area in square degrees, honouring the west>east crossing convention.
+
+    A comparative measure of how much ground a query asks for, not a real ground area — a
+    degree of longitude shrinks toward the pole, so the two are not proportional. That is
+    fine for its one use, choosing between boxes over the same latitudes.
+    """
+    west, south, east, north = bbox
+    span = east - west if west <= east else (180.0 - west) + (east + 180.0)
+    return span * (north - south)
+
+
 def live_tile_block_bboxes_wgs84(
     spec: ZoneSpec, tile_live: np.ndarray, *, block_tiles: int
 ) -> list[tuple[tuple[float, float, float, float], int]]:
@@ -751,6 +830,12 @@ def _roi_is_current(
     group's ``registry_sha256`` is the discriminator: a new delivery (different
     ``tile_live_2048``) changes the sha and forces a rebuild. Any open failure
     (missing store) means "rebuild".
+
+    ``bbox_wgs84_bands`` is required as well, so a mask written before that attr existed
+    is rebuilt on the next export rather than being kept forever on the single-envelope
+    query path. Presence only, not the band COUNT: a mask banded at a different count is
+    still a correct set of boxes, and tying a tuning constant to a whole-artifact rewrite
+    is not a trade this path should make.
     """
     try:
         existing = zarr.open(dest_path, mode="r", storage_options=storage_options)
@@ -763,6 +848,7 @@ def _roi_is_current(
         and existing.attrs.get("crs") == crs
         and list(cast("list[float]", existing.attrs.get("transform", []))) == transform
         and existing.attrs.get("coverage_sha256") == coverage_sha
+        and bool(existing.attrs.get("bbox_wgs84_bands"))
     )
 
 
@@ -833,6 +919,7 @@ def export_zone_roi(
     z.attrs["transform"] = transform
     z.attrs["resolution"] = PIXEL_M
     z.attrs["bbox_wgs84"] = list(_live_tile_bbox_wgs84(spec, tile_live))
+    z.attrs["bbox_wgs84_bands"] = [list(b) for b in live_tile_band_bboxes_wgs84(spec, tile_live, bands=ROI_QUERY_BANDS)]
     z.attrs["_manifest"] = RoiManifest(resolution=PIXEL_M, chunk_size=INGEST_CHUNK_SIZE, crs=spec.crs).to_dict()
 
     # Upsample tile-liveness onto pixels one chunk-aligned block at a time (each
@@ -899,6 +986,30 @@ def live_chunk_count(
     )
 
 
+def _band_bbox_problems(z: zarr.Array, spec: ZoneSpec, tile_live: np.ndarray) -> list[str]:
+    """Check a mask's ``bbox_wgs84_bands`` against the boxes its coverage bitmap implies.
+
+    These boxes decide which imagery the optical query asks for, so a mask carrying the
+    wrong ones loses data without failing anything else: the ingest would run, write, and
+    report success over whatever the boxes happened to cover. Re-deriving from the bitmap
+    with the writer's own function is the only check that catches that.
+
+    Compared with a tolerance rather than exactly. The values are inverse projections, so a
+    pyproj or PROJ-data update can move them in the last few digits without moving any box
+    the width of a pixel, and a gate that fails on that would fail every mask after an
+    unrelated dependency bump.
+    """
+    stored = cast("list[list[float]] | None", z.attrs.get("bbox_wgs84_bands"))
+    expected = live_tile_band_bboxes_wgs84(spec, tile_live, bands=ROI_QUERY_BANDS)
+    if not stored:
+        return [f"bbox_wgs84_bands {stored!r} is absent or empty — the optical query has no per-band boxes"]
+    if len(stored) != len(expected) or any(len(b) != 4 for b in stored):
+        return [f"bbox_wgs84_bands has {len(stored)} box(es), the coverage bitmap implies {len(expected)}"]
+    if not np.allclose(np.asarray(stored, dtype="float64"), np.asarray(expected, dtype="float64"), atol=1e-6):
+        return [f"bbox_wgs84_bands {stored} != the boxes the coverage bitmap implies {expected}"]
+    return []
+
+
 def validate_zone_roi(
     zone: str,
     *,
@@ -919,7 +1030,8 @@ def validate_zone_roi(
       (via :func:`_zone_roi_transform`, the writer's own source), plus a WGS84
       bbox in range. ``west > east`` is accepted: zones 01/60 straddle the
       antimeridian and the bbox is deliberately written in the GeoJSON crossing
-      convention.
+      convention. The per-band query boxes are re-derived from the coverage bitmap and
+      compared, because they decide which imagery the optical query asks for.
     * **Completion** — ``coverage_sha256`` matches the coverage group's
       ``registry_sha256``. The writer stamps it last, so its presence is the only
       evidence every pixel landed, and its value is what makes the mask current
@@ -974,6 +1086,7 @@ def validate_zone_roi(
 
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
     coverage_sha = cast("str | None", cov.attrs.get("registry_sha256"))
+    problems.extend(_band_bbox_problems(z, spec, np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)))
     if z.attrs.get("coverage_sha256") != coverage_sha:
         problems.append(f"coverage_sha256 {z.attrs.get('coverage_sha256')!r} != coverage {coverage_sha!r}")
 

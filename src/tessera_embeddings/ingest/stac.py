@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from itertools import count
@@ -1389,6 +1389,7 @@ def _query_stac_items(
     bbox: tuple[float, float, float, float] | None = None,
     item_provider_fn: Callable[[], list[Any]] | None = None,
     extra_bands: list[str] | None = None,
+    query_bboxes: Sequence[tuple[float, float, float, float]] | None = None,
 ) -> list[Any]:
     """Query STAC catalog for items matching tile and date range.
 
@@ -1409,6 +1410,10 @@ def _query_stac_items(
         extra_bands: Additional assets the caller will load. Kept in the pruned
             items — pruning runs at query time, so an asset dropped here cannot
             be loaded later.
+        query_bboxes: Boxes to ask the catalogue with, instead of the single ``bbox``.
+            Together they must cover every pixel the caller will load; ``bbox`` remains
+            what the result is labelled and grouped by. Overlapping boxes are safe — the
+            items they share are deduped below, the same way the antimeridian halves' are.
 
     Returns:
         List of pystac Items
@@ -1441,7 +1446,15 @@ def _query_stac_items(
     # concurrently and read back depth-first, in date order, which is the order the serial
     # walk produced. The same searches run on every attempt, so the layer above can still
     # decide a refusal is deterministic by seeing the identical signature twice.
-    roots = [_WindowWalk(sub_bbox, (start_date, end_date)) for sub_bbox in split_antimeridian_bbox(bbox)]
+    # One root per spatial term the caller gave, each split at the antimeridian if it
+    # crosses. A caller that passes per-latitude-band boxes is asking the catalogue for the
+    # ground its region actually occupies rather than for the envelope that bounds it, which
+    # for a UTM zone is several times larger — see land_mask.live_tile_band_bboxes_wgs84.
+    roots = [
+        _WindowWalk(sub_bbox, (start_date, end_date))
+        for box in (query_bboxes if query_bboxes else [bbox])
+        for sub_bbox in split_antimeridian_bbox(box)
+    ]
     budget = _RePartitionBudget(_MAX_REFUSAL_RE_PARTITIONS)
     _fill_window_tree(
         lambda node: _walk_query_window(clients.get(), provider, collection_config, tile_id, keep_assets, budget, node),
@@ -1450,7 +1463,8 @@ def _query_stac_items(
     )
 
     # Dedupe across every search this query ran, first occurrence winning, in tree order.
-    # A granule straddling +/-180 is returned by both antimeridian halves, one acquired on
+    # A granule straddling +/-180 is returned by both antimeridian halves, one on the
+    # latitude two band boxes share by both of them, one acquired on
     # a seam instant by both windows that share it, and every item of a re-cut window's
     # first page by the shorter windows that replaced it. Done HERE rather than as pages
     # arrive because which page arrives first is now a matter of timing, and
@@ -1568,6 +1582,7 @@ def query_stac_items(
     item_provider_fn: Callable[[], list[Any]] | None = None,
     extra_bands: list[str] | None = None,
     mid_longitude: float | None = None,
+    query_bboxes: Sequence[tuple[float, float, float, float]] | None = None,
 ) -> tuple[list[Any], dict[str, int]]:
     """Query STAC catalog, filter items, and extract baselines.
 
@@ -1594,6 +1609,9 @@ def query_stac_items(
             day. ``existing_dates`` is then keyed on solar days, and matching an
             item's UTC date against it half-filters a committed group. Omit for
             callers that group by UTC date.
+        query_bboxes: Boxes to ask the catalogue with in place of ``bbox`` — see
+            :func:`_query_stac_items`. ``bbox`` is still what labels the query and, absent
+            ``mid_longitude``, what the solar-day grouping is derived from.
 
     Returns:
         Tuple of (items, baselines) where:
@@ -1613,6 +1631,7 @@ def query_stac_items(
         bbox=bbox,
         item_provider_fn=item_provider_fn,
         extra_bands=extra_bands,
+        query_bboxes=query_bboxes,
     )
 
     query_label = f"tile {tile_id}" if tile_id else f"bbox {bbox}"
@@ -2034,6 +2053,7 @@ def stream_stac_months(
     query_fn: Callable[..., tuple[list[Any], dict[str, int]]] | None = None,
     mid_longitude: float | None = None,
     extra_bands: list[str] | None = None,
+    query_bboxes: Sequence[tuple[float, float, float, float]] | None = None,
     log: logging.Logger | logging.LoggerAdapter | None = None,
 ) -> Iterator[tuple[SolarDayRange, list[Any], dict[str, int]]]:
     """Yield one calendar month of STAC items at a time, prefetching the next.
@@ -2077,6 +2097,8 @@ def stream_stac_months(
         extra_bands: Additional assets the caller will load. Forwarded to the query
             because pruning runs THERE — an asset the caller loads but does not
             name here is dropped before the loader ever sees it.
+        query_bboxes: Boxes to ask the catalogue with in place of ``bbox`` — see
+            :func:`_query_stac_items`. Forwarded to every month's query unchanged.
         log: Optional logger.
 
     Yields:
@@ -2110,6 +2132,7 @@ def stream_stac_months(
             # Asset pruning happens HERE, at query time. A band the caller will load but
             # does not name is gone before the loader runs — see _loadable_assets.
             extra_bands=extra_bands,
+            query_bboxes=query_bboxes,
         )
         log.info("Queried %s..%s in %.1fs", mr.query_start, mr.query_end, time.monotonic() - t0)
         return result

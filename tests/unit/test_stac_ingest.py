@@ -746,6 +746,60 @@ class TestAntimeridianBboxSplit:
         # item "S" is deduped to one copy and keeps the position its first sighting gave it.
         assert [i.id for i in items] == ["S", "E", "W"]
 
+    def test_band_boxes_are_each_searched_and_shared_items_deduped(self, monkeypatch):
+        """Per-latitude-band boxes replace the single envelope, and the seam costs nothing.
+
+        A UTM zone's WGS84 envelope is several times wider than the zone, because the
+        meridians bounding it converge toward the pole, so most of what a query with that
+        envelope returns is discarded. Asking one box per latitude band instead means the
+        catalogue is asked for the ground the zone occupies. Two adjacent bands share their
+        seam latitude, so an item there is returned by both — deduped, as the antimeridian
+        halves' shared items are.
+        """
+        searched: list = []
+
+        def _raw(id_: str) -> dict:
+            return {
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": id_,
+                "geometry": {"type": "Point", "coordinates": [12.0, 50.0]},
+                "bbox": [12.0, 50.0, 12.0, 50.0],
+                "properties": {"datetime": "2024-01-05T00:00:00Z"},
+                "links": [{"rel": "self", "href": f"https://example/{id_}"}],
+                "assets": {"blue": {"href": f"s3://b/{id_}-blue.tif"}},
+            }
+
+        class _Search:
+            def __init__(self, ids):
+                self._ids = ids
+
+            def pages_as_dicts(self):
+                yield {"features": [_raw(i) for i in self._ids]}
+
+        class _Client:
+            def search(self, **kw):
+                searched.append(kw["bbox"])
+                # "SEAM" sits on the latitude the two bands share, so both return it.
+                return _Search(["SOUTH", "SEAM"] if kw["bbox"][1] == 40.0 else ["SEAM", "NORTH"])
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac.Client.open", lambda *a, **k: _Client())
+        south = (9.0, 40.0, 15.0, 50.0)
+        north = (0.0, 50.0, 24.0, 60.0)
+        items = _query_stac_items(
+            _get_provider_config("earth-search"),
+            _get_collection_config("earth-search", "sentinel-2-l2a"),
+            None,
+            "2024-01-01",
+            "2024-01-31",
+            bbox=(0.0, 40.0, 24.0, 60.0),  # the envelope: still the label and the load box
+            query_bboxes=[south, north],
+        )
+
+        # The envelope is NOT searched — that is the whole point of the change.
+        assert sorted(searched) == sorted([south, north])
+        assert [i.id for i in items] == ["SOUTH", "SEAM", "NORTH"]
+
 
 class TestItemPruning:
     """Tests for _prune_item_dict / _loadable_assets.

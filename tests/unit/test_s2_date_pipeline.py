@@ -28,6 +28,7 @@ import xarray as xr
 
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest import s2_roi
+from tessera_embeddings.ingest.roi import ROIMetadata
 from tessera_embeddings.ingest.stac import HeterogeneousProducerError
 from tessera_embeddings.storage.zarr_store import store_write_retrying
 
@@ -50,10 +51,12 @@ STAGE_LINE = re.compile(
     r"write=(?P<write>[\d.]+)s total=(?P<total>[\d.]+)s"
 )
 
-_ROI = SimpleNamespace(
+# The real metadata object, not a stand-in for it: the ingest reads derived attributes off
+# it (`query_bboxes`), and a hand-rolled namespace silently stops carrying whatever is added.
+_ROI = ROIMetadata(
     bbox_wgs84=(-105.0, 39.0, -104.9, 39.1),
     native_crs="EPSG:32613",
-    geobox=None,
+    geobox=None,  # type: ignore[arg-type]  # nothing in this test's load path reads it
     height=SIZE,
     width=SIZE,
 )

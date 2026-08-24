@@ -71,6 +71,34 @@ class TestReadROIMetadata:
         assert result.height == 50
         assert result.bbox_wgs84 == expected_bbox
 
+    def test_query_bboxes_are_the_stored_latitude_bands(self, tmp_path):
+        """The per-band boxes are what a catalogue query is asked with when present."""
+        zarr_path = tmp_path / "banded.zarr"
+        bands = [[-95.0, 45.0, -94.0, 45.5], [-94.8, 45.5, -94.2, 46.0]]
+        _write_test_zarr(zarr_path, "EPSG:32615", (4e5, 5e6, 4.1e5, 5.01e6), bbox_wgs84=(-95.0, 45.0, -94.0, 46.0))
+        z = zarr.open_array(str(zarr_path), mode="a")
+        z.attrs["bbox_wgs84_bands"] = bands
+
+        result = read_roi_metadata(str(zarr_path))
+
+        assert result.bbox_wgs84_bands == tuple(tuple(b) for b in bands)
+        assert result.query_bboxes == tuple(tuple(b) for b in bands)
+
+    def test_query_bboxes_fall_back_to_the_envelope_for_a_store_without_bands(self, tmp_path):
+        """A mask written before the band attr existed still queries — with the old box.
+
+        The envelope asks for MORE ground than the bands do, so the fallback over-queries
+        rather than under-queries. That is the safe direction: no imagery is missed.
+        """
+        zarr_path = tmp_path / "unbanded.zarr"
+        envelope = (-95.0, 45.0, -94.0, 46.0)
+        _write_test_zarr(zarr_path, "EPSG:32615", (4e5, 5e6, 4.1e5, 5.01e6), bbox_wgs84=envelope)
+
+        result = read_roi_metadata(str(zarr_path))
+
+        assert result.bbox_wgs84_bands == ()
+        assert result.query_bboxes == (envelope,)
+
     def test_missing_crs_raises(self, tmp_path):
         """A Zarr store without CRS attrs should raise KeyError."""
         zarr_path = tmp_path / "no_crs.zarr"

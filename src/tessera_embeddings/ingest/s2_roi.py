@@ -1155,6 +1155,9 @@ def ingest_s2_roi_reflectance(
             start_date=start_date,
             end_date=end_date,
             bbox=roi.bbox_wgs84,
+            # Per-latitude-band boxes where the ROI carries them, so the query asks for the
+            # ground the zone occupies rather than the much larger envelope that bounds it.
+            query_bboxes=roi.query_bboxes,
             existing_dates_fn=lambda: get_existing_dates(reflectance_store, s3_region=s3_region),
             # Same assets _drive will load: pruning happens in the query, so a band
             # named only at load time is already gone by then.
@@ -1181,6 +1184,7 @@ def ingest_s2_roi_reflectance(
             end_date=window.query_end,
             existing_dates=get_existing_dates(reflectance_store, s3_region=s3_region),
             bbox=roi.bbox_wgs84,
+            query_bboxes=roi.query_bboxes,  # as in the streamed branch
             # As in the streamed branch: the query prunes, so it must be told.
             extra_bands=_LOADED_EXTRA_BANDS,
             # The committed dates are SOLAR days (that is what _drive groups and writes),
