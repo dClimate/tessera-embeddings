@@ -53,8 +53,15 @@ def source_read_retrying(log: logging.Logger | logging.LoggerAdapter[logging.Log
 
     Not narrowed by exception type. Reads fail through several unrelated surfaces —
     rasterio, GDAL/CPL, botocore, plain socket timeouts — and enumerating them is how a new
-    transient class silently becomes fatal. A read is idempotent, so retrying one that
-    turns out to be permanent costs three attempts and a logged warning.
+    transient class silently becomes fatal.
+
+    A read is idempotent, so retrying one that turns out to be permanent is safe — but it is no
+    longer cheap, and the cost belongs here rather than in a fleet-budget guess. The ladder is
+    :data:`SOURCE_READ_ATTEMPTS` attempts with seven exponential sleeps: **about 61 seconds of
+    backoff per permanently-failing date**, on top of the read time each attempt spends. That is
+    the price of outlasting a provider having a bad minute, and it falls entirely on the failing
+    path — a transient read succeeds on its second or third attempt and pays only the first
+    sleeps.
     """
     return Retrying(
         stop=stop_after_attempt(SOURCE_READ_ATTEMPTS),
