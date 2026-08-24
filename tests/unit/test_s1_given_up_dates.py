@@ -221,12 +221,20 @@ def test_a_cause_the_source_does_not_own_still_fails_the_leg(monkeypatch, exc: E
         _run(monkeypatch, failures={"2024-01-02": exc})
 
 
-def test_past_the_ceiling_the_leg_stops_and_asks_to_be_re_dispatched(monkeypatch) -> None:
-    """A leg losing dates at this rate is in an outage, and a refusal clears.
+def test_past_the_ceiling_the_leg_stops_and_says_a_retry_cannot_help(monkeypatch) -> None:
+    """RENAMED, and the message rewritten with it. It used to be
+    ``..._asks_to_be_re_dispatched``, and asserted the message said "RE-DISPATCH once the provider
+    is answering again" — because a leg losing dates at this rate was assumed to be in an outage,
+    and an outage clears.
 
-    So the dates named in the message are written by a re-dispatch rather than lost, which is why
-    stopping beats grinding on. No assessed-window record: that attribute says the range was
-    examined in full, and this leg never reached most of it.
+    Nothing counted toward the ceiling clears now: a provider refusal is retried in order and never
+    reaches this counter, so every date here failed for a cause that recomputes. Following the old
+    advice would re-read the same objects, spend the per-read ladder on each, and hold a fleet to
+    reach the identical answer — which is why the error is also terminal in
+    ``_NON_RETRYABLE_LEG_MARKERS``.
+
+    No assessed-window record either: that attribute says the range was examined in full, and this
+    leg never reached most of it.
     """
     from tessera_embeddings.ingest import s1_roi
 
@@ -234,7 +242,9 @@ def test_past_the_ceiling_the_leg_stops_and_asks_to_be_re_dispatched(monkeypatch
     with pytest.raises(s1_roi.TooManyGivenUpDatesError, match=r"2 date\(s\).*ceiling of 1") as caught:
         _run(monkeypatch, failures={d: _raise("RasterioIOError: ZIPDecode: error") for d in _CATALOGUE})
     message = str(caught.value)
-    assert "RE-DISPATCH" in message
+    assert "TERMINAL" in message, "the message must not invite a retry that cannot help"
+    assert "RE-DISPATCH" not in message
+    assert "reprocessed copies" in message, "it must name the one thing that would change the answer"
     assert "2024-01-01(unreadable)" in message
     assert "roi=zone_35N" in message
 

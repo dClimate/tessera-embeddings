@@ -631,12 +631,14 @@ def ingest_s1_roi_sar(
             listed = ", ".join(f"{g['date']}({g['scope']})" for g in given_up_dates)
             raise TooManyGivenUpDatesError(
                 f"STOPPING [{orbit}] roi={roi_label}: {len(given_up_dates)} date(s) given up, past "
-                f"the ceiling of {MAX_GIVEN_UP_DATES}. This many says the source is refusing reads "
-                f"rather than holding one bad object, and every further date attempted while that "
-                f"lasts becomes a durable hole for nothing. Dates: {listed}. RE-DISPATCH once the "
-                f"provider is answering again — these dates are written by the retry rather than "
-                f"lost. If they survive a retry the objects themselves are unreadable, and the "
-                f"catalogue is what to check."
+                f"the ceiling of {MAX_GIVEN_UP_DATES}. Every one of them failed to read for a cause "
+                f"that RECOMPUTES — a provider refusing reads is retried in order and never counted "
+                f"here — so this many says the objects themselves are bad, not that the service is "
+                f"having a bad minute. Dates: {listed}. This error is TERMINAL: re-dispatching "
+                f"re-reads the same objects, spends the per-read retry ladder on each, and holds a "
+                f"fleet to reach the identical answer. ACTION: check the catalogue for reprocessed "
+                f"copies of these dates; until they exist this orbit-year is too damaged to be "
+                f"worth a mosaic."
             )
         return True
 
