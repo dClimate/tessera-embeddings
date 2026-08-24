@@ -616,11 +616,18 @@ def ingest_s1_roi_sar(
     #: attempt skipped them and then committed a later date. A loss like any other: the pixels
     #: exist at the provider and are absent from the mosaic.
     unfillable_dates: list[dict[str, str]] = []
-    #: Losses decided but not yet on the store. They ride the NEXT date write's commit (see
-    #: ``write_day_windows(losses=...)``), which is the same commit that puts the skipped date
-    #: below the frontier — so no kill can land one without the other, and no skip costs a
-    #: commit of its own. Cleared once written.
-    pending_losses: list[dict[str, str]] = []
+
+    def _losses_so_far() -> list[dict[str, str]]:
+        """Every loss this run has decided, in one list.
+
+        Handed to EVERY date write, not just the first after a loss. The store merges losses as a
+        union keyed on the date, so re-sending one already recorded is a no-op — which means no
+        queue has to be drained, cleared, or kept in step with these lists. A write is therefore
+        the commit that records every loss decided before it, including the loss that the very
+        same commit puts out of reach.
+        """
+        return [*given_up_dates, *unfillable_dates]
+
     #: Owned items across every batch — the number that distinguishes "the source does not
     #: cover this ROI for this orbit" from "we found items and committed none of them".
     total_items_seen = 0
@@ -680,7 +687,6 @@ def ingest_s1_roi_sar(
             "error": f"{type(exc).__name__}: {exc}"[:300],
         }
         given_up_dates.append(entry)
-        pending_losses.append(entry)
         log.error(
             "[%s] DATA LOSS roi=%s date=%s: the source read failed and this date is SKIPPED, so "
             "its pixels are absent from the mosaic. scope=%s error=%s — recorded on the store as "
@@ -906,7 +912,6 @@ def ingest_s1_roi_sar(
                     given_up.add(date_str)
                     loss = {"date": date_str, "scope": "unfillable", "error": ""}
                     unfillable_dates.append(loss)
-                    pending_losses.append(loss)
                     log.error(
                         "[%s] DATA LOSS roi=%s date=%s: the source offers this date and the "
                         "store's time axis already holds %s, so it can never be appended and its "
@@ -976,11 +981,12 @@ def ingest_s1_roi_sar(
                                     chunks=INGEST_CHUNKS,
                                     parallel_windows=overlap_window_writes,
                                     s3_region=s3_region,
-                                    # THIS commit is what puts every pending loss out of reach,
-                                    # so it is the one that must carry them. Re-sent on a retry
-                                    # and merged as a union, so a partially-applied attempt
-                                    # cannot duplicate or drop one.
-                                    losses=pending_losses,
+                                    # THIS commit is what puts a loss decided just now out of
+                                    # reach, so it is the one that must carry it. Sending every
+                                    # loss so far is deliberate: the merge is a union, so a
+                                    # repeat costs nothing and no write can be the one that
+                                    # quietly dropped a record.
+                                    losses=_losses_so_far(),
                                 )
                 except Exception as exc:
                     # The retry is exhausted. THIS is why one refused read used to take the
@@ -1004,7 +1010,6 @@ def ingest_s1_roi_sar(
                     if not _give_up_date(date_str, exc):
                         raise
                     continue
-                pending_losses.clear()  # committed with the date above
                 date_s = time.monotonic() - date_started
                 write_total_s += date_s
                 written_dates.add(date_str)
@@ -1092,7 +1097,7 @@ def ingest_s1_roi_sar(
             # Merged with what the store already records, minus any date now back on the axis —
             # see storage.zarr_store.merge_recorded_losses. A resume re-derives only the losses
             # of the months it walked, so an unconditional write would erase the rest.
-            unreadable=[*given_up_dates, *unfillable_dates],
+            unreadable=_losses_so_far(),
             get_credentials=None,
             s3_region=s3_region,
         )

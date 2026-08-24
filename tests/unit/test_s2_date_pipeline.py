@@ -792,7 +792,11 @@ def test_the_loss_record_rides_the_write_that_makes_the_date_unfillable(run_inge
     run = run_ingest.runs[-1]
 
     assert not assessed, "the leg died before the end-of-leg record — as a killed leg does"
-    assert run.losses_at_write[0] == [
-        {"date": "2018-05-10", "tiles": "", "tried": "", "objects": "", "scope": "unfillable"}
-    ], "the first write after the skip carried it"
-    assert run.losses_at_write[1] == [], "and did not carry it twice"
+    loss = {"date": "2018-05-10", "tiles": "", "tried": "", "objects": "", "scope": "unfillable"}
+    assert run.losses_at_write[0] == [loss], "the first write after the skip carried it"
+    # And every later write carries it again, which is the point rather than a leak: the store
+    # merges losses as a union keyed on the date, so a repeat is a no-op. Asserting it appeared
+    # exactly once would pin a drained queue — state that has to be cleared at the right moment
+    # and kept in step with the lists it mirrors — when what actually has to hold is that no
+    # commit sealing a date can fail to carry it.
+    assert all(loss in w for w in run.losses_at_write), "and every later write carries it too"

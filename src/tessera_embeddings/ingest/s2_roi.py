@@ -537,11 +537,17 @@ def ingest_s2_roi_reflectance(
     #: attempt skipped them and then committed a later date. A loss like any other: the pixels
     #: exist at the provider and are absent from the mosaic.
     unfillable_dates: list[dict[str, str]] = []
-    #: Losses decided but not yet on the store. They ride the NEXT date write's commit (see
-    #: ``write_days_windows(losses=...)``), which is the same commit that puts the skipped date
-    #: below the frontier — so no kill can land one without the other, and no skip costs a
-    #: commit of its own. Cleared once written.
-    pending_losses: list[dict[str, str]] = []
+
+    def _losses_so_far() -> list[dict[str, str]]:
+        """Every loss this run has decided, in one list.
+
+        Handed to EVERY date write, not just the first after a loss. The store merges losses as a
+        union keyed on the date, so re-sending one already recorded is a no-op — which means no
+        queue has to be drained, cleared, or kept in step with these three lists. A write is
+        therefore the commit that records every loss decided before it, including the loss that
+        the very same commit puts out of reach.
+        """
+        return [*unreadable_tile_dates, *producer_conflict_dates, *unfillable_dates]
 
     def _prepare_date(day_items: list) -> _PreparedDate:
         """Build one solar day's write-ready dataset, or the reason it has none.
@@ -794,12 +800,12 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
-                        # THIS commit is what puts every pending loss out of reach, so it is the
-                        # one that must carry them. Re-sent on a retry and merged as a union, so
-                        # a partially-applied attempt cannot duplicate or drop one.
-                        losses=pending_losses,
+                        # THIS commit is what puts a loss decided just now out of reach, so it
+                        # is the one that must carry it. Sending every loss so far is deliberate:
+                        # the merge is a union, so a repeat costs nothing and no write can be the
+                        # one that quietly dropped a record.
+                        losses=_losses_so_far(),
                     )
-        pending_losses.clear()
         # One line per kept date, partitioning its wall clock into the client-side
         # graph build, the coverage-gate compute, and the write (windows + commit).
         # Stable format: CloudWatch queries and the pipeline analysis key off it.
@@ -855,9 +861,8 @@ def ingest_s2_roi_reflectance(
                     chunks=INGEST_CHUNKS,
                     parallel_windows=overlap_window_writes,
                     s3_region=s3_region,
-                    losses=pending_losses,  # see _write_date
+                    losses=_losses_so_far(),  # see _write_date
                 )
-        pending_losses.clear()
         # The batch's write is ONE compute, so a per-date write time does not exist
         # as a measurement — this line is the batched counterpart of `Stage timings`
         # and analysis divides by n. build/gate are sums of the real per-date values.
@@ -945,7 +950,6 @@ def ingest_s2_roi_reflectance(
                 "scope": "producer-conflict",
             }
             producer_conflict_dates.append(entry)
-            pending_losses.append(entry)
 
         def _record_unreadable(
             prepared: _PreparedDate,
@@ -981,7 +985,6 @@ def ingest_s2_roi_reflectance(
                 "scope": "attributed" if attributed else "whole-date",
             }
             unreadable_tile_dates.append(entry)
-            pending_losses.append(entry)
             log.error(
                 "DATA LOSS roi=%s date=%s: every catalogue copy failed to read, so this date "
                 "is SKIPPED and its pixels are absent from the mosaic. objects=%s scope=%s "
@@ -1148,7 +1151,6 @@ def ingest_s2_roi_reflectance(
             del by_date[date]
             entry = {"date": date, "tiles": "", "tried": "", "objects": "", "scope": "unfillable"}
             unfillable_dates.append(entry)
-            pending_losses.append(entry)
             log.error(
                 "DATA LOSS roi=%s date=%s: the catalogue offers this date and the store's time "
                 "axis already holds %s, so it can never be appended and its pixels are absent "
@@ -1304,7 +1306,7 @@ def ingest_s2_roi_reflectance(
             # so the months an earlier leg did assess stay assessed.
             start_date,
             end_date,
-            unreadable=[*unreadable_tile_dates, *producer_conflict_dates, *unfillable_dates],
+            unreadable=_losses_so_far(),
             s3_region=s3_region,
         )
 
