@@ -65,6 +65,7 @@ from tessera_embeddings.ingest.duplicates import (
     item_tile,
     log_duplicate_selection,
     select_preferred_duplicates,
+    should_try_another_copy,
     step_down_copies,
 )
 from tessera_embeddings.ingest.live_windows import (
@@ -652,7 +653,7 @@ def ingest_s2_roi_reflectance(
             # leg, so a single bad preferred copy stranded the whole zone-year and did so
             # identically on every retry. Returned instead, it reaches the same ladder the
             # write's failures do, and an older copy of the same tile-date gets its turn.
-            if not is_unreadable_source(exc):
+            if not should_try_another_copy(exc):
                 raise
             build_s, gate_s = built_at - stage_started, time.monotonic() - built_at
             return _PreparedDate(
@@ -995,7 +996,7 @@ def ingest_s2_roi_reflectance(
                         total_processed += 1
                         return
                 except Exception as write_exc:
-                    if not is_unreadable_source(write_exc):
+                    if not should_try_another_copy(write_exc):
                         raise
                     exc = write_exc
 
@@ -1014,6 +1015,12 @@ def ingest_s2_roi_reflectance(
                 bad_items = implicated_items(attempt.items, hrefs) if hrefs else []
                 stepped = step_down_copies(date_alternates, attempt.items, only=blamed, implicated=bad_items)
                 if stepped is None:
+                    # Copies exhausted. Giving up the date is the only irreversible thing
+                    # this loop does, so it needs positive evidence that the BYTES are bad.
+                    # A cause-free wrapper — all a stripped GDAL error leaves behind — is
+                    # not that, and is re-raised so the leg fails and retries in order.
+                    if not is_unreadable_source(exc):
+                        raise exc
                     _record_unreadable(attempt, exc, tried, blamed, hrefs)
                     total_filtered += 1
                     return
@@ -1067,7 +1074,7 @@ def ingest_s2_roi_reflectance(
             try:
                 _write_batch(batch, stall_s)
             except Exception as exc:
-                if not is_unreadable_source(exc):
+                if not should_try_another_copy(exc):
                     raise
                 log.warning(
                     "Batched write failed roi=%s dates=%s..%s n=%d on an unreadable source (%s) — "

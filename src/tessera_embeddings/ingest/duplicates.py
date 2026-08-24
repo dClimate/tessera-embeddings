@@ -723,31 +723,27 @@ def alternates_for(
 
 #: Signatures of a source object that cannot be READ, as distinct from a transient failure.
 #:
-#: Matched as TEXT on the whole chain, because the read runs on a Dask worker and the failure
-#: reaches the orchestrating worker through tblib, which cannot reconstruct rasterio's GDAL-backed
-#: classes. What arrives is a plain ``Exception`` carrying the outer exception's **repr**.
+#: Matched as TEXT on the whole chain, because the read runs on a Dask worker and tblib cannot
+#: rebuild rasterio's GDAL-backed classes: what arrives is a plain ``Exception`` carrying the outer
+#: exception's repr, and that repr does not include the cause. So after the hop a corrupt tile and
+#: a stripped 5xx are the same string, and no status or transport exclusion can fire because their
+#: evidence was stripped too.
 #:
-#: That repr does not include the cause, and the generic wrappers were once removed from this list
-#: on the assumption that it did. It does not: measured in prod on 2026-08-24, `ZIPDecode:Decoding
-#: error at scanline 0` appeared only in `dask/dask-worker` logs while the orchestrator saw exactly
-#: `Exception: RasterioIOError('Read failed. See previous exception for details.')`. So the wrapper
-#: is the ONLY evidence that survives the hop, and declining it did not make an unreadable object
-#: fail loudly — it disabled the alternate-copy step-down that :func:`step_down_copies` exists for,
-#: stranding the whole zone-year on one bad copy that a good duplicate could have replaced.
+#: This list therefore stays NARROW and guards only the DESTRUCTIVE decision — giving up a date
+#: once no copy is left. A cause-free wrapper is not evidence of bad bytes and must never reach
+#: that decision; it fails the leg instead, which is recoverable, where a wrong skip is not.
 #:
-#: The safety that made removing them attractive is still here, and it sits EARLIER: every refusal
-#: marker and every HTTP status range is tested before this list, so a cause that IS visible still
-#: decides the verdict. What remains is the genuinely blind case, and two things bound it — the
-#: read has already failed :data:`SOURCE_READ_ATTEMPTS` times across about 61 s, so a transient is
-#: mostly gone by here, and this `True` first tries another copy rather than giving up a date.
+#: Entering the alternate-copy ladder is a different question with the opposite risk profile, and
+#: :func:`should_try_another_copy` answers it. Conflating the two is what made a cause-free wrapper
+#: unanswerable: strict enough to protect the skip meant strict enough to disable the fallback.
 _UNREADABLE_MARKERS = (
     "ZIPDecode",
     "TIFFReadEncodedTile",
-    # Generic block-read wrappers. Ambiguous by nature, but see above: after the hop they are all
-    # that is left, and treating them as transient costs the whole cell instead of one date.
-    "Chunk and warp failed",
-    "Read failed. See previous exception",
-    "IReadBlock failed",
+    # Not a codec, but the same KIND of fact: an asset-incomplete item cannot yield the band, on
+    # this attempt or any other, and a different reprocessing of the tile-date routinely carries
+    # the full set. What unites this list is that every entry is a deterministic property of THIS
+    # copy — which is exactly what the bare wrappers are not.
+    "No such band/alias",
 )
 
 #: Signatures of a source object that is NOT THERE — which none of the markers above can see,
@@ -773,6 +769,27 @@ _MISSING_OBJECT_MARKERS = (
     "The specified key does not exist",
     "HTTP response code: 404",
 )
+
+
+def should_try_another_copy(exc: BaseException) -> bool:
+    """Is trying a different catalogue copy of this tile-date worth doing?
+
+    Deliberately permissive, because it gates a NON-DESTRUCTIVE action. Another copy is a
+    different object, often in a different bucket and region, so it can succeed where this one
+    failed for reasons that have nothing to do with the bytes. The cost of trying and failing is
+    one read; the cost of NOT trying is the whole zone-year, since the alternative is to re-raise
+    and let the leg fail identically on every retry.
+
+    This is the question :func:`is_unreadable_source` used to be asked, and could not answer: the
+    cause chain does not survive the worker hop, so a strict predicate declines the very failures
+    the ladder exists for. Nothing here decides that a date is lost — that stays with
+    :func:`is_unreadable_source`, once the ladder is actually exhausted.
+
+    Only a failure that is not about the source at all is declined: bad credentials or a missing
+    region reproduce identically on every copy, so stepping down burns reads to reach the same
+    error.
+    """
+    return not any(m in _exception_chain_text(exc) for m in _NOT_THE_DATAS_FAULT)
 
 
 def is_unreadable_source(exc: BaseException) -> bool:

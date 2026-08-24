@@ -40,6 +40,7 @@ from tessera_embeddings.ingest.duplicates import (
     item_tile,
     refuses_its_date,
     select_preferred_duplicates,
+    should_try_another_copy,
     step_down_copies,
 )
 from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
@@ -273,29 +274,48 @@ class TestWhenToStepDown:
             "B02.tif, band 1: IReadBlock failed at X offset 6, Y offset 9",
         ],
     )
-    def test_a_bare_wrapper_still_steps_down(self, message: str) -> None:
-        """The wrapper is all that survives the Dask hop, so declining it strands the cell.
+    def test_a_bare_wrapper_never_gives_up_a_date(self, message: str) -> None:
+        """Not evidence about the bytes, so it cannot reach the destructive verdict.
 
-        These wrappers are ambiguous, and were briefly declined for that reason. But tblib cannot
-        rebuild rasterio's GDAL classes, so the orchestrating worker receives the outer exception's
-        repr with no cause attached: in prod the codec name appeared only in the reading worker's
-        log. Declining the wrapper therefore did not make bad bytes fail loudly, it stopped
-        :func:`step_down_copies` ever being reached, and one bad copy failed the whole zone-year
-        while a good duplicate sat unused.
+        These are what GDAL raises when a block read fails for ANY reason. Claiming them would
+        make "give up this date" the fallback for every cause the transient lists do not
+        recognise, which is how a throttle and a DNS failure each became recorded data loss.
         """
-        assert is_unreadable_source(RuntimeError(message))
+        assert not is_unreadable_source(RuntimeError(message))
 
-    def test_the_shape_dask_actually_delivers_steps_down(self) -> None:
-        """The regression, in the exact form it arrives — not a hand-made wrapper.
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Read failed. See previous exception for details.",
+            "rasterio.errors.WarpOperationError: Chunk and warp failed",
+            "B02.tif, band 1: IReadBlock failed at X offset 6, Y offset 9",
+        ],
+    )
+    def test_a_bare_wrapper_still_tries_another_copy(self, message: str) -> None:
+        """...but it must still reach the copy ladder, which is the non-destructive half.
 
-        The previous test for this used ``RuntimeError(message)``. Production delivers a plain
-        ``Exception`` whose message is the *repr* of the wrapper and whose ``__cause__`` is None,
-        because the chain did not survive serialisation. That shape was never exercised, which is
-        why a change that looked safe against the fake broke the real thing.
+        One predicate used to answer both questions and could not: strict enough to protect the
+        skip meant strict enough to disable the fallback, and one bad copy then failed a whole
+        zone-year while a good duplicate sat unused.
+        """
+        assert should_try_another_copy(RuntimeError(message))
+
+    def test_the_shape_dask_actually_delivers(self) -> None:
+        """The regression in the exact form it arrives — not a hand-made wrapper.
+
+        Production delivers a plain ``Exception`` whose message is the *repr* of the wrapper, with
+        no ``__cause__``, because tblib cannot rebuild rasterio's GDAL classes. The old test used
+        ``RuntimeError(message)``, so this shape was never exercised: it must step down copies and
+        must not give up the date.
         """
         flattened = Exception("RasterioIOError('Read failed. See previous exception for details.')")
         assert flattened.__cause__ is None
-        assert is_unreadable_source(flattened)
+        assert should_try_another_copy(flattened)
+        assert not is_unreadable_source(flattened)
+
+    def test_a_failure_that_is_not_about_the_source_skips_the_ladder(self) -> None:
+        """Credentials reproduce identically on every copy, so stepping down only burns reads."""
+        assert not should_try_another_copy(RuntimeError("InvalidAccessKeyId"))
 
     @pytest.mark.parametrize(
         "transport",
