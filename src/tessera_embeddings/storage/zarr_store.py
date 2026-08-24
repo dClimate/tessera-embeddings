@@ -1349,9 +1349,12 @@ def record_assessed_window(
     without this the two are indistinguishable and no later run revisits the date. A log line
     is lost the moment nobody greps for it; this is the durable record of where the loss is.
 
-    OPENS, never creates: this runs only against a store that was just written. Failing
-    here must not be fatal — the assessment is an optimisation of the gate's judgement, and
-    a store without it simply falls back to the stricter every-month-present rule.
+    OPENS, never creates: this runs only against a store that was just written. Failing here is
+    normally a WARNING — the assessment is an optimisation of the gate's judgement, and a store
+    without it simply falls back to the stricter every-month-present rule. ``required`` reverses
+    that for a caller with nothing else carrying its losses: a leg that gave up dates and
+    committed none has no commit to ride, so this write is their only durable trace and a failure
+    has to raise, bringing the leg back rather than finalising it with the loss named nowhere.
     """
     try:
         repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)

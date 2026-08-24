@@ -1532,8 +1532,9 @@ indistinguishable, and the coverage gate has to fail on both.
 resumed run starts partway through the year, so those are different. And both records are
 **added to** what the store already holds rather than replacing it:
 
-- **The two ranges are joined only if they touch.** When the new range overlaps the stored one or
-  begins the day after it, the pair describes one unbroken stretch and the join is safe — which is
+- **The two ranges are joined only if they touch.** When the new range overlaps the stored one,
+  or sits directly against it with no day in between, the pair describes one unbroken stretch and
+  the join is safe — which is
   what lets a resumed run keep the months an earlier run genuinely examined instead of erasing
   them. When there is a gap between the two, joining would certify the days in the gap, which
   nobody looked at, and the coverage gate would then excuse months that are missing because nobody
@@ -1572,8 +1573,11 @@ downgrade.
 
 Every uncertain path is strict: an absent, malformed or unparseable attribute excuses nothing,
 and a partially-covered month stays an error because it could hide unexamined days. Failing to
-write the attribute is logged, never raised — the gate simply falls back to requiring every
-month. `assessed_empty_dates` is recorded alongside for observability, separating "sparse region"
+write the attribute is normally logged rather than raised — the gate simply falls back to
+requiring every month. The exception is a run that gave days up and stored none of them: no
+commit anywhere is carrying that record, so this write is its only durable trace, and a failure
+fails the run rather than finishing it green with the loss written down nowhere.
+`assessed_empty_dates` is recorded alongside for observability, separating "sparse region"
 from "the footprints are wrong".
 
 ### Narrowing a date's windows, and skipping dates that reach none

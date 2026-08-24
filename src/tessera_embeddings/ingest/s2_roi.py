@@ -1318,8 +1318,9 @@ def ingest_s2_roi_reflectance(
             reflectance_store,
             # The FLOORED start: what this leg walked, not what it was asked for. A resume
             # skipped the months below its frontier, and claiming them here would say they were
-            # examined and clean. record_assessed_window keeps whatever start is already stored,
-            # so the months an earlier leg did assess stay assessed.
+            # examined and clean. The stored range is joined to this one when the two meet, so
+            # the months an earlier leg did assess stay assessed; across a gap the join is refused
+            # and this leg's range stands alone, which only makes the coverage gate stricter.
             start_date,
             end_date,
             unreadable=_losses_so_far(),
