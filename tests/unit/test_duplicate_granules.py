@@ -2491,6 +2491,28 @@ class TestAMessageMayNotBeItsOwnCorroboration:
         assert is_unreadable_source(_read_failure("ZIPDecode:Decoding error at scanline 0")) is True
 
 
+class TestANamedTransportFailureIsNotBadData:
+    """A link that failed says nothing about the bytes, and carries no HTTP status to say so with.
+
+    Half this class was named and half was not, so a dropped connection was declined while a
+    refused one fell through to the markers and could be read as permanent loss — the same link
+    failing, classified two ways depending on which word GDAL happened to use.
+    """
+
+    @pytest.mark.parametrize(
+        "transport",
+        [
+            "Could not resolve host: sentinel-cogs.s3.us-west-2.amazonaws.com",
+            "Connection refused",
+            "Empty reply from server",
+            "SSL peer handshake failed",
+            "Connection reset by peer",
+        ],
+    )
+    def test_it_is_never_grounds_to_give_up_a_date(self, transport: str) -> None:
+        assert is_unreadable_source(_read_failure(transport)) is False
+
+
 class TestRecognisingAFailureThatArrivedWithNoEvidence:
     """The shape Dask substitutes when it cannot serialise a read failure.
 
