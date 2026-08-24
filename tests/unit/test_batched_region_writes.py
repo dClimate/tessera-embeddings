@@ -18,7 +18,6 @@ from tessera_embeddings.errors import DuplicateDateError, NonMonotonicDateError
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
 from tessera_embeddings.storage.zarr_store import (
     CONCURRENT_WRITER_ERRORS,
-    PERMANENT_SKIP_SCOPES,
     batched_region_writes,
     get_existing_dates,
     open_repo,
@@ -198,17 +197,51 @@ class TestASkipIsDurableBeforeTheLegEnds:
         record_skipped_date(missing, self._LOST)
         assert skipped_dates(missing) == set()
 
-    def test_only_a_read_failure_settles_a_date(self, store):
-        """Recorded is not the same as settled, and conflating them loses recoverable dates.
+    def test_a_transient_scope_below_the_committed_maximum_is_still_settled(self, store):
+        """Scope does not decide this, and keying on it left the fatal path open.
 
-        A producer conflict is decided during preparation and never reaches the writer, so it
-        cannot wedge anything and must stay re-offerable — and blocking a transient provider
-        refusal would turn a recoverable outage into permanent loss.
+        A `coverage` or `provider-refused` date reads as recoverable, so an earlier version
+        re-offered it. But if the condition has since cleared it now produces data, reaches the
+        writer BELOW the committed maximum, and raises — which is the exact bug this mechanism
+        exists to close, reachable through the scopes that looked safest.
         """
-        for scope in ("producer-conflict", "provider-refused"):
-            record_skipped_date(store, {"date": f"2024-05-{scope[:2]}", "scope": scope})
-        assert skipped_dates(store) == set(), "a preparation-time skip must not settle a date"
-        assert set(PERMANENT_SKIP_SCOPES) == {"attributed", "whole-date", "unreadable"}
+        for day, scope in (("11", "coverage"), ("12", "provider-refused"), ("13", "producer-conflict")):
+            record_skipped_date(store, {"date": f"2024-05-{day}", "scope": scope})
+        # The fixture holds 2024-06-01, so every one of those is below the maximum.
+        assert skipped_dates(store) == {"2024-05-11", "2024-05-12", "2024-05-13"}
+
+    def test_a_tail_skip_with_nothing_later_committed_is_re_offered(self, store):
+        """The other direction: suppressing it would make a recovered source unreachable.
+
+        Nothing later has been committed, so the append would succeed. A read failure that
+        looks permanent is still worth one attempt when the axis can accept it — and the axis,
+        not the scope, is what knows that.
+        """
+        record_skipped_date(store, {"date": "2024-09-09", "scope": "whole-date"})
+        assert skipped_dates(store) == set(), "a date above the committed maximum stays offerable"
+        # And it settles the moment something later lands, without the record changing.
+        with batched_region_writes(store, message="later") as batch:
+            batch.append_time_slot(np.datetime64("2024-10-01", "ns"))
+        assert skipped_dates(store) == {"2024-09-09"}
+
+    def test_a_stronger_classification_replaces_a_weaker_one(self, store):
+        """A later pass can classify the same date more precisely, and the record must follow."""
+        record_skipped_date(store, {"date": "2024-05-20", "scope": "coverage"})
+        record_skipped_date(store, {"date": "2024-05-20", "scope": "whole-date"})
+        held = dict(open_store_as_zarr_group(store).attrs)["pending_skipped_dates"]
+        assert [e["scope"] for e in held if e["date"] == "2024-05-20"] == ["whole-date"]
+
+    def test_a_read_failure_that_is_not_absence_is_not_a_permissive_answer(self, store, monkeypatch):
+        """Returning empty on a transient read re-offers every settled date at once.
+
+        That is the fatal path for all of them, so an unknown must never be converted into
+        "nothing is settled".
+        """
+        import tessera_embeddings.storage.zarr_store as zs
+
+        monkeypatch.setattr(zs, "open_repo", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("transport")))
+        with pytest.raises(RuntimeError, match="transport"):
+            skipped_dates(store)
 
     def test_a_gate_rejection_is_traceable_without_a_commit_of_its_own(self, store):
         """The ordinary path, so it must not add a commit — and must still leave a trace.
@@ -225,7 +258,9 @@ class TestASkipIsDurableBeforeTheLegEnds:
         assert _snapshots(store) == before + 1, "the trace must ride in the assessment's own commit"
         attrs = dict(open_store_as_zarr_group(store).attrs)
         assert attrs["assessed_filtered_dates"] == [{"date": "2024-03-04", "scope": "coverage"}]
-        assert skipped_dates(store) == set(), "a gate rejection must stay re-offerable"
+        # And it counts toward settlement like any other record, because the axis decides that
+        # and 2024-03-04 is below the fixture's committed date.
+        assert skipped_dates(store) == {"2024-03-04"}
 
     def test_the_end_of_leg_record_supersedes_and_clears_the_crash_durable_one(self, store):
         """Otherwise a date a repair run recovered would read as skipped forever."""
@@ -236,8 +271,27 @@ class TestASkipIsDurableBeforeTheLegEnds:
         # crash-durable half does not un-settle the date it was holding.
         assert skipped_dates(store) == {"2024-05-20"}
 
-    def test_a_recovered_date_stops_being_settled(self, store):
-        """A run that lost nothing must leave nothing behind, or it fences off its own dates."""
+    def test_a_date_that_was_actually_written_is_dropped_from_the_record(self, store):
+        """Recovery is evidenced by presence on the axis, so a filled date clears its own record.
+
+        Without this the attr grows into a history rather than describing the store, and an
+        audit reading it reports pixels missing that are now present.
+        """
+        record_skipped_date(store, {"date": "2024-06-01", "scope": "whole-date"})  # the fixture's date
+        record_assessed_window(store, "2024-01-01", "2024-12-31", unreadable=[])
+        assert dict(open_store_as_zarr_group(store).attrs)["assessed_unreadable_dates"] == []
+
+    def test_a_skip_from_an_earlier_attempt_survives_a_clean_resume(self, store):
+        """The bug two reviewers caught independently.
+
+        A resumed leg does not re-offer a settled date, so it never enters that invocation's
+        list — and overwriting the attr with the invocation's own list erased the earlier loss.
+        The parent could then stamp a completion marker over a mosaic whose holes were recorded
+        nowhere.
+        """
         record_skipped_date(store, self._LOST)
         record_assessed_window(store, "2024-01-01", "2024-12-31", unreadable=[])
-        assert skipped_dates(store) == set()
+        assert [e["date"] for e in dict(open_store_as_zarr_group(store).attrs)["assessed_unreadable_dates"]] == [
+            "2024-05-20"
+        ]
+        assert skipped_dates(store) == {"2024-05-20"}

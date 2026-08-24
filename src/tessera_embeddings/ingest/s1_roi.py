@@ -563,6 +563,14 @@ def ingest_s1_roi_sar(
     #: boundary solar day comes back from two consecutive batches — without this it would be
     #: given up twice, listed twice, and cost two of the leg's budget.
     given_up: set[str] = set()
+    #: Skips whose durable write did not land, retried after the next write. See `_give_up_date`.
+    undelivered_skips: list[dict[str, str]] = []
+
+    def _flush_skips() -> None:
+        for entry in list(undelivered_skips):
+            if record_skipped_date(orbit_store, entry, s3_region=s3_region):
+                undelivered_skips.remove(entry)
+
     #: Owned items across every batch — the number that distinguishes "the source does not
     #: cover this ROI for this orbit" from "we found items and committed none of them".
     total_items_seen = 0
@@ -604,7 +612,11 @@ def ingest_s1_roi_sar(
         # as settled (`PERMANENT_SKIP_SCOPES`); a `provider-refused` date is recorded but still
         # re-offered, because that refusal is transient and blocking it would turn a recoverable
         # outage into permanent loss.
-        record_skipped_date(orbit_store, entry, s3_region=s3_region)
+        if not record_skipped_date(orbit_store, entry, s3_region=s3_region):
+            # Held, not dropped: a skip taken before the first write has no store to land on,
+            # and discarding it leaves exactly the unfillable store the record prevents. Flushed
+            # after the next successful write, which is when a store starts existing.
+            undelivered_skips.append(entry)
         log.error(
             "[%s] DATA LOSS roi=%s date=%s: the source read failed and this date is SKIPPED, so "
             "its pixels are absent from the mosaic. scope=%s error=%s — recorded on the store as "
@@ -901,6 +913,9 @@ def ingest_s1_roi_sar(
             # reporting it as processed would overstate a resumed run's progress.
             n = written_this_batch
             total_processed += n
+            if n and undelivered_skips:
+                # A store exists now, so a skip taken before the first write can finally land.
+                _flush_skips()
             log.info(
                 "[%s] Batch %s..%s roi=%s: wrote %d dates (total: %d)",
                 orbit,

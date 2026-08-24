@@ -1173,19 +1173,9 @@ ASSESSED_WINDOW_ATTR = "assessed_window"
 #: record stay a description of THIS assessment.
 SKIPPED_DATES_ATTR = "pending_skipped_dates"
 
-#: The ``scope`` values a later attempt must NOT offer again — and only these.
-#:
-#: The discriminator is whether the failure can FLIP. These three are read failures: the
-#: objects would not read, and the same objects can read on the next attempt. That is the one
-#: shape that reaches the writer with a date the store can no longer accept, because later
-#: dates are on the axis by then and the axis cannot be inserted into.
-#:
-#: Every other skip — a coverage rejection, a producer conflict — is decided during
-#: PREPARATION and never reaches the writer at all, so re-offering it costs one re-evaluation
-#: and cannot wedge anything. Those are still recorded, because a leg that dropped dates should
-#: be able to say which; they are simply not treated as settled. The distinction matters most
-#: for a provider outage, where blocking would turn a recoverable refusal into permanent loss.
-PERMANENT_SKIP_SCOPES = frozenset({"attributed", "whole-date", "unreadable"})
+#: Attributes holding the dates a leg gave up on, newest-written first. All three are read
+#: together when deciding what is settled — see :func:`skipped_dates`.
+SKIP_RECORD_ATTRS = (SKIPPED_DATES_ATTR, "assessed_unreadable_dates", "assessed_filtered_dates")
 """Root attribute naming the date range an ingest examined in full.
 
 The distinction it exists to draw: a month absent from a mosaic's time axis means either
@@ -1249,11 +1239,28 @@ def record_assessed_window(
         # advertised on the store, and an audit reading this attr would report pixels
         # missing that are now present — the assessment describes THIS assessment, so an
         # empty answer has to overwrite a previous non-empty one.
-        root.attrs["assessed_unreadable_dates"] = list(unreadable or ())
-        # The authoritative list now covers everything the per-skip record was holding on
-        # its behalf, so clear it. Leaving it would make a recovered date look skipped
-        # forever, since `skipped_dates` reads both.
+        # CARRIED FORWARD, not replaced. This invocation's list holds only what THIS invocation
+        # gave up on, and a resumed leg does not re-offer a date an earlier attempt settled — so
+        # overwriting would erase the earlier losses, and the parent would then stamp a
+        # completion marker over a mosaic whose holes are no longer recorded anywhere.
+        #
+        # A date that was actually RECOVERED is dropped, which is what keeps the attr a
+        # description of the store rather than an ever-growing history: presence on the time
+        # axis is the evidence, so a repair run that filled a date clears its record by filling
+        # it. Two reviewers caught this independently; the first version of this cleared the
+        # record on the first successful resume.
+        written = _dates_on_axis(root)
+        carried = [
+            entry
+            for entry in _recorded_entries(root)
+            if isinstance(entry.get("date"), str) and entry["date"] not in written
+        ]
+        current = list(unreadable or ())
+        by_date = {e["date"]: e for e in carried if "date" in e}
+        by_date.update({e["date"]: e for e in current if isinstance(e.get("date"), str)})
+        root.attrs["assessed_unreadable_dates"] = [by_date[d] for d in sorted(by_date)]
         root.attrs["assessed_filtered_dates"] = list(filtered or ())
+        # Now superseded by the authoritative list above, which carries every entry it held.
         root.attrs[SKIPPED_DATES_ATTR] = []
         # ``allow_empty`` because re-recording the SAME window writes no bytes, and icechunk
         # refuses a commit with no changes ("cannot commit, no changes made to the session").
@@ -1278,39 +1285,76 @@ def record_assessed_window(
         logger.warning(f"Could not record assessed window on {store_path}: {exc}")
 
 
+def _recorded_entries(root: zarr.Group) -> list[dict[str, Any]]:
+    """Every skip entry on a store, from both the crash-durable list and the authoritative one."""
+    out: list[dict[str, Any]] = []
+    for attr in SKIP_RECORD_ATTRS:
+        held = root.attrs.get(attr)
+        if isinstance(held, (list, tuple)):
+            out.extend(e for e in held if isinstance(e, dict))
+    return out
+
+
+def _dates_on_axis(root: zarr.Group) -> set[str]:
+    """``YYYY-MM-DD`` dates the store's time axis holds, or empty if it has none yet."""
+    try:
+        return {str(v)[:10] for v in read_time_values(root)}
+    except Exception:  # no time array yet, or a group that is not a store root
+        return set()
+
+
 def record_skipped_date(
     store_path: str,
     entry: dict[str, str],
     *,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
-) -> None:
+) -> bool:
     """Append ONE deliberately-skipped date to :data:`SKIPPED_DATES_ATTR`, immediately.
+
+    Returns False for exactly one reason: no store exists yet. **The caller must retain that
+    and flush it as soon as one does**, and this is NOT harmless — a skip before the first
+    write, a later date that creates the store, and then a crash leaves exactly the unfillable
+    store this exists to prevent. Every other failure RAISES, because a durable record whose
+    write can fail silently is not durable.
 
     Called at the moment a date is given up on, so the record survives the leg dying before
     the end-of-leg assessment. See :data:`SKIPPED_DATES_ATTR` for what that protects against.
 
-    **Best effort, never fatal.** A skip can happen before any date has been written, and
-    then there is no store to annotate — but that is also the one case where nothing can go
-    wrong, because the wedge this prevents needs a LATER date already on the axis, and an
-    absent store has no axis. So failing to record is exactly harmless where it is possible,
-    and giving up the whole leg over a bookkeeping write would be the worse trade.
-
-    Idempotent per date: re-recording a date already listed rewrites nothing.
+    Idempotent per date: an identical entry rewrites nothing, and a changed one replaces the
+    old, since a later pass may classify the same date more precisely.
     """
     try:
         repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
         session = repo.writable_session("main")
         root = zarr.open_group(session.store, mode="a")
         held = root.attrs.get(SKIPPED_DATES_ATTR)
-        recorded = list(held) if isinstance(held, (list, tuple)) else []
-        if any(isinstance(e, dict) and e.get("date") == entry.get("date") for e in recorded):
-            return
+        recorded = [e for e in (held if isinstance(held, (list, tuple)) else []) if isinstance(e, dict)]
+        # Keyed by date, but a match is not a no-op: `scope` is what decides whether the entry
+        # SETTLES the date, so a pass that reclassifies a `producer-conflict` as a read failure
+        # has to replace the weaker record. Leaving it would let the next attempt re-offer the
+        # date, which is the whole thing this prevents. A permanent scope is never downgraded.
+        prior = next((e for e in recorded if e.get("date") == entry.get("date")), None)
+        if prior == entry:
+            return True
+        if prior is not None:
+            recorded = [e for e in recorded if e.get("date") != entry.get("date")]
         root.attrs[SKIPPED_DATES_ATTR] = [*recorded, entry]
         session.commit(f"skipped date {entry.get('date')} ({entry.get('scope')})")
         logger.info("Recorded skipped date %s on %s", entry.get("date"), store_path)
-    except Exception as exc:
-        logger.warning("Could not record skipped date %s on %s: %s", entry.get("date"), store_path, exc)
+        return True
+    except icechunk.IcechunkError as exc:
+        if not is_missing_repo(exc):
+            # A durability mechanism whose write can fail silently is not durable. Absence is
+            # the ONE recoverable case — the caller queues and flushes once a store exists —
+            # and auth, transport or a decode failure must not be filed under it.
+            raise
+        logger.info(
+            "No store at %s yet, so skipped date %s is held for the first write",
+            store_path,
+            entry.get("date"),
+        )
+        return False
 
 
 def skipped_dates(
@@ -1322,11 +1366,12 @@ def skipped_dates(
     """Dates an earlier attempt on this store recorded as deliberately skipped.
 
     Read alongside :func:`get_existing_dates` to decide what is still outstanding: a date
-    that was given up on for a reason that cannot change is as settled as one that was
-    written, and re-offering it is what wedges the store. Reads BOTH the crash-durable list
-    and the authoritative one, so the answer does not depend on whether the previous attempt
-    reached its own ending, and filters to :data:`PERMANENT_SKIP_SCOPES` — see there for why
-    that is narrower than "everything that was skipped".
+    that was given up on for a reason that cannot change, AND that the store can no longer
+    accept, is as settled as one that was written — and re-offering it is what wedges the
+    store. Reads BOTH the crash-durable list and the authoritative one, so the answer does not
+    depend on whether the previous attempt reached its own ending, and filters to
+    :data:`PERMANENT_SKIP_SCOPES` — see there for why that is narrower than "everything that
+    was skipped".
 
     **Fails open, unlike :func:`get_existing_dates`.** An unreadable attr here means dates
     get re-offered — the behaviour before this existed — whereas failing closed would skip
@@ -1336,17 +1381,30 @@ def skipped_dates(
     try:
         repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
         root = zarr.open_group(repo.readonly_session("main").store, mode="r")
-        for attr in (SKIPPED_DATES_ATTR, "assessed_unreadable_dates"):
-            recorded = root.attrs.get(attr)
-            if not isinstance(recorded, (list, tuple)):
-                continue
-            for entry in recorded:
-                if not isinstance(entry, dict) or entry.get("scope") not in PERMANENT_SKIP_SCOPES:
-                    continue
-                if date := entry.get("date"):
-                    dates.add(str(date))
-    except Exception as exc:
-        logger.debug("No skipped-date record on %s: %s", store_path, exc)
+        recorded = {str(d) for entry in _recorded_entries(root) if (d := entry.get("date"))}
+        axis = _dates_on_axis(root)
+        # THE AXIS DECIDES, not the scope. A date at or below the committed maximum can never be
+        # appended — the axis is sampled positionally and cannot be inserted into — so offering
+        # it again can only end in the fatal refusal, whatever the reason it was skipped for.
+        # Above the maximum it is still appendable, so it is worth re-offering however permanent
+        # the earlier failure looked: if the source has recovered the hole is filled, and if it
+        # has not the cost is one read attempt.
+        #
+        # An earlier version keyed this on the skip's `scope`, and that was wrong in both
+        # directions at once. It re-offered a `coverage` or `provider-refused` date below the
+        # maximum, which is the fatal path this whole mechanism exists to close; and it
+        # suppressed a read failure at the TAIL, where nothing later had been committed and the
+        # append would have succeeded. Scope is provenance and reporting now, nothing more.
+        latest = max(axis) if axis else None
+        dates = {d for d in recorded if latest is not None and d <= latest}
+    except icechunk.IcechunkError as exc:
+        if not is_missing_repo(exc):
+            # Do NOT turn an unknown into a permissive answer. Returning empty here re-offers
+            # every settled date at once, which is the fatal path for all of them.
+            raise
+        logger.debug("No store yet at %s, so nothing is settled", store_path)
+    except FileNotFoundError:  # GroupNotFoundError (rootless repo) subclasses this
+        logger.debug("No root group at %s, so nothing is settled", store_path)
     return dates
 
 

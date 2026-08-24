@@ -144,6 +144,8 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", fake_write_day_windows)
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _store, **_kw: set(existing))
+    monkeypatch.setattr(s1_roi, "skipped_dates", lambda _s, **_k: set())
+    monkeypatch.setattr(s1_roi, "record_skipped_date", lambda *_a, **_k: True)
     monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
     monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
     monkeypatch.setattr(
@@ -281,6 +283,8 @@ def _run_with_footprints(
         lambda _s, data, w, **_k: written.append((str(data["time"].values[0])[:10], len(w))),
     )
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _s, **_kw: set())
+    monkeypatch.setattr(s1_roi, "skipped_dates", lambda _s, **_k: set())
+    monkeypatch.setattr(s1_roi, "record_skipped_date", lambda *_a, **_k: True)
     monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
     monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
     monkeypatch.setattr(s1_roi, "live_windows_for_mask", fake_live_windows_for_mask)
@@ -470,6 +474,8 @@ def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", lambda *a, **k: written.append("write"))
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _store, **_kw: set())
+    monkeypatch.setattr(s1_roi, "skipped_dates", lambda _s, **_k: set())
+    monkeypatch.setattr(s1_roi, "record_skipped_date", lambda *_a, **_k: True)
     monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
     monkeypatch.setattr(
         s1_roi,
