@@ -259,12 +259,54 @@ class TestWhenToStepDown:
         [
             "ZIPDecode:Decoding error at scanline 0",
             "B02.tif, band 1: IReadBlock failed at X offset 6, Y offset 9: TIFFReadEncodedTile() failed.",
-            "Read failed. See previous exception for details.",
-            "rasterio.errors.WarpOperationError: Chunk and warp failed",
         ],
     )
     def test_a_decode_failure_means_step_down(self, message: str) -> None:
+        """Both name a CODEC or format operation failing, which is a statement about the bytes."""
         assert is_unreadable_source(RuntimeError(message))
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Read failed. See previous exception for details.",
+            "rasterio.errors.WarpOperationError: Chunk and warp failed",
+            "B02.tif, band 1: IReadBlock failed at X offset 6, Y offset 9",
+        ],
+    )
+    def test_a_bare_wrapper_is_not_a_decode_failure(self, message: str) -> None:
+        """USED TO STEP DOWN, and that was the bug behind a whole class of findings.
+
+        These are what GDAL raises when a block read fails FOR ANY REASON — a codec, yes, but
+        equally a DNS failure, a refused connection, a TLS error, a throttle nobody enumerated.
+        Claiming them made "give up this date" the DEFAULT verdict for every cause the transient
+        lists did not recognise, so each gap in those lists became silent data loss. This class's
+        own docstring already promised the opposite: "narrow and fails closed: anything
+        unrecognised is re-raised by the caller rather than treated as bad data."
+
+        The wrapped case is unaffected — a chain whose cause names a codec still steps down,
+        because the whole chain is matched. Only the bare wrapper changes, and it now re-raises so
+        the leg retries in order.
+        """
+        assert not is_unreadable_source(RuntimeError(message))
+
+    @pytest.mark.parametrize(
+        "transport",
+        [
+            "Could not resolve host: sentinel-cogs.s3.us-west-2.amazonaws.com",
+            "Connection refused",
+            "Empty reply from server",
+            "SSL peer handshake failed",
+            "Connection reset by peer",
+        ],
+    )
+    def test_a_statusless_transport_failure_is_not_bad_data(self, transport: str) -> None:
+        """The reason the wrapper had to stop being claimed, rather than the transport list
+        growing again. None of these carries an HTTP status, several are not in any enumeration,
+        and every one of them says the link failed rather than the bytes.
+        """
+        wrapper = Exception("WarpOperationError: Chunk and warp failed")
+        wrapper.__cause__ = Exception(f"CPLE_AppDefinedError: {transport}")
+        assert not is_unreadable_source(wrapper)
 
     @pytest.mark.parametrize(
         "message",
@@ -455,7 +497,6 @@ class TestWhenTheProviderRefused:
         [
             "RasterioIOError: ZIPDecode: Decoding error at scanline 0",
             "CPLE_AppDefinedError: TIFFReadEncodedTile() failed",
-            "RasterioIOError: IReadBlock failed at X offset 0, Y offset 0",
         ],
     )
     def test_data_that_will_never_decode_is_still_claimed(self, message: str) -> None:

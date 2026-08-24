@@ -732,12 +732,26 @@ def alternates_for(
 #: the failure is re-raised on the driver through tblib, which cannot reconstruct rasterio's
 #: GDAL-backed exception classes. What arrives is a plain ``Exception`` carrying the original's
 #: repr, so an ``isinstance`` check matches nothing and the message is the only evidence left.
+#: Only signatures that name a CODEC OR FORMAT OPERATION failing. Deliberately minimal, and the
+#: minimality is the point: this predicate's `True` means "give up this date", and it is reached as
+#: the DEFAULT for anything the transient lists above do not recognise. Every gap in those lists
+#: therefore used to become a silent data-loss verdict — that is how a 429, and separately a DNS
+#: failure, a refused connection and a TLS error, each came to be recorded as permanently bad
+#: imagery.
+#:
+#: So the generic wrappers are gone: `Chunk and warp failed`, `Read failed. See previous exception`
+#: and `IReadBlock failed` are what GDAL raises when a block read fails FOR ANY REASON, including
+#: every transport failure nobody has enumerated. They say a read failed, never that the bytes are
+#: bad, and matching them made the dangerous verdict the fallback for the unknown.
+#:
+#: A refusal wrapped in one of them is still caught, because the CAUSE carries the codec name and
+#: the whole chain is matched. What changes is the unrecognised case: it now re-raises and the leg
+#: retries in order, rather than costing a date. A genuinely truncated object that names no codec
+#: therefore fails the leg loudly instead of quietly holing the store, which is the direction to
+#: fail in.
 _UNREADABLE_MARKERS = (
     "ZIPDecode",
     "TIFFReadEncodedTile",
-    "IReadBlock failed",
-    "Chunk and warp failed",
-    "Read failed. See previous exception",
 )
 
 #: Signatures of a source object that is NOT THERE — which none of the markers above can see,

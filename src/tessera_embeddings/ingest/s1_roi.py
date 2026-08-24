@@ -27,9 +27,10 @@ Algorithm (unchanged from the reference):
    * Apply the ROI mask, then write each date's live windows via
      :func:`tessera_embeddings.storage.zarr_store.write_day_windows` with a
      narrow tenacity retry on transient GDAL errors. Past that retry the date
-     is GIVEN UP rather than allowed to fail the leg, and recorded on the
-     store. Up to :data:`MAX_GIVEN_UP_DATES`; past that the leg stops and asks
-     to be re-dispatched.
+     is GIVEN UP rather than allowed to fail the leg — but ONLY when the cause
+     recomputes, so a provider refusing reads re-raises and the leg retries in
+     order instead. Up to :data:`MAX_GIVEN_UP_DATES`; past that the leg stops
+     terminally, because nothing counted toward that ceiling can clear.
 """
 
 from __future__ import annotations
@@ -974,9 +975,9 @@ def ingest_s1_roi_sar(
         # that says a green leg is nonetheless missing pixels, and where.
         log.error(
             "[%s] DATA LOSS SUMMARY roi=%s: %d date(s) skipped because their source reads "
-            "failed — %s. Recorded on the store as assessed_unreadable_dates. A "
-            "provider-refused date is recoverable by re-running this window; an unreadable one "
-            "needs a reprocessed copy at the provider.",
+            "failed — %s. Recorded on the store as assessed_unreadable_dates. Every one of them "
+            "failed for a cause that RECOMPUTES, so re-running this window will not recover any "
+            "of them: what they need is a reprocessed copy at the provider.",
             orbit,
             roi_label,
             len(given_up_dates),
@@ -1020,11 +1021,15 @@ def ingest_s1_roi_sar(
             # that lets the cell finish with an orbit missing and inference run on optical
             # alone. A leg that gave up EVERY date it had, onto a store that holds nothing,
             # is data loss wearing the same clothes as absence — and the two must not be
-            # returned identically. Retryable, so a re-dispatch writes what this leg refused.
+            # returned identically. TERMINAL: every date here failed for a cause that
+            # recomputes, so a re-dispatch reads the same objects to the same answer.
             raise TooManyGivenUpDatesError(
                 f"[{orbit}] roi={roi_label} window={start_date}..{end_date} gave up every one "
                 f"of its {len(given_up_dates)} date(s) and committed none, so no store exists "
-                f"to record the loss on. Re-dispatch: a refusal that clears will write them. "
+                f"to record the loss on. This is TERMINAL, not a request to come back: each of "
+                f"these failed for a cause that recomputes, so re-reading them costs the "
+                f"per-read ladder and a fleet to reach the identical answer. ACTION: check the "
+                f"catalogue for reprocessed copies. "
                 f"Given up: {'; '.join(f'{g["date"]} scope={g["scope"]}' for g in given_up_dates)}"
             )
         return SarIngestResult(

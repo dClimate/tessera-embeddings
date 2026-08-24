@@ -46,12 +46,31 @@ def waited(monkeypatch):
     """
     seen: list[float] = []
     real_sleep = mod.asyncio.sleep
+    real_wait_for = mod.asyncio.wait_for
 
     async def fake_sleep(seconds, *args, **kwargs):
         seen.append(seconds)
         await real_sleep(0)
 
+    async def fake_wait_for(awaitable, timeout=None, **kwargs):
+        """The first-dispatch stagger waits HERE, not in ``sleep``, so intercept both.
+
+        It races the offset against the doomed gate rather than sleeping through it, which put a
+        real multi-minute wait back into every flow invocation — the exact cost this fixture's
+        docstring was written about, reintroduced by a change that moved the wait to a different
+        primitive. Patching only ``sleep`` also left ``seen`` empty, so the test asserting the
+        stagger is on by default had nothing to assert against.
+
+        The RACE is preserved and only the wall clock is collapsed: a cell already doomed still
+        returns immediately, and a viable one still takes the timeout path.
+        """
+        if timeout is not None:
+            seen.append(timeout)
+            timeout = 0.01
+        return await real_wait_for(awaitable, timeout=timeout, **kwargs)
+
     monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(mod.asyncio, "wait_for", fake_wait_for)
     return seen
 
 

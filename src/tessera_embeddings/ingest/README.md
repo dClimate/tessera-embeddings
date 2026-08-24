@@ -1817,15 +1817,16 @@ for — OPERA publishes one copy of a granule:
 1. **Retry**, through the shared `store_write_retrying` policy, which covers a refusal that
    clears inside a backoff.
 2. **Give up the date** once that retry is exhausted, if and only if the failure is one the
-   source is answerable for. `scope=provider-refused` and `scope=unreadable` are recorded
+   source is answerable for AND recomputes. `scope=unreadable` is recorded
    separately: the first is recoverable by re-running the window, the second needs a reprocessed
    copy at the provider.
 3. **Record it on the store** in the same `assessed_unreadable_dates` attribute the optical path
    writes, so the coverage gate refuses to excuse a month that lost dates.
-4. **Stop past `MAX_GIVEN_UP_DATES`**, and stopping is a request to be RE-DISPATCHED rather than
+4. **Stop past `MAX_GIVEN_UP_DATES`**, and stopping is TERMINAL rather than
    a refusal to try again: `TooManyGivenUpDatesError` is deliberately absent from the leg-retry
-   classifier's non-retryable set. A refusal clears, and a leg that *finishes* returns success so
-   nothing comes back for it — declining to retry would turn a passing outage into permanent loss.
+   classifier's non-retryable set, because nothing counted toward the ceiling clears: a provider
+   refusal re-raises and is retried in order, so every date reaching that counter failed for a
+   cause that recomputes and a re-dispatch would read the same objects to the same answer.
 
 A date offered by two consecutive batches is given up ONCE. Batch queries are padded a day either
 side, so a boundary solar day comes back from two queries and would otherwise be listed twice and
