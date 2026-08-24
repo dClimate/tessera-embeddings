@@ -710,7 +710,14 @@ def test_a_terminal_leg_failure_is_not_forgotten_when_a_sibling_retries(wired, m
     monkeypatch.setattr(mod, "arun_deployment", fake_arun)
 
     with pytest.raises(RuntimeError, match="ObjectNotFound"):
-        _run(s1_orbit="both", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+        # Stagger off, so all three legs reach their FIRST dispatch and the assertion below is
+        # about retrying. With it on, the terminal failure lands while the siblings are still
+        # waiting out their offsets and the `doomed` gate stops them ever dispatching — which is
+        # the point of that gate, and is covered by its own test.
+        _run(
+            s1_orbit="both",
+            ingest_settings=mod.IngestSettings(max_leg_attempts=3, leg_stagger_window_s=0),
+        )
 
     # Aborted on the first attempt rather than retrying the recoverable legs around a
     # failure that a re-dispatch cannot fix.
@@ -1156,6 +1163,45 @@ class TestLegsRetryIndependently:
             _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
 
         assert dispatched.count("ascending") == 1, "the retryable leg did not spend attempts on a doomed cell"
+
+    def test_a_leg_doomed_during_its_stagger_never_dispatches_and_is_not_a_success(self, wired, monkeypatch):
+        """The stagger opened a window the gate did not cover.
+
+        `doomed` was checked only where the loop decides to start ANOTHER attempt, which was
+        every decision to start work while the first attempt began immediately. A leg that
+        waits out an offset can wake into a cell a sibling has already doomed, and provisioning
+        a Dask fleet for it delays the cell's failure report by however long that child runs.
+
+        Its detail must not be None either: None is this function's "the leg ran", so a leg
+        that never dispatched would be gathered as a success.
+        """
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        dispatched: list[str] = []
+        cell_is_doomed = asyncio.Event()
+
+        async def fake_arun(dep, parameters=None, tags=None):
+            dispatched.append(parameters.get("orbit") or "s2")
+            cell_is_doomed.set()
+            # Terminal: no re-dispatch can register a missing deployment.
+            return SimpleNamespace(
+                id="r",
+                state=SimpleNamespace(
+                    type=StateType.FAILED, name="Failed", message="ObjectNotFound: no such deployment"
+                ),
+            )
+
+        # Only the radar leg staggers, and its wait outlives the optical leg's terminal failure —
+        # so the race this test is about happens every run rather than on a timing accident.
+        monkeypatch.setattr(mod, "_leg_stagger_s", lambda z, y, label, w: 30.0 if "s1" in label else 0.0)
+        monkeypatch.setattr(mod.asyncio, "sleep", lambda *a, **k: cell_is_doomed.wait())
+        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+
+        with pytest.raises(RuntimeError, match="not dispatched") as raised:
+            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+
+        assert dispatched == ["s2"], "the staggered leg held a fleet for a cell that cannot succeed"
+        assert "another leg of this cell failed terminally" in str(raised.value)
 
     def test_a_dirty_mosaic_prefix_is_terminal_on_the_first_failure(self, wired, monkeypatch):
         """A prefix holding objects but no repository fails ``Repository.create`` identically every

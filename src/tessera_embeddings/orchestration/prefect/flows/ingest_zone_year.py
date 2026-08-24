@@ -705,6 +705,30 @@ async def ingest_zone_year(
                 ingest_settings.leg_stagger_window_s,
             )
             await asyncio.sleep(stagger)
+            if doomed.is_set():
+                # Re-checked after the wait, for the reason the retry backoff re-checks after
+                # its own: a sibling can reach its terminal failure while this leg is waiting,
+                # and the gate exists to not START work for a cell that cannot succeed. The
+                # stagger is what makes this reachable — the first attempt used to begin
+                # immediately, so there was no window here to lose the race in.
+                #
+                # Returns a DETAIL, not None. None is this function's "the leg ran", so a leg
+                # that never dispatched would be gathered as a success and the cell would be
+                # finalised on two legs' worth of work. It has no failure of its own to report,
+                # so it reports not having started.
+                never_started = (
+                    "not dispatched: another leg of this cell failed terminally before this "
+                    "leg's stagger elapsed, so the cell cannot succeed"
+                )
+                log.warning(
+                    "Zone %s year %s: %s was never dispatched — another leg failed terminally "
+                    "while this one was waiting out its stagger. Detail: %s",
+                    zone,
+                    year,
+                    label,
+                    never_started,
+                )
+                return never_started
         started = monotonic()
         last_token: str | None = None
         detail: str | None = None
