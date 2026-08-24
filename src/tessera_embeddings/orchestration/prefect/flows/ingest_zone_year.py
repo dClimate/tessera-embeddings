@@ -855,13 +855,32 @@ async def ingest_zone_year(
                 doomed.set()
                 return detail
             wait = _leg_backoff_s(attempt, detail)
-            # CAPPED by what is left of the wall-clock budget. The check just above bounds the
-            # decision to start another attempt, and it was true when it was made — but a
-            # refusal's backoff is tens of minutes now, so an uncapped wait would carry the next
-            # dispatch past a deadline that had only just been tested, and provision a fleet
-            # after the bound the setting promises. Capping keeps that check sufficient rather
-            # than adding a second one that can drift from it.
-            wait = min(wait, max(ingest_settings.max_leg_wall_clock_s - elapsed, 0.0))
+            # A backoff that does not FIT the remaining budget is a verdict, not a wait. Capping
+            # it to the remainder was the first fix here and it was wrong in an instructive way:
+            # waiting exactly the remainder makes the next dispatch land ON the deadline every
+            # time, which turns a race into a guarantee of the thing the budget forbids. There is
+            # no time to both wait and start an attempt, so waiting only delays a decision already
+            # made — stop here instead, on the same terms as the branch above.
+            if wait >= ingest_settings.max_leg_wall_clock_s - elapsed:
+                log.error(
+                    "Zone %s year %s: %s — %.0f s elapsed and this failure's backoff is %.0f s, "
+                    "which does not fit the wall-clock budget for starting another attempt "
+                    "(max_leg_wall_clock_s=%d), so attempt %d/%d is refused rather than waited "
+                    "for. No running leg was interrupted. The cell fails back to the campaign "
+                    "work list and a later dispatch RESUMES from the dates already committed. "
+                    "Detail: %s",
+                    zone,
+                    year,
+                    label,
+                    elapsed,
+                    wait,
+                    ingest_settings.max_leg_wall_clock_s,
+                    attempt + 1,
+                    ingest_settings.max_leg_attempts,
+                    detail,
+                )
+                doomed.set()
+                return detail
             # A re-dispatch RESUMES: already-committed dates are skipped, not rewritten, so the
             # retry costs only the work that was actually lost. That idempotency is what makes
             # retrying the default rather than the exception.
