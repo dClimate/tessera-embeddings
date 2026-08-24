@@ -268,7 +268,7 @@ Three nested budgets, none of which knew anything about the failure's class:
 
 | layer | knob | default | how a catalogue 502 is treated |
 |---|---|---|---|
-| leg | `IngestSettings.max_leg_attempts` | 3 | retryable — `_NON_RETRYABLE_LEG_MARKERS` names no HTTP failure, and the default is TRUE |
+| leg | `IngestSettings.max_leg_attempts` | 3 | retried, because nothing marks it permanent and retrying is the default. **Corrected in place:** this row used to say the permanent-failure list "names no HTTP failure", which stopped being the whole test once the parent also began asking whether the bytes are gone (see "Some failures say enough to be judged"). The answer does not change: that check recognises a status code only in the specific form GDAL writes it, and this text is not in that form |
 | cell | `attempts_per_cell_in_cluster` (`sequential_fill` / `fill_zones_sequential`) | 2 | eligible — retry eligibility is by **phase**, and this is `inputs/prepare`, which additionally gets `discard()` + `start()`, re-dispatching the whole ingest |
 | zone round | `max_dispatch_rounds` (`run_global_campaign`) | 2 | re-dispatched; the zero-progress guard only breaks *after* a whole round has made none |
 
@@ -1263,6 +1263,60 @@ the verdict is carried into the store's own record as `scope`, and the layer hol
 acts on the count rather than on the message. What is new is the direction of the verdict: the
 error the ceiling raises is left OUT of `_NON_RETRYABLE_LEG_MARKERS` on purpose, because a
 refusal clears and the retry is what recovers the dates.
+
+### Some failures say enough to be judged, and those skip the retries
+
+The advice above concerns failures whose real cause was thrown away in transit. It got read more
+broadly than intended — as "the parent can never tell why a leg failed" — and that reading is wrong
+for failures where the last exception raised is itself the complete answer. Reading it too broadly
+cost fleets.
+
+**The clearest example is a date offered out of order.** Dates can only be added to a store newest
+last, so a date older than the newest one already stored is refused. It will be refused identically
+every time, and no amount of re-running moves anything — the only way forward is a person deleting
+the store. Yet a failed leg was re-dispatched up to three times, and each attempt builds a
+sixty-worker cluster, walks to the same date, and dies there. Three clusters to learn what the first
+failure already established.
+
+So `NonMonotonicDateError` is now in the list of failures the parent will not re-dispatch. Its class
+name survives the trip to the parent intact, which is what makes this possible at all.
+
+**Alongside it, the parent now asks the same question the worker asks: are these bytes gone?** It
+calls `duplicates.unreadable_source_in`, a text-reading form of the check the worker already uses,
+looking at the same markers in the same order. Deliberately the same one, so the parent deciding
+whether to re-dispatch and the worker deciding whether to try another copy cannot reach opposite
+conclusions from identical words.
+
+Only two answers skip the retries: the data could not be read, and the data is not there. Every
+other answer — the provider refused us, our credentials failed, a refusal we could not attribute, a
+client error, or no idea — keeps all its attempts. Those are the situations retrying exists for.
+
+**The default is still to retry, and that is the part to protect.** Only a failure positively
+identified as permanent may skip anything; a failure nobody recognises goes through the retries
+untouched. The asymmetry is what settles it. Retrying something permanent wastes one cluster.
+Failing to retry something temporary strands a cell until a person notices.
+
+### What actually reaches the parent when a leg fails
+
+A leg runs as its own separate deployment, and the parent finds out how it went by reading the
+record back from the Prefect server over HTTP. So the parent never holds the failure itself, only a
+description of it:
+
+- The exception object exists only inside the process that raised it. It cannot be sent to the
+  server at all, so the parent cannot ask "what type of error was this?" in the normal way, at any
+  price.
+- What the server keeps is one line: the exception's class name, a colon, and its message. No stack
+  trace, and none of the chain of underlying causes — the last exception raised is all that is left.
+
+That leads to two things worth knowing. **The class name is the only reliable thing to match on**,
+which is why both the list of permanent failures and the bytes-are-gone check key on names rather
+than on the position of a word or a number in a message.
+
+And **a failure that began as a file that would not open arrives here looking unrecognisable**. The
+underlying cause has been stripped, and the surviving wrapper mentions no filenames, so the check
+answers "no idea" — which earns a retry. That is the safe direction. It is the same loss of
+information the Dask worker boundary causes, arriving by a different route, and the repair in
+`ingest/loader_failures.py` does not reach this one.
 
 ## Why the object was hard to identify — an attribution gap, now closed
 

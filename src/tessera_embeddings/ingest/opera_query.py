@@ -14,7 +14,7 @@ import time
 import warnings
 from collections import Counter
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import mgrs
 import requests
@@ -23,7 +23,7 @@ from pystac.utils import str_to_datetime
 from requests.adapters import HTTPAdapter
 
 from tessera_embeddings.config import S1_OPERA_BANDS
-from tessera_embeddings.ingest._http import make_logging_retry
+from tessera_embeddings.ingest._http import NonJsonResponseError, json_or_raise, make_logging_retry
 from tessera_embeddings.ingest.auth import get_edl_session, resolve_item_assets, rewrite_assets_to_s3
 from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 
@@ -73,6 +73,13 @@ _CMR_RETRY = make_logging_retry(
     allowed_methods=frozenset(["GET"]),
     respect_retry_after_header=True,
 )
+
+
+#: Attempts at ONE page whose body did not parse, and the seconds between them (times the
+#: attempt number). Scoped to that case alone: it is the single failure ``_CMR_RETRY``
+#: cannot see, since its ladder keys on status and this response's status is fine.
+_NON_JSON_PAGE_ATTEMPTS = 4
+_NON_JSON_PAGE_BACKOFF_S = 5.0
 
 
 def _cmr_session() -> requests.Session:
@@ -310,6 +317,42 @@ def _query_cmr_granules(
     return _query_cmr_granules_one(bbox, start_date, end_date, orbit_direction)
 
 
+def _fetch_granule_page(
+    session: requests.Session,
+    params: dict[str, str | int | list[str]],
+    headers: dict[str, str],
+    page: int,
+) -> tuple[dict[str, Any], str | None]:
+    """Fetch ONE page of granules, re-asking when the body is not JSON.
+
+    Returns the decoded body and the cursor to carry into the next page.
+
+    Retried here because the session's ladder cannot reach this failure: it keys on status,
+    and an unparseable body arrives under a success status that ``raise_for_status`` passes.
+    Unretried, one such page ends a leg that is a zone-year of already-written batches.
+    Safe to repeat — a GET whose cursor the archive itself issued names the identical page.
+    """
+    for attempt in range(1, _NON_JSON_PAGE_ATTEMPTS + 1):
+        resp = session.get(_CMR_GRANULE_URL, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+        try:
+            body = cast(dict[str, Any], json_or_raise(resp, log_body=True))
+        except NonJsonResponseError:
+            if attempt == _NON_JSON_PAGE_ATTEMPTS:
+                raise
+            logger.warning(
+                "CMR page %d unparseable (attempt %d/%d), re-asking in %.0fs",
+                page,
+                attempt,
+                _NON_JSON_PAGE_ATTEMPTS,
+                _NON_JSON_PAGE_BACKOFF_S * attempt,
+            )
+            time.sleep(_NON_JSON_PAGE_BACKOFF_S * attempt)
+            continue
+        return body, resp.headers.get("CMR-Search-After")
+    raise AssertionError("unreachable: the loop either returns or raises")  # pragma: no cover
+
+
 def _query_cmr_granules_one(
     bbox: tuple[float, float, float, float],
     start_date: str,
@@ -350,9 +393,7 @@ def _query_cmr_granules_one(
     page = 0
     while True:
         page += 1
-        resp = session.get(_CMR_GRANULE_URL, params=params, headers=headers, timeout=30)
-        resp.raise_for_status()
-        body = resp.json()
+        body, search_after = _fetch_granule_page(session, params, headers, page)
 
         entries = body.get("feed", {}).get("entry", [])
         if not entries:
@@ -364,7 +405,6 @@ def _query_cmr_granules_one(
             f"({len(items)} items so far, {time.monotonic() - t0:.1f}s)"
         )
 
-        search_after = resp.headers.get("CMR-Search-After")
         if search_after and len(entries) == params["page_size"]:
             headers["CMR-Search-After"] = search_after
         else:
