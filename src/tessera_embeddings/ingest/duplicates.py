@@ -844,16 +844,19 @@ def _exception_chain_text(exc: BaseException) -> str:
 #: error. All statements about the SERVICE rather than the bytes: the same object read moments
 #: before and reads again once the service recovers.
 #:
-#: Consumed as an EXCLUSION by :func:`is_unreadable_source`, which is the only reader. There was
-#: once a companion predicate answering "is this a refusal?" positively, so a caller could give up
-#: the date and record it; nothing does that any more, because giving up a date and then
-#: committing a later one puts the earlier date permanently below the store's append-only
-#: maximum. A refusal is transient, so the response is to retry and — if it will not clear — to
-#: fail the leg with the axis unmoved.
+#: Read two ways. As an EXCLUSION by :func:`is_unreadable_source`, and positively by
+#: :func:`is_provider_refusal`, whose whole purpose is to earn the failure a longer WAIT.
 #:
-#: The exclusion needs no :data:`_SOURCE_READER_MARKERS` corroboration, unlike the positive
-#: verdict it replaced: declining is the safe direction, and a failure nothing claims is
-#: re-raised either way.
+#: What a positive verdict may never do is give up the date. It used to, and that is the one
+#: response a refusal must not get: giving up a date and then committing a later one puts the
+#: earlier date permanently below the store's append-only maximum, so the re-run meant to
+#: recover it is refused instead. A refusal is transient, so the response is to wait it out and —
+#: if it will not clear — to fail the leg with the axis unmoved.
+#:
+#: The exclusion needs no :data:`_SOURCE_READER_MARKERS` corroboration; the positive verdict
+#: does. Declining is the safe direction either way, but spending a long wait is not: an
+#: exception nobody can attribute to the source reader must fail on its first date rather than
+#: hold a fleet idle first.
 _PROVIDER_REFUSAL_MARKERS = (
     "AccessDenied",
     "SlowDown",
@@ -947,6 +950,39 @@ _OWN_CREDENTIAL_MARKERS = (
 #: `is_unreadable_source`, so the same credential fault was skipped as bad data on one path and
 #: raised on the other.
 _NOT_THE_DATAS_FAULT = (*_OWN_CREDENTIAL_MARKERS, "AccessDenied", "SlowDown")
+
+
+def is_provider_refusal(exc: BaseException) -> bool:
+    """Whether ``exc`` says the source PROVIDER refused the read.
+
+    A refusal is a statement about the service and not about the bytes, so the only thing that
+    resolves it is time — never a different copy of the object, which is what
+    :func:`is_unreadable_source` gates and why that predicate declines everything matched here.
+    The two are disjoint by construction, so no call order decides a verdict.
+
+    Sits beside a retry policy rather than beside a skip. A caller passes it as that policy's
+    ``wait_out`` and the failure buys patience with it; nothing may spend it on giving up a date.
+
+    Fails closed three ways, and each closed door costs only the ordinary attempt limit. Our own
+    credential fault is excluded first, because it is repairable here and no waiting fixes it. A
+    refusal nothing attributes to the source reader is excluded (see
+    :data:`_SOURCE_READER_MARKERS`) — every string in :data:`_PROVIDER_REFUSAL_MARKERS` belongs
+    to S3, and the destination store speaks S3 too. And anything unrecognised is excluded, which
+    is what a failure that reached the driver with its cause stripped looks like: it gets the
+    short ladder and then fails the leg, rather than silently drawing the long wait.
+
+    Args:
+        exc: The exception a source read failed with.
+
+    Returns:
+        ``True`` when the chain names a refusal the provider owns.
+    """
+    text = _exception_chain_text(exc)
+    if any(m in text for m in _OWN_CREDENTIAL_MARKERS):
+        return False
+    if not any(m in text for m in _SOURCE_READER_MARKERS):
+        return False
+    return any(m in text for m in _PROVIDER_REFUSAL_MARKERS)
 
 
 def step_down_copies(

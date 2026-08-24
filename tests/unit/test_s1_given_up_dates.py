@@ -6,9 +6,10 @@ therefore cost every LATER date in the window too, which is how a source that re
 thirteen minutes emptied 178 zone-years that had committed months of sound data.
 
 The tests drive the real ``ingest_s1_roi_sar`` loop, since the rule lives in that loop. The write
-retry is replaced with one that keeps the real attempt COUNT and drops only the sleeps, so a
-give-up still happens where production has it — after the retry is exhausted — without the test
-paying the backoff.
+retry is the production policy with only its SLEEPS dropped — not a stand-in with the same attempt
+count — so a give-up still happens where production has it, after the retry is exhausted, and the
+policy's own decision about how long to wait is the one under test. It terminates with a no-op
+sleep because the wait-out budget is accumulated backoff rather than wall clock.
 """
 
 from __future__ import annotations
@@ -16,10 +17,9 @@ from __future__ import annotations
 import logging
 
 import pytest
-from tenacity import Retrying, retry_if_not_exception_type, stop_after_attempt
 
 from tessera_embeddings.ingest import s1_roi
-from tessera_embeddings.storage.zarr_store import CONCURRENT_WRITER_ERRORS, STORE_WRITE_ATTEMPTS
+from tessera_embeddings.storage.zarr_store import STORE_WRITE_ATTEMPTS, store_write_retrying
 
 _CATALOGUE = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
 
@@ -36,13 +36,25 @@ def _raise(message: str, cause: str | None = None) -> Exception:
     return exc
 
 
-def _run(monkeypatch, *, failures: dict[str, Exception], catalogue: list[str] = _CATALOGUE, **kwargs):
+def _run(
+    monkeypatch,
+    *,
+    failures: dict[str, Exception],
+    clears_after: dict[str, int] | None = None,
+    catalogue: list[str] = _CATALOGUE,
+    **kwargs,
+):
     """Drive the real loop, failing the write for the dates named in ``failures``.
+
+    ``clears_after`` names dates whose failure STOPS after that many attempts, which is how a
+    source that recovers differs from one that never does. Without it every failure is permanent,
+    and a policy that waits is indistinguishable from one that does not.
 
     Returns ``(result, written, recorded, attempts)``. ``recorded`` collects the keyword arguments
     each ``record_assessed_window`` call was given — the durable half of the skip, and the only
     place a reader of the store can learn a date was lost.
     """
+    clears_after = clears_after or {}
     import collections
 
     import numpy as np
@@ -67,17 +79,20 @@ def _run(monkeypatch, *, failures: dict[str, Exception], catalogue: list[str] = 
     def fake_write_day_windows(_store, data, *_a, **_k):
         date = str(data["time"].values[0])[:10]
         attempts[date] += 1
-        if date in failures:
+        if date in failures and attempts[date] <= clears_after.get(date, 10**9):
             raise failures[date]
         written.append(date)
 
-    def no_wait_retrying(_log):
-        """The production attempt count and exclusion, without the production backoff."""
-        return Retrying(
-            stop=stop_after_attempt(STORE_WRITE_ATTEMPTS),
-            retry=retry_if_not_exception_type(CONCURRENT_WRITER_ERRORS),
-            reraise=True,
-        )
+    def no_wait_retrying(_log, **policy):
+        """The production policy, verbatim, with the sleeps replaced by nothing.
+
+        Passing ``**policy`` through matters: the leg is what chooses whether a failure may be
+        waited out, and a shim that dropped the argument would test a policy production does not
+        use.
+        """
+        retrying = store_write_retrying(_log, **policy)
+        retrying.sleep = lambda _seconds: None  # type: ignore[method-assign]
+        return retrying
 
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", fake_write_day_windows)
@@ -199,10 +214,38 @@ def test_the_retry_is_exhausted_before_a_date_is_given_up(monkeypatch) -> None:
 
     2024-01-02 also ends the first batch and is offered again by the second batch's padded
     query, so this pins the boundary case too: attempted once, listed once.
+
+    The NEGATIVE CONTROL for the long wait, since it now runs the real policy: a codec failure is
+    a statement about the bytes, it recomputes to the same verdict every time, and no amount of
+    waiting changes it. Exactly the attempt limit, and none of the wait-out budget.
     """
     _r, _w, recorded, attempts = _run(monkeypatch, failures={"2024-01-02": _raise("RasterioIOError: ZIPDecode: error")})
     assert attempts["2024-01-02"] == STORE_WRITE_ATTEMPTS
     assert [g["date"] for g in recorded[0]["unreadable"]] == ["2024-01-02"]
+
+
+def test_a_refusal_outlasting_the_attempt_limit_is_waited_out(monkeypatch) -> None:
+    """THE case the campaign lost 85 radar legs to, and the one nothing in this file could catch.
+
+    The write's retry was three attempts of exponential backoff. A provider that stops serving
+    reads does not come back inside that, so the failure walked out of the loop, out of the leg's
+    own retries, and took the cell — with every date the leg had already committed still sitting
+    in the store and no way to add to it.
+
+    So the failing date must be attempted PAST the attempt limit, and every later date must be
+    written. Attempted past it, not merely written eventually: a leg that recovered on a leg-level
+    retry would also end with the dates present.
+    """
+    _r, written, recorded, attempts = _run(
+        monkeypatch,
+        failures={
+            "2024-01-02": _raise("WarpOperationError: Chunk and warp failed", "RasterioIOError: AccessDenied"),
+        },
+        clears_after={"2024-01-02": STORE_WRITE_ATTEMPTS + 2},
+    )
+    assert attempts["2024-01-02"] == STORE_WRITE_ATTEMPTS + 3
+    assert written == _CATALOGUE
+    assert recorded[0]["unreadable"] == [], "a refusal that was waited out must cost no date at all"
 
 
 @pytest.mark.parametrize(

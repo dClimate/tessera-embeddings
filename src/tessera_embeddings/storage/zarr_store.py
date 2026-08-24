@@ -61,7 +61,14 @@ import numpy as np
 import xarray as xr
 import zarr
 from icechunk.xarray import to_icechunk
-from tenacity import Retrying, before_sleep_log, retry_if_not_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    RetryCallState,
+    Retrying,
+    before_sleep_log,
+    retry_if_not_exception_type,
+    wait_exponential,
+    wait_random,
+)
 
 from tessera_embeddings.errors import (
     CorruptedStoreError,
@@ -110,14 +117,37 @@ NEVER_CLEAN_UP: tuple[type[BaseException], ...] = (
 
 #: Attempts per store write. Three has been enough for the transient failures this path
 #: actually sees (throttling, a credential rolling over mid-write, a flaky COG read).
+#:
+#: It is NOT enough for a source provider that stops serving reads for minutes at a time, and
+#: that is a different kind of failure rather than a bigger one: waiting is the only thing that
+#: resolves it, and three attempts of exponential backoff do not wait long enough to matter. A
+#: caller that can identify such a failure passes ``wait_out`` to :func:`store_write_retrying`
+#: and gets :data:`WAIT_OUT_BACKOFF_S` of patience for that failure alone.
 STORE_WRITE_ATTEMPTS = 3
 
+#: The total backoff ONE store write may spend on a failure its caller has said to wait out.
+#:
+#: The single lever for that tolerance: no other constant, ladder or attempt count needs
+#: touching to change it, and the ladder's cap below is what turns it into an attempt count.
+#: Budgeted as accumulated BACKOFF rather than as wall clock so the bound is a property of the
+#: policy alone — the work each attempt does is the caller's, and unmeasurable from here.
+WAIT_OUT_BACKOFF_S = 600.0
 
-def store_write_retrying(log: "logging.Logger | logging.LoggerAdapter[logging.Logger]") -> Retrying:
+#: Ceiling on ONE sleep in the ladder. Reached only by a write that is waiting something out:
+#: :data:`STORE_WRITE_ATTEMPTS` attempts sleep twice and never approach it, so the ordinary
+#: policy is unchanged by it.
+WAIT_OUT_MAX_SLEEP_S = 60.0
+
+
+def store_write_retrying(
+    log: "logging.Logger | logging.LoggerAdapter[logging.Logger]",
+    *,
+    wait_out: Callable[[BaseException], bool] | None = None,
+) -> Retrying:
     """The retry policy for ONE store write, shared by every ingest write site.
 
-    Three attempts with exponential backoff, re-raising the last failure, and
-    **never retrying** a :data:`CONCURRENT_WRITER_ERRORS` member.
+    Exponential backoff with jitter, re-raising the last failure, and **never retrying** a
+    :data:`CONCURRENT_WRITER_ERRORS` member. :data:`STORE_WRITE_ATTEMPTS` attempts by default.
 
     Shared rather than built per site — S1's per-date write, S2's per-date write and S2's
     per-batch write all use it — because the exclusion is the part that is easy to omit,
@@ -126,10 +156,36 @@ def store_write_retrying(log: "logging.Logger | logging.LoggerAdapter[logging.Lo
     Retrying is safe precisely because a failed write commits NOTHING — every write site
     goes through a single-session commit, so an abandoned attempt is invisible to readers
     and the next attempt starts from the last committed state.
+
+    Args:
+        log: Logger for the before-sleep line.
+        wait_out: Predicate over the failure that decides whether this write may keep going
+            past the attempt limit, up to :data:`WAIT_OUT_BACKOFF_S` of accumulated backoff.
+            A predicate, not a flag, because the classification belongs to the ingest layer
+            that owns the source's vocabulary; storage only owns the budget. Default
+            ``None`` keeps the attempt limit for every failure, which is what a caller whose
+            answer to a source refusing reads is to read a DIFFERENT copy of the object
+            wants: a long wait per copy would multiply with that ladder.
+
+    Returns:
+        A ``Retrying`` to iterate around the write.
+
+    The jitter is unconditional. At fleet width thousands of writes fail in the same second
+    when a shared source falters, and an undithered ladder re-issues all of them in the same
+    second too.
     """
+
+    def _stop(state: RetryCallState) -> bool:
+        exc = state.outcome.exception() if state.outcome is not None else None
+        if wait_out is not None and exc is not None and wait_out(exc):
+            # Refusing the sleep that would cross the budget, rather than the one after it, so
+            # the ceiling is the real bound and not the bound plus one full sleep.
+            return state.idle_for + state.upcoming_sleep > WAIT_OUT_BACKOFF_S
+        return state.attempt_number >= STORE_WRITE_ATTEMPTS
+
     return Retrying(
-        stop=stop_after_attempt(STORE_WRITE_ATTEMPTS),
-        wait=wait_exponential(multiplier=1, min=2, max=8),
+        stop=_stop,
+        wait=wait_exponential(multiplier=1, min=2, max=WAIT_OUT_MAX_SLEEP_S) + wait_random(0, 5),
         before_sleep=before_sleep_log(cast("logging.Logger", log), logging.WARNING),
         retry=retry_if_not_exception_type(CONCURRENT_WRITER_ERRORS),
         reraise=True,

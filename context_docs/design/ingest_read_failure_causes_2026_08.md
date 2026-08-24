@@ -1,10 +1,13 @@
-# Ingest source-read failures: eight causes, and the retry budget they share
+# Ingest source-read failures: nine causes, and the retry budget they share
 
 Investigation record. Causes 1 and 2 traced 2026-08-04/05 on `global-tessera-dev`; cause 3 absorbed
 2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20,
-cause 5 on 2026-08-21, and causes 6 and 7 on 2026-08-22/23, all from live campaign legs. **Corrected
-in place: this document said "three causes" until cause 4 was added, "four causes" until cause 5
-joined it, "five causes" until cause 6 did, and "six causes" until cause 7 did.** Cause 7 is the
+cause 5 on 2026-08-21, causes 6 and 7 on 2026-08-22/23, and causes 8 and 9 on 2026-08-24, all from
+live campaign legs. **Corrected in place: this document said "three causes" until cause 4 was
+added, "four causes" until cause 5 joined it, "five causes" until cause 6 did, "six causes" until
+cause 7 did, and "eight causes" until cause 9 did.** Cause 9 is the second half of cause 8 rather
+than a new mechanism: the same refusal, classified correctly and then given a budget that could
+not act on the classification. Cause 7 is the
 only one here that is not a source failure — it is our own bookkeeping, and the only one that left
 holes nothing can fill. Traces
 `WarpOperationError('Chunk and warp failed')` and `PermissionError: The provided token has
@@ -1045,6 +1048,116 @@ interior gaps below its axis maximum, resumed, re-offered all three, skipped the
 advanced past the old maximum with zero `NonMonotonicDateError`. The polarisation filter ran 134 CMR
 queries with zero skip warnings, against 115,276 in 45 minutes of the production run.
 
+## Cause 9 — the refusal was recognised, and then not waited out, 2026-08-24
+
+Cause 8 stopped a refusal being recorded as unreadable data. It left the refusal with nowhere to
+go: correctly classified, correctly declined as a give-up, and then handed to a retry an order of
+magnitude too short to be the answer.
+
+### The failure
+
+**85 radar legs failed across 53 distinct cells inside two five-minute bins**, 16:20–16:26 UTC, after
+seventy minutes of clean running. Sentinel-2 was untouched throughout — S1 reads ASF, S2 reads
+Element 84, and only the ASF-backed sensor moved, which is the signature of a provider event
+rather than of anything of ours. Alongside them: **1,304 `AccessDenied` and 253 HTTP 403 log
+lines, all from the 16:20 bin onward and zero before it.**
+
+Three explanations were ruled out rather than argued away:
+
+- **Not corrupt data.** The refusal is an authorization verdict on ASF's own bucket, across 53
+  unrelated cells and many years at once.
+- **Not credential expiry.** An expired credential answers `ExpiredToken` or
+  `InvalidAccessKeyId`; **zero of each** were logged. The credential ticker recorded **zero**
+  refresh failures and **zero** unparseable expiries, with **766 acquisitions and 762
+  broadcasts** in the window.
+- **Not the documented own-bucket mix-up.** OPERA-scoped env credentials leaking into icechunk
+  operations do produce `AccessDenied`, but on OUR bucket. The resource named is
+  `asf-cumulus-prod-opera-products`.
+
+### The defect: every budget was an order of magnitude short
+
+| layer | budget |
+|---|---|
+| ASF refused reads for | **~360 s** (16:20 → 16:26) |
+| `store_write_retrying`, 3 attempts, `wait_exponential(min=2, max=8)` | **~6 s of backoff** |
+| the leg retry, 3 attempts at 30 s then 60 s | **90 s**, and each attempt walks back into the refusal |
+
+Radar's source read happens *inside* the write's compute, so `store_write_retrying` is the ladder
+that covers it — `source_read_retrying` is optical-only. A refusal therefore walked through all
+three layers and killed the cell, with every date the leg had already committed still in the store
+and no way to add to it.
+
+The 2026-08-21 event in Cause 5 sets the target: **about six minutes at full rate and roughly
+seven more decaying.** Six seconds against six minutes is not a budget that needs raising, it is
+the wrong instrument.
+
+### The change
+
+`store_write_retrying` gains an optional `wait_out` predicate. A failure the predicate recognises
+keeps retrying until `WAIT_OUT_BACKOFF_S` (600 s) of accumulated backoff is spent; every other
+failure keeps `STORE_WRITE_ATTEMPTS`. `is_provider_refusal` is restored in `ingest/duplicates.py`
+— deleted in Cause 8 as having no caller, and this is the caller — and radar's per-date write is
+the one site that passes it.
+
+Three properties are load-bearing:
+
+- **The budget is accumulated BACKOFF, not wall clock.** The bound is then a property of the
+  policy alone, since the work each attempt does belongs to the caller and is unmeasurable from
+  the policy. It also makes the tolerance testable at zero wall clock: a no-op sleep still spends
+  the budget, where a wall-clock budget would spin until the clock caught up.
+- **The stop refuses the sleep that would CROSS the budget**, not the one after it, so 600 s is
+  the real ceiling rather than the ceiling plus one full sleep.
+- **Jitter is unconditional.** 5,532 tasks were in flight. Thousands of writes fail in the same
+  second when a shared source falters, and an undithered ladder re-issues all of them in the same
+  second too.
+
+Measured over 400 runs of a permanently-refusing write: **15 attempts, 563–594 s of backoff**,
+never above 600. Recovery is cheap — a refusal that clears on the sixth attempt costs about 52 s
+and the date is written.
+
+### Bounding the PAIR, not each lever
+
+The lever this multiplies with is the leg retry, and the multiplication is bounded by an
+already-existing decision rather than by a new one: **a refusal is not a give-up.** When the
+budget is spent the write fails, `_give_up_date` declines it, and the exception leaves the date
+loop and the leg. So **at most ONE date per leg attempt pays the full budget** — the loop does not
+carry on to spend it again on the next date.
+
+| | per date | per leg attempt | per leg |
+|---|---|---|---|
+| write attempts on a permanent refusal | 15 | 15 | **45** |
+| backoff | ≤ 600 s | ≤ 600 s | **≤ 1,800 s** |
+| leg backoff | — | — | 90 s |
+
+So a cell tolerates **about 31 minutes** of provider refusal before failing, in three
+independently-recovering windows, and spends at most **45 write attempts** doing it. That covers
+the 2026-08-24 event (~6 min) with a wide margin and the longer 2026-08-21 one (~13 min including
+its decaying tail) inside two leg attempts.
+
+An INTERMITTENT refusal is the case that does not collapse to one date, and it is the case worth
+paying for: each affected date can spend up to the budget, but every date that spends it and then
+succeeds is a date saved rather than a cell lost. The dangerous shape — a long wait per rung of a
+fallback ladder — is why radar alone passes `wait_out`. The optical path answers a refusal with the
+copy ladder, and a 600 s wait per copy would multiply with it.
+
+### Why ten minutes
+
+A campaign cell holds roughly 356 vCPU, so ten idle minutes is a few dollars of Fargate against
+losing the cell and every date it had committed. The number that actually constrains it is the
+other side: at three leg attempts, ten minutes per attempt is half an hour of tolerance per cell,
+which is comfortably longer than the two refusals on record and short enough that a genuinely
+broken source still fails a leg the same day. A materially larger budget would start to trade the
+fleet's throughput for events nobody has observed.
+
+### Dependence on the cause surviving the worker boundary
+
+A refusal that cannot be RECOGNISED cannot be waited out. About **70 of the 85** failures arrived
+on the driver with their cause stripped — `Exception: RasterioIOError('Read failed. See previous
+exception for details.')`, `__cause__` of `None` — for the reason the section below documents.
+`is_provider_refusal` declines that shape: it names a source reader but no refusal, so the write
+takes the ordinary attempt limit and the leg fails recoverably. That is the correct fail-closed
+direction, and it means this change realises its full value only once the cause survives the hop.
+
 ## Coupling to the leg retry
 
 `orchestration/prefect/flows/ingest_zone_year.py` retries a failed leg up to
@@ -1075,6 +1188,11 @@ that cannot serve a particular query. The fix follows the prescription above: cl
 failure happens, carry the request identity into the failure detail, and let the layer holding the
 budget act on a REPEAT of it. Note that the "Caveat on the sample" 502s above are the first
 recorded observation of that same upstream defect.
+
+**Since Cause 9, the write retry is also a lever the leg retry multiplies with**, and the product
+is bounded by the fact that a refusal is never given up: the failure leaves the date loop, so one
+date per leg attempt pays the budget rather than every date in the year. The table in Cause 9 is
+the arithmetic.
 
 **A third instance, resolved for the radar read itself:** Cause 5 above. The prescription is the
 same and was followed literally — `is_provider_refusal` classifies at the point the read fails,

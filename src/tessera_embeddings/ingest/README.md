@@ -1793,16 +1793,25 @@ imagery — the same object read minutes earlier and reads again once the servic
 fallback copy helps, which is why `is_unreadable_source` declines them and why this predicate
 sits beside it rather than inside it.
 
-It fails closed three ways. A credential fault on THIS side is excluded first, because it is
-repairable here and no waiting fixes it. A refusal nothing attributes to the source reader is
-excluded too: `AccessDenied`, `SlowDown` and `InternalError` are S3's words and every S3 client
-shares them, so those markers only count alongside GDAL's own vocabulary (`RasterioIOError`,
-`WarpOperationError`, `CPLE_`, `HTTP response code:`) — GDAL reads source imagery here and
-nothing else. And anything unrecognised is excluded, so the caller re-raises.
+**What a positive verdict buys is TIME, and nothing else.** It is passed to the shared write
+retry as `wait_out`, and the policy then keeps re-attempting that one failure until it has spent
+`WAIT_OUT_BACKOFF_S` of backoff. It may never be spent on giving up a date: a date given up and a
+later date committed puts the earlier one permanently below the store's append-only maximum, so
+the re-run meant to recover it is refused instead. If the wait is not enough, the write fails, the
+leg fails with its time axis unmoved, and the leg's own retry re-offers the date in order.
 
-One asymmetry to know about: `is_unreadable_source` recognises refusals by NAME, so a refusal
-reported as a bare status code carries none of the words it looks for and both predicates claim
-it. Callers that can act on both resolve it by ORDER, asking about the refusal first.
+It fails closed three ways, and each closed door costs only the ordinary attempt limit. A
+credential fault on THIS side is excluded first, because it is repairable here and no waiting
+fixes it. A refusal nothing attributes to the source reader is excluded too: `AccessDenied`,
+`SlowDown` and `InternalError` are S3's words and every S3 client shares them, so those markers
+only count alongside GDAL's own vocabulary (`RasterioIOError`, `WarpOperationError`, `CPLE_`) —
+GDAL reads source imagery here and nothing else. And anything unrecognised is excluded, which is
+what a failure whose cause was stripped crossing the worker boundary looks like: it draws no long
+wait on suspicion, and it is not given up either.
+
+The two predicates were once overlapping, and a caller's ORDER of asking decided the verdict.
+They are now disjoint by construction — `is_unreadable_source` declines every refusal marker
+outright — so a caller that knows only one of them cannot misclassify.
 
 ### The radar bounded skip (`s1_roi.py`)
 
@@ -1814,8 +1823,11 @@ months of sound data.
 The radar response is the tail of the optical one without the copy ladder, which radar has no use
 for — OPERA publishes one copy of a granule:
 
-1. **Retry**, through the shared `store_write_retrying` policy, which covers a refusal that
-   clears inside a backoff.
+1. **Retry**, through the shared `store_write_retrying` policy — and for a provider refusal,
+   retry for far longer than the attempt limit, because that is the only response a refusal has.
+   Radar is the one caller that asks for this: OPERA publishes one copy of a granule, so there is
+   nothing to step down to, and the optical path's answer is the copy ladder instead. A long wait
+   per rung of that ladder would multiply with it.
 2. **Give up the date** once that retry is exhausted, if and only if the failure is one the
    source is answerable for AND recomputes. There is one scope, `unreadable`, and one remedy: a
    reprocessed copy at the provider. A refusal used to be a second, recoverable scope

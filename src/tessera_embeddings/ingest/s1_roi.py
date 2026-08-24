@@ -50,7 +50,7 @@ import xarray as xr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
 from tessera_embeddings.ingest._pipeline import pipelined
-from tessera_embeddings.ingest.duplicates import is_unreadable_source
+from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreadable_source
 from tessera_embeddings.ingest.live_windows import (
     WINDOW_COST_IN_CHUNKS,
     WINDOW_COST_IN_CHUNKS_OVERLAPPED,
@@ -857,9 +857,15 @@ def ingest_s1_roi_sar(
                 # was S2's, whose read fires in its coverage gate, outside any retry. What
                 # this path lacked is attribution: once the retry is exhausted the exception
                 # names neither the zone nor the date.
+                #
+                # `wait_out` is what makes the retry long enough to be the answer to a provider
+                # refusal, which for radar is the ONLY answer: OPERA publishes one copy of a
+                # granule, so there is nothing to step down to, and giving the date up would
+                # hole the store. Radar alone asks for it — the optical path's response is the
+                # copy ladder, and a long wait per rung would multiply with it.
                 try:
                     with read_failure_context(log, roi=roi_label, date=date_str):
-                        for attempt in store_write_retrying(log):
+                        for attempt in store_write_retrying(log, wait_out=is_provider_refusal):
                             with attempt:
                                 write_day_windows(
                                     orbit_store,

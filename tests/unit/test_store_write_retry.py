@@ -12,43 +12,91 @@ That distinction was missing from all three write sites at once (S1 per-date, S2
 per-date, S2 per-batch), each of which had built its own ``Retrying``. Hence the shared
 factory, and hence the last test here: an inlined fourth copy would silently reopen the
 hole, so the absence of one is asserted rather than assumed.
+
+A third call sits on top of the two: a **source provider that stops serving reads** is
+resolved by waiting and by nothing else, and the attempt limit is far too short to be that
+wait. A caller that can recognise such a failure passes ``wait_out`` and buys a bounded
+backoff budget for it alone — so these tests have to pin both directions, since a budget
+that leaked onto a failure which recomputes would spend minutes per date to reach the same
+verdict, and one that never engaged would be the defect it exists to fix.
 """
 
 from __future__ import annotations
 
 import inspect
 import logging
+from collections.abc import Callable
 
 import icechunk
 import pytest
 
 from tessera_embeddings.errors import DuplicateDateError, InconclusiveStoreProbeError
 from tessera_embeddings.ingest import s1_roi, s2_roi
+from tessera_embeddings.ingest.duplicates import is_provider_refusal
 from tessera_embeddings.storage import zarr_store
 from tessera_embeddings.storage.zarr_store import (
     CONCURRENT_WRITER_ERRORS,
     STORE_WRITE_ATTEMPTS,
+    WAIT_OUT_BACKOFF_S,
     store_write_retrying,
 )
 
 log = logging.getLogger(__name__)
 
 
-def _attempts(exc: BaseException | None, *, fail_times: int = 99) -> int:
-    """Run the policy against a callable that raises ``exc``; return attempts made.
+def _run(
+    exc: BaseException | None,
+    *,
+    fail_times: int = 99,
+    wait_out: Callable[[BaseException], bool] | None = None,
+) -> tuple[int, float, BaseException | None]:
+    """Run the policy against a callable that raises ``exc``.
 
-    Sleeps are stubbed out — the policy's backoff is deliberately seconds long, and
-    waiting it out would make this file the slowest in the suite for no added coverage.
+    Returns the attempts made, the backoff slept, and whatever the policy finally re-raised.
+
+    Sleeps are counted rather than taken — the policy's backoff is deliberately seconds long and
+    the wait-out budget is minutes long, so taking either would make this file the slowest in the
+    suite for no added coverage. Counting works because the budget is accumulated BACKOFF and not
+    wall clock: a no-op sleep still spends it, where a wall-clock budget would spin until the
+    clock caught up.
     """
     calls = 0
-    retrying = store_write_retrying(log)
-    retrying.sleep = lambda _seconds: None  # type: ignore[method-assign]
-    for attempt in retrying:
-        with attempt:
-            calls += 1
-            if exc is not None and calls <= fail_times:
-                raise exc
+    slept = 0.0
+    retrying = store_write_retrying(log, wait_out=wait_out)
+
+    def _count(seconds: float) -> None:
+        nonlocal slept
+        slept += seconds
+
+    retrying.sleep = _count  # type: ignore[method-assign]
+    try:
+        for attempt in retrying:
+            with attempt:
+                calls += 1
+                if exc is not None and calls <= fail_times:
+                    raise exc
+    except BaseException as raised:  # the policy's verdict is exactly what is under test
+        return calls, slept, raised
+    return calls, slept, None
+
+
+def _attempts(exc: BaseException | None, *, fail_times: int = 99) -> int:
+    """Attempts the default policy makes, re-raising whatever it gave up on."""
+    calls, _slept, raised = _run(exc, fail_times=fail_times)
+    if raised is not None:
+        raise raised
     return calls
+
+
+def _exhausted(exc: BaseException, *, wait_out: Callable[[BaseException], bool]) -> tuple[int, float]:
+    """Attempts and backoff spent on a failure that never clears.
+
+    Asserts the re-raise rather than suppressing it: a spent budget must fail the write. A policy
+    that swallowed the failure would satisfy every attempt count here while losing the date.
+    """
+    calls, slept, raised = _run(exc, wait_out=wait_out)
+    assert type(raised) is type(exc), "an exhausted policy must re-raise the failure, not absorb it"
+    return calls, slept
 
 
 def _conflict() -> icechunk.ConflictError:
@@ -111,6 +159,97 @@ def test_every_failure_surfaces_as_itself_not_as_a_retryerror():
         _attempts(DuplicateDateError("dup"))
     with pytest.raises(RuntimeError, match="throttled"):
         _attempts(RuntimeError("throttled"))
+
+
+def _refusal() -> Exception:
+    """A refused source read, shaped the way the driver receives one.
+
+    tblib cannot rebuild rasterio's GDAL-backed classes across the worker boundary, so what
+    arrives is a plain exception carrying the original's text.
+    """
+    exc = RuntimeError("WarpOperationError: Chunk and warp failed")
+    exc.__cause__ = RuntimeError("RasterioIOError: AccessDenied on asf-cumulus-prod-opera-products")
+    return exc
+
+
+def test_a_failure_the_caller_waits_out_outlasts_the_attempt_limit():
+    """The whole point. A provider that stops serving reads does not come back inside three
+    attempts of exponential backoff, so the attempt limit is not a short budget for this failure —
+    it is the wrong instrument, and the write has to be allowed to keep asking.
+    """
+    calls, _slept = _exhausted(_refusal(), wait_out=is_provider_refusal)
+    assert calls > STORE_WRITE_ATTEMPTS
+
+
+def test_the_wait_out_budget_bounds_the_backoff_it_authorises():
+    """A longer wait that is not BOUNDED is an outage of its own — a leg holds a Dask fleet while
+    it waits, and thousands of them wait at once. The ladder is exponential and capped, so the
+    budget converts into a small attempt count rather than a tight loop against a struggling
+    provider.
+    """
+    calls, slept = _exhausted(_refusal(), wait_out=is_provider_refusal)
+    assert slept <= WAIT_OUT_BACKOFF_S
+    assert slept > WAIT_OUT_BACKOFF_S / 2, "the budget must be nearly spent, or the ladder wastes it"
+    assert calls < 2 * STORE_WRITE_ATTEMPTS * 5, f"{calls} attempts is a tight loop, not a backoff"
+
+
+def test_a_failure_the_predicate_declines_gets_only_the_attempt_limit():
+    """The negative control, and the reason the long wait is gated on a predicate at all.
+
+    A codec failure is a statement about the bytes: it recomputes to the same verdict on every
+    attempt, so waiting cannot change it and the entire cost falls on a path that was always going
+    to fail. Passing ``wait_out`` must not widen what gets waited out — only the failures the
+    predicate positively recognises.
+    """
+    exc = RuntimeError("RasterioIOError: ZIPDecode: Decoding error at scanline 0")
+    assert _exhausted(exc, wait_out=is_provider_refusal)[0] == STORE_WRITE_ATTEMPTS
+
+
+def test_a_cause_that_was_stripped_in_transit_gets_no_long_wait():
+    """The blind case, which must fail SHORT rather than expensively.
+
+    A read failure whose cause did not survive the Dask hop arrives as the bare wrapper, and a
+    refusal is unrecognisable in it. That must not draw the long wait on suspicion — the leg fails
+    on its attempt limit and retries, which costs a leg attempt instead of ten idle minutes per
+    date, and it must not be given up either.
+    """
+    assert (
+        _run(RuntimeError("WarpOperationError: Chunk and warp failed"), wait_out=is_provider_refusal)[0]
+        == STORE_WRITE_ATTEMPTS
+    )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(RuntimeError("RasterioIOError: ExpiredToken: the token has expired"), id="our-own-credential"),
+        pytest.param(RuntimeError("IcechunkError: AccessDenied writing the mosaic"), id="the-destination-store"),
+    ],
+)
+def test_a_refusal_that_is_not_the_sources_gets_no_long_wait(exc):
+    """Both exclusions the predicate exists to make, priced.
+
+    A credential fault on this side is repairable here and no waiting fixes it. A refusal from the
+    DESTINATION store is not the source provider's at all — and it says ``AccessDenied`` in the
+    same words the source does, so only the source reader's own vocabulary separates them. Either
+    one must fail the leg on its first date instead of holding a fleet idle first.
+    """
+    assert _exhausted(exc, wait_out=is_provider_refusal)[0] == STORE_WRITE_ATTEMPTS
+
+
+def test_a_moved_branch_tip_is_never_retried_even_when_waiting_something_out():
+    """The exclusion outranks the budget. Otherwise the one error that must never be retried
+    would be retried for as long as the budget allows, on the caller that opted into it.
+    """
+    calls = 0
+    retrying = store_write_retrying(log, wait_out=is_provider_refusal)
+    retrying.sleep = lambda _seconds: None  # type: ignore[method-assign]
+    with pytest.raises(icechunk.ConflictError):
+        for attempt in retrying:
+            with attempt:
+                calls += 1
+                raise _conflict()
+    assert calls == 1
 
 
 def test_concurrent_writer_errors_names_both_collision_shapes():
