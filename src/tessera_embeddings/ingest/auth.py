@@ -251,16 +251,16 @@ def _get_edl_token(session: _EDLSession) -> str:
         raise RuntimeError("EDL authentication failed — check username/password")
     list_resp.raise_for_status()
 
-    # Never quoted on failure: this body carries bearer tokens, and the case that
-    # fails to parse is a truncated one — whose leading bytes are the secret.
-    tokens = json_or_raise(list_resp, quote_body=False)
+    # log_body=False on all three EDL calls: the body that fails to parse is a truncated
+    # credential document, and its leading bytes are the credential.
+    tokens = json_or_raise(list_resp, log_body=False)
     if tokens:
         return tokens[0]["access_token"]
 
     # No existing tokens — create one
     create_resp = session.post(_EDL_TOKEN_URL, timeout=30)
     create_resp.raise_for_status()
-    token = json_or_raise(create_resp, quote_body=False).get("access_token")
+    token = json_or_raise(create_resp, log_body=False).get("access_token")
     if not token:
         raise RuntimeError(f"Unexpected EDL token response: {create_resp.text[:200]}")
     return token
@@ -306,7 +306,7 @@ def get_s3_credentials(
         timeout=60,
     )
     s3_resp.raise_for_status()
-    creds = json_or_raise(s3_resp, quote_body=False)
+    creds = json_or_raise(s3_resp, log_body=False)
 
     required_keys = {"accessKeyId", "secretAccessKey", "sessionToken"}
     if not required_keys.issubset(creds):

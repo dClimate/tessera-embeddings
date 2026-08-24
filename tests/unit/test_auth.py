@@ -7,11 +7,13 @@ are either not invoked or patched; no network access is required.
 
 from __future__ import annotations
 
+import logging
 import os
 
 import pytest
 import requests
 
+from tessera_embeddings.ingest._http import NonJsonResponseError, json_or_raise
 from tessera_embeddings.ingest.auth import _EDLSession
 
 # ---------------------------------------------------------------------------
@@ -400,3 +402,22 @@ def test_credential_drift_keeps_the_tasks_gdal_options(monkeypatch: pytest.Monke
     assert out["later_readdir"] == "EMPTY_DIR"
     # The refresh still has to land, or the options were kept by not refreshing.
     assert out["key"] == "REFRESHED_KEY_BBBBBB"
+
+
+def test_a_credential_body_is_never_logged_or_raised(caplog: pytest.LogCaptureFixture) -> None:
+    """A credential document truncated mid-write is exactly the body that fails to parse.
+
+    Its leading bytes are the credential, so the three EDL calls pass ``log_body=False``.
+    """
+    resp = requests.Response()
+    resp.status_code = 200
+    resp._content = b'{"accessKeyId": "ASIAEXAMPLE", "secretAccessKey": "SUPERSECRET'
+    resp.url = "https://cumulus.asf.alaska.edu/s3credentials"
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(NonJsonResponseError) as exc_info:
+        json_or_raise(resp, log_body=False)
+
+    assert "SUPERSECRET" not in str(exc_info.value)
+    assert "SUPERSECRET" not in caplog.text
+    # Suppressing the body must not cost the fields that identify the failure.
+    assert "cumulus.asf.alaska.edu" in str(exc_info.value)

@@ -75,16 +75,10 @@ _CMR_RETRY = make_logging_retry(
 )
 
 
-#: Attempts at ONE page whose body did not parse as JSON. Scoped deliberately to that
-#: case: a non-JSON body under a success status is the single failure ``_CMR_RETRY``
-#: cannot see, because its ladder keys on status and this response's status is fine.
-#: Every other failure still reaches that ladder, unchanged.
+#: Attempts at ONE page whose body did not parse, and the seconds between them (times the
+#: attempt number). Scoped to that case alone: it is the single failure ``_CMR_RETRY``
+#: cannot see, since its ladder keys on status and this response's status is fine.
 _NON_JSON_PAGE_ATTEMPTS = 4
-
-#: Seconds before re-asking for a page that came back unparseable, multiplied by the
-#: attempt number. The pages this query asks for run to tens of megabytes, so a body that
-#: arrives truncated is evidence the path is briefly under strain — the wait is the only
-#: thing that makes the re-ask different from the ask.
 _NON_JSON_PAGE_BACKOFF_S = 5.0
 
 
@@ -329,45 +323,29 @@ def _fetch_granule_page(
     headers: dict[str, str],
     page: int,
 ) -> tuple[dict[str, Any], str | None]:
-    """Fetch ONE page of granules and parse it, re-asking when the body is not JSON.
+    """Fetch ONE page of granules, re-asking when the body is not JSON.
 
-    Returns the decoded body and the pagination cursor to carry into the next page.
+    Returns the decoded body and the cursor to carry into the next page.
 
-    Retried here because the session's ladder cannot reach this failure: it keys on
-    status, and a truncated or error-page body arrives under a success status that
-    ``raise_for_status`` passes. Left unretried, one unparseable page ends the leg — and a
-    leg is a zone-year, so the cost is every batch it had already written, discarded for a
-    page the archive will serve on the next ask.
-
-    Re-asking is safe to repeat: the request is a GET, and its cursor header is a value
-    the archive issued, so the identical request names the identical page.
+    Retried here because the session's ladder cannot reach this failure: it keys on status,
+    and an unparseable body arrives under a success status that ``raise_for_status`` passes.
+    Unretried, one such page ends a leg that is a zone-year of already-written batches.
+    Safe to repeat — a GET whose cursor the archive itself issued names the identical page.
     """
     for attempt in range(1, _NON_JSON_PAGE_ATTEMPTS + 1):
         resp = session.get(_CMR_GRANULE_URL, params=params, headers=headers, timeout=30)
         resp.raise_for_status()
         try:
-            body = cast(dict[str, Any], json_or_raise(resp, quote_body=True))
-        except NonJsonResponseError as exc:
-            # The body is LOGGED, never raised: the failure message is substring-matched to
-            # decide whether a failed leg may be retried, and provider-chosen text in it
-            # could match a non-retryable marker and strand the zone-year.
+            body = cast(dict[str, Any], json_or_raise(resp, log_body=True))
+        except NonJsonResponseError:
             if attempt == _NON_JSON_PAGE_ATTEMPTS:
-                logger.error(
-                    "CMR page %d still unparseable after %d attempt(s) — %s Body began: %r",
-                    page,
-                    attempt,
-                    exc,
-                    exc.excerpt,
-                )
                 raise
             logger.warning(
-                "CMR page %d came back unparseable (attempt %d/%d), re-asking in %.0fs — %s Body began: %r",
+                "CMR page %d unparseable (attempt %d/%d), re-asking in %.0fs",
                 page,
                 attempt,
                 _NON_JSON_PAGE_ATTEMPTS,
                 _NON_JSON_PAGE_BACKOFF_S * attempt,
-                exc,
-                exc.excerpt,
             )
             time.sleep(_NON_JSON_PAGE_BACKOFF_S * attempt)
             continue

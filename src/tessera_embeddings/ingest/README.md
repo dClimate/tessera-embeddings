@@ -23,7 +23,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `source_coverage.py` | Optical-source preflight: whether the catalogue publishes ANYTHING reaching a zone's live land in a window, answered by limit-1 existence probes over live-tile block envelopes (window padded per the solar-day convention) before any cluster is provisioned. The verdict is three-valued — only a positive finding of absence refuses; inconclusive and provisional-present both pass the cell through, because a wrong refusal loses campaign coverage while a pass-through only costs the late failure it would have hit anyway. Deliberately OUTSIDE the mosaic-content fingerprint closure (its probe is built here, not in `stac.py`), so shipping preflight changes never invalidates in-flight mosaics. Called by the chained fill driver's pre-cluster triage. |
 | `catalogue_refusal.py` | Tells a catalogue that is BUSY apart from one that cannot serve a given REQUEST, and names the request either way. The client stack discards the search body when it wraps a transport failure, so a refusal arrives identifying the host and the endpoint path and nothing about what was asked. Both refusals are one exception type from one endpoint and need opposite responses: waiting is the entire remedy for a stated overload and pure waste against a request that is refused every time. The status separates them but does not settle it — what settles it is an identical REPEAT, which only the layer holding the attempt budget can observe, so this module classifies and that layer supplies the repeat. |
 | `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
-| `_http.py` | Shared HTTP helpers for catalogue and granule queries: `make_logging_retry` (a `urllib3.Retry` that logs each attempt, since urllib3 otherwise retries silently and a stalled query looks like a hang), `spawn_abandonable` (a daemon-thread waiter for calls that must be bounded by a deadline the caller owns), and `json_or_raise`/`NonJsonResponseError` — the guard for a provider that answers 2xx with a body that is not JSON, which no status-based retry ladder can see. |
+| `_http.py` | Shared HTTP helpers for catalogue and granule queries: `make_logging_retry` (a `urllib3.Retry` that logs each attempt, since urllib3 otherwise retries silently and a stalled query looks like a hang), `spawn_abandonable` (a daemon-thread waiter for calls bounded by a deadline the caller owns), and `json_or_raise` — the guard for a provider that answers 2xx with a body that is not JSON, which no status-based retry ladder can see. |
 | `_pipeline.py` | A prepare/consume pipeline with a configurable look-ahead `depth`: overlaps the preparation of the next item with the consumption of the current one on one background thread, and reports the preparation time the consumer had to wait for. Used by the S2 date loop (`pipeline_dates`), with `depth` sized to `batch_dates` so a batch's whole preparation can hide behind the previous batch's write. Depth buys BUFFERING, never concurrency — preparation stays on one thread in order, so the side-effect-free contract holds at any depth. |
 | `live_windows.py` | (Merge exchange rate is caller-owned: pass `WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows share one graph, the higher `WINDOW_COST_IN_CHUNKS` when each is a blocking write. Both S2 and S1 select it from how the run writes, so the rate cannot drift from the write strategy it prices.) Derives the chunk-aligned live windows every ingest loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
 
@@ -2213,45 +2213,22 @@ pagination is handled via the `CMR-Search-After` response header, which pages cl
 
 #### A page that answers 2xx with a body that is not JSON
 
-A granule page can arrive with a success status and a body that does not parse. This is the
-one catalogue failure `_CMR_RETRY` cannot act on: that ladder keys on status, and this
-response's status is fine — only the body is wrong. `raise_for_status` passes it for the same
-reason. Reaching `resp.json()` in that state ends the leg with a bare `JSONDecodeError`
-reading `Expecting value: line 1 column 1 (char 0)`, which names neither the endpoint, nor
-the status, nor what actually arrived — and ingest parses JSON from several endpoints, so
-that message does not even say which one broke.
+A granule page can arrive with a success status and a body that does not parse. It is the one
+catalogue failure `_CMR_RETRY` cannot act on — that ladder keys on status, and this response's
+status is fine — and `raise_for_status` passes it for the same reason.
 
-`_fetch_granule_page` closes both halves:
+`_fetch_granule_page` re-asks such a page, up to `_NON_JSON_PAGE_ATTEMPTS`. Scoped to that case
+alone: every other failure still reaches `_CMR_RETRY` unchanged, and a 5xx is not re-asked here
+because that ladder has already spent its backoff on it. The re-ask replays the archive's own
+cursor, so it names the identical page and cannot skip granules.
 
-- **It re-asks.** A page whose body did not parse is requested again, up to
-  `_NON_JSON_PAGE_ATTEMPTS`, waiting `_NON_JSON_PAGE_BACKOFF_S` times the attempt number in
-  between. The request is a GET and its cursor is a value the archive itself issued, so the
-  re-ask names the identical page and cannot skip granules. Scoped to this case alone: every
-  other failure still reaches `_CMR_RETRY` unchanged, and a 5xx is deliberately not re-asked
-  here because that ladder has already spent its backoff on it.
-- **It names what arrived.** Once the attempts are spent, `json_or_raise` (`_http.py`) raises
-  `NonJsonResponseError` carrying the URL, the status, the `Content-Type` and the body
-  length. A `Content-Type` of `application/json` beside an unparseable body means truncation;
-  `text/html` means an error page.
-
-**The body excerpt is logged, never raised.** It is captured onto `NonJsonResponseError.excerpt`
-and written to the log beside the failure, but it is kept out of the exception message on
-purpose: `ingest_zone_year._is_retryable_leg_failure` decides whether a failed leg may be
-re-dispatched by substring-matching the failure text against `_NON_RETRYABLE_LEG_MARKERS`. The
-excerpt is text the provider chose, so an error page containing one of those marker words —
-`ValidationError` among them — would turn a retryable leg permanently dead and cost a
-zone-year of coverage.
-
-`NonJsonResponseError` defines `__reduce__` because the query runs on a Dask worker and the
-failure is serialised before it reaches the flow. Its constructor is keyword-only, which
-pickle's default rebuild cannot call, so without it the caller receives a flattened substitute
-instead of the fields the class exists to carry.
-
-`json_or_raise` takes `quote_body` with no default, because the safe answer differs per
-endpoint. The catalogue's body is captured — it holds nothing secret, and it is what tells
-truncation apart from an error page. The EDL endpoints in `auth.py` pass `quote_body=False`: a
-document truncated mid-write is exactly the body that fails to parse, and the leading bytes of
-a credential document are the credential.
+`json_or_raise` (`_http.py`) raises `NonJsonResponseError`, naming the endpoint, status, content-type
+and body size. **The body itself is logged, never put in the message:**
+`ingest_zone_year._is_retryable_leg_failure` substring-matches the failure text against
+`_NON_RETRYABLE_LEG_MARKERS`, so a provider error page containing one of those words would turn a
+retryable leg permanently dead. The three EDL calls in `auth.py` pass `log_body=False` — a
+credential document truncated mid-write is exactly the body that fails to parse, and its leading
+bytes are the credential.
 
 ### Burst Timestamp Normalisation
 
