@@ -930,12 +930,34 @@ alongside `get_existing_dates` so a settled date is not outstanding. It is best-
 can precede the first write, and that is also the only case where failing to record is
 harmless, since the refusal needs a later date already on the axis.
 
-**Only a READ failure settles a date** (`PERMANENT_SKIP_SCOPES`). That is the one shape that
-flips — the same objects can read on the next attempt. A coverage rejection or a producer
-conflict is decided during preparation and never reaches the writer, so it cannot wedge
-anything; both are recorded, so a leg that dropped dates can say which, but they stay
-re-offerable. The distinction matters most for the radar path's `provider-refused` scope
-(Cause 5): blocking that would turn a recoverable outage into permanent loss.
+**THE TIME AXIS DECIDES what is settled, not the skip's reason.** A date at or below the
+store's committed maximum can never be appended, so re-offering it can only end in the fatal
+refusal, whatever it was skipped for. Above the maximum it is still appendable, so it is worth
+one more attempt however permanent the earlier failure looked — if the source has recovered the
+hole is filled, and if not the cost is one read attempt. `scope` is provenance and reporting.
+
+**Corrected in place.** This first keyed settlement on a set of "permanent" scopes, on the
+reasoning that only a read failure can flip while a coverage rejection or producer conflict is
+decided during preparation and never reaches the writer. **That was wrong in both directions at
+once, and two independent reviewers found one direction each.** It was too permissive: a
+`coverage` or `provider-refused` date was re-offered, and if the condition had cleared it then
+produced data, reached the writer below the maximum, and raised — the exact failure this
+mechanism exists to close, reachable through the scopes that looked safest. And too strict: a
+read failure at the TAIL, with nothing later committed, is still appendable, so suppressing it
+made a recovered source unreachable and the hole permanent for no reason.
+
+**Two further holes in the same mechanism, from the same reviews.** A record whose write can
+fail silently is not durable: only a genuinely absent repository is recoverable (the caller
+holds the entry and flushes it after the next write, which is when a store starts existing);
+everything else raises. And reading the record no longer answers "nothing is settled" on a
+transient failure, which would have re-offered every settled date at once — the fatal path for
+all of them. The general rule both violated: never convert an unknown into a permissive answer.
+
+**And the end-of-leg record carries forward** what earlier attempts settled, dropping only
+dates now present on the axis. Writing it from the current invocation's list alone erased the
+earlier losses, because a resumed leg does not re-offer a settled date and so never re-derives
+its record — after which a parent could stamp a completion marker over a mosaic whose holes
+were recorded nowhere.
 
 The radar path had the same end-of-leg-only record and gets the same treatment.
 
