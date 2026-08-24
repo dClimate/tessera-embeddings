@@ -46,7 +46,8 @@ import itertools
 import logging
 import re
 from collections.abc import Iterable, Sequence
-from typing import Any
+from enum import StrEnum
+from typing import Any, assert_never
 
 from tessera_embeddings.config.satellites import S2_BASELINE_THRESHOLD
 from tessera_embeddings.ingest.asset_locations import (
@@ -780,6 +781,86 @@ _MISSING_OBJECT_MARKERS = (
 )
 
 
+class ReadFailure(StrEnum):
+    """What one read failure IS — exactly one member, so no two verdicts can both apply.
+
+    The point of a closed set here is not tidiness. Correctness used to rest on nine marker tuples
+    being jointly COMPLETE and mutually EXCLUSIVE, with nothing checking either: gaps recurred one
+    status at a time (429, then 401, then every 5xx), and an overlap let call ORDER decide whether a
+    date was skipped or a leg retried. A function returning one member cannot overlap, and a member
+    nobody handles is a decision somebody has to make rather than a silence.
+
+    Ordered by what the evidence is ABOUT, and that order is the classification:
+
+    * :attr:`OUR_CREDENTIAL` — repairable here, and no waiting or copy fixes it.
+    * :attr:`PROVIDER_REFUSED` — the service said no; only time resolves it.
+    * :attr:`REFUSAL_UNATTRIBUTED` — refusal words with nothing tying them to the source reader.
+      Every string in the refusal markers belongs to S3, and the destination store speaks S3 too,
+      so unattributed it may be our own bucket answering and must claim nothing.
+    * :attr:`CLIENT_ERROR` — the request is wrong; every copy sends the same kind of request.
+    * :attr:`UNREADABLE` — these bytes will not yield, on this attempt or any other.
+    * :attr:`ABSENT` — the object was never published.
+    * :attr:`UNDECIDABLE` — no evidence either way, which is what a cause destroyed crossing the
+      worker boundary looks like. It earns nothing: no wait on suspicion, and no date given up.
+    """
+
+    OUR_CREDENTIAL = "our-credential"
+    PROVIDER_REFUSED = "provider-refused"
+    REFUSAL_UNATTRIBUTED = "refusal-unattributed"
+    CLIENT_ERROR = "client-error"
+    UNREADABLE = "unreadable"
+    ABSENT = "absent"
+    UNDECIDABLE = "undecidable"
+
+
+def _means_the_copy_is_lost(verdict: ReadFailure) -> bool:
+    """Whether ``verdict`` says THIS COPY will not yield its bytes.
+
+    Written as an exhaustive match rather than a set so the type checker enforces what the closed
+    set is for: add a member and mypy reports this function as reachable past its cases, naming the
+    member it does not handle. A set would silently answer ``False`` for anything new, which is the
+    quiet-wrong-answer this whole design exists to remove — and the direction that costs a store.
+    """
+    match verdict:
+        case ReadFailure.UNREADABLE | ReadFailure.ABSENT:
+            return True
+        case (
+            ReadFailure.OUR_CREDENTIAL
+            | ReadFailure.PROVIDER_REFUSED
+            | ReadFailure.REFUSAL_UNATTRIBUTED
+            | ReadFailure.CLIENT_ERROR
+            | ReadFailure.UNDECIDABLE
+        ):
+            return False
+    assert_never(verdict)
+
+
+def classify_read_failure(exc: BaseException) -> ReadFailure:
+    """The single verdict for ``exc``, from which both public predicates are derived.
+
+    Text over ``isinstance`` for the reason :func:`_exception_chain_text` gives. The ORDER is the
+    policy and each step is a claim about what outranks what: our own fault first, because no
+    amount of waiting or stepping down repairs it; then the service refusing, because that outranks
+    every statement about bytes made in the same chain; then the request being wrong, since no copy
+    is fetched differently; and only then anything about the data itself.
+    """
+    text = _exception_chain_text(exc)
+    if any(m in text for m in _OWN_CREDENTIAL_MARKERS):
+        return ReadFailure.OUR_CREDENTIAL
+    if _names_a_transient_refusal(text):
+        if not any(m in text for m in _SOURCE_READER_MARKERS):
+            return ReadFailure.REFUSAL_UNATTRIBUTED
+        return ReadFailure.PROVIDER_REFUSED
+    statuses = _http_statuses(text)
+    if any(400 <= n < 500 and n not in _ABSENT_4XX and n != 403 for n in statuses):
+        return ReadFailure.CLIENT_ERROR
+    if any(m in text for m in _UNREADABLE_MARKERS):
+        return ReadFailure.UNREADABLE
+    if any(m in text for m in _MISSING_OBJECT_MARKERS) and any(m in text for m in _SOURCE_READER_MARKERS):
+        return ReadFailure.ABSENT
+    return ReadFailure.UNDECIDABLE
+
+
 def _names_a_transient_refusal(text: str) -> bool:
     """Whether the chain says the SERVICE refused, by name or by status RANGE.
 
@@ -816,29 +897,9 @@ def is_unreadable_source(exc: BaseException) -> bool:
     Note what is NOT matched: a whole bucket or prefix being gone, which is systemic by
     definition and must fail the run on the first date rather than be skipped date by date.
     """
-    text = _exception_chain_text(exc)
-    if any(m in text for m in _NOT_THE_DATAS_FAULT):
-        return False
-    # A PROVIDER REFUSAL IS NEVER BAD DATA, whatever wrapper it arrives in. This once overlapped
-    # a separate refusal predicate, since removed: a refusal reaches us through a block-read
-    # wrapper, so the chain carries a refusal marker AND an unreadable one, and whichever
-    # predicate the caller happened to ask first decided. The radar path asked about refusals
-    # first and the optical path never asked at all, so the same failure was transient for one
-    # sensor and permanent data loss for the other. Excluding them here makes the two disjoint by
-    # construction, so neither call order nor a caller that knows only one predicate can
-    # misclassify. Through the SHARED classifier, so the two cannot drift apart: what
-    # `is_provider_refusal` claims is exactly what this declines.
-    # See context_docs/monitoring/incident-2026-08-24-nonmonotonic-append.md.
-    if _names_a_transient_refusal(text):
-        return False
-    statuses = _http_statuses(text)
-    # Ranged, so a status nobody enumerated cannot be read as bad data. See the note on
-    # `_HTTP_STATUS_RE` for why each range is decidable.
-    if any(400 <= s < 500 and s not in _ABSENT_4XX and s != 403 for s in statuses):
-        return False
-    if any(m in text for m in _UNREADABLE_MARKERS):
-        return True
-    return any(m in text for m in _MISSING_OBJECT_MARKERS) and any(m in text for m in _SOURCE_READER_MARKERS)
+    # Derived, so this cannot disagree with `is_provider_refusal`: one classifier assigns one
+    # verdict and each predicate reports which verdicts it owns.
+    return _means_the_copy_is_lost(classify_read_failure(exc))
 
 
 def cause_was_flattened(exc: BaseException) -> bool:
@@ -1026,12 +1087,7 @@ def is_provider_refusal(exc: BaseException) -> bool:
     Returns:
         ``True`` when the chain names a refusal the provider owns.
     """
-    text = _exception_chain_text(exc)
-    if any(m in text for m in _OWN_CREDENTIAL_MARKERS):
-        return False
-    if not any(m in text for m in _SOURCE_READER_MARKERS):
-        return False
-    return _names_a_transient_refusal(text)
+    return classify_read_failure(exc) is ReadFailure.PROVIDER_REFUSED
 
 
 def step_down_copies(

@@ -815,6 +815,92 @@ This is a fully lazy Dask operation — no data is materialised until the Zarr w
 
 ---
 
+## When a read fails
+
+Reading one satellite image can fail for very different reasons, and the right answer to each is
+different — sometimes opposite. Getting it wrong is expensive both ways. Give up too easily and we
+punch a permanent hole in a dataset, because the time axis only ever grows: once a later date is
+written, an earlier one can never be filled in. Give up too late and one bad file stops a whole
+year of work that was otherwise fine.
+
+So a failed read is asked one question, once, and gets exactly one answer.
+
+```
+                            a read fails
+                                 |
+                                 v
+                  +-------------------------------+
+                  |  What does the error say the  |
+                  |  problem actually IS?         |
+                  +-------------------------------+
+                                 |
+   our own login is wrong  <-----+-----> the provider said "no"
+   (bad key, expired token)      |       (busy, throttling, 500s, "access denied")
+        |                        |            |
+        v                        |            v
+   STOP the job.                 |       WAIT, then ask again. Their bad day,
+   No retry and no other         |       not our data. Minutes, not seconds.
+   copy fixes our own key.       |
+                                 |
+   the request is wrong  <-------+-------> the file is damaged
+   (400, 401, a bad URL)         |         (won't decompress, truncated,
+        |                        |          missing a band we need)
+        v                        |            |
+   STOP the job.                 |            v
+   Every copy is fetched         |       Try ANOTHER COPY of the same
+   the same way, so no           |       image. Providers often publish
+   copy will read either.        |       the same scene twice. Only if no
+                                 |       copy is left, skip this one date.
+                                 |
+                                 +-----> the file was never published
+                                 |       (404, "no such key")
+                                 |            |
+                                 |            v
+                                 |       Same as damaged: another copy first,
+                                 |       then skip the date if there is none.
+                                 |
+                                 +-----> WE CANNOT TELL
+                                              |
+                                              v
+                                         Fail the job so it runs again later.
+                                         Never skip a date on a guess.
+```
+
+The last branch is the important one. **A date is only ever abandoned on positive evidence that the
+image itself is unusable.** Anything we cannot explain fails the job instead, which costs time and
+is recoverable, rather than costing a date, which is not.
+
+### Why "we cannot tell" happens at all
+
+The image is read on one machine and the decision is made on another. Sending an error between
+machines loses the useful part: what arrives is the outer message ("read failed, see the previous
+error") without the previous error attached. The reason — say, "this file will not decompress" —
+stays behind on the machine that read it.
+
+We fix that at the source rather than guessing afterwards. Every machine that reads is given a
+small patch that lets the real reason travel with the error, and a job **refuses to start** unless
+every machine confirms it has that patch. A job that cannot explain its own failures is a job that
+can quietly ruin a dataset, so it is better not to start.
+
+### Waiting: where it happens changes what it costs
+
+Two different budgets, for one reason:
+
+```
+  waiting INSIDE a running job     ~ minutes    the machines it rented sit idle, so this is expensive
+  waiting BETWEEN attempts          ~ tens of   the machines are already released, so this is nearly
+                                      minutes   free — patience goes here
+```
+
+A provider having a bad minute is ridden out inside the job. A provider having a bad half-hour is
+better handled by letting the job fail, releasing the machines, and trying again later — a restart
+picks up from the dates already written, so nothing is redone.
+
+One extra guard: the long wait is only granted after a job has already read something successfully.
+"Access denied" looks identical whether the provider is misbehaving or our permissions are simply
+wrong — but wrong permissions fail the very first image, while a provider wobble arrives after the
+job has already been served. So the first successful read is what earns the patience.
+
 ## Performance Optimizations
 
 ### Cropping to live windows (unconditional)
