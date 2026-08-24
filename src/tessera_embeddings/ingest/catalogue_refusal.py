@@ -72,6 +72,14 @@ UPSTREAM_ERROR_STATUSES = frozenset({500, 502, 504})
 #: the leg once and letting the attempt budget decide.
 OVERSIZED_RESPONSE_STATUSES = frozenset({502})
 
+#: Statuses that are a THROTTLE from some providers and an authorization verdict from
+#: others, so they are named per provider and never globally. Where a catalogue is public
+#: and unauthenticated, a 403 cannot be about who is asking and waiting is the remedy —
+#: the same remedy as 429. Where it is about who is asking, no amount of patience can
+#: change the answer and a backoff ladder is spent to learn nothing. The caller that knows
+#: which catalogue it is talking to passes this in; the default names neither.
+THROTTLE_STATUSES = frozenset({403})
+
 #: Name under which the signature is emitted into the failure text. Matched by NAME —
 #: never by position within the message — so the human-readable detail around it can
 #: change without breaking the parse.
@@ -239,8 +247,14 @@ def _status_from_exhaustion(exc: BaseException) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def classify_refusal(exc: BaseException) -> CatalogueRefusal:
+def classify_refusal(exc: BaseException, *, throttle_statuses: frozenset[int] = frozenset()) -> CatalogueRefusal:
     """Classify a catalogue failure by the status it rests on.
+
+    ``throttle_statuses`` names the statuses THIS catalogue uses to mean "slow down", for
+    the ones that mean something else elsewhere (see :data:`THROTTLE_STATUSES`). They are
+    classified ``LOAD``, which is the same answer 429 gets and for the same reason. Empty
+    by default, so a caller that does not know which catalogue it is talking to cannot
+    accidentally put an authorization refusal on a backoff ladder.
 
     Reads the exception CHAIN rather than the top-level message, because the status is
     structured data one or two links down and the top-level text is a stringification
@@ -253,22 +267,22 @@ def classify_refusal(exc: BaseException) -> CatalogueRefusal:
     """
     for link in _chain(exc):
         if isinstance(link, MaxRetryError) and (status := _status_from_exhaustion(link)) is not None:
-            return CatalogueRefusal(_kind_for(status), status, exhausted=True)
+            return CatalogueRefusal(_kind_for(status, throttle_statuses), status, exhausted=True)
         code = getattr(link, "status_code", None)
         if isinstance(code, int):
-            return CatalogueRefusal(_kind_for(code), code, exhausted=False)
+            return CatalogueRefusal(_kind_for(code, throttle_statuses), code, exhausted=False)
     # The chain is gone (a re-raise across a boundary that carries only text, a client
     # that raises `from None`). urllib3's exhaustion cause is still quoted inside the
     # message it stringified, so the weaker read is the same read on worse evidence.
     match = _EXHAUSTED_STATUS_RE.search(str(exc))
     if match:
         status = int(match.group(1))
-        return CatalogueRefusal(_kind_for(status), status, exhausted=True)
+        return CatalogueRefusal(_kind_for(status, throttle_statuses), status, exhausted=True)
     return CatalogueRefusal(RefusalKind.UNKNOWN, None, exhausted=False)
 
 
-def _kind_for(status: int) -> RefusalKind:
-    if status in LOAD_REFUSAL_STATUSES:
+def _kind_for(status: int, throttle_statuses: frozenset[int]) -> RefusalKind:
+    if status in LOAD_REFUSAL_STATUSES or status in throttle_statuses:
         return RefusalKind.LOAD
     if status in UPSTREAM_ERROR_STATUSES:
         return RefusalKind.UPSTREAM_ERROR
@@ -335,6 +349,7 @@ def raise_catalogue_query_error(
     *,
     log: logging.Logger | logging.LoggerAdapter | None = None,
     items_so_far: int | None = None,
+    throttle_statuses: frozenset[int] = frozenset(),
 ) -> NoReturn:
     """Log the failing request, then raise it classified.
 
@@ -344,7 +359,7 @@ def raise_catalogue_query_error(
     signature that has to be stable across attempts.
     """
     log = log or logger
-    refusal = classify_refusal(cause)
+    refusal = classify_refusal(cause, throttle_statuses=throttle_statuses)
     log.error(
         "CATALOGUE REFUSED %s with %s%s — classified %s. A load refusal is waited out; an "
         "upstream error that repeats on the identical request is not.",

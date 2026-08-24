@@ -1,9 +1,10 @@
-# Ingest source-read failures: five causes, and the retry budget they share
+# Ingest source-read failures: six causes, and the retry budget they share
 
 Investigation record. Causes 1 and 2 traced 2026-08-04/05 on `global-tessera-dev`; cause 3 absorbed
-2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20
-and cause 5 on 2026-08-21, both from live campaign legs. **Corrected in place: this document said
-"three causes" until cause 4 was added, and "four causes" until cause 5 joined it.** Traces
+2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20,
+cause 5 on 2026-08-21 and cause 6 on 2026-08-22/23, all from live campaign legs. **Corrected in
+place: this document said "three causes" until cause 4 was added, "four causes" until cause 5
+joined it, and "five causes" until cause 6 did.** Traces
 `WarpOperationError('Chunk and warp failed')` and `PermissionError: The provided token has
 expired` to their exact causes, so the guards can be aimed at the right terms.
 
@@ -433,8 +434,14 @@ failure mode that survives a green CI run.
 `400` and other client errors classify as `UNKNOWN` and keep today's expansive retry. They are
 deterministic in the request by definition, so this is arguably wrong — but no observed failure
 has that shape, and a general-purpose HTTP classifier was explicitly out of scope. A unit test
-asserts the two named sets jointly cover `_STAC_RETRY.status_forcelist`, which is the set that
-can actually reach us as an exhaustion.
+asserts the named sets jointly cover the ladder's force-list, which is the set that can actually
+reach us as an exhaustion.
+
+**Corrected in place, 2026-08-23.** That test read a module-level `_STAC_RETRY` constant, and
+`403` has since become a fourth case: named for one provider and deliberately unnamed for the
+rest (cause 6). There is no longer one ladder to read, so the invariant is checked per provider
+against `stac._retry_for(provider)` — a status a catalogue is waited out for and the taxonomy
+cannot name is the same silent failure whether the retry is global or scoped.
 
 ### Fingerprint consequence — a real cost, paid once
 
@@ -758,6 +765,98 @@ options — the HTTP retry ladder among them — survive the refresh. `reset()` 
 other two call sites, neither of which is nested inside `rio_env()`. A task that has been through a
 refresh therefore keeps its ten GDAL retries, which is the containment this cause's bounded skip
 sits on top of.
+
+## Cause 6 — the catalogue refuses the RATE (optical), 2026-08-22/23
+
+The catalogue analogue of cause 5. Same status, opposite end of the pipeline: cause 5 is a
+provider refusing OBJECT READS on the radar path, this is a catalogue refusing SEARCH REQUESTS on
+the optical one.
+
+| | source | preceded by | retryable? |
+|---|---|---|---|
+| **Catalogue refusing the rate** | Earth Search (Element 84), `sentinel-2-l2a` | `HTTP 403 {"message":"Forbidden"}` on `POST /v1/search` | **yes** — by waiting, not by asking differently |
+
+### The failure
+
+16 flow runs failed in a 2.5-minute burst about fifteen minutes after the campaign started from a
+freshly wiped store, every one a Sentinel-2 catalogue query refused with 403. Sentinel-1 was
+entirely spared: 13,764 CMR query lines, zero refusals — so this is one catalogue's constraint,
+not a network fault. Nine leg failures in total, every one re-dispatched, no cell lost. Survivable
+but degrading.
+
+**The request is not the problem; the aggregate instantaneous rate is.** One of the exact failing
+requests — same bbox, same date window, same page size of 100 — replayed from a single sequential
+client walked **95 pages, every one HTTP 200, in 68 seconds** at 2.1 MB per page. Page depth is
+not the mechanism either: the fleet's 403s span pages 1 through 94.
+
+### Corrected in place: it is not a cold-start phenomenon
+
+This was first read as a single burst caused by phase alignment — 60 cells started at one instant,
+each spending about as long provisioning, all arriving at the catalogue together, where previous
+campaigns at the same 60-cell width had been resumed runs whose cells sat at random phases. **That
+was measured on the wrong needle.** Counting the `CATALOGUE REFUSED` log line found one episode;
+counting `CATALOGUE_REFUSAL=` — the `REFUSAL_TOKEN` the code says to match by name — finds three:
+
+| bin (UTC) | events | pages |
+|---|---|---|
+| 23:20 | 96 | 40–93 |
+| 23:35 | 6 | 43 |
+| 23:40 | 6 | 43 |
+
+And zone 47N failed **24 minutes into a healthy leg**: it had committed 2017-01-25 through
+2017-01-31 normally, then died querying the next window (`2017-01-31/2017-03-01`, page 43). Phase
+alignment explains the opening peak and nothing after it.
+
+**The two needles disagree in both directions, and that is a measurement hazard, not a code
+defect.** The ERROR line yielded 446 events where the token yielded 96, and zero for the 23:35 and
+23:40 episodes the token found. They read different populations: the line is emitted once per
+refusal reaching `raise_catalogue_query_error` and lands in the application log, while the token
+travels inside the exception MESSAGE and is re-logged by the leg loop at up to five sites per
+attempt (`_run_leg`'s re-dispatch, load-refusal, doomed, wall-clock and terminal branches all
+interpolate the failure detail). Neither count is the number of refusals. **Use the token for
+existence and the line for per-request forensics, and do not compare their totals.** Not fixed
+here — it needs the log lines restructured, which is not a mid-incident change.
+
+### Why no lever engaged
+
+`403` was in none of the three status sets in `ingest/catalogue_refusal.py`, so `_kind_for(403)`
+returned `UNKNOWN`, `is_oversized_response` was False, and neither recovery lever ran. It was also
+absent from the urllib3 force-list, so it arrived on the FIRST refusal with no backoff at all and
+raised straight out of the leg. That is the literal content of "without being retried" in the
+failure text: a leg representing hours of work and a live Dask fleet, ended by a refusal that
+clears on its own in seconds.
+
+### The change, and why it is provider-scoped
+
+`THROTTLE_STATUSES = frozenset({403})`, deliberately NOT added to `LOAD_REFUSAL_STATUSES`.
+`STACProvider` gains `throttles_with_forbidden`, set only on `earth-search`; `stac._retry_statuses`
+builds each provider's force-list from its flags, and `stac._throttle_statuses` feeds the same flag
+into the classification so the ladder and the taxonomy cannot fall out of step.
+
+The scoping is the whole point. Earth Search is public and unauthenticated — we send it no
+credential — so a 403 from it cannot be a statement about who is asking. Everywhere else it is
+exactly that, and an authorization verdict on a backoff ladder is pure cost: **364 s of measured
+backoff** per refused request (`total=8`, `backoff_factor=2`, urllib3's `DEFAULT_BACKOFF_MAX` of
+120 capping the tail at 2, 4, 8, 16, 32, 64, 120, 120), spent to learn something already known.
+This mirrors `refuses_oversized_pages`, which scopes the 502 exclusion the same way.
+
+**Bounding the pair rather than each lever.** The two existing recovery levers — window re-cut and
+page-size halving — both gate on `is_oversized_response`, which is `status in {502}`. A 403
+therefore cannot reach either, so it cannot hand a ladder to a recursion of child windows the way
+a force-listed 500 would. Its worst case is the ladder's own 364 s per page request, and
+`max_leg_wall_clock_s` (6 h) bounds the leg above that. A unit test pins the non-interaction, since
+adding 403 to `OVERSIZED_RESPONSE_STATUSES` later would be a silent multiplication.
+
+### The stagger, and what it does not fix
+
+`leg_stagger_window_s` (default 600 s) delays each leg's first dispatch by an offset derived from
+`sha256(zone/year/label)` — deterministic so a test can assert it, and not `random` or `hash`,
+neither of which is reproducible inside a worker. At the campaign's width that puts legs roughly
+5–10 s apart, which is the separation the fleet needed.
+
+**It addresses the opening peak only.** It cannot help a leg that starts a new window mid-run,
+which is what zone 47N did, and it should not be described as the fix for this cause — the ladder
+is. It is also paid as latency on every leg's first dispatch, not only on a cold start.
 
 ## Coupling to the leg retry
 

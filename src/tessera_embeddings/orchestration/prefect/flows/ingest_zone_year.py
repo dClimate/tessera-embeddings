@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from hashlib import sha256
 from time import monotonic
 from typing import Any, cast
 
@@ -301,6 +302,23 @@ def _leg_failure_detail(run: object, label: str) -> str | None:
         message = getattr(state, "message", None) or ""
         return f"{exc}{f': {message}' if message else ''}"
     return None
+
+
+def _leg_stagger_s(zone: str, year: int, label: str, window_s: int) -> float:
+    """Seconds this leg delays its FIRST dispatch by, to decorrelate the fleet's cold start.
+
+    Derived from the leg's identity rather than drawn at random, so a leg's delay is the same
+    on every run and a test can assert it. ``hash`` would not do: it is salted per process, so
+    two workers would not agree on the spread. Spread across the whole window instead of by a
+    fixed step because a leg cannot know how many others are running — identical identities
+    collide, but a collision leaves two legs in phase, not the whole fleet.
+
+    Returns 0 for a window of 0, which is how the stagger is turned off.
+    """
+    if window_s <= 0:
+        return 0.0
+    digest = sha256(f"{zone}/{year}/{label}".encode()).digest()
+    return window_s * int.from_bytes(digest[:8], "big") / 2**64
 
 
 def _is_retryable_leg_failure(detail: str) -> bool:
@@ -674,6 +692,19 @@ async def ingest_zone_year(
         the source catalogue, a marker meaning a re-dispatch cannot help, a load refusal that is
         evidence FOR patience — read per leg instead of per round.
         """
+        # Before the wall-clock anchor, so a leg's stagger is not charged to the budget that
+        # decides whether it may attempt again.
+        if (stagger := _leg_stagger_s(zone, year, label, ingest_settings.leg_stagger_window_s)) > 0:
+            log.info(
+                "Zone %s year %s: %s — waiting %.0f s before its first dispatch so the fleet "
+                "does not reach the catalogue in phase (leg_stagger_window_s=%d).",
+                zone,
+                year,
+                label,
+                stagger,
+                ingest_settings.leg_stagger_window_s,
+            )
+            await asyncio.sleep(stagger)
         started = monotonic()
         last_token: str | None = None
         detail: str | None = None

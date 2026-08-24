@@ -219,9 +219,9 @@ class TestGranuleToItem:
     def test_skip_reports_polarizations_found(self, caplog):
         """The counter names WHAT was published, so an anomaly is quantifiable per query.
 
-        Since the query filters POLARIZATION server-side, anything reaching here advertised VV
-        in its metadata and then published something else — a catalogue inconsistency rather
-        than a regional coverage fact, which is what the message now says.
+        Since the query requires POLARIZATION to name BOTH polarisations, anything reaching
+        here claimed the pair in its metadata and then published something else — a catalogue
+        inconsistency rather than a regional coverage fact, which is what the message says.
 
         The cross-pol label deliberately does NOT claim EW mode. It used to read
         "(EW-mode?)", and that guess cost real investigation time: checked against CMR, the
@@ -241,9 +241,18 @@ class TestGranuleToItem:
             "no data links": 1,
         }
         assert "EW-mode" not in caplog.text, "the swath-mode guess must not come back"
-        assert "the published bands are ['VV']" in caplog.text
-        assert "the published bands are ['HH', 'HV']" in caplog.text
-        assert "the published bands are none" in caplog.text
+        assert "published bands are ['VV']" in caplog.text
+        assert "published bands are ['HH', 'HV']" in caplog.text
+        assert "published bands are none" in caplog.text
+        # It used to interpolate our OWN required-polarisation constant into a "CMR reported"
+        # slot, so it could only ever print that constant back. The granule search response
+        # carries no polarisation field at all, so nothing here may claim to quote the
+        # catalogue — it names what the QUERY required.
+        assert "CMR reported" not in caplog.text
+        assert "requiring POLARIZATION to include VV+VH" in caplog.text
+        # A granule that publishes only VV is single-polarisation, not self-contradictory; the
+        # verdict is about the disagreement between its metadata and its links.
+        assert "inconsistent with its own metadata" not in caplog.text
 
     def test_handles_missing_polygon(self):
         item = _granule_to_item(_granule_entry("g1", with_ring=False))
@@ -270,8 +279,8 @@ class TestQueryCmrGranules:
         """BOTH filters, orbit and polarisation, and both server-side.
 
         The polarisation one is a cost fix, not a correctness one: ingest needs dual-pol
-        VV+VH, so a granule whose POLARIZATION lacks VV is rejected client-side anyway. Asking
-        CMR to exclude them is what stops us paying to page them. Measured on the all-Greenland
+        VV+VH, so a granule whose POLARIZATION lacks either is rejected client-side anyway.
+        Asking CMR to exclude them is what stops us paying to page them. Measured on the all-Greenland
         zone 23N, a month's descending query went from 7.9 s over 138k rejected granules to
         0.6 s over none, and on mixed zone 25N from 11.6 s to 2.7 s returning the SAME 2,799
         usable items — which is the property that makes it safe.
@@ -285,17 +294,20 @@ class TestQueryCmrGranules:
         assert mock_get.call_args.kwargs["params"]["attribute[]"] == [
             "string,ASCENDING_DESCENDING,DESCENDING",
             "string,POLARIZATION,VV",
+            "string,POLARIZATION,VH",
         ]
 
-    def test_requires_co_pol_only(self):
-        """Requiring VH as well would be redundant; requiring it instead would admit nothing new.
+    def test_requires_both_polarisations_not_just_vv(self):
+        """VV alone is NOT equivalent to the pair, which is what the old filter assumed.
 
-        CMR matches a multi-valued attribute if ANY value matches, so VV alone admits every
-        VV+VH granule.
+        CMR matches a multi-valued attribute if ANY of its values matches, so VV alone admits
+        every dual VV+VH granule — and also every genuinely single-polarisation VV-only one,
+        which ingest cannot use. Repeating the attribute name is what makes CMR require both,
+        and requiring both is what stops those being paged and rejected one at a time.
         """
-        from tessera_embeddings.ingest.opera_query import _REQUIRED_POLARIZATION
+        from tessera_embeddings.ingest.opera_query import _REQUIRED_POLARIZATIONS
 
-        assert _REQUIRED_POLARIZATION == "VV"
+        assert _REQUIRED_POLARIZATIONS == ("VV", "VH")
 
     def test_paginates_with_cmr_search_after(self):
         page1 = _cmr_response(

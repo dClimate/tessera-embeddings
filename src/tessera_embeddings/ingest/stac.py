@@ -44,6 +44,7 @@ from tessera_embeddings.ingest.asset_locations import (
 from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.catalogue_refusal import (
     OVERSIZED_RESPONSE_STATUSES,
+    THROTTLE_STATUSES,
     CatalogueRequest,
     bbox_area_label,
     classify_refusal,
@@ -96,38 +97,57 @@ def chunks_to_odc(chunks: dict[str, int]) -> dict[str, int]:
 logger = logging.getLogger(__name__)
 
 
-_STAC_RETRY = make_logging_retry(
-    "STAC",
-    total=8,
-    backoff_factor=2,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset(["GET", "POST"]),
-    respect_retry_after_header=True,
-)
+#: Statuses every catalogue's page fetches are retried in place for. Provider flags add to
+#: and subtract from this — see :func:`_retry_statuses`.
+_STAC_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
-# The same ladder without 502, for a provider that refuses an oversized response with one.
-#
-# There the remedy is to ask a DIFFERENT request — a shorter date window, or fewer items per
-# page — so retrying the same one first buys nothing and costs the ladder's whole backoff
-# before the remedy can start. Measured at 364 s per refused request.
-#
-# Scoped to that provider rather than applied to the session, because nothing was measured
-# about anyone else's 502 and a catalogue with no such remedy wants its retries. 429 and 503
-# stay in both, since those are the refusals where waiting IS the remedy, and connection and
-# read failures keep the full ladder either way because they carry no status.
-_STAC_RETRY_NO_502 = make_logging_retry(
-    "STAC",
-    total=8,
-    backoff_factor=2,
-    status_forcelist=(429, 500, 503, 504),
-    allowed_methods=frozenset(["GET", "POST"]),
-    respect_retry_after_header=True,
-)
+
+def _retry_statuses(provider: STACProvider) -> frozenset[int]:
+    """Which statuses this provider's requests are retried IN PLACE for.
+
+    Both adjustments are per provider rather than applied to the session, because each rests
+    on a measurement of one catalogue and a catalogue that does not behave that way wants the
+    default. 429 and 503 are in every ladder, since those are the refusals where waiting is
+    unambiguously the remedy, and connection and read failures keep the ladder either way
+    because they carry no status at all.
+
+    **502 comes OUT for a provider that refuses an oversized response with one.** There the
+    remedy is to ask a DIFFERENT request — a shorter date window, or fewer items per page — so
+    retrying the same one first buys nothing and costs the ladder's whole backoff before the
+    remedy can start.
+
+    **403 goes IN for a provider that throttles with it.** Otherwise it reaches the query
+    layer on the first refusal, finds no remedy there — asking for less does not help a
+    catalogue that is refusing the rate — and fails the whole leg. A leg is hours of work and
+    a fleet, so a momentary refusal costs both; the ladder absorbs it instead.
+    """
+    statuses = _STAC_RETRY_STATUSES
+    if provider.refuses_oversized_pages:
+        statuses -= OVERSIZED_RESPONSE_STATUSES
+    if provider.throttles_with_forbidden:
+        statuses |= THROTTLE_STATUSES
+    return statuses
+
+
+def _throttle_statuses(provider: STACProvider) -> frozenset[int]:
+    """The statuses that mean "slow down" from THIS provider, for classifying its refusals.
+
+    Read off the same flag the ladder is built from, so a status the ladder waits out cannot
+    be classified as something patience does not fix.
+    """
+    return THROTTLE_STATUSES if provider.throttles_with_forbidden else frozenset()
 
 
 def _retry_for(provider: STACProvider) -> Retry:
     """The retry ladder this provider's requests should sit behind."""
-    return _STAC_RETRY_NO_502 if provider.refuses_oversized_pages else _STAC_RETRY
+    return make_logging_retry(
+        "STAC",
+        total=8,
+        backoff_factor=2,
+        status_forcelist=tuple(sorted(_retry_statuses(provider))),
+        allowed_methods=frozenset(["GET", "POST"]),
+        respect_retry_after_header=True,
+    )
 
 
 # (connect_timeout, read_timeout) in seconds. Without an explicit timeout,
@@ -1196,7 +1216,9 @@ class _PerThreadClient:
                     )
                     time.sleep(_ROOT_OPEN_BACKOFF_S * attempt)
                     continue
-                raise_catalogue_query_error(request, exc, log=logger)
+                raise_catalogue_query_error(
+                    request, exc, log=logger, throttle_statuses=_throttle_statuses(self._provider)
+                )
         raise AssertionError("unreachable: the loop either returns or raises")  # pragma: no cover
 
 
@@ -1306,7 +1328,13 @@ def _walk_query_window(
                     )
                     node.children = [_WindowWalk(node.bbox, node.window, smaller)]
                     return
-            raise_catalogue_query_error(request, exc, log=logger, items_so_far=len(node.items))
+            raise_catalogue_query_error(
+                request,
+                exc,
+                log=logger,
+                items_so_far=len(node.items),
+                throttle_statuses=_throttle_statuses(provider),
+            )
         for raw in page.get("features", []):
             # `id` is required by the STAC spec; an item without one cannot be deduped by
             # the assembly step, and defaulting it would collapse EVERY such item into a

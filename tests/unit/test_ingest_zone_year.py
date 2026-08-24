@@ -602,6 +602,58 @@ class TestLegFailureDetail:
         assert "did not complete successfully" in detail
 
 
+class TestTheLegStaggerDecorrelatesTheColdStart:
+    """Every cell starts at once and each leg then spends about as long provisioning, so the
+    fleet reaches the catalogue in phase and a source can refuse the instantaneous rate even
+    though it serves each request happily on its own. The offset breaks that phase alignment.
+    """
+
+    def test_offsets_are_deterministic_spread_and_inside_the_window(self) -> None:
+        """Deterministic so it is assertable at all; spread so the fleet is not still in phase.
+
+        `random` would be neither, and randomness drawn inside a worker is not reproducible
+        even in principle.
+        """
+        legs = [(f"{z}N", 2017, label) for z in range(10, 40) for label in ("s2", "s1-asc", "s1-desc")]
+        offsets = [mod._leg_stagger_s(*leg, 600) for leg in legs]
+
+        assert offsets == [mod._leg_stagger_s(*leg, 600) for leg in legs], "must not vary run to run"
+        assert all(0 <= o < 600 for o in offsets)
+        assert len(set(offsets)) > 0.95 * len(offsets), "near-collisions would leave the fleet in phase"
+        # Spread over the whole window, not bunched in one part of it: a stagger that puts
+        # every leg in the first minute of a ten-minute window has not staggered anything.
+        assert min(offsets) < 60 and max(offsets) > 540
+        assert 240 < sum(offsets) / len(offsets) < 360
+
+    def test_the_two_legs_of_one_cell_do_not_share_an_offset(self) -> None:
+        """A cell's legs are dispatched together, so identity has to include the leg."""
+        assert mod._leg_stagger_s("33N", 2017, "s2", 600) != mod._leg_stagger_s("33N", 2017, "s1-asc", 600)
+
+    def test_a_zero_window_turns_it_off(self) -> None:
+        assert mod._leg_stagger_s("33N", 2017, "s2", 0) == 0.0
+
+    def test_it_is_on_by_default_and_only_delays_the_first_dispatch(self, wired, monkeypatch, waited) -> None:
+        """A default nobody sets has never run, so it must ship enabled.
+
+        And it must be paid ONCE per leg: a retry is already spread by the retry backoff and by
+        whenever the failure landed, so staggering it again would only add latency.
+        """
+        from tessera_embeddings.config.ingest import IngestSettings
+
+        assert IngestSettings().leg_stagger_window_s > 0
+
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        _run(s1_orbit="ascending", ingest_settings=IngestSettings(leg_stagger_window_s=600))
+
+        # One offset per leg (optical + one orbit) and nothing else: no retries happened, and
+        # the retry backoff is the only other thing in this flow that sleeps.
+        assert sorted(waited) == sorted(
+            mod._leg_stagger_s("33N", 2025, label, 600)
+            for label in ("ingest_s1_roi_sar (ascending)", "ingest_s2_roi_reflectance")
+        )
+
+
 def test_max_leg_attempts_defaults_to_retrying() -> None:
     """Off by default would leave the behaviour that cost three zones a day."""
     from tessera_embeddings.config.ingest import IngestSettings
@@ -1065,7 +1117,9 @@ class TestLegsRetryIndependently:
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(
                 s1_orbit="ascending",
-                ingest_settings=mod.IngestSettings(max_leg_attempts=5, leg_retry_backoff_s=10),
+                # Stagger off: this test is about the retry SCHEDULE, and a first-dispatch
+                # offset would sit in front of it as a delay this assertion does not describe.
+                ingest_settings=mod.IngestSettings(max_leg_attempts=5, leg_retry_backoff_s=10, leg_stagger_window_s=0),
             )
 
         assert waited == [10, 20, 40, 40], "doubling from the base, capped at four times it"
