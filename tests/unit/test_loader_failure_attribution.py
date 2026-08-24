@@ -33,6 +33,7 @@ from distributed.core import clean_exception, error_message
 from rasterio._err import CPLE_AppDefinedError, CPLE_BaseError
 from rasterio.errors import RasterioIOError, WarpOperationError
 
+from tessera_embeddings.ingest import loader_failures
 from tessera_embeddings.ingest.duplicates import (
     alternates_for,
     cause_was_flattened,
@@ -564,7 +565,11 @@ class TestBothRescuesReachTheWorker:
         ],
     )
     def test_a_fleet_that_cannot_classify_refuses_to_start(
-        self, registers: Exception | None, answers: dict[str, bool] | None, expected: str | None
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        registers: Exception | None,
+        answers: dict[str, bool] | None,
+        expected: str | None,
     ) -> None:
         """USED TO BE TOLERATED, and that was right while these rescues only sharpened attribution.
 
@@ -572,6 +577,9 @@ class TestBothRescuesReachTheWorker:
         failure strands the whole zone-year on one bad object rather than costing a date. Verified
         rather than assumed, because registration returning is not the worker having run setup.
         """
+        # The attempts are what this asserts; their spacing is not, and paying it would put the
+        # backoff's wall clock on every run of the failing path.
+        monkeypatch.setattr(loader_failures, "_REGISTRATION_BACKOFF_S", 0.0)
 
         class _Client:
             def register_plugin(self, *_a: object, **_k: object) -> None:

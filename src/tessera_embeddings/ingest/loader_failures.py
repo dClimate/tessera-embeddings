@@ -56,6 +56,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from collections import deque
 from collections.abc import Iterable
 from typing import Any
@@ -236,6 +237,12 @@ class AbortedReadCapture(WorkerPlugin):
 #: rather than a cell.
 _REGISTRATION_ATTEMPTS = 3
 
+#: Seconds to wait after a failed attempt, doubling. Without a wait the three attempts complete
+#: in the same instant, which is one attempt with extra steps: the case they exist for is a
+#: scheduler that is restarting, and it cannot recover inside a microsecond. Bounded low because
+#: this is paid at leg dispatch, before any fleet exists to sit idle.
+_REGISTRATION_BACKOFF_S = 2.0
+
 
 def install_capture_everywhere(client: dask.distributed.Client | None) -> None:
     """Install both rescues locally and across the cluster, and VERIFY they took.
@@ -264,6 +271,8 @@ def install_capture_everywhere(client: dask.distributed.Client | None) -> None:
                 _REGISTRATION_ATTEMPTS,
                 exc_info=True,
             )
+            if attempt < _REGISTRATION_ATTEMPTS:
+                time.sleep(_REGISTRATION_BACKOFF_S * 2 ** (attempt - 1))
             continue
         unrescued = [w for w, ok in answers.items() if ok is not True]
         if not unrescued:
@@ -276,6 +285,8 @@ def install_capture_everywhere(client: dask.distributed.Client | None) -> None:
             attempt,
             _REGISTRATION_ATTEMPTS,
         )
+        if attempt < _REGISTRATION_ATTEMPTS:
+            time.sleep(_REGISTRATION_BACKOFF_S * 2 ** (attempt - 1))
 
     detail = f"registration kept failing ({last!r})" if last else "workers reported it missing"
     raise ReadRescuesNotInstalledError(
