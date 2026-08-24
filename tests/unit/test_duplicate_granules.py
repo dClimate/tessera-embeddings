@@ -2552,7 +2552,7 @@ class TestANamedTransportFailureIsNotBadData:
             "Connection reset by peer",
         ],
     )
-    def test_it_takes_PRECEDENCE_over_a_bad_data_marker_in_the_same_chain(self, transport: str) -> None:
+    def test_it_takes_precedence_over_a_bad_data_marker_in_the_same_chain(self, transport: str) -> None:
         """Written to fail if the markers are removed, which the first version of it did not.
 
         Every message here lacks a codec name, so `is_unreadable_source` already declined them for
