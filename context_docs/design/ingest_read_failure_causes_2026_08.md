@@ -1,10 +1,12 @@
-# Ingest source-read failures: six causes, and the retry budget they share
+# Ingest source-read failures: seven causes, and the retry budget they share
 
 Investigation record. Causes 1 and 2 traced 2026-08-04/05 on `global-tessera-dev`; cause 3 absorbed
 2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20,
-cause 5 on 2026-08-21 and cause 6 on 2026-08-22/23, all from live campaign legs. **Corrected in
-place: this document said "three causes" until cause 4 was added, "four causes" until cause 5
-joined it, and "five causes" until cause 6 did.** Traces
+cause 5 on 2026-08-21, and causes 6 and 7 on 2026-08-22/23, all from live campaign legs. **Corrected
+in place: this document said "three causes" until cause 4 was added, "four causes" until cause 5
+joined it, "five causes" until cause 6 did, and "six causes" until cause 7 did.** Cause 7 is the
+only one here that is not a source failure — it is our own bookkeeping, and the only one that left
+holes nothing can fill. Traces
 `WarpOperationError('Chunk and warp failed')` and `PermissionError: The provided token has
 expired` to their exact causes, so the guards can be aimed at the right terms.
 
@@ -847,6 +849,26 @@ a force-listed 500 would. Its worst case is the ladder's own 364 s per page requ
 `max_leg_wall_clock_s` (6 h) bounds the leg above that. A unit test pins the non-interaction, since
 adding 403 to `OVERSIZED_RESPONSE_STATUSES` later would be a silent multiplication.
 
+### Corrected in place, again: the mechanism is the WINDOW-WALK CONCURRENCY
+
+The section above blamed phase alignment, and phase alignment is real but it is not what
+made this campaign different. `stac._QUERY_WINDOW_WORKERS` walks each leg's catalogue date
+windows **six at a time**. At 60 cells that is roughly **360 concurrent search streams**
+against one provider for the same total request volume, and **221 were measured in flight**
+at the moment Earth Search began refusing. The campaign of 19 August, which ran at the same
+fleet width before this concurrency existed, refused nothing of any kind.
+
+The setting's own comment predicted exactly this — it calls itself "a MULTIPLIER on the
+concurrent search streams Element 84 sees, and what they answer an overload with ... is a load
+refusal the whole leg then waits out". The number was the error, not the reasoning.
+
+**Lowered to 2.** Not to 1: a walk is idle for almost all of its wall clock (the latency split
+is in the setting's comment), so overlap is the only lever on a leg's query time and
+serialising it would be a large throughput regression for a problem a small overlap solves.
+It stays a module constant rather than a setting because nothing in `ingest/` reads
+`IngestSettings` and the query is reached from three call sites that would each have to carry
+one; tuning it in an incident means a release, and that is the trade accepted.
+
 ### The stagger, and what it does not fix
 
 `leg_stagger_window_s` (default 600 s) delays each leg's first dispatch by an offset derived from
@@ -857,6 +879,69 @@ neither of which is reproducible inside a worker. At the campaign's width that p
 **It addresses the opening peak only.** It cannot help a leg that starts a new window mid-run,
 which is what zone 47N did, and it should not be described as the fix for this cause — the ladder
 is. It is also paid as latency on every leg's first dispatch, not only on a cold start.
+
+## Cause 7 — a skipped date whose record died with the process, 2026-08-23
+
+Not a source failure at all, and the only cause here that produced **unfillable holes in
+committed stores**. Independent of the 403s; found while investigating them.
+
+| | source | preceded by | retryable? |
+|---|---|---|---|
+| **A lost date offered twice** | our own bookkeeping | `DATA LOSS roi=... date=...: every catalogue copy failed to read` | **no** — the store can no longer be completed |
+
+### The mechanism
+
+When every catalogue copy of a date fails to read, `s2_roi._record_unreadable` skips the date
+deliberately — losing one date beats losing every later date — and later dates commit normally.
+The loss went into an in-memory list that reached durability only at the single
+`record_assessed_window` call **after the whole drive loop**, at the very end of the leg.
+
+If the leg died before that line, for any reason, **the record was gone.** The next attempt
+rebuilds its outstanding work from what was WRITTEN, finds the date absent, and offers it
+again. If a copy reads that time, the append is refused by the monotonic guard — later dates
+are already on the axis, and the axis is sampled positionally so it cannot be inserted into.
+The cell can then never progress and the date can never be filled in place.
+
+`_record_skip`'s own docstring anticipated it: *"a hole nobody recorded is a hole no later run
+revisits."* The record it protects simply did not survive a mid-leg death. The coverage path
+was weaker still — it incremented an in-memory counter and left no trace anywhere.
+
+### Evidence
+
+Four `DATA LOSS` events. **Five stores hold an unfillable hole**: 34N/2017 and 32N/2017
+(2017-01-18), 35N/2017 (2017-02-01), 43N/2017 (2017-02-11), 33N/2018 (2018-01-24). Only two of
+the five had actually raised the error — the campaign was stopped before the rest were retried
+— so the error count understates the damage, and that silence is what makes it dangerous.
+
+### The change
+
+**The append refusal stays FATAL.** Softening it was considered and rejected: a leg that
+reported the refusal and carried on would complete the cell with a hole, and the parent reads
+a completed cell as success, so we would ship a silently degraded store. A log line is not a
+guard, because nothing downstream reads one. There is also a cost argument — a date that
+cannot be appended in place means the store must be wiped and re-ingested anyway, so
+continuing past the refusal spends compute on a store already destined for deletion. It now
+names the store and the date and states the action, because the remedy is per store and there
+are 1,008 cells.
+
+**Not re-offering the date is the fix.** `storage.zarr_store.record_skipped_date` writes the
+loss on the store at the moment of the skip, one date per commit, and `skipped_dates` is read
+alongside `get_existing_dates` so a settled date is not outstanding. It is best-effort: a skip
+can precede the first write, and that is also the only case where failing to record is
+harmless, since the refusal needs a later date already on the axis.
+
+**Only a READ failure settles a date** (`PERMANENT_SKIP_SCOPES`). That is the one shape that
+flips — the same objects can read on the next attempt. A coverage rejection or a producer
+conflict is decided during preparation and never reaches the writer, so it cannot wedge
+anything; both are recorded, so a leg that dropped dates can say which, but they stay
+re-offerable. The distinction matters most for the radar path's `provider-refused` scope
+(Cause 5): blocking that would turn a recoverable outage into permanent loss.
+
+The radar path had the same end-of-leg-only record and gets the same treatment.
+
+**Cost.** One attrs-only icechunk commit per skipped date. Coverage rejections are the ordinary
+path, so this is the dominant term — a few hundred small metadata commits against a leg that
+already commits pixels per date and runs for hours.
 
 ## Coupling to the leg retry
 
