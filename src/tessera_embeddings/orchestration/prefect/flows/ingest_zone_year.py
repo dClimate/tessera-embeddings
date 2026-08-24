@@ -855,6 +855,13 @@ async def ingest_zone_year(
                 doomed.set()
                 return detail
             wait = _leg_backoff_s(attempt, detail)
+            # CAPPED by what is left of the wall-clock budget. The check just above bounds the
+            # decision to start another attempt, and it was true when it was made — but a
+            # refusal's backoff is tens of minutes now, so an uncapped wait would carry the next
+            # dispatch past a deadline that had only just been tested, and provision a fleet
+            # after the bound the setting promises. Capping keeps that check sufficient rather
+            # than adding a second one that can drift from it.
+            wait = min(wait, max(ingest_settings.max_leg_wall_clock_s - elapsed, 0.0))
             # A re-dispatch RESUMES: already-committed dates are skipped, not rewritten, so the
             # retry costs only the work that was actually lost. That idempotency is what makes
             # retrying the default rather than the exception.

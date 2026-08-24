@@ -780,6 +780,22 @@ _MISSING_OBJECT_MARKERS = (
 )
 
 
+def _names_a_transient_refusal(text: str) -> bool:
+    """Whether the chain says the SERVICE refused, by name or by status RANGE.
+
+    The one expression both public predicates read, which is what makes them disjoint by
+    construction rather than by two lists kept in step. Kept in step is what failed: the markers
+    name 403 and 500 as strings while the ranges cover every 5xx, so `HTTP response code: 503` was
+    a refusal to neither predicate — and radar drew the ordinary attempt limit for the commonest
+    shape of outage there is.
+
+    Ranged for the reason the ranges exist: a status nobody enumerated must not change the verdict.
+    """
+    if any(m in text for m in _PROVIDER_REFUSAL_MARKERS):
+        return True
+    return any(s >= 500 or s in _TRANSIENT_4XX for s in _http_statuses(text))
+
+
 def is_unreadable_source(exc: BaseException) -> bool:
     """Whether ``exc`` says a source object could not be read.
 
@@ -810,14 +826,14 @@ def is_unreadable_source(exc: BaseException) -> bool:
     # first and the optical path never asked at all, so the same failure was transient for one
     # sensor and permanent data loss for the other. Excluding them here makes the two disjoint by
     # construction, so neither call order nor a caller that knows only one predicate can
-    # misclassify. See context_docs/monitoring/incident-2026-08-24-nonmonotonic-append.md.
-    if any(m in text for m in _PROVIDER_REFUSAL_MARKERS):
+    # misclassify. Through the SHARED classifier, so the two cannot drift apart: what
+    # `is_provider_refusal` claims is exactly what this declines.
+    # See context_docs/monitoring/incident-2026-08-24-nonmonotonic-append.md.
+    if _names_a_transient_refusal(text):
         return False
     statuses = _http_statuses(text)
     # Ranged, so a status nobody enumerated cannot be read as bad data. See the note on
     # `_HTTP_STATUS_RE` for why each range is decidable.
-    if any(s >= 500 or s in _TRANSIENT_4XX for s in statuses):
-        return False
     if any(400 <= s < 500 and s not in _ABSENT_4XX and s != 403 for s in statuses):
         return False
     if any(m in text for m in _UNREADABLE_MARKERS):
@@ -1008,7 +1024,7 @@ def is_provider_refusal(exc: BaseException) -> bool:
         return False
     if not any(m in text for m in _SOURCE_READER_MARKERS):
         return False
-    return any(m in text for m in _PROVIDER_REFUSAL_MARKERS)
+    return _names_a_transient_refusal(text)
 
 
 def step_down_copies(

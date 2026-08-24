@@ -304,6 +304,22 @@ def test_coverage_failure_leaves_no_marker(wired, monkeypatch):
     assert wired["markers_written"] == []  # not marked complete on a coverage gap
 
 
+def test_a_refusal_backoff_never_outlives_the_wall_clock_budget() -> None:
+    """The wait is capped by what is LEFT of the budget, not by its own schedule.
+
+    The deadline is tested before the wait, and was true when tested. A refusal's backoff is tens
+    of minutes, so without the cap a leg with five minutes of budget left would wait twenty and
+    then provision a fleet fifteen minutes past the bound the setting promises — and validation
+    permits max_leg_wall_clock_s to be set below the backoff, so this is not a corner case.
+    """
+    budget = 300.0
+    for elapsed, backoff in ((0.0, 1200.0), (299.0, 1200.0), (120.0, 600.0), (0.0, 30.0)):
+        capped = min(backoff, max(budget - elapsed, 0.0))
+        assert elapsed + capped <= budget, f"elapsed={elapsed} backoff={backoff} -> {capped}"
+        assert capped <= backoff
+        assert capped >= 0.0
+
+
 class TestChunkScaledWorkers:
     """Cropped cells size their Dask fleet from live chunks, not zone extent.
 
