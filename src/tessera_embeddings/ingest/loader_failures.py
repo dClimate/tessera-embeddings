@@ -199,6 +199,26 @@ def keep_causes_picklable() -> None:
         cls.__reduce__ = _reduce_by_args  # type: ignore[method-assign, assignment]
 
 
+def rescues_are_installed() -> bool:
+    """Whether THIS process can let a read failure's cause survive serialisation.
+
+    Asked of a worker to verify what the plugin claims, rather than trusting the registration
+    call's return. Checks the reducer rather than the capture because only the reducer decides
+    whether a verdict is reachable.
+    """
+    return all(getattr(cls, "__reduce__", None) is _reduce_by_args for cls in _CAUSES_THAT_DO_NOT_TRAVEL)
+
+
+class ReadRescuesNotInstalledError(RuntimeError):
+    """A leg refused to start because its fleet cannot classify read failures.
+
+    Not retryable by widening anything: every read on an unrescued worker arrives with its cause
+    destroyed, so a corrupt object strands the whole zone-year instead of costing one date. The
+    leg's own retry is the right response, since a scheduler that refused the plugin once will
+    usually accept it on the next dispatch.
+    """
+
+
 class AbortedReadCapture(WorkerPlugin):
     """Installs both rescues on every current and future worker.
 
@@ -215,23 +235,65 @@ class AbortedReadCapture(WorkerPlugin):
         keep_causes_picklable()
 
 
-def install_capture_everywhere(client: dask.distributed.Client | None) -> None:
-    """Install both rescues locally and across the cluster, tolerating a failure to do so.
+#: How many times to try registering before refusing the leg. A scheduler is briefly
+#: unreachable often enough that one attempt would fail cells for nothing; it is unreachable
+#: for a whole leg's dispatch rarely enough that a handful of tries settles the question.
+_REGISTRATION_ATTEMPTS = 3
 
-    Never raises. Both rescues sharpen a path that still works without them — an
-    unattributed step-down, and a failure that re-raises for want of a decidable cause — so a
-    plugin registration that fails must not fail the ingest. It must not pass unnoticed
-    either: a fleet reading without these is a fleet whose read failures are undecidable
-    again, so the warning below is the signal that a leg's verdicts cannot be trusted.
+
+def install_capture_everywhere(client: dask.distributed.Client | None) -> None:
+    """Install both rescues locally and across the cluster, and VERIFY they took.
+
+    Raises :class:`ReadRescuesNotInstalledError` if any worker is reading without the reducer.
+    That is a deliberate change of policy. Tolerating a failed registration was right while
+    these rescues only sharpened attribution; the reducer now decides whether a read failure is
+    decidable at all, and an undecidable failure does not cost precision — it strands the whole
+    zone-year on one bad object. Failing at dispatch is far cheaper than discovering that after
+    an hour of work.
+
+    Verified rather than assumed, because registration returning is not the worker having run
+    ``setup``: the call can succeed while a worker's setup throws, and tasks submitted before
+    setup completes would read unrescued. Asking every worker closes both, and the ask is also
+    the barrier that removes the race.
     """
     install_capture()
     keep_causes_picklable()
     if client is None:
         return
-    try:
-        client.register_plugin(AbortedReadCapture())
-    except Exception:
-        logger.warning("Could not install the read-failure rescues on workers", exc_info=True)
+
+    last: Exception | None = None
+    for attempt in range(1, _REGISTRATION_ATTEMPTS + 1):
+        try:
+            client.register_plugin(AbortedReadCapture())
+            answers = client.run(rescues_are_installed)
+        except Exception as exc:
+            last = exc
+            logger.warning(
+                "Could not install the read-failure rescues on workers (attempt %d/%d)",
+                attempt,
+                _REGISTRATION_ATTEMPTS,
+                exc_info=True,
+            )
+            continue
+        unrescued = [w for w, ok in answers.items() if ok is not True]
+        if not unrescued:
+            return
+        last = None
+        logger.warning(
+            "%d of %d worker(s) are reading without the read-failure rescues (attempt %d/%d)",
+            len(unrescued),
+            len(answers),
+            attempt,
+            _REGISTRATION_ATTEMPTS,
+        )
+
+    detail = f"registration kept failing ({last!r})" if last else "workers reported it missing"
+    raise ReadRescuesNotInstalledError(
+        "Refusing to read: this fleet cannot classify read failures because the cause-preserving "
+        f"reducer is not installed on every worker after {_REGISTRATION_ATTEMPTS} attempts — "
+        f"{detail}. Every read failure would arrive with its cause destroyed, so one corrupt "
+        "object would strand this zone-year rather than cost a single date."
+    )
 
 
 def collect_aborted_hrefs(client: dask.distributed.Client | None) -> list[str]:

@@ -43,6 +43,7 @@ from tessera_embeddings.ingest.duplicates import (
 )
 from tessera_embeddings.ingest.loader_failures import (
     AbortedReadCapture,
+    ReadRescuesNotInstalledError,
     collect_aborted_hrefs,
     drain_local,
     href_key,
@@ -550,15 +551,52 @@ class TestBothRescuesReachTheWorker:
         arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
         assert type(arrived.__cause__) is CPLE_AppDefinedError
 
-    def test_a_cluster_that_refuses_the_plugin_does_not_fail_the_ingest(self) -> None:
-        """Never raises: the local install still happened, and the paths both rescues sharpen
-        work without them. The warning it logs is the signal that a leg's verdicts are weaker.
+    def test_a_cluster_that_refuses_the_plugin_fails_the_leg(self) -> None:
+        """USED TO BE TOLERATED, and that was right when these rescues only sharpened attribution.
+
+        The reducer now decides whether a read failure is decidable, and an undecidable failure
+        strands the whole zone-year on one bad object rather than costing a date. So a fleet that
+        cannot classify refuses to start, and the leg's own retry gets a fresh dispatch.
         """
 
         class _RefusingClient:
             def register_plugin(self, *_args: object, **_kwargs: object) -> None:
                 raise OSError("scheduler unreachable")
 
-        install_capture_everywhere(_RefusingClient())  # type: ignore[arg-type]
+            def run(self, *_args: object, **_kwargs: object) -> dict[str, bool]:
+                raise AssertionError("must not be reached when registration itself failed")
+
+        with pytest.raises(ReadRescuesNotInstalledError, match="cannot classify read failures"):
+            install_capture_everywhere(_RefusingClient())  # type: ignore[arg-type]
+
+    def test_a_worker_that_reports_it_missing_fails_the_leg(self) -> None:
+        """Registration returning is not the worker having run setup.
+
+        The call can succeed while a worker's setup throws, and tasks submitted before setup
+        completes would read unrescued. Verifying with every worker is what catches that, and the
+        ask doubles as the barrier that removes the race.
+        """
+
+        class _LyingClient:
+            def register_plugin(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def run(self, *_args: object, **_kwargs: object) -> dict[str, bool]:
+                return {"tcp://a": True, "tcp://b": False}
+
+        with pytest.raises(ReadRescuesNotInstalledError, match="reported it missing"):
+            install_capture_everywhere(_LyingClient())  # type: ignore[arg-type]
+
+    def test_a_fleet_that_confirms_it_proceeds(self) -> None:
+        """The ordinary path: every worker answers yes, so nothing is raised."""
+
+        class _HonestClient:
+            def register_plugin(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def run(self, *_args: object, **_kwargs: object) -> dict[str, bool]:
+                return {"tcp://a": True, "tcp://b": True}
+
+        install_capture_everywhere(_HonestClient())  # type: ignore[arg-type]
         arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
         assert type(arrived.__cause__) is CPLE_AppDefinedError

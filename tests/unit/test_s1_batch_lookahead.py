@@ -31,6 +31,24 @@ import pytest
 from tessera_embeddings.ingest._pipeline import pipelined
 
 
+def _fake_client():
+    """A stand-in cluster that answers the read-failure rescue check.
+
+    The leg now refuses to start unless every worker confirms the rescues are installed, so a
+    client that ignored ``run`` would assert a fleet state nothing had established. ``run`` really
+    calls the function here, which reports the in-process install.
+    """
+    return type(
+        "C",
+        (),
+        {
+            "persist": staticmethod(lambda x: x),
+            "register_plugin": staticmethod(lambda _plugin: None),
+            "run": staticmethod(lambda fn, *a, **k: {"inproc://fake": fn(*a, **k)}),
+        },
+    )()
+
+
 def test_next_batch_is_prepared_during_the_current_batch_write() -> None:
     """The whole point: batch N+1's query runs while batch N is still writing."""
     events: list[str] = []
@@ -163,7 +181,7 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
         start_date="2024-01-01",
         end_date="2024-01-04",
         store_path="s3://bucket/mosaics",
-        client=type("C", (), {"persist": staticmethod(lambda x: x)})(),
+        client=_fake_client(),
         orbit="ascending",
         batch_days=2,
         **kwargs,
@@ -297,7 +315,7 @@ def _run_with_footprints(
         start_date="2024-01-01",
         end_date="2024-01-02",
         store_path="s3://bucket/mosaics",
-        client=type("C", (), {"persist": staticmethod(lambda x: x)})(),
+        client=_fake_client(),
         orbit="ascending",
         batch_days=5,
         narrow_windows_per_date=narrow,
@@ -486,7 +504,7 @@ def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
         start_date="2024-01-01",
         end_date="2024-01-04",
         store_path="s3://bucket/mosaics",
-        client=type("C", (), {"persist": staticmethod(lambda x: x)})(),
+        client=_fake_client(),
         orbit="ascending",
     )
 
