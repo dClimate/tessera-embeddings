@@ -1544,6 +1544,13 @@ fetched and then discarded, which date slicing does not. That is an efficiency c
 item-set consequence, and it should be priced and gated on its own rather than folded into a
 defect fix.
 
+**Done as latitude bands, 2026-08-23** — see `ingest-graph-and-stac-budget.md` section 11.
+`ROIMetadata` now carries `bbox_wgs84_bands` and the query takes a list of boxes, so the
+"not reachable from the query" objection above no longer holds. One part of it was also
+wrong: **no coverage re-delivery was needed.** The boxes are derived from the coverage
+bitmap the ROI export already reads, and the export's own currency check treats the attr's
+absence as reason to rebuild, so existing masks gain it with no operator step.
+
 ## 8. Numbers of record
 
 | quantity | value | provenance |
