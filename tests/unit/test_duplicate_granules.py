@@ -2534,6 +2534,37 @@ class TestTheTwoVerdictsCannotDisagree:
         assert is_unreadable_source(flattened) is False
 
 
+class TestANamedTransportFailureIsNotBadData:
+    """A link that failed says nothing about the bytes, and carries no HTTP status to say so with.
+
+    Half this class was named and half was not, so a dropped connection was declined while a
+    refused one fell through to the markers and could be read as permanent loss — the same link
+    failing, classified two ways depending on which word GDAL happened to use.
+    """
+
+    @pytest.mark.parametrize(
+        "transport",
+        [
+            "Could not resolve host: sentinel-cogs.s3.us-west-2.amazonaws.com",
+            "Connection refused",
+            "Empty reply from server",
+            "SSL peer handshake failed",
+            "Connection reset by peer",
+        ],
+    )
+    def test_it_takes_PRECEDENCE_over_a_bad_data_marker_in_the_same_chain(self, transport: str) -> None:
+        """Written to fail if the markers are removed, which the first version of it did not.
+
+        Every message here lacks a codec name, so `is_unreadable_source` already declined them for
+        want of one and the test passed whether or not these entries existed. Putting a real codec
+        marker in the same chain is what exercises the branch they change: without them the chain
+        reads as bad data, with them the link failure wins and no date is given up.
+        """
+        chain = _read_failure(f"{transport}: ZIPDecode:Decoding error at scanline 0")
+        assert is_unreadable_source(chain) is False
+        assert is_provider_refusal(chain) is True
+
+
 class TestRecognisingAFailureThatArrivedWithNoEvidence:
     """The shape Dask substitutes when it cannot serialise a read failure.
 

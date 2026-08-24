@@ -922,6 +922,13 @@ _PROVIDER_REFUSAL_MARKERS = (
     "timed out",
     "Connection aborted",
     "RequestTimeout",
+    # The statusless rest of that class. Half of it was named and half was not, so a dropped
+    # connection was declined while a refused one fell through to be read as bad data — the same
+    # link failing, classified two ways depending on which word GDAL happened to use.
+    "Could not resolve host",
+    "Connection refused",
+    "Empty reply from server",
+    "handshake failed",
 )
 
 #: GDAL's HTTP driver reports a bare status, so the numeric forms are classified by RANGE rather
