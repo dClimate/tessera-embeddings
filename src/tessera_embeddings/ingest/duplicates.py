@@ -728,10 +728,11 @@ def alternates_for(
 #: reason, and the reason — a codec that cannot inflate a tile — is what says the object is
 #: broken rather than briefly unavailable.
 #:
-#: Matched as TEXT, and that is forced rather than chosen: the read runs on a Dask worker and
-#: the failure is re-raised on the driver through tblib, which cannot reconstruct rasterio's
-#: GDAL-backed exception classes. What arrives is a plain ``Exception`` carrying the original's
-#: repr, so an ``isinstance`` check matches nothing and the message is the only evidence left.
+#: Matched as TEXT because the type NAMES survive the hop to the orchestrator regardless of how
+#: faithfully the classes themselves are rebuilt, and because one string can name a condition
+#: several unrelated layers report. What the chain CONTAINS is a separate question, and the
+#: answer used to be nothing: see ``ingest/loader_failures.py`` for what the chain arrives with
+#: and what has to be installed on the reader for it to arrive at all.
 #: Only signatures that name a CODEC OR FORMAT OPERATION failing. Deliberately minimal, and the
 #: minimality is the point: this predicate's `True` means "give up this date", and it is reached as
 #: the DEFAULT for anything the transient lists above do not recognise. Every gap in those lists
@@ -824,13 +825,38 @@ def is_unreadable_source(exc: BaseException) -> bool:
     return any(m in text for m in _MISSING_OBJECT_MARKERS) and any(m in text for m in _SOURCE_READER_MARKERS)
 
 
+def cause_was_flattened(exc: BaseException) -> bool:
+    """Whether ``exc`` is a read failure that arrived with its cause destroyed.
+
+    The shape is Dask's substitute for an exception it could not serialise: a plain
+    ``Exception`` whose whole message is the repr of the real one, and no chain behind it.
+    Every predicate here reads the chain, so this shape is not merely hard to classify — it
+    carries no evidence to classify, and the fail-closed verdict it gets is the absence of a
+    decision rather than one.
+
+    ``ingest/loader_failures.py`` stops it being produced. This recognises it anyway, because
+    that rescue is installed per process and best effort: a worker it did not reach reads
+    exactly as the whole fleet used to, and the difference is invisible in the verdict. So the
+    detector exists to make the residue LOUD — the one signal that says a re-raise happened
+    for want of evidence, not for want of a matching marker.
+    """
+    return (
+        type(exc) is Exception
+        and exc.__cause__ is None
+        and exc.__context__ is None
+        and any(m in str(exc) for m in _SOURCE_READER_MARKERS)
+    )
+
+
 def _exception_chain_text(exc: BaseException) -> str:
     """The chain's type names and messages, joined, for text classification.
 
-    Text rather than ``isinstance`` because the read runs on a Dask worker and is re-raised on
-    the driver through tblib, which cannot rebuild rasterio's GDAL-backed classes — what arrives
-    is a plain exception carrying the original's repr. The whole chain, because the wrapper
-    discards the reason: ``WarpOperationError('Chunk and warp failed')`` says nothing on its own.
+    Text rather than ``isinstance`` because the chain crosses the Dask boundary and the classes
+    that reach it there are rebuilt by tblib, whose reconstruction is only as faithful as the
+    reducer each class exposes. The type NAMES survive that regardless, which is what makes
+    them the stable thing to match; see ``ingest/loader_failures.py`` for what keeps the chain
+    itself intact. The whole chain, because the wrapper discards the reason:
+    ``WarpOperationError('Chunk and warp failed')`` says nothing on its own.
     """
     seen: list[str] = []
     current: BaseException | None = exc

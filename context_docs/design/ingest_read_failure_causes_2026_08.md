@@ -28,6 +28,12 @@ Both surface as the identical exception text, so **the leg-retry classifier cann
 apart from the message**, and one of them makes retrying pure waste. See "Coupling to the leg
 retry" below.
 
+**And for a while it could not tell them apart from the CAUSE either, which is the deeper
+finding.** Every predicate here reads the cause chain, and the chain was being destroyed on its
+way out of the Dask worker — so four of the causes below were diagnosed as gaps in a marker list
+when three of them were one architectural loss in different clothes. See "Why the reason was hard
+to read" at the end; read it before widening any predicate in `ingest/duplicates.py`.
+
 **Correction, in place.** `docs/runbooks/incident-response.md` previously attributed this error to
 "a Dask worker task definition missing a `ulimit` the library needed", citing the
 `mirror-a-pinned-resource-field-for-field` episode. **That attribution was wrong for these
@@ -537,12 +543,15 @@ What the driver receives is:
 Exception("RasterioIOError('ObjectNotFound: The specified key does not exist.')")
 ```
 
-A plain `Exception` carrying a repr — the read runs on a Dask worker and tblib cannot reconstruct
-rasterio's GDAL-backed classes across the boundary. **An `isinstance` check against a rasterio or
-GDAL type is therefore not available here**, however much it would be the better test. Text is the
-only evidence that survives, which is why the fix is three markers — `ObjectNotFound` (GDAL and
-rasterio), `NoSuchKey` (the S3 API error code), and `The specified key does not exist` (the
-response body) — covering the three layers that can be the one to surface it.
+A plain `Exception` carrying a repr. **Corrected in place 2026-08-24: this said an `isinstance`
+check "is therefore not available here" and that "text is the only evidence that survives". Both
+were wrong, and see the evidence-gap section at the end for why** — the chain was reconstructable
+all along, and the reason it did not arrive was a single unpicklable class. The fix below is still
+three markers, and still correct: the markers are matched against the CHAIN, which now has one.
+
+The three are `ObjectNotFound` (GDAL and rasterio), `NoSuchKey` (the S3 API error code), and
+`The specified key does not exist` (the response body) — covering the three layers that can be the
+one to surface it.
 
 ### Not-found alone does not say whose object it was
 
@@ -1098,6 +1107,89 @@ wrapped and carries the day's items, so the failure names the granule directly.
 The general shape, which is the part worth keeping: **an attribution context has to wrap every
 compute that reads source pixels, not just the first one.** A lazy graph moves the read to wherever
 it is finally computed, and a gate that computes a subset of bands only protects that subset.
+
+## Why the reason was hard to read — an evidence gap, now closed
+
+The twin of the attribution gap above, and the deeper of the two. That one lost WHICH object
+failed. This one lost WHY, and it is why Causes 2, 4 and 8 were each hard in the same way: every
+one was a classifier reading a string that no longer contained the answer.
+
+### The mechanism
+
+Every predicate in `ingest/duplicates.py` matches the whole exception CHAIN, because the wrapper
+discards the reason and only GDAL's cause states it. The chain did not arrive. Dask serialises a
+worker's failure with `tblib`, which rebuilds a class that has a custom `__init__` and no
+`__reduce__` by assigning its attributes — including `args`. rasterio's `CPLE_BaseError` publishes
+`args` as a **read-only property**, so the assignment throws:
+
+```
+AttributeError: property 'args' of 'CPLE_AppDefinedError' object has no setter
+distributed.protocol.pickle - INFO - Failed to deserialize b"...tblib...RasterioIOError..."
+```
+
+`distributed.core.error_message` unpickles its own output before sending it, so a failure never
+becomes an unrecoverable one on the wire — and when that check fails it substitutes
+`Exception(repr(e))`. What the orchestrator receives is one line of text with `__cause__` of
+`None`. No marker list, however complete, recovers a reason that is not in the message.
+
+The two log streams are the proof: `CPLE_AppDefinedError: ZIPDecode:Decoding error at scanline 0,
+unknown compression method` appears **only** in `dask/dask-worker` streams, while the
+orchestrator's carries exactly `Exception: RasterioIOError('Read failed. See previous exception for
+details.')`.
+
+In roughly one hour of the 2026-08-24 window: **70+ zone/date pairs, 85 radar leg failures across
+53 cells, 6 optical, 1 cell failed outright.** 70 of the 85 radar failures arrived as the bare
+`Chunk and warp failed` — a decision to be made with no evidence at all, on the path that has no
+alternate-copy ladder and so only two answers.
+
+### The change
+
+One reducer, `CPLE_BaseError.__reduce__ = lambda exc: (type(exc), tuple(exc.args))`. Three things
+about it are load-bearing:
+
+- **Faithful, not merely sufficient.** GDAL's constructor takes exactly the triple its `args`
+  reports, so the rebuilt exception carries the error class, the CPL error number and the codec's
+  message rather than a flattened string.
+- **`__reduce__`, not a `copyreg` reducer.** tblib consults `__reduce__` and falls back to
+  assigning `args` only for classes that define none, so defining one steers tblib onto its own
+  good path. A `copyreg` registration would be overwritten — tblib re-registers itself there for
+  every class in the chain, on every failure.
+- **On the SENDING side.** Dask decides to flatten before it sends, so a process that only
+  receives cannot repair what it is handed. The reducer goes where the credential broadcast goes:
+  a `WorkerPlugin`, the only thing that reaches a worker which joined after the ingest started.
+
+### Why one class, and why that is a census rather than a guess
+
+tblib's heuristic is broad — **808** loaded exception classes match "custom `__init__`, no
+`__reduce__`" — but the assignment only fails where `args` is read-only. Scanning every exception
+class in the loaded read stack (rasterio, odc, botocore, aiohttp, urllib3, pystac, s3fs, icechunk,
+zarr, xarray), **18** publish `args` read-only and **all 18 derive from `CPLE_BaseError`**,
+`ObjectNullError` included. Patching the base covers them all, and covers classes a later GDAL
+adds. `test_no_other_exception_in_the_read_stack_needs_an_entry` re-runs the scan, so a nineteenth
+fails a test rather than a campaign leg.
+
+### What did NOT change, and why that is the point
+
+The marker lists, the ranged status handling, the Cause 8 polarity — all untouched. They were
+never the defect. They were reading a string the architecture had already emptied, and they work
+as written the moment it has content.
+
+That is also why the interim mitigation on PR #125 — splitting one predicate into a permissive
+`should_try_another_copy` for the reversible ladder and a strict `is_unreadable_source` for the
+destructive skip — should stand once it merges, rather than being backed out as superseded. The
+undecidable failure is not abolished: the
+reducer is installed per process and best effort, so a worker it does not reach reads exactly as
+the fleet used to, and produces identical verdicts reached from nothing. `cause_was_flattened`
+recognises that substitution and `read_failure_context` logs `READ CAUSE LOST` on it — the only
+signal that a re-raise happened for want of evidence rather than because evidence said to.
+
+### The general shape, which is the part worth keeping
+
+**A classifier is only as good as what crosses the boundary to it.** Four causes here were
+diagnosed as gaps in a marker list, and three were one architectural loss in different clothes.
+Before widening a predicate, check that its input still contains what it is meant to read — and
+prefer a test that PRODUCES the real input over one that imitates its shape, because a stand-in
+built to the shape you already believe in cannot falsify you.
 
 ## Method notes
 

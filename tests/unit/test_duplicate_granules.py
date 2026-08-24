@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 
 import pystac
 import pytest
+from rasterio.errors import RasterioIOError, WarpOperationError
 
 from tessera_embeddings.ingest.asset_locations import (
     PREFERRED_ASSET_BUCKETS,
@@ -33,6 +34,7 @@ from tessera_embeddings.ingest.duplicates import (
     acquisition_identity,
     acquisition_instant,
     alternates_for,
+    cause_was_flattened,
     copies_label,
     is_unreadable_source,
     item_processing_baseline,
@@ -2461,3 +2463,72 @@ class TestAMessageMayNotBeItsOwnCorroboration:
 
     def test_genuinely_corrupt_data_is_still_unreadable(self) -> None:
         assert is_unreadable_source(Exception("Chunk and warp failed: ZIPDecode error")) is True
+
+
+class TestRecognisingAFailureThatArrivedWithNoEvidence:
+    """The shape Dask substitutes when it cannot serialise a read failure.
+
+    ``ingest/loader_failures.py`` stops it being produced, and the tests that prove that run
+    the exception through Dask's own error path. This is the other half: recognising the shape
+    if it turns up anyway, because that rescue is installed per process and best effort. Every
+    predicate here reads the cause chain, so this shape does not get a wrong verdict — it gets
+    no verdict, and the point of naming it is to make that difference visible in a log.
+    """
+
+    @staticmethod
+    def _flattened(outer: BaseException) -> Exception:
+        """The substitution, built the way Dask builds it: ``Exception(repr(outer))``.
+
+        From the real class rather than a copied string, so the message cannot drift from what
+        rasterio actually produces. A hand-made ``RuntimeError`` stood here once and is why the
+        defect shipped — it had the same shape without having the same origin.
+        """
+        return Exception(repr(outer))
+
+    def test_the_production_shape_is_recognised(self) -> None:
+        flattened = self._flattened(RasterioIOError("Read failed. See previous exception for details."))
+        assert flattened.__cause__ is None
+        assert cause_was_flattened(flattened) is True
+
+    def test_the_bare_warp_wrapper_is_recognised(self) -> None:
+        """The radar form: the outer exception names no codec and no status, so its repr is all
+        that arrives and it says only that a read failed.
+        """
+        assert cause_was_flattened(self._flattened(WarpOperationError("Chunk and warp failed"))) is True
+
+    def test_it_gets_no_verdict_rather_than_the_wrong_one(self) -> None:
+        """Fail-closed, which is right — but the caller then re-raises for want of evidence, not
+        because the evidence said to. Only this predicate can tell those two apart.
+        """
+        flattened = self._flattened(RasterioIOError("Read failed. See previous exception for details."))
+        assert is_unreadable_source(flattened) is False
+
+    def test_a_chain_that_arrived_intact_is_not_flattened(self) -> None:
+        """The negative that matters: once the cause survives, this must stay silent."""
+        wrapper = Exception("RasterioIOError: Read failed. See previous exception for details.")
+        wrapper.__cause__ = Exception("CPLE_AppDefinedError: ZIPDecode:Decoding error at scanline 0")
+        assert cause_was_flattened(wrapper) is False
+
+    def test_a_context_counts_as_a_chain(self) -> None:
+        """``raise`` inside an ``except`` attaches a CONTEXT and no cause, and the classifier
+        reads either. A failure carrying one has evidence, so it is not the flattened shape.
+        """
+        try:
+            try:
+                raise ValueError("ZIPDecode:Decoding error at scanline 0")
+            except ValueError:
+                raise Exception("RasterioIOError('Read failed.')")  # noqa: B904
+        except Exception as exc:
+            assert exc.__context__ is not None
+            assert cause_was_flattened(exc) is False
+
+    def test_a_typed_exception_is_not_the_flattened_shape(self) -> None:
+        """The substitution is always a bare ``Exception``. A subclass arrived as itself, which
+        means its class survived and so did anything under it.
+        """
+        assert cause_was_flattened(RasterioIOError("Read failed. See previous exception.")) is False
+
+    def test_an_unrelated_failure_is_not_claimed(self) -> None:
+        """A bug of ours is not a read whose evidence was lost, and must not be reported as one."""
+        assert cause_was_flattened(Exception("KeyError('northing')")) is False
+        assert cause_was_flattened(Exception("some unrelated bug")) is False

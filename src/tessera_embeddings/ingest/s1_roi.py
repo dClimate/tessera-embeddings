@@ -57,6 +57,7 @@ from tessera_embeddings.ingest.live_windows import (
     live_windows_for_mask,
     windows_for_date,
 )
+from tessera_embeddings.ingest.loader_failures import install_capture_everywhere
 from tessera_embeddings.ingest.opera_query import make_s1_item_provider
 from tessera_embeddings.ingest.roi import (
     StorageOptions,
@@ -276,7 +277,7 @@ def ingest_s1_roi_sar(
     start_date: str,
     end_date: str,
     store_path: str,
-    client: dask.distributed.Client,  # noqa: ARG001 — see the docstring: held, not called
+    client: dask.distributed.Client,
     orbit: S1Orbit,
     batch_days: int = 30,
     edl_credentials_fn: Callable[[], dict[str, str]] | None = None,
@@ -303,12 +304,13 @@ def ingest_s1_roi_sar(
         store_path: Base path for satellite mosaics; the function
             creates ``sar_<orbit>.zarr`` underneath.
         client: Connected :class:`dask.distributed.Client`. Callers
-            create this; we do not call ``get_client``. Required but never
-            invoked directly: every compute here goes through the AMBIENT
-            client, which constructing one makes current. Keeping it in the
-            signature is what states that a connected cluster is a
-            precondition — the S2 ingest takes it for the same reason and
-            does use it, so the two entry points stay symmetric.
+            create this; we do not call ``get_client``. Every compute here goes
+            through the AMBIENT client, which constructing one makes current, so
+            this is used for one thing only: registering the worker plugin that
+            keeps a failed read's evidence, which has to name the cluster
+            explicitly because it must reach workers no compute has touched yet.
+            The S2 ingest takes it for the same reason, so the two entry points
+            stay symmetric.
         orbit: ``"ascending"`` or ``"descending"`` — one orbit per call.
             Multi-orbit ingestion is a flow-level concern (call twice).
         batch_days: Days per time batch. Smaller values keep each Dask
@@ -370,6 +372,13 @@ def ingest_s1_roi_sar(
     #: (``.../zone_47S.zarr`` -> ``zone_47S``) rather than taken as a parameter, so every
     #: caller gets it without threading one more argument through the flows.
     roi_label = roi_zarr_path.rstrip("/").rsplit("/", 1)[-1].removesuffix(".zarr")
+
+    # Before the first read, because what it keeps is only kept AS the read fails, on whichever
+    # worker fails it. This path needs it more than the optical one, not less: with no
+    # alternate-copy ladder, an undecidable failure leaves only "fail the leg" or "give up the
+    # date", so a cause that arrives is the whole difference between a retry and a hole.
+    install_capture_everywhere(client)
+
     roi = read_roi_metadata(roi_zarr_path, storage_options=storage_options)
 
     ingest_manifest = IngestManifest.from_roi_store(
