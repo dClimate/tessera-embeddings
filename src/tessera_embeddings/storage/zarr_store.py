@@ -1205,6 +1205,7 @@ def record_assessed_window(
     *,
     empty_dates: int = 0,
     unreadable: list[dict[str, str]] | None = None,
+    filtered: list[dict[str, str]] | None = None,
     required: bool = False,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
@@ -1225,6 +1226,14 @@ def record_assessed_window(
     without this the two are indistinguishable and no later run revisits the date. A log line
     is lost the moment nobody greps for it; this is the durable record of where the loss is.
 
+    ``filtered`` names dates a quality gate rejected. Unlike ``unreadable`` these are not
+    losses — the gate working is the ordinary path — but a finished leg could not say WHICH
+    dates it dropped, only how many, and the count died with the process. Written in THIS
+    commit rather than one per date, deliberately: a gate rejection never reaches the writer,
+    so nothing about it needs to survive a crash, and a commit per rejection would both cost
+    hundreds of them a leg and make a store's history depend on whether a write happened
+    before the first rejection.
+
     OPENS, never creates: this runs only against a store that was just written. Failing
     here must not be fatal — the assessment is an optimisation of the gate's judgement, and
     a store without it simply falls back to the stricter every-month-present rule.
@@ -1244,6 +1253,7 @@ def record_assessed_window(
         # The authoritative list now covers everything the per-skip record was holding on
         # its behalf, so clear it. Leaving it would make a recovered date look skipped
         # forever, since `skipped_dates` reads both.
+        root.attrs["assessed_filtered_dates"] = list(filtered or ())
         root.attrs[SKIPPED_DATES_ATTR] = []
         # ``allow_empty`` because re-recording the SAME window writes no bytes, and icechunk
         # refuses a commit with no changes ("cannot commit, no changes made to the session").
@@ -1253,7 +1263,8 @@ def record_assessed_window(
         # means something. The record is idempotent, so committing it again is harmless.
         session.commit(
             f"assessed window {start_date}..{end_date} ({empty_dates} empty date(s)"
-            f"{f', {len(unreadable)} unreadable' if unreadable else ''})",
+            f"{f', {len(unreadable)} unreadable' if unreadable else ''}"
+            f"{f', {len(filtered)} gate-filtered' if filtered else ''})",
             allow_empty=True,
         )
         logger.info(f"Recorded assessed window {start_date}..{end_date} on {store_path}")

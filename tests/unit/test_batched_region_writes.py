@@ -201,14 +201,31 @@ class TestASkipIsDurableBeforeTheLegEnds:
     def test_only_a_read_failure_settles_a_date(self, store):
         """Recorded is not the same as settled, and conflating them loses recoverable dates.
 
-        A coverage rejection and a producer conflict are decided during preparation and never
-        reach the writer, so they cannot wedge anything and must stay re-offerable — blocking a
-        transient provider refusal would turn a recoverable outage into permanent loss.
+        A producer conflict is decided during preparation and never reaches the writer, so it
+        cannot wedge anything and must stay re-offerable — and blocking a transient provider
+        refusal would turn a recoverable outage into permanent loss.
         """
-        for scope in ("coverage", "producer-conflict", "provider-refused"):
+        for scope in ("producer-conflict", "provider-refused"):
             record_skipped_date(store, {"date": f"2024-05-{scope[:2]}", "scope": scope})
         assert skipped_dates(store) == set(), "a preparation-time skip must not settle a date"
         assert set(PERMANENT_SKIP_SCOPES) == {"attributed", "whole-date", "unreadable"}
+
+    def test_a_gate_rejection_is_traceable_without_a_commit_of_its_own(self, store):
+        """The ordinary path, so it must not add a commit — and must still leave a trace.
+
+        A gate rejection needs no crash durability: it is decided during preparation, so the
+        date never reaches the writer. Committing one per rejection would cost hundreds a leg
+        AND make the store's history depend on whether a write happened before the first
+        rejection, which is what the batched-versus-serial parity test caught.
+        """
+        before = _snapshots(store)
+        record_assessed_window(
+            store, "2024-01-01", "2024-12-31", filtered=[{"date": "2024-03-04", "scope": "coverage"}]
+        )
+        assert _snapshots(store) == before + 1, "the trace must ride in the assessment's own commit"
+        attrs = dict(open_store_as_zarr_group(store).attrs)
+        assert attrs["assessed_filtered_dates"] == [{"date": "2024-03-04", "scope": "coverage"}]
+        assert skipped_dates(store) == set(), "a gate rejection must stay re-offerable"
 
     def test_the_end_of_leg_record_supersedes_and_clears_the_crash_durable_one(self, store):
         """Otherwise a date a repair run recovered would read as skipped forever."""

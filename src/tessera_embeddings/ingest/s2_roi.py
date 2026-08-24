@@ -510,6 +510,10 @@ def ingest_s2_roi_reflectance(
     # must name them all. Kept out of the coverage counter, whose contract is the SCL gate: a run
     # that lost most of a year to metadata was reporting it as coverage filtering.
     producer_conflict_dates: list[dict[str, str]] = []
+    #: Dates the coverage gate rejected. Not a loss — the gate working is the ordinary path —
+    #: so these are recorded for observability in the end-of-leg commit rather than one at a
+    #: time, and are deliberately still re-offerable.
+    coverage_filtered_dates: list[dict[str, str]] = []
 
     def _prepare_date(day_items: list) -> _PreparedDate:
         """Build one solar day's write-ready dataset, or the reason it has none.
@@ -888,26 +892,18 @@ def ingest_s2_roi_reflectance(
             nonlocal total_filtered, total_refused
             if prepared.skip_reason != "producer-conflict":
                 total_filtered += 1
-                # A COVERAGE rejection. Recorded durably too, because it left no trace at all
-                # before — not in the store, not anywhere but a counter that dies with the
-                # process — so a finished leg could not say which dates the gate had dropped.
+                # A COVERAGE rejection, which left no trace at all before — not on the store,
+                # nowhere but a counter that died with the process — so a finished leg could
+                # say how many dates the gate dropped but never which.
                 #
-                # Recorded but NOT treated as settled: `skipped_dates` excludes this scope, so
-                # a later attempt re-evaluates the date. That asymmetry is deliberate. The gate
-                # is a function of the imagery, so re-offering costs one re-evaluation and
-                # cannot wedge the store — while a raised threshold or a newly published copy
-                # can only ever recover the date if it IS re-offered.
-                record_skipped_date(
-                    reflectance_store,
-                    {
-                        "date": prepared.date,
-                        "tiles": "",
-                        "tried": copies_label(prepared.items),
-                        "objects": "",
-                        "scope": "coverage",
-                    },
-                    s3_region=s3_region,
-                )
+                # Collected, not committed. It needs no crash durability: the gate is decided
+                # during preparation, so the date never reaches the writer and re-offering it
+                # cannot wedge the store. `skipped_dates` therefore excludes this scope, and a
+                # later attempt re-evaluates the date — which is the only way a raised
+                # threshold or a newly published copy ever recovers it. Committing each one
+                # would also cost hundreds of commits a leg and make the store's history
+                # depend on whether a write happened before the first rejection.
+                coverage_filtered_dates.append({"date": prepared.date, "scope": "coverage"})
                 return
             total_refused += 1
             entry = {
@@ -1261,6 +1257,7 @@ def ingest_s2_roi_reflectance(
             start_date,
             end_date,
             unreadable=[*unreadable_tile_dates, *producer_conflict_dates],
+            filtered=coverage_filtered_dates,
             s3_region=s3_region,
         )
 
