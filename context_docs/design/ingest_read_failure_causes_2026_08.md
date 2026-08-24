@@ -939,9 +939,16 @@ re-offerable. The distinction matters most for the radar path's `provider-refuse
 
 The radar path had the same end-of-leg-only record and gets the same treatment.
 
-**Cost.** One attrs-only icechunk commit per skipped date. Coverage rejections are the ordinary
-path, so this is the dominant term — a few hundred small metadata commits against a leg that
-already commits pixels per date and runs for hours.
+**Cost, and a correction in place.** One attrs-only icechunk commit per skipped date. Coverage
+rejections were briefly recorded this way too and **that was wrong on two counts**, both caught
+by the batched-versus-serial parity test rather than by reasoning: the record needs the store to
+exist, and a rejection can precede the first write, so a store's snapshot history came to depend
+on write ordering; and rejections are the ordinary path, so it cost hundreds of commits a leg.
+A gate rejection also needs no crash durability at all — it is decided during preparation, the
+date never reaches the writer, and it was already excluded from the settled set for exactly that
+reason. Those dates now ride in the end-of-leg assessment's own commit as
+`assessed_filtered_dates`: a trace where there was none, at no extra commit. Only the scopes that
+can FLIP pay for a commit of their own, and they are rare.
 
 ## Coupling to the leg retry
 
