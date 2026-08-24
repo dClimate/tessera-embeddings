@@ -1796,11 +1796,11 @@ object from failing a zone-year identically on every retry.
 
 ### When the provider refuses the read
 
-An authorization refusal, a throttle and a server error are a different finding again, and
-`is_provider_refusal` in `duplicates.py` is the predicate for them. They say nothing about the
-imagery — the same object read minutes earlier and reads again once the service recovers — so no
-fallback copy helps, which is why `is_unreadable_source` declines them and why this predicate
-sits beside it rather than inside it.
+An authorization refusal, a throttle and a server error are a different finding again. They say
+nothing about the imagery — the same object read minutes earlier and reads again once the service
+recovers — so no fallback copy helps and no date should be given up for one. That verdict is
+reached inside `is_unreadable_source` in `duplicates.py`, which declines them before any
+bad-data marker is consulted; there is no separate predicate to ask.
 
 It fails closed three ways. A credential fault on THIS side is excluded first, because it is
 repairable here and no waiting fixes it. A refusal nothing attributes to the source reader is
@@ -1809,9 +1809,10 @@ shares them, so those markers only count alongside GDAL's own vocabulary (`Raste
 `WarpOperationError`, `CPLE_`, `HTTP response code:`) — GDAL reads source imagery here and
 nothing else. And anything unrecognised is excluded, so the caller re-raises.
 
-One asymmetry to know about: `is_unreadable_source` recognises refusals by NAME, so a refusal
-reported as a bare status code carries none of the words it looks for and both predicates claim
-it. Callers that can act on both resolve it by ORDER, asking about the refusal first.
+One limit to know about: refusals are recognised by NAME and by status RANGE, so a refusal that
+carries neither — a transport failure with no status, or a cause destroyed in transit — is
+declined for want of evidence rather than named as a refusal. That is the fail-closed direction,
+and `cause_was_flattened` is what says which of the two happened.
 
 ### The radar bounded skip (`s1_roi.py`)
 

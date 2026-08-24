@@ -803,12 +803,12 @@ def is_unreadable_source(exc: BaseException) -> bool:
     text = _exception_chain_text(exc)
     if any(m in text for m in _NOT_THE_DATAS_FAULT):
         return False
-    # A PROVIDER REFUSAL IS NEVER BAD DATA, whatever wrapper it arrives in. This predicate and
-    # `is_provider_refusal` overlap otherwise: a refusal reaches us through a block-read wrapper,
-    # so the chain carries a refusal marker AND an unreadable one, and whichever predicate the
-    # caller happens to ask first decides. The radar path asks about refusals first and the
-    # optical path never asks at all, so the same failure was transient for one sensor and
-    # permanent data loss for the other. Excluding them here makes the two disjoint by
+    # A PROVIDER REFUSAL IS NEVER BAD DATA, whatever wrapper it arrives in. This once overlapped
+    # a separate refusal predicate, since removed: a refusal reaches us through a block-read
+    # wrapper, so the chain carries a refusal marker AND an unreadable one, and whichever
+    # predicate the caller happened to ask first decided. The radar path asked about refusals
+    # first and the optical path never asked at all, so the same failure was transient for one
+    # sensor and permanent data loss for the other. Excluding them here makes the two disjoint by
     # construction, so neither call order nor a caller that knows only one predicate can
     # misclassify. See context_docs/monitoring/incident-2026-08-24-nonmonotonic-append.md.
     if any(m in text for m in _PROVIDER_REFUSAL_MARKERS):
@@ -935,9 +935,9 @@ def _http_statuses(text: str) -> set[int]:
 
 #: What makes a failure the SOURCE reader's: GDAL is the layer that reported it.
 #:
-#: Required alongside :data:`_MISSING_OBJECT_MARKERS` by :func:`is_unreadable_source`, and
-#: alongside :data:`_PROVIDER_REFUSAL_MARKERS` by :func:`is_provider_refusal`, for one reason
-#: shared by both. Every string in those two tuples belongs to S3, and every S3 client in this
+#: Required alongside :data:`_MISSING_OBJECT_MARKERS` and :data:`_PROVIDER_REFUSAL_MARKERS` by
+#: :func:`is_unreadable_source`, for one reason shared by both. Every string in those two tuples
+#: belongs to S3, and every S3 client in this
 #: process speaks S3 — icechunk's error enum carries ``ObjectNotFound`` and ``NoSuchKey``
 #: verbatim, our own store write answers ``AccessDenied`` when icechunk picks up the
 #: OPERA-scoped token instead of the role (``storage/zarr_store.py`` documents exactly that),
@@ -968,8 +968,8 @@ _OWN_CREDENTIAL_MARKERS = (
 )
 
 #: Everything neither predicate may claim, because none of it is the DATA being at fault: our
-#: own credential, and a throttle. One list, used by both, because two lists drifted — a chain
-#: carrying `InvalidAccessKeyId` was refused by `is_provider_refusal` and accepted by
+#: own credential, and a throttle. One list because two drifted — a chain carrying
+#: `InvalidAccessKeyId` was refused by the refusal predicate of the time and accepted by
 #: `is_unreadable_source`, so the same credential fault was skipped as bad data on one path and
 #: raised on the other.
 _NOT_THE_DATAS_FAULT = (*_OWN_CREDENTIAL_MARKERS, "AccessDenied", "SlowDown")
