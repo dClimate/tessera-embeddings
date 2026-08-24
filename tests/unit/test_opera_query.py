@@ -1,13 +1,17 @@
 """Unit tests for opera_query.py - OPERA RTC-S1 query utilities."""
 
+import json
 import logging
 from collections import Counter
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
+from tessera_embeddings.ingest._http import NonJsonResponseError
 from tessera_embeddings.ingest.opera_query import (
+    _NON_JSON_PAGE_ATTEMPTS,
     _granule_to_item,
     _query_cmr_granules,
     make_s1_item_provider,
@@ -383,3 +387,100 @@ class TestMakeS1ItemProvider:
         assert mock_rewrite.call_count == 2
         # Same-date bursts share the canonical noon-UTC timestamp.
         assert all(item.datetime == datetime(2024, 6, 2, 12, 0, 0, tzinfo=UTC) for item in result)
+
+
+# ---------------------------------------------------------------------------
+# A page that answers 2xx with a body that is not JSON
+# ---------------------------------------------------------------------------
+
+
+def _raw_response(body: bytes, *, status: int = 200, content_type: str = "application/json", search_after=None):
+    """A REAL response, so an unparseable body fails the way CMR makes it fail.
+
+    ``_cmr_response`` stubs ``.json()`` and so cannot express a body that does not parse.
+    """
+    resp = requests.Response()
+    resp.status_code = status
+    resp._content = body
+    resp.url = "https://cmr.earthdata.nasa.gov/search/granules.json"
+    resp.headers["Content-Type"] = content_type
+    if search_after:
+        resp.headers["CMR-Search-After"] = search_after
+    return resp
+
+
+def _good_page(entries, search_after=None):
+    body = json.dumps({"feed": {"entry": entries}}).encode()
+    return _raw_response(body, search_after=search_after)
+
+
+class TestUnparseableGranulePage:
+    """A success status carrying a non-JSON body is the one failure the ladder cannot see.
+
+    ``_CMR_RETRY`` keys on status, and these responses have a good status — only the body
+    is wrong. Unretried, a single such page ends a leg that may already have written most
+    of a zone-year.
+    """
+
+    BBOX = (-122.0, 37.0, -121.0, 38.0)
+
+    def test_unparseable_page_is_re_asked_and_the_query_succeeds(self):
+        entries = [_granule_entry("g-1")]
+        patcher, mock_get = _patch_cmr_session(
+            side_effect=[_raw_response(b"", content_type="text/html"), _good_page(entries)]
+        )
+        with patcher, patch("tessera_embeddings.ingest.opera_query.time.sleep"):
+            items = _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
+
+        assert {item.id for item in items} == {"g-1"}
+        assert mock_get.call_count == 2
+
+    def test_exhausting_the_re_asks_names_the_endpoint_and_what_arrived(self):
+        """The failure must identify itself — a bare JSONDecodeError names nothing."""
+        pages = [_raw_response(b"<html><title>502 Bad Gateway</title>", content_type="text/html")] * 8
+        patcher, mock_get = _patch_cmr_session(side_effect=pages)
+        with (
+            patcher,
+            patch("tessera_embeddings.ingest.opera_query.time.sleep"),
+            pytest.raises(NonJsonResponseError) as exc_info,
+        ):
+            _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
+
+        exc = exc_info.value
+        assert exc.url.endswith("/search/granules.json")
+        assert exc.status == 200
+        assert exc.content_type == "text/html"
+        # On the attribute, never in the message the retry decision substring-matches.
+        assert "502 Bad Gateway" in (exc.excerpt or "")
+        assert "502 Bad Gateway" not in str(exc)
+        assert mock_get.call_count == _NON_JSON_PAGE_ATTEMPTS
+
+    def test_a_re_asked_page_repeats_the_same_cursor(self):
+        """Re-asking must name the same page, or the retry silently skips granules."""
+        page1 = _good_page([_granule_entry(f"g-{i}") for i in range(2000)], search_after="token123")
+        patcher, mock_get = _patch_cmr_session(
+            side_effect=[page1, _raw_response(b""), _good_page([_granule_entry("g-final")])]
+        )
+        with patcher, patch("tessera_embeddings.ingest.opera_query.time.sleep"):
+            items = _query_cmr_granules(self.BBOX, "2024-01-01", "2024-12-31", "ascending")
+
+        assert any(item.id == "g-final" for item in items)
+        # The failed ask and the re-ask both carried the cursor page 1 issued.
+        assert mock_get.call_args_list[1].kwargs["headers"]["CMR-Search-After"] == "token123"
+        assert mock_get.call_args_list[2].kwargs["headers"]["CMR-Search-After"] == "token123"
+
+    def test_a_server_error_is_not_re_asked_by_this_path(self):
+        """Scope check: only a non-JSON body is re-asked here.
+
+        A 5xx belongs to the session's own ladder, which has already spent its backoff by
+        the time it reaches us. Re-asking it here would multiply that budget.
+        """
+        patcher, mock_get = _patch_cmr_session(side_effect=[_raw_response(b"nope", status=500)])
+        with (
+            patcher,
+            patch("tessera_embeddings.ingest.opera_query.time.sleep"),
+            pytest.raises(requests.HTTPError),
+        ):
+            _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
+
+        assert mock_get.call_count == 1

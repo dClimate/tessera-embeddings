@@ -14,7 +14,7 @@ import time
 import warnings
 from collections import Counter
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import mgrs
 import requests
@@ -23,7 +23,7 @@ from pystac.utils import str_to_datetime
 from requests.adapters import HTTPAdapter
 
 from tessera_embeddings.config import S1_OPERA_BANDS
-from tessera_embeddings.ingest._http import make_logging_retry
+from tessera_embeddings.ingest._http import NonJsonResponseError, json_or_raise, make_logging_retry
 from tessera_embeddings.ingest.auth import get_edl_session, resolve_item_assets, rewrite_assets_to_s3
 from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 
@@ -73,6 +73,19 @@ _CMR_RETRY = make_logging_retry(
     allowed_methods=frozenset(["GET"]),
     respect_retry_after_header=True,
 )
+
+
+#: Attempts at ONE page whose body did not parse as JSON. Scoped deliberately to that
+#: case: a non-JSON body under a success status is the single failure ``_CMR_RETRY``
+#: cannot see, because its ladder keys on status and this response's status is fine.
+#: Every other failure still reaches that ladder, unchanged.
+_NON_JSON_PAGE_ATTEMPTS = 4
+
+#: Seconds before re-asking for a page that came back unparseable, multiplied by the
+#: attempt number. The pages this query asks for run to tens of megabytes, so a body that
+#: arrives truncated is evidence the path is briefly under strain — the wait is the only
+#: thing that makes the re-ask different from the ask.
+_NON_JSON_PAGE_BACKOFF_S = 5.0
 
 
 def _cmr_session() -> requests.Session:
@@ -310,6 +323,58 @@ def _query_cmr_granules(
     return _query_cmr_granules_one(bbox, start_date, end_date, orbit_direction)
 
 
+def _fetch_granule_page(
+    session: requests.Session,
+    params: dict[str, str | int | list[str]],
+    headers: dict[str, str],
+    page: int,
+) -> tuple[dict[str, Any], str | None]:
+    """Fetch ONE page of granules and parse it, re-asking when the body is not JSON.
+
+    Returns the decoded body and the pagination cursor to carry into the next page.
+
+    Retried here because the session's ladder cannot reach this failure: it keys on
+    status, and a truncated or error-page body arrives under a success status that
+    ``raise_for_status`` passes. Left unretried, one unparseable page ends the leg — and a
+    leg is a zone-year, so the cost is every batch it had already written, discarded for a
+    page the archive will serve on the next ask.
+
+    Re-asking is safe to repeat: the request is a GET, and its cursor header is a value
+    the archive issued, so the identical request names the identical page.
+    """
+    for attempt in range(1, _NON_JSON_PAGE_ATTEMPTS + 1):
+        resp = session.get(_CMR_GRANULE_URL, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+        try:
+            body = cast(dict[str, Any], json_or_raise(resp, quote_body=True))
+        except NonJsonResponseError as exc:
+            # The body is LOGGED, never raised: the failure message is substring-matched to
+            # decide whether a failed leg may be retried, and provider-chosen text in it
+            # could match a non-retryable marker and strand the zone-year.
+            if attempt == _NON_JSON_PAGE_ATTEMPTS:
+                logger.error(
+                    "CMR page %d still unparseable after %d attempt(s) — %s Body began: %r",
+                    page,
+                    attempt,
+                    exc,
+                    exc.excerpt,
+                )
+                raise
+            logger.warning(
+                "CMR page %d came back unparseable (attempt %d/%d), re-asking in %.0fs — %s Body began: %r",
+                page,
+                attempt,
+                _NON_JSON_PAGE_ATTEMPTS,
+                _NON_JSON_PAGE_BACKOFF_S * attempt,
+                exc,
+                exc.excerpt,
+            )
+            time.sleep(_NON_JSON_PAGE_BACKOFF_S * attempt)
+            continue
+        return body, resp.headers.get("CMR-Search-After")
+    raise AssertionError("unreachable: the loop either returns or raises")  # pragma: no cover
+
+
 def _query_cmr_granules_one(
     bbox: tuple[float, float, float, float],
     start_date: str,
@@ -350,9 +415,7 @@ def _query_cmr_granules_one(
     page = 0
     while True:
         page += 1
-        resp = session.get(_CMR_GRANULE_URL, params=params, headers=headers, timeout=30)
-        resp.raise_for_status()
-        body = resp.json()
+        body, search_after = _fetch_granule_page(session, params, headers, page)
 
         entries = body.get("feed", {}).get("entry", [])
         if not entries:
@@ -364,7 +427,6 @@ def _query_cmr_granules_one(
             f"({len(items)} items so far, {time.monotonic() - t0:.1f}s)"
         )
 
-        search_after = resp.headers.get("CMR-Search-After")
         if search_after and len(entries) == params["page_size"]:
             headers["CMR-Search-After"] = search_after
         else:
