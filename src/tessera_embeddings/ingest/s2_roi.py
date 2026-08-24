@@ -393,10 +393,10 @@ def ingest_s2_roi_reflectance(
         raise ValueError(f"batch_dates must be >= 1 or None for auto, got {batch_dates}")
     reflectance_store = f"{store_path}/reflectance.zarr"
 
-    # Before the first read, because what it captures is only ever recorded as the read
-    # happens: the loader names the object it gave up on in its own log record on whichever
-    # worker hit it, and nothing in the exception carries it. Installed on every current and
-    # future worker; never fatal, since the recovery it sharpens works without it.
+    # Before the first read, because what it keeps is only kept AS the read happens, on
+    # whichever worker hit it: the object the loader gave up on, which it names only in its own
+    # log record, and the failure's cause, which is otherwise destroyed on the way out of the
+    # worker. Installed on every current and future worker; never fatal.
     install_capture_everywhere(client)
 
     roi = read_roi_metadata(roi_zarr_path, storage_options=storage_options)

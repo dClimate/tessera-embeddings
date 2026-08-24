@@ -118,7 +118,17 @@ def _run(
         start_date="2024-01-01",
         end_date="2024-01-04",
         store_path="s3://bucket/mosaics",
-        client=type("C", (), {"persist": staticmethod(lambda x: x)})(),
+        client=type(
+            "C",
+            (),
+            {
+                "persist": staticmethod(lambda x: x),
+                # The leg refuses to start unless every worker confirms the read-failure
+                # rescues are installed, so this answers for one worker by really calling it.
+                "register_plugin": staticmethod(lambda _plugin: None),
+                "run": staticmethod(lambda fn, *a, **k: {"inproc://fake": fn(*a, **k)}),
+            },
+        )(),
         orbit="ascending",
         batch_days=2,
         **kwargs,

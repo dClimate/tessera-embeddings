@@ -97,6 +97,23 @@ class _FakeClient:
         """The cropped gate submits its reduce explicitly; hand back a local future."""
         return SimpleNamespace(result=obj.compute)
 
+    @staticmethod
+    def register_plugin(_plugin):
+        """Accept the plugin. A worker's ``setup`` is what installs the rescues on a real
+        cluster; here the in-process install has already run, which is what ``run`` reports.
+        """
+        return None
+
+    @staticmethod
+    def run(fn, *args, **kwargs):
+        """Answer for one worker by really calling ``fn`` in this process.
+
+        Faithful rather than convenient: the leg now refuses to start unless every worker
+        confirms the rescues are installed, so a stub that ignored this would assert a fleet
+        state nothing had established.
+        """
+        return {"inproc://fake": fn(*args, **kwargs)}
+
 
 def _item(date: str, item_id: str | None = None):
     # `id` is carried because the ingest sort breaks cloud-cover ties on it, so an item without

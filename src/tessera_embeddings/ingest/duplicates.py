@@ -728,10 +728,11 @@ def alternates_for(
 #: reason, and the reason — a codec that cannot inflate a tile — is what says the object is
 #: broken rather than briefly unavailable.
 #:
-#: Matched as TEXT, and that is forced rather than chosen: the read runs on a Dask worker and
-#: the failure is re-raised on the driver through tblib, which cannot reconstruct rasterio's
-#: GDAL-backed exception classes. What arrives is a plain ``Exception`` carrying the original's
-#: repr, so an ``isinstance`` check matches nothing and the message is the only evidence left.
+#: Matched as TEXT because the type NAMES survive the hop to the orchestrator regardless of how
+#: faithfully the classes themselves are rebuilt, and because one string can name a condition
+#: several unrelated layers report. What the chain CONTAINS is a separate question, and the
+#: answer used to be nothing: see ``ingest/loader_failures.py`` for what the chain arrives with
+#: and what has to be installed on the reader for it to arrive at all.
 #: Only signatures that name a CODEC OR FORMAT OPERATION failing. Deliberately minimal, and the
 #: minimality is the point: this predicate's `True` means "give up this date", and it is reached as
 #: the DEFAULT for anything the transient lists above do not recognise. Every gap in those lists
@@ -802,12 +803,12 @@ def is_unreadable_source(exc: BaseException) -> bool:
     text = _exception_chain_text(exc)
     if any(m in text for m in _NOT_THE_DATAS_FAULT):
         return False
-    # A PROVIDER REFUSAL IS NEVER BAD DATA, whatever wrapper it arrives in. This predicate and
-    # `is_provider_refusal` overlap otherwise: a refusal reaches us through a block-read wrapper,
-    # so the chain carries a refusal marker AND an unreadable one, and whichever predicate the
-    # caller happens to ask first decides. The radar path asks about refusals first and the
-    # optical path never asks at all, so the same failure was transient for one sensor and
-    # permanent data loss for the other. Excluding them here makes the two disjoint by
+    # A PROVIDER REFUSAL IS NEVER BAD DATA, whatever wrapper it arrives in. This once overlapped
+    # a separate refusal predicate, since removed: a refusal reaches us through a block-read
+    # wrapper, so the chain carries a refusal marker AND an unreadable one, and whichever
+    # predicate the caller happened to ask first decided. The radar path asked about refusals
+    # first and the optical path never asked at all, so the same failure was transient for one
+    # sensor and permanent data loss for the other. Excluding them here makes the two disjoint by
     # construction, so neither call order nor a caller that knows only one predicate can
     # misclassify. See context_docs/monitoring/incident-2026-08-24-nonmonotonic-append.md.
     if any(m in text for m in _PROVIDER_REFUSAL_MARKERS):
@@ -824,13 +825,38 @@ def is_unreadable_source(exc: BaseException) -> bool:
     return any(m in text for m in _MISSING_OBJECT_MARKERS) and any(m in text for m in _SOURCE_READER_MARKERS)
 
 
+def cause_was_flattened(exc: BaseException) -> bool:
+    """Whether ``exc`` is a read failure that arrived with its cause destroyed.
+
+    The shape is Dask's substitute for an exception it could not serialise: a plain
+    ``Exception`` whose whole message is the repr of the real one, and no chain behind it.
+    Every predicate here reads the chain, so this shape is not merely hard to classify — it
+    carries no evidence to classify, and the fail-closed verdict it gets is the absence of a
+    decision rather than one.
+
+    ``ingest/loader_failures.py`` stops it being produced. This recognises it anyway, because
+    that rescue is installed per process and best effort: a worker it did not reach reads
+    exactly as the whole fleet used to, and the difference is invisible in the verdict. So the
+    detector exists to make the residue LOUD — the one signal that says a re-raise happened
+    for want of evidence, not for want of a matching marker.
+    """
+    return (
+        type(exc) is Exception
+        and exc.__cause__ is None
+        and exc.__context__ is None
+        and any(m in str(exc) for m in _SOURCE_READER_MARKERS)
+    )
+
+
 def _exception_chain_text(exc: BaseException) -> str:
     """The chain's type names and messages, joined, for text classification.
 
-    Text rather than ``isinstance`` because the read runs on a Dask worker and is re-raised on
-    the driver through tblib, which cannot rebuild rasterio's GDAL-backed classes — what arrives
-    is a plain exception carrying the original's repr. The whole chain, because the wrapper
-    discards the reason: ``WarpOperationError('Chunk and warp failed')`` says nothing on its own.
+    Text rather than ``isinstance`` because the chain crosses the Dask boundary and the classes
+    that reach it there are rebuilt by tblib, whose reconstruction is only as faithful as the
+    reducer each class exposes. The type NAMES survive that regardless, which is what makes
+    them the stable thing to match; see ``ingest/loader_failures.py`` for what keeps the chain
+    itself intact. The whole chain, because the wrapper discards the reason:
+    ``WarpOperationError('Chunk and warp failed')`` says nothing on its own.
     """
     seen: list[str] = []
     current: BaseException | None = exc
@@ -912,9 +938,9 @@ def _http_statuses(text: str) -> set[int]:
 
 #: What makes a failure the SOURCE reader's: GDAL is the layer that reported it.
 #:
-#: Required alongside :data:`_MISSING_OBJECT_MARKERS` by :func:`is_unreadable_source`, and
-#: alongside :data:`_PROVIDER_REFUSAL_MARKERS` by :func:`is_provider_refusal`, for one reason
-#: shared by both. Every string in those two tuples belongs to S3, and every S3 client in this
+#: Required alongside :data:`_MISSING_OBJECT_MARKERS` and :data:`_PROVIDER_REFUSAL_MARKERS` by
+#: :func:`is_unreadable_source`, for one reason shared by both. Every string in those two tuples
+#: belongs to S3, and every S3 client in this
 #: process speaks S3 — icechunk's error enum carries ``ObjectNotFound`` and ``NoSuchKey``
 #: verbatim, our own store write answers ``AccessDenied`` when icechunk picks up the
 #: OPERA-scoped token instead of the role (``storage/zarr_store.py`` documents exactly that),
@@ -945,8 +971,8 @@ _OWN_CREDENTIAL_MARKERS = (
 )
 
 #: Everything neither predicate may claim, because none of it is the DATA being at fault: our
-#: own credential, and a throttle. One list, used by both, because two lists drifted — a chain
-#: carrying `InvalidAccessKeyId` was refused by `is_provider_refusal` and accepted by
+#: own credential, and a throttle. One list because two drifted — a chain carrying
+#: `InvalidAccessKeyId` was refused by the refusal predicate of the time and accepted by
 #: `is_unreadable_source`, so the same credential fault was skipped as bad data on one path and
 #: raised on the other.
 _NOT_THE_DATAS_FAULT = (*_OWN_CREDENTIAL_MARKERS, "AccessDenied", "SlowDown")

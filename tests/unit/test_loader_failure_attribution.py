@@ -1,4 +1,6 @@
-"""Attributing an unreadable read to the object the loader actually gave up on.
+"""Keeping a failed load's evidence: the object it gave up on, and the reason it gave.
+
+Attributing an unreadable read to the object the loader actually gave up on.
 
 The loader names that object in its own log record and raises an exception that does not
 carry it. Without the name, the duplicate ladder has to step every duplicated tile-date in
@@ -11,25 +13,45 @@ the date, and these tests hold the two properties that makes the difference betw
 
 Both properties are stated against a date shaped like a real wide-ROI one: many duplicated
 tiles, one of them broken.
+
+The reason is held in the exception's CAUSE, and the tests for it run the exception through
+Dask's own error path rather than a stand-in, because the loss happens inside that path. A
+hand-made substitute is what let the loss ship: it looked like the flattened exception the
+orchestrator receives without being produced the way the real one is.
 """
 
 from __future__ import annotations
 
+import copyreg
+import inspect
 import logging
+from collections.abc import Iterator
 from datetime import UTC, datetime
 
+import pytest
+from distributed.core import clean_exception, error_message
+from rasterio._err import CPLE_AppDefinedError, CPLE_BaseError
+from rasterio.errors import RasterioIOError, WarpOperationError
+
+from tessera_embeddings.ingest import loader_failures
 from tessera_embeddings.ingest.duplicates import (
     alternates_for,
+    cause_was_flattened,
     copies_label,
+    is_unreadable_source,
     select_preferred_duplicates,
     step_down_copies,
 )
 from tessera_embeddings.ingest.loader_failures import (
+    AbortedReadCapture,
+    ReadRescuesNotInstalledError,
     collect_aborted_hrefs,
     drain_local,
     href_key,
     implicated_tile_dates,
     install_capture,
+    install_capture_everywhere,
+    keep_causes_picklable,
     label_objects,
 )
 
@@ -294,3 +316,284 @@ class TestWhatTheLogSays:
         kept, alternates = select_preferred_duplicates(items)
         foreign = ("MGRS-99XXX", "2021-09-08")
         assert foreign not in alternates_for(alternates, kept, only={foreign})
+
+
+#: What GDAL says when libtiff cannot inflate a tile, verbatim from a fleet log. The message a
+#: verdict about a failed read is supposed to be reached from.
+CODEC_FAILURE = "ZIPDecode:Decoding error at scanline 0, unknown compression method"
+
+#: What rasterio wraps it in, verbatim. It reports that a read failed and nothing about why.
+READ_FAILED = "Read failed. See previous exception for details."
+
+
+def _as_rasterio_ships() -> None:
+    """Drop any reducer already installed, leaving the class as the installed wheel defines it."""
+    if "__reduce__" in CPLE_BaseError.__dict__:
+        del CPLE_BaseError.__reduce__
+
+
+@pytest.fixture
+def gdal_errors_travel_as_shipped() -> Iterator[None]:
+    """Start every test from rasterio as shipped, and put back whatever was installed.
+
+    The reducer is an attribute on a third-party class and tblib registers itself in
+    ``copyreg``, so both are process-global for the rest of the session. Any earlier test that
+    starts an ingest installs the reducer, and a test asserting the loss would then observe a
+    rescue it never asked for — which is order-dependent, and which is what happened: the same
+    three tests passed alone and failed after a radar leg test in the same worker.
+
+    So establishing the precondition matters as much as restoring afterwards. Restoring alone
+    leaves the assertion at the mercy of what ran before it.
+    """
+    installed = CPLE_BaseError.__dict__.get("__reduce__")
+    dispatch = dict(copyreg.dispatch_table)
+    _as_rasterio_ships()
+    try:
+        yield
+    finally:
+        if installed is None:
+            _as_rasterio_ships()
+        else:
+            CPLE_BaseError.__reduce__ = installed  # type: ignore[method-assign]
+        copyreg.dispatch_table.clear()
+        copyreg.dispatch_table.update(dispatch)
+
+
+def _codec_failure_reading_a_tile() -> RasterioIOError:
+    """The optical failure, raised the way a reading worker raises it.
+
+    Raised rather than constructed: the cause is attached by ``raise ... from``, which is the
+    only thing that puts a chain on an exception, and the chain is the subject here.
+    """
+    try:
+        raise CPLE_AppDefinedError(1, 4, CODEC_FAILURE)
+    except CPLE_AppDefinedError as cause:
+        try:
+            raise RasterioIOError(READ_FAILED) from cause
+        except RasterioIOError as failure:
+            return failure
+
+
+def _refusal_behind_the_warp_wrapper() -> WarpOperationError:
+    """The radar failure: a provider refusal, three links down under a bare wrapper."""
+    try:
+        raise CPLE_AppDefinedError(1, 11, "HTTP response code: 503")
+    except CPLE_AppDefinedError as cause:
+        try:
+            raise RasterioIOError(READ_FAILED) from cause
+        except RasterioIOError as inner:
+            try:
+                raise WarpOperationError("Chunk and warp failed") from inner
+            except WarpOperationError as failure:
+                return failure
+
+
+def _across_the_worker_boundary(exc: BaseException) -> BaseException:
+    """What the orchestrating worker receives for ``exc`` raised on a reading worker.
+
+    Dask's own two halves, unmodified. ``error_message`` runs where the read failed and
+    pickles the exception, and — this is the half that matters — it unpickles its own output
+    first and substitutes a flattened exception when that fails. So the loss is decided on the
+    SENDING side, which is why a reducer installed only where the failure lands is too late.
+    """
+    message = error_message(exc)
+    payload = message["exception"]
+    _, arrived, _ = clean_exception(exception=getattr(payload, "data", payload))
+    assert arrived is not None
+    return arrived
+
+
+@pytest.mark.usefixtures("gdal_errors_travel_as_shipped")
+class TestTheReasonDoesNotSurviveTheWorkerBoundary:
+    """What arrives without the reducer — the shape every read verdict was reached from."""
+
+    def test_the_cause_is_replaced_by_the_wrappers_repr(self) -> None:
+        """The exact production shape, produced rather than imitated.
+
+        A plain ``Exception`` whose entire message is the outer exception's repr, and no chain
+        under it. tblib rebuilds an exception with a custom ``__init__`` by assigning to
+        ``args``, GDAL publishes ``args`` read-only, the assignment throws, and Dask falls back
+        to this. The GDAL class, its error number and the codec's message are all gone.
+        """
+        arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
+
+        assert type(arrived) is Exception
+        assert str(arrived) == repr(RasterioIOError(READ_FAILED))
+        assert arrived.__cause__ is None
+        assert CODEC_FAILURE not in str(arrived)
+
+    def test_the_verdict_is_undecidable(self) -> None:
+        """Corrupt bytes, and the classifier cannot say so — nothing in what arrived says it.
+
+        This is the whole defect. The verdict is not wrong, it is absent: the predicate fails
+        closed, the caller re-raises, and the leg dies on a date another copy could have served.
+        """
+        arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
+        assert is_unreadable_source(arrived) is False
+        assert cause_was_flattened(arrived) is True
+
+    def test_the_bare_warp_wrapper_arrives_saying_nothing_at_all(self) -> None:
+        """The radar shape. Its own message names neither a codec nor a status."""
+        arrived = _across_the_worker_boundary(_refusal_behind_the_warp_wrapper())
+        assert str(arrived) == repr(WarpOperationError("Chunk and warp failed"))
+        assert cause_was_flattened(arrived) is True
+
+
+@pytest.mark.usefixtures("gdal_errors_travel_as_shipped")
+class TestTheReasonSurvivesOnceTheReducerIsInstalled:
+    """The same failures, through the same Dask path, with the reducer on the sending side."""
+
+    def test_the_whole_chain_arrives(self) -> None:
+        keep_causes_picklable()
+        arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
+
+        assert type(arrived) is RasterioIOError
+        assert str(arrived) == READ_FAILED
+        assert type(arrived.__cause__) is CPLE_AppDefinedError
+        assert str(arrived.__cause__) == CODEC_FAILURE
+
+    def test_the_gdal_error_number_survives_too(self) -> None:
+        """Faithful, not merely sufficient: the class is rebuilt through its own constructor
+        from its own ``args``, so it carries what it carried rather than a flattened string.
+        """
+        keep_causes_picklable()
+        arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
+        assert arrived.__cause__ is not None
+        assert arrived.__cause__.args == (1, 4, CODEC_FAILURE)
+
+    def test_corrupt_bytes_are_now_classified_as_unreadable(self) -> None:
+        """The payoff. The same failure that arrived undecidable now decides a step-down."""
+        keep_causes_picklable()
+        arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
+        assert is_unreadable_source(arrived) is True
+        assert cause_was_flattened(arrived) is False
+
+    def test_a_refusal_three_links_down_is_still_not_the_datas_fault(self) -> None:
+        """Decidable must not mean permissive. The status is now visible and it says transient,
+        so the verdict declines — for a stated reason rather than for want of evidence.
+        """
+        keep_causes_picklable()
+        arrived = _across_the_worker_boundary(_refusal_behind_the_warp_wrapper())
+        assert is_unreadable_source(arrived) is False
+        assert cause_was_flattened(arrived) is False
+        assert "503" in str(arrived.__cause__.__cause__)
+
+    def test_installing_twice_changes_nothing(self) -> None:
+        """A worker's plugin setup runs again on reconnect."""
+        keep_causes_picklable()
+        keep_causes_picklable()
+        arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
+        assert type(arrived.__cause__) is CPLE_AppDefinedError
+
+    def test_every_gdal_error_class_is_covered_by_the_one_entry(self) -> None:
+        """One entry names the BASE, so no subclass has to be enumerated — including ones a
+        later GDAL adds. Asserted over the installed wheel's classes so an upgrade that breaks
+        the assumption fails here rather than on a campaign leg.
+        """
+        keep_causes_picklable()
+        classes = [CPLE_BaseError, *_all_subclasses(CPLE_BaseError)]
+        assert len(classes) > 1
+
+        for cls in classes:
+            arrived = _across_the_worker_boundary(cls(1, 4, CODEC_FAILURE))
+            assert type(arrived) is cls, f"{cls.__name__} did not survive"
+            assert str(arrived) == CODEC_FAILURE, f"{cls.__name__} lost its message"
+
+    def test_no_other_exception_in_the_read_stack_needs_an_entry(self) -> None:
+        """Why the entry is one class and not a list to keep in step with rasterio.
+
+        tblib's assignment only fails where ``args`` is a read-only property, and every class
+        in the loaded read stack with one is a ``CPLE_BaseError``. That is what makes the entry
+        complete rather than merely current, so it is checked rather than asserted in prose.
+        """
+        readonly = []
+        for cls in _all_subclasses(BaseException):
+            descriptor = inspect.getattr_static(cls, "args", None)
+            if isinstance(descriptor, property) and descriptor.fset is None:
+                readonly.append(cls)
+        assert readonly
+        assert all(issubclass(cls, CPLE_BaseError) for cls in readonly), [
+            f"{c.__module__}.{c.__qualname__}" for c in readonly if not issubclass(c, CPLE_BaseError)
+        ]
+
+
+def _all_subclasses(cls: type) -> list[type]:
+    """Every direct and indirect subclass of ``cls`` currently loaded."""
+    found: dict[int, type] = {}
+    todo = list(cls.__subclasses__())
+    while todo:
+        current = todo.pop()
+        if id(current) in found:
+            continue
+        found[id(current)] = current
+        todo += current.__subclasses__()
+    return list(found.values())
+
+
+@pytest.mark.usefixtures("gdal_errors_travel_as_shipped")
+class TestBothRescuesReachTheWorker:
+    """The wiring. Each rescue needs code running on the reader BEFORE the read fails, and
+    the plugin is the only thing that reaches a worker that joined after the ingest started.
+    """
+
+    def test_the_plugin_installs_the_reducer_as_well_as_the_capture(self) -> None:
+        AbortedReadCapture().setup(worker=None)
+
+        arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
+        assert type(arrived.__cause__) is CPLE_AppDefinedError
+
+        drain_local()
+        logging.getLogger("odc.loader._rio").error(ABORT_MESSAGE)
+        assert len(drain_local()) == 1
+
+    def test_a_serial_run_with_no_cluster_still_gets_both(self) -> None:
+        """Reads happen in-process when there is no client, and must be as decidable there."""
+        install_capture_everywhere(None)
+        arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
+        assert type(arrived.__cause__) is CPLE_AppDefinedError
+
+    @pytest.mark.parametrize(
+        ("registers", "answers", "expected"),
+        [
+            pytest.param(
+                OSError("scheduler unreachable"), None, "cannot classify read failures", id="registration-refused"
+            ),
+            pytest.param(
+                None, {"tcp://a": True, "tcp://b": False}, "reported it missing", id="a-worker-says-it-is-missing"
+            ),
+            pytest.param(None, {"tcp://a": True, "tcp://b": True}, None, id="every-worker-confirms"),
+        ],
+    )
+    def test_a_fleet_that_cannot_classify_refuses_to_start(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        registers: Exception | None,
+        answers: dict[str, bool] | None,
+        expected: str | None,
+    ) -> None:
+        """USED TO BE TOLERATED, and that was right while these rescues only sharpened attribution.
+
+        The reducer now decides whether a read failure is decidable at all, and an undecidable
+        failure strands the whole zone-year on one bad object rather than costing a date. Verified
+        rather than assumed, because registration returning is not the worker having run setup.
+        """
+        # The attempts are what this asserts; their spacing is not, and paying it would put the
+        # backoff's wall clock on every run of the failing path.
+        monkeypatch.setattr(loader_failures, "_REGISTRATION_BACKOFF_S", 0.0)
+
+        class _Client:
+            def register_plugin(self, *_a: object, **_k: object) -> None:
+                if registers is not None:
+                    raise registers
+
+            def run(self, *_a: object, **_k: object) -> dict[str, bool]:
+                assert answers is not None, "must not be reached when registration itself failed"
+                return answers
+
+        if expected is None:
+            install_capture_everywhere(_Client())  # type: ignore[arg-type]
+            arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
+            assert type(arrived.__cause__) is CPLE_AppDefinedError
+            return
+        with pytest.raises(ReadRescuesNotInstalledError, match=expected):
+            install_capture_everywhere(_Client())  # type: ignore[arg-type]

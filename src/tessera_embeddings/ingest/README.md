@@ -16,7 +16,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `item_baselines.py` | The ONE reader of `s2:processing_baseline`. Reports an integer hundredth (`04.00` -> `400`), the same scale `S2_BASELINE_THRESHOLD` is expressed in, and `None` for every kind of unreadable. Exists because there were two readers on two scales with two notions of unreadable, so each numeric edge case had to be fixed twice — and they had drifted before anyone noticed. |
 | `asset_locations.py` | Answers the two questions asked of where an item's assets live, and keeps them apart: **is the read cheap** (a property of the bucket's REGION) and **has the reflectance offset already been removed** (a property of the PRODUCER). They have the same answer today and would not the first time anyone mirrors unharmonised data in region, so two bucket lists make that impossible to conflate. Also holds `AssetSources`, which reports the keys it could NOT resolve rather than dropping them — the primitive that generated the same defect three times when it returned only what it found. Its item-level harmonisation answer feeds duplicate RANKING; the correction itself is decided per asset in `boa_offset.py`. |
 | `duplicates.py` | Chooses between DUPLICATE catalogue items for one tile-date — Element 84 publishes more than one whenever a granule is reprocessed, distinguished by `s2:sequence`. Usable first, then the newest baseline, then the copy owing no offset correction; the rejected copies are retained as a fallback the write steps down when a source object will never read. Reducing to one copy before the loader is what makes a fallback possible at all, since `odc.stac.load` FUSES a solar-day group — and it is also what makes the recorded baseline match the pixels written. |
-| `loader_failures.py` | Names the source object a failed load could not read. `odc.stac.load` reports it in its OWN log record and raises an exception that does not carry it, so a logging handler on every reader process records each aborted href, and the caller collects them after a failure and maps them back to tile-dates. That name is what lets the duplicate ladder step down ONE copy instead of every duplicated tile in the date. Attribution is best effort by design: an empty answer means "attribute nothing", never "nothing was at fault", and the recovery it sharpens still works without it. |
+| `loader_failures.py` | Keeps what a failed load knows — WHICH object, and WHY — since neither reaches the caller on its own and both need code running on the reader before the read fails. One `install_capture_everywhere` call per ingest installs both on every current and future worker. Names the source object a failed load could not read. `odc.stac.load` reports it in its OWN log record and raises an exception that does not carry it, so a logging handler on every reader process records each aborted href, and the caller collects them after a failure and maps them back to tile-dates. That name is what lets the duplicate ladder step down ONE copy instead of every duplicated tile in the date. Attribution is best effort by design: an empty answer means "attribute nothing", never "nothing was at fault", and the recovery it sharpens still works without it. |
 | `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary AWS credentials minted by ASF, ~1 hour) and legacy CloudFront signed URL resolution. Those credentials expire on their OWN clock, unrelated to any unit of work, so renewal must be driven by a timer and by the advertised expiry — never by the work loop, which can only renew between units and so cannot renew inside one that outlives the margin. |
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
@@ -1731,6 +1731,15 @@ throttle markers explicitly. It fails CLOSED: anything unrecognised propagates r
 being treated as bad data, because responding to a bad minute by reading worse imagery is
 the one outcome the recovery must never produce.
 
+**The chain only exists if something kept it.** The read fails on a Dask worker, and rasterio's
+GDAL error classes cannot be serialised out of it by default — Dask detects that and substitutes
+a plain `Exception` holding the wrapper's repr, so what arrives is one line with no cause and
+every predicate here has nothing to read. `loader_failures.keep_causes_picklable`, installed on
+every worker by the same plugin as the object capture, is what makes the cause arrive. It is best
+effort, so `cause_was_flattened` recognises a failure that arrived without one and
+`read_failure_context` logs `READ CAUSE LOST` — the signal that a verdict was reached from
+nothing rather than from evidence.
+
 **An object that was never published counts too, and needs its own markers.** Every
 codec-level signature is emitted by a BLOCK READ, and a missing object fails at open, before
 any block is requested — so a catalogue item naming an href the provider never wrote used to
@@ -1787,11 +1796,11 @@ object from failing a zone-year identically on every retry.
 
 ### When the provider refuses the read
 
-An authorization refusal, a throttle and a server error are a different finding again, and
-`is_provider_refusal` in `duplicates.py` is the predicate for them. They say nothing about the
-imagery — the same object read minutes earlier and reads again once the service recovers — so no
-fallback copy helps, which is why `is_unreadable_source` declines them and why this predicate
-sits beside it rather than inside it.
+An authorization refusal, a throttle and a server error are a different finding again. They say
+nothing about the imagery — the same object read minutes earlier and reads again once the service
+recovers — so no fallback copy helps and no date should be given up for one. That verdict is
+reached inside `is_unreadable_source` in `duplicates.py`, which declines them before any
+bad-data marker is consulted; there is no separate predicate to ask.
 
 **What a positive verdict buys is TIME, and nothing else.** It is passed to the shared write
 retry as `wait_out`, and the policy then keeps re-attempting that one failure until it has spent
@@ -1831,8 +1840,16 @@ what a failure whose cause was stripped crossing the worker boundary looks like:
 wait on suspicion, and it is not given up either.
 
 The two predicates were once overlapping, and a caller's ORDER of asking decided the verdict.
-They are now disjoint by construction — `is_unreadable_source` declines every refusal marker
-outright — so a caller that knows only one of them cannot misclassify.
+They are now disjoint by construction, and by sharing one classification rather than keeping two
+lists in step: both read the same markers and the same HTTP status RANGES, so a status nobody
+enumerated cannot be a refusal to one predicate and bad data to the other. A caller that knows
+only one of them cannot misclassify.
+
+That leaves one honest gap, and it is the fail-closed direction. A refusal carrying neither a
+name nor a status — a transport failure with no code, or a cause destroyed crossing the worker
+boundary — is declined for want of evidence rather than named as a refusal. It draws no long wait
+on suspicion and is not given up either. `cause_was_flattened` is what says which of those two
+happened, so a leg reading without a decidable cause is visible rather than silent.
 
 ### The radar bounded skip (`s1_roi.py`)
 
