@@ -1,5 +1,11 @@
 # Slow tests
 
+> **STATUS: empty, 2026-08-25.** The canonical occupant described below has not been written
+> — it exists as `tests/parity/test_full_pipeline_parity.py`, an `xfail(strict=True)` stub
+> raising `NotImplementedError`, filed under `parity/` because it needs both markers.
+> `nightly.yml` was pointed at it and its **schedule is suspended** until the test is real.
+> See `tests/README.md` → Roadmap 1.
+
 Tests that take more than ~2 minutes to run. Marked
 `@pytest.mark.slow`. Run nightly in CI and on demand locally.
 

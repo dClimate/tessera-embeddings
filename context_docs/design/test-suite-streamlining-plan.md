@@ -18,7 +18,7 @@ estimate it says so.
 
 ```
              files    tests    LOC     runs in CI as
-tests/unit     120     3367   48387    unit.yml (3.12 + 3.13), downstream-smoke.yml
+tests/unit     120     3367   48387    unit.yml (3.12 + 3.13)
 tests/integration 4       9      602    integration.yml
 tests/parity      9       9     1139    integration.yml (fast), nightly.yml (slow)
 tests/architecture 2       3       98    architecture.yml
@@ -36,7 +36,7 @@ says, and the drift is the source of most of §2's findings:
 
 | Tier | README says it runs | What actually runs it |
 |---|---|---|
-| `unit/` | every PR | `unit.yml` (3.12 + 3.13), `downstream-smoke.yml` — correct |
+| `unit/` | every PR | `unit.yml` (3.12 + 3.13) — correct. Note `downstream-smoke.yml` also runs this suite but is deliberately disabled to manual-only, pending a stable release of the private downstream consumer |
 | `architecture/` | every PR | `architecture.yml` — correct |
 | `integration/` | path-filtered PRs **+ nightly** | `integration.yml` on path-filtered PRs only. **Never nightly.** |
 | `parity/` | flow-touching PRs + nightly | correct — but see §2.3 for what nightly actually selects |
@@ -140,8 +140,9 @@ and shadows the fixture's. Proved it by mutating the production retire path to n
 `ray.kill` and confirming `TestRetireIdle::test_idle_actor_killed_after_grace` still fails.
 Both the source mutation and the test prototype were reverted.
 
-**Expected result: 84.3 s → ~25 s.** Two CI jobs (`unit.yml` × 2 Python versions,
-`downstream-smoke.yml`) get most of that back.
+**Expected result: 84.3 s → ~25 s**, on every PR and every push to `main`, across both
+Python versions in the `unit.yml` matrix — and on every local `uv run pytest`, which is where
+it will be felt most.
 
 ### Phase 2 — Remove dead weight (zero behavioural risk)
 
@@ -198,7 +199,7 @@ Consider adding this to `context_docs/decisions/` as an ADR. It is a standing de
 consequence a future reader will trip over ("why is the CUDA path untested?"), and the ADR
 tree is where this repo answers that kind of question.
 
-**2.3 — The nightly workflow runs one unimplemented test.** `nightly.yml` fires daily at
+**2.3 — The nightly workflow runs one unimplemented test. — DONE 2026-08-25.** `nightly.yml` fires daily at
 06:00 with a 120-minute timeout and runs `pytest tests/parity -m "parity and slow"`. That
 selector matches exactly one test: `test_full_pipeline_parity`, whose body is `raise
 NotImplementedError` under `@pytest.mark.xfail(strict=True)`.
@@ -210,10 +211,18 @@ nobody has written yet. Recommend suspending the schedule (keep `workflow_dispat
 the test is real, rather than paying a daily runner to confirm a placeholder is still a
 placeholder.
 
-**2.4 — `tests/README.md` needs correcting either way.** Its tier table claims integration
-runs nightly (it does not), and that `slow/` and `gpu/` are populated (they are not).
-Whatever is decided for 2.2 and 2.3, the table has to end up describing what is wired. This
-is a docs change in `tests/`, so it stays inside the test-only boundary.
+**2.4 — `tests/README.md` needs correcting either way. — DONE 2026-08-25.** Its tier table
+claimed integration runs nightly (it does not), and that `slow/` and `gpu/` are populated
+(they are not). It also listed `downstream-smoke.yml` as a runner of the unit suite; that
+workflow is deliberately disabled to manual-only, pending a stable release of the private
+downstream consumer.
+
+The table now describes what is wired, and a **Roadmap** section at the end of
+`tests/README.md` carries the four undone things — the empty `slow/` tier and the suspended
+nightly, the accepted GPU gap, the two orphaned tests from §2.5, and the 30-second bound
+broken by §3 item 1.1 — so they can be scooped up rather than rediscovered. Status banners
+were added to `tests/slow/README.md` and `tests/gpu/README.md` so the tier docs no longer
+contradict the top-level one.
 
 **2.5 — Two tests that no CI job ever runs.** The root `addopts` deselects
 `integration`, `parity`, `slow` and `gpu`; `integration.yml` runs only `tests/integration`
