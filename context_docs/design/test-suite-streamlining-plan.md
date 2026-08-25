@@ -1,6 +1,8 @@
 # Streamlining the test suite
 
-**Status:** plan, not yet executed. Drawn up 2026-08-25 against `main` @ `76aeda9`.
+**Status:** plan, not yet executed. Drawn up 2026-08-25 against `main` @ `76aeda9`, which is
+the tip including PRs #133–#140 — the GDAL-forwarder, ranged-reader-status, radar-refusal and
+GPU-hours work that landed that day. Every measurement below was taken on that commit.
 
 The suite has grown across many PRs and nobody has looked at it as a whole. This plan says
 what to change, what to leave alone, and — most importantly — what has to hold true before
@@ -26,6 +28,28 @@ tests/slow         0       0        0    nothing — no tests exist
 
 Unit suite: **84.3 s wall, 168 s CPU, 3366 passed / 1 skipped.** Line coverage of
 `src/tessera_embeddings` is **83 %** (13,038 statements, 2,221 missed).
+
+### The tiers as documented vs. as wired
+
+`tests/README.md` describes a six-tier design. Three of the six are not wired the way it
+says, and the drift is the source of most of §2's findings:
+
+| Tier | README says it runs | What actually runs it |
+|---|---|---|
+| `unit/` | every PR | `unit.yml` (3.12 + 3.13), `downstream-smoke.yml` — correct |
+| `architecture/` | every PR | `architecture.yml` — correct |
+| `integration/` | path-filtered PRs **+ nightly** | `integration.yml` on path-filtered PRs only. **Never nightly.** |
+| `parity/` | flow-touching PRs + nightly | correct — but see §2.3 for what nightly actually selects |
+| `slow/` | nightly + on-demand | **directory is empty.** Its documented occupant is an `xfail` stub in `parity/` |
+| `gpu/` | inference-touching PRs only | **directory is empty, marker has zero uses, no workflow runs `-m gpu`** |
+
+`tests/README.md` also states that unit tests are "< 30s each". One is 61 s (§3, item 1.1),
+so the suite's own documented bound is being broken by the slowest test in it.
+
+Separately, and *not* a defect: collecting `tests/unit` in a plain checkout produces 17
+import errors for `ray`, `prefect`, `httpx` and `s3fs`. `tests/README.md` explains this — the
+`inference` extra is optional because torch is large. CI installs `--all-extras` and never
+sees it. Reproducing CI locally needs `uv sync --all-extras --frozen`.
 
 Two things I expected to find and did not:
 
@@ -84,7 +108,9 @@ projected). Nothing is deleted; each test keeps its assertions.
 
 **1.1 in detail.** `SOURCE_READ_ATTEMPTS = 8` with `wait_exponential(multiplier=1, min=2,
 max=15)` is about 61 s of backoff, and the docstring in `roi_processing.py` says so
-deliberately — that ladder is a production decision and this plan does not touch it. The test
+deliberately — that ladder is a production decision and this plan does not touch it. Note
+that at 61 s this single test breaks the "< 30s each" bound `tests/README.md` sets for the
+unit tier, by a factor of two. The test
 does not need to *experience* the ladder to assert that a permanent read still raises.
 Verified:
 
@@ -127,17 +153,38 @@ is referenced only inside `tests/unit/conftest.py`; the last two only reference 
 so the set is closed. Zero references anywhere else — including as `usefixtures` strings and
 `getfixturevalue` strings, which a name-based grep catches because fixture lookup is by name.
 
-**2.2 — The `gpu` marker has zero uses**, and `tests/gpu/` contains only `__init__.py` and a
-README. Either delete the marker and the directory, or write the test the README describes.
+**2.2 — The `gpu` tier is empty, and the one real GPU test is filed outside it.** The `gpu`
+marker has zero uses and `tests/gpu/` holds only `__init__.py` and a README. But that README
+is not junk — it is a carefully written contract (tiny inputs, tiny model, compare GPU output
+to a CPU reference, ≤ 2 CI minutes per run). It is an unimplemented design, not dead code,
+so **do not just delete it.**
 
-**2.3 — The nightly workflow runs nothing real.** `nightly.yml` fires daily at 06:00 with a
-120-minute timeout and runs `pytest tests/parity -m "parity and slow"`. That selector matches
-exactly one test: `test_full_pipeline_parity`, whose body is `raise NotImplementedError`
-under `@pytest.mark.xfail(strict=True)`. A scheduled runner every day to confirm a
-placeholder is still a placeholder. Recommend disabling the schedule until the test is real
-(keep the file — it is a legitimate `xfail` placeholder, just not one worth a nightly).
+Meanwhile `tests/unit/test_inference_loop.py::TestRunInference::test_pipelined_matches_serial`
+is gated by `@pytest.mark.skipif(not torch.cuda.is_available())` rather than
+`@pytest.mark.gpu`, and its own docstring says it is "the only coverage of the pinned-buffer /
+CUDA-event / two-deep-drain / backbone-stream-ordering path". No CI runner has a GPU, so it
+skips everywhere — it is the `1 skipped` in every run. **That inference hot path has no CI
+coverage at all today.** This is the most consequential gap in the review and the least
+related to speed; it needs a decision (GPU runner, or accept and document), not a cleanup.
 
-**2.4 — Two tests that no CI job ever runs.** The root `addopts` deselects
+**2.3 — The nightly workflow runs one unimplemented test.** `nightly.yml` fires daily at
+06:00 with a 120-minute timeout and runs `pytest tests/parity -m "parity and slow"`. That
+selector matches exactly one test: `test_full_pipeline_parity`, whose body is `raise
+NotImplementedError` under `@pytest.mark.xfail(strict=True)`.
+
+The wiring is not an accident — `tests/slow/README.md` names the full plain-runner end-to-end
+as that tier's canonical occupant, and this stub is it, written in `parity/` because it needs
+both markers. So the honest description is: the nightly job is correctly pointed at a test
+nobody has written yet. Recommend suspending the schedule (keep `workflow_dispatch`) until
+the test is real, rather than paying a daily runner to confirm a placeholder is still a
+placeholder.
+
+**2.4 — `tests/README.md` needs correcting either way.** Its tier table claims integration
+runs nightly (it does not), and that `slow/` and `gpu/` are populated (they are not).
+Whatever is decided for 2.2 and 2.3, the table has to end up describing what is wired. This
+is a docs change in `tests/`, so it stays inside the test-only boundary.
+
+**2.5 — Two tests that no CI job ever runs.** The root `addopts` deselects
 `integration`, `parity`, `slow` and `gpu`; `integration.yml` runs only `tests/integration`
 and `tests/parity`. So these two, which live in `tests/unit/`, are executed by nothing:
 
@@ -208,7 +255,7 @@ failure. They are cheap and they catch circular imports. Leave them.
 | | before | after |
 |---|---|---|
 | unit suite wall time | 84.3 s | ~25 s |
-| tests | 3367 | 3365 (2 orphans in §2.4, if deleted rather than moved) |
+| tests | 3367 | 3365 (2 orphans in §2.5, if deleted rather than moved) |
 | test LOC | 49,953 | ~49,650 |
 | src line coverage | 83 % | unchanged — enforced by the gate |
 | daily CI runners doing nothing | 1 | 0 |
