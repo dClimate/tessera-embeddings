@@ -1,11 +1,13 @@
 """Unit tests for tessera_embeddings/inference/scheduling.py.
 
 Covers all modularized pieces (ActorPool, _poll_tracker) in isolation.
-No Ray cluster is required — all Ray calls are mocked.
+No Ray cluster is required — all Ray calls are mocked, the cluster capacity query
+included (see the autouse fixture below; unmocked it raises rather than answering).
 """
 
 from __future__ import annotations
 
+import itertools
 import logging
 import time
 from collections import deque
@@ -18,6 +20,7 @@ from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.scheduling import (
     ActorPool,
     _batch_actors_to_request,
+    _joined_gpu_count,
     _poll_tracker,
     _process_chunks_work_stealing,
 )
@@ -25,6 +28,23 @@ from tessera_embeddings.inference.scheduling import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _capacity_query_is_mocked():
+    """The cluster capacity query, mocked like every other Ray call in this file.
+
+    Left unmocked it does not return a value in a test process: Ray is not initialised, so it
+    RAISES, and the caller's guard turns that into a fallback. Every loop test would then take the
+    guard's failure branch on each iteration and report a figure frozen at its seed, while reading
+    as though it exercised the measurement. Mocking it makes these tests exercise the path they
+    name, and keeps the file's promise that no Ray cluster is required.
+
+    Deliberately answers with no GPU key, so the default is inert and perturbs no existing
+    assertion. A test that needs a particular capacity, or a failure, patches over this.
+    """
+    with patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 8.0}):
+        yield
 
 
 def _make_pool(n: int = 3, **kwargs) -> ActorPool:
@@ -95,6 +115,43 @@ def test_replace_carries_credentials_and_region_to_new_actor():
     args = cls.options.return_value.remote.call_args.args
     assert args[2] is creds
     assert args[3] == "eu-west-1"
+
+
+# ===========================================================================
+# _joined_gpu_count
+# ===========================================================================
+
+
+class TestJoinedGpuCount:
+    """The capacity reading behind the progress line's GPU-hours."""
+
+    def test_reads_the_cluster_total(self) -> None:
+        with patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 40.0, "GPU": 7.0}):
+            assert _joined_gpu_count(0.0, 1.0) == 7.0
+
+    def test_no_gpu_nodes_yet_reads_zero(self) -> None:
+        """Before the first worker joins, the cluster has no GPU key at all."""
+        with patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 8.0}):
+            assert _joined_gpu_count(3.0, 1.0) == 0.0
+
+    def test_a_run_that_asks_for_no_gpu_reports_none(self) -> None:
+        """A CPU-only run on a GPU-capable cluster must not charge itself the cluster's GPUs.
+
+        The reading is of the CLUSTER, so it says nothing about this run once this run reserves
+        no GPU. Answering with the cluster total there would invent GPU-hours for a fill that
+        used none.
+        """
+        with patch.object(_sched_mod.ray, "cluster_resources", return_value={"GPU": 64.0}) as looked:
+            assert _joined_gpu_count(0.0, 0.0) == 0.0
+            assert not looked.called, "a CPU-only run should not even ask"
+
+    def test_a_failed_lookup_carries_the_previous_count_forward(self) -> None:
+        """The caller is in the dispatch loop, outside the tracker poll's guard.
+
+        A control-plane hiccup must cost accuracy in a log line, never the fill.
+        """
+        with patch.object(_sched_mod.ray, "cluster_resources", side_effect=RuntimeError("gcs unavailable")):
+            assert _joined_gpu_count(5.0, 1.0) == 5.0
 
 
 # ===========================================================================
@@ -947,6 +1004,180 @@ class TestWorkStealingLoopCondition:
         # The chunk must have been processed despite the actor dying
         assert len(results) == 1
         assert results[0]["status"] == "ok"
+
+
+# ===========================================================================
+# _process_chunks_work_stealing — the progress line's GPU-hours figure
+# ===========================================================================
+
+
+class TestWorkStealingGpuHours:
+    """The reported GPU-hours must integrate BILLED capacity, not requested capacity."""
+
+    @staticmethod
+    def _run_loop(
+        n_unplaced: int,
+        cluster_resources,
+        *,
+        n_chunks: int = 1,
+        sample_interval: float = 0.0,
+    ) -> tuple[list[dict], MagicMock]:
+        """Drive ``n_chunks`` loop iterations on a fleet that is mostly unplaced.
+
+        The state is built explicitly rather than assumed: one actor that works,
+        and ``n_unplaced`` slots whose instance-ID fetch never answers because
+        the instance behind them does not exist. One actor and one chunk per
+        iteration, so iterations and completions are the same count. Returns the
+        kwargs of each progress poll, and the capacity query so a caller can
+        count how often it was made.
+
+        ``sample_interval`` is the loop's capacity-sampling interval, defaulting
+        to zero — every iteration samples. The cadence and the charging policy
+        are separate properties, and a test of one neutralises the other rather
+        than letting its own arithmetic depend on it.
+        """
+        actors = [MagicMock(name=f"actor_{i}") for i in range(1 + n_unplaced)]
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+
+        work_ref = MagicMock(name="work_ref")
+        iid_ref = MagicMock(name="iid_ref")
+        actors[0].process_chunk.remote.return_value = work_ref
+        for unplaced in actors[1:]:
+            unplaced.get_instance_id.remote.return_value = iid_ref
+
+        def fake_wait(refs, num_returns=None, timeout=60):
+            # timeout=0 is resolve_iid. The unplaced slots never answer it —
+            # their get_instance_id is queued behind an __init__ that cannot
+            # start until an instance exists.
+            if timeout == 0:
+                return ([], list(refs))
+            return ([work_ref], [r for r in refs if r is not work_ref])
+
+        # A synthetic clock, so the two figures on the progress line are exactly
+        # determined instead of racing microseconds against each other.
+        clock = itertools.count(start=1.0, step=1.0)
+        polls: list[dict] = []
+
+        def record_poll(*args, **kwargs) -> list[str]:
+            polls.append(kwargs)
+            return []
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
+            patch.object(_sched_mod.ray, "get", return_value={"chunk": "c0", "status": "ok"}),
+            patch.object(_sched_mod.ray, "cluster_resources", **cluster_resources) as capacity,
+            patch.object(_sched_mod.time, "monotonic", side_effect=lambda: next(clock)),
+            patch.object(_sched_mod, "_CAPACITY_SAMPLE_INTERVAL_SEC", sample_interval),
+            patch.object(_sched_mod, "_poll_tracker", side_effect=record_poll),
+        ):
+            results = _process_chunks_work_stealing(
+                actors=actors,  # type: ignore[arg-type]
+                actor_instance_ids=["i-0000"] + ["pending-init"] * n_unplaced,
+                chunks=[_fake_chunk(f"c{i}") for i in range(n_chunks)],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                log=logging.getLogger("test"),
+                tracker=MagicMock(),
+                still_initializing=set(range(1, 1 + n_unplaced)),
+            )
+        assert len(results) == n_chunks, "every chunk must complete for the poll figures to mean anything"
+        assert len(polls) == n_chunks, "one progress report per completion, so the counts below are exact"
+        return polls, capacity
+
+    @pytest.mark.parametrize(
+        ("readings", "rejected"),
+        [
+            ([{"GPU": 10.0}, {"GPU": 40.0}], "the reading taken when the wait returned (40)"),
+            ([{"GPU": 40.0}, {"GPU": 10.0}], "the reading taken when the interval began (40)"),
+        ],
+        ids=["capacity-rose", "capacity-fell"],
+    )
+    def test_an_interval_is_charged_at_its_lower_endpoint(self, readings, rejected) -> None:
+        """Capacity moves in STEPS inside an interval a blocking wait can stretch to a minute.
+
+        A batch joining just before the wait returns did not run for that interval; a node leaving
+        just after it began did. The step's timing is unknown, so only the smaller endpoint is
+        safe in both directions — which is also what keeps the figure the lower bound it is
+        documented to be. An average would assume the change fell halfway and can overstate
+        either way.
+
+        Both directions are pinned because each rules out a different wrong policy: charging at
+        the interval's end, and charging at its start.
+        """
+        polls, _ = self._run_loop(0, {"side_effect": readings})
+        gpu_seconds = polls[0]["gpu_hours"] * 3600
+        # The clock is synthetic and steps one second per read, so this is exact: one interval of
+        # one second, charged at the lower of its endpoints.
+        assert gpu_seconds == pytest.approx(10.0), (
+            f"{gpu_seconds} GPU-seconds; expected the interval charged at its lower endpoint (10), not {rejected}"
+        )
+
+    def test_gpu_hours_follows_the_cluster_not_the_requested_fleet(self) -> None:
+        """During scale-up most requested slots have no instance behind them.
+
+        The pool asks for its whole fleet up front; Ray accepts every handle and
+        the autoscaler brings nodes up behind the request. Integrating the
+        requested-slot count reports a fleet-sized GPU-hours figure while only a
+        fraction of the fleet is billed, and it does so for the whole of
+        scale-up — the window in which an operator reads the figure to decide
+        whether to cap the fleet.
+        """
+        n_unplaced = 19
+        polls, _ = self._run_loop(n_unplaced, {"return_value": {"CPU": 8.0, "GPU": 1.0}})
+        gpu_hours = polls[0]["gpu_hours"]
+        elapsed_hours = polls[0]["elapsed_min"] / 60
+
+        # The figure must still be REPORTED. Omitting it, or leaving it at zero,
+        # satisfies any upper bound while telling an operator nothing.
+        assert gpu_hours > 0
+
+        # One billed GPU cannot burn materially more than one GPU-hour per
+        # elapsed hour. The factor of two is slack for the clock ticks between
+        # the loop's own read and the formatter's, not room for extra GPUs:
+        # counting the requested slots instead puts the figure an order of
+        # magnitude above this bound.
+        assert gpu_hours < 2 * elapsed_hours, (
+            f"{gpu_hours * 3600:.1f} GPU-seconds over {elapsed_hours * 3600:.1f} elapsed seconds against one "
+            f"billed GPU — the {n_unplaced} requested-but-unplaced slots are being billed for"
+        )
+
+    def test_a_failed_capacity_lookup_does_not_abort_the_run(self) -> None:
+        """The lookup sits outside the try/except that wraps the tracker poll.
+
+        Unguarded, a control-plane hiccup would propagate out of the dispatch
+        loop and destroy a fill over a log number. The figure is what degrades.
+        """
+        polls, _ = self._run_loop(3, {"side_effect": RuntimeError("gcs unavailable")})
+        assert polls[0]["gpu_hours"] == 0.0
+
+    def test_capacity_is_not_queried_once_per_completed_chunk(self) -> None:
+        """The query is a synchronous cluster-wide round trip sitting on the dispatch path.
+
+        ``ray.wait(num_returns=1)`` hands back one completion at a time, so a query per iteration
+        is a query per finished chunk — and while it is in flight the loop is not handing work
+        back to the actor that just finished. A burst of completions would serialise one round
+        trip per chunk into the fleet's idle time, which is the very thing the figure it feeds
+        exists to describe.
+
+        Driven at the real interval, with the synthetic clock advancing a second per reading so
+        the whole run fits inside one interval by construction: the seeding reading taken before
+        the loop is then the only one any number of completions can produce.
+        """
+        n_chunks = 4
+        polls, capacity = self._run_loop(
+            0,
+            {"return_value": {"CPU": 8.0, "GPU": 4.0}},
+            n_chunks=n_chunks,
+            sample_interval=_sched_mod._CAPACITY_SAMPLE_INTERVAL_SEC,
+        )
+        assert len(polls) == n_chunks, "the loop must have iterated once per chunk for this to mean anything"
+        assert capacity.call_count == 1, (
+            f"{capacity.call_count} capacity queries across {n_chunks} completions — the loop is asking the "
+            "cluster once per finished chunk rather than on a timer"
+        )
 
 
 # ===========================================================================

@@ -15,6 +15,21 @@ Default `pytest` invocation only runs unit + architecture, per
 `addopts = "-m 'not integration and not parity and not slow and not gpu'"` in
 `pyproject.toml`. CI workflows opt in to the heavier markers explicitly.
 
+## Optional dependencies
+
+Ray and torch are the `inference` extra, not part of the base install, because
+torch is large and platform-specific. Anything under `inference/` — the actor
+pool, the work-stealing scheduler — therefore cannot even be imported in a plain
+checkout, and its tests fail at collection with `ModuleNotFoundError: ray`. That
+is a missing extra, not a broken suite. Install them without touching the
+lockfile:
+
+```bash
+uv sync --extra inference --frozen
+```
+
+CI installs `--all-extras`, so it never sees this.
+
 ## Hypothesis
 
 Property-based tests live alongside example-based tests in `unit/`.

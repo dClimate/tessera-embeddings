@@ -177,7 +177,11 @@ class ActorPool:
 
     @property
     def live_count(self) -> int:
-        """Number of non-retired actor slots."""
+        """Number of non-retired actor slots — the pool's CONTROL quantity.
+
+        Slots the pool intends to dispatch to, placed on a node or not. It is
+        not capacity; for that see :func:`_joined_gpu_count`.
+        """
         return len(self.actors) - len(self._retired)
 
     def outstanding_work(self, queued: int) -> int:
@@ -546,6 +550,59 @@ class ActorPool:
 # ---------------------------------------------------------------------------
 
 
+_CAPACITY_SAMPLE_INTERVAL_SEC = 30.0
+"""Minimum seconds between cluster-capacity readings in the dispatch loop.
+
+Half the loop's long ``ray.wait`` timeout, so a fleet whose actors are all busy still reads
+capacity once per wait — full resolution while it is free — and a burst of completions, which
+the loop takes one at a time, collapses to one reading instead of one per chunk.
+
+The figure this feeds is read by a human deciding whether to cap a fleet, so its resolution is
+irrelevant at any timescale a person acts on. The reading's cost is not: it is a synchronous
+cluster-wide query on the path between a finished chunk and the actor's next one, so at a high
+completion rate an unthrottled reading buys precision with the idle GPU time it exists to
+describe.
+"""
+
+
+def _joined_gpu_count(last_known: float, gpus_per_actor: float) -> float:
+    """GPUs JOINED to the cluster. A floor on what is billed, not the billed figure.
+
+    Every GPU worker declares one GPU and the head declares none, so the cluster total is the
+    joined worker count. Total, not available: a GPU an actor is working on is still billed, so
+    ``available_resources()`` — the idle remainder — is the wrong call. A slot Ray has accepted
+    but not yet placed contributes nothing, which is the point.
+
+    **Named for what it measures, because it is not the same as billed.** A worker starts
+    charging when its instance launches, and Ray only counts it once bootstrap has joined it, so
+    every worker's boot-and-bootstrap interval is billed and uncounted here. This is therefore a
+    LOWER BOUND, and deliberately so: the quantity it replaced was a fleet-sized over-count, and
+    a floor is the safe direction for a number read to decide whether to cap a fleet. Its caller
+    integrates it at the lower of each interval's endpoints, so the floor survives the
+    integration rather than only the reading.
+
+    **Scoped to this cluster, not to this pool.** In the attached-cluster mode the cluster may
+    hold GPUs belonging to other work, which would be counted here. The campaign cannot reach
+    that: it derives a cluster name per flow run, so a fill always owns its cluster alone. Zero
+    is returned outright when the pool's actors request no GPU, since then no reading of the
+    cluster can be about this run.
+
+    The guard is load-bearing, not defensive. Its caller sits in the dispatch loop OUTSIDE the
+    try/except that wraps the tracker poll, so an exception from this lookup would abort a fill
+    over a log number; a failure carries the previous count forward instead.
+
+    Args:
+        last_known: Count to fall back to when the lookup fails.
+        gpus_per_actor: GPUs each actor reserves. Zero means this run is not on GPUs at all.
+    """
+    if not gpus_per_actor:
+        return 0.0
+    try:
+        return float(ray.cluster_resources().get("GPU", 0))
+    except Exception:
+        return last_known
+
+
 def _poll_tracker(
     tracker: ray.actor.ActorHandle,
     n_done: int,
@@ -578,8 +635,9 @@ def _poll_tracker(
             way). Measured from the run's start it read as though inference had been going for the
             ingest, cluster-bringup and model-load time too, and disagreed with ``gpu_hours`` on the
             same line.
-        gpu_hours: Fleet GPU-hours consumed so far (live-actor-count integrated
-            over wall time; one GPU per actor), folded into the same line.
+        gpu_hours: Fleet GPU-hours consumed so far — the cluster's JOINED GPU count integrated
+            over wall time (see :func:`_joined_gpu_count`, which is a FLOOR on what is
+            billed) — folded into the same line.
         recovery_threshold_sec: Seconds without an update before a chunk is
             declared unrecoverable in place and returned for kill-and-requeue.
             Deliberately well above ``stall_threshold_sec`` so a warning always
@@ -635,8 +693,10 @@ def _poll_tracker(
             # a bare "elapsed" beside a chunk counter is what invited reading it as run wall-clock.
             elapsed = f" — {elapsed_min:.1f} min inferring" if elapsed_min is not None else ""
             gpu = f", {gpu_hours:.1f} GPU-hrs" if gpu_hours is not None else ""
+            # "chunks done" labels the whole first clause: what follows it counts chunks in
+            # flight, not actor slots and not GPUs. GPU-hrs carries its own unit.
             log.info(
-                "Progress: %d/%d done, %d active (%s), %d stalled%s%s",
+                "Progress: %d/%d chunks done, %d active (%s), %d stalled%s%s",
                 n_done,
                 n_total,
                 n_active,
@@ -1079,9 +1139,15 @@ def _process_chunks_work_stealing(
                 _finalize_prior_write(actor_idx, prior)
 
     # --- Main work-stealing loop ---
-    # gpu_seconds integrates live-actor-count over wall time (one GPU per
-    # actor) so the progress line can report fleet GPU-hours consumed so far.
+    # gpu_seconds integrates JOINED GPUs over wall time so the progress line can
+    # report fleet GPU-hours consumed so far. Billed, not requested: a slot the
+    # pool has asked for but Ray has not placed costs nothing until its instance
+    # exists. Logging-only — nothing scales, retires or branches on it.
     gpu_seconds = 0.0
+    # Seeded with a real reading rather than zero: the loop starts once actors are ready, so
+    # capacity is already non-zero, and the first interval is charged at the lower of its
+    # endpoints — against a zero seed that is zero, so the fleet's first interval would be free.
+    joined_gpus = _joined_gpu_count(0.0, config.num_gpus)
     last_tick = time.monotonic()
     # The progress line's elapsed clock, and it starts HERE rather than at ``t0``.
     #
@@ -1147,8 +1213,31 @@ def _process_chunks_work_stealing(
             time.sleep(5)
             ready_refs = []
         now = time.monotonic()
-        gpu_seconds += pool.live_count * (now - last_tick)
-        last_tick = now
+        # Sampled on a timer, NOT once per completion. `ray.wait(num_returns=1)` hands back one
+        # chunk at a time, so a burst of completions would otherwise put a synchronous
+        # cluster-wide query between every finished chunk and the actor's next one — spending the
+        # idle GPU time this figure exists to describe on describing it. Between samples the
+        # previous reading is carried forward and the interval is left uncharged until the next
+        # one, which is the same shape the failed-lookup path already has.
+        #
+        # An interval is charged at the LOWER of its two endpoints, which is what keeps this
+        # figure the lower bound it claims to be. Capacity moves in steps inside an interval a
+        # blocking `ray.wait` can already stretch to a minute: a batch joining just before the
+        # sample did not run for the interval, and a node leaving just after it began did. Since
+        # the step's timing is unknown, only the smaller endpoint is safe in both directions — an
+        # average would assume the change fell halfway and can overstate either.
+        #
+        # Sampling less often lengthens those intervals, which LOOSENS that bound without
+        # breaking it: while capacity moves in one direction, every point inside the interval is
+        # at or above the smaller endpoint however many steps it takes, so the charge still
+        # understates. What a longer interval does admit is more room for capacity to rise and
+        # fall back within one of them — already possible inside a single blocking wait, so the
+        # direction of the bound is unchanged and only its tightness moves, the safe way.
+        if now - last_tick >= _CAPACITY_SAMPLE_INTERVAL_SEC:
+            previous_gpus = joined_gpus
+            joined_gpus = _joined_gpu_count(joined_gpus, pool.config.num_gpus)
+            gpu_seconds += min(previous_gpus, joined_gpus) * (now - last_tick)
+            last_tick = now
 
         # Poll tracker on every iteration (including timeouts with no completions)
         # so stall detection stays responsive.
