@@ -24,13 +24,36 @@ only the first, and aborted. Nothing about the fill was wrong; it was told to st
 while AWS was still refusing.
 
 Two separate defects fell out of it. The first — waiting too short — was fixed separately
-by raising the first-actor wait from 600 s to 1800 s (PR #140). This document is about the
-second.
+by raising the first-actor wait, from 600 s to 1800 s in PR #140 and then to 21600 s (six
+hours) in PR #142. This document is about the second.
 
 **Recovery was not prompt.** The driver's re-dispatch loop is a barrier: it gathers every
 subflow's outcome before re-reading the store. With `overlap_years=true` there is a single
 round for the whole campaign, so those 81 cells waited for the other nine fills to finish
 — days, not minutes.
+
+### How this composes with the longer first-actor wait
+
+Two changes now address the same failure from opposite ends, so it is worth recording that
+they were meant to coexist and that neither retires the other.
+
+`ACTOR_INIT_TIMEOUT_SEC` (`inference/lifecycle.py`) governs how long a fill waits for its
+first GPU actor. Raising it to six hours means a fill in a real drought **stops dying** —
+it outlasts the drought instead. `immediate_refill` governs what a death **costs** when one
+happens anyway, for a drought longer than six hours or for any of the reasons that have
+nothing to do with capacity.
+
+They also compose in a second, less obvious direction: **the longer wait makes the barrier
+more expensive, not less.** A dispatch round closes only when every fill returns, so a fill
+sitting in a six-hour actor wait now holds its round open for up to six hours. That wait is
+precisely what `immediate_refill` takes off the critical path of any OTHER fill in the round
+that has already died. The timeout constant's own docstring names the same coupling from the
+other side — an unbounded wait "would also stop the driver's dispatch round from ever
+closing, since a round closes only when every fill returns, which is the very recovery a
+starved fill needs."
+
+So: the wait decides how often a roster is stranded; this decides how long a stranded roster
+waits. Removing either one puts back a distinct cost.
 
 ## The reframing that shaped the fix
 
@@ -173,7 +196,7 @@ amplification across the cell and round budgets. Untouched.
 | teach the sweeper to spare a dying fill's ingest children | breaks one-writer-per-mosaic-prefix and produces an orphan the retry structurally cannot see; and the bytes already survive, so it buys nothing |
 | remove the barrier entirely | the store re-read and the no-progress guard live there; needs a per-cell attempt ledger first |
 | retry harder inside the child | already exists (`attempts_per_cell_in_cluster`, plus the runner's in-child retry pass, whose comment gives the same rationale). Cannot help when the session never came up, which is this failure |
-| wait out the drought | PR #140, already merged. Reduces how often this fires; does not make recovery prompt |
+| wait out the drought | PRs #140 and #142, already merged. Reduces how often this fires, and cannot help a fill that failed for any other reason. It also LENGTHENS the barrier it leaves in place — see the composition note above |
 | give each fill fewer zones | `max_parallel_clusters`, `max_parallel_ingest`, `num_actors` and `overlap_years` are one decision that moves together (§3). Changes cost and fleet shape to shrink a blast radius without speeding recovery |
 | move ingest dispatch up into the driver | the child's look-ahead is what keeps GPUs fed; hoisting it reintroduces the backpressure ADR-011 removed and creates a second owner for the mosaic prefix |
 | a global scan for orphaned cells | a per-run recovery that scans globally amplifies. This is one paged live-runs query, made in-process, at most once per settled slot, dispatching at most one replacement |
