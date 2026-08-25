@@ -68,7 +68,9 @@ context_docs/
     ├── global-store-test-plan.md                 the T0-T8 scale tests; §8 is the icechunk API ledger
     │
     │  MODEL
-    └── v2_data_source_alignment_2026_07.md       AWS-vs-MPC input for Tessera v2
+    ├── v2_data_source_alignment_2026_07.md       AWS-vs-MPC input for Tessera v2
+    ├── v2_large_rollout_2026_07.md               adding the v2 Large student alongside v1.1
+    └── v2_large_readback_gate_2026_07.md         the read-back gate the v2 rollout is held to
 ```
 
 ## How to read these

@@ -23,6 +23,8 @@ from importlib.metadata import version as _dist_version
 import numpy as np
 from pyproj import CRS
 
+from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion, encoder_url
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,12 +84,11 @@ _GEOEMB_CONVENTION = {
 }
 
 # --- geoemb: field defaults (this pipeline's fixed provenance) --------------
-#: Encoder checkpoint version (v1.1 pipeline). Versions the ``geoemb:model`` URL;
-#: overridable per call via ``model_version``. (``geoemb:build_version`` is the
+#: v1.1's public encoder version. The live ``geoemb:model`` lookup is
+#: :func:`~tessera_embeddings.config.inference.encoder_url`, keyed by model
+#: family; this remains the v1.1 identifier. (``geoemb:build_version`` is the
 #: software/package version, not this.)
 ENCODER_VERSION = "1.1"
-#: Public encoder reference URL, keyed by the encoder version (ENCODER_VERSION).
-_MODEL_URL_TEMPLATE = "https://geotessera.org/model/{version}"
 #: Precise source datasets we pull from: Sentinel-2 L2A COGs (Earth Search AWS
 #: Open Data) and OPERA RTC-S1 (ASF datapool).
 DEFAULT_SOURCE_DATA: tuple[str, ...] = (
@@ -98,7 +99,7 @@ DEFAULT_SOURCE_DATA: tuple[str, ...] = (
 QUANTIZED_DTYPE = "int8"
 
 
-def expected_model_url(model_url: str | None = None) -> str:
+def expected_model_url(model_url: str | None = None, model_version: ModelVersion | None = None) -> str:
     """The ``geoemb:model`` URL this build stamps for the current encoder version.
 
     A seeded store records this once at its root; the fill re-derives it to verify
@@ -106,8 +107,40 @@ def expected_model_url(model_url: str | None = None) -> str:
     mismatch means a model upgrade slipped in between seeding and filling. Passing
     *model_url* mirrors the seed-time override so a store seeded with a custom URL
     round-trips.
+
+    Routed through :func:`~tessera_embeddings.config.inference.encoder_url` rather than a
+    module constant, and taking *model_version*, on the instruction that function's own
+    docstring left for this merge: with one hard-coded encoder version the gate compares a
+    v2 fill against v1.1's URL — rejecting a correct run, or waving through a real mismatch
+    when the seed happened to carry the same stale constant. Omitting *model_version* keeps
+    the historical single-encoder behaviour.
     """
-    return model_url or _MODEL_URL_TEMPLATE.format(version=ENCODER_VERSION)
+    return model_url or encoder_url(model_version or DEFAULT_MODEL_VERSION)
+
+
+def assert_encoder_matches(published: str | None, *, model_version: ModelVersion | None, where: str) -> None:
+    """Refuse a write whose encoder disagrees with the store's published one.
+
+    **One implementation because there are several readers.** The assembly append gate and the
+    pre-flight that runs before any compute is provisioned both have to answer the same question,
+    and two copies of "is this the same encoder" is how they end up disagreeing about one store —
+    worse than either answer alone, because a run is then refused or admitted depending on which
+    door it arrived through.
+
+    ``published is None`` is read as v1.1, NOT waved through: ``geoemb:model`` postdates v1.1 and
+    predates v2, so a store lacking it necessarily holds v1.1 embeddings. Treating absence as "no
+    claim" is what let a v2 run append to a legacy store and restamp the whole thing.
+    """
+    expected = expected_model_url(model_version=model_version)
+    actual = published or expected_model_url(model_version=DEFAULT_MODEL_VERSION)
+    if actual != expected:
+        raise ValueError(
+            f"Refusing to append to {where}: it was published by encoder {actual!r} and this run "
+            f"uses {expected!r}. Appending would mix two model families in one store and restamp "
+            "the whole thing with this run's encoder. Assemble into a store of the matching "
+            "family, or a fresh path. (A store carrying no geoemb:model at all is read as v1.1 — "
+            "the attr predates v2, so its absence dates the store rather than leaving it open.)"
+        )
 
 
 def tile_id_to_epsg(tile_id: str) -> str | None:
@@ -247,6 +280,7 @@ def _geoemb_fields(
     gsd: float | None,
     spatial_layout: str | None,
     source_data: tuple[str, ...],
+    encoder_version: ModelVersion | None = None,
 ) -> dict:
     """The ``geoemb:*`` (+ ``checkpoint_id``) attrs, shared by the single-ROI root
     builder and the multi-group root builder.
@@ -258,7 +292,12 @@ def _geoemb_fields(
     attrs: dict = {
         "geoemb:type": "pixel",  # per-pixel embeddings (not chip)
         "geoemb:dimensions": embedding_dim,
-        "geoemb:model": expected_model_url(model_url),
+        # The PUBLIC encoder reference, resolved from the model FAMILY and never from
+        # *model_version* — which in production is an internal checkpoint filename stem
+        # (`checkpoint_to_version(...)`). That stem is kept separately as `checkpoint_id`
+        # below, so a v1.0 / future / custom checkpoint cannot advertise a synthetic public
+        # URL. Keyed by encoder_version so v2 Large stamps its own URL rather than v1.1's.
+        "geoemb:model": model_url or encoder_url(encoder_version or DEFAULT_MODEL_VERSION),
         "geoemb:source_data": list(source_data),
         "geoemb:data_type": data_type,
         # build_version is the SOFTWARE build (this package) per the convention.
@@ -287,6 +326,7 @@ def build_geoemb_root_attrs(
     spatial_layout: str,
     gsd: float | None = None,
     model_version: str | None = None,
+    encoder_version: ModelVersion | None = None,
     model_url: str | None = None,
     data_type: str = QUANTIZED_DTYPE,
     source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
@@ -302,6 +342,7 @@ def build_geoemb_root_attrs(
     attrs = _geoemb_fields(
         embedding_dim=embedding_dim,
         model_version=model_version,
+        encoder_version=encoder_version,
         model_url=model_url,
         data_type=data_type,
         gsd=gsd,
@@ -322,6 +363,7 @@ def build_convention_attrs(
     y_coords: np.ndarray | None = None,
     x_coords: np.ndarray | None = None,
     model_version: str | None = None,
+    encoder_version: ModelVersion | None = None,
     model_url: str | None = None,
     data_type: str = QUANTIZED_DTYPE,
     gsd: float | None = None,
@@ -344,10 +386,12 @@ def build_convention_attrs(
 
     The ``geoemb:`` fields record encoder-model provenance and quantization:
     ``geoemb:model`` is the PUBLIC encoder reference URL — *model_url* when a
-    caller supplies the exact public URI for the encoder it used, else derived
-    from :data:`ENCODER_VERSION`. It is NEVER built from *model_version*, which
-    in production is an internal checkpoint filename stem; that is recorded as a
-    plain ``checkpoint_id`` provenance attr. ``geoemb:build_version`` is the
+    caller supplies the exact public URI for the encoder it used, else looked up
+    from *encoder_version* (the model FAMILY, e.g. ``"v2-large"``). It is NEVER
+    built from *model_version*, which in production is an internal checkpoint
+    filename stem; that is recorded as a plain ``checkpoint_id`` provenance attr.
+    Passing the family matters: omitting it stamps the default model's URL, so a
+    v2 store would advertise itself as v1.1. ``geoemb:build_version`` is the
     software/package version. *data_type* is the quantized storage dtype.
     *gsd* (metres) is emitted only when trustworthy — derived from a metre-based
     CRS's coordinate spacing, or an explicit *gsd* the caller vouches for; for a
@@ -406,6 +450,7 @@ def build_convention_attrs(
             _geoemb_fields(
                 embedding_dim=embedding_dim,
                 model_version=model_version,
+                encoder_version=encoder_version,
                 model_url=model_url,
                 data_type=data_type,
                 gsd=gsd_val,

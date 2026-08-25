@@ -27,7 +27,7 @@ from prefect import flow, get_run_logger
 from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, FaultInjection
-from tessera_embeddings.config.inference import checkpoint_filename
+from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion, checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
@@ -110,6 +110,7 @@ def _assert_seeded_model_matches(
     allow_model_mismatch: bool,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
     s3_region: str | None = None,
+    encoder_version: ModelVersion = DEFAULT_MODEL_VERSION,
 ) -> None:
     """Refuse to fill a store seeded for a different encoder/checkpoint than this build.
 
@@ -132,7 +133,12 @@ def _assert_seeded_model_matches(
     """
     root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
     seeded = cast("str | None", root.attrs.get("geoemb:model"))
-    expected = expected_model_url()
+    # EXPLICIT, not defaulted. The campaign fills with v1.1 today — `fill_zone_year` exposes no
+    # model selector — but an unversioned call here silently compares any future v2 fill
+    # against v1.1's URL, which is what `encoder_url`'s own docstring warns this merge about:
+    # it rejects a correct run, or waves through a real mismatch when the seed carried the
+    # same stale default. Passing the version makes the seam visible and one-line to move.
+    expected = expected_model_url(model_version=encoder_version)
     if seeded is not None and seeded != expected and not allow_model_mismatch:
         raise ValueError(
             f"Global store {store_path} was seeded for encoder {seeded!r} but this build embeds with "

@@ -16,6 +16,7 @@ S1 stream.
 from __future__ import annotations
 
 import functools
+from collections.abc import Callable
 
 import numpy as np
 
@@ -43,14 +44,82 @@ def build_resample_indices(valid_len: int, target_size: int) -> np.ndarray:
     return np.concatenate([np.arange(valid_len, dtype=np.int64), extras], axis=0)
 
 
+def build_resample_indices_v2(valid_len: int, target_size: int) -> np.ndarray:
+    """Deterministic index vector resampling ``valid_len`` rows to ``target_size``, v2 rules.
+
+    **A different algorithm from v1.1's, not a refinement of it.** It reproduces upstream v2's
+    ``_pad_pattern`` (``tessera_infer_v2/student/infer.py``), which is the padding the v2 student
+    was trained under, and it disagrees with :func:`build_resample_indices` on almost every
+    inexact count — 1,163 of the 1,188 (count, bucket) pairs across this pipeline's 32 bucket
+    sizes. For ``n=5, B=8`` v1.1 appends ``[1, 2, 3]`` and v2 appends ``[1, 3, 4]``; downsampling
+    differs everywhere. Feeding v2 the v1.1 pattern gives the model an observation sequence its
+    training contract never produced, and nothing downstream can detect it — the tensor is the
+    right shape and dtype either way.
+
+    Three details are load-bearing and reproduce upstream exactly rather than approximately:
+
+    * downsampling is ``np.linspace(..., dtype=np.int64)``, whose cast TRUNCATES. Rounding here
+      would shift roughly half the selected indices by one.
+    * when the shortfall is at most ``valid_len`` the fill takes the MEDIAN of each split group,
+      the same construction v1.1 uses for downsampling, applied to the padding side.
+    * when the shortfall exceeds ``valid_len`` the fill cycles ``arange(remain) % valid_len``
+      rather than spreading; a very short series is repeated in order.
+
+    ``valid_len == 0`` returns an empty vector rather than upstream's ``zeros(B)``: every caller
+    here excludes zero-count rows before gathering (see :func:`_local_resample_matrix`), so the
+    branch is unreachable, and matching v1.1's contract keeps the two interchangeable at the call
+    site. The parity test asserts agreement for every reachable count.
+    """
+    if valid_len <= 0:
+        return np.zeros((0,), dtype=np.int64)
+    if valid_len >= target_size:
+        return np.linspace(0, valid_len - 1, target_size, dtype=np.int64)
+    remain = target_size - valid_len
+    if remain <= valid_len:
+        groups = np.array_split(np.arange(valid_len), remain)
+        fill = np.array([gp[len(gp) // 2] for gp in groups], dtype=np.int64)
+    else:
+        fill = (np.arange(remain) % valid_len).astype(np.int64)
+    return np.concatenate([np.arange(valid_len, dtype=np.int64), fill])
+
+
+#: Resampler per model family. v1.1's entry is the ORIGINAL function, untouched, so no existing
+#: run's output can shift: selecting a resampler is the only thing this change does to that path.
+_RESAMPLERS: dict[str, Callable[[int, int], np.ndarray]] = {
+    "v1.1": build_resample_indices,
+    "v2-large": build_resample_indices_v2,
+}
+
+
+def resampler_for(model_version: str) -> Callable[[int, int], np.ndarray]:
+    """The padding/subsampling rule *model_version* was trained under.
+
+    Raises on an unknown version rather than defaulting to v1.1: silently resampling a new
+    student by the old rules is the failure this function exists to prevent, and it produces a
+    correctly-shaped tensor that no downstream check can question.
+    """
+    try:
+        return _RESAMPLERS[model_version]
+    except KeyError:
+        valid = ", ".join(repr(k) for k in _RESAMPLERS)
+        raise ValueError(f"No resampler for model_version={model_version!r}. Known: {valid}.") from None
+
+
 # build_resample_indices depends only on (valid_len, target), both small ints
 # (valid_len <= T of the chunk, target one of ~32 checkpoints), so the index
 # vectors are memoised. Callers must treat the returned arrays as READ-ONLY —
 # they are shared across every pixel with the same (valid_len, target).
 _resample_indices_cached = functools.lru_cache(maxsize=None)(build_resample_indices)
+_resample_indices_cached_v2 = functools.lru_cache(maxsize=None)(build_resample_indices_v2)
+#: Cached counterpart of :data:`_RESAMPLERS`, keyed the same way. Separate caches rather than one
+#: keyed by version, so a v1.1 lookup is exactly the call it always was.
+_CACHED_RESAMPLERS: dict[str, Callable[[int, int], np.ndarray]] = {
+    "v1.1": _resample_indices_cached,
+    "v2-large": _resample_indices_cached_v2,
+}
 
 
-def _local_resample_matrix(counts: np.ndarray, target: int) -> np.ndarray:
+def _local_resample_matrix(counts: np.ndarray, target: int, model_version: str = "v1.1") -> np.ndarray:
     """Stack per-pixel local resample indices into a ``(B, target)`` matrix.
 
     ``counts[i]`` is pixel *i*'s valid-observation count; row *i* of the result
@@ -61,11 +130,12 @@ def _local_resample_matrix(counts: np.ndarray, target: int) -> np.ndarray:
     bucket) instead of per pixel, which is what makes the bucket resamplers
     vectorised rather than 2 x batch_size Python iterations per sub-batch.
     """
+    cached = _CACHED_RESAMPLERS[model_version]
     local = np.zeros((len(counts), target), dtype=np.int64)
     for count in np.unique(counts):
         if count == 0:
             continue
-        local[counts == count] = _resample_indices_cached(int(count), target)
+        local[counts == count] = cached(int(count), target)
     return local
 
 
@@ -120,6 +190,7 @@ def resample_s2_bucket(
     target: int,
     s2_mean: np.ndarray,
     s2_std: np.ndarray,
+    model_version: str = "v1.1",
 ) -> np.ndarray:
     """Resample a batch of pixels' S2 observations to a uniform length.
 
@@ -128,6 +199,9 @@ def resample_s2_bucket(
         s2_masks: ``(B, T)`` bool binary validity mask from SCL.
         s2_doys: ``(B, T)`` int32 day-of-year, broadcast across pixels.
         target: Target sequence length (bucket size).
+        model_version: Which student's padding rule to resample with. See
+            :func:`build_resample_indices_v2` — the two rules disagree on almost every
+            inexact count, and both produce a correctly-shaped bucket.
         s2_mean: ``(10,)`` per-band mean.
         s2_std: ``(10,)`` per-band std.
 
@@ -151,7 +225,7 @@ def resample_s2_bucket(
         return out
     _, nz_cols = np.nonzero(s2_masks)
     starts = _row_starts(counts)
-    local = _local_resample_matrix(counts, target)
+    local = _local_resample_matrix(counts, target, model_version)
 
     real = nz_cols[starts[rows, None] + local[rows]]  # (Bv, target) absolute time idx
     gathered = s2_bands[rows[:, None], real].astype(np.float32, copy=False)
@@ -170,6 +244,7 @@ def resample_s1_bucket(
     s1a_std: np.ndarray,
     s1d_mean: np.ndarray,
     s1d_std: np.ndarray,
+    model_version: str = "v1.1",
 ) -> np.ndarray:
     """Resample a batch of pixels' merged S1 observations to a uniform length.
 
@@ -183,6 +258,9 @@ def resample_s1_bucket(
         s1_desc_bands: ``(B, T_desc, 2)`` uint16.
         s1_desc_doys: ``(B, T_desc)`` int32, broadcast across pixels.
         target: Target sequence length (bucket size).
+        model_version: Which student's padding rule to resample with. See
+            :func:`build_resample_indices_v2` — the two rules disagree on almost every
+            inexact count, and both produce a correctly-shaped bucket.
         s1a_mean: ``(2,)`` ascending-orbit mean.
         s1a_std: ``(2,)`` ascending-orbit std.
         s1d_mean: ``(2,)`` descending-orbit mean.
@@ -212,7 +290,7 @@ def resample_s1_bucket(
     if rows.size == 0:
         return out
 
-    local = _local_resample_matrix(total, target)[rows]  # (Bv, target) merged idx
+    local = _local_resample_matrix(total, target, model_version)[rows]  # (Bv, target) merged idx
     ca_v = ca[rows, None]
     from_asc = local < ca_v
 

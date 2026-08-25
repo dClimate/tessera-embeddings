@@ -5,6 +5,7 @@ from importlib.metadata import version as _dist_version
 import numpy as np
 import pytest
 
+from tessera_embeddings.config.inference import encoder_url
 from tessera_embeddings.inference.conventions import (
     ENCODER_VERSION,
     build_convention_attrs,
@@ -168,6 +169,27 @@ class TestBuildConventionAttrs:
         # No checkpoint id supplied -> no checkpoint_id attr.
         assert "checkpoint_id" not in build_convention_attrs(total_y=10, total_x=10, embedding_dim=128)
 
+    def test_model_url_tracks_the_encoder_family(self) -> None:
+        """A v2 store must not advertise v1.1's public URL.
+
+        The checkpoint stem and the public URL are separate provenance, so the
+        stem alone cannot select the URL — the family has to be threaded.
+        """
+        v2 = build_convention_attrs(
+            total_y=10, total_x=10, embedding_dim=128, model_version="student_large", encoder_version="v2-large"
+        )
+        assert v2["geoemb:model"] == encoder_url("v2-large")
+        assert v2["geoemb:model"] != encoder_url("v1.1")
+        assert v2["checkpoint_id"] == "student_large"  # stem stays separate provenance
+        # An explicit URL still wins over the family lookup.
+        explicit = build_convention_attrs(
+            total_y=10, total_x=10, embedding_dim=128, encoder_version="v2-large", model_url="https://example/x"
+        )
+        assert explicit["geoemb:model"] == "https://example/x"
+        # Provenance is never guessed: an unregistered family errors, not defaults.
+        with pytest.raises(ValueError, match="No public encoder URL"):
+            encoder_url("v3-imaginary")  # type: ignore[arg-type]
+
     def test_spatial_layout_omitted_by_default_included_when_set(self) -> None:
         """spatial_layout is optional: omitted for a root-only single-ROI store,
         present when a multi-group caller (e.g. the campaign) sets it.
@@ -299,3 +321,38 @@ class TestMultiGroupPlacement:
         assert [c["name"] for c in attrs["zarr_conventions"]] == ["geoemb:"]
         assert "proj:code" not in attrs
         assert "spatial:dimensions" not in attrs
+
+
+# ── the multi-group root must state the same family the single-store root does ──
+
+
+def test_the_global_root_stamps_the_encoder_family_it_was_seeded_for() -> None:
+    """A campaign store states its encoder ONCE, at the root. Left unversioned it stamped v1.1's
+    URL over a v2 seed — wrong provenance, and the cross-family gate then refuses the very append
+    the store was seeded for, which is the failure being self-inflicted rather than caught.
+    """
+    from tessera_embeddings.config.inference import encoder_url
+    from tessera_embeddings.inference.conventions import build_geoemb_root_attrs
+
+    v2 = build_geoemb_root_attrs(embedding_dim=128, spatial_layout="utm_zones", encoder_version="v2-large")
+    assert v2["geoemb:model"] == encoder_url("v2-large")
+
+    default = build_geoemb_root_attrs(embedding_dim=128, spatial_layout="utm_zones")
+    assert default["geoemb:model"] == encoder_url("v1.1"), "omitting it must stay v1.1"
+    assert v2["geoemb:model"] != default["geoemb:model"], "the two families publish different URLs"
+
+
+def test_one_comparison_serves_every_reader_of_the_encoder_identity() -> None:
+    """Assembly and the pre-flight both gate on this. Two copies is how they come to disagree
+    about one store, so the shared function is asserted directly.
+    """
+    from tessera_embeddings.config.inference import encoder_url
+    from tessera_embeddings.inference.conventions import assert_encoder_matches
+
+    assert_encoder_matches(encoder_url("v1.1"), model_version="v1.1", where="s")
+    assert_encoder_matches(None, model_version="v1.1", where="s")  # absence dates the store
+    assert_encoder_matches(encoder_url("v2-large"), model_version="v2-large", where="s")
+
+    for published, wanted in ((encoder_url("v1.1"), "v2-large"), (None, "v2-large"), (encoder_url("v2-large"), "v1.1")):
+        with pytest.raises(ValueError, match="Refusing to append"):
+            assert_encoder_matches(published, model_version=wanted, where="s")

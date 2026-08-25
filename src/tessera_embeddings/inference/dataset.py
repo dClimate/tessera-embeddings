@@ -19,14 +19,11 @@ from typing import Literal
 import numpy as np
 
 from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
     DEFAULT_NUM_OBS_CHECKPOINTS,
-    S1_ASC_BAND_MEAN,
-    S1_ASC_BAND_STD,
-    S1_DESC_BAND_MEAN,
-    S1_DESC_BAND_STD,
-    S2_BAND_MEAN,
-    S2_BAND_STD,
+    ModelVersion,
     _normalize_obs_checkpoints,
+    band_stats,
 )
 from tessera_embeddings.inference.data_loading import ChunkData
 from tessera_embeddings.inference.sampling import compute_bin_keys, resample_s1_bucket, resample_s2_bucket
@@ -61,6 +58,15 @@ class MosaicChunkInferenceDataset:
             refuses thinner pixels, which is **not** a filter a consumer can undo: the
             refused pixel has no embedding, so recovering it means re-running its shard.
             Zero is rejected rather than treated as "off" — see ``__init__``.
+        model_version: Which student's PADDING RULE to resample with. Versioned for the same
+            reason ``stats`` is, and just as invisibly if wrong: v1.1 and v2 disagree on the
+            index pattern for almost every inexact observation count, and the resulting tensor
+            is the correct shape and dtype either way, so a mismatch reaches the model as a
+            plausible but untrained observation sequence rather than as an error.
+        norm_source: v1.1 statistic set — ``"aws"`` (the default when ``None``) or ``"mpc"``.
+            Ignored by v2, which hard-codes one set. The band statistics are DERIVED from this
+            and ``model_version`` rather than passed in, so normalisation and resampling cannot
+            describe different students.
     """
 
     def __init__(
@@ -70,6 +76,8 @@ class MosaicChunkInferenceDataset:
         s1_orbit: Literal["ascending", "descending", "both", "none"] = "both",
         allow_s2_only: bool = False,
         optical_min_obs: int | None = None,
+        model_version: ModelVersion = DEFAULT_MODEL_VERSION,
+        norm_source: str | None = None,
     ) -> None:
         if optical_min_obs is not None and optical_min_obs <= 0:
             # Zero would refuse nothing while reading as a configured rule, so a caller that
@@ -80,6 +88,7 @@ class MosaicChunkInferenceDataset:
                 f"optical_min_obs={optical_min_obs} refuses nothing — pass None for no minimum, "
                 "or a positive number of observations."
             )
+        self.model_version = model_version
         self.num_obs_checkpoints = _normalize_obs_checkpoints(num_obs_checkpoints)
         self.s1_orbit = s1_orbit
         self.allow_s2_only = allow_s2_only
@@ -87,12 +96,17 @@ class MosaicChunkInferenceDataset:
         self.H = chunk_data.height
         self.W = chunk_data.width
 
-        self.s2_band_mean = np.array(S2_BAND_MEAN, dtype=np.float32)
-        self.s2_band_std = np.array(S2_BAND_STD, dtype=np.float32)
-        self.s1a_band_mean = np.array(S1_ASC_BAND_MEAN, dtype=np.float32)
-        self.s1a_band_std = np.array(S1_ASC_BAND_STD, dtype=np.float32)
-        self.s1d_band_mean = np.array(S1_DESC_BAND_MEAN, dtype=np.float32)
-        self.s1d_band_std = np.array(S1_DESC_BAND_STD, dtype=np.float32)
+        # DERIVED, not accepted. `stats` used to be a separate argument, so a caller could pass
+        # v2's model_version with v1.1's statistics — or the reverse — and get an embedding
+        # normalised by one student and resampled by the other. Both halves describe the same
+        # thing, so only one of them is an input now and the contradiction cannot be expressed.
+        stats = band_stats(model_version, norm_source)
+        self.s2_band_mean = np.array(stats["s2_mean"], dtype=np.float32)
+        self.s2_band_std = np.array(stats["s2_std"], dtype=np.float32)
+        self.s1a_band_mean = np.array(stats["s1_asc_mean"], dtype=np.float32)
+        self.s1a_band_std = np.array(stats["s1_asc_std"], dtype=np.float32)
+        self.s1d_band_mean = np.array(stats["s1_desc_mean"], dtype=np.float32)
+        self.s1d_band_std = np.array(stats["s1_desc_std"], dtype=np.float32)
 
         self._bucket_pixels: dict[tuple[int, int], np.ndarray] = {}
         self._rows = np.empty((0,), dtype=np.int64)
@@ -271,6 +285,7 @@ class MosaicChunkInferenceDataset:
             target=s2_target,
             s2_mean=self.s2_band_mean,
             s2_std=self.s2_band_std,
+            model_version=self.model_version,
         )
 
         s1 = resample_s1_bucket(
@@ -283,6 +298,7 @@ class MosaicChunkInferenceDataset:
             s1a_std=self.s1a_band_std,
             s1d_mean=self.s1d_band_mean,
             s1d_std=self.s1d_band_std,
+            model_version=self.model_version,
         )
 
         return {

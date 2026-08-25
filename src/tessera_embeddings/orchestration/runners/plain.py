@@ -28,7 +28,13 @@ import yaml
 from dask.distributed import Client
 
 from tessera_embeddings.config.assembly import AssemblyConfig
-from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
+from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
+    INFERENCE_CHUNK_SIZE,
+    ModelVersion,
+    checkpoint_filename,
+    run_id_prefix,
+)
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
@@ -36,6 +42,7 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
 from tessera_embeddings.inference.data_loading import _active_orbits, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
+    assert_output_store_accepts,
     build_inference_config,
     checkpoint_to_version,
     enumerate_mosaic_chunks,
@@ -152,6 +159,7 @@ def _run_inference_and_assemble(
     s1_orbit: Literal["ascending", "descending", "both"],
     checkpoint_dir: str | None,
     checkpoint_url: str | None,
+    model_version: ModelVersion,
     num_gpus: int,
     allow_s2_only: bool = False,
     log: logging.Logger,
@@ -162,13 +170,14 @@ def _run_inference_and_assemble(
 
     time_window = parse_time_window(time_window_end)
     # A full checkpoint URL/path (e.g. a HuggingFace `resolve/main` link) wins;
-    # otherwise derive `{checkpoint_dir or {inputs}/models}/{canonical filename}`.
-    # Remote URIs (s3://, https://, …) are downloaded and cached by the actor.
+    # otherwise derive `{checkpoint_dir or {inputs}/models}/{canonical filename}`
+    # for the selected model version. Remote URIs (s3://, https://, …) are
+    # downloaded and cached by the actor.
     if checkpoint_url:
         checkpoint_path = checkpoint_url
     else:
         model_dir = checkpoint_dir or f"{inputs_bucket.rstrip('/')}/models"
-        checkpoint_path = f"{model_dir.rstrip('/')}/{checkpoint_filename()}"
+        checkpoint_path = f"{model_dir.rstrip('/')}/{checkpoint_filename(model_version=model_version)}"
 
     mosaic_base = paths.store_for(roi_name, "reflectance").rsplit("/", 1)[0]
     staging_base = f"{output_bucket.rstrip('/')}/staging"
@@ -196,6 +205,7 @@ def _run_inference_and_assemble(
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,
         num_gpus=num_gpus,
+        model_version=model_version,
         allow_s2_only=allow_s2_only,
     )
 
@@ -203,7 +213,22 @@ def _run_inference_and_assemble(
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_path)
     log.info("ROI filter: %d/%d chunks intersect the ROI", len(live_chunks), len(chunks))
 
-    run_id = uuid.uuid4().hex[:12]
+    # From the EFFECTIVE model on the config, not the raw parameter, so the id records what
+    # will actually run. Unprefixed for v1.1, so nothing about the historical path changes.
+    run_id = run_id_prefix(config.model_version) + uuid.uuid4().hex[:12]
+    # BEFORE the cluster and before a single chunk. The encoder mismatch is decided by the store
+    # and this config alone, so discovering it in `assemble` means every chunk was inferred and
+    # none of it can be published. The Prefect flow got this gate; this runner is the other way
+    # in and was left burning the work for the same deterministic answer.
+    assert_output_store_accepts(
+        output_bucket=output_bucket,
+        roi_name=roi_name,
+        output_name_suffix="",
+        config=config,
+        mosaic_base=mosaic_base,
+        log=log,
+    )
+
     t0 = time.monotonic()
 
     if num_gpus == 0:
@@ -237,10 +262,11 @@ def _run_inference_and_assemble(
     n_assembly_workers = AssemblyConfig().compute_n_workers(n_live)
     output_path = f"{output_bucket.rstrip('/')}/embeddings/{roi_name}.zarr"
     writer = ZarrWriter(staging_base)
-    model_version = checkpoint_to_version(config.checkpoint_path)
+    # Provenance id: the checkpoint filename stem, not the ModelVersion literal.
+    checkpoint_id = checkpoint_to_version(config.checkpoint_path)
     upstream_manifests = read_upstream_manifests(mosaic_base, config.s1_orbit)
     manifest = EmbeddingManifest.from_upstream_stores(
-        model_checkpoint=model_version,
+        model_checkpoint=checkpoint_id,
         num_obs_checkpoints=config.num_obs_checkpoints,
         upstream_manifests=upstream_manifests,
         allow_s2_only=config.allow_s2_only,
@@ -257,7 +283,8 @@ def _run_inference_and_assemble(
         log=log,
         time_window=time_window,
         tile_id=roi_name,
-        model_version=model_version,
+        model_version=checkpoint_id,
+        encoder_version=config.model_version,
         manifest=manifest,
         n_workers=n_assembly_workers,
     )
@@ -295,6 +322,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
             n_workers: 2
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
             checkpoint_url: null    # full checkpoint URI (s3://, https://, …); overrides checkpoint_dir
+            model_version: v1.1     # "v1.1" or "v2-large" (43.8M v2 student, 128-d native)
             device: auto            # "auto" | "cpu" | "cuda"
             storage_options: null
 
@@ -369,6 +397,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         s1_orbit=cfg.get("s1_orbit", "both"),
         checkpoint_dir=cfg.get("checkpoint_dir"),
         checkpoint_url=cfg.get("checkpoint_url"),
+        model_version=cfg.get("model_version", DEFAULT_MODEL_VERSION),
         num_gpus=num_gpus,
         allow_s2_only=cfg.get("allow_s2_only", False),
         log=log,

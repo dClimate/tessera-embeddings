@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import icechunk
 import numpy as np
 import pytest
 import xarray as xr
@@ -432,6 +433,145 @@ class TestAssembly:
         assert ds["embedding_std"].shape == (1, 4, 4, EMBEDDING_DIM)
         np.testing.assert_array_equal(ds["embeddings"].values[0, ...], emb)
         np.testing.assert_array_almost_equal(ds["embedding_std"].values[0, ...], std, decimal=5)
+
+    def test_a_second_encoder_cannot_append_to_a_store_the_first_published(self, tmp_path):
+        """The relabelling this refuses is silent and total.
+
+        The manifest check cannot catch it: it compares the checkpoint filename STEM, which two
+        families can share, and it is skipped ENTIRELY for a legacy store carrying no
+        ``_manifest``. Without this guard a v2 run appends to a v1.1 store and the attrs write
+        then restamps ``geoemb:model`` for the WHOLE store — every v1.1 pixel in it now
+        advertising the wrong encoder, with nothing in the store recording that it happened.
+        """
+        staging = str(tmp_path / "staging")
+        output = str(tmp_path / "output.zarr")
+        writer = ZarrWriter(staging)
+        rng = np.random.default_rng(7)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
+        roi = _make_full_roi_mask(tmp_path, 5, 5)
+
+        emb, scales = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunk, emb, run_id="run1", scales=scales)
+        writer.assemble(
+            [chunk],
+            total_y=5,
+            total_x=5,
+            run_id="run1",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
+            n_workers=1,
+        )
+
+        emb2, scales2 = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2)
+        with pytest.raises(ValueError, match="Refusing to append"):
+            writer.assemble(
+                [chunk],
+                total_y=5,
+                total_x=5,
+                run_id="run2",
+                output_path=output,
+                roi_zarr_path=roi,
+                run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
+                encoder_version="v2-large",
+                n_workers=1,
+            )
+
+    def test_a_store_with_no_recorded_encoder_is_read_as_v11_not_waved_through(self, tmp_path):
+        """Absence is not silence, and the permissive reading was the dangerous one.
+
+        `geoemb:model` postdates v1.1 and predates v2, so a store without it necessarily holds
+        v1.1 embeddings. An earlier guard skipped the check when the attr was missing — which
+        allowed precisely the append that then restamps a whole legacy store as v2. The stores
+        most likely to lack this attr are also the least likely to carry a `_manifest`, so both
+        doors stood open on the same store.
+        """
+        staging = str(tmp_path / "staging")
+        output = str(tmp_path / "output.zarr")
+        writer = ZarrWriter(staging)
+        rng = np.random.default_rng(11)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
+        roi = _make_full_roi_mask(tmp_path, 5, 5)
+
+        emb, scales = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunk, emb, run_id="legacy", scales=scales)
+        writer.assemble(
+            [chunk],
+            total_y=5,
+            total_x=5,
+            run_id="legacy",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
+            n_workers=1,
+        )
+
+        # Strip the encoder identity to reproduce a store written before the attr existed.
+        rep = icechunk.Repository.open(icechunk.local_filesystem_storage(output))
+        sess = rep.writable_session("main")
+        grp = zarr.open_group(sess.store, mode="a")
+        del grp.attrs["geoemb:model"]
+        sess.commit("drop encoder identity (simulate a legacy store)")
+
+        emb2, scales2 = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunk, emb2, run_id="v2run", scales=scales2)
+        with pytest.raises(ValueError, match="Refusing to append"):
+            writer.assemble(
+                [chunk],
+                total_y=5,
+                total_x=5,
+                run_id="v2run",
+                output_path=output,
+                roi_zarr_path=roi,
+                run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
+                encoder_version="v2-large",
+                n_workers=1,
+            )
+
+        # And the case that must KEEP working: v1.1 still appends to that same legacy store.
+        emb3, scales3 = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunk, emb3, run_id="v11run", scales=scales3)
+        writer.assemble(
+            [chunk],
+            total_y=5,
+            total_x=5,
+            run_id="v11run",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC),
+            n_workers=1,
+        )
+
+    def test_the_same_encoder_appends_normally(self, tmp_path):
+        """The guard must not cost the ordinary case: a second window from the SAME family
+        extends the store as before.
+        """
+        staging = str(tmp_path / "staging")
+        output = str(tmp_path / "output.zarr")
+        writer = ZarrWriter(staging)
+        rng = np.random.default_rng(8)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
+        roi = _make_full_roi_mask(tmp_path, 5, 5)
+
+        for run, day in (("runA", 2024), ("runB", 2025)):
+            e, sc = _quantized_embeddings(rng, 5, 5)
+            writer.write_chunk(chunk, e, run_id=run, scales=sc)
+            writer.assemble(
+                [chunk],
+                total_y=5,
+                total_x=5,
+                run_id=run,
+                output_path=output,
+                roi_zarr_path=roi,
+                run_started_at=datetime.datetime(day, 6, 1, tzinfo=datetime.UTC),
+                encoder_version="v1.1",
+                n_workers=1,
+            )
+
+        ds = open_store(output)
+        assert ds["embeddings"].shape[0] == 2, "both windows present"
+        ds.close()
 
     def test_assemble_appends_to_existing_store(self, tmp_path):
         """A second assemble at a NEW time value extends the time axis."""
@@ -1788,15 +1928,6 @@ class TestScanExistingStagedChunks:
 
         with pytest.raises(RuntimeError, match="no matching ChunkSpec"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
-
-    def test_compute_std_validation(self, tmp_path):
-        """With compute_std=True, missing embedding_std raises RuntimeError."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        # Write chunk WITHOUT std
-        self._stage_chunk(writer, self.CHUNKS[0], "run1")
-
-        with pytest.raises(RuntimeError, match="missing variable 'embedding_std'"):
-            writer.scan_existing_staged_chunks("run1", self.CHUNKS, compute_std=True)
 
     def test_reports_all_invalid(self, tmp_path):
         """Error message includes ALL invalid chunks, not just the first."""

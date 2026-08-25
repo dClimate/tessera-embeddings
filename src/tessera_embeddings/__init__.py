@@ -45,6 +45,10 @@ from tessera_embeddings.ingest.s2_roi import (
 
 
 def __getattr__(name: str) -> object:
+    if name == "run_id_prefix":
+        from tessera_embeddings.config.inference import run_id_prefix
+
+        return run_id_prefix
     if name == "run_inference":
         from tessera_embeddings.inference.runner import run_inference
 
@@ -69,5 +73,6 @@ __all__ = [
     "ingest_s1_roi_sar",
     "ingest_s2_roi_reflectance",
     "parse_time_window",
+    "run_id_prefix",
     "run_inference",
 ]

@@ -29,6 +29,7 @@ import ray
 import requests
 
 from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
     EMBEDDING_DIM,
     OPTICAL_MIN_OBS,
     PREFETCH_DEPTH,
@@ -37,6 +38,7 @@ from tessera_embeddings.config.inference import (
     S2_BAND_ORDER,
     InferenceConfig,
     S1Orbit,
+    est_px_per_sec,
 )
 from tessera_embeddings.config.store_layout import MONTH_COVERED_VARS, MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -171,13 +173,19 @@ _MIN_STRIP_H = 256
 # Strategy-only estimator constants, calibrated from the 2026-07-17 run logs
 # (chunk_0_9's two strips: 4.85 GB in 19.4s and 0.19 GB in 14.5s => BW ~950 MB/s,
 # fixed ~14s/read from re-decompressing the shared 4000^2 storage chunks + zarr
-# open + bucketing; inference px/s ~constant at ~16K, GPU-bound). These pick a
-# strip STRATEGY only — never a correctness value and never a RAM bound. A wrong
-# estimate's worst case is the previous always-prefetch behavior, because both
-# strategies respect the same resident-pair ceiling (see _strip_plan).
-_EST_PX_PER_SEC = 16_000.0
+# open + bucketing). These pick a strip STRATEGY only — never a correctness
+# value and never a RAM bound. A wrong estimate's worst case is the previous
+# always-prefetch behavior, because both strategies respect the same
+# resident-pair ceiling (see _strip_plan).
 _EST_READ_BYTES_PER_SEC = 900e6
 _EST_FIXED_READ_S = 13.0
+
+# Inference throughput is per-model (config.inference.MODEL_EST_PX_PER_SEC).
+# This is only the signature fallback for the planning helpers below; callers
+# that know their model pass est_px_per_sec(config.model_version).
+_EST_PX_PER_SEC = est_px_per_sec(DEFAULT_MODEL_VERSION)
+
+
 # P2 starter strip: a deliberately small first strip so the GPU starts inferring
 # after only the ~fixed read cost instead of a full budget-sized load, with the
 # remainder hiding behind it. Bounded upside (~bytes-of-one-budget / BW ~= 7s);
@@ -297,7 +305,15 @@ class _StripPlan:
     starter_first: bool = False
 
 
-def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width: int | None = None) -> _StripPlan:
+def _strip_plan(
+    t_kept: int,
+    height: int,
+    width: int,
+    valid_px: int,
+    mask_width: int | None = None,
+    *,
+    px_per_sec: float = _EST_PX_PER_SEC,
+) -> _StripPlan:
     """Choose a strip tiling + prefetch strategy for a chunk.
 
     Bytes scale with ``t_kept x height x width``; inference time scales with
@@ -325,7 +341,7 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width:
     # inference time against estimated total load time (fixed per-read cost x
     # number of 1x-budget strips, plus bytes / bandwidth).
     n_dense = (per_set_1x + budget - 1) // budget
-    t_infer = valid_px / _EST_PX_PER_SEC
+    t_infer = valid_px / px_per_sec
     t_load = n_dense * _EST_FIXED_READ_S + bytes_total / _EST_READ_BYTES_PER_SEC
 
     if t_infer >= t_load:
@@ -363,7 +379,9 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width:
     )
 
 
-def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice | None, int, _StripPlan]:
+def _chunk_read_plan(
+    chunk: ChunkSpec, mask_bundle: S2MaskBundle, *, px_per_sec: float = _EST_PX_PER_SEC
+) -> tuple[slice | None, int, _StripPlan]:
     """Crop bbox, valid-pixel count, and strip plan derived from the SCL mask.
 
     Shared by the serial prologue and the cross-chunk starter prefetch so both
@@ -404,11 +422,19 @@ def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice
     valid_px = int(valid_any[:, x_sub].sum()) if x_sub is not None else int(valid_any.sum())
     # Bands read at effective_width (possibly cropped); the SCL mask stays
     # full chunk width, so charge it at chunk.width in the budget.
-    plan = _strip_plan(t_kept, chunk.height, effective_width, valid_px, mask_width=chunk.width)
+    plan = _strip_plan(t_kept, chunk.height, effective_width, valid_px, mask_width=chunk.width, px_per_sec=px_per_sec)
     return x_sub, valid_px, plan
 
 
-def _xchunk_rung(chunk: ChunkSpec, t_kept: int, x_sub: slice | None, valid_px: int, plan: _StripPlan) -> str:
+def _xchunk_rung(
+    chunk: ChunkSpec,
+    t_kept: int,
+    x_sub: slice | None,
+    valid_px: int,
+    plan: _StripPlan,
+    *,
+    px_per_sec: float = _EST_PX_PER_SEC,
+) -> str:
     """Choose the prefetch rung for a hinted next chunk: "starter" or "mask-only".
 
     The starter rung requires ``plan.strips[0]`` to be the SMALL 256-row
@@ -424,7 +450,7 @@ def _xchunk_rung(chunk: ChunkSpec, t_kept: int, x_sub: slice | None, valid_px: i
     if plan.starter_first:
         candidate = True
     elif len(plan.strips) == 1 and not plan.pair_budget and chunk.height > _STARTER_STRIP_H:
-        starter_infer_s = (_STARTER_STRIP_H / chunk.height) * (valid_px / _EST_PX_PER_SEC)
+        starter_infer_s = (_STARTER_STRIP_H / chunk.height) * (valid_px / px_per_sec)
         candidate = starter_infer_s >= _EST_FIXED_READ_S
     else:
         candidate = False
@@ -711,7 +737,9 @@ class InferenceActor:
         """Open stores, load the SCL bundle, and derive the chunk read plan."""
         store_opener = make_store_opener(region=self._s3_region)
         mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, time_window, store_opener=store_opener)
-        x_sub, valid_px, plan = _chunk_read_plan(chunk, mask_bundle)
+        x_sub, valid_px, plan = _chunk_read_plan(
+            chunk, mask_bundle, px_per_sec=est_px_per_sec(self.config.model_version)
+        )
         return store_opener, mask_bundle, x_sub, valid_px, plan
 
     def _load_strip_dataset(
@@ -761,6 +789,8 @@ class InferenceActor:
             s1_orbit=s1_orbit,
             allow_s2_only=allow_s2_only,
             optical_min_obs=self.config.optical_min_obs,
+            model_version=self.config.model_version,
+            norm_source=self.config.norm_source,
         )
         return data, dataset
 
@@ -830,7 +860,14 @@ class InferenceActor:
         credential-window miss degrades to the unprefetched behaviour.
         """
         store_opener, mask_bundle, x_sub, valid_px, plan = self._open_and_plan(chunk, mosaic_base, time_window)
-        rung = _xchunk_rung(chunk, int(mask_bundle.mask.shape[0]), x_sub, valid_px, plan)
+        rung = _xchunk_rung(
+            chunk,
+            int(mask_bundle.mask.shape[0]),
+            x_sub,
+            valid_px,
+            plan,
+            px_per_sec=est_px_per_sec(self.config.model_version),
+        )
 
         first_strip = None
         if rung == "starter":
@@ -1569,7 +1606,6 @@ class InferenceActor:
                         chunk,
                         embeddings,
                         run_id,
-                        embeddings_std=None,
                         scales=scales,
                         obs_counts=obs_buffers,
                         month_covered=month_buffers,

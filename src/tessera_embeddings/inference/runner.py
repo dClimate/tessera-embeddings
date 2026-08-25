@@ -22,7 +22,7 @@ from typing import Any
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.inference import InferenceConfig, assert_run_id_matches_model
 from tessera_embeddings.inference.actors import InferenceActor
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -125,6 +125,13 @@ def run_inference(
     """
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors}")
+
+    # BEFORE anything is reused. This is a public entry point, so a caller can arrive here
+    # with a run_id and a config that disagree about the encoder without ever passing through
+    # the Prefect flow's guard — and the artifacts themselves cannot settle it, being the same
+    # shape and dtype under either student. Checked even when `chunks` is empty: a chained
+    # session reuses the same run_id for the work that arrives later.
+    assert_run_id_matches_model(run_id, config.model_version)
 
     # --- Resume check: skip chunks already staged from a prior run ---
     # Gated on a non-empty chunk list: a chained session starts empty (work

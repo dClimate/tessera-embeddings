@@ -35,6 +35,15 @@ def test_checkpoint_filename_invalid_raises() -> None:
         checkpoint_filename("bogus")
 
 
+def test_checkpoint_filename_v2_large() -> None:
+    assert checkpoint_filename(model_version="v2-large") == "student_large.pt"
+
+
+def test_checkpoint_filename_v2_ignores_norm_source() -> None:
+    """v2 ships one checkpoint per student size — no norm_source split."""
+    assert checkpoint_filename("mpc", model_version="v2-large") == checkpoint_filename(model_version="v2-large")
+
+
 # ---------------------------------------------------------------------------
 # _normalize_obs_checkpoints
 # ---------------------------------------------------------------------------
@@ -114,6 +123,16 @@ def test_inference_config_empty_num_obs_checkpoints_raises() -> None:
         _minimal_config(num_obs_checkpoints=())
 
 
+def test_inference_config_default_model_version_is_v11() -> None:
+    cfg = _minimal_config()
+    assert cfg.model_version == "v1.1"
+
+
+def test_inference_config_invalid_model_version_raises() -> None:
+    with pytest.raises(ValueError, match="Invalid model_version"):
+        _minimal_config(model_version="v3")
+
+
 def test_inference_config_compute_std_forced_false() -> None:
     cfg = _minimal_config(compute_std=True)  # type: ignore[call-arg]
     assert cfg.compute_std is False
@@ -127,10 +146,12 @@ def test_the_newest_field_is_the_last_field() -> None:
 
     Moving this assertion is the expected cost of adding a field, and it is worth paying: the
     tripwire fires on an insertion and on an append alike, so whoever moves it has to look at
-    where their field landed. It named allow_s2_only until 2026-08-13, when optical_min_obs was
-    appended after it.
+    where their field landed. It named allow_s2_only until 2026-08-13, then optical_min_obs, and now
+    model_version — which arrived on the v2-large branch INSERTED second, before this
+    rule existed on that branch, and was moved to the end during the merge rather than
+    left to rebind every positional argument after ``time_window``.
     """
-    assert fields(InferenceConfig)[-1].name == "optical_min_obs"
+    assert fields(InferenceConfig)[-1].name == "model_version"
 
 
 def test_the_minimum_depth_rule_defaults_to_no_rule() -> None:
@@ -150,3 +171,32 @@ def test_a_rule_that_refuses_nothing_is_refused_by_the_config() -> None:
 def test_allow_s2_only_defaults_off() -> None:
     assert _minimal_config().allow_s2_only is False
     assert _minimal_config(allow_s2_only=True).allow_s2_only is True
+
+
+def test_an_explicitly_empty_norm_source_is_refused_not_defaulted() -> None:
+    """`or "aws"` accepted every falsy value and silently selected AWS statistics.
+
+    Pairing a checkpoint with the wrong band statistics produces embeddings that are wrong and
+    perfectly well-formed — no shape error, no NaN, nothing downstream to object. Only the UNSET
+    case may default; anything supplied goes through validation.
+    """
+    with pytest.raises(ValueError, match="Invalid norm_source"):
+        _minimal_config(norm_source="")  # type: ignore[arg-type]
+    assert _minimal_config(norm_source=None).norm_source == "aws", "unset still defaults"
+    assert _minimal_config(norm_source="mpc").norm_source == "mpc"
+
+
+def test_band_stats_refuses_an_empty_norm_source_too() -> None:
+    """The SAME defaulting trap, at a second site — and the validation just below it cannot
+    catch this one, because `""` has already become `"aws"` by the time the check runs.
+
+    Worth its own test rather than folding into the config test above: `band_stats` is called
+    directly by the actor with whatever the config resolved, so it is reachable independently.
+    """
+    from tessera_embeddings.config.inference import band_stats
+
+    with pytest.raises(ValueError, match="Invalid norm_source"):
+        band_stats("v1.1", norm_source="")
+    assert band_stats("v1.1", norm_source=None) == band_stats("v1.1", norm_source="aws")
+    # v2 hard-codes one set and ignores the argument entirely.
+    assert band_stats("v2-large", norm_source="") == band_stats("v2-large")
