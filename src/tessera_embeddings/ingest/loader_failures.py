@@ -451,9 +451,26 @@ def _collect[T](client: dask.distributed.Client | None, read: Callable[[], list[
     except Exception:
         logger.warning("Could not collect %s from workers", what, exc_info=True)
         return found
+    silent = 0
     for result in per_worker.values():
         if isinstance(result, list):
             found.extend(result)
+        else:
+            silent += 1
+    if silent:
+        # NAMED, because the buffer lives on the worker that read, and a worker that dies or is
+        # retired between the failure and this call takes its evidence with it. `on_error="ignore"`
+        # is right — raising here would replace a recoverable read error with an unrecoverable one
+        # — but silently returning a short answer would let a refusal be judged as bad bytes with
+        # nothing saying the evidence was merely unreachable. This line is what makes that
+        # diagnosable rather than invisible.
+        logger.warning(
+            "Collected %s from %d of %d worker(s): %d did not answer, so any evidence they held is not in this verdict",
+            what,
+            len(per_worker) - silent,
+            len(per_worker),
+            silent,
+        )
     return found
 
 

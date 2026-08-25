@@ -1075,8 +1075,11 @@ _PROVIDER_REFUSAL_MARKERS = (
 #: anchored on ``HTTP response code:`` reads a status out of NEITHER, so every date of that
 #: outage classified ``undecidable`` and the refusal both lines state was never seen.
 #:
-#: The gap is BOUNDED rather than open, so a long single line cannot bind the phrase to some
-#: unrelated number far away from it, and the match is kept inside one line.
+#: What sits between the phrase and the status is an OBJECT ADDRESS, so it is matched as one —
+#: ``\S+``, since a URL holds no whitespace. That is what keeps this from binding the phrase to
+#: some unrelated number later on a flattened traceback line, and it needs no length cap: a
+#: CloudFront-signed OPERA href runs past 900 characters once its policy and signature are on it,
+#: which is the shape the radar path uses whenever ``use_s3_direct=False``.
 #:
 #: **The separator must be a colon followed by a SPACE, and that is what keeps a URL port out.**
 #: GDAL formats the pair as ``%s: %d``; an authority writes ``host:443`` with no space. Without
@@ -1084,7 +1087,7 @@ _PROVIDER_REFUSAL_MARKERS = (
 #: a 4xx that is neither absence nor a reason to wait, so the real refusal is dropped and the
 #: codec failure keeps its unreadable verdict and costs its date. A ``:503`` port went the other
 #: way and invented a refusal. The trailing guard rejects a longer port such as ``:8443``.
-_HTTP_STATUS_RE = re.compile(r"HTTP (?:response|error) code[^\n]{0,400}?:[ \t]+(\d{3})(?![\d/])")
+_HTTP_STATUS_RE = re.compile(r"HTTP (?:response|error) code(?: on \S+)?:[ \t]+(\d{3})(?![\d/])")
 
 #: 4xx statuses that mean WAIT rather than stop.
 #:

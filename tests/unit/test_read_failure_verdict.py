@@ -320,10 +320,28 @@ def test_a_url_port_is_not_mistaken_for_a_status(text: str, verdict: ReadFailure
 
 
 def test_a_status_is_not_bound_to_a_phrase_far_away_from_it() -> None:
-    """The gap between the phrase and the status is bounded, so one line cannot bind across it.
+    """What sits between the phrase and the status is an ADDRESS, and an address has no spaces.
 
-    A traceback flattened onto a single line can carry an unrelated number hundreds of characters
-    later. Unbounded, the pattern would reach it and read a status the message never stated.
+    A traceback flattened onto a single line can carry an unrelated number later on. Matching the
+    gap as a URL rather than as "anything up to N characters" is what refuses it — and it refuses
+    at any distance, where a length cap only refuses past its own bound.
     """
     far = "HTTP response code" + " x" * 400 + ": 503"
     assert classify_read_failure_in(far) is ReadFailure.UNDECIDABLE
+
+
+def test_a_signed_url_does_not_outrun_the_pattern() -> None:
+    """Radar runs on CloudFront-signed hrefs whenever ``use_s3_direct=False``.
+
+    A policy and a signature push an OPERA href past 900 characters, so any length cap on the gap
+    silently stops matching in that mode — the handler drops the line, the codec exception keeps
+    its unreadable verdict, and the date is given up. There is no cap: the gap is one address.
+    """
+    signed = (
+        "https://d1234abcd.cloudfront.net/OPERA_L2_RTC-S1/"
+        "OPERA_L2_RTC-S1_T072-152803-IW2_20211108T150433Z_S1B_30_v1.0/x_VV.tif"
+        "?Policy=" + "e" * 420 + "&Signature=" + "s" * 340 + "&Key-Pair-Id=APKAABCDEFGHIJKLMNOP"
+    )
+    assert len(signed) > 900, "the point of this case is that the href is long"
+    line = f"CPLE_AppDefined in HTTP response code on {signed}: 403"
+    assert classify_read_failure_in(line) is ReadFailure.PROVIDER_REFUSED
