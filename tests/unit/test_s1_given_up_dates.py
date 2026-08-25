@@ -52,8 +52,9 @@ def _run(
     and a policy that waits is indistinguishable from one that does not.
 
     Returns ``(result, written, recorded, attempts)``. ``recorded`` collects the keyword arguments
-    each ``record_assessed_window`` call was given — the durable half of the skip, and the only
-    place a reader of the store can learn a date was lost.
+    each ``record_assessed_window`` call was given, which is now the examined RANGE and nothing
+    about individual dates: a date given up below the store's newest one is closed for good, so a
+    record of it unlocks no action and none is kept. What a lost date leaves is a log line.
     """
     clears_after = clears_after or {}
     import collections
@@ -183,22 +184,30 @@ def test_a_refusal_fails_the_leg_rather_than_being_given_up(monkeypatch, message
         _run(monkeypatch, failures={"2024-01-02": _raise(message, cause)})
 
 
-def test_the_loss_is_recorded_on_the_store_and_scoped_by_cause(monkeypatch) -> None:
-    """A skip nobody can read from the store is a gap, not a finding.
+def test_the_loss_is_named_in_the_log_and_scoped_by_cause(monkeypatch, caplog) -> None:
+    """A skipped date must say which date, why, and that the loss is permanent.
 
-    ``scope`` decides what to do next: a refused date is recoverable by re-running the window,
-    an unreadable one needs a reprocessed copy at the provider. Both causes here, because the
-    record has to tell them apart.
+    The log is where this lives now. Nothing goes onto the store, because a day is only ever
+    skipped once a later day has committed above it — so it is closed for good, and a durable
+    record of it names something no run can act on.
+
+    ``scope`` still separates the causes, because they say different things to a human reading a
+    green leg: unreadable bytes need a reprocessed copy at the provider, and nothing else does.
     """
-    _r, _w, recorded, _a = _run(
-        monkeypatch,
-        failures={
-            "2024-01-03": _raise("WarpOperationError: Chunk and warp failed", "ZIPDecode: error at scanline 0"),
-        },
-    )
-    given_up = recorded[0]["unreadable"]
-    assert [(g["date"], g["scope"]) for g in given_up] == [("2024-01-03", "unreadable")]
-    assert "Chunk and warp failed" in given_up[0]["error"]
+    with caplog.at_level(logging.ERROR):
+        _r, _w, recorded, _a = _run(
+            monkeypatch,
+            failures={
+                "2024-01-03": _raise("WarpOperationError: Chunk and warp failed", "ZIPDecode: error at scanline 0"),
+            },
+        )
+
+    loss = [r.getMessage() for r in caplog.records if "DATA LOSS roi=" in r.getMessage()]
+    assert len(loss) == 1, f"one line per lost date: {loss}"
+    assert "date=2024-01-03" in loss[0]
+    assert "scope=unreadable" in loss[0]
+    assert "Chunk and warp failed" in loss[0]
+    assert all("unreadable" not in kwargs for kwargs in recorded), "nothing about the date is stored"
 
 
 def test_a_refusal_wrapped_in_a_warp_failure_is_still_a_refusal(monkeypatch) -> None:
@@ -218,7 +227,7 @@ def test_a_refusal_wrapped_in_a_warp_failure_is_still_a_refusal(monkeypatch) -> 
         )
 
 
-def test_the_retry_is_exhausted_before_a_date_is_given_up(monkeypatch) -> None:
+def test_the_retry_is_exhausted_before_a_date_is_given_up(monkeypatch, caplog) -> None:
     """Giving up is the LAST resort. A refusal that clears inside the write's own retry costs
     nothing, so the skip sits outside that retry — and the record holds one entry for the date
     rather than one per attempt.
@@ -230,12 +239,20 @@ def test_the_retry_is_exhausted_before_a_date_is_given_up(monkeypatch) -> None:
     a statement about the bytes, it recomputes to the same verdict every time, and no amount of
     waiting changes it. Exactly the attempt limit, and none of the wait-out budget.
     """
-    _r, _w, recorded, attempts = _run(monkeypatch, failures={"2024-01-02": _raise("RasterioIOError: ZIPDecode: error")})
+    with caplog.at_level(logging.ERROR):
+        _r, _w, _recorded, attempts = _run(
+            monkeypatch, failures={"2024-01-02": _raise("RasterioIOError: ZIPDecode: error")}
+        )
     assert attempts["2024-01-02"] == STORE_WRITE_ATTEMPTS
-    assert [g["date"] for g in recorded[0]["unreadable"]] == ["2024-01-02"]
+    loss = [r.getMessage() for r in caplog.records if "DATA LOSS roi=" in r.getMessage()]
+    # Counted before it is filtered. `[m for m in loss if ...] == loss` is satisfied by an EMPTY
+    # loss, so it would have passed if the per-date line stopped being emitted at all — and that
+    # line is now the only record a lost date leaves.
+    assert len(loss) == 1, f"exactly one loss line, whatever it says: {loss}"
+    assert "date=2024-01-02" in loss[0], f"and it names the boundary date once: {loss}"
 
 
-def test_a_refusal_outlasting_the_attempt_limit_is_waited_out(monkeypatch) -> None:
+def test_a_refusal_outlasting_the_attempt_limit_is_waited_out(monkeypatch, caplog) -> None:
     """THE case the campaign lost 85 radar legs to, and the one nothing in this file could catch.
 
     The write's retry was three attempts of exponential backoff. A provider that stops serving
@@ -247,16 +264,19 @@ def test_a_refusal_outlasting_the_attempt_limit_is_waited_out(monkeypatch) -> No
     written. Attempted past it, not merely written eventually: a leg that recovered on a leg-level
     retry would also end with the dates present.
     """
-    _r, written, recorded, attempts = _run(
-        monkeypatch,
-        failures={
-            "2024-01-02": _raise("WarpOperationError: Chunk and warp failed", "RasterioIOError: AccessDenied"),
-        },
-        clears_after={"2024-01-02": STORE_WRITE_ATTEMPTS + 2},
-    )
+    with caplog.at_level(logging.ERROR):
+        _r, written, _recorded, attempts = _run(
+            monkeypatch,
+            failures={
+                "2024-01-02": _raise("WarpOperationError: Chunk and warp failed", "RasterioIOError: AccessDenied"),
+            },
+            clears_after={"2024-01-02": STORE_WRITE_ATTEMPTS + 2},
+        )
     assert attempts["2024-01-02"] == STORE_WRITE_ATTEMPTS + 3
     assert written == _CATALOGUE
-    assert recorded[0]["unreadable"] == [], "a refusal that was waited out must cost no date at all"
+    assert not [r for r in caplog.records if "DATA LOSS roi=" in r.getMessage()], (
+        "a refusal that was waited out must cost no date at all"
+    )
 
 
 def test_a_refusal_before_any_successful_read_is_not_waited_out(monkeypatch) -> None:
@@ -372,27 +392,3 @@ def test_a_leg_that_gave_up_some_dates_and_committed_others_still_succeeds(monke
     assert result.status == "success"
     assert written == _CATALOGUE[1:]
     assert recorded, "the store must carry the record of what was given up"
-
-
-def test_the_record_of_a_given_up_date_is_marked_load_bearing(monkeypatch) -> None:
-    """`record_assessed_window` warns and continues on failure, which is wrong when it is
-    the only durable trace of a lost date.
-
-    A swallowed failure there lets the leg succeed, collect a completion marker, and be
-    short-circuited by every later run, leaving a hole nothing names. The caller therefore
-    has to say the write is required, and only when there is something to lose.
-    """
-    _result, _written, recorded, _attempts = _run(
-        monkeypatch, failures={_CATALOGUE[0]: _raise("RasterioIOError: ZIPDecode: error")}
-    )
-
-    assert recorded, "the window must be recorded"
-    assert recorded[-1]["required"] is True
-
-
-def test_a_clean_leg_does_not_make_the_record_load_bearing(monkeypatch) -> None:
-    """Nothing was lost, so a failed metadata write must stay a warning rather than fail a leg."""
-    _result, _written, recorded, _attempts = _run(monkeypatch, failures={})
-
-    assert recorded
-    assert recorded[-1]["required"] is False

@@ -686,15 +686,16 @@ def ingest_s1_roi_sar(
         entry = {
             "date": date_str,
             "scope": scope,
-            # Truncated: this lands in the store's metadata, which every reader of the
-            # attribute pays for, and the first line is what identifies the cause.
+            # Truncated: a GDAL chain can run to thousands of characters, and the first line
+            # is what identifies the cause. The rest is in the traceback `read_failure_context`
+            # already logged.
             "error": f"{type(exc).__name__}: {exc}"[:300],
         }
         given_up_dates.append(entry)
         log.error(
             "[%s] DATA LOSS roi=%s date=%s: the source read failed and this date is SKIPPED, so "
-            "its pixels are absent from the mosaic. scope=%s error=%s — recorded on the store as "
-            "assessed_unreadable_dates.",
+            "its pixels are absent from the mosaic, permanently — a later date commits above it "
+            "and the time axis only grows. scope=%s error=%s",
             orbit,
             roi_label,
             date_str,
@@ -1090,13 +1091,6 @@ def ingest_s1_roi_sar(
             start_date,
             end_date,
             empty_dates=empty_dates,
-            # A given-up date exists ONLY here. Everything else about it is a log line, and a
-            # log line is not read by the coverage gate or by a later resume, so losing this
-            # write loses the fact that the date was ever examined.
-            required=bool(given_up_dates),
-            # Written unconditionally, so a clean re-run clears an earlier run's list rather
-            # than leaving dates advertised as lost that are now present.
-            unreadable=given_up_dates,
             get_credentials=None,
             s3_region=s3_region,
         )
@@ -1106,9 +1100,9 @@ def ingest_s1_roi_sar(
         # that says a green leg is nonetheless missing pixels, and where.
         log.error(
             "[%s] DATA LOSS SUMMARY roi=%s: %d date(s) skipped because their source reads "
-            "failed — %s. Recorded on the store as assessed_unreadable_dates. Every one of them "
-            "failed for a cause that RECOMPUTES, so re-running this window will not recover any "
-            "of them: what they need is a reprocessed copy at the provider.",
+            "failed — %s. Every one of them failed for a cause that RECOMPUTES, and each is now "
+            "below the store's newest date, so no re-run can recover any of them whatever the "
+            "provider republishes. The published coverage masks are what describe the result.",
             orbit,
             roi_label,
             len(given_up_dates),

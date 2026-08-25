@@ -972,11 +972,19 @@ too cloudy to keep, a day whose files would not read — none of them put a pixe
 nothing that consumes a mosaic tells them apart. The coverage layers say what is there. Why
 something is not there changes nothing about how what *is* there gets used.
 
-One attribute is a separate matter and is still written: `assessed_unreadable_dates` (see *When a
-source object will not read*). It serves the month-level coverage gate, which has to distinguish a
-month that was examined and found to hold nothing reachable from a month no run ever reached. It
-works at month granularity, nothing reads it to make a decision about a day, and it is not a
-record of loss.
+There used to be one: `assessed_unreadable_dates` named every day a leg gave up on, and the
+coverage gate subtracted the months holding those days from the months an assessed window
+excuses. It is gone. That subtraction refuses a month that can never be filled — nothing can be
+written below the line — so it deadlocked the cell rather than protecting anything, and the only
+way out was to delete the store, which is a judgement a person makes from an audit.
+
+What remains on the store is `assessed_window`, which is not a loss record. It says which range a
+leg examined, so a month holding no dates reads as "we looked and there was nothing" rather than
+as "no run reached this month". It works at month granularity and unblocks a cell rather than
+blocking one. `assessed_empty_dates` sits beside it as a count, for observability only.
+
+A lost day still produces a `DATA LOSS` line naming the date, the cause and the objects, and a
+summary at the end of the leg. What it does not produce is a record anything later reads.
 
 ## Performance Optimizations
 
@@ -1937,9 +1945,8 @@ Past that point the response is a ladder, in `s2_roi.py`'s consume path:
 2. **Step down** those tile-dates to their next catalogue copy and re-prepare the date. The
    copy is older reprocessing, so this trades processing baseline for a date that reads.
 3. **Give up, loudly,** when the implicated tile-dates have no copies left: the date is
-   skipped rather than the leg failed, and it is recorded on the store as
-   `assessed_unreadable_dates` so the absence reads as a finding rather than an unexamined
-   gap.
+   skipped rather than the leg failed, and a `DATA LOSS` line names the date, the objects and
+   the scope. Nothing is written to the store — see *Why nothing records what was missed*.
 
 Two properties are worth stating because they are what the attribution step buys, and they
 are held by tests rather than by comment:
@@ -2112,8 +2119,9 @@ for — OPERA publishes one copy of a granule:
    (`provider-refused`); it is not, because giving up a date and then committing a later one puts
    the earlier one permanently below the append-only maximum, so the re-run meant to recover it is
    refused instead.
-3. **Record it on the store** in the same `assessed_unreadable_dates` attribute the optical path
-   writes, so the coverage gate refuses to excuse a month that lost dates.
+3. **Name it in the log**, per date and again in an end-of-leg summary, exactly as the optical
+   path does. Nothing durable: the day is below the store's newest date by the time the next
+   date commits, so no record of it changes an outcome.
 4. **Stop past `MAX_GIVEN_UP_DATES`**, and stopping is TERMINAL.
    `TooManyGivenUpDatesError` is IN the leg-retry classifier's non-retryable set, because nothing
    counted toward the ceiling can clear: a provider refusal re-raises and is retried in order, so

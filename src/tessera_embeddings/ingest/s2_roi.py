@@ -173,8 +173,8 @@ class IngestResult:
             in the one place a caller looks.
         dates_refused_producer_conflict: Number of dates refused because no
             single BOA-offset decision fits the day. Deliberate losses, not
-            coverage rejections, and durably recorded on the store as
-            ``assessed_unreadable_dates`` with ``scope=producer-conflict``.
+            coverage rejections, and counted separately because the remedy
+            differs: no retry or fallback copy addresses one.
     """
 
     roi_path: str
@@ -1315,15 +1315,10 @@ def ingest_s2_roi_reflectance(
     # month as an unexplained gap and the zone-year can never complete. The extra probe
     # runs ONLY in the zero-write case, so a normal run pays nothing for it.
     if total_processed or get_existing_dates(reflectance_store, s3_region=s3_region):
-        # Both kinds of deliberate loss, in ONE durable list. The attr answers "where are the
-        # holes in this assessed window", and a hole is a hole whether the objects would not read
-        # or the day had no correct offset decision. `scope` distinguishes them for anyone acting
-        # on the record.
         record_assessed_window(
             reflectance_store,
             start_date,
             end_date,
-            unreadable=[*unreadable_tile_dates, *producer_conflict_dates],
             s3_region=s3_region,
         )
 
@@ -1333,8 +1328,8 @@ def ingest_s2_roi_reflectance(
         # says a green leg is nonetheless missing pixels, and where.
         log.error(
             "DATA LOSS SUMMARY roi=%s: %d date(s) skipped because every catalogue copy was "
-            "unreadable — %s. Recorded on the store as assessed_unreadable_dates, so the gap "
-            "reads as a finding rather than as an unexamined window.",
+            "unreadable — %s. Each is now below the store's newest date, so no re-run recovers "
+            "one whatever the provider republishes.",
             roi_label,
             len(unreadable_tile_dates),
             "; ".join(f"{u['date']} objects={u['objects']} scope={u['scope']}" for u in unreadable_tile_dates),
@@ -1347,9 +1342,9 @@ def ingest_s2_roi_reflectance(
         # as a whole.
         log.error(
             "DATA LOSS SUMMARY roi=%s: %d date(s) refused because no single offset decision fits "
-            "the day — %s. Recorded on the store as assessed_unreadable_dates with "
-            "scope=producer-conflict. These are NOT coverage rejections and are counted "
-            "separately, and no retry or fallback copy addresses one. The remedy is to classify the "
+            "the day, scope=producer-conflict — %s. These are NOT coverage rejections and are "
+            "counted separately, and no retry or fallback copy addresses one. The remedy is to "
+            "classify the "
             "source's bucket in `asset_locations` as harmonised or unharmonised, or to fix the "
             "catalogue item's `s2:processing_baseline`; the exception text names which applies.",
             roi_label,

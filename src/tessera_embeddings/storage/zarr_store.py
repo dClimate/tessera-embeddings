@@ -1239,8 +1239,6 @@ def record_assessed_window(
     end_date: str,
     *,
     empty_dates: int = 0,
-    unreadable: list[dict[str, str]] | None = None,
-    required: bool = False,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
 ) -> None:
@@ -1254,11 +1252,12 @@ def record_assessed_window(
     how many dates were examined and skipped as reaching no live window, which is the
     difference between "sparse region" and "something is wrong with the footprints".
 
-    ``unreadable`` names dates this window DELIBERATELY gave up on because every catalogue
-    copy of some source object failed to read. It has to be recorded on the store, not only
-    logged: the assessed window makes absence inside it a finding rather than a gap, so
-    without this the two are indistinguishable and no later run revisits the date. A log line
-    is lost the moment nobody greps for it; this is the durable record of where the loss is.
+    **It does not record which dates were lost, and that is deliberate.** A store's time axis only
+    grows, so once a later date commits, every day at or below it is closed to that store for
+    good — whatever the imagery for it turns out to be. A run therefore never revisits such a day,
+    and a record of it unlocks no action. What survives a fill is the embeddings store, and it
+    already publishes per-pixel observation counts and a per-month coverage mask per sensor; the
+    mosaic this attribute sits on is deleted once a cell lands. See ``ingest/README.md``.
 
     OPENS, never creates: this runs only against a store that was just written. Failing
     here must not be fatal — the assessment is an optimisation of the gate's judgement, and
@@ -1270,12 +1269,6 @@ def record_assessed_window(
         root = zarr.open_group(session.store, mode="a")
         root.attrs[ASSESSED_WINDOW_ATTR] = [start_date, end_date]
         root.attrs["assessed_empty_dates"] = int(empty_dates)
-        # Written UNCONDITIONALLY, so a clean re-assessment clears an earlier one's list.
-        # Guarded on truthiness, a repair run that recovered every date left the old dates
-        # advertised on the store, and an audit reading this attr would report pixels
-        # missing that are now present — the assessment describes THIS assessment, so an
-        # empty answer has to overwrite a previous non-empty one.
-        root.attrs["assessed_unreadable_dates"] = list(unreadable or ())
         # ``allow_empty`` because re-recording the SAME window writes no bytes, and icechunk
         # refuses a commit with no changes ("cannot commit, no changes made to the session").
         # That refusal surfaced as a WARNING on healthy stores — every resumed leg that had
@@ -1283,18 +1276,11 @@ def record_assessed_window(
         # fires routinely teaches the reader to skip the whole line, including the times it
         # means something. The record is idempotent, so committing it again is harmless.
         session.commit(
-            f"assessed window {start_date}..{end_date} ({empty_dates} empty date(s)"
-            f"{f', {len(unreadable)} unreadable' if unreadable else ''})",
+            f"assessed window {start_date}..{end_date} ({empty_dates} empty date(s))",
             allow_empty=True,
         )
         logger.info(f"Recorded assessed window {start_date}..{end_date} on {store_path}")
     except Exception as exc:
-        if required:
-            # The caller says this record is the only durable trace of something. Warning and
-            # continuing would let the leg succeed, collect a completion marker, and be
-            # short-circuited by every later run — leaving a hole nothing names. Raise so the
-            # leg is retried instead of finalised.
-            raise
         logger.warning(f"Could not record assessed window on {store_path}: {exc}")
 
 
