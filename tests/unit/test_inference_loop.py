@@ -289,6 +289,21 @@ class TestPipelinedGpuLoop:
     only coverage of the pinned-buffer / CUDA-event / two-deep-drain / backbone-
     stream-ordering path — the CPU tests exercise `_serial_loop` only. Skips when
     no GPU is present (CI), runs on GPU boxes.
+
+    **THIS PATH HAS NO CI COVERAGE, BY DECISION (2026-08-25).** No GPU runner is available
+    to the project and one will not be provisioned, so the skip below fires on every CI run
+    and this test is verified BY HAND. It keeps its ``skipif`` rather than taking
+    ``@pytest.mark.gpu`` precisely so it still reports as a skip: the marker is filtered out
+    by the default ``addopts``, and the test would then vanish from the run entirely, leaving
+    nothing to notice the gap by.
+
+    Run it on any CUDA machine after touching the pipelined loop, the actor pool or the
+    chunk-staging path, and once before a campaign starts::
+
+        uv sync --all-extras --frozen
+        uv run pytest tests/unit/test_inference_loop.py -k pipelined -v
+
+    See ``tests/README.md`` → Roadmap 2.
     """
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for the pipelined GPU loop")

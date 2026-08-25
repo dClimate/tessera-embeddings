@@ -1104,29 +1104,35 @@ class TestDetectStagedChunkSize:
         with pytest.raises(FileNotFoundError, match="No staged chunks found"):
             writer.detect_staged_chunk_size("run1")
 
+    # The extents below are deliberately SMALL. What is under test is that the method reads a
+    # size off whichever chunk it finds, not that it can handle a production-sized one — and
+    # the size is read from the array's shape, so it is scale-free. A real 2000-px chunk is
+    # 2000 x 2000 x 128 int8, half a gigabyte to generate, quantise and write, which cost 10 s
+    # of suite wall time to assert an integer.
+
     def test_uses_first_available_chunk(self, tmp_path):
         """Returns chunk_size from first staged label — not chunk_0_0 specifically."""
         writer = ZarrWriter(str(tmp_path / "staging"))
         # Stage only a non-origin chunk (simulates sparse ROI where chunk_0_0 is empty)
-        chunk = ChunkSpec(row=3, col=5, y_start=6000, y_stop=8000, x_start=10000, x_stop=12000)
+        chunk = ChunkSpec(row=3, col=5, y_start=600, y_stop=800, x_start=1000, x_stop=1200)
         rng = np.random.default_rng(0)
         emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
         writer.write_chunk(chunk, emb, "run1", scales=scales)
 
         result = writer.detect_staged_chunk_size("run1")
-        assert result == 2000
+        assert result == 200
 
     def test_returns_max_of_height_width(self, tmp_path):
         """Edge chunks with non-square extents return max(h, w)."""
         writer = ZarrWriter(str(tmp_path / "staging"))
-        # Non-square edge chunk: height=500, width=2000
-        chunk = ChunkSpec(row=0, col=1, y_start=0, y_stop=500, x_start=2000, x_stop=4000)
+        # Non-square edge chunk: height=50, width=200 — the wider side must win
+        chunk = ChunkSpec(row=0, col=1, y_start=0, y_stop=50, x_start=200, x_stop=400)
         rng = np.random.default_rng(1)
         emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
         writer.write_chunk(chunk, emb, "run1", scales=scales)
 
         result = writer.detect_staged_chunk_size("run1")
-        assert result == 2000
+        assert result == 200
 
 
 class _RecordingMarkerFS:

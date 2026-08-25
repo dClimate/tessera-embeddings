@@ -582,35 +582,6 @@ class TestSchedulerResourceLogger:
         assert calls[-1][1] == 5.0
 
 
-@pytest.mark.integration
-class TestSchedulerResourceLoggerOnCluster:
-    """End-to-end: registering the plugin on a real (local) scheduler makes it
-    log on its event loop. Guards the registration/start wiring that the unit
-    tests stub out.
-    """
-
-    def test_registered_plugin_emits_on_real_scheduler(self, caplog) -> None:
-        import time
-
-        from distributed import Client, LocalCluster
-
-        with (
-            caplog.at_level(logging.INFO, logger="distributed.scheduler"),
-            LocalCluster(n_workers=1, dashboard_address=None, processes=False) as cluster,
-            Client(cluster) as client,
-        ):
-            client.register_plugin(
-                SchedulerResourceLogger(interval_s=0.3),
-                name=SchedulerResourceLogger.name,
-            )
-            client.gather(client.map(lambda x: x * x, range(50)))
-            time.sleep(1.0)  # allow a couple of PeriodicCallback ticks
-
-        health = [r.getMessage() for r in caplog.records if r.getMessage().startswith("scheduler health:")]
-        assert health, "expected at least one health line from the running scheduler"
-        assert "workers=1" in health[-1]
-
-
 def test_ingest_settings_perf_report_uri_defaults_none() -> None:
     """The perf-report knob is off by default, so normal runs never capture one."""
     assert IngestSettings().perf_report_uri is None

@@ -424,12 +424,18 @@ class TestTheFailingRequestIsNamed:
         assert isinstance(caught.value.__cause__, APIError)
         assert "too many 502 error responses" in str(caught.value.__cause__)
 
-    def test_a_refusal_before_any_search_is_named_as_the_catalogue_root(self, caplog) -> None:
+    def test_a_refusal_before_any_search_is_named_as_the_catalogue_root(self, caplog, monkeypatch) -> None:
         """Opening the catalogue is its own request.
 
         Reading its refusal as a refusal of the search would attribute a root outage to a
         window that was never asked for.
+
+        The root backoff is zeroed the way ``TestTheCatalogueRootKeepsTheRetryTheLadderStoppedGiving``
+        does it: what is asserted here is how the refusal is NAMED, and paying the real 6 s
+        ladder to reach that naming made this the slowest test in the file. The ladder's own
+        length is that class's subject, and it still asserts the attempt count.
         """
+        monkeypatch.setattr(stac, "_ROOT_OPEN_BACKOFF_S", 0.0)
         provider = stac._get_provider_config("earth-search")
         collection = stac._get_collection_config("earth-search", "sentinel-2-l2a")
         with (
