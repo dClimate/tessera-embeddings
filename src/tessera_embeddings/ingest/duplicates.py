@@ -1064,16 +1064,21 @@ _PROVIDER_REFUSAL_MARKERS = (
 #: * **Every other 4xx is neither** — a malformed request or a rejected credential is not the
 #:   data's fault and is not fixed by waiting, so it re-raises and fails the leg on its first
 #:   date instead of being skipped date by date.
-#: GDAL states a status in more than one wording, and both of them reach this classifier.
-#: Captured from production during the 2026-08-24 outage, on ``rasterio._env`` at WARNING:
+#: GDAL states a status in four wordings, and all of them reach this classifier as
+#: ``rasterio._env`` records at WARNING:
 #:
 #: * ``CPLE_AppDefined in HTTP response code on <url>: 403``
 #: * ``CPLE_AppDefined in HTTP error code: 503 - <url>. Retrying again in 0.5 secs``
+#: * ``CPLE_AppDefined in HTTP error code for <url> range <first>-<last>: 503. Retrying again ...``
+#: * ``CPLE_AppDefined in Request for <url> range <first>-<last> failed with response_code=403``
 #:
-#: The first puts the object's URL BETWEEN the phrase and the colon — 249 characters of it on a
-#: real OPERA href — and the second says "error" where the first says "response". A pattern
-#: anchored on ``HTTP response code:`` reads a status out of NEITHER, so every date of that
-#: outage classified ``undecidable`` and the refusal both lines state was never seen.
+#: The first three spell the status after ``code``, and differ only in what sits between: the
+#: first the object's URL, the second nothing at all, the third both the URL and the byte range.
+#: The fourth spells it ``response_code=`` instead — it is what the ranged reader states when it
+#: STOPS retrying, where the third is what it says on each retry. A pattern anchored on
+#: ``HTTP response code:`` reads a status out of NONE of them, and a line carrying no status is
+#: not a refusal, so the refusal each states goes unseen and the codec failure beneath it keeps
+#: its unreadable verdict.
 #:
 #: What sits between the phrase and the status is an OBJECT ADDRESS, so it is matched as one —
 #: ``\S+``, since a URL holds no whitespace. That is what keeps this from binding the phrase to
@@ -1088,17 +1093,17 @@ _PROVIDER_REFUSAL_MARKERS = (
 #: codec failure keeps its unreadable verdict and costs its date. A ``:503`` port went the other
 #: way and invented a refusal. The trailing guard rejects a longer port such as ``:8443``.
 #:
-#: **The ranged reader states the same refusal in a third wording**, ``Request for <url> range
-#: <first>-<last> failed with response_code=403``, from ``Request for %s range %s failed with
-#: response_code=%ld`` in the library itself. A pattern reading only the ``code:`` forms above
-#: leaves it unread, and a line carrying no status is not a refusal. It is matched on its own key
-#: rather than folded into the alternation because the separator differs: ``=`` with no space,
-#: which is unambiguous and needs none of the port guard the colon forms do.
+#: **The fourth is matched on its own key**, not folded into the alternation with the others:
+#: ``response_code=`` separates with ``=`` and no space, which is unambiguous and needs none of
+#: the port guard the ``code:`` forms do. It comes from ``Request for %s range %s failed with
+#: response_code=%ld`` in the library itself.
 #:
 #: ``\d{3}`` and not ``\d+`` is what keeps ``response_code=0`` out. GDAL prints that when the
 #: request never completed, and it is the absence of a status rather than a status — read as one
 #: it would be neither absence nor a reason to wait, which is the verdict that re-raises.
-_HTTP_STATUS_RE = re.compile(r"(?:HTTP (?:response|error) code(?: on \S+)?:[ \t]+|response_code=)(\d{3})(?![\d/])")
+_HTTP_STATUS_RE = re.compile(
+    r"(?:HTTP (?:response|error) code(?: on \S+| for \S+ range \S+)?:[ \t]+|response_code=)(\d{3})(?![\d/])"
+)
 
 #: 4xx statuses that mean WAIT rather than stop.
 #:
@@ -1106,8 +1111,8 @@ _HTTP_STATUS_RE = re.compile(r"(?:HTTP (?:response|error) code(?: on \S+)?:[ \t]
 #: a status is a fact. The literal ``HTTP response code: 403`` matches what GDAL says when it
 #: cannot OPEN an object — and that failure carries the words into the exception anyway, where
 #: the marker was always going to catch them. It does not match what GDAL says when a chunk READ
-#: is refused mid-transfer, which is the shape every lost date of that outage arrived in, and
-#: whose exception says only ``Chunk and warp failed``.
+#: is refused mid-transfer, which is the shape a lost date arrives in, and whose exception says
+#: only ``Chunk and warp failed``.
 #:
 #: This module already recorded this defect once, for 5xx: "the markers name 403 and 500 as
 #: strings while the ranges cover every 5xx, so ``HTTP response code: 503`` was a refusal to
