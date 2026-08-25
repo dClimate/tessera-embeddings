@@ -323,6 +323,48 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         _gdal_logs(LOGGED_REFUSAL)
         assert collect_logged_refusals(_SlowCluster(), since=read_began) == [LOGGED_REFUSAL]
 
+    def test_a_worker_that_did_not_answer_is_named(self, caplog) -> None:
+        """A short answer must say it is short, or a lost refusal reads as bad bytes.
+
+        The buffer lives on the worker that read, so a worker dying or being retired between the
+        failure and this collection takes its evidence with it. Nothing can be done about that
+        here — raising while handling a read failure would replace a recoverable error with an
+        unrecoverable one — but returning fewer lines in silence lets the date be given up with
+        nothing recording that the evidence was merely unreachable.
+
+        This is why the collection asks for ``on_error="return"`` and not ``"ignore"``: Dask's
+        ``"ignore"`` REMOVES the failed worker from the result dict, so a worker that died holding
+        the only line is indistinguishable from one that had nothing, and no count can exist.
+        """
+
+        class _HalfDeadCluster:
+            @staticmethod
+            def run(fn, on_error=None):
+                assert on_error == "return", f"a removed worker cannot be counted: on_error={on_error!r}"
+                # (age, message) pairs, as a worker reports them.
+                return {"worker-0": [(0.1, LOGGED_REFUSAL)], "worker-1": RuntimeError("gone")}
+
+        with caplog.at_level(logging.WARNING):
+            found = collect_logged_refusals(_HalfDeadCluster())
+
+        assert found == [LOGGED_REFUSAL], "what did answer is still used"
+        said = [r.getMessage() for r in caplog.records if "did not answer" in r.getMessage()]
+        assert len(said) == 1, f"the incomplete collection must be named exactly once: {said}"
+        assert "1 of 2" in said[0] and "1 did not answer" in said[0]
+
+    def test_a_complete_collection_says_nothing(self, caplog) -> None:
+        """The control. A warning that fires on every healthy collection is one nobody reads."""
+
+        class _HealthyCluster:
+            @staticmethod
+            def run(fn, on_error=None):
+                return {"worker-0": [], "worker-1": []}
+
+        with caplog.at_level(logging.WARNING):
+            collect_logged_refusals(_HealthyCluster())
+
+        assert not [r for r in caplog.records if "did not answer" in r.getMessage()]
+
     def test_a_line_older_than_the_read_is_still_refused(self) -> None:
         """The control: latency widens the window, it does not remove it.
 

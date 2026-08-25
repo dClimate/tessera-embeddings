@@ -447,7 +447,13 @@ def _collect[T](client: dask.distributed.Client | None, read: Callable[[], list[
     if client is None:
         return found
     try:
-        per_worker = client.run(read, on_error="ignore")
+        # ``"return"`` and not ``"ignore"``: both refuse to raise, which is the requirement here —
+        # a second failure while handling a read failure would replace a recoverable error with an
+        # unrecoverable one. But ``"ignore"`` REMOVES the failed worker from the result dict, so a
+        # worker that died holding the only refusal line is indistinguishable from one that had
+        # nothing to give. ``"return"`` puts the exception in its place, which is what lets the
+        # count below exist at all.
+        per_worker = client.run(read, on_error="return")
     except Exception:
         logger.warning("Could not collect %s from workers", what, exc_info=True)
         return found
@@ -459,11 +465,9 @@ def _collect[T](client: dask.distributed.Client | None, read: Callable[[], list[
             silent += 1
     if silent:
         # NAMED, because the buffer lives on the worker that read, and a worker that dies or is
-        # retired between the failure and this call takes its evidence with it. `on_error="ignore"`
-        # is right — raising here would replace a recoverable read error with an unrecoverable one
-        # — but silently returning a short answer would let a refusal be judged as bad bytes with
-        # nothing saying the evidence was merely unreachable. This line is what makes that
-        # diagnosable rather than invisible.
+        # retired between the failure and this call takes its evidence with it. Returning a short
+        # answer in silence would let a refusal be judged as bad bytes with nothing recording that
+        # the evidence was merely unreachable. This line is what makes that diagnosable.
         logger.warning(
             "Collected %s from %d of %d worker(s): %d did not answer, so any evidence they held is not in this verdict",
             what,
