@@ -31,19 +31,34 @@ from tessera_embeddings.inference.scheduling import (
 
 
 @pytest.fixture(autouse=True)
-def _capacity_query_is_mocked():
-    """The cluster capacity query, mocked like every other Ray call in this file.
+def _ray_calls_are_mocked():
+    """The two Ray calls this file must never make for real.
 
-    Left unmocked it does not return a value in a test process: Ray is not initialised, so it
-    RAISES, and the caller's guard turns that into a fallback. Every loop test would then take the
-    guard's failure branch on each iteration and report a figure frozen at its seed, while reading
-    as though it exercised the measurement. Mocking it makes these tests exercise the path they
-    name, and keeps the file's promise that no Ray cluster is required.
+    **``cluster_resources``** — the cluster capacity query, mocked like every other Ray call
+    here. Left unmocked it does not return a value in a test process: Ray is not initialised,
+    so it RAISES, and the caller's guard turns that into a fallback. Every loop test would
+    then take the guard's failure branch on each iteration and report a figure frozen at its
+    seed, while reading as though it exercised the measurement. Mocking it makes these tests
+    exercise the path they name, and keeps the file's promise that no Ray cluster is required.
 
     Deliberately answers with no GPU key, so the default is inert and perturbs no existing
     assertion. A test that needs a particular capacity, or a failure, patches over this.
+
+    **``kill``** — a backstop, because an unpatched ``ray.kill`` does not fail, it BOOTS A
+    REAL LOCAL RAY CLUSTER (see the note in ``_do_replace``). ``_do_replace`` has always
+    patched it, but two tests called ``pool.replace()`` directly and did not, costing 19 s of
+    suite wall time and risking the multi-GB working-directory upload on every run. Patching
+    it here means a new test cannot reintroduce that by forgetting.
+
+    This does NOT weaken the tests that assert on kills: each of those opens its own
+    ``patch.object(_sched_mod.ray, "kill")``, which nests inside this one and shadows it, so
+    they still observe their own mock. Verified by mutation — removing the ``ray.kill`` call
+    from the retire path still fails ``TestRetireIdle::test_idle_actor_killed_after_grace``.
     """
-    with patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 8.0}):
+    with (
+        patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 8.0}),
+        patch.object(_sched_mod.ray, "kill"),
+    ):
         yield
 
 

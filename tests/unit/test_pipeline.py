@@ -135,14 +135,20 @@ def test_abandoning_the_generator_does_not_wait_on_the_in_flight_preparation():
     def prepare(item):
         workers.append(threading.current_thread())
         prepared_items.append(item)
+        # Item 0 is CONSUMED, not abandoned, so it must not block: the pool is
+        # `max_workers=1`, which makes preparations strictly sequential, and stalling the one
+        # the test consumes only delays the test by the full timeout before anything under
+        # test happens. What has to be in flight at close() is item 1, and `started` below
+        # synchronises on exactly that.
+        if item == 0:
+            return item
         started.set()
         release.wait(5)
         return item
 
     gen = pipelined(range(4), prepare, depth=2)
     next(gen)  # consumes item 0; item 1 is in flight and item 2 is queued
-    started.clear()
-    started.wait(5)
+    assert started.wait(5), "item 1's preparation never started, so close() has nothing to abandon"
 
     closed_at = time.monotonic()
     gen.close()
