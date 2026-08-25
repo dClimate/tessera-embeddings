@@ -554,6 +554,11 @@ def ingest_s2_roi_reflectance(
     #: exist at the provider and are absent from the mosaic.
     unfillable_dates: list[dict[str, str]] = []
 
+    #: How many losses a successful write has already carried into a commit. Every write takes the
+    #: whole list, so a loss is durable the moment any write lands after it — and only the ones
+    #: decided since the last write have nowhere else to be recorded.
+    losses_committed = 0
+
     def _losses_so_far() -> list[dict[str, str]]:
         """Every loss this run has decided, in one list.
 
@@ -822,6 +827,8 @@ def ingest_s2_roi_reflectance(
                         # one that quietly dropped a record.
                         losses=_losses_so_far(),
                     )
+        nonlocal losses_committed
+        losses_committed = len(_losses_so_far())
         # One line per kept date, partitioning its wall clock into the client-side
         # graph build, the coverage-gate compute, and the write (windows + commit).
         # Stable format: CloudWatch queries and the pipeline analysis key off it.
@@ -879,6 +886,8 @@ def ingest_s2_roi_reflectance(
                     s3_region=s3_region,
                     losses=_losses_so_far(),  # see _write_date
                 )
+        nonlocal losses_committed
+        losses_committed = len(_losses_so_far())
         # The batch's write is ONE compute, so a per-date write time does not exist
         # as a measurement — this line is the batched counterpart of `Stage timings`
         # and analysis divides by n. build/gate are sums of the real per-date values.
@@ -1328,7 +1337,12 @@ def ingest_s2_roi_reflectance(
             # was. A leg whose only finding is a date it cannot fill writes nothing, so no
             # commit carries the record and this call is its sole durable trace; swallowing a
             # failure here would finish the leg green with the loss named nowhere.
-            required=bool(_losses_so_far()),
+            # Required only for losses NO write carried. A loss recorded by a commit already has
+            # a durable home, so failing the leg over this record would refuse a run whose losses
+            # are safely stored. A loss decided after the last write has nowhere else to be, and
+            # for that one a swallowed commit failure means the leg finishes green with a hole
+            # named nowhere.
+            required=len(_losses_so_far()) > losses_committed,
             s3_region=s3_region,
         )
 

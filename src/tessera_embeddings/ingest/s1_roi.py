@@ -634,6 +634,11 @@ def ingest_s1_roi_sar(
     #: exist at the provider and are absent from the mosaic.
     unfillable_dates: list[dict[str, str]] = []
 
+    #: How many losses a successful write has already carried into a commit. Every write takes the
+    #: whole list, so a loss is durable the moment any write lands after it — and only the ones
+    #: decided since the last write have nowhere else to be recorded.
+    losses_committed = 0
+
     def _losses_so_far() -> list[dict[str, str]]:
         """Every loss this run has decided, in one list.
 
@@ -1005,6 +1010,7 @@ def ingest_s1_roi_sar(
                                     # quietly dropped a record.
                                     losses=_losses_so_far(),
                                 )
+                    losses_committed = len(_losses_so_far())
                 except Exception as exc:
                     # The retry is exhausted. THIS is why one refused read used to take the
                     # zone-year: the exception left the loop, so a date the source would not hand
@@ -1110,7 +1116,10 @@ def ingest_s1_roi_sar(
             # log line is not read by the coverage gate or by a later resume, so losing this
             # write loses the fact that the date was ever examined. An unfillable date counts
             # for the same reason: a leg that only refused dates wrote nothing to carry them.
-            required=bool(given_up_dates or unfillable_dates),
+            # Required only for losses NO write carried — see the optical path for the reasoning.
+            # A loss a commit already holds has a durable home, and failing the leg over this
+            # record would refuse a run whose losses are safely stored.
+            required=len(_losses_so_far()) > losses_committed,
             # Merged with what the store already records, minus any date now back on the axis —
             # see storage.zarr_store.merge_recorded_losses. A resume re-derives only the losses
             # of the months it walked, so an unconditional write would erase the rest.

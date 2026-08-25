@@ -559,7 +559,9 @@ def test_a_date_below_the_frontier_is_recorded_as_lost_rather_than_raised(monkey
 
     assert written == ["2018-06-05"], "the unfillable date is never offered to the writer"
     assert recorded[0]["start"] == "2018-05-01", "the leg assessed from the frontier's month"
-    assert recorded[0]["required"] is True, "the record is load-bearing when something was lost"
+    # NOT load-bearing: the assertion below proves the loss rode 2018-06-05's commit, so this
+    # record is not its only trace. `required` is for a loss no write could carry.
+    assert recorded[0]["required"] is False
     assert [entry["date"] for entry in recorded[0]["unreadable"]] == ["2018-05-10"]
     assert losses_seen[0] == [{"date": "2018-05-10", "scope": "unfillable", "error": ""}], (
         "the loss rides the commit that seals it, so a killed leg still leaves the record"

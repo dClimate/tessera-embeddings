@@ -769,7 +769,32 @@ def test_a_date_below_the_frontier_is_recorded_as_lost_rather_than_raised(
     lost = [entry for c in assessed for entry in c["unreadable"]]
     assert lost == [{"date": "2018-05-10", "tiles": "", "tried": "", "objects": "", "scope": "unfillable"}]
     assert "DATA LOSS" in caplog.text and "2018-05-10" in caplog.text
-    # No date was written, so no commit carried the loss and this record is its only trace.
+    # NOT required: 2018-06-05 was written after the loss was decided, and every write carries
+    # the losses so far, so that commit is already a durable home for it. Failing the leg over
+    # this record would refuse a run whose loss is safely stored.
+    assert assessed[-1]["required"] is False
+
+
+@BOTH_MODES
+def test_a_loss_no_write_could_carry_makes_the_final_record_required(run_ingest, assessed, pipeline_dates):
+    """When nothing is written after a loss, the end-of-run record is its ONLY durable trace.
+
+    Every write carries the losses decided before it, so a loss normally has a home the moment any
+    later date lands. A loss decided when no date follows has none — and a swallowed commit failure
+    would then finish the leg green with a hole named nowhere. That is the case `required` exists
+    for, and the only one: demanding it whenever any loss exists would fail a run whose losses are
+    already safely stored.
+    """
+    run = run_ingest(
+        # The unfillable date is the LAST thing offered, so no write follows it.
+        {"2018-05-10": True},
+        pipeline_dates=pipeline_dates,
+        existing_dates={FRONTIER},
+    )
+
+    assert run.written == [], "nothing was written, so no commit could have carried the loss"
+    lost = [entry for c in assessed for entry in c["unreadable"]]
+    assert [e["date"] for e in lost] == ["2018-05-10"]
     assert assessed[-1]["required"] is True
 
 
