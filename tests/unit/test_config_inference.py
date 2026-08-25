@@ -128,9 +128,9 @@ def test_the_newest_field_is_the_last_field() -> None:
     Moving this assertion is the expected cost of adding a field, and it is worth paying: the
     tripwire fires on an insertion and on an append alike, so whoever moves it has to look at
     where their field landed. It named allow_s2_only until 2026-08-13, when optical_min_obs was
-    appended after it.
+    appended after it, and actor_request_headroom appended after that.
     """
-    assert fields(InferenceConfig)[-1].name == "optical_min_obs"
+    assert fields(InferenceConfig)[-1].name == "actor_request_headroom"
 
 
 def test_the_minimum_depth_rule_defaults_to_no_rule() -> None:

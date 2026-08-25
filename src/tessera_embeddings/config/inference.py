@@ -325,6 +325,9 @@ class InferenceConfig:
             actor_batch_placement_timeout_sec: Max seconds to wait for a batch's
                 instances to join the cluster before requesting the next batch
                 regardless (capacity-shortfall escape hatch).
+            actor_request_headroom: Hold the request to the fleet's placed GPU
+                nodes plus this many, replacing the batch-and-timeout policy above.
+                None keeps today's behaviour.
     """
 
     # Time window (required — no default)
@@ -410,6 +413,15 @@ class InferenceConfig:
     # campaign whose value silently resolved to 0 would publish under no rule while believing it
     # had one, which is the shape of two failures already in this repo's register.
     optical_min_obs: int | None = None
+
+    # How far the actor request may run ahead of the GPU nodes the fleet actually holds.
+    # Set, it replaces the batch-and-timeout policy outright: the run asks for what it
+    # has plus this, so a region that cannot place instances stops the fleet growing
+    # rather than letting the request run away from it (see `_batch_actors_to_request`,
+    # and ACTOR_REQUEST_HEADROOM for the value to pass). None keeps the historical
+    # policy, so a release cannot change how a fleet already in flight grows; a caller
+    # that wants the bound asks for it, and names the distance in the same breath.
+    actor_request_headroom: int | None = None
 
     def __post_init__(self) -> None:
         """Validate and normalise config fields."""

@@ -16,8 +16,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import tessera_embeddings.inference.scheduling as _sched_mod
+from tessera_embeddings.inference.lifecycle import ACTOR_INIT_TIMEOUT_SEC
 from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.scheduling import (
+    ACTOR_REQUEST_HEADROOM,
     ActorPool,
     _batch_actors_to_request,
     _joined_gpu_count,
@@ -927,6 +929,222 @@ class TestBatchActorsToRequest:
         assert timed_out is False
 
 
+def _walk(
+    *,
+    headroom: int | None,
+    placeable: int,
+    target: int = 250,
+    batch_size: int = 50,
+    intervals: int = 12,
+    reopens_at: int | None = None,
+) -> tuple[int, int]:
+    """Drive the request decision the way the scheduler loop drives it.
+
+    The region can hold ``placeable`` GPU nodes and no more, so once that many have
+    joined every later interval expires with nothing placed — the shape of a capacity
+    drought. ``reopens_at`` lifts the shortage at that interval, which is how the
+    fleet's ability to grow is checked rather than assumed.
+
+    The first request is made before the loop starts, as the runner makes it, and is
+    subject to the same bound.
+
+    Args:
+        headroom: Passed through to the decision function.
+        placeable: GPU nodes the region will place while the shortage lasts.
+        target: Actors the run should eventually reach.
+        batch_size: Actors per batch.
+        intervals: Placement intervals to walk.
+        reopens_at: Interval at which the region can place the full target.
+
+    Returns:
+        ``(requested, placed, worst_excess)`` — the last of these is the furthest the
+        request ever ran ahead of joined nodes, which is the property under test rather
+        than a number read off the end state.
+    """
+    requested = min(batch_size, target) if headroom is None else min(batch_size, target, headroom)
+    alive = 0
+    nodes_at_last_batch = 0
+    last_batch_size = requested
+    worst_excess = requested
+    for interval in range(intervals):
+        ceiling = target if reopens_at is not None and interval >= reopens_at else placeable
+        granted = max(0, min(ceiling - alive, requested - alive))
+        alive += granted
+        n, _ = _batch_actors_to_request(
+            requested=requested,
+            target=target,
+            outstanding=10_000,  # a large zone: remaining work never binds
+            alive_gpu_nodes=alive,
+            nodes_at_last_batch=nodes_at_last_batch,
+            last_batch_size=last_batch_size,
+            # Nodes joining means placement was observed inside the interval; none
+            # joining means the interval ran out.
+            secs_since_last_batch=1.0 if granted else 301.0,
+            placement_timeout_sec=300.0,
+            batch_size=batch_size,
+            headroom=headroom,
+        )
+        if n:
+            requested += n
+            nodes_at_last_batch = alive
+            last_batch_size = n
+        worst_excess = max(worst_excess, requested - alive)
+    return requested, alive, worst_excess
+
+
+class TestActorRequestHeadroom:
+    """The rule that holds an actor request a fixed distance ahead of the fleet.
+
+    Every test states its control — what the same inputs do with ``headroom=None`` —
+    because the change is a difference in behaviour, and a test that pins only the new
+    number cannot show one.
+    """
+
+    def _call(self, **overrides) -> tuple[int, bool]:
+        kwargs = dict(
+            requested=25,
+            target=250,
+            outstanding=10_000,
+            alive_gpu_nodes=25,
+            nodes_at_last_batch=0,
+            last_batch_size=25,
+            secs_since_last_batch=1.0,
+            placement_timeout_sec=300.0,
+            batch_size=50,
+            headroom=ACTOR_REQUEST_HEADROOM,
+        )
+        kwargs.update(overrides)
+        return _batch_actors_to_request(**kwargs)
+
+    def test_a_cold_fleet_may_ask_for_the_whole_allowance(self) -> None:
+        """Nothing has placed yet, so the allowance IS the first request.
+
+        The bound is a distance ahead of the fleet, and at the start that distance is
+        the entire ask. Without this a run with no nodes could never request its first
+        actor and nothing would ever begin.
+        """
+        assert self._call(requested=0, alive_gpu_nodes=0)[0] == ACTOR_REQUEST_HEADROOM
+
+    def test_the_request_never_exceeds_placed_nodes_plus_the_headroom(self) -> None:
+        """The rule itself, checked at the boundary and one node inside it.
+
+        Asked at exactly the allowance the answer is nothing; asked one node further on
+        it is one more. The control grants a whole batch at both, which is how the
+        observed run reached its target against a handful of placed instances.
+        """
+        at_the_line = 25 + ACTOR_REQUEST_HEADROOM
+        assert self._call(requested=at_the_line, alive_gpu_nodes=25)[0] == 0
+        assert self._call(requested=at_the_line, alive_gpu_nodes=26)[0] == 1
+        control, _ = self._call(requested=at_the_line, alive_gpu_nodes=25, headroom=None)
+        assert control == 50, "control: nothing holds the request to what has placed"
+
+    def test_each_placement_earns_the_right_to_ask_for_more(self) -> None:
+        """Self-scaling: the ceiling rises exactly as fast as nodes join.
+
+        This is what replaces the placement gate. There is nothing to release, because
+        progress is a consequence of placement rather than of a timer expiring.
+        """
+        assert self._call(requested=25, alive_gpu_nodes=25)[0] == ACTOR_REQUEST_HEADROOM
+        assert self._call(requested=25, alive_gpu_nodes=24)[0] == ACTOR_REQUEST_HEADROOM - 1
+        assert self._call(requested=25, alive_gpu_nodes=0)[0] == 0
+
+    def test_no_timeout_is_consulted(self) -> None:
+        """The escape hatch is not repaired but bypassed, so it cannot fire.
+
+        An interval that has run far past the placement timeout gets the same answer as
+        one that has just started — and the historical path answers those two
+        differently, which is the escalation this replaces.
+        """
+        # A batch of 50 with 5 joined: placement is nowhere near satisfied, so on the
+        # historical path the timeout is the only thing that can release the next batch.
+        unplaced = dict(requested=50, alive_gpu_nodes=5, last_batch_size=50, nodes_at_last_batch=0)
+        fresh = self._call(**unplaced, secs_since_last_batch=1.0)
+        expired = self._call(**unplaced, secs_since_last_batch=99_999.0)
+        assert fresh == expired
+        assert expired[1] is False, "the headroom path reports no timeout, having consulted none"
+
+        control_fresh = self._call(**unplaced, secs_since_last_batch=1.0, headroom=None)
+        control_expired = self._call(**unplaced, secs_since_last_batch=99_999.0, headroom=None)
+        assert control_fresh == (0, False), "control: an unplaced batch gates the next one"
+        assert control_expired == (50, True), "control: the timeout releases a full batch regardless"
+
+    def test_readiness_is_not_what_counts(self) -> None:
+        """Nodes, not ready actors — the bound is about hardware the run already holds.
+
+        The function is given a node count precisely so a slow checkpoint load cannot
+        read as a capacity shortage: those instances are joined and billed whether or
+        not the actors on them have finished loading, and a fleet that already has its
+        hardware should not be held back waiting for it to warm up.
+        """
+        assert self._call(requested=25, alive_gpu_nodes=25, last_batch_size=25)[0] == ACTOR_REQUEST_HEADROOM
+
+    def test_remaining_work_still_caps_the_request(self) -> None:
+        """A second ceiling beside the work cap, never a replacement for it.
+
+        Both are live and they bind differently: 30 chunks left against 25 actors leaves
+        room for 5 more, while 25 placed nodes leave room for 25. The smaller wins, so a
+        short tail cannot be over-provisioned by a region that is placing freely.
+        """
+        assert self._call(requested=25, outstanding=20)[0] == 0
+        assert self._call(requested=25, outstanding=30, alive_gpu_nodes=25)[0] == 5
+        assert self._call(requested=25, outstanding=10_000, alive_gpu_nodes=25)[0] == ACTOR_REQUEST_HEADROOM
+
+    def test_the_final_batch_is_clamped_to_the_target(self) -> None:
+        """The target still bounds the request; the headroom only adds a second bound.
+
+        The second case is the one that separates the two: ten actors short of the
+        target but twenty nodes short of the fleet, the headroom is the tighter bound
+        and the control takes the whole remainder.
+        """
+        assert self._call(requested=240, target=250, alive_gpu_nodes=240)[0] == 10
+        assert self._call(requested=240, target=250, alive_gpu_nodes=220)[0] == 5
+        assert self._call(requested=240, target=250, alive_gpu_nodes=220, headroom=None)[0] == 10
+
+    def test_a_drought_leaves_the_request_flat(self) -> None:
+        """Nothing places, so the request stops rather than climbing — against control.
+
+        Walked across the whole span a fill sits in a drought, because that span is what
+        decides how long an escalated request keeps the autoscaler retrying against the
+        account's launch quota.
+        """
+        intervals = int(ACTOR_INIT_TIMEOUT_SEC // 300)
+        unbounded, _, _ = _walk(headroom=None, placeable=5, intervals=intervals)
+        bounded, placed, worst = _walk(headroom=ACTOR_REQUEST_HEADROOM, placeable=5, intervals=intervals)
+        assert unbounded == 250, "control: repeated timeouts carry the request to the target"
+        assert placed == 5
+        assert worst <= ACTOR_REQUEST_HEADROOM, f"request ran {worst} ahead of {placed} placed nodes"
+        assert bounded <= placed + ACTOR_REQUEST_HEADROOM
+
+    def test_a_fleet_still_reaches_its_target_when_placements_arrive(self) -> None:
+        """The failure to fear is a fleet that stops asking, so it is checked directly.
+
+        Both halves together: flat while the region is shut, and the full fleet once it
+        opens. Either alone misleads — staying bounded is worthless if the fleet never
+        recovers, and recovering is not evidence of a bound if the request climbed to
+        the target while the region was still empty.
+        """
+        _, _, during = _walk(headroom=ACTOR_REQUEST_HEADROOM, placeable=5, intervals=4)
+        assert during <= ACTOR_REQUEST_HEADROOM, "the request ran past the headroom mid-drought"
+        requested, alive, _ = _walk(headroom=ACTOR_REQUEST_HEADROOM, placeable=5, reopens_at=4, intervals=40)
+        assert (requested, alive) == (250, 250), "a fleet must still reach its target once capacity returns"
+
+    def test_a_healthy_region_reaches_the_target_without_running_ahead(self) -> None:
+        """Growth is automatic when capacity exists: no gate, no timer, just placement.
+
+        Both properties, because reaching the target is not the interesting half — the
+        control reaches it too. What separates them is the path: the bounded run is
+        never more than the allowance ahead of its own nodes on the way there, and the
+        control opens with a whole batch outstanding before anything has placed.
+        """
+        requested, alive, worst = _walk(headroom=ACTOR_REQUEST_HEADROOM, placeable=250, intervals=40)
+        assert (requested, alive) == (250, 250)
+        assert worst <= ACTOR_REQUEST_HEADROOM
+
+        control_requested, control_alive, control_worst = _walk(headroom=None, placeable=250, intervals=40)
+        assert (control_requested, control_alive) == (250, 250)
+        assert control_worst > ACTOR_REQUEST_HEADROOM, "control: nothing bounds the distance ahead"
+
+
 # ===========================================================================
 # _process_chunks_work_stealing — loop condition
 # ===========================================================================
@@ -1345,6 +1563,9 @@ class TestWorkStealingBatching:
         config = MagicMock()
         config.checkpoint_path = "s3://bucket/ckpt.pt"
         config.actor_request_batch_size = 2
+        # A MagicMock answers every attribute, and a Mock is not None — so the
+        # headroom bound would engage on a config nobody configured.
+        config.actor_request_headroom = None
 
         chunks = [_fake_chunk(f"c{i}") for i in range(4)]
 
@@ -1412,6 +1633,7 @@ class TestWorkStealingBatching:
         config = MagicMock()
         config.checkpoint_path = "s3://bucket/ckpt.pt"
         config.actor_request_batch_size = 2  # set, but no factory → disabled
+        config.actor_request_headroom = None
 
         actor0 = MagicMock()
         actor0.process_chunk.remote.side_effect = lambda *a, **k: MagicMock()

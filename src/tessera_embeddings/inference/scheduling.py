@@ -718,6 +718,23 @@ def _poll_tracker(
         return []
 
 
+ACTOR_REQUEST_HEADROOM = 25
+"""How far an actor request may run ahead of the GPU nodes the fleet actually holds.
+
+The recommended value for ``InferenceConfig.actor_request_headroom``, and the number
+the whole rule turns on: a run asks for what it has plus this, never for its target.
+
+What it trades. Larger ramps a fleet to full width in fewer steps when capacity is
+free, and wastes more requests on a region that cannot fill them — every request that
+never places is retried by the autoscaler against the account's launch quota, so the
+surplus is paid in throttling that the run itself then has to wait out. Smaller is
+gentler on that quota and slower to reach width when capacity is plentiful. It is a
+constant rather than a function of the target because the quota it protects is a
+property of the ACCOUNT: a fleet of 250 and a fleet of 20 draw on the same bucket, and
+sizing the allowance to the ask is what let the larger one drown the smaller.
+"""
+
+
 def _batch_actors_to_request(
     *,
     requested: int,
@@ -730,6 +747,7 @@ def _batch_actors_to_request(
     placement_timeout_sec: float,
     batch_size: int,
     placement_tolerance: int = 2,
+    headroom: int | None = None,
 ) -> tuple[int, bool]:
     """Decide how many actors to request for the next batch.
 
@@ -744,6 +762,46 @@ def _batch_actors_to_request(
     from permanently gating every later batch on the timeout path: once a
     subsequent batch places, its increment satisfies the check even though the
     earlier shortfall is never made up.
+
+    **``headroom`` replaces all of that with one rule.** The gate above has an
+    escape hatch — a placement timeout, so a shortfall cannot gate every later
+    batch forever — and the hatch is what fails under a real shortage: nothing
+    places, every interval expires, and the request climbs to the target on no
+    evidence at all. Each request that never places is then retried by the
+    autoscaler against an account-wide launch quota, so the run manufactures the
+    throttling that keeps it from growing.
+
+    With ``headroom`` set, the request may never exceed the number of GPU nodes
+    the fleet actually holds plus that constant. Not a climb toward the target in
+    batches, but a small fixed distance ahead of reality, and it needs no gate at
+    all: each placement earns the right to ask for a little more, so growth is
+    automatic when capacity exists and simply stops when it does not. Neither
+    ``placement_timeout_sec`` nor the placement gate is consulted on this path —
+    there is nothing left for them to release. They remain only because the
+    unbounded path is still the default; retiring that path retires them, along
+    with ``nodes_at_last_batch``, ``last_batch_size``, ``secs_since_last_batch``
+    and ``placement_tolerance``.
+
+    Three properties this rests on:
+
+    * **Nodes, not ready actors.** ``alive_gpu_nodes`` counts GPU nodes joined to
+      the cluster, whether or not the actors on them have finished loading their
+      checkpoint. That is the right measure because the bound is about hardware
+      the run is already holding and paying for. Counting readiness instead would
+      make a slow model load look like a capacity shortage and stall a fleet that
+      already has its instances.
+    * **The cold start.** At zero nodes the bound still permits ``headroom``
+      requests, which is what lets a run begin at all: the allowance is a distance
+      ahead of the fleet, and at the start that distance is the whole request.
+    * **A second ceiling, not a replacement for the first.** ``outstanding`` caps
+      the request by remaining WORK and this caps it by placement; the smaller
+      wins. A short tail is therefore still safe from over-provisioning — an
+      almost-idle region cannot let the run request actors for chunks that are
+      already spoken for.
+
+    The failure to fear is a fleet that stops asking, and this rule cannot cause
+    one: a request is refused only while the fleet is already a full headroom
+    ahead of its nodes, and every node that joins re-opens exactly that much room.
 
     Args:
         requested: Actors requested so far (``len(pool.actors)``).
@@ -760,11 +818,16 @@ def _batch_actors_to_request(
         batch_size: Actors per batch.
         placement_tolerance: Stragglers tolerated before the prior batch counts
             as placed, so one slow instance doesn't gate the next request.
+        headroom: How far the request may run ahead of the fleet's placed GPU
+            nodes. ``None`` is the historical arithmetic — a placement gate with
+            a timeout escape hatch, and no limit on how far the request runs
+            ahead. :data:`ACTOR_REQUEST_HEADROOM` is the value to pass.
 
     Returns:
         ``(n, timed_out)`` — number of actors to request (0 = none) and whether
         the placement timeout (rather than placement itself) allowed it. The
         flag is only meaningful when ``n > 0``; the caller uses it for logging.
+        Always ``False`` under ``headroom``, which consults no timeout.
     """
     if requested >= target:
         return 0, False
@@ -772,6 +835,12 @@ def _batch_actors_to_request(
     # as there is work left, no further batches are needed.
     if requested >= outstanding:
         return 0, False
+    if headroom is not None:
+        # Both ceilings, plus the batch step. The placement ceiling is what makes
+        # a drought stop the fleet growing rather than run the request away from
+        # it; `outstanding` is what keeps a short tail from over-provisioning.
+        allowed = alive_gpu_nodes + headroom - requested
+        return max(0, min(batch_size, target - requested, outstanding - requested, allowed)), False
     placed = alive_gpu_nodes - nodes_at_last_batch >= last_batch_size - placement_tolerance
     timed_out = secs_since_last_batch > placement_timeout_sec
     if not (placed or timed_out):
@@ -961,6 +1030,7 @@ def _process_chunks_work_stealing(
             secs_since_last_batch=time.monotonic() - last_batch_at,
             placement_timeout_sec=placement_timeout_sec,
             batch_size=config.actor_request_batch_size,
+            headroom=config.actor_request_headroom,
         )
         if n == 0:
             return

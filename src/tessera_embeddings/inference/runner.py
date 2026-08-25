@@ -179,6 +179,12 @@ def run_inference(
     # batch_size <= 0 disables batching: request the whole fleet at once.
     batch_size = config.actor_request_batch_size
     first_batch = min(batch_size, num_actors) if batch_size > 0 else num_actors
+    if config.actor_request_headroom is not None:
+        # The cold start of the headroom rule. No GPU node has joined yet, so the whole
+        # allowance is the distance ahead of an empty fleet — and this first batch is
+        # requested here rather than by the loop, so the bound has to be applied here
+        # too or the run opens by breaking it.
+        first_batch = min(first_batch, config.actor_request_headroom)
     actors = actor_factory(first_batch)
     if batch_size > 0 and first_batch < num_actors:
         log.info(

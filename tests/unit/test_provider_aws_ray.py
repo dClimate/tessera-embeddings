@@ -25,6 +25,7 @@ from moto import mock_aws
 from tessera_embeddings.providers.aws import ray as ray_mod
 from tessera_embeddings.providers.aws.ray import (
     DEFAULT_CLUSTER_TEMPLATE,
+    LAUNCH_PACING_ENV,
     PROJECT_TAG_VALUE,
     _resolve_ray_config,
     cleanup_ray_tempfiles,
@@ -508,3 +509,104 @@ def test_ray_down_is_bounded_so_the_tag_fallback_can_still_run(monkeypatch):
 
     assert ray_mod._stop_ray_cluster("/tmp/resolved.yaml", _LOG) is False
     assert seen["timeout"] == ray_mod.RAY_DOWN_TIMEOUT_S
+
+
+# ===========================================================================
+# Launch pacing
+# ===========================================================================
+
+
+def _head_ray_start(resolved: str) -> str:
+    """The resolved YAML's head command that starts Ray."""
+    commands = yaml.safe_load(Path(resolved).read_text())["head_start_ray_commands"]
+    return next(cmd for cmd in commands if "ray start" in str(cmd))
+
+
+@mock_aws
+def test_launch_pacing_is_off_by_default() -> None:
+    """Default resolution must carry no trace of pacing.
+
+    The campaign this ships into is already running, so a release that changed how a
+    fleet grows would change it without anyone having decided to.
+    """
+    ami_param, _, _ = _seed_ssm_and_vpc()
+    resolved = _resolve_ray_config(
+        DEFAULT_CLUSTER_TEMPLATE, region=REGION, ami_ssm_name=ami_param, ssm_prefix=SSM_PREFIX
+    )
+    try:
+        rendered = yaml.safe_dump(yaml.safe_load(Path(resolved).read_text()))
+        for name in LAUNCH_PACING_ENV:
+            assert name not in rendered, f"{name} reached a cluster nobody asked to pace"
+    finally:
+        cleanup_ray_tempfiles(resolved)
+
+
+@mock_aws
+def test_launch_pacing_assigns_the_env_on_the_heads_ray_start() -> None:
+    """Every name has to land on the command that starts Ray, not beside it.
+
+    Ray runs each start command as its own shell over SSH, so an assignment on any
+    other entry reaches nothing — and the autoscaler that issues the launch requests
+    is a child of this process, which is how the setting reaches it at all.
+    """
+    ami_param, _, _ = _seed_ssm_and_vpc()
+    resolved = _resolve_ray_config(
+        DEFAULT_CLUSTER_TEMPLATE,
+        region=REGION,
+        ami_ssm_name=ami_param,
+        ssm_prefix=SSM_PREFIX,
+        launch_pacing=True,
+    )
+    try:
+        starts_ray = _head_ray_start(resolved)
+        for name, value in LAUNCH_PACING_ENV.items():
+            assignment = f"{name}={value}"
+            assert assignment in starts_ray, f"{assignment} is not on the command that starts Ray"
+            assert starts_ray.index(assignment) < starts_ray.index("ray start")
+
+        # Workers run no autoscaler, so pacing there would configure nothing.
+        worker = yaml.safe_dump(yaml.safe_load(Path(resolved).read_text())["worker_start_ray_commands"])
+        assert not any(name in worker for name in LAUNCH_PACING_ENV)
+    finally:
+        cleanup_ray_tempfiles(resolved)
+
+
+def test_pacing_refuses_a_template_that_never_starts_ray() -> None:
+    """A pacing request that lands nowhere is worse than one refused.
+
+    The cluster would come up looking configured and launch at the unpaced rate, and
+    the only evidence would be the throttling the setting was meant to prevent.
+    """
+    with pytest.raises(ValueError, match="no start command invokes"):
+        ray_mod._pace_ray_start(["echo hello"], LAUNCH_PACING_ENV)
+
+
+def test_the_pacing_env_reaches_the_client_ray_builds_for_launches(monkeypatch) -> None:
+    """The premise the provider change rests on, checked against Ray's own code.
+
+    Ray builds its launch client with an explicit botocore retry config, which is why
+    an attempt-count environment variable cannot reach it — an explicitly configured
+    count wins over the environment. It sets no retry MODE, and that one botocore does
+    still resolve from the environment. Asserted through Ray's own client factory
+    rather than a client of our own, because a client we built ourselves could not
+    falsify this.
+    """
+    from ray.autoscaler._private.aws.utils import resource_cache
+
+    for name, value in LAUNCH_PACING_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+
+    # max_retries=0 is what Ray passes for the fail-fast resource it launches through.
+    # resource_cache is lru_cached on its arguments, so an otherwise unused region keeps
+    # this off any entry another test may have built.
+    client = resource_cache("ec2", "eu-central-1", 0).meta.client
+    retries = client.meta.config.retries
+
+    assert retries["mode"] == "adaptive", "the launch client is not rate limited"
+    assert retries["total_max_attempts"] == 1, "Ray's fail-fast attempt count was overridden"
+    handlers = client.meta.events._emitter._handlers.prefix_search("before-send")
+    assert any("ClientRateLimiter" in type(getattr(h, "__self__", h)).__name__ for h in handlers), (
+        "adaptive mode registered no send-side rate limiter"
+    )

@@ -510,6 +510,9 @@ async def run_global_campaign(
     years: tuple[int, ...] | None = None,
     zones: list[str] | None = None,
     max_parallel_clusters: int = 10,
+    launch_pacing: bool = False,
+    actor_request_headroom: int | None = None,
+    actor_request_batch_size: int | None = None,
     fill_strategy: str = "chained-clusters",
     chained_fill_deployment: str | None = None,
     commit_limit_name: str = "tessera-global-commits",
@@ -590,6 +593,30 @@ async def run_global_campaign(
             the global campaign. A width that is wrong does not fail — the run completes and
             publishes real data at a fraction of the intended rate, with no error and no
             symptom but a wall clock nobody has a baseline for.
+        launch_pacing: Pace every fill's EC2 launch requests against the account's
+            shared RunInstances quota, which is a small burst capacity refilled at a
+            fixed rate and is not adjustable. This is where the setting belongs
+            because contention is a property of the CAMPAIGN, not of a fill: one
+            cluster growing alone contends with nothing, while ``n`` autoscalers
+            requesting at the same moment drain the bucket and are refused. Forwarded
+            to whichever fill strategy runs. Default ``False`` keeps today's launch
+            behaviour, so enabling it is a deliberate act on a campaign that is
+            already running.
+        actor_request_headroom: Hold every fill's actor request to the GPU nodes it has
+            actually placed plus this many, rather than letting it climb toward
+            ``num_actors``. The unbounded case is what feeds the launch quota: a fill
+            that asks for its whole target while a handful of instances have placed
+            leaves the rest to be retried by its autoscaler for as long as the fill
+            lives. Paired with ``launch_pacing``, which makes each remaining request
+            cheaper; this one makes there be fewer of them, and it is the larger half.
+            ``None`` keeps today's behaviour;
+            :data:`~tessera_embeddings.inference.scheduling.ACTOR_REQUEST_HEADROOM` is
+            the value to pass.
+        actor_request_batch_size: Actors per batch for every fill, overriding the
+            inference default. Config rather than code, and therefore the fastest
+            relief available: the quota is a rate over CALLS, and a batch of B actors
+            is ceil(B / instances-per-call) calls per cluster per placement round.
+            ``None`` keeps the default.
         fill_strategy: Named for the CLUSTER LIFECYCLE — both strategies run
             up to ``max_parallel_clusters`` zones at once.
             ``"chained-clusters"`` (default) dispatches up to ``max_parallel_clusters``
@@ -1071,6 +1098,21 @@ async def run_global_campaign(
             # phases don't burst K times the target PUTs (the ~800-req SlowDown). D6
             # gates committers; this bounds the ungated upload phase.
             "s3_concurrency": max(1, TARGET_AGGREGATE_S3_CONCURRENCY // max_parallel_clusters),
+            # The same idea one layer down the stack: a fleet-wide rate the concurrent
+            # fills have to share, here the account's RunInstances request quota. Unlike
+            # the S3 budget there is no share to divide — the enforcement is a client-side
+            # limiter each autoscaler runs for itself — so what the campaign passes is
+            # whether to run it at all.
+            "launch_pacing": launch_pacing,
+            # The other half of the same problem, one layer up: pacing makes a launch
+            # request cheaper, this bounds how many of them a fill makes at all. OMITTED
+            # when unset, so the fill's own default decides.
+            **({"actor_request_headroom": actor_request_headroom} if actor_request_headroom else {}),
+            # OMITTED when the campaign names no size, so the inference default stands.
+            # Passing None would override it with nothing, which disables batching and
+            # asks for the whole fleet at once — the failure this parameter exists to
+            # avoid.
+            **({"actor_request_batch_size": actor_request_batch_size} if actor_request_batch_size else {}),
             "ssm_prefix": ssm_prefix,
             "cloudwatch_log_group": cloudwatch_log_group,
             "code_bucket": code_bucket,
@@ -1348,6 +1390,17 @@ async def run_global_campaign(
                         # at the aggregate target.
                         "look_ahead": cell_look_ahead,
                         "s3_concurrency": max(1, TARGET_AGGREGATE_S3_CONCURRENCY // (2 * n_clusters)),
+                        # As in _fill_params: the account's RunInstances quota is the
+                        # fleet-wide rate these clusters share, and each autoscaler
+                        # enforces its own share client-side rather than being handed a
+                        # divided count.
+                        "launch_pacing": launch_pacing,
+                        # And as in _fill_params, the bound on how many launch requests
+                        # a cluster makes, beside the pacing that makes each one cheaper.
+                        **({"actor_request_headroom": actor_request_headroom} if actor_request_headroom else {}),
+                        # OMITTED when unset so the inference default stands; None would
+                        # disable batching and ask for the whole fleet at once.
+                        **({"actor_request_batch_size": actor_request_batch_size} if actor_request_batch_size else {}),
                         "cleanup_mosaics": cleanup_mosaics,
                         "ingest_settings": ingest_settings.model_dump(),
                         # The shared cap. Every cluster names the same limit, which is

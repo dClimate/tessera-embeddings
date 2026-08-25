@@ -87,6 +87,87 @@ _REQUIRED_SSM_KEYS = frozenset(
     {"security-group-id", "instance-profile-arn", "private-subnet-ids", "key-pair-name", "key-pair-id"}
 )
 
+LAUNCH_PACING_ENV = {
+    # Client-side rate limiting on the EC2 client Ray builds for launches. Ray sets
+    # only `max_attempts` on that client's botocore Config and never `mode`, so the
+    # mode is still resolved from the environment — this is the one place we can reach
+    # inside Ray's launch path without owning its retry loop. Adaptive mode paces
+    # sends through a token bucket that narrows when EC2 answers with a throttle and
+    # widens again on success. The INVARIANT that makes it safe to hand a fleet's
+    # growth to it: botocore floors that bucket's fill rate, so a paced client never
+    # stops asking. A throttled request is retried; a fleet that stops asking is
+    # stuck, and the floor is what rules the second case out.
+    "AWS_RETRY_MODE": "adaptive",
+    # Instances per RunInstances call. The request quota is a rate over CALLS, not
+    # over instances, so asking for more per call buys fleet at a fixed price in
+    # quota. MinCount stays 1, so a call the region can only partly fill returns what
+    # it can rather than failing — a larger batch does not trade capacity for volume.
+    # It also narrows the burst: Ray sizes its launcher-thread pool as
+    # ceil(max_concurrent_launches / max_launch_batch), so a bigger batch is fewer
+    # threads calling at once.
+    "AUTOSCALER_MAX_LAUNCH_BATCH": "25",
+    # Ray retries a failed launch in a loop with no delay between attempts, rotating
+    # to the next subnet each time, for max(this, subnet count) attempts. A rotation
+    # is spent whatever the error was, so a throttled attempt consumes an availability
+    # zone that a capacity-short attempt still needs. Setting this below the subnet
+    # count leaves exactly one pass over the zones: capacity failover is preserved and
+    # the surplus no-delay attempts are not made.
+    "BOTO_CREATE_MAX_RETRIES": "1",
+}
+"""Environment that paces this cluster's EC2 launch requests.
+
+The account's RunInstances quota is a token bucket — a small burst capacity,
+refilled at a fixed rate — and it is not adjustable. Concurrent clusters share
+one bucket, so several autoscalers requesting at the same moment drain it and
+everything behind them is refused; those refusals are retried and drain it
+again. None of that loop is ours: the call is made by Ray's AWS node provider
+and the retry around it is Ray's. What we can set is the environment the
+autoscaler process runs in, and every name here is one Ray or botocore reads
+from the environment.
+
+Applied only when a caller asks for it (``launch_pacing=True``). Default-off
+because it changes how a live fleet grows.
+"""
+
+_RAY_START = "ray start"
+"""The token in a ``*_start_ray_commands`` entry that :func:`_pace_ray_start` prefixes.
+
+Ray runs each entry as its own shell command over SSH, so an ``export`` on its own
+line reaches nothing. Assignments have to ride on the command that starts Ray — and
+the autoscaler is a child of that process, which is what carries the pacing to the
+code that actually launches nodes.
+"""
+
+
+def _pace_ray_start(commands: list[str], pacing: dict[str, str]) -> list[str]:
+    """Return ``commands`` with ``pacing`` assigned on the entry that starts Ray.
+
+    Args:
+        commands: A cluster-YAML ``*_start_ray_commands`` list.
+        pacing: Environment names and values to assign.
+
+    Returns:
+        A new list, with the assignments prefixed to the ``ray start`` invocation.
+
+    Raises:
+        ValueError: If no entry starts Ray. A pacing request that lands nowhere is
+            worse than one refused: the cluster comes up looking configured and
+            launches at the unpaced rate, so this refuses rather than warns.
+    """
+    assignments = " ".join(f"{name}={value}" for name, value in pacing.items())
+    paced = []
+    applied = False
+    for cmd in commands:
+        if not applied and isinstance(cmd, str) and _RAY_START in cmd:
+            paced.append(cmd.replace(_RAY_START, f"{assignments} {_RAY_START}", 1))
+            applied = True
+        else:
+            paced.append(cmd)
+    if not applied:
+        msg = f"launch pacing requested but no start command invokes {_RAY_START!r}: {commands}"
+        raise ValueError(msg)
+    return paced
+
 
 def resolve_ami_id(ami_ssm_name: str, region: str = "us-west-2") -> str:
     """Resolve the worker AMI ID the ``ami_ssm_name`` SSM parameter currently points at.
@@ -241,6 +322,7 @@ def _resolve_ray_config(
     cloudwatch_log_group: str = DEFAULT_CLOUDWATCH_LOG_GROUP,
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
     idle_timeout_minutes: int | None = None,
+    launch_pacing: bool = False,
 ) -> str:
     """Inject AWS resource IDs from SSM into a Ray cluster YAML template.
 
@@ -286,6 +368,12 @@ def _resolve_ray_config(
             cluster across zones and must survive the inter-zone gap
             (staged-completeness verify + next zone's dispatch), so it passes
             a larger value. ``None`` keeps the template's value.
+        launch_pacing: Assign :data:`LAUNCH_PACING_ENV` on the head's ``ray start``
+            command, so the autoscaler it spawns paces its EC2 launch requests
+            against the account's shared request quota. ``False`` leaves the
+            template's commands untouched; pass ``True`` when several clusters
+            will be growing at once. Worker start commands are never touched —
+            only the head runs an autoscaler.
 
     Returns:
         Path to the resolved YAML tempfile.
@@ -404,6 +492,13 @@ def _resolve_ray_config(
     config["head_start_ray_commands"].append(cw_cmd)
     config["worker_start_ray_commands"].append(cw_cmd)
 
+    # Pace this cluster's EC2 launch requests. Head only: the autoscaler that issues
+    # RunInstances is a child of the head's `ray start`, and a worker has none to
+    # inherit the setting. Applied after the CloudWatch append so the entry that
+    # starts Ray is the one that gets the assignments.
+    if launch_pacing:
+        config["head_start_ray_commands"] = _pace_ray_start(config["head_start_ray_commands"], LAUNCH_PACING_ENV)
+
     # Substitute {CODE_BUCKET} and {CODE_SUFFIX} in setup_commands. With no bucket the
     # command is DROPPED, not left alone: an unsubstituted `aws s3 cp
     # s3://{CODE_BUCKET}/...` is a valid command line over a bucket name that cannot
@@ -477,6 +572,8 @@ def _sync_code_to_s3(
 def _start_ray_cluster(
     resolved_yaml: str,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    *,
+    launch_pacing: bool = False,
 ) -> str:
     """Launch a Ray cluster via ``ray up`` on a resolved YAML; return the head IP.
 
@@ -484,12 +581,19 @@ def _start_ray_cluster(
     resolved path is already bound when a failed launch unwinds to the
     teardown block — ``ray down`` must target the real (uuid-suffixed)
     cluster, not the unresolved template.
+
+    ``launch_pacing`` paces the head node's OWN launch. ``ray up`` runs the node
+    provider in this process, not on the head, so the head's RunInstances call
+    draws on the same account quota from here — and several clusters starting
+    together is exactly when that matters. The workers' pacing is separate and
+    travels in the resolved YAML (see :func:`_resolve_ray_config`).
     """
     log.info("Starting Ray cluster from %s", resolved_yaml)
     ray_up = subprocess.run(
         ["ray", "up", resolved_yaml, "-y", "--no-config-cache"],
         capture_output=True,
         text=True,
+        env={**os.environ, **LAUNCH_PACING_ENV} if launch_pacing else None,
     )
     if ray_up.returncode != 0:
         log.error("ray up failed (exit %d)", ray_up.returncode)
@@ -702,6 +806,7 @@ def ray_cluster(
     cloudwatch_log_group: str = DEFAULT_CLOUDWATCH_LOG_GROUP,
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
     idle_timeout_minutes: int | None = None,
+    launch_pacing: bool = False,
 ) -> Iterator[str | None]:
     """Provision an AWS-backed Ray cluster; tear it down on exit.
 
@@ -745,6 +850,12 @@ def ray_cluster(
         idle_timeout_minutes: Optional override of the template's autoscaler
             idle-down delay; ``None`` keeps the template's value. Rationale at
             :func:`_resolve_ray_config`.
+        launch_pacing: Pace this cluster's EC2 launch requests against the
+            account's shared RunInstances quota — see :data:`LAUNCH_PACING_ENV`.
+            Default ``False`` keeps today's launch behaviour. Pass ``True`` when
+            several clusters grow concurrently; one cluster alone contends with
+            nothing and gains only a smaller call count. Ignored in the
+            ``ray_address`` path, which provisions nothing.
 
     Yields:
         Path to the resolved cluster YAML tempfile when this context
@@ -796,8 +907,9 @@ def ray_cluster(
                 cloudwatch_log_group=cloudwatch_log_group,
                 cloudwatch_template=cloudwatch_template,
                 idle_timeout_minutes=idle_timeout_minutes,
+                launch_pacing=launch_pacing,
             )
-            head_ip = _start_ray_cluster(resolved_yaml, log)
+            head_ip = _start_ray_cluster(resolved_yaml, log, launch_pacing=launch_pacing)
             head_address = f"ray://{head_ip}:10001"
             log.info("Connecting to Ray at %s", head_address)
             ray.init(address=head_address, ignore_reinit_error=True)

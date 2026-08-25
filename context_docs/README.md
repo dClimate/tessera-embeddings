@@ -41,6 +41,7 @@ context_docs/
     ├── campaign-cost-model.md                    every cost, rate, fleet size, GPU-hour
     ├── campaign-cluster-sizing.md                how work balances across N clusters
     ├── campaign_inference_profile_2026_08.md     measured per-cell inference behaviour
+    ├── ec2_launch_throttling_2026_08.md          why fleets throttle themselves on RunInstances, and the two bounds
     ├── radar_source_coverage_2026_08.md          which zones publish no usable radar
     ├── optical_depth_census_2026_08.md           how much of the product is optically thin, and where
     ├── minimum-optical-depth-plan.md             BUILT at 15; the evidence behind ADR-018

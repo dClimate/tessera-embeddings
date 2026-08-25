@@ -608,6 +608,9 @@ def fill_zones_sequential_flow(
     allow_model_mismatch: bool = False,
     allow_ingest_code_mismatch: bool = False,
     s3_concurrency: int | None = None,
+    launch_pacing: bool = False,
+    actor_request_headroom: int | None = None,
+    actor_request_batch_size: int | None = None,
     idle_timeout_minutes: int = 10,
     ingest: bool = True,
     ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
@@ -687,6 +690,23 @@ def fill_zones_sequential_flow(
         s3_concurrency: Each trailing assembly's slice of the fleet S3-PUT
             budget. ``None`` = the aggregate target halved, leaving headroom
             for the live cell's concurrent staging writes.
+        launch_pacing: Pace this cluster's EC2 launch requests against the
+            account's shared RunInstances quota. Same shape as ``s3_concurrency``:
+            a budget concurrent clusters share, except this one is a request RATE
+            and the enforcement lives in the client rather than in a count we
+            divide. Default ``False`` keeps today's launch behaviour; the campaign
+            turns it on when it runs more than one cluster.
+        actor_request_headroom: Hold the actor request to the GPU nodes this cluster
+            has actually placed plus this many, rather than letting it climb toward
+            ``num_actors`` on a region that is not placing them
+            (:func:`tessera_embeddings.inference.scheduling._batch_actors_to_request`).
+            ``None`` keeps today's behaviour;
+            :data:`~tessera_embeddings.inference.scheduling.ACTOR_REQUEST_HEADROOM` is
+            the value to pass.
+        actor_request_batch_size: Actors per batch, overriding the inference
+            default. The quota that batches contend for is a rate over CALLS, so
+            this is the cheapest available relief: a smaller batch is fewer
+            simultaneous launch requests per cluster. ``None`` keeps the default.
         idle_timeout_minutes: Autoscaler idle-down override for the shared
             cluster (template default 2 min suits per-cell fills; the
             inter-zone seam here needs more slack).
@@ -851,6 +871,10 @@ def fill_zones_sequential_flow(
             chunk_size=SHARD_PX,  # 1 inference tile == 1 shard (D3)
             allow_s2_only=allow_s2_only,
             optical_min_obs=_store_optical_min_obs(),
+            actor_request_headroom=actor_request_headroom,
+            # Omitted when unset so the inference default stands. Passing None would
+            # override that default with nothing and disable batching outright.
+            **({"actor_request_batch_size": actor_request_batch_size} if actor_request_batch_size else {}),
         )
 
     # ------------------------------------------------------------------
@@ -1331,6 +1355,7 @@ def fill_zones_sequential_flow(
             code_suffix=code_suffix,
             idle_timeout_minutes=idle_timeout_minutes,
             cluster_name=cluster_name_for_flow_run(flow_run_ctx.id),
+            launch_pacing=launch_pacing,
         ) as resolved_yaml:
             activate(resolved_yaml)
             seq = fill_zones_sequential(
