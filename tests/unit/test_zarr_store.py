@@ -41,6 +41,7 @@ from tessera_embeddings.storage.zarr_store import (
     _DEFAULT_STORAGE_MAX_TRIES,
     S3Config,
     _default_repo_config,
+    _loss_date,
     _open_writable_session,
     _write_new,
     compute_doy,
@@ -1310,3 +1311,61 @@ class TestTheAssessmentLog:
         log = [{"examined": ["2018-01-01", "2018-01-31"], "losses": [{"date": "2018-01-06"}]}]
         _, losses = project_assessment(log, present={"2018-01-06"})
         assert losses == []
+
+    def test_losses_without_a_window_survive_the_upgrade(self):
+        """The state a run leaves when it stops after sealing a loss and before its final record.
+
+        A loss is committed by the write that seals its date; the range is recorded at the end.
+        Between those two a store legitimately holds losses and no window — and that is the state
+        most in need of preserving, because the record is the hole's only durable account. Reading
+        it as an empty history would have let the next append overwrite it.
+        """
+        attrs = {"assessed_unreadable_dates": [{"date": "2018-03-04", "scope": "unreadable"}]}
+        log = read_assessment_log(attrs)
+        assert log == [
+            {"examined": None, "losses": [{"date": "2018-03-04", "scope": "unreadable"}], "source": "pre-log"}
+        ]
+        _, losses = project_assessment(log)
+        assert [e["date"] for e in losses] == ["2018-03-04"]
+
+    def test_an_entry_this_cannot_read_is_refused_not_filtered(self):
+        """An attribute is written whole, so anything the read drops, the rewrite deletes.
+
+        Filtering an unrecognised entry would destroy the evidence the append-only promise exists
+        to keep, and would do it silently — the opposite of the fail-closed behaviour the reader
+        gives a malformed log as a whole.
+        """
+        with pytest.raises(TypeError, match="not records"):
+            read_assessment_log({"assessment_log": [{"examined": None, "losses": []}, "a bare string"]})
+
+    def test_a_date_lost_cleared_and_lost_again_is_a_new_observation(self):
+        """Deduplication keys on the CURRENT verdict, never on every mention ever made.
+
+        Matching against history would suppress the second loss, so the commit sealing it would
+        carry no record of it, and an interruption before the final record would leave the hole
+        unnamed — the exact durability guarantee this record exists for.
+        """
+        log = [
+            {"examined": ["2018-01-01", "2018-01-31"], "losses": [{"date": "2018-01-06"}]},
+            {"examined": ["2018-01-01", "2018-01-31"], "losses": []},  # re-examined, cleared
+        ]
+        _, current = project_assessment(log)
+        assert current == [], "cleared, so nothing is currently advertised"
+        assert _loss_date({"date": "2018-01-06"}) not in {_loss_date(x) for x in current}, (
+            "so losing it again is a fresh observation and must be recorded"
+        )
+
+    def test_a_recovered_date_stays_recovered_across_unrelated_writes(self):
+        """The fold replays all history, so it must be filtered against ALL stored dates.
+
+        Filtered against one batch only, a recovered date disappears while that batch folds and is
+        republished by the next unrelated write, which sees a different batch and the same history.
+        """
+        log = [{"examined": ["2018-01-01", "2018-01-31"], "losses": [{"date": "2018-01-06"}]}]
+
+        # the recovery batch
+        _, during = project_assessment(log, present={"2018-01-06"})
+        assert during == []
+        # a later, unrelated write — the axis still holds the recovered date
+        _, after = project_assessment(log, present={"2018-01-06", "2018-02-11"})
+        assert after == [], "and it must not come back"

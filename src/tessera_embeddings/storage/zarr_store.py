@@ -1278,7 +1278,18 @@ def read_assessment_log(attrs: "Mapping[str, Any]") -> list[dict[str, Any]]:
                 "and append. Whatever is on the store was not written by this code path and may be "
                 "the only account of a hole — inspect it before letting a run extend it."
             )
-        return [dict(e) for e in log if isinstance(e, dict)]
+        # LOSSLESS, and that is not fussiness. An attribute is written whole, so appending means
+        # reading, extending and rewriting — and anything this read drops, that rewrite deletes.
+        # Filtering an entry it does not recognise would therefore destroy exactly the evidence the
+        # append-only promise exists to keep, and would do it silently.
+        bad = [i for i, entry in enumerate(log) if not isinstance(entry, dict)]
+        if bad:
+            raise TypeError(
+                f"{ASSESSMENT_LOG_ATTR} on this store holds {len(bad)} entr(y/ies) that are not "
+                f"records, at position(s) {bad}. Refusing to read and rewrite: the next append "
+                "would drop them, and one of them may be the only account of a hole."
+            )
+        return [dict(e) for e in log]
 
     window = attrs.get(ASSESSED_WINDOW_ATTR)
     losses = attrs.get(UNREADABLE_DATES_ATTR)
@@ -1287,15 +1298,31 @@ def read_assessment_log(attrs: "Mapping[str, Any]") -> list[dict[str, Any]]:
             f"{UNREADABLE_DATES_ATTR} is {type(losses).__name__}, not a sequence; refusing to read "
             "and overwrite. Evidence in a shape nobody wrote is not evidence of nothing."
         )
-    if not (isinstance(window, (list, tuple)) and len(window) == 2):
+    examined: list[str] | None = None
+    if isinstance(window, (list, tuple)) and len(window) == 2:
+        examined = [str(window[0]), str(window[1])]
+    if examined is None and not losses:
         return []
+    # Losses WITHOUT a window is a normal state, not a corrupt one: a loss is committed by the
+    # write that seals its date, and a run can stop before the end-of-run record ever names a
+    # range. Returning nothing here would have let the next append overwrite the only durable
+    # account of that hole — which is the state most in need of preserving.
     return [
         {
-            "examined": [str(window[0]), str(window[1])],
+            "examined": examined,
             "losses": list(losses or ()),
             "source": "pre-log",
         }
     ]
+
+
+def _loss_date(loss: object) -> str:
+    """The date a loss record is about, whatever shape it was written in.
+
+    A bare date string is a shape earlier code wrote and readers still tolerate, so it is matched
+    rather than normalised — a record written by hand is not ours to reformat.
+    """
+    return str(loss.get("date", "")) if isinstance(loss, dict) else str(loss)
 
 
 def _contiguous_blocks(ranges: "Iterable[tuple[str, str]]") -> list[tuple[str, str]]:
@@ -2110,25 +2137,27 @@ def write_days_windows(
         # some dates, it did not survey a window. The fold treats them accordingly — they
         # contribute a verdict and no coverage, and a later run whose range covers them supersedes
         # them, which is how a recovered or re-filtered date stops being advertised as a hole.
-        written = {str(w)[:10] for w in whens}
+        # EVERY committed date, not just this batch's. A projection filtered on the batch alone
+        # drops a recovered date only while that batch is the one folding; the next unrelated write
+        # folds the same history against a different set and republishes the historical loss. The
+        # axis is the only set that answers "is this date stored" for all of them.
+        stored = {str(t)[:10] for t in read_time_values(batch.group)} | {str(w)[:10] for w in whens}
         log = read_assessment_log(attrs)
-        known = {
-            str(loss.get("date", "")) if isinstance(loss, dict) else str(loss)
-            for entry in log
-            for loss in entry.get("losses") or ()
-        }
-        fresh = [
-            loss
-            for loss in losses or ()
-            if (str(loss.get("date", "")) if isinstance(loss, dict) else str(loss)) not in known
-        ]
+
+        # Deduplicated against the CURRENT verdict, never against every mention ever made. A date
+        # lost, later re-examined and cleared, and then lost again is a new observation — and
+        # matching it against history would suppress it, so the commit sealing it would carry no
+        # record and an interruption before the end-of-run record would leave the hole unnamed.
+        _, current = project_assessment(log, present=stored)
+        already = {_loss_date(loss) for loss in current}
+        fresh = [loss for loss in losses or () if _loss_date(loss) not in already]
         if fresh:
             log.append({"examined": None, "losses": fresh, "source": "write"})
         if log:
             attrs[ASSESSMENT_LOG_ATTR] = log
             # Derived from the log, so this commit's view and the end-of-run view agree by
             # construction rather than by two rules being kept in step.
-            _window, projected = project_assessment(log, present=written)
+            _window, projected = project_assessment(log, present=stored)
             attrs[UNREADABLE_DATES_ATTR] = projected
         if parallel_windows and _write_windows_overlapped(batch.session, writes):
             return  # normal context exit: the batched commit below still runs
