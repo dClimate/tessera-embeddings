@@ -430,10 +430,12 @@ charges a leg for the productive work of every prior attempt, so it cannot tell 
 behaving pathologically from one that has been working steadily all along. Progress is read
 from the leg's own child store — through the same `get_existing_dates` the ingest itself
 resumes from, so the parent and the leg cannot disagree about what the store holds — and a
-store that cannot be read earns nothing, which is the same answer as no progress. Three
-things bound it: a grant is a FIXED size, grants are limited to the number of re-dispatch
-decisions a leg has (one fewer than `max_leg_attempts`), and each has to be paid for by
-dates committed since the previous grant. So the ceiling is
+store that cannot be read earns nothing, which is the same answer as no progress. Two
+things bound it: a grant is a FIXED size, and each has to be PAID FOR by dates committed
+since the previous grant. Payment is also what limits the rate: the extension is asked for
+wherever the deadline is about to refuse an attempt, but only a RUNNING leg commits and every
+ask sits after an attempt has failed, so the asks within one attempt compete for the same
+growth and at most one of them is paid. So the ceiling is
 `max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s`, a leg that
 commits nothing never leaves `max_leg_wall_clock_s`, and setting the extension to 0 restores
 the plain deadline and its reads along with it.

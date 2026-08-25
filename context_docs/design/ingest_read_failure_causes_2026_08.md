@@ -1633,15 +1633,24 @@ the first — two mechanisms where there was none. What went in instead is a bou
 whose store has gained dates earns a fixed extension, `leg_progress_extension_s`, and the absolute
 ceiling stays computable.
 
-Three things bound it, and all three are load-bearing:
+Two things bound it, and both are load-bearing:
 
 - a grant is a **fixed** size, so a leg cannot earn a deadline proportional to how far it overran —
   the caller re-reads the deadline after a grant rather than assuming one was enough, and an attempt
   that overran by more than a whole extension is past what progress buys;
-- grants are limited to the number of **re-dispatch decisions** a leg has, which is one fewer than
-  `max_leg_attempts` — no new counter, because the loop already bounds it;
 - each grant has to be **paid for** by dates committed since the previous grant, so a store that
   stops growing stops earning them.
+
+**Payment is also what bounds the RATE, which is why the extension can be asked for at every refusal
+rather than at one chosen gate.** An earlier draft limited grants by counting call sites, and that
+was the wrong bound: it made the credit depend on which of the deadline's two expressions happened
+to fire — "no time left" or "no time left to wait first" — so a leg that failed 480 s into a 500 s
+budget, with 20 s left and a 30 s base rung, was refused without its progress ever being asked
+about. Both reviewers of PR #145 found exactly that case. The real limit was always payment: only a
+RUNNING leg commits dates, and every ask sits after an attempt has failed, so the asks within one
+attempt compete for the same growth and at most one of them can be paid for. Grants therefore stay
+bounded by the re-dispatch decisions a leg has, one fewer than `max_leg_attempts`, with no counter
+anywhere. `test_progress_is_credited_at_the_rung_refusal_too_not_only_the_elapsed_one` pins it.
 
 Ceiling: `max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s`. A leg that
 commits nothing never leaves `max_leg_wall_clock_s`, and 0 restores the plain deadline exactly,

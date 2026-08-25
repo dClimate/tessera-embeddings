@@ -289,10 +289,11 @@ class IngestSettings(BaseModel):
     # from what it committed, so its next attempt starts further along than its last one did, and
     # the campaign slot it holds is buying something.
     #
-    # Bounded by construction rather than by a second lever, and all three bounds carry weight: a
-    # grant costs this fixed amount; grants are limited to the number of re-dispatch decisions a
-    # leg has, which is one fewer than `max_leg_attempts`; and each one has to be PAID FOR by
-    # dates committed since the previous grant, so a store that stops growing stops earning them.
+    # Bounded by construction rather than by a second lever, and both bounds carry weight: a grant
+    # costs this fixed amount, and each one has to be PAID FOR by dates committed since the previous
+    # grant, so a store that stops growing stops earning them. Payment is what limits the pay-out
+    # rate: only a RUNNING leg commits, and the extension is only ever asked for after an attempt
+    # has failed, so at most one grant per attempt can be paid for however many times it is asked.
     # The ceiling is therefore `max_leg_wall_clock_s + (max_leg_attempts - 1) * this`, and a leg
     # that commits nothing never leaves `max_leg_wall_clock_s`.
     #

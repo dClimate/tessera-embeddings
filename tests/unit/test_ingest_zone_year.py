@@ -1625,6 +1625,31 @@ class TestALegStillCommittingDatesEarnsWallClock:
 
         assert dispatched.count("s2") == 3, "a leg that is still committing dates is not the stuck one"
 
+    def test_progress_is_credited_at_the_rung_refusal_too_not_only_the_elapsed_one(self, wired, monkeypatch):
+        """The deadline refuses two ways, and progress has to be worth the same at both.
+
+        The leg fails INSIDE its budget — 480 s of 500 — so the elapsed gate never fires. What
+        refuses it is the other expression of the same deadline: 20 s left and a 30 s base rung,
+        no room to wait before starting. A leg whose store grew must not lose its attempt to
+        which side of the deadline its failure happened to land on.
+        """
+        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=480.0)
+        self._growing_store(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(
+                    max_leg_attempts=3,
+                    max_leg_wall_clock_s=500,
+                    leg_retry_backoff_s=30,
+                    leg_progress_extension_s=2000,
+                    leg_stagger_window_s=0,
+                ),
+            )
+
+        assert dispatched.count("s2") == 3, "the rung refusal must credit progress like the elapsed one"
+
     def test_a_leg_committing_nothing_is_refused_exactly_as_before(self, wired, monkeypatch):
         """The control, and the polarity. Only progress buys anything; the default buys nothing."""
         dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)

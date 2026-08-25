@@ -881,13 +881,17 @@ async def ingest_zone_year(
             A store that has grown is not the cell the deadline was written for. It resumes from
             what it committed, so its next attempt starts further along than its last one did.
 
-            Bounded by construction rather than by a second lever, and all three bounds are needed:
-            a grant costs a FIXED extension; grants are limited to the number of re-dispatch
-            decisions a leg has, which is one fewer than its attempts; and each one has to be PAID
-            FOR by dates committed since the previous grant, so a store that stops growing stops
-            earning them. The ceiling is therefore
-            ``max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s``, and a leg
-            that commits nothing never leaves ``max_leg_wall_clock_s``.
+            Bounded by construction rather than by a second lever, and both bounds are needed: a
+            grant costs a FIXED extension, and each one has to be PAID FOR by dates committed since
+            the previous grant, so a store that stops growing stops earning them.
+
+            Payment is what limits how often this can pay out, which is why it may be asked wherever
+            the deadline is about to refuse rather than at one chosen gate. Only a RUNNING leg
+            commits, and every ask sits after an attempt has failed, so the asks within one attempt
+            compete for the same growth and at most one of them is paid for. Grants are therefore
+            bounded by the re-dispatch decisions a leg has, one fewer than its attempts, and the
+            ceiling is ``max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s``.
+            A leg that commits nothing never leaves ``max_leg_wall_clock_s``.
 
             The extension is FIXED for that reason, so the caller has to re-read the deadline after
             a grant rather than assume one was enough. An attempt that overran by more than a whole
@@ -1001,12 +1005,13 @@ async def ingest_zone_year(
             # has already had a deadline's worth of wall clock. Per leg now, because the legs no
             # longer share a loop: one leg's slow retries must not spend another's budget.
             elapsed = monotonic() - started
-            if elapsed >= budget_s:
-                # Asked ONLY here, and only once per failed attempt: this is the gate that bounds
-                # elapsed time, so this is where a leg that spent that time working has to be told
-                # apart from one that spent it stalling. The deadline is re-read below rather than
-                # assumed to have moved far enough — a grant is a fixed size, and one is not owed
-                # to be enough.
+            # ONE credit decision per failed attempt, taken before EITHER deadline-based refusal
+            # below. They are the same deadline asked two ways — "no time left" and "no time left
+            # to wait first" — so asking at only one of them would recognise a leg's progress or
+            # not according to which side of the deadline its attempt happened to land on. The
+            # deadline is re-read after, never assumed to have moved far enough: a grant is a
+            # fixed size, and one is not owed to be enough.
+            if elapsed >= budget_s or _leg_backoff_base_s(detail) >= budget_s - elapsed:
                 _credit_progress()
             if elapsed >= budget_s:
                 log.error(
@@ -1083,6 +1088,12 @@ async def ingest_zone_year(
             # loop gets to it, so a wait chosen as just inside the budget can land just outside
             # it. Only a reading taken after the await observes what actually happened.
             elapsed = monotonic() - started
+            # The same rule: a deadline refusal asks first. Nothing ran during the backoff, so this
+            # can only ever be paid for by progress the gates above had no reason to ask about —
+            # which is the case this gate exists for, a wait that landed outside the budget because
+            # the event loop overran.
+            if elapsed >= budget_s:
+                _credit_progress()
             if elapsed >= budget_s:
                 log.error(
                     "Zone %s year %s: %s — the backoff ended %.0f s after this leg's first "
