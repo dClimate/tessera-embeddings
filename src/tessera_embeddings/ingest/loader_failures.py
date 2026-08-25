@@ -271,8 +271,8 @@ def clear_local_refusals() -> None:
 _REFUSAL_RETENTION_S = 3600.0
 
 
-def read_local_refusals(max_age_s: float | None = None) -> list[str]:
-    """This process's recorded refusal lines, WITHOUT consuming them.
+def read_local_refusals() -> list[tuple[float, str]]:
+    """This process's recorded refusal lines with their AGES, without consuming them.
 
     Reading rather than draining, and that is the whole safety property. Two reads are in flight
     at once whenever the optical path pipelines a date: the look-ahead prepares date N+1, whose
@@ -281,15 +281,12 @@ def read_local_refusals(max_age_s: float | None = None) -> list[str]:
     other's evidence — the second failure then saw only the codec's complaint, classified as
     unreadable data, and gave its date up. Reading leaves the line for the other to find.
 
-    ``max_age_s`` is how long the read now being judged has been running, so a line logged before
-    it began is not returned. That is what a destructive collection used to provide and what makes
-    a non-destructive one safe: a read that logs a refusal and then SUCCEEDS on a later attempt —
-    exactly what the read retry exists to allow — would otherwise leave its line to be inherited
-    forever, and on the optical path a genuinely corrupt object would read as a refusal and the
-    copy ladder would never step down.
-
-    Passing ``None`` returns everything still retained, which is what a caller with no read to
-    date its evidence against gets.
+    **Ages, not timestamps, and the decision is not taken here.** This runs on a worker and the
+    caller runs somewhere else, so their clocks are not comparable; an elapsed time is. Whether a
+    line is recent enough to describe the read being judged is decided by the caller, against its
+    own clock, AFTER this answer arrives — see :func:`collect_logged_refusals`. Filtering here
+    against a duration the caller measured before the round trip discarded evidence whenever the
+    trip took longer than the read, which classified a refusal as unreadable data and cost a date.
 
     A separate buffer from the hrefs, and read by a different caller for a different purpose. One
     buffer would mean the caller that classifies destroys the evidence the caller that attributes
@@ -302,10 +299,7 @@ def read_local_refusals(max_age_s: float | None = None) -> list[str]:
         # any read that could still be judging it.
         while _refused and now - _refused[0][0] > _REFUSAL_RETENTION_S:
             _refused.popleft()
-        found = list(_refused)
-    if max_age_s is None:
-        return [message for _at, message in found]
-    return [message for at, message in found if now - at <= max_age_s]
+        return [(now - at, message) for at, message in _refused]
 
 
 #: Exception classes whose cause cannot be serialised out of the worker that raised it, and
@@ -443,23 +437,23 @@ def install_capture_everywhere(client: dask.distributed.Client | None) -> None:
     )
 
 
-def _collect(client: dask.distributed.Client | None, drain: Callable[[], list[str]], what: str) -> list[str]:
-    """Drain one buffer on the local process and on each worker.
+def _collect[T](client: dask.distributed.Client | None, read: Callable[[], list[T]], what: str) -> list[T]:
+    """Read one buffer on the local process and on each worker.
 
     Worker errors are ignored rather than raised — this runs while handling a failure, and a
     second failure here would replace a recoverable read error with an unrecoverable one.
     """
-    found = drain()
+    found = read()
     if client is None:
         return found
     try:
-        per_worker = client.run(drain, on_error="ignore")
+        per_worker = client.run(read, on_error="ignore")
     except Exception:
         logger.warning("Could not collect %s from workers", what, exc_info=True)
         return found
     for result in per_worker.values():
         if isinstance(result, list):
-            found.extend(h for h in result if isinstance(h, str))
+            found.extend(result)
     return found
 
 
@@ -468,16 +462,28 @@ def collect_aborted_hrefs(client: dask.distributed.Client | None) -> list[str]:
     return _collect(client, drain_local, "aborted hrefs")
 
 
-def collect_logged_refusals(client: dask.distributed.Client | None, max_age_s: float | None = None) -> list[str]:
-    """Every refusal GDAL logged during the last ``max_age_s`` seconds, cluster-wide.
+def collect_logged_refusals(client: dask.distributed.Client | None, since: float | None = None) -> list[str]:
+    """Every refusal GDAL logged since ``since``, cluster-wide.
 
-    The age is a DURATION rather than an instant, so each worker answers against its own clock
-    and nothing here depends on the fleet's clocks agreeing.
+    ``since`` is a ``time.monotonic`` reading on THIS process, taken when the read began. Each
+    worker reports how OLD its lines are by its own clock, and the cutoff is computed here, after
+    the round trip, against this process's clock. So nothing depends on the fleet's clocks
+    agreeing, and nothing depends on the round trip being quick.
+
+    **The cutoff has to be taken after the call, not before it.** Measured before, it excluded the
+    scheduling and RPC latency that the workers' ages already include, so a line logged during a
+    short read looked older than the read itself and was thrown away — leaving the codec exception
+    classified as unreadable data, which costs the date. The error that remains is the return leg
+    alone, and it biases towards KEEPING a line, which costs a wait rather than a date.
 
     Non-consuming: see :func:`read_local_refusals`. A second read in flight must still be able to
     find the evidence for its own failure.
     """
-    return _collect(client, lambda: read_local_refusals(max_age_s), "logged refusals")
+    aged = _collect(client, read_local_refusals, "logged refusals")
+    if since is None:
+        return [message for _age, message in aged]
+    cutoff = time.monotonic() - since
+    return [message for age, message in aged if age <= cutoff]
 
 
 #: How the attached evidence introduces itself in a log and on an exception. A reader has to be
@@ -491,7 +497,7 @@ _LINES_PER_NOTE = 4
 
 
 def carry_logged_refusal(
-    exc: BaseException, client: dask.distributed.Client | None, max_age_s: float | None = None
+    exc: BaseException, client: dask.distributed.Client | None, since: float | None = None
 ) -> None:
     """Attach to ``exc`` any refusal GDAL logged for this read but did not raise.
 
@@ -500,27 +506,29 @@ def carry_logged_refusal(
     attaching is what makes one classifier decide from the whole of what is known — rather than
     each caller re-deciding from whatever it happens to hold.
 
-    **Attached, not merely read**, because the collection is DESTRUCTIVE: a caller that
-    classified and discarded would leave the next reader of the same exception a different
-    verdict from the same failure. Written onto the exception, the evidence travels with it —
-    from the retry policy that spends patience on it to the handler that decides whether a date
-    is lost.
+    **Attached, not merely read.** A caller that classified and discarded would leave the next
+    reader of the same exception a different verdict from the same failure, and the radar path
+    has two readers: the retry policy that spends patience, and the handler that decides whether
+    a date is lost. Written onto the exception, the evidence travels with it.
 
     Only onto a SOURCE READ failure, per :func:`is_source_read_failure`. A store conflict or a
     duplicate date raised while some other read is being refused would otherwise be explained by
     that refusal, and answered with a wait that fixes nothing.
 
-    The evidence is cluster-wide and drained, so a date failing while another date's read is
-    being refused can take the other's lines. That is the same race the href attribution runs,
-    and it is bounded the same way — by what a wrong answer costs. A borrowed refusal buys a
-    write the refusal budget and then fails the leg with the time axis unmoved; nothing is
-    skipped, and the date is judged alone on the re-dispatch. Draining on every failure rather
-    than only on an undecided one is part of that bound: a buffer left unread is a buffer whose
-    lines are still there to be borrowed by a date that fails minutes later.
+    ``since`` is when the read being judged began, by this process's ``time.monotonic``. Reading
+    the buffer does NOT consume it — see :func:`read_local_refusals` — so a second read in flight
+    still finds the evidence for its own failure; what keeps a stale line out is its age.
+
+    The evidence is cluster-wide, so a date failing while ANOTHER date's read is being refused can
+    still take the other's lines into its note. That is the same race the href attribution runs,
+    and it is bounded the same way — by what a wrong answer costs. A borrowed refusal buys a write
+    the refusal budget and then fails the leg with the time axis unmoved; nothing is skipped, and
+    the date is judged alone on the re-dispatch. What is no longer possible is the opposite: one
+    read REMOVING the evidence another read needs, which cost a date rather than a wait.
     """
     if not is_source_read_failure(exc):
         return
-    lines = collect_logged_refusals(client, max_age_s)
+    lines = collect_logged_refusals(client, since)
     if not lines:
         return
     note = f"{_REFUSAL_NOTE} {' | '.join(sorted(set(lines))[:_LINES_PER_NOTE])}"
@@ -544,9 +552,8 @@ def refusal_wait_out(client: dask.distributed.Client | None) -> Callable[[BaseEx
         # the time since the write began. So the evidence considered is always the evidence this
         # attempt produced, without the predicate having to be told when the attempt started.
         nonlocal since
-        now = time.monotonic()
-        carry_logged_refusal(exc, client, max_age_s=now - since)
-        since = now
+        started, since = since, time.monotonic()
+        carry_logged_refusal(exc, client, since=started)
         return is_provider_refusal(exc)
 
     return _refused

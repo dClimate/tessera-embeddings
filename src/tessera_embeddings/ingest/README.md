@@ -1952,14 +1952,27 @@ Four properties are what make it safe to add evidence at all:
   other read is being refused is still a store conflict, and answering it with a wait fixes
   nothing. `is_source_read_failure` gates it on the same `_SOURCE_READER_MARKERS` every other
   corroboration here uses.
-- **A separate buffer from the aborted hrefs.** Collection is destructive and cluster-wide, so one
-  buffer would mean the caller that classifies destroys the evidence the optical copy ladder
-  attributes from. The two are drained independently, and the href race is unchanged.
+- **A separate buffer from the aborted hrefs**, read independently. One buffer would mean the
+  caller that classifies destroys the evidence the optical copy ladder attributes from. The href
+  buffer is still drained destructively and its race is unchanged.
+- **Reading the refusals does not consume them.** Two reads are in flight whenever the optical
+  path pipelines a date — the look-ahead prepares date N+1, whose coverage gate reads, while date
+  N's write is still reading — and each is inside its own `read_failure_context`. A destructive
+  collection let whichever failed first take the other's evidence; the second then saw only the
+  codec's complaint, read as unreadable data, and gave its date up. A line is removed only by
+  eviction past a retention horizon far longer than any single read.
+- **What keeps a stale line out is its AGE, not its removal.** A read that logs a refusal and then
+  succeeds on a later attempt drains nothing, so without an age bound its line would be inherited
+  by whatever failed next — and on the optical path a genuinely corrupt object would then read as
+  a refusal and never step down the copy ladder. Each worker reports how old its lines are by its
+  own clock, and the caller applies the cutoff **after** the round trip, against its own. Nothing
+  depends on the fleet's clocks agreeing, and nothing depends on the collection being quick: a
+  cutoff measured before the call excluded the latency the workers' ages already included, and
+  discarded evidence for the very read it was fetching it for.
 
-The evidence is ATTACHED rather than answered because collection is destructive: a caller that
-classified and discarded would hand the next reader of the same exception the opposite verdict,
-and the radar path has two readers — the retry policy that spends patience, and the handler that
-decides whether the date is lost.
+The evidence is ATTACHED rather than answered: a caller that classified and discarded would hand
+the next reader of the same exception the opposite verdict, and the radar path has two readers —
+the retry policy that spends patience, and the handler that decides whether the date is lost.
 
 Radar asks for it twice, and the second ask is what arms `wait_out`. `refusal_wait_out(client)` is
 `is_provider_refusal` over evidence gathered at the moment the policy asks, which is per attempt;

@@ -129,7 +129,7 @@ def read_failure_context(
         # Before anything reads a verdict off this failure, including the line below. Bounded by
         # how long THIS read has been running: a line older than that was logged before the read
         # began, and belongs to a read that has since succeeded or been judged already.
-        carry_logged_refusal(exc, client, max_age_s=time.monotonic() - entered)
+        carry_logged_refusal(exc, client, since=entered)
         ids = ", ".join(str(getattr(i, "id", "?")) for i in items[:4]) or "none"
         log.exception("READ FAILED roi=%s date=%s items=%d first=%s", roi, date, len(items), ids)
         if cause_was_flattened(exc):

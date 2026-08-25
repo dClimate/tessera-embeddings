@@ -239,6 +239,16 @@ def capture_installed() -> Iterator[None]:
         clear_local_refusals()
 
 
+def _refusal_messages() -> list[str]:
+    """The recorded refusal lines, dropping the ages the worker reports them with.
+
+    ``read_local_refusals`` answers with ``(age, message)`` because the caller decides what is
+    recent enough — see ``collect_logged_refusals``. These tests are about WHICH lines are kept,
+    not about when.
+    """
+    return [message for _age, message in read_local_refusals()]
+
+
 def _gdal_logs(message: str) -> None:
     """Emit ``message`` the way rasterio's CPL error handler emits GDAL's warnings."""
     logging.getLogger("rasterio._env").warning(message)
@@ -252,7 +262,7 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
     def test_a_logged_refusal_is_recorded(self, line: str) -> None:
         """Both wordings the incident produced, on text taken from the incident's own logs."""
         _gdal_logs(line)
-        assert read_local_refusals() == [line]
+        assert _refusal_messages() == [line]
 
     @pytest.mark.parametrize("line", BENIGN_GDAL_LINES, ids=["sidecar-404", "the-codec-itself", "a-tiff-quirk"])
     def test_only_a_refusal_is_recorded(self, line: str) -> None:
@@ -264,7 +274,7 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         for, and both would let this capture make a verdict worse.
         """
         _gdal_logs(line)
-        assert read_local_refusals() == []
+        assert _refusal_messages() == []
 
     def test_the_two_buffers_do_not_drain_each_other(self) -> None:
         """The optical copy ladder attributes from the href buffer, and classification drains
@@ -274,7 +284,7 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         logging.getLogger("odc.loader._rio").error(ABORT_MESSAGE)
         _gdal_logs(LOGGED_REFUSAL)
 
-        assert len(read_local_refusals()) == 1
+        assert len(_refusal_messages()) == 1
         assert len(drain_local()) == 1, "draining the refusals took the href with it"
 
     def test_installing_twice_does_not_double_the_record(self) -> None:
@@ -284,12 +294,45 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         install_capture()
         clear_local_refusals()
         _gdal_logs(LOGGED_REFUSAL)
-        assert len(read_local_refusals()) == 1
+        assert len(_refusal_messages()) == 1
 
     def test_collection_without_a_cluster_returns_the_local_record(self) -> None:
         """A serial run has no client, and its verdicts must be reached the same way."""
         _gdal_logs(LOGGED_REFUSAL)
         assert collect_logged_refusals(None) == [LOGGED_REFUSAL]
+
+    def test_a_slow_collection_does_not_age_out_the_evidence_it_is_fetching(self) -> None:
+        """The cutoff is taken AFTER the round trip, because the workers' ages include it.
+
+        A worker reports how old its lines are at the moment it answers. Compared against a
+        duration the caller measured before issuing the call, a line logged during a short read
+        looks older than the read itself as soon as scheduling and RPC latency exceed it — and
+        discarding it leaves the codec exception classified as unreadable data, which costs the
+        date. Here the trip takes far longer than the read did.
+        """
+
+        class _SlowCluster:
+            """A cluster whose round trip dwarfs the read being judged."""
+
+            @staticmethod
+            def run(fn, on_error=None):
+                time.sleep(0.2)
+                return {"worker-0": []}
+
+        read_began = time.monotonic()
+        _gdal_logs(LOGGED_REFUSAL)
+        assert collect_logged_refusals(_SlowCluster(), since=read_began) == [LOGGED_REFUSAL]
+
+    def test_a_line_older_than_the_read_is_still_refused(self) -> None:
+        """The control: latency widens the window, it does not remove it.
+
+        A line from a read that has since recovered is not this failure's evidence, and no amount
+        of round-trip time makes it so.
+        """
+        _gdal_logs(LOGGED_REFUSAL)
+        time.sleep(0.05)
+        read_began = time.monotonic()
+        assert collect_logged_refusals(None, since=read_began) == []
 
 
 def test_the_capture_hears_gdal_at_the_level_rasterio_really_uses() -> None:
@@ -308,7 +351,7 @@ def test_the_capture_hears_gdal_at_the_level_rasterio_really_uses() -> None:
     assert gdal.level == logging.NOTSET, "this asserts the DEFAULT, so the logger must be unset"
     clear_local_refusals()
     gdal.warning("%s", LOGGED_REFUSAL)
-    assert read_local_refusals() == [LOGGED_REFUSAL]
+    assert _refusal_messages() == [LOGGED_REFUSAL]
 
 
 def _decode_failure_over_a_refused_object() -> WarpOperationError:
