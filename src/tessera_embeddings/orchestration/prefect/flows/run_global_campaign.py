@@ -530,9 +530,10 @@ async def run_global_campaign(
     mask_name: str = "global",
     max_parallel_ingest: int = 60,
     max_dispatch_rounds: int = 2,
-    # Staging-reuse escape hatches. Both default off; see `_staging_code_identity`.
+    # Staging-reuse escape hatches. All default off; see `_staging_code_identity`.
     force_staging_reuse: bool = False,
     force_staging_restage: str = "",
+    staging_code_identity: str = "",
     overlap_years: bool = True,
     ingest_limit_name: str = "tessera-global-ingests",
     inference_pause_gate: str = "tessera-global-inference",
@@ -684,14 +685,42 @@ async def run_global_campaign(
             **This flag cannot reach staging that was created without it.** It substitutes a
             constant into the run-id hash, so it produces a *different* prefix from the one an
             unflagged run staged under; it preserves reuse only between runs that both set it.
-            To resume a specific existing prefix, pass ``fill-zone-year``'s explicit ``run_id``
-            — that is the only reliable lever.
+            To resume a prefix an earlier campaign staged, pass ``staging_code_identity`` below
+            (this used to say ``fill-zone-year``'s ``run_id`` was the only lever; that is still
+            true per cell, but it cannot restart a campaign).
 
             Set it when a change to the inference source provably cannot alter staged output (a
             log line, a comment, a type annotation) and the staging hours are worth having.
             Unsafe if that judgement is wrong: it mixes two code versions into one write-once
             zone-year, and ``assemble_global`` probes the variable set from a single tile on the
             assumption that a staging prefix is homogeneous.
+        staging_code_identity: The staging fingerprint's code component, stated OUTRIGHT
+            instead of derived. The one lever that can reach a prefix an earlier campaign
+            staged under, because it is the only one that does not derive the value it is
+            trying to match. Empty (default) derives it, which is what every ordinary run
+            wants.
+
+            Its case is a campaign RESTART across a code change that provably cannot alter
+            staged tile CONTENT — an orchestration or scheduling fix, a timeout, a preflight
+            gate. Derivation cannot see that distinction: the fingerprint covers the whole
+            inference closure, so a change to how many actors are requested abandons every
+            staged tile exactly as a change to the model would. On a deployment that ships a
+            source tarball the term is doubly unforgiving, since re-uploading the tarball moves
+            the fingerprint whatever the change was.
+
+            **Copy it from the run being resumed** — every fill records the value it used in
+            its own ``staging_code_identity`` parameter, so the string to pass is a read rather
+            than a reconstruction. A value that was never staged under simply starts a fresh
+            prefix, which costs re-inference and nothing else.
+
+            **The judgement it rests on is the operator's, and it is the same one
+            ``force_staging_reuse`` asks for**: that the code change cannot alter what a staged
+            tile holds. Wrong, and two code versions land in one write-once zone-year. What
+            catches the coarse form is the per-tile validation in ``StagedShardSource`` — every
+            expected variable present, one shard tall and wide, matching the probe's dtype, or
+            the read fails naming the tile. What it cannot catch is same-shape different-numbers,
+            so a change to the model, the checkpoint, or the pixel maths is not a candidate
+            however tempting the staged hours look.
         force_staging_restage: An arbitrary token mixed into the staging fingerprint, so a
             change the source hash CANNOT see starts a fresh prefix. Its case is the opposite
             of ``force_staging_reuse``'s: a deliberate dependency upgrade mid-campaign, where a
@@ -833,6 +862,17 @@ async def run_global_campaign(
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
     if fill_strategy not in ("cluster-per-zone", "chained-clusters"):
         raise ValueError(f"fill_strategy must be 'cluster-per-zone' or 'chained-clusters', got {fill_strategy!r}")
+    # Each of the three staging levers CLAIMS the identity, so any pair of them is a
+    # contradiction rather than a combination — and resolving one silently is how a run lands on
+    # a prefix nobody chose. Refused rather than ordered by precedence: the cost of guessing
+    # wrong is a whole campaign's re-inference in the cheap direction and mixed code versions in
+    # the expensive one, and neither is worth inferring from a parameter the caller did not mean.
+    if staging_code_identity and (force_staging_reuse or force_staging_restage):
+        raise ValueError(
+            f"staging_code_identity={staging_code_identity!r} states the staging identity outright, "
+            f"but force_staging_reuse={force_staging_reuse!r} / force_staging_restage="
+            f"{force_staging_restage!r} would derive a different one. Pass exactly one."
+        )
 
     campaign_years = tuple(years) if years is not None else CAMPAIGN_YEARS
 
@@ -1004,7 +1044,15 @@ async def run_global_campaign(
         ``force_staging_restage`` mixes in a caller-supplied token, so a change the hash
         CANNOT see starts a fresh prefix. The case that needs it is a deliberate library
         upgrade mid-campaign — a new torch changes the numbers without changing our source.
+
+        ``staging_code_identity`` states the answer instead of deriving one. It is the only
+        lever that can reach a prefix an earlier campaign staged under, precisely because it
+        does not derive: the other two compute a value from the code in front of them, and no
+        computation over CHANGED code reproduces the identity that changed code replaced. The
+        three are mutually exclusive, refused at preflight rather than ordered here.
         """
+        if staging_code_identity:
+            return staging_code_identity
         if force_staging_reuse:
             return "infcode-forced-reuse"
         identity = inference_code_identity()

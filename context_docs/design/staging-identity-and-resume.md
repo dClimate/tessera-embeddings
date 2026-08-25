@@ -60,8 +60,35 @@ one rule cannot express both.
 
 ## 3. Reaching existing staging: what works, and what only looks like it does
 
-**`run_id` is the only reliable lever.** Pass `fill-zone-year`'s explicit `run_id` to resume a
-specific prefix. Everything else changes the prefix as a side effect of changing the fingerprint.
+**`staging_code_identity` is the campaign-level lever, and `run_id` the per-cell one.** Pass
+`run_global_campaign`'s `staging_code_identity` to state the fingerprint's code component outright
+instead of deriving it, or `fill-zone-year`'s explicit `run_id` to resume one specific prefix.
+Everything else changes the prefix as a side effect of changing the fingerprint.
+
+**This paragraph used to say `run_id` was the only reliable lever, and that was true when it was
+written.** It is still the only one for a single cell, but a campaign dispatches its own children
+and derives their run ids, so there was no way to restart a campaign onto tiles it had already
+staged. The distinction that matters is DERIVED versus STATED: both `force_staging_*` hatches
+compute the identity from the code in front of them, and no computation over changed code can
+reproduce the identity that changed code replaced. Only stating it reaches backwards.
+
+The judgement `staging_code_identity` rests on is exactly `force_staging_reuse`'s — that the change
+cannot alter what a staged tile CONTAINS. What makes a restart across an orchestration fix a fair
+case is that the fingerprint covers the whole inference closure, so a change to how many actors are
+requested, to an initialisation timeout, or to a preflight coverage gate abandons every staged tile
+exactly as a change to the model would. On a deployment that ships a source tarball it is worse
+still: the tarball's ETag is a term in the identity, so re-uploading it moves the fingerprint
+whatever the change was, and the code comment calling that term "empty in production" assumes a
+baked-AMI deploy that the global campaign is not running.
+
+The three levers are mutually exclusive and refused together at preflight rather than ordered by
+precedence, because each of them CLAIMS the identity and silently preferring one lands the run on a
+prefix nobody chose.
+
+**What it cannot be used for.** A change to the model, the checkpoint, or the pixel maths. The
+per-tile validation in `StagedShardSource` catches the coarse form of a wrong judgement — a missing
+variable, a wrong shard extent, a dtype mismatch, each failing loudly and naming the tile — but
+same-shape-different-numbers passes it, and lands two code versions in one write-once zone-year.
 
 **`force_staging_reuse` cannot reach staging created without it.** It substitutes a constant into the
 hash, so it yields a *different* prefix from the one an unflagged run staged under; it preserves

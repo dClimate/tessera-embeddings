@@ -523,6 +523,61 @@ def test_force_staging_reuse_survives_an_inference_change(wired, monkeypatch):
     assert _fill_run_id(wired) != base
 
 
+class TestAPinnedStagingIdentityReachesAnEarlierCampaignsPrefix:
+    """The lever for restarting a campaign onto the tiles it already staged.
+
+    Both other hatches DERIVE the identity from the code in front of them, so neither can
+    reproduce the value that changed code replaced — which is why a restart across an
+    orchestration fix abandoned every staged tile. Stating the identity outright is the only
+    form that reaches backwards.
+    """
+
+    def test_it_survives_an_inference_change(self, wired, monkeypatch):
+        pinned = _chained_staging_identity(wired, staging_code_identity="infcode-EARLIER")
+        assert pinned == "infcode-EARLIER"
+        monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-DIFFERENT")
+        assert _chained_staging_identity(wired, staging_code_identity="infcode-EARLIER") == pinned
+
+    def test_it_survives_a_changed_tarball(self, wired, monkeypatch):
+        """The term that bites hardest on a tarball deployment: re-uploading moves it."""
+        monkeypatch.setattr(mod, "_resolve_tarball_identity", lambda *a, **k: "tarball=NEW")
+        assert _chained_staging_identity(wired, staging_code_identity="infcode-EARLIER|tarball=OLD") == (
+            "infcode-EARLIER|tarball=OLD"
+        )
+
+    def test_it_reaches_the_per_zone_path_too(self, wired, monkeypatch):
+        """Both strategies, as the narrowing already requires of the other two hatches."""
+        base = _fill_run_id(wired, staging_code_identity="infcode-EARLIER")
+        monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-DIFFERENT")
+        assert _fill_run_id(wired, staging_code_identity="infcode-EARLIER") == base
+        assert _fill_run_id(wired) != base
+
+    def test_an_empty_pin_derives_exactly_as_before(self, wired, monkeypatch):
+        """The control and the default: off must cost nothing, including the derivation."""
+        monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-FIXED")
+        assert _chained_staging_identity(wired, staging_code_identity="") == "infcode-FIXED"
+
+    @pytest.mark.parametrize(
+        ("kwargs", "needle"),
+        [
+            ({"force_staging_reuse": True}, "force_staging_reuse"),
+            ({"force_staging_restage": "torch-2.9"}, "force_staging_restage"),
+        ],
+    )
+    def test_it_is_refused_alongside_a_derived_hatch(self, wired, kwargs, needle) -> None:
+        """Three levers each CLAIMING the identity is a contradiction, not a combination.
+
+        Refused rather than ordered by precedence: silently preferring one lands the run on a
+        prefix nobody chose, and the two directions of that mistake cost a campaign's
+        re-inference and a mixed-code zone-year respectively.
+        """
+        with pytest.raises(ValueError, match="Pass exactly one") as excinfo:
+            _chained_staging_identity(wired, staging_code_identity="infcode-EARLIER", **kwargs)
+        # The message has to NAME the lever that conflicts: an operator restarting a campaign
+        # passed three staging arguments and needs to know which one to drop.
+        assert needle in str(excinfo.value)
+
+
 def test_force_staging_restage_forces_a_fresh_prefix(wired) -> None:
     """The escape hatch for a change the source hash cannot see — a torch upgrade."""
     base = _fill_run_id(wired)
