@@ -1076,9 +1076,15 @@ _PROVIDER_REFUSAL_MARKERS = (
 #: outage classified ``undecidable`` and the refusal both lines state was never seen.
 #:
 #: The gap is BOUNDED rather than open, so a long single line cannot bind the phrase to some
-#: unrelated number far away from it, and ``.`` not matching a newline keeps a match inside one
-#: statement.
-_HTTP_STATUS_RE = re.compile(r"HTTP (?:response|error) code.{0,400}?:\s*(\d{3})\b")
+#: unrelated number far away from it, and the match is kept inside one line.
+#:
+#: **The separator must be a colon followed by a SPACE, and that is what keeps a URL port out.**
+#: GDAL formats the pair as ``%s: %d``; an authority writes ``host:443`` with no space. Without
+#: that, the shortest match in ``... on https://host:443/object.tif: 403`` is the PORT — read as
+#: a 4xx that is neither absence nor a reason to wait, so the real refusal is dropped and the
+#: codec failure keeps its unreadable verdict and costs its date. A ``:503`` port went the other
+#: way and invented a refusal. The trailing guard rejects a longer port such as ``:8443``.
+_HTTP_STATUS_RE = re.compile(r"HTTP (?:response|error) code[^\n]{0,400}?:[ \t]+(\d{3})(?![\d/])")
 
 #: 4xx statuses that mean WAIT rather than stop.
 #:

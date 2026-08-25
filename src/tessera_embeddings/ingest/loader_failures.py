@@ -252,30 +252,59 @@ def drain_local() -> list[str]:
     return _drain(_aborted)
 
 
-def drain_local_refusals(max_age_s: float | None = None) -> list[str]:
-    """Take and clear this process's recorded refusal lines, returning the ones still current.
+def clear_local_refusals() -> None:
+    """Empty this process's refusal buffer outright.
 
-    A separate buffer from the hrefs, drained by a different caller for a different purpose.
-    One buffer would mean the caller that classifies destroys the evidence the caller that
-    attributes needs, and the optical copy ladder would silently stop attributing.
-
-    ``max_age_s`` is how long the read now being judged has been running. A line older than that
-    was logged BEFORE this read began and cannot describe it — which is the case a failure alone
-    never reaches, because the buffer is drained only when something fails. A read that logs a
-    refusal and then SUCCEEDS on a later attempt, exactly what the read retry exists to allow,
-    leaves its line behind for the next failure to inherit; on the optical path that reads a
-    genuinely corrupt object as a refusal and the copy ladder never steps down.
-
-    Everything is cleared either way, current or not: a line too old to describe this read is too
-    old to describe any later one. Passing ``None`` keeps every line, which is what a caller with
-    no read to date it against gets.
+    For a caller that needs a known-empty starting point — a test between cases, not the read
+    path. Nothing on the read path clears: see :func:`read_local_refusals` for why taking a line
+    away from a read still in flight costs a date.
     """
     with _lock:
-        found = list(_refused)
         _refused.clear()
+
+
+#: How long a recorded refusal is kept. It has to outlast the longest single read — the read
+#: ladder is :data:`~tessera_embeddings.ingest.roi_processing.SOURCE_READ_ATTEMPTS` attempts and
+#: the radar write may then wait out :data:`~tessera_embeddings.storage.zarr_store.WAIT_OUT_BACKOFF_S`
+#: on top — while being far shorter than a leg, so a buffer cannot accumulate a whole day. The
+#: ``maxlen`` on the buffer bounds it a second way, by count.
+_REFUSAL_RETENTION_S = 3600.0
+
+
+def read_local_refusals(max_age_s: float | None = None) -> list[str]:
+    """This process's recorded refusal lines, WITHOUT consuming them.
+
+    Reading rather than draining, and that is the whole safety property. Two reads are in flight
+    at once whenever the optical path pipelines a date: the look-ahead prepares date N+1, whose
+    coverage gate reads, while date N's write is still reading. Both enter their own
+    ``read_failure_context``, and a destructive collection let whichever failed FIRST take the
+    other's evidence — the second failure then saw only the codec's complaint, classified as
+    unreadable data, and gave its date up. Reading leaves the line for the other to find.
+
+    ``max_age_s`` is how long the read now being judged has been running, so a line logged before
+    it began is not returned. That is what a destructive collection used to provide and what makes
+    a non-destructive one safe: a read that logs a refusal and then SUCCEEDS on a later attempt —
+    exactly what the read retry exists to allow — would otherwise leave its line to be inherited
+    forever, and on the optical path a genuinely corrupt object would read as a refusal and the
+    copy ladder would never step down.
+
+    Passing ``None`` returns everything still retained, which is what a caller with no read to
+    date its evidence against gets.
+
+    A separate buffer from the hrefs, and read by a different caller for a different purpose. One
+    buffer would mean the caller that classifies destroys the evidence the caller that attributes
+    needs, and the optical copy ladder would silently stop attributing.
+    """
+    now = time.monotonic()
+    with _lock:
+        # Eviction is the only thing that removes a line, and it happens on the way past rather
+        # than on a timer: nothing in flight can be evicted, because the horizon is longer than
+        # any read that could still be judging it.
+        while _refused and now - _refused[0][0] > _REFUSAL_RETENTION_S:
+            _refused.popleft()
+        found = list(_refused)
     if max_age_s is None:
         return [message for _at, message in found]
-    now = time.monotonic()
     return [message for at, message in found if now - at <= max_age_s]
 
 
@@ -444,8 +473,11 @@ def collect_logged_refusals(client: dask.distributed.Client | None, max_age_s: f
 
     The age is a DURATION rather than an instant, so each worker answers against its own clock
     and nothing here depends on the fleet's clocks agreeing.
+
+    Non-consuming: see :func:`read_local_refusals`. A second read in flight must still be able to
+    find the evidence for its own failure.
     """
-    return _collect(client, lambda: drain_local_refusals(max_age_s), "logged refusals")
+    return _collect(client, lambda: read_local_refusals(max_age_s), "logged refusals")
 
 
 #: How the attached evidence introduces itself in a log and on an exception. A reader has to be

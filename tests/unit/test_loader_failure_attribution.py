@@ -50,16 +50,17 @@ from tessera_embeddings.ingest.loader_failures import (
     AbortedReadCapture,
     ReadRescuesNotInstalledError,
     carry_logged_refusal,
+    clear_local_refusals,
     collect_aborted_hrefs,
     collect_logged_refusals,
     drain_local,
-    drain_local_refusals,
     href_key,
     implicated_tile_dates,
     install_capture,
     install_capture_everywhere,
     keep_causes_picklable,
     label_objects,
+    read_local_refusals,
     refusal_wait_out,
 )
 
@@ -229,13 +230,13 @@ def capture_installed() -> Iterator[None]:
     previous = gdal.level
     gdal.setLevel(logging.WARNING)
     drain_local()
-    drain_local_refusals()
+    clear_local_refusals()
     try:
         yield
     finally:
         gdal.setLevel(previous)
         drain_local()
-        drain_local_refusals()
+        clear_local_refusals()
 
 
 def _gdal_logs(message: str) -> None:
@@ -251,7 +252,7 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
     def test_a_logged_refusal_is_recorded(self, line: str) -> None:
         """Both wordings the incident produced, on text taken from the incident's own logs."""
         _gdal_logs(line)
-        assert drain_local_refusals() == [line]
+        assert read_local_refusals() == [line]
 
     @pytest.mark.parametrize("line", BENIGN_GDAL_LINES, ids=["sidecar-404", "the-codec-itself", "a-tiff-quirk"])
     def test_only_a_refusal_is_recorded(self, line: str) -> None:
@@ -263,7 +264,7 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         for, and both would let this capture make a verdict worse.
         """
         _gdal_logs(line)
-        assert drain_local_refusals() == []
+        assert read_local_refusals() == []
 
     def test_the_two_buffers_do_not_drain_each_other(self) -> None:
         """The optical copy ladder attributes from the href buffer, and classification drains
@@ -273,7 +274,7 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         logging.getLogger("odc.loader._rio").error(ABORT_MESSAGE)
         _gdal_logs(LOGGED_REFUSAL)
 
-        assert len(drain_local_refusals()) == 1
+        assert len(read_local_refusals()) == 1
         assert len(drain_local()) == 1, "draining the refusals took the href with it"
 
     def test_installing_twice_does_not_double_the_record(self) -> None:
@@ -281,9 +282,9 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         refusals — it is one, quoted twice, on an exception a human has to read.
         """
         install_capture()
-        drain_local_refusals()
+        clear_local_refusals()
         _gdal_logs(LOGGED_REFUSAL)
-        assert len(drain_local_refusals()) == 1
+        assert len(read_local_refusals()) == 1
 
     def test_collection_without_a_cluster_returns_the_local_record(self) -> None:
         """A serial run has no client, and its verdicts must be reached the same way."""
@@ -305,9 +306,9 @@ def test_the_capture_hears_gdal_at_the_level_rasterio_really_uses() -> None:
     install_capture()
     gdal = logging.getLogger("rasterio._env")
     assert gdal.level == logging.NOTSET, "this asserts the DEFAULT, so the logger must be unset"
-    drain_local_refusals()
+    clear_local_refusals()
     gdal.warning("%s", LOGGED_REFUSAL)
-    assert drain_local_refusals() == [LOGGED_REFUSAL]
+    assert read_local_refusals() == [LOGGED_REFUSAL]
 
 
 def _decode_failure_over_a_refused_object() -> WarpOperationError:
@@ -357,17 +358,37 @@ class TestTheReasonGdalDidNotRaise:
     def test_the_evidence_travels_with_the_exception(self) -> None:
         """Attaching rather than answering is what makes the verdict stable.
 
-        Collection is destructive, so a caller that classified and threw the evidence away would
-        hand the next reader of the same exception the opposite answer — and there are two
-        readers on the radar path alone: the retry policy that spends patience, and the handler
-        that decides whether a date is lost.
+        Two readers ask about the same failure on the radar path alone — the retry policy that
+        spends patience, and the handler that decides whether a date is lost — and a caller that
+        classified and discarded would hand the second the opposite answer.
         """
         _gdal_logs(LOGGED_REFUSAL)
         failure = _decode_failure_over_a_refused_object()
         carry_logged_refusal(failure, None)
 
-        assert collect_logged_refusals(None) == [], "the collection must have been destructive"
         assert is_provider_refusal(failure) is True
+
+    def test_collecting_does_not_take_the_line_from_another_read_in_flight(self) -> None:
+        """Two reads overlap whenever the optical path pipelines, and both must find the evidence.
+
+        The look-ahead prepares date N+1, whose coverage gate reads, while date N's write is still
+        reading. Both enter their own context. When collection was destructive, whichever failed
+        FIRST took the line: the second failure saw only the codec's complaint, classified as
+        unreadable data, and gave its date up.
+
+        This test asserted the opposite — that the collection ``must have been destructive`` —
+        which is how the defect survived as the contract.
+        """
+        _gdal_logs(LOGGED_REFUSAL)
+
+        first = _decode_failure_over_a_refused_object()
+        carry_logged_refusal(first, None)
+        second = _decode_failure_over_a_refused_object()
+        carry_logged_refusal(second, None)
+
+        assert is_provider_refusal(first) is True
+        assert is_provider_refusal(second) is True, "the second read was left with no evidence"
+        assert is_unreadable_source(second) is False, "so its date would have been given up"
 
     def test_the_same_line_is_not_quoted_twice(self) -> None:
         """The policy asks per attempt and GDAL repeats itself on each of them, so one refused

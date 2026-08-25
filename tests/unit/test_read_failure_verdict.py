@@ -284,6 +284,41 @@ def test_the_wider_status_match_does_not_widen_what_a_status_means(text: str, ve
     assert classify_read_failure_in(text) is verdict
 
 
+@pytest.mark.parametrize(
+    ("text", "verdict", "why"),
+    [
+        (
+            "CPLE_AppDefined in HTTP response code on https://host:443/object.tif: 403",
+            ReadFailure.PROVIDER_REFUSED,
+            "the port must not be read as the status, or the refusal is dropped and the date lost",
+        ),
+        (
+            "CPLE_AppDefined in HTTP error code: 503 - https://host:443/object.tif. Retrying",
+            ReadFailure.PROVIDER_REFUSED,
+            "and the same in the wording that puts the status first",
+        ),
+        (
+            "CPLE_OpenFailed in HTTP response code on https://host:503/object.tif: 404 NoSuchKey",
+            ReadFailure.ABSENT,
+            "a :503 port must not invent a refusal over a real absence",
+        ),
+        (
+            "CPLE_AppDefined in HTTP response code on https://host:8443/object.tif: 403",
+            ReadFailure.PROVIDER_REFUSED,
+            "a four-digit port is not three digits",
+        ),
+    ],
+)
+def test_a_url_port_is_not_mistaken_for_a_status(text: str, verdict: ReadFailure, why: str) -> None:
+    """GDAL writes ``%s: %d``; an authority writes ``host:443``. The space is the discriminator.
+
+    Both directions cost something. Reading the port as the status drops the real refusal, and the
+    codec failure keeps its unreadable verdict — which gives the date up. A ``:503`` port going the
+    other way invents a refusal over an absence.
+    """
+    assert classify_read_failure_in(text) is verdict, why
+
+
 def test_a_status_is_not_bound_to_a_phrase_far_away_from_it() -> None:
     """The gap between the phrase and the status is bounded, so one line cannot bind across it.
 

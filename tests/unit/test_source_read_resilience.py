@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreadable_source
-from tessera_embeddings.ingest.loader_failures import drain_local_refusals, install_capture
+from tessera_embeddings.ingest.loader_failures import clear_local_refusals, install_capture
 from tessera_embeddings.ingest.roi_processing import (
     SOURCE_READ_ATTEMPTS,
     read_failure_context,
@@ -146,10 +146,10 @@ class TestTheContextCompletesTheReason:
         gdal = logging.getLogger("rasterio._env")
         previous = gdal.level
         gdal.setLevel(logging.WARNING)
-        drain_local_refusals()
+        clear_local_refusals()
         yield
         gdal.setLevel(previous)
-        drain_local_refusals()
+        clear_local_refusals()
 
     def _raise_through_the_context(
         self, log: logging.Logger, while_reading: Callable[[], None] | None = None

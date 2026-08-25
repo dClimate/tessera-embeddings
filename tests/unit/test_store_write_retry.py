@@ -34,7 +34,11 @@ import pytest
 from tessera_embeddings.errors import DuplicateDateError, InconclusiveStoreProbeError
 from tessera_embeddings.ingest import s1_roi, s2_roi
 from tessera_embeddings.ingest.duplicates import is_provider_refusal
-from tessera_embeddings.ingest.loader_failures import drain_local_refusals, install_capture, refusal_wait_out
+from tessera_embeddings.ingest.loader_failures import (
+    clear_local_refusals,
+    install_capture,
+    refusal_wait_out,
+)
 from tessera_embeddings.storage import zarr_store
 from tessera_embeddings.storage.zarr_store import (
     CONCURRENT_WRITER_ERRORS,
@@ -269,10 +273,10 @@ class TestArmingThePatienceOnEvidenceTheChainDoesNotCarry:
         gdal = logging.getLogger("rasterio._env")
         previous = gdal.level
         gdal.setLevel(logging.WARNING)
-        drain_local_refusals()
+        clear_local_refusals()
         yield
         gdal.setLevel(previous)
-        drain_local_refusals()
+        clear_local_refusals()
 
     @staticmethod
     def _decode_failure() -> BaseException:
