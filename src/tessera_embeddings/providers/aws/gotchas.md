@@ -297,6 +297,97 @@ the scheduler stream. Do not "fix" those numbers.
 
 ---
 
+## Launch throttling — the account quota nobody owns
+
+Every cluster's autoscaler launches EC2 instances by calling `RunInstances`, and the
+account meters that call with a **request bucket**: a small burst capacity refilled at
+a fixed rate. Both numbers are Service Quotas, both are marked non-adjustable, and the
+bucket is shared by every caller in the account. Concurrent clusters therefore contend
+for one allowance that cannot be raised, and the way they contend is unhelpful — the
+refusals are retried, and the retries drain the bucket again.
+
+**None of that loop is ours.** Read it before proposing a place to put backoff:
+
+| Where | What it does |
+|---|---|
+| `ray.autoscaler._private.autoscaler` | Splits a fleet request into `AUTOSCALER_MAX_LAUNCH_BATCH` chunks, drained by `ceil(AUTOSCALER_MAX_CONCURRENT_LAUNCHES / AUTOSCALER_MAX_LAUNCH_BATCH)` launcher threads |
+| `ray.autoscaler._private.aws.node_provider` | Calls `create_instances` on a client built with **zero** botocore retries, and wraps it in its OWN loop that rotates to the next subnet on any `ClientError`, with no delay between attempts |
+| `botocore` | Under the default retry mode, sends whenever asked |
+
+So the retry is Ray's, in a loop with no sleep, and the launch client refuses botocore's
+retries outright. Two consequences worth knowing:
+
+* An attempt refused for throttling **spends a subnet rotation**, because the loop
+  rotates on any error. Throttling therefore eats into the multi-AZ capacity failover
+  described above — a fleet can exhaust its subnet list on refusals without ever
+  having asked the later zones for capacity.
+* `AWS_MAX_ATTEMPTS` cannot reach that client. An explicitly configured attempt count
+  wins over the environment, and Ray configures one.
+
+### What we can reach: the pacing environment
+
+Ray sets the attempt count but **not** the retry MODE, and the mode is still resolved
+from the environment. That is the one seam into the launch path. `ray_cluster(
+launch_pacing=True)` assigns the pacing on the head's `ray start` command, and the
+autoscaler — a child of that process — inherits it.
+
+**It is split in two, by audience, and the split is load-bearing:**
+
+| Constant | Who gets it | Why |
+|---|---|---|
+| `LAUNCH_PACING_CLIENT_ENV` | any process that launches instances, `ray up` included | Only spaces attempts out; never removes one |
+| `LAUNCH_PACING_AUTOSCALER_ENV` | the head-resident autoscaler only | Changes how many attempts a launch gets |
+
+The distinction is whether a failed launch will be made again. A worker request is
+reissued on the autoscaler's next cycle, so trading attempts for a gentler burst is a
+fair trade. **The head-node launch happens once**: `ray up` runs the node provider in
+the flow-runner process, nothing retries a head that failed to start, and losing it
+fails the whole fill. Giving the bootstrap the autoscaler's reduced attempt budget once
+cut it from five passes over the subnets to one — worst exactly when several clusters
+start together, which is the scenario the option exists for. So `_start_ray_cluster`
+passes the client half alone.
+
+The settings themselves:
+
+* `AWS_RETRY_MODE=adaptive` puts a client-side rate limiter in front of every send,
+  narrowing when EC2 answers with a throttle and widening on success. **botocore floors
+  that limiter's fill rate**, which is the property that makes it safe to hand a fleet's
+  growth to: a paced client never stops asking. That floor is per client, and every
+  cluster runs its own, so the aggregate floor scales with the cluster count.
+* `AUTOSCALER_MAX_LAUNCH_BATCH` raised buys more instances per call. The quota meters
+  CALLS, not instances, and `MinCount` stays 1, so a call the region can only partly
+  fill returns what it can rather than failing. It also narrows the burst, since the
+  launcher-thread count is derived from it.
+* `BOTO_CREATE_MAX_RETRIES` below the subnet count leaves exactly one pass over the
+  zones: capacity failover intact, surplus no-delay attempts gone.
+
+The assignments must ride on the `ray start` command itself. Ray runs each entry of
+`head_start_ray_commands` as its own shell command over SSH, so an `export` on its own
+line reaches nothing. Worker commands are deliberately untouched — a worker runs no
+autoscaler.
+
+Default off. Enabling it changes how a live fleet grows, so it is a decision, not a
+release. One cluster alone contends with nothing and gains only a smaller call count;
+the setting is for when several clusters grow at once.
+
+### The larger half is upstream, in the scheduler
+
+Pacing makes each launch request cheaper. What makes there be fewer of them is
+`inference/scheduling.py::ACTOR_REQUEST_HEADROOM`: with it set, a run may never request
+more actors than the actor SLOTS it actually holds plus that constant — slots, not
+nodes, since the two are equal only at one actor per node and a node count stalls the
+fleet permanently anywhere else. Without it, a run
+whose placements are timing out requests another full batch on each expiry and climbs
+to its target against a handful of placed instances — and every request that never
+places is retried by the autoscaler, against this same bucket, for as long as the fill
+lives. Bounding the request is what stops the bursts being generated; pacing is what
+makes the survivors cost less.
+
+---
+
+
+---
+
 ## Connection modes
 
 `ray_cluster` supports two modes:

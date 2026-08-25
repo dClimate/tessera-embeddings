@@ -40,6 +40,7 @@ from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
     dispatch_cell_validation,
     validation_run_tag,
 )
+from tessera_embeddings.orchestration.prefect.flows._overrides import set_overrides
 from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     activate,
     deactivate,
@@ -182,6 +183,9 @@ def fill_zone_year_flow(
     allow_s2_only: bool = False,
     mosaic_base: str | None = None,
     s3_concurrency: int | None = None,
+    launch_pacing: bool = False,
+    actor_request_headroom: int | None = None,
+    actor_request_batch_size: int | None = None,
     run_id: str | None = None,
     fault_injection: FaultInjection | None = None,
     validation_deployment: str | None = None,
@@ -251,6 +255,23 @@ def fill_zone_year_flow(
         s3_concurrency: This fill's slice of the fleet S3-PUT budget for the shard
             write (``None`` = the full target, for a lone fill). The campaign passes
             ``target // max_parallel_zones`` so K concurrent fills stay near target.
+        launch_pacing: Pace this cluster's EC2 launch requests against the account's
+            shared RunInstances quota. Same shape as ``s3_concurrency``: a budget that
+            concurrent fills share, except this one is a request RATE and the
+            enforcement lives in the client rather than in a count we divide. Default
+            ``False`` keeps today's launch behaviour; the campaign turns it on when it
+            runs more than one cluster.
+        actor_request_headroom: Hold the actor request to the actor slots this fill has
+            actually placed plus this many, rather than letting it climb toward
+            ``num_actors`` on a region that is not placing them
+            (:func:`tessera_embeddings.inference.scheduling._batch_actors_to_request`).
+            ``None`` keeps today's behaviour;
+            :data:`~tessera_embeddings.inference.scheduling.ACTOR_REQUEST_HEADROOM` is
+            the value to pass.
+        actor_request_batch_size: Actors per batch, overriding the inference default.
+            The quota that batches contend for is a rate over CALLS, so this is the
+            cheapest available relief: a smaller batch is fewer simultaneous launch
+            requests per cluster. ``None`` keeps the default.
         run_id: Reuse a prior run's id to resume it (staged tiles are skipped).
         fault_injection: A supervised failure drill's request to inject one deliberate
             fault into THIS run. Absent by default, and this flow hosts only the
@@ -385,6 +406,10 @@ def fill_zone_year_flow(
         # default from silently unaligning the campaign.
         chunk_size=SHARD_PX,
         allow_s2_only=allow_s2_only,
+        actor_request_headroom=actor_request_headroom,
+        # Omitted when unset so the inference default stands — and keyed on None, not on
+        # truthiness, because 0 is a documented mode here rather than an absent value.
+        **set_overrides(actor_request_batch_size=actor_request_batch_size),
     )
 
     # None when this cell short-circuits before the preflight (an already-complete retag),
@@ -530,6 +555,7 @@ def fill_zone_year_flow(
             code_bucket=code_bucket,
             code_suffix=code_suffix,
             cluster_name=cluster_name_for_flow_run(flow_run_ctx.id),
+            launch_pacing=launch_pacing,
         ) as resolved_yaml:
             activate(resolved_yaml)
             summary = fill_zone_year(**fill_kwargs)

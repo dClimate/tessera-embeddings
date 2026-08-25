@@ -141,6 +141,13 @@ worker_setup_commands: []
 
 # Ray start commands activate the pre-installed venv at /opt/tessera/venv.
 # Adjust the venv path if your AMI puts it elsewhere.
+#
+# INJECT: launch-pacing environment — when the caller asks for it, the provider
+# assigns LAUNCH_PACING_ENV on the head's `ray start` invocation below, so the
+# autoscaler it spawns paces its EC2 launch requests against the account's shared
+# RunInstances quota. Head only: a worker runs no autoscaler. The assignments must
+# ride on the `ray start` command itself — Ray runs each entry as its own shell
+# command over SSH, so an `export` on its own line reaches nothing.
 head_start_ray_commands:
     - ray stop
     - ulimit -n 65536 && PYTHONPATH=$HOME/tessera-embeddings ray start --head --port=6379 --object-manager-port=8076 --autoscaling-config=~/ray_bootstrap_config.yaml --dashboard-host=0.0.0.0

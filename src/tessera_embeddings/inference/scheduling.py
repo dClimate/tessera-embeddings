@@ -603,6 +603,35 @@ def _joined_gpu_count(last_known: float, gpus_per_actor: float) -> float:
         return last_known
 
 
+def _placed_actor_slots(joined_gpus: float, gpus_per_actor: float) -> int:
+    """Actor slots the cluster's joined GPUs can hold — the unit an actor request is in.
+
+    A node count is NOT this quantity, and using one stalls the fleet permanently
+    wherever a node holds more than one actor. Reserve half a GPU each and 25 actors sit
+    on 13 nodes, so a rule comparing a request to a node count converges to a fixed point
+    far below the target and then asks for nothing, for ever. Slots and nodes coincide
+    only at exactly one actor per node, which is the production shape and is why the
+    error is invisible there.
+
+    Reads GPUs rather than counting nodes because a GPU is what an actor reserves;
+    :func:`_joined_gpu_count` is the reading, and it is a FLOOR (an instance is billed
+    from launch but counted only once bootstrap joins it). A floor is the safe direction
+    here: it under-states how much room there is to grow, so the bound errs toward asking
+    for less rather than more.
+
+    Args:
+        joined_gpus: GPUs joined to the cluster, from :func:`_joined_gpu_count`.
+        gpus_per_actor: GPUs each actor reserves. Zero means this run is not on GPUs,
+            for which the request bound is refused at config time rather than guessed at.
+
+    Returns:
+        Whole slots. Fractional room is rounded down, keeping the floor a floor.
+    """
+    if not gpus_per_actor:
+        return 0
+    return int(joined_gpus / gpus_per_actor)
+
+
 def _poll_tracker(
     tracker: ray.actor.ActorHandle,
     n_done: int,
@@ -718,18 +747,36 @@ def _poll_tracker(
         return []
 
 
+ACTOR_REQUEST_HEADROOM = 25
+"""How far an actor request may run ahead of the GPU nodes the fleet actually holds.
+
+The recommended value for ``InferenceConfig.actor_request_headroom``, and the number
+the whole rule turns on: a run asks for what it has plus this, never for its target.
+
+What it trades. Larger ramps a fleet to full width in fewer steps when capacity is
+free, and wastes more requests on a region that cannot fill them — every request that
+never places is retried by the autoscaler against the account's launch quota, so the
+surplus is paid in throttling that the run itself then has to wait out. Smaller is
+gentler on that quota and slower to reach width when capacity is plentiful. It is a
+constant rather than a function of the target because the quota it protects is a
+property of the ACCOUNT: a fleet of 250 and a fleet of 20 draw on the same bucket, and
+sizing the allowance to the ask is what let the larger one drown the smaller.
+"""
+
+
 def _batch_actors_to_request(
     *,
     requested: int,
     target: int,
     outstanding: int,
-    alive_gpu_nodes: int,
+    placed_actor_slots: int,
     nodes_at_last_batch: int,
     last_batch_size: int,
     secs_since_last_batch: float,
     placement_timeout_sec: float,
     batch_size: int,
     placement_tolerance: int = 2,
+    headroom: int | None = None,
 ) -> tuple[int, bool]:
     """Decide how many actors to request for the next batch.
 
@@ -745,13 +792,61 @@ def _batch_actors_to_request(
     subsequent batch places, its increment satisfies the check even though the
     earlier shortfall is never made up.
 
+    **``headroom`` replaces all of that with one rule.** The gate above has an
+    escape hatch — a placement timeout, so a shortfall cannot gate every later
+    batch forever — and the hatch is what fails under a real shortage: nothing
+    places, every interval expires, and the request climbs to the target on no
+    evidence at all. Each request that never places is then retried by the
+    autoscaler against an account-wide launch quota, so the run manufactures the
+    throttling that keeps it from growing.
+
+    With ``headroom`` set, the request may never exceed the number of GPU nodes
+    the fleet actually holds plus that constant. Not a climb toward the target in
+    batches, but a small fixed distance ahead of reality, and it needs no gate at
+    all: each placement earns the right to ask for a little more, so growth is
+    automatic when capacity exists and simply stops when it does not. Neither
+    ``placement_timeout_sec`` nor the placement gate is consulted on this path —
+    there is nothing left for them to release. They remain only because the
+    unbounded path is still the default; retiring that path retires them, along
+    with ``nodes_at_last_batch``, ``last_batch_size``, ``secs_since_last_batch``
+    and ``placement_tolerance``.
+
+    Three properties this rests on:
+
+    * **Placed slots, not ready actors and not nodes.** ``placed_actor_slots``
+      counts the actor slots the cluster's joined GPUs can hold, whether or not
+      the actors on them have finished loading their checkpoint. Readiness is the
+      wrong measure because the bound is about hardware the run already holds and
+      pays for, and a slow model load would read as a capacity shortage. A NODE
+      count is wrong for a different and worse reason: it is only equal to slots at
+      exactly one actor per node, and anywhere else the recurrence reaches a fixed
+      point below the target and stops asking permanently. See
+      :func:`_placed_actor_slots`, and note that a run reserving no GPU cannot
+      express this bound at all — ``InferenceConfig`` refuses that combination
+      rather than letting it stall here.
+    * **The cold start.** At zero slots the bound still permits ``headroom``
+      requests, which is what lets a run begin at all: the allowance is a distance
+      ahead of the fleet, and at the start that distance is the whole request.
+    * **A second ceiling, not a replacement for the first.** ``outstanding`` caps
+      the request by remaining WORK and this caps it by placement; the smaller
+      wins. A short tail is therefore still safe from over-provisioning — an
+      almost-idle region cannot let the run request actors for chunks that are
+      already spoken for.
+
+    The failure to fear is a fleet that stops asking, and this rule cannot cause
+    one PROVIDED the two sides are in the same unit: a request is refused only
+    while the fleet is already a full headroom ahead of its placed slots, and every
+    slot that joins re-opens exactly that much room. Comparing a request against a
+    NODE count breaks that guarantee outright — see :func:`_placed_actor_slots`.
+
     Args:
         requested: Actors requested so far (``len(pool.actors)``).
         target: Total actors the run should eventually reach.
         outstanding: In-flight + queued chunks. Caps requests so we don't
             provision more actors than there is work left.
-        alive_gpu_nodes: GPU nodes currently joined to the cluster.
-        nodes_at_last_batch: GPU nodes that were joined when the last batch was
+        placed_actor_slots: Actor slots the cluster's joined GPUs can currently
+            hold (:func:`_placed_actor_slots`).
+        nodes_at_last_batch: Slots that were placed when the last batch was
             requested. The baseline for the incremental placement check.
         last_batch_size: Number of actors in the last batch requested. The
             increment expected to join before the prior batch counts as placed.
@@ -760,11 +855,16 @@ def _batch_actors_to_request(
         batch_size: Actors per batch.
         placement_tolerance: Stragglers tolerated before the prior batch counts
             as placed, so one slow instance doesn't gate the next request.
+        headroom: How far the request may run ahead of the fleet's placed GPU
+            nodes. ``None`` is the historical arithmetic — a placement gate with
+            a timeout escape hatch, and no limit on how far the request runs
+            ahead. :data:`ACTOR_REQUEST_HEADROOM` is the value to pass.
 
     Returns:
         ``(n, timed_out)`` — number of actors to request (0 = none) and whether
         the placement timeout (rather than placement itself) allowed it. The
         flag is only meaningful when ``n > 0``; the caller uses it for logging.
+        Always ``False`` under ``headroom``, which consults no timeout.
     """
     if requested >= target:
         return 0, False
@@ -772,7 +872,13 @@ def _batch_actors_to_request(
     # as there is work left, no further batches are needed.
     if requested >= outstanding:
         return 0, False
-    placed = alive_gpu_nodes - nodes_at_last_batch >= last_batch_size - placement_tolerance
+    if headroom is not None:
+        # Both ceilings, plus the batch step. The placement ceiling is what makes
+        # a drought stop the fleet growing rather than run the request away from
+        # it; `outstanding` is what keeps a short tail from over-provisioning.
+        allowed = placed_actor_slots + headroom - requested
+        return max(0, min(batch_size, target - requested, outstanding - requested, allowed)), False
+    placed = placed_actor_slots - nodes_at_last_batch >= last_batch_size - placement_tolerance
     timed_out = secs_since_last_batch > placement_timeout_sec
     if not (placed or timed_out):
         return 0, False
@@ -931,49 +1037,55 @@ def _process_chunks_work_stealing(
     # --- Actor-batch requesting ---
     # When batching is enabled the caller supplies only the first batch of
     # actors; the loop requests the rest here, pacing the demand the autoscaler
-    # forwards to AWS. The gate is placement (instances joined as GPU nodes),
+    # forwards to AWS. The gate is placement (slots the joined GPUs can hold),
     # not readiness, so a slow checkpoint load never stalls the next AWS ask.
     batching_enabled = (
         actor_factory is not None and total_actors_target is not None and config.actor_request_batch_size > 0
     )
     last_batch_at = time.monotonic()
     # Placement baseline for the incremental check in _batch_actors_to_request:
-    # the GPU-node count and size of the most recently requested batch. The
+    # the placed-slot count and size of the most recently requested batch. The
     # first batch was already requested by the caller, so seed last_batch_size
     # from the pool we were handed; nodes_at_last_batch starts at 0 because no
-    # GPU nodes are guaranteed present before the first batch is placed.
+    # slot is guaranteed placed before the first batch is.
     nodes_at_last_batch = 0
     last_batch_size = len(pool.actors)
+    # Carried across calls because the reading can fail, and a failed reading must
+    # report the previous count rather than zero — zero would read as a fleet that
+    # has placed nothing and would refuse to grow.
+    last_joined_gpus = 0.0
 
     def _maybe_request_next_batch() -> None:
-        nonlocal last_batch_at, nodes_at_last_batch, last_batch_size
+        nonlocal last_batch_at, nodes_at_last_batch, last_batch_size, last_joined_gpus
         if not batching_enabled:
             return
         assert actor_factory is not None and total_actors_target is not None  # narrowed by batching_enabled
-        alive_gpu_nodes = sum(1 for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0) > 0)
+        last_joined_gpus = _joined_gpu_count(last_joined_gpus, config.num_gpus)
+        placed_actor_slots = _placed_actor_slots(last_joined_gpus, config.num_gpus)
         n, timed_out = _batch_actors_to_request(
             requested=len(pool.actors),
             target=total_actors_target,
             outstanding=pool.outstanding_work(len(chunk_queue)),
-            alive_gpu_nodes=alive_gpu_nodes,
+            placed_actor_slots=placed_actor_slots,
             nodes_at_last_batch=nodes_at_last_batch,
             last_batch_size=last_batch_size,
             secs_since_last_batch=time.monotonic() - last_batch_at,
             placement_timeout_sec=placement_timeout_sec,
             batch_size=config.actor_request_batch_size,
+            headroom=config.actor_request_headroom,
         )
         if n == 0:
             return
         pool.add_actors(actor_factory(n))
         last_batch_at = time.monotonic()
-        nodes_at_last_batch = alive_gpu_nodes
+        nodes_at_last_batch = placed_actor_slots
         last_batch_size = n
         log.info(
-            "Requested actor batch: +%d (%d/%d total, %d GPU nodes placed)%s",
+            "Requested actor batch: +%d (%d/%d total, %d actor slots placed)%s",
             n,
             len(pool.actors),
             total_actors_target,
-            alive_gpu_nodes,
+            placed_actor_slots,
             " — placement timed out, requesting anyway" if timed_out else "",
         )
 
