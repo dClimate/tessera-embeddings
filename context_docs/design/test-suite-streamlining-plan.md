@@ -272,6 +272,49 @@ module, and the parity suite is green after the move (6 passed, 2 skipped, 121 s
 an available lever, and the review's own first pass overstated it by measuring names instead
 of bodies.
 
+### Phase 4 — the source-text assertion pass
+
+45 functions across `tests/` read source with `read_text`, `ast.parse` or `inspect.getsource`.
+Read one at a time against what each is really protecting, they sort into four groups.
+
+**Not source assertions at all — the §7.2 count was wrong.** The six
+`test_provider_aws_ray.py` hits read the YAML that `_resolve_ray_config` **writes**. That is
+its output, so those are ordinary behavioural tests and nothing needs doing. The same is true
+of `test_context_docs_index.py` (reads a Markdown index), `test_public_api.py`'s doc check,
+and the code-identity tests, whose whole subject is hashing source — reading it is the point.
+
+**One was superseded by a linter, and is deleted.**
+`test_source_read_resilience.py::test_placeholders_match_arguments` walked the AST of
+`ingest/s1_roi.py` counting `%`-placeholders against arguments. Ruff's `PLE1205` and `PLE1206`
+make exactly that check across every file in the repo. Both rules are now enabled in
+`ruff.toml`, verified to fire nothing on `src/`, `tests/` and `scripts/` as they stand, and
+verified **equivalent by mutation**: a too-many mutant and a too-few mutant in `s1_roi.py`
+each fail the lint exactly as they used to fail the test. Net effect is wider coverage, one
+module to all of them, for 18 fewer lines of test.
+
+**The rest are project-specific invariants with no linter equivalent, and they stay put.**
+Things like "no Prefect import outside the orchestration subtree", "every caller of
+`apply_roi_mask` supplies the mask", "no ingest module builds its own retry policy". Each
+encodes a real past incident, and each already runs on every PR in `unit.yml`. Moving them to
+`tests/architecture/` would relocate the same hand-rolled AST walks into a folder whose job
+runs on the same trigger — churn with no gain, and a real chance of losing context in the
+move. The one thing that would genuinely improve them is expressing them as rules in
+`src/tessera_embeddings/architecture_tests/`, which is production code and out of scope here.
+
+**The pass turned up a real asymmetry — flagged, not fixed.** Two of these rules read only
+`ingest/s1_roi.py`, the radar path, though nothing about them is radar-specific:
+
+- `test_placeholders_match_arguments` — now moot, since the linter covers both sensors.
+- `test_every_informational_line_carries_the_roi` — "a line without `roi=` cannot be tied to
+  a cell: the log stream is a task id". **`ingest/s2_roi.py` has 12 informational lines and
+  6 of them carry no ROI**, including `"Writing %d live window(s)"` and
+  `"%d/%d dates passed coverage filter"`.
+
+Widening that test to the optical module would fail today. Whether that is a logging gap on
+the optical path or a convention that legitimately stops at the radar one is a question about
+`src/`, so it is left here rather than answered. It matters because the test currently reads
+as a suite-wide convention and enforces it on half the surface.
+
 ---
 
 ## 4. What NOT to do, and why
@@ -316,16 +359,55 @@ failure. They are cheap and they catch circular imports. Leave them.
 
 ---
 
-## 5. Expected outcome
+## 5. Outcome — MEASURED, all phases landed
 
 | | before | after |
 |---|---|---|
-| unit suite wall time | 84.3 s | ~25 s |
-| tests | 3367 | 3365 (2 orphans in §2.5, if deleted rather than moved) |
-| test LOC | 49,953 | ~49,650 |
-| src line coverage | 83 % | unchanged — enforced by the gate |
+| unit suite wall time | 84.3 s | **24.5 s** (3.4×) |
+| tests, all tiers | 3398 | 3402 |
+| tests deleted | — | **1**, plus 1 moved and 1 superseded (§5.1) |
+| test LOC | 49,953 | 49,796 |
+| src lines covered | 10,817 | **10,817 — none lost**, by the §6 gate |
 | daily CI runners doing nothing | 1 | 0 |
+| tests no CI job ran | 2 | 0 |
 | GPU inference path | uncovered, unstated | uncovered, **stated and runnable by hand** (§2.2) |
+
+### 5.1 Every test movement, named
+
+The S4 gate: collect all tiers with markers disabled, before and after, and diff the IDs.
+
+**Removed (3)**
+- `test_provider_aws_dask.py::TestSchedulerResourceLoggerOnCluster::test_registered_plugin_emits_on_real_scheduler`
+  — **moved**, not deleted; reappears under `tests/integration/`.
+- `test_provider_local_ray.py::test_local_ray_cluster_enters_and_exits` — **deleted.** The only
+  genuine deletion in the whole exercise. Marked `slow` inside `tests/unit/`, so no CI job had
+  ever run it; `test_imports.py` already imports the module, and the coverage gate confirms
+  nothing was lost.
+- `test_source_read_resilience.py::TestZeroDateOutcomeIsAttributable::test_placeholders_match_arguments`
+  — **superseded** by ruff `PLE1205`/`PLE1206`, which check the same thing repo-wide (Phase 4).
+
+**Added (4 tests, 6 IDs)**
+- the moved scheduler-plugin test, in its new tier;
+- `test_the_retry_ladder_is_the_one_production_pays_for` — pins the retry budget that Phase 1
+  stopped waiting out;
+- `test_a_longer_number_is_not_a_status_with_its_tail_ignored` (4 parametrised rows) — closes
+  the untested regex guard from §7.1;
+- one auto-parametrised row of `test_every_document_is_listed`, because this document exists.
+
+### 5.2 What the exercise was actually worth
+
+**The speedup is the whole prize.** 84.3 s to 24.5 s, on every PR, both Python versions, and
+every local `uv run pytest`. Five of the six offending tests were *waiting*, not working.
+
+**Line count was not an available lever, and the plan's own first estimate of it was wrong.**
+157 lines net, against an estimate of ~300, and Phase 3's share of that estimate rested on
+counting helper NAMES rather than comparing their bodies (§3, Phase 3). This suite is verbose
+because it pins a great many behaviours in deliberately long names, not because it repeats
+itself.
+
+**Three CI gaps closed, one accepted.** A nightly runner that confirmed a placeholder; two
+tests no job executed; a regex guard nothing exercised. The GPU path stays uncovered by
+decision, and is now written down in the three places a reader will meet it.
 
 **LOC reduction is a small lever here and the plan says so.** About 300 lines of 49,953,
 roughly 0.6 %. The suite is not bloated with copy-paste; it is verbose because the behaviours
@@ -386,10 +468,4 @@ status. Removing it breaks no test in the suite. This is a **test gap, not a bug
 guard looks correct, nothing exercises it. Adding a row to the characterisation table in
 `test_read_failure_verdict.py` is a test-only fix and could be folded into Phase 2 if wanted.
 
-**7.2 — Tests that assert on source text.** About 20 files read `.py` files with
-`Path.read_text()`, `ast.parse` or `inspect.getsource` and assert on the shape of the source
-— 8 such assertions in `test_provider_aws_ray.py`, 5 in `test_source_read_resilience.py`.
-Some are legitimately architectural ("the package hard-exits in exactly one place") and
-belong in `tests/architecture/`. Others are structural assertions that a behavioural test
-would cover better. Sorting them requires reading each one against what it is really
-protecting; worth a separate pass, and it is test-only, so it could become a Phase 4.
+**7.2 — Tests that assert on source text. — DONE as Phase 4, see below.**

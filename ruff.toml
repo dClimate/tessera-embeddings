@@ -40,7 +40,14 @@ select = [
     "ANN",  # flake8-annotations
 ]
 
-extend-select = ["E501"]
+# A miscounted %-placeholder raises inside logging, which swallows it and drops the line —
+# on a Dask worker, where the dropped line was the only record that the task ran. This was
+# checked by a hand-rolled AST walk in tests/unit/test_source_read_resilience.py that read
+# ONE module (ingest/s1_roi.py); these rules make the same check over every file in the repo.
+# Verified to fire nothing on src/, tests/ and scripts/ when enabled (2026-08-25), and
+# verified equivalent: both a too-many and a too-few mutant are caught by the rules and were
+# caught by the test they replace.
+extend-select = ["E501", "PLE1205", "PLE1206"]
 
 ignore = [
     "D100",   # Missing docstring in public module

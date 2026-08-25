@@ -288,24 +288,11 @@ class TestZeroDateOutcomeIsAttributable:
         missing = [c.strip() for c in calls if "roi=" not in c and "ROI %s" not in c]
         assert not missing, f"informational line(s) with no ROI: {missing}"
 
-    def test_placeholders_match_arguments(self) -> None:
-        """A miscounted %-placeholder loses the line on a worker rather than raising here."""
-        tree = ast.parse((_SRC / "ingest" / "s1_roi.py").read_text())
-        bad = []
-        for node in ast.walk(tree):
-            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
-                continue
-            if node.func.attr not in {"info", "warning", "error", "debug", "exception"}:
-                continue
-            if not node.args or not isinstance(node.args[0], ast.Constant):
-                continue
-            text = node.args[0].value
-            if not isinstance(text, str):
-                continue
-            placeholders = text.count("%") - 2 * text.count("%%")
-            if placeholders != len(node.args) - 1:
-                bad.append((node.lineno, text[:50]))
-        assert not bad, f"placeholder/argument mismatch: {bad}"
+    # test_placeholders_match_arguments lived here. It walked the AST of ingest/s1_roi.py
+    # counting %-placeholders against arguments. Ruff's PLE1205/PLE1206 make the same check
+    # over EVERY file rather than this one module, so the rule is enabled in ruff.toml and
+    # the test is gone. Removed 2026-08-25 after confirming both a too-many and a too-few
+    # mutant in s1_roi.py fail the lint exactly as they used to fail the test.
 
 
 class TestEveryComputeThatReadsSourceIsAttributed:

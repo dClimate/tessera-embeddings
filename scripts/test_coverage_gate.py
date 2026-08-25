@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Compare two coverage runs and fail if any source line lost its last covering test.
+r"""Compare two coverage runs and fail if any source line lost its last covering test.
 
 The gate behind ``context_docs/design/test-suite-streamlining-plan.md``. Restructuring a test
 suite is safe exactly insofar as it changes no source line's coverage; the percentage cannot
@@ -47,6 +47,7 @@ def executed_lines(report: Path) -> set[tuple[str, int]]:
 
 
 def main() -> int:
+    """Diff the two reports named on the command line; exit 1 if any line lost coverage."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("before", type=Path, help="coverage JSON from before the change")
     parser.add_argument("after", type=Path, help="coverage JSON from after the change")
