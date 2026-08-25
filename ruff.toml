@@ -43,10 +43,15 @@ select = [
 # A miscounted %-placeholder raises inside logging, which swallows it and drops the line —
 # on a Dask worker, where the dropped line was the only record that the task ran. This was
 # checked by a hand-rolled AST walk in tests/unit/test_source_read_resilience.py that read
-# ONE module (ingest/s1_roi.py); these rules make the same check over every file in the repo.
-# Verified to fire nothing on src/, tests/ and scripts/ when enabled (2026-08-25), and
-# verified equivalent: both a too-many and a too-few mutant are caught by the rules and were
-# caught by the test they replace.
+# ONE module (ingest/s1_roi.py); these rules make the same check over ALL OF src/ AND tests/,
+# which is strictly wider. Verified equivalent before that test was removed: a too-many and a
+# too-few mutant in s1_roi.py each fail these rules exactly as they failed the test.
+#
+# Scope caveat: lint.yml runs `ruff check src/ tests/`, so scripts/ is NOT covered in CI even
+# though these rules would apply to it — roughly ten scale-test scripts use %-style logging.
+# scripts/ passes the whole rule set as it stands (checked 2026-08-25), and the per-file
+# ignores below already anticipate it being linted, so adding it to lint.yml would be green
+# today. That is a CI-scope decision rather than part of the test-suite work, so it is left.
 extend-select = ["E501", "PLE1205", "PLE1206"]
 
 ignore = [

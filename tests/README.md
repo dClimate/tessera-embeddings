@@ -122,20 +122,14 @@ path, and once before a campaign starts.
 look like if a runner ever becomes available, and the `gpu` marker stays declared so those
 instructions remain valid.
 
-### 3. Two tests that no CI job runs
+### Closed, for reference
 
-Both live in `tests/unit/` but carry a marker the default `addopts` deselects, and no other
-workflow covers that directory:
+Two further items were on this list and were fixed in the same change that added it, so they
+are recorded here rather than left reading as open work:
 
-- `tests/unit/test_provider_local_ray.py::test_local_ray_cluster_enters_and_exits` (`slow`)
-- `tests/unit/test_provider_aws_dask.py:585` (`integration`)
-
-They read as coverage and provide none. Each needs to move to the tier whose job would run
-it, or be deleted.
-
-### 4. One unit test breaks this suite's own 30-second bound
-
-`test_source_read_resilience.py::test_a_permanent_read_still_surfaces` takes 61 s, because it
-sits through the real 8-attempt source-read retry ladder. Six tests in total hold 59 s of the
-suite's 84 s wall time. The fixes are test-only and do not remove any assertion; see §3 of the
-streamlining plan.
+- **Two tests no CI job ran.** Both sat in `tests/unit/` behind a marker the default
+  `addopts` deselects. The local-Ray smoke test was deleted; the Dask scheduler-plugin test
+  moved to `tests/integration/`, where `integration.yml` runs it.
+- **A unit test that broke the 30-second bound above.** The source-read resilience test sat
+  through the real 8-attempt retry ladder, 61 s of genuine backoff. It now asserts the
+  ladder's shape instead of waiting it out, which checks more and takes 0.5 s.

@@ -42,7 +42,15 @@ class TestSchedulerResourceLoggerOnCluster:
             )
             client.gather(client.map(lambda x: x * x, range(50)))
             time.sleep(1.0)  # allow a couple of PeriodicCallback ticks
+            # Snapshot INSIDE the cluster context, so only heartbeats from a RUNNING scheduler
+            # are considered. Read after the `with` exits, the last line can be one the
+            # PeriodicCallback emitted while the worker was already unregistering — a correct
+            # heartbeat reporting workers=0 — and the assertion below would fail on teardown
+            # timing rather than on the wiring it is meant to guard.
+            health = [r.getMessage() for r in caplog.records if r.getMessage().startswith("scheduler health:")]
 
-        health = [r.getMessage() for r in caplog.records if r.getMessage().startswith("scheduler health:")]
         assert health, "expected at least one health line from the running scheduler"
-        assert "workers=1" in health[-1]
+        # ANY line rather than the last: the plugin may also tick once before the worker has
+        # registered. What this test claims is that the registered plugin ran on the
+        # scheduler's own event loop and saw the configured worker, not that every tick did.
+        assert any("workers=1" in line for line in health), health
