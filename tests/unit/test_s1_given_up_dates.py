@@ -245,7 +245,11 @@ def test_the_retry_is_exhausted_before_a_date_is_given_up(monkeypatch, caplog) -
         )
     assert attempts["2024-01-02"] == STORE_WRITE_ATTEMPTS
     loss = [r.getMessage() for r in caplog.records if "DATA LOSS roi=" in r.getMessage()]
-    assert [m for m in loss if "date=2024-01-02" in m] == loss, f"one date, named once: {loss}"
+    # Counted before it is filtered. `[m for m in loss if ...] == loss` is satisfied by an EMPTY
+    # loss, so it would have passed if the per-date line stopped being emitted at all — and that
+    # line is now the only record a lost date leaves.
+    assert len(loss) == 1, f"exactly one loss line, whatever it says: {loss}"
+    assert "date=2024-01-02" in loss[0], f"and it names the boundary date once: {loss}"
 
 
 def test_a_refusal_outlasting_the_attempt_limit_is_waited_out(monkeypatch, caplog) -> None:

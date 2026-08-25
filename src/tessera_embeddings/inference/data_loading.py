@@ -535,11 +535,19 @@ def check_time_window_coverage(
         # cannot tell it from a hole. Anything reading this field to raise an alarm must key
         # on the UNEXPLAINED count, never on the month total, or it fires on healthy cells.
         _assessed = root.attrs.get(ASSESSED_WINDOW_ATTR)
-        # A month wholly inside the assessed window is EXPLAINED: the ingest looked, and what it
-        # did not write it can never write, because the time axis only grows. WHY a day is absent
-        # stops being a distinction the moment it is closed — an unreadable day and a cloudy one
-        # are the same absence to everything downstream, and the published coverage masks say
-        # which months a pixel actually has.
+        # A month wholly inside the assessed window is EXPLAINED: the ingest looked, and WHY a day
+        # is absent is not a distinction this gate can act on. An unreadable day and a cloudy one
+        # are the same absence downstream, and the published coverage masks say which months a
+        # pixel actually has.
+        #
+        # Below the store's newest date the day is also closed for good, since the time axis only
+        # grows. A TRAILING month is not closed — a resume starts at the newest date plus one and
+        # would re-offer it — and it is excused anyway, for a different reason: a date is only ever
+        # given up when `is_unreadable_source` says the bytes are permanently bad, and that verdict
+        # recomputes. Re-offering recovers nothing the provider has not republished, so refusing
+        # the month blocks the cell without bringing the imagery any closer. What DOES change the
+        # answer is republished data or a correction to our own classification, and either is a
+        # re-ingest a person decides on from an audit.
         _explained = _months_within_assessed(missing, _assessed) if missing else set()
         # The ingest's own account of what it looked at and did not keep, carried onto the year
         # because it is recorded on the MOSAIC and the mosaic is deleted once a cell lands. Empty
