@@ -13,7 +13,20 @@ from typing import Any
 
 import ray
 
-ACTOR_INIT_TIMEOUT_SEC = 600
+#: How long to wait for a fleet's FIRST actor before giving the fill up.
+#:
+#: Long, because of what this bound actually gates. The wait ends the moment ``min_required``
+#: actors are ready and lets the rest join while work proceeds, so in a healthy account it is
+#: never reached — a fleet that is filling normally leaves after the first actor answers. It binds
+#: only when the account cannot supply a SINGLE GPU instance, which is a property of the region's
+#: spare capacity rather than of anything the fill did wrong.
+#:
+#: That makes the two outcomes badly asymmetric. Waiting costs an idle head node. Giving up fails
+#: the fill, and a chained fill owns a whole roster of zones — so it takes the ingest it would
+#: have dispatched with it, and the work waits for the driver's next re-dispatch round rather than
+#: for capacity. Erring long is therefore much cheaper than erring short, and a drought long
+#: enough to outlast this is one where a human should be deciding, not a timeout.
+ACTOR_INIT_TIMEOUT_SEC = 1800
 """Maximum wall-clock seconds to wait for actor ``__init__`` to complete.
 
 Sized for the worst case: instance launch + container pull + checkpoint
