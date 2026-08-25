@@ -1064,16 +1064,18 @@ _PROVIDER_REFUSAL_MARKERS = (
 #: * **Every other 4xx is neither** — a malformed request or a rejected credential is not the
 #:   data's fault and is not fixed by waiting, so it re-raises and fails the leg on its first
 #:   date instead of being skipped date by date.
-#: GDAL states a status in more than one wording, and both of them reach this classifier.
-#: Captured from production during the 2026-08-24 outage, on ``rasterio._env`` at WARNING:
+#: GDAL states a status in three wordings, and all of them reach this classifier as
+#: ``rasterio._env`` records at WARNING:
 #:
 #: * ``CPLE_AppDefined in HTTP response code on <url>: 403``
 #: * ``CPLE_AppDefined in HTTP error code: 503 - <url>. Retrying again in 0.5 secs``
+#: * ``CPLE_AppDefined in HTTP error code for <url> range <first>-<last>: 503. Retrying again ...``
 #:
-#: The first puts the object's URL BETWEEN the phrase and the colon — 249 characters of it on a
-#: real OPERA href — and the second says "error" where the first says "response". A pattern
-#: anchored on ``HTTP response code:`` reads a status out of NEITHER, so every date of that
-#: outage classified ``undecidable`` and the refusal both lines state was never seen.
+#: The first puts the object's URL BETWEEN the phrase and the colon; the second says "error" where
+#: the first says "response"; the third is what the ranged reader retries on, and it puts TWO
+#: addresses in that gap, the URL and the byte range. A pattern anchored on ``HTTP response code:``
+#: reads a status out of NONE of them — and a line carrying no status is not a refusal, so the
+#: refusal each states goes unseen and the codec failure beneath it keeps its unreadable verdict.
 #:
 #: What sits between the phrase and the status is an OBJECT ADDRESS, so it is matched as one —
 #: ``\S+``, since a URL holds no whitespace. That is what keeps this from binding the phrase to
@@ -1087,7 +1089,7 @@ _PROVIDER_REFUSAL_MARKERS = (
 #: a 4xx that is neither absence nor a reason to wait, so the real refusal is dropped and the
 #: codec failure keeps its unreadable verdict and costs its date. A ``:503`` port went the other
 #: way and invented a refusal. The trailing guard rejects a longer port such as ``:8443``.
-_HTTP_STATUS_RE = re.compile(r"HTTP (?:response|error) code(?: on \S+)?:[ \t]+(\d{3})(?![\d/])")
+_HTTP_STATUS_RE = re.compile(r"HTTP (?:response|error) code(?: on \S+| for \S+ range \S+)?:[ \t]+(\d{3})(?![\d/])")
 
 #: 4xx statuses that mean WAIT rather than stop.
 #:
