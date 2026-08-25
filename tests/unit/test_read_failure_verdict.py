@@ -251,10 +251,9 @@ REAL_GDAL_REFUSALS = {
         "OPERA_L2_RTC-S1_T072-152803-IW2_20211108T150433Z_S1B_30_v1.0_VV.tif. "
         "Retrying again in 0.5 secs"
     ),
-    # What GDAL's ranged reader retries on, and the commonest of the three in the optical logs.
-    # TWO addresses sit in the gap here, the URL and the byte range, so a pattern matching one
-    # address reads no status out of it. Body verbatim from CloudWatch on 2026-08-25, under the
-    # ``CPLE_AppDefined in`` prefix the line carries once it reaches a logger.
+    # What GDAL's ranged reader retries on. TWO addresses sit in the gap here, the URL and the
+    # byte range, so a pattern matching one address reads no status out of it. Carries the
+    # ``CPLE_AppDefined in`` prefix a GDAL line picks up on reaching a logger.
     "ranged-read 503": (
         "CPLE_AppDefined in HTTP error code for "
         "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/33/S/WC/2021/6/"
