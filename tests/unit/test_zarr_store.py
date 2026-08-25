@@ -1195,32 +1195,38 @@ class TestAssessedWindowRecord:
         assert [e["date"] for e in self._attrs(path)["assessed_unreadable_dates"]] == ["2024-02-14"]
 
 
-def test_unfillable_supersedes_an_earlier_verdict_for_the_same_date():
-    """One scope overrides prior-wins, and only one.
+def test_prior_wins_uniformly_with_no_scope_excepted():
+    """A recorded scope is never overwritten, whatever the new one claims.
 
-    ``unfillable`` is read off the store's own time axis, not from the source, so no better
-    knowledge of the imagery can correct it — and it carries the opposite remedy to every other
-    scope. Keeping the older verdict would leave the store telling an operator to wait for a
-    reprocessed copy when the only remedy left is deleting the store.
+    An earlier version let one scope override this, so a date the axis had moved past would have
+    its verdict corrected in place. That was storing an answer that changes on its own: a date
+    becomes unappendable the instant any later date commits, so the stored verdict needed
+    migrating on every such transition — and each transition nobody migrated left a store
+    advertising the wrong remedy. Reviewers found those one at a time.
+
+    Whether a date can still be appended is now DERIVED where it is needed (``date <= max(axis)``,
+    and every reader of this attribute has the axis), so there is nothing here to keep current.
+    A scope records only what was observed, and the earliest observation wins — which is what
+    protects a record placed by hand during a repair.
     """
     prior = [{"date": "2018-02-03", "scope": "unreadable", "error": "RasterioIOError"}]
 
-    upgraded = merge_recorded_losses(prior, [{"date": "2018-02-03", "scope": "unfillable"}])
-    assert upgraded == [{"date": "2018-02-03", "scope": "unfillable"}]
-
-    # And the protection prior-wins exists for is intact: an ordinary rediscovery does not
-    # overwrite a record that may have been placed by hand.
-    kept = merge_recorded_losses(prior, [{"date": "2018-02-03", "scope": "whole-date"}])
-    assert kept == prior
+    for claim in ("unfillable", "whole-date", "producer-conflict"):
+        kept = merge_recorded_losses(prior, [{"date": "2018-02-03", "scope": claim}])
+        assert kept == prior, f"{claim} must not overwrite what was already recorded"
 
 
-def test_an_upgrade_keeps_its_position_in_the_list():
-    """A superseded entry is replaced in place, so the attribute stays comparable run to run."""
-    prior = [{"date": "2018-01-05", "scope": "unreadable"}, {"date": "2018-03-09", "scope": "unreadable"}]
+def test_a_prior_that_is_not_a_sequence_is_refused_rather_than_dropped():
+    """Evidence in a shape nobody wrote is not evidence of nothing.
 
-    merged = merge_recorded_losses(prior, [{"date": "2018-01-05", "scope": "unfillable"}])
+    Silently treating it as empty lets the next run replace whatever it recorded, and since a
+    resumed run no longer re-derives the earlier months' losses, that erasure is unrecoverable.
+    Refusing keeps the store's own account intact for someone to look at.
+    """
+    with pytest.raises(TypeError, match="not a sequence"):
+        merge_recorded_losses({"2018-02-03": "unreadable"}, [])
 
-    assert merged == [
-        {"date": "2018-01-05", "scope": "unfillable"},
-        {"date": "2018-03-09", "scope": "unreadable"},
+    # None is the ordinary absent case and stays absent rather than raising.
+    assert merge_recorded_losses(None, [{"date": "2018-02-03", "scope": "unreadable"}]) == [
+        {"date": "2018-02-03", "scope": "unreadable"}
     ]

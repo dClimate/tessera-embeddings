@@ -1176,12 +1176,19 @@ def ingest_s2_roi_reflectance(
             del by_date[date]
             entry = {"date": date, "tiles": "", "tried": "", "objects": "", "scope": UNFILLABLE_SCOPE}
             unfillable_dates.append(entry)
+            # States what was OBSERVED and no more. This date is dropped before preparation, so
+            # nothing here knows whether it would have been written: it might have failed the
+            # coverage gate or reached no live window, in which case no pixels were lost at all.
+            # Claiming loss either way inflates the count that decides whether a store is worth
+            # re-ingesting, and re-ingesting a year is expensive enough that the claim has to be
+            # earned.
             log.error(
-                "DATA LOSS roi=%s date=%s: the catalogue offers this date and the store's time "
-                "axis already holds %s, so it can never be appended and its pixels are absent "
-                "from the mosaic. An earlier attempt skipped it and then committed a later date. "
-                "Recorded on the store as assessed_unreadable_dates with scope=unfillable — the "
-                "only remedy is to re-ingest this store's window from empty.",
+                "UNASSESSED roi=%s date=%s: the catalogue offers this date and the store's time "
+                "axis already holds %s, so it cannot be appended and this run did not read it. "
+                "An earlier attempt skipped it and then committed a later date. Recorded on the "
+                "store as assessed_unreadable_dates with scope=unfillable. Whether pixels were "
+                "lost is NOT known — the date was never read, and it may have been one the "
+                "coverage gate would have skipped anyway.",
                 roi_label,
                 date,
                 frontier,

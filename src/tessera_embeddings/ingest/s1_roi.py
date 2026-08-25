@@ -934,13 +934,17 @@ def ingest_s1_roi_sar(
                     given_up.add(date_str)
                     loss = {"date": date_str, "scope": UNFILLABLE_SCOPE, "error": ""}
                     unfillable_dates.append(loss)
+                    # States what was OBSERVED and no more — see the optical path. The date is
+                    # dropped before any read, so whether pixels were lost is not known here, and
+                    # claiming loss inflates the count that decides whether a store is worth
+                    # re-ingesting.
                     log.error(
-                        "[%s] DATA LOSS roi=%s date=%s: the source offers this date and the "
-                        "store's time axis already holds %s, so it can never be appended and its "
-                        "pixels are absent from the mosaic. An earlier attempt skipped it and then "
-                        "committed a later date. Recorded on the store as "
-                        "assessed_unreadable_dates with scope=unfillable — the only remedy is to "
-                        "re-ingest this store's window from empty.",
+                        "[%s] UNASSESSED roi=%s date=%s: the source offers this date and the "
+                        "store's time axis already holds %s, so it cannot be appended and this run "
+                        "did not read it. An earlier attempt skipped it and then committed a later "
+                        "date. Recorded on the store as assessed_unreadable_dates with "
+                        "scope=unfillable. Whether pixels were lost is NOT known — the date was "
+                        "never read.",
                         orbit,
                         roi_label,
                         date_str,

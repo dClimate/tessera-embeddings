@@ -1274,26 +1274,39 @@ def merge_recorded_losses(
     unconditional overwrite this replaced was protecting, and it is the only case it was
     protecting.
 
-    :data:`UNFILLABLE_SCOPE` is the ONE verdict that overrides prior-wins, because it is not a
-    claim about the source at all — it says this store's axis has moved past the date, which is
-    read from the axis and cannot be corrected by better knowledge of the imagery. Every other
-    scope explains why a source did not yield, and a hand-written record may know that better
-    than a leg does. Keeping the older scope here would leave the store prescribing a wait for a
-    reprocessed copy when the only remedy left is deleting the store.
+    **A scope records what was OBSERVED, never what to do about it.** Whether a date can still be
+    appended is not a property of the date and is deliberately not stored: it is one comparison
+    against the store's own axis — ``date <= max(axis)`` — and every reader of this attribute has
+    that axis in front of it. Storing that answer instead of deriving it is what made this
+    function need an upgrade rule, because the answer changes the moment any later date commits.
+    A stored verdict then has to be migrated on every such transition, and each transition anyone
+    forgets becomes a store advertising the wrong remedy. Derived, there is nothing to migrate.
+
+    So prior-wins is UNIFORM, with no scope excepted. A hand-written record — a repair's account
+    of a hole — survives a later leg rediscovering the same date, which is the whole reason the
+    rule exists.
+
+    ``present`` is what keeps the union from advertising a hole that has since been filled: a date
+    back on the time axis is not a loss, whoever recorded it. That is the case the unconditional
+    overwrite this replaced was protecting, and it is the only case it was protecting.
 
     Entries are carried through VERBATIM, including shapes this does not understand, because
     the readers of the attribute tolerate a bare date string and a hand-written record is not
-    ours to normalise.
+    ours to normalise. A ``prior`` that is not a sequence at all is a different matter: it is
+    evidence in a shape nobody wrote, and dropping it would erase whatever it recorded, so it is
+    refused rather than normalised away.
     """
+    if prior is not None and not isinstance(prior, (list, tuple)):
+        raise TypeError(
+            f"recorded losses are {type(prior).__name__}, not a sequence; refusing to merge and "
+            "overwrite. Whatever is on the store was not written by this code path and may be the "
+            "only account of a hole — inspect it before letting a run replace it."
+        )
     merged: dict[str, Any] = {}
-    for entry in (*(prior if isinstance(prior, (list, tuple)) else ()), *new):
+    for entry in (*(prior or ()), *new):
         date = str(entry.get("date", "")) if isinstance(entry, dict) else str(entry)
-        if date in present:
+        if date in present or date in merged:
             continue
-        if date in merged and not (isinstance(entry, dict) and entry.get("scope") == UNFILLABLE_SCOPE):
-            continue
-        # Reassignment keeps the original insertion position, so an upgrade does not reorder
-        # the list — the attribute stays comparable across runs.
         merged[date] = entry
     return list(merged.values())
 
