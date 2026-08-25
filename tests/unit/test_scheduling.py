@@ -1015,13 +1015,26 @@ class TestWorkStealingGpuHours:
     """The reported GPU-hours must integrate BILLED capacity, not requested capacity."""
 
     @staticmethod
-    def _run_one_chunk(n_unplaced: int, cluster_resources) -> list[dict]:
-        """Drive one loop iteration on a fleet that is mostly unplaced.
+    def _run_loop(
+        n_unplaced: int,
+        cluster_resources,
+        *,
+        n_chunks: int = 1,
+        sample_interval: float = 0.0,
+    ) -> tuple[list[dict], MagicMock]:
+        """Drive ``n_chunks`` loop iterations on a fleet that is mostly unplaced.
 
         The state is built explicitly rather than assumed: one actor that works,
         and ``n_unplaced`` slots whose instance-ID fetch never answers because
-        the instance behind them does not exist. Returns the kwargs of each
-        progress poll.
+        the instance behind them does not exist. One actor and one chunk per
+        iteration, so iterations and completions are the same count. Returns the
+        kwargs of each progress poll, and the capacity query so a caller can
+        count how often it was made.
+
+        ``sample_interval`` is the loop's capacity-sampling interval, defaulting
+        to zero — every iteration samples. The cadence and the charging policy
+        are separate properties, and a test of one neutralises the other rather
+        than letting its own arithmetic depend on it.
         """
         actors = [MagicMock(name=f"actor_{i}") for i in range(1 + n_unplaced)]
         config = MagicMock()
@@ -1053,14 +1066,15 @@ class TestWorkStealingGpuHours:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
             patch.object(_sched_mod.ray, "get", return_value={"chunk": "c0", "status": "ok"}),
-            patch.object(_sched_mod.ray, "cluster_resources", **cluster_resources),
+            patch.object(_sched_mod.ray, "cluster_resources", **cluster_resources) as capacity,
             patch.object(_sched_mod.time, "monotonic", side_effect=lambda: next(clock)),
+            patch.object(_sched_mod, "_CAPACITY_SAMPLE_INTERVAL_SEC", sample_interval),
             patch.object(_sched_mod, "_poll_tracker", side_effect=record_poll),
         ):
             results = _process_chunks_work_stealing(
                 actors=actors,  # type: ignore[arg-type]
                 actor_instance_ids=["i-0000"] + ["pending-init"] * n_unplaced,
-                chunks=[_fake_chunk("c0")],
+                chunks=[_fake_chunk(f"c{i}") for i in range(n_chunks)],
                 mosaic_base="m",
                 staging_base="s",
                 run_id="r",
@@ -1069,9 +1083,9 @@ class TestWorkStealingGpuHours:
                 tracker=MagicMock(),
                 still_initializing=set(range(1, 1 + n_unplaced)),
             )
-        assert len(results) == 1, "the chunk must complete for the poll figures to mean anything"
-        assert len(polls) == 1, "the run must report progress exactly once for the bound below to be exact"
-        return polls
+        assert len(results) == n_chunks, "every chunk must complete for the poll figures to mean anything"
+        assert len(polls) == n_chunks, "one progress report per completion, so the counts below are exact"
+        return polls, capacity
 
     @pytest.mark.parametrize(
         ("readings", "rejected"),
@@ -1093,7 +1107,7 @@ class TestWorkStealingGpuHours:
         Both directions are pinned because each rules out a different wrong policy: charging at
         the interval's end, and charging at its start.
         """
-        polls = self._run_one_chunk(0, {"side_effect": readings})
+        polls, _ = self._run_loop(0, {"side_effect": readings})
         gpu_seconds = polls[0]["gpu_hours"] * 3600
         # The clock is synthetic and steps one second per read, so this is exact: one interval of
         # one second, charged at the lower of its endpoints.
@@ -1112,7 +1126,7 @@ class TestWorkStealingGpuHours:
         whether to cap the fleet.
         """
         n_unplaced = 19
-        polls = self._run_one_chunk(n_unplaced, {"return_value": {"CPU": 8.0, "GPU": 1.0}})
+        polls, _ = self._run_loop(n_unplaced, {"return_value": {"CPU": 8.0, "GPU": 1.0}})
         gpu_hours = polls[0]["gpu_hours"]
         elapsed_hours = polls[0]["elapsed_min"] / 60
 
@@ -1136,8 +1150,34 @@ class TestWorkStealingGpuHours:
         Unguarded, a control-plane hiccup would propagate out of the dispatch
         loop and destroy a fill over a log number. The figure is what degrades.
         """
-        polls = self._run_one_chunk(3, {"side_effect": RuntimeError("gcs unavailable")})
+        polls, _ = self._run_loop(3, {"side_effect": RuntimeError("gcs unavailable")})
         assert polls[0]["gpu_hours"] == 0.0
+
+    def test_capacity_is_not_queried_once_per_completed_chunk(self) -> None:
+        """The query is a synchronous cluster-wide round trip sitting on the dispatch path.
+
+        ``ray.wait(num_returns=1)`` hands back one completion at a time, so a query per iteration
+        is a query per finished chunk — and while it is in flight the loop is not handing work
+        back to the actor that just finished. A burst of completions would serialise one round
+        trip per chunk into the fleet's idle time, which is the very thing the figure it feeds
+        exists to describe.
+
+        Driven at the real interval, with the synthetic clock advancing a second per reading so
+        the whole run fits inside one interval by construction: the seeding reading taken before
+        the loop is then the only one any number of completions can produce.
+        """
+        n_chunks = 4
+        polls, capacity = self._run_loop(
+            0,
+            {"return_value": {"CPU": 8.0, "GPU": 4.0}},
+            n_chunks=n_chunks,
+            sample_interval=_sched_mod._CAPACITY_SAMPLE_INTERVAL_SEC,
+        )
+        assert len(polls) == n_chunks, "the loop must have iterated once per chunk for this to mean anything"
+        assert capacity.call_count == 1, (
+            f"{capacity.call_count} capacity queries across {n_chunks} completions — the loop is asking the "
+            "cluster once per finished chunk rather than on a timer"
+        )
 
 
 # ===========================================================================

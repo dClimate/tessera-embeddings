@@ -550,6 +550,21 @@ class ActorPool:
 # ---------------------------------------------------------------------------
 
 
+_CAPACITY_SAMPLE_INTERVAL_SEC = 30.0
+"""Minimum seconds between cluster-capacity readings in the dispatch loop.
+
+Half the loop's long ``ray.wait`` timeout, so a fleet whose actors are all busy still reads
+capacity once per wait — full resolution while it is free — and a burst of completions, which
+the loop takes one at a time, collapses to one reading instead of one per chunk.
+
+The figure this feeds is read by a human deciding whether to cap a fleet, so its resolution is
+irrelevant at any timescale a person acts on. The reading's cost is not: it is a synchronous
+cluster-wide query on the path between a finished chunk and the actor's next one, so at a high
+completion rate an unthrottled reading buys precision with the idle GPU time it exists to
+describe.
+"""
+
+
 def _joined_gpu_count(last_known: float, gpus_per_actor: float) -> float:
     """GPUs JOINED to the cluster. A floor on what is billed, not the billed figure.
 
@@ -1130,7 +1145,8 @@ def _process_chunks_work_stealing(
     # exists. Logging-only — nothing scales, retires or branches on it.
     gpu_seconds = 0.0
     # Seeded with a real reading rather than zero: the loop starts once actors are ready, so
-    # capacity is already non-zero, and averaging the first interval against zero would halve it.
+    # capacity is already non-zero, and the first interval is charged at the lower of its
+    # endpoints — against a zero seed that is zero, so the fleet's first interval would be free.
     joined_gpus = _joined_gpu_count(0.0, config.num_gpus)
     last_tick = time.monotonic()
     # The progress line's elapsed clock, and it starts HERE rather than at ``t0``.
@@ -1197,16 +1213,31 @@ def _process_chunks_work_stealing(
             time.sleep(5)
             ready_refs = []
         now = time.monotonic()
-        # Charged at the LOWER of the interval's two endpoints, which is what keeps this figure
-        # the lower bound it claims to be. A blocking `ray.wait` can stretch an interval to a
-        # minute, and capacity moves in steps within it: a batch joining just before the wait
-        # returns did not run for the interval, and a node leaving just after it started did.
-        # Since the step's timing is unknown, only the smaller endpoint is safe in both
-        # directions — an average would assume the change fell halfway and can overstate either.
-        previous_gpus = joined_gpus
-        joined_gpus = _joined_gpu_count(joined_gpus, pool.config.num_gpus)
-        gpu_seconds += min(previous_gpus, joined_gpus) * (now - last_tick)
-        last_tick = now
+        # Sampled on a timer, NOT once per completion. `ray.wait(num_returns=1)` hands back one
+        # chunk at a time, so a burst of completions would otherwise put a synchronous
+        # cluster-wide query between every finished chunk and the actor's next one — spending the
+        # idle GPU time this figure exists to describe on describing it. Between samples the
+        # previous reading is carried forward and the interval is left uncharged until the next
+        # one, which is the same shape the failed-lookup path already has.
+        #
+        # An interval is charged at the LOWER of its two endpoints, which is what keeps this
+        # figure the lower bound it claims to be. Capacity moves in steps inside an interval a
+        # blocking `ray.wait` can already stretch to a minute: a batch joining just before the
+        # sample did not run for the interval, and a node leaving just after it began did. Since
+        # the step's timing is unknown, only the smaller endpoint is safe in both directions — an
+        # average would assume the change fell halfway and can overstate either.
+        #
+        # Sampling less often lengthens those intervals, which LOOSENS that bound without
+        # breaking it: while capacity moves in one direction, every point inside the interval is
+        # at or above the smaller endpoint however many steps it takes, so the charge still
+        # understates. What a longer interval does admit is more room for capacity to rise and
+        # fall back within one of them — already possible inside a single blocking wait, so the
+        # direction of the bound is unchanged and only its tightness moves, the safe way.
+        if now - last_tick >= _CAPACITY_SAMPLE_INTERVAL_SEC:
+            previous_gpus = joined_gpus
+            joined_gpus = _joined_gpu_count(joined_gpus, pool.config.num_gpus)
+            gpu_seconds += min(previous_gpus, joined_gpus) * (now - last_tick)
+            last_tick = now
 
         # Poll tracker on every iteration (including timeouts with no completions)
         # so stall detection stays responsive.
