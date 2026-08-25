@@ -72,9 +72,9 @@ classifier decides both, over the same evidence.
 
 **And most of what GDAL logs is not on a logger.** rasterio's handler is installed per THREAD, so
 GDAL's own fetch threads report to GDAL's process-wide handler instead, which writes to stderr and
-to nothing a ``logging.Handler`` can reach — 1,462 of 1,475 refusal statements in one outage.
-:func:`hear_gdal_from_every_thread` gives that handler somewhere to forward to, in rasterio's own
-wording, so the handler above is what decides on those lines too.
+to nothing a ``logging.Handler`` can reach. :func:`hear_gdal_from_every_thread` gives that handler
+somewhere to forward to, in rasterio's own wording, so the handler above is what decides on those
+lines too.
 
 **Only refusals are recorded, and that is what makes the direction safe.** A line is kept only
 if the classifier reads THAT LINE ALONE as ``PROVIDER_REFUSED`` or ``OUR_CREDENTIAL``. Refusal
@@ -161,6 +161,11 @@ _aborted: deque[str] = deque(maxlen=_CAPACITY)
 #: only ever compared inside the process that wrote it, so no clock is compared across machines.
 _refused: deque[tuple[float, str]] = deque(maxlen=_REFUSAL_CAPACITY)
 _lock = threading.Lock()
+#: Serialises the install in :func:`hear_gdal_from_every_thread`. Separate from ``_lock``
+#: because the handlers that take that one run INSIDE the forwarder, so a lock held across the
+#: install must not be one a forwarded message can ask for.
+_install_lock = threading.Lock()
+
 _handlers: list[logging.Handler] = []
 
 
@@ -257,10 +262,9 @@ def hear_gdal_from_every_thread() -> None:
     ``logging.Handler``, so it cannot see them: not for want of a level or a wording, but because
     the message was never a log record.
 
-    That is what cost dates on 2026-08-25. **1,462 of the 1,475 statements GDAL made about a 403
-    that day went to stderr; 13 reached ``rasterio._env``** — so the capture could see under one
-    per cent of what GDAL said, and the three radar dates given up were the reads whose own leg
-    held none of the 13. See ``context_docs/design/ingest_read_failure_causes_2026_08.md``.
+    A refusal stated only there is therefore invisible to the capture, and the read it belongs to
+    is judged on its exception alone — which is how a transient refusal comes to be given up as
+    unreadable. See ``context_docs/design/ingest_read_failure_causes_2026_08.md``.
 
     **Chained, not replaced.** The handler already installed is called first, so GDAL's stderr line
     still appears where an operator greps for it and ``CE_Fatal`` still aborts through it. All this
@@ -276,55 +280,61 @@ def hear_gdal_from_every_thread() -> None:
     process-wide handler has no such call to judge it, and ``INFO`` is below both the logger's
     default level and the capture's, so honouring the downgrade would record it nowhere.
 
-    Never raises. A process that cannot install this reads exactly as the fleet did before it.
+    **Installed once, under a lock.** GDAL keeps the function POINTER, and only the module-level
+    reference keeps the callback object alive; two installs would leave the first collectable while
+    GDAL and the chained handler still hold its address, so the next GDAL error would call into
+    freed memory. The check and the install therefore have to be one critical section.
+
+    Never raises. A process that cannot install this reads exactly as it did before it.
     """
     global _forwarder
-    if _forwarder is not None:
-        return
-    gdal_log = logging.getLogger(_GDAL_LOGGER)
-    # Reassigned below to whatever was installed; read by `forward` through the closure, so the
-    # chain is live from the moment it exists and is simply empty for the instant before.
-    already: Any = None
+    with _install_lock:
+        if _forwarder is not None:
+            return
+        gdal_log = logging.getLogger(_GDAL_LOGGER)
+        # Reassigned below to whatever was installed; read by `forward` through the closure, so the
+        # chain is live from the moment it exists and is simply empty for the instant before.
+        already: Any = None
 
-    def forward(err_class: int, err_no: int, message: bytes) -> None:
-        try:
-            if already is not None:
-                already(err_class, err_no, message)
-            if err_class not in (_CE_WARNING, _CE_FAILURE):
+        def forward(err_class: int, err_no: int, message: bytes) -> None:
+            try:
+                if already is not None:
+                    already(err_class, err_no, message)
+                if err_class not in (_CE_WARNING, _CE_FAILURE):
+                    return
+                text = message.decode("utf-8", "replace")
+                if err_no in code_map:
+                    gdal_log.log(level_map[err_class], "%s in %s", code_map[err_no], text)
+                else:
+                    gdal_log.log(level_map[err_class], "%s", text)
+            except Exception:  # pragma: no cover — GDAL is C, and cannot be handed an exception
                 return
-            text = message.decode("utf-8", "replace")
-            if err_no in code_map:
-                gdal_log.log(level_map[err_class], "%s in %s", code_map[err_no], text)
-            else:
-                gdal_log.log(level_map[err_class], "%s", text)
-        except Exception:  # pragma: no cover — GDAL is C, and cannot be handed an exception
+
+        try:
+            # Through the rasterio extension that LINKS GDAL rather than by a library filename:
+            # rasterio's wheels ship GDAL version-stamped inside a private directory whose name
+            # differs by platform and release, while `dlsym` on a loaded extension searches what that
+            # extension was linked against. So this asks the one thing whose path Python already knows.
+            gdal = ctypes.CDLL(rasterio._base.__file__)
+            gdal.CPLSetErrorHandler.restype = _CPL_ERROR_HANDLER
+            gdal.CPLSetErrorHandler.argtypes = [_CPL_ERROR_HANDLER]
+            forwarder = _CPL_ERROR_HANDLER(forward)
+            already = gdal.CPLSetErrorHandler(forwarder)
+            _forwarder = forwarder
+        except Exception:
+            logger.warning(
+                "Could not forward GDAL's process-wide messages to %s: a refusal stated on a thread "
+                "rasterio's handler does not cover will not reach the capture, and the read it "
+                "belongs to will be judged on its exception alone.",
+                _GDAL_LOGGER,
+                exc_info=True,
+            )
             return
 
-    try:
-        # Through the rasterio extension that LINKS GDAL rather than by a library filename:
-        # rasterio's wheels ship GDAL version-stamped inside a private directory whose name
-        # differs by platform and release, while `dlsym` on a loaded extension searches what that
-        # extension was linked against. So this asks the one thing whose path Python already knows.
-        gdal = ctypes.CDLL(rasterio._base.__file__)
-        gdal.CPLSetErrorHandler.restype = _CPL_ERROR_HANDLER
-        gdal.CPLSetErrorHandler.argtypes = [_CPL_ERROR_HANDLER]
-        forwarder = _CPL_ERROR_HANDLER(forward)
-        already = gdal.CPLSetErrorHandler(forwarder)
-        _forwarder = forwarder
-    except Exception:
-        logger.warning(
-            "Could not forward GDAL's process-wide messages to %s: a refusal stated on a thread "
-            "rasterio's handler does not cover will not reach the capture, and the read it "
-            "belongs to will be judged on its exception alone.",
-            _GDAL_LOGGER,
-            exc_info=True,
-        )
-        return
-
-    # Put GDAL's own handler back while the interpreter is still there to be called into. A
-    # callback GDAL invokes from one of its threads has to take the GIL, and taking it after
-    # finalisation has begun is fatal to the process rather than to the read.
-    atexit.register(gdal.CPLSetErrorHandler, already)
+        # Put GDAL's own handler back while the interpreter is still there to be called into. A
+        # callback GDAL invokes from one of its threads has to take the GIL, and taking it after
+        # finalisation has begun is fatal to the process rather than to the read.
+        atexit.register(gdal.CPLSetErrorHandler, already)
 
 
 def install_capture() -> None:

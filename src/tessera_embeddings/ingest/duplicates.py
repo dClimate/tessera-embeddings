@@ -1088,13 +1088,12 @@ _PROVIDER_REFUSAL_MARKERS = (
 #: codec failure keeps its unreadable verdict and costs its date. A ``:503`` port went the other
 #: way and invented a refusal. The trailing guard rejects a longer port such as ``:8443``.
 #:
-#: **A third wording, and in production it is the common one.** GDAL's ranged reader states the
-#: same refusal as ``Request for <url> range <first>-<last> failed with response_code=403``, from
-#: ``Request for %s range %s failed with response_code=%ld`` in the library itself. In the
-#: 2026-08-25 outage that wording appeared 1,462 times against 13 of the two above — so a pattern
-#: reading only the ``code:`` forms sees under one per cent of what GDAL says. It is matched on
-#: its own key rather than folded into the alternation above because the separator is different:
-#: ``=`` with no space, which is unambiguous and needs none of the port guard the colon forms do.
+#: **The ranged reader states the same refusal in a third wording**, ``Request for <url> range
+#: <first>-<last> failed with response_code=403``, from ``Request for %s range %s failed with
+#: response_code=%ld`` in the library itself. A pattern reading only the ``code:`` forms above
+#: leaves it unread, and a line carrying no status is not a refusal. It is matched on its own key
+#: rather than folded into the alternation because the separator differs: ``=`` with no space,
+#: which is unambiguous and needs none of the port guard the colon forms do.
 #:
 #: ``\d{3}`` and not ``\d+`` is what keeps ``response_code=0`` out. GDAL prints that when the
 #: request never completed, and it is the absence of a status rather than a status — read as one
