@@ -653,6 +653,9 @@ def ingest_s1_roi_sar(
     #: Owned items across every batch — the number that distinguishes "the source does not
     #: cover this ROI for this orbit" from "we found items and committed none of them".
     total_items_seen = 0
+    #: Every date this run actually judged. The range says where it looked; only this
+    #: says what it looked AT, and a date no response offered was never judged at all.
+    considered_dates: set[str] = set()
     #: Whether THIS leg has read the source successfully at least once, which is the local
     #: evidence that our access to it is sound.
     #:
@@ -905,6 +908,7 @@ def ingest_s1_roi_sar(
                 entry = prepared.date_windows.get(str(data["time"].values[i])[:19])
                 solar_day, footprint = entry if entry else (None, None)
                 date_str = solar_day or str(data["time"].values[i])[:10]
+                considered_dates.add(date_str)
                 # THE authority on what has been written, checked here rather than
                 # relying on the query filter: under a look-ahead the query for this
                 # batch may have been built before an earlier batch committed, so a
@@ -1123,6 +1127,8 @@ def ingest_s1_roi_sar(
             # Required only for losses NO write carried — see the optical path for the reasoning.
             # A loss a commit already holds has a durable home, and failing the leg over this
             # record would refuse a run whose losses are safely stored.
+            # What this leg actually judged — see the optical path.
+            considered=considered_dates,
             required=len(_losses_so_far()) > losses_committed,
             # Merged with what the store already records, minus any date now back on the axis —
             # see storage.zarr_store.merge_recorded_losses. A resume re-derives only the losses

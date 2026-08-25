@@ -49,7 +49,7 @@ import datetime
 import itertools
 import logging
 import time
-from collections.abc import Callable, Container, Iterable, Iterator
+from collections.abc import Callable, Container, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -1246,95 +1246,166 @@ a time, by :func:`write_days_windows` — see ``losses`` there for why the secon
 
 UNFILLABLE_SCOPE = "unfillable"
 
+#: The store's assessments, oldest first, one entry per run that examined it. APPEND-ONLY: an
+#: entry is never edited, reconciled or upgraded once written.
+#:
+#: This exists because the two attributes it feeds are a SUMMARY, and a summary maintained
+#: incrementally has to be corrected every time the world moves under it. Whether a date can still
+#: be appended changes when any later date commits; whether a recorded loss is still a loss changes
+#: when a later run re-examines its month. Each such transition needed a rule, the rules interacted,
+#: and reviewers kept finding the combinations nobody had thought through. None of that is
+#: reachable from an append-only history: there is no stored answer to go stale, only statements
+#: about what each run saw, and the answer is folded out of them on demand.
+#:
+#: Each entry is ``{"examined": [start, end], "losses": [...], "source": str}``.
+ASSESSMENT_LOG_ATTR = "assessment_log"
+
+
+def read_assessment_log(attrs: "Mapping[str, Any]") -> list[dict[str, Any]]:
+    """The store's assessments, oldest first.
+
+    A store written before the log existed carries the same claim in two attributes — a range it
+    examined and the dates it lost — which is exactly one entry's worth of information. It is
+    synthesised here rather than migrated, so no store has to be rewritten and nothing is invented:
+    the entry says precisely what the old attributes said, and only the identity of the run that
+    wrote it is unknown, which nothing reads.
+    """
+    log = attrs.get(ASSESSMENT_LOG_ATTR)
+    if log is not None:
+        if not isinstance(log, (list, tuple)):
+            raise TypeError(
+                f"{ASSESSMENT_LOG_ATTR} is {type(log).__name__}, not a sequence; refusing to read "
+                "and append. Whatever is on the store was not written by this code path and may be "
+                "the only account of a hole — inspect it before letting a run extend it."
+            )
+        # LOSSLESS, and that is not fussiness. An attribute is written whole, so appending means
+        # reading, extending and rewriting — and anything this read drops, that rewrite deletes.
+        # Filtering an entry it does not recognise would therefore destroy exactly the evidence the
+        # append-only promise exists to keep, and would do it silently.
+        bad = [i for i, entry in enumerate(log) if not isinstance(entry, dict)]
+        if bad:
+            raise TypeError(
+                f"{ASSESSMENT_LOG_ATTR} on this store holds {len(bad)} entr(y/ies) that are not "
+                f"records, at position(s) {bad}. Refusing to read and rewrite: the next append "
+                "would drop them, and one of them may be the only account of a hole."
+            )
+        return [dict(e) for e in log]
+
+    window = attrs.get(ASSESSED_WINDOW_ATTR)
+    losses = attrs.get(UNREADABLE_DATES_ATTR)
+    if losses is not None and not isinstance(losses, (list, tuple)):
+        raise TypeError(
+            f"{UNREADABLE_DATES_ATTR} is {type(losses).__name__}, not a sequence; refusing to read "
+            "and overwrite. Evidence in a shape nobody wrote is not evidence of nothing."
+        )
+    examined: list[str] | None = None
+    if isinstance(window, (list, tuple)) and len(window) == 2:
+        examined = [str(window[0]), str(window[1])]
+    if examined is None and not losses:
+        return []
+    # Losses WITHOUT a window is a normal state, not a corrupt one: a loss is committed by the
+    # write that seals its date, and a run can stop before the end-of-run record ever names a
+    # range. Returning nothing here would have let the next append overwrite the only durable
+    # account of that hole — which is the state most in need of preserving.
+    return [
+        {
+            "examined": examined,
+            "losses": list(losses or ()),
+            "source": "pre-log",
+        }
+    ]
+
+
+def _loss_date(loss: object) -> str:
+    """The date a loss record is about, whatever shape it was written in.
+
+    A bare date string is a shape earlier code wrote and readers still tolerate, so it is matched
+    rather than normalised — a record written by hand is not ours to reformat.
+    """
+    return str(loss.get("date", "")) if isinstance(loss, dict) else str(loss)
+
+
+def _contiguous_blocks(ranges: "Iterable[tuple[str, str]]") -> list[tuple[str, str]]:
+    """Ranges coalesced where they overlap or meet, earliest first."""
+    ordered = sorted(ranges)
+    blocks: list[tuple[str, str]] = []
+    for start, end in ordered:
+        if blocks and _ranges_touch(blocks[-1][0], blocks[-1][1], start, end):
+            blocks[-1] = (blocks[-1][0], max(blocks[-1][1], end))
+        else:
+            blocks.append((start, end))
+    return blocks
+
+
+def project_assessment(
+    log: "Iterable[dict[str, Any]]", *, present: "Container[str]" = ()
+) -> tuple[list[str] | None, list[Any]]:
+    """Fold the whole log into the two attributes readers consume.
+
+    A FOLD, not a merge. A merge is what you do holding partial knowledge and a stored summary;
+    this sees every assessment at once, so the questions that needed rules — does this range join
+    that one, does this verdict supersede that one, was this date re-examined — are answered by the
+    data rather than by a policy applied incrementally.
+
+    The range published is the contiguous block reaching furthest forward. Where the log is
+    disjoint no single range can describe it, so this UNDER-claims rather than spanning a gap
+    nobody examined; a reader wanting exact coverage reads the log itself.
+
+    A date's verdict comes from the LAST entry that CONSIDERED it, because that run judged it most
+    recently. An entry that considered a date and did not list it as lost is saying it is not lost,
+    which is what retires a stale record — a date once unreadable, later re-read and legitimately
+    filtered, stops being advertised as a hole.
+
+    Considered, never merely covered by a range: a run sees only the days the catalogue returned,
+    so a range says where it looked and not that it judged every day inside. A date no entry
+    considered keeps its most recent mention, which is what preserves both a day some response
+    omitted and a record written by hand during a repair.
+    """
+    ranges: list[tuple[str, str]] = []
+    decided: dict[str, Any] = {}
+    for entry in log:
+        examined = entry.get("examined")
+        covers: tuple[str, str] | None = None
+        if isinstance(examined, (list, tuple)) and len(examined) == 2:
+            covers = (str(examined[0]), str(examined[1]))
+            ranges.append(covers)
+
+        # Supersession keys on the dates a run actually CONSIDERED, never on its range. Examining
+        # a range is not judging every day in it: a run sees only the days the catalogue returned,
+        # so a day omitted from one response — a transient omission is enough — was never judged.
+        # Clearing its record on that basis deletes real evidence, and if it were its month's only
+        # acquisition the month would then read as legitimately empty and an incomplete mosaic
+        # could publish.
+        considered = entry.get("considered")
+        if isinstance(considered, (list, tuple)):
+            for date in {str(d) for d in considered} & set(decided):
+                del decided[date]
+        elif covers is not None:
+            # An entry from before runs recorded what they considered — including the one
+            # synthesised for a store predating the log. Its range is the only statement it makes,
+            # so it is taken at its word: the coarser reading, and the only one available.
+            for date in [d for d in decided if covers[0] <= d <= covers[1]]:
+                del decided[date]
+
+        for loss in entry.get("losses") or ():
+            decided[_loss_date(loss)] = loss
+
+    window: list[str] | None = None
+    if ranges:
+        furthest = max(_contiguous_blocks(ranges), key=lambda b: b[1])
+        window = [furthest[0], furthest[1]]
+    losses = [entry for date, entry in sorted(decided.items()) if date not in present]
+    return window, losses
+
+
 """The ``scope`` of a loss caused by the store's own time axis rather than by the source.
 
 The date is below the newest date the store holds and absent from it, so no re-read reaches it
 and no reprocessed copy helps: the store has to be rebuilt. Distinguished from every other
 scope because the remedy is different and because it is derived from the axis, which is why
-:func:`merge_recorded_losses` lets it override a record it would otherwise keep.
+The fold in :func:`project_assessment` decides what it means alongside every other
+assessment; nothing here is reconciled in place.
 """
-
-
-def merge_recorded_losses(
-    prior: object,
-    new: "Iterable[dict[str, str]]",
-    *,
-    present: "Container[str]" = (),
-    reassessed: tuple[str, str] | None = None,
-) -> list[Any]:
-    """``prior`` loss records plus ``new`` ones, reconciled against what this run actually looked at.
-
-    A UNION rather than a replacement. A resumed run re-derives only the losses of the window it
-    walked, so writing its own list alone would erase what earlier runs recorded and the store's
-    holes would end up advertised nowhere.
-
-    **The run that looked most recently at a date is the authority on it; a run that did not look
-    has no opinion.** That single rule is what decides every case here:
-
-    * ``reassessed`` is the inclusive ``(start, end)`` this run examined — the same range it
-      records as its assessed window. A prior entry INSIDE it was re-examined, so this run's
-      answer replaces it, and a date this run no longer considers lost simply disappears. Without
-      that, a date once recorded unreadable that is later re-read successfully but legitimately
-      filtered — too cloudy, no live window — would keep its stale entry forever, and if it were
-      that month's only acquisition the month could never pass the coverage gate.
-    * A prior entry OUTSIDE that range was not looked at, so it survives untouched. That is what
-      protects a record placed by hand during a repair: those describe months below a resume
-      floor, which is precisely the ground a run skips.
-    * ``present`` removes a date that is now on the time axis, whoever recorded it. A date that is
-      stored is not a hole.
-
-    Passing no ``reassessed`` range keeps every prior entry — the conservative reading, for a
-    caller that cannot say what it examined.
-
-    **A scope records what was OBSERVED, never what to do about it.** Whether a date can still be
-    appended is not a property of the date and is deliberately not stored: it is one comparison
-    against the store's own axis (``date <= max(axis)``), and every reader of this attribute has
-    that axis. Storing that answer instead of deriving it is what made this function need an
-    upgrade rule, because the answer changes the moment any later date commits — so it needed
-    migrating on every such transition, and each transition nobody migrated left a store
-    advertising the wrong remedy. Derived, there is nothing to migrate.
-
-    Entries are carried through VERBATIM, including shapes this does not understand, because the
-    readers of the attribute tolerate a bare date string and a hand-written record is not ours to
-    normalise. A ``prior`` that is not a sequence at all is a different matter: it is evidence in a
-    shape nobody wrote, and dropping it would erase whatever it recorded, so it is refused rather
-    than normalised away.
-    """
-    if prior is not None and not isinstance(prior, (list, tuple)):
-        raise TypeError(
-            f"recorded losses are {type(prior).__name__}, not a sequence; refusing to merge and "
-            "overwrite. Whatever is on the store was not written by this code path and may be the "
-            "only account of a hole — inspect it before letting a run replace it."
-        )
-
-    def _date_of(entry: object) -> str:
-        """The date an entry is about, whatever shape it was written in.
-
-        A bare date string is a shape earlier code wrote and readers still tolerate, so it is
-        matched here rather than normalised — a hand-written record is not ours to reformat.
-        """
-        return str(entry.get("date", "")) if isinstance(entry, dict) else str(entry)
-
-    def _was_reassessed(date: str) -> bool:
-        if reassessed is None:
-            return False
-        start, end = reassessed
-        return start <= date <= end
-
-    merged: dict[str, Any] = {}
-    # Prior first, so an entry this run did not revisit keeps its position and the attribute stays
-    # comparable between runs.
-    for entry in prior or ():
-        date = _date_of(entry)
-        if date in present or _was_reassessed(date):
-            continue
-        merged.setdefault(date, entry)
-    for entry in new:
-        date = _date_of(entry)
-        if date in present:
-            continue
-        merged.setdefault(date, entry)
-    return list(merged.values())
 
 
 def _ranges_touch(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
@@ -1361,6 +1432,7 @@ def record_assessed_window(
     *,
     empty_dates: int = 0,
     unreadable: list[dict[str, str]] | None = None,
+    considered: "Iterable[str] | None" = None,
     required: bool = False,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
@@ -1406,47 +1478,30 @@ def record_assessed_window(
             # every one is kept. Keeping a loss that is actually present costs a false alarm;
             # dropping one that is real costs the only record of a hole.
             present = set()
-        prior_window = root.attrs.get(ASSESSED_WINDOW_ATTR)
-        start, end = start_date, end_date
-        if isinstance(prior_window, (list, tuple)) and len(prior_window) == 2:
-            prior_start, prior_end = str(prior_window[0]), str(prior_window[1])
-            if _ranges_touch(prior_start, prior_end, start, end):
-                # ONE stretch, so the union of the two is itself examined in full. This is what
-                # lets a resume keep the months an earlier leg assessed: it begins at its
-                # frontier's month, and stamping only its own start would retract them.
-                start, end = min(start, prior_start), max(end, prior_end)
-            else:
-                # A GAP between them, and the attribute holds one range — so spanning it would
-                # certify days neither run queried, and the gate would then excuse a month that
-                # is missing because nobody looked. That is the one failure this record must
-                # never produce, so the span is refused and the range this run can vouch for is
-                # what gets written. Both choices only make the gate stricter, and the stored
-                # range may be arbitrarily old while this one was just verified.
-                logger.warning(
-                    "Assessed window %s..%s on %s does not meet %s..%s; recording the range this "
-                    "run examined and dropping the stored one rather than certifying the days "
-                    "between them.",
-                    prior_start,
-                    prior_end,
-                    store_path,
-                    start,
-                    end,
-                )
-        root.attrs[ASSESSED_WINDOW_ATTR] = [start, end]
+        # APPEND, then project. The log is the record; the two attributes below are a view of it
+        # kept for readers that predate it. Nothing here reconciles: this run states what it
+        # examined and what it lost, and the fold decides what that means alongside every earlier
+        # statement.
+        log = read_assessment_log(root.attrs)
+        entry: dict[str, Any] = {
+            "examined": [start_date, end_date],
+            "losses": list(unreadable or ()),
+            "source": "ingest",
+        }
+        if considered is not None:
+            # The dates this run actually judged. Only these supersede an earlier verdict; the
+            # range says where it looked, not that it looked at every day inside.
+            entry["considered"] = sorted({str(d) for d in considered})
+        log.append(entry)
+        window, losses = project_assessment(log, present=present)
+        root.attrs[ASSESSMENT_LOG_ATTR] = log
+        # Derived, never merged — recomputed wholesale from the log on every write, so the two can
+        # never disagree and no incremental rule is needed to keep them together.
+        if window is not None:
+            root.attrs[ASSESSED_WINDOW_ATTR] = window
+        root.attrs[UNREADABLE_DATES_ATTR] = losses
         root.attrs["assessed_empty_dates"] = int(empty_dates)
-        # A UNION, minus the dates now on the axis — see merge_recorded_losses. An
-        # unconditional write was correct only while one leg assessed the whole window: once a
-        # resume starts at its frontier's month it never re-derives the earlier months' losses,
-        # so writing its own list alone would erase them.
-        root.attrs[UNREADABLE_DATES_ATTR] = merge_recorded_losses(
-            root.attrs.get(UNREADABLE_DATES_ATTR),
-            unreadable or (),
-            present=present,
-            # THIS run's own range, never the merged one. The merged range may reach back over
-            # months an earlier run examined and this one skipped; reconciling against it would
-            # discard their records on the strength of a look this run never took.
-            reassessed=(start_date, end_date),
-        )
+        start, end = (window or [start_date, end_date])[0], (window or [start_date, end_date])[1]
         # ``allow_empty`` because re-recording the SAME window writes no bytes, and icechunk
         # refuses a commit with no changes ("cannot commit, no changes made to the session").
         # That refusal surfaced as a WARNING on healthy stores — every resumed leg that had
@@ -2094,18 +2149,37 @@ def write_days_windows(
             # Same commit as the dates it describes; a union, since one resume writes many.
             prior = cast("list", attrs.get(MIXED_CODE_IDENTITIES_ATTR, []))
             attrs[MIXED_CODE_IDENTITIES_ATTR] = sorted(set(prior) | set(mixed))
-        prior_losses = attrs.get(UNREADABLE_DATES_ATTR)
-        if losses or prior_losses:
-            # Run whenever the store records ANY loss, not only when this call brings new ones.
-            # A date recorded as lost at the tail of an earlier leg is still appendable, so a
-            # later leg can recover it — and that recovery arrives here with nothing new to add.
-            # Skipping the merge then commits the pixels while leaving the date advertised as
-            # lost, and a leg that dies before its end-of-leg record leaves it that way for good.
-            #
-            # ``present`` is this batch's own dates: a date being written is not a loss.
-            attrs[UNREADABLE_DATES_ATTR] = merge_recorded_losses(
-                prior_losses, losses or (), present={str(w)[:10] for w in whens}
-            )
+        # A loss has to be durable BEFORE the run ends, because the commit that seals a date is
+        # this one and a run can die before its final record. So it is appended here, in the same
+        # commit — and only the losses the log does not already carry, which keeps one entry per
+        # distinct loss rather than one per write.
+        #
+        # These entries state losses without claiming to have EXAMINED a range: this call wrote
+        # some dates, it did not survey a window. The fold treats them accordingly — they
+        # contribute a verdict and no coverage, and a later run whose range covers them supersedes
+        # them, which is how a recovered or re-filtered date stops being advertised as a hole.
+        # EVERY committed date, not just this batch's. A projection filtered on the batch alone
+        # drops a recovered date only while that batch is the one folding; the next unrelated write
+        # folds the same history against a different set and republishes the historical loss. The
+        # axis is the only set that answers "is this date stored" for all of them.
+        stored = {str(t)[:10] for t in read_time_values(batch.group)} | {str(w)[:10] for w in whens}
+        log = read_assessment_log(attrs)
+
+        # Deduplicated against the CURRENT verdict, never against every mention ever made. A date
+        # lost, later re-examined and cleared, and then lost again is a new observation — and
+        # matching it against history would suppress it, so the commit sealing it would carry no
+        # record and an interruption before the end-of-run record would leave the hole unnamed.
+        _, current = project_assessment(log, present=stored)
+        already = {_loss_date(loss) for loss in current}
+        fresh = [loss for loss in losses or () if _loss_date(loss) not in already]
+        if fresh:
+            log.append({"examined": None, "losses": fresh, "source": "write"})
+        if log:
+            attrs[ASSESSMENT_LOG_ATTR] = log
+            # Derived from the log, so this commit's view and the end-of-run view agree by
+            # construction rather than by two rules being kept in step.
+            _window, projected = project_assessment(log, present=stored)
+            attrs[UNREADABLE_DATES_ATTR] = projected
         if parallel_windows and _write_windows_overlapped(batch.session, writes):
             return  # normal context exit: the batched commit below still runs
         for one_ds, one_windows, t, drop in writes:

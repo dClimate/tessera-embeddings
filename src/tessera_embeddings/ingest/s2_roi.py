@@ -540,6 +540,9 @@ def ingest_s2_roi_reflectance(
     total_filtered = 0
     total_refused = 0
     total_seen = 0
+    #: Every date the catalogue offered this run, which is what it actually judged.
+    #: A range says where a run looked; only this says what it looked AT.
+    considered_dates: set[str] = set()
     #: Tile-dates whose every copy failed to read. Their pixels are absent from the mosaic,
     #: so this is the ONLY record of where the loss is; it is re-stated at the end of the run.
     unreadable_tile_dates: list[dict[str, str]] = []
@@ -1194,6 +1197,7 @@ def ingest_s2_roi_reflectance(
                 frontier,
             )
         total_seen += len(by_date)
+        considered_dates.update(by_date)
         prepare = _prepare_date
         if batch_dates > 1:
             # Only PASSING dates occupy batch slots — a skipped date adds no work to
@@ -1340,6 +1344,10 @@ def ingest_s2_roi_reflectance(
             start_date,
             end_date,
             unreadable=_losses_so_far(),
+            # What this leg actually judged, which is not every day in the range above: it saw
+            # only the days the catalogue returned. Recording it is what stops a later run
+            # clearing a loss for a day no response ever offered it.
+            considered=considered_dates,
             # Load-bearing exactly when there is something to lose, as the radar path already
             # was. A leg whose only finding is a date it cannot fill writes nothing, so no
             # commit carries the record and this call is its sole durable trace; swallowing a

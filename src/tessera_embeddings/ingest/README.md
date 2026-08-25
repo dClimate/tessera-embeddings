@@ -1544,22 +1544,25 @@ resumed run starts partway through the year, so those are different. And both re
   may be arbitrarily old, while this one was just verified. When the store has no record at all,
   the range simply begins where this run began, leaving earlier months outside it, which correctly
   reads as *never looked at*.
-- **The list of lost days is added to, not replaced** (`zarr_store.merge_recorded_losses`). A
-  resumed run only knows about the months it walked, so overwriting the list with its own findings
-  would erase everything earlier runs recorded. Two things do change an entry:
-  - **A day that has since been stored drops off**, because it is no longer lost. That happens at
-    the commit that stores it, not only at the end of a run, so a run killed in between cannot
-    leave a stored day still advertised as missing.
-  - **A day found to be below the newest stored date replaces whatever was recorded before**
-    (`scope=unfillable`). That verdict is read off the store itself rather than from the imagery,
-    so nothing known about the source can correct it, and it carries the opposite instruction:
-    every other reason says wait for a republished file, this one says the store has to be rebuilt.
-  Otherwise the existing entry wins, which means a record written by hand during a repair survives
-  later runs rather than being wiped by them.
+- **The list of lost days is folded out of the history, not maintained.** Each run appends what it
+  examined and what it lost; nothing is edited, reconciled or upgraded afterwards. The two
+  attributes readers consume are recomputed from that history on every write, so they cannot drift
+  from it or from each other.
 
-The attribute belongs on the repo the gate opens — `reflectance.zarr` or `sar_<orbit>.zarr` —
-not on the mosaic directory that contains them.
+  Three things follow, and none of them is a rule anyone has to remember:
+  - **A day's verdict comes from the last run whose range covered it**, because that run looked
+    most recently. A day once unreadable, later re-read and legitimately filtered — too cloudy, no
+    live window — simply stops being listed, rather than blocking its month forever.
+  - **A day no run examined keeps its record.** A resumed run starts at its own resume point and
+    never re-derives the earlier months, so it has no opinion on them. This is also what preserves
+    a record written by hand during a repair: those describe exactly the months runs skip.
+  - **A day back on the time axis is not a loss**, whoever recorded it. That happens at the commit
+    that stores it, not only at the end of a run, so a run killed in between cannot leave a stored
+    day still advertised as missing.
 
+  Whether a day can still be written is deliberately NOT stored: it is one comparison against the
+  store's own axis, and every reader has the axis. Storing it is what previously required a rule
+  to keep it current, since the answer changes the moment any later day commits.
 **It is written whenever the store exists, not only when the run wrote a date.** The case that
 needs it most writes nothing. A run interrupted between its last date commit and this record
 leaves every date present and the attribute absent; the retry then dedupes all of those dates
