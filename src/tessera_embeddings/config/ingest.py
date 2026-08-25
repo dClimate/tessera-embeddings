@@ -274,6 +274,32 @@ class IngestSettings(BaseModel):
     # to ONE class, recognised by `errors.ProviderRefusedReadsError` reaching the leg's failure
     # detail, and every other failure keeps the short backoff.
     leg_refusal_backoff_s: int = Field(default=600, ge=0)
+    # Seconds of extra wall clock a leg EARNS by committing dates, each time
+    # `max_leg_wall_clock_s` would otherwise refuse its next attempt. 0 turns it off, which
+    # restores the plain deadline exactly.
+    #
+    # The deadline above bounds PATIENCE — wall clock a leg spends not getting anywhere — and it
+    # says so: "this deadline only ever binds on a cell already behaving pathologically". Counted
+    # from the leg's first dispatch, it could not keep that promise. It charges a leg for the
+    # productive work of every prior attempt, so a leg that committed steadily for hours and then
+    # hit a transient failure is refused the attempt that would have resumed from those hours,
+    # on the same terms as a leg that achieved nothing.
+    #
+    # A leg whose store has GAINED DATES is not the cell the deadline was written for. It resumes
+    # from what it committed, so its next attempt starts further along than its last one did, and
+    # the campaign slot it holds is buying something.
+    #
+    # Bounded by construction rather than by a second lever, and all three bounds carry weight: a
+    # grant costs this fixed amount; grants are limited to the number of re-dispatch decisions a
+    # leg has, which is one fewer than `max_leg_attempts`; and each one has to be PAID FOR by
+    # dates committed since the previous grant, so a store that stops growing stops earning them.
+    # The ceiling is therefore `max_leg_wall_clock_s + (max_leg_attempts - 1) * this`, and a leg
+    # that commits nothing never leaves `max_leg_wall_clock_s`.
+    #
+    # Sized as a rung of patience rather than as a whole extra leg: what a grant has to cover is
+    # the backoff plus the START of one more attempt, since a running leg is never judged
+    # against the deadline at all.
+    leg_progress_extension_s: int = Field(default=3600, ge=0)
     # Width, in seconds, of the window each ingest leg spreads its FIRST dispatch over. 0 is off.
     #
     # A cell's legs are dispatched the moment the cell is, and a campaign starts every cell it

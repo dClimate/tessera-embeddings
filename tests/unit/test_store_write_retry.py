@@ -56,10 +56,18 @@ def _run(
     fail_times: int = 99,
     wait_out: Callable[[BaseException], bool] | None = None,
     while_attempting: Callable[[], None] | None = None,
+    new_failure: Callable[[], BaseException] | None = None,
 ) -> tuple[int, float, BaseException | None]:
-    """Run the policy against a callable that raises ``exc``.
+    """Run the policy against a callable that raises ``exc``, or ``new_failure()`` per attempt.
 
     Returns the attempts made, the backoff slept, and whatever the policy finally re-raised.
+
+    **``new_failure`` is the production shape, and the difference is not cosmetic.** A real write
+    builds a new graph per attempt and raises a NEW exception each time. Re-raising one object
+    instead lets the evidence attached to it on the first attempt persist onto every later one —
+    so a predicate that reads the exception's notes latches by accident, and a test written that
+    way reports patience the real path does not have. Pass ``new_failure`` wherever what is under
+    test is how a failure is JUDGED; ``exc`` is fine where only the attempt count matters.
 
     Sleeps are counted rather than taken — the policy's backoff is deliberately seconds long and
     the wait-out budget is minutes long, so taking either would make this file the slowest in the
@@ -82,6 +90,8 @@ def _run(
                 calls += 1
                 if while_attempting is not None:
                     while_attempting()
+                if new_failure is not None and calls <= fail_times:
+                    raise new_failure()
                 if exc is not None and calls <= fail_times:
                     raise exc
     except BaseException as raised:  # the policy's verdict is exactly what is under test
@@ -102,6 +112,7 @@ def _exhausted(
     *,
     wait_out: Callable[[BaseException], bool],
     while_attempting: Callable[[], None] | None = None,
+    new_failure: Callable[[], BaseException] | None = None,
 ) -> tuple[int, float]:
     """Attempts and backoff spent on a failure that never clears.
 
@@ -110,8 +121,11 @@ def _exhausted(
 
     ``while_attempting`` runs inside each attempt, which is where GDAL writes its log line. An
     outage states its refusal on every attempt it refuses, not once before the write begins.
+
+    ``new_failure`` raises a fresh exception per attempt, which is what a real write does — see
+    :func:`_run`.
     """
-    calls, slept, raised = _run(exc, wait_out=wait_out, while_attempting=while_attempting)
+    calls, slept, raised = _run(exc, wait_out=wait_out, while_attempting=while_attempting, new_failure=new_failure)
     assert type(raised) is type(exc), "an exhausted policy must re-raise the failure, not absorb it"
     return calls, slept
 
@@ -255,12 +269,19 @@ def test_a_refusal_that_is_not_the_sources_gets_no_long_wait(exc):
 
 
 class TestArmingThePatienceOnEvidenceTheChainDoesNotCarry:
-    """Whether the budget engages for the failure it was written for.
+    """Whether the budget engages for the failure it was written for, and for how long.
 
     A refused object comes back as an error document where the imagery should be, so the codec
     raises a decode failure and the refusal is stated only in GDAL's own log. A predicate reading
     the exception alone therefore declines the very outage the budget exists to outlast, and the
     write spends three attempts on it — which is the ordinary limit, reached in seconds.
+
+    The evidence window is the WRITE, and that is the second thing these pin. An outage states its
+    refusal while it is refusing, not on a schedule of ours, so a window re-armed per attempt asks
+    "was anything refused in the last few seconds" — which a recovering provider answers correctly
+    with NO, one attempt before the write would have succeeded. Both edges of the window are
+    tested: a refusal stated once during the write counts for the whole of it, and a refusal
+    stated before the write began counts for none of it.
 
     Both directions are pinned, because widening what gets waited out is expensive in its own
     right: a codec failure recomputes to the same verdict, and every second spent on it is a
@@ -280,6 +301,13 @@ class TestArmingThePatienceOnEvidenceTheChainDoesNotCarry:
 
     @staticmethod
     def _decode_failure() -> BaseException:
+        """What a refused object raises: the codec complaining about an XML error document.
+
+        Built fresh per call, and every test here that turns on the VERDICT raises a fresh one per
+        attempt — see :func:`_run`. Re-raising a single object would carry the first attempt's
+        attached evidence onto every later attempt, which is a latch this code does not have and
+        must not be credited with.
+        """
         exc = RuntimeError("WarpOperationError: Chunk and warp failed")
         exc.__cause__ = RuntimeError("RasterioIOError: ZIPDecode: Decoding error at scanline 0")
         return exc
@@ -294,32 +322,73 @@ class TestArmingThePatienceOnEvidenceTheChainDoesNotCarry:
     )
 
     def test_a_refusal_only_gdal_logged_outlasts_the_attempt_limit(self):
-        """The refusal is stated on every attempt it refuses, which is when GDAL logs it.
-
-        The predicate considers the evidence of the attempt that just failed, so a line from
-        before the write began is not this write's evidence — see the control below.
-        """
+        """The refusal is stated on every attempt it refuses, which is when GDAL logs it."""
         calls, slept = _exhausted(
             self._decode_failure(),
             wait_out=refusal_wait_out(None),
+            new_failure=self._decode_failure,
             while_attempting=lambda: logging.getLogger("rasterio._env").warning(self.REFUSAL),
         )
         assert calls > STORE_WRITE_ATTEMPTS
         assert slept <= WAIT_OUT_BACKOFF_S
 
-    def test_a_line_left_over_from_an_earlier_write_buys_nothing(self):
-        """A refusal that has since recovered is not evidence about this failure.
+    def test_a_refusal_stated_once_is_evidence_for_the_whole_write(self):
+        """The failure this budget exists for, and the one it was not spent on.
 
-        Unbounded, it would hand an unrelated codec failure the whole refusal budget: a fleet
-        held idle for minutes to reach the verdict it already had.
+        An outage states its refusal while it is refusing. It does not restate it on the schedule
+        the retry ladder happens to ask on, and it stops restating it the moment it clears — which
+        is one attempt before the write would have succeeded. So a window re-armed per attempt
+        withdraws patience at exactly the moment patience was about to pay off, and the budget is
+        left almost entirely unspent.
+
+        The refusal here is stated during the FIRST attempt and never again. The write must go on
+        asking until the budget is spent, and it must not spend more than the budget doing it.
+        """
+        stated = []
+
+        def _state_it_once() -> None:
+            if not stated:
+                stated.append(True)
+                logging.getLogger("rasterio._env").warning(self.REFUSAL)
+
+        calls, slept = _exhausted(
+            self._decode_failure(),
+            wait_out=refusal_wait_out(None),
+            new_failure=self._decode_failure,
+            while_attempting=_state_it_once,
+        )
+        assert calls > STORE_WRITE_ATTEMPTS, "patience was withdrawn as soon as the outage went quiet"
+        assert slept > WAIT_OUT_BACKOFF_S / 2, "a budget left unspent is a budget that did not act"
+        assert slept <= WAIT_OUT_BACKOFF_S, "the window widened, and the bound on it must not have"
+
+    def test_a_line_left_over_from_an_earlier_write_buys_nothing(self):
+        """The other edge of the window, and the reason it is a window rather than a memory.
+
+        A refusal that had already recovered before this write began is not evidence about this
+        failure. Unbounded on that side, it would hand an unrelated codec failure the whole refusal
+        budget: a fleet held idle for minutes to reach the verdict it already had.
         """
         logging.getLogger("rasterio._env").warning(self.REFUSAL)
         time.sleep(0.05)
-        assert _exhausted(self._decode_failure(), wait_out=refusal_wait_out(None))[0] == STORE_WRITE_ATTEMPTS
+        assert (
+            _exhausted(
+                self._decode_failure(),
+                wait_out=refusal_wait_out(None),
+                new_failure=self._decode_failure,
+            )[0]
+            == STORE_WRITE_ATTEMPTS
+        )
 
     def test_the_same_failure_with_nothing_logged_gets_only_the_attempt_limit(self):
         """The control. The predicate must complete a reason, never invent one."""
-        assert _exhausted(self._decode_failure(), wait_out=refusal_wait_out(None))[0] == STORE_WRITE_ATTEMPTS
+        assert (
+            _exhausted(
+                self._decode_failure(),
+                wait_out=refusal_wait_out(None),
+                new_failure=self._decode_failure,
+            )[0]
+            == STORE_WRITE_ATTEMPTS
+        )
 
 
 def test_a_moved_branch_tip_is_never_retried_even_when_waiting_something_out():
