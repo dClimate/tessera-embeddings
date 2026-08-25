@@ -562,7 +562,9 @@ def _joined_gpu_count(last_known: float, gpus_per_actor: float) -> float:
     charging when its instance launches, and Ray only counts it once bootstrap has joined it, so
     every worker's boot-and-bootstrap interval is billed and uncounted here. This is therefore a
     LOWER BOUND, and deliberately so: the quantity it replaced was a fleet-sized over-count, and
-    a floor is the safe direction for a number read to decide whether to cap a fleet.
+    a floor is the safe direction for a number read to decide whether to cap a fleet. Its caller
+    integrates it at the lower of each interval's endpoints, so the floor survives the
+    integration rather than only the reading.
 
     **Scoped to this cluster, not to this pool.** In the attached-cluster mode the cluster may
     hold GPUs belonging to other work, which would be counted here. The campaign cannot reach
@@ -1195,13 +1197,15 @@ def _process_chunks_work_stealing(
             time.sleep(5)
             ready_refs = []
         now = time.monotonic()
-        # Sampled at the END of an interval that a blocking `ray.wait` can stretch to a minute,
-        # so charging the whole interval at this reading bills a batch that joined near the end
-        # for time it was not there. Averaging the two endpoints splits a mid-interval change
-        # across it instead, which is the standard trapezoid over a sampled signal.
+        # Charged at the LOWER of the interval's two endpoints, which is what keeps this figure
+        # the lower bound it claims to be. A blocking `ray.wait` can stretch an interval to a
+        # minute, and capacity moves in steps within it: a batch joining just before the wait
+        # returns did not run for the interval, and a node leaving just after it started did.
+        # Since the step's timing is unknown, only the smaller endpoint is safe in both
+        # directions — an average would assume the change fell halfway and can overstate either.
         previous_gpus = joined_gpus
         joined_gpus = _joined_gpu_count(joined_gpus, pool.config.num_gpus)
-        gpu_seconds += 0.5 * (previous_gpus + joined_gpus) * (now - last_tick)
+        gpu_seconds += min(previous_gpus, joined_gpus) * (now - last_tick)
         last_tick = now
 
         # Poll tracker on every iteration (including timeouts with no completions)

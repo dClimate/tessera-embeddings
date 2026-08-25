@@ -1073,23 +1073,32 @@ class TestWorkStealingGpuHours:
         assert len(polls) == 1, "the run must report progress exactly once for the bound below to be exact"
         return polls
 
-    def test_a_mid_interval_capacity_change_is_split_across_the_interval(self) -> None:
-        """A blocking wait can stretch an interval to a minute, so WHEN capacity is sampled matters.
+    @pytest.mark.parametrize(
+        ("readings", "rejected"),
+        [
+            ([{"GPU": 10.0}, {"GPU": 40.0}], "the reading taken when the wait returned (40)"),
+            ([{"GPU": 40.0}, {"GPU": 10.0}], "the reading taken when the interval began (40)"),
+        ],
+        ids=["capacity-rose", "capacity-fell"],
+    )
+    def test_an_interval_is_charged_at_its_lower_endpoint(self, readings, rejected) -> None:
+        """Capacity moves in STEPS inside an interval a blocking wait can stretch to a minute.
 
-        Charging the whole interval at the reading taken when the wait returns bills a batch that
-        joined near the end for time it was not there. Averaging the interval's two endpoints
-        splits the change across it. Here capacity goes from none to forty between the seed
-        reading and the loop's, so a correct integral charges twenty for that interval and
-        end-sampling would charge forty.
+        A batch joining just before the wait returns did not run for that interval; a node leaving
+        just after it began did. The step's timing is unknown, so only the smaller endpoint is
+        safe in both directions — which is also what keeps the figure the lower bound it is
+        documented to be. An average would assume the change fell halfway and can overstate
+        either way.
+
+        Both directions are pinned because each rules out a different wrong policy: charging at
+        the interval's end, and charging at its start.
         """
-        polls = self._run_one_chunk(0, {"side_effect": [{"GPU": 0.0}, {"GPU": 40.0}]})
+        polls = self._run_one_chunk(0, {"side_effect": readings})
         gpu_seconds = polls[0]["gpu_hours"] * 3600
-        # The clock is synthetic and steps one second per read, so the accumulated figure is
-        # exact rather than approximate: one interval of one second, charged at the average of
-        # its endpoints. End-sampling would charge that second at 40 and report double.
-        assert gpu_seconds == pytest.approx(20.0), (
-            f"{gpu_seconds} GPU-seconds; expected the interval charged at the average of its "
-            "endpoints (20), not at the reading taken when the wait returned (40)"
+        # The clock is synthetic and steps one second per read, so this is exact: one interval of
+        # one second, charged at the lower of its endpoints.
+        assert gpu_seconds == pytest.approx(10.0), (
+            f"{gpu_seconds} GPU-seconds; expected the interval charged at its lower endpoint (10), not {rejected}"
         )
 
     def test_gpu_hours_follows_the_cluster_not_the_requested_fleet(self) -> None:
