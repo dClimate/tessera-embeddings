@@ -177,35 +177,12 @@ class ActorPool:
 
     @property
     def live_count(self) -> int:
-        """Number of non-retired actor slots, placed on a node or not.
+        """Number of non-retired actor slots — the pool's CONTROL quantity.
 
-        The pool's CONTROL quantity: dispatch, next-chunk reservation and the
-        loop's exit condition are all sized on slots the pool intends to use.
-        For the number of slots with an instance behind them — the billed
-        capacity — see ``placed_count``.
+        Slots the pool intends to dispatch to, placed on a node or not. It is
+        not billed capacity; for that see :func:`_billed_gpu_count`.
         """
         return len(self.actors) - len(self._retired)
-
-    @property
-    def placed_count(self) -> int:
-        """Number of non-retired actor slots that have hardware behind them.
-
-        A slot counts once the pool has heard from its actor — the instance-ID
-        fetch answering, or a chunk coming back. Only a process running on a
-        node can reply, so a reply proves a GPU instance exists for that slot
-        and is being billed. A slot Ray has accepted but not yet placed never
-        replies: the pool asks for actors before the instances exist and the
-        autoscaler brings the nodes up behind the request, so such a slot costs
-        nothing until it does. A fetch that FAILS rather than answers also
-        clears the slot, which is then killed, replaced and re-marked, so it is
-        over-counted for at most one loop iteration.
-
-        A MONITORING quantity only: nothing scales, retires or branches on it.
-        It is pure in-process arithmetic over the pool's own state and makes no
-        Ray call, so a reader on the dispatch loop's hot path can neither raise
-        nor stall.
-        """
-        return max(0, len(self.actors) - len(self._retired | self._initializing))
 
     def outstanding_work(self, queued: int) -> int:
         """In-flight + queued + reserved chunks — the true remaining-work count.
@@ -573,6 +550,29 @@ class ActorPool:
 # ---------------------------------------------------------------------------
 
 
+def _billed_gpu_count(last_known: float) -> float:
+    """GPUs joined to the cluster — the capacity actually being billed.
+
+    Every GPU worker declares one GPU and the head declares none, so the cluster
+    TOTAL is the billed worker count. Total, not available: a GPU an actor is
+    working on is still billed, so ``available_resources()`` — the idle
+    remainder — is the wrong call. A slot Ray has accepted but not yet placed
+    contributes nothing, which is the point.
+
+    The guard is load-bearing, not defensive. Its caller sits in the dispatch
+    loop OUTSIDE the try/except that wraps the tracker poll, so an exception
+    from this lookup would abort a fill over a log number; a failure carries the
+    previous count forward instead.
+
+    Args:
+        last_known: Count to fall back to when the lookup fails.
+    """
+    try:
+        return float(ray.cluster_resources().get("GPU", 0))
+    except Exception:
+        return last_known
+
+
 def _poll_tracker(
     tracker: ray.actor.ActorHandle,
     n_done: int,
@@ -605,10 +605,8 @@ def _poll_tracker(
             way). Measured from the run's start it read as though inference had been going for the
             ingest, cluster-bringup and model-load time too, and disagreed with ``gpu_hours`` on the
             same line.
-        gpu_hours: Fleet GPU-hours consumed so far (PLACED-actor count integrated over wall time;
-            one GPU per actor), folded into the same line. Counting placed slots rather than every
-            slot the pool has created is what makes this billed capacity during scale-up as well as
-            in steady state — an unplaced slot has no instance behind it and costs nothing.
+        gpu_hours: Fleet GPU-hours consumed so far — the cluster's BILLED GPU count integrated
+            over wall time (see :func:`_billed_gpu_count`) — folded into the same line.
         recovery_threshold_sec: Seconds without an update before a chunk is
             declared unrecoverable in place and returned for kill-and-requeue.
             Deliberately well above ``stall_threshold_sec`` so a warning always
@@ -1110,16 +1108,12 @@ def _process_chunks_work_stealing(
                 _finalize_prior_write(actor_idx, prior)
 
     # --- Main work-stealing loop ---
-    # gpu_seconds integrates the PLACED-actor count over wall time (one GPU per
-    # actor) so the progress line can report fleet GPU-hours consumed so far.
-    #
-    # Placed, not live: the pool asks for its whole fleet before the instances
-    # exist, so for the length of scale-up most slots have no hardware behind
-    # them and cost nothing. Integrating created slots would report a
-    # fleet-sized figure while a fraction of it is billed — and scale-up is
-    # precisely when the figure is read to decide whether to cap the fleet.
-    # See ActorPool.placed_count; the figure is logging-only either way.
+    # gpu_seconds integrates BILLED GPUs over wall time so the progress line can
+    # report fleet GPU-hours consumed so far. Billed, not requested: a slot the
+    # pool has asked for but Ray has not placed costs nothing until its instance
+    # exists. Logging-only — nothing scales, retires or branches on it.
     gpu_seconds = 0.0
+    billed_gpus = 0.0
     last_tick = time.monotonic()
     # The progress line's elapsed clock, and it starts HERE rather than at ``t0``.
     #
@@ -1185,7 +1179,8 @@ def _process_chunks_work_stealing(
             time.sleep(5)
             ready_refs = []
         now = time.monotonic()
-        gpu_seconds += pool.placed_count * (now - last_tick)
+        billed_gpus = _billed_gpu_count(billed_gpus)
+        gpu_seconds += billed_gpus * (now - last_tick)
         last_tick = now
 
         # Poll tracker on every iteration (including timeouts with no completions)

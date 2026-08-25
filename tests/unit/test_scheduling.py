@@ -19,6 +19,7 @@ from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.scheduling import (
     ActorPool,
     _batch_actors_to_request,
+    _billed_gpu_count,
     _poll_tracker,
     _process_chunks_work_stealing,
 )
@@ -96,6 +97,32 @@ def test_replace_carries_credentials_and_region_to_new_actor():
     args = cls.options.return_value.remote.call_args.args
     assert args[2] is creds
     assert args[3] == "eu-west-1"
+
+
+# ===========================================================================
+# _billed_gpu_count
+# ===========================================================================
+
+
+class TestBilledGpuCount:
+    """The billed-capacity reading behind the progress line's GPU-hours."""
+
+    def test_reads_the_cluster_total(self) -> None:
+        with patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 40.0, "GPU": 7.0}):
+            assert _billed_gpu_count(0.0) == 7.0
+
+    def test_no_gpu_nodes_yet_reads_zero(self) -> None:
+        """Before the first worker joins, the cluster has no GPU key at all."""
+        with patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 8.0}):
+            assert _billed_gpu_count(3.0) == 0.0
+
+    def test_a_failed_lookup_carries_the_previous_count_forward(self) -> None:
+        """The caller is in the dispatch loop, outside the tracker poll's guard.
+
+        A control-plane hiccup must cost accuracy in a log line, never the fill.
+        """
+        with patch.object(_sched_mod.ray, "cluster_resources", side_effect=RuntimeError("gcs unavailable")):
+            assert _billed_gpu_count(5.0) == 5.0
 
 
 # ===========================================================================
@@ -231,24 +258,6 @@ class TestActorPoolProperties:
         assert pool.live_count == 3
         pool._retired.add(0)
         assert pool.live_count == 2
-
-    def test_placed_count_excludes_created_but_unplaced_slots(self) -> None:
-        """A slot Ray accepted but has not put on a node has no GPU behind it.
-
-        ``live_count`` must keep counting it — it is a slot the pool intends to
-        dispatch to — while ``placed_count`` must not, because nothing is billed
-        until the instance exists.
-        """
-        pool = _make_pool(3)
-        pool.mark_initializing(1)
-        pool.mark_initializing(2)
-        assert pool.live_count == 3
-        assert pool.placed_count == 1
-
-    def test_placed_count_excludes_retired_slots(self) -> None:
-        pool = _make_pool(3)
-        pool._retired.add(0)
-        assert pool.placed_count == 2
 
 
 # ===========================================================================
@@ -976,21 +985,15 @@ class TestWorkStealingLoopCondition:
 class TestWorkStealingGpuHours:
     """The reported GPU-hours must integrate BILLED capacity, not requested capacity."""
 
-    def test_gpu_hours_integrates_placed_actors_not_created_slots(self) -> None:
-        """During scale-up most slots have no instance behind them yet.
+    @staticmethod
+    def _run_one_chunk(n_unplaced: int, cluster_resources) -> list[dict]:
+        """Drive one loop iteration on a fleet that is mostly unplaced.
 
-        The pool asks for its whole fleet up front; Ray accepts every handle and
-        the autoscaler brings nodes up behind the request. Integrating the
-        created-slot count therefore reports a fleet-sized GPU-hours figure while
-        only a fraction of the fleet is billed, and it does so for the whole of
-        scale-up — the window in which an operator reads the figure to decide
-        whether to cap the fleet.
-
-        The state that makes this observable is built explicitly: one placed
-        actor, and many slots whose instance-ID fetch never answers because the
-        instance behind them does not exist.
+        The state is built explicitly rather than assumed: one actor that works,
+        and ``n_unplaced`` slots whose instance-ID fetch never answers because
+        the instance behind them does not exist. Returns the kwargs of each
+        progress poll.
         """
-        n_unplaced = 19
         actors = [MagicMock(name=f"actor_{i}") for i in range(1 + n_unplaced)]
         config = MagicMock()
         config.checkpoint_path = "s3://bucket/ckpt.pt"
@@ -1021,6 +1024,7 @@ class TestWorkStealingGpuHours:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
             patch.object(_sched_mod.ray, "get", return_value={"chunk": "c0", "status": "ok"}),
+            patch.object(_sched_mod.ray, "cluster_resources", **cluster_resources),
             patch.object(_sched_mod.time, "monotonic", side_effect=lambda: next(clock)),
             patch.object(_sched_mod, "_poll_tracker", side_effect=record_poll),
         ):
@@ -1036,9 +1040,22 @@ class TestWorkStealingGpuHours:
                 tracker=MagicMock(),
                 still_initializing=set(range(1, 1 + n_unplaced)),
             )
-
-        assert len(results) == 1
+        assert len(results) == 1, "the chunk must complete for the poll figures to mean anything"
         assert len(polls) == 1, "the run must report progress exactly once for the bound below to be exact"
+        return polls
+
+    def test_gpu_hours_follows_the_cluster_not_the_requested_fleet(self) -> None:
+        """During scale-up most requested slots have no instance behind them.
+
+        The pool asks for its whole fleet up front; Ray accepts every handle and
+        the autoscaler brings nodes up behind the request. Integrating the
+        requested-slot count reports a fleet-sized GPU-hours figure while only a
+        fraction of the fleet is billed, and it does so for the whole of
+        scale-up — the window in which an operator reads the figure to decide
+        whether to cap the fleet.
+        """
+        n_unplaced = 19
+        polls = self._run_one_chunk(n_unplaced, {"return_value": {"CPU": 8.0, "GPU": 1.0}})
         gpu_hours = polls[0]["gpu_hours"]
         elapsed_hours = polls[0]["elapsed_min"] / 60
 
@@ -1046,15 +1063,24 @@ class TestWorkStealingGpuHours:
         # satisfies any upper bound while telling an operator nothing.
         assert gpu_hours > 0
 
-        # One placed actor cannot burn materially more than one GPU-hour per
+        # One billed GPU cannot burn materially more than one GPU-hour per
         # elapsed hour. The factor of two is slack for the clock ticks between
-        # the loop's own read and the formatter's, not room for extra actors:
-        # counting every created slot puts the figure an order of magnitude above
-        # this bound.
+        # the loop's own read and the formatter's, not room for extra GPUs:
+        # counting the requested slots instead puts the figure an order of
+        # magnitude above this bound.
         assert gpu_hours < 2 * elapsed_hours, (
-            f"{gpu_hours * 3600:.1f} GPU-seconds over {elapsed_hours * 3600:.1f} elapsed seconds with one "
-            f"placed actor — the {n_unplaced} created-but-unplaced slots are being billed for"
+            f"{gpu_hours * 3600:.1f} GPU-seconds over {elapsed_hours * 3600:.1f} elapsed seconds against one "
+            f"billed GPU — the {n_unplaced} requested-but-unplaced slots are being billed for"
         )
+
+    def test_a_failed_capacity_lookup_does_not_abort_the_run(self) -> None:
+        """The lookup sits outside the try/except that wraps the tracker poll.
+
+        Unguarded, a control-plane hiccup would propagate out of the dispatch
+        loop and destroy a fill over a log number. The figure is what degrades.
+        """
+        polls = self._run_one_chunk(3, {"side_effect": RuntimeError("gcs unavailable")})
+        assert polls[0]["gpu_hours"] == 0.0
 
 
 # ===========================================================================
