@@ -74,6 +74,7 @@ from tessera_embeddings.ingest.solar_days import (
     owned_items,
     resume_window_start,
     solar_grouping_longitude,
+    validated_window,
 )
 from tessera_embeddings.ingest.stac import ingest_tile
 from tessera_embeddings.ingest.transforms import amplitude_to_db
@@ -553,29 +554,39 @@ def ingest_s1_roi_sar(
     #: store and never shared.
     last_written_date: str | None = max(written_dates, default=None)
 
-    # A window whose end precedes its start is a caller error and always was. Checked BEFORE the
-    # resume start is computed, so a misconfigured leg cannot be reported as a successful skip.
-    if start_date > end_date:
-        raise ValueError(f"start_date {start_date} is after end_date {end_date}; this window contains no days")
-    if last_written_date is not None and last_written_date >= end_date:
-        # Every day in this window is already closed to the store. Compared on the RAW date, not on
-        # anything derived from it: a value floored first can still precede the window's end while
-        # the date it came from does not.
+    # Both bounds are parsed before anything else compares them. Every comparison the resume makes
+    # is between date STRINGS, and a leg can now decide it has nothing to do without ever reaching
+    # `fixed_day_ranges` — which used to be the only thing that rejected a malformed or reversed
+    # window. Checked before the resume start is computed, so a misconfigured leg can never be
+    # reported as a successful skip.
+    validated_window(start_date, end_date)
+
+    # Where the CATALOGUE is searched from. Everything at or below the newest held date is closed,
+    # so searching back there cannot write anything — and searching is most of what a resumed run
+    # does.
+    #
+    # `start_date` is deliberately NOT reassigned. It names the window that was REQUESTED, and
+    # that is what `record_assessed_window` below describes: narrowing the record to the resumed
+    # start would retract the earlier leg's assessment of every month beneath it, and the coverage
+    # gate reads an unassessed absent month as an unexplained gap the zone-year can never clear.
+    query_start_date = resume_window_start(start_date, last_written_date)
+    if query_start_date > end_date:
+        # The store already holds this window's last day, so every batch would sit below the line.
+        # No ranges, and NO early return: the end of this function repairs an assessed-window
+        # record that an interrupted leg never wrote, and a resume over a complete store is
+        # precisely the run that has to perform that repair.
         log.info(
-            "[%s] Nothing to do for roi=%s %s..%s: the store's newest date is %s, so every day in "
-            "this window is already closed to it.",
+            "[%s] Nothing to search for roi=%s %s..%s: the store's newest date is %s, so every day "
+            "in this window is already closed to it.",
             orbit,
             roi_label,
             start_date,
             end_date,
             last_written_date,
         )
-        return SarIngestResult(roi_path=roi_zarr_path, status="skipped", dates_processed={orbit: 0})
-
-    # Everything at or below the newest held date is closed, so searching the catalogue back there
-    # cannot write anything — and searching is most of what a resumed run does.
-    start_date = resume_window_start(start_date, last_written_date)
-    batch_ranges: list[SolarDayRange] = fixed_day_ranges(start_date, end_date, batch_days)
+    batch_ranges: list[SolarDayRange] = (
+        fixed_day_ranges(query_start_date, end_date, batch_days) if query_start_date <= end_date else []
+    )
 
     # Read ONCE, then maintained in-process as dates are written.
     #

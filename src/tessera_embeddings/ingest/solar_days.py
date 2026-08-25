@@ -326,7 +326,16 @@ def _padded(spans: list[tuple[datetime.date, datetime.date]]) -> list[SolarDayRa
     ]
 
 
-def _window(start_date: str, end_date: str) -> tuple[datetime.date, datetime.date]:
+def validated_window(start_date: str, end_date: str) -> tuple[datetime.date, datetime.date]:
+    """The two bounds as dates, refusing anything that is not a real window.
+
+    Public because the range builders below are no longer the only callers that need it. A
+    resumed ingest decides whether it has anything to do BEFORE it builds any range, and it
+    decides by comparing ``YYYY-MM-DD`` strings — which is exact for well-formed dates and
+    silently wrong for anything else, since ``"2024-02-30"`` sorts like a real date and is not
+    one. A leg handed one used to be rejected here; without this call first it would instead be
+    reported as a successful skip.
+    """
     start = datetime.date.fromisoformat(start_date)
     end = datetime.date.fromisoformat(end_date)
     if end < start:
@@ -345,7 +354,7 @@ def month_ranges(start_date: str, end_date: str) -> list[SolarDayRange]:
     month — which is what makes the slices independent. No cross-month state is needed
     to deduplicate, and that matters because the worker can be restarted at any point.
     """
-    start, end = _window(start_date, end_date)
+    start, end = validated_window(start_date, end_date)
     spans: list[tuple[datetime.date, datetime.date]] = []
     year, month = start.year, start.month
     while (year, month) <= (end.year, end.month):
@@ -367,7 +376,7 @@ def fixed_day_ranges(start_date: str, end_date: str, days: int) -> list[SolarDay
     """
     if days < 1:
         raise ValueError(f"days must be >= 1, got {days}")
-    start, end = _window(start_date, end_date)
+    start, end = validated_window(start_date, end_date)
     spans: list[tuple[datetime.date, datetime.date]] = []
     span_start = start
     while span_start <= end:
@@ -385,7 +394,7 @@ def whole_window_range(start_date: str, end_date: str) -> SolarDayRange:
     without it the first and last solar day of the run are queried on a UTC bound that
     excludes part of their imagery.
     """
-    start, end = _window(start_date, end_date)
+    start, end = validated_window(start_date, end_date)
     return _padded([(start, end)])[0]
 
 

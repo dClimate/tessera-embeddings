@@ -96,6 +96,7 @@ from tessera_embeddings.ingest.solar_days import (
     owned_items,
     resume_window_start,
     solar_grouping_longitude,
+    validated_window,
     whole_window_range,
 )
 from tessera_embeddings.ingest.stac import (
@@ -483,11 +484,12 @@ def ingest_s2_roi_reflectance(
         # failing coverage: an ROI with no live pixel can only ever produce a skip.
         log.warning("ROI has no live pixels — every date will fail the coverage gate")
 
-    # A window whose end precedes its start is a caller error and always was — the range builders
-    # refuse it. Checked BEFORE the resume start is computed, so the resume can never be blamed
-    # for it and a misconfigured leg cannot be reported as a successful skip.
-    if start_date > end_date:
-        raise ValueError(f"start_date {start_date} is after end_date {end_date}; this window contains no days")
+    # Both bounds are parsed before anything else compares them. Every comparison the resume makes
+    # is between date STRINGS, and a leg can now decide it has nothing to do without ever reaching
+    # a range builder — which used to be the only thing that rejected a malformed or reversed
+    # window. Checked before the resume start is computed, so a misconfigured leg can never be
+    # reported as a successful skip.
+    validated_window(start_date, end_date)
 
     #: The newest date this store holds, and the line everything at or below is closed by. Read
     #: ONCE, before any work: it decides where this run starts, and re-reading it mid-run would
@@ -495,29 +497,17 @@ def ingest_s2_roi_reflectance(
     _committed_at_start = get_existing_dates(reflectance_store, s3_region=s3_region)
     last_written_date: str | None = max(_committed_at_start, default=None)
 
-    if last_written_date is not None and last_written_date >= end_date:
-        # The store already holds this window's last day, so every day in it is closed. Compared
-        # on the RAW date rather than on anything derived from it: a value floored or rounded first
-        # can still precede the window's end while the date it came from does not.
-        log.info(
-            "Nothing to do for roi=%s %s..%s: the store's newest date is %s, so every day in this "
-            "window is already closed to it.",
-            roi_zarr_path,
-            start_date,
-            end_date,
-            last_written_date,
-        )
-        return IngestResult(
-            roi_path=roi_zarr_path,
-            status="skipped",
-            dates_processed=0,
-            dates_filtered_coverage=0,
-            dates_refused_producer_conflict=0,
-        )
-
-    # Everything at or below the newest held date is closed for good, so searching the catalogue
-    # back there cannot write anything — and searching is most of what a resumed run does.
-    start_date = resume_window_start(start_date, last_written_date)
+    # Where the CATALOGUE is searched from. Everything at or below the newest held date is closed
+    # for good, so searching back there cannot write anything — and searching is most of what a
+    # resumed run does.
+    #
+    # `start_date` is deliberately NOT reassigned. It names the window that was REQUESTED, and
+    # that is what `record_assessed_window` below describes: narrowing the record to the resumed
+    # start would retract the earlier leg's assessment of every month beneath it, and the coverage
+    # gate reads an unassessed absent month as an unexplained gap the zone-year can never clear.
+    # Which days this run queries is a property of the run; what the store was examined over is a
+    # property of the store.
+    query_start_date = resume_window_start(start_date, last_written_date)
 
     def _settled_dates() -> set[str]:
         """Dates this leg must not offer: the ones already written.
@@ -1223,14 +1213,27 @@ def ingest_s2_roi_reflectance(
                 # incomparable, which is the one thing this line exists to do.
                 _consume(prepared, prepared.build_s + prepared.gate_s)
 
-    if stream_stac_monthly:
+    if query_start_date > end_date:
+        # The store already holds this window's last day, so every day in it is closed and there
+        # is nothing to search for. Falling through rather than returning: the end of this
+        # function repairs an assessed-window record that an interrupted leg never wrote, and a
+        # resume over a complete store is precisely the run that has to perform that repair.
+        log.info(
+            "Nothing to search for roi=%s %s..%s: the store's newest date is %s, so every day in "
+            "this window is already closed to it.",
+            roi_zarr_path,
+            start_date,
+            end_date,
+            last_written_date,
+        )
+    elif stream_stac_monthly:
         # Stream month by month: querying the whole window up front retains every item
         # for the run's duration, which a zone-year cannot fit on this worker.
         for _mr, month_items, _month_baselines in stream_stac_months(
             provider=provider,
             collection=collection,
             tile_id=None,
-            start_date=start_date,
+            start_date=query_start_date,
             end_date=end_date,
             bbox=roi.bbox_wgs84,
             existing_dates_fn=lambda: _settled_dates(),
@@ -1250,7 +1253,7 @@ def ingest_s2_roi_reflectance(
         # return the imagery that belongs to the first and last solar day but carries an
         # adjacent UTC date, so those two days were quietly written short. The range
         # pads the query and still owns only the window — see ingest.solar_days.
-        window = whole_window_range(start_date, end_date)
+        window = whole_window_range(query_start_date, end_date)
         items, _baselines = query_stac_items(
             provider=provider,
             collection=collection,
