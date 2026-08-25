@@ -301,19 +301,35 @@ runs on the same trigger — churn with no gain, and a real chance of losing con
 move. The one thing that would genuinely improve them is expressing them as rules in
 `src/tessera_embeddings/architecture_tests/`, which is production code and out of scope here.
 
-**The pass turned up a real asymmetry — flagged, not fixed.** Two of these rules read only
-`ingest/s1_roi.py`, the radar path, though nothing about them is radar-specific:
+**The pass turned up an asymmetry, now ruled on.** Two of these rules read only
+`ingest/s1_roi.py`, the radar path:
 
-- `test_placeholders_match_arguments` — now moot, since the linter covers both sensors.
+- `test_placeholders_match_arguments` — moot, since the linter covers both sensors.
 - `test_every_informational_line_carries_the_roi` — "a line without `roi=` cannot be tied to
-  a cell: the log stream is a task id". **`ingest/s2_roi.py` has 12 informational lines and
-  6 of them carry no ROI**, including `"Writing %d live window(s)"` and
-  `"%d/%d dates passed coverage filter"`.
+  a cell: the log stream is a task id". `ingest/s2_roi.py` has 12 informational lines and 6
+  carry no ROI, so widening the test would fail today.
 
-Widening that test to the optical module would fail today. Whether that is a logging gap on
-the optical path or a convention that legitimately stops at the radar one is a question about
-`src/`, so it is left here rather than answered. It matters because the test currently reads
-as a suite-wide convention and enforces it on half the surface.
+**Ruling 2026-08-25: radar-only is correct, keep it.** Attribution earns its cost where dates
+are actually abandoned, and radar is that path — `s1_roi.py` carries 25 mentions of data
+loss, giving up and skipping against `s2_roi.py`'s 7. The optical path is the more forgiving
+one, so a log line there is far less likely to be the only surviving record of a lost date.
+
+Note for anyone reading the test later: the ``roi=`` it demands is the **region of interest**,
+the cell being processed, taken from the ROI Zarr's filename. It is unrelated to the AWS
+region locality that decides which copy of a granule to read — an easy collision, since both
+are called "region" in this codebase and radar is genuinely the in-region-only sensor.
+
+**One narrower observation left open.** Four of the six unattributed optical lines are
+progress telemetry, where the run context is already obvious. The other two are warnings:
+
+```
+s2_roi.py:485  ROI has no live pixels — every date will fail the coverage gate
+s2_roi.py:652  Load failed on asset-incomplete STAC item(s): %s
+```
+
+Those two are the ones where the radar argument transfers — a warning you would want to trace
+to a cell. Naming them is a change to `src/` and out of scope here; recorded so the decision
+is a decision rather than an omission.
 
 ---
 
@@ -468,4 +484,8 @@ status. Removing it breaks no test in the suite. This is a **test gap, not a bug
 guard looks correct, nothing exercises it. Adding a row to the characterisation table in
 `test_read_failure_verdict.py` is a test-only fix and could be folded into Phase 2 if wanted.
 
-**7.2 — Tests that assert on source text. — DONE as Phase 4, see below.**
+**7.2 — Tests that assert on source text. — DONE as Phase 4 (§3).** One test was replaced by a
+ruff rule; the rest stay. The radar-only scope of the ROI-logging rule was **ruled correct**
+on 2026-08-25 — attribution earns its cost where dates are abandoned, and radar is that path.
+Two optical *warnings* remain unattributed and would be worth naming; that is a `src/` change
+and is not made here.
