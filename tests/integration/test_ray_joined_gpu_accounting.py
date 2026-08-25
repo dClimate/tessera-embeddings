@@ -1,6 +1,6 @@
 """The Ray resource semantics the progress line's GPU-hours figure rests on.
 
-``_billed_gpu_count`` reports fleet GPU-hours from ``ray.cluster_resources()``.
+``_joined_gpu_count`` reports fleet GPU-hours from ``ray.cluster_resources()``.
 That is only the billed capacity if the total does NOT shrink as actors claim
 GPUs — otherwise the figure would collapse towards zero exactly when the fleet
 is busiest, and the whole approach would be wrong. The sibling call,
@@ -35,7 +35,7 @@ from pathlib import Path
 import pytest
 import ray
 
-from tessera_embeddings.inference.scheduling import _billed_gpu_count
+from tessera_embeddings.inference.scheduling import _joined_gpu_count
 
 DECLARED_GPUS = 4
 
@@ -101,17 +101,17 @@ def test_cluster_total_holds_while_actors_claim_gpus(ray_instance: None) -> None
     as flat across claiming, and pins ``available_resources`` as the call that
     does move, since confusing the two is the whole risk.
     """
-    assert _billed_gpu_count(0.0) == DECLARED_GPUS
+    assert _joined_gpu_count(0.0, 1.0) == DECLARED_GPUS
     assert ray.available_resources().get("GPU", 0) == DECLARED_GPUS
 
     holders = [_GpuHolder.remote() for _ in range(2)]  # type: ignore[attr-defined]
     assert all(ray.get([h.ping.remote() for h in holders]))
 
-    assert _billed_gpu_count(0.0) == DECLARED_GPUS, "a GPU an actor is working on is still billed"
+    assert _joined_gpu_count(0.0, 1.0) == DECLARED_GPUS, "a GPU an actor is working on is still joined"
     assert _wait_for_available_gpus_below(DECLARED_GPUS), (
         "available_resources must be the one that drops — if it stops dropping, the two calls "
         "have converged and the distinction this rests on is gone"
     )
     # And the total is still flat once the claim HAS registered, which is the
     # property being pinned: the two calls disagree, and we read the stable one.
-    assert _billed_gpu_count(0.0) == DECLARED_GPUS
+    assert _joined_gpu_count(0.0, 1.0) == DECLARED_GPUS

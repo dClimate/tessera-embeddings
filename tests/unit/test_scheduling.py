@@ -19,7 +19,7 @@ from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.scheduling import (
     ActorPool,
     _batch_actors_to_request,
-    _billed_gpu_count,
+    _joined_gpu_count,
     _poll_tracker,
     _process_chunks_work_stealing,
 )
@@ -100,21 +100,32 @@ def test_replace_carries_credentials_and_region_to_new_actor():
 
 
 # ===========================================================================
-# _billed_gpu_count
+# _joined_gpu_count
 # ===========================================================================
 
 
-class TestBilledGpuCount:
-    """The billed-capacity reading behind the progress line's GPU-hours."""
+class TestJoinedGpuCount:
+    """The capacity reading behind the progress line's GPU-hours."""
 
     def test_reads_the_cluster_total(self) -> None:
         with patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 40.0, "GPU": 7.0}):
-            assert _billed_gpu_count(0.0) == 7.0
+            assert _joined_gpu_count(0.0, 1.0) == 7.0
 
     def test_no_gpu_nodes_yet_reads_zero(self) -> None:
         """Before the first worker joins, the cluster has no GPU key at all."""
         with patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 8.0}):
-            assert _billed_gpu_count(3.0) == 0.0
+            assert _joined_gpu_count(3.0, 1.0) == 0.0
+
+    def test_a_run_that_asks_for_no_gpu_reports_none(self) -> None:
+        """A CPU-only run on a GPU-capable cluster must not charge itself the cluster's GPUs.
+
+        The reading is of the CLUSTER, so it says nothing about this run once this run reserves
+        no GPU. Answering with the cluster total there would invent GPU-hours for a fill that
+        used none.
+        """
+        with patch.object(_sched_mod.ray, "cluster_resources", return_value={"GPU": 64.0}) as looked:
+            assert _joined_gpu_count(0.0, 0.0) == 0.0
+            assert not looked.called, "a CPU-only run should not even ask"
 
     def test_a_failed_lookup_carries_the_previous_count_forward(self) -> None:
         """The caller is in the dispatch loop, outside the tracker poll's guard.
@@ -122,7 +133,7 @@ class TestBilledGpuCount:
         A control-plane hiccup must cost accuracy in a log line, never the fill.
         """
         with patch.object(_sched_mod.ray, "cluster_resources", side_effect=RuntimeError("gcs unavailable")):
-            assert _billed_gpu_count(5.0) == 5.0
+            assert _joined_gpu_count(5.0, 1.0) == 5.0
 
 
 # ===========================================================================
@@ -1043,6 +1054,25 @@ class TestWorkStealingGpuHours:
         assert len(results) == 1, "the chunk must complete for the poll figures to mean anything"
         assert len(polls) == 1, "the run must report progress exactly once for the bound below to be exact"
         return polls
+
+    def test_a_mid_interval_capacity_change_is_split_across_the_interval(self) -> None:
+        """A blocking wait can stretch an interval to a minute, so WHEN capacity is sampled matters.
+
+        Charging the whole interval at the reading taken when the wait returns bills a batch that
+        joined near the end for time it was not there. Averaging the interval's two endpoints
+        splits the change across it. Here capacity goes from none to forty between the seed
+        reading and the loop's, so a correct integral charges twenty for that interval and
+        end-sampling would charge forty.
+        """
+        polls = self._run_one_chunk(0, {"side_effect": [{"GPU": 0.0}, {"GPU": 40.0}]})
+        gpu_seconds = polls[0]["gpu_hours"] * 3600
+        # The clock is synthetic and steps one second per read, so the accumulated figure is
+        # exact rather than approximate: one interval of one second, charged at the average of
+        # its endpoints. End-sampling would charge that second at 40 and report double.
+        assert gpu_seconds == pytest.approx(20.0), (
+            f"{gpu_seconds} GPU-seconds; expected the interval charged at the average of its "
+            "endpoints (20), not at the reading taken when the wait returned (40)"
+        )
 
     def test_gpu_hours_follows_the_cluster_not_the_requested_fleet(self) -> None:
         """During scale-up most requested slots have no instance behind them.
