@@ -1688,6 +1688,29 @@ def _round(monkeypatch, wired, round_, zones=("01N", "02N"), years=(2025,)):
     return round_
 
 
+@pytest.mark.asyncio
+async def test_still_running_ignores_a_task_that_finished_but_was_not_harvested():
+    """Not `bool(the map)`. The drain loop harvests tasks when it wakes, so a task can be
+    finished and still present — and a truthiness test would then report a round as open
+    when everything in it had stopped, which is the difference between a replacement that
+    saves wall clock and one that only spends a fleet.
+
+    Tested directly because the window it guards is a scheduling race that cannot be forced
+    from the flow; asserting the helper's contract is what makes the distinction real rather
+    than assumed.
+    """
+    done: asyncio.Future = asyncio.get_running_loop().create_future()
+    done.set_result(None)
+    pending: asyncio.Future = asyncio.get_running_loop().create_future()
+    try:
+        assert mod._still_running({pending: 0}) is True
+        assert mod._still_running({done: 0}) is False, "a finished task read as still running"
+        assert mod._still_running({done: 0, pending: 1}) is True
+        assert mod._still_running({}) is False
+    finally:
+        pending.cancel()
+
+
 class TestImmediateRefill:
     """A settled fill's roster must not wait on the slowest cluster in its round.
 
@@ -1812,6 +1835,37 @@ class TestImmediateRefill:
         asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
         assert mod.CANCELLATION_CONFIRM_S in slept, f"the replacement did not wait: {slept}"
         assert r.dispatches().count(("01N",)) == 2, "the replacement never went out"
+
+    def test_settling_delays_run_concurrently_not_in_series(self, wired, monkeypatch):
+        """Each settled slot waits out its OWN delay, at the same time as the others.
+
+        Awaiting a planner inline would stop the drain loop harvesting anything else, so
+        several clusters failing together would serialise their waits end to end — and a
+        sibling finishing mid-wait could not close the round until that wait expired.
+        """
+        r = _round(
+            monkeypatch,
+            wired,
+            _Round(wired, ends={"01N": "FAILED", "02N": "FAILED"}, hold="03N"),
+            zones=("01N", "02N", "03N"),
+        )
+        monkeypatch.setattr(mod, "_SETTLE_DELAY_S", mod.CANCELLATION_CONFIRM_S)
+        marks: list[str] = []
+        real_sleep = asyncio.sleep
+
+        async def spy(delay, *a, **k):
+            if delay != mod.CANCELLATION_CONFIRM_S:
+                return await real_sleep(0)
+            marks.append("start")
+            for _ in range(5):
+                await real_sleep(0)
+            marks.append("end")
+            return None
+
+        monkeypatch.setattr(mod.asyncio, "sleep", spy)
+        asyncio.run(r.drive(max_parallel_clusters=3, immediate_refill=True, max_dispatch_rounds=1))
+        assert marks.count("start") == 2, f"both settled rosters should have waited: {marks}"
+        assert marks[:2] == ["start", "start"], f"the settling delays ran in series: {marks}"
 
     def test_the_settling_delay_is_derived_from_the_cancellation_budget(self):
         """Derived, not chosen. A fill's teardown spends this budget waiting for its own

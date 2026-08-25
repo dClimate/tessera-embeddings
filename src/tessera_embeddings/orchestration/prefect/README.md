@@ -109,10 +109,12 @@ today:
    process that died, and the verdict can be reached from missed heartbeats while the run
    is still writing), and a **cancellation** is a request rather than a fact. Both wait.
 2. **Enough time has passed for its descendants to have stopped.** Condition 1 covers the
-   fill's own writers, and — because its teardown cancels its children and waits for each
-   to confirm terminal before the state is set — its direct children too. What nothing
-   waited for is *their* grandchildren, whose cancellation is requested by a hook that does
-   not block. The delay is that same confirmation budget again, for that level, derived from
+   fill's own writers, and — because its teardown cancels its children and waits on them
+   before the state is set — most of its direct children too. **That wait is best effort:**
+   it gives up after its budget and logs whatever it could not confirm. And *their*
+   grandchildren are only ever asked, by a hook that does not block. So condition 1 is not a
+   guarantee about descendants, and the delay is not a belt on a working brace — it is the
+   time those two unconfirmed levels actually need. The delay is that same confirmation budget again, for that level, derived from
    it rather than chosen. Counted from the cancellation request, the two together come to
    the interval the crash-recovery record already recommends between a run's death and
    re-dispatching its cells.
