@@ -73,6 +73,7 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
 from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
+from tessera_embeddings.orchestration.prefect.flows._overrides import set_overrides
 from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
     _assert_seeded_model_matches,
     _optical_min_obs_from_store,
@@ -602,7 +603,7 @@ async def run_global_campaign(
             to whichever fill strategy runs. Default ``False`` keeps today's launch
             behaviour, so enabling it is a deliberate act on a campaign that is
             already running.
-        actor_request_headroom: Hold every fill's actor request to the GPU nodes it has
+        actor_request_headroom: Hold every fill's actor request to the actor slots it has
             actually placed plus this many, rather than letting it climb toward
             ``num_actors``. The unbounded case is what feeds the launch quota: a fill
             that asks for its whole target while a handful of instances have placed
@@ -1105,14 +1106,13 @@ async def run_global_campaign(
             # whether to run it at all.
             "launch_pacing": launch_pacing,
             # The other half of the same problem, one layer up: pacing makes a launch
-            # request cheaper, this bounds how many of them a fill makes at all. OMITTED
-            # when unset, so the fill's own default decides.
-            **({"actor_request_headroom": actor_request_headroom} if actor_request_headroom else {}),
-            # OMITTED when the campaign names no size, so the inference default stands.
-            # Passing None would override it with nothing, which disables batching and
-            # asks for the whole fleet at once — the failure this parameter exists to
-            # avoid.
-            **({"actor_request_batch_size": actor_request_batch_size} if actor_request_batch_size else {}),
+            # request cheaper, this bounds how many of them a fill makes at all. Both are
+            # OMITTED when unset so the fill's own default decides — keyed on None rather
+            # than on truthiness, since 0 is a documented batch mode and not an absence.
+            **set_overrides(
+                actor_request_headroom=actor_request_headroom,
+                actor_request_batch_size=actor_request_batch_size,
+            ),
             "ssm_prefix": ssm_prefix,
             "cloudwatch_log_group": cloudwatch_log_group,
             "code_bucket": code_bucket,
@@ -1397,10 +1397,11 @@ async def run_global_campaign(
                         "launch_pacing": launch_pacing,
                         # And as in _fill_params, the bound on how many launch requests
                         # a cluster makes, beside the pacing that makes each one cheaper.
-                        **({"actor_request_headroom": actor_request_headroom} if actor_request_headroom else {}),
-                        # OMITTED when unset so the inference default stands; None would
-                        # disable batching and ask for the whole fleet at once.
-                        **({"actor_request_batch_size": actor_request_batch_size} if actor_request_batch_size else {}),
+                        # Omitted when unset so the child's own default stands.
+                        **set_overrides(
+                            actor_request_headroom=actor_request_headroom,
+                            actor_request_batch_size=actor_request_batch_size,
+                        ),
                         "cleanup_mosaics": cleanup_mosaics,
                         "ingest_settings": ingest_settings.model_dump(),
                         # The shared cap. Every cluster names the same limit, which is

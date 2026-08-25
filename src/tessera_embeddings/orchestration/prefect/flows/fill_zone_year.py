@@ -40,6 +40,7 @@ from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
     dispatch_cell_validation,
     validation_run_tag,
 )
+from tessera_embeddings.orchestration.prefect.flows._overrides import set_overrides
 from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     activate,
     deactivate,
@@ -260,7 +261,7 @@ def fill_zone_year_flow(
             enforcement lives in the client rather than in a count we divide. Default
             ``False`` keeps today's launch behaviour; the campaign turns it on when it
             runs more than one cluster.
-        actor_request_headroom: Hold the actor request to the GPU nodes this fill has
+        actor_request_headroom: Hold the actor request to the actor slots this fill has
             actually placed plus this many, rather than letting it climb toward
             ``num_actors`` on a region that is not placing them
             (:func:`tessera_embeddings.inference.scheduling._batch_actors_to_request`).
@@ -406,9 +407,9 @@ def fill_zone_year_flow(
         chunk_size=SHARD_PX,
         allow_s2_only=allow_s2_only,
         actor_request_headroom=actor_request_headroom,
-        # Omitted when unset so the inference default stands. Passing None would
-        # override that default with nothing and disable batching outright.
-        **({"actor_request_batch_size": actor_request_batch_size} if actor_request_batch_size else {}),
+        # Omitted when unset so the inference default stands — and keyed on None, not on
+        # truthiness, because 0 is a documented mode here rather than an absent value.
+        **set_overrides(actor_request_batch_size=actor_request_batch_size),
     )
 
     # None when this cell short-circuits before the preflight (an already-complete retag),

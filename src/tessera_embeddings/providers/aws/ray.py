@@ -87,17 +87,22 @@ _REQUIRED_SSM_KEYS = frozenset(
     {"security-group-id", "instance-profile-arn", "private-subnet-ids", "key-pair-name", "key-pair-id"}
 )
 
-LAUNCH_PACING_ENV = {
-    # Client-side rate limiting on the EC2 client Ray builds for launches. Ray sets
-    # only `max_attempts` on that client's botocore Config and never `mode`, so the
-    # mode is still resolved from the environment — this is the one place we can reach
-    # inside Ray's launch path without owning its retry loop. Adaptive mode paces
-    # sends through a token bucket that narrows when EC2 answers with a throttle and
-    # widens again on success. The INVARIANT that makes it safe to hand a fleet's
-    # growth to it: botocore floors that bucket's fill rate, so a paced client never
-    # stops asking. A throttled request is retried; a fleet that stops asking is
-    # stuck, and the floor is what rules the second case out.
+LAUNCH_PACING_CLIENT_ENV = {
+    # Client-side rate limiting on whatever EC2 client the process builds. Ray sets only
+    # `max_attempts` on its launch client's botocore Config and never `mode`, so the mode
+    # is still resolved from the environment — this is the one place we can reach inside
+    # Ray's launch path without owning its retry loop. Adaptive mode paces sends through a
+    # token bucket that narrows when EC2 answers with a throttle and widens again on
+    # success. The INVARIANT that makes it safe to hand a fleet's growth to: botocore
+    # floors that bucket's fill rate, so a paced client never stops asking.
+    #
+    # Safe for ANY launching process because it only spaces attempts out — it never
+    # removes one. That is what separates it from the autoscaler settings below.
     "AWS_RETRY_MODE": "adaptive",
+}
+"""Pacing that is safe wherever instances are launched, including one-shot launches."""
+
+LAUNCH_PACING_AUTOSCALER_ENV = {
     # Instances per RunInstances call. The request quota is a rate over CALLS, not
     # over instances, so asking for more per call buys fleet at a fixed price in
     # quota. MinCount stays 1, so a call the region can only partly fill returns what
@@ -114,7 +119,13 @@ LAUNCH_PACING_ENV = {
     # the surplus no-delay attempts are not made.
     "BOTO_CREATE_MAX_RETRIES": "1",
 }
-"""Environment that paces this cluster's EC2 launch requests.
+"""Tuning for the AUTOSCALER's launch loop, and for nothing else.
+
+Separate from :data:`LAUNCH_PACING_CLIENT_ENV` because these two settings change
+how many attempts a launch gets, not merely how they are spaced. That is safe for
+a worker request, which the autoscaler will make again on its next cycle, and
+unsafe for a launch that happens once. Give this to a process that runs the
+autoscaler; give the client pacing to anything else that launches.
 
 The account's RunInstances quota is a token bucket — a small burst capacity,
 refilled at a fixed rate — and it is not adjustable. Concurrent clusters share
@@ -124,6 +135,10 @@ again. None of that loop is ours: the call is made by Ray's AWS node provider
 and the retry around it is Ray's. What we can set is the environment the
 autoscaler process runs in, and every name here is one Ray or botocore reads
 from the environment.
+"""
+
+LAUNCH_PACING_ENV = {**LAUNCH_PACING_CLIENT_ENV, **LAUNCH_PACING_AUTOSCALER_ENV}
+"""Everything the head node wants: it both launches and hosts the autoscaler.
 
 Applied only when a caller asks for it (``launch_pacing=True``). Default-off
 because it changes how a live fleet grows.
@@ -585,15 +600,21 @@ def _start_ray_cluster(
     ``launch_pacing`` paces the head node's OWN launch. ``ray up`` runs the node
     provider in this process, not on the head, so the head's RunInstances call
     draws on the same account quota from here — and several clusters starting
-    together is exactly when that matters. The workers' pacing is separate and
-    travels in the resolved YAML (see :func:`_resolve_ray_config`).
+    together is exactly when that matters.
+
+    It gets :data:`LAUNCH_PACING_CLIENT_ENV` only, NOT the autoscaler tuning. This
+    launch happens once: nothing retries a head that failed to start, and losing it
+    fails the whole fill. Spacing its attempts out is a help; taking attempts away
+    from it is a fleet-ending risk taken in exchange for nothing, since the batch
+    size is meaningless for a single instance. The autoscaler's own settings travel
+    separately, in the resolved YAML (see :func:`_resolve_ray_config`).
     """
     log.info("Starting Ray cluster from %s", resolved_yaml)
     ray_up = subprocess.run(
         ["ray", "up", resolved_yaml, "-y", "--no-config-cache"],
         capture_output=True,
         text=True,
-        env={**os.environ, **LAUNCH_PACING_ENV} if launch_pacing else None,
+        env={**os.environ, **LAUNCH_PACING_CLIENT_ENV} if launch_pacing else None,
     )
     if ray_up.returncode != 0:
         log.error("ray up failed (exit %d)", ray_up.returncode)

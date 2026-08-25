@@ -2,7 +2,7 @@
 
 **Status:** measured and implemented, default-off, 2026-08-25.
 **Code:** `inference/scheduling.py::ACTOR_REQUEST_HEADROOM`,
-`providers/aws/ray.py::LAUNCH_PACING_ENV`.
+`providers/aws/ray.py::LAUNCH_PACING_CLIENT_ENV` and `::LAUNCH_PACING_AUTOSCALER_ENV`.
 
 ---
 
@@ -134,7 +134,7 @@ more valuable, not less.
 
 ### The rule that replaced it
 
-**A run may never request more actors than the GPU nodes it actually holds, plus a
+**A run may never request more actors than the actor SLOTS it actually holds, plus a
 fixed headroom.** `ACTOR_REQUEST_HEADROOM = 25`.
 
 Not a climb toward the target in batches, but a small constant distance ahead of
@@ -147,19 +147,22 @@ the default; retiring that path retires them, along with `nodes_at_last_batch`,
 
 Four properties, each of which had to be got right:
 
-* **Nodes, not ready actors.** The bound is about hardware the run already holds and
-  pays for. Counting readiness would make a slow checkpoint load look like a capacity
-  shortage and stall a fleet that already has its instances.
-* **The cold start.** At zero nodes the bound still permits `headroom` requests — the
+* **Placed slots, not ready actors — and not nodes.** The bound is about hardware the
+  run already holds and pays for, so readiness is the wrong measure: a slow checkpoint
+  load would read as a capacity shortage. **Corrected after review — this document
+  first said "nodes, not ready actors", and a node count is wrong.** Slots and nodes
+  are equal only at exactly one actor per node. See §7.
+* **The cold start.** At zero slots the bound still permits `headroom` requests — the
   allowance is a distance ahead of the fleet, and at the start that distance is the
-  whole ask. Applied in `inference/runner.py` too, since the first batch is requested
-  before the scheduler loop begins.
+  whole ask. Decided in `InferenceConfig.initial_actor_request`, which the runner and
+  the scheduler both read, because the first batch is requested before the loop begins.
 * **A second ceiling, not a replacement.** `outstanding_work` caps the request by
   remaining WORK; this caps it by placement; the smaller wins. A short tail still
   cannot be over-provisioned.
-* **It cannot stall.** A request is refused only while the fleet is already a full
-  headroom ahead of its nodes, and every node that joins re-opens exactly that much
-  room.
+* **It cannot stall, given the right unit.** A request is refused only while the fleet
+  is already a full headroom ahead of its placed slots, and every slot that joins
+  re-opens exactly that much room. **This claim was false as first written**, because
+  the quantity compared was a node count. See §7.
 
 Why 25 is a constant rather than a fraction of the target: the quota it protects is a
 property of the ACCOUNT. A fleet of 250 and a fleet of 20 draw on one bucket, and
@@ -348,3 +351,78 @@ also that it interacts with the other two levers: once `launch_pacing` raises Ra
 per-call instance count, a batch of 50 costs only 2 calls and the config can go back up.
 And once `actor_request_headroom` is on, a batch larger than the headroom is inert,
 because the headroom is the tighter bound.
+
+---
+
+## 7. What review found, and what it changed
+
+Nine threads across two independent reviewers, five distinct findings, three root
+causes. Recorded here because two of them falsify claims made earlier in this document,
+and a reader who stops at §3 should not carry away the version that was wrong.
+
+### A. The two request knobs had no single definition
+
+`actor_request_batch_size` already carried a sentinel — `0` means "all at once" — before
+`actor_request_headroom` arrived carrying another, `None` for "off". Nothing reconciled
+them, and the omit-when-unset rule for forwarding them was hand-written at **six** call
+sites across three flows. Three findings, all cells of the same undefined truth table:
+
+| Symptom | What it did |
+|---|---|
+| `if value else {}` when forwarding | Dropped an explicit `0`, so the documented unbatched mode was unreachable from any new surface |
+| headroom set with batching disabled | Clamped the opening pool, then never grew it — the run completed silently at reduced width |
+| headroom of `0` or negative | Created an empty actor list and raised on an empty pool, with no validation |
+
+The fix defines the combination once, in `InferenceConfig.__post_init__`, and refuses
+what cannot be given a meaning. **The two-sentinel scheme survives, but the two settings
+are now mutually exclusive:** a batch size of `0` asks for the whole fleet at once and a
+headroom asks never to exceed placement, so the pair is a contradiction rather than an
+unimplemented case. It is refused rather than resolved for the caller — silently picking
+one is how the reduced-width run happened. The forwarding rule now lives in
+`flows/_overrides.py`, keyed on `None` alone.
+
+### B. One constant served two audiences
+
+`LAUNCH_PACING_ENV` mixed client-side pacing (which only spaces attempts out) with
+autoscaler tuning (which takes attempts away). Passing all of it to `ray up` cut the
+head-node bootstrap's launch attempts from five to one pass over the subnets — and the
+head launch happens ONCE. Nothing retries it, so exhausting its budget fails the whole
+fill, and it bit hardest in the exact scenario the option exists for: several clusters
+starting together.
+
+Split by audience. `LAUNCH_PACING_CLIENT_ENV` is safe wherever instances are launched
+and is all the one-shot bootstrap gets; `LAUNCH_PACING_AUTOSCALER_ENV` reaches only the
+head-resident autoscaler, whose requests the next cycle will make again.
+
+### C. The headroom was counted in the wrong unit
+
+**This falsifies "it cannot stall" as §3 first stated it.** The recurrence compared a
+request in actors against a count of GPU-bearing NODES. Those are equal at exactly one
+actor per node — the campaign's own shape, which is why the error is invisible in
+production — and nowhere else. Walked with the real function:
+
+| `num_gpus` | Settles at | Target |
+|---|---|---|
+| 1.0 | 250 | 250 |
+| 0.5 | **50** | 250 |
+| 0.25 | **34** | 250 |
+
+At half a GPU per actor the fleet reaches a fixed point at twice the headroom and then
+asks for nothing, for ever — a silent permanent stall at a fraction of the requested
+width, which is the precise failure the bound was introduced to rule out.
+
+The quantity was already in the codebase: `_joined_gpu_count` reads the cluster's joined
+GPUs and was written for the GPU-hour accounting. `_placed_actor_slots` divides that by
+the per-actor reservation, and the recurrence now speaks slots. A run reserving no GPU
+cannot express the bound at all, so that combination is refused at construction rather
+than left to stall.
+
+### Does the fleet reach its target?
+
+Asked directly, because finding A's second row is a case where it demonstrably did not.
+The pure-function walk in §5.5 cannot answer it: it reproduces the recurrence by hand
+and so cannot see whether the loop driving it actually runs. A test now drives the real
+scheduler loop with placements arriving, and asserts the fleet ends at its configured
+target — at one actor per node, at two actors per node, and with batching disabled.
+Reverting the unit fix turns the two-actors-per-node case into **49 of 120**, which is
+the stall reproduced as a test rather than as an argument.

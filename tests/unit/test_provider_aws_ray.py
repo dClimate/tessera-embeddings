@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import boto3
 import pytest
@@ -25,6 +26,8 @@ from moto import mock_aws
 from tessera_embeddings.providers.aws import ray as ray_mod
 from tessera_embeddings.providers.aws.ray import (
     DEFAULT_CLUSTER_TEMPLATE,
+    LAUNCH_PACING_AUTOSCALER_ENV,
+    LAUNCH_PACING_CLIENT_ENV,
     LAUNCH_PACING_ENV,
     PROJECT_TAG_VALUE,
     _resolve_ray_config,
@@ -610,3 +613,56 @@ def test_the_pacing_env_reaches_the_client_ray_builds_for_launches(monkeypatch) 
     assert any("ClientRateLimiter" in type(getattr(h, "__self__", h)).__name__ for h in handlers), (
         "adaptive mode registered no send-side rate limiter"
     )
+
+
+def test_the_head_bootstrap_keeps_its_launch_attempts(monkeypatch) -> None:
+    """`ray up` launches the head ONCE, so it must be paced without losing attempts.
+
+    Nothing retries a head that failed to start — there is no autoscaler yet, and a
+    failed `ray up` fails the whole fill. Attempt-reducing settings are safe for a worker
+    request precisely because the autoscaler will make it again on its next cycle, and
+    that reasoning does not transfer. So the bootstrap gets the client-side pacing, which
+    only spaces attempts out, and none of the autoscaler tuning, which takes them away.
+    """
+    # Keyed by verb: `_start_ray_cluster` also shells out to `ray get-head-ip`, and a
+    # single slot would report whichever ran last rather than the launch.
+    seen: dict = {}
+
+    def _capture(cmd, **kwargs):
+        seen[cmd[1]] = kwargs.get("env")
+        return subprocess.CompletedProcess(cmd, 0, stdout="10.0.0.1\n", stderr="")
+
+    monkeypatch.setattr(ray_mod.subprocess, "run", _capture)
+    ray_mod._start_ray_cluster("/tmp/resolved.yaml", _LOG, launch_pacing=True)
+
+    env = seen["up"]
+    assert env["AWS_RETRY_MODE"] == "adaptive", "the one-shot launch should still be paced"
+    for name in LAUNCH_PACING_AUTOSCALER_ENV:
+        assert name not in env, f"{name} tunes the autoscaler and must not reach the head bootstrap"
+
+
+def test_the_head_start_command_carries_both_halves() -> None:
+    """The head both launches and hosts the autoscaler, so it wants everything.
+
+    The split is about audience, not about dropping a setting: whatever is withheld from
+    the one-shot bootstrap still has to reach the autoscaler, or the pacing that matters
+    for worker launches would be lost along with it.
+    """
+    assert LAUNCH_PACING_CLIENT_ENV.items() <= LAUNCH_PACING_ENV.items()
+    assert LAUNCH_PACING_AUTOSCALER_ENV.items() <= LAUNCH_PACING_ENV.items()
+    assert not set(LAUNCH_PACING_CLIENT_ENV) & set(LAUNCH_PACING_AUTOSCALER_ENV), (
+        "a name in both halves has no single owner"
+    )
+
+
+def test_pacing_off_leaves_the_bootstrap_environment_alone() -> None:
+    """Default-off means `ray up` inherits this process's environment untouched."""
+    seen: dict = {}
+
+    def _capture(cmd, **kwargs):
+        seen[cmd[1]] = kwargs.get("env")
+        return subprocess.CompletedProcess(cmd, 0, stdout="10.0.0.1\n", stderr="")
+
+    with patch.object(ray_mod.subprocess, "run", _capture):
+        ray_mod._start_ray_cluster("/tmp/resolved.yaml", _LOG)
+    assert seen["up"] is None

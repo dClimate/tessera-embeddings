@@ -175,16 +175,12 @@ def run_inference(
         return [actor_cls.remote(config, config.checkpoint_path, get_credentials, s3_region) for _ in range(n)]
 
     # Request the first batch up front; the work-stealing scheduler requests
-    # the rest as instances are placed (see scheduling._maybe_request_next_batch).
-    # batch_size <= 0 disables batching: request the whole fleet at once.
+    # the rest as slots are placed (see scheduling._maybe_request_next_batch).
+    # The size is the config's to decide — both the batching sentinel and the
+    # headroom's cold start live in one method there, so this cannot drift from
+    # what the scheduler will go on to do.
     batch_size = config.actor_request_batch_size
-    first_batch = min(batch_size, num_actors) if batch_size > 0 else num_actors
-    if config.actor_request_headroom is not None:
-        # The cold start of the headroom rule. No GPU node has joined yet, so the whole
-        # allowance is the distance ahead of an empty fleet — and this first batch is
-        # requested here rather than by the loop, so the bound has to be applied here
-        # too or the run opens by breaking it.
-        first_batch = min(first_batch, config.actor_request_headroom)
+    first_batch = config.initial_actor_request(num_actors)
     actors = actor_factory(first_batch)
     if batch_size > 0 and first_batch < num_actors:
         log.info(

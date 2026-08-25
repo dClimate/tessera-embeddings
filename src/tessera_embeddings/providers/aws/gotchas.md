@@ -324,12 +324,30 @@ retries outright. Two consequences worth knowing:
 * `AWS_MAX_ATTEMPTS` cannot reach that client. An explicitly configured attempt count
   wins over the environment, and Ray configures one.
 
-### What we can reach: `LAUNCH_PACING_ENV`
+### What we can reach: the pacing environment
 
 Ray sets the attempt count but **not** the retry MODE, and the mode is still resolved
 from the environment. That is the one seam into the launch path. `ray_cluster(
-launch_pacing=True)` assigns `providers/aws/ray.py::LAUNCH_PACING_ENV` on the head's
-`ray start` command, and the autoscaler — a child of that process — inherits it:
+launch_pacing=True)` assigns the pacing on the head's `ray start` command, and the
+autoscaler — a child of that process — inherits it.
+
+**It is split in two, by audience, and the split is load-bearing:**
+
+| Constant | Who gets it | Why |
+|---|---|---|
+| `LAUNCH_PACING_CLIENT_ENV` | any process that launches instances, `ray up` included | Only spaces attempts out; never removes one |
+| `LAUNCH_PACING_AUTOSCALER_ENV` | the head-resident autoscaler only | Changes how many attempts a launch gets |
+
+The distinction is whether a failed launch will be made again. A worker request is
+reissued on the autoscaler's next cycle, so trading attempts for a gentler burst is a
+fair trade. **The head-node launch happens once**: `ray up` runs the node provider in
+the flow-runner process, nothing retries a head that failed to start, and losing it
+fails the whole fill. Giving the bootstrap the autoscaler's reduced attempt budget once
+cut it from five passes over the subnets to one — worst exactly when several clusters
+start together, which is the scenario the option exists for. So `_start_ray_cluster`
+passes the client half alone.
+
+The settings themselves:
 
 * `AWS_RETRY_MODE=adaptive` puts a client-side rate limiter in front of every send,
   narrowing when EC2 answers with a throttle and widening on success. **botocore floors
@@ -356,7 +374,9 @@ the setting is for when several clusters grow at once.
 
 Pacing makes each launch request cheaper. What makes there be fewer of them is
 `inference/scheduling.py::ACTOR_REQUEST_HEADROOM`: with it set, a run may never request
-more actors than the GPU nodes it actually holds plus that constant. Without it, a run
+more actors than the actor SLOTS it actually holds plus that constant — slots, not
+nodes, since the two are equal only at one actor per node and a node count stalls the
+fleet permanently anywhere else. Without it, a run
 whose placements are timing out requests another full batch on each expiry and climbs
 to its target against a handful of placed instances — and every request that never
 places is retried by the autoscaler, against this same bucket, for as long as the fill

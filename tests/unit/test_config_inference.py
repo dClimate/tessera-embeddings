@@ -150,3 +150,64 @@ def test_a_rule_that_refuses_nothing_is_refused_by_the_config() -> None:
 def test_allow_s2_only_defaults_off() -> None:
     assert _minimal_config().allow_s2_only is False
     assert _minimal_config(allow_s2_only=True).allow_s2_only is True
+
+
+class TestActorRequestPolicy:
+    """The combined meaning of the two actor-request knobs, decided in one place.
+
+    `actor_request_batch_size` carried a sentinel (0 = all at once) before
+    `actor_request_headroom` arrived with another (None = off). Nothing reconciled them,
+    so contradictory pairs were accepted and then half-honoured somewhere downstream.
+    These pin what each combination means, at the only layer that can enforce it.
+    """
+
+    def test_a_headroom_at_or_below_zero_is_refused(self) -> None:
+        """It would clamp the opening request to nothing and fail on an empty pool.
+
+        Zero is the dangerous one: it reads as "disable the bound" and does the
+        opposite, so it has to be refused rather than interpreted.
+        """
+        for bad in (0, -1):
+            with pytest.raises(ValueError, match="bounds the fleet at or below nothing"):
+                _minimal_config(num_gpus=1.0, actor_request_headroom=bad)
+        # The neighbouring legal value, so the refusal is a line and not a blanket.
+        assert _minimal_config(num_gpus=1.0, actor_request_headroom=1).actor_request_headroom == 1
+
+    def test_a_headroom_with_batching_disabled_is_refused(self) -> None:
+        """Two opposite instructions, so neither is silently chosen for the caller.
+
+        A batch size of 0 asks for the whole fleet at once; a headroom asks never to
+        exceed what has been placed. Honouring one and dropping the other is how a run
+        came to open at the reduced width and stay there.
+        """
+        with pytest.raises(ValueError, match="two opposite things"):
+            _minimal_config(num_gpus=1.0, actor_request_headroom=25, actor_request_batch_size=0)
+        # Each alone is still legal — it is only the pair that has no meaning.
+        assert _minimal_config(actor_request_batch_size=0).actor_request_batch_size == 0
+        assert _minimal_config(num_gpus=1.0, actor_request_headroom=25, actor_request_batch_size=50)
+
+    def test_a_headroom_without_a_gpu_reservation_is_refused(self) -> None:
+        """The bound counts actor slots derived from GPUs, and a CPU run places none.
+
+        Refused loudly rather than supported: the bound exists to protect an EC2 launch
+        quota that a CPU-only run does not draw on, and the alternative to a clear
+        refusal here is a fleet that silently never grows.
+        """
+        with pytest.raises(ValueError, match="needs a GPU reservation"):
+            _minimal_config(num_gpus=0, actor_request_headroom=25)
+        # A CPU run that asks for no bound is untouched, which is what keeps this a
+        # refusal of one combination rather than of CPU runs.
+        assert _minimal_config(num_gpus=0).actor_request_headroom is None
+        assert _minimal_config(num_gpus=1.0, actor_request_headroom=25).actor_request_headroom == 25
+
+    def test_the_opening_request_is_decided_in_one_place(self) -> None:
+        """Both the runner and the scheduler read this, so they cannot disagree again."""
+        # Batching disabled: the whole fleet up front.
+        assert _minimal_config(actor_request_batch_size=0).initial_actor_request(250) == 250
+        # Batching on, no bound: one batch.
+        assert _minimal_config(actor_request_batch_size=50).initial_actor_request(250) == 50
+        # Bounded: the cold start is the whole allowance, since nothing is placed yet.
+        bounded = _minimal_config(num_gpus=1.0, actor_request_batch_size=50, actor_request_headroom=25)
+        assert bounded.initial_actor_request(250) == 25
+        # A target smaller than either still wins, so a tiny run does not over-ask.
+        assert bounded.initial_actor_request(10) == 10
