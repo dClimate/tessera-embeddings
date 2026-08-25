@@ -646,9 +646,7 @@ _REFUSAL_NOTE = "The source reader logged, but did not raise:"
 _LINES_PER_NOTE = 4
 
 
-def carry_logged_refusal(
-    exc: BaseException, client: dask.distributed.Client | None, since: float | None = None
-) -> None:
+def carry_logged_refusal(exc: BaseException, client: dask.distributed.Client | None, since: float | None = None) -> int:
     """Attach to ``exc`` any refusal GDAL logged for this read but did not raise.
 
     The single bridge between the evidence and the verdict, and the only writer of exception
@@ -673,15 +671,19 @@ def carry_logged_refusal(
     the same way — by what a wrong answer costs. A borrowed refusal buys a write the refusal budget
     and then fails the leg with the time axis unmoved; nothing is skipped, and the date is judged
     alone on the re-dispatch.
+
+    Returns how many refusal lines the window held, so a caller deciding from this evidence can
+    say what it decided from. A verdict nobody can see the input to is a verdict nobody can check.
     """
     if not is_source_read_failure(exc):
-        return
+        return 0
     lines = collect_logged_refusals(client, since)
     if not lines:
-        return
+        return 0
     note = f"{_REFUSAL_NOTE} {' | '.join(sorted(set(lines))[:_LINES_PER_NOTE])}"
     if note not in getattr(exc, "__notes__", ()):
         exc.add_note(note)
+    return len(lines)
 
 
 def refusal_wait_out(client: dask.distributed.Client | None) -> Callable[[BaseException], bool]:
@@ -689,20 +691,45 @@ def refusal_wait_out(client: dask.distributed.Client | None) -> Callable[[BaseEx
 
     :func:`~tessera_embeddings.ingest.duplicates.is_provider_refusal` unchanged — the verdict is
     still one classifier's — over evidence gathered at the moment the question is asked. That
-    timing is the whole of it: the retry policy asks PER ATTEMPT, so a predicate reading only the
-    exception decides a refusal it cannot see, declines, and spends the ordinary three attempts
-    on an outage the budget exists to outlast.
+    gathering is what arms it at all: a predicate reading only the exception decides a refusal it
+    cannot see, declines, and spends the ordinary three attempts on an outage the budget exists to
+    outlast.
+
+    **The window is the WRITE, not the attempt, and that is the load-bearing part.** The predicate
+    is asked once per failed attempt, but what it is asked is whether THIS WRITE is being refused,
+    and an outage states its refusal while it is refusing rather than on a schedule of ours. Re-armed
+    per attempt, the question silently became "was anything refused in the last few seconds" — which
+    a recovering outage answers correctly with NO, one attempt before the write would have succeeded.
+    Patience was then withdrawn at precisely the moment it was about to pay off.
+
+    One window also makes the two readings of one failure AGREE. ``read_failure_context`` judges the
+    same failure over the whole write when the retry finally gives up, so a narrower window here let
+    the same words be a refusal to one reader and not to the other — the enclosing context raising
+    ``ProviderRefusedReadsError`` over a failure this predicate had just declined to wait for.
+
+    Nothing here is a memory of a past verdict: the window is derived, so the evidence is re-read
+    and re-classified on every attempt, and a write whose window holds no refusal never waits. What
+    bounds a write that keeps seeing one is the caller's budget, unchanged —
+    :data:`~tessera_embeddings.storage.zarr_store.WAIT_OUT_BACKOFF_S` of accumulated backoff, after
+    which the write fails with its date unskipped and its time axis unmoved.
     """
     since = time.monotonic()
 
     def _refused(exc: BaseException) -> bool:
-        # The gap between two calls IS the attempt that just failed, and on the first call it is
-        # the time since the write began. So the evidence considered is always the evidence this
-        # attempt produced, without the predicate having to be told when the attempt started.
-        nonlocal since
-        started, since = since, time.monotonic()
-        carry_logged_refusal(exc, client, since=started)
-        return is_provider_refusal(exc)
+        evidence = carry_logged_refusal(exc, client, since=since)
+        verdict = is_provider_refusal(exc)
+        # The one line that says what was decided and what it was decided from. Without it the
+        # only observable is the attempt count, which is the same for "no refusal was logged" and
+        # "a refusal was logged and not read" — and those want opposite repairs.
+        logger.warning(
+            "REFUSAL WAIT-OUT verdict=%s evidence=%d: %s",
+            "wait" if verdict else "no-wait",
+            evidence,
+            "the write may keep asking until its backoff budget is spent"
+            if verdict
+            else "the write gets the ordinary attempt limit for this failure",
+        )
+        return verdict
 
     return _refused
 
