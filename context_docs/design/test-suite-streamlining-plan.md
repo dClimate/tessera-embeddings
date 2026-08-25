@@ -164,8 +164,39 @@ is gated by `@pytest.mark.skipif(not torch.cuda.is_available())` rather than
 `@pytest.mark.gpu`, and its own docstring says it is "the only coverage of the pinned-buffer /
 CUDA-event / two-deep-drain / backbone-stream-ordering path". No CI runner has a GPU, so it
 skips everywhere — it is the `1 skipped` in every run. **That inference hot path has no CI
-coverage at all today.** This is the most consequential gap in the review and the least
-related to speed; it needs a decision (GPU runner, or accept and document), not a cleanup.
+coverage at all today.**
+
+**Decision, 2026-08-25: the gap is accepted.** A GPU CI runner is not available to this
+project and will not be provisioned. The pinned-buffer / CUDA-event / stream-ordering path in
+the pipelined inference loop is therefore **verified manually, not by CI**. What follows from
+that is a documentation and ergonomics job, not a coverage one:
+
+- **Keep the `skipif`; do not add `@pytest.mark.gpu` to this test.** The marker would be
+  caught by the default `addopts` deselection and the test would vanish from the unit run
+  entirely. The `skipif` keeps it collected, so it reports as `1 skipped` on every CI run —
+  which is the only standing signal that the gap exists. Losing that is worse than the tidiness
+  of a used marker.
+- **State the gap where a reader will hit it.** `tests/README.md` and the class docstring
+  should say plainly that this path has no automated coverage and is checked by hand. A skip
+  that nobody explains reads as "not applicable here", which is how an accepted gap turns
+  into an assumed one.
+- **Make the manual run one documented command**, so "verified manually" is a thing someone
+  can actually do on any CUDA machine:
+  ```bash
+  uv sync --all-extras --frozen
+  uv run pytest tests/unit/test_inference_loop.py -k pipelined -v
+  ```
+- **Name when to run it**: after any change to the pipelined loop, the actor pool, or the
+  chunk-staging path, and once before a campaign starts. Manual verification with no trigger
+  attached to it does not happen.
+- **Keep `tests/gpu/` and its README.** With the decision made, that directory is a dormant
+  spec rather than a plan-in-progress — it describes what a GPU tier would look like if a
+  runner ever appears. Say that in the README so it is not mistaken for work in flight, and
+  leave the `gpu` marker declared in `pyproject.toml` so the README's instructions stay valid.
+
+Consider adding this to `context_docs/decisions/` as an ADR. It is a standing decision with a
+consequence a future reader will trip over ("why is the CUDA path untested?"), and the ADR
+tree is where this repo answers that kind of question.
 
 **2.3 — The nightly workflow runs one unimplemented test.** `nightly.yml` fires daily at
 06:00 with a 120-minute timeout and runs `pytest tests/parity -m "parity and slow"`. That
@@ -259,12 +290,20 @@ failure. They are cheap and they catch circular imports. Leave them.
 | test LOC | 49,953 | ~49,650 |
 | src line coverage | 83 % | unchanged — enforced by the gate |
 | daily CI runners doing nothing | 1 | 0 |
+| GPU inference path | uncovered, unstated | uncovered, **stated and runnable by hand** (§2.2) |
 
 **LOC reduction is a small lever here and the plan says so.** About 300 lines of 49,953,
 roughly 0.6 %. The suite is not bloated with copy-paste; it is verbose because the behaviours
 it pins are genuinely numerous and the naming is deliberately long. The 3.4× speedup and the
 two closed CI gaps are the real wins. If a larger LOC cut is wanted, it has to come from
 §4 — and §4 is the part I would not do.
+
+**One gap is accepted rather than closed.** Per §2.2 the pipelined CUDA path stays outside
+CI, because no GPU runner is available. Nothing in this plan changes that; what changes is
+that it stops being silent. The honest reading of the "after" column is *84 % of the codebase
+verified automatically, one hot path verified by hand on a documented trigger* — which is a
+weaker guarantee than the coverage number alone suggests, and is written down here so the
+number is not read as more than it is.
 
 ---
 
