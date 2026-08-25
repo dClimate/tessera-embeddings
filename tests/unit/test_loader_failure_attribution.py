@@ -178,10 +178,30 @@ class TestCapturingWhatTheLoaderReports:
         assert len(collect_aborted_hrefs(None)) == 1
 
 
-#: How GDAL words a refusal in its own log, in rasterio's ``"<CPL error class> in <message>"``
-#: format. It says nothing to the codec, which is the whole problem: the object comes back as an
-#: error document, and libtiff raises the only thing it can see.
-LOGGED_REFUSAL = "CPLE_AWSAccessDenied in HTTP response code: 403"
+#: How GDAL worded a refusal in its own log during the 2026-08-24 ASF outage, copied verbatim
+#: from CloudWatch with the granule name shortened. It says nothing to the codec, which is the
+#: whole problem: the object comes back as an error document, and libtiff raises the only thing
+#: it can see.
+#:
+#: **Captured, not composed.** This constant used to read
+#: ``"CPLE_AWSAccessDenied in HTTP response code: 403"``, which is the wording of the rasterio
+#: EXCEPTION class and a shape GDAL never writes to a log. Every test here passed against it
+#: while the capture recorded nothing at all in production, because the real line puts the
+#: object's URL between the phrase and the status and names ``CPLE_AppDefined``.
+LOGGED_REFUSAL = (
+    "CPLE_AppDefined in HTTP response code on "
+    "https://asf-cumulus-prod-opera-products.s3.us-west-2.amazonaws.com/OPERA_L2_RTC-S1/"
+    "OPERA_L2_RTC-S1_T072-152803-IW2_20211108T150433Z_S1B_30_v1.0_VV.tif: 403"
+)
+
+#: The other wording seen that night: the provider overloaded rather than refusing, and GDAL
+#: says "error code" where the line above says "response code". One of the 25 records in the
+#: window, and a refusal by exactly the same reasoning.
+LOGGED_OVERLOAD = (
+    "CPLE_AppDefined in HTTP error code: 503 - "
+    "https://asf-cumulus-prod-opera-products.s3.us-west-2.amazonaws.com/OPERA_L2_RTC-S1/"
+    "OPERA_L2_RTC-S1_T072-152803-IW2_20211108T150433Z_S1B_30_v1.0_VV.tif. Retrying again in 0.5 secs"
+)
 
 #: GDAL log lines that are NOT refusals, each chosen for what keeping it would do to a verdict.
 #: The 404 is the dangerous one — GDAL probes for sidecars that were never published, and that
@@ -226,9 +246,11 @@ def _gdal_logs(message: str) -> None:
 class TestCapturingWhatGdalLogsButDoesNotRaise:
     """The second buffer: refusals stated in GDAL's own log and nowhere else."""
 
-    def test_a_logged_refusal_is_recorded(self) -> None:
-        _gdal_logs(LOGGED_REFUSAL)
-        assert drain_local_refusals() == [LOGGED_REFUSAL]
+    @pytest.mark.parametrize("line", [LOGGED_REFUSAL, LOGGED_OVERLOAD], ids=["refused-403", "overloaded-503"])
+    def test_a_logged_refusal_is_recorded(self, line: str) -> None:
+        """Both wordings the incident produced, on text taken from the incident's own logs."""
+        _gdal_logs(line)
+        assert drain_local_refusals() == [line]
 
     @pytest.mark.parametrize("line", BENIGN_GDAL_LINES, ids=["sidecar-404", "the-codec-itself", "a-tiff-quirk"])
     def test_only_a_refusal_is_recorded(self, line: str) -> None:
@@ -266,6 +288,25 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         """A serial run has no client, and its verdicts must be reached the same way."""
         _gdal_logs(LOGGED_REFUSAL)
         assert collect_logged_refusals(None) == [LOGGED_REFUSAL]
+
+
+def test_the_capture_hears_gdal_at_the_level_rasterio_really_uses() -> None:
+    """No fixture, and no level set: the default configuration has to be enough on its own.
+
+    Every other test here levels ``rasterio._env`` explicitly, which is convenient and hides the
+    question. A handler only sees what its logger is enabled for, that setting is inherited, and
+    ``install_capture`` deliberately reads the level rather than raising it — so if rasterio ever
+    moved these records below WARNING, the capture would go silent with nothing failing.
+
+    Production settles which level matters: every one of the 25 GDAL records in the outage window
+    arrived on ``rasterio._env`` at WARNING.
+    """
+    install_capture()
+    gdal = logging.getLogger("rasterio._env")
+    assert gdal.level == logging.NOTSET, "this asserts the DEFAULT, so the logger must be unset"
+    drain_local_refusals()
+    gdal.warning("%s", LOGGED_REFUSAL)
+    assert drain_local_refusals() == [LOGGED_REFUSAL]
 
 
 def _decode_failure_over_a_refused_object() -> WarpOperationError:

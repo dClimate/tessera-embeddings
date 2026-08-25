@@ -866,7 +866,10 @@ def classify_read_failure_in(text: str) -> ReadFailure:
             return ReadFailure.REFUSAL_UNATTRIBUTED
         return ReadFailure.PROVIDER_REFUSED
     statuses = _http_statuses(text)
-    if any(400 <= n < 500 and n not in _ABSENT_4XX and n != 403 for n in statuses):
+    # Every 4xx that is neither absence nor a reason to wait. Both exceptions are named by their
+    # own sets rather than one by a set and the other by a literal, so a status can be moved
+    # between the two by editing one line and cannot end up in both.
+    if any(400 <= n < 500 and n not in (_ABSENT_4XX | _TRANSIENT_4XX) for n in statuses):
         return ReadFailure.CLIENT_ERROR
     if any(m in text for m in _UNREADABLE_MARKERS):
         return ReadFailure.UNREADABLE
@@ -1061,8 +1064,35 @@ _PROVIDER_REFUSAL_MARKERS = (
 #: * **Every other 4xx is neither** — a malformed request or a rejected credential is not the
 #:   data's fault and is not fixed by waiting, so it re-raises and fails the leg on its first
 #:   date instead of being skipped date by date.
-_HTTP_STATUS_RE = re.compile(r"HTTP response code:\s*(\d{3})")
-_TRANSIENT_4XX = frozenset({408, 429})
+#: GDAL states a status in more than one wording, and both of them reach this classifier.
+#: Captured from production during the 2026-08-24 outage, on ``rasterio._env`` at WARNING:
+#:
+#: * ``CPLE_AppDefined in HTTP response code on <url>: 403``
+#: * ``CPLE_AppDefined in HTTP error code: 503 - <url>. Retrying again in 0.5 secs``
+#:
+#: The first puts the object's URL BETWEEN the phrase and the colon — 249 characters of it on a
+#: real OPERA href — and the second says "error" where the first says "response". A pattern
+#: anchored on ``HTTP response code:`` reads a status out of NEITHER, so every date of that
+#: outage classified ``undecidable`` and the refusal both lines state was never seen.
+#:
+#: The gap is BOUNDED rather than open, so a long single line cannot bind the phrase to some
+#: unrelated number far away from it, and ``.`` not matching a newline keeps a match inside one
+#: statement.
+_HTTP_STATUS_RE = re.compile(r"HTTP (?:response|error) code.{0,400}?:\s*(\d{3})\b")
+
+#: 4xx statuses that mean WAIT rather than stop.
+#:
+#: **403 belongs here and not only in** :data:`_PROVIDER_REFUSAL_MARKERS`. A marker is a wording;
+#: a status is a fact. The literal ``HTTP response code: 403`` matches what GDAL says when it
+#: cannot OPEN an object — and that failure carries the words into the exception anyway, where
+#: the marker was always going to catch them. It does not match what GDAL says when a chunk READ
+#: is refused mid-transfer, which is the shape every lost date of that outage arrived in, and
+#: whose exception says only ``Chunk and warp failed``.
+#:
+#: This module already recorded this defect once, for 5xx: "the markers name 403 and 500 as
+#: strings while the ranges cover every 5xx, so ``HTTP response code: 503`` was a refusal to
+#: neither predicate". 403 was the entry left behind by that fix.
+_TRANSIENT_4XX = frozenset({403, 408, 429})
 _ABSENT_4XX = frozenset({404, 410})
 
 
