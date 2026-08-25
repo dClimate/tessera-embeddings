@@ -45,10 +45,11 @@ from tessera_embeddings.storage.zarr_store import (
     _write_new,
     compute_doy,
     get_existing_dates,
-    merge_recorded_losses,
     open_repo,
     open_store,
     open_store_as_zarr_group,
+    project_assessment,
+    read_assessment_log,
     record_assessed_window,
     resolve_region,
     rollback_commits,
@@ -1216,38 +1217,96 @@ class TestAssessedWindowRecord:
         assert [e["date"] for e in self._attrs(path)["assessed_unreadable_dates"]] == ["2024-01-06"]
 
 
-def test_prior_wins_uniformly_with_no_scope_excepted():
-    """A recorded scope is never overwritten, whatever the new one claims.
-
-    An earlier version let one scope override this, so a date the axis had moved past would have
-    its verdict corrected in place. That was storing an answer that changes on its own: a date
-    becomes unappendable the instant any later date commits, so the stored verdict needed
-    migrating on every such transition — and each transition nobody migrated left a store
-    advertising the wrong remedy. Reviewers found those one at a time.
-
-    Whether a date can still be appended is now DERIVED where it is needed (``date <= max(axis)``,
-    and every reader of this attribute has the axis), so there is nothing here to keep current.
-    A scope records only what was observed, and the earliest observation wins — which is what
-    protects a record placed by hand during a repair.
-    """
-    prior = [{"date": "2018-02-03", "scope": "unreadable", "error": "RasterioIOError"}]
-
-    for claim in ("unfillable", "whole-date", "producer-conflict"):
-        kept = merge_recorded_losses(prior, [{"date": "2018-02-03", "scope": claim}])
-        assert kept == prior, f"{claim} must not overwrite what was already recorded"
-
-
-def test_a_prior_that_is_not_a_sequence_is_refused_rather_than_dropped():
+def test_malformed_recorded_evidence_is_refused_rather_than_dropped():
     """Evidence in a shape nobody wrote is not evidence of nothing.
 
-    Silently treating it as empty lets the next run replace whatever it recorded, and since a
+    Silently reading it as empty lets the next run replace whatever it recorded, and since a
     resumed run no longer re-derives the earlier months' losses, that erasure is unrecoverable.
     Refusing keeps the store's own account intact for someone to look at.
     """
     with pytest.raises(TypeError, match="not a sequence"):
-        merge_recorded_losses({"2018-02-03": "unreadable"}, [])
+        read_assessment_log({"assessment_log": {"oops": True}})
 
-    # None is the ordinary absent case and stays absent rather than raising.
-    assert merge_recorded_losses(None, [{"date": "2018-02-03", "scope": "unreadable"}]) == [
-        {"date": "2018-02-03", "scope": "unreadable"}
-    ]
+    with pytest.raises(TypeError, match="not a sequence"):
+        read_assessment_log(
+            {"assessed_window": ["2018-01-01", "2018-01-31"], "assessed_unreadable_dates": "2018-01-06"}
+        )
+
+
+class TestTheAssessmentLog:
+    """The record is a history of what each run saw, folded on demand into what readers consume.
+
+    Every case here was previously a RULE — join-or-refuse, prior-wins, reconcile-within-range,
+    upgrade-the-verdict — and each rule was a reviewer's finding before it was a rule. They are
+    properties of an append-only history rather than policies applied to a mutable summary, which
+    is the point: there is no stored answer left to go stale.
+    """
+
+    def test_a_store_written_before_the_log_reads_as_one_entry(self):
+        """No store has to be rewritten. The old pair says exactly what one entry says."""
+        attrs = {
+            "assessed_window": ["2018-01-01", "2018-06-30"],
+            "assessed_unreadable_dates": [{"date": "2018-03-04", "scope": "unreadable"}],
+        }
+        assert read_assessment_log(attrs) == [
+            {
+                "examined": ["2018-01-01", "2018-06-30"],
+                "losses": [{"date": "2018-03-04", "scope": "unreadable"}],
+                "source": "pre-log",
+            }
+        ]
+        window, losses = project_assessment(read_assessment_log(attrs))
+        assert window == ["2018-01-01", "2018-06-30"], "and folds back to what it claimed"
+        assert [e["date"] for e in losses] == ["2018-03-04"]
+
+    def test_a_store_with_nothing_recorded_has_an_empty_history(self):
+        assert read_assessment_log({}) == []
+        assert project_assessment([]) == (None, [])
+
+    def test_disjoint_ranges_under_claim_rather_than_span_the_gap(self):
+        """One range cannot describe two, and spanning would certify days nobody examined.
+
+        Under-claiming only makes the coverage gate stricter; over-claiming lets it excuse a month
+        that is missing because nobody looked, which is the one failure this record must never
+        produce.
+        """
+        log = [
+            {"examined": ["2018-01-01", "2018-03-31"], "losses": []},
+            {"examined": ["2018-06-01", "2018-12-31"], "losses": []},
+        ]
+        window, _ = project_assessment(log)
+        assert window == ["2018-06-01", "2018-12-31"], "the block reaching furthest forward"
+
+        # Adjacent ranges are one stretch and DO combine.
+        joined, _ = project_assessment(
+            [
+                {"examined": ["2018-01-01", "2018-03-31"], "losses": []},
+                {"examined": ["2018-04-01", "2018-12-31"], "losses": []},
+            ]
+        )
+        assert joined == ["2018-01-01", "2018-12-31"]
+
+    def test_the_run_that_looked_most_recently_decides(self):
+        """A later run covering a date supersedes an earlier verdict, including by omission."""
+        log = [
+            {"examined": ["2018-01-01", "2018-01-31"], "losses": [{"date": "2018-01-06", "scope": "unreadable"}]},
+            # Re-examined the same month and found nothing lost — the date now reads, or is
+            # legitimately filtered. Either way it is no longer a hole.
+            {"examined": ["2018-01-01", "2018-01-31"], "losses": []},
+        ]
+        _, losses = project_assessment(log)
+        assert losses == [], "the stale record is retired by the later look"
+
+    def test_a_date_no_run_examined_keeps_its_record(self):
+        """What protects a repair written by hand: it describes ground runs skip."""
+        log = [
+            {"examined": None, "losses": [{"date": "2018-01-06", "scope": "unfillable"}], "source": "repair"},
+            {"examined": ["2018-05-01", "2018-12-31"], "losses": []},
+        ]
+        _, losses = project_assessment(log)
+        assert [e["date"] for e in losses] == ["2018-01-06"], "January was never examined"
+
+    def test_a_date_back_on_the_axis_is_not_a_loss(self):
+        log = [{"examined": ["2018-01-01", "2018-01-31"], "losses": [{"date": "2018-01-06"}]}]
+        _, losses = project_assessment(log, present={"2018-01-06"})
+        assert losses == []
