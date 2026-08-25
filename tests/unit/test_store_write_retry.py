@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import time
 from collections.abc import Callable
 
 import icechunk
@@ -50,6 +51,7 @@ def _run(
     *,
     fail_times: int = 99,
     wait_out: Callable[[BaseException], bool] | None = None,
+    while_attempting: Callable[[], None] | None = None,
 ) -> tuple[int, float, BaseException | None]:
     """Run the policy against a callable that raises ``exc``.
 
@@ -74,6 +76,8 @@ def _run(
         for attempt in retrying:
             with attempt:
                 calls += 1
+                if while_attempting is not None:
+                    while_attempting()
                 if exc is not None and calls <= fail_times:
                     raise exc
     except BaseException as raised:  # the policy's verdict is exactly what is under test
@@ -89,13 +93,21 @@ def _attempts(exc: BaseException | None, *, fail_times: int = 99) -> int:
     return calls
 
 
-def _exhausted(exc: BaseException, *, wait_out: Callable[[BaseException], bool]) -> tuple[int, float]:
+def _exhausted(
+    exc: BaseException,
+    *,
+    wait_out: Callable[[BaseException], bool],
+    while_attempting: Callable[[], None] | None = None,
+) -> tuple[int, float]:
     """Attempts and backoff spent on a failure that never clears.
 
     Asserts the re-raise rather than suppressing it: a spent budget must fail the write. A policy
     that swallowed the failure would satisfy every attempt count here while losing the date.
+
+    ``while_attempting`` runs inside each attempt, which is where GDAL writes its log line. An
+    outage states its refusal on every attempt it refuses, not once before the write begins.
     """
-    calls, slept, raised = _run(exc, wait_out=wait_out)
+    calls, slept, raised = _run(exc, wait_out=wait_out, while_attempting=while_attempting)
     assert type(raised) is type(exc), "an exhausted policy must re-raise the failure, not absorb it"
     return calls, slept
 
@@ -268,11 +280,38 @@ class TestArmingThePatienceOnEvidenceTheChainDoesNotCarry:
         exc.__cause__ = RuntimeError("RasterioIOError: ZIPDecode: Decoding error at scanline 0")
         return exc
 
+    #: The wording GDAL really used, from CloudWatch during the 2026-08-24 outage. The composed
+    #: "CPLE_AWSAccessDenied in HTTP response code: 403" that stood here is the rasterio
+    #: EXCEPTION class's phrasing and is never written to a log.
+    REFUSAL = (
+        "CPLE_AppDefined in HTTP response code on "
+        "https://asf-cumulus-prod-opera-products.s3.us-west-2.amazonaws.com/OPERA_L2_RTC-S1/"
+        "OPERA_L2_RTC-S1_T072-152803-IW2_20211108T150433Z_S1B_30_v1.0_VV.tif: 403"
+    )
+
     def test_a_refusal_only_gdal_logged_outlasts_the_attempt_limit(self):
-        logging.getLogger("rasterio._env").warning("CPLE_AWSAccessDenied in HTTP response code: 403")
-        calls, slept = _exhausted(self._decode_failure(), wait_out=refusal_wait_out(None))
+        """The refusal is stated on every attempt it refuses, which is when GDAL logs it.
+
+        The predicate considers the evidence of the attempt that just failed, so a line from
+        before the write began is not this write's evidence — see the control below.
+        """
+        calls, slept = _exhausted(
+            self._decode_failure(),
+            wait_out=refusal_wait_out(None),
+            while_attempting=lambda: logging.getLogger("rasterio._env").warning(self.REFUSAL),
+        )
         assert calls > STORE_WRITE_ATTEMPTS
         assert slept <= WAIT_OUT_BACKOFF_S
+
+    def test_a_line_left_over_from_an_earlier_write_buys_nothing(self):
+        """A refusal that has since recovered is not evidence about this failure.
+
+        Unbounded, it would hand an unrelated codec failure the whole refusal budget: a fleet
+        held idle for minutes to reach the verdict it already had.
+        """
+        logging.getLogger("rasterio._env").warning(self.REFUSAL)
+        time.sleep(0.05)
+        assert _exhausted(self._decode_failure(), wait_out=refusal_wait_out(None))[0] == STORE_WRITE_ATTEMPTS
 
     def test_the_same_failure_with_nothing_logged_gets_only_the_attempt_limit(self):
         """The control. The predicate must complete a reason, never invent one."""

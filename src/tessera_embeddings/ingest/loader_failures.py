@@ -139,7 +139,9 @@ _KEEPABLE = (ReadFailure.PROVIDER_REFUSED, ReadFailure.OUR_CREDENTIAL)
 
 #: Bounded because they are written from the loader's threads and read from the caller's.
 _aborted: deque[str] = deque(maxlen=_CAPACITY)
-_refused: deque[str] = deque(maxlen=_REFUSAL_CAPACITY)
+#: Each entry is ``(recorded_at, message)``. The time is this WORKER's ``monotonic`` clock and is
+#: only ever compared inside the process that wrote it, so no clock is compared across machines.
+_refused: deque[tuple[float, str]] = deque(maxlen=_REFUSAL_CAPACITY)
 _lock = threading.Lock()
 _handlers: list[logging.Handler] = []
 
@@ -208,7 +210,7 @@ class _LoggedRefusalHandler(logging.Handler):
         except Exception:  # pragma: no cover — a broken record must not break a read
             return
         with _lock:
-            _refused.append(message)
+            _refused.append((time.monotonic(), message))
 
 
 def install_capture() -> None:
@@ -250,14 +252,31 @@ def drain_local() -> list[str]:
     return _drain(_aborted)
 
 
-def drain_local_refusals() -> list[str]:
-    """Take and clear this process's recorded refusal lines.
+def drain_local_refusals(max_age_s: float | None = None) -> list[str]:
+    """Take and clear this process's recorded refusal lines, returning the ones still current.
 
     A separate buffer from the hrefs, drained by a different caller for a different purpose.
     One buffer would mean the caller that classifies destroys the evidence the caller that
     attributes needs, and the optical copy ladder would silently stop attributing.
+
+    ``max_age_s`` is how long the read now being judged has been running. A line older than that
+    was logged BEFORE this read began and cannot describe it — which is the case a failure alone
+    never reaches, because the buffer is drained only when something fails. A read that logs a
+    refusal and then SUCCEEDS on a later attempt, exactly what the read retry exists to allow,
+    leaves its line behind for the next failure to inherit; on the optical path that reads a
+    genuinely corrupt object as a refusal and the copy ladder never steps down.
+
+    Everything is cleared either way, current or not: a line too old to describe this read is too
+    old to describe any later one. Passing ``None`` keeps every line, which is what a caller with
+    no read to date it against gets.
     """
-    return _drain(_refused)
+    with _lock:
+        found = list(_refused)
+        _refused.clear()
+    if max_age_s is None:
+        return [message for _at, message in found]
+    now = time.monotonic()
+    return [message for at, message in found if now - at <= max_age_s]
 
 
 #: Exception classes whose cause cannot be serialised out of the worker that raised it, and
@@ -420,9 +439,13 @@ def collect_aborted_hrefs(client: dask.distributed.Client | None) -> list[str]:
     return _collect(client, drain_local, "aborted hrefs")
 
 
-def collect_logged_refusals(client: dask.distributed.Client | None) -> list[str]:
-    """Every refusal GDAL logged since the last collection, cluster-wide."""
-    return _collect(client, drain_local_refusals, "logged refusals")
+def collect_logged_refusals(client: dask.distributed.Client | None, max_age_s: float | None = None) -> list[str]:
+    """Every refusal GDAL logged during the last ``max_age_s`` seconds, cluster-wide.
+
+    The age is a DURATION rather than an instant, so each worker answers against its own clock
+    and nothing here depends on the fleet's clocks agreeing.
+    """
+    return _collect(client, lambda: drain_local_refusals(max_age_s), "logged refusals")
 
 
 #: How the attached evidence introduces itself in a log and on an exception. A reader has to be
@@ -435,7 +458,9 @@ _REFUSAL_NOTE = "The source reader logged, but did not raise:"
 _LINES_PER_NOTE = 4
 
 
-def carry_logged_refusal(exc: BaseException, client: dask.distributed.Client | None) -> None:
+def carry_logged_refusal(
+    exc: BaseException, client: dask.distributed.Client | None, max_age_s: float | None = None
+) -> None:
     """Attach to ``exc`` any refusal GDAL logged for this read but did not raise.
 
     The single bridge between the evidence and the verdict, and the only writer of exception
@@ -463,7 +488,7 @@ def carry_logged_refusal(exc: BaseException, client: dask.distributed.Client | N
     """
     if not is_source_read_failure(exc):
         return
-    lines = collect_logged_refusals(client)
+    lines = collect_logged_refusals(client, max_age_s)
     if not lines:
         return
     note = f"{_REFUSAL_NOTE} {' | '.join(sorted(set(lines))[:_LINES_PER_NOTE])}"
@@ -480,9 +505,16 @@ def refusal_wait_out(client: dask.distributed.Client | None) -> Callable[[BaseEx
     exception decides a refusal it cannot see, declines, and spends the ordinary three attempts
     on an outage the budget exists to outlast.
     """
+    since = time.monotonic()
 
     def _refused(exc: BaseException) -> bool:
-        carry_logged_refusal(exc, client)
+        # The gap between two calls IS the attempt that just failed, and on the first call it is
+        # the time since the write began. So the evidence considered is always the evidence this
+        # attempt produced, without the predicate having to be told when the attempt started.
+        nonlocal since
+        now = time.monotonic()
+        carry_logged_refusal(exc, client, max_age_s=now - since)
+        since = now
         return is_provider_refusal(exc)
 
     return _refused

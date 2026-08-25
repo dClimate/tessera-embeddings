@@ -798,24 +798,40 @@ def ingest_s2_roi_reflectance(
         batch cleanly from the graphs already prepared.
         """
         write_started = time.monotonic()
-        for attempt in store_write_retrying(log):
-            with attempt:
-                days: list[tuple[xr.Dataset, list[tuple[int, int, int, int]]]] = []
-                for p in batch:
-                    assert p.day_ds is not None, f"date {p.date} was skipped ({p.skip_reason}); not batchable"
-                    days.append((p.day_ds, p.windows))
-                write_days_windows(
-                    reflectance_store,
-                    days,
-                    roi=roi,
-                    manifest=ingest_manifest,
-                    baselines={d: b for p in batch for d, b in p.baselines.items()},
-                    tile_id=roi_zarr_path,
-                    crs=roi.native_crs,
-                    chunks=INGEST_CHUNKS,
-                    parallel_windows=overlap_window_writes,
-                    s3_region=s3_region,
-                )
+        # The same evidence collection a single date's write gets. Without it a batch failure is
+        # classified from the codec exception alone, so a refusal reads as unreadable data: the
+        # batch burns its whole retry ladder, `_write_batch_or_isolate` then recomputes every date
+        # in it singly, and only the per-date context can finally see the refusal. The verdict was
+        # reached in the end, at the cost of several full-batch recomputations per batch, on every
+        # worker at once, during exactly the outage the budget exists to outlast.
+        #
+        # `date` names the span rather than a day, and `items` is empty: a batch has no single
+        # date's item list, and the objects a load aborted on are drained by the per-date ladder
+        # from a SEPARATE buffer that this must not empty.
+        with read_failure_context(
+            log,
+            roi=roi_label,
+            date=f"{batch[0].date}..{batch[-1].date}",
+            client=client,
+        ):
+            for attempt in store_write_retrying(log):
+                with attempt:
+                    days: list[tuple[xr.Dataset, list[tuple[int, int, int, int]]]] = []
+                    for p in batch:
+                        assert p.day_ds is not None, f"date {p.date} was skipped ({p.skip_reason}); not batchable"
+                        days.append((p.day_ds, p.windows))
+                    write_days_windows(
+                        reflectance_store,
+                        days,
+                        roi=roi,
+                        manifest=ingest_manifest,
+                        baselines={d: b for p in batch for d, b in p.baselines.items()},
+                        tile_id=roi_zarr_path,
+                        crs=roi.native_crs,
+                        chunks=INGEST_CHUNKS,
+                        parallel_windows=overlap_window_writes,
+                        s3_region=s3_region,
+                    )
         # The batch's write is ONE compute, so a per-date write time does not exist
         # as a measurement — this line is the batched counterpart of `Stage timings`
         # and analysis divides by n. build/gate are sums of the real per-date values.

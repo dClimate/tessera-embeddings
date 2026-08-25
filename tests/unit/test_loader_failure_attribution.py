@@ -25,6 +25,7 @@ from __future__ import annotations
 import copyreg
 import inspect
 import logging
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
@@ -419,11 +420,27 @@ class TestArmingThePatience:
     def test_it_arms_on_a_refusal_only_the_log_names(self) -> None:
         """What ``is_provider_refusal`` alone cannot answer, and the difference between minutes
         of patience and the ordinary attempt limit.
+
+        The predicate is built BEFORE the line is logged, because that is the order the write
+        runs in: the retry policy is constructed, the attempt reads, GDAL logs, the attempt
+        fails. Each call considers the evidence of the attempt that just failed.
+        """
+        armed = refusal_wait_out(None)
+        _gdal_logs(LOGGED_REFUSAL)
+
+        assert armed(_decode_failure_over_a_refused_object()) is True
+
+    def test_it_declines_a_line_logged_before_the_write_began(self) -> None:
+        """A refusal from an earlier read that has since recovered is not this write's evidence.
+
+        Unbounded, it would buy an unrelated codec failure the whole refusal budget — a fleet
+        held idle for minutes to reach the verdict it already had.
         """
         _gdal_logs(LOGGED_REFUSAL)
-        failure = _decode_failure_over_a_refused_object()
+        time.sleep(0.05)
+        armed = refusal_wait_out(None)
 
-        assert refusal_wait_out(None)(failure) is True
+        assert armed(_decode_failure_over_a_refused_object()) is False
 
     def test_it_declines_a_failure_nothing_says_was_refused(self) -> None:
         """The negative control. Widening what gets waited out is the expensive direction: a
