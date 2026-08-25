@@ -1,8 +1,14 @@
 name: Nightly
 
+# SCHEDULE SUSPENDED 2026-08-25. The selector below matches exactly one test —
+# tests/parity/test_full_pipeline_parity.py — whose body is `raise NotImplementedError`
+# under `@pytest.mark.xfail(strict=True)`. The wiring is correct; the test it points at
+# has not been written yet, so a daily 120-minute runner was confirming a placeholder is
+# still a placeholder. Restore the `schedule:` block below when that test is real.
+# See tests/README.md "Roadmap" and context_docs/design/test-suite-streamlining-plan.md §2.3.
 on:
-  schedule:
-    - cron: '0 6 * * *'
+  # schedule:
+  #   - cron: '0 6 * * *'
   workflow_dispatch: {}
 
 jobs:

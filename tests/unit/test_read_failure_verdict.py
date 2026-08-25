@@ -332,6 +332,46 @@ def test_a_url_port_is_not_mistaken_for_a_status(text: str, verdict: ReadFailure
     assert classify_read_failure_in(text) is verdict, why
 
 
+@pytest.mark.parametrize(
+    ("text", "why"),
+    [
+        (
+            "CPLE_AppDefined in HTTP response code on https://host/o.tif: 4030",
+            "a four-digit number is not a status whose first three digits happen to be 403",
+        ),
+        (
+            "CPLE_AppDefined in HTTP error code: 5030 - https://host/o.tif. Retrying",
+            "and the same in the wording that puts the number first",
+        ),
+        (
+            "CPLE_AppDefined in HTTP response code on https://host/o.tif: 403/404",
+            "a number that continues into a path is part of an address, not a status",
+        ),
+        (
+            "response_code=4030",
+            "and the same on the non-GDAL branch of the pattern",
+        ),
+    ],
+)
+def test_a_longer_number_is_not_a_status_with_its_tail_ignored(text: str, why: str) -> None:
+    r"""The status must be the WHOLE number, not the first three digits of a longer one.
+
+    ``\d{3}`` alone matches greedily from the left, so ``4030`` would yield ``403`` and a
+    malformed or truncated line would earn the refusal budget on the strength of a number that
+    was never a status. The negative lookahead is what refuses it, in both directions a longer
+    run can continue: another digit, or a slash starting a path segment.
+
+    The verdict is UNDECIDABLE rather than any specific failure, which is the fail-closed side
+    of the choice — an unrecognised line claims nothing. Claiming the wrong thing here is the
+    expensive error: PROVIDER_REFUSED spends the refusal budget waiting out an outage that is
+    not happening, and ABSENT gives the date up outright.
+
+    Added 2026-08-25. The guard was correct and untested — removing the lookahead broke no test
+    in the suite, which is how a mutation probe found it. See the streamlining plan §7.1.
+    """
+    assert classify_read_failure_in(text) is ReadFailure.UNDECIDABLE, why
+
+
 def test_a_status_is_not_bound_to_a_phrase_far_away_from_it() -> None:
     """What sits between the phrase and the status is an ADDRESS, and an address has no spaces.
 

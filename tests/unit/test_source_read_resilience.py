@@ -56,14 +56,57 @@ class _Item:
 
 
 def _read(log: logging.Logger, fail_times: int) -> int:
-    """Call through the retry, failing the first ``fail_times`` attempts."""
+    """Call through the retry, failing the first ``fail_times`` attempts.
+
+    The real ladder spends ~61 s asleep (see :func:`source_read_retrying`), and a permanent
+    failure pays all of it. That is a production decision, but it is not something a unit test
+    should sit through — it made this file alone 67 s of the suite's wall time.
+
+    Only ``sleep`` is replaced. The stop condition and the wait policy are left exactly as
+    production builds them, so the attempt COUNT and the ordering of the log lines are still
+    the real ones; what is skipped is the waiting between attempts, which no test here asserts
+    on. The ladder's own shape is pinned directly by
+    :func:`test_the_retry_ladder_is_the_one_production_pays_for` instead, which checks more
+    than experiencing it ever did.
+    """
     state = {"calls": 0}
-    for attempt in source_read_retrying(log):
+    retrying = source_read_retrying(log)
+    retrying.sleep = lambda _seconds: None
+    for attempt in retrying:
         with attempt:
             state["calls"] += 1
             if state["calls"] <= fail_times:
                 raise OSError("Read failed. See previous exception for details.")
     return state["calls"]
+
+
+def test_the_retry_ladder_is_the_one_production_pays_for() -> None:
+    """The budget a permanently-failing date costs, asserted rather than waited out.
+
+    ``_read`` skips the sleeps so the suite stays fast, which would otherwise leave the ladder
+    itself unchecked — a change to the multiplier or the cap would go unnoticed. This pins the
+    three parameters that decide the cost, and the total they add up to.
+
+    61 s per permanently-failing date is deliberate: long enough to outlast a provider having
+    a bad minute, and paid only on the failing path. ``reraise`` is what stops the last
+    attempt's failure being replaced by tenacity's own ``RetryError``, which is how a real
+    read failure would otherwise lose its cause.
+    """
+    retrying = source_read_retrying(logging.getLogger("t.ladder"))
+
+    assert retrying.stop.max_attempt_number == SOURCE_READ_ATTEMPTS
+    assert (retrying.wait.multiplier, retrying.wait.min, retrying.wait.max) == (1, 2.0, 15.0)
+    assert retrying.reraise is True
+
+    class _State:
+        """The one field :class:`wait_exponential` reads off a retry state."""
+
+        def __init__(self, attempt: int) -> None:
+            self.attempt_number = attempt
+
+    sleeps = [retrying.wait(_State(n)) for n in range(1, SOURCE_READ_ATTEMPTS)]
+    assert sleeps == [2.0, 2.0, 4, 8, 15.0, 15.0, 15.0]
+    assert sum(sleeps) == 61.0, "the per-date backoff budget named in source_read_retrying"
 
 
 def test_a_transient_read_survives(caplog) -> None:
@@ -245,24 +288,11 @@ class TestZeroDateOutcomeIsAttributable:
         missing = [c.strip() for c in calls if "roi=" not in c and "ROI %s" not in c]
         assert not missing, f"informational line(s) with no ROI: {missing}"
 
-    def test_placeholders_match_arguments(self) -> None:
-        """A miscounted %-placeholder loses the line on a worker rather than raising here."""
-        tree = ast.parse((_SRC / "ingest" / "s1_roi.py").read_text())
-        bad = []
-        for node in ast.walk(tree):
-            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
-                continue
-            if node.func.attr not in {"info", "warning", "error", "debug", "exception"}:
-                continue
-            if not node.args or not isinstance(node.args[0], ast.Constant):
-                continue
-            text = node.args[0].value
-            if not isinstance(text, str):
-                continue
-            placeholders = text.count("%") - 2 * text.count("%%")
-            if placeholders != len(node.args) - 1:
-                bad.append((node.lineno, text[:50]))
-        assert not bad, f"placeholder/argument mismatch: {bad}"
+    # test_placeholders_match_arguments lived here. It walked the AST of ingest/s1_roi.py
+    # counting %-placeholders against arguments. Ruff's PLE1205/PLE1206 make the same check
+    # over EVERY file rather than this one module, so the rule is enabled in ruff.toml and
+    # the test is gone. Removed 2026-08-25 after confirming both a too-many and a too-few
+    # mutant in s1_roi.py fail the lint exactly as they used to fail the test.
 
 
 class TestEveryComputeThatReadsSourceIsAttributed:

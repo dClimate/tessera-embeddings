@@ -107,32 +107,6 @@ def sample_reflectance_data():
     return _make_data
 
 
-@pytest.fixture
-def sample_sar_data():
-    """Factory returning xarray Dataset with VV/VH bands (SAR-style)."""
-
-    def _make(
-        dates: list[str],
-        height: int = 20,
-        width: int = 20,
-        seed: int = 42,
-    ) -> xr.Dataset:
-        rng = np.random.default_rng(seed)
-        n_times = len(dates)
-        data_vars = {}
-        for band in ["VV", "VH"]:
-            data = rng.uniform(-25.0, 5.0, size=(n_times, height, width)).astype(np.float32)
-            data_vars[band] = (["time", "northing", "easting"], data)
-        coords = {
-            "time": [np.datetime64(d, "ns") for d in dates],
-            "northing": np.arange(height),
-            "easting": np.arange(width),
-        }
-        return xr.Dataset(data_vars, coords=coords)
-
-    return _make
-
-
 # -----------------------------------------------------------------------------
 # STAC Mock Fixtures
 # -----------------------------------------------------------------------------
@@ -199,99 +173,6 @@ def local_zarr_path(tmp_path):
     zarr_dir = tmp_path / "zarr_stores"
     zarr_dir.mkdir()
     return zarr_dir
-
-
-# -----------------------------------------------------------------------------
-# Icechunk S3 Fixtures
-# -----------------------------------------------------------------------------
-
-
-@pytest.fixture
-def icechunk_s3_config(moto_server, test_bucket):
-    """Provide Icechunk S3 configuration for moto-backed tests.
-
-    Returns a dict with parameters for icechunk.s3_storage().
-    """
-    return {
-        "bucket": test_bucket,
-        "endpoint_url": moto_server,
-        "allow_http": True,
-        "access_key_id": "testing",
-        "secret_access_key": "testing",
-        "region": "us-east-1",
-    }
-
-
-@pytest.fixture
-def icechunk_s3_store_path(test_bucket):
-    """Return a factory that generates S3 store paths for Icechunk.
-
-    Usage:
-        path = icechunk_s3_store_path("my-store")
-        # Returns: "s3://test-tessera-embeddings/my-store"
-    """
-
-    def _make_path(store_name: str) -> str:
-        return f"s3://{test_bucket}/{store_name}"
-
-    return _make_path
-
-
-# -----------------------------------------------------------------------------
-# ROI Test Fixtures
-# -----------------------------------------------------------------------------
-
-
-@pytest.fixture
-def mock_roi_metadata():
-    """Factory returning ROIMetadata with configurable size/CRS.
-
-    Builds ROIMetadata dataclass instances without touching the filesystem.
-    """
-    from unittest.mock import Mock
-
-    from tessera_embeddings.ingest.roi import ROIMetadata
-
-    def _make(
-        height: int = 20,
-        width: int = 20,
-        crs: str = "EPSG:32615",
-        bbox_wgs84: tuple[float, float, float, float] = (-90.5, 44.0, -90.0, 44.5),
-    ) -> ROIMetadata:
-        geobox = Mock()
-        geobox.shape = Mock(y=height, x=width)
-        return ROIMetadata(
-            bbox_wgs84=bbox_wgs84,
-            native_crs=crs,
-            geobox=geobox,
-            width=width,
-            height=height,
-        )
-
-    return _make
-
-
-@pytest.fixture
-def roi_mask_array():
-    """Factory returning boolean numpy array with configurable coverage.
-
-    Args via factory call:
-        height, width: spatial dimensions (default 20x20)
-        coverage: fraction of True pixels (default 0.8)
-        seed: RNG seed for reproducibility
-    """
-
-    def _make(
-        height: int = 20,
-        width: int = 20,
-        coverage: float = 0.8,
-        seed: int = 42,
-    ) -> np.ndarray:
-        rng = np.random.default_rng(seed)
-        mask = rng.random((height, width)) < coverage
-        return mask
-
-    return _make
 
 
 # -----------------------------------------------------------------------------

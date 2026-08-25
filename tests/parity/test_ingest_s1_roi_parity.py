@@ -36,13 +36,11 @@ import pytest
 import requests
 from dask.distributed import Client
 
-from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.ingest import auth as auth_module
 from tessera_embeddings.ingest import opera_query as opera_query_module
-from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.ingest.s1_roi import ingest_s1_roi_sar
 from tessera_embeddings.orchestration.prefect.flows import ingest_s1_roi_sar as flow_module
-from tests.parity.helpers import assert_zarr_equivalent
+from tests.parity.helpers import assert_zarr_equivalent, stage_quickstart_roi
 
 CASSETTE_NAME = "test_s1_roi_parity"
 
@@ -51,20 +49,6 @@ CASSETTE_NAME = "test_s1_roi_parity"
 # whose CMR/STAC query end lands on 2024-07-31.
 DENVER_DATES = ("2024-07-01", "2024-07-31")
 DENVER_BATCH_DAYS = 31
-FORCE_CRS = "EPSG:32613"  # UTM zone 13N covers Denver
-
-
-def _stage_quickstart_roi(tmp_path: Path, roi_geojson: Path) -> Path:
-    """Rasterise the quickstart GeoJSON to a Zarr ROI under ``tmp_path``."""
-    roi_zarr = tmp_path / "roi.zarr"
-    rasterize_roi_zarr(
-        output_path=str(roi_zarr),
-        resolution=10.0,
-        chunk_size=INGEST_CHUNK_SIZE,
-        force_crs=FORCE_CRS,
-        input_path=str(roi_geojson),
-    )
-    return roi_zarr
 
 
 def _bearer_session_factory(token: str) -> requests.Session:
@@ -139,7 +123,7 @@ def test_s1_roi_parity(
         monkeypatch.setattr(auth_module, "get_edl_session", bearer_factory)
         monkeypatch.setattr(opera_query_module, "get_edl_session", bearer_factory)
 
-    roi_zarr = _stage_quickstart_roi(tmp_path, fixture_quickstart_roi)
+    roi_zarr = stage_quickstart_roi(tmp_path, fixture_quickstart_roi)
 
     domain_store = tmp_path / "domain"
     flow_store = tmp_path / "flow"
