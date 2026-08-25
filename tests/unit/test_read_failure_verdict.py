@@ -251,6 +251,15 @@ REAL_GDAL_REFUSALS = {
         "OPERA_L2_RTC-S1_T072-152803-IW2_20211108T150433Z_S1B_30_v1.0_VV.tif. "
         "Retrying again in 0.5 secs"
     ),
+    # What GDAL's ranged reader retries on, and the commonest of the three in the optical logs.
+    # TWO addresses sit in the gap here, the URL and the byte range, so a pattern matching one
+    # address reads no status out of it. Body verbatim from CloudWatch on 2026-08-25, under the
+    # ``CPLE_AppDefined in`` prefix the line carries once it reaches a logger.
+    "ranged-read 503": (
+        "CPLE_AppDefined in HTTP error code for "
+        "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/33/S/WC/2021/6/"
+        "S2B_33SWC_20210621_3_L2A/B06.tif range 236068-238191: 503. Retrying again in 0.5 secs"
+    ),
 }
 
 
@@ -306,6 +315,11 @@ def test_the_wider_status_match_does_not_widen_what_a_status_means(text: str, ve
             "CPLE_AppDefined in HTTP response code on https://host:8443/object.tif: 403",
             ReadFailure.PROVIDER_REFUSED,
             "a four-digit port is not three digits",
+        ),
+        (
+            "CPLE_AppDefined in HTTP error code for https://host:443/o.tif range 1-2: 503. Retrying",
+            ReadFailure.PROVIDER_REFUSED,
+            "and the same where the gap holds a URL and a byte range",
         ),
     ],
 )
