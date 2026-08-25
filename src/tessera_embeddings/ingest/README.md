@@ -2013,11 +2013,22 @@ opposites: bad bytes means give the date up, refused means wait and give up noth
 failure gets was decided by which GDAL error happened to land last in the retry ladder.
 
 `loader_failures` closes it with a second handler on `rasterio._env`, the logger rasterio's CPL
-error handler forwards every GDAL message to. `carry_logged_refusal` attaches what it collected to
+error handler forwards GDAL's messages to. `carry_logged_refusal` attaches what it collected to
 the failing exception as a note, `_exception_chain_text` reads notes with the rest of the chain,
 and `classify_read_failure` therefore decides from all of it. Both sensors reach this through
 `roi_processing.read_failure_context`, which every per-date read on both paths already passes
 through — so it is one classifier over one set of evidence, not a rule per sensor.
+
+That handler only hears what reaches a logger, and most of it does not. rasterio installs its CPL
+error handler with `CPLPushErrorHandler`, which GDAL keeps **per thread**, so a message reported on
+one of GDAL's own fetch threads falls through to GDAL's process-wide handler and is written to the
+process's stderr — where no `logging.Handler` can reach it. `hear_gdal_from_every_thread` gives that
+process-wide handler somewhere to forward to, in rasterio's own wording, and `install_capture`
+installs it alongside the two log handlers because it is the same sensor: they hear what GDAL says
+to a logger, and it is what makes GDAL say the rest of it to one. It chains to the handler already
+installed rather than replacing it, so GDAL's stderr line still appears and a fatal error still
+aborts through it; and GDAL consults the reporting thread's own handler first, so nothing rasterio
+already forwards is forwarded twice.
 
 Four properties are what make it safe to add evidence at all:
 
