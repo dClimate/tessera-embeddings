@@ -1335,8 +1335,26 @@ class TestTheAssessmentLog:
         to keep, and would do it silently — the opposite of the fail-closed behaviour the reader
         gives a malformed log as a whole.
         """
-        with pytest.raises(TypeError, match="not records"):
+        with pytest.raises(TypeError, match="not a record"):
             read_assessment_log({"assessment_log": [{"examined": None, "losses": []}, "a bare string"]})
+
+    def test_a_malformed_field_inside_an_entry_is_refused_too(self):
+        """Validation is complete or it is a false guarantee.
+
+        The reader refused an entry it could not interpret while the fold quietly coerced the
+        fields INSIDE one — a range of ``[None, None]`` became the literal strings ``"None"``,
+        which sort after every real date and so took over the published window. Two policies over
+        one record, and the stricter was the one a reader would have relied on.
+        """
+        for bad, why in (
+            ({"examined": [None, None]}, "a bound that is not a date"),
+            ({"examined": ["2018-01-01"]}, "a range of the wrong arity"),
+            ({"examined": "2018-01-01"}, "a range that is not a pair"),
+            ({"considered": [20180106]}, "a considered date that is a number"),
+            ({"losses": "2018-01-06"}, "a losses field that is not a list"),
+        ):
+            with pytest.raises(TypeError):
+                read_assessment_log({"assessment_log": [bad]}), why
 
     def test_a_date_lost_cleared_and_lost_again_is_a_new_observation(self):
         """Deduplication keys on the CURRENT verdict, never on every mention ever made.

@@ -1282,14 +1282,10 @@ def read_assessment_log(attrs: "Mapping[str, Any]") -> list[dict[str, Any]]:
         # reading, extending and rewriting — and anything this read drops, that rewrite deletes.
         # Filtering an entry it does not recognise would therefore destroy exactly the evidence the
         # append-only promise exists to keep, and would do it silently.
-        bad = [i for i, entry in enumerate(log) if not isinstance(entry, dict)]
-        if bad:
-            raise TypeError(
-                f"{ASSESSMENT_LOG_ATTR} on this store holds {len(bad)} entr(y/ies) that are not "
-                f"records, at position(s) {bad}. Refusing to read and rewrite: the next append "
-                "would drop them, and one of them may be the only account of a hole."
-            )
-        return [dict(e) for e in log]
+        # Every entry, completely — see _validated_entry. Refusing beats repairing: the next
+        # append rewrites this attribute whole, so anything read wrongly here is written wrongly
+        # back, and one of these entries may be the only account of a hole.
+        return [_validated_entry(entry, f"{ASSESSMENT_LOG_ATTR}[{i}] on this store") for i, entry in enumerate(log)]
 
     window = attrs.get(ASSESSED_WINDOW_ATTR)
     losses = attrs.get(UNREADABLE_DATES_ATTR)
@@ -1314,6 +1310,44 @@ def read_assessment_log(attrs: "Mapping[str, Any]") -> list[dict[str, Any]]:
             "source": "pre-log",
         }
     ]
+
+
+def _validated_entry(entry: object, where: str) -> dict[str, Any]:
+    """One assessment entry, checked completely, or an exception naming what is wrong.
+
+    Validation happens HERE and nowhere else. Splitting it left the reader refusing an entry it
+    could not interpret while the fold quietly coerced the fields inside one — so a range of
+    ``[None, None]`` became the literal strings ``"None"``, which sort after every real date and
+    took over the published window. Two policies over the same data, and the stricter one was the
+    guarantee people would have relied on.
+
+    Checking once means the fold can treat what it receives as sound, which is why it has no
+    defensive branches: everything it could have defended against is refused before it arrives.
+    """
+    if not isinstance(entry, dict):
+        raise TypeError(f"{where} is {type(entry).__name__}, not a record")
+
+    examined = entry.get("examined")
+    if examined is not None:
+        if not (isinstance(examined, (list, tuple)) and len(examined) == 2):
+            raise TypeError(f"{where} has an 'examined' that is not a pair of dates: {examined!r}")
+        if not all(isinstance(bound, str) and bound for bound in examined):
+            raise TypeError(f"{where} has an 'examined' bound that is not a date string: {examined!r}")
+
+    considered = entry.get("considered")
+    if considered is not None:
+        if not isinstance(considered, (list, tuple)):
+            raise TypeError(f"{where} has a 'considered' that is not a list: {considered!r}")
+        if not all(isinstance(date, str) for date in considered):
+            # A number here would silently fail to match a stored date and so silently fail to
+            # supersede it, which looks exactly like a run that examined nothing.
+            raise TypeError(f"{where} has a 'considered' entry that is not a date string")
+
+    losses = entry.get("losses")
+    if losses is not None and not isinstance(losses, (list, tuple)):
+        raise TypeError(f"{where} has a 'losses' that is not a list: {type(losses).__name__}")
+
+    return dict(entry)
 
 
 def _loss_date(loss: object) -> str:
@@ -1367,8 +1401,8 @@ def project_assessment(
     for entry in log:
         examined = entry.get("examined")
         covers: tuple[str, str] | None = None
-        if isinstance(examined, (list, tuple)) and len(examined) == 2:
-            covers = (str(examined[0]), str(examined[1]))
+        if examined is not None:
+            covers = (examined[0], examined[1])
             ranges.append(covers)
 
         # Supersession keys on the dates a run actually CONSIDERED, never on its range. Examining
@@ -1378,8 +1412,8 @@ def project_assessment(
         # acquisition the month would then read as legitimately empty and an incomplete mosaic
         # could publish.
         considered = entry.get("considered")
-        if isinstance(considered, (list, tuple)):
-            for date in {str(d) for d in considered} & set(decided):
+        if considered is not None:
+            for date in set(considered) & set(decided):
                 del decided[date]
         elif covers is not None:
             # An entry from before runs recorded what they considered — including the one
