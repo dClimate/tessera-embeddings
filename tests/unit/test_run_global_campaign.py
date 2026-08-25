@@ -145,13 +145,6 @@ def wired(monkeypatch):
 
     monkeypatch.setattr(mod, "arun_deployment", fake_arun)
 
-    # The live-claim query is a real Prefect API read. Stubbed to "nothing is claimed" so a
-    # test that turns `immediate_refill` on cannot reach the network; tests about the claim
-    # rule override it.
-    async def _no_claims():
-        return set()
-
-    monkeypatch.setattr(mod, "zone_years_claimed_by_live_runs", _no_claims)
     monkeypatch.setattr(mod, "delete_prefix", lambda uri, **k: rec["deletes"].append(uri))
     # The fleet-wide caps are real Prefect API writes; record them instead.
     monkeypatch.setattr(
@@ -1582,12 +1575,10 @@ class _Round:
     timing hope.
     """
 
-    def __init__(self, wired, *, ends: dict[str, str], hold: str, claims=None, claims_error=False):
+    def __init__(self, wired, *, ends: dict[str, str], hold: str):
         self.wired = wired
         self.ends = ends  # a dispatch's first zone -> terminal state name, or "raise"
         self.hold = hold
-        self.claims = claims
-        self.claims_error = claims_error
         self.release = asyncio.Event()
         #: ("dispatch" | "settle", zones) in the order it happened. The ORDER is the subject.
         self.timeline: list[tuple[str, tuple[str, ...]]] = []
@@ -1634,11 +1625,6 @@ class _Round:
         finally:
             self.timeline.append(("settle", zones))
             self.held -= set(zones)
-
-    async def claim_query(self):
-        if self.claims_error:
-            raise RuntimeError("Prefect API unreachable")
-        return set(self.claims or ())
 
     async def drive(self, **kwargs):
         """Run the campaign, releasing the held cluster once the driver has decided.
@@ -1696,7 +1682,9 @@ def _round(monkeypatch, wired, round_, zones=("01N", "02N"), years=(2025,)):
     monkeypatch.setattr(mod, "campaign_work_list", _shrinking(cells, wired))
     monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: 100.0)
     monkeypatch.setattr(mod, "arun_deployment", round_.arun)
-    monkeypatch.setattr(mod, "zone_years_claimed_by_live_runs", round_.claim_query)
+    # The settling wait is real seconds in production. Zeroed here by default; the tests
+    # that are ABOUT the wait put it back.
+    monkeypatch.setattr(mod, "_SETTLE_DELAY_S", 0)
     return round_
 
 
@@ -1803,38 +1791,85 @@ class TestImmediateRefill:
         assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]
         assert "the dispatch itself raised" in "\n".join(rec.getMessage() for rec in caplog.records)
 
-    def test_a_live_claim_withholds_the_whole_zone_not_just_the_claimed_year(self, wired, monkeypatch):
-        """Zone granularity, because a zone's years must stay in ONE cluster.
+    def test_a_replacement_waits_for_the_settling_delay_before_dispatching(self, wired, monkeypatch):
+        """The one thing standing between a settled fill and its replacement, now that the
+        live-run census is gone.
 
-        A fill's grandchild ingests are cancelled a level further out and asynchronously, so
-        one of a dead cluster's cells can still have a live writer. Dropping that year while
-        keeping its zone's others would split the zone across two clusters — the one thing
-        the partition exists to prevent.
+        A census could only report what was true a moment ago, and could not make a
+        lingering child stop. The wait gives an asynchronous cancellation the one thing it
+        actually needs.
         """
-        r = _round(
-            monkeypatch,
-            wired,
-            _Round(wired, ends={"01N": "FAILED"}, hold="02N", claims={("01N", 2024)}),
-            zones=("01N", "02N", "03N"),
-            years=(2025, 2024),
-        )
-        # 01N and 03N in one cluster, 02N alone, so the dead cluster carries a claimed zone
-        # AND a free one — which is what makes the granularity observable.
-        monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: 300.0 if zone == "02N" else 100.0)
-        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, overlap_years=True))
-        refills = [p for d, p in wired["arun"][2:] if "fill-zones-sequential" in d]
-        assert refills, "the free zone was never refilled"
-        assert _zones_of(refills[0]) == ("03N",), "a claimed zone was re-dispatched, or its sibling withheld"
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N"))
+        monkeypatch.setattr(mod, "_SETTLE_DELAY_S", mod.CANCELLATION_CONFIRM_S)
+        slept: list[float] = []
+        real_sleep = asyncio.sleep
 
-    def test_an_unreadable_claim_query_declines_the_refill(self, wired, monkeypatch):
-        """An unanswerable query means nothing was learned about who is writing.
+        async def spy(delay, *a, **k):
+            slept.append(delay)
+            return await real_sleep(0)  # the wait is asserted, never actually served
 
-        It must not read as "nothing is claimed" — that is the direction that dispatches a
-        second writer.
+        monkeypatch.setattr(mod.asyncio, "sleep", spy)
+        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
+        assert mod.CANCELLATION_CONFIRM_S in slept, f"the replacement did not wait: {slept}"
+        assert r.dispatches().count(("01N",)) == 2, "the replacement never went out"
+
+    def test_the_settling_delay_is_derived_from_the_cancellation_budget(self):
+        """Derived, not chosen. A fill's teardown spends this budget waiting for its own
+        children before it goes terminal; the delay is the same budget again for the level
+        below, whose cancellation nothing waited for. One constant, so the two cannot drift
+        into disagreeing about how long an asynchronous cancellation takes.
         """
-        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N", claims_error=True))
-        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True))
-        assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]
+        assert mod._SETTLE_DELAY_S == mod.CANCELLATION_CONFIRM_S
+
+    def test_a_roster_with_nothing_left_to_do_does_not_pay_the_wait(self, wired, monkeypatch):
+        """Most clusters settle having landed everything, and those must not hold the drain
+        loop for a wait that protects a dispatch which is not going to happen. So the store
+        is read once BEFORE the wait, purely to decide whether the wait is worth paying.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={}, hold="02N"))  # 01N completes cleanly
+        monkeypatch.setattr(mod, "_SETTLE_DELAY_S", mod.CANCELLATION_CONFIRM_S)
+        slept: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def spy(delay, *a, **k):
+            slept.append(delay)
+            return await real_sleep(0)
+
+        monkeypatch.setattr(mod.asyncio, "sleep", spy)
+        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
+        assert mod.CANCELLATION_CONFIRM_S not in slept, "waited for a roster that had nothing missing"
+
+    def test_the_store_is_re_read_between_the_wait_and_the_dispatch(self, wired, monkeypatch):
+        """The dispatch is based on the SETTLED picture, not on what was true before the
+        descendants were given time to stop — a cell that landed meanwhile must not cost a
+        fleet.
+
+        Asserted as "a read happens between the wait and the next dispatch", not merely as
+        "a read happens after the wait": the round always re-reads the store when it closes,
+        so the weaker form is satisfied by a read that has nothing to do with this decision.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N"))
+        monkeypatch.setattr(mod, "_SETTLE_DELAY_S", mod.CANCELLATION_CONFIRM_S)
+        status = SimpleNamespace(zones=dict.fromkeys(("01N", "02N"), ()), has=lambda z, y: False)
+        real_sleep = asyncio.sleep
+
+        def read(*_a, **_k):
+            r.timeline.append(("read", ()))
+            return status
+
+        async def spy(delay, *a, **k):
+            if delay == mod.CANCELLATION_CONFIRM_S:
+                r.timeline.append(("wait", ()))
+            return await real_sleep(0)
+
+        monkeypatch.setattr(mod, "campaign_status", read)
+        monkeypatch.setattr(mod.asyncio, "sleep", spy)
+        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
+        kinds = [kind for kind, _ in r.timeline]
+        assert "wait" in kinds, "the replacement never waited"
+        after = kinds[kinds.index("wait") :]
+        upto_dispatch = after[: after.index("dispatch")]
+        assert "read" in upto_dispatch, f"the store was not re-read between the wait and the dispatch: {kinds}"
 
     def test_one_generation_per_slot_per_round(self, wired, monkeypatch):
         """A replacement is not itself replaced — that is what bounds the extra fleets.
@@ -1866,15 +1901,18 @@ class TestImmediateRefill:
         an answer that is already known.
         """
         r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="_none"), zones=("01N",))
-        asked = {"n": 0}
+        status = SimpleNamespace(zones={"01N": ()}, has=lambda z, y: False)
+        reads = {"n": 0}
 
-        async def counting_claim_query():
-            asked["n"] += 1
-            return set()
+        def counting_read(*_a, **_k):
+            reads["n"] += 1
+            return status
 
-        monkeypatch.setattr(mod, "zone_years_claimed_by_live_runs", counting_claim_query)
+        monkeypatch.setattr(mod, "campaign_status", counting_read)
         asyncio.run(r.drive(max_parallel_clusters=1, immediate_refill=True, max_dispatch_rounds=1))
-        assert asked["n"] == 0, "the live-run scan ran for a round that had already finished"
+        # One read at flow start and one when the round closes. A third would mean the
+        # planner ran for a round that was already over.
+        assert reads["n"] == 2, f"the planner ran for a round that had already finished ({reads['n']} reads)"
 
 
 class TestTheDispatchDecisionIsAtomic:
@@ -1915,13 +1953,18 @@ class TestTheDispatchDecisionIsAtomic:
         """
         r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N"))
 
-        async def claim_query_that_lets_the_sibling_finish():
-            r.release.set()  # 02N's dispatch is parked on this
-            for _ in range(20):
-                await asyncio.sleep(0)
-            return set()
+        monkeypatch.setattr(mod, "_SETTLE_DELAY_S", mod.CANCELLATION_CONFIRM_S)
+        real_sleep = asyncio.sleep
 
-        monkeypatch.setattr(mod, "zone_years_claimed_by_live_runs", claim_query_that_lets_the_sibling_finish)
+        async def wait_that_lets_the_sibling_finish(delay, *a, **k):
+            if delay == mod.CANCELLATION_CONFIRM_S:
+                r.release.set()  # 02N's dispatch is parked on this
+                for _ in range(20):
+                    await real_sleep(0)
+                return None
+            return await real_sleep(0)
+
+        monkeypatch.setattr(mod.asyncio, "sleep", wait_that_lets_the_sibling_finish)
         with caplog_at_info() as records:
             asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
         assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]

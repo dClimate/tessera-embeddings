@@ -73,8 +73,11 @@ from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
 from tessera_embeddings.inference.data_loading import _active_orbits
-from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
-from tessera_embeddings.orchestration.prefect.flows._live_claims import zone_years_claimed_by_live_runs
+from tessera_embeddings.orchestration.prefect.flows._child_runs import (
+    CANCELLATION_CONFIRM_S,
+    child_run_tag,
+    make_child_cancel_hook,
+)
 from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
     _assert_seeded_model_matches,
     _optical_min_obs_from_store,
@@ -151,6 +154,28 @@ MAX_SIMULTANEOUS_COMMITTERS = 8
 #: promptly is a separate change and needs fencing at the WRITE — a lease the committer
 #: checks — rather than an inference about who has stopped.
 _QUIESCENT_TERMINAL_STATES = frozenset({StateType.FAILED, StateType.COMPLETED})
+
+#: How long a settled fill's cells are left alone before a replacement may be dispatched.
+#:
+#: DERIVED, not chosen. Cancellation is asynchronous, and the run tree is three levels
+#: deep: the fill, its zone ingests, and their S1/S2 grandchildren. A fill's own teardown
+#: already spends :data:`CANCELLATION_CONFIRM_S` waiting for level two to confirm terminal
+#: BEFORE the state this driver reads is set — so reaching a quiescent state already buys
+#: one budget. What nothing waited for is level three, whose cancellation is requested by a
+#: hook that does not block. This is that same budget again, once, for that level.
+#:
+#: Counted from the cancellation request rather than from the terminal state, the two
+#: together come to twice this — which is the interval the crash-recovery record already
+#: recommends between a run's death and re-dispatching its cells. Arriving at the recorded
+#: number from the mechanism rather than adopting it is the point: if the confirmation
+#: budget changes, this follows.
+#:
+#: Time, not inspection, because that is what an asynchronous cancellation actually needs.
+#: A census of who is writing can only report what was true a moment ago and cannot make a
+#: lingering child stop; waiting gives it the thing it needs. Two mechanisms already act
+#: rather than observe — the teardown that waits for children, and the orphan sweep that
+#: collects whatever the teardown could not confirm — and this delay is what lets them.
+_SETTLE_DELAY_S = CANCELLATION_CONFIRM_S
 
 
 def _still_running(live: dict[asyncio.Task[Any], int | None]) -> bool:
@@ -758,13 +783,29 @@ async def run_global_campaign(
             1. The predecessor reached a state that PROVES it stopped writing
                (``_QUIESCENT_TERMINAL_STATES``). A crash, a cancellation, or a
                dispatch that raised — which may still have dispatched — all decline.
-            2. Nothing live claims any of the cells
-               (:func:`~tessera_embeddings.orchestration.prefect.flows._live_claims.zone_years_claimed_by_live_runs`).
-               Condition 1 covers the fill's own writers but not everything downstream
-               of it: its grandchild ingests are cancelled one level further out and
-               asynchronously, and the in-child sweep is best-effort by construction.
-               Refusal is at ZONE granularity, so a claim on any year of a zone
-               withholds that whole zone — a zone's years must stay in one cluster.
+            2. ``_SETTLE_DELAY_S`` has passed since it settled, so the asynchronous
+               cancellation of the level BELOW its own children has had time to take
+               effect. Condition 1 covers the fill's own writers and, because its teardown
+               waits for them, its direct children too; what nothing waited for is their
+               grandchildren, and the delay is that same confirmation budget again for
+               that level.
+
+            **Why a wait rather than a check of who is writing.** A census of live runs
+            was tried and removed. It can only report what was true a moment ago, and it
+            cannot make a lingering child stop — the wrong instrument for settling an
+            asynchronous cancellation, and one whose paging, state-filter and staleness
+            semantics were all load-bearing and none of them reliable. Two mechanisms
+            already ACT rather than observe, and the delay is what lets them finish: the
+            fill's own teardown, which cancels its children and waits for each to confirm
+            terminal; and the orphan sweep, which independently finds and stops whatever
+            outlived a teardown, on its own schedule.
+
+            What remains is not a reservation. Nothing here locks a cell, so a dispatcher
+            outside this campaign could still start a writer. That is not introduced here
+            — the round's own re-dispatch has always worked this way — and closing it means
+            fencing at the WRITE, the same prerequisite the crashed and cancelled cases
+            above are waiting on. The store makes the residual affordable rather than
+            silent: mosaic commits do not rebase, so a second writer fails loudly.
 
             The two-writer invariant is otherwise unchanged and still structural: a
             replacement covers ONLY zones its predecessor owned, and the round's
@@ -780,11 +821,11 @@ async def run_global_campaign(
             whole campaign, and a persistent capacity shortage cannot become a dispatch
             loop.
 
-            Every read the decision makes — the store's tip and tags, the live-run scan,
-            and the replacement's own land-mask and SSM probes — declines on failure
-            rather than propagating. Uncertainty is not permission, and an exception
-            escaping mid-round would fail the campaign while sibling fills were still
-            running, which an ordinary FAILED state does not sweep.
+            Every read the decision makes — the store's tip and tags, and the
+            replacement's own land-mask and SSM probes — declines on failure rather than
+            propagating. Uncertainty is not permission, and an exception escaping mid-round
+            would fail the campaign while sibling fills were still running, which an
+            ordinary FAILED state does not sweep.
 
             NOT part of the staging fingerprint, deliberately: this changes WHEN work is
             dispatched, not what is computed, and folding it in would abandon the staged
@@ -1538,47 +1579,70 @@ async def run_global_campaign(
                     # unguarded it would instead escape into the drain loop and fail the whole
                     # campaign while sibling fills were still running, and an ordinary FAILED
                     # state does not fire the child-cancellation hook that would clean them up.
+                    # ONE guard over every read this decision makes. Each reaches a network —
+                    # the store's branch tip and tag list, and the land-mask and SSM probes
+                    # inside `_chained_params` — and each can fail transiently. Uncertainty is
+                    # not permission: a failure anywhere in here means nothing was established,
+                    # so it declines. Left unguarded it would escape into the drain loop and
+                    # fail the whole campaign while sibling fills were still running, and an
+                    # ordinary FAILED state does not fire the child-cancellation hook.
                     try:
-                        # The STORE decides what is missing, exactly as the round does — never
-                        # the child's return value, which can report success on cells it never
-                        # attempted. A snapshot of its own, so the round's `status` keeps meaning
-                        # what it meant when the round opened.
-                        fresh = campaign_status(repo, years=campaign_years)
-                        # Intersected with the inherited roster as well as scoped by it. The
-                        # scope is the work list's contract; the intersection is structural, and
-                        # it is what makes "a replacement can never reach a zone a live sibling
-                        # holds" a property of THIS function rather than one delegated to another.
+
+                        def _missing(snapshot: CampaignStatus) -> list[tuple[str, int]]:
+                            """This roster's cells the STORE still lacks and that may be refilled.
+
+                            The store decides, exactly as the round does — never the child's
+                            return value, which can report success on cells it never attempted.
+                            Intersected with the inherited roster as well as scoped by it: the
+                            scope is the work list's contract, the intersection is structural,
+                            and it is what makes "a replacement can never reach a zone a live
+                            sibling holds" a property of this function rather than one delegated.
+                            """
+                            return [
+                                (z, y)
+                                for z, y in campaign_work_list(
+                                    snapshot, set(repo.list_tags()), expected_zones=zones, years=years
+                                )
+                                if z in roster and (z, y) not in refilled_cells
+                            ]
+
                         roster = set(zones)
-                        missing = [
-                            (z, y)
-                            for z, y in campaign_work_list(
-                                fresh, set(repo.list_tags()), expected_zones=zones, years=years
-                            )
-                            if z in roster and (z, y) not in refilled_cells
-                        ]
+                        # Read FIRST, and cheaply, so the settling wait below is only ever paid
+                        # for a roster that actually has something to refill. Most clusters
+                        # settle having landed everything, and those must not hold the drain
+                        # loop for a wait whose whole purpose is to protect a dispatch that is
+                        # not going to happen.
+                        if not _missing(campaign_status(repo, years=campaign_years)):
+                            return None
+                        # THE SETTLING WAIT. The fill is terminal, so its own writers are
+                        # provably stopped and its direct children were cancelled AND waited
+                        # for. What has not been waited for is the level below them, whose
+                        # cancellation was requested by a hook that does not block. This is the
+                        # time that request needs to take effect — and time is the instrument
+                        # that suits it, because nothing can be observed into stopping.
+                        log.info(
+                            "Waiting %.0fs before refilling %d zone(s), so the settled fill's remaining "
+                            "descendants have time to stop.",
+                            _SETTLE_DELAY_S,
+                            len(zones),
+                        )
+                        await asyncio.sleep(_SETTLE_DELAY_S)
+                        # RE-READ after the wait, so the dispatch is based on the settled
+                        # picture rather than on what was true before it. A cell that landed
+                        # meanwhile is no longer missing, and a fleet is not spent on it.
+                        fresh = campaign_status(repo, years=campaign_years)
+                        missing = _missing(fresh)
                         if not missing:
                             return None
-                        claimed = await zone_years_claimed_by_live_runs()
-                        blocked = {z for z, _y in claimed} & {z for z, _y in missing}
-                        if blocked:
-                            log.warning(
-                                "Withholding %d zone(s) from the immediate refill — a live run still claims them: %s",
-                                len(blocked),
-                                ", ".join(sorted(blocked)),
-                            )
-                        free = [(z, y) for z, y in missing if z not in blocked]
-                        if not free:
-                            return None
-                        # The cluster count is the ROUND'S: the replacement takes the vacated slot, so
-                        # its ingest share and S3 concurrency slice are the ones the round sized.
-                        # Built HERE rather than at the dispatch, so its probes are covered by
-                        # this guard — a failing land-mask read must decline a refill, not end a
-                        # campaign.
-                        cells = [[z, y] for z, y in free]
+                        # The cluster count is the ROUND'S: the replacement takes the vacated
+                        # slot, so its ingest share and S3 concurrency slice are the ones the
+                        # round sized. Inside this guard because its land-mask and SSM probes
+                        # must decline a refill, not end a campaign.
+                        cells = [[z, y] for z, y in missing]
                         return (
                             _chained_params(cells, n_clusters, cell_look_ahead, fresh),
-                            sorted({str(z) for z, _y in free}),
-                            sorted({y for _z, y in free}),
+                            sorted({str(z) for z, _y in missing}),
+                            sorted({y for _z, y in missing}),
                         )
                     except Exception:
                         log.warning(

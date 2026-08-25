@@ -128,38 +128,61 @@ descendants are swept asynchronously and without waiting.
 
 So `_QUIESCENT_TERMINAL_STATES = {FAILED, COMPLETED}`, and nothing else.
 
-**Condition two — nothing live claims the cells.**
+**Condition two — enough time has passed for its descendants to have stopped.**
 
-Condition one covers the fill's own writers, not everything downstream. Its grandchild ROI
-ingests are cancelled one level further out and asynchronously, and `shutdown()` says of
-itself that it is best effort — it logs by name any child it could not confirm.
+Condition one covers the fill's own writers and, because `inputs.shutdown()` cancels its
+direct children and waits up to `CANCELLATION_CONFIRM_S` for each to confirm terminal before
+the state is set, its direct children too. What nothing waited for is *their* grandchildren —
+the S1/S2 ROI ingests — whose cancellation is requested by an `on_cancellation` hook that does
+not block.
 
-So `_live_claims.zone_years_claimed_by_live_runs` asks the orchestrator which cells a live
-run claims. This is **lifted from `yield-embeddings/scripts/dispatch_pending_fills.py`**,
-which has been corrected once by an incident and whose three claim forms encode that
-knowledge:
+So the driver waits `_SETTLE_DELAY_S` before dispatching a replacement. **The figure is
+derived, not chosen:** it is `CANCELLATION_CONFIRM_S`, the same budget the level above already
+spent, applied once more to the one level that did not get it. Measured from the cancellation
+request rather than from the terminal state the two come to twice that — which is the interval
+`orphaned-fleet-teardown.md` already recommends between a run's death and re-dispatching its
+cells. Arriving at the recorded number from the mechanism rather than adopting it is the
+point: if the confirmation budget moves, this follows, because it is the same constant.
 
-1. a `zone` plus `year` parameter,
-2. an entry in a `cells` list,
-3. **any parameter value containing a `mosaics/<zone>/<year>` path.**
+### A live-run census was built, and then deleted
 
-Form 3 is the one that cost a run: a one-month optical top-up (`topup-59S-2021-dec`) was
-still committing December when 59S read as "complete (3 legs)", so a fill was dispatched
-against a mosaic that was still growing. It would have inferred from a short year, tagged
-it complete, and nothing would have flagged it.
+The first two versions of this change asked the orchestrator which cells a live run claimed,
+and withheld those. It is recorded here because the reasoning generalises.
 
-Two polarity choices are load-bearing and are pinned by tests:
+The census attracted review findings faster than they could be fixed: offset pagination
+skipping a claim as the result set mutated; runs with a null state excluded by the filter; the
+same null-state hole surviving the stability loop added to fix the first two; and the bounding
+of that loop. Each fix added a mechanism — negate the terminal states rather than list the live
+ones, repeat until two passes agree, union across passes, cap the passes, decline if unsettled
+— and every one was individually defensible. Together they were a great deal of machinery
+guarding one window.
 
-- **No allow-list of known writers.** An unrecognised flow reads as a claim. An allow-list
-  fails silently in the one direction that matters, because a writer missing from it reads
-  as an absence of claims. `claims_in` takes a run's parameters and nothing else, so there
-  is no identity to consult.
-- **An unanswerable query is not an empty answer.** It raises, and the driver declines.
-  Same rule `orphaned-fleet-teardown.md` gives for a state that could not be read.
+**The deeper problem is that a census is the wrong instrument.** It can only report what was
+true a moment ago, and it cannot make a lingering child stop. An asynchronous cancellation is
+settled by time, not by observation. Two mechanisms in this system already ACT rather than
+observe, and what they need is for someone to let them finish:
 
-Refusal is at **zone** granularity. Dropping one claimed year while keeping its zone's
-others would put that zone's years on two clusters — the split the partition exists to
-prevent.
+| mechanism | what it does |
+|---|---|
+| the fill's own teardown | cancels its child ingests and WAITS for each to confirm terminal, before its state is set |
+| the orphan sweep flows | independently find and stop runs and mosaics that outlived a teardown, on their own schedule |
+
+The census was a third guard layered over two that already existed, and it was the only one of
+the three that could not actually stop anything. Deleting it removed a module, its tests, and
+every finding it had produced or would produce.
+
+**What is lost.** The census could catch a child that ignored its cancellation for longer than
+the delay, and a writer dispatched from outside the campaign. Neither is eliminated now — but
+neither was *guaranteed* before either, since a point-in-time query cannot exclude a writer
+that starts after it, which is what the last review round said about it in its own terms. The
+residual is bounded by what the store does with a second writer: mosaic commits pass no
+`rebase_with` and never retry `ConflictError`, so the loser fails loudly. The cost is a wasted
+fleet and a cell that waits for the round, not silent corruption.
+
+**What is not claimed.** Nothing here reserves a cell. Closing that properly means fencing at
+the write — a lease or generation token the committer checks — which is the same prerequisite
+the crashed and cancelled cases are waiting on, and it is a larger change than belongs in a
+mid-campaign merge.
 
 **And a structural third.** The replacement's cells are intersected with the roster it
 inherited, as well as scoped by it in the work-list query. The scope is the work list's
@@ -273,21 +296,22 @@ not the safety gate, and it is now pinned as one.
 
 | mutation | tests that failed |
 |---|---|
-| decision neutralised (never refill) | flag pair (on), replacement scope, live-claim withholding, raised-dispatch reason, one-generation |
+| decision neutralised (never refill) | flag pair (on), replacement scope, raised-dispatch reason, one-generation, campaign-wide bound, settling wait, wait-not-paid |
 | every terminal state accepted | crashed, cancelled |
-| live claims ignored | live-claim withholding |
-| unreadable claim query reads as "nothing claimed" | unreadable-query decline |
-| "a sibling is still running" gate dropped | flag pair (on), last-cluster |
-| replacements made eligible for their own replacement | 5 tests, incl. one-generation and disjointness |
-| store ignored, whole roster re-dispatched | replacement scope |
-| roster intersection AND zone scope dropped | 5 tests, incl. **disjointness** |
+| pre-plan liveness gate dropped | round-already-over |
+| replacements made eligible for their own replacement | 7 tests |
+| store ignored, whole roster re-dispatched | replacement scope, campaign-wide bound |
+| roster intersection AND zone scope dropped | 7 tests, incl. **disjointness** |
 | raised-dispatch reason folded into the state check | raised-dispatch |
-| mosaic-path claim form dropped | mosaic-path, unpadded-zone |
-| zone canonicalisation dropped | unpadded-zone |
-| CANCELLING treated as finished | cancelling-is-live |
-| paging stops after the first page | paging |
-| malformed cell entry not tolerated | malformed-cell |
-| unparseable zone dropped instead of recorded | unparseable-zone |
+| build and schedule interleaved again | 15 tests |
+| commit gate removed | round-ended-while-planning |
+| liveness judged by truthiness, not `done()` | round-ended-while-planning |
+| planning guard narrowed | store-read decline, replacement-build decline |
+| refill eligibility scoped to the round | campaign-wide bound |
+| settling wait removed | settling wait, round-ended-while-planning, re-read ordering |
+| wait no longer derived from the cancellation budget | derivation |
+| wait paid even when nothing is missing | wait-not-paid |
+| the wait moved after the re-read | re-read ordering |
 
 Two notes on test design, recorded because both were nearly got wrong:
 

@@ -73,7 +73,11 @@ from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
     dispatch_cell_validation,
     validation_run_tag,
 )
-from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
+from tessera_embeddings.orchestration.prefect.flows._child_runs import (
+    CANCELLATION_CONFIRM_S,
+    child_run_tag,
+    make_child_cancel_hook,
+)
 from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     activate,
     deactivate,
@@ -124,11 +128,6 @@ _INGEST_POLL_S = 15.0
 # retry across it. A PERSISTENT failure eventually raises — leaving the id
 # registered so shutdown's sweep can still reach the live child.
 _INGEST_POLL_MAX_ERRORS = 10
-# How long a cancelled child is given to reach a terminal state before the retry is
-# refused. Generous: Prefect's cancellation is asynchronous — the server marks the run
-# Cancelling and a worker acts on it — and a mid-write ingest finishes its commit first.
-# Waiting is cheap next to the alternative, which is two writers on one mosaic prefix.
-_CANCEL_CONFIRM_S = 300.0
 # Lease length for a held fleet-wide ingest slot. Renewed in the background for the
 # life of the ingest; generous so a slow renewal round-trip never drops the slot.
 _INGEST_LEASE_S = 900.0
@@ -449,7 +448,7 @@ class _DeploymentCellInputs:
                 self._log.warning(
                     "Cancelling still-registered ingest %s-%d (%s) before re-dispatching it", zone, year, fr_id
                 )
-                deadline = time.monotonic() + _CANCEL_CONFIRM_S
+                deadline = time.monotonic() + CANCELLATION_CONFIRM_S
                 while time.monotonic() < deadline and not self._stopping.is_set():
                     run = client.read_flow_run(fr_id)
                     if run.state is not None and run.state.is_final():
@@ -469,7 +468,7 @@ class _DeploymentCellInputs:
             ) from exc
         raise RuntimeError(
             f"the previous ingest of {zone}-{year} ({fr_id}) did not reach a terminal state within "
-            f"{_CANCEL_CONFIRM_S:.0f}s of being cancelled. Refusing to start a second one over the same "
+            f"{CANCELLATION_CONFIRM_S:.0f}s of being cancelled. Refusing to start a second one over the same "
             f"mosaic prefix — those commits do not rebase, so the loser's failure is terminal."
         )
 
@@ -526,7 +525,7 @@ class _DeploymentCellInputs:
                         )
                 # Then wait for them, all together — the requests are already in, so this
                 # costs one child's teardown, not the sum of them.
-                deadline = time.monotonic() + _CANCEL_CONFIRM_S
+                deadline = time.monotonic() + CANCELLATION_CONFIRM_S
                 # A run of read errors ends the wait early, on the same budget the poller
                 # uses. An API that is not answering is the case where confirmation is
                 # IMPOSSIBLE rather than slow, and spending the full window re-asking it
@@ -552,7 +551,7 @@ class _DeploymentCellInputs:
                         zone,
                         year,
                         fr_id,
-                        _CANCEL_CONFIRM_S,
+                        CANCELLATION_CONFIRM_S,
                     )
         except Exception:
             self._log.warning("Ingest cancellation sweep failed — check the Prefect UI for orphans", exc_info=True)

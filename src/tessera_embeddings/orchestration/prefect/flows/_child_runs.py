@@ -31,6 +31,18 @@ from prefect.states import Cancelling
 #: is 200; asking explicitly is what makes "a short page means the last page" true.
 _PAGE = 200
 
+#: How long a cancelled run is given to reach a terminal state before a caller stops
+#: waiting on it. Generous: Prefect's cancellation is asynchronous — the server marks the
+#: run Cancelling and a worker acts on it — and a mid-write child finishes its commit
+#: first. Waiting is cheap next to the alternative, which is two writers on one prefix.
+#:
+#: Lives here rather than beside either caller because two layers spend it, one per level
+#: of the run tree: a parent waits this long for its own children before it goes terminal,
+#: and anything re-dispatching over that parent's work must allow the SAME budget again
+#: for the level below, whose cancellation nothing waited for. One constant, so the two
+#: cannot drift into disagreeing about how long an asynchronous cancellation takes.
+CANCELLATION_CONFIRM_S = 300.0
+
 
 def child_run_tag(prefix: str, flow_run_id: object) -> str | None:
     """The tag a parent stamps on its children, or ``None`` outside a flow run.

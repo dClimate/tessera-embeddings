@@ -108,12 +108,27 @@ today:
    set. A **crash** carries none of that (the process that would run the `finally` is the
    process that died, and the verdict can be reached from missed heartbeats while the run
    is still writing), and a **cancellation** is a request rather than a fact. Both wait.
-2. **Nothing live claims the cells.** Condition 1 covers the fill's own writers, not
-   everything downstream of it: grandchild ingests are cancelled a level further out and
-   asynchronously, and the in-child sweep is best-effort by construction. So the driver
-   asks the orchestrator which cells a live run claims and withholds those — at **zone**
-   granularity, because dropping one claimed year while keeping its zone's others is
-   exactly the split the partition exists to prevent.
+2. **Enough time has passed for its descendants to have stopped.** Condition 1 covers the
+   fill's own writers, and — because its teardown cancels its children and waits for each
+   to confirm terminal before the state is set — its direct children too. What nothing
+   waited for is *their* grandchildren, whose cancellation is requested by a hook that does
+   not block. The delay is that same confirmation budget again, for that level, derived from
+   it rather than chosen. Counted from the cancellation request, the two together come to
+   the interval the crash-recovery record already recommends between a run's death and
+   re-dispatching its cells.
+
+**Why a wait and not a check of who is writing.** A census of live runs was built and then
+removed. It can only report what was true a moment ago, and it cannot make a lingering child
+stop — the wrong instrument for settling an asynchronous cancellation. Two mechanisms already
+*act* rather than observe, and the delay is simply what lets them finish: the fill's own
+teardown, which waits for its children; and the orphan sweep, which independently finds and
+stops whatever outlived a teardown, on its own schedule.
+
+**It reserves nothing**, and should not be read as doing so. A dispatcher outside the campaign
+could still start a writer. That is not introduced here — the round's own re-dispatch has
+always worked this way — and closing it means fencing at the write, the same prerequisite the
+crashed and cancelled cases are waiting on. The store keeps the residual affordable rather
+than silent: mosaic commits do not rebase, so a second writer fails loudly.
 
 Bounded per **cell**, for the life of the campaign rather than of a round: a cell that has
 had its replacement is not eligible for another on a later round, a replacement is not
@@ -121,7 +136,7 @@ itself eligible for one, and none is issued unless a sibling is still running. A
 therefore gains at most one attempt beyond `max_dispatch_rounds` in total.
 
 Every read the decision makes declines on failure rather than propagating — the store's tip
-and tags, the live-run scan, and the replacement's own land-mask and SSM probes. Declining
+and tags, and the replacement's own land-mask and SSM probes. Declining
 costs a round's wait; an exception escaping mid-round would fail the campaign while sibling
 fills were still writing, and an ordinary `FAILED` state does not fire the child-cancel hook
 that would sweep them.

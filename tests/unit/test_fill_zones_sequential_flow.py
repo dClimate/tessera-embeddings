@@ -535,7 +535,7 @@ def _running_child(monkeypatch, run_id: str):
     # This child NEVER reports terminal, and both discard() and shutdown() now wait for
     # confirmation — so the confirmation window has to be short or every test using this
     # helper sits out the production five minutes.
-    monkeypatch.setattr(mod, "_CANCEL_CONFIRM_S", 0.05)
+    monkeypatch.setattr(mod, "CANCELLATION_CONFIRM_S", 0.05)
     monkeypatch.setattr(
         mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id=run_id, state=None)
     )
@@ -839,7 +839,7 @@ def test_poll_error_keeps_id_registered_for_shutdown(monkeypatch):
     """
     monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.001)
     monkeypatch.setattr(mod, "_INGEST_POLL_MAX_ERRORS", 3)
-    monkeypatch.setattr(mod, "_CANCEL_CONFIRM_S", 0.05)
+    monkeypatch.setattr(mod, "CANCELLATION_CONFIRM_S", 0.05)
     monkeypatch.setattr(
         mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-5", state=None)
     )
@@ -1077,7 +1077,7 @@ def test_shutdown_waits_for_the_children_it_cancelled(monkeypatch):
     a collision is terminal for one of them.
     """
     monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
-    monkeypatch.setattr(mod, "_CANCEL_CONFIRM_S", 5.0)
+    monkeypatch.setattr(mod, "CANCELLATION_CONFIRM_S", 5.0)
     monkeypatch.setattr(
         mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-slow", state=None)
     )
@@ -1102,7 +1102,7 @@ def test_shutdown_gives_up_on_an_unreachable_api_rather_than_holding_teardown(mo
     """
     monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.001)
     monkeypatch.setattr(mod, "_INGEST_POLL_MAX_ERRORS", 3)
-    monkeypatch.setattr(mod, "_CANCEL_CONFIRM_S", 60.0)  # long: the error budget must end it
+    monkeypatch.setattr(mod, "CANCELLATION_CONFIRM_S", 60.0)  # long: the error budget must end it
     monkeypatch.setattr(
         mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-dead", state=None)
     )
