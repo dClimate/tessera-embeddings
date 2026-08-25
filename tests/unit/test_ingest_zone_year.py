@@ -117,6 +117,10 @@ def wired(monkeypatch):
     # unconditional, so it is an external touchpoint like the rest. A test that cares about
     # the resulting worker count overrides this in its own body.
     monkeypatch.setattr(mod, "live_chunk_count", lambda zone, **kw: _LIVE_CHUNKS)
+    # A leg's progress is read from its own child store, which is an external touchpoint like the
+    # rest. The default is a store that never grows, so no leg earns wall-clock budget it did not
+    # ask for; a test about progress supplies its own reading.
+    monkeypatch.setattr(mod, "_committed_date_count", lambda store, log, **kw: 0)
     return rec
 
 
@@ -303,30 +307,6 @@ def test_coverage_failure_leaves_no_marker(wired, monkeypatch):
     with pytest.raises(InsufficientCoverageError):
         _run(s1_orbit="ascending")
     assert wired["markers_written"] == []  # not marked complete on a coverage gap
-
-
-def test_a_backoff_that_does_not_fit_the_budget_is_terminal_not_capped() -> None:
-    """Capping the wait to the remainder was the wrong fix, and instructively so.
-
-    Waiting exactly the remaining budget makes the next dispatch land ON the deadline every time,
-    which converts a race into a guarantee of the thing the budget forbids. A backoff that does not
-    fit is a verdict: there is no time to both wait and start an attempt, so waiting only delays a
-    decision already made.
-    """
-    budget = 300.0
-    # (elapsed, backoff) -> may the leg still wait and then dispatch inside the budget?
-    for elapsed, backoff, may_retry in (
-        (0.0, 1200.0, False),  # validation permits a budget below the backoff
-        (299.0, 1200.0, False),
-        (299.0, 30.0, False),  # fits neither: 1 s left, 30 s wanted
-        (120.0, 600.0, False),
-        (0.0, 30.0, True),  # room to wait and still start inside the budget
-        (200.0, 30.0, True),
-    ):
-        fits = backoff < budget - elapsed
-        assert fits is may_retry, f"elapsed={elapsed} backoff={backoff}"
-        if fits:
-            assert elapsed + backoff < budget
 
 
 class TestChunkScaledWorkers:
@@ -1474,3 +1454,298 @@ class TestAPermanentLegFailureSkipsTheLadder:
             )
 
         assert dispatched.count("ascending") == 3, "an unclassified failure was denied its retries"
+
+
+#: Sized so the SECOND rung (200 s) overruns the budget while the first (100 s) fits: two attempts
+#: of 120 s leave 110 s of a 350 s budget. The progress extension is off, so the ladder is the only
+#: thing deciding whether another attempt happens.
+_RUNG_SETTINGS: dict[str, int] = {
+    "max_leg_attempts": 3,
+    "leg_retry_backoff_s": 100,
+    "max_leg_wall_clock_s": 350,
+    "leg_stagger_window_s": 0,
+    "leg_progress_extension_s": 0,
+}
+
+
+class TestABackoffThatDoesNotFitDescendsTheLadder:
+    """A rung longer than the remaining budget is not a reason to stop retrying.
+
+    The leg retry escalates: each attempt waits twice what the last one did, up to a cap. When the
+    rung an attempt has escalated to no longer fits the wall-clock budget, the question is which of
+    the two the leg should be judged on. It used to be judged on the ESCALATION — a leg with a
+    quarter of an hour of budget left, refused its next attempt because the next wait was twenty
+    minutes, when the rung beneath it would have fitted with room to spare. Every attempt so denied
+    was a fleet provisioned from scratch by the campaign instead.
+
+    So the ladder descends to the longest rung that fits, and only a leg with no room for even the
+    base rung is refused. Two things this deliberately is NOT. It does not change the rungs: a leg
+    with budget still escalates exactly as before, which matters because the escalation has never
+    been shown to be wrong — it was simply unreachable. And it does not cap the wait to the
+    REMAINDER, which was tried and was wrong in an instructive way: waiting exactly what is left
+    makes the next dispatch land ON the deadline every time, turning a race into a guarantee of the
+    thing the budget forbids. A rung is taken only if it leaves room after it.
+    """
+
+    @staticmethod
+    def _one_failing_leg(monkeypatch, clock, *, leg_duration: float):
+        """The optical leg fails every attempt, consuming ``leg_duration`` of the clock each time."""
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        monkeypatch.setattr(mod, "monotonic", clock)
+        dispatched: list[str] = []
+
+        async def fake_arun(dep, parameters=None, tags=None):
+            leg = parameters.get("orbit") or "s2"
+            dispatched.append(leg)
+            if leg != "s2":
+                return _completed_run()
+            clock.now += leg_duration
+            return SimpleNamespace(
+                id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=_TRANSIENT_DETAIL)
+            )
+
+        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+        return dispatched
+
+    def test_the_shorter_rung_is_taken_rather_than_the_attempt_refused(self, wired, monkeypatch, waited):
+        dispatched = self._one_failing_leg(monkeypatch, _ManualClock(), leg_duration=120.0)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(**_RUNG_SETTINGS))
+
+        assert dispatched.count("s2") == 3, "the leg had budget for another attempt and must have taken it"
+        assert waited == [100, 100], "the second rung did not fit, so the ladder descended to the first"
+
+    def test_a_leg_with_budget_still_escalates(self, wired, monkeypatch, waited):
+        """The control, and the reason the rungs themselves are left alone.
+
+        The longer rung had never once been observed to fire, which reads as dead tuning until you
+        notice what was refusing it. Given room, it fires — so the evidence for deleting it was
+        produced by the defect, not by the rung.
+        """
+        dispatched = self._one_failing_leg(monkeypatch, _ManualClock(), leg_duration=120.0)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(**{**_RUNG_SETTINGS, "max_leg_wall_clock_s": 1_000_000}),
+            )
+
+        assert dispatched.count("s2") == 3
+        assert waited == [100, 200], "with room to escalate, the ladder escalates exactly as before"
+
+    def test_no_room_for_even_the_base_rung_is_still_terminal(self, wired, monkeypatch, waited):
+        """The bound. Descending the ladder must not become descending below it.
+
+        The base rung is the policy's own statement of how long this class of failure is worth
+        waiting for; there is nothing beneath it to fall back to. A leg with less budget left than
+        that has no time to both wait and start, so waiting would only delay a decision already
+        made.
+        """
+        dispatched = self._one_failing_leg(monkeypatch, _ManualClock(), leg_duration=280.0)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(**_RUNG_SETTINGS))
+
+        assert dispatched.count("s2") == 1, "70 s left and the shortest rung is 100 s — nothing fits"
+        assert waited == [], "a leg that cannot wait must not wait"
+
+
+class TestALegStillCommittingDatesEarnsWallClock:
+    """The wall-clock deadline bounds patience, and could not tell patience from work.
+
+    Its own reasoning says it "only ever binds on a cell already behaving pathologically". It is
+    counted from the leg's first dispatch, though, so it charges a leg for the productive hours of
+    every attempt that came before — and a leg that committed steadily for most of a day and then
+    hit a transient failure is refused the attempt that would have resumed from those hours, on
+    exactly the same terms as a leg that achieved nothing.
+
+    So a leg whose STORE HAS GAINED DATES earns more deadline. Read from the store rather than
+    inferred from the failure, because the store is ground truth on every failure class and a leg
+    dies naming a date that failed rather than one it committed.
+
+    The bound is the part that needs testing, not the allowance: three things contain it. A grant
+    is a FIXED size, so a leg cannot earn a deadline proportional to how long it overran. Grants
+    are limited to the number of re-dispatch decisions a leg has, which is one fewer than its
+    attempts. And each one has to be paid for by dates committed since the previous grant, so a
+    store that stops growing stops earning them.
+    """
+
+    @staticmethod
+    def _leg_that_runs_long(monkeypatch, clock, *, leg_duration: float):
+        """The optical leg fails every attempt after ``leg_duration`` of clock."""
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        monkeypatch.setattr(mod, "monotonic", clock)
+        dispatched: list[str] = []
+
+        async def fake_arun(dep, parameters=None, tags=None):
+            leg = parameters.get("orbit") or "s2"
+            dispatched.append(leg)
+            if leg != "s2":
+                return _completed_run()
+            clock.now += leg_duration
+            return SimpleNamespace(
+                id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=_TRANSIENT_DETAIL)
+            )
+
+        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+        return dispatched
+
+    @staticmethod
+    def _growing_store(monkeypatch) -> list[str]:
+        """Every reading of a leg's store shows one more date than the last. Records what was read."""
+        seen: list[str] = []
+        counts: dict[str, int] = {}
+
+        def _count(store, log, **kw):
+            seen.append(store)
+            counts[store] = counts.get(store, 0) + 1
+            return counts[store]
+
+        monkeypatch.setattr(mod, "_committed_date_count", _count)
+        return seen
+
+    def test_a_leg_still_committing_dates_gets_the_attempt_the_deadline_refused(self, wired, monkeypatch):
+        """The whole point: the same clock, the same failure, and a store that grew."""
+        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)
+        self._growing_store(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(
+                    max_leg_attempts=3,
+                    max_leg_wall_clock_s=500,
+                    leg_progress_extension_s=2000,
+                    leg_stagger_window_s=0,
+                ),
+            )
+
+        assert dispatched.count("s2") == 3, "a leg that is still committing dates is not the stuck one"
+
+    def test_progress_is_credited_at_the_rung_refusal_too_not_only_the_elapsed_one(self, wired, monkeypatch):
+        """The deadline refuses two ways, and progress has to be worth the same at both.
+
+        The leg fails INSIDE its budget — 480 s of 500 — so the elapsed gate never fires. What
+        refuses it is the other expression of the same deadline: 20 s left and a 30 s base rung,
+        no room to wait before starting. A leg whose store grew must not lose its attempt to
+        which side of the deadline its failure happened to land on.
+        """
+        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=480.0)
+        self._growing_store(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(
+                    max_leg_attempts=3,
+                    max_leg_wall_clock_s=500,
+                    leg_retry_backoff_s=30,
+                    leg_progress_extension_s=2000,
+                    leg_stagger_window_s=0,
+                ),
+            )
+
+        assert dispatched.count("s2") == 3, "the rung refusal must credit progress like the elapsed one"
+
+    def test_a_leg_committing_nothing_is_refused_exactly_as_before(self, wired, monkeypatch):
+        """The control, and the polarity. Only progress buys anything; the default buys nothing."""
+        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(
+                    max_leg_attempts=3,
+                    max_leg_wall_clock_s=500,
+                    leg_progress_extension_s=2000,
+                    leg_stagger_window_s=0,
+                ),
+            )
+
+        assert dispatched.count("s2") == 1, "the store never grew, so the deadline stands where it was"
+
+    def test_the_extension_can_be_turned_off(self, wired, monkeypatch):
+        """0 restores the plain deadline, growing store or not — the one lever, and it reaches 0."""
+        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)
+        seen = self._growing_store(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(
+                    max_leg_attempts=3,
+                    max_leg_wall_clock_s=500,
+                    leg_progress_extension_s=0,
+                    leg_stagger_window_s=0,
+                ),
+            )
+
+        assert dispatched.count("s2") == 1
+        assert seen == [], "turning it off must cost no store reads either"
+
+    def test_a_store_that_grows_forever_still_stops(self, wired, monkeypatch):
+        """The ceiling, which is what makes "more patient" safe to ship.
+
+        Every reading shows progress, so every decision earns a grant — and the leg still stops.
+        The grants are bounded by the number of re-dispatch decisions, and the deadline they build
+        to is bounded by ``max_leg_wall_clock_s`` plus that many fixed extensions. The last attempt
+        must therefore have STARTED inside that ceiling, however productive the leg claims to be.
+        """
+        clock = _ManualClock()
+        attempts, budget, extension, leg_duration = 5, 500, 600, 600.0
+        dispatched = self._leg_that_runs_long(monkeypatch, clock, leg_duration=leg_duration)
+        self._growing_store(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(
+                    max_leg_attempts=attempts,
+                    max_leg_wall_clock_s=budget,
+                    leg_progress_extension_s=extension,
+                    leg_retry_backoff_s=0,
+                    leg_stagger_window_s=0,
+                ),
+            )
+
+        ceiling = budget + (attempts - 1) * extension
+        assert dispatched.count("s2") == attempts, "the attempt budget is the other bound, and still holds"
+        assert clock.now - leg_duration <= ceiling, "the last attempt started past the deadline's ceiling"
+
+    def test_a_siblings_progress_buys_this_leg_nothing(self, wired, monkeypatch):
+        """The control on WHOSE progress counts, and the reason it is read per store.
+
+        The legs write separate child stores and fail independently, so a radar orbit still
+        committing dates is no evidence at all that the optical leg is. Read from the cell rather
+        than from the leg, this would hand the deadline to whichever leg in the cell happened to be
+        healthy — which is precisely the leg not asking for it.
+
+        Here only the radar store grows. The optical leg must be refused on exactly the terms it
+        would have been if nothing in the cell had moved.
+        """
+        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)
+        counts: dict[str, int] = {}
+
+        def _only_the_sibling_grows(store, log, **kw):
+            if store.endswith("reflectance.zarr"):
+                return 0
+            counts[store] = counts.get(store, 0) + 1
+            return counts[store]
+
+        monkeypatch.setattr(mod, "_committed_date_count", _only_the_sibling_grows)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(
+                    max_leg_attempts=3,
+                    max_leg_wall_clock_s=500,
+                    leg_progress_extension_s=2000,
+                    leg_stagger_window_s=0,
+                ),
+            )
+
+        assert dispatched.count("s2") == 1, "the optical leg's own store never grew"

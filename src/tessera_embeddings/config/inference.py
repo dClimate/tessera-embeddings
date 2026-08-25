@@ -325,6 +325,9 @@ class InferenceConfig:
             actor_batch_placement_timeout_sec: Max seconds to wait for a batch's
                 instances to join the cluster before requesting the next batch
                 regardless (capacity-shortfall escape hatch).
+            actor_request_headroom: Hold the request to the fleet's placed GPU
+                nodes plus this many, replacing the batch-and-timeout policy above.
+                None keeps today's behaviour.
     """
 
     # Time window (required — no default)
@@ -411,8 +414,73 @@ class InferenceConfig:
     # had one, which is the shape of two failures already in this repo's register.
     optical_min_obs: int | None = None
 
+    # How far the actor request may run ahead of the actor slots the fleet actually
+    # holds. Set, it replaces the batch-and-timeout policy outright: the run asks for
+    # what it has plus this, so a region that cannot place instances stops the fleet
+    # growing rather than letting the request run away from it (see
+    # `_batch_actors_to_request`, and ACTOR_REQUEST_HEADROOM for the value to pass).
+    # None keeps the historical policy, so a release cannot change how a fleet already
+    # in flight grows; a caller that wants the bound asks for it, and names the
+    # distance in the same breath. `__post_init__` decides what each combination of
+    # this and `actor_request_batch_size` MEANS — read that before adding a third knob.
+    actor_request_headroom: int | None = None
+
+    def initial_actor_request(self, num_actors: int) -> int:
+        """How many actors to create before the scheduling loop takes over.
+
+        The cold start of whichever request policy is in force, in ONE place. Deriving it
+        here and gating it again in the scheduler lets the two disagree: the clamp below
+        applies on a path where the loop that undoes it may not run, and a fleet then
+        opens at the reduced width and stays there. Both callers read this instead.
+
+        Args:
+            num_actors: The run's actor target.
+
+        Returns:
+            Actors to create up front, always at least one for a positive target.
+        """
+        if self.actor_request_batch_size <= 0:
+            return num_actors  # batching disabled: the whole fleet is requested at once
+        first = min(self.actor_request_batch_size, num_actors)
+        if self.actor_request_headroom is not None:
+            # No slot has been placed yet, so the whole allowance is the distance ahead
+            # of an empty fleet. `__post_init__` guarantees batching is on here, which is
+            # what makes the clamp safe: something exists to request the remainder.
+            first = min(first, self.actor_request_headroom)
+        return first
+
     def __post_init__(self) -> None:
         """Validate and normalise config fields."""
+        # The actor-request policy, defined once as a total function over both knobs.
+        # `actor_request_batch_size` carried a sentinel (0 = all at once) before
+        # `actor_request_headroom` arrived with another (None = off), and the
+        # combinations were never reconciled — which is how a contradictory pair came to
+        # be accepted and then silently half-honoured. Each refusal below is a
+        # combination that cannot be given a coherent meaning, so it is refused here
+        # rather than resolved for the caller at run time.
+        if self.actor_request_headroom is not None:
+            if self.actor_request_headroom < 1:
+                raise ValueError(
+                    f"actor_request_headroom={self.actor_request_headroom} bounds the fleet at or "
+                    "below nothing, so no actor is ever created and the run fails on an empty pool. "
+                    "Pass a positive distance, or None for no bound."
+                )
+            if self.actor_request_batch_size <= 0:
+                raise ValueError(
+                    f"actor_request_headroom={self.actor_request_headroom} with "
+                    f"actor_request_batch_size={self.actor_request_batch_size} asks for two opposite "
+                    "things: a batch size of 0 requests the whole fleet at once, and a headroom "
+                    "never requests beyond what has been placed. Choose one — a positive batch size "
+                    "to grow under the bound, or no headroom to keep the all-at-once mode."
+                )
+            if not self.num_gpus:
+                raise ValueError(
+                    f"actor_request_headroom={self.actor_request_headroom} needs a GPU reservation to "
+                    "measure against: it counts placed actor SLOTS, derived from the cluster's joined "
+                    "GPUs and num_gpus, and a run reserving no GPU places none of them. The bound "
+                    "exists to protect an EC2 launch quota that a CPU-only run does not draw on — "
+                    "leave it None there."
+                )
         if self.optical_min_obs is not None and self.optical_min_obs <= 0:
             raise ValueError(
                 f"optical_min_obs={self.optical_min_obs} refuses nothing — pass None for no "

@@ -412,6 +412,34 @@ committed (Icechunk commits a date's time slot atomically with its pixels), so t
 costs latency, never work. The default's derivation against measured leg durations is in
 `context_docs/design/ingest_read_failure_causes_2026_08.md` (cause 3).
 
+**Two things stop that bound refusing an attempt a leg had the budget for.**
+
+The retry ladder DESCENDS rather than ending the retry. The backoff doubles per attempt, so
+the rung an attempt has escalated to can be longer than the deadline has left even while a
+shorter rung fits easily. The rungs beneath are the same policy applied one escalation
+earlier, and the base is the policy's own statement of how long that class of failure is
+worth waiting for — so the loop takes the longest rung that FITS, and only a leg with no
+room for even the base rung is refused. What it deliberately does not do is cap the wait to
+the REMAINDER: waiting exactly what is left makes the next dispatch land on the deadline
+every time, which turns a race into a guarantee of the thing the deadline forbids. The rungs
+themselves are unchanged, and a leg with budget still escalates exactly as before.
+
+And a leg that is still COMMITTING DATES earns more deadline, by
+`IngestSettings.leg_progress_extension_s`. Counted from the first dispatch, the deadline
+charges a leg for the productive work of every prior attempt, so it cannot tell a cell
+behaving pathologically from one that has been working steadily all along. Progress is read
+from the leg's own child store — through the same `get_existing_dates` the ingest itself
+resumes from, so the parent and the leg cannot disagree about what the store holds — and a
+store that cannot be read earns nothing, which is the same answer as no progress. Two
+things bound it: a grant is a FIXED size, and each has to be PAID FOR by dates committed
+since the previous grant. Payment is also what limits the rate: the extension is asked for
+wherever the deadline is about to refuse an attempt, but only a RUNNING leg commits and every
+ask sits after an attempt has failed, so the asks within one attempt compete for the same
+growth and at most one of them is paid. So the ceiling is
+`max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s`, a leg that
+commits nothing never leaves `max_leg_wall_clock_s`, and setting the extension to 0 restores
+the plain deadline and its reads along with it.
+
 `source_coverage.py`'s preflight probe deliberately does **not** use any of this. Every
 failure of that probe is already INCONCLUSIVE by design, which is the right answer for both
 refusals at once, and the module sits outside the mosaic-content fingerprint closure.
@@ -2069,9 +2097,23 @@ the next reader of the same exception the opposite verdict, and the radar path h
 the retry policy that spends patience, and the handler that decides whether the date is lost.
 
 Radar asks for it twice, and the second ask is what arms `wait_out`. `refusal_wait_out(client)` is
-`is_provider_refusal` over evidence gathered at the moment the policy asks, which is per attempt;
-a predicate reading only the exception declines the outage the budget exists to outlast and spends
-the ordinary three attempts on it. Optical does not pass `wait_out` at all — its answer to a
+`is_provider_refusal` over evidence gathered at the moment the policy asks; a predicate reading
+only the exception declines the outage the budget exists to outlast and spends the ordinary three
+attempts on it.
+
+**The evidence window is the WRITE, not the attempt.** The policy asks once per failed attempt,
+but what it is asked is whether this WRITE is being refused, and an outage states its refusal
+while it is refusing rather than on the schedule the ladder happens to ask on. Re-armed per
+attempt, the question silently becomes "was anything refused in the last few seconds" — which a
+recovering provider answers correctly with NO, one attempt before the write would have succeeded,
+so patience is withdrawn at exactly the moment it was about to pay off. One window per write also
+makes the two readings of one failure agree: `read_failure_context` judges the same failure over
+the whole write when the retry finally gives up, so a narrower window here let the same words be a
+refusal to one reader and not to the other. Nothing is remembered — the window is derived, so the
+evidence is re-read and re-classified on every attempt, a write whose window holds no refusal never
+waits, and what bounds a write that keeps seeing one is `WAIT_OUT_BACKOFF_S`, unchanged. Each ask
+logs its verdict and how many refusal lines it read, because an attempt count alone cannot separate
+"no refusal was logged" from "a refusal was logged and not read", and those want opposite repairs. Optical does not pass `wait_out` at all — its answer to a
 refusal is a leg failure with the axis unmoved, because its per-date remedy is the copy ladder and
 a long wait per rung would multiply with it. The evidence still reaches optical through the same
 context manager, so a refusal there is declined by `is_unreadable_source` and fails the leg rather

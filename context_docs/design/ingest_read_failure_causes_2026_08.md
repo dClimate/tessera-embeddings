@@ -1,16 +1,18 @@
-# Ingest source-read failures: eleven causes, and the retry budget they share
+# Ingest source-read failures: twelve causes, and the retry budget they share
 
 Investigation record. Causes 1 and 2 traced 2026-08-04/05 on `global-tessera-dev`; cause 3 absorbed
 2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20,
-cause 5 on 2026-08-21, causes 6 and 7 on 2026-08-22/23, causes 8, 9 and 10 on 2026-08-24, and cause
-11 on 2026-08-25, all from live campaign legs. **Corrected in place: this document said "three
-causes" until cause 4 was added, "four causes" until cause 5 joined it, "five causes" until cause 6
-did, "six causes" until cause 7 did, "eight causes" until cause 9 did, "nine causes" until cause 10
-did, and "ten causes" until cause 11 did.** Causes 9, 10 and 11 are all later halves of cause 8
-rather than new mechanisms: cause 9 is the same refusal classified correctly and then given a budget
-that could not act on the classification, cause 10 is the same refusal never classified at all
-because the evidence for it was never in the exception, and cause 11 is the sensor built for cause 10
-listening to a channel the evidence was not on. Cause 7 is the
+cause 5 on 2026-08-21, causes 6 and 7 on 2026-08-22/23, causes 8, 9 and 10 on 2026-08-24, and causes
+11 and 12 on 2026-08-25, all from live campaign legs. **Corrected in place: this document said
+"three causes" until cause 4 was added, "four causes" until cause 5 joined it, "five causes" until
+cause 6 did, "six causes" until cause 7 did, "eight causes" until cause 9 did, "nine causes" until
+cause 10 did, "ten causes" until cause 11 did, and "eleven causes" until cause 12 did.** Causes 9,
+10, 11 and 12 are all later halves of cause 8 rather than new mechanisms: cause 9 is the same
+refusal classified correctly and then given a budget that could not act on the classification,
+cause 10 is the same refusal never classified at all because the evidence for it was never in the
+exception, cause 11 is the sensor built for cause 10 listening to a channel the evidence was not on,
+and cause 12 is cause 9's budget correctly armed and then withdrawn one attempt before it would have
+paid off. Cause 7 is the
 only one here that is not a source failure — it is our own bookkeeping, and the only one that left
 holes nothing can fill. Traces
 `WarpOperationError('Chunk and warp failed')` and `PermissionError: The provided token has
@@ -1199,6 +1201,11 @@ budget** — the loop does not carry on to spend it again on the next date.
 | in-leg backoff, fleet HELD | ≤ 300 s | ≤ 300 s | **≤ 900 s** |
 | between-leg delay, fleet RELEASED | — | — | 1,800 s |
 
+**Corrected in place 2026-08-25: neither column of that table was reached.** The in-leg budget was
+armed and then withdrawn one attempt in (Cause 12, defect 1), and the between-leg delay's second
+rung was refused rather than taken whenever it overran the leg's remaining wall clock (Cause 12,
+defect 2). The arithmetic below is unchanged and is now attainable rather than theoretical.
+
 So a cell tolerates **about 45 minutes** of provider refusal before failing, of which **at most 15
 minutes holds a fleet**, and it spends at most **30 write attempts** doing it. In practice both
 figures are lower, because the first-date gate makes the second and third attempts fail in seconds.
@@ -1293,6 +1300,10 @@ unmoved instead of walking the copy ladder and recording DATA LOSS.
 Radar asks a second time, per retry attempt, through `refusal_wait_out(client)`. That is what arms
 Cause 9's budget: the retry policy asks its `wait_out` on every failure, and a predicate reading only
 the exception declines the outage the budget exists to outlast.
+
+**Corrected in place 2026-08-25: the predicate is asked per attempt, but the evidence it is asked
+over is the whole WRITE.** It re-armed its window on every ask, so patience was withdrawn as soon as
+an outage stopped restating itself — which is as it recovers. See Cause 12.
 
 ### The polarity, which is the load-bearing part
 
@@ -1481,6 +1492,200 @@ out: the evidence existed, in the right process, at the right moment, and the se
 Python logger while the library was writing to a file descriptor. Before trusting a capture, count
 what it sees against what the source emits — 13 against 1,475 was visible in the log group from the
 first query, and no amount of reasoning about levels, ages or retention would have found it.
+
+## Cause 12 — the patience was armed, and then withdrawn as the outage cleared, 2026-08-25
+
+**Cause 9's budget, reachable at last, and spent 9% of the way.** Cause 8 made the taxonomy
+correct, cause 9 gave the correct verdict a budget worth having, cause 10 got the verdict reached
+at all, and cause 11 got the evidence onto the channel the sensor listens to. This is what the
+budget then did with all of that: 26.9 s of a 300 s allowance, and a lost cell.
+
+Three separate defects, all in the retry path, all with the same shape — **a decision reached from
+a window narrower than the thing it decides about.**
+
+### The failure
+
+One cell's radar leg ran five and a half hours across two attempts and gave up, failing its cell.
+The time was not wasted: it committed **250 dates**, and **91.9% of the elapsed time was productive
+writing** at a steady **75 s per date**. Slowness is not what killed it.
+
+**Both attempts died on a transient provider refusal, and both gave up as the provider was
+recovering.** ASF's S3 answered `AccessDenied` for its own download role in two bursts of one to two
+minutes each. The exact date one attempt died on **committed successfully nineteen minutes later**,
+and there were **zero refusals in the minute the first write quit**.
+
+### Defect 1 — the in-leg budget is never spent
+
+`WAIT_OUT_BACKOFF_S` is 300 s of accumulated backoff, and cause 9 records it measuring **255–280 s
+over ten attempts** against a permanently refusing write. Here it spent **26.9 s** on the first
+death and **9.78 s** on the second. The retry trails: sleeps of 2.98, 5.07, 7.91, 10.9 s then
+give-up; and 5.78, 4 s then give-up.
+
+**The mechanism.** `refusal_wait_out` re-armed its evidence window on every call — `since` was
+reassigned to `time.monotonic()` each time the retry policy asked — so each attempt was judged on
+the refusals logged during THAT ATTEMPT alone. An outage states its refusal while it is refusing.
+It stops the moment it clears, which is one attempt before the write would have succeeded, so the
+question the predicate was really asking — "was anything refused in the last few seconds" — gets a
+correct NO at exactly the moment patience was about to pay off.
+
+The signature is **two readings of one failure disagreeing**: the enclosing `read_failure_context`,
+whose window is the whole write, concluded `ProviderRefusedReadsError`, while the per-attempt
+predicate concluded "not a refusal" about the same words.
+
+**Indicated, then established.** The predicate's return value was not logged, so the above was an
+inference from the sleep trail. It was confirmed by driving the real `store_write_retrying` against
+the real `refusal_wait_out`, with the refusal stated during the first attempt and never again:
+
+| refusal restated | exception per attempt | attempts | backoff | verdict trail |
+|---|---|---|---|---|
+| every attempt | fresh | 10 | 266.1 s | `TTTTTTTTTT` |
+| first attempt only | **fresh** | **3** | **12.0 s** | **`TFF`** |
+| first attempt only | one object re-raised | 10 | 264.6 s | `TTTTTTTTTT` |
+
+The third row is a trap worth not re-hitting. `carry_logged_refusal` attaches its evidence to the
+exception as a NOTE, so a harness that re-raises one exception object carries the first attempt's
+evidence onto every later attempt and latches by accident — the defect vanishes and the test reports
+patience the real path does not have. A real write builds a new graph per attempt and raises a new
+exception, so **a test of this predicate has to raise a fresh failure per attempt or it proves
+nothing.**
+
+**Cause 11's forwarder is not a substitute, and the question was asked.** The forwarder that put
+GDAL's stderr refusals onto a logger shipped seven minutes after this leg died, so a fair question
+is whether a sensor that sees everything makes the window irrelevant. It does not, and the reason is
+not about sensitivity: a perfect sensor asked "was anything refused in the last few seconds" still
+answers NO, correctly, at the moment an outage clears. The two fixes are orthogonal — cause 11 is
+about whether the evidence exists, this is about how far back the question looks.
+
+**The fix is not a latch.** A latch — remembering that the predicate once answered yes — was
+considered and rejected: it introduces a stored state to reason about, and it freezes one of the two
+disagreeing answers rather than removing the disagreement. Fixing the WINDOW does both jobs at once.
+`since` is now fixed at the write's start, which is the same window `read_failure_context` already
+judges by, so the two readings agree by construction. Nothing is remembered: the evidence is
+re-collected and re-classified on every attempt, and a write whose window holds no refusal never
+waits. What makes it behave like a latch is only that the buffer is read non-destructively and
+retained far longer than any write lasts.
+
+The bound is unchanged, and that is the part that had to be checked. The stop condition is still
+"refuse the sleep that would cross `WAIT_OUT_BACKOFF_S`", the budget is still accumulated backoff
+rather than wall clock, and the measured spend after the fix is **268.7 s over 10 attempts** — the
+same shape cause 9 recorded, now reached by the failure it was written for. The exposure the wider
+window adds is the one cause 10 already priced: a write refused early and then broken differently
+spends its refusal budget before failing, which costs patience, never a date.
+
+**And it is now observable.** Every ask logs its verdict and the number of refusal lines it read.
+An attempt count alone cannot separate "no refusal was logged" from "a refusal was logged and not
+read", and those two want opposite repairs — which is why this defect took a sleep trail to find.
+
+### Defect 2 — the second backoff rung had never once fired
+
+The leg retry ladder's rungs are `leg_refusal_backoff_s` then twice it: 600 s then 1,200 s. Over
+seven days, **56 legs took the 600 s rung and not one ever took the 1,200**.
+
+That reads as dead tuning until you look at what was refusing it. Three cells lost their third
+attempt within the same 43 seconds, all descending radar, all because the next backoff did not fit
+the remaining wall-clock budget:
+
+| cell | elapsed | budget left | backoff wanted | short by |
+|---|---|---|---|---|
+| 43N/2017 | 20,458 s | 1,142 s | 1,200 s | **58 s** |
+| 37N/2018 | 20,430 s | 1,170 s | 1,200 s | 30 s |
+| 34N/2017 | 20,714 s | 886 s | 1,200 s | 314 s |
+
+Each had fifteen to twenty minutes of budget left and was denied because the next wait was twenty.
+**All three would have fitted on the 600 s rung.**
+
+**The rungs are NOT changed, and that is the finding.** Flattening the ladder was the obvious
+reading of "a rung that never fires", and it is wrong twice over: the rung was unreachable rather
+than mistuned, so the evidence for deleting it was produced by the defect; and deleting it removes
+an escalation that has never actually been tried. What changes is the gate. A rung longer than what
+is left now DESCENDS the ladder to the longest rung that fits, and only a leg with no room for even
+the base rung is refused.
+
+Two things it deliberately is not. It does not cap the wait to the REMAINDER — that was tried
+earlier and is recorded in the code as wrong in an instructive way: waiting exactly what is left
+makes the next dispatch land on the deadline every time, turning a race into a guarantee of the
+thing the budget forbids. A rung is taken only if it is strictly shorter than what remains. And it
+cannot change behaviour for any leg that is not within one rung of its deadline, so the escalation
+every other leg sees is untouched.
+
+The counter-argument worth answering is whether a shortened wait is a wasted attempt — whether the
+rung length encodes how long an outage lasts. It does not: the BASE rung is the policy's statement
+of that, derived in `leg_refusal_backoff_s`'s own comment from outages of about six and thirteen
+minutes, and the doubling above it is escalation rather than the minimum viable wait. Falling back
+to the rung 56 legs have already used is not waiting less than the policy asks for. The alternative
+is waiting zero and taking no attempt at all.
+
+**Effect on cause 9's arithmetic:** none to the ceiling, which still assumes both rungs are taken.
+What changes is that the ceiling becomes attainable — before this, a cell near its deadline gave up
+instead of spending its last attempt.
+
+### Defect 3 — the budget charges time spent succeeding
+
+`max_leg_wall_clock_s` is measured from the leg's first dispatch, so it includes all the productive
+work of every prior attempt. Its own comment says the deadline "only ever binds on a cell already
+behaving pathologically", and as written it could not keep that promise: the cell above committed
+250 dates and was refused its third attempt on exactly the same terms as a cell that had achieved
+nothing.
+
+**Re-anchoring the clock was rejected.** Measuring from the last attempt that committed a date means
+a leg committing one date an hour runs forever, so it immediately needs a second bound to contain
+the first — two mechanisms where there was none. What went in instead is a bounded CLAUSE: a leg
+whose store has gained dates earns a fixed extension, `leg_progress_extension_s`, and the absolute
+ceiling stays computable.
+
+Two things bound it, and both are load-bearing:
+
+- a grant is a **fixed** size, so a leg cannot earn a deadline proportional to how far it overran —
+  the caller re-reads the deadline after a grant rather than assuming one was enough, and an attempt
+  that overran by more than a whole extension is past what progress buys;
+- each grant has to be **paid for** by dates committed since the previous grant, so a store that
+  stops growing stops earning them.
+
+**Payment is also what bounds the RATE, which is why the extension can be asked for at every refusal
+rather than at one chosen gate.** An earlier draft limited grants by counting call sites, and that
+was the wrong bound: it made the credit depend on which of the deadline's two expressions happened
+to fire — "no time left" or "no time left to wait first" — so a leg that failed 480 s into a 500 s
+budget, with 20 s left and a 30 s base rung, was refused without its progress ever being asked
+about. Both reviewers of PR #145 found exactly that case. The real limit was always payment: only a
+RUNNING leg commits dates, and every ask sits after an attempt has failed, so the asks within one
+attempt compete for the same growth and at most one of them can be paid for. Grants therefore stay
+bounded by the re-dispatch decisions a leg has, one fewer than `max_leg_attempts`, with no counter
+anywhere. `test_progress_is_credited_at_the_rung_refusal_too_not_only_the_elapsed_one` pins it.
+
+Ceiling: `max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s`. A leg that
+commits nothing never leaves `max_leg_wall_clock_s`, and 0 restores the plain deadline exactly,
+including its store reads.
+
+**Progress is read from the STORE, not from the failure.** The parent holds only a failure detail
+string, and a leg dies naming the date that failed rather than one it committed — so the message
+cannot answer this, and reading a date out of a message would be the field-position matching the
+rest of this document forbids. The reader is `get_existing_dates`, the same one the ingest resumes
+from, so the parent and the leg cannot disagree about what the store holds. It is read per LEG,
+against the leg's own child store: a radar orbit still committing is no evidence that the optical
+leg is, and reading it per cell would hand the deadline to whichever leg was healthy — precisely
+the leg not asking for it. An unreadable store earns nothing, which is the same answer as no
+progress and leaves the deadline where it was.
+
+### What each defect cost, which is not the same thing
+
+Worth separating, because it decides how much machinery each deserves. Defect 1 loses a cell's
+whole attempt budget in seconds to an outage that clears in minutes, and it is the one that reaches
+`_give_up_date` territory if the classification ever slips. Defects 2 and 3 cost **fleet-hours and
+latency, never work**: the cell returns to the campaign work list and resumes from its committed
+dates. That is why defect 1 is a straight bug fix with no lever, defect 2 is a straight bug fix
+touching one comparison, and defect 3 is the only one of the three that gets a setting — it widens
+a latency bound that the config comments describe as a policy choice, so an operator has to be able
+to put it back.
+
+### The general shape
+
+**A decision reached from a window narrower than the thing it decides about.** All three are the
+same error at different layers: a refusal judged on one attempt rather than the write, a retry
+judged on the rung it escalated to rather than the rungs available, and a leg judged on elapsed time
+rather than on what it did with it. In each case the narrow window gives an answer that is correct
+about itself and wrong about the question. Before trusting a predicate, ask what interval its
+evidence covers and whether that is the interval the decision is about — and if two readers of one
+failure can disagree, the narrower one is the one to widen, not the one to freeze.
 
 ## Coupling to the leg retry
 
