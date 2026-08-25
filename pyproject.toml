@@ -47,7 +47,17 @@ dependencies = [
     # on no protocol. At 0.x the minor version is where breaking changes land either way.
     "odc-loader>=0.6.4,<0.7",
     "odc-geo",
-    "rasterio",
+    # Bounded because `ingest/loader_failures.py` reaches into three private rasterio names to
+    # forward the GDAL messages no per-thread handler is installed for: `rasterio._env.code_map`
+    # and `level_map` for the wording and level, `rasterio._err.CPLE_BaseError` for the cause
+    # class, and `rasterio._base.__file__` as the extension to `dlsym` GDAL out of. The wording
+    # is load-bearing rather than cosmetic — the classifier corroborates that a line came from
+    # the source READER by its `CPLE_` prefix, so a renamed map entry silences the sensor rather
+    # than breaking it. `tests/unit/test_loader_failure_attribution.py` drives a real `CPLError`
+    # through the real map and asserts the whole line, so drift fails CI; the bound is what keeps
+    # a fresh resolution from walking into it unasked. See
+    # context_docs/design/ingest_read_failure_causes_2026_08.md.
+    "rasterio>=1.5.0,<1.6",
     "rioxarray",
     "pystac",
     "pystac-client",
