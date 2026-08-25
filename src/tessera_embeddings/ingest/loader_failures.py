@@ -255,9 +255,8 @@ def drain_local() -> list[str]:
 def clear_local_refusals() -> None:
     """Empty this process's refusal buffer outright.
 
-    For a caller that needs a known-empty starting point — a test between cases, not the read
-    path. Nothing on the read path clears: see :func:`read_local_refusals` for why taking a line
-    away from a read still in flight costs a date.
+    For a caller that needs a known-empty starting point — a test between cases, never the read
+    path. See :func:`read_local_refusals` for why.
     """
     with _lock:
         _refused.clear()
@@ -288,9 +287,8 @@ def read_local_refusals() -> list[tuple[float, str]]:
     against a duration the caller measured before the round trip discarded evidence whenever the
     trip took longer than the read, which classified a refusal as unreadable data and cost a date.
 
-    A separate buffer from the hrefs, and read by a different caller for a different purpose. One
-    buffer would mean the caller that classifies destroys the evidence the caller that attributes
-    needs, and the optical copy ladder would silently stop attributing.
+    Separate from the href buffer, which is still drained destructively: one buffer would mean the
+    caller that classifies destroys the evidence the optical copy ladder attributes from.
     """
     now = time.monotonic()
     with _lock:
@@ -438,10 +436,11 @@ def install_capture_everywhere(client: dask.distributed.Client | None) -> None:
 
 
 def _collect[T](client: dask.distributed.Client | None, read: Callable[[], list[T]], what: str) -> list[T]:
-    """Read one buffer on the local process and on each worker.
+    """Read one buffer on the local process and on each worker, never raising.
 
-    Worker errors are ignored rather than raised — this runs while handling a failure, and a
-    second failure here would replace a recoverable read error with an unrecoverable one.
+    This runs while handling a failure, so a second failure here would replace a recoverable read
+    error with an unrecoverable one. A worker that could not answer is COUNTED rather than dropped
+    — see the call below for why that distinction is the whole point.
     """
     found = read()
     if client is None:
@@ -496,9 +495,6 @@ def collect_logged_refusals(client: dask.distributed.Client | None, since: float
     short read looked older than the read itself and was thrown away — leaving the codec exception
     classified as unreadable data, which costs the date. The error that remains is the return leg
     alone, and it biases towards KEEPING a line, which costs a wait rather than a date.
-
-    Non-consuming: see :func:`read_local_refusals`. A second read in flight must still be able to
-    find the evidence for its own failure.
     """
     aged = _collect(client, read_local_refusals, "logged refusals")
     if since is None:
@@ -536,16 +532,14 @@ def carry_logged_refusal(
     duplicate date raised while some other read is being refused would otherwise be explained by
     that refusal, and answered with a wait that fixes nothing.
 
-    ``since`` is when the read being judged began, by this process's ``time.monotonic``. Reading
-    the buffer does NOT consume it — see :func:`read_local_refusals` — so a second read in flight
-    still finds the evidence for its own failure; what keeps a stale line out is its age.
+    ``since`` is when the read being judged began, by this process's ``time.monotonic``; what that
+    buys and what it costs is documented on :func:`read_local_refusals`.
 
     The evidence is cluster-wide, so a date failing while ANOTHER date's read is being refused can
-    still take the other's lines into its note. That is the same race the href attribution runs,
-    and it is bounded the same way — by what a wrong answer costs. A borrowed refusal buys a write
-    the refusal budget and then fails the leg with the time axis unmoved; nothing is skipped, and
-    the date is judged alone on the re-dispatch. What is no longer possible is the opposite: one
-    read REMOVING the evidence another read needs, which cost a date rather than a wait.
+    take the other's lines into its note. That is the same race the href attribution runs, bounded
+    the same way — by what a wrong answer costs. A borrowed refusal buys a write the refusal budget
+    and then fails the leg with the time axis unmoved; nothing is skipped, and the date is judged
+    alone on the re-dispatch.
     """
     if not is_source_read_failure(exc):
         return
