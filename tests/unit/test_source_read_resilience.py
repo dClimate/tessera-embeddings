@@ -15,15 +15,33 @@ from __future__ import annotations
 import ast
 import logging
 import re
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreadable_source
+from tessera_embeddings.ingest.loader_failures import clear_local_refusals, install_capture
 from tessera_embeddings.ingest.roi_processing import (
     SOURCE_READ_ATTEMPTS,
     read_failure_context,
     source_read_retrying,
 )
+
+#: The wording GDAL really used, copied from CloudWatch during the 2026-08-24 outage. Composed
+#: text is what let this whole area pass while recording nothing in production.
+REAL_LOGGED_REFUSAL = (
+    "CPLE_AppDefined in HTTP response code on "
+    "https://asf-cumulus-prod-opera-products.s3.us-west-2.amazonaws.com/OPERA_L2_RTC-S1/"
+    "OPERA_L2_RTC-S1_T072-152803-IW2_20211108T150433Z_S1B_30_v1.0_VV.tif: 403"
+)
+
+
+def _gdal_logs(message: str) -> None:
+    """Emit ``message`` the way rasterio's CPL error handler emits GDAL's warnings."""
+    logging.getLogger("rasterio._env").warning(message)
+
 
 #: Read as text rather than imported: these two tests assert on the SHAPE of log calls, which
 #: is not observable from the module object once the interpreter has compiled it.
@@ -110,6 +128,105 @@ def test_context_is_transparent_when_nothing_fails(caplog) -> None:
     assert caplog.records == []
 
 
+class TestTheContextCompletesTheReason:
+    """The one place both sensors' reads pass through, and so the one place their evidence meets.
+
+    A read failure's reason is not always in the exception. A refused object comes back as an
+    error document, GDAL states the refusal in its own log, and the codec raises the decode
+    failure it fails on — so the chain says the bytes are bad while the words saying the service
+    refused sit one log line away. The two verdicts are opposites: bad bytes means give the date
+    up, refused means wait and give up nothing. Collecting that evidence here is what makes one
+    classifier decide both paths from all of what is known.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _capture(self):
+        """The capture running and its buffer empty either side of the test."""
+        install_capture()
+        gdal = logging.getLogger("rasterio._env")
+        previous = gdal.level
+        gdal.setLevel(logging.WARNING)
+        clear_local_refusals()
+        yield
+        gdal.setLevel(previous)
+        clear_local_refusals()
+
+    def _raise_through_the_context(
+        self, log: logging.Logger, while_reading: Callable[[], None] | None = None
+    ) -> BaseException:
+        """One date's read failing the way a refused object fails: a codec, and nothing else.
+
+        Chained with ``raise ... from``, which is the only thing that puts a cause on an
+        exception, because the cause is what every verdict here is read from.
+
+        ``while_reading`` runs INSIDE the context, which is where GDAL writes its log line — the
+        read is under way by then. Logging it before the context is entered describes a different
+        situation entirely: a line left over from an earlier read, which the context deliberately
+        will not attach.
+        """
+        with pytest.raises(OSError) as caught, read_failure_context(log, roi="zone_55N", date="2021-03-14"):
+            if while_reading is not None:
+                while_reading()
+            try:
+                raise ValueError("CPLE_AppDefinedError: ZIPDecode:Decoding error at scanline 0")
+            except ValueError as cause:
+                raise OSError("RasterioIOError: Read failed. See previous exception for details.") from cause
+        return caught.value
+
+    def test_a_refusal_only_gdal_logged_reaches_the_verdict(self, caplog) -> None:
+        """The failure that cost a hundred and fifty-eight dates, decided the other way."""
+        with caplog.at_level(logging.ERROR):
+            arrived = self._raise_through_the_context(
+                logging.getLogger("t.refused"), while_reading=lambda: _gdal_logs(REAL_LOGGED_REFUSAL)
+            )
+
+        assert is_provider_refusal(arrived) is True
+        assert is_unreadable_source(arrived) is False, "a refusal must never give a date up"
+
+    def test_a_line_left_over_from_an_earlier_read_is_not_attached(self, caplog) -> None:
+        """The bound on the evidence, and the reason it is needed.
+
+        A read that logs a refusal and then SUCCEEDS on a later attempt is what the read retry
+        exists to allow, and it drains nothing — the buffer is emptied only when something fails.
+        Left unbounded, that line is attached to whatever fails next, and on the optical path a
+        genuinely corrupt object then reads as a refusal and the copy ladder never steps down.
+
+        Only the evidence produced DURING the read being judged is attached.
+        """
+        _gdal_logs(REAL_LOGGED_REFUSAL)
+        time.sleep(0.05)
+        with caplog.at_level(logging.ERROR):
+            arrived = self._raise_through_the_context(logging.getLogger("t.stale"))
+
+        assert is_provider_refusal(arrived) is False, "the stale line was inherited"
+        assert is_unreadable_source(arrived) is True, "so the failure is still read as bad bytes"
+
+    def test_the_same_failure_with_nothing_logged_still_reads_as_bad_bytes(self, caplog) -> None:
+        """The control: the context must complete a reason, never invent one. A codec failure
+        with no refusal behind it is still permanently bad imagery, and still costs its date.
+        """
+        with caplog.at_level(logging.ERROR):
+            arrived = self._raise_through_the_context(logging.getLogger("t.corrupt"))
+
+        assert is_provider_refusal(arrived) is False
+        assert is_unreadable_source(arrived) is True
+
+    def test_both_sensors_hand_the_context_their_cluster(self) -> None:
+        """The evidence is on the READING workers, so a context with no client decides from the
+        chain alone — silently, and only on the path that dropped it. One sensor keeping the
+        argument and the other losing it is exactly the split this change exists to close.
+        """
+        for module in ("s1_roi.py", "s2_roi.py"):
+            src = (_SRC / "ingest" / module).read_text()
+            contexts = re.findall(r"read_failure_context\(([^)]*)\)", src)
+            assert contexts, f"{module}: no read_failure_context call found — has it been renamed?"
+            for call in contexts:
+                assert "client=client" in call, (
+                    f"{module}: `read_failure_context({call})` cannot collect what GDAL logged "
+                    "without the cluster, so a refusal there reads as unreadable data"
+                )
+
+
 class TestZeroDateOutcomeIsAttributable:
     """A radar leg that writes nothing must say which zone, and whether the source was empty.
 
@@ -158,11 +275,18 @@ class TestEveryComputeThatReadsSourceIsAttributed:
     """
 
     def test_both_sensor_writes_are_wrapped(self) -> None:
-        """``write_day_windows`` must never be reached outside ``read_failure_context``.
+        """No write that computes source pixels may be reached outside ``read_failure_context``.
 
         Checked by CONTAINMENT, not by textual order. The optical gate's own context appears
         earlier in the file, so "a context exists above the write" is satisfied by a write
         that is not wrapped at all.
+
+        The writers are matched by SHAPE rather than named one by one, because naming them was
+        the defect. This check said ``write_day_windows`` and did not say ``write_days_windows``
+        — one letter apart, and the batched writer is the DEFAULT path for a compact ROI. It went
+        unwrapped, so a batch failure was classified from the codec exception alone: the refusal
+        was invisible until the batch had burned its retry ladder and every date in it had been
+        recomputed singly.
         """
         for module in ("s1_roi.py", "s2_roi.py"):
             tree = ast.parse((_SRC / "ingest" / module).read_text())
@@ -171,14 +295,14 @@ class TestEveryComputeThatReadsSourceIsAttributed:
                 for node in ast.walk(tree)
                 if isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
-                and node.func.id == "write_day_windows"
+                and _WRITES_SOURCE_PIXELS.match(node.func.id)
             ]
-            assert writes, f"{module}: no write_day_windows call found — has it been renamed?"
+            assert writes, f"{module}: no source-pixel write found — have they been renamed?"
             for write in writes:
                 assert _enclosing_contexts(tree, write) & {"read_failure_context"}, (
-                    f"{module}: the write at line {write.lineno} computes source pixels, so it "
-                    "must be lexically inside `with read_failure_context(...)` — otherwise a "
-                    "failed read names no granule"
+                    f"{module}: `{write.func.id}` at line {write.lineno} computes source pixels, "  # type: ignore[attr-defined]
+                    "so it must be lexically inside `with read_failure_context(...)` — otherwise "
+                    "a failed read names no granule and a logged refusal reaches no verdict"
                 )
 
     def test_the_optical_write_passes_its_items(self) -> None:
@@ -189,6 +313,12 @@ class TestEveryComputeThatReadsSourceIsAttributed:
         """
         src = (_SRC / "ingest" / "s2_roi.py").read_text()
         assert "items=prepared.items" in src, "the optical write must pass the day's items"
+
+
+#: Every function that computes source pixels on the cluster, matched on shape. A per-date writer
+#: and a batched one differ by a single letter, and an enumeration that missed the second is what
+#: left the default optical path unwrapped.
+_WRITES_SOURCE_PIXELS = re.compile(r"^write_day")
 
 
 def _enclosing_contexts(tree: object, target: object) -> set[str]:

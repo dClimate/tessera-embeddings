@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import time
 from collections.abc import Callable
 
 import icechunk
@@ -33,6 +34,11 @@ import pytest
 from tessera_embeddings.errors import DuplicateDateError, InconclusiveStoreProbeError
 from tessera_embeddings.ingest import s1_roi, s2_roi
 from tessera_embeddings.ingest.duplicates import is_provider_refusal
+from tessera_embeddings.ingest.loader_failures import (
+    clear_local_refusals,
+    install_capture,
+    refusal_wait_out,
+)
 from tessera_embeddings.storage import zarr_store
 from tessera_embeddings.storage.zarr_store import (
     CONCURRENT_WRITER_ERRORS,
@@ -49,6 +55,7 @@ def _run(
     *,
     fail_times: int = 99,
     wait_out: Callable[[BaseException], bool] | None = None,
+    while_attempting: Callable[[], None] | None = None,
 ) -> tuple[int, float, BaseException | None]:
     """Run the policy against a callable that raises ``exc``.
 
@@ -73,6 +80,8 @@ def _run(
         for attempt in retrying:
             with attempt:
                 calls += 1
+                if while_attempting is not None:
+                    while_attempting()
                 if exc is not None and calls <= fail_times:
                     raise exc
     except BaseException as raised:  # the policy's verdict is exactly what is under test
@@ -88,13 +97,21 @@ def _attempts(exc: BaseException | None, *, fail_times: int = 99) -> int:
     return calls
 
 
-def _exhausted(exc: BaseException, *, wait_out: Callable[[BaseException], bool]) -> tuple[int, float]:
+def _exhausted(
+    exc: BaseException,
+    *,
+    wait_out: Callable[[BaseException], bool],
+    while_attempting: Callable[[], None] | None = None,
+) -> tuple[int, float]:
     """Attempts and backoff spent on a failure that never clears.
 
     Asserts the re-raise rather than suppressing it: a spent budget must fail the write. A policy
     that swallowed the failure would satisfy every attempt count here while losing the date.
+
+    ``while_attempting`` runs inside each attempt, which is where GDAL writes its log line. An
+    outage states its refusal on every attempt it refuses, not once before the write begins.
     """
-    calls, slept, raised = _run(exc, wait_out=wait_out)
+    calls, slept, raised = _run(exc, wait_out=wait_out, while_attempting=while_attempting)
     assert type(raised) is type(exc), "an exhausted policy must re-raise the failure, not absorb it"
     return calls, slept
 
@@ -235,6 +252,74 @@ def test_a_refusal_that_is_not_the_sources_gets_no_long_wait(exc):
     one must fail the leg on its first date instead of holding a fleet idle first.
     """
     assert _exhausted(exc, wait_out=is_provider_refusal)[0] == STORE_WRITE_ATTEMPTS
+
+
+class TestArmingThePatienceOnEvidenceTheChainDoesNotCarry:
+    """Whether the budget engages for the failure it was written for.
+
+    A refused object comes back as an error document where the imagery should be, so the codec
+    raises a decode failure and the refusal is stated only in GDAL's own log. A predicate reading
+    the exception alone therefore declines the very outage the budget exists to outlast, and the
+    write spends three attempts on it — which is the ordinary limit, reached in seconds.
+
+    Both directions are pinned, because widening what gets waited out is expensive in its own
+    right: a codec failure recomputes to the same verdict, and every second spent on it is a
+    fleet held idle to reach the answer it already had.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _capture(self):
+        install_capture()
+        gdal = logging.getLogger("rasterio._env")
+        previous = gdal.level
+        gdal.setLevel(logging.WARNING)
+        clear_local_refusals()
+        yield
+        gdal.setLevel(previous)
+        clear_local_refusals()
+
+    @staticmethod
+    def _decode_failure() -> BaseException:
+        exc = RuntimeError("WarpOperationError: Chunk and warp failed")
+        exc.__cause__ = RuntimeError("RasterioIOError: ZIPDecode: Decoding error at scanline 0")
+        return exc
+
+    #: The wording GDAL really used, from CloudWatch during the 2026-08-24 outage. The composed
+    #: "CPLE_AWSAccessDenied in HTTP response code: 403" that stood here is the rasterio
+    #: EXCEPTION class's phrasing and is never written to a log.
+    REFUSAL = (
+        "CPLE_AppDefined in HTTP response code on "
+        "https://asf-cumulus-prod-opera-products.s3.us-west-2.amazonaws.com/OPERA_L2_RTC-S1/"
+        "OPERA_L2_RTC-S1_T072-152803-IW2_20211108T150433Z_S1B_30_v1.0_VV.tif: 403"
+    )
+
+    def test_a_refusal_only_gdal_logged_outlasts_the_attempt_limit(self):
+        """The refusal is stated on every attempt it refuses, which is when GDAL logs it.
+
+        The predicate considers the evidence of the attempt that just failed, so a line from
+        before the write began is not this write's evidence — see the control below.
+        """
+        calls, slept = _exhausted(
+            self._decode_failure(),
+            wait_out=refusal_wait_out(None),
+            while_attempting=lambda: logging.getLogger("rasterio._env").warning(self.REFUSAL),
+        )
+        assert calls > STORE_WRITE_ATTEMPTS
+        assert slept <= WAIT_OUT_BACKOFF_S
+
+    def test_a_line_left_over_from_an_earlier_write_buys_nothing(self):
+        """A refusal that has since recovered is not evidence about this failure.
+
+        Unbounded, it would hand an unrelated codec failure the whole refusal budget: a fleet
+        held idle for minutes to reach the verdict it already had.
+        """
+        logging.getLogger("rasterio._env").warning(self.REFUSAL)
+        time.sleep(0.05)
+        assert _exhausted(self._decode_failure(), wait_out=refusal_wait_out(None))[0] == STORE_WRITE_ATTEMPTS
+
+    def test_the_same_failure_with_nothing_logged_gets_only_the_attempt_limit(self):
+        """The control. The predicate must complete a reason, never invent one."""
+        assert _exhausted(self._decode_failure(), wait_out=refusal_wait_out(None))[0] == STORE_WRITE_ATTEMPTS
 
 
 def test_a_moved_branch_tip_is_never_retried_even_when_waiting_something_out():

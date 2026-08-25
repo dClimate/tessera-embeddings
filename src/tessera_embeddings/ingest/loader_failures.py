@@ -49,6 +49,33 @@ only evidence the classifier had to read.
 classes a ``__reduce__`` that rebuilds them from their own ``args`` through their own
 constructor. Nothing else changes: the chain arrives, and the predicates that always wanted
 to read it now can.
+
+Keeping the reason GDAL did not raise
+-------------------------------------
+
+An intact chain is still only what the reader chose to RAISE, and GDAL does not raise
+everything it knows. A refused object comes back as an error document where the imagery
+should be, GDAL states the refusal in its own log and hands the document to the codec, and
+the codec raises the only thing it can see: a decode failure. So the chain says
+``ZIPDecode`` and the classifier says these bytes are bad, while the words that say the
+service refused sit one log line away, never consulted.
+
+The verdicts that follow are opposites. Unreadable means give the date up; refused means wait
+and give up nothing — and a date given up below a store's append-only maximum cannot be
+back-filled by the re-run meant to recover it. A whole outage's worth of recoverable dates can
+therefore be spent on which of two errors GDAL happened to raise last.
+
+So a second handler records the refusals GDAL logs, and :func:`carry_logged_refusal` attaches
+them to the failing exception, where ``duplicates.classify_read_failure`` reads them with the
+rest of the chain. Both sensors reach it through ``roi_processing.read_failure_context``, so one
+classifier decides both, over the same evidence.
+
+**Only refusals are recorded, and that is what makes the direction safe.** A line is kept only
+if the classifier reads THAT LINE ALONE as ``PROVIDER_REFUSED`` or ``OUR_CREDENTIAL``. Refusal
+is tested before anything about the bytes, so attaching such a line can only move a verdict
+INTO those two — never into "unreadable" or "absent", and so never into giving a date up. What
+it can cost is patience: a date that borrows another's refusal waits out the write budget and
+then fails its leg with the axis unmoved, and is judged again, alone, on the re-dispatch.
 """
 
 from __future__ import annotations
@@ -58,7 +85,7 @@ import re
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -69,7 +96,13 @@ from dask.distributed import WorkerPlugin
 # wrappers, and every GDAL/CPL error that becomes a wrapper's cause lives here.
 from rasterio._err import CPLE_BaseError
 
-from tessera_embeddings.ingest.duplicates import item_tile
+from tessera_embeddings.ingest.duplicates import (
+    ReadFailure,
+    classify_read_failure_in,
+    is_provider_refusal,
+    is_source_read_failure,
+    item_tile,
+)
 from tessera_embeddings.ingest.solar_days import solar_day_of
 
 logger = logging.getLogger(__name__)
@@ -89,10 +122,28 @@ _ABORT_RE = re.compile(r"failure while reading:\s*(\S+)")
 #: bounds the memory a pathological run can hold.
 _CAPACITY = 256
 
-#: Bounded because it is written from the loader's threads and read from the caller's.
+#: Logger GDAL's OWN messages reach. rasterio installs a CPL error handler that forwards every
+#: GDAL error and warning here, which is the only place a refusal GDAL declined to raise is
+#: stated at all.
+_GDAL_LOGGER = "rasterio._env"
+
+#: How many distinct refusal lines one process retains. Far smaller than the href capacity
+#: because these repeat almost exactly — an outage says the same sentence about every object —
+#: and because every one of them can end up quoted on an exception.
+_REFUSAL_CAPACITY = 16
+
+#: The verdicts a line has to reach ON ITS OWN to be worth keeping. Both are ordered above every
+#: statement about the bytes, which is what bounds what this capture can do to a verdict: it can
+#: move one into these two and nowhere else, and neither of them gives a date up.
+_KEEPABLE = (ReadFailure.PROVIDER_REFUSED, ReadFailure.OUR_CREDENTIAL)
+
+#: Bounded because they are written from the loader's threads and read from the caller's.
 _aborted: deque[str] = deque(maxlen=_CAPACITY)
+#: Each entry is ``(recorded_at, message)``. The time is this WORKER's ``monotonic`` clock and is
+#: only ever compared inside the process that wrote it, so no clock is compared across machines.
+_refused: deque[tuple[float, str]] = deque(maxlen=_REFUSAL_CAPACITY)
 _lock = threading.Lock()
-_handler: logging.Handler | None = None
+_handlers: list[logging.Handler] = []
 
 
 def _strip_band_suffix(href: str) -> str:
@@ -139,31 +190,114 @@ class _AbortedReadHandler(logging.Handler):
             _aborted.append(match.group(1))
 
 
+class _LoggedRefusalHandler(logging.Handler):
+    """Records the refusals GDAL states in its own log and does not raise.
+
+    Filtered by the CLASSIFIER rather than by a marker list of its own, so there is one
+    vocabulary for what a refusal is and this cannot drift from it. A line is kept only if it
+    reaches :data:`_KEEPABLE` read alone — which also settles corroboration, since GDAL's
+    wording carries its own ``CPLE_`` class name and GDAL reads nothing here but source imagery.
+
+    Everything else GDAL says is dropped, and that is the safety property rather than tidiness:
+    a benign 404 probing for a sidecar, kept, would be evidence that an object is ABSENT.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+            if classify_read_failure_in(message) not in _KEEPABLE:
+                return
+        except Exception:  # pragma: no cover — a broken record must not break a read
+            return
+        with _lock:
+            _refused.append((time.monotonic(), message))
+
+
 def install_capture() -> None:
-    """Start recording aborted hrefs in THIS process. Idempotent.
+    """Start recording aborted hrefs and logged refusals in THIS process. Idempotent.
 
     Idempotence matters more than it looks: the worker plugin's ``setup`` runs again when a
     worker reconnects, and a second handler would double every entry.
+
+    A handler sees a record only if the logger it sits on is enabled for that level, and
+    GDAL's refusals arrive as warnings — nothing in this package raises a logger above
+    ``WARNING``, and lowering GDAL's own would emit its whole warning stream to the root
+    handlers, so the level is read rather than set.
     """
-    global _handler
-    if _handler is not None:
+    if _handlers:
         return
-    handler = _AbortedReadHandler(level=logging.ERROR)
-    logging.getLogger(_ODC_LOGGER).addHandler(handler)
-    _handler = handler
+    for name, handler in (
+        (_ODC_LOGGER, _AbortedReadHandler(level=logging.ERROR)),
+        (_GDAL_LOGGER, _LoggedRefusalHandler(level=logging.WARNING)),
+    ):
+        logging.getLogger(name).addHandler(handler)
+        _handlers.append(handler)
+
+
+def _drain(buffer: deque[str]) -> list[str]:
+    """Take and clear one of this process's buffers.
+
+    Draining rather than reading, so one failure's evidence cannot be inherited by the next
+    one. A date that fails, steps down and fails again must be judged on the second attempt's
+    objects only.
+    """
+    with _lock:
+        found = list(buffer)
+        buffer.clear()
+    return found
 
 
 def drain_local() -> list[str]:
-    """Take and clear this process's recorded hrefs.
+    """Take and clear this process's recorded hrefs."""
+    return _drain(_aborted)
 
-    Draining rather than reading, so one failure's attribution cannot be inherited by the
-    next one. A date that fails, steps down and fails again must attribute the second
-    failure to the second attempt's objects only.
+
+def clear_local_refusals() -> None:
+    """Empty this process's refusal buffer outright.
+
+    For a caller that needs a known-empty starting point — a test between cases, never the read
+    path. See :func:`read_local_refusals` for why.
     """
     with _lock:
-        found = list(_aborted)
-        _aborted.clear()
-    return found
+        _refused.clear()
+
+
+#: How long a recorded refusal is kept. It has to outlast the longest single read — the read
+#: ladder is :data:`~tessera_embeddings.ingest.roi_processing.SOURCE_READ_ATTEMPTS` attempts and
+#: the radar write may then wait out :data:`~tessera_embeddings.storage.zarr_store.WAIT_OUT_BACKOFF_S`
+#: on top — while being far shorter than a leg, so a buffer cannot accumulate a whole day. The
+#: ``maxlen`` on the buffer bounds it a second way, by count.
+_REFUSAL_RETENTION_S = 3600.0
+
+
+def read_local_refusals() -> list[tuple[float, str]]:
+    """This process's recorded refusal lines with their AGES, without consuming them.
+
+    Reading rather than draining, and that is the whole safety property. Two reads are in flight
+    at once whenever the optical path pipelines a date: the look-ahead prepares date N+1, whose
+    coverage gate reads, while date N's write is still reading. Both enter their own
+    ``read_failure_context``, and a destructive collection let whichever failed FIRST take the
+    other's evidence — the second failure then saw only the codec's complaint, classified as
+    unreadable data, and gave its date up. Reading leaves the line for the other to find.
+
+    **Ages, not timestamps, and the decision is not taken here.** This runs on a worker and the
+    caller runs somewhere else, so their clocks are not comparable; an elapsed time is. Whether a
+    line is recent enough to describe the read being judged is decided by the caller, against its
+    own clock, AFTER this answer arrives — see :func:`collect_logged_refusals`. Filtering here
+    against a duration the caller measured before the round trip discarded evidence whenever the
+    trip took longer than the read, which classified a refusal as unreadable data and cost a date.
+
+    Separate from the href buffer, which is still drained destructively: one buffer would mean the
+    caller that classifies destroys the evidence the optical copy ladder attributes from.
+    """
+    now = time.monotonic()
+    with _lock:
+        # Eviction is the only thing that removes a line, and it happens on the way past rather
+        # than on a timer: nothing in flight can be evicted, because the horizon is longer than
+        # any read that could still be judging it.
+        while _refused and now - _refused[0][0] > _REFUSAL_RETENTION_S:
+            _refused.popleft()
+        return [(now - at, message) for at, message in _refused]
 
 
 #: Exception classes whose cause cannot be serialised out of the worker that raised it, and
@@ -203,8 +337,12 @@ def keep_causes_picklable() -> None:
 def rescues_are_installed() -> bool:
     """Whether THIS process can let a read failure's cause survive serialisation.
 
-    The reducer only: the capture sharpens attribution, but the reducer decides whether a verdict
-    is reachable at all.
+    The reducer only. Both captures matter to a verdict — the href sharpens attribution, and the
+    refusal decides whether a refusal GDAL only logged is reachable at all — but neither is gated
+    here. A worker missing them reads as the fleet used to, which costs dates in an outage; a
+    worker missing the reducer cannot classify anything, which strands a zone-year. Only the
+    second is worth refusing a leg over, and installation is one call, so in practice they travel
+    together.
     """
     return all(getattr(cls, "__reduce__", None) is _reduce_by_args for cls in _CAUSES_THAT_DO_NOT_TRAVEL)
 
@@ -297,25 +435,143 @@ def install_capture_everywhere(client: dask.distributed.Client | None) -> None:
     )
 
 
-def collect_aborted_hrefs(client: dask.distributed.Client | None) -> list[str]:
-    """Every aborted href recorded since the last collection, cluster-wide.
+def _collect[T](client: dask.distributed.Client | None, read: Callable[[], list[T]], what: str) -> list[T]:
+    """Read one buffer on the local process and on each worker, never raising.
 
-    Drains the local process and each worker. Worker errors are ignored rather than
-    raised — this runs while handling a failure, and a second failure here would replace a
-    recoverable read error with an unrecoverable one.
+    This runs while handling a failure, so a second failure here would replace a recoverable read
+    error with an unrecoverable one. A worker that could not answer is COUNTED rather than dropped
+    — see the call below for why that distinction is the whole point.
     """
-    found = drain_local()
+    found = read()
     if client is None:
         return found
     try:
-        per_worker = client.run(drain_local, on_error="ignore")
+        # ``"return"`` and not ``"ignore"``: both refuse to raise, which is the requirement here —
+        # a second failure while handling a read failure would replace a recoverable error with an
+        # unrecoverable one. But ``"ignore"`` REMOVES the failed worker from the result dict, so a
+        # worker that died holding the only refusal line is indistinguishable from one that had
+        # nothing to give. ``"return"`` puts the exception in its place, which is what lets the
+        # count below exist at all.
+        per_worker = client.run(read, on_error="return")
     except Exception:
-        logger.warning("Could not collect aborted hrefs from workers", exc_info=True)
+        logger.warning("Could not collect %s from workers", what, exc_info=True)
         return found
+    silent = 0
     for result in per_worker.values():
         if isinstance(result, list):
-            found.extend(h for h in result if isinstance(h, str))
+            found.extend(result)
+        else:
+            silent += 1
+    if silent:
+        # NAMED, because the buffer lives on the worker that read, and a worker that dies or is
+        # retired between the failure and this call takes its evidence with it. Returning a short
+        # answer in silence would let a refusal be judged as bad bytes with nothing recording that
+        # the evidence was merely unreachable. This line is what makes that diagnosable.
+        logger.warning(
+            "Collected %s from %d of %d worker(s): %d did not answer, so any evidence they held is not in this verdict",
+            what,
+            len(per_worker) - silent,
+            len(per_worker),
+            silent,
+        )
     return found
+
+
+def collect_aborted_hrefs(client: dask.distributed.Client | None) -> list[str]:
+    """Every aborted href recorded since the last collection, cluster-wide."""
+    return _collect(client, drain_local, "aborted hrefs")
+
+
+def collect_logged_refusals(client: dask.distributed.Client | None, since: float | None = None) -> list[str]:
+    """Every refusal GDAL logged since ``since``, cluster-wide.
+
+    ``since`` is a ``time.monotonic`` reading on THIS process, taken when the read began. Each
+    worker reports how OLD its lines are by its own clock, and the cutoff is computed here, after
+    the round trip, against this process's clock. So nothing depends on the fleet's clocks
+    agreeing, and nothing depends on the round trip being quick.
+
+    **The cutoff has to be taken after the call, not before it.** Measured before, it excluded the
+    scheduling and RPC latency that the workers' ages already include, so a line logged during a
+    short read looked older than the read itself and was thrown away — leaving the codec exception
+    classified as unreadable data, which costs the date. The error that remains is the return leg
+    alone, and it biases towards KEEPING a line, which costs a wait rather than a date.
+    """
+    aged = _collect(client, read_local_refusals, "logged refusals")
+    if since is None:
+        return [message for _age, message in aged]
+    cutoff = time.monotonic() - since
+    return [message for age, message in aged if age <= cutoff]
+
+
+#: How the attached evidence introduces itself in a log and on an exception. A reader has to be
+#: able to tell a line the reader COPIED from a line the reader was given.
+_REFUSAL_NOTE = "The source reader logged, but did not raise:"
+
+#: Distinct lines one note quotes. An outage repeats one sentence per object, so the first few
+#: distinct ones carry the whole finding and the rest are volume on a store attribute and in a
+#: traceback.
+_LINES_PER_NOTE = 4
+
+
+def carry_logged_refusal(
+    exc: BaseException, client: dask.distributed.Client | None, since: float | None = None
+) -> None:
+    """Attach to ``exc`` any refusal GDAL logged for this read but did not raise.
+
+    The single bridge between the evidence and the verdict, and the only writer of exception
+    notes here. Every predicate in ``duplicates.py`` reads the chain's text, notes included, so
+    attaching is what makes one classifier decide from the whole of what is known — rather than
+    each caller re-deciding from whatever it happens to hold.
+
+    **Attached, not merely read.** A caller that classified and discarded would leave the next
+    reader of the same exception a different verdict from the same failure, and the radar path
+    has two readers: the retry policy that spends patience, and the handler that decides whether
+    a date is lost. Written onto the exception, the evidence travels with it.
+
+    Only onto a SOURCE READ failure, per :func:`is_source_read_failure`. A store conflict or a
+    duplicate date raised while some other read is being refused would otherwise be explained by
+    that refusal, and answered with a wait that fixes nothing.
+
+    ``since`` is when the read being judged began, by this process's ``time.monotonic``; what that
+    buys and what it costs is documented on :func:`read_local_refusals`.
+
+    The evidence is cluster-wide, so a date failing while ANOTHER date's read is being refused can
+    take the other's lines into its note. That is the same race the href attribution runs, bounded
+    the same way — by what a wrong answer costs. A borrowed refusal buys a write the refusal budget
+    and then fails the leg with the time axis unmoved; nothing is skipped, and the date is judged
+    alone on the re-dispatch.
+    """
+    if not is_source_read_failure(exc):
+        return
+    lines = collect_logged_refusals(client, since)
+    if not lines:
+        return
+    note = f"{_REFUSAL_NOTE} {' | '.join(sorted(set(lines))[:_LINES_PER_NOTE])}"
+    if note not in getattr(exc, "__notes__", ()):
+        exc.add_note(note)
+
+
+def refusal_wait_out(client: dask.distributed.Client | None) -> Callable[[BaseException], bool]:
+    """The ``wait_out`` predicate for a write whose read failures may be refusals GDAL only logged.
+
+    :func:`~tessera_embeddings.ingest.duplicates.is_provider_refusal` unchanged — the verdict is
+    still one classifier's — over evidence gathered at the moment the question is asked. That
+    timing is the whole of it: the retry policy asks PER ATTEMPT, so a predicate reading only the
+    exception decides a refusal it cannot see, declines, and spends the ordinary three attempts
+    on an outage the budget exists to outlast.
+    """
+    since = time.monotonic()
+
+    def _refused(exc: BaseException) -> bool:
+        # The gap between two calls IS the attempt that just failed, and on the first call it is
+        # the time since the write began. So the evidence considered is always the evidence this
+        # attempt produced, without the predicate having to be told when the attempt started.
+        nonlocal since
+        started, since = since, time.monotonic()
+        carry_logged_refusal(exc, client, since=started)
+        return is_provider_refusal(exc)
+
+    return _refused
 
 
 #: How many objects a label names before it summarises the rest. One failing date aborts

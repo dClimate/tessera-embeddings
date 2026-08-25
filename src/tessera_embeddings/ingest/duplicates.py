@@ -866,7 +866,10 @@ def classify_read_failure_in(text: str) -> ReadFailure:
             return ReadFailure.REFUSAL_UNATTRIBUTED
         return ReadFailure.PROVIDER_REFUSED
     statuses = _http_statuses(text)
-    if any(400 <= n < 500 and n not in _ABSENT_4XX and n != 403 for n in statuses):
+    # Every 4xx that is neither absence nor a reason to wait. Both exceptions are named by their
+    # own sets rather than one by a set and the other by a literal, so a status can be moved
+    # between the two by editing one line and cannot end up in both.
+    if any(400 <= n < 500 and n not in (_ABSENT_4XX | _TRANSIENT_4XX) for n in statuses):
         return ReadFailure.CLIENT_ERROR
     if any(m in text for m in _UNREADABLE_MARKERS):
         return ReadFailure.UNREADABLE
@@ -928,6 +931,21 @@ def unreadable_source_in(text: str) -> bool:
     return _means_the_copy_is_lost(classify_read_failure_in(text))
 
 
+def is_source_read_failure(exc: BaseException) -> bool:
+    """Whether ``exc``'s chain says the SOURCE READER is what failed, whatever it failed with.
+
+    Not a verdict about the failure — :func:`classify_read_failure` is that — but about whose
+    failure it is. The one caller is the code that copies a refusal out of GDAL's log onto an
+    exception: that evidence is about a READ, and attaching it to anything else would let a
+    concurrent read's refusal explain a store conflict or a duplicate date. Same marker set as
+    every other corroboration here, for the reason :data:`_SOURCE_READER_MARKERS` gives.
+
+    Admits the flattened shape too, whose whole message is the reader's wrapper repr — that is
+    the shape this evidence exists to rescue, so excluding it would defeat the point.
+    """
+    return any(m in _exception_chain_text(exc) for m in _SOURCE_READER_MARKERS)
+
+
 def cause_was_flattened(exc: BaseException) -> bool:
     """Whether ``exc`` is a read failure that arrived with its cause destroyed.
 
@@ -960,12 +978,22 @@ def _exception_chain_text(exc: BaseException) -> str:
     them the stable thing to match; see ``ingest/loader_failures.py`` for what keeps the chain
     itself intact. The whole chain, because the wrapper discards the reason:
     ``WarpOperationError('Chunk and warp failed')`` says nothing on its own.
+
+    A chain's NOTES are part of its text. Not all of a read failure's reason is ever in the
+    exception: GDAL states some of it only in its own log and raises something else entirely, so
+    the reader holding that log attaches what it found as a note — see
+    :func:`tessera_embeddings.ingest.loader_failures.carry_logged_refusal`, the only writer of
+    notes in this pipeline. Without this line that evidence would be gathered and then ignored.
     """
     seen: list[str] = []
     current: BaseException | None = exc
-    while current is not None and len(seen) < 20:
+    links = 0
+    # Links, not entries: a note must not shorten how far down the chain this reads.
+    while current is not None and links < 20:
         seen.append(f"{type(current).__name__}: {current}")
+        seen.extend(str(note) for note in getattr(current, "__notes__", ()))
         current = current.__cause__ or current.__context__
+        links += 1
     return " | ".join(seen)
 
 
@@ -1036,8 +1064,44 @@ _PROVIDER_REFUSAL_MARKERS = (
 #: * **Every other 4xx is neither** — a malformed request or a rejected credential is not the
 #:   data's fault and is not fixed by waiting, so it re-raises and fails the leg on its first
 #:   date instead of being skipped date by date.
-_HTTP_STATUS_RE = re.compile(r"HTTP response code:\s*(\d{3})")
-_TRANSIENT_4XX = frozenset({408, 429})
+#: GDAL states a status in more than one wording, and both of them reach this classifier.
+#: Captured from production during the 2026-08-24 outage, on ``rasterio._env`` at WARNING:
+#:
+#: * ``CPLE_AppDefined in HTTP response code on <url>: 403``
+#: * ``CPLE_AppDefined in HTTP error code: 503 - <url>. Retrying again in 0.5 secs``
+#:
+#: The first puts the object's URL BETWEEN the phrase and the colon — 249 characters of it on a
+#: real OPERA href — and the second says "error" where the first says "response". A pattern
+#: anchored on ``HTTP response code:`` reads a status out of NEITHER, so every date of that
+#: outage classified ``undecidable`` and the refusal both lines state was never seen.
+#:
+#: What sits between the phrase and the status is an OBJECT ADDRESS, so it is matched as one —
+#: ``\S+``, since a URL holds no whitespace. That is what keeps this from binding the phrase to
+#: some unrelated number later on a flattened traceback line, and it needs no length cap: a
+#: CloudFront-signed OPERA href runs past 900 characters once its policy and signature are on it,
+#: which is the shape the radar path uses whenever ``use_s3_direct=False``.
+#:
+#: **The separator must be a colon followed by a SPACE, and that is what keeps a URL port out.**
+#: GDAL formats the pair as ``%s: %d``; an authority writes ``host:443`` with no space. Without
+#: that, the shortest match in ``... on https://host:443/object.tif: 403`` is the PORT — read as
+#: a 4xx that is neither absence nor a reason to wait, so the real refusal is dropped and the
+#: codec failure keeps its unreadable verdict and costs its date. A ``:503`` port went the other
+#: way and invented a refusal. The trailing guard rejects a longer port such as ``:8443``.
+_HTTP_STATUS_RE = re.compile(r"HTTP (?:response|error) code(?: on \S+)?:[ \t]+(\d{3})(?![\d/])")
+
+#: 4xx statuses that mean WAIT rather than stop.
+#:
+#: **403 belongs here and not only in** :data:`_PROVIDER_REFUSAL_MARKERS`. A marker is a wording;
+#: a status is a fact. The literal ``HTTP response code: 403`` matches what GDAL says when it
+#: cannot OPEN an object — and that failure carries the words into the exception anyway, where
+#: the marker was always going to catch them. It does not match what GDAL says when a chunk READ
+#: is refused mid-transfer, which is the shape every lost date of that outage arrived in, and
+#: whose exception says only ``Chunk and warp failed``.
+#:
+#: This module already recorded this defect once, for 5xx: "the markers name 403 and 500 as
+#: strings while the ranges cover every 5xx, so ``HTTP response code: 503`` was a refusal to
+#: neither predicate". 403 was the entry left behind by that fix.
+_TRANSIENT_4XX = frozenset({403, 408, 429})
 _ABSENT_4XX = frozenset({404, 410})
 
 

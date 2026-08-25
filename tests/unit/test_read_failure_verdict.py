@@ -21,6 +21,7 @@ from tessera_embeddings.ingest.duplicates import (
     ReadFailure,
     cause_was_flattened,
     classify_read_failure,
+    classify_read_failure_in,
     is_provider_refusal,
     is_unreadable_source,
     unreadable_source_in,
@@ -149,6 +150,41 @@ def test_every_verdict_in_the_closed_set_is_reachable() -> None:
     assert reached == set(ReadFailure), f"never produced: {set(ReadFailure) - reached}"
 
 
+def test_a_note_is_part_of_the_chain_the_verdict_is_read_from() -> None:
+    """Evidence attached to a failure counts, because not all of it ever reaches the exception.
+
+    GDAL states some refusals only in its own log and raises the codec failure that follows, so
+    the reader holding that log writes what it found onto the exception — see
+    ``loader_failures.carry_logged_refusal``, the only writer of notes here. If this text were
+    not read, that evidence would be gathered and then ignored, and the verdict would be reached
+    from half of what is known.
+    """
+    failure = _chained("ZIPDecode:Decoding error at scanline 0")
+    assert classify_read_failure(failure) is ReadFailure.UNREADABLE
+
+    failure.add_note("CPLE_AWSAccessDenied in HTTP response code: 403")
+    assert classify_read_failure(failure) is ReadFailure.PROVIDER_REFUSED
+
+
+def test_a_note_cannot_shorten_how_far_down_the_chain_is_read() -> None:
+    """The chain's bound counts LINKS, not entries. Counting entries would let notes push a
+    cause out of view — and the cause is the whole of what a verdict is reached from, so
+    attaching evidence would cost evidence.
+
+    Built at the bound rather than near it: a short chain passes either way, which is how a
+    bound that counts the wrong thing survives a test written for it.
+    """
+    deepest: BaseException = ValueError("CPLE_AppDefinedError: ZIPDecode:Decoding error at scanline 0")
+    current = deepest
+    for i in range(19):
+        wrapper: BaseException = RuntimeError(f"RasterioIOError: wrapper {i}")
+        wrapper.add_note("a note that says nothing")
+        wrapper.__cause__ = current
+        current = wrapper
+
+    assert classify_read_failure(current) is ReadFailure.UNREADABLE
+
+
 class TestLosingTheEvidenceVersusNotRecognisingIt:
     """Two different things that both end in no verdict, and the relationship between them.
 
@@ -189,3 +225,123 @@ class TestLosingTheEvidenceVersusNotRecognisingIt:
         false alarm on this detector reads as "the fleet cannot classify", which stops a leg.
         """
         assert cause_was_flattened(_chained(cause, opening=opening)) is False
+
+
+#: The two wordings GDAL actually used during the 2026-08-24 ASF outage, copied verbatim from
+#: CloudWatch (log group ``/ecs/global-tessera-prod``, 23:45 to 00:10 UTC) with only the granule
+#: name shortened. Both arrived on ``rasterio._env`` at WARNING; 24 of the 25 records in that
+#: window were the first shape and one was the second.
+#:
+#: They are checked in as CAPTURED text rather than composed here on purpose. The classifier read
+#: neither, so every one of the 158 dates lost that night was judged ``undecidable`` and skipped
+#: as unreadable data — and the tests that were meant to cover this asserted against a wording
+#: rasterio never emits, so they passed throughout.
+REAL_GDAL_REFUSALS = {
+    # A chunk READ refused mid-transfer. The object's URL sits BETWEEN the phrase and the colon,
+    # 249 characters of it, so a pattern anchored on `HTTP response code:` matches nothing.
+    "mid-read 403": (
+        "CPLE_AppDefined in HTTP response code on "
+        "https://asf-cumulus-prod-opera-products.s3.us-west-2.amazonaws.com/OPERA_L2_RTC-S1/"
+        "OPERA_L2_RTC-S1_T072-152803-IW2_20211108T150433Z_S1B_30_v1.0_VV.tif: 403"
+    ),
+    # The provider overloaded rather than refusing. "error code" where the other says "response".
+    "mid-read 503": (
+        "CPLE_AppDefined in HTTP error code: 503 - "
+        "https://asf-cumulus-prod-opera-products.s3.us-west-2.amazonaws.com/OPERA_L2_RTC-S1/"
+        "OPERA_L2_RTC-S1_T072-152803-IW2_20211108T150433Z_S1B_30_v1.0_VV.tif. "
+        "Retrying again in 0.5 secs"
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(REAL_GDAL_REFUSALS))
+def test_the_wordings_gdal_really_used_are_read_as_refusals(shape: str) -> None:
+    """The verdict on text captured from the incident, not on text written to pass.
+
+    Both say a status the service chose to send. Read as anything else, the response is to give
+    up the date — which is what happened, 158 times.
+    """
+    assert classify_read_failure_in(REAL_GDAL_REFUSALS[shape]) is ReadFailure.PROVIDER_REFUSED
+
+
+@pytest.mark.parametrize(
+    ("text", "verdict"),
+    [
+        # Absence keeps its own verdict in the same wording: widening how a status is FOUND must
+        # not widen what a status MEANS. This is the line that decides a date is abandoned.
+        (
+            "CPLE_OpenFailed in HTTP response code on https://asf/x_VV.tif: 404 NoSuchKey",
+            ReadFailure.ABSENT,
+        ),
+        # A 4xx that is neither absence nor a reason to wait still fails the leg.
+        ("CPLE_AppDefined in HTTP response code on https://asf/x_VV.tif: 401", ReadFailure.CLIENT_ERROR),
+        # And the exception the refusal hides behind, alone, still claims nothing.
+        ("WarpOperationError: Chunk and warp failed", ReadFailure.UNDECIDABLE),
+    ],
+)
+def test_the_wider_status_match_does_not_widen_what_a_status_means(text: str, verdict: ReadFailure) -> None:
+    """Negative controls for the pattern change, one per verdict it could have leaked into."""
+    assert classify_read_failure_in(text) is verdict
+
+
+@pytest.mark.parametrize(
+    ("text", "verdict", "why"),
+    [
+        (
+            "CPLE_AppDefined in HTTP response code on https://host:443/object.tif: 403",
+            ReadFailure.PROVIDER_REFUSED,
+            "the port must not be read as the status, or the refusal is dropped and the date lost",
+        ),
+        (
+            "CPLE_AppDefined in HTTP error code: 503 - https://host:443/object.tif. Retrying",
+            ReadFailure.PROVIDER_REFUSED,
+            "and the same in the wording that puts the status first",
+        ),
+        (
+            "CPLE_OpenFailed in HTTP response code on https://host:503/object.tif: 404 NoSuchKey",
+            ReadFailure.ABSENT,
+            "a :503 port must not invent a refusal over a real absence",
+        ),
+        (
+            "CPLE_AppDefined in HTTP response code on https://host:8443/object.tif: 403",
+            ReadFailure.PROVIDER_REFUSED,
+            "a four-digit port is not three digits",
+        ),
+    ],
+)
+def test_a_url_port_is_not_mistaken_for_a_status(text: str, verdict: ReadFailure, why: str) -> None:
+    """GDAL writes ``%s: %d``; an authority writes ``host:443``. The space is the discriminator.
+
+    Both directions cost something. Reading the port as the status drops the real refusal, and the
+    codec failure keeps its unreadable verdict — which gives the date up. A ``:503`` port going the
+    other way invents a refusal over an absence.
+    """
+    assert classify_read_failure_in(text) is verdict, why
+
+
+def test_a_status_is_not_bound_to_a_phrase_far_away_from_it() -> None:
+    """What sits between the phrase and the status is an ADDRESS, and an address has no spaces.
+
+    A traceback flattened onto a single line can carry an unrelated number later on. Matching the
+    gap as a URL rather than as "anything up to N characters" is what refuses it — and it refuses
+    at any distance, where a length cap only refuses past its own bound.
+    """
+    far = "HTTP response code" + " x" * 400 + ": 503"
+    assert classify_read_failure_in(far) is ReadFailure.UNDECIDABLE
+
+
+def test_a_signed_url_does_not_outrun_the_pattern() -> None:
+    """Radar runs on CloudFront-signed hrefs whenever ``use_s3_direct=False``.
+
+    A policy and a signature push an OPERA href past 900 characters, so any length cap on the gap
+    silently stops matching in that mode — the handler drops the line, the codec exception keeps
+    its unreadable verdict, and the date is given up. There is no cap: the gap is one address.
+    """
+    signed = (
+        "https://d1234abcd.cloudfront.net/OPERA_L2_RTC-S1/"
+        "OPERA_L2_RTC-S1_T072-152803-IW2_20211108T150433Z_S1B_30_v1.0/x_VV.tif"
+        "?Policy=" + "e" * 420 + "&Signature=" + "s" * 340 + "&Key-Pair-Id=APKAABCDEFGHIJKLMNOP"
+    )
+    assert len(signed) > 900, "the point of this case is that the href is long"
+    line = f"CPLE_AppDefined in HTTP response code on {signed}: 403"
+    assert classify_read_failure_in(line) is ReadFailure.PROVIDER_REFUSED
