@@ -934,32 +934,6 @@ def ingest_s1_roi_sar(
                     log.debug("[%s] Skipping date %s: already given up", orbit, date_str)
                     continue
 
-                # The month floor cannot reach these: the first batch starts at the frontier's
-                # MONTH, so the dates below the frontier inside that month are still offered.
-                # Dropped here rather than at the writer, where they raise and the store's only
-                # remedy is deletion.
-                if _unfillable(date_str):
-                    given_up.add(date_str)
-                    loss = {"date": date_str, "scope": UNFILLABLE_SCOPE, "error": ""}
-                    unfillable_dates.append(loss)
-                    # States what was OBSERVED and no more — see the optical path. The date is
-                    # dropped before any read, so whether pixels were lost is not known here, and
-                    # claiming loss inflates the count that decides whether a store is worth
-                    # re-ingesting.
-                    log.error(
-                        "[%s] UNASSESSED roi=%s date=%s: the source offers this date and the "
-                        "store's time axis already holds %s, so it cannot be appended and this run "
-                        "did not read it. An earlier attempt skipped it and then committed a later "
-                        "date. Recorded on the store as assessed_unreadable_dates with "
-                        "scope=unfillable. Whether pixels were lost is NOT known — the date was "
-                        "never read.",
-                        orbit,
-                        roi_label,
-                        date_str,
-                        frontier,
-                    )
-                    continue
-
                 if footprint is not None and not footprint:
                     # Reaches no live window at all. Writing it would build a full graph
                     # to store nothing, since all-fill chunks are never persisted.
@@ -968,6 +942,34 @@ def ingest_s1_roi_sar(
                     log.debug("[%s] Skipping date %s: imagery reaches no live window", orbit, date_str)
                     empty_dates += 1
                     continue
+                # AFTER the empty-window check above, deliberately. A date below the frontier
+                # that reaches no live window was never going to be written, so nothing was lost
+                # by not writing it — recording one made the coverage gate refuse a month that is
+                # genuinely fine and sent an operator to rebuild a store that would come back
+                # identical. Only a date that would otherwise have been written is a loss.
+                #
+                # It must still never reach the writer: the append would be refused and the
+                # refusal is fatal, which is what this guard exists for.
+                if _unfillable(date_str):
+                    given_up.add(date_str)
+                    loss = {"date": date_str, "scope": UNFILLABLE_SCOPE, "error": ""}
+                    unfillable_dates.append(loss)
+                    # A real loss now: this date cleared the checks that would otherwise have
+                    # skipped it, so its pixels were reachable and are absent from the mosaic.
+                    log.error(
+                        "[%s] DATA LOSS roi=%s date=%s: the source offers this date and the "
+                        "store's time axis already holds %s, so it cannot be appended and this run "
+                        "did not read it. An earlier attempt skipped it and then committed a later "
+                        "date. Recorded on the store as assessed_unreadable_dates with "
+                        "scope=unfillable — the only remedy is to re-ingest this store's window "
+                        "from empty.",
+                        orbit,
+                        roi_label,
+                        date_str,
+                        frontier,
+                    )
+                    continue
+
                 date_windows = footprint if (narrow_windows_per_date and footprint) else live_windows
 
                 # Stamp the slice with its solar day. The store's axis is day-granular

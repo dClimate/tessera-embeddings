@@ -1033,6 +1033,40 @@ def ingest_s2_roi_reflectance(
                 exc_info=True,
             )
 
+        def _intercept_unfillable(prepared: _PreparedDate) -> bool:
+            """Record a date the axis can no longer accept, and keep it away from the writer.
+
+            Called AFTER preparation, which is the whole point. A date below the frontier that the
+            coverage gate would have skipped anyway costs nothing and is no loss — recording one
+            makes the gate refuse a month that is genuinely fine, and sends an operator to rebuild
+            a store that would come back identical. Only a date that WOULD have been written is a
+            loss worth naming.
+
+            It must still never reach the writer: the append would be refused and the refusal is
+            fatal, which is the failure this whole path exists to prevent.
+            """
+            if not _unfillable(prepared.date):
+                return False
+            entry = {
+                "date": prepared.date,
+                "tiles": "",
+                "tried": "",
+                "objects": "",
+                "scope": UNFILLABLE_SCOPE,
+            }
+            unfillable_dates.append(entry)
+            log.error(
+                "DATA LOSS roi=%s date=%s: this date would have been written, and the store's "
+                "time axis already holds %s, so it can never be appended — its pixels are absent "
+                "from the mosaic. An earlier attempt skipped it and then committed a later date. "
+                "Recorded on the store as assessed_unreadable_dates with scope=unfillable; the "
+                "only remedy is to re-ingest this store's window from empty.",
+                roi_label,
+                prepared.date,
+                frontier,
+            )
+            return True
+
         def _consume(prepared: _PreparedDate, stall_s: float) -> None:
             """Count or write one prepared date — the ONE consume path both modes take.
 
@@ -1055,7 +1089,14 @@ def ingest_s2_roi_reflectance(
             """
             nonlocal total_processed, total_filtered
             if prepared.day_ds is None and prepared.read_error is None:
+                # Filtered on its own merits. If it also sits below the frontier, nothing was
+                # lost — it was never going to be written — so it is counted and not recorded.
                 _record_skip(prepared)
+                return
+            if _intercept_unfillable(prepared):
+                # Checked BEFORE the duplicate ladder: stepping copies for a date that cannot be
+                # appended buys nothing, and a copy that succeeded would reach the writer and be
+                # refused fatally.
                 return
             attempt: _PreparedDate = prepared
             tried: list[str] = []
@@ -1176,30 +1217,12 @@ def ingest_s2_roi_reflectance(
         # enough to cross UTC midnight (the far-eastern and far-western zones).
         items.sort(key=solar_day_sort_key)
         by_date = group_items_by_date(items)
-        # The month floor cannot reach these: it starts the query at the frontier's MONTH, so
-        # the dates below the frontier INSIDE that month are still offered. Dropped here rather
-        # than at the writer, where they raise and the store's only remedy is deletion.
-        for date in [d for d in by_date if _unfillable(d)]:
-            del by_date[date]
-            entry = {"date": date, "tiles": "", "tried": "", "objects": "", "scope": UNFILLABLE_SCOPE}
-            unfillable_dates.append(entry)
-            # States what was OBSERVED and no more. This date is dropped before preparation, so
-            # nothing here knows whether it would have been written: it might have failed the
-            # coverage gate or reached no live window, in which case no pixels were lost at all.
-            # Claiming loss either way inflates the count that decides whether a store is worth
-            # re-ingesting, and re-ingesting a year is expensive enough that the claim has to be
-            # earned.
-            log.error(
-                "UNASSESSED roi=%s date=%s: the catalogue offers this date and the store's time "
-                "axis already holds %s, so it cannot be appended and this run did not read it. "
-                "An earlier attempt skipped it and then committed a later date. Recorded on the "
-                "store as assessed_unreadable_dates with scope=unfillable. Whether pixels were "
-                "lost is NOT known — the date was never read, and it may have been one the "
-                "coverage gate would have skipped anyway.",
-                roi_label,
-                date,
-                frontier,
-            )
+        # Dates below the frontier are NOT dropped here. The month floor cannot reach them — it
+        # starts the query at the frontier's month — but dropping them before preparation meant
+        # judging them without looking: a date the coverage gate would have skipped anyway was
+        # recorded as a loss, the gate then refused to excuse a month that was actually fine, and
+        # re-ingesting would have rebuilt the identical store. They are prepared like any other
+        # date and intercepted before the WRITE instead, by `_intercept_unfillable`.
         total_seen += len(by_date)
         considered_dates.update(by_date)
         prepare = _prepare_date
@@ -1244,6 +1267,8 @@ def ingest_s2_roi_reflectance(
                     continue
                 if prepared.day_ds is None:
                     _record_skip(prepared)
+                    continue
+                if _intercept_unfillable(prepared):
                     continue
                 batch.append(prepared)
                 batch_stall += stall_s

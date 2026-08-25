@@ -765,7 +765,10 @@ def test_a_date_below_the_frontier_is_recorded_as_lost_rather_than_raised(
         )
 
     assert run.written == ["2018-06-05"], "the unfillable date is never offered to the writer"
-    assert "2018-05-10" not in run.loaded, "and never even prepared"
+    assert "2018-05-10" in run.loaded, (
+        "but it IS prepared: whether it would have been written is the difference between a real "
+        "loss and a date the coverage gate was going to skip anyway"
+    )
     lost = [entry for c in assessed for entry in c["unreadable"]]
     assert lost == [{"date": "2018-05-10", "tiles": "", "tried": "", "objects": "", "scope": "unfillable"}]
     assert "DATA LOSS" in caplog.text and "2018-05-10" in caplog.text
@@ -773,6 +776,35 @@ def test_a_date_below_the_frontier_is_recorded_as_lost_rather_than_raised(
     # the losses so far, so that commit is already a durable home for it. Failing the leg over
     # this record would refuse a run whose loss is safely stored.
     assert assessed[-1]["required"] is False
+
+
+@pytest.mark.parametrize("batch_dates", [1, 2], ids=["per-date", "batched"])
+@BOTH_MODES
+def test_a_date_below_the_frontier_the_gate_would_skip_anyway_is_not_a_loss(
+    run_ingest, assessed, pipeline_dates, batch_dates
+):
+    """Being unwritable is not the same as being lost.
+
+    A date below the frontier that the coverage gate rejects on its own merits was never going to
+    be written, so nothing was lost by not writing it. Recording it as a loss made the gate refuse
+    a month that is genuinely fine and sent an operator to rebuild a store that would come back
+    identical — and this path is exactly where the counts that decide a rebuild come from.
+
+    The distinction can only be drawn AFTER preparation, which is why the date is no longer
+    dropped before it.
+    """
+    run = run_ingest(
+        # 2018-05-10 is below the frontier AND fails coverage on its own merits.
+        {"2018-05-10": False, "2018-06-05": True},
+        pipeline_dates=pipeline_dates,
+        batch_dates=batch_dates,
+        existing_dates={FRONTIER},
+    )
+
+    assert run.written == ["2018-06-05"]
+    assert "2018-05-10" in run.loaded, "it was judged, not assumed"
+    lost = [entry for c in assessed for entry in c["unreadable"]]
+    assert lost == [], "nothing was lost, so nothing is recorded"
 
 
 @BOTH_MODES
