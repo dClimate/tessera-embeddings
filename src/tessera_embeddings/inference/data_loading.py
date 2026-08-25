@@ -542,12 +542,21 @@ def check_time_window_coverage(
         #
         # Below the store's newest date the day is also closed for good, since the time axis only
         # grows. A TRAILING month is not closed — a resume starts at the newest date plus one and
-        # would re-offer it — and it is excused anyway, for a different reason: a date is only ever
-        # given up when `is_unreadable_source` says the bytes are permanently bad, and that verdict
-        # recomputes. Re-offering recovers nothing the provider has not republished, so refusing
-        # the month blocks the cell without bringing the imagery any closer. What DOES change the
-        # answer is republished data or a correction to our own classification, and either is a
-        # re-ingest a person decides on from an audit.
+        # would re-offer it — and it is excused anyway. Two loss paths can leave one, and neither
+        # is worth blocking a cell for:
+        #
+        # * A date given up because `is_unreadable_source` says the bytes are permanently bad. That
+        #   verdict RECOMPUTES, so re-offering recovers nothing the provider has not republished.
+        # * A date refused as `producer-conflict`, where no single BOA-offset decision fits the
+        #   day. That one is OURS to fix — classify the bucket in `ingest/asset_locations.py` — and
+        #   a re-run after the fix would recover it. But for a whole month to be absent, EVERY date
+        #   in it must have been refused, which is a catalogue-wide event rather than a per-date
+        #   accident, and it announces itself: the leg ends with a DATA LOSS SUMMARY naming the
+        #   remedy. Blocking one cell's inference is not what surfaces that, and the fix is a code
+        #   change and a re-ingest either way.
+        #
+        # In both cases the published `*_month_covered` mask records the month as uncovered, per
+        # pixel, so the absence is legible in the product rather than silent.
         _explained = _months_within_assessed(missing, _assessed) if missing else set()
         # The ingest's own account of what it looked at and did not keep, carried onto the year
         # because it is recorded on the MOSAIC and the mosaic is deleted once a cell lands. Empty
