@@ -1351,12 +1351,15 @@ def project_assessment(
     disjoint no single range can describe it, so this UNDER-claims rather than spanning a gap
     nobody examined; a reader wanting exact coverage reads the log itself.
 
-    A date's verdict comes from the LAST entry whose examined range covers it, because that run
-    looked most recently. An entry that examined a range and did not list a date within it is
-    saying the date is not lost, which is what retires a stale record — a date once unreadable,
-    later re-read and legitimately filtered, stops being advertised as a hole. A date no entry's
-    range covers keeps its most recent mention, which is what preserves a hand-written repair
-    record: those describe months below a resume floor, exactly the ground runs skip.
+    A date's verdict comes from the LAST entry that CONSIDERED it, because that run judged it most
+    recently. An entry that considered a date and did not list it as lost is saying it is not lost,
+    which is what retires a stale record — a date once unreadable, later re-read and legitimately
+    filtered, stops being advertised as a hole.
+
+    Considered, never merely covered by a range: a run sees only the days the catalogue returned,
+    so a range says where it looked and not that it judged every day inside. A date no entry
+    considered keeps its most recent mention, which is what preserves both a day some response
+    omitted and a record written by hand during a repair.
     """
     ranges: list[tuple[str, str]] = []
     decided: dict[str, Any] = {}
@@ -1366,12 +1369,26 @@ def project_assessment(
         if isinstance(examined, (list, tuple)) and len(examined) == 2:
             covers = (str(examined[0]), str(examined[1]))
             ranges.append(covers)
-            # This run re-examined the range, so its answer replaces every earlier verdict inside
-            # it — including the absence of one.
+
+        # Supersession keys on the dates a run actually CONSIDERED, never on its range. Examining
+        # a range is not judging every day in it: a run sees only the days the catalogue returned,
+        # so a day omitted from one response — a transient omission is enough — was never judged.
+        # Clearing its record on that basis deletes real evidence, and if it were its month's only
+        # acquisition the month would then read as legitimately empty and an incomplete mosaic
+        # could publish.
+        considered = entry.get("considered")
+        if isinstance(considered, (list, tuple)):
+            for date in {str(d) for d in considered} & set(decided):
+                del decided[date]
+        elif covers is not None:
+            # An entry from before runs recorded what they considered — including the one
+            # synthesised for a store predating the log. Its range is the only statement it makes,
+            # so it is taken at its word: the coarser reading, and the only one available.
             for date in [d for d in decided if covers[0] <= d <= covers[1]]:
                 del decided[date]
+
         for loss in entry.get("losses") or ():
-            decided[str(loss.get("date", "")) if isinstance(loss, dict) else str(loss)] = loss
+            decided[_loss_date(loss)] = loss
 
     window: list[str] | None = None
     if ranges:
@@ -1415,6 +1432,7 @@ def record_assessed_window(
     *,
     empty_dates: int = 0,
     unreadable: list[dict[str, str]] | None = None,
+    considered: "Iterable[str] | None" = None,
     required: bool = False,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
@@ -1465,13 +1483,16 @@ def record_assessed_window(
         # examined and what it lost, and the fold decides what that means alongside every earlier
         # statement.
         log = read_assessment_log(root.attrs)
-        log.append(
-            {
-                "examined": [start_date, end_date],
-                "losses": list(unreadable or ()),
-                "source": "ingest",
-            }
-        )
+        entry: dict[str, Any] = {
+            "examined": [start_date, end_date],
+            "losses": list(unreadable or ()),
+            "source": "ingest",
+        }
+        if considered is not None:
+            # The dates this run actually judged. Only these supersede an earlier verdict; the
+            # range says where it looked, not that it looked at every day inside.
+            entry["considered"] = sorted({str(d) for d in considered})
+        log.append(entry)
         window, losses = project_assessment(log, present=present)
         root.attrs[ASSESSMENT_LOG_ATTR] = log
         # Derived, never merged — recomputed wholesale from the log on every write, so the two can

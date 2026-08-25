@@ -1369,3 +1369,28 @@ class TestTheAssessmentLog:
         # a later, unrelated write — the axis still holds the recovered date
         _, after = project_assessment(log, present={"2018-01-06", "2018-02-11"})
         assert after == [], "and it must not come back"
+
+    def test_a_date_no_run_considered_keeps_its_record(self):
+        """Examining a range is not judging every day in it.
+
+        A run sees only the days the catalogue returned. A day omitted from one response — a
+        transient omission is enough — was never judged, so clearing its record on the strength of
+        the range would delete real evidence; and if it were its month's only acquisition, the
+        month would then read as legitimately empty and an incomplete mosaic could publish.
+        """
+        log = [
+            {"examined": ["2018-01-01", "2018-01-31"], "losses": [{"date": "2018-01-06"}]},
+            # A later run over the same month whose catalogue response omitted the 6th.
+            {
+                "examined": ["2018-01-01", "2018-01-31"],
+                "considered": ["2018-01-05", "2018-01-07"],
+                "losses": [],
+            },
+        ]
+        _, losses = project_assessment(log)
+        assert [e["date"] for e in losses] == ["2018-01-06"], "never judged, so never cleared"
+
+        # And a run that DID consider it, and did not call it lost, does clear it.
+        log[1]["considered"] = ["2018-01-05", "2018-01-06", "2018-01-07"]
+        _, cleared = project_assessment(log)
+        assert cleared == []
