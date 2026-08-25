@@ -1190,9 +1190,30 @@ class TestAssessedWindowRecord:
 
         data = sample_reflectance_data(["2024-01-06"], height=64, width=64, seed=9)
         _write_reflectance(path, data, tile_id="33UUP", baselines={"2024-01-06": 400})
-        record_assessed_window(path, "2024-01-01", "2024-02-28")
 
-        assert [e["date"] for e in self._attrs(path)["assessed_unreadable_dates"]] == ["2024-02-14"]
+        # A run over BOTH months reporting no losses says it looked and found none, so the
+        # February entry goes too. That is the point: a date once recorded unreadable and later
+        # re-read but legitimately filtered — too cloudy, no live window — would otherwise keep a
+        # stale entry forever, and if it were that month's only acquisition the month could never
+        # pass the coverage gate.
+        record_assessed_window(path, "2024-01-01", "2024-02-28")
+        assert self._attrs(path)["assessed_unreadable_dates"] == []
+
+    def test_a_loss_outside_the_range_a_run_examined_survives_it(self, local_zarr_path, sample_reflectance_data):
+        """Reconciliation reaches only as far as the run looked.
+
+        A resumed run starts at its frontier's month and never re-derives the earlier months'
+        losses, so those entries are not stale — they are simply unexamined, and this run has no
+        opinion on them. This is also what protects a record placed by hand during a repair: those
+        describe months below a resume floor, which is exactly the ground a run skips.
+        """
+        path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"])
+        record_assessed_window(path, "2024-01-01", "2024-01-31", unreadable=[{"date": "2024-01-06"}])
+
+        # A later run examines FEBRUARY only, and reports nothing lost there.
+        record_assessed_window(path, "2024-02-01", "2024-02-28")
+
+        assert [e["date"] for e in self._attrs(path)["assessed_unreadable_dates"]] == ["2024-01-06"]
 
 
 def test_prior_wins_uniformly_with_no_scope_excepted():

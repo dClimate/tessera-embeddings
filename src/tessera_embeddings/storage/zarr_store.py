@@ -1260,41 +1260,45 @@ def merge_recorded_losses(
     new: "Iterable[dict[str, str]]",
     *,
     present: "Container[str]" = (),
+    reassessed: tuple[str, str] | None = None,
 ) -> list[Any]:
-    """``prior`` loss records plus ``new`` ones, minus any date now on the time axis.
+    """``prior`` loss records plus ``new`` ones, reconciled against what this run actually looked at.
 
-    A UNION rather than a replacement. A resumed leg re-derives only the losses of the
-    window it actually walked, so writing its own list alone erases what an earlier attempt
-    recorded and the store's holes end up advertised nowhere. The PRIOR entry wins on a
-    repeated date, so a record placed by hand — a repair's account of a hole — survives a
-    later leg rediscovering the same date.
+    A UNION rather than a replacement. A resumed run re-derives only the losses of the window it
+    walked, so writing its own list alone would erase what earlier runs recorded and the store's
+    holes would end up advertised nowhere.
 
-    ``present`` is what keeps the union from advertising a hole that has since been filled:
-    a date back on the time axis is not a loss, whoever recorded it. That is the case the
-    unconditional overwrite this replaced was protecting, and it is the only case it was
-    protecting.
+    **The run that looked most recently at a date is the authority on it; a run that did not look
+    has no opinion.** That single rule is what decides every case here:
+
+    * ``reassessed`` is the inclusive ``(start, end)`` this run examined — the same range it
+      records as its assessed window. A prior entry INSIDE it was re-examined, so this run's
+      answer replaces it, and a date this run no longer considers lost simply disappears. Without
+      that, a date once recorded unreadable that is later re-read successfully but legitimately
+      filtered — too cloudy, no live window — would keep its stale entry forever, and if it were
+      that month's only acquisition the month could never pass the coverage gate.
+    * A prior entry OUTSIDE that range was not looked at, so it survives untouched. That is what
+      protects a record placed by hand during a repair: those describe months below a resume
+      floor, which is precisely the ground a run skips.
+    * ``present`` removes a date that is now on the time axis, whoever recorded it. A date that is
+      stored is not a hole.
+
+    Passing no ``reassessed`` range keeps every prior entry — the conservative reading, for a
+    caller that cannot say what it examined.
 
     **A scope records what was OBSERVED, never what to do about it.** Whether a date can still be
     appended is not a property of the date and is deliberately not stored: it is one comparison
-    against the store's own axis — ``date <= max(axis)`` — and every reader of this attribute has
-    that axis in front of it. Storing that answer instead of deriving it is what made this
-    function need an upgrade rule, because the answer changes the moment any later date commits.
-    A stored verdict then has to be migrated on every such transition, and each transition anyone
-    forgets becomes a store advertising the wrong remedy. Derived, there is nothing to migrate.
+    against the store's own axis (``date <= max(axis)``), and every reader of this attribute has
+    that axis. Storing that answer instead of deriving it is what made this function need an
+    upgrade rule, because the answer changes the moment any later date commits — so it needed
+    migrating on every such transition, and each transition nobody migrated left a store
+    advertising the wrong remedy. Derived, there is nothing to migrate.
 
-    So prior-wins is UNIFORM, with no scope excepted. A hand-written record — a repair's account
-    of a hole — survives a later leg rediscovering the same date, which is the whole reason the
-    rule exists.
-
-    ``present`` is what keeps the union from advertising a hole that has since been filled: a date
-    back on the time axis is not a loss, whoever recorded it. That is the case the unconditional
-    overwrite this replaced was protecting, and it is the only case it was protecting.
-
-    Entries are carried through VERBATIM, including shapes this does not understand, because
-    the readers of the attribute tolerate a bare date string and a hand-written record is not
-    ours to normalise. A ``prior`` that is not a sequence at all is a different matter: it is
-    evidence in a shape nobody wrote, and dropping it would erase whatever it recorded, so it is
-    refused rather than normalised away.
+    Entries are carried through VERBATIM, including shapes this does not understand, because the
+    readers of the attribute tolerate a bare date string and a hand-written record is not ours to
+    normalise. A ``prior`` that is not a sequence at all is a different matter: it is evidence in a
+    shape nobody wrote, and dropping it would erase whatever it recorded, so it is refused rather
+    than normalised away.
     """
     if prior is not None and not isinstance(prior, (list, tuple)):
         raise TypeError(
@@ -1302,12 +1306,34 @@ def merge_recorded_losses(
             "overwrite. Whatever is on the store was not written by this code path and may be the "
             "only account of a hole — inspect it before letting a run replace it."
         )
+
+    def _date_of(entry: object) -> str:
+        """The date an entry is about, whatever shape it was written in.
+
+        A bare date string is a shape earlier code wrote and readers still tolerate, so it is
+        matched here rather than normalised — a hand-written record is not ours to reformat.
+        """
+        return str(entry.get("date", "")) if isinstance(entry, dict) else str(entry)
+
+    def _was_reassessed(date: str) -> bool:
+        if reassessed is None:
+            return False
+        start, end = reassessed
+        return start <= date <= end
+
     merged: dict[str, Any] = {}
-    for entry in (*(prior or ()), *new):
-        date = str(entry.get("date", "")) if isinstance(entry, dict) else str(entry)
-        if date in present or date in merged:
+    # Prior first, so an entry this run did not revisit keeps its position and the attribute stays
+    # comparable between runs.
+    for entry in prior or ():
+        date = _date_of(entry)
+        if date in present or _was_reassessed(date):
             continue
-        merged[date] = entry
+        merged.setdefault(date, entry)
+    for entry in new:
+        date = _date_of(entry)
+        if date in present:
+            continue
+        merged.setdefault(date, entry)
     return list(merged.values())
 
 
@@ -1413,7 +1439,13 @@ def record_assessed_window(
         # resume starts at its frontier's month it never re-derives the earlier months' losses,
         # so writing its own list alone would erase them.
         root.attrs[UNREADABLE_DATES_ATTR] = merge_recorded_losses(
-            root.attrs.get(UNREADABLE_DATES_ATTR), unreadable or (), present=present
+            root.attrs.get(UNREADABLE_DATES_ATTR),
+            unreadable or (),
+            present=present,
+            # THIS run's own range, never the merged one. The merged range may reach back over
+            # months an earlier run examined and this one skipped; reconciling against it would
+            # discard their records on the strength of a look this run never took.
+            reassessed=(start_date, end_date),
         )
         # ``allow_empty`` because re-recording the SAME window writes no bytes, and icechunk
         # refuses a commit with no changes ("cannot commit, no changes made to the session").
