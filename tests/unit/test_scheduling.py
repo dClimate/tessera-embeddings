@@ -1,7 +1,8 @@
 """Unit tests for tessera_embeddings/inference/scheduling.py.
 
 Covers all modularized pieces (ActorPool, _poll_tracker) in isolation.
-No Ray cluster is required — all Ray calls are mocked.
+No Ray cluster is required — all Ray calls are mocked, the cluster capacity query
+included (see the autouse fixture below; unmocked it raises rather than answering).
 """
 
 from __future__ import annotations
@@ -27,6 +28,23 @@ from tessera_embeddings.inference.scheduling import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _capacity_query_is_mocked():
+    """The cluster capacity query, mocked like every other Ray call in this file.
+
+    Left unmocked it does not return a value in a test process: Ray is not initialised, so it
+    RAISES, and the caller's guard turns that into a fallback. Every loop test would then take the
+    guard's failure branch on each iteration and report a figure frozen at its seed, while reading
+    as though it exercised the measurement. Mocking it makes these tests exercise the path they
+    name, and keeps the file's promise that no Ray cluster is required.
+
+    Deliberately answers with no GPU key, so the default is inert and perturbs no existing
+    assertion. A test that needs a particular capacity, or a failure, patches over this.
+    """
+    with patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 8.0}):
+        yield
 
 
 def _make_pool(n: int = 3, **kwargs) -> ActorPool:
