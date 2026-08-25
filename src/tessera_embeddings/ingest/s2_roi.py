@@ -111,7 +111,6 @@ from tessera_embeddings.ingest.stac import (
 )
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
-    UNFILLABLE_SCOPE,
     get_existing_dates,
     record_assessed_window,
     store_write_retrying,
@@ -484,69 +483,65 @@ def ingest_s2_roi_reflectance(
         # failing coverage: an ROI with no live pixel can only ever produce a skip.
         log.warning("ROI has no live pixels — every date will fail the coverage gate")
 
-    # THE STORE'S FRONTIER: the latest date it already holds, and the line below which this
-    # leg can write nothing. The time axis is append-only and strictly increasing because it is
-    # sampled POSITIONALLY downstream, so a date at or under the frontier can never enter this
-    # store however well it reads today.
-    #
-    # Read ONCE. Every date this leg commits is above the frontier by construction, so both the
-    # floor and the per-date check below stay true for the whole run without re-reading. This
-    # store's frontier and no other: a cell's three child stores advance independently.
-    committed_at_start = get_existing_dates(reflectance_store, s3_region=s3_region)
-    frontier: str | None = max(committed_at_start, default=None)
-    # Rebound, so nothing downstream can use the unfloored window by accident — including the
-    # assessed-window record, which must describe the months this leg actually walked.
-    start_date = resume_window_start(start_date, frontier)
-    # Tested on the FRONTIER, not on the floored start. The floor is the first of the frontier's
-    # month, so a store whose newest date is past the window but inside that same month floors to
-    # a start that still precedes ``end_date`` — the window reads as walkable while every day in
-    # it is already closed.
-    if (frontier is not None and frontier >= end_date) or start_date > end_date:
-        # The store already holds a date past this window, so the window is empty and there is
-        # nothing to walk. Returned BEFORE any range is built: the range constructors refuse a
-        # reversed window, and an already-advanced store is a no-op rather than an error. No
-        # assessed window is recorded either — this leg examined none of the range it was given,
-        # and saying otherwise is the one thing that record must never do.
-        log.warning(
-            "NOTHING TO DO roi=%s window=%s: the store's newest date %s is past it, so no date "
-            "in this window can be written. The window and the store disagree — check which was "
-            "intended before re-dispatching.",
-            roi_label,
+    # A window whose end precedes its start is a caller error and always was — the range builders
+    # refuse it. Checked BEFORE the resume start is computed, so the resume can never be blamed
+    # for it and a misconfigured leg cannot be reported as a successful skip.
+    if start_date > end_date:
+        raise ValueError(f"start_date {start_date} is after end_date {end_date}; this window contains no days")
+
+    #: The newest date this store holds, and the line everything at or below is closed by. Read
+    #: ONCE, before any work: it decides where this run starts, and re-reading it mid-run would
+    #: move the line under decisions already made against it.
+    _committed_at_start = get_existing_dates(reflectance_store, s3_region=s3_region)
+    last_written_date: str | None = max(_committed_at_start, default=None)
+
+    if last_written_date is not None and last_written_date >= end_date:
+        # The store already holds this window's last day, so every day in it is closed. Compared
+        # on the RAW date rather than on anything derived from it: a value floored or rounded first
+        # can still precede the window's end while the date it came from does not.
+        log.info(
+            "Nothing to do for roi=%s %s..%s: the store's newest date is %s, so every day in this "
+            "window is already closed to it.",
+            roi_zarr_path,
+            start_date,
             end_date,
-            frontier,
+            last_written_date,
         )
-        return IngestResult(roi_path=roi_zarr_path, status="skipped", dates_processed=0, dates_filtered_coverage=0)
-    if frontier is not None:
-        log.info("Resuming roi=%s above the frontier %s: querying %s..%s", roi_label, frontier, start_date, end_date)
+        return IngestResult(
+            roi_path=roi_zarr_path,
+            status="skipped",
+            dates_processed=0,
+            dates_filtered_coverage=0,
+            dates_refused_producer_conflict=0,
+        )
 
-    def _unfillable(date: str) -> bool:
-        """Whether ``date`` is one the axis can no longer accept.
-
-        Below the frontier and absent from the axis means an earlier attempt skipped it and
-        then committed a later date. The imagery may well read now — our own read-failure fixes
-        change verdicts between attempts — but there is nowhere to put it, so offering it can
-        only raise and destroy the cell.
-        """
-        return frontier is not None and date <= frontier and date not in committed_at_start
+    # Everything at or below the newest held date is closed for good, so searching the catalogue
+    # back there cannot write anything — and searching is most of what a resumed run does.
+    start_date = resume_window_start(start_date, last_written_date)
 
     def _settled_dates() -> set[str]:
         """Dates this leg must not offer: the ones already written.
 
-        A date an earlier attempt gave up on IS re-offered, and deliberately: a skip verdict is
-        not stable across attempts, because a change to how sources are read changes what reads.
-        Above the frontier that re-offer is exactly how a recovered date is recovered. Below it
-        the date is unreachable whatever it would read, and :func:`_unfillable` — not this — is
-        what keeps it from being offered.
+        A date an earlier attempt gave up on is re-offered and gives up again for the same
+        reason, because every accepted cause is DETERMINISTIC — unreadable bytes, a coverage
+        rejection, no live window — and so recomputes to the same verdict. Re-offering costs one
+        re-evaluation and cannot wedge anything.
         """
         return get_existing_dates(reflectance_store, s3_region=s3_region)
+
+    def _closed_to_this_store(date: str) -> bool:
+        """Whether the axis can no longer accept ``date``.
+
+        Should never be true: the run starts the day AFTER the newest held date, so nothing at or
+        below it is offered. Kept because the append it prevents is refused fatally and the store
+        has no remedy but deletion — a cheap comparison against a failure that costs a cell.
+        """
+        return last_written_date is not None and date <= last_written_date
 
     total_processed = 0
     total_filtered = 0
     total_refused = 0
     total_seen = 0
-    #: Every date the catalogue offered this run, which is what it actually judged.
-    #: A range says where a run looked; only this says what it looked AT.
-    considered_dates: set[str] = set()
     #: Tile-dates whose every copy failed to read. Their pixels are absent from the mosaic,
     #: so this is the ONLY record of where the loss is; it is re-stated at the end of the run.
     unreadable_tile_dates: list[dict[str, str]] = []
@@ -556,26 +551,6 @@ def ingest_s2_roi_reflectance(
     # must name them all. Kept out of the coverage counter, whose contract is the SCL gate: a run
     # that lost most of a year to metadata was reporting it as coverage filtering.
     producer_conflict_dates: list[dict[str, str]] = []
-    #: Dates the catalogue still offers that this store can never hold, because an earlier
-    #: attempt skipped them and then committed a later date. A loss like any other: the pixels
-    #: exist at the provider and are absent from the mosaic.
-    unfillable_dates: list[dict[str, str]] = []
-
-    #: How many losses a successful write has already carried into a commit. Every write takes the
-    #: whole list, so a loss is durable the moment any write lands after it — and only the ones
-    #: decided since the last write have nowhere else to be recorded.
-    losses_committed = 0
-
-    def _losses_so_far() -> list[dict[str, str]]:
-        """Every loss this run has decided, in one list.
-
-        Handed to EVERY date write, not just the first after a loss. The store merges losses as a
-        union keyed on the date, so re-sending one already recorded is a no-op — which means no
-        queue has to be drained, cleared, or kept in step with these three lists. A write is
-        therefore the commit that records every loss decided before it, including the loss that
-        the very same commit puts out of reach.
-        """
-        return [*unreadable_tile_dates, *producer_conflict_dates, *unfillable_dates]
 
     def _prepare_date(day_items: list) -> _PreparedDate:
         """Build one solar day's write-ready dataset, or the reason it has none.
@@ -828,14 +803,7 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
-                        # THIS commit is what puts a loss decided just now out of reach, so it
-                        # is the one that must carry it. Sending every loss so far is deliberate:
-                        # the merge is a union, so a repeat costs nothing and no write can be the
-                        # one that quietly dropped a record.
-                        losses=_losses_so_far(),
                     )
-        nonlocal losses_committed
-        losses_committed = len(_losses_so_far())
         # One line per kept date, partitioning its wall clock into the client-side
         # graph build, the coverage-gate compute, and the write (windows + commit).
         # Stable format: CloudWatch queries and the pipeline analysis key off it.
@@ -891,10 +859,7 @@ def ingest_s2_roi_reflectance(
                     chunks=INGEST_CHUNKS,
                     parallel_windows=overlap_window_writes,
                     s3_region=s3_region,
-                    losses=_losses_so_far(),  # see _write_date
                 )
-        nonlocal losses_committed
-        losses_committed = len(_losses_so_far())
         # The batch's write is ONE compute, so a per-date write time does not exist
         # as a measurement — this line is the batched counterpart of `Stage timings`
         # and analysis divides by n. build/gate are sums of the real per-date values.
@@ -1017,6 +982,7 @@ def ingest_s2_roi_reflectance(
                 "scope": "attributed" if attributed else "whole-date",
             }
             unreadable_tile_dates.append(entry)
+            # DURABLE NOW, not at the end of the leg. This is the date the wedge is built
             log.error(
                 "DATA LOSS roi=%s date=%s: every catalogue copy failed to read, so this date "
                 "is SKIPPED and its pixels are absent from the mosaic. objects=%s scope=%s "
@@ -1032,40 +998,6 @@ def ingest_s2_roi_reflectance(
                 exc,
                 exc_info=True,
             )
-
-        def _intercept_unfillable(prepared: _PreparedDate) -> bool:
-            """Record a date the axis can no longer accept, and keep it away from the writer.
-
-            Called AFTER preparation, which is the whole point. A date below the frontier that the
-            coverage gate would have skipped anyway costs nothing and is no loss — recording one
-            makes the gate refuse a month that is genuinely fine, and sends an operator to rebuild
-            a store that would come back identical. Only a date that WOULD have been written is a
-            loss worth naming.
-
-            It must still never reach the writer: the append would be refused and the refusal is
-            fatal, which is the failure this whole path exists to prevent.
-            """
-            if not _unfillable(prepared.date):
-                return False
-            entry = {
-                "date": prepared.date,
-                "tiles": "",
-                "tried": "",
-                "objects": "",
-                "scope": UNFILLABLE_SCOPE,
-            }
-            unfillable_dates.append(entry)
-            log.error(
-                "DATA LOSS roi=%s date=%s: this date would have been written, and the store's "
-                "time axis already holds %s, so it can never be appended — its pixels are absent "
-                "from the mosaic. An earlier attempt skipped it and then committed a later date. "
-                "Recorded on the store as assessed_unreadable_dates with scope=unfillable; the "
-                "only remedy is to re-ingest this store's window from empty.",
-                roi_label,
-                prepared.date,
-                frontier,
-            )
-            return True
 
         def _consume(prepared: _PreparedDate, stall_s: float) -> None:
             """Count or write one prepared date — the ONE consume path both modes take.
@@ -1089,14 +1021,7 @@ def ingest_s2_roi_reflectance(
             """
             nonlocal total_processed, total_filtered
             if prepared.day_ds is None and prepared.read_error is None:
-                # Filtered on its own merits. If it also sits below the frontier, nothing was
-                # lost — it was never going to be written — so it is counted and not recorded.
                 _record_skip(prepared)
-                return
-            if _intercept_unfillable(prepared):
-                # Checked BEFORE the duplicate ladder: stepping copies for a date that cannot be
-                # appended buys nothing, and a copy that succeeded would reach the writer and be
-                # refused fatally.
                 return
             attempt: _PreparedDate = prepared
             tried: list[str] = []
@@ -1217,14 +1142,22 @@ def ingest_s2_roi_reflectance(
         # enough to cross UTC midnight (the far-eastern and far-western zones).
         items.sort(key=solar_day_sort_key)
         by_date = group_items_by_date(items)
-        # Dates below the frontier are NOT dropped here. The month floor cannot reach them — it
-        # starts the query at the frontier's month — but dropping them before preparation meant
-        # judging them without looking: a date the coverage gate would have skipped anyway was
-        # recorded as a loss, the gate then refused to excuse a month that was actually fine, and
-        # re-ingesting would have rebuilt the identical store. They are prepared like any other
-        # date and intercepted before the WRITE instead, by `_intercept_unfillable`.
+        # Belt and braces. The run starts the day after the newest held date, so nothing here
+        # should be closed — but the append this prevents is refused fatally and leaves the store
+        # with no remedy but deletion, which is too expensive to leave to one arithmetic. Dropped
+        # rather than raised: reaching here means the resume start is wrong, and killing a run
+        # over a bug that is otherwise harmless would cost the cell the bug did not.
+        for closed in [d for d in by_date if _closed_to_this_store(d)]:
+            del by_date[closed]
+            log.error(
+                "Not offering %s for roi=%s: the store's newest date is %s, so this day is closed "
+                "to it. The run should have started after that date — this is a bug in the resume "
+                "start, not a property of the imagery.",
+                closed,
+                roi_label,
+                last_written_date,
+            )
         total_seen += len(by_date)
-        considered_dates.update(by_date)
         prepare = _prepare_date
         if batch_dates > 1:
             # Only PASSING dates occupy batch slots — a skipped date adds no work to
@@ -1267,8 +1200,6 @@ def ingest_s2_roi_reflectance(
                     continue
                 if prepared.day_ds is None:
                     _record_skip(prepared)
-                    continue
-                if _intercept_unfillable(prepared):
                     continue
                 batch.append(prepared)
                 batch_stall += stall_s
@@ -1365,42 +1296,10 @@ def ingest_s2_roi_reflectance(
         # on the record.
         record_assessed_window(
             reflectance_store,
-            # The FLOORED start: what this leg walked, not what it was asked for. A resume
-            # skipped the months below its frontier, and claiming them here would say they were
-            # examined and clean. The stored range is joined to this one when the two meet, so
-            # the months an earlier leg did assess stay assessed; across a gap the join is refused
-            # and this leg's range stands alone, which only makes the coverage gate stricter.
             start_date,
             end_date,
-            unreadable=_losses_so_far(),
-            # What this leg actually judged, which is not every day in the range above: it saw
-            # only the days the catalogue returned. Recording it is what stops a later run
-            # clearing a loss for a day no response ever offered it.
-            considered=considered_dates,
-            # Load-bearing exactly when there is something to lose, as the radar path already
-            # was. A leg whose only finding is a date it cannot fill writes nothing, so no
-            # commit carries the record and this call is its sole durable trace; swallowing a
-            # failure here would finish the leg green with the loss named nowhere.
-            # Required only for losses NO write carried. A loss recorded by a commit already has
-            # a durable home, so failing the leg over this record would refuse a run whose losses
-            # are safely stored. A loss decided after the last write has nowhere else to be, and
-            # for that one a swallowed commit failure means the leg finishes green with a hole
-            # named nowhere.
-            required=len(_losses_so_far()) > losses_committed,
+            unreadable=[*unreadable_tile_dates, *producer_conflict_dates],
             s3_region=s3_region,
-        )
-
-    if unfillable_dates:
-        # First of the three summaries, because it is the one that says the STORE is finished
-        # rather than that a date is: nothing can fill these holes in place.
-        log.error(
-            "DATA LOSS SUMMARY roi=%s: %d date(s) below the store's committed maximum %s and "
-            "absent from it — %s. The imagery exists and this store can never hold it. ACTION: "
-            "re-ingest this store's window from empty.",
-            roi_label,
-            len(unfillable_dates),
-            frontier,
-            ", ".join(u["date"] for u in unfillable_dates[:20]),
         )
 
     if unreadable_tile_dates:

@@ -375,23 +375,19 @@ def test_a_leg_that_gave_up_some_dates_and_committed_others_still_succeeds(monke
 
 
 def test_the_record_of_a_given_up_date_is_marked_load_bearing(monkeypatch) -> None:
-    """A loss with no write to carry it makes the end-of-run record load-bearing.
+    """`record_assessed_window` warns and continues on failure, which is wrong when it is
+    the only durable trace of a lost date.
 
-    A swallowed failure there would let the leg succeed, collect a completion marker, and be
-    short-circuited by every later run, leaving a hole nothing names. But that only applies to a
-    loss no commit carried: losses ride every write after them, so a loss followed by a successful
-    date already has a durable home and this record is a convenience for it.
-
-    Here the FIRST catalogue date is lost and later dates are written, so the loss is carried and
-    the record is not required. The uncarried case is covered by
-    ``test_a_loss_no_write_could_carry_makes_the_final_record_required``.
+    A swallowed failure there lets the leg succeed, collect a completion marker, and be
+    short-circuited by every later run, leaving a hole nothing names. The caller therefore
+    has to say the write is required, and only when there is something to lose.
     """
     _result, _written, recorded, _attempts = _run(
         monkeypatch, failures={_CATALOGUE[0]: _raise("RasterioIOError: ZIPDecode: error")}
     )
 
     assert recorded, "the window must be recorded"
-    assert recorded[-1]["required"] is False
+    assert recorded[-1]["required"] is True
 
 
 def test_a_clean_leg_does_not_make_the_record_load_bearing(monkeypatch) -> None:

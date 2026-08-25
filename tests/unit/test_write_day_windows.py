@@ -48,7 +48,7 @@ def _day_ds(date: str, band_val: int) -> xr.Dataset:
     )
 
 
-def _write(store: str, date: str, band_val: int, windows=((0, 4, 0, 8),), manifest=MANIFEST, losses=None) -> None:
+def _write(store: str, date: str, band_val: int, windows=((0, 4, 0, 8),), manifest=MANIFEST) -> None:
     write_day_windows(
         store,
         _day_ds(date, band_val),
@@ -59,7 +59,6 @@ def _write(store: str, date: str, band_val: int, windows=((0, 4, 0, 8),), manife
         tile_id="roi.zarr",
         crs="EPSG:32601",
         chunks=CHUNKS,
-        losses=losses,
     )
 
 
@@ -278,71 +277,3 @@ def test_parallel_falls_back_when_private_api_missing(tmp_path, monkeypatch, cap
     g = open_store_as_zarr_group(store)
     assert (g["band"][0, :4, :] == 7).all()
     assert (g["band"][0, 4:, :4] == 7).all()
-
-
-def _snapshots(store: str) -> int:
-    return len(list(open_repo(store).ancestry(branch="main")))
-
-
-def test_a_loss_rides_the_commit_that_puts_the_date_out_of_reach(tmp_path):
-    """A skipped date has to be recorded by the commit that makes it unfillable, not later.
-
-    The time axis refuses anything older than its maximum, so it is THIS write that turns
-    yesterday's skip into a permanent hole. Recorded in the same commit, the two cannot be
-    separated by a kill: either the store holds the later date and the record of the hole, or
-    it holds neither. An end-of-leg record is separated by the whole rest of the leg.
-    """
-    store = str(tmp_path / "reflectance.zarr")
-    _write(store, "2024-06-01", 7)
-    before = _snapshots(store)
-
-    _write(store, "2024-06-11", 8, losses=[{"date": "2024-06-05", "scope": "unfillable"}])
-
-    assert _snapshots(store) - before == 1, "the record costs no commit of its own"
-    attrs = dict(open_store_as_zarr_group(store).attrs)
-    assert attrs["assessed_unreadable_dates"] == [{"date": "2024-06-05", "scope": "unfillable"}]
-
-
-def test_a_re_sent_loss_is_merged_and_a_written_date_is_never_one(tmp_path):
-    """Two properties of the merge, both reachable from an ordinary retry.
-
-    A write that fails part way is retried with the same pending list, so the same entry
-    arrives twice and must not be listed twice. And a caller still holding an entry for a date
-    this batch is writing is contradicting itself — the date is present, so it is not a loss.
-    """
-    store = str(tmp_path / "reflectance.zarr")
-    _write(store, "2024-06-01", 7, losses=[{"date": "2024-05-30", "scope": "unfillable"}])
-    _write(store, "2024-06-11", 8, losses=[{"date": "2024-05-30", "scope": "unfillable"}])
-
-    assert dict(open_store_as_zarr_group(store).attrs)["assessed_unreadable_dates"] == [
-        {"date": "2024-05-30", "scope": "unfillable"}
-    ]
-
-    _write(store, "2024-06-21", 9, losses=[{"date": "2024-06-21", "scope": "unfillable"}])
-    recorded = dict(open_store_as_zarr_group(store).attrs)["assessed_unreadable_dates"]
-    assert [entry["date"] for entry in recorded] == ["2024-05-30"]
-
-
-def test_a_recovered_date_stops_being_advertised_as_lost_at_its_own_commit(tmp_path):
-    """A recovery brings NO new loss, and the reconciliation must still run.
-
-    A date given up at the tail of an earlier leg is still appendable, so a later leg can read
-    it and write it — arriving here with nothing to add. Skipping the merge on that path commits
-    the pixels while the store goes on advertising the date as lost, and a leg that dies before
-    its end-of-leg record leaves it that way for good.
-    """
-    store = str(tmp_path / "reflectance.zarr")
-    _write(store, "2024-06-01", 7, losses=[{"date": "2024-06-11", "scope": "unreadable"}])
-    assert dict(open_store_as_zarr_group(store).attrs)["assessed_unreadable_dates"]
-
-    _write(store, "2024-06-11", 8)  # the recovery: no losses passed at all
-
-    assert dict(open_store_as_zarr_group(store).attrs)["assessed_unreadable_dates"] == []
-
-
-def test_a_store_that_records_no_loss_gains_no_attribute(tmp_path):
-    """The complement, so the reconciliation cannot become an attribute every store carries."""
-    store = str(tmp_path / "reflectance.zarr")
-    _write(store, "2024-06-01", 7)
-
-    assert "assessed_unreadable_dates" not in dict(open_store_as_zarr_group(store).attrs)

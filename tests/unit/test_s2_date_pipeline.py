@@ -148,8 +148,6 @@ class _Run:
         self.load_started: dict[str, float] = {}
         self.write_ended: dict[str, float] = {}
         self.attempts: list[str] = []
-        #: What each write was handed to record durably in its own commit, in write order.
-        self.losses_at_write: list[list[dict[str, str]]] = []
 
 
 @pytest.fixture
@@ -225,16 +223,12 @@ def run_ingest(monkeypatch):
             run.written.append(date)
             run.write_ended[date] = time.monotonic()
 
-        def write_day_windows(_store, day_ds, _windows, losses=None, **_kwargs):
-            # Snapshotted, because the caller clears its pending list after the call — and
-            # what this asserts on is precisely what rode THIS commit.
-            run.losses_at_write.append([dict(entry) for entry in losses or ()])
+        def write_day_windows(_store, day_ds, _windows, **_kwargs):
             _record_write(day_ds)
 
-        def write_days_windows(_store, days, losses=None, **_kwargs):
+        def write_days_windows(_store, days, **_kwargs):
             # The batched writer takes (day_ds, windows) pairs; each still counts as its
             # own write, which is what the one-commit-per-date accounting assumes.
-            run.losses_at_write.append([dict(entry) for entry in losses or ()])
             for day_ds, _windows in days:
                 _record_write(day_ds)
 
@@ -251,8 +245,10 @@ def run_ingest(monkeypatch):
 
         run.result = s2_roi.ingest_s2_roi_reflectance(
             roi_zarr_path="memory://roi.zarr",
-            start_date=min(dates),
-            end_date=max(dates),
+            # Derived from the catalogue unless a test names them, which is how a deliberately
+            # reversed window gets exercised.
+            start_date=ingest_kwargs.pop("start_date", min(dates)),
+            end_date=ingest_kwargs.pop("end_date", max(dates)),
             store_path="memory://store",
             client=_FakeClient(),
             min_valid_coverage=COVERAGE_THRESHOLD,
@@ -694,202 +690,58 @@ def test_an_asset_incomplete_item_reaches_the_duplicate_ladder(run_ingest, caplo
     assert "2024-01-01" in caplog.text
 
 
-# ---------------------------------------------------------------------------
-# Resuming over a store that already holds dates.
-#
-# The time axis is append-only and strictly increasing, so a date at or below the store's
-# latest committed date can never be written. A leg that offers one raises and the store's
-# only remedy is deletion, so these three tests pin the three things that stop it: the
-# window floor, the per-date check the floor cannot reach, and the record surviving a kill.
-# ---------------------------------------------------------------------------
-
-#: A store stopped at 2018-05-27 with a hole at 2018-05-10 behind it, and imagery on both
-#: sides. 2018-05-27 itself is absent from the catalogue because the real query filters the
-#: committed dates out; this fake does not, and re-offering it would test the dedupe instead.
 RESUME_CATALOGUE = {"2018-01-24": True, "2018-05-10": True, "2018-06-05": True}
-FRONTIER = "2018-05-27"
-
-
-@pytest.fixture
-def assessed(monkeypatch):
-    """Capture the assessed-window record, which no other stub in this module intercepts."""
-    calls: list[dict] = []
-    monkeypatch.setattr(
-        s2_roi,
-        "record_assessed_window",
-        lambda path, start, end, **kw: calls.append({"path": path, "start": start, "end": end, **kw}),
-    )
-    return calls
+LAST_WRITTEN = "2018-05-27"
 
 
 @BOTH_MODES
-def test_a_resume_assesses_from_the_frontiers_month_and_says_so(run_ingest, assessed, pipeline_dates):
-    """The window this leg walked starts at the frontier's MONTH, and the record says that.
+def test_a_resume_offers_nothing_at_or_before_the_newest_held_date(run_ingest, pipeline_dates):
+    """The days an old gap sits in are never reached, so the fatal append cannot happen.
 
-    Two things at once, because they are the same decision. The months below the frontier hold
-    nothing this store can accept, so walking them is pure cost on a year-long window. And the
-    record of what was assessed must not claim them: a month absent from an assessed window is
-    a gap, a month absent inside one is a finding, and a leg that never queried January must
-    not certify it.
+    2018-05-10 is absent from the axis and below the newest held date. Offering it would build a
+    dataset the store then refuses, and that refusal is fatal and unrepairable — it is what left
+    real stores with no remedy but deletion. Starting the day after 2018-05-27 means it is never
+    queried for, never prepared, and never offered.
     """
-    run = run_ingest(RESUME_CATALOGUE, pipeline_dates=pipeline_dates, existing_dates={FRONTIER})
+    run = run_ingest(RESUME_CATALOGUE, pipeline_dates=pipeline_dates, existing_dates={LAST_WRITTEN})
 
-    assert [c["start"] for c in assessed] == ["2018-05-01"], "not the leg's configured start"
-    assert [c["end"] for c in assessed] == ["2018-06-05"], "and the end is still the window's"
-    assert "2018-01-24" not in run.loaded, "a month below the frontier is never queried"
-    # And, because it was never queried, its hole is not claimed either way. Three states have
-    # to stay distinguishable — assessed and empty, assessed and lost, not assessed — and this
-    # month is the third. Recording it as a loss would assert an examination that did not happen.
-    assert "2018-01-24" not in [entry["date"] for c in assessed for entry in c["unreadable"]]
+    assert run.written == ["2018-06-05"], "only days after the newest held one are written"
+    assert "2018-05-10" not in run.loaded, "and the closed day is never even read"
+    assert "2018-01-24" not in run.loaded, "nor any earlier one"
 
 
 @BOTH_MODES
-@pytest.mark.parametrize("batch_dates", [1, 2], ids=["per-date", "batched"])
-def test_a_date_below_the_frontier_is_recorded_as_lost_rather_than_raised(
-    run_ingest, assessed, pipeline_dates, batch_dates, caplog
-):
-    """The floor is not sufficient, and this is the case it cannot reach.
+def test_a_store_already_past_the_window_is_a_no_op(run_ingest, pipeline_dates):
+    """Every day asked for is already closed, so there is nothing to do and nothing to record.
 
-    2018-05-10 lies inside the frontier's own month, so the floor still offers it. Preparing it
-    would succeed and the append would then be refused, which is fatal and unrepairable — so it
-    is dropped before preparation and recorded as the deliberate loss it is. Recording rather
-    than raising is the whole point: the store cannot hold the date either way, and raising
-    additionally costs every later date.
-    """
-    with caplog.at_level(logging.ERROR):
-        run = run_ingest(
-            RESUME_CATALOGUE,
-            pipeline_dates=pipeline_dates,
-            existing_dates={FRONTIER},
-            batch_dates=batch_dates,
-        )
-
-    assert run.written == ["2018-06-05"], "the unfillable date is never offered to the writer"
-    assert "2018-05-10" in run.loaded, (
-        "but it IS prepared: whether it would have been written is the difference between a real "
-        "loss and a date the coverage gate was going to skip anyway"
-    )
-    lost = [entry for c in assessed for entry in c["unreadable"]]
-    assert lost == [{"date": "2018-05-10", "tiles": "", "tried": "", "objects": "", "scope": "unfillable"}]
-    assert "DATA LOSS" in caplog.text and "2018-05-10" in caplog.text
-    # NOT required: 2018-06-05 was written after the loss was decided, and every write carries
-    # the losses so far, so that commit is already a durable home for it. Failing the leg over
-    # this record would refuse a run whose loss is safely stored.
-    assert assessed[-1]["required"] is False
-
-
-@pytest.mark.parametrize("batch_dates", [1, 2], ids=["per-date", "batched"])
-@BOTH_MODES
-def test_a_date_below_the_frontier_the_gate_would_skip_anyway_is_not_a_loss(
-    run_ingest, assessed, pipeline_dates, batch_dates
-):
-    """Being unwritable is not the same as being lost.
-
-    A date below the frontier that the coverage gate rejects on its own merits was never going to
-    be written, so nothing was lost by not writing it. Recording it as a loss made the gate refuse
-    a month that is genuinely fine and sent an operator to rebuild a store that would come back
-    identical — and this path is exactly where the counts that decide a rebuild come from.
-
-    The distinction can only be drawn AFTER preparation, which is why the date is no longer
-    dropped before it.
+    Decided on the newest held date itself. A value floored to its month first can still precede
+    the window's end while the date it came from does not, which is how this case slipped through
+    when the resume started at a month boundary.
     """
     run = run_ingest(
-        # 2018-05-10 is below the frontier AND fails coverage on its own merits.
-        {"2018-05-10": False, "2018-06-05": True},
+        {"2018-05-10": True},
         pipeline_dates=pipeline_dates,
-        batch_dates=batch_dates,
-        existing_dates={FRONTIER},
+        existing_dates={"2018-05-27"},
     )
 
-    assert run.written == ["2018-06-05"]
-    assert "2018-05-10" in run.loaded, "it was judged, not assumed"
-    lost = [entry for c in assessed for entry in c["unreadable"]]
-    assert lost == [], "nothing was lost, so nothing is recorded"
+    assert run.written == []
+    assert run.loaded == [], "nothing was queried, let alone read"
+    assert run.result.status == "skipped"
 
 
 @BOTH_MODES
-def test_a_loss_no_write_could_carry_makes_the_final_record_required(run_ingest, assessed, pipeline_dates):
-    """When nothing is written after a loss, the end-of-run record is its ONLY durable trace.
+def test_a_window_whose_end_precedes_its_start_is_refused(run_ingest, pipeline_dates):
+    """A caller error stays an error rather than becoming a successful skip.
 
-    Every write carries the losses decided before it, so a loss normally has a home the moment any
-    later date lands. A loss decided when no date follows has none — and a swallowed commit failure
-    would then finish the leg green with a hole named nowhere. That is the case `required` exists
-    for, and the only one: demanding it whenever any loss exists would fail a run whose losses are
-    already safely stored.
+    The resume no-op above and this share a shape, so the two are decided separately: reporting a
+    misconfigured leg as complete would let it be marked done with nothing ingested.
     """
-    run = run_ingest(
-        # The window must reach PAST the frontier or the leg is a no-op and never looks. So the
-        # last date offered is one the coverage gate rejects: it is examined, not written, and no
-        # commit follows the unfillable date to carry its record.
-        {"2018-05-10": True, "2018-06-05": False},
-        pipeline_dates=pipeline_dates,
-        existing_dates={FRONTIER},
-    )
-
-    assert run.written == [], "nothing was written, so no commit could have carried the loss"
-    lost = [entry for c in assessed for entry in c["unreadable"]]
-    assert [e["date"] for e in lost] == ["2018-05-10"]
-    assert assessed[-1]["required"] is True
-
-
-@BOTH_MODES
-def test_the_loss_record_rides_the_write_that_makes_the_date_unfillable(run_ingest, assessed, pipeline_dates):
-    """A leg killed mid-run must still leave the truthful record. This is what makes it true.
-
-    The end-of-leg record is written once, after the whole loop, so a leg killed before it
-    reaches that line leaves committed dates, holes, and nothing saying why — the state that
-    produced the wedged stores. Handing the pending losses to the WRITE closes it by
-    construction: the commit that seals a date below the frontier is the same commit that
-    records it, so no kill can land one without the other, and a skip costs no commit of
-    its own.
-    """
-    with pytest.raises(RuntimeError, match="write of 2018-06-20 failed"):
+    with pytest.raises(ValueError, match="after end_date"):
+        # The harness derives the window from the catalogue, so the bounds are passed explicitly
+        # to make them reversed — which is the caller mistake this refuses.
         run_ingest(
-            RESUME_CATALOGUE | {"2018-06-20": True},
+            {"2018-06-05": True},
             pipeline_dates=pipeline_dates,
-            existing_dates={FRONTIER},
-            fail_on="2018-06-20",
+            start_date="2018-12-31",
+            end_date="2018-01-01",
         )
-    run = run_ingest.runs[-1]
-
-    assert not assessed, "the leg died before the end-of-leg record — as a killed leg does"
-    loss = {"date": "2018-05-10", "tiles": "", "tried": "", "objects": "", "scope": "unfillable"}
-    assert run.losses_at_write[0] == [loss], "the first write after the skip carried it"
-    # And every later write carries it again, which is the point rather than a leak: the store
-    # merges losses as a union keyed on the date, so a repeat is a no-op. Asserting it appeared
-    # exactly once would pin a drained queue — state that has to be cleared at the right moment
-    # and kept in step with the lists it mirrors — when what actually has to hold is that no
-    # commit sealing a date can fail to carry it.
-    assert all(loss in w for w in run.losses_at_write), "and every later write carries it too"
-
-
-@BOTH_MODES
-def test_a_store_already_past_the_window_is_a_no_op_rather_than_an_error(run_ingest, assessed, pipeline_dates):
-    """A frontier beyond `end_date` empties the window, and an empty window is not a failure.
-
-    The floor is not clamped, because every day it could be clamped to is one the leg must not
-    walk. So the leg has to recognise the empty window itself, BEFORE it builds a range — the
-    range constructors refuse a reversed one, and a store that has already advanced past its
-    window would fail the leg instead of finishing it.
-    """
-    run = run_ingest(
-        {"2024-01-15": True, "2024-02-15": True},
-        pipeline_dates=pipeline_dates,
-        existing_dates={"2024-12-20"},
-    )
-
-    assert run.result.status == "skipped" and run.written == []
-    assert not assessed, "this leg examined none of the window it was given, so it certifies none of it"
-
-
-@BOTH_MODES
-def test_a_clean_leg_does_not_make_its_assessment_load_bearing(run_ingest, assessed, pipeline_dates):
-    """Nothing was lost, so a failed metadata write must stay a warning rather than fail a leg.
-
-    The complement of the rule above, and the reason it is keyed on the losses rather than set
-    always: a record that fails a leg whenever it cannot commit turns a metadata wobble into a
-    re-dispatch on every healthy cell.
-    """
-    run_ingest({"2024-01-01": True, "2024-01-02": True}, pipeline_dates=pipeline_dates)
-
-    assert assessed and assessed[-1]["required"] is False

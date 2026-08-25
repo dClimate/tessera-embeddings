@@ -374,24 +374,44 @@ def test_owned_items_inherits_the_guard() -> None:
         owned_items([_Item(datetime.datetime(2024, 1, 15, 23, 30))], rng)
 
 
-def test_a_resume_starts_on_the_frontiers_month_boundary() -> None:
-    """The floor is the frontier's MONTH, and the reason is the query padding.
+class TestResumeWindowStart:
+    """Where a run begins, given what the store already holds.
 
-    A solar day straddles the UTC boundary, so a day's query is padded either side. Starting a
-    resume at ``frontier + 1 day`` would query the first owned day on an unpadded bound and
-    write it short — the same defect the batch slicing exists to prevent, reintroduced by the
-    resume. A month boundary keeps every owned day's padding inside the query.
+    Dates go into a store newest-last and cannot be inserted behind one already written, so every
+    day at or before the newest held date is closed to it for good. These are the two things that
+    follow: never search there, and never offer a day from there.
     """
-    assert resume_window_start("2018-01-01", "2018-05-27") == "2018-05-01"
-    assert resume_window_start("2018-01-01", "2018-05-01") == "2018-05-01"
-    assert resume_window_start("2018-01-01", "2018-12-31") == "2018-12-01"
 
+    def test_a_store_with_nothing_written_starts_where_it_was_asked_to(self):
+        assert resume_window_start("2018-01-01", None) == "2018-01-01"
 
-def test_a_floor_never_moves_a_window_start_backwards() -> None:
-    """A frontier below the window says nothing about months the window never asked for.
+    def test_a_resume_starts_the_day_after_the_newest_held_date(self):
+        """The DAY, not the first of its month.
 
-    An empty store has no frontier at all, and a store whose frontier predates the window is
-    being extended forwards — in both cases the leg starts where it was told to.
-    """
-    assert resume_window_start("2018-06-01", None) == "2018-06-01"
-    assert resume_window_start("2018-06-01", "2018-03-14") == "2018-06-01"
+        A month start still offers the earlier days of that month, and an old gap sits exactly
+        there — which is what reached the writer, was refused, and left stores with no remedy but
+        deletion. The day after offers none of them.
+        """
+        assert resume_window_start("2018-01-01", "2018-05-27") == "2018-05-28"
+        assert resume_window_start("2018-01-01", "2018-05-01") == "2018-05-02"
+
+    def test_it_never_moves_the_start_backwards(self):
+        """A store behind the window it was asked for still starts where it was asked."""
+        assert resume_window_start("2019-01-01", "2018-05-27") == "2019-01-01"
+
+    def test_a_month_end_rolls_into_the_next_month(self):
+        assert resume_window_start("2018-01-01", "2018-01-31") == "2018-02-01"
+        assert resume_window_start("2018-01-01", "2018-12-31") == "2019-01-01"
+
+    def test_one_day_of_query_padding_still_covers_the_first_owned_day(self):
+        """Nothing is lost to the tighter start, which is why it is safe.
+
+        A solar day's imagery can carry the adjacent UTC date. The query is padded a day either
+        side of what a run OWNS and the pad is not clamped, so an owned start of ``last + 1`` is
+        still queried from ``last``. The offset is whole hours within [-12, +12], so a solar day
+        never reaches beyond the adjacent UTC day and one day of padding is provably enough.
+        """
+        start = resume_window_start("2018-01-01", "2018-05-27")
+        rng = whole_window_range(start, "2018-12-31")
+        assert rng.own_start == "2018-05-28", "writes only days after the newest held one"
+        assert rng.query_start == "2018-05-27", "but still asks the catalogue about the day before"

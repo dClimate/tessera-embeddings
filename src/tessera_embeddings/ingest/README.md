@@ -1444,83 +1444,6 @@ estimates. The store's axis is day-granular either way, so this only decides WHI
 ordering and which tile wins are untouched, and at mid longitudes the value is unchanged because
 the solar day IS the UTC date there.
 
-### Resuming over a store that already holds dates
-
-**A run that resumes over a store which is already mostly full used to search the catalogue for
-the whole year again, and nearly all of that search could not have produced a single write.**
-Catalogue searching is most of what a resumed run does — the writing is comparatively quick — so
-a store needing one more month paid almost the same search cost as one starting from nothing. On
-an already-complete store the run did nothing else at all: it searched every month, wrote
-nothing, and finished. That is the cost this section removes.
-
-It is removable because of one rule about how stores are written:
-
-**Dates can only ever be added to a store in order, newest last. Once a store holds a date, no
-earlier date can ever be added to it again.**
-
-Slotting one into the middle would mean shifting every chunk after it along by one, and a Zarr
-store's chunks sit at fixed positions — there is nowhere to shift them to. The write is refused
-(`NonMonotonicDateError`) rather than attempted.
-
-So everything at or before the newest date a store holds is closed to it for good, and searching
-the catalogue back there cannot write anything. (The code calls that newest-held date the store's
-`frontier`.)
-
-```
-       already stored                  can still be added
-  |=============================|-------------------------->
-  Jan                    newest date held                 Dec
-                            (Jun 14)
-   \_____ searching here can never write anything _____/
-```
-
-A resumed run therefore starts at the beginning of the month containing that newest date
-(`solar_days.resume_window_start`) rather than at the year's start. It starts at the beginning of
-that *month*, not the day after, because a satellite "day" does not line up with a calendar day —
-we search a day either side to catch the edges, and starting mid-month would clip that margin and
-write the first day short.
-
-Two smaller pieces come with it, because skipping the search is not by itself enough.
-
-**Days at or before the newest held date can still be offered** when they fall inside that same
-month, so each ingest drops them before doing any work.
-
-**And such a day is written down as a loss rather than stopping the run.** It can never be stored
-no matter what we do, so failing destroys the rest of the year and changes nothing else. This
-matters because days do get skipped in normal running — too cloudy, imagery missing the land we
-care about, a file that will not open — and a skipped day leaves a hole that later writes seal
-permanently. Whether a day gets skipped is not settled forever either: improve how unreadable
-files are handled and a day once given up on may read perfectly well, so a resumed run can find
-an old hole, succeed at reading it, and be refused. Before this change that refusal stopped the
-run, and the only cure was deleting the store and re-ingesting the year.
-
-**Later dates are never suppressed.** A day an earlier run gave up on is offered again on purpose
-— it can still be written, so re-offering is exactly how a day recovers once the underlying
-problem is fixed. Failing again costs one re-check.
-
-Each of a cell's three stores (optical, and each of the two radar orbits) works this out
-separately, because they fill at different speeds and a shared answer would skip months a slower
-store never reached.
-
-**A store already past the window it was asked for has nothing to do.** The resume point is not
-clamped to the window's end, because every day it could be clamped to is one the run must not
-search. So each ingest checks for the empty window itself and returns, before building any search
-range — the range builders refuse a backwards one, and a store that has run ahead of its window is
-a no-op rather than a failure. Nothing is recorded in that case: the run looked at none of the
-window it was given.
-
-**A lost day is written down by the same commit that seals it.** This used to be recorded once,
-at the very end of a run. A run killed before reaching that line left behind stored dates, holes,
-and nothing explaining them — indistinguishable from a run that simply had not got there yet. Now
-a pending loss travels with the next date written (`write_days_windows(losses=...)`) and lands in
-the same commit. That commit is the one that seals the skipped day, so nothing can record one
-without the other, and it costs no extra commits.
-
-**Months before the resume point are deliberately left alone.** Their holes are not re-examined
-and not claimed. Three situations have to stay tellable apart — a month examined and genuinely
-empty, a month examined that lost days, and a month never looked at — and a month a run skipped
-is the third.
-
 ### Recording the window an ingest examined
 
 Both paths write `assessed_window` — the date range processed in full — onto the store. A month
@@ -1528,41 +1451,9 @@ absent from the time axis but wholly inside that range was **examined and found 
 reachable**, which is a finding; a month outside it is a gap. Without the record those are
 indistinguishable, and the coverage gate has to fail on both.
 
-**What gets recorded is what the run actually looked at**, not the range it was asked for — a
-resumed run starts partway through the year, so those are different. And both records are
-**added to** what the store already holds rather than replacing it:
+The attribute belongs on the repo the gate opens — `reflectance.zarr` or `sar_<orbit>.zarr` —
+not on the mosaic directory that contains them.
 
-- **The two ranges are joined only if they touch.** When the new range overlaps the stored one,
-  or sits directly against it with no day in between, the pair describes one unbroken stretch and
-  the join is safe — which is
-  what lets a resumed run keep the months an earlier run genuinely examined instead of erasing
-  them. When there is a gap between the two, joining would certify the days in the gap, which
-  nobody looked at, and the coverage gate would then excuse months that are missing because nobody
-  searched for them. The attribute holds one range and cannot describe two, so the join is refused,
-  a warning names the range being dropped, and the range this run can vouch for is what is
-  written. Both choices only make the gate stricter, which is the safe direction; the stored range
-  may be arbitrarily old, while this one was just verified. When the store has no record at all,
-  the range simply begins where this run began, leaving earlier months outside it, which correctly
-  reads as *never looked at*.
-- **The list of lost days is folded out of the history, not maintained.** Each run appends what it
-  examined and what it lost; nothing is edited, reconciled or upgraded afterwards. The two
-  attributes readers consume are recomputed from that history on every write, so they cannot drift
-  from it or from each other.
-
-  Three things follow, and none of them is a rule anyone has to remember:
-  - **A day's verdict comes from the last run whose range covered it**, because that run looked
-    most recently. A day once unreadable, later re-read and legitimately filtered — too cloudy, no
-    live window — simply stops being listed, rather than blocking its month forever.
-  - **A day no run examined keeps its record.** A resumed run starts at its own resume point and
-    never re-derives the earlier months, so it has no opinion on them. This is also what preserves
-    a record written by hand during a repair: those describe exactly the months runs skip.
-  - **A day back on the time axis is not a loss**, whoever recorded it. That happens at the commit
-    that stores it, not only at the end of a run, so a run killed in between cannot leave a stored
-    day still advertised as missing.
-
-  Whether a day can still be written is deliberately NOT stored: it is one comparison against the
-  store's own axis, and every reader has the axis. Storing it is what previously required a rule
-  to keep it current, since the answer changes the moment any later day commits.
 **It is written whenever the store exists, not only when the run wrote a date.** The case that
 needs it most writes nothing. A run interrupted between its last date commit and this record
 leaves every date present and the attribute absent; the retry then dedupes all of those dates
@@ -1576,11 +1467,8 @@ downgrade.
 
 Every uncertain path is strict: an absent, malformed or unparseable attribute excuses nothing,
 and a partially-covered month stays an error because it could hide unexamined days. Failing to
-write the attribute is normally logged rather than raised — the gate simply falls back to
-requiring every month. The exception is a run that gave days up and stored none of them: no
-commit anywhere is carrying that record, so this write is its only durable trace, and a failure
-fails the run rather than finishing it green with the loss written down nowhere.
-`assessed_empty_dates` is recorded alongside for observability, separating "sparse region"
+write the attribute is logged, never raised — the gate simply falls back to requiring every
+month. `assessed_empty_dates` is recorded alongside for observability, separating "sparse region"
 from "the footprints are wrong".
 
 ### Narrowing a date's windows, and skipping dates that reach none
@@ -1969,8 +1857,7 @@ Past that point the response is a ladder, in `s2_roi.py`'s consume path:
 3. **Give up, loudly,** when the implicated tile-dates have no copies left: the date is
    skipped rather than the leg failed, and it is recorded on the store as
    `assessed_unreadable_dates` so the absence reads as a finding rather than an unexamined
-   gap. That record rides the NEXT date's commit, so a leg killed mid-run still leaves it —
-   see *Resuming over a store that already holds dates*.
+   gap.
 
 Two properties are worth stating because they are what the attribution step buys, and they
 are held by tests rather than by comment:
@@ -2076,10 +1963,7 @@ for — OPERA publishes one copy of a granule:
    the earlier one permanently below the append-only maximum, so the re-run meant to recover it is
    refused instead.
 3. **Record it on the store** in the same `assessed_unreadable_dates` attribute the optical path
-   writes, so the coverage gate refuses to excuse a month that lost dates. The record rides the
-   NEXT date's commit rather than waiting for the end of the leg — see *Resuming over a store
-   that already holds dates* — because that commit is the one that puts the skipped date below
-   the frontier.
+   writes, so the coverage gate refuses to excuse a month that lost dates.
 4. **Stop past `MAX_GIVEN_UP_DATES`**, and stopping is TERMINAL.
    `TooManyGivenUpDatesError` is IN the leg-retry classifier's non-retryable set, because nothing
    counted toward the ceiling can clear: a provider refusal re-raises and is retried in order, so

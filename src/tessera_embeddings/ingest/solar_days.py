@@ -55,7 +55,6 @@ __all__ = [
     "normalize_to_solar_day",
     "owned_items",
     "resolve_grouping_longitude",
-    "resume_window_start",
     "solar_day_of",
     "solar_day_offset_seconds",
     "solar_grouping_longitude",
@@ -378,40 +377,6 @@ def fixed_day_ranges(start_date: str, end_date: str, days: int) -> list[SolarDay
     return _padded(spans)
 
 
-def resume_window_start(start_date: str, frontier: str | None) -> str:
-    """Where a leg resuming over a store must begin: the first day of ``frontier``'s MONTH.
-
-    ``frontier`` is the latest date already on that store's time axis, and the axis is
-    append-only in order — so every date at or below it is unreachable and re-walking the
-    months below it is pure cost. On a year-long window a resume near the end was re-querying
-    and re-evaluating the whole year to write a handful of dates.
-
-    The floor is the frontier's MONTH, not the frontier itself and not the day after it. A
-    solar day straddles the UTC boundary, so the query for a day is padded either side
-    (:func:`whole_window_range`, :func:`owned_items`) — start at ``frontier + 1 day`` and the
-    first owned solar day is queried on a bound that excludes part of its imagery, and it is
-    written short. Starting on a month boundary keeps the padding intact and costs at most
-    the re-evaluation of the frontier's own month.
-
-    Dropping the earlier months does NOT by itself make the resume safe: dates below the
-    frontier inside its own month are still offered. The caller must drop those per date —
-    the floor bounds the cost, the per-date check is the correctness.
-
-    The result can land AFTER the caller's ``end_date``, when the store has already advanced
-    past the window it was asked for. That is an empty window, not an error, and the caller
-    must recognise it before building any range: :func:`fixed_day_ranges` and
-    :func:`whole_window_range` both refuse a reversed one. No clamp is applied here, because
-    every value this could clamp to would name a day the caller must not walk.
-
-    Each store has its OWN frontier. A cell's three child stores (reflectance and both radar
-    orbits) advance independently, so a floor computed once and shared would silently skip
-    months a lagging store never reached.
-    """
-    if frontier is None:
-        return start_date
-    return max(start_date, f"{frontier[:7]}-01")
-
-
 def whole_window_range(start_date: str, end_date: str) -> SolarDayRange:
     """A single range owning the entire window.
 
@@ -434,3 +399,33 @@ def owned_items(items: list[Any], rng: SolarDayRange) -> list[Any]:
     needed to rejoin them is gone.
     """
     return [it for it in items if rng.owns(solar_day_of(it))]
+
+
+def resume_window_start(start_date: str, last_written_date: str | None) -> str:
+    """Where a run should begin, given what the store already holds.
+
+    **A store's dates can only be added in order, newest last.** Slotting one into the middle
+    would mean shifting every chunk after it, and a Zarr store's chunks sit at fixed positions —
+    there is nowhere to shift them to. So every day at or before the newest date a store holds is
+    closed to it for good, whatever the imagery turns out to be.
+
+    Two things follow. Searching the catalogue back there cannot write anything, and searching is
+    most of what a resumed run does — so a run resuming over a mostly-full store used to spend
+    nearly all its time on months it could not write to. And a day down there must never reach the
+    writer: the append is refused and the refusal is fatal, which is what wedged real stores.
+
+    Starting the day AFTER the newest held date, rather than at the start of its month, is what
+    makes both true at once. A month start still offers the earlier days of that month, which is
+    exactly where an old gap sits. The day after offers none of them.
+
+    Nothing is lost to the tighter bound, because the query is padded a day either side of what a
+    run OWNS (see :func:`_padded`) — a solar day's imagery can carry the adjacent UTC date, and the
+    pad is what catches it. The owned span is what gates writing, and it starts the day after.
+
+    Each store works this out for itself: a cell's three child stores advance independently, so a
+    start computed once and shared would skip days a lagging store never reached.
+    """
+    if last_written_date is None:
+        return start_date
+    day_after = datetime.date.fromisoformat(last_written_date[:10]) + datetime.timedelta(days=1)
+    return max(start_date, day_after.isoformat())

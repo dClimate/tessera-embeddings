@@ -23,7 +23,6 @@ were checked to fail when the skip is removed, so they are not passing vacuously
 
 from __future__ import annotations
 
-import logging
 import threading
 import time
 
@@ -121,16 +120,7 @@ def test_prepare_exceptions_surface_when_the_batch_is_consumed() -> None:
     assert consumed == [0], f"batch 0 should have been consumed before the failure: {consumed}"
 
 
-def _run_ingest(
-    monkeypatch,
-    catalogue: list[str],
-    existing: set[str],
-    *,
-    start_date: str = "2024-01-01",
-    end_date: str = "2024-01-04",
-    losses_seen: list[list[dict[str, str]]] | None = None,
-    **kwargs,
-) -> list[str]:
+def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs) -> list[str]:
     """Drive ``ingest_s1_roi_sar`` against a faked catalogue and store.
 
     ``catalogue`` is every solar date the catalogue holds; the fake returns the ones
@@ -166,11 +156,7 @@ def _run_ingest(
         )
         return ds, {}
 
-    def fake_write_day_windows(_store, data, *_args, losses=None, **_kwargs):
-        # Snapshotted: the caller clears its pending list after the call, and what a test
-        # asserts on is precisely what rode THIS commit.
-        if losses_seen is not None:
-            losses_seen.append([dict(entry) for entry in losses or ()])
+    def fake_write_day_windows(_store, data, *_args, **_kwargs):
         written.append(str(data["time"].values[0])[:10])
 
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
@@ -192,12 +178,15 @@ def _run_ingest(
 
     s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/roi.zarr",
-        start_date=start_date,
-        end_date=end_date,
+        # Defaults unless a test names them — which is how the resume cases set a window that
+        # straddles what the store already holds.
+        start_date=kwargs.pop("start_date", "2024-01-01"),
+        end_date=kwargs.pop("end_date", "2024-01-04"),
         store_path="s3://bucket/mosaics",
         client=_fake_client(),
         orbit="ascending",
-        **{"batch_days": 2, **kwargs},
+        batch_days=kwargs.pop("batch_days", 2),
+        **kwargs,
     )
     return written
 
@@ -527,67 +516,39 @@ def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
     assert queried == [], "and the catalogue need not be queried at all"
 
 
-def test_a_date_below_the_frontier_is_recorded_as_lost_rather_than_raised(monkeypatch, caplog) -> None:
-    """Each orbit store has its OWN frontier, and its own dates below it to refuse.
+def test_a_resume_offers_nothing_at_or_before_the_newest_held_date(monkeypatch) -> None:
+    """The radar half of the resume rule.
 
-    Radar is the same defect with a different loop: a date at or under the store's latest
-    committed date can never be appended, so offering it can only raise and leave the store
-    unrepairable. The first batch starts at the frontier's MONTH — the query padding needs a
-    month boundary — which leaves the dates below the frontier inside that month still
-    offered, and those are what this drops and records.
+    2018-05-10 is absent from the axis and below the newest held date. Offering it would build a
+    dataset the store then refuses, and that refusal is fatal and unrepairable. Starting the day
+    after 2018-05-27 means it is never queried for and never offered.
     """
-    from tessera_embeddings.ingest import s1_roi
-
-    recorded: list[dict] = []
-    monkeypatch.setattr(
-        s1_roi,
-        "record_assessed_window",
-        lambda path, start, end, **kw: recorded.append({"start": start, "end": end, **kw}),
-    )
-    losses_seen: list[list[dict[str, str]]] = []
-
-    with caplog.at_level(logging.ERROR):
-        written = _run_ingest(
-            monkeypatch,
-            catalogue=["2018-01-24", "2018-05-10", "2018-06-05"],
-            existing={"2018-05-27"},
-            start_date="2018-01-01",
-            end_date="2018-06-30",
-            batch_days=31,
-            losses_seen=losses_seen,
-        )
-
-    assert written == ["2018-06-05"], "the unfillable date is never offered to the writer"
-    assert recorded[0]["start"] == "2018-05-01", "the leg assessed from the frontier's month"
-    # NOT load-bearing: the assertion below proves the loss rode 2018-06-05's commit, so this
-    # record is not its only trace. `required` is for a loss no write could carry.
-    assert recorded[0]["required"] is False
-    assert [entry["date"] for entry in recorded[0]["unreadable"]] == ["2018-05-10"]
-    assert losses_seen[0] == [{"date": "2018-05-10", "scope": "unfillable", "error": ""}], (
-        "the loss rides the commit that seals it, so a killed leg still leaves the record"
-    )
-    assert "DATA LOSS" in caplog.text and "2018-05-10" in caplog.text
-
-
-def test_a_store_already_past_the_window_is_a_no_op_rather_than_an_error(monkeypatch) -> None:
-    """The radar half of the empty-window case.
-
-    The floor is not clamped, because every day it could be clamped to is one the leg must not
-    walk. `fixed_day_ranges` refuses a reversed window, so a store that has already advanced
-    past the window it was asked for would fail the leg rather than finish it.
-    """
-    from tessera_embeddings.ingest import s1_roi
-
-    recorded: list[str] = []
-    monkeypatch.setattr(s1_roi, "record_assessed_window", lambda path, *_a, **_k: recorded.append(path))
-
     written = _run_ingest(
         monkeypatch,
-        catalogue=["2024-01-15", "2024-02-15"],
-        existing={"2024-12-20"},
-        start_date="2024-01-01",
-        end_date="2024-06-30",
+        catalogue=["2018-01-24", "2018-05-10", "2018-06-05"],
+        existing={"2018-05-27"},
+        start_date="2018-01-01",
+        end_date="2018-06-30",
+        batch_days=31,
+    )
+
+    assert written == ["2018-06-05"], "only days after the newest held one"
+
+
+def test_a_store_already_past_the_window_is_a_no_op(monkeypatch) -> None:
+    """Decided on the newest held date itself, not on anything derived from it.
+
+    A start floored to that date's month can still precede the window's end while the date it came
+    from does not — and the range builders then refuse the reversed window and fail the leg instead
+    of finishing it.
+    """
+    written = _run_ingest(
+        monkeypatch,
+        catalogue=["2018-05-10"],
+        existing={"2018-06-30"},
+        start_date="2018-01-01",
+        end_date="2018-06-15",
+        batch_days=31,
     )
 
     assert written == []
-    assert recorded == [], "this leg examined none of the window it was given, so it certifies none of it"
