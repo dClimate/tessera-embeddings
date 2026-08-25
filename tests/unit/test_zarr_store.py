@@ -1394,3 +1394,24 @@ class TestTheAssessmentLog:
         log[1]["considered"] = ["2018-01-05", "2018-01-06", "2018-01-07"]
         _, cleared = project_assessment(log)
         assert cleared == []
+
+    def test_entries_with_no_readable_date_are_all_kept(self):
+        """A record this cannot key is still somebody's account of a hole.
+
+        Keying them by the empty string filed every such entry under one key and kept only the
+        last, silently destroying the rest — the opposite of what an append-only record promises.
+        They cannot be superseded or deduplicated, so they are carried through verbatim.
+        """
+        log = [{"examined": None, "losses": [{"note": "opaque one"}, {"note": "opaque two"}]}]
+        _, losses = project_assessment(log)
+        assert losses == [{"note": "opaque one"}, {"note": "opaque two"}]
+
+    def test_the_empty_date_count_describes_the_range_the_window_does(self):
+        """It is per-run data, so writing one run's figure onto a joined window mismatched them."""
+        log = [
+            {"examined": ["2018-01-01", "2018-01-31"], "losses": [], "empty_dates": 4},
+            {"examined": ["2018-02-01", "2018-02-28"], "losses": [], "empty_dates": 3},
+        ]
+        window, _ = project_assessment(log)
+        assert window == ["2018-01-01", "2018-02-28"]
+        assert sum(int(e.get("empty_dates", 0)) for e in log) == 7, "both months, not just the last"

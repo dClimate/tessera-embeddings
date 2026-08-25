@@ -1363,6 +1363,7 @@ def project_assessment(
     """
     ranges: list[tuple[str, str]] = []
     decided: dict[str, Any] = {}
+    unkeyed: list[Any] = []
     for entry in log:
         examined = entry.get("examined")
         covers: tuple[str, str] | None = None
@@ -1388,14 +1389,22 @@ def project_assessment(
                 del decided[date]
 
         for loss in entry.get("losses") or ():
-            decided[_loss_date(loss)] = loss
+            date = _loss_date(loss)
+            if not date:
+                # No date this can read, so it can be neither superseded nor deduplicated —
+                # keying it would file every such entry under the same empty string and keep
+                # only the last. Carried through verbatim instead: an entry nobody here
+                # understands is still somebody's account of a hole.
+                unkeyed.append(loss)
+                continue
+            decided[date] = loss
 
     window: list[str] | None = None
     if ranges:
         furthest = max(_contiguous_blocks(ranges), key=lambda b: b[1])
         window = [furthest[0], furthest[1]]
     losses = [entry for date, entry in sorted(decided.items()) if date not in present]
-    return window, losses
+    return window, [*losses, *unkeyed]
 
 
 """The ``scope`` of a loss caused by the store's own time axis rather than by the source.
@@ -1487,6 +1496,10 @@ def record_assessed_window(
             "examined": [start_date, end_date],
             "losses": list(unreadable or ()),
             "source": "ingest",
+            # Per RUN, because that is what it measures. Written straight onto the store it
+            # described only this run's months, so a resume whose window joined an earlier one
+            # published a count for part of the range it was attached to.
+            "empty_dates": int(empty_dates),
         }
         if considered is not None:
             # The dates this run actually judged. Only these supersede an earlier verdict; the
@@ -1500,7 +1513,9 @@ def record_assessed_window(
         if window is not None:
             root.attrs[ASSESSED_WINDOW_ATTR] = window
         root.attrs[UNREADABLE_DATES_ATTR] = losses
-        root.attrs["assessed_empty_dates"] = int(empty_dates)
+        # Summed over the history, so it describes the same range the window does.
+        # Observability only — no gate reads it.
+        root.attrs["assessed_empty_dates"] = sum(int(e.get("empty_dates", 0) or 0) for e in log)
         start, end = (window or [start_date, end_date])[0], (window or [start_date, end_date])[1]
         # ``allow_empty`` because re-recording the SAME window writes no bytes, and icechunk
         # refuses a commit with no changes ("cannot commit, no changes made to the session").

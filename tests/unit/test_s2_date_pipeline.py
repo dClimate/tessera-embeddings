@@ -786,8 +786,10 @@ def test_a_loss_no_write_could_carry_makes_the_final_record_required(run_ingest,
     already safely stored.
     """
     run = run_ingest(
-        # The unfillable date is the LAST thing offered, so no write follows it.
-        {"2018-05-10": True},
+        # The window must reach PAST the frontier or the leg is a no-op and never looks. So the
+        # last date offered is one the coverage gate rejects: it is examined, not written, and no
+        # commit follows the unfillable date to carry its record.
+        {"2018-05-10": True, "2018-06-05": False},
         pipeline_dates=pipeline_dates,
         existing_dates={FRONTIER},
     )

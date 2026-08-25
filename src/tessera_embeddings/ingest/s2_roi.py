@@ -497,7 +497,11 @@ def ingest_s2_roi_reflectance(
     # Rebound, so nothing downstream can use the unfloored window by accident — including the
     # assessed-window record, which must describe the months this leg actually walked.
     start_date = resume_window_start(start_date, frontier)
-    if start_date > end_date:
+    # Tested on the FRONTIER, not on the floored start. The floor is the first of the frontier's
+    # month, so a store whose newest date is past the window but inside that same month floors to
+    # a start that still precedes ``end_date`` — the window reads as walkable while every day in
+    # it is already closed.
+    if (frontier is not None and frontier >= end_date) or start_date > end_date:
         # The store already holds a date past this window, so the window is empty and there is
         # nothing to walk. Returned BEFORE any range is built: the range constructors refuse a
         # reversed window, and an already-advanced store is a no-op rather than an error. No
