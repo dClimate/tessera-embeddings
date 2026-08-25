@@ -6,6 +6,7 @@ No Ray cluster is required — all Ray calls are mocked.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import time
 from collections import deque
@@ -230,6 +231,24 @@ class TestActorPoolProperties:
         assert pool.live_count == 3
         pool._retired.add(0)
         assert pool.live_count == 2
+
+    def test_placed_count_excludes_created_but_unplaced_slots(self) -> None:
+        """A slot Ray accepted but has not put on a node has no GPU behind it.
+
+        ``live_count`` must keep counting it — it is a slot the pool intends to
+        dispatch to — while ``placed_count`` must not, because nothing is billed
+        until the instance exists.
+        """
+        pool = _make_pool(3)
+        pool.mark_initializing(1)
+        pool.mark_initializing(2)
+        assert pool.live_count == 3
+        assert pool.placed_count == 1
+
+    def test_placed_count_excludes_retired_slots(self) -> None:
+        pool = _make_pool(3)
+        pool._retired.add(0)
+        assert pool.placed_count == 2
 
 
 # ===========================================================================
@@ -947,6 +966,95 @@ class TestWorkStealingLoopCondition:
         # The chunk must have been processed despite the actor dying
         assert len(results) == 1
         assert results[0]["status"] == "ok"
+
+
+# ===========================================================================
+# _process_chunks_work_stealing — the progress line's GPU-hours figure
+# ===========================================================================
+
+
+class TestWorkStealingGpuHours:
+    """The reported GPU-hours must integrate BILLED capacity, not requested capacity."""
+
+    def test_gpu_hours_integrates_placed_actors_not_created_slots(self) -> None:
+        """During scale-up most slots have no instance behind them yet.
+
+        The pool asks for its whole fleet up front; Ray accepts every handle and
+        the autoscaler brings nodes up behind the request. Integrating the
+        created-slot count therefore reports a fleet-sized GPU-hours figure while
+        only a fraction of the fleet is billed, and it does so for the whole of
+        scale-up — the window in which an operator reads the figure to decide
+        whether to cap the fleet.
+
+        The state that makes this observable is built explicitly: one placed
+        actor, and many slots whose instance-ID fetch never answers because the
+        instance behind them does not exist.
+        """
+        n_unplaced = 19
+        actors = [MagicMock(name=f"actor_{i}") for i in range(1 + n_unplaced)]
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+
+        work_ref = MagicMock(name="work_ref")
+        iid_ref = MagicMock(name="iid_ref")
+        actors[0].process_chunk.remote.return_value = work_ref
+        for unplaced in actors[1:]:
+            unplaced.get_instance_id.remote.return_value = iid_ref
+
+        def fake_wait(refs, num_returns=None, timeout=60):
+            # timeout=0 is resolve_iid. The unplaced slots never answer it —
+            # their get_instance_id is queued behind an __init__ that cannot
+            # start until an instance exists.
+            if timeout == 0:
+                return ([], list(refs))
+            return ([work_ref], [r for r in refs if r is not work_ref])
+
+        # A synthetic clock, so the two figures on the progress line are exactly
+        # determined instead of racing microseconds against each other.
+        clock = itertools.count(start=1.0, step=1.0)
+        polls: list[dict] = []
+
+        def record_poll(*args, **kwargs) -> list[str]:
+            polls.append(kwargs)
+            return []
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
+            patch.object(_sched_mod.ray, "get", return_value={"chunk": "c0", "status": "ok"}),
+            patch.object(_sched_mod.time, "monotonic", side_effect=lambda: next(clock)),
+            patch.object(_sched_mod, "_poll_tracker", side_effect=record_poll),
+        ):
+            results = _process_chunks_work_stealing(
+                actors=actors,  # type: ignore[arg-type]
+                actor_instance_ids=["i-0000"] + ["pending-init"] * n_unplaced,
+                chunks=[_fake_chunk("c0")],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                log=logging.getLogger("test"),
+                tracker=MagicMock(),
+                still_initializing=set(range(1, 1 + n_unplaced)),
+            )
+
+        assert len(results) == 1
+        assert len(polls) == 1, "the run must report progress exactly once for the bound below to be exact"
+        gpu_hours = polls[0]["gpu_hours"]
+        elapsed_hours = polls[0]["elapsed_min"] / 60
+
+        # The figure must still be REPORTED. Omitting it, or leaving it at zero,
+        # satisfies any upper bound while telling an operator nothing.
+        assert gpu_hours > 0
+
+        # One placed actor cannot burn materially more than one GPU-hour per
+        # elapsed hour. The factor of two is slack for the clock ticks between
+        # the loop's own read and the formatter's, not room for extra actors:
+        # counting every created slot puts the figure an order of magnitude above
+        # this bound.
+        assert gpu_hours < 2 * elapsed_hours, (
+            f"{gpu_hours * 3600:.1f} GPU-seconds over {elapsed_hours * 3600:.1f} elapsed seconds with one "
+            f"placed actor — the {n_unplaced} created-but-unplaced slots are being billed for"
+        )
 
 
 # ===========================================================================
