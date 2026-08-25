@@ -335,6 +335,13 @@ def validated_window(start_date: str, end_date: str) -> tuple[datetime.date, dat
     silently wrong for anything else, since ``"2024-02-30"`` sorts like a real date and is not
     one. A leg handed one used to be rejected here; without this call first it would instead be
     reported as a successful skip.
+
+    **A caller that goes on to compare strings must take them from the returned dates**, not
+    from what it was handed. ``date.fromisoformat`` accepts every ISO spelling, including the
+    compact ``"20180101"``, and those do not sort with the canonical form: ``"20180101"`` orders
+    ABOVE ``"2018-12-31"``, because ``"0"`` exceeds ``"-"``. A window spelled that way reads as
+    entirely behind its own end. Returning dates rather than strings is deliberate for the same
+    reason — a caller has to pick a form, and can only pick the canonical one.
     """
     start = datetime.date.fromisoformat(start_date)
     end = datetime.date.fromisoformat(end_date)
@@ -364,6 +371,20 @@ def month_ranges(start_date: str, end_date: str) -> list[SolarDayRange]:
     return _padded(spans)
 
 
+def validated_batch_days(days: int) -> int:
+    """The batch width, refusing one that cannot partition anything.
+
+    Public for the same reason :func:`validated_window` is. A resumed ingest can find that its
+    whole window is already closed and build no range at all, and :func:`fixed_day_ranges` was
+    the only place this rule lived — so the same invalid configuration raised over a partial
+    store and reported a successful skip over a complete one, which is worse than either
+    outcome alone. The caller asks first; this stays here so there is one rule and one message.
+    """
+    if days < 1:
+        raise ValueError(f"days must be >= 1, got {days}")
+    return days
+
+
 def fixed_day_ranges(start_date: str, end_date: str, days: int) -> list[SolarDayRange]:
     """One range per ``days``-long run of solar days across ``[start_date, end_date]``.
 
@@ -374,8 +395,7 @@ def fixed_day_ranges(start_date: str, end_date: str, days: int) -> list[SolarDay
     loop used to cut on UTC dates and write every group the loader produced, which
     truncated any solar day landing on a cut.
     """
-    if days < 1:
-        raise ValueError(f"days must be >= 1, got {days}")
+    validated_batch_days(days)
     start, end = validated_window(start_date, end_date)
     spans: list[tuple[datetime.date, datetime.date]] = []
     span_start = start

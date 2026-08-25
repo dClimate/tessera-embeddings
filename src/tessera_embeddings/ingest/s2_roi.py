@@ -489,7 +489,13 @@ def ingest_s2_roi_reflectance(
     # a range builder — which used to be the only thing that rejected a malformed or reversed
     # window. Checked before the resume start is computed, so a misconfigured leg can never be
     # reported as a successful skip.
-    validated_window(start_date, end_date)
+    # Canonical form, taken from the PARSE rather than from the caller's spelling. Every
+    # comparison the resume makes is a string comparison, and `date.fromisoformat` accepts the
+    # compact "20180101" as readily as "2018-01-01" — but "20180101" sorts ABOVE "2018-12-31",
+    # so a leg spelled that way read its own window as entirely closed, skipped every open date
+    # in it, and reported success.
+    _start, _end = validated_window(start_date, end_date)
+    start_date, end_date = _start.isoformat(), _end.isoformat()
 
     #: The newest date this store holds, and the line everything at or below is closed by. Read
     #: ONCE, before any work: it decides where this run starts, and re-reading it mid-run would

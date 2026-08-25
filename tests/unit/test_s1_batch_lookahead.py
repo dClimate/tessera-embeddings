@@ -608,6 +608,52 @@ def test_the_assessed_window_records_the_requested_start_not_the_resumed_one(mon
     )
 
 
+@pytest.mark.parametrize(
+    ("existing", "state"),
+    [
+        (set(), "an empty store"),
+        ({"2018-03-01"}, "a partially advanced store"),
+        ({"2018-06-30"}, "a store already past the window"),
+    ],
+)
+def test_an_unusable_batch_width_is_refused_whatever_the_store_holds(monkeypatch, existing, state) -> None:
+    """One invalid configuration, one answer — the store's contents must not change the verdict.
+
+    ``fixed_day_ranges`` was the only place enforcing a width of at least one, and a resume over a
+    complete store now builds no range and never calls it. Left there, ``batch_days=0`` would have
+    raised over the first two stores and reported ``status="skipped"`` over the third, so the same
+    misconfigured leg could be recorded as complete depending on how far an earlier attempt got.
+    """
+    with pytest.raises(ValueError, match="days must be >= 1"):
+        _run_ingest(
+            monkeypatch,
+            catalogue=["2018-05-10"],
+            existing=existing,
+            start_date="2018-01-01",
+            end_date="2018-06-15",
+            batch_days=0,
+        )
+
+
+def test_a_compact_iso_window_is_not_read_as_closed(monkeypatch) -> None:
+    """A window spelled `20180101` must behave exactly like one spelled `2018-01-01`.
+
+    ``date.fromisoformat`` accepts both, but the resume compares strings, and `"20180101"` sorts
+    ABOVE `"2018-12-31"` because `"0"` exceeds `"-"`. Taken as handed, the leg reads its own
+    window as entirely behind its end and silently writes nothing.
+    """
+    written = _run_ingest(
+        monkeypatch,
+        catalogue=["2018-01-24", "2018-06-05"],
+        existing={"2018-05-27"},
+        start_date="20180101",
+        end_date="2018-12-31",
+        batch_days=31,
+    )
+
+    assert written == ["2018-06-05"], "the open date is written, not skipped"
+
+
 @pytest.mark.parametrize("bad_end", ["2018-02-30", "not-a-date"])
 def test_a_bound_that_is_not_a_date_is_refused(monkeypatch, bad_end: str) -> None:
     """Every comparison a resume makes is between strings, and a string can sort without meaning.

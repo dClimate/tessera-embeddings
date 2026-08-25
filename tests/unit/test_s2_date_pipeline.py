@@ -803,6 +803,27 @@ def test_a_window_whose_end_precedes_its_start_is_refused(run_ingest, pipeline_d
 
 
 @BOTH_MODES
+def test_a_compact_iso_window_is_not_read_as_closed(run_ingest, pipeline_dates):
+    """A window spelled `20180101` must behave exactly like one spelled `2018-01-01`.
+
+    ``date.fromisoformat`` accepts both, but the resume compares strings, and `"20180101"` sorts
+    ABOVE `"2018-12-31"` because `"0"` exceeds `"-"`. Taken as handed, the leg reads its own
+    window as entirely behind its end, skips every open date in it, and reports success — the
+    worst shape a bug can take here, because nothing raises and nothing is logged as lost.
+    """
+    run = run_ingest(
+        {"2018-06-05": True},
+        pipeline_dates=pipeline_dates,
+        existing_dates={"2018-05-27"},
+        start_date="20180101",
+        end_date="2018-12-31",
+    )
+
+    assert run.written == ["2018-06-05"], "the open date is written, not skipped"
+    assert run.result.status == "success"
+
+
+@BOTH_MODES
 @pytest.mark.parametrize("bad_end", ["2018-02-30", "not-a-date"])
 def test_a_bound_that_is_not_a_date_is_refused(run_ingest, pipeline_dates, bad_end):
     """Every comparison a resume makes is between strings, and a string can sort without meaning.

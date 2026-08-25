@@ -74,6 +74,7 @@ from tessera_embeddings.ingest.solar_days import (
     owned_items,
     resume_window_start,
     solar_grouping_longitude,
+    validated_batch_days,
     validated_window,
 )
 from tessera_embeddings.ingest.stac import ingest_tile
@@ -554,12 +555,22 @@ def ingest_s1_roi_sar(
     #: store and never shared.
     last_written_date: str | None = max(written_dates, default=None)
 
-    # Both bounds are parsed before anything else compares them. Every comparison the resume makes
-    # is between date STRINGS, and a leg can now decide it has nothing to do without ever reaching
-    # `fixed_day_ranges` — which used to be the only thing that rejected a malformed or reversed
-    # window. Checked before the resume start is computed, so a misconfigured leg can never be
-    # reported as a successful skip.
-    validated_window(start_date, end_date)
+    # Everything `fixed_day_ranges` would have rejected is rejected HERE, because a leg can now
+    # decide it has nothing to search for and never reach it — and a configuration that raises
+    # over a partial store while reporting a successful skip over a complete one is worse than
+    # either answer on its own. Both checks live in `solar_days`, so there is one rule and one
+    # message per rule rather than a copy that drifts.
+    #
+    # The bounds in particular have to be PARSED, not compared: every comparison the resume makes
+    # is between date strings, and "2018-02-30" sorts like a real date without being one.
+    # Canonical form, taken from the PARSE rather than from the caller's spelling. Every
+    # comparison the resume makes is a string comparison, and `date.fromisoformat` accepts the
+    # compact "20180101" as readily as "2018-01-01" — but "20180101" sorts ABOVE "2018-12-31",
+    # so a leg spelled that way read its own window as entirely closed, skipped every open date
+    # in it, and reported success.
+    _start, _end = validated_window(start_date, end_date)
+    start_date, end_date = _start.isoformat(), _end.isoformat()
+    validated_batch_days(batch_days)
 
     # Where the CATALOGUE is searched from. Everything at or below the newest held date is closed,
     # so searching back there cannot write anything — and searching is most of what a resumed run
