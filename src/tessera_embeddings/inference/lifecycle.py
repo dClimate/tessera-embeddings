@@ -21,12 +21,21 @@ import ray
 #: only when the account cannot supply a SINGLE GPU instance, which is a property of the region's
 #: spare capacity rather than of anything the fill did wrong.
 #:
-#: That makes the two outcomes badly asymmetric. Waiting costs an idle head node. Giving up fails
-#: the fill, and a chained fill owns a whole roster of zones — so it takes the ingest it would
-#: have dispatched with it, and the work waits for the driver's next re-dispatch round rather than
-#: for capacity. Erring long is therefore much cheaper than erring short, and a drought long
-#: enough to outlast this is one where a human should be deciding, not a timeout.
-ACTOR_INIT_TIMEOUT_SEC = 1800
+#: That makes the two outcomes badly asymmetric. Waiting costs an idle head node and no GPU at
+#: all. Giving up fails the fill, and a chained fill owns a whole roster of zones — so it takes
+#: the ingest it would have dispatched with it, and the work waits for the driver's next
+#: re-dispatch round rather than for capacity. Erring long is much cheaper than erring short.
+#:
+#: **But not unbounded, and that is the reason there is a number here at all.** A misconfigured
+#: launch — a stale image, a revoked permission, an exhausted subnet — presents exactly as a
+#: drought does: zero actors arriving. This bound is the only thing that distinguishes the two, so
+#: removing it converts a failure that says what went wrong into a run that waits forever looking
+#: patient. It would also stop the driver's dispatch round from ever closing, since a round closes
+#: only when every fill returns, which is the very recovery a starved fill needs.
+#:
+#: So: long enough to outlast any real drought, short enough that nothing legitimate reaches it.
+#: Placing one instance does not take hours when the capacity exists.
+ACTOR_INIT_TIMEOUT_SEC = 21600
 """Maximum wall-clock seconds to wait for actor ``__init__`` to complete.
 
 Sized for the worst case: instance launch + container pull + checkpoint
