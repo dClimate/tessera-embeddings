@@ -66,6 +66,7 @@ context_docs/
     ├── staging-identity-and-resume.md            what a run_id identifies, and what resumes
     ├── d3-sharding-plan.md                       settled ADR-008 D3; spec for scale_tests/t8
     ├── global-store-test-plan.md                 the T0-T8 scale tests; §8 is the icechunk API ledger
+    ├── test-suite-streamlining-plan.md           where the unit suite's time goes, and what is safe to cut
     │
     │  MODEL
     └── v2_data_source_alignment_2026_07.md       AWS-vs-MPC input for Tessera v2
