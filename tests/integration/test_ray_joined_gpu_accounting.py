@@ -15,6 +15,12 @@ No GPU is needed. ``num_gpus`` is a scheduling resource that Ray will hand out
 on a machine with no accelerator at all, and it is the accounting we are
 checking, not any device.
 
+The GPU is claimed with a PLACEMENT GROUP rather than an actor. A placement group
+is a reservation the raylet satisfies on its own, so nothing has to start a
+Python worker process — which is the step that has to succeed for an actor, and
+the step a small runner cannot always manage. The reservation exercises the same
+accounting, with strictly fewer moving parts.
+
 What is deliberately NOT here: the created-but-unplaced actor. Locally the only
 way to make an actor unplaceable is to claim every declared GPU, which is not
 the shape of the real case (there the node does not exist yet), and an actor
@@ -34,6 +40,7 @@ from pathlib import Path
 
 import pytest
 import ray
+from ray.util.placement_group import placement_group, remove_placement_group
 
 from tessera_embeddings.inference.scheduling import _joined_gpu_count
 
@@ -84,16 +91,8 @@ def _wait_for_available_gpus_below(total: float, timeout: float = 30.0) -> bool:
     return False
 
 
-@ray.remote(num_gpus=1)
-class _GpuHolder:
-    """Claims one GPU for as long as it lives."""
-
-    def ping(self) -> bool:
-        return True
-
-
 @pytest.mark.integration
-def test_cluster_total_holds_while_actors_claim_gpus(ray_instance: None) -> None:
+def test_cluster_total_holds_while_gpus_are_claimed(ray_instance: None) -> None:
     """The total is billed capacity; the available remainder is not.
 
     If ``cluster_resources`` ever started reporting the unclaimed remainder,
@@ -104,14 +103,17 @@ def test_cluster_total_holds_while_actors_claim_gpus(ray_instance: None) -> None
     assert _joined_gpu_count(0.0, 1.0) == DECLARED_GPUS
     assert ray.available_resources().get("GPU", 0) == DECLARED_GPUS
 
-    holders = [_GpuHolder.remote() for _ in range(2)]  # type: ignore[attr-defined]
-    assert all(ray.get([h.ping.remote() for h in holders]))
+    group = placement_group([{"GPU": 1}, {"GPU": 1}], strategy="PACK")
+    try:
+        ray.get(group.ready(), timeout=60)
 
-    assert _joined_gpu_count(0.0, 1.0) == DECLARED_GPUS, "a GPU an actor is working on is still joined"
-    assert _wait_for_available_gpus_below(DECLARED_GPUS), (
-        "available_resources must be the one that drops — if it stops dropping, the two calls "
-        "have converged and the distinction this rests on is gone"
-    )
-    # And the total is still flat once the claim HAS registered, which is the
-    # property being pinned: the two calls disagree, and we read the stable one.
-    assert _joined_gpu_count(0.0, 1.0) == DECLARED_GPUS
+        assert _joined_gpu_count(0.0, 1.0) == DECLARED_GPUS, "a claimed GPU is still a joined GPU"
+        assert _wait_for_available_gpus_below(DECLARED_GPUS), (
+            "available_resources must be the one that drops — if it stops dropping, the two calls "
+            "have converged and the distinction this rests on is gone"
+        )
+        # And the total is still flat once the claim HAS registered, which is the
+        # property being pinned: the two calls disagree, and we read the stable one.
+        assert _joined_gpu_count(0.0, 1.0) == DECLARED_GPUS
+    finally:
+        remove_placement_group(group)
