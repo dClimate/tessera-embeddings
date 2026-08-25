@@ -245,8 +245,10 @@ def run_ingest(monkeypatch):
 
         run.result = s2_roi.ingest_s2_roi_reflectance(
             roi_zarr_path="memory://roi.zarr",
-            start_date=min(dates),
-            end_date=max(dates),
+            # Derived from the catalogue unless a test names them, which is how a deliberately
+            # reversed window gets exercised.
+            start_date=ingest_kwargs.pop("start_date", min(dates)),
+            end_date=ingest_kwargs.pop("end_date", max(dates)),
             store_path="memory://store",
             client=_FakeClient(),
             min_valid_coverage=COVERAGE_THRESHOLD,
@@ -686,3 +688,155 @@ def test_an_asset_incomplete_item_reaches_the_duplicate_ladder(run_ingest, caplo
     # of these, and leaves the date indistinguishable from one the coverage gate rejected.
     assert "DATA LOSS" in caplog.text
     assert "2024-01-01" in caplog.text
+
+
+RESUME_CATALOGUE = {"2018-01-24": True, "2018-05-10": True, "2018-06-05": True}
+LAST_WRITTEN = "2018-05-27"
+
+
+@BOTH_MODES
+def test_a_resume_offers_nothing_at_or_before_the_newest_held_date(run_ingest, pipeline_dates):
+    """The days an old gap sits in are never reached, so the fatal append cannot happen.
+
+    2018-05-10 is absent from the axis and below the newest held date. Offering it would build a
+    dataset the store then refuses, and that refusal is fatal and unrepairable — it is what left
+    real stores with no remedy but deletion. Starting the day after 2018-05-27 means it is never
+    queried for, never prepared, and never offered.
+    """
+    run = run_ingest(RESUME_CATALOGUE, pipeline_dates=pipeline_dates, existing_dates={LAST_WRITTEN})
+
+    assert run.written == ["2018-06-05"], "only days after the newest held one are written"
+    assert "2018-05-10" not in run.loaded, "and the closed day is never even read"
+    assert "2018-01-24" not in run.loaded, "nor any earlier one"
+
+
+@BOTH_MODES
+def test_a_store_already_past_the_window_is_a_no_op(run_ingest, pipeline_dates):
+    """Every day asked for is already closed, so nothing is searched for.
+
+    The whole window sits at or below the newest held date, so the resumed start passes the end
+    and there is no range left to query. The leg still finishes, and still reports a skip.
+    """
+    run = run_ingest(
+        {"2018-05-10": True},
+        pipeline_dates=pipeline_dates,
+        existing_dates={"2018-05-27"},
+    )
+
+    assert run.written == []
+    assert run.loaded == [], "nothing was queried, let alone read"
+    assert run.result.status == "skipped"
+
+
+@BOTH_MODES
+def test_a_no_op_resume_still_repairs_the_assessed_window(monkeypatch, run_ingest, pipeline_dates):
+    """Writing that record is what a resume over a complete store exists to do.
+
+    A leg interrupted between its last date commit and the assessed-window write leaves every
+    date present and the attribute absent. Returning as soon as there is nothing left to ingest
+    would skip the repair on that retry and on every retry after it, and the coverage gate would
+    read a legitimately empty month as an unexplained gap forever.
+    """
+    from tessera_embeddings.ingest import s2_roi
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(s2_roi, "record_assessed_window", lambda *a, **_k: recorded.append(a))
+
+    run = run_ingest(
+        {"2018-05-10": True},
+        pipeline_dates=pipeline_dates,
+        existing_dates={"2018-05-27"},
+        start_date="2018-01-01",
+        end_date="2018-05-15",
+    )
+
+    assert run.written == []
+    assert run.loaded == [], "and the repair costs no query"
+    assert [a[1:] for a in recorded] == [("2018-01-01", "2018-05-15")]
+
+
+@BOTH_MODES
+def test_the_assessed_window_records_the_requested_start_not_the_resumed_one(monkeypatch, run_ingest, pipeline_dates):
+    """Which days this run queried is not what the store was examined over.
+
+    ``record_assessed_window`` overwrites the attribute with the bounds it is handed, and the
+    coverage gate excuses a month holding no dates only while the attribute covers it. Handing it
+    the resumed start would retract the earlier leg's assessment of every month beneath the line —
+    and an empty month down there would become an unexplained gap that no later run can clear,
+    because no later run can write below the line either.
+    """
+    from tessera_embeddings.ingest import s2_roi
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(s2_roi, "record_assessed_window", lambda *a, **_k: recorded.append(a))
+
+    run = run_ingest(
+        {"2018-06-05": True},
+        pipeline_dates=pipeline_dates,
+        existing_dates={LAST_WRITTEN},
+        start_date="2018-01-01",
+        end_date="2018-12-31",
+    )
+
+    assert run.written == ["2018-06-05"], "the resumed start still governs what is queried"
+    assert [a[1:] for a in recorded] == [("2018-01-01", "2018-12-31")], (
+        "but the record names the window that was asked for, not 2018-05-28"
+    )
+
+
+@BOTH_MODES
+def test_a_window_whose_end_precedes_its_start_is_refused(run_ingest, pipeline_dates):
+    """A caller error stays an error rather than becoming a successful skip.
+
+    The resume no-op above and this share a shape, so the two are decided separately: reporting a
+    misconfigured leg as complete would let it be marked done with nothing ingested.
+    """
+    with pytest.raises(ValueError, match="precedes start_date"):
+        # The harness derives the window from the catalogue, so the bounds are passed explicitly
+        # to make them reversed — which is the caller mistake this refuses.
+        run_ingest(
+            {"2018-06-05": True},
+            pipeline_dates=pipeline_dates,
+            start_date="2018-12-31",
+            end_date="2018-01-01",
+        )
+
+
+@BOTH_MODES
+def test_a_compact_iso_window_is_not_read_as_closed(run_ingest, pipeline_dates):
+    """A window spelled `20180101` must behave exactly like one spelled `2018-01-01`.
+
+    ``date.fromisoformat`` accepts both, but the resume compares strings, and `"20180101"` sorts
+    ABOVE `"2018-12-31"` because `"0"` exceeds `"-"`. Taken as handed, the leg reads its own
+    window as entirely behind its end, skips every open date in it, and reports success — the
+    worst shape a bug can take here, because nothing raises and nothing is logged as lost.
+    """
+    run = run_ingest(
+        {"2018-06-05": True},
+        pipeline_dates=pipeline_dates,
+        existing_dates={"2018-05-27"},
+        start_date="20180101",
+        end_date="2018-12-31",
+    )
+
+    assert run.written == ["2018-06-05"], "the open date is written, not skipped"
+    assert run.result.status == "success"
+
+
+@BOTH_MODES
+@pytest.mark.parametrize("bad_end", ["2018-02-30", "not-a-date"])
+def test_a_bound_that_is_not_a_date_is_refused(run_ingest, pipeline_dates, bad_end):
+    """Every comparison a resume makes is between strings, and a string can sort without meaning.
+
+    ``"2018-02-30"`` orders before ``"2018-05-27"``, so a store past it would take the no-op path
+    and report a misconfigured leg as complete. Before this, the range builder was the only thing
+    that parsed the bounds — and a leg with nothing to search for never reaches one.
+    """
+    with pytest.raises(ValueError):
+        run_ingest(
+            {"2018-06-05": True},
+            pipeline_dates=pipeline_dates,
+            existing_dates={"2018-05-27"},
+            start_date="2018-01-01",
+            end_date=bad_end,
+        )

@@ -72,7 +72,10 @@ from tessera_embeddings.ingest.solar_days import (
     fixed_day_ranges,
     normalize_to_solar_day,
     owned_items,
+    resume_window_start,
     solar_grouping_longitude,
+    validated_batch_days,
+    validated_window,
 )
 from tessera_embeddings.ingest.stac import ingest_tile
 from tessera_embeddings.ingest.transforms import amplitude_to_db
@@ -545,7 +548,56 @@ def ingest_s1_roi_sar(
     #
     # Materialised as a list rather than advanced in the loop because the look-ahead has
     # to know what comes next before the current batch is done with.
-    batch_ranges: list[SolarDayRange] = fixed_day_ranges(start_date, end_date, batch_days)
+    written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region)
+    #: The newest date this store holds. Everything at or below it is closed for good: a Zarr
+    #: store's chunks sit at fixed positions, so a day cannot be slotted in behind one already
+    #: written. Each of a cell's three child stores advances independently, so this is read per
+    #: store and never shared.
+    last_written_date: str | None = max(written_dates, default=None)
+
+    # Everything `fixed_day_ranges` would have rejected is rejected HERE, because a leg can now
+    # decide it has nothing to search for and never reach it — and a configuration that raises
+    # over a partial store while reporting a successful skip over a complete one is worse than
+    # either answer on its own. Both checks live in `solar_days`, so there is one rule and one
+    # message per rule rather than a copy that drifts.
+    #
+    # The bounds in particular have to be PARSED, not compared: every comparison the resume makes
+    # is between date strings, and "2018-02-30" sorts like a real date without being one.
+    # Canonical form, taken from the PARSE rather than from the caller's spelling. Every
+    # comparison the resume makes is a string comparison, and `date.fromisoformat` accepts the
+    # compact "20180101" as readily as "2018-01-01" — but "20180101" sorts ABOVE "2018-12-31",
+    # so a leg spelled that way read its own window as entirely closed, skipped every open date
+    # in it, and reported success.
+    _start, _end = validated_window(start_date, end_date)
+    start_date, end_date = _start.isoformat(), _end.isoformat()
+    validated_batch_days(batch_days)
+
+    # Where the CATALOGUE is searched from. Everything at or below the newest held date is closed,
+    # so searching back there cannot write anything — and searching is most of what a resumed run
+    # does.
+    #
+    # `start_date` is deliberately NOT reassigned. It names the window that was REQUESTED, and
+    # that is what `record_assessed_window` below describes: narrowing the record to the resumed
+    # start would retract the earlier leg's assessment of every month beneath it, and the coverage
+    # gate reads an unassessed absent month as an unexplained gap the zone-year can never clear.
+    query_start_date = resume_window_start(start_date, last_written_date)
+    if query_start_date > end_date:
+        # The store already holds this window's last day, so every batch would sit below the line.
+        # No ranges, and NO early return: the end of this function repairs an assessed-window
+        # record that an interrupted leg never wrote, and a resume over a complete store is
+        # precisely the run that has to perform that repair.
+        log.info(
+            "[%s] Nothing to search for roi=%s %s..%s: the store's newest date is %s, so every day "
+            "in this window is already closed to it.",
+            orbit,
+            roi_label,
+            start_date,
+            end_date,
+            last_written_date,
+        )
+    batch_ranges: list[SolarDayRange] = (
+        fixed_day_ranges(query_start_date, end_date, batch_days) if query_start_date <= end_date else []
+    )
 
     # Read ONCE, then maintained in-process as dates are written.
     #
@@ -569,7 +621,6 @@ def ingest_s1_roi_sar(
     # and re-offering costs one re-evaluation rather than risking anything. A record of the skip
     # would only be needed if the verdict could change between attempts, which is what treating a
     # transient failure as a skip used to allow.
-    written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region)
     # Counted for the assessed-window record: it separates "sparse region" from
     # "the footprints are wrong", which look identical in a date count alone.
     empty_dates = 0
@@ -855,6 +906,24 @@ def ingest_s1_roi_sar(
                 # happened.
                 if date_str in given_up:
                     log.debug("[%s] Skipping date %s: already given up", orbit, date_str)
+                    continue
+
+                # Belt and braces. The run starts the day after the newest held date, so nothing
+                # here should be closed — but the append this prevents is refused fatally and
+                # leaves the store with no remedy but deletion. Dropped rather than raised:
+                # reaching here means the resume start is wrong, and killing a run over a bug that
+                # is otherwise harmless would cost the cell the bug did not.
+                if last_written_date is not None and date_str <= last_written_date:
+                    log.error(
+                        "[%s] Not offering %s for roi=%s: the store's newest date is %s, so this "
+                        "day is closed to it. The run should have started after that date — this "
+                        "is a bug in the resume start, not a property of the imagery.",
+                        orbit,
+                        date_str,
+                        roi_label,
+                        last_written_date,
+                    )
+                    given_up.add(date_str)
                     continue
 
                 if footprint is not None and not footprint:

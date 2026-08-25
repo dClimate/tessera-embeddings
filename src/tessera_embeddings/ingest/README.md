@@ -895,12 +895,88 @@ Two different budgets, for one reason:
 
 A provider having a bad minute is ridden out inside the job. A provider having a bad half-hour is
 better handled by letting the job fail, releasing the machines, and trying again later — a restart
-picks up from the dates already written, so nothing is redone.
+begins the day after the newest date the store holds, so nothing is redone (see *Where a resumed
+run starts*).
 
 One extra guard: the long wait is only granted after a job has already read something successfully.
 "Access denied" looks identical whether the provider is misbehaving or our permissions are simply
 wrong — but wrong permissions fail the very first image, while a provider wobble arrives after the
 job has already been served. So the first successful read is what earns the patience.
+
+## Where a resumed run starts
+
+A store's dates can only be added in order, newest last. Slotting one into the middle would mean
+shifting every chunk after it, and a Zarr store's chunks sit at fixed positions — there is nowhere
+to shift them to. So **every day at or before the newest date a store already holds is closed to
+that store for good**, whatever the imagery for that day later turns out to be.
+
+Most runs are resumes. A leg is dispatched for a whole calendar year, fails or is stopped part way
+through, and is dispatched again for the same year. Everything below the line it reached last time
+is settled; only the days above it are still open.
+
+**So a run starts the day after the newest date its own store holds** (`resume_window_start` in
+`solar_days.py`). Three questions are asked in order, before the catalogue is queried and before
+any date is prepared:
+
+1. **Does the window end before it begins?** That is a caller mistake and always was, so the run
+   refuses it. Asked first, so a misconfigured leg can never be reported as a successful skip.
+2. **Is the store's newest date already at or past the window's last day?** Then nothing in this
+   window is open to it. The run reports a skip and stops without querying anything. The
+   comparison is against the raw date, not against anything derived from it: a value floored to
+   its month first can precede the window's end while the date it came from does not.
+3. **Otherwise, begin the day after that newest date.**
+
+**The day after, rather than the first of its month.** Starting at the month boundary still offers
+the earlier days of that month, and that is exactly where an old gap sits — a day an earlier
+attempt could not write while later days landed above it. Offering such a day to the writer is
+fatal: the append is refused, the leg dies, and it dies again on every retry, because the imagery
+is the same every time. Starting the day after offers none of them. A drop-and-log guard sits in
+front of the writer as well; it should never fire, and it is there because the failure it prevents
+leaves a store with no remedy but deletion.
+
+Nothing is lost by the tighter start. What a run may *write* is the span it **owns**, and every
+catalogue query is padded a day either side of that span, because a solar day's imagery can carry
+the adjacent UTC date (see *Solar days versus UTC queries*). The pad is what catches that edge
+day; the owned span still begins the day after the newest held date. One day of padding is
+provably enough, because a solar offset is a whole number of hours within ±12.
+
+Each store works this out for itself. A cell has up to three of them — optical, ascending radar,
+descending radar — and they advance at different rates, so a start computed once and shared would
+skip days a lagging store never reached.
+
+The saving is the point as much as the safety. Searching the catalogue below the line cannot write
+anything, and searching is most of what a resumed run does, so a resume over a mostly-full store
+used to spend nearly all of its time on months it could not write to.
+
+### Why nothing records what was missed
+
+Once a day is closed, what happened on it stops mattering. Suppose an image that would not read
+this morning reads perfectly this afternoon: it still cannot be written, because a day below the
+line cannot be appended. Readability can change; the outcome cannot.
+
+That is why there is no ledger here of days that were missed. It could not change a decision —
+there is no action it would unlock — it would be one more thing that has to stay in step with the
+store, and it would be deleted along with the mosaic it was written on.
+
+**The published product already answers the question a reader actually has.** A mosaic is an
+intermediate: embeddings are computed from it and then it is deleted. What survives is the
+embeddings store, and it carries per-pixel coverage layers alongside the embeddings themselves —
+`s2_obs_count`, `s1_asc_obs_count` and `s1_desc_obs_count` count the usable observations a pixel
+had, and `s2_month_covered`, `s1_asc_month_covered` and `s1_desc_month_covered` give one
+true-or-false per pixel for each month of the year (see `config/store_layout.py`). "Does this
+pixel have data for August" is answered by the published data itself rather than by a note
+attached to something that no longer exists.
+
+**Downstream, every absence is the same absence.** A day the satellite did not pass over, a day
+too cloudy to keep, a day whose files would not read — none of them put a pixel in the mosaic, and
+nothing that consumes a mosaic tells them apart. The coverage layers say what is there. Why
+something is not there changes nothing about how what *is* there gets used.
+
+One attribute is a separate matter and is still written: `assessed_unreadable_dates` (see *When a
+source object will not read*). It serves the month-level coverage gate, which has to distinguish a
+month that was examined and found to hold nothing reachable from a month no run ever reached. It
+works at month granularity, nothing reads it to make a decision about a day, and it is not a
+record of loss.
 
 ## Performance Optimizations
 
@@ -2004,9 +2080,12 @@ Dask operations. (Inference reads 2048×2048 sub-tiles out of these 4096×4096 c
 catalog and checks for new dates without reading any raster data or starting Fargate tasks,
 so a flow can exit early when nothing is new.
 
-**Not yet wired into any flow** — until it is, the caller is responsible for not passing date
-ranges that overlap what's already in the store (otherwise we spin up a cluster and iterate
-batches only to discover there's nothing to write). Wiring it into the S1/S2 ROI flows is
+**Not yet wired into any flow.** An overlapping date range is no longer a correctness problem for
+the S1/S2 ROI ingests — each of them now begins the day after the newest date its store holds, and
+a window that is wholly below that line returns a skip without querying anything (see *Where a
+resumed run starts*). What the pre-check would still buy is avoiding the cluster: the skip is
+decided inside the ingest, which the caller reaches only after provisioning one. Wiring it into
+the S1/S2 ROI flows is
 tracked in [issue #47](https://github.com/dClimate/tessera-embeddings/issues/47). When doing
 so, avoid sharing one OPERA `item_provider_fn` between the pre-check and the real query — the
 provider re-queries CMR on every call, so reuse would double the query cost.

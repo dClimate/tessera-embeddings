@@ -326,7 +326,23 @@ def _padded(spans: list[tuple[datetime.date, datetime.date]]) -> list[SolarDayRa
     ]
 
 
-def _window(start_date: str, end_date: str) -> tuple[datetime.date, datetime.date]:
+def validated_window(start_date: str, end_date: str) -> tuple[datetime.date, datetime.date]:
+    """The two bounds as dates, refusing anything that is not a real window.
+
+    Public because the range builders below are no longer the only callers that need it. A
+    resumed ingest decides whether it has anything to do BEFORE it builds any range, and it
+    decides by comparing ``YYYY-MM-DD`` strings — which is exact for well-formed dates and
+    silently wrong for anything else, since ``"2024-02-30"`` sorts like a real date and is not
+    one. A leg handed one used to be rejected here; without this call first it would instead be
+    reported as a successful skip.
+
+    **A caller that goes on to compare strings must take them from the returned dates**, not
+    from what it was handed. ``date.fromisoformat`` accepts every ISO spelling, including the
+    compact ``"20180101"``, and those do not sort with the canonical form: ``"20180101"`` orders
+    ABOVE ``"2018-12-31"``, because ``"0"`` exceeds ``"-"``. A window spelled that way reads as
+    entirely behind its own end. Returning dates rather than strings is deliberate for the same
+    reason — a caller has to pick a form, and can only pick the canonical one.
+    """
     start = datetime.date.fromisoformat(start_date)
     end = datetime.date.fromisoformat(end_date)
     if end < start:
@@ -345,7 +361,7 @@ def month_ranges(start_date: str, end_date: str) -> list[SolarDayRange]:
     month — which is what makes the slices independent. No cross-month state is needed
     to deduplicate, and that matters because the worker can be restarted at any point.
     """
-    start, end = _window(start_date, end_date)
+    start, end = validated_window(start_date, end_date)
     spans: list[tuple[datetime.date, datetime.date]] = []
     year, month = start.year, start.month
     while (year, month) <= (end.year, end.month):
@@ -353,6 +369,20 @@ def month_ranges(start_date: str, end_date: str) -> list[SolarDayRange]:
         spans.append((max(start, datetime.date(year, month, 1)), min(end, datetime.date(year, month, last_day))))
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
     return _padded(spans)
+
+
+def validated_batch_days(days: int) -> int:
+    """The batch width, refusing one that cannot partition anything.
+
+    Public for the same reason :func:`validated_window` is. A resumed ingest can find that its
+    whole window is already closed and build no range at all, and :func:`fixed_day_ranges` was
+    the only place this rule lived — so the same invalid configuration raised over a partial
+    store and reported a successful skip over a complete one, which is worse than either
+    outcome alone. The caller asks first; this stays here so there is one rule and one message.
+    """
+    if days < 1:
+        raise ValueError(f"days must be >= 1, got {days}")
+    return days
 
 
 def fixed_day_ranges(start_date: str, end_date: str, days: int) -> list[SolarDayRange]:
@@ -365,9 +395,8 @@ def fixed_day_ranges(start_date: str, end_date: str, days: int) -> list[SolarDay
     loop used to cut on UTC dates and write every group the loader produced, which
     truncated any solar day landing on a cut.
     """
-    if days < 1:
-        raise ValueError(f"days must be >= 1, got {days}")
-    start, end = _window(start_date, end_date)
+    validated_batch_days(days)
+    start, end = validated_window(start_date, end_date)
     spans: list[tuple[datetime.date, datetime.date]] = []
     span_start = start
     while span_start <= end:
@@ -385,7 +414,7 @@ def whole_window_range(start_date: str, end_date: str) -> SolarDayRange:
     without it the first and last solar day of the run are queried on a UTC bound that
     excludes part of their imagery.
     """
-    start, end = _window(start_date, end_date)
+    start, end = validated_window(start_date, end_date)
     return _padded([(start, end)])[0]
 
 
@@ -399,3 +428,33 @@ def owned_items(items: list[Any], rng: SolarDayRange) -> list[Any]:
     needed to rejoin them is gone.
     """
     return [it for it in items if rng.owns(solar_day_of(it))]
+
+
+def resume_window_start(start_date: str, last_written_date: str | None) -> str:
+    """Where a run should begin, given what the store already holds.
+
+    **A store's dates can only be added in order, newest last.** Slotting one into the middle
+    would mean shifting every chunk after it, and a Zarr store's chunks sit at fixed positions —
+    there is nowhere to shift them to. So every day at or before the newest date a store holds is
+    closed to it for good, whatever the imagery turns out to be.
+
+    Two things follow. Searching the catalogue back there cannot write anything, and searching is
+    most of what a resumed run does — so a run resuming over a mostly-full store used to spend
+    nearly all its time on months it could not write to. And a day down there must never reach the
+    writer: the append is refused and the refusal is fatal, which is what wedged real stores.
+
+    Starting the day AFTER the newest held date, rather than at the start of its month, is what
+    makes both true at once. A month start still offers the earlier days of that month, which is
+    exactly where an old gap sits. The day after offers none of them.
+
+    Nothing is lost to the tighter bound, because the query is padded a day either side of what a
+    run OWNS (see :func:`_padded`) — a solar day's imagery can carry the adjacent UTC date, and the
+    pad is what catches it. The owned span is what gates writing, and it starts the day after.
+
+    Each store works this out for itself: a cell's three child stores advance independently, so a
+    start computed once and shared would skip days a lagging store never reached.
+    """
+    if last_written_date is None:
+        return start_date
+    day_after = datetime.date.fromisoformat(last_written_date[:10]) + datetime.timedelta(days=1)
+    return max(start_date, day_after.isoformat())

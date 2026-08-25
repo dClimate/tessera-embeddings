@@ -178,12 +178,14 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
 
     s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/roi.zarr",
-        start_date="2024-01-01",
-        end_date="2024-01-04",
+        # Defaults unless a test names them — which is how the resume cases set a window that
+        # straddles what the store already holds.
+        start_date=kwargs.pop("start_date", "2024-01-01"),
+        end_date=kwargs.pop("end_date", "2024-01-04"),
         store_path="s3://bucket/mosaics",
         client=_fake_client(),
         orbit="ascending",
-        batch_days=2,
+        batch_days=kwargs.pop("batch_days", 2),
         **kwargs,
     )
     return written
@@ -512,3 +514,160 @@ def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
     assert result.dates_processed == {"ascending": 0}
     assert written == [], "no date may be committed when nothing can be stored"
     assert queried == [], "and the catalogue need not be queried at all"
+
+
+def test_a_resume_offers_nothing_at_or_before_the_newest_held_date(monkeypatch) -> None:
+    """The radar half of the resume rule.
+
+    2018-05-10 is absent from the axis and below the newest held date. Offering it would build a
+    dataset the store then refuses, and that refusal is fatal and unrepairable. Starting the day
+    after 2018-05-27 means it is never queried for and never offered.
+    """
+    written = _run_ingest(
+        monkeypatch,
+        catalogue=["2018-01-24", "2018-05-10", "2018-06-05"],
+        existing={"2018-05-27"},
+        start_date="2018-01-01",
+        end_date="2018-06-30",
+        batch_days=31,
+    )
+
+    assert written == ["2018-06-05"], "only days after the newest held one"
+
+
+def test_a_store_already_past_the_window_is_a_no_op(monkeypatch) -> None:
+    """The whole window sits below the line, so there is no batch left to build.
+
+    The resumed start passes the window's end. Handing that to ``fixed_day_ranges`` would be a
+    reversed range and would fail the leg instead of finishing it, so no range is built at all.
+    """
+    written = _run_ingest(
+        monkeypatch,
+        catalogue=["2018-05-10"],
+        existing={"2018-06-30"},
+        start_date="2018-01-01",
+        end_date="2018-06-15",
+        batch_days=31,
+    )
+
+    assert written == []
+
+
+def test_a_no_op_resume_still_repairs_the_assessed_window(monkeypatch) -> None:
+    """Writing that record is what a resume over a complete store exists to do.
+
+    A leg interrupted between its last date commit and the assessed-window write leaves the orbit
+    store complete and unannotated. Returning as soon as there is nothing left to ingest would
+    skip the repair on that retry and on every retry after it, and the coverage gate would read a
+    month the orbit genuinely never saw as an unexplained gap forever.
+    """
+    from tessera_embeddings.ingest import s1_roi
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(s1_roi, "record_assessed_window", lambda *a, **_k: recorded.append(a))
+
+    written = _run_ingest(
+        monkeypatch,
+        catalogue=["2018-05-10"],
+        existing={"2018-06-30"},
+        start_date="2018-01-01",
+        end_date="2018-06-15",
+        batch_days=31,
+    )
+
+    assert written == []
+    assert [a[1:] for a in recorded] == [("2018-01-01", "2018-06-15")]
+
+
+def test_the_assessed_window_records_the_requested_start_not_the_resumed_one(monkeypatch) -> None:
+    """Which days this run queried is not what the store was examined over.
+
+    ``record_assessed_window`` overwrites the attribute with the bounds it is handed, and the
+    coverage gate excuses a month holding no dates only while the attribute covers it. Handing it
+    the resumed start would retract the earlier leg's assessment of every month beneath the line —
+    and an absent month down there would become an unexplained gap that no later run can clear,
+    because no later run can write below the line either.
+    """
+    from tessera_embeddings.ingest import s1_roi
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(s1_roi, "record_assessed_window", lambda *a, **_k: recorded.append(a))
+
+    written = _run_ingest(
+        monkeypatch,
+        catalogue=["2018-01-24", "2018-06-05"],
+        existing={"2018-05-27"},
+        start_date="2018-01-01",
+        end_date="2018-12-31",
+        batch_days=31,
+    )
+
+    assert written == ["2018-06-05"], "the resumed start still governs what is queried"
+    assert [a[1:] for a in recorded] == [("2018-01-01", "2018-12-31")], (
+        "but the record names the window that was asked for, not 2018-05-28"
+    )
+
+
+@pytest.mark.parametrize(
+    ("existing", "state"),
+    [
+        (set(), "an empty store"),
+        ({"2018-03-01"}, "a partially advanced store"),
+        ({"2018-06-30"}, "a store already past the window"),
+    ],
+)
+def test_an_unusable_batch_width_is_refused_whatever_the_store_holds(monkeypatch, existing, state) -> None:
+    """One invalid configuration, one answer — the store's contents must not change the verdict.
+
+    ``fixed_day_ranges`` was the only place enforcing a width of at least one, and a resume over a
+    complete store now builds no range and never calls it. Left there, ``batch_days=0`` would have
+    raised over the first two stores and reported ``status="skipped"`` over the third, so the same
+    misconfigured leg could be recorded as complete depending on how far an earlier attempt got.
+    """
+    with pytest.raises(ValueError, match="days must be >= 1"):
+        _run_ingest(
+            monkeypatch,
+            catalogue=["2018-05-10"],
+            existing=existing,
+            start_date="2018-01-01",
+            end_date="2018-06-15",
+            batch_days=0,
+        )
+
+
+def test_a_compact_iso_window_is_not_read_as_closed(monkeypatch) -> None:
+    """A window spelled `20180101` must behave exactly like one spelled `2018-01-01`.
+
+    ``date.fromisoformat`` accepts both, but the resume compares strings, and `"20180101"` sorts
+    ABOVE `"2018-12-31"` because `"0"` exceeds `"-"`. Taken as handed, the leg reads its own
+    window as entirely behind its end and silently writes nothing.
+    """
+    written = _run_ingest(
+        monkeypatch,
+        catalogue=["2018-01-24", "2018-06-05"],
+        existing={"2018-05-27"},
+        start_date="20180101",
+        end_date="2018-12-31",
+        batch_days=31,
+    )
+
+    assert written == ["2018-06-05"], "the open date is written, not skipped"
+
+
+@pytest.mark.parametrize("bad_end", ["2018-02-30", "not-a-date"])
+def test_a_bound_that_is_not_a_date_is_refused(monkeypatch, bad_end: str) -> None:
+    """Every comparison a resume makes is between strings, and a string can sort without meaning.
+
+    ``"2018-02-30"`` orders before ``"2018-05-27"``, so a store past it would take the no-op path
+    and report a misconfigured leg as complete. Before this, ``fixed_day_ranges`` was the only
+    thing that parsed the bounds — and a leg with nothing to search for never reaches it.
+    """
+    with pytest.raises(ValueError):
+        _run_ingest(
+            monkeypatch,
+            catalogue=["2018-06-05"],
+            existing={"2018-05-27"},
+            start_date="2018-01-01",
+            end_date=bad_end,
+            batch_days=31,
+        )
