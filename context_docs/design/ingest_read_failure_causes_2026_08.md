@@ -13,6 +13,15 @@ holes nothing can fill. Traces
 `WarpOperationError('Chunk and warp failed')` and `PermissionError: The provided token has
 expired` to their exact causes, so the guards can be aimed at the right terms.
 
+**Corrected in place 2026-08-25: the store attribute `assessed_unreadable_dates` no longer
+exists.** Passages below that describe a lost date being written to it are a record of what the
+code did at the time, not of what it does now. The attribute was removed once the resume rule
+landed: a leg begins the day after the newest date its store holds, so a date it gave up on is
+closed to that store for good, and the coverage gate subtracting such months refused a month
+nothing could ever fill. A lost date is still logged per date and again in an end-of-leg summary;
+what survives a fill is the embeddings store's per-pixel observation counts and per-month coverage
+masks. `assessed_window` and `assessed_empty_dates` are unaffected.
+
 Companion to `ingest_optimization_campaign_2026_07.md` (the authoritative ingest record) and
 `ingest_concurrency_investigation_2026_08.md` (the fleet-width contention work).
 
@@ -645,7 +654,7 @@ identically, so it fails the leg on the first date rather than being skipped dat
 **The owner's decision, 2026-08-20/21: skip the date, keep the leg, accept the loss of depth the
 second case implies, and add nothing else.** No count, no ceiling, no new failure mode. At the rate
 below, any bound would only ever fire on a fault of some other kind — and every date given up is
-already logged at error level and written to the store's `assessed_unreadable_dates`, so a leg that
+already logged at error level, so a leg that
 lost an implausible number of them says so on the record without a guard to announce it.
 
 ### The observed rate — why this is low priority
@@ -719,7 +728,7 @@ something a pinning defect explains.
 `ingest/duplicates.py` gains `is_provider_refusal`, beside `is_unreadable_source` rather than
 inside it — an unreadable object wants a different copy or a give-up, a refusal wants only to be
 waited out. `ingest/s1_roi.py` gains the bounded skip: retry, then give up the one date, record
-it on the store as `assessed_unreadable_dates` with `scope=provider-refused` or
+it on the store as `assessed_unreadable_dates` (since REMOVED — see the head of this document) with `scope=provider-refused` or
 `scope=unreadable`, and stop past `MAX_GIVEN_UP_DATES = 10`.
 
 Two properties carry the design:

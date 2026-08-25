@@ -295,43 +295,35 @@ class TestCheckTimeWindowCoverage:
         with pytest.raises(InsufficientCoverageError, match="no timestamps within the window"):
             check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending")
 
-    def test_a_month_lost_to_unreadable_imagery_is_not_excused(self, monkeypatch):
-        """A whole-month DATA-LOSS hole must not publish as a legitimate absence.
+    def test_a_month_whose_dates_were_all_lost_is_excused_like_any_other(self, monkeypatch):
+        """The behaviour this replaces, stated as a decision rather than left as a silence.
 
-        The assessed window says "we looked here". It cannot say "and there was nothing to
-        find" for a month whose every acquisition was skipped as unreadable — there the
-        imagery existed and was lost. Both look identical to a present-month count, and the
-        year is write-once, so excusing this one makes the hole permanent and mislabelled.
+        Absence inside the assessed window used to be split in two: a month with nothing to find
+        was excused, and a month whose acquisitions were skipped as unreadable was not. The store
+        recorded the second in ``assessed_unreadable_dates``, and the gate subtracted it.
+
+        That distinction cannot survive the resume rule. A day only ever fails to be written once
+        a later day has committed above it, and a store's time axis only grows — so the day is
+        closed for good, whatever the imagery turns out to be. Refusing the month therefore does
+        not protect anything; it deadlocks the cell, because no run can ever fill it and the only
+        exit is deleting the store. That is a judgement a human makes from an audit.
+
+        What the reader gets instead is the published product: per-pixel observation counts and a
+        per-month coverage mask per sensor, which say what a pixel actually has rather than why.
         """
         import tessera_embeddings.inference.data_loading as dl
 
         def _open_store(path, **kwargs):
             root = _make_time_group("2024-08-01", "2024-10-31")  # first 3 months only
-            root.attrs["assessed_window"] = ["2024-08-01", "2025-07-31"]  # would excuse them all
+            root.attrs["assessed_window"] = ["2024-08-01", "2025-07-31"]
+            # What an old store may still carry. It must be inert, not merely unread: a store
+            # written before the removal must not behave differently from one written after.
             root.attrs["assessed_unreadable_dates"] = [{"date": "2025-03-14", "objects": 4, "scope": "tile"}]
             return root
 
         monkeypatch.setattr(dl, "open_store_as_zarr_group", _open_store)
-        with pytest.raises(InsufficientCoverageError, match="2025-03"):
-            check_time_window_coverage("s3://fake/mosaic", parse_time_window("July 2025"), s1_orbit="ascending")
-
-    def test_an_unparseable_unreadable_record_excuses_nothing(self, monkeypatch):
-        """Same asymmetry the assessed-window parser uses: a damaged record makes it STRICTER.
-
-        If the list cannot be read, which month lost imagery is unknown — so no month may be
-        excused. Over-excusing publishes a hole; under-excusing costs a re-ingest.
-        """
-        import tessera_embeddings.inference.data_loading as dl
-
-        def _open_store(path, **kwargs):
-            root = _make_time_group("2024-08-01", "2024-10-31")
-            root.attrs["assessed_window"] = ["2024-08-01", "2025-07-31"]
-            root.attrs["assessed_unreadable_dates"] = [{"date": "not-a-date"}]
-            return root
-
-        monkeypatch.setattr(dl, "open_store_as_zarr_group", _open_store)
-        with pytest.raises(InsufficientCoverageError):
-            check_time_window_coverage("s3://fake/mosaic", parse_time_window("July 2025"), s1_orbit="ascending")
+        summary = check_time_window_coverage("s3://fake/mosaic", parse_time_window("July 2025"), s1_orbit="ascending")
+        assert summary["stores"]["reflectance"]["months_absent_unexplained"] == 0
 
     def test_an_assessed_window_still_excuses_absent_months_when_data_exists(self, monkeypatch):
         """The guard must not undo what the assessed window is FOR.
