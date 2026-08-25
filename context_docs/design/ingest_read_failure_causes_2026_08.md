@@ -1,15 +1,16 @@
-# Ingest source-read failures: ten causes, and the retry budget they share
+# Ingest source-read failures: eleven causes, and the retry budget they share
 
 Investigation record. Causes 1 and 2 traced 2026-08-04/05 on `global-tessera-dev`; cause 3 absorbed
 2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20,
-cause 5 on 2026-08-21, causes 6 and 7 on 2026-08-22/23, and causes 8, 9 and 10 on 2026-08-24, all
-from live campaign legs. **Corrected in place: this document said "three causes" until cause 4 was
-added, "four causes" until cause 5 joined it, "five causes" until cause 6 did, "six causes" until
-cause 7 did, "eight causes" until cause 9 did, and "nine causes" until cause 10 did.** Causes 9 and
-10 are both second halves of cause 8 rather than new mechanisms: cause 9 is the same refusal
-classified correctly and then given a budget that could not act on the classification, and cause 10
-is the same refusal never classified at all, because the evidence for it was never in the exception
-to begin with. Cause 7 is the
+cause 5 on 2026-08-21, causes 6 and 7 on 2026-08-22/23, causes 8, 9 and 10 on 2026-08-24, and cause
+11 on 2026-08-25, all from live campaign legs. **Corrected in place: this document said "three
+causes" until cause 4 was added, "four causes" until cause 5 joined it, "five causes" until cause 6
+did, "six causes" until cause 7 did, "eight causes" until cause 9 did, "nine causes" until cause 10
+did, and "ten causes" until cause 11 did.** Causes 9, 10 and 11 are all later halves of cause 8
+rather than new mechanisms: cause 9 is the same refusal classified correctly and then given a budget
+that could not act on the classification, cause 10 is the same refusal never classified at all
+because the evidence for it was never in the exception, and cause 11 is the sensor built for cause 10
+listening to a channel the evidence was not on. Cause 7 is the
 only one here that is not a source failure — it is our own bookkeeping, and the only one that left
 holes nothing can fill. Traces
 `WarpOperationError('Chunk and warp failed')` and `PermissionError: The provided token has
@@ -1279,7 +1280,7 @@ entered the exception at all.** No reducer recovers it, because there is nothing
 
 `ingest/loader_failures.py` already installed a log handler on the loader's own logger, to name the
 object a load aborted on. It gains a second, on `rasterio._env` — the logger rasterio's CPL error
-handler forwards every GDAL message to, and the only place the refusal is stated.
+handler forwards GDAL's messages to, and the only place the refusal is stated.
 `carry_logged_refusal` attaches what it collected to the failing exception as a note,
 `_exception_chain_text` reads notes with the rest of the chain, and `classify_read_failure`
 therefore decides from all of it.
@@ -1330,6 +1331,156 @@ to stop destroying it. This one looks identical from the classifier's seat and h
 the reader has to go and fetch what the raiser never said. Before widening a predicate, ask not only
 whether the input still contains what it should, but whether it ever did — and where else the same
 process wrote it down.
+
+## Cause 11 — the log the sensor listens to was not where GDAL said it, 2026-08-25
+
+**Cause 10's capture, shipped and working, and three more dates gone.** Cause 10 went in the morning
+of 2026-08-25. That afternoon ASF refused reads again and the capture largely held: in one
+half-hour window, **663 `ProviderRefusedReadsError`** — the good outcome, no date skipped — and
+**102 log lines quoting captured evidence**, against **zero `TooManyGivenUpDatesError`**.
+
+Three radar dates were skipped anyway, all with the pre-fix signature:
+
+| time (UTC) | task | orbit | zone | date |
+|---|---|---|---|---|
+| 15:20:44.488 | `process-roi-sar-d7b` | ascending | 37N | 2020-12-31 |
+| 15:21:23.456 | `process-roi-sar-119` | descending | 36N | 2017-11-19 |
+| 15:21:36.917 | `process-roi-sar-135` | ascending | 32N | 2019-11-03 |
+
+Each logged `scope=unreadable error=Chunk and warp failed`.
+
+### The mechanism
+
+GDAL keeps its error handlers **per thread**. `CPLPushErrorHandler`, which is what
+`rasterio.Env.__enter__` calls to install rasterio's logging handler, pushes onto the calling
+thread's stack; a message reported on a thread whose stack is empty falls through to GDAL's
+process-wide handler, `CPLDefaultErrorHandler`, which writes to the process's stderr and to no
+logger. GDAL's ranged reader fetches on threads of its own, and those threads never enter a
+`rasterio.Env`.
+
+So the refusal for these three reads was stated, in the same process, 43 ms before the loader gave
+up on the object — and it was never a Python log record at all. `_LoggedRefusalHandler` is a
+`logging.Handler`. There was nothing for it to see.
+
+### Evidence
+
+Everything below is from log group `/ecs/global-tessera-prod`, 15:15–15:25 on 2026-08-25.
+
+The lost read, on worker `9fd26b71`, in order:
+
+```
+15:20:11.570  ERROR 1: Request for https://asf-cumulus-prod-opera-products.s3.us-west-2.amazonaws.com/
+              OPERA_L2_RTC-S1/...T072-152798-IW1_20201231T150410Z..._VV.tif
+              range 1358074-3075915 failed with response_code=403
+15:20:11.613  ERROR | odc.loader._rio - Aborting load due to failure while reading: <the same object>
+15:20:12.083  INFO  | distributed.worker - Run out-of-band function 'read_local_refusals'
+15:20:12.482  WARNING | Retrying <unknown> in 3.22 seconds as it raised WarpOperationError: Chunk and warp failed.
+...
+15:20:44.465  INFO  | distributed.worker - Run out-of-band function 'read_local_refusals'
+15:20:44.480  INFO  | distributed.worker - Run out-of-band function 'read_local_refusals'
+15:20:44.488  ERROR | DATA LOSS roi=zone_37N date=2020-12-31 ... scope=unreadable error=Chunk and warp failed
+```
+
+**The `ERROR 1:` prefix is the whole diagnosis.** `ERROR %d: %s` is the format string of
+`CPLDefaultErrorHandler` and appears nowhere in rasterio's Python or Cython source; rasterio's own
+handler formats `%s in %s` from its `code_map`. A line reading `ERROR 1: …` was therefore written by
+GDAL's process-wide handler, which means the reporting thread had no handler pushed.
+
+Counts over the same window, which is what makes this a class rather than an incident:
+
+| where GDAL's 403 statements went | count |
+|---|---|
+| stderr, via `CPLDefaultErrorHandler` (`ERROR 1: Request for … response_code=403`) | **1,462** |
+| `rasterio._env` at WARNING (`CPLE_AppDefined in HTTP response code on <url>: 403`) | **13** |
+
+**The capture could see 0.9% of what GDAL said.** The 13 visible lines were on 12 workers; the 51
+reads saved by captured evidence all borrowed from those 13, cluster-wide. The three lost reads were
+the ones whose own leg held none of them — each leg's collection fanned out to about ten workers, and
+none of `d7b`'s ten appears in the list of twelve.
+
+**This document had already written the wording down.** The headline table at the top of this file
+records `ERROR 1: Request for <url> range X-Y failed with response_code=403` as the line that
+precedes the expired-credential case, and has since cause 1. The `ERROR 1:` prefix that identifies
+the channel, and the `response_code=` spelling the classifier could not read, were both sitting in
+this file's own summary while cause 10's capture was built against a different wording entirely.
+
+### What was NOT the cause, each checked
+
+The collection worked. Every one of these was eliminated against the logs:
+
+- **A worker died holding the evidence.** `_collect` logs `"… did not answer …"` when a worker fails
+  to answer, and that line appears **zero times in the hour**. All four collections for the lost
+  read are visible on the worker's own stream.
+- **The age bound dropped it.** The read entered `read_failure_context` at about 15:19:52 and the
+  first collection ran at 15:20:12.083, so the cutoff was ~20 s; the newest cluster-wide line was
+  0.9 s old.
+- **`_REFUSAL_RETENTION_S` evicted it.** 3,600 s against a read that lasted 53 s.
+- **`is_source_read_failure` returned early.** The chain carried both `WarpOperationError` and
+  `CPLE_`, so it did not.
+- **The cause was destroyed in transit.** `READ CAUSE LOST` never fired, and the chain arrived whole:
+  `WarpOperationError: Chunk and warp failed` ← `CPLE_AppDefinedError: ZIPDecode:Decoding error at
+  scanline 0`.
+- **The imagery was genuinely bad.** Three objects, in the same minute as 1,462 refusals of the same
+  bucket, each preceded by a 403 on the exact object the loader then gave up on.
+
+**And these three are the whole of it.** Eight dates were skipped between 14:30 and 16:00. The other
+five are optical, `scope=attributed`, on `sentinel-cogs` and `sentinel-s2-l2a` rather than ASF, and
+their last errors are `ObjectNotFound` (cause 4) or a `Chunk and warp failed` on one tile that two
+separate legs reproduced 23 minutes apart — a corrupt object (cause 2), which is what the copy
+ladder exists for. No optical date was lost to this mechanism.
+
+### A second defect, in the same path and independent of the first
+
+Even reaching the logger, that line would have been dropped. `_LoggedRefusalHandler` keeps a line
+only if the classifier reads it ALONE as a refusal, and `_HTTP_STATUS_RE` was anchored on GDAL's two
+`code:` wordings. The ranged reader says `response_code=` instead, so the pattern read **no status**
+out of the wording that accounts for 99% of production's refusal statements, and a line with no
+status is not a refusal. Confirmed directly: `classify_read_failure_in` returned `undecidable` for
+the exact line above.
+
+So the fix is two halves, and each was verified to be load-bearing by reverting it alone.
+
+### The change
+
+`ingest/loader_failures.py` gains `hear_gdal_from_every_thread`, installed alongside the two log
+handlers by `install_capture` — the same sensor, since the handlers hear what GDAL says to a logger
+and this is what makes GDAL say the rest of it to one. It sets GDAL's process-wide handler, through
+`CPLSetErrorHandler`, to a callback that forwards to `rasterio._env`.
+
+Four properties carry the safety of it:
+
+- **Chained, not replaced.** The previously installed handler is called first, so GDAL's stderr line
+  still appears where an operator greps for it and `CE_Fatal` still aborts through it. All this adds
+  is a second copy, on a logger.
+- **Thread-local still wins.** GDAL consults the reporting thread's stack first, so nothing rasterio
+  already forwards is forwarded twice. Tested, because without it every note would quote every line
+  twice.
+- **rasterio's own wording, from rasterio's own `code_map`.** The classifier's corroboration that a
+  line is the source READER's is GDAL's vocabulary, and `CPLE_AppDefined in <message>` carries the
+  `CPLE_` a bare GDAL sentence does not. Borrowing the format is what lets such a line be judged on
+  its own, and means no new marker was added to `_SOURCE_READER_MARKERS`.
+- **Not levelled the way rasterio levels it.** rasterio downgrades `CE_Failure` to INFO because one
+  of its calls may emit several and still succeed. A message reaching the process-wide handler has no
+  such call to judge it, and INFO is below both the logger's default level and the capture's, so
+  honouring the downgrade would record it nowhere.
+
+`ingest/duplicates.py` widens `_HTTP_STATUS_RE` to read a status out of `response_code=<n>` as well.
+`\d{3}` and not `\d+`, because GDAL prints `response_code=0` when the request never completed: that
+is the absence of a status, and admitting it would make it a 4xx meaning neither wait nor absence —
+the verdict that re-raises and fails a leg on its first date.
+
+The polarity argument of cause 10 is unchanged and still the reason this is safe: a kept line can
+only move a verdict into `PROVIDER_REFUSED` or `OUR_CREDENTIAL`, so the capture cannot cost a date,
+and a wrong one costs patience.
+
+### The general shape
+
+**A sensor on a log is a sensor on a CHANNEL, and the channel may not be where the thing is said.**
+Cause 10 asked whether the evidence was ever in the exception. This asks the same question one layer
+out: the evidence existed, in the right process, at the right moment, and the sensor was pointed at a
+Python logger while the library was writing to a file descriptor. Before trusting a capture, count
+what it sees against what the source emits — 13 against 1,475 was visible in the log group from the
+first query, and no amount of reasoning about levels, ages or retention would have found it.
 
 ## Coupling to the leg retry
 

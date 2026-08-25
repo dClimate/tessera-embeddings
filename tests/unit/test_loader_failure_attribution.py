@@ -23,13 +23,17 @@ orchestrator receives without being produced the way the real one is.
 from __future__ import annotations
 
 import copyreg
+import ctypes
 import inspect
 import logging
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 
 import pytest
+import rasterio
+import rasterio._base
 from distributed.core import clean_exception, error_message
 from rasterio._err import CPLE_AppDefinedError, CPLE_BaseError
 from rasterio.errors import RasterioIOError, WarpOperationError
@@ -205,14 +209,34 @@ LOGGED_OVERLOAD = (
     "OPERA_L2_RTC-S1_T072-152803-IW2_20211108T150433Z_S1B_30_v1.0_VV.tif. Retrying again in 0.5 secs"
 )
 
+#: GDAL's ranged reader, with the CPL class prefixed as the forwarder prefixes it. The third
+#: wording, alongside the two above.
+#:
+#: It says ``response_code=`` where they say ``code:``, so a pattern anchored on theirs reads no
+#: status out of it — and a line with no status is not a refusal to the classifier, so this one
+#: was dropped by the very filter that keeps the capture safe.
+GDAL_RANGED_REFUSAL = (
+    "Request for https://asf-cumulus-prod-opera-products.s3.us-west-2.amazonaws.com/OPERA_L2_RTC-S1/"
+    "OPERA_L2_RTC-S1_T072-152798-IW1_20201231T150410Z_20250906T012248Z_S1B_30_v1.0/"
+    "OPERA_L2_RTC-S1_T072-152798-IW1_20201231T150410Z_20250906T012248Z_S1B_30_v1.0_VV.tif "
+    "range 1358074-3075915 failed with response_code=403"
+)
+LOGGED_RANGED_REFUSAL = f"CPLE_AppDefined in {GDAL_RANGED_REFUSAL}"
+
 #: GDAL log lines that are NOT refusals, each chosen for what keeping it would do to a verdict.
 #: The 404 is the dangerous one — GDAL probes for sidecars that were never published, and that
 #: line read as evidence says the imagery is ABSENT, which gives a date up.
+#:
+#: ``response_code=0`` is the ranged reader's way of saying the request never completed, so it is
+#: the ABSENCE of a status rather than one. Read as a status it is a 4xx that means neither wait
+#: nor absence, which is the verdict that fails a leg on its first date.
 BENIGN_GDAL_LINES = [
     "CPLE_AppDefined in HTTP response code: 404",
     "CPLE_AppDefined in ZIPDecode:Decoding error at scanline 0",
     "CPLE_AppDefined in TIFFReadDirectory:Sum of Photometric type-related color channels "
     "and ExtraSamples doesn't match SamplesPerPixel",
+    "CPLE_AppDefined in Request for https://h/o.tif range 1-2 failed with response_code=0",
+    "CPLE_AppDefined in Request for https://h/o.tif range 900-901 failed with response_code=416",
 ]
 
 
@@ -258,13 +282,27 @@ def _gdal_logs(message: str) -> None:
 class TestCapturingWhatGdalLogsButDoesNotRaise:
     """The second buffer: refusals stated in GDAL's own log and nowhere else."""
 
-    @pytest.mark.parametrize("line", [LOGGED_REFUSAL, LOGGED_OVERLOAD], ids=["refused-403", "overloaded-503"])
+    @pytest.mark.parametrize(
+        "line",
+        [LOGGED_REFUSAL, LOGGED_OVERLOAD, LOGGED_RANGED_REFUSAL],
+        ids=["refused-403", "overloaded-503", "ranged-403"],
+    )
     def test_a_logged_refusal_is_recorded(self, line: str) -> None:
-        """Both wordings the incident produced, on text taken from the incident's own logs."""
+        """All three wordings GDAL states a status in."""
         _gdal_logs(line)
         assert _refusal_messages() == [line]
 
-    @pytest.mark.parametrize("line", BENIGN_GDAL_LINES, ids=["sidecar-404", "the-codec-itself", "a-tiff-quirk"])
+    @pytest.mark.parametrize(
+        "line",
+        BENIGN_GDAL_LINES,
+        ids=[
+            "sidecar-404",
+            "the-codec-itself",
+            "a-tiff-quirk",
+            "no-response-at-all",
+            "range-past-the-end",
+        ],
+    )
     def test_only_a_refusal_is_recorded(self, line: str) -> None:
         """The filter is the polarity guard, so it is asserted case by case rather than argued.
 
@@ -272,6 +310,13 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         published, and that verdict GIVES A DATE UP. Keeping the codec's own line would let the
         capture confirm what the exception already said. Neither is what the log is being read
         for, and both would let this capture make a verdict worse.
+
+        The 416 is the one to watch, because it is the shape a TRUNCATED object takes: the tile
+        index claims a range past the end of the file, and the store answers the range it cannot
+        satisfy. Read alone that line is a client error, which is not skippable — so keeping it
+        would turn a date that is skipped today into a leg that fails on its first date. It is
+        dropped only because ``_KEEPABLE`` holds the two refusals and nothing else, which makes
+        that tuple load-bearing rather than a tidy-up, and is why widening it needs this case.
         """
         _gdal_logs(line)
         assert _refusal_messages() == []
@@ -394,6 +439,108 @@ def test_the_capture_hears_gdal_at_the_level_rasterio_really_uses() -> None:
     clear_local_refusals()
     gdal.warning("%s", LOGGED_REFUSAL)
     assert _refusal_messages() == [LOGGED_REFUSAL]
+
+
+def _make_gdal_report(err_class: int, message: str) -> Callable[[], None]:
+    """A call that makes GDAL state ``message`` at ``err_class``, through GDAL itself.
+
+    ``CPLError`` rather than a rasterio call, because the case under test is defined by WHICH
+    THREAD reports: rasterio pushes its handler on any thread that enters an ``Env``, and there is
+    no Python-level GDAL call that reports from a thread of GDAL's own making. So the thread is
+    what these tests construct; the message is the one production emitted.
+    """
+    gdal = ctypes.CDLL(rasterio._base.__file__)
+    gdal.CPLError.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+    return lambda: gdal.CPLError(err_class, 1, message.encode())
+
+
+@pytest.mark.usefixtures("capture_installed")
+class TestHearingGdalWhereRasterioDoesNot:
+    """The messages GDAL states to its process-wide handler, which no logger sees.
+
+    GDAL's ranged reader fetches on threads of its own and rasterio's handler is pushed per
+    thread, so a refusal those threads state goes to the process's stderr and reaches no logger
+    at all. A capture built only of ``logging.Handler``s cannot see it.
+    """
+
+    def test_a_refusal_stated_off_any_rasterio_thread_is_recorded(self) -> None:
+        """The whole point: a thread rasterio never entered still reaches the capture.
+
+        ``CE_Failure``, because that is the class a refused range fetch is stated at. rasterio's own handler
+        would log it at INFO — below both the logger's default level and the capture's — so
+        honouring that downgrade here would record it nowhere.
+        """
+        report = _make_gdal_report(3, GDAL_RANGED_REFUSAL)
+        thread = threading.Thread(target=report)
+        thread.start()
+        thread.join()
+
+        assert _refusal_messages() == [LOGGED_RANGED_REFUSAL]
+
+    def test_a_thread_rasterio_did_enter_is_not_heard_twice(self) -> None:
+        """The bound on the change: the pushed handler still wins, so nothing is doubled.
+
+        GDAL consults the reporting thread's handler stack and only falls through to the
+        process-wide one when it is empty. If that were not so, every message rasterio already
+        forwards would be recorded a second time and every note would quote it twice.
+        """
+        report = _make_gdal_report(2, GDAL_RANGED_REFUSAL)
+        with rasterio.Env():
+            report()
+
+        assert _refusal_messages() == [LOGGED_RANGED_REFUSAL]
+
+    def test_concurrent_installs_leave_exactly_one_forwarder(self, monkeypatch) -> None:
+        """Two installers must not each chain a callback GDAL then holds the address of.
+
+        The callback is kept alive only by the module-level reference. If two calls both install,
+        the second overwrites that reference and the first callback becomes collectable while GDAL
+        and the chained handler still hold its address — a dangling pointer the next GDAL error
+        calls into. Installing under a lock is what makes the count exactly one.
+        """
+        installs: list[object] = []
+
+        class _FakeEntryPoint:
+            """Stands in for a ctypes function pointer: callable, and carries the two signatures."""
+
+            restype: object = None
+            argtypes: object = None
+
+            def __call__(self, handler: object) -> None:
+                installs.append(handler)
+                return None
+
+        class _FakeGdal:
+            CPLSetErrorHandler = _FakeEntryPoint()
+
+        def load(_: str) -> _FakeGdal:
+            """Yields, because the real ``ctypes.CDLL`` call RELEASES the GIL.
+
+            That release is what makes the window between the check and the assignment reachable
+            by a second thread. A fake that holds the GIL throughout cannot exercise it, and the
+            test would pass with no lock at all.
+            """
+            time.sleep(0.01)
+            return _FakeGdal()
+
+        monkeypatch.setattr(loader_failures.ctypes, "CDLL", load)
+        monkeypatch.setattr(loader_failures.atexit, "register", lambda *a, **k: None)
+        monkeypatch.setattr(loader_failures, "_forwarder", None)
+
+        start = threading.Barrier(8)
+
+        def install() -> None:
+            start.wait()
+            loader_failures.hear_gdal_from_every_thread()
+
+        threads = [threading.Thread(target=install) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(installs) == 1
+        assert loader_failures._forwarder is installs[0]
 
 
 def _decode_failure_over_a_refused_object() -> WarpOperationError:
