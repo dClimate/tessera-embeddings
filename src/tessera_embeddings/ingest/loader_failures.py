@@ -246,10 +246,16 @@ _CE_FAILURE = 3
 #: A CPL error handler: ``void (*)(CPLErr, CPLErrorNum, const char *)``.
 _CPL_ERROR_HANDLER = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_int, ctypes.c_char_p)
 
-#: The installed forwarder, held at module scope for as long as GDAL may call it — GDAL keeps the
-#: function POINTER, so nothing else keeps the callback object alive. Doubles as the idempotence
-#: flag, since a second install would chain the forwarder to itself.
-_forwarder: Any = None
+#: Every forwarder ever installed, held at module scope for as long as GDAL may call it — GDAL
+#: keeps the function POINTER, so nothing else keeps the callback object alive. Doubles as the
+#: idempotence flag, since a second install would chain the forwarder to itself.
+#:
+#: **A list that is only ever appended to, rather than one slot.** A slot makes the callback's
+#: lifetime depend on nothing ever reassigning it: overwrite it while GDAL and a chained handler
+#: still hold the old address and the next GDAL error calls into freed memory, which recurses
+#: through the chain rather than failing cleanly. Appending makes that structurally impossible
+#: instead of a rule to remember.
+_forwarders: list[Any] = []
 
 
 def hear_gdal_from_every_thread() -> None:
@@ -287,9 +293,8 @@ def hear_gdal_from_every_thread() -> None:
 
     Never raises. A process that cannot install this reads exactly as it did before it.
     """
-    global _forwarder
     with _install_lock:
-        if _forwarder is not None:
+        if _forwarders:
             return
         gdal_log = logging.getLogger(_GDAL_LOGGER)
         # Reassigned below to whatever was installed; read by `forward` through the closure, so the
@@ -320,7 +325,7 @@ def hear_gdal_from_every_thread() -> None:
             gdal.CPLSetErrorHandler.argtypes = [_CPL_ERROR_HANDLER]
             forwarder = _CPL_ERROR_HANDLER(forward)
             already = gdal.CPLSetErrorHandler(forwarder)
-            _forwarder = forwarder
+            _forwarders.append(forwarder)
         except Exception:
             logger.warning(
                 "Could not forward GDAL's process-wide messages to %s: a refusal stated on a thread "
