@@ -2506,6 +2506,30 @@ class TestTheTwoVerdictsCannotDisagree:
         assert is_provider_refusal(failure) is True
         assert is_unreadable_source(failure) is False
 
+    @pytest.mark.parametrize("status", [403, 429, 500, 503])
+    def test_the_ranged_readers_wording_carries_a_status_too(self, status: int) -> None:
+        """GDAL's third wording, and the one production overwhelmingly uses.
+
+        ``Request for <url> range <first>-<last> failed with response_code=<n>`` says
+        ``response_code=`` where the two wordings this file already covers say ``code:``. On
+        2026-08-25 it accounted for 1,462 of the 1,475 statements GDAL made about a 403 — and read
+        by a pattern anchored on the others it carries no status at all, so the refusal it states
+        was undecidable and the codec failure beneath it kept its unreadable verdict.
+        """
+        failure = _read_failure(f"Request for https://h/o.tif range 1-2 failed with response_code={status}")
+        assert is_provider_refusal(failure) is True
+        assert is_unreadable_source(failure) is False
+
+    def test_a_request_that_never_got_a_response_names_no_status(self) -> None:
+        """``response_code=0`` is the absence of a status, and must not be read as one.
+
+        GDAL prints it when the request did not complete. Three digits is what separates it from a
+        status, and admitting it would make it a 4xx that means neither wait nor absence — the
+        verdict that re-raises and fails a leg on its first date.
+        """
+        failure = _read_failure("Request for https://h/o.tif range 1-2 failed with response_code=0")
+        assert is_provider_refusal(failure) is False
+
     @pytest.mark.parametrize(
         ("cause", "refusal", "unreadable"),
         [
