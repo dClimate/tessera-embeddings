@@ -525,7 +525,7 @@ class TestHearingGdalWhereRasterioDoesNot:
 
         monkeypatch.setattr(loader_failures.ctypes, "CDLL", load)
         monkeypatch.setattr(loader_failures.atexit, "register", lambda *a, **k: None)
-        monkeypatch.setattr(loader_failures, "_forwarder", None)
+        monkeypatch.setattr(loader_failures, "_forwarders", [])
 
         start = threading.Barrier(8)
 
@@ -540,7 +540,7 @@ class TestHearingGdalWhereRasterioDoesNot:
             thread.join()
 
         assert len(installs) == 1
-        assert loader_failures._forwarder is installs[0]
+        assert loader_failures._forwarders == installs
 
 
 def _decode_failure_over_a_refused_object() -> WarpOperationError:
