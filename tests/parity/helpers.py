@@ -21,6 +21,8 @@ import numpy as np
 import xarray as xr
 import zarr
 
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
+from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.storage.zarr_store import open_store
 
 # Attribute keys that are *expected* to differ between runs and are
@@ -165,3 +167,26 @@ def _compare_arrays(arr_a: np.ndarray, arr_b: np.ndarray, *, name: str, rtol: fl
 def _iter_array_names(group: zarr.Group) -> list[str]:
     """List array names in a Zarr group (one level deep)."""
     return [name for name, _ in group.arrays()]
+
+
+#: UTM zone 13N, which covers the Denver quickstart AOI. Both ROI-parity tests rasterise
+#: against it, and a mismatch between them would compare two different projections.
+FORCE_CRS = "EPSG:32613"
+
+
+def stage_quickstart_roi(tmp_path: Path, roi_geojson: Path) -> Path:
+    """Rasterise the quickstart GeoJSON to a Zarr ROI under ``tmp_path``.
+
+    Shared because the S1 and S2 ROI-parity tests staged it with byte-identical code. Both
+    compare a Prefect flow against the plain runner over the SAME staged ROI, so the staging
+    is setup common to them rather than anything either one is testing.
+    """
+    roi_zarr = tmp_path / "roi.zarr"
+    rasterize_roi_zarr(
+        output_path=str(roi_zarr),
+        resolution=10.0,
+        chunk_size=INGEST_CHUNK_SIZE,
+        force_crs=FORCE_CRS,
+        input_path=str(roi_geojson),
+    )
+    return roi_zarr

@@ -23,31 +23,15 @@ from pathlib import Path
 import pytest
 from dask.distributed import Client
 
-from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
-from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
 from tessera_embeddings.orchestration.prefect.flows import ingest_s2_roi_reflectance as flow_module
-from tests.parity.helpers import assert_zarr_equivalent
+from tests.parity.helpers import assert_zarr_equivalent, stage_quickstart_roi
 
 CASSETTE_NAME = "test_s2_roi_parity"
 
 # Denver, CO. The fixture covers July 2024 — non-trivial S2
 # cloud coverage that exercises the cloud sort.
 DENVER_DATES = ("2024-07-01", "2024-07-31")
-FORCE_CRS = "EPSG:32613"  # UTM zone 13N covers Denver
-
-
-def _stage_quickstart_roi(tmp_path: Path, roi_geojson: Path) -> Path:
-    """Rasterise the quickstart GeoJSON to a Zarr ROI under ``tmp_path``."""
-    roi_zarr = tmp_path / "roi.zarr"
-    rasterize_roi_zarr(
-        output_path=str(roi_zarr),
-        resolution=10.0,
-        chunk_size=INGEST_CHUNK_SIZE,
-        force_crs=FORCE_CRS,
-        input_path=str(roi_geojson),
-    )
-    return roi_zarr
 
 
 @pytest.mark.parity
@@ -62,7 +46,7 @@ def test_s2_roi_parity(
     """Domain function and Prefect flow produce identical S2 reflectance Zarrs."""
     monkeypatch.setattr(flow_module, "get_run_logger", lambda: logging.getLogger("parity-s2"))
 
-    roi_zarr = _stage_quickstart_roi(tmp_path, fixture_quickstart_roi)
+    roi_zarr = stage_quickstart_roi(tmp_path, fixture_quickstart_roi)
 
     domain_store = tmp_path / "domain"
     flow_store = tmp_path / "flow"

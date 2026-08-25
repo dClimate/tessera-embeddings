@@ -235,16 +235,42 @@ They are not protecting anything today. Decide per test: move it to the tier who
 run it, or delete it. Do not leave it where it is — a test that never runs reads as coverage
 and is not.
 
-### Phase 3 — DRY the stubs (moderate value)
+### Phase 3 — DRY the stubs — MOSTLY NOT DONE, and the estimate was wrong
 
-**27 duplicated stub definitions, 217 lines.** Nine separate `_item` STAC-item factories, six
-`_Item` classes, and exact clones of `_Roi` (×3), `_snapshots` (×2), `_gdal_logs` (×2),
-`_day_ds` (×3). Consolidate into a shared `tests/unit/_stubs.py` — a module, not a conftest,
-so it is imported explicitly and a reader can see where the stub came from.
+The plan sized this at "27 duplicated stub definitions, 217 lines" and estimated ~175 lines
+saved. **That measurement counted definitions sharing a NAME as duplication.** Comparing the
+actual bodies by AST digest shows most are not duplicates at all:
 
-Do this **after** Phase 1 and 2 and behind the S2 gate. The stubs differ in small ways and a
-shared one that quietly changes a default is exactly the kind of change that makes a test
-pass for a new reason. Estimated saving ~175 lines.
+| Stub | Definitions | Distinct bodies |
+|---|---|---|
+| `_Item` | 6 | **6** |
+| `_item` | 9 | 7 |
+| `_day_ds` | 3 | 3 |
+| `_snapshots` | 4 | 3 |
+| `_Roi` | 3 | 1 |
+| `_gdal_logs`, `_mask_store`, `_completed_run`, `_stage_quickstart_roi` | 2 each | 1 each |
+
+The `_Item` and `_item` stubs are **deliberately minimal**, each carrying exactly the surface
+the code under test reads, and several say so in their own docstrings — "carrying only what
+the baseline decision reads", "the minimum of a STAC item the date loop touches", "minimum
+surface both ingests' items expose to the ownership filter". That is a feature: each stub
+documents what the production function actually requires of its input. A shared superset stub
+would delete that information, hand every test fields it does not use, and create a coupling
+point where a change made for one file silently reaches nine.
+
+The genuinely identical helpers are 2–5 lines each. Hoisting the five that live in
+`tests/unit/` would save ~20 lines gross and cost ~26 in a new module header plus import
+lines — a net loss, for the price of making a reader jump files to see what a four-line stub
+is. **Not done.**
+
+**One consolidation was worth it and is done:** `_stage_quickstart_roi` was byte-identical
+across the two ROI-parity tests, both of which already import from `tests/parity/helpers.py`.
+It moves there as `stage_quickstart_roi`, with the duplicated `FORCE_CRS` constant. No new
+module, and the parity suite is green after the move (6 passed, 2 skipped, 121 s).
+
+**The finding to carry forward: this suite is not repetitive.** Reducing its line count is not
+an available lever, and the review's own first pass overstated it by measuring names instead
+of bodies.
 
 ---
 
