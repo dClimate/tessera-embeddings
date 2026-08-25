@@ -1970,6 +1970,55 @@ class TestTheDispatchDecisionIsAtomic:
         assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]
         assert "the round finished while the refill was being planned" in "\n".join(records)
 
+    def test_an_unwinding_drain_waits_for_its_dispatches_to_finish_unwinding(self, wired, monkeypatch):
+        """`cancel()` is a REQUEST, and returning on it is not the same as waiting.
+
+        A dispatch caught mid-unwind may still be registering a child run server-side. If
+        the flow reaches its terminal hook first, that child appears AFTER the hook's
+        one-shot tag sweep has run and nothing collects it. `gather` waited for its children
+        before the outer await raised; the drain loop that replaced it has to do the same.
+        """
+
+        class _DrainInterruptedError(Exception):
+            pass
+
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N"))
+        real_wait = asyncio.wait
+        calls = {"n": 0}
+
+        async def wait_then_fail(tasks, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:  # after both dispatches exist and one has settled
+                raise _DrainInterruptedError("the drain loop was interrupted")
+            return await real_wait(tasks, **kwargs)
+
+        monkeypatch.setattr(mod.asyncio, "wait", wait_then_fail)
+
+        async def _go():
+            task = asyncio.ensure_future(
+                mod.run_global_campaign.fn(
+                    paths=_PATHS,
+                    ami_ssm_name="ami",
+                    fill_strategy="chained-clusters",
+                    max_parallel_clusters=2,
+                    immediate_refill=True,
+                )
+            )
+            for _ in range(200):
+                await asyncio.sleep(0)
+                if task.done():
+                    break
+            with pytest.raises(_DrainInterruptedError):
+                await task
+            # Captured while the loop is still running, so this cannot be satisfied by the
+            # tidy-up `asyncio.run` does to pending tasks on its way out.
+            return list(r.timeline)
+
+        timeline = asyncio.run(_go())
+        assert ("settle", ("02N",)) in timeline, (
+            f"the held dispatch had not finished unwinding when the flow returned: {timeline}"
+        )
+
 
 class TestUncertaintyIsNotPermission:
     """Every read the refill decision makes can fail, and a failure must DECLINE.

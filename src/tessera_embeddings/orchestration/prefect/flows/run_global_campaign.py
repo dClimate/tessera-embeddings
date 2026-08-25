@@ -1732,10 +1732,22 @@ async def run_global_campaign(
                             pending_refills.append((take_zones, take_years, refill_task))
                 finally:
                     # What `gather` did for its own children when the outer await was
-                    # cancelled. Cancelling the WAIT does not cancel the child run; the
-                    # flow's terminal hook sweeps those by tag, exactly as before.
+                    # cancelled — and BOTH halves of it. Cancelling the WAIT does not cancel
+                    # the child run; the flow's terminal hook sweeps those by tag, as before.
+                    #
+                    # The await is not a formality. `cancel()` only REQUESTS cancellation, so
+                    # returning here would let the flow reach its terminal hook while a
+                    # dispatch was still unwinding — and a dispatch mid-unwind may still be
+                    # registering a child run server-side. That child would then appear AFTER
+                    # the hook's one-shot sweep had already run, and nothing would collect it.
+                    # `gather` waited for its children to finish unwinding before the outer
+                    # await raised; this restores that, and `return_exceptions` keeps a
+                    # cancelled task's own `CancelledError` from displacing the exception
+                    # that brought us here.
                     for task in live:
                         task.cancel()
+                    if live:
+                        await asyncio.gather(*live, return_exceptions=True)
                 # Replacement outcomes are futures until here, because the loop records them
                 # at dispatch and cannot know their result yet. Every one is done — `live`
                 # emptying is what ended the loop.
