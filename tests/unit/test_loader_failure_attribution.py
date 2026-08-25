@@ -236,6 +236,7 @@ BENIGN_GDAL_LINES = [
     "CPLE_AppDefined in TIFFReadDirectory:Sum of Photometric type-related color channels "
     "and ExtraSamples doesn't match SamplesPerPixel",
     "CPLE_AppDefined in Request for https://h/o.tif range 1-2 failed with response_code=0",
+    "CPLE_AppDefined in Request for https://h/o.tif range 900-901 failed with response_code=416",
 ]
 
 
@@ -294,7 +295,13 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
     @pytest.mark.parametrize(
         "line",
         BENIGN_GDAL_LINES,
-        ids=["sidecar-404", "the-codec-itself", "a-tiff-quirk", "no-response-at-all"],
+        ids=[
+            "sidecar-404",
+            "the-codec-itself",
+            "a-tiff-quirk",
+            "no-response-at-all",
+            "range-past-the-end",
+        ],
     )
     def test_only_a_refusal_is_recorded(self, line: str) -> None:
         """The filter is the polarity guard, so it is asserted case by case rather than argued.
@@ -303,6 +310,13 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         published, and that verdict GIVES A DATE UP. Keeping the codec's own line would let the
         capture confirm what the exception already said. Neither is what the log is being read
         for, and both would let this capture make a verdict worse.
+
+        The 416 is the one to watch, because it is the shape a TRUNCATED object takes: the tile
+        index claims a range past the end of the file, and the store answers the range it cannot
+        satisfy. Read alone that line is a client error, which is not skippable — so keeping it
+        would turn a date that is skipped today into a leg that fails on its first date. It is
+        dropped only because ``_KEEPABLE`` holds the two refusals and nothing else, which makes
+        that tuple load-bearing rather than a tidy-up, and is why widening it needs this case.
         """
         _gdal_logs(line)
         assert _refusal_messages() == []
