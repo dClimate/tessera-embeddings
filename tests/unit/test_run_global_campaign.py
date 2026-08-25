@@ -53,7 +53,15 @@ def _shrinking(cells: list[tuple[str, int]], wired: dict):
 
     def _work(_status=None, _tags=None, *, expected_zones=None, years=None):
         wanted = set(years) if years else None
-        return [c for c in cells if c not in wired["landed"] and (wanted is None or c[1] in wanted)]
+        # `expected_zones` is HONOURED, as the real one honours it. A stub that ignored it
+        # would hand a zone-scoped caller every zone, which is the shape of the bug a
+        # zone-scoped caller exists to avoid.
+        scope = set(expected_zones) if expected_zones is not None else None
+        return [
+            c
+            for c in cells
+            if c not in wired["landed"] and (wanted is None or c[1] in wanted) and (scope is None or c[0] in scope)
+        ]
 
     return _work
 
@@ -135,6 +143,14 @@ def wired(monkeypatch):
         return _completed_run()
 
     monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+
+    # The live-claim query is a real Prefect API read. Stubbed to "nothing is claimed" so a
+    # test that turns `immediate_refill` on cannot reach the network; tests about the claim
+    # rule override it.
+    async def _no_claims():
+        return set()
+
+    monkeypatch.setattr(mod, "zone_years_claimed_by_live_runs", _no_claims)
     monkeypatch.setattr(mod, "delete_prefix", lambda uri, **k: rec["deletes"].append(uri))
     # The fleet-wide caps are real Prefect API writes; record them instead.
     monkeypatch.setattr(
@@ -1540,3 +1556,265 @@ def test_the_dev_overlay_folds_the_tarball_etag_into_the_staging_identity(monkey
 
     monkeypatch.setattr(ray_mod, "source_tarball_identity", lambda b, s, r: f"tarball=etag-{b}{s}")
     assert mod._resolve_tarball_identity("bkt", "-branch", None) == "tarball=etag-bkt-branch"
+
+
+# --- immediate_refill: replacing a settled fill without waiting for the round ------------
+
+
+def _zones_of(params: dict) -> tuple[str, ...]:
+    """The zones one dispatch covers, sorted — multi-year safe, unlike `_dispatched_zones`."""
+    return tuple(sorted({z for z, _y in _dispatched_cells(params)}))
+
+
+def _run_in(state: str) -> SimpleNamespace:
+    """A settled child run in the named terminal state."""
+    return SimpleNamespace(id=f"r-{state}", state=SimpleNamespace(type=getattr(StateType, state), name=state.title()))
+
+
+class _Round:
+    """A round in which one cluster settles while another is HELD open.
+
+    The immediate path only fires while a sibling is still running, so every test here —
+    the refusals included — needs one; otherwise a refusal would pass for the wrong
+    reason. `hold` names the zone whose dispatch parks until the driver has decided,
+    which is what makes "before its sibling settled" an observable fact rather than a
+    timing hope.
+    """
+
+    def __init__(self, wired, *, ends: dict[str, str], hold: str, claims=None, claims_error=False):
+        self.wired = wired
+        self.ends = ends  # a dispatch's first zone -> terminal state name, or "raise"
+        self.hold = hold
+        self.claims = claims
+        self.claims_error = claims_error
+        self.release = asyncio.Event()
+        #: ("dispatch" | "settle", zones) in the order it happened. The ORDER is the subject.
+        self.timeline: list[tuple[str, tuple[str, ...]]] = []
+        self.held: set[str] = set()
+        #: Zones a dispatch found already held. RECORDED rather than raised: the driver
+        #: catches a dispatch's exception and records it as a cluster failure, so an
+        #: assertion thrown in here would be swallowed and the test would pass.
+        self.overlaps: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+
+    def dispatches(self) -> list[tuple[str, ...]]:
+        return [zs for kind, zs in self.timeline if kind == "dispatch"]
+
+    def dispatched_before(self, sibling: tuple[str, ...]) -> list[tuple[str, ...]]:
+        """Every dispatch that happened before ``sibling`` settled."""
+        cut = self.timeline.index(("settle", sibling))
+        return [zs for kind, zs in self.timeline[:cut] if kind == "dispatch"]
+
+    async def arun(self, dep, parameters=None, tags=None):
+        zones = _zones_of(parameters or {})
+        self.wired["arun"].append((dep, parameters))
+        if "fill-zones-sequential" not in dep:
+            self.wired["land"](parameters)
+            return _completed_run()
+        # DISJOINTNESS, checked on entry and therefore across the whole run: two
+        # dispatches must never hold one zone at the same time, whatever order they
+        # settle in and whether or not a replacement was issued.
+        if self.held & set(zones):
+            self.overlaps.append((zones, tuple(sorted(self.held & set(zones)))))
+        self.held |= set(zones)
+        self.timeline.append(("dispatch", zones))
+        try:
+            if zones and zones[0] == self.hold and not self.release.is_set():
+                await self.release.wait()
+            ends = self.ends.get(zones[0], "COMPLETED") if zones else "COMPLETED"
+            if ends == "raise":
+                raise RuntimeError("dispatch failed")
+            if ends == "COMPLETED":
+                self.wired["land"](parameters)
+            return _run_in(ends)
+        finally:
+            self.timeline.append(("settle", zones))
+            self.held -= set(zones)
+
+    async def claim_query(self):
+        if self.claims_error:
+            raise RuntimeError("Prefect API unreachable")
+        return set(self.claims or ())
+
+    async def drive(self, **kwargs):
+        """Run the campaign, releasing the held cluster once the driver has decided.
+
+        The release waits a budget of event-loop TURNS rather than a delay: everything the
+        decision touches is stubbed, so it needs a handful of turns and no wall clock. A
+        driver that needed more would fail these tests rather than hang.
+        """
+        task = asyncio.ensure_future(
+            mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", **kwargs)
+        )
+        for _ in range(200):
+            await asyncio.sleep(0)
+        self.release.set()
+        return await task
+
+
+def _round(monkeypatch, wired, round_, zones=("01N", "02N"), years=(2025,)):
+    """Wire a pending (zone, year) grid and drive dispatch through ``round_``."""
+    cells = [(z, y) for y in years for z in zones]
+    status = SimpleNamespace(zones=dict.fromkeys(zones, ()), has=lambda z, y: False)
+    monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
+    monkeypatch.setattr(mod, "campaign_work_list", _shrinking(cells, wired))
+    monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: 100.0)
+    monkeypatch.setattr(mod, "arun_deployment", round_.arun)
+    monkeypatch.setattr(mod, "zone_years_claimed_by_live_runs", round_.claim_query)
+    return round_
+
+
+class TestImmediateRefill:
+    """A settled fill's roster must not wait on the slowest cluster in its round.
+
+    The dispatch round is a barrier: it collects every cluster's outcome before re-reading
+    the store. A cluster owns a roster of zones, so one dying early costs that whole roster
+    the wait for its slowest sibling. These pin when the driver may skip that wait and —
+    more importantly — when it may not.
+    """
+
+    @pytest.mark.parametrize("flag,replaced_before_sibling", [(False, False), (True, True)])
+    def test_the_flag_decides_whether_a_replacement_waits_for_the_round(
+        self, wired, monkeypatch, flag, replaced_before_sibling
+    ):
+        """The whole point of the change, and the whole safety argument for merging it.
+
+        Parametrised as a PAIR deliberately. A "the default is unchanged" assertion on its
+        own passes whether or not the change is present, which makes it worse than no test;
+        pinned against the flag-on case it cannot.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N"))
+        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=flag))
+        before = r.dispatched_before(("02N",))
+        assert (before == [("01N",), ("02N",), ("01N",)]) is replaced_before_sibling, before
+        # Either way the cell is re-dispatched — the flag decides WHEN, not whether. The extra
+        # attempt is the flag's whole cost, and it is exactly one: the round's own budget is
+        # untouched, so a cell that keeps failing gains one fleet, not a loop of them.
+        assert r.dispatches().count(("01N",)) == 2 + int(replaced_before_sibling)
+
+    def test_the_replacement_covers_only_the_dead_clusters_still_missing_cells(self, wired, monkeypatch):
+        """Its predecessor's zones, and only the cells the STORE still lacks.
+
+        Never the child's failure list: a child can report success on cells it never
+        attempted, so the store is the only thing that may decide — exactly as the round
+        decides.
+        """
+        r = _round(
+            monkeypatch,
+            wired,
+            _Round(wired, ends={"01N": "FAILED"}, hold="02N"),
+            zones=("01N", "02N"),
+            years=(2025, 2024),
+        )
+        wired["landed"].add(("01N", 2024))  # one of the dead cluster's cells did land
+        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, overlap_years=True))
+        # Located by happening BEFORE the sibling settled, so this cannot pass instead on a
+        # NEXT-ROUND re-dispatch that happens to have the same scope. Asserted on the shape
+        # rather than the sequence: the partition decides which cluster is dealt first.
+        before = r.dispatched_before(("02N",))
+        assert len(before) == 3 and before.count(("01N",)) == 2, before
+        refill = [p for d, p in wired["arun"] if "fill-zones-sequential" in d][2]
+        assert sorted(map(tuple, refill["cells"])) == [("01N", 2025)]
+
+    def test_no_two_dispatches_ever_hold_one_zone_at_once(self, wired, monkeypatch):
+        """The two-writer property, asserted across the whole run rather than at a moment.
+
+        Nothing locks a zone: the zone partition IS the guarantee, and an immediate
+        replacement is the one thing that could dispatch a zone while something else still
+        held it. ``_Round.arun`` checks disjointness on every entry, so this fails on the
+        first overlap wherever in the run it occurs. The second assertion is the same
+        property stated over the whole run: a zone is only ever dispatched as part of one
+        shard, so no replacement ever widened past the roster it inherited.
+        """
+        r = _round(
+            monkeypatch,
+            wired,
+            _Round(wired, ends={"01N": "FAILED", "03N": "FAILED"}, hold="02N"),
+            zones=("01N", "02N", "03N", "04N"),
+            years=(2025, 2024),
+        )
+        asyncio.run(r.drive(max_parallel_clusters=4, immediate_refill=True, overlap_years=True))
+        assert r.overlaps == [], f"a zone was dispatched while another dispatch still held it: {r.overlaps}"
+        owner: dict[str, tuple[str, ...]] = {}
+        for zs in r.dispatches():
+            for z in zs:
+                assert owner.setdefault(z, zs) == zs, f"zone {z} appeared in two different shards"
+
+    @pytest.mark.parametrize("ends", ["CRASHED", "CANCELLED"])
+    def test_a_fill_that_cannot_prove_it_stopped_waits_for_the_round(self, wired, monkeypatch, ends):
+        """Neither state carries the proof the immediate path needs.
+
+        A crashed run's ``finally`` never ran, and the verdict can be reached from missed
+        heartbeats while the run is still committing; a cancellation is a REQUEST, and its
+        descendants are cancelled one level further out. Both wait for the round, which is
+        what they do today.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": ends}, hold="02N"))
+        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True))
+        assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]
+
+    def test_a_dispatch_that_raised_is_not_replaced_immediately(self, wired, monkeypatch, caplog):
+        """A dispatch that failed to RETURN may still have dispatched.
+
+        So it establishes nothing at all about what is running, and its cells wait. The
+        REASON is asserted as well as the outcome: a state check alone would also decline
+        this (an exception carries no state), so without the reason nothing here would
+        distinguish the rule from that accident.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "raise"}, hold="02N"))
+        with caplog.at_level(logging.INFO):
+            asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True))
+        assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]
+        assert "the dispatch itself raised" in "\n".join(rec.getMessage() for rec in caplog.records)
+
+    def test_a_live_claim_withholds_the_whole_zone_not_just_the_claimed_year(self, wired, monkeypatch):
+        """Zone granularity, because a zone's years must stay in ONE cluster.
+
+        A fill's grandchild ingests are cancelled a level further out and asynchronously, so
+        one of a dead cluster's cells can still have a live writer. Dropping that year while
+        keeping its zone's others would split the zone across two clusters — the one thing
+        the partition exists to prevent.
+        """
+        r = _round(
+            monkeypatch,
+            wired,
+            _Round(wired, ends={"01N": "FAILED"}, hold="02N", claims={("01N", 2024)}),
+            zones=("01N", "02N", "03N"),
+            years=(2025, 2024),
+        )
+        # 01N and 03N in one cluster, 02N alone, so the dead cluster carries a claimed zone
+        # AND a free one — which is what makes the granularity observable.
+        monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: 300.0 if zone == "02N" else 100.0)
+        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, overlap_years=True))
+        refills = [p for d, p in wired["arun"][2:] if "fill-zones-sequential" in d]
+        assert refills, "the free zone was never refilled"
+        assert _zones_of(refills[0]) == ("03N",), "a claimed zone was re-dispatched, or its sibling withheld"
+
+    def test_an_unreadable_claim_query_declines_the_refill(self, wired, monkeypatch):
+        """An unanswerable query means nothing was learned about who is writing.
+
+        It must not read as "nothing is claimed" — that is the direction that dispatches a
+        second writer.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N", claims_error=True))
+        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True))
+        assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]
+
+    def test_one_generation_per_slot_per_round(self, wired, monkeypatch):
+        """A replacement is not itself replaced — that is what bounds the extra fleets.
+
+        Without it a persistent shortage (the account unable to supply a single GPU) turns
+        one round into a dispatch loop.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N"))
+        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
+        assert r.dispatches().count(("01N",)) == 2, r.dispatches()
+
+    def test_the_last_cluster_to_settle_is_left_to_the_round(self, wired, monkeypatch):
+        """With nothing else running there is nothing to skip waiting for.
+
+        The round re-dispatches it anyway, so a replacement here would buy an extra fleet
+        for no wall clock at all — which is what keeps a cell's total attempts bounded.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="_none"), zones=("01N",))
+        asyncio.run(r.drive(max_parallel_clusters=1, immediate_refill=True, max_dispatch_rounds=1))
+        assert r.dispatches() == [("01N",)], r.dispatches()

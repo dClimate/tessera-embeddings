@@ -86,6 +86,58 @@ deterministic failure looks like from the driver: a coverage gate, a fingerprint
 mismatch, an unseeded group. Those want a human, not another GPU fleet, so the
 campaign logs them at ERROR and moves on rather than burning a cluster per attempt.
 
+#### Not waiting for the round: `immediate_refill`
+
+A dispatch round is a **barrier**: it collects every cluster's outcome before re-reading
+the store. Since a cluster owns a roster of zones, one dying early costs that whole
+roster the wait for the round's slowest sibling. `immediate_refill` (default **off**,
+and off is byte-for-byte the behaviour above) re-dispatches a settled cluster's
+still-missing cells into the slot it just vacated — so the replacement inherits its
+ingest share, its committer share and its place under `max_parallel_clusters`, and the
+fleet's width and cost do not change.
+
+**Nothing locks a zone; the zone partition IS the guarantee that a zone's years never
+land on two clusters.** So a replacement is admitted only when both of these hold, and
+declining is always safe because the cells then wait for the round exactly as they do
+today:
+
+1. **The predecessor reached a state that proves it stopped writing.** A fill that
+   returned or raised has, by then, joined the trailing assembly thread that does its
+   committing, cancelled its child ingests and waited for them to confirm terminal, and
+   torn down its fleet — all inside `finally` blocks that complete before the state is
+   set. A **crash** carries none of that (the process that would run the `finally` is the
+   process that died, and the verdict can be reached from missed heartbeats while the run
+   is still writing), and a **cancellation** is a request rather than a fact. Both wait.
+2. **Nothing live claims the cells.** Condition 1 covers the fill's own writers, not
+   everything downstream of it: grandchild ingests are cancelled a level further out and
+   asynchronously, and the in-child sweep is best-effort by construction. So the driver
+   asks the orchestrator which cells a live run claims and withholds those — at **zone**
+   granularity, because dropping one claimed year while keeping its zone's others is
+   exactly the split the partition exists to prevent.
+
+Bounded at one generation per slot per round, and only issued while a sibling is still
+running: with the round over, the loop re-dispatches anyway, so a replacement then would
+buy an extra fleet for no wall clock. A cell therefore gains at most one attempt beyond
+`max_dispatch_rounds`.
+
+What it deliberately does not address: crashed and cancelled fills, which need fencing at
+the write rather than an inference about who has stopped; the barrier itself, which still
+closes the round for everything the immediate path declined; and the lifetime coupling
+between a fill and its ingest children, which is load-bearing — see below.
+
+#### A dying fill's ingest bytes are not lost
+
+Worth stating plainly, because the opposite is the natural assumption. A failing fill
+cancels its in-flight ingests and waits for them to stop, and that wait is deliberate: a
+retry is a NEW parent run, deriving its child tag from its own run id, so it can neither
+find an orphaned ingest nor be told about it — and mosaic commits do not rebase, so two
+writers on one prefix is a failure nothing downstream detects. What is cancelled is the
+*process*, not the work: a failed cell's mosaic is retained (cleanup runs only for a cell
+that landed, and the orphan-mosaic sweep only touches cells that are complete AND tagged),
+and an interrupted mosaic is resumed rather than rebuilt. So a fill's death costs the wall
+clock of the wait, not the bytes — which is why shortening the wait is the whole fix, and
+why loosening any teardown rule would be the wrong one.
+
 At the very end — after every year has had its attempts — the campaign raises with
 the complete list of unfilled cells. It fails loudly, but only once it has done
 everything it could, and a re-run resumes from exactly there.

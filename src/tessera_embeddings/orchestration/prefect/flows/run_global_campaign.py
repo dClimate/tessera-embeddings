@@ -66,6 +66,7 @@ from prefect import flow, get_run_logger
 from prefect.client.orchestration import get_client
 from prefect.deployments import arun_deployment
 from prefect.runtime import flow_run as flow_run_ctx
+from prefect.states import StateType
 
 from tessera_embeddings.config.inference import checkpoint_filename, inference_code_identity
 from tessera_embeddings.config.ingest import IngestSettings
@@ -73,6 +74,7 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
 from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
+from tessera_embeddings.orchestration.prefect.flows._live_claims import zone_years_claimed_by_live_runs
 from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
     _assert_seeded_model_matches,
     _optical_min_obs_from_store,
@@ -130,6 +132,25 @@ _cancel_children_on_cancellation = make_child_cancel_hook(_CHILD_TAG_PREFIX, "ca
 #: <=2x-serial acceptance criterion), N=120 -> 58 / 15 s. The recorded firm
 #: constraint is 4-8; this is its upper end.
 MAX_SIMULTANEOUS_COMMITTERS = 8
+
+
+#: Terminal states after which a chained fill has PROVABLY stopped writing, and is
+#: therefore the only ones an immediate replacement may follow.
+#:
+#: The proof is a chain of ``finally`` blocks, not an assumption about the state name.
+#: Reaching either of these means the fill's own function returned or raised, so the
+#: runner joined its trailing assembly thread — the only thread that commits to the
+#: embeddings store — and the flow then cancelled its child ingests and WAITED for them
+#: to confirm terminal before tearing its fleet down. All of that completes before the
+#: state is set.
+#:
+#: ``CRASHED`` and ``CANCELLED`` are excluded because neither carries that proof: the
+#: process that would run the ``finally`` is the process that died, and a crash verdict
+#: can be reached from missed heartbeats while the run is still writing. Those cells
+#: wait for the dispatch round to close, which is what they do today. Re-dispatching them
+#: promptly is a separate change and needs fencing at the WRITE — a lease the committer
+#: checks — rather than an inference about who has stopped.
+_QUIESCENT_TERMINAL_STATES = frozenset({StateType.FAILED, StateType.COMPLETED})
 
 
 def _upsert_limit(name: str, limit: int, *, what: str, log: logging.Logger | LoggerAdapter) -> None:
@@ -526,6 +547,7 @@ async def run_global_campaign(
     mask_name: str = "global",
     max_parallel_ingest: int = 60,
     max_dispatch_rounds: int = 2,
+    immediate_refill: bool = False,
     # Staging-reuse escape hatches. Both default off; see `_staging_code_identity`.
     force_staging_reuse: bool = False,
     force_staging_restage: str = "",
@@ -702,6 +724,49 @@ async def run_global_campaign(
             mismatch, an unseeded group), and it is what bounds the two budgets
             compounding on a cell that will never succeed. Those want a human, not
             another cluster. Set to 1 to disable retries.
+        immediate_refill: Replace a settled chained fill's still-missing cells at
+            once, instead of waiting for the whole round to close. **Off by default,
+            and off is byte-for-byte today's behaviour** — the dispatch path is the
+            same either way, and with the flag off nothing is ever added to the set
+            of live dispatches, so a round waits for every cluster exactly as it did
+            and reports its outcomes in the clusters' original order.
+
+            The problem it addresses: the round above is a BARRIER. A cluster owns a
+            roster of zones, so when one dies early its whole roster waits for every
+            sibling to finish before the store is re-read — and the sibling that
+            decides that wait is the slowest one in the round.
+
+            When on, a settled cluster's cells are re-dispatched into the slot it just
+            vacated, so the replacement inherits its ingest share, its committer share
+            and its place under ``max_parallel_clusters``: the fleet's width and cost
+            do not change. Two conditions must BOTH hold first, and when either fails
+            the cells simply wait for the round, which is never worse than the default:
+
+            1. The predecessor reached a state that PROVES it stopped writing
+               (``_QUIESCENT_TERMINAL_STATES``). A crash, a cancellation, or a
+               dispatch that raised — which may still have dispatched — all decline.
+            2. Nothing live claims any of the cells
+               (:func:`~tessera_embeddings.orchestration.prefect.flows._live_claims.zone_years_claimed_by_live_runs`).
+               Condition 1 covers the fill's own writers but not everything downstream
+               of it: its grandchild ingests are cancelled one level further out and
+               asynchronously, and the in-child sweep is best-effort by construction.
+               Refusal is at ZONE granularity, so a claim on any year of a zone
+               withholds that whole zone — a zone's years must stay in one cluster.
+
+            The two-writer invariant is otherwise unchanged and still structural: a
+            replacement covers ONLY zones its predecessor owned, and the round's
+            clusters partition zones disjointly, so it cannot reach a zone a live
+            sibling holds.
+
+            Bounded at one generation per slot per round, and only issued while a
+            sibling is still running — with the round over, the loop above re-dispatches
+            anyway, so a replacement then would be an extra fleet for nothing. A cell
+            therefore gains at most one attempt beyond ``max_dispatch_rounds``, and a
+            persistent capacity shortage cannot become a dispatch loop.
+
+            NOT part of the staging fingerprint, deliberately: this changes WHEN work is
+            dispatched, not what is computed, and folding it in would abandon the staged
+            tiles a retry exists to resume.
         ingest_limit_name: Prefect global concurrency limit backing
             ``max_parallel_ingest`` under ``"chained-clusters"``. The campaign
             upserts it to that value at start, so the parameter is the single place
@@ -1297,7 +1362,12 @@ async def run_global_campaign(
                 # Every per-year value this closure reads is passed IN rather than captured:
                 # it is defined inside the year loop, so a captured name would be whatever
                 # the last iteration left behind if the call ever outlived its iteration.
-                def _chained_params(cells: list[list[Any]], n_clusters: int, cell_look_ahead: int) -> dict[str, Any]:
+                def _chained_params(
+                    cells: list[list[Any]],
+                    n_clusters: int,
+                    cell_look_ahead: int,
+                    snapshot: CampaignStatus = status,
+                ) -> dict[str, Any]:
                     return {
                         # (zone, year) PAIRS. With `overlap_years` a cluster's pairs span
                         # years; without it they all share one. Either way a zone's years
@@ -1313,7 +1383,10 @@ async def run_global_campaign(
                         # access. The ocean probe is one small bitmap GET per zone — the
                         # same price the per-cell path already pays — and it runs only
                         # for cells that are not already complete.
-                        "ami_id": _ami_id() if _needs_ray(cells) else None,
+                        # The snapshot is passed THROUGH rather than defaulted here, so an
+                        # immediate refill probes against the store it just read rather than
+                        # against the one the round opened on.
+                        "ami_id": _ami_id() if _needs_ray(cells, snapshot) else None,
                         "store_name": store_name,
                         "mask_name": mask_name,
                         "num_actors": num_actors,
@@ -1362,17 +1435,174 @@ async def run_global_campaign(
                         **({"validation_deployment": validation_deployment} if validation_deployment else {}),
                     }
 
-                chained_results = await asyncio.gather(
-                    *(
-                        arun_deployment(
-                            chained_fill_deployment,
-                            parameters=_chained_params(cells_for[id(cl)], len(clusters), look_ahead),
-                            tags=_tags,
+                async def _settle(parameters: dict[str, Any]) -> Any:  # noqa: ANN401 — Prefect FlowRun
+                    """Dispatch one chained fill and return its outcome, run OR exception.
+
+                    Mirrors ``gather(return_exceptions=True)`` exactly, ``BaseException``
+                    included: a dispatch that raises is a RESULT here, because one cluster
+                    failing must not abandon the round, and the bookkeeping below tells the
+                    two apart by type rather than by how it was delivered.
+                    """
+                    try:
+                        return await arun_deployment(chained_fill_deployment, parameters=parameters, tags=_tags)
+                    except BaseException as exc:  # mirrors gather(return_exceptions=True)
+                        return exc
+
+                # `batch_years` is passed IN rather than captured, for the reason
+                # `_chained_params` gives beside it: this is defined inside the batch loop, so
+                # a captured name would be whatever the last iteration left behind if the call
+                # ever outlived its iteration.
+                async def _refill(
+                    zones: list[str],
+                    outcome: Any,  # noqa: ANN401 — Prefect FlowRun or the exception that replaced it
+                    years: tuple[int, ...] = tuple(batch_years),
+                ) -> tuple[list[list[Any]], list[int], CampaignStatus] | None:
+                    """The cells an immediate replacement may take over, or ``None`` to decline.
+
+                    Both admission conditions live here, and DECLINING IS ALWAYS SAFE: the
+                    cells stay in `remaining`, so the round re-dispatches them exactly as it
+                    does today. That asymmetry is the whole shape of this function — it
+                    refuses on anything it cannot establish, including its own inability to
+                    ask.
+
+                    Condition one is the predecessor's terminal state, which is what proves
+                    the fill's OWN writers stopped (see `_QUIESCENT_TERMINAL_STATES`).
+                    Condition two is that nothing live claims the cells, which is what covers
+                    everything DOWNSTREAM of it: a fill's grandchild ingests are cancelled one
+                    level further out and asynchronously, and the in-child sweep says of
+                    itself that it is best effort.
+
+                    Refusal is at ZONE granularity, never per cell. Dropping one claimed year
+                    and keeping its zone's others would put that zone's years on two clusters,
+                    which is the invariant the whole partition exists to hold.
+                    """
+                    if isinstance(outcome, BaseException):
+                        # Its own reason, not folded into the state check below. A dispatch that
+                        # RAISED and a fill that ended in a state we cannot trust are different
+                        # facts, and an operator reading a declined refill needs to know which.
+                        log.info(
+                            "Not refilling %d zone(s) immediately: the dispatch itself raised, so it may "
+                            "still have dispatched and establishes nothing about what is running. They "
+                            "wait for the round.",
+                            len(zones),
                         )
-                        for cl in clusters
-                    ),
-                    return_exceptions=True,
-                )
+                        return None
+                    state = getattr(outcome, "state", None)
+                    if state is None or state.type not in _QUIESCENT_TERMINAL_STATES:
+                        log.info(
+                            "Not refilling %d zone(s) immediately: the fill ended %s, which does not "
+                            "establish that it stopped writing. They wait for the round.",
+                            len(zones),
+                            state.name if state is not None else "UNKNOWN",
+                        )
+                        return None
+                    # The STORE decides what is missing, exactly as the round does — never the
+                    # child's return value, which can report success on cells it never attempted.
+                    # A snapshot of its own, so the round's `status` keeps meaning what it meant
+                    # when the round opened.
+                    fresh = campaign_status(repo, years=campaign_years)
+                    # Intersected with the inherited roster as well as scoped by it. The scope
+                    # is the work list's contract; the intersection is structural, and it is
+                    # what makes "a replacement can never reach a zone a live sibling holds"
+                    # a property of THIS function rather than a property delegated to another.
+                    roster = set(zones)
+                    missing = [
+                        (z, y)
+                        for z, y in campaign_work_list(fresh, set(repo.list_tags()), expected_zones=zones, years=years)
+                        if z in roster
+                    ]
+                    if not missing:
+                        return None
+                    try:
+                        claimed = await zone_years_claimed_by_live_runs()
+                    except Exception:
+                        # An unanswerable query means nothing was learned about who is writing.
+                        log.warning(
+                            "Could not read live run claims — declining the immediate refill of %d zone(s); "
+                            "they wait for the round.",
+                            len(zones),
+                            exc_info=True,
+                        )
+                        return None
+                    blocked = {z for z, _y in claimed} & {z for z, _y in missing}
+                    if blocked:
+                        log.warning(
+                            "Withholding %d zone(s) from the immediate refill — a live run still claims them: %s",
+                            len(blocked),
+                            ", ".join(sorted(blocked)),
+                        )
+                    free = [(z, y) for z, y in missing if z not in blocked]
+                    if not free:
+                        return None
+                    # JSON-shaped cells (lists, not tuples) for the deployment parameters, and
+                    # the years read off the typed pairs before that shape is taken.
+                    # The snapshot travels WITH the cells, so the dispatch below probes against
+                    # the store this decision was made from rather than reading it a second time.
+                    return [[z, y] for z, y in free], sorted({y for _z, y in free}), fresh
+
+                # DISPATCH, then drain as each cluster SETTLES rather than all at once. With
+                # `immediate_refill` off nothing is ever added to `live`, so this waits for
+                # every cluster just as a gather would, and the bookkeeping below still reads
+                # the outcomes in the clusters' ORIGINAL order — so the dispatch sequence, the
+                # log lines and the returned summary are identical, not merely equivalent.
+                #
+                # Parameters are built EAGERLY, before the task exists, because that is when a
+                # gather's generator built them: `_chained_params` probes the land mask, and
+                # moving those reads inside the coroutines would reorder them.
+                live: dict[asyncio.Task[Any], int | None] = {}
+                for slot, cl in enumerate(clusters):
+                    params = _chained_params(cells_for[id(cl)], len(clusters), look_ahead)
+                    live[asyncio.ensure_future(_settle(params))] = slot
+                chained_results: list[Any] = [None] * len(clusters)
+                #: Replacements, in dispatch order: the zones and years each covered, and the
+                #: task carrying its outcome. Kept apart from `chained_results` so the
+                #: originals' bookkeeping is untouched by whether any replacement happened.
+                pending_refills: list[tuple[list[str], list[int], asyncio.Task[Any]]] = []
+                try:
+                    while live:
+                        done, _ = await asyncio.wait(set(live), return_when=asyncio.FIRST_COMPLETED)
+                        # Deregister everything that settled BEFORE deciding anything, so
+                        # "a sibling is still running" is read off work that really is running.
+                        settled = [(live.pop(task), task) for task in done]
+                        for settled_slot, task in settled:
+                            outcome = task.result()
+                            if settled_slot is None:
+                                # A replacement carries NO slot, and that is the whole bound:
+                                # one generation per slot per round, because a replacement is
+                                # not itself eligible for one. Without it a shortage that
+                                # persists — an account that cannot supply a single GPU — would
+                                # turn one round into a dispatch loop. Its outcome was recorded
+                                # at dispatch; there is nothing to decide here.
+                                continue
+                            chained_results[settled_slot] = outcome
+                            if not immediate_refill or not live:
+                                continue
+                            planned = await _refill(list(clusters[settled_slot]), outcome)
+                            if planned is None:
+                                continue
+                            take, take_years, take_status = planned
+                            log.warning(
+                                "Refilling %d cell(s) across %d zone(s) at once rather than waiting for the round: %s",
+                                len(take),
+                                len({z for z, _y in take}),
+                                ", ".join(sorted({str(z) for z, _y in take})),
+                            )
+                            # `len(clusters)` unchanged: the replacement takes the vacated slot, so
+                            # its ingest share and S3 concurrency slice are the ones the round sized.
+                            replacement = _chained_params(take, len(clusters), look_ahead, take_status)
+                            refill_task = asyncio.ensure_future(_settle(replacement))
+                            live[refill_task] = None
+                            pending_refills.append((sorted({str(z) for z, _y in take}), take_years, refill_task))
+                finally:
+                    # What `gather` did for its own children when the outer await was
+                    # cancelled. Cancelling the WAIT does not cancel the child run; the
+                    # flow's terminal hook sweeps those by tag, exactly as before.
+                    for task in live:
+                        task.cancel()
+                # Replacement outcomes are futures until here, because the loop records them
+                # at dispatch and cannot know their result yet. Every one is done — `live`
+                # emptying is what ended the loop.
+                refills = [(zs, ys, task.result()) for zs, ys, task in pending_refills]
                 # RECORDED, never raised: one cluster failing must not abandon the
                 # year, and certainly not the years after it. What each cluster
                 # actually landed is already committed and tagged per zone-year, so
@@ -1402,6 +1632,31 @@ async def run_global_campaign(
                     len(clusters) - len(round_failures),
                     len(clusters),
                 )
+                # The replacements, after their predecessors and in dispatch order, so the
+                # count above keeps meaning what it has always meant: the round's own
+                # clusters. Same three records as the loop above — a failure is reported, a
+                # landed run is credited, and it is credited to the years IT owns.
+                refills_landed = 0
+                for refill_zones, refill_years, r in refills:
+                    if isinstance(r, BaseException):
+                        round_failures.append(f"immediate refill {refill_zones[0]}..({len(refill_zones)} zones): {r!r}")
+                        continue
+                    try:
+                        _check_completed(r, f"immediate refill year(s) {batch_years}")
+                    except Exception as exc:  # a returned-but-not-COMPLETED terminal state
+                        round_failures.append(str(exc))
+                        continue
+                    refills_landed += 1
+                    round_runs.append(str(r.id))
+                    for y in refill_years:
+                        runs_this_round_by_year.setdefault(y, []).append(str(r.id))
+                if refills:
+                    log.info(
+                        "Year(s) %s: %d/%d immediate refill(s) landed",
+                        batch_years,
+                        refills_landed,
+                        len(refills),
+                    )
             elif batch_cells:
                 log.info("Year(s) %s: dispatching %d zone fill(s)", batch_years, len(batch_cells))
 
