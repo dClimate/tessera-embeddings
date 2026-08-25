@@ -10,11 +10,13 @@ from contextlib import contextmanager
 from typing import cast
 
 import dask.array as da
+import dask.distributed
 import numpy as np
 import xarray as xr
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
 from tessera_embeddings.ingest.duplicates import cause_was_flattened
+from tessera_embeddings.ingest.loader_failures import carry_logged_refusal
 from tessera_embeddings.ingest.roi import read_roi_mask
 
 logger = logging.getLogger(__name__)
@@ -74,9 +76,14 @@ def source_read_retrying(log: logging.Logger | logging.LoggerAdapter[logging.Log
 
 @contextmanager
 def read_failure_context(
-    log: logging.Logger | logging.LoggerAdapter[logging.Logger], *, roi: str, date: str, items: Sequence[object] = ()
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    *,
+    roi: str,
+    date: str,
+    items: Sequence[object] = (),
+    client: dask.distributed.Client | None = None,
 ) -> Iterator[None]:
-    """Name the ROI, the date and the granules on any failure raised inside.
+    """Name the ROI, the date and the granules on any failure raised inside, and complete its reason.
 
     Per-date telemetry is emitted *after* a date commits, so the last date in a log is the
     last date that WORKED — a date that failed leaves no record of having been attempted,
@@ -98,10 +105,27 @@ def read_failure_context(
 
     Emitted only on failure, so it costs nothing on the success path and does not scale
     with worker count the way a per-date INFO line does.
+
+    And the reason itself may be INCOMPLETE, which is what ``client`` is for. GDAL states some
+    refusals only in its own log and raises the codec failure that follows from them, so the
+    chain can say the bytes are bad while the words saying the service refused sit in a log
+    line. Both sensors' reads pass through here, so this is where that evidence is collected
+    and attached — one classifier, one set of evidence, on either path. Without a client the
+    cluster cannot be asked and the chain alone decides, which is what a serial run gets.
+
+    Args:
+        log: Logger the failure is named on.
+        roi: ROI label, the field that attributes a fleet-wide error to one cell.
+        date: The date being read.
+        items: The catalogue items this read opened, named in the log line. Optical passes
+            them; radar keeps no per-date item list.
+        client: Cluster to collect GDAL's logged refusals from, if there is one.
     """
     try:
         yield
     except Exception as exc:
+        # Before anything reads a verdict off this failure, including the line below.
+        carry_logged_refusal(exc, client)
         ids = ", ".join(str(getattr(i, "id", "?")) for i in items[:4]) or "none"
         log.exception("READ FAILED roi=%s date=%s items=%d first=%s", roi, date, len(items), ids)
         if cause_was_flattened(exc):

@@ -33,6 +33,7 @@ import pytest
 from tessera_embeddings.errors import DuplicateDateError, InconclusiveStoreProbeError
 from tessera_embeddings.ingest import s1_roi, s2_roi
 from tessera_embeddings.ingest.duplicates import is_provider_refusal
+from tessera_embeddings.ingest.loader_failures import drain_local_refusals, install_capture, refusal_wait_out
 from tessera_embeddings.storage import zarr_store
 from tessera_embeddings.storage.zarr_store import (
     CONCURRENT_WRITER_ERRORS,
@@ -235,6 +236,47 @@ def test_a_refusal_that_is_not_the_sources_gets_no_long_wait(exc):
     one must fail the leg on its first date instead of holding a fleet idle first.
     """
     assert _exhausted(exc, wait_out=is_provider_refusal)[0] == STORE_WRITE_ATTEMPTS
+
+
+class TestArmingThePatienceOnEvidenceTheChainDoesNotCarry:
+    """Whether the budget engages for the failure it was written for.
+
+    A refused object comes back as an error document where the imagery should be, so the codec
+    raises a decode failure and the refusal is stated only in GDAL's own log. A predicate reading
+    the exception alone therefore declines the very outage the budget exists to outlast, and the
+    write spends three attempts on it — which is the ordinary limit, reached in seconds.
+
+    Both directions are pinned, because widening what gets waited out is expensive in its own
+    right: a codec failure recomputes to the same verdict, and every second spent on it is a
+    fleet held idle to reach the answer it already had.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _capture(self):
+        install_capture()
+        gdal = logging.getLogger("rasterio._env")
+        previous = gdal.level
+        gdal.setLevel(logging.WARNING)
+        drain_local_refusals()
+        yield
+        gdal.setLevel(previous)
+        drain_local_refusals()
+
+    @staticmethod
+    def _decode_failure() -> BaseException:
+        exc = RuntimeError("WarpOperationError: Chunk and warp failed")
+        exc.__cause__ = RuntimeError("RasterioIOError: ZIPDecode: Decoding error at scanline 0")
+        return exc
+
+    def test_a_refusal_only_gdal_logged_outlasts_the_attempt_limit(self):
+        logging.getLogger("rasterio._env").warning("CPLE_AWSAccessDenied in HTTP response code: 403")
+        calls, slept = _exhausted(self._decode_failure(), wait_out=refusal_wait_out(None))
+        assert calls > STORE_WRITE_ATTEMPTS
+        assert slept <= WAIT_OUT_BACKOFF_S
+
+    def test_the_same_failure_with_nothing_logged_gets_only_the_attempt_limit(self):
+        """The control. The predicate must complete a reason, never invent one."""
+        assert _exhausted(self._decode_failure(), wait_out=refusal_wait_out(None))[0] == STORE_WRITE_ATTEMPTS
 
 
 def test_a_moved_branch_tip_is_never_retried_even_when_waiting_something_out():

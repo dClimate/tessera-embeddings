@@ -35,9 +35,12 @@ from rasterio.errors import RasterioIOError, WarpOperationError
 
 from tessera_embeddings.ingest import loader_failures
 from tessera_embeddings.ingest.duplicates import (
+    ReadFailure,
     alternates_for,
     cause_was_flattened,
+    classify_read_failure,
     copies_label,
+    is_provider_refusal,
     is_unreadable_source,
     select_preferred_duplicates,
     step_down_copies,
@@ -45,14 +48,18 @@ from tessera_embeddings.ingest.duplicates import (
 from tessera_embeddings.ingest.loader_failures import (
     AbortedReadCapture,
     ReadRescuesNotInstalledError,
+    carry_logged_refusal,
     collect_aborted_hrefs,
+    collect_logged_refusals,
     drain_local,
+    drain_local_refusals,
     href_key,
     implicated_tile_dates,
     install_capture,
     install_capture_everywhere,
     keep_causes_picklable,
     label_objects,
+    refusal_wait_out,
 )
 
 #: The message odc's reader emits for the object it gave up on, verbatim from a fleet log.
@@ -169,6 +176,220 @@ class TestCapturingWhatTheLoaderReports:
         drain_local()
         logging.getLogger("odc.loader._rio").error(ABORT_MESSAGE)
         assert len(collect_aborted_hrefs(None)) == 1
+
+
+#: How GDAL words a refusal in its own log, in rasterio's ``"<CPL error class> in <message>"``
+#: format. It says nothing to the codec, which is the whole problem: the object comes back as an
+#: error document, and libtiff raises the only thing it can see.
+LOGGED_REFUSAL = "CPLE_AWSAccessDenied in HTTP response code: 403"
+
+#: GDAL log lines that are NOT refusals, each chosen for what keeping it would do to a verdict.
+#: The 404 is the dangerous one — GDAL probes for sidecars that were never published, and that
+#: line read as evidence says the imagery is ABSENT, which gives a date up.
+BENIGN_GDAL_LINES = [
+    "CPLE_AppDefined in HTTP response code: 404",
+    "CPLE_AppDefined in ZIPDecode:Decoding error at scanline 0",
+    "CPLE_AppDefined in TIFFReadDirectory:Sum of Photometric type-related color channels "
+    "and ExtraSamples doesn't match SamplesPerPixel",
+]
+
+
+@pytest.fixture
+def capture_installed() -> Iterator[None]:
+    """The capture running, GDAL's channel audible, and both buffers empty either side.
+
+    Both buffers are process-global and outlive the test that filled them, so a line left behind
+    is read as the NEXT failure's evidence — which is the confusion this code exists to bound,
+    and would be a false pass here. GDAL's logger is levelled explicitly because a handler only
+    ever sees what its logger is enabled for, and that is inherited.
+    """
+    install_capture()
+    gdal = logging.getLogger("rasterio._env")
+    previous = gdal.level
+    gdal.setLevel(logging.WARNING)
+    drain_local()
+    drain_local_refusals()
+    try:
+        yield
+    finally:
+        gdal.setLevel(previous)
+        drain_local()
+        drain_local_refusals()
+
+
+def _gdal_logs(message: str) -> None:
+    """Emit ``message`` the way rasterio's CPL error handler emits GDAL's warnings."""
+    logging.getLogger("rasterio._env").warning(message)
+
+
+@pytest.mark.usefixtures("capture_installed")
+class TestCapturingWhatGdalLogsButDoesNotRaise:
+    """The second buffer: refusals stated in GDAL's own log and nowhere else."""
+
+    def test_a_logged_refusal_is_recorded(self) -> None:
+        _gdal_logs(LOGGED_REFUSAL)
+        assert drain_local_refusals() == [LOGGED_REFUSAL]
+
+    @pytest.mark.parametrize("line", BENIGN_GDAL_LINES, ids=["sidecar-404", "the-codec-itself", "a-tiff-quirk"])
+    def test_only_a_refusal_is_recorded(self, line: str) -> None:
+        """The filter is the polarity guard, so it is asserted case by case rather than argued.
+
+        Keeping a sidecar 404 would supply the one marker that reads as a source object never
+        published, and that verdict GIVES A DATE UP. Keeping the codec's own line would let the
+        capture confirm what the exception already said. Neither is what the log is being read
+        for, and both would let this capture make a verdict worse.
+        """
+        _gdal_logs(line)
+        assert drain_local_refusals() == []
+
+    def test_the_two_buffers_do_not_drain_each_other(self) -> None:
+        """The optical copy ladder attributes from the href buffer, and classification drains
+        the refusal buffer. One buffer would mean whichever asked first destroyed the other's
+        evidence, and the ladder would stop attributing without anything saying so.
+        """
+        logging.getLogger("odc.loader._rio").error(ABORT_MESSAGE)
+        _gdal_logs(LOGGED_REFUSAL)
+
+        assert len(drain_local_refusals()) == 1
+        assert len(drain_local()) == 1, "draining the refusals took the href with it"
+
+    def test_installing_twice_does_not_double_the_record(self) -> None:
+        """A worker's plugin setup runs again on reconnect, and a doubled line is not two
+        refusals — it is one, quoted twice, on an exception a human has to read.
+        """
+        install_capture()
+        drain_local_refusals()
+        _gdal_logs(LOGGED_REFUSAL)
+        assert len(drain_local_refusals()) == 1
+
+    def test_collection_without_a_cluster_returns_the_local_record(self) -> None:
+        """A serial run has no client, and its verdicts must be reached the same way."""
+        _gdal_logs(LOGGED_REFUSAL)
+        assert collect_logged_refusals(None) == [LOGGED_REFUSAL]
+
+
+def _decode_failure_over_a_refused_object() -> WarpOperationError:
+    """The radar failure this exists for, as a worker raises it.
+
+    The object came back as an error document, GDAL logged the refusal, and libtiff was handed
+    the document — so the chain names a codec and nothing else. Read from the chain alone this is
+    permanently bad imagery, and the date is given up.
+    """
+    try:
+        raise CPLE_AppDefinedError(1, 4, CODEC_FAILURE)
+    except CPLE_AppDefinedError as cause:
+        try:
+            raise RasterioIOError(READ_FAILED) from cause
+        except RasterioIOError as inner:
+            try:
+                raise WarpOperationError("Chunk and warp failed") from inner
+            except WarpOperationError as failure:
+                return failure
+
+
+@pytest.mark.usefixtures("capture_installed")
+class TestTheReasonGdalDidNotRaise:
+    """The verdict on one failure, with and without the half of its reason GDAL only logged."""
+
+    def test_without_the_log_the_refusal_reads_as_bad_imagery(self) -> None:
+        """The defect, stated as the baseline the fix moves. Nothing here is wrong on its own
+        terms — the chain really does say a codec failed, and that really does mean give up.
+        """
+        failure = _decode_failure_over_a_refused_object()
+        carry_logged_refusal(failure, None)
+        assert classify_read_failure(failure) is ReadFailure.UNREADABLE
+        assert is_unreadable_source(failure) is True
+
+    def test_the_logged_refusal_decides_the_same_failure_the_other_way(self) -> None:
+        """The payoff. Same exception, same classifier, one more piece of evidence — and the
+        opposite verdict: wait, and give up nothing.
+        """
+        _gdal_logs(LOGGED_REFUSAL)
+        failure = _decode_failure_over_a_refused_object()
+        carry_logged_refusal(failure, None)
+
+        assert classify_read_failure(failure) is ReadFailure.PROVIDER_REFUSED
+        assert is_provider_refusal(failure) is True
+        assert is_unreadable_source(failure) is False
+
+    def test_the_evidence_travels_with_the_exception(self) -> None:
+        """Attaching rather than answering is what makes the verdict stable.
+
+        Collection is destructive, so a caller that classified and threw the evidence away would
+        hand the next reader of the same exception the opposite answer — and there are two
+        readers on the radar path alone: the retry policy that spends patience, and the handler
+        that decides whether a date is lost.
+        """
+        _gdal_logs(LOGGED_REFUSAL)
+        failure = _decode_failure_over_a_refused_object()
+        carry_logged_refusal(failure, None)
+
+        assert collect_logged_refusals(None) == [], "the collection must have been destructive"
+        assert is_provider_refusal(failure) is True
+
+    def test_the_same_line_is_not_quoted_twice(self) -> None:
+        """The policy asks per attempt and GDAL repeats itself on each of them, so one refused
+        object would otherwise be quoted once per attempt on the exception a human reads.
+        """
+        failure = _decode_failure_over_a_refused_object()
+        for _ in range(3):
+            _gdal_logs(LOGGED_REFUSAL)
+            carry_logged_refusal(failure, None)
+        assert failure.__notes__ == [f"{loader_failures._REFUSAL_NOTE} {LOGGED_REFUSAL}"]
+
+    def test_a_failure_that_is_not_the_source_readers_is_left_alone(self) -> None:
+        """A store conflict raised while some other read is being refused is still a store
+        conflict. Explaining it with that refusal would answer it with a wait that fixes
+        nothing — and would consume evidence a real read failure is about to ask for.
+        """
+        _gdal_logs(LOGGED_REFUSAL)
+        conflict = RuntimeError("DuplicateDateError: 2021-04-12 is already on the time axis")
+        carry_logged_refusal(conflict, None)
+
+        assert getattr(conflict, "__notes__", ()) == ()
+        assert is_provider_refusal(conflict) is False
+        assert collect_logged_refusals(None) == [LOGGED_REFUSAL], "the read's evidence was consumed"
+
+    def test_nothing_logged_changes_nothing(self) -> None:
+        failure = _decode_failure_over_a_refused_object()
+        carry_logged_refusal(failure, None)
+        assert getattr(failure, "__notes__", ()) == ()
+
+    @pytest.mark.parametrize("line", [LOGGED_REFUSAL, "CPLE_AppDefined in HTTP response code: 503"])
+    def test_attached_evidence_can_never_cost_a_date(self, line: str) -> None:
+        """The direction this capture is allowed to move a verdict, asserted rather than argued.
+
+        Whatever the chain said, a line that is itself a refusal can only produce a refusal
+        verdict — refusal is tested before every statement about the bytes. So the cost of a
+        wrong attribution is patience, never a date: a leg fails with its time axis unmoved and
+        the date is judged alone on the re-dispatch. The reverse would be unrecoverable, since a
+        date given up under a later committed one cannot be back-filled.
+        """
+        _gdal_logs(line)
+        failure = _decode_failure_over_a_refused_object()
+        carry_logged_refusal(failure, None)
+        assert is_unreadable_source(failure) is False
+
+
+@pytest.mark.usefixtures("capture_installed")
+class TestArmingThePatience:
+    """The predicate a write's retry policy asks, per attempt, while the failure is fresh."""
+
+    def test_it_arms_on_a_refusal_only_the_log_names(self) -> None:
+        """What ``is_provider_refusal`` alone cannot answer, and the difference between minutes
+        of patience and the ordinary attempt limit.
+        """
+        _gdal_logs(LOGGED_REFUSAL)
+        failure = _decode_failure_over_a_refused_object()
+
+        assert refusal_wait_out(None)(failure) is True
+
+    def test_it_declines_a_failure_nothing_says_was_refused(self) -> None:
+        """The negative control. Widening what gets waited out is the expensive direction: a
+        codec failure recomputes to the same verdict, so every second spent on it is a fleet
+        held idle to reach the answer it already had.
+        """
+        assert refusal_wait_out(None)(_decode_failure_over_a_refused_object()) is False
 
 
 class TestMappingObjectsBackToCopies:

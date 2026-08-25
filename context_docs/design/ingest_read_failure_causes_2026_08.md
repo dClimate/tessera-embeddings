@@ -1,13 +1,15 @@
-# Ingest source-read failures: nine causes, and the retry budget they share
+# Ingest source-read failures: ten causes, and the retry budget they share
 
 Investigation record. Causes 1 and 2 traced 2026-08-04/05 on `global-tessera-dev`; cause 3 absorbed
 2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20,
-cause 5 on 2026-08-21, causes 6 and 7 on 2026-08-22/23, and causes 8 and 9 on 2026-08-24, all from
-live campaign legs. **Corrected in place: this document said "three causes" until cause 4 was
+cause 5 on 2026-08-21, causes 6 and 7 on 2026-08-22/23, and causes 8, 9 and 10 on 2026-08-24, all
+from live campaign legs. **Corrected in place: this document said "three causes" until cause 4 was
 added, "four causes" until cause 5 joined it, "five causes" until cause 6 did, "six causes" until
-cause 7 did, and "eight causes" until cause 9 did.** Cause 9 is the second half of cause 8 rather
-than a new mechanism: the same refusal, classified correctly and then given a budget that could
-not act on the classification. Cause 7 is the
+cause 7 did, "eight causes" until cause 9 did, and "nine causes" until cause 10 did.** Causes 9 and
+10 are both second halves of cause 8 rather than new mechanisms: cause 9 is the same refusal
+classified correctly and then given a budget that could not act on the classification, and cause 10
+is the same refusal never classified at all, because the evidence for it was never in the exception
+to begin with. Cause 7 is the
 only one here that is not a source failure — it is our own bookkeeping, and the only one that left
 holes nothing can fill. Traces
 `WarpOperationError('Chunk and warp failed')` and `PermissionError: The provided token has
@@ -1220,6 +1222,105 @@ exception for details.')`, `__cause__` of `None` — for the reason the section 
 `is_provider_refusal` declines that shape: it names a source reader but no refusal, so the write
 takes the ordinary attempt limit and the leg fails recoverably. That is the correct fail-closed
 direction, and it means this change realises its full value only once the cause survives the hop.
+
+**And that is only the first of two dependencies.** A cause that survives intact is still only what
+the reader chose to raise, and for a refused object that is a codec failure. See Cause 10.
+
+## Cause 10 — the refusal was never classified, because GDAL logged it instead of raising it, 2026-08-24
+
+**The third and last half of cause 8.** Cause 8 made the taxonomy correct. Cause 9 gave the correct
+verdict a budget worth having. This is why neither fired: the verdict was never reached, because
+the words it is reached from were never in the exception.
+
+### The failure
+
+An ASF credential expiry caused an eight-minute authorization outage. Every affected read returned
+HTTP 403 `AccessDenied`, and S3 delivered an XML error document in the place of the imagery. GDAL
+handed that document to the TIFF decompressor — that is what the reader had asked for — and the
+decompressor failed on it: `ZIPDecode: Decoding error at scanline 0`, of which **25 said "unknown
+compression method" outright**, which is a codec reporting that the bytes are not compressed data.
+
+The ingest gave up **158 radar dates across 55 stores** as permanently unreadable. **The imagery is
+fine**: 60 of 60 sampled granules read successfully afterwards, against a 30-of-30 control. Sixty of
+those dates are now permanently unfillable, because later dates were committed above them and the
+time axis is append-only.
+
+### The mechanism, and the one leg that got it right
+
+**Not one of the 158 exception chains contained an HTTP status or the string `AccessDenied`.** GDAL
+reported the 403 to its own log as a warning and raised only the decode failure. So
+`is_provider_refusal` saw `ZIPDecode`, correctly said no, and `wait_out` stayed `None` — the
+patience of Cause 9 never armed, and `_give_up_date` accepted the date as unreadable.
+
+At **00:00:32** one leg happened to surface `AccessDenied` as its final exception instead of a
+decode error. It classified as a provider refusal and skipped no date.
+
+**The same outage produced the permanent-loss verdict 158 times and the correct transient verdict
+once, decided purely by which GDAL error landed last in the retry ladder.**
+
+### Why the classifier was not at fault
+
+Read from the chain alone, `UNREADABLE` is the right answer to `ZIPDecode`. Nothing in the marker
+lists, the ranged statuses or the ordering was wrong. This is the same shape as the evidence gap at
+the end of this document — a classifier reading a string that does not contain the answer — with one
+difference that matters: there, the reason existed and was destroyed in transit; **here it never
+entered the exception at all.** No reducer recovers it, because there is nothing to serialise.
+
+### The change
+
+`ingest/loader_failures.py` already installed a log handler on the loader's own logger, to name the
+object a load aborted on. It gains a second, on `rasterio._env` — the logger rasterio's CPL error
+handler forwards every GDAL message to, and the only place the refusal is stated.
+`carry_logged_refusal` attaches what it collected to the failing exception as a note,
+`_exception_chain_text` reads notes with the rest of the chain, and `classify_read_failure`
+therefore decides from all of it.
+
+Both sensors reach that through `roi_processing.read_failure_context`, which every per-date read on
+both paths already passes through. One classifier, one set of evidence — the optical path is
+corrected by the same change, and a refusal that only GDAL logged now fails its leg with the axis
+unmoved instead of walking the copy ladder and recording DATA LOSS.
+
+Radar asks a second time, per retry attempt, through `refusal_wait_out(client)`. That is what arms
+Cause 9's budget: the retry policy asks its `wait_out` on every failure, and a predicate reading only
+the exception declines the outage the budget exists to outlast.
+
+### The polarity, which is the load-bearing part
+
+Adding evidence to a classifier can make a verdict worse in both directions, and only one of them is
+recoverable. Reading a refusal as unreadable cost 60 dates permanently. Reading unreadable bytes as
+a refusal makes a leg wait minutes and re-dispatch on data that will never read.
+
+**A line is kept only if the classifier reads that line ALONE as `PROVIDER_REFUSED` or
+`OUR_CREDENTIAL`** — the classifier is its own filter, so there is no second vocabulary to drift.
+Because refusal is tested before any statement about the bytes, an attached line can only move a
+verdict into those two members, never into `UNREADABLE` or `ABSENT`. **The capture cannot cost a
+date.** A wrong attribution costs patience: the write spends its refusal budget, the leg fails with
+its axis unmoved, and the date is judged alone on the re-dispatch.
+
+The rejected cases are what the filter is really for. GDAL probes for sidecars that were never
+published, and a kept `HTTP response code: 404` is exactly the marker that says a source object is
+absent — a verdict that gives a date up. A capture that took every GDAL warning would have been a
+new way to lose dates rather than a fix for the old one.
+
+### Two races, kept apart
+
+The href capture is destructive and cluster-wide, and `s2_roi.py` documents why that race fails
+safely: a lost attribution costs precision, a borrowed one would step down a tile that read.
+
+The refusals live in a **separate buffer**. One buffer would have meant the caller that classifies
+destroys the evidence the optical copy ladder attributes from — silently, and the ladder would
+simply stop attributing. The new buffer is drained on **every** read failure rather than only on an
+undecided one: a buffer left unread is a buffer whose lines are still there to be borrowed by a date
+that fails minutes later.
+
+### The general shape
+
+**The evidence a classifier needs may never have been in its input, rather than lost from it.** The
+evidence gap at the end of this document was about a reason destroyed in transit, and the answer was
+to stop destroying it. This one looks identical from the classifier's seat and has no such answer:
+the reader has to go and fetch what the raiser never said. Before widening a predicate, ask not only
+whether the input still contains what it should, but whether it ever did — and where else the same
+process wrote it down.
 
 ## Coupling to the leg retry
 

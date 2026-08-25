@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreadable_source
+from tessera_embeddings.ingest.loader_failures import drain_local_refusals, install_capture
 from tessera_embeddings.ingest.roi_processing import (
     SOURCE_READ_ATTEMPTS,
     read_failure_context,
@@ -108,6 +110,77 @@ def test_context_is_transparent_when_nothing_fails(caplog) -> None:
     with caplog.at_level(logging.DEBUG), read_failure_context(log, roi="zone_02N", date="2021-01-01"):
         pass
     assert caplog.records == []
+
+
+class TestTheContextCompletesTheReason:
+    """The one place both sensors' reads pass through, and so the one place their evidence meets.
+
+    A read failure's reason is not always in the exception. A refused object comes back as an
+    error document, GDAL states the refusal in its own log, and the codec raises the decode
+    failure it fails on — so the chain says the bytes are bad while the words saying the service
+    refused sit one log line away. The two verdicts are opposites: bad bytes means give the date
+    up, refused means wait and give up nothing. Collecting that evidence here is what makes one
+    classifier decide both paths from all of what is known.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _capture(self):
+        """The capture running and its buffer empty either side of the test."""
+        install_capture()
+        gdal = logging.getLogger("rasterio._env")
+        previous = gdal.level
+        gdal.setLevel(logging.WARNING)
+        drain_local_refusals()
+        yield
+        gdal.setLevel(previous)
+        drain_local_refusals()
+
+    def _raise_through_the_context(self, log: logging.Logger) -> BaseException:
+        """One date's read failing the way a refused object fails: a codec, and nothing else.
+
+        Chained with ``raise ... from``, which is the only thing that puts a cause on an
+        exception, because the cause is what every verdict here is read from.
+        """
+        with pytest.raises(OSError) as caught, read_failure_context(log, roi="zone_55N", date="2021-03-14"):
+            try:
+                raise ValueError("CPLE_AppDefinedError: ZIPDecode:Decoding error at scanline 0")
+            except ValueError as cause:
+                raise OSError("RasterioIOError: Read failed. See previous exception for details.") from cause
+        return caught.value
+
+    def test_a_refusal_only_gdal_logged_reaches_the_verdict(self, caplog) -> None:
+        """The failure that cost a hundred and fifty-eight dates, decided the other way."""
+        logging.getLogger("rasterio._env").warning("CPLE_AWSAccessDenied in HTTP response code: 403")
+        with caplog.at_level(logging.ERROR):
+            arrived = self._raise_through_the_context(logging.getLogger("t.refused"))
+
+        assert is_provider_refusal(arrived) is True
+        assert is_unreadable_source(arrived) is False, "a refusal must never give a date up"
+
+    def test_the_same_failure_with_nothing_logged_still_reads_as_bad_bytes(self, caplog) -> None:
+        """The control: the context must complete a reason, never invent one. A codec failure
+        with no refusal behind it is still permanently bad imagery, and still costs its date.
+        """
+        with caplog.at_level(logging.ERROR):
+            arrived = self._raise_through_the_context(logging.getLogger("t.corrupt"))
+
+        assert is_provider_refusal(arrived) is False
+        assert is_unreadable_source(arrived) is True
+
+    def test_both_sensors_hand_the_context_their_cluster(self) -> None:
+        """The evidence is on the READING workers, so a context with no client decides from the
+        chain alone — silently, and only on the path that dropped it. One sensor keeping the
+        argument and the other losing it is exactly the split this change exists to close.
+        """
+        for module in ("s1_roi.py", "s2_roi.py"):
+            src = (_SRC / "ingest" / module).read_text()
+            contexts = re.findall(r"read_failure_context\(([^)]*)\)", src)
+            assert contexts, f"{module}: no read_failure_context call found — has it been renamed?"
+            for call in contexts:
+                assert "client=client" in call, (
+                    f"{module}: `read_failure_context({call})` cannot collect what GDAL logged "
+                    "without the cluster, so a refusal there reads as unreadable data"
+                )
 
 
 class TestZeroDateOutcomeIsAttributable:

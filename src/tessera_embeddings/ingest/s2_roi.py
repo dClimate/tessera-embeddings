@@ -634,7 +634,7 @@ def ingest_s2_roi_reflectance(
         # date that consumes it; the graph itself is cheap next to the pixels it reads.
         date_mask = read_roi_mask(roi_zarr_path, spatial_chunks, storage_options=storage_options)
         try:
-            with read_failure_context(log, roi=roi_label, date=date, items=day_items):
+            with read_failure_context(log, roi=roi_label, date=date, items=day_items, client=client):
                 for attempt in source_read_retrying(log):
                     with attempt:
                         passes, any_valid = _coverage_from_scl(
@@ -744,7 +744,7 @@ def ingest_s2_roi_reflectance(
         # permanently unreadable object exhausts the retry and kills the leg. Which object
         # it was is the difference between a one-command diagnosis and a fleet-wide log
         # correlation.
-        with read_failure_context(log, roi=roi_label, date=prepared.date, items=prepared.items):
+        with read_failure_context(log, roi=roi_label, date=prepared.date, items=prepared.items, client=client):
             for attempt in store_write_retrying(log):
                 with attempt:
                     write_day_windows(

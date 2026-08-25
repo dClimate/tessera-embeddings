@@ -149,6 +149,41 @@ def test_every_verdict_in_the_closed_set_is_reachable() -> None:
     assert reached == set(ReadFailure), f"never produced: {set(ReadFailure) - reached}"
 
 
+def test_a_note_is_part_of_the_chain_the_verdict_is_read_from() -> None:
+    """Evidence attached to a failure counts, because not all of it ever reaches the exception.
+
+    GDAL states some refusals only in its own log and raises the codec failure that follows, so
+    the reader holding that log writes what it found onto the exception — see
+    ``loader_failures.carry_logged_refusal``, the only writer of notes here. If this text were
+    not read, that evidence would be gathered and then ignored, and the verdict would be reached
+    from half of what is known.
+    """
+    failure = _chained("ZIPDecode:Decoding error at scanline 0")
+    assert classify_read_failure(failure) is ReadFailure.UNREADABLE
+
+    failure.add_note("CPLE_AWSAccessDenied in HTTP response code: 403")
+    assert classify_read_failure(failure) is ReadFailure.PROVIDER_REFUSED
+
+
+def test_a_note_cannot_shorten_how_far_down_the_chain_is_read() -> None:
+    """The chain's bound counts LINKS, not entries. Counting entries would let notes push a
+    cause out of view — and the cause is the whole of what a verdict is reached from, so
+    attaching evidence would cost evidence.
+
+    Built at the bound rather than near it: a short chain passes either way, which is how a
+    bound that counts the wrong thing survives a test written for it.
+    """
+    deepest: BaseException = ValueError("CPLE_AppDefinedError: ZIPDecode:Decoding error at scanline 0")
+    current = deepest
+    for i in range(19):
+        wrapper: BaseException = RuntimeError(f"RasterioIOError: wrapper {i}")
+        wrapper.add_note("a note that says nothing")
+        wrapper.__cause__ = current
+        current = wrapper
+
+    assert classify_read_failure(current) is ReadFailure.UNREADABLE
+
+
 class TestLosingTheEvidenceVersusNotRecognisingIt:
     """Two different things that both end in no verdict, and the relationship between them.
 

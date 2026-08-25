@@ -58,7 +58,7 @@ from tessera_embeddings.ingest.live_windows import (
     live_windows_for_mask,
     windows_for_date,
 )
-from tessera_embeddings.ingest.loader_failures import install_capture_everywhere
+from tessera_embeddings.ingest.loader_failures import install_capture_everywhere, refusal_wait_out
 from tessera_embeddings.ingest.opera_query import make_s1_item_provider
 from tessera_embeddings.ingest.roi import (
     StorageOptions,
@@ -895,9 +895,16 @@ def ingest_s1_roi_sar(
                 # holding a fleet idle for minutes is the wrong response to a fault no waiting
                 # fixes. Re-evaluated per date rather than captured, so the leg starts spending
                 # patience the moment it has earned the right to.
+                #
+                # `refusal_wait_out` is the same classifier, asked over the same evidence the
+                # verdict below is reached from: the chain PLUS the refusals GDAL logged and
+                # did not raise. Reaching the verdict from the exception alone is why the
+                # patience never armed — a refused object comes back as an error document, the
+                # codec raises the decode failure it fails with, and the words naming the
+                # refusal are one log line away.
                 try:
-                    with read_failure_context(log, roi=roi_label, date=date_str):
-                        wait_out = is_provider_refusal if read_at_least_once else None
+                    with read_failure_context(log, roi=roi_label, date=date_str, client=client):
+                        wait_out = refusal_wait_out(client) if read_at_least_once else None
                         for attempt in store_write_retrying(log, wait_out=wait_out):
                             with attempt:
                                 write_day_windows(

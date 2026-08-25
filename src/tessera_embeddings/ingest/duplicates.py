@@ -928,6 +928,21 @@ def unreadable_source_in(text: str) -> bool:
     return _means_the_copy_is_lost(classify_read_failure_in(text))
 
 
+def is_source_read_failure(exc: BaseException) -> bool:
+    """Whether ``exc``'s chain says the SOURCE READER is what failed, whatever it failed with.
+
+    Not a verdict about the failure — :func:`classify_read_failure` is that — but about whose
+    failure it is. The one caller is the code that copies a refusal out of GDAL's log onto an
+    exception: that evidence is about a READ, and attaching it to anything else would let a
+    concurrent read's refusal explain a store conflict or a duplicate date. Same marker set as
+    every other corroboration here, for the reason :data:`_SOURCE_READER_MARKERS` gives.
+
+    Admits the flattened shape too, whose whole message is the reader's wrapper repr — that is
+    the shape this evidence exists to rescue, so excluding it would defeat the point.
+    """
+    return any(m in _exception_chain_text(exc) for m in _SOURCE_READER_MARKERS)
+
+
 def cause_was_flattened(exc: BaseException) -> bool:
     """Whether ``exc`` is a read failure that arrived with its cause destroyed.
 
@@ -960,12 +975,22 @@ def _exception_chain_text(exc: BaseException) -> str:
     them the stable thing to match; see ``ingest/loader_failures.py`` for what keeps the chain
     itself intact. The whole chain, because the wrapper discards the reason:
     ``WarpOperationError('Chunk and warp failed')`` says nothing on its own.
+
+    A chain's NOTES are part of its text. Not all of a read failure's reason is ever in the
+    exception: GDAL states some of it only in its own log and raises something else entirely, so
+    the reader holding that log attaches what it found as a note — see
+    :func:`tessera_embeddings.ingest.loader_failures.carry_logged_refusal`, the only writer of
+    notes in this pipeline. Without this line that evidence would be gathered and then ignored.
     """
     seen: list[str] = []
     current: BaseException | None = exc
-    while current is not None and len(seen) < 20:
+    links = 0
+    # Links, not entries: a note must not shorten how far down the chain this reads.
+    while current is not None and links < 20:
         seen.append(f"{type(current).__name__}: {current}")
+        seen.extend(str(note) for note in getattr(current, "__notes__", ()))
         current = current.__cause__ or current.__context__
+        links += 1
     return " | ".join(seen)
 
 

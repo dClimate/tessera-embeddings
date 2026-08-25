@@ -1106,7 +1106,9 @@ per passing date (one writable session ── one commit)
   whose log stream is an ECS task id, so without it the same error text appears for every
   zone in the fleet and belongs to none of them. The traceback is what recovers rasterio's
   cause — it reports `Read failed. See previous exception for details.` and that previous
-  exception is GDAL's, discarded unless the chain is logged.
+  exception is GDAL's, discarded unless the chain is logged. It is also where the half of the
+  reason GDAL never raised is collected and attached — see *When GDAL logs the reason instead
+  of raising it* below.
 - **Each date narrows further, to the land its own imagery reaches.** A run's windows
   say where the ROI has land, and are the same on every date; a single date is not, because
   an optical satellite images a fraction of a wide ROI per pass. Windows a date does not
@@ -1818,6 +1820,10 @@ throttle markers explicitly. It fails CLOSED: anything unrecognised propagates r
 being treated as bad data, because responding to a bad minute by reading worse imagery is
 the one outcome the recovery must never produce.
 
+**An intact chain is still only what the reader chose to RAISE.** GDAL states some refusals in
+its own log and raises something else entirely, and the section *When GDAL logs the reason instead
+of raising it* below is what closes that.
+
 **The chain only exists if something kept it.** The read fails on a Dask worker, and rasterio's
 GDAL error classes cannot be serialised out of it by default — Dask detects that and substitutes
 a plain `Exception` holding the wrapper's repr, so what arrives is one line with no cause and
@@ -1908,6 +1914,61 @@ discarded the cause long before. So a radar write that exhausts its in-leg budge
 raises `errors.ProviderRefusedReadsError`, whose name reaches the detail and is what
 `_leg_backoff_s` keys the long delay on. Nothing about the failure changes: it fails the leg
 exactly as it did, and skips exactly as much, which is nothing.
+
+### When GDAL logs the reason instead of raising it
+
+Everything above reads the exception chain. Some of a read failure's reason never reaches it.
+
+A refused object is not empty: S3 answers the range request with an XML error document, and GDAL
+hands that document to the TIFF decompressor because that is what it asked for. The decompressor
+fails on it — `ZIPDecode: Decoding error at scanline 0`, sometimes `unknown compression method`,
+which is a codec saying the bytes are not compressed data — and that is what gets raised. GDAL
+does state the refusal, as a warning in its OWN log, and raises nothing about it.
+
+So the chain says the bytes are bad and the log says the service refused. Those two verdicts are
+opposites: bad bytes means give the date up, refused means wait and give up nothing. Which one a
+failure gets was decided by which GDAL error happened to land last in the retry ladder.
+
+`loader_failures` closes it with a second handler on `rasterio._env`, the logger rasterio's CPL
+error handler forwards every GDAL message to. `carry_logged_refusal` attaches what it collected to
+the failing exception as a note, `_exception_chain_text` reads notes with the rest of the chain,
+and `classify_read_failure` therefore decides from all of it. Both sensors reach this through
+`roi_processing.read_failure_context`, which every per-date read on both paths already passes
+through — so it is one classifier over one set of evidence, not a rule per sensor.
+
+Four properties are what make it safe to add evidence at all:
+
+- **Only refusals are recorded.** A line is kept only if the classifier reads THAT LINE ALONE as
+  `PROVIDER_REFUSED` or `OUR_CREDENTIAL` — the classifier itself is the filter, so there is no
+  second vocabulary to drift. Everything else GDAL says is dropped, and the dropped cases are the
+  point: GDAL probes for sidecars that were never published, and a kept `HTTP response code: 404`
+  is the marker that says a source object is ABSENT, which gives a date up.
+- **The direction is bounded.** Refusal is tested before any statement about the bytes, so an
+  attached line can only move a verdict into those two — never into `UNREADABLE` or `ABSENT`.
+  **This capture cannot cost a date.** What a wrong attribution costs is patience: the write
+  spends its refusal budget, the leg fails with its time axis unmoved, and the date is judged
+  alone on the re-dispatch.
+- **Only onto a source read failure.** A store conflict or a duplicate date raised while some
+  other read is being refused is still a store conflict, and answering it with a wait fixes
+  nothing. `is_source_read_failure` gates it on the same `_SOURCE_READER_MARKERS` every other
+  corroboration here uses.
+- **A separate buffer from the aborted hrefs.** Collection is destructive and cluster-wide, so one
+  buffer would mean the caller that classifies destroys the evidence the optical copy ladder
+  attributes from. The two are drained independently, and the href race is unchanged.
+
+The evidence is ATTACHED rather than answered because collection is destructive: a caller that
+classified and discarded would hand the next reader of the same exception the opposite verdict,
+and the radar path has two readers — the retry policy that spends patience, and the handler that
+decides whether the date is lost.
+
+Radar asks for it twice, and the second ask is what arms `wait_out`. `refusal_wait_out(client)` is
+`is_provider_refusal` over evidence gathered at the moment the policy asks, which is per attempt;
+a predicate reading only the exception declines the outage the budget exists to outlast and spends
+the ordinary three attempts on it. Optical does not pass `wait_out` at all — its answer to a
+refusal is a leg failure with the axis unmoved, because its per-date remedy is the copy ladder and
+a long wait per rung would multiply with it. The evidence still reaches optical through the same
+context manager, so a refusal there is declined by `is_unreadable_source` and fails the leg rather
+than stepping copies and recording data loss.
 
 **And only a refusal that arrives AFTER a successful read earns the expensive wait.** An
 authorization verdict on a valid credential is either the provider misbehaving or our permissions
