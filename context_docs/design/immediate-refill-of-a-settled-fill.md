@@ -202,6 +202,62 @@ amplification across the cell and round budgets. Untouched.
 | a global scan for orphaned cells | a per-run recovery that scans globally amplifies. This is one paged live-runs query, made in-process, at most once per settled slot, dispatching at most one replacement |
 | an integer knob for the generation bound | a fourth number is a fourth thing to get wrong under pressure, and the value is not a judgement an operator is placed to make mid-incident |
 
+## What the first review found, and what it changed
+
+Two independent reviewers produced eleven threads on the first version. Tabulated by root
+cause rather than by file, they were **six distinct findings, five of them raised by both
+reviewers** — which is the signal worth recording: two careful readers walking into the same
+five things is a structural problem, not eleven edge cases.
+
+| Finding | Root cause |
+|---|---|
+| Parameters built lazily; tasks created outside the cancellation `try` | A |
+| The sibling-liveness gate is stale by the time the dispatch happens | A |
+| The store re-read escapes instead of declining | B |
+| Offset paging can silently under-report a claim | B |
+| Null-state runs excluded by the live-state filter | B |
+| The refill bound resets every round | C |
+
+**Root cause A — a hand-rolled `gather` lost its atomicity.** `gather(*(...))` consumes its
+whole generator before scheduling anything, so a `_chained_params` that raised dispatched
+nothing at all. Interleaving build and schedule meant a later cluster's failing land-mask
+probe left earlier fills running while the campaign failed — and an ordinary `FAILED` state
+does not fire the child-cancel hook. The rule now stated in the source: **nothing that can
+await or raise may sit between deciding to dispatch and dispatching.** Every parameter set is
+built before any task exists; every task is created inside the `try`; and an await-free commit
+gate re-checks liveness immediately before the dispatch, because planning awaits and a sibling
+can finish across that await while its task sits unharvested in the map.
+
+**Root cause B — uncertainty was not uniformly fail-closed.** `_refill`'s own docstring
+promised it "refuses on anything it cannot establish, including its own inability to ask", and
+the store re-read two lines below it was unguarded. One guard now covers every read the
+decision makes. The claim query stops enumerating LIVE states and negates Prefect's own
+`TERMINAL_STATES`, so the dangerous verdict is no longer the fallback, and it repeats until
+two consecutive passes agree, unioning across them — which fixes the paging skip and the
+null-state window with one mechanism, bounded at `_STABILITY_PASSES` and declining, never
+proceeding, when it runs out.
+
+**Root cause C — a bound implemented per round against a promise made per cell.** The marker
+lived in the round's task map, so each round handed out fresh eligibility: four attempts at the
+default two rounds, against three documented in the flag's docstring, this file, the README and
+the pull request. A documented bound that is not true is worse than an undocumented one,
+because the next person sizing a fleet believes it. Eligibility is now tracked per cell at
+campaign scope.
+
+**A defect neither reviewer caught, found by the structural pass.** The replacement's own
+`_chained_params` call does an S3 land-mask probe and an SSM read, and it sat outside the
+guard — so a transient read failure there ended the campaign rather than declining a refill.
+It is the clearest argument for tabulating by cause instead of answering eleven comments in
+order: nothing in the list pointed at it, and the rule that fixes root cause B fixes it too.
+
+**Two remedies were declined, with reasons.** Finding 5 suggested including null-state runs in
+the query or classifying locally: the first is impossible, since the server compiles both the
+inclusive and the exclusive state filter to SQL that drops NULL, and the second means paging
+the whole run history per refill decision against a server this campaign already knows goes
+quiet at fleet width. Finding 6 offered "count the refill against the cell's dispatch budget"
+as an alternative: that would give a refilled cell FEWER round attempts than an un-refilled
+one, silently weakening the recovery path `max_dispatch_rounds` exists for.
+
 ## Verification
 
 Green: 3,390 unit tests, `tests/architecture`, the module-rule runner, ruff and mypy.
@@ -210,7 +266,10 @@ flag-off claim.
 
 Every new test was checked against a **mutation**, not only against a full revert — a full
 revert makes them all fail on an unknown parameter, which proves nothing about what they
-measure.
+measure. The table was REBUILT from scratch after the review restructure rather than ported,
+which is how the one genuine gap in it was found: the pre-plan liveness check had no test of
+its own, because the commit gate that followed it subsumed its effect. It is a cost filter,
+not the safety gate, and it is now pinned as one.
 
 | mutation | tests that failed |
 |---|---|

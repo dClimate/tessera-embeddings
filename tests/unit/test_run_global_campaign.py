@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1618,8 +1619,12 @@ class _Round:
         self.held |= set(zones)
         self.timeline.append(("dispatch", zones))
         try:
-            if zones and zones[0] == self.hold and not self.release.is_set():
+            if zones and zones[0] == self.hold:
                 await self.release.wait()
+                # RE-ARM. The hold has to work in every round, not just the first: a
+                # bound that spans rounds cannot be observed if only round one has a
+                # sibling to hold.
+                self.release.clear()
             ends = self.ends.get(zones[0], "COMPLETED") if zones else "COMPLETED"
             if ends == "raise":
                 raise RuntimeError("dispatch failed")
@@ -1640,15 +1645,47 @@ class _Round:
 
         The release waits a budget of event-loop TURNS rather than a delay: everything the
         decision touches is stubbed, so it needs a handful of turns and no wall clock. A
-        driver that needed more would fail these tests rather than hang.
+        driver that needed more would fail these tests rather than hang. Pumped in a loop
+        rather than once, so a held cluster works in every round.
         """
         task = asyncio.ensure_future(
             mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", **kwargs)
         )
-        for _ in range(200):
-            await asyncio.sleep(0)
-        self.release.set()
+        for _ in range(50):  # rounds, generously; the assert below catches a real hang
+            if task.done():
+                break
+            for _ in range(200):
+                await asyncio.sleep(0)
+                if task.done():
+                    break
+            self.release.set()
+        assert task.done() or not self.timeline, "the campaign did not settle within the turn budget"
         return await task
+
+
+@contextmanager
+def caplog_at_info():
+    """Collect the driver's log messages at INFO, as a list of strings.
+
+    A plain handler rather than the `caplog` fixture, because these tests drive the flow
+    inside `asyncio.run` from a helper and want the records regardless of propagation.
+    """
+    records: list[str] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    logger = logging.getLogger("test-campaign")
+    handler = _Collect()
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
 
 
 def _round(monkeypatch, wired, round_, zones=("01N", "02N"), years=(2025,)):
@@ -1818,3 +1855,142 @@ class TestImmediateRefill:
         r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="_none"), zones=("01N",))
         asyncio.run(r.drive(max_parallel_clusters=1, immediate_refill=True, max_dispatch_rounds=1))
         assert r.dispatches() == [("01N",)], r.dispatches()
+
+    def test_a_round_that_is_already_over_is_not_even_planned_for(self, wired, monkeypatch):
+        """The gate before planning is a COST filter, not the safety one.
+
+        The commit gate below it is what actually prevents a pointless replacement, and it
+        would decline this case on its own. This one exists so the driver does not pay for
+        a store re-read and a full live-run scan per settled cluster once the round is
+        over — which, at the fleet's cluster count, is a burst of orchestrator queries for
+        an answer that is already known.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="_none"), zones=("01N",))
+        asked = {"n": 0}
+
+        async def counting_claim_query():
+            asked["n"] += 1
+            return set()
+
+        monkeypatch.setattr(mod, "zone_years_claimed_by_live_runs", counting_claim_query)
+        asyncio.run(r.drive(max_parallel_clusters=1, immediate_refill=True, max_dispatch_rounds=1))
+        assert asked["n"] == 0, "the live-run scan ran for a round that had already finished"
+
+
+class TestTheDispatchDecisionIsAtomic:
+    """Nothing that can await or raise may sit between deciding to dispatch and dispatching.
+
+    A starred ``gather`` gave both halves of that for free: it consumed its whole generator
+    before scheduling anything, and its tasks never existed outside the awaited expression.
+    A hand-rolled drain loop has to earn them.
+    """
+
+    def test_a_parameter_build_that_raises_dispatches_nothing(self, wired, monkeypatch):
+        """Partial dispatch is the worst outcome available here.
+
+        The parameter build probes the land mask and reads SSM, so it can fail for a later
+        cluster after earlier ones are already scheduled. Those fills would then keep
+        running while the campaign fails — and an ordinary FAILED state does not fire the
+        child-cancellation hook, so nothing would sweep them.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={}, hold="_none"), zones=("01N", "02N"))
+
+        def probe(_mask, zone, **_k):
+            if zone == "02N":
+                raise RuntimeError("land-mask read failed")
+            return True
+
+        monkeypatch.setattr(mod, "zone_has_live_tiles", probe)
+        with pytest.raises(RuntimeError, match="land-mask read failed"):
+            asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True))
+        assert r.dispatches() == [], f"a fill was dispatched before the build failed: {r.dispatches()}"
+
+    def test_a_round_that_ends_while_the_refill_is_planned_does_not_get_one(self, wired, monkeypatch):
+        """The gate checked before planning is stale by the time the dispatch happens.
+
+        Planning reads the store and queries the orchestrator, and a sibling can finish
+        across those awaits while its task sits in ``live`` unharvested. Dispatching then
+        buys an extra fleet and an extra attempt for no wall clock at all, because the round
+        is already over and would re-dispatch anyway.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N"))
+
+        async def claim_query_that_lets_the_sibling_finish():
+            r.release.set()  # 02N's dispatch is parked on this
+            for _ in range(20):
+                await asyncio.sleep(0)
+            return set()
+
+        monkeypatch.setattr(mod, "zone_years_claimed_by_live_runs", claim_query_that_lets_the_sibling_finish)
+        with caplog_at_info() as records:
+            asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
+        assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]
+        assert "the round finished while the refill was being planned" in "\n".join(records)
+
+
+class TestUncertaintyIsNotPermission:
+    """Every read the refill decision makes can fail, and a failure must DECLINE.
+
+    Declining costs a round's wait. Proceeding on an unestablished fact risks a second
+    writer; escaping fails the campaign while sibling fills are still running, which an
+    ordinary FAILED state does not sweep.
+    """
+
+    def test_a_store_read_failure_declines_instead_of_failing_the_campaign(self, wired, monkeypatch):
+        """`campaign_status` and `list_tags` reach the store over a network."""
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N"))
+        status = SimpleNamespace(zones=dict.fromkeys(("01N", "02N"), ()), has=lambda z, y: False)
+        calls = {"n": 0}
+
+        def flaky_status(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 2:  # the refill's own re-read; the round's own reads still work
+                raise RuntimeError("store unreachable")
+            return status
+
+        monkeypatch.setattr(mod, "campaign_status", flaky_status)
+        with caplog_at_info() as records:
+            summary = asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
+        assert summary["unfilled"] == {2025: ["01N"]}, "the campaign should finish, not fail"
+        assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]
+        assert "Could not establish what is safe to refill" in "\n".join(records)
+
+    def test_a_failing_replacement_parameter_build_declines_instead_of_failing_the_campaign(self, wired, monkeypatch):
+        """The replacement's OWN build probes the land mask and reads SSM, exactly as the
+        round's does — and it runs mid-round, with siblings still writing. Left outside the
+        guard it would end the campaign over a transient read.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N"))
+        dispatched: list[int] = []
+
+        def probe(_mask, _zone, **_k):
+            # Fails only once a fill has settled, so the round's own builds succeed and only
+            # the replacement's fails.
+            if r.timeline and any(kind == "settle" for kind, _z in r.timeline):
+                raise RuntimeError("land-mask read failed")
+            dispatched.append(1)
+            return True
+
+        monkeypatch.setattr(mod, "zone_has_live_tiles", probe)
+        with caplog_at_info() as records:
+            summary = asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
+        assert summary["unfilled"] == {2025: ["01N"]}, "the campaign should finish, not fail"
+        assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]
+        assert "Could not establish what is safe to refill" in "\n".join(records)
+
+
+class TestTheExtraAttemptIsBoundedAcrossRounds:
+    """The bound advertised is per CELL for the whole campaign: at most one attempt beyond
+    the round budget. Rounds are re-entered, so a marker scoped to a round would hand that
+    extra attempt out again on every one.
+    """
+
+    def test_a_cell_gets_one_extra_attempt_for_the_campaign_not_one_per_round(self, wired, monkeypatch):
+        """Both zones keep failing, so every round has a sibling to hold and the immediate
+        path is genuinely reachable in each. `max_dispatch_rounds=2` therefore permits two
+        originals plus ONE refill, not one refill per round.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED", "02N": "FAILED"}, hold="02N"))
+        summary = asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=2))
+        assert summary["unfilled"] == {2025: ["01N", "02N"]}
+        assert r.dispatches().count(("01N",)) == 3, r.dispatches()

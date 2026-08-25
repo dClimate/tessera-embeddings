@@ -115,10 +115,16 @@ today:
    granularity, because dropping one claimed year while keeping its zone's others is
    exactly the split the partition exists to prevent.
 
-Bounded at one generation per slot per round, and only issued while a sibling is still
-running: with the round over, the loop re-dispatches anyway, so a replacement then would
-buy an extra fleet for no wall clock. A cell therefore gains at most one attempt beyond
-`max_dispatch_rounds`.
+Bounded per **cell**, for the life of the campaign rather than of a round: a cell that has
+had its replacement is not eligible for another on a later round, a replacement is not
+itself eligible for one, and none is issued unless a sibling is still running. A cell
+therefore gains at most one attempt beyond `max_dispatch_rounds` in total.
+
+Every read the decision makes declines on failure rather than propagating — the store's tip
+and tags, the live-run scan, and the replacement's own land-mask and SSM probes. Declining
+costs a round's wait; an exception escaping mid-round would fail the campaign while sibling
+fills were still writing, and an ordinary `FAILED` state does not fire the child-cancel hook
+that would sweep them.
 
 What it deliberately does not address: crashed and cancelled fills, which need fencing at
 the write rather than an inference about who has stopped; the barrier itself, which still
