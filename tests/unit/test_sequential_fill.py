@@ -171,6 +171,22 @@ class BudgetProbeInputs(RecordingInputs):
             self.alive -= 1
 
 
+class FailingWaitInputs(BudgetProbeInputs):
+    """Every ingest FAILS, and fails where the feeder itself sees it.
+
+    Ingest failures surface synchronously inside the feeder loop (``inputs.wait``
+    raises, the cell is recorded and counted, the loop continues), which is what makes
+    the retained-failure cap deterministic. Inference failures are the other case —
+    they land on the trailing finalizer thread, so the feeder can admit further cells
+    before the count catches up. See the two cap tests below.
+    """
+
+    def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+        with self._lock:
+            self.events.append(f"wait:{zone}")
+        raise RuntimeError(f"ingest failed for {zone}-{year}")
+
+
 def _resume(done=frozenset(), skipped=frozenset()):
     """A StagedResume stub for the resume scan."""
     return StagedResume(done=set(done), skipped=set(skipped))
@@ -516,29 +532,95 @@ def test_a_mismatched_run_does_not_deadlock_the_feeder():
 
 
 def test_systematic_failure_stops_feeder_at_retained_cap():
-    """A run that fails EVERY cell must not free-then-retain every shard's mosaic:
-    once retained failures reach look_ahead + 2, the feeder stops admitting, so
-    peak retained mosaics stays bounded rather than growing to the whole shard.
+    """A run whose every INGEST fails must stop admitting at the cap.
+
+    This is the deterministic half of the cap. An ingest failure raises inside
+    ``inputs.wait`` on the feeder's own thread, so the cell is counted before the loop's
+    next cap check — the feeder therefore cannot get past the cap no matter how fast the
+    fake runs. ``look_ahead=1`` → cap = 3, so a 12-cell run must attempt far fewer.
+    """
+    events: list[str] = []
+    inputs = FailingWaitInputs(events)
+    with pytest.raises(RuntimeError, match="cell"):
+        # attempts=1 disables the in-child retry pass, which calls `inputs.wait` too —
+        # counting its attempts as admissions reported 6 for a feeder that stopped at 3.
+        _run(_cells(12), inputs=inputs, look_ahead=1, attempts_per_cell_in_cluster=1)
+    waited = len([e for e in events if e.startswith("wait:")])
+    started = len([e for e in events if e.startswith("start:")])
+    assert waited == 3, f"the feeder must stop admitting at the cap of 3, admitted {waited}"
+    assert started == 12, "ingest is no longer gated by admission, so every cell starts"
+    assert "cleanup:" not in "".join(events)
+
+
+def test_inference_failures_are_paced_by_ingest_not_by_the_cap():
+    """The other half of the cap, and a DELIBERATE weakening — pinned so it is visible.
+
+    An inference failure is recorded on the trailing finalizer thread, not the feeder's,
+    so the feeder can admit further cells before the count catches up. Admission used to
+    be bounded by a semaphore released only after a cell's ASSEMBLY landed, which capped
+    the run-ahead at ``look_ahead + 2`` cells — and also stalled inference behind
+    assembly and capped fleet-fill parallelism, which is why it is gone.
+
+    With instant fakes the feeder therefore admits every cell. That is a property of the
+    fake, not of production: there ``inputs.wait`` blocks on a real ingest, only
+    ``1 + look_ahead`` of which run at a time and each taking tens of minutes to hours,
+    so the feeder can only run as far ahead as ingests actually complete.
+
+    What must still hold is that the run FAILS and no cell's mosaic is deleted, so every
+    failed cell stays resumable.
     """
     events: list[str] = []
     inputs = BudgetProbeInputs(events)
     with pytest.raises(RuntimeError, match="cell"):
-        # 12 cells, all fail inference; look_ahead=1 → retained-failure cap = 3.
         _run(
             _cells(12),
             session=_sync_session(fail={f"{i + 1:02d}N" for i in range(12)}, events=events),
             inputs=inputs,
             look_ahead=1,
         )
-    # ADMISSION is what the cap bounds, and it is now measured directly. It used to be
-    # inferred from the ingest-start count, which worked only while ingest was chained
-    # behind admission — decoupling them made that proxy report 12 for a feeder that had
-    # correctly stopped. The two counts are now asserted apart, which is the point.
-    admitted = len([e for e in events if e.startswith("infer:")])
-    started = len([e for e in events if e.startswith("start:")])
-    assert admitted < 12, f"the feeder must stop admitting at the cap, admitted {admitted}"
-    assert started == 12, "ingest is no longer gated by admission, so every cell starts"
-    assert "cleanup:" not in "".join(events)
+    assert len([e for e in events if e.startswith("start:")]) == 12
+    assert "cleanup:" not in "".join(events), "a failed cell must keep its mosaic for resume"
+
+
+def test_inference_does_not_wait_for_assembly():
+    """THE point of removing the admission bound: a stuck assembly must not stall inference.
+
+    The single assembly thread is held until every cell has finished inference. That can
+    only happen if admission is unbounded — the old semaphore admitted ``look_ahead + 2``
+    un-finalized cells and released a slot only after a cell's assembly landed, so with
+    ``look_ahead=0`` the feeder would stall after two cells and never reach the eighth.
+
+    Fails on the pre-change code: the release never comes, the hold times out, and the
+    cells that did stream fail in assembly.
+    """
+    n = 8
+    all_streamed = threading.Event()
+    assembled: list[str] = []
+
+    def blocking_assemble(handoff, prep):
+        if not all_streamed.wait(timeout=5.0):
+            raise AssertionError("inference stalled behind assembly — admission is still bounded")
+        assembled.append(handoff.zone)
+        return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
+
+    def session(more_work, on_item_done):
+        results: list[dict] = []
+        streamed: set[str] = set()
+        while True:
+            batch = more_work()
+            if batch is None:
+                return results
+            for item in batch:
+                result = {"chunk": item.chunk.label, "status": "success"}
+                results.append(result)
+                on_item_done(item, result)
+                streamed.add(item.ctx.run_id.removeprefix("r-"))
+            if len(streamed) == n:
+                all_streamed.set()
+
+    _run(_cells(n), session=session, assemble=blocking_assemble, inputs=RecordingInputs([]), look_ahead=0)
+
+    assert len(assembled) == n, f"every cell must assemble once the hold lifts, got {assembled}"
 
 
 def test_sporadic_failures_below_cap_do_not_stop_the_run():
