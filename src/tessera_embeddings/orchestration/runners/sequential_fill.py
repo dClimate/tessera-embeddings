@@ -431,23 +431,18 @@ def fill_zones_sequential(
             inputs.start(cell.zone, cell.year)
 
     def _finalize(tally: _ZoneTally) -> None:
-        """Trailing-thread body: assemble a completed zone, release its slot.
+        """Trailing-thread body: assemble a SUCCESSFUL zone, then delete its mosaic.
 
-        The mosaic delete (potentially multi-TB) also runs here, overlapping
-        later zones' inference. A failed zone keeps its mosaic — the retry
-        re-derives its fingerprinted run_id from the mosaic's ingest marker
-        and resumes its staged tiles.
+        Only reached for a cell whose inference succeeded — ``_submit_assembly`` accounts
+        failures itself. The mosaic delete (potentially multi-TB) also runs here,
+        overlapping later zones' inference. A zone that fails to ASSEMBLE keeps its mosaic:
+        the retry re-derives its fingerprinted run_id from the mosaic's ingest marker and
+        resumes its staged tiles.
         """
         cell, prep = tally.cell, tally.prep
         cleaned = False
         failed_assembly = False
         try:
-            if tally.failed:
-                bad = [r for r in tally.results if r.get("status") == "failed"]
-                _record_failure(
-                    cell, "inference", RuntimeError(f"{len(bad)}/{len(tally.results)} tiles failed (e.g. {bad[0]})")
-                )
-                return
             handoff = complete_zone_inference(tally.plan, results=tally.results)
             _record_outcome(assemble(handoff, prep))
         except Exception as exc:
@@ -473,12 +468,12 @@ def fill_zones_sequential(
                         cell.year,
                     )
         finally:
-            # FAILED cell → retain the mosaic for resume and COUNT it, so a systematic
+            # FAILED assembly → retain the mosaic for resume and COUNT it, so a systematic
             # failure cannot accumulate every cluster's mosaic unbounded. LANDED cell whose
             # delete failed → leak, uncounted: the cell is correct and must not consume the
             # cap that exists to stop the feeder.
             if not cleaned:
-                if tally.failed or failed_assembly:
+                if failed_assembly:
                     _retain_failed_mosaic(cell)
                 else:
                     _leak_mosaic(cell)
@@ -486,8 +481,30 @@ def fill_zones_sequential(
                 nonlocal assembly_pending
                 assembly_pending -= 1
 
+    def _account_failed_inference(tally: _ZoneTally) -> None:
+        """Record and count a cell whose inference failed. Does NO I/O, by design.
+
+        Must not run on the finalizer thread: it would queue behind the assembly backlog,
+        and since nothing bounds admission the feeder would admit the rest of the cluster
+        before the first failure was counted — leaving the retained-failure cap blind
+        exactly when a systematic failure is what it exists to catch.
+        """
+        bad = [r for r in tally.results if r.get("status") == "failed"]
+        _record_failure(
+            tally.cell, "inference", RuntimeError(f"{len(bad)}/{len(tally.results)} tiles failed (e.g. {bad[0]})")
+        )
+        _retain_failed_mosaic(tally.cell)
+
     def _submit_assembly(tally: _ZoneTally) -> None:
-        """Queue a completed cell's assembly, counting it as backlog until it lands."""
+        """Route a completed cell. Failures are accounted NOW; only successes are queued.
+
+        A failed tally needs no assembly — only bookkeeping — so the finalizer is an
+        ASSEMBLY queue and nothing else. That keeps the retained-failure cap prompt
+        however deep the backlog is.
+        """
+        if tally.failed:
+            _account_failed_inference(tally)
+            return
         nonlocal assembly_pending
         with lock:
             assembly_pending += 1

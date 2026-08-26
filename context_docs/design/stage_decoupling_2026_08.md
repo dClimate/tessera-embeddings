@@ -58,13 +58,31 @@ including past the end of it.
 
 ## Two accepted costs
 
-**The retained-failure cap is looser.** It still stops admission deterministically for
-failures the feeder sees itself — an ingest failure raises inside `inputs.wait` on the
-feeder's own thread and is counted before the loop's next cap check. An *inference* failure
-is recorded on the trailing finalizer thread, so the feeder can admit further cells before
-the count catches up. In production that run-ahead is bounded by ingest rather than by a
-gate: `inputs.wait` blocks on a real ingest, only `1 + look_ahead` run at a time, and each
-takes tens of minutes to hours. Two tests name which half is which.
+**The retained-failure cap is slightly looser, but not blind.** This was the one real
+defect the first version of the change introduced, found in review.
+
+A cell's outcome has two parts: RECORDING it (bookkeeping, instant) and ASSEMBLING it
+(I/O, hours). `_finalize` did both on the single trailing thread, so a failed tally — which
+needs no assembly at all — queued behind the entire assembly backlog before being counted.
+With admission unbounded the feeder could then admit the whole cluster before the first
+failure registered, leaving the cap blind for hours in exactly the systematic-failure case
+it exists for. Measured: with the assembly thread held, **zero** cells reached the cap.
+
+The fix makes the finalizer an ASSEMBLY queue only. `_submit_assembly` accounts a failed
+tally on the caller's thread and never queues it. With the assembly thread held, failures
+now reach the cap immediately.
+
+What remains: accounting is still asynchronous relative to the feeder — an inference
+failure is counted on the scheduler's thread, not the feeder's — so the feeder can admit a
+few more cells before the count catches up. That residual is thread-scheduling latency
+rather than an unbounded I/O wait, and in production the feeder is paced by `inputs.wait`
+on a real ingest anyway. An ingest failure is exact, because it raises on the feeder's own
+thread before the loop's next cap check.
+
+**Do not test this by counting admissions.** With instant fakes the feeder outruns the
+scheduler and the admitted count ranged 4 to 12 across runs. The stable axis is which
+thread does the accounting; the test holds one assembly and asserts failures are counted
+meanwhile.
 
 **The assembly drain at the end can be long.** It runs inside the caller's Ray context, but
 the session has already retired its actors by then, so the cluster's GPU workers idle down
@@ -86,7 +104,7 @@ needed, which is what made this cheap:
 | `test_ingest_starts_for_every_cell_and_is_not_paced_by_the_fill` | an ingest started only after a cell was finalized |
 | `test_the_readiest_cell_is_taken_wherever_it_sits` | took `01N` instead of the landed `05N` |
 | `test_systematic_failure_stops_feeder_at_retained_cap` | ingest was gated by admission |
-| `test_inference_failures_are_paced_by_ingest_not_by_the_cap` | admitted 6 of 12 |
+| `test_failed_cells_are_counted_while_an_assembly_is_stuck` | 0 cells reached the cap while one assembly was held |
 
 **Not covered:** reaching 60 concurrent is only observable in prod at full width. The
 mechanism is the same code path at any divisor, and the dispatch log above already shows the

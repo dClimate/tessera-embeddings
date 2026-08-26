@@ -9,6 +9,7 @@ dependency, stubbed at the module namespace.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import pathlib
 import threading
@@ -198,7 +199,7 @@ def _no_scan(monkeypatch):
     )
 
 
-def _run(cells, *, orbits=None, plan=None, session=None, assemble=None, infer_single=_no_fallback, **kw):
+def _run(cells, *, orbits=None, plan=None, session=None, assemble=None, infer_single=_no_fallback, log=LOG, **kw):
     return fill_zones_sequential(
         cells=cells,
         prepare=_prepare_for(orbits),
@@ -207,7 +208,7 @@ def _run(cells, *, orbits=None, plan=None, session=None, assemble=None, infer_si
         assemble=assemble or _assemble(),
         infer_single=infer_single,
         session_s1_orbit="both",
-        log=LOG,
+        log=log,
         **kw,
     )
 
@@ -547,26 +548,77 @@ def test_systematic_failure_stops_feeder_at_retained_cap():
     assert "cleanup:" not in "".join(events)
 
 
-def test_inference_failures_are_paced_by_ingest_not_by_the_cap():
-    """The other half of the cap, and a DELIBERATE weakening — pinned so it stays visible.
+class _CountRetainedFailures(logging.Handler):
+    """Sets ``event`` once ``target`` cells have been counted against the failure cap."""
 
-    An inference failure is recorded on the trailing finalizer thread, so the feeder can
-    admit further cells before the count catches up. With instant fakes it admits all 12;
-    in production ``inputs.wait`` blocks on a real ingest, so the run-ahead is bounded by
-    ingest rather than by a gate. What must still hold: the run FAILS and no mosaic is
-    deleted, so every failed cell stays resumable.
+    def __init__(self, target: int, event: threading.Event) -> None:
+        super().__init__()
+        self.n = 0
+        self._target, self._event = target, event
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if "retained for resume" in record.getMessage():
+            self.n += 1
+            if self.n >= self._target:
+                self._event.set()
+
+
+def test_failed_cells_are_counted_while_an_assembly_is_stuck():
+    """An inference failure must not need the assembly thread to be counted.
+
+    A failed tally requires no assembly, only bookkeeping. Submitting it to the serial
+    finalizer put the retained-failure cap behind the assembly backlog, so with admission
+    otherwise unbounded the cap went blind for as long as that backlog — in exactly the
+    systematic-failure case it exists for. It is now accounted on the caller's thread.
+
+    Held on the stable axis. HOW MANY cells the feeder admits before the cap trips is not
+    testable here: with instant fakes the feeder outruns the scheduler and the count ranged
+    4 to 12 across runs. WHICH THREAD does the accounting is exact — 01N succeeds and its
+    assembly is held by THIS thread for the duration, so a failure counted meanwhile cannot
+    have gone through the finalizer.
+
+    ``look_ahead=6`` so that neither the old admission bound (8) nor the failure cap (8)
+    stops the feeder first; the only thing under test is the accounting thread.
     """
-    events: list[str] = []
-    inputs = MosaicCountingInputs(events)
-    with pytest.raises(RuntimeError, match="cell"):
-        _run(
-            _cells(12),
-            session=_sync_session(fail={f"{i + 1:02d}N" for i in range(12)}, events=events),
-            inputs=inputs,
-            look_ahead=1,
-        )
-    assert len([e for e in events if e.startswith("start:")]) == 12
-    assert "cleanup:" not in "".join(events), "a failed cell must keep its mosaic for resume"
+    hold = threading.Event()  # released by the test, never by the assembly itself
+    reached_cap = threading.Event()
+    handler = _CountRetainedFailures(3, reached_cap)
+    log = logging.getLogger("test-stuck-assembly")
+    log.addHandler(handler)
+
+    def blocking_assemble(handoff, prep):
+        hold.wait(timeout=30.0)
+        return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
+
+    def run() -> None:
+        with contextlib.suppress(BaseException):  # the run is expected to fail its cells
+            _run(
+                _cells(8),
+                session=_sync_session(fail={f"{i + 2:02d}N" for i in range(7)}),
+                assemble=blocking_assemble,
+                inputs=RecordingInputs([]),
+                look_ahead=6,
+                attempts_per_cell_in_cluster=1,
+                log=log,
+            )
+
+    worker = threading.Thread(target=run, name="stuck-assembly-run", daemon=True)
+    worker.start()
+    try:
+        counted_while_stuck = reached_cap.wait(timeout=10.0)
+        # Snapshot BEFORE releasing: once the assembly thread is free the queued tallies
+        # are counted after all, and reading it later reports a healthy-looking total for
+        # a run whose cap was blind throughout.
+        n_while_stuck = handler.n
+    finally:
+        hold.set()
+        worker.join(timeout=30.0)
+        log.removeHandler(handler)
+
+    assert counted_while_stuck, (
+        f"only {n_while_stuck} cell(s) reached the failure cap while the assembly thread "
+        "was held — the accounting is queued behind assembly"
+    )
 
 
 def test_inference_does_not_wait_for_assembly():
