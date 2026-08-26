@@ -286,7 +286,8 @@ is in this table because it is the most consequential value in it.
 | **`optical_min_obs`** | **15** | **The one data-quality line, and the only reason a pixel is refused.** Fewer than fifteen clear optical observations in the year and the pixel is left empty; exactly fifteen is kept. Stamped on the store when it is seeded, so every cell is measured against the same line and a consumer can read what it was. Nothing about radar enters this decision |
 | **`overlap_years`** | **`true`** ★ | every requested year dispatched as one batch, so a zone's later years overlap the inference of its earlier ones and the campaign boots 8 clusters rather than 72. Certified on six cells that each carry both radar orbits, including a same-zone year rollover inside one cluster |
 | `attempts_per_cell_in_cluster` | 2 | **The cheap retry.** One more go at a failed cell on the cluster that is still standing, reusing its kept mosaic and staged tiles — minutes, not a fresh zone-year. Covers "the work failed but the machine is fine"; a dead run is `max_dispatch_rounds`' job (§8) |
-| `force_staging_reuse` | `false` | Escape hatch, and it cannot reach staging created without it: setting it changes the prefix, so it only preserves reuse between runs that both set it. To resume a specific prefix, pass `fill-zone-year`'s explicit `run_id` (§8) |
+| `force_staging_reuse` | `false` | Escape hatch, and it cannot reach staging created without it: setting it changes the prefix, so it only preserves reuse between runs that both set it. To RESTART onto an earlier campaign's staged tiles, pass `staging_code_identity` (§8) |
+| `staging_code_identity` | `""` | The restart lever. States the fingerprint's code component outright instead of deriving it, which is the only form that reaches an existing prefix. Copy the value from the driver's log of the campaign being resumed. Mutually exclusive with both rows around it (§8) |
 | `force_staging_restage` | `""` | Any new token forces a fresh staging prefix, for a change the source hash cannot see (a dependency upgrade). Abandoning stale staged work is always safe, so unlike the row above this one is usable in production |
 | commit limit | derived, `min(clusters, 8)` = **8** | Never set by hand. It bounds commits in flight (~1 s each), not concurrent assemblies — so at 10 clusters two may briefly queue a commit, which is the intent: the gate is a bound, not an operating point, and seconds of queueing costs nothing against zones that run for hours |
 | leg retry wall-clock budget | **6 h** (`max_leg_wall_clock_s`) | **Ingest.** A zone-year's ingest is three legs (optical, plus one per radar orbit), and each retries on its own when a source misbehaves. This caps how long ONE leg may keep retrying, so a single stuck source cannot hold a whole zone (and the Dask fleet it is paying for) indefinitely. **Counted per leg**, from that leg's first try, so one slow leg cannot spend another's budget. Measured in time rather than tries because one try can itself take minutes. Nothing is lost when it fires: ingest commits date by date, so everything already fetched is kept, the cell goes back on the work list, and the next dispatch carries on from where it stopped — giving up early costs latency, not work. Six hours still clears three legs of the slowest dense zone |
@@ -821,9 +822,23 @@ commits rather than a deadlock, and there is no manual release procedure.
 > when all three match. The code component is the inference source alone, so an orchestration or
 > ingest fix reuses staging rather than abandoning it.
 >
-> **To resume a specific staging prefix, pass `fill-zone-year`'s explicit `run_id`.** That is the
-> only reliable lever; the two `force_staging_*` knobs change the prefix as a side effect of
-> changing the fingerprint (§3). None of them relaxes a gate on the published store.
+> **To RESTART a campaign onto the tiles it already staged, pass `staging_code_identity`**, copied
+> from the driver's log of the run being resumed (it announces the value once, and once the
+> inference source or the code tarball moves it cannot be recomputed). To resume one specific
+> prefix for one cell, `fill-zone-year`'s explicit `run_id` still does that.
+>
+> This paragraph used to call `run_id` the only reliable lever, which was true per cell and left a
+> campaign with nothing: a driver derives its children's run ids, so there was no way to restart one
+> onto its own staged work. The distinction is DERIVED versus STATED — both `force_staging_*` knobs
+> compute the identity from the code in front of them, and no computation over changed code
+> reproduces the identity that changed code replaced. The three are mutually exclusive and a run
+> passing more than one is refused at preflight. None of them relaxes a gate on the published store.
+>
+> **Judge it the way `force_staging_reuse` is judged**: only for a change that cannot alter what a
+> staged tile CONTAINS. Orchestration, scheduling, timeouts and preflight gates qualify; the model,
+> the checkpoint and the pixel maths never do. What makes the case common is that the fingerprint
+> covers the whole inference closure and, wherever `code_bucket` is set, the code tarball's ETag as
+> well — so an orchestration fix and a re-upload each abandon every staged tile.
 >
 > **A change inside that fingerprint's import closure has a landing window.** It moves the
 > fingerprint, so a mosaic caught mid-append refuses its next append and needs its interrupted store
