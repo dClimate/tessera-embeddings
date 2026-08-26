@@ -122,6 +122,12 @@ needed. Fixes made *during* review were checked against the rejected fix instead
 
 Whole unit suite: **3,449 passed, 1 skipped**; ruff and mypy clean.
 
-**Not covered:** reaching 60 concurrent is only observable in prod at full width. The
-mechanism is the same code path at any divisor, and the dispatch log above already shows the
-per-cluster share computed correctly.
+## Confirmed in production, 2026-08-26 23:00Z
+
+The one thing the test suite could not cover — reaching 60 concurrent at full width — was measured
+on the restart. Concurrent `ingest-zone-year` runs went 0 -> 11 -> 18 -> 49 -> 60 in the six minutes
+after dispatch and then held, with `tessera-global-ingests` pinned at **60/60**. The run this
+replaced sat at **7 ingests against the same gate of 60 for 18 hours**. Ingest legs ramped 5 -> 12
+-> 23 behind it, so the slots carry real work rather than being merely held.
+
+That closes the gap this note previously recorded as not covered.
