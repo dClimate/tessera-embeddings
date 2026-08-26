@@ -424,13 +424,18 @@ same rate either way. What the ingest configuration decides is whether the fleet
 
 ### Size the fleet UNDER what ingest can feed
 
-> **MEASURED 2026-08-26: per-chunk cost varies ~7x BY ZONE, so a single per-zone-year figure
+> **MEASURED 2026-08-26: per-chunk cost varies ~2.2x BY ZONE, so a single per-zone-year figure
 > cannot size a fleet.** Marginal GPU-hours per 2048-px chunk, taken on legs with ZERO resumed
 > tiles so nothing is flattered by staged work resolving free: **37N 0.094, 32N-2018 0.199,
-> 34N 0.204**, against a reference of 0.104 implied by this section. Legs with partial resumption
-> read as low as 0.029 and that is an artefact — resumed tiles cost nothing and drag the average
-> down. Campaign-wide marginal cost over a 6.4 h window was 0.072, which is the flattered figure,
-> not the sustainable one.
+> 34N 0.204**, against a reference of 0.104 implied by this section. That is 0.204/0.094 = **2.17x**.
+>
+> **An earlier draft of this note said ~7x, and that was self-contradictory.** The 7x came from
+> including a 0.029 reading which the very next sentence rejects as a partial-resumption artefact —
+> resumed tiles cost nothing and drag a leg's average down. Using a figure to size the spread while
+> declaring it invalid overstates sustainable variation and weakens the fleet-sizing conclusion it
+> was meant to support. **The uncontaminated spread is 2.2x.** Campaign-wide marginal cost over a
+> 6.4 h window was 0.072, which carries the same flattery at fleet scale and is likewise not a
+> sustainable rate.
 >
 > The spread is observation depth and it straddles the reference rather than sitting on it, so the
 > matched-fleet arithmetic below is right in form and needs a per-zone cost to be right in value.
@@ -785,13 +790,20 @@ question is whether assembly finishes before the next cell's inference does:
 > **The commit really is negligible, confirmed twice.** 0.77 s for the shard commit and 0.475 s for
 > the attrs commit, out of 20,815 s. Assembly IS the shard write.
 
-**1.10× at the campaign's 250 actors per cluster**, and scale-invariant because both terms are
+> **WITHDRAWN 2026-08-26, not merely annotated.** Everything in the paragraph below rests on the
+> 1.10x margin, and both of that ratio's terms have been re-measured at 1.7-2.6x their modelled
+> values. So the **275-actor crossover is unsupported**, and so is the ten-clusters-rather-than-eight
+> conclusion drawn from it. Do not size a fleet from this paragraph until the margin is re-derived
+> from a matched pair of measurements. It is kept here for provenance, struck through, because a
+> note saying "re-derive this" above prose that still reads as current guidance is not a withdrawal.
+
+~~**1.10× at the campaign's 250 actors per cluster**, and scale-invariant because both terms are
 linear in tiles. (At 228 it was 1.21×; the two cross at **275**, which is what caps actors per
-cluster and therefore why the fleet is 10 clusters rather than 8.) Assembly stays off the critical path, but by 21% rather than comfortably, and a
-cluster runs ~126 cells in sequence so a persistent deficit compounds rather than averaging out.
-That is what makes the **39% of CPU left idle** worth keeping: not spare performance to harvest,
-but the margin's only buffer. **F8 now tests a thin ratio rather than confirming a comfortable
-one.**
+cluster and therefore why the fleet is 10 clusters rather than 8.) Assembly stays off the critical
+path, but by 21% rather than comfortably, and a cluster runs ~126 cells in sequence so a persistent
+deficit compounds rather than averaging out. That is what makes the **39% of CPU left idle** worth
+keeping: not spare performance to harvest, but the margin's only buffer. **F8 now tests a thin ratio
+rather than confirming a comfortable one.**~~
 
 ### Throughput is not purely token-bound, and the floor bites where tokens are fewest
 
