@@ -1796,6 +1796,33 @@ async def run_global_campaign(
                             planners.add(
                                 asyncio.ensure_future(_plan_and_dispatch(list(clusters[settled_slot]), outcome))
                             )
+                        # A planner has nothing left to outrun once no dispatch remains: its own
+                        # gate declines, and the round's re-dispatch covers the same cells on the
+                        # same terms. Waiting out its settling sleep would hold the store re-read
+                        # and the whole next round for a replacement that cannot happen — the
+                        # barrier this feature exists to remove, reintroduced at the end of it.
+                        #
+                        # Safe to cancel rather than await: a planner that HAS dispatched put its
+                        # task into `dispatches`, so an empty `dispatches` is proof that none of
+                        # them did. Awaited after cancelling for the reason the teardown below
+                        # gives — a request to cancel is not a cancellation.
+                        if not dispatches and planners:
+                            # Said out loud, and in the same words the planner would have used
+                            # had it woken to decide this for itself. Dropping the wait must not
+                            # also drop the explanation: an operator seeing a settled roster get
+                            # no replacement needs to know it was refused for a reason and not
+                            # missed.
+                            log.info(
+                                "Not refilling %d settled roster(s) immediately: the round finished while "
+                                "the refill was being planned, so a replacement would buy an extra fleet "
+                                "and no wall clock — the round re-dispatches these cells anyway. The "
+                                "settling wait is dropped rather than served out.",
+                                len(planners),
+                            )
+                            for planner in planners:
+                                planner.cancel()
+                            await asyncio.gather(*planners, return_exceptions=True)
+                            planners.clear()
                 finally:
                     # What `gather` did for its own children when the outer await was
                     # cancelled — and BOTH halves of it. Cancelling the WAIT does not cancel

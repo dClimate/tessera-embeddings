@@ -1867,6 +1867,36 @@ class TestImmediateRefill:
         assert marks.count("start") == 2, f"both settled rosters should have waited: {marks}"
         assert marks[:2] == ["start", "start"], f"the settling delays ran in series: {marks}"
 
+    def test_a_planner_is_dropped_once_no_dispatch_is_left_to_outrun(self, wired, monkeypatch):
+        """The barrier this feature removes, reintroduced at the end of it.
+
+        The last sibling settles while a failed roster is still waiting out its delay, so the
+        replacement can no longer buy any wall clock — with the round over, the loop
+        re-dispatches the same cells on the same terms. Serving the rest of that wait would
+        hold the store re-read for the whole settling budget on behalf of a dispatch that
+        cannot happen.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N"))
+        monkeypatch.setattr(mod, "_SETTLE_DELAY_S", mod.CANCELLATION_CONFIRM_S)
+        served: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def spy(delay, *a, **k):
+            if delay != mod.CANCELLATION_CONFIRM_S:
+                return await real_sleep(0)
+            # The last sibling settles DURING the wait, which is the case under test.
+            r.release.set()
+            for _ in range(10):
+                await real_sleep(0)
+            served.append(delay)  # reached only if the planner was never dropped
+            return None
+
+        monkeypatch.setattr(mod.asyncio, "sleep", spy)
+        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
+        assert served == [], "the settling wait was served out after the round had nothing left to outrun"
+        assert r.dispatches().count(("01N",)) == 1, "a replacement went out with no sibling to outrun"
+        assert not r.overlaps, f"two dispatches held one zone: {r.overlaps}"
+
     def test_the_settling_delay_is_derived_from_the_cancellation_budget(self):
         """Derived, not chosen. A fill's teardown spends this budget waiting for its own
         children before it goes terminal; the delay is the same budget again for the level
