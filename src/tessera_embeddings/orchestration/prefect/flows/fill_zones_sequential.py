@@ -766,8 +766,10 @@ def fill_zones_sequential_flow(
             first; 2 means one retry on the still-provisioned fleet. Distinct from
             the campaign driver's `max_dispatch_rounds`, which counts whole-dispatch
             rounds — see `sequential_fill.fill_zones_sequential`.
-        look_ahead: Cells beyond the current one kept in ingest flight (bounds
-            concurrent ingest Dask clusters AND in-flight mosaics, ADR-011).
+        look_ahead: Sizes INGEST width only — the ingest driver runs ``1 + look_ahead``
+            cells at a time, which also sets the priming abort quorum and the runner's
+            retained-failure cap. It no longer bounds in-flight mosaics: peak storage is a
+            cluster's mosaics by design (ADR-011).
         cleanup_mosaics: Delete each campaign-ingested mosaic after its cell
             lands (transient input). Ignored for ``ingest=False`` mosaics.
         ingest_settings: Grouped ingest tuning knobs (worker bounds, S2
