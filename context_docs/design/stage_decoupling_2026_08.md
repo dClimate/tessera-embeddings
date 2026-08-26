@@ -118,6 +118,29 @@ preference we have no evidence we need.
 failed ones, or a cap trip on a cluster that had plenty of landed work available. Neither
 has been observed.
 
+**A systematic ASSEMBLY failure escapes the retained-mosaic cap.** Found independently by
+two reviewers, and the diagnosis is right. Assembly failures are only discovered when
+`_finalize` runs them. If the error manifests SLOWLY, inference outruns the single assembly
+thread, the backlog fills with the whole cluster, and every queued cell then fails and
+retains its mosaic — so `retained_failed` passes `look_ahead + 2` with no admission left to
+stop it. A fast-failing assembly error is fine: the finalizer keeps up and the cap trips
+after about seven cells.
+
+Declined, for two reasons. The suggested fix — reserve admission against assemblies that
+have not yet succeeded — is an admission bound released by assembly, which is the exact
+coupling this change removes. And the alternative of cancelling the queued backlog does not
+help: an unassembled cell retains its mosaic too, so the retained set does not shrink.
+Retained storage is also explicitly out of scope: peak storage is a cluster's mosaics by
+design and the campaign owner has ruled out a storage knob.
+
+**What is NOT waived is the GPU cost.** Once assembly failures reach the cap nothing can
+publish, so every further cell inferred is fleet time spent on a run that cannot produce
+anything — potentially a full cluster's worth. A circuit breaker that drains the prepared
+queue at that point would save it, and it does not violate the ordering principle: aborting
+a run whose OUTPUT stage is systematically broken is not the same as throttling inference
+behind healthy assembly. **This is the open item from review** — a separate change and an
+owner decision, deliberately not folded in here.
+
 ## Verification
 
 Every behavioural test fails against the pre-change source and passes against the new one.
