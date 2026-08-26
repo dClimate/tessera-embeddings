@@ -643,21 +643,32 @@ def test_the_head_bootstrap_keeps_its_launch_attempts(monkeypatch) -> None:
         assert name not in env, f"{name} tunes the autoscaler and must not reach the head bootstrap"
 
 
-def _ray_autoscaler_interval(env: dict[str, str] | None) -> int:
-    """What RAY resolves the interval to, in a fresh interpreter with ``env`` applied.
+#: The name under test, so the baseline below removes exactly the right key.
+_INTERVAL = "AUTOSCALER_UPDATE_INTERVAL_S"
+
+
+def _ray_autoscaler_interval(override: str | None) -> int:
+    """What RAY resolves the interval to in a fresh interpreter: ``override``, or its own default.
 
     A subprocess because the constant is bound at module import: reading it in-process after
     monkeypatching the environment would report the value this test session imported with, not
     the value a freshly-started autoscaler would see. The autoscaler IS a fresh process, so this
     reproduces its conditions rather than approximating them.
+
+    **The baseline STRIPS the key rather than inheriting the environment**, which is why this
+    takes an override rather than a dict. A developer machine or CI runner configured with launch
+    pacing already exports this name, and an inherited environment would then measure that
+    override and call it Ray's default — failing the comparison below on precisely the hosts the
+    setting exists for. Correct code, red test.
     """
     # Imports ONE constants module and prints an int. No `ray.init()`, no `ray start`, no
     # cluster — this repo has stranded a Ray cluster from a test before and the RAM cost was
     # felt for days, so the subprocess is deliberately the narrowest thing that can answer.
     code = "from ray.autoscaler._private.constants import AUTOSCALER_UPDATE_INTERVAL_S as v; print(v)"
-    out = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env={**os.environ, **(env or {})}, check=True
-    )
+    env = {k: v for k, v in os.environ.items() if k != _INTERVAL}
+    if override is not None:
+        env[_INTERVAL] = override
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, check=True)
     return int(out.stdout.strip())
 
 
@@ -672,9 +683,9 @@ def test_ray_actually_reads_the_interval_from_the_environment() -> None:
     interval as a plain module constant, the value we export would be silently ignored while the
     export still reads like tuning. That failure is invisible everywhere else.
     """
-    ours = int(LAUNCH_PACING_AUTOSCALER_ENV["AUTOSCALER_UPDATE_INTERVAL_S"])
+    ours = int(LAUNCH_PACING_AUTOSCALER_ENV[_INTERVAL])
     default = _ray_autoscaler_interval(None)
-    applied = _ray_autoscaler_interval({"AUTOSCALER_UPDATE_INTERVAL_S": str(ours)})
+    applied = _ray_autoscaler_interval(str(ours))
     assert applied == ours, (
         f"Ray resolved AUTOSCALER_UPDATE_INTERVAL_S to {applied} with the environment set to "
         f"{ours}; the setting is not environment-backed in this Ray and paces nothing"
@@ -682,7 +693,7 @@ def test_ray_actually_reads_the_interval_from_the_environment() -> None:
     assert ours > default, (
         f"our value {ours} is at or below Ray's own default {default}, so it slows nothing even though Ray reads it"
     )
-    assert "AUTOSCALER_UPDATE_INTERVAL_S" not in LAUNCH_PACING_CLIENT_ENV, (
+    assert _INTERVAL not in LAUNCH_PACING_CLIENT_ENV, (
         "`ray up` runs no autoscaler loop, so the name is inert in the one-shot bootstrap"
     )
 
