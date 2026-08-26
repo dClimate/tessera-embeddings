@@ -791,74 +791,45 @@ async def run_global_campaign(
             mismatch, an unseeded group), and it is what bounds the two budgets
             compounding on a cell that will never succeed. Those want a human, not
             another cluster. Set to 1 to disable retries.
-        immediate_refill: Replace a settled chained fill's still-missing cells at
-            once, instead of waiting for the whole round to close. **Off by default,
-            and off is byte-for-byte today's behaviour** — the dispatch path is the
-            same either way, and with the flag off nothing is ever added to the set
-            of live dispatches, so a round waits for every cluster exactly as it did
-            and reports its outcomes in the clusters' original order.
+        immediate_refill: Replace a settled chained fill's still-missing cells at once,
+            instead of waiting for the whole round to close. **Off by default, and off is
+            byte-for-byte today's behaviour** — with the flag off nothing is ever added to
+            the set of live dispatches, so a round waits for every cluster exactly as it
+            did and reports outcomes in the clusters' original order.
 
-            The problem it addresses: the round above is a BARRIER. A cluster owns a
-            roster of zones, so when one dies early its whole roster waits for every
-            sibling to finish before the store is re-read — and the sibling that
-            decides that wait is the slowest one in the round.
+            The round is a BARRIER: a cluster owns a roster of zones, so when one dies
+            early its whole roster waits on the slowest sibling before the store is
+            re-read. On, the settled cluster's cells are re-dispatched into the slot it
+            just vacated, inheriting its ingest share, its committer share and its place
+            under ``max_parallel_clusters`` — the fleet's width and cost do not change.
 
-            When on, a settled cluster's cells are re-dispatched into the slot it just
-            vacated, so the replacement inherits its ingest share, its committer share
-            and its place under ``max_parallel_clusters``: the fleet's width and cost
-            do not change. Two conditions must BOTH hold first, and when either fails
-            the cells simply wait for the round, which is never worse than the default:
+            Two conditions must BOTH hold, and either failing just returns the cells to
+            the round, which is never worse than the default: the predecessor reached a
+            state that PROVES it stopped writing (``_QUIESCENT_TERMINAL_STATES``, so a
+            crash, a cancellation, or a dispatch that raised all decline), and
+            ``_SETTLE_DELAY_S`` has passed since it settled, which is what the level below
+            its own children needs — a teardown waits for the children, nothing waits for
+            their grandchildren.
 
-            1. The predecessor reached a state that PROVES it stopped writing
-               (``_QUIESCENT_TERMINAL_STATES``). A crash, a cancellation, or a
-               dispatch that raised — which may still have dispatched — all decline.
-            2. ``_SETTLE_DELAY_S`` has passed since it settled, so the asynchronous
-               cancellation of the level BELOW its own children has had time to take
-               effect. Condition 1 covers the fill's own writers and, because its teardown
-               waits for them, its direct children too; what nothing waited for is their
-               grandchildren, and the delay is that same confirmation budget again for
-               that level.
+            **Bounded per CELL for the life of the campaign, not per round.** A cell that
+            has had its replacement is never eligible for another, a replacement is not
+            itself eligible, and none is issued unless a sibling is still running. So a
+            cell gains at most ONE attempt beyond ``max_dispatch_rounds``, and a persistent
+            capacity shortage cannot become a dispatch loop.
 
-            **Why a wait rather than a check of who is writing.** A census of live runs
-            was tried and removed. It can only report what was true a moment ago, and it
-            cannot make a lingering child stop — the wrong instrument for settling an
-            asynchronous cancellation, and one whose paging, state-filter and staleness
-            semantics were all load-bearing and none of them reliable. Two mechanisms
-            already ACT rather than observe, and the delay is what lets them finish: the
-            fill's own teardown, which cancels its children and waits for each to confirm
-            terminal; and the orphan sweep, which independently finds and stops whatever
-            outlived a teardown, on its own schedule.
+            **The two-writer invariant is structural and unchanged**: a replacement covers
+            only zones its predecessor owned and the round's clusters partition zones
+            disjointly, so it cannot reach a zone a live sibling holds. It is not a
+            reservation — nothing locks a cell against a dispatcher outside this campaign,
+            which the store makes affordable rather than silent, since mosaic commits do
+            not rebase and a second writer fails loudly.
 
-            What remains is not a reservation. Nothing here locks a cell, so a dispatcher
-            outside this campaign could still start a writer. That is not introduced here
-            — the round's own re-dispatch has always worked this way — and closing it means
-            fencing at the WRITE, the same prerequisite the crashed and cancelled cases
-            above are waiting on. The store makes the residual affordable rather than
-            silent: mosaic commits do not rebase, so a second writer fails loudly.
+            Every read the decision makes declines on failure rather than propagating:
+            uncertainty is not permission, and an exception escaping mid-round would fail
+            the campaign while sibling fills were still running. Not part of the staging
+            fingerprint — it changes WHEN work is dispatched, not what is computed.
 
-            The two-writer invariant is otherwise unchanged and still structural: a
-            replacement covers ONLY zones its predecessor owned, and the round's
-            clusters partition zones disjointly, so it cannot reach a zone a live
-            sibling holds.
-
-            Bounded per CELL and for the life of the campaign, not per round: a cell that
-            has had its replacement is not eligible for another on any later round. A
-            replacement is also not itself eligible for one, and none is issued unless a
-            sibling is still running — with the round over the loop re-dispatches anyway,
-            so a replacement then would be an extra fleet for no wall clock. A cell
-            therefore gains at most ONE attempt beyond ``max_dispatch_rounds`` for the
-            whole campaign, and a persistent capacity shortage cannot become a dispatch
-            loop.
-
-            Every read the decision makes — the store's tip and tags, and the
-            replacement's own land-mask and SSM probes — declines on failure rather than
-            propagating. Uncertainty is not permission, and an exception escaping mid-round
-            would fail the campaign while sibling fills were still running, which an
-            ordinary FAILED state does not sweep.
-
-            NOT part of the staging fingerprint, deliberately: this changes WHEN work is
-            dispatched, not what is computed, and folding it in would abandon the staged
-            tiles a retry exists to resume.
+            Design record: ``context_docs/design/immediate-refill-of-a-settled-fill.md``.
         ingest_limit_name: Prefect global concurrency limit backing
             ``max_parallel_ingest`` under ``"chained-clusters"``. The campaign
             upserts it to that value at start, so the parameter is the single place
