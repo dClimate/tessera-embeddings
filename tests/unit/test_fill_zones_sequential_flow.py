@@ -917,6 +917,41 @@ def test_wait_first_skips_a_failed_cell_while_a_sibling_is_still_ingesting():
         adapter.shutdown()
 
 
+def test_wait_first_does_not_abort_while_a_first_wave_cell_can_still_land():
+    """The false abort a running failure COUNT introduces — the worst of both designs.
+
+    The executor starts a queued cell the moment a worker frees, so with ``max_parallel=2``
+    a fast failure (01N) plus a later-wave fast failure (03N) reach two failures while 02N,
+    the other original worker, is still running and about to succeed. A cumulative quorum
+    aborts there, and the caller's ``finally`` shuts the adapter down and cancels 02N — so
+    the cluster makes no progress despite a real mosaic being produced.
+
+    The quorum is the first wave {01N, 02N}, so it cannot be met while 02N is unsettled.
+    """
+    adapter = _adapter(max_parallel=2)
+    slow_but_good: Future = Future()
+    try:
+        adapter._futures = {
+            ("01N", 2024): _settled(RuntimeError("fast failure, first wave")),
+            ("02N", 2024): slow_but_good,
+            ("03N", 2024): _settled(RuntimeError("fast failure, second wave")),
+            ("04N", 2024): Future(),
+        }
+        landed: list = []
+
+        def _land() -> None:
+            # Let wait_first observe the two failures first, then settle the good one.
+            time.sleep(0.3)
+            slow_but_good.set_result(None)
+
+        threading.Thread(target=_land, daemon=True).start()
+        got = adapter.wait_first([(f"{i:02d}N", 2024) for i in range(1, 5)], timeout=5.0)
+        landed.append(got)
+        assert got == ("02N", 2024), f"the still-running first-wave cell must be allowed to land, got {got}"
+    finally:
+        adapter.shutdown()
+
+
 def test_wait_first_aborts_on_a_pool_of_failures_not_the_whole_list():
     """A systematic failure must surface after one pool, not after every wave.
 

@@ -336,19 +336,21 @@ class _DeploymentCellInputs:
         lands first is a real mosaic, and the failure still surfaces when the runner
         reaches that cell.
 
-        Once ``max_parallel`` cells have failed with NONE landing this RAISES, rather than
-        blocking on the rest or nominating one of the failures. Reporting a failed cell as
-        landed would send the caller straight into ``ray up`` — five to ten minutes of
-        billed GPU bringup for a mosaic that does not exist, torn down again the moment
-        the feeder reaches the same failure. Raising costs nothing and loses nothing: the
-        underlying ingest error is chained as the cause, and the priming this call belongs
-        to runs inside the flow's shutdown guard, so the started children are still
-        cancelled on the way out.
+        Once every cell of the FIRST WAVE — the first ``max_parallel`` of ``cells``, which
+        are the ones the pool starts — has failed, this RAISES rather than blocking on the
+        rest or nominating one of the failures. Reporting a failed cell as landed would send
+        the caller straight into ``ray up`` — five to ten minutes of billed GPU bringup for a
+        mosaic that does not exist, torn down again the moment the feeder reaches the same
+        failure. Raising costs nothing and loses nothing: the underlying ingest error is
+        chained as the cause, and the priming this call belongs to runs inside the flow's
+        shutdown guard, so the started children are still cancelled on the way out.
 
-        The quorum is a POOL's worth, not the whole list. The caller offers every live cell,
-        so requiring all of them to fail would run a systematic failure through wave after
-        wave before surfacing it — and one pool failing with nothing landing already tells
-        the operator everything the last wave would.
+        The quorum is that named wave, NOT the whole list and NOT a running failure count.
+        The list would hold a systematic failure through wave after wave before surfacing it.
+        A running count is the subtler trap: the executor starts a queued cell as soon as a
+        worker frees, so fast failures accumulate across waves while a slow first-wave cell
+        is still running and about to succeed — aborting there cancels the very ingest that
+        was going to land.
 
         ``None`` therefore means one thing only: the wait timed out (or no cell of
         ``cells`` was ever started).
@@ -358,14 +360,25 @@ class _DeploymentCellInputs:
             return None
         deadline = None if timeout is None else time.monotonic() + timeout
         pending = set(futs)
-        # A fully-failed POOL is the abort signal, not a fully-failed LIST. The caller now
-        # offers every live cell (an ingest is started for all of them), and waiting for all
-        # of those to fail before raising would run a systematic failure through wave after
-        # wave — hours, when each wave fails slowly — before anything surfaced. `_max_parallel`
-        # is what runs at once, so one pool's worth of failures with no success is already the
-        # whole signal, and it reproduces the quorum from when the caller passed a window.
-        quorum = min(self._max_parallel, len(futs))
-        settled_failed: set[Future[None]] = set()
+        # A fully-failed FIRST WAVE is the abort signal — not a fully-failed list, and not a
+        # running total of failures.
+        #
+        # Not the list: the caller offers every live cell now, so requiring all of them to
+        # fail would run a systematic failure through wave after wave before surfacing it.
+        #
+        # Not a running total either, which is the trap. The executor starts a queued cell the
+        # moment a worker frees, so `_max_parallel` FAST failures accumulate across successive
+        # waves while a slow cell from the first wave is still running and about to succeed.
+        # Counting cumulatively aborts on that, and the caller's `finally` then cancels the
+        # very ingest that was going to land — a false abort that makes no progress at all.
+        #
+        # These specific cells are the ones the pool starts first (submission follows `cells`
+        # order and the pool is FIFO), so "every one of them failed" cannot be true while any
+        # of them might still succeed. It is also the quorum that held when the caller passed
+        # a look-ahead window rather than the whole list.
+        ordered = [c for c in cells if c in self._futures]
+        first_wave = {self._futures[c] for c in ordered[: self._max_parallel]}
+        failed_first_wave: set[Future[None]] = set()
         while pending:
             budget = None if deadline is None else max(0.0, deadline - time.monotonic())
             done, pending = wait(pending, timeout=budget, return_when=FIRST_COMPLETED)
@@ -379,13 +392,14 @@ class _DeploymentCellInputs:
                         return futs[fut]
                 except CancelledError:
                     pass
-                settled_failed.add(fut)
-            if len(settled_failed) >= quorum:
-                # EVERY failure seen so far, not this iteration's `done`: the loop drains
+                if fut in first_wave:
+                    failed_first_wave.add(fut)
+            if failed_first_wave == first_wave:
+                # EVERY first-wave failure, not this iteration's `done`: the loop drains
                 # `pending` over several waits, so `done` holds only whatever settled last —
                 # and reporting that made a whole pool's failure read as one cell, hiding both
                 # the extent and, when they failed for one shared reason, the cause.
-                self._raise_window_all_failed(futs, settled_failed)
+                self._raise_window_all_failed(futs, failed_first_wave)
         return None
 
     @staticmethod
