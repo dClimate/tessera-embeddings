@@ -119,43 +119,37 @@ failed ones, or a cap trip on a cluster that had plenty of landed work available
 has been observed.
 
 **A systematic ASSEMBLY failure escapes the retained-mosaic cap.** Found independently by
-two reviewers, and the diagnosis is right. Assembly failures are only discovered when
-`_finalize` runs them. If the error manifests SLOWLY, inference outruns the single assembly
-thread, the backlog fills with the whole cluster, and every queued cell then fails and
-retains its mosaic — so `retained_failed` passes `look_ahead + 2` with no admission left to
-stop it. A fast-failing assembly error is fine: the finalizer keeps up and the cap trips
-after about seven cells.
+two reviewers. The mechanism is real: assembly failures are only discovered when `_finalize`
+runs them, so if the error manifests SLOWLY, inference outruns the single assembly thread,
+the backlog fills with the whole cluster, and every queued cell then fails and retains its
+mosaic — `retained_failed` passes `look_ahead + 2` with no admission left to stop it. A
+fast-failing assembly error is fine: the finalizer keeps up and the cap trips after about
+seven cells.
 
-Declined, for two reasons. The suggested fix — reserve admission against assemblies that
-have not yet succeeded — is an admission bound released by assembly, which is the exact
-coupling this change removes. And the alternative of cancelling the queued backlog does not
-help: an unassembled cell retains its mosaic too, so the retained set does not shrink.
-Retained storage is also explicitly out of scope: peak storage is a cluster's mosaics by
-design and the campaign owner has ruled out a storage knob.
+**Declined, because this is the DESIRED behaviour, not a defect.** If assembly is
+systematically broken, inference should run to completion and leave a pile of assembly work.
+The owner's ruling, 2026-08-26: *"If assembly systematically fails, inference should just
+continue and infer everything, so that we end up with a ton of assembly tasks to do and
+nothing else... we would expect to fix assembly, re-run, and wipe the mosaics afterwards. If
+we incur storage costs so be it."*
 
-**What is NOT waived is the GPU cost.** Once assembly failures reach the cap nothing can
-publish, so every further cell inferred is fleet time spent on a run that cannot produce
-anything — potentially a full cluster's worth. A circuit breaker that drains the prepared
-queue at that point would save it, and it does not violate the ordering principle: aborting
-a run whose OUTPUT stage is systematically broken is not the same as throttling inference
-behind healthy assembly. **This is the open item from review** — a separate change and an
-owner decision, deliberately not folded in here.
+The suggested fix — reserve admission against assemblies that have not yet succeeded — is an
+admission bound released by assembly, i.e. the exact coupling this change removes.
 
-## Verification
+**A claim made in review and WITHDRAWN.** The first reply on those threads said the GPU cost
+of finishing a doomed run is real and that a circuit breaker draining the prepared queue
+would save fleet time. **That is wrong, and the opposite is true.** Staged tiles persist, and
+`ZarrWriter.scan_existing_staged_artifacts` treats a staged tile as "do not re-infer" — so
+the inference is fully reusable and a re-run assembles without re-inferring anything. A
+circuit breaker would forfeit exactly the work worth keeping. There is no open item here.
 
-Every behavioural test fails against the pre-change source and passes against the new one.
-Run by pointing `PYTHONPATH` at a checkout that still has both semaphores — no patching
-needed, which is what made this cheap:
+**The recovery procedure, and its one trap.** Fix assembly, re-run, assemble from staging,
+then sweep the mosaics. The trap: `_staging_run_id` hashes `_STAGED_OUTPUT_SOURCES`, which is
+`("inference", "config/inference.py")` — the whole `inference` package, and `assembly.py` is
+in it. **Fixing assembly therefore changes the staging fingerprint and orphans every staged
+tile under the old `run_id`.** The re-run must pass `staging_code_identity` pinned to the
+pre-fix value so it resolves the same staging prefix. That parameter exists for this class of
+situation (`staging-identity-and-resume.md`).
 
-| test | on pre-change source |
-|---|---|
-| `test_inference_does_not_wait_for_assembly` | `RuntimeError: 8/8 cell(s) failed` — the feeder stalled at 2 of 8, the assembly hold timed out |
-| `test_ingest_starts_for_every_cell_and_is_not_paced_by_the_fill` | an ingest started only after a cell was finalized |
-| `test_the_readiest_cell_is_taken_wherever_it_sits` | took `01N` instead of the landed `05N` |
-| `test_systematic_failure_stops_feeder_at_retained_cap` | ingest was gated by admission |
-| `test_failed_cells_are_counted_while_an_assembly_is_stuck` | 0 cells reached the cap while one assembly was held |
-| `test_wait_first_aborts_on_a_pool_of_failures_not_the_whole_list` | `DID NOT RAISE` — it waited on four still-pending cells |
-
-**Not covered:** reaching 60 concurrent is only observable in prod at full width. The
-mechanism is the same code path at any divisor, and the dispatch log above already shows the
-per-cluster share being computed correctly.
+Note also that assembly reads `mosaic_base` for projected coordinates and CRS
+(`assembly.py:339`), so a retained mosaic is REQUIRED for an assembly retry, not incidental.
