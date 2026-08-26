@@ -14,7 +14,9 @@ below with the launch/teardown helpers stubbed out.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -641,29 +643,48 @@ def test_the_head_bootstrap_keeps_its_launch_attempts(monkeypatch) -> None:
         assert name not in env, f"{name} tunes the autoscaler and must not reach the head bootstrap"
 
 
-#: Ray's own default for the autoscaler loop period, from
-#: ``ray.autoscaler._private.constants``. Named here so the test below states what it is
-#: comparing against instead of asserting a bare number.
-_RAY_DEFAULT_UPDATE_INTERVAL_S = 5
+def _ray_autoscaler_interval(env: dict[str, str] | None) -> int:
+    """What RAY resolves the interval to, in a fresh interpreter with ``env`` applied.
 
-
-def test_the_loop_interval_actually_slows_the_loop() -> None:
-    """The one setting that reduces how OFTEN a cluster asks, so a no-op value is a defect.
-
-    The other two pacing settings change what a call carries and how many attempts it spends;
-    neither reduces calls per minute, which is the axis the request quota is a rate over. This
-    one does, and only if it exceeds Ray's default — set to the default or below it is inert
-    while still reading like tuning.
-
-    Autoscaler-only, and that is not a preference: ``ray up`` runs no autoscaler loop, so the
-    name would be inert in the one-shot bootstrap's environment.
+    A subprocess because the constant is bound at module import: reading it in-process after
+    monkeypatching the environment would report the value this test session imported with, not
+    the value a freshly-started autoscaler would see. The autoscaler IS a fresh process, so this
+    reproduces its conditions rather than approximating them.
     """
-    raw = LAUNCH_PACING_AUTOSCALER_ENV["AUTOSCALER_UPDATE_INTERVAL_S"]
-    assert int(raw) > _RAY_DEFAULT_UPDATE_INTERVAL_S, (
-        f"AUTOSCALER_UPDATE_INTERVAL_S={raw} is at or below Ray's default of "
-        f"{_RAY_DEFAULT_UPDATE_INTERVAL_S}s, so it slows nothing"
+    # Imports ONE constants module and prints an int. No `ray.init()`, no `ray start`, no
+    # cluster — this repo has stranded a Ray cluster from a test before and the RAM cost was
+    # felt for days, so the subprocess is deliberately the narrowest thing that can answer.
+    code = "from ray.autoscaler._private.constants import AUTOSCALER_UPDATE_INTERVAL_S as v; print(v)"
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env={**os.environ, **(env or {})}, check=True
     )
-    assert "AUTOSCALER_UPDATE_INTERVAL_S" not in LAUNCH_PACING_CLIENT_ENV
+    return int(out.stdout.strip())
+
+
+def test_ray_actually_reads_the_interval_from_the_environment() -> None:
+    """The setting is only pacing if RAY reads it, and that is Ray's contract to keep, not ours.
+
+    Asserting our own dict against a default copied out of Ray proves nothing about Ray — it
+    passes whether or not the name is environment-backed. So this asks Ray, in a fresh
+    interpreter, and compares the answer with and without the variable set.
+
+    **This is the regression that would make the whole setting inert**: if a future Ray pins the
+    interval as a plain module constant, the value we export would be silently ignored while the
+    export still reads like tuning. That failure is invisible everywhere else.
+    """
+    ours = int(LAUNCH_PACING_AUTOSCALER_ENV["AUTOSCALER_UPDATE_INTERVAL_S"])
+    default = _ray_autoscaler_interval(None)
+    applied = _ray_autoscaler_interval({"AUTOSCALER_UPDATE_INTERVAL_S": str(ours)})
+    assert applied == ours, (
+        f"Ray resolved AUTOSCALER_UPDATE_INTERVAL_S to {applied} with the environment set to "
+        f"{ours}; the setting is not environment-backed in this Ray and paces nothing"
+    )
+    assert ours > default, (
+        f"our value {ours} is at or below Ray's own default {default}, so it slows nothing even though Ray reads it"
+    )
+    assert "AUTOSCALER_UPDATE_INTERVAL_S" not in LAUNCH_PACING_CLIENT_ENV, (
+        "`ray up` runs no autoscaler loop, so the name is inert in the one-shot bootstrap"
+    )
 
 
 def test_the_head_start_command_carries_both_halves() -> None:
