@@ -79,13 +79,22 @@ rather than an unbounded I/O wait, and in production the feeder is paced by `inp
 on a real ingest anyway. An ingest failure is exact, because it raises on the feeder's own
 thread before the loop's next cap check.
 
-**A pool is the failure quorum, not the whole list.** Same shape as the defect above, in
-the priming wait. `wait_first` raised only once EVERY future it was given had failed, and
-the caller now hands it every live cell — so a doomed cluster would have run wave after wave
-through the ingest pool before anything surfaced. The quorum is now `max_parallel`: one
-pool's worth of failures with nothing landing aborts the wait, which is exactly the quorum
-that held when the caller passed a look-ahead window. The adapter already knew its own pool
-width, so this needed no new parameter.
+**The FIRST WAVE is the failure quorum — not the whole list, and not a running count.**
+Same shape as the defect above, in the priming wait, and it took two passes to get right.
+
+`wait_first` originally raised only once EVERY future it was given had failed, and this
+change hands it every live cell, so a doomed cluster would have run wave after wave before
+anything surfaced. **The first fix counted failures cumulatively against `max_parallel`,
+which was worse than the bug.** The executor starts a queued cell the moment a worker frees,
+so two fast failures from successive waves reach that quorum while a slow first-wave cell is
+still running and about to succeed — priming aborts, the caller's `finally` cancels that
+ingest, and the cluster makes no progress despite a real mosaic being produced.
+
+The quorum is now the named first wave: the first `max_parallel` of the supplied cells,
+which are the ones the pool starts. "Every one of them failed" cannot be true while any of
+them might still succeed. It is also exactly the quorum that held when the caller passed a
+look-ahead window, and the adapter already knew its own pool width, so it needed no new
+parameter.
 
 **Do not test this by counting admissions.** With instant fakes the feeder outruns the
 scheduler and the admitted count ranged 4 to 12 across runs. The stable axis is which
@@ -153,3 +162,30 @@ situation (`staging-identity-and-resume.md`).
 
 Note also that assembly reads `mosaic_base` for projected coordinates and CRS
 (`assembly.py:339`), so a retained mosaic is REQUIRED for an assembly retry, not incidental.
+
+## Verification
+
+Every behavioural test fails against the pre-change source and passes against the new one.
+Run by pointing `PYTHONPATH` at a checkout that still has both semaphores — no patching
+needed, which is what made this cheap:
+
+| test | on pre-change source |
+|---|---|
+| `test_inference_does_not_wait_for_assembly` | `RuntimeError: 8/8 cell(s) failed` — the feeder stalled at 2 of 8, the assembly hold timed out |
+| `test_ingest_starts_for_every_cell_and_is_not_paced_by_the_fill` | an ingest started only after a cell was finalized |
+| `test_the_readiest_cell_is_taken_wherever_it_sits` | took `01N` instead of the landed `05N` |
+| `test_systematic_failure_stops_feeder_at_retained_cap` | ingest was gated by admission |
+| `test_failed_cells_are_counted_while_an_assembly_is_stuck` | 0 cells reached the cap while one assembly was held |
+| `test_wait_first_aborts_on_a_pool_of_failures_not_the_whole_list` | `DID NOT RAISE` — it waited on four still-pending cells |
+
+The last of the review fixes needed a different baseline, because the bug was in the fix
+rather than in the original. Restoring the cumulative-count logic makes
+`test_wait_first_does_not_abort_while_a_first_wave_cell_can_still_land` fail with
+`2 ingest(s) failed with none landing (01N-2024, 03N-2024)` — 03N being the second-wave cell
+that should never have counted.
+
+Whole unit suite on the final state: **3,447 passed, 1 skipped**; ruff and mypy clean.
+
+**Not covered:** reaching 60 concurrent is only observable in prod at full width. The
+mechanism is the same code path at any divisor, and the dispatch log above already shows the
+per-cluster share being computed correctly.
