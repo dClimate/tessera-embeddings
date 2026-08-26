@@ -1342,10 +1342,10 @@ async def run_global_campaign(
     # gone is the BACKPRESSURE, not the cleanup.
     #
     # This applies to `cluster-per-zone` only. In `chained-clusters` — the default —
-    # the per-cell chain below is bypassed and each child bounds its own mosaics at
-    # `look_ahead + 2` (sequential_fill._MosaicBudget). Across the cluster count those
-    # settings imply, that bound already exceeds the zones in a year, so it is not
-    # the binding constraint there either.
+    # the per-cell chain below is bypassed and the child does not bound its mosaics at
+    # all: peak storage is a cluster's mosaics by design, and the two semaphores that
+    # used to bound them throttled ingest and inference behind assembly
+    # (`context_docs/design/stage_decoupling_2026_08.md`).
 
     async def _process(zone: str, year: int) -> str:
         # Ingest (if enabled) → fill → drop the transient mosaic. ingest_sem/fill_sem

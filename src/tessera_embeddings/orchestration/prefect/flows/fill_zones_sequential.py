@@ -182,7 +182,10 @@ class _DeploymentCellInputs:
         # never runs when Prefect kills the flow process). Mirrors the Ray
         # terminate-instances-by-tag pattern.
         self._child_tag = child_tag
-        self._executor = ThreadPoolExecutor(max_workers=max(1, max_parallel), thread_name_prefix="cell-ingest")
+        # Kept, not just handed to the executor: it is also the failure quorum
+        # ``wait_first`` aborts on — see there for why that must not be the whole list.
+        self._max_parallel = max(1, max_parallel)
+        self._executor = ThreadPoolExecutor(max_workers=self._max_parallel, thread_name_prefix="cell-ingest")
         self._futures: dict[tuple[str, int], Future[None]] = {}
         self._lock = threading.Lock()
         self._inflight: dict[tuple[str, int], Any] = {}  # (zone, year) → flow-run id
@@ -333,14 +336,21 @@ class _DeploymentCellInputs:
         lands first is a real mosaic, and the failure still surfaces when the runner
         reaches that cell.
 
-        When EVERY cell has finished and every one FAILED this RAISES, rather than
-        blocking forever or nominating one of the failures. Reporting a failed cell as
-        landed would send the caller straight into ``ray up`` — five to ten minutes of
-        billed GPU bringup for a mosaic that does not exist, torn down again the moment
-        the feeder reaches the same failure. Raising costs nothing and loses nothing: the
-        underlying ingest error is chained as the cause, and the priming this call belongs
-        to runs inside the flow's shutdown guard, so the started children are still
-        cancelled on the way out.
+        Once every cell of the FIRST WAVE — the first ``max_parallel`` of ``cells``, which
+        are the ones the pool starts — has failed, this RAISES rather than blocking on the
+        rest or nominating one of the failures. Reporting a failed cell as landed would send
+        the caller straight into ``ray up`` — five to ten minutes of billed GPU bringup for a
+        mosaic that does not exist, torn down again the moment the feeder reaches the same
+        failure. Raising costs nothing and loses nothing: the underlying ingest error is
+        chained as the cause, and the priming this call belongs to runs inside the flow's
+        shutdown guard, so the started children are still cancelled on the way out.
+
+        The quorum is that named wave, NOT the whole list and NOT a running failure count.
+        The list would hold a systematic failure through wave after wave before surfacing it.
+        A running count is the subtler trap: the executor starts a queued cell as soon as a
+        worker frees, so fast failures accumulate across waves while a slow first-wave cell
+        is still running and about to succeed — aborting there cancels the very ingest that
+        was going to land.
 
         ``None`` therefore means one thing only: the wait timed out (or no cell of
         ``cells`` was ever started).
@@ -350,6 +360,16 @@ class _DeploymentCellInputs:
             return None
         deadline = None if timeout is None else time.monotonic() + timeout
         pending = set(futs)
+        # The abort signal is a fully-failed FIRST WAVE — not a fully-failed list (the caller
+        # offers every live cell, so that would run a doomed cluster through wave after wave),
+        # and not a running failure total. The total is the trap: the pool starts a queued cell
+        # as soon as a worker frees, so fast failures accumulate across waves while a slow
+        # first-wave cell is still running and about to succeed, and aborting cancels it.
+        # These cells are the ones the pool starts first, so "all failed" cannot be true while
+        # any might still succeed. Same quorum as when the caller passed a window.
+        ordered = [c for c in cells if c in self._futures]
+        first_wave = {self._futures[c] for c in ordered[: self._max_parallel]}
+        failed_first_wave: set[Future[None]] = set()
         while pending:
             budget = None if deadline is None else max(0.0, deadline - time.monotonic())
             done, pending = wait(pending, timeout=budget, return_when=FIRST_COMPLETED)
@@ -362,28 +382,28 @@ class _DeploymentCellInputs:
                     if fut.exception() is None:
                         return futs[fut]
                 except CancelledError:
-                    continue
-            if not pending:
-                # ALL of `futs`, not this iteration's `done`. The loop drains `pending` over
-                # several waits, so `done` holds only whatever settled last — and reporting
-                # that made a whole window's failure read as one cell, hiding both the real
-                # extent and, when the cells failed for one shared reason, the cause. Every
-                # future is settled by the time `pending` is empty, so `.exception()` still
-                # cannot block.
-                self._raise_window_all_failed(futs, set(futs))
+                    pass
+                if fut in first_wave:
+                    failed_first_wave.add(fut)
+            if failed_first_wave == first_wave:
+                # EVERY first-wave failure, not this iteration's `done`: the loop drains
+                # `pending` over several waits, so `done` holds only whatever settled last —
+                # and reporting that made a whole pool's failure read as one cell, hiding both
+                # the extent and, when they failed for one shared reason, the cause.
+                self._raise_window_all_failed(futs, failed_first_wave)
         return None
 
     @staticmethod
-    def _raise_window_all_failed(futs: dict[Future[None], tuple[str, int]], done: set[Future[None]]) -> None:
-        """Every cell offered to :meth:`wait_first` finished and every one failed.
+    def _raise_window_all_failed(futs: dict[Future[None], tuple[str, int]], failed: set[Future[None]]) -> None:
+        """A pool's worth of ingests failed with none succeeding — abort the priming wait.
 
-        ``done`` must be every settled future, not one wait's slice of them: the message
-        names the cells an operator will go and look at, and a short list points at the
-        wrong subsystem when a fleet-wide failure took the whole window down.
+        ``failed`` must be every failure seen so far, not one wait's slice of them: the
+        message names the cells an operator will go and look at, and a short list points at
+        the wrong subsystem when one shared fault took the whole pool down.
         """
-        cells = sorted(futs[f] for f in done)
+        cells = sorted(futs[f] for f in failed)
         cause: BaseException | None = None
-        for fut in done:
+        for fut in failed:
             try:
                 cause = fut.exception()
             except CancelledError as exc:
@@ -392,8 +412,8 @@ class _DeploymentCellInputs:
                 break
         listed = ", ".join(f"{z}-{y}" for z, y in cells)
         raise RuntimeError(
-            f"every ingest in the opening window failed ({listed}) — there is no mosaic to "
-            f"infer, so no GPU fleet is requested. The first failure is chained below."
+            f"{len(cells)} ingest(s) failed with none landing ({listed}) — there is no mosaic "
+            f"to infer, so no GPU fleet is requested. The first failure is chained below."
         ) from cause
 
     def cleanup(self, zone: str, year: int) -> None:
@@ -472,6 +492,26 @@ class _DeploymentCellInputs:
             f"{CANCELLATION_CONFIRM_S:.0f}s of being cancelled. Refusing to start a second one over the same "
             f"mosaic prefix — those commits do not rebase, so the loser's failure is terminal."
         )
+
+    def cancel_unstarted(self) -> int:
+        """Cancel queued ingests that have not begun, and forget them. Returns how many.
+
+        ``Future.cancel()`` succeeds only for a task still sitting in the pool's queue, so
+        a running or finished ingest is untouched — this drops work, never interrupts it.
+
+        Called before the in-child retry pass: every pending cell's ingest is submitted up
+        front, so a retry's fresh ``start`` would otherwise sit behind most of a cluster in
+        this FIFO queue and block for hours on a still-billing cluster. Those cells are
+        unattempted either way and stay pending for the next campaign pass.
+        """
+        cancelled = 0
+        for key, fut in list(self._futures.items()):
+            if fut.cancel():
+                self._futures.pop(key, None)
+                cancelled += 1
+        if cancelled:
+            self._log.info("Cancelled %d queued ingest(s) that had not started", cancelled)
+        return cancelled
 
     def shutdown(self) -> None:
         """Stop dispatching, cancel in-flight child ingest runs, and WAIT for them to stop.
@@ -737,8 +777,10 @@ def fill_zones_sequential_flow(
             first; 2 means one retry on the still-provisioned fleet. Distinct from
             the campaign driver's `max_dispatch_rounds`, which counts whole-dispatch
             rounds — see `sequential_fill.fill_zones_sequential`.
-        look_ahead: Cells beyond the current one kept in ingest flight (bounds
-            concurrent ingest Dask clusters AND in-flight mosaics, ADR-011).
+        look_ahead: Sizes INGEST width only — the ingest driver runs ``1 + look_ahead``
+            cells at a time, which also sets the priming abort quorum and the runner's
+            retained-failure cap. It no longer bounds in-flight mosaics: peak storage is a
+            cluster's mosaics by design (ADR-011).
         cleanup_mosaics: Delete each campaign-ingested mosaic after its cell
             lands (transient input). Ignored for ``ingest=False`` mosaics.
         ingest_settings: Grouped ingest tuning knobs (worker bounds, S2
@@ -766,8 +808,8 @@ def fill_zones_sequential_flow(
     t0_flow = time.monotonic()
 
     # Validate BEFORE any side effect (triage reads, primed ingests, `ray up`):
-    # look_ahead < 0 sizes the mosaic budget / zone_slots semaphore at zero
-    # capacity, deadlocking the feeder — and it would only wedge AFTER priming
+    # look_ahead < 0 sizes the ingest driver's thread pool (1 + look_ahead) at zero
+    # width, so no cell would ever ingest — and it would only wedge AFTER priming
     # has launched ingests and the GPU cluster is up. Fail fast instead.
     if look_ahead < 0:
         raise ValueError(f"look_ahead must be >= 0, got {look_ahead}")
@@ -1317,14 +1359,20 @@ def fill_zones_sequential_flow(
     # server-side that a prompt retry of this flow would then race.
     try:
         if inputs is not None:
-            ingest_window = live[: 1 + look_ahead]
+            # EVERY live cell, not a look-ahead window. The driver's `max_parallel` is what
+            # bounds concurrency; starting only a window meant a new ingest could not begin
+            # until the feeder admitted a cell, which waited on an assembly — so a cluster
+            # configured for 6 concurrent ingests ran 1.
+            ingest_window = live
             for cell in ingest_window:
                 inputs.start(cell.zone, cell.year)
 
             log.info(
-                "Ingesting %d UTM zone(s); GPUs are requested as soon as the first mosaic lands (sizes %s tiles)",
+                "Ingesting %d cell(s), %d at a time; GPUs are requested as soon as the first "
+                "mosaic lands (densest first: %s tiles)",
                 len(ingest_window),
-                ", ".join(f"{c.n_tiles:,}" for c in ingest_window),
+                1 + look_ahead,
+                ", ".join(f"{c.n_tiles:,}" for c in ingest_window[:6]),
             )
             t0 = time.monotonic()
             first = inputs.wait_first([(c.zone, c.year) for c in ingest_window])
