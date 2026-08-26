@@ -100,6 +100,24 @@ a change to the runner's contract, deliberately not made. **If the drain proves 
 campaign's critical path, that is the change to make**, and the measurement to take first is
 assembly wall time against inference wall time on the same cell.
 
+## Declined in review, and what would change our mind
+
+**`ready()` treats a failed ingest as landed.** `_take_next` now scans the whole pending
+list, so a failed ingest anywhere in it becomes pickable immediately — where before only a
+look-ahead window was reachable. Review asked for readiness to be success-aware.
+
+Declined. `ready()` returning true for a failure is deliberate and documented: the
+alternative is blocking forever on a mosaic that will never arrive. A failed pick costs
+microseconds — `inputs.wait` re-raises, the cell is recorded and retained for the in-child
+retry, the feeder continues — so it does not idle the fleet. And the cap tripping after
+`look_ahead + 2` genuine ingest failures is the cap working, not a misfire. Making
+readiness success-aware needs a new method on the `CellInputs` protocol to buy an ordering
+preference we have no evidence we need.
+
+**What would change our mind:** a run where cells with good mosaics sat unstarted behind
+failed ones, or a cap trip on a cluster that had plenty of landed work available. Neither
+has been observed.
+
 ## Verification
 
 Every behavioural test fails against the pre-change source and passes against the new one.
