@@ -148,9 +148,9 @@ class RecordingInputs:
             self.events.append(f"discard:{zone}")
 
 
-class BudgetProbeInputs(RecordingInputs):
+class MosaicCountingInputs(RecordingInputs):
     """RecordingInputs that also tracks the started-not-cleaned high-water mark —
-    the mosaic count the budget is supposed to bound.
+    how many cells hold a mosaic at once.
     """
 
     def __init__(self, events: list[str]) -> None:
@@ -171,14 +171,9 @@ class BudgetProbeInputs(RecordingInputs):
             self.alive -= 1
 
 
-class FailingWaitInputs(BudgetProbeInputs):
-    """Every ingest FAILS, and fails where the feeder itself sees it.
-
-    Ingest failures surface synchronously inside the feeder loop (``inputs.wait``
-    raises, the cell is recorded and counted, the loop continues), which is what makes
-    the retained-failure cap deterministic. Inference failures are the other case —
-    they land on the trailing finalizer thread, so the feeder can admit further cells
-    before the count catches up. See the two cap tests below.
+class FailingWaitInputs(RecordingInputs):
+    """Every ingest FAILS, and fails where the feeder itself sees it — which is what
+    makes the retained-failure cap deterministic (see the two cap tests).
     """
 
     def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
@@ -423,7 +418,7 @@ def test_ingest_starts_for_every_cell_and_is_not_paced_by_the_fill():
     that the runner does not add a second, tighter gate of its own.
     """
     events: list[str] = []
-    inputs = BudgetProbeInputs(events)
+    inputs = MosaicCountingInputs(events)
     _run(_cells(8), inputs=inputs, look_ahead=1)
 
     # ORDERING is the isolating property, not the count. Counting starts passes either way:
@@ -448,7 +443,7 @@ def test_failed_cell_releases_budget_slot_and_keeps_mosaic():
     its budget slot — a slot held forever would starve the feeder.
     """
     events: list[str] = []
-    inputs = BudgetProbeInputs(events)
+    inputs = MosaicCountingInputs(events)
     with pytest.raises(RuntimeError, match="1/8 cell"):
         _run(_cells(8), session=_sync_session(fail={"01N"}), inputs=inputs, look_ahead=0)
     assert "cleanup:01N" not in events  # mosaic retained for the retry...
@@ -466,7 +461,7 @@ def test_every_cell_mismatching_the_session_orbit_still_completes():
     storage bound still holds.
     """
     events: list[str] = []
-    inputs = BudgetProbeInputs(events)
+    inputs = MosaicCountingInputs(events)
 
     summary = _run(
         _cells(4),
@@ -512,7 +507,7 @@ def test_a_mismatched_run_does_not_deadlock_the_feeder():
     must drain rather than wedge, under a look-ahead that leaves the budget tight.
     """
     events: list[str] = []
-    inputs = BudgetProbeInputs(events)
+    inputs = MosaicCountingInputs(events)
     result: dict = {}
 
     def target():
@@ -553,24 +548,16 @@ def test_systematic_failure_stops_feeder_at_retained_cap():
 
 
 def test_inference_failures_are_paced_by_ingest_not_by_the_cap():
-    """The other half of the cap, and a DELIBERATE weakening — pinned so it is visible.
+    """The other half of the cap, and a DELIBERATE weakening — pinned so it stays visible.
 
-    An inference failure is recorded on the trailing finalizer thread, not the feeder's,
-    so the feeder can admit further cells before the count catches up. Admission used to
-    be bounded by a semaphore released only after a cell's ASSEMBLY landed, which capped
-    the run-ahead at ``look_ahead + 2`` cells — and also stalled inference behind
-    assembly and capped fleet-fill parallelism, which is why it is gone.
-
-    With instant fakes the feeder therefore admits every cell. That is a property of the
-    fake, not of production: there ``inputs.wait`` blocks on a real ingest, only
-    ``1 + look_ahead`` of which run at a time and each taking tens of minutes to hours,
-    so the feeder can only run as far ahead as ingests actually complete.
-
-    What must still hold is that the run FAILS and no cell's mosaic is deleted, so every
-    failed cell stays resumable.
+    An inference failure is recorded on the trailing finalizer thread, so the feeder can
+    admit further cells before the count catches up. With instant fakes it admits all 12;
+    in production ``inputs.wait`` blocks on a real ingest, so the run-ahead is bounded by
+    ingest rather than by a gate. What must still hold: the run FAILS and no mosaic is
+    deleted, so every failed cell stays resumable.
     """
     events: list[str] = []
-    inputs = BudgetProbeInputs(events)
+    inputs = MosaicCountingInputs(events)
     with pytest.raises(RuntimeError, match="cell"):
         _run(
             _cells(12),
@@ -585,13 +572,10 @@ def test_inference_failures_are_paced_by_ingest_not_by_the_cap():
 def test_inference_does_not_wait_for_assembly():
     """THE point of removing the admission bound: a stuck assembly must not stall inference.
 
-    The single assembly thread is held until every cell has finished inference. That can
-    only happen if admission is unbounded — the old semaphore admitted ``look_ahead + 2``
-    un-finalized cells and released a slot only after a cell's assembly landed, so with
-    ``look_ahead=0`` the feeder would stall after two cells and never reach the eighth.
-
-    Fails on the pre-change code: the release never comes, the hold times out, and the
-    cells that did stream fail in assembly.
+    The single assembly thread is held until every cell has finished inference, which can
+    only happen if admission is unbounded. On the pre-change code (``look_ahead=0`` → two
+    slots, released after assembly) the feeder stalls at cell 3 of 8, the hold times out,
+    and every streamed cell fails in assembly.
     """
     n = 8
     all_streamed = threading.Event()
@@ -628,7 +612,7 @@ def test_sporadic_failures_below_cap_do_not_stop_the_run():
     is still attempted (only a systematic failure trips the early stop).
     """
     events: list[str] = []
-    inputs = BudgetProbeInputs(events)
+    inputs = MosaicCountingInputs(events)
     with pytest.raises(RuntimeError, match="2/8 cell"):
         _run(_cells(8), session=_sync_session(fail={"03N", "06N"}), inputs=inputs, look_ahead=2)
     # All 8 admitted (2 failed, 6 cleaned) — the run wasn't cut short.
@@ -637,8 +621,8 @@ def test_sporadic_failures_below_cap_do_not_stop_the_run():
 
 
 def test_negative_look_ahead_rejected():
-    """look_ahead < 0 would size the budget / zone_slots at <= 0 capacity and
-    deadlock the feeder — the runner rejects it up front.
+    """look_ahead < 0 would size the ingest driver's pool at zero width, so no cell
+    would ever ingest — the runner rejects it up front.
     """
     with pytest.raises(ValueError, match="look_ahead must be >= 0"):
         _run(_cells(1), look_ahead=-1)

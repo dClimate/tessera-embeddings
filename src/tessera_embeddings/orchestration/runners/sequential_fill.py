@@ -10,7 +10,7 @@ worker — are paid once per CLUSTER of a campaign year instead of once per zone
 ("cluster" throughout means one Ray cluster and the UTM zones assigned to it;
 "zone" always means a UTM zone, and "shard" always means a storage shard.)
 
-Keeping the shared fleet busy is the whole game, and three mechanisms
+Keeping the shared fleet busy is the whole game, and the mechanisms below
 cooperate on it (this docstring is the canonical statement of the rationale —
 the flow and README point here):
 
@@ -31,32 +31,22 @@ the flow and README point here):
   does its two jobs (sizing the session from the largest cell, putting the island
   tail last); it is simply no longer a barrier.
 - **Nothing gates the three stages against each other.** GPUs are by far the most
-  expensive resource in the stack, so the ordering principle is that inference
-  never waits for anything but its own input:
+  expensive resource here, so inference never waits for anything but its own input:
 
-  * INGEST runs at the ingest driver's own ``max_parallel`` (``1 + look_ahead``,
-    which is all ``look_ahead`` still sizes). An ingest is started for every
-    pending cell up front, so when one finishes the next begins immediately.
-  * INFERENCE is admitted without bound. Its only pacing is ``inputs.wait`` on
-    the chosen cell's own mosaic.
-  * ASSEMBLY serialises on one trailing thread and may lag arbitrarily far
-    behind inference, including past the end of it.
+  * INGEST runs ``1 + look_ahead`` cells at a time (all ``look_ahead`` still sizes).
+    An ingest is started for every pending cell up front, so when one finishes the
+    next begins immediately.
+  * INFERENCE is admitted without bound, paced only by ``inputs.wait`` on the
+    chosen cell's own mosaic.
+  * ASSEMBLY serialises on one trailing thread and may lag arbitrarily far behind
+    inference, including past the end of it.
 
-  Two gates used to sit here and BOTH idled the fleet. A mosaic budget admitted
-  ingest *starts* against ``look_ahead + 2`` capacity released only after an
-  assembly landed, so ingest throughput was set by assembly throughput: a fleet
-  configured for 60 concurrent ingests ran 7, measured live. Beside it,
-  ``zone_slots`` admitted ``look_ahead + 2`` un-finalized cells on the same
-  after-assembly release, which stalled inference once that many cells were
-  awaiting assembly and separately capped how many zones' tiles were dispatchable
-  at once (the "small-zone fleet fill" limitation, now retired).
-
-  Both were a STORAGE bound originally. They are not any more: the flow ingests
-  its whole cluster before requesting GPUs, so a fleet is never billed against an
-  unfinished ingest, and peak storage is a cluster's mosaics by design (ADR-011).
   What remains bounded is FAILURE, not throughput: a failed cell keeps its mosaic
   for staged resume and is counted, and the feeder stops admitting once
-  ``max_retained_failures`` of them are outstanding.
+  ``max_retained_failures`` of them are outstanding. Two semaphores here used to
+  release on ASSEMBLY and so throttled the two stages ahead of it; the cost of
+  removing them is an assembly backlog, which is the cheap direction to fail.
+  Both, with the measurements: ``context_docs/design/stage_decoupling_2026_08.md``.
 - **In-child retry**: a failed cell is re-attempted on the still-provisioned
   cluster before the run ends (``attempts_per_cell_in_cluster``), reusing the per-cell
   ``infer_single`` path and the mosaic that was retained for exactly this. Without
@@ -67,14 +57,9 @@ the flow and README point here):
   thread; a zone's mosaic is deleted only after its assembly lands. A zone counts
   as complete only when every tile's result is FINAL — the scheduler fires the
   completion callback after any deferred staging write confirms, so assembly never
-  races an in-flight upload.
-
-  This was assumed to be ~10-15% of a cell's inference wall time, which would make
-  the backlog self-limiting. Do not rely on that: the first three assemblies of the
-  2026-08 global campaign ran at ~1,380 tiles/hour each (1,369 / 1,354 / 1,424 —
-  within 5%), which on dense cells is a far larger fraction than assumed. The
-  backlog is therefore expected to grow through a cluster's run, and the drain at
-  the end is expected to be long. Nothing depends on it being short.
+  races an in-flight upload. Do NOT assume it is a small fraction of inference: it
+  is measured, and slower than it looks (see the design note above). Nothing here
+  depends on the backlog staying short.
 
 Idle-actor retirement needs no per-zone gating here: the scheduler suppresses
 it while the work source is unexhausted and resumes it for the true cluster
@@ -90,18 +75,9 @@ the globe are radar-free in principle, so a cell resolving ``"none"`` against a
 There is therefore no post-stream fallback pass any more. ``infer_single`` itself is
 still live: the in-child retry runs failed cells on it, on the still-provisioned cluster.
 
-The small-zone fleet-fill limitation is RETIRED. While admission was bounded, that
-bound doubled as the fleet-fill parallelism — only that many zones' tiles could be
-in flight at once, so a cluster of zones each far smaller than the fleet (an
-all-island Pacific cluster, say) left actors idle. Unbounded admission means every
-prepared zone's tiles are dispatchable, so the stream fills the fleet from as many
-zones as it takes.
-
-The cost of unbounded admission is an assembly BACKLOG: inference can finish a
-cluster's cells long before assembly drains them. That is deliberate and it is the
-cheap direction to fail — an idle assembly thread costs one CPU, an idle GPU fleet
-costs hundreds. See ``ASSEMBLY TAIL`` at the drain site for what it means for the
-caller's Ray context.
+The small-zone fleet-fill limitation is RETIRED: the bound on admission doubled as
+the fleet-fill parallelism, so a cluster of zones each far smaller than the fleet
+left actors idle. Every prepared zone's tiles are now dispatchable.
 
 Contracts: Prefect-free (the deployment-backed ingest adapter, the
 input-fingerprinted run_id, the per-cell config/plan, and the session itself
@@ -138,7 +114,7 @@ if TYPE_CHECKING:
 class CellInputs(Protocol):
     """Lifecycle of a cell's input mosaics, implemented by the flow layer.
 
-    The runner drives *when* (start ``look_ahead`` cells early, wait before
+    The runner drives *when* (start every pending cell up front, wait before
     planning, clean up after the cell lands); the implementation owns *how*
     (typically a Prefect ingest deployment per cell). All three methods are
     keyed by ``(zone, year)`` and must be idempotent — ``start`` on an
@@ -338,12 +314,9 @@ def fill_zones_sequential(
             ``max_dispatch_rounds`` is for. The two are nested, not alternatives: a
             deterministic failure will burn both, and what actually stops that is the
             driver's no-progress check rather than either count.
-        look_ahead: Sizes INGEST width only — the ingest driver runs
-            ``1 + look_ahead`` cells at a time, and every pending cell's ingest is
-            started up front so the next begins the moment one finishes. It does not
-            bound inference (admission is unbounded) and it does not bound assembly.
-            It still sets ``max_retained_failures``, which is a failure cap rather
-            than a throughput one.
+        look_ahead: Sizes INGEST width only — the driver runs ``1 + look_ahead`` cells
+            at a time. It bounds neither inference nor assembly. It also sets
+            ``max_retained_failures``, which caps failures rather than throughput.
         fault: Supervised-drill hook, consulted where prepared work crosses from the
             feeder to the scheduler. Inert unless the run was armed for the
             supply-withholding fault (:mod:`tessera_embeddings.config.fault_injection`).
@@ -375,14 +348,7 @@ def fill_zones_sequential(
     feeder_done = threading.Event()
     feeder_error: list[BaseException] = []  # an exception outside the per-cell guards
     stop = threading.Event()  # session crashed — unwind the feeder
-    # NOTHING bounds admission to the inference stream. GPUs are the most expensive
-    # resource in the stack, so inference runs as fast as it can and stops only when it
-    # runs out of cells; assembly is allowed to lag arbitrarily behind it, including
-    # past the end of inference. The semaphore that used to sit here admitted
-    # `look_ahead + 2` un-finalized cells and released the slot only after a cell's
-    # ASSEMBLY landed, which idled the fleet two ways: inference stalled once that many
-    # cells were awaiting assembly, and the same bound capped how many zones' tiles were
-    # dispatchable at once (the "small-zone fleet fill" limitation this retires).
+    # NOTHING bounds admission to the inference stream — see the module docstring.
     # A FAILED cell keeps its mosaic (for the retry's staged resume). Retained failures
     # are counted, and once they reach this cap the feeder stops admitting new cells (the
     # run then winds down and fails on the recorded failures) — otherwise a systematic
@@ -391,10 +357,9 @@ def fill_zones_sequential(
     #: Cells that LANDED but whose mosaic delete failed. Tracked apart from
     #: ``retained_failed`` because these must not stop the feeder — see ``_leak_mosaic``.
     cleanup_leaked: set[tuple[str, int]] = set()
-    #: Cells submitted to the trailing finalizer and not yet assembled. Exists only to
-    #: report the size of the assembly backlog at the drain, which can now be most of a
-    #: cluster's cells and can take hours.
-    assembly_pending: set[tuple[str, int]] = set()
+    #: Cells submitted to the trailing finalizer and not yet assembled. Reported at the
+    #: drain, where the backlog can be most of a cluster's cells and take hours.
+    assembly_pending = 0
     max_retained_failures = look_ahead + 2
     finalizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trailing-assembly")
 
@@ -456,15 +421,9 @@ def fill_zones_sequential(
     def _start_ingests(pending: list[SequentialCell]) -> None:
         """Start an ingest for EVERY pending cell. Idempotent, so it is safe per feed step.
 
-        **Ingest concurrency is the ingest driver's own ``max_parallel``, and nothing else.**
-        This used to start only ``1 + look_ahead`` cells, and because ``pending`` shrinks only
-        when the feeder ADMITS a cell — which then needed a budget slot released after the
-        cell's assembly lands — every new ingest waited on an assembly six cells back. Ingest
-        throughput was therefore set by assembly throughput. Measured live: 7 ingests running
-        fleet-wide against a configured 60.
-
-        Density order is unaffected: this only decides WHEN an ingest starts, and the driver
-        works its queue in the order given, which is ``pending`` order — densest first.
+        Ingest concurrency is the driver's own ``max_parallel`` and nothing else — starting
+        only a window here is what chained ingest to assembly. Density order is unaffected:
+        the driver works its queue in the order given, which is ``pending`` order.
         """
         if inputs is None:
             return
@@ -524,14 +483,14 @@ def fill_zones_sequential(
                 else:
                     _leak_mosaic(cell)
             with lock:
-                assembly_pending.discard((cell.zone, cell.year))
+                nonlocal assembly_pending
+                assembly_pending -= 1
 
     def _submit_assembly(tally: _ZoneTally) -> None:
-        """Queue a completed cell's assembly. Registered BEFORE submitting, so the
-        backlog reported at the drain counts cells still sitting in the queue.
-        """
+        """Queue a completed cell's assembly, counting it as backlog until it lands."""
+        nonlocal assembly_pending
         with lock:
-            assembly_pending.add((tally.cell.zone, tally.cell.year))
+            assembly_pending += 1
         finalizer.submit(_finalize, tally)
 
     def _take_next(pending: list[SequentialCell]) -> SequentialCell:
@@ -807,20 +766,13 @@ def fill_zones_sequential(
         feeder.join(timeout=600)
         if feeder.is_alive():
             log.warning("Zone feeder did not exit within 600s — continuing teardown (daemon thread)")
-        # ASSEMBLY TAIL. Inference is admitted without bound, so by here the backlog can
-        # be most of the cluster's cells, and they assemble one at a time on this thread.
-        # That is the intended trade: assembly is allowed to lag arbitrarily so the GPU
-        # fleet never waits on it.
-        #
-        # The tail is NOT free, because the caller owns the Ray context and this drain runs
-        # inside it. What makes it cheap rather than ruinous is that the session has already
-        # retired its actors, so the cluster's GPU workers go idle and the autoscaler
-        # terminates them on `idle_timeout_minutes`; the head node is what stays up for the
-        # remainder. Moving this drain outside the Ray context would remove even that, at
-        # the cost of handing pending assemblies back to the flow — a change to this
-        # runner's contract, deliberately not made here.
+        # The backlog here can be most of the cluster's cells, and this drain runs INSIDE
+        # the caller's Ray context. It is cheap anyway because the session has retired its
+        # actors, so GPU workers idle down and only the head node remains. Draining outside
+        # the Ray context would need pending assemblies handed back to the flow — see the
+        # design note in the module docstring.
         with lock:
-            n_pending = len(assembly_pending)
+            n_pending = assembly_pending
         if n_pending:
             log.info(
                 "Inference complete — draining %d trailing assembly/assemblies, one at a time. "

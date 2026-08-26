@@ -766,8 +766,8 @@ def fill_zones_sequential_flow(
     t0_flow = time.monotonic()
 
     # Validate BEFORE any side effect (triage reads, primed ingests, `ray up`):
-    # look_ahead < 0 sizes the mosaic budget / zone_slots semaphore at zero
-    # capacity, deadlocking the feeder — and it would only wedge AFTER priming
+    # look_ahead < 0 sizes the ingest driver's thread pool (1 + look_ahead) at zero
+    # width, so no cell would ever ingest — and it would only wedge AFTER priming
     # has launched ingests and the GPU cluster is up. Fail fast instead.
     if look_ahead < 0:
         raise ValueError(f"look_ahead must be >= 0, got {look_ahead}")
