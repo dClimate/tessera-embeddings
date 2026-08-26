@@ -583,6 +583,27 @@ class TestAPinnedStagingIdentityReachesAnEarlierCampaignsPrefix:
         assert "infcode-FIXED" in announced[0]
         assert len(announced) == 1, f"announced once per campaign, not per cell: {len(announced)}"
 
+    def test_the_derived_identity_is_never_frozen_by_the_announcement(self, wired, monkeypatch, caplog):
+        """Announcing once must not mean deriving once.
+
+        The tarball ETag is the one term that can move WHILE a campaign runs, and the safe
+        response to a replaced tarball is a FRESH prefix. Caching the identity to make the log
+        line fire once would instead send later dispatches back to the prefix the OLD code
+        staged — two code versions in one write-once zone-year, which is the failure the
+        fingerprint exists to prevent. A pinned identity is a constant and never consults the
+        tarball, so this is the derived path's hazard alone.
+        """
+        tarballs = iter(["tarball=FIRST", "tarball=SECOND"])
+        monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-FIXED")
+        monkeypatch.setattr(mod, "_resolve_tarball_identity", lambda *a, **k: next(tarballs, "tarball=SECOND"))
+        with caplog.at_level("INFO"):
+            first = _chained_staging_identity(wired)
+            second = _chained_staging_identity(wired)
+        assert first == "infcode-FIXED|tarball=FIRST"
+        assert second == "infcode-FIXED|tarball=SECOND", "a replaced tarball must start a fresh prefix"
+        announced = [r.getMessage() for r in caplog.records if "Staging code identity" in r.getMessage()]
+        assert len(announced) == 2, "a mid-campaign swap must announce itself, not hide behind the first line"
+
     @pytest.mark.parametrize(
         ("kwargs", "needle"),
         [

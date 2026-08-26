@@ -1139,7 +1139,7 @@ async def run_global_campaign(
         return optical_rule_cache[0]
 
     code_identity_cache: list[str] = []
-    staging_identity_cache: list[str] = []
+    announced_staging_identities: set[str] = set()
 
     def _staging_code_identity() -> str:
         """The staging fingerprint's code component — narrowed, with two escape hatches.
@@ -1163,23 +1163,30 @@ async def run_global_campaign(
         computation over CHANGED code reproduces the identity that changed code replaced. The
         three are mutually exclusive, refused at preflight rather than ordered here.
         """
-        if staging_identity_cache:
-            return staging_identity_cache[0]
         identity = _derive_staging_code_identity()
-        staging_identity_cache.append(identity)
-        # SAID ONCE, BY THE DRIVER, whatever the strategy. `staging_code_identity` can only be
-        # used to restart onto an earlier campaign's tiles if the earlier campaign's value can be
-        # read back, and the chained path's child parameters are not a general answer: a
+        # ANNOUNCED, never cached, and the difference is load-bearing. The tarball's ETag is the
+        # one term that can move WHILE a campaign runs: replace the object and later dispatches
+        # download new code. Freezing the identity at first use would send those dispatches back
+        # to the prefix the OLD code staged, mixing two code versions in one write-once
+        # zone-year — the failure the whole fingerprint exists to prevent. Re-deriving keeps the
+        # behaviour that was already here: a replaced tarball starts a FRESH prefix, which costs
+        # re-inference and can never mix. (A pinned identity is a constant, so it never consults
+        # the tarball at all; this hazard belongs to the derived path alone.)
+        #
+        # SAID BY THE DRIVER, whatever the strategy, because a restart needs the earlier
+        # campaign's value and the chained path's child parameters are not a general source: a
         # `cluster-per-zone` campaign hands its children a run_id with the identity already
-        # hashed irreversibly into it. This line is the one place the value survives in a form an
-        # operator can copy, and by then the code or the tarball that produced it has moved.
-        log.info(
-            "Staging code identity for this campaign: %s (%s). Pass this back as "
-            "`staging_code_identity` to restart onto the tiles this campaign stages; once the "
-            "inference source or the code tarball moves it cannot be recomputed.",
-            identity,
-            "stated by staging_code_identity" if staging_code_identity else "derived",
-        )
+        # hashed irreversibly into it. Once per DISTINCT value, so a mid-campaign tarball swap
+        # announces itself rather than hiding behind the first line.
+        if identity not in announced_staging_identities:
+            announced_staging_identities.add(identity)
+            log.info(
+                "Staging code identity for this campaign: %s (%s). Pass this back as "
+                "`staging_code_identity` to restart onto the tiles this campaign stages; once the "
+                "inference source or the code tarball moves it cannot be recomputed.",
+                identity,
+                "stated by staging_code_identity" if staging_code_identity else "derived",
+            )
         return identity
 
     def _derive_staging_code_identity() -> str:
