@@ -182,7 +182,10 @@ class _DeploymentCellInputs:
         # never runs when Prefect kills the flow process). Mirrors the Ray
         # terminate-instances-by-tag pattern.
         self._child_tag = child_tag
-        self._executor = ThreadPoolExecutor(max_workers=max(1, max_parallel), thread_name_prefix="cell-ingest")
+        # Kept, not just handed to the executor: it is also the failure quorum
+        # ``wait_first`` aborts on — see there for why that must not be the whole list.
+        self._max_parallel = max(1, max_parallel)
+        self._executor = ThreadPoolExecutor(max_workers=self._max_parallel, thread_name_prefix="cell-ingest")
         self._futures: dict[tuple[str, int], Future[None]] = {}
         self._lock = threading.Lock()
         self._inflight: dict[tuple[str, int], Any] = {}  # (zone, year) → flow-run id
@@ -333,14 +336,19 @@ class _DeploymentCellInputs:
         lands first is a real mosaic, and the failure still surfaces when the runner
         reaches that cell.
 
-        When EVERY cell has finished and every one FAILED this RAISES, rather than
-        blocking forever or nominating one of the failures. Reporting a failed cell as
+        Once ``max_parallel`` cells have failed with NONE landing this RAISES, rather than
+        blocking on the rest or nominating one of the failures. Reporting a failed cell as
         landed would send the caller straight into ``ray up`` — five to ten minutes of
         billed GPU bringup for a mosaic that does not exist, torn down again the moment
         the feeder reaches the same failure. Raising costs nothing and loses nothing: the
         underlying ingest error is chained as the cause, and the priming this call belongs
         to runs inside the flow's shutdown guard, so the started children are still
         cancelled on the way out.
+
+        The quorum is a POOL's worth, not the whole list. The caller offers every live cell,
+        so requiring all of them to fail would run a systematic failure through wave after
+        wave before surfacing it — and one pool failing with nothing landing already tells
+        the operator everything the last wave would.
 
         ``None`` therefore means one thing only: the wait timed out (or no cell of
         ``cells`` was ever started).
@@ -350,6 +358,14 @@ class _DeploymentCellInputs:
             return None
         deadline = None if timeout is None else time.monotonic() + timeout
         pending = set(futs)
+        # A fully-failed POOL is the abort signal, not a fully-failed LIST. The caller now
+        # offers every live cell (an ingest is started for all of them), and waiting for all
+        # of those to fail before raising would run a systematic failure through wave after
+        # wave — hours, when each wave fails slowly — before anything surfaced. `_max_parallel`
+        # is what runs at once, so one pool's worth of failures with no success is already the
+        # whole signal, and it reproduces the quorum from when the caller passed a window.
+        quorum = min(self._max_parallel, len(futs))
+        settled_failed: set[Future[None]] = set()
         while pending:
             budget = None if deadline is None else max(0.0, deadline - time.monotonic())
             done, pending = wait(pending, timeout=budget, return_when=FIRST_COMPLETED)
@@ -362,28 +378,27 @@ class _DeploymentCellInputs:
                     if fut.exception() is None:
                         return futs[fut]
                 except CancelledError:
-                    continue
-            if not pending:
-                # ALL of `futs`, not this iteration's `done`. The loop drains `pending` over
-                # several waits, so `done` holds only whatever settled last — and reporting
-                # that made a whole window's failure read as one cell, hiding both the real
-                # extent and, when the cells failed for one shared reason, the cause. Every
-                # future is settled by the time `pending` is empty, so `.exception()` still
-                # cannot block.
-                self._raise_window_all_failed(futs, set(futs))
+                    pass
+                settled_failed.add(fut)
+            if len(settled_failed) >= quorum:
+                # EVERY failure seen so far, not this iteration's `done`: the loop drains
+                # `pending` over several waits, so `done` holds only whatever settled last —
+                # and reporting that made a whole pool's failure read as one cell, hiding both
+                # the extent and, when they failed for one shared reason, the cause.
+                self._raise_window_all_failed(futs, settled_failed)
         return None
 
     @staticmethod
-    def _raise_window_all_failed(futs: dict[Future[None], tuple[str, int]], done: set[Future[None]]) -> None:
-        """Every cell offered to :meth:`wait_first` finished and every one failed.
+    def _raise_window_all_failed(futs: dict[Future[None], tuple[str, int]], failed: set[Future[None]]) -> None:
+        """A pool's worth of ingests failed with none succeeding — abort the priming wait.
 
-        ``done`` must be every settled future, not one wait's slice of them: the message
-        names the cells an operator will go and look at, and a short list points at the
-        wrong subsystem when a fleet-wide failure took the whole window down.
+        ``failed`` must be every failure seen so far, not one wait's slice of them: the
+        message names the cells an operator will go and look at, and a short list points at
+        the wrong subsystem when one shared fault took the whole pool down.
         """
-        cells = sorted(futs[f] for f in done)
+        cells = sorted(futs[f] for f in failed)
         cause: BaseException | None = None
-        for fut in done:
+        for fut in failed:
             try:
                 cause = fut.exception()
             except CancelledError as exc:
@@ -392,8 +407,8 @@ class _DeploymentCellInputs:
                 break
         listed = ", ".join(f"{z}-{y}" for z, y in cells)
         raise RuntimeError(
-            f"every ingest in the opening window failed ({listed}) — there is no mosaic to "
-            f"infer, so no GPU fleet is requested. The first failure is chained below."
+            f"{len(cells)} ingest(s) failed with none landing ({listed}) — there is no mosaic "
+            f"to infer, so no GPU fleet is requested. The first failure is chained below."
         ) from cause
 
     def cleanup(self, zone: str, year: int) -> None:

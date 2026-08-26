@@ -79,6 +79,14 @@ rather than an unbounded I/O wait, and in production the feeder is paced by `inp
 on a real ingest anyway. An ingest failure is exact, because it raises on the feeder's own
 thread before the loop's next cap check.
 
+**A pool is the failure quorum, not the whole list.** Same shape as the defect above, in
+the priming wait. `wait_first` raised only once EVERY future it was given had failed, and
+the caller now hands it every live cell — so a doomed cluster would have run wave after wave
+through the ingest pool before anything surfaced. The quorum is now `max_parallel`: one
+pool's worth of failures with nothing landing aborts the wait, which is exactly the quorum
+that held when the caller passed a look-ahead window. The adapter already knew its own pool
+width, so this needed no new parameter.
+
 **Do not test this by counting admissions.** With instant fakes the feeder outruns the
 scheduler and the admitted count ranged 4 to 12 across runs. The stable axis is which
 thread does the accounting; the test holds one assembly and asserts failures are counted
@@ -105,6 +113,7 @@ needed, which is what made this cheap:
 | `test_the_readiest_cell_is_taken_wherever_it_sits` | took `01N` instead of the landed `05N` |
 | `test_systematic_failure_stops_feeder_at_retained_cap` | ingest was gated by admission |
 | `test_failed_cells_are_counted_while_an_assembly_is_stuck` | 0 cells reached the cap while one assembly was held |
+| `test_wait_first_aborts_on_a_pool_of_failures_not_the_whole_list` | `DID NOT RAISE` — it waited on four still-pending cells |
 
 **Not covered:** reaching 60 concurrent is only observable in prod at full width. The
 mechanism is the same code path at any divisor, and the dispatch log above already shows the

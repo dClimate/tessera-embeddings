@@ -917,6 +917,34 @@ def test_wait_first_skips_a_failed_cell_while_a_sibling_is_still_ingesting():
         adapter.shutdown()
 
 
+def test_wait_first_aborts_on_a_pool_of_failures_not_the_whole_list():
+    """A systematic failure must surface after one pool, not after every wave.
+
+    The caller offers EVERY live cell now (an ingest is started for all of them), so a
+    quorum of "all supplied futures failed" would hold the priming wait through wave after
+    wave of a doomed cluster — hours, when each ingest fails slowly — before anything
+    raised. One pool's worth of failures with nothing landing is already the whole signal.
+
+    Two failures against ``max_parallel=2`` with four cells still ingesting: must raise.
+    Pre-change this returns ``None`` at the timeout instead, because four futures are still
+    pending.
+    """
+    adapter = _adapter(max_parallel=2)
+    try:
+        adapter._futures = {
+            ("01N", 2024): _settled(RuntimeError("bad credentials")),
+            ("02N", 2024): _settled(RuntimeError("bad credentials")),
+            **{(f"{i:02d}N", 2024): Future() for i in range(3, 7)},
+        }
+        with pytest.raises(RuntimeError, match="ingest\\(s\\) failed with none landing") as caught:
+            adapter.wait_first([(f"{i:02d}N", 2024) for i in range(1, 7)], timeout=2.0)
+        named = str(caught.value)
+        assert "01N-2024" in named and "02N-2024" in named
+        assert "03N-2024" not in named, "a cell that never settled must not be reported as failed"
+    finally:
+        adapter.shutdown()
+
+
 def test_wait_first_raises_rather_than_booting_gpus_when_every_cell_failed():
     """No mosaic is coming, so the one thing that must not happen is `ray up`.
 
@@ -932,7 +960,7 @@ def test_wait_first_raises_rather_than_booting_gpus_when_every_cell_failed():
             ("01N", 2024): _settled(RuntimeError("bad credentials")),
             ("02N", 2024): _settled(RuntimeError("bad credentials")),
         }
-        with pytest.raises(RuntimeError, match="every ingest in the opening window failed") as caught:
+        with pytest.raises(RuntimeError, match="ingest\\(s\\) failed with none landing") as caught:
             adapter.wait_first([("01N", 2024), ("02N", 2024)])
         assert "01N-2024" in str(caught.value) and "02N-2024" in str(caught.value)
         assert isinstance(caught.value.__cause__, RuntimeError)
@@ -962,7 +990,7 @@ def test_the_all_failed_report_names_cells_that_failed_in_earlier_waits():
         }
         threading.Timer(0.05, lambda: late.set_exception(RuntimeError("bad credentials"))).start()
 
-        with pytest.raises(RuntimeError, match="every ingest in the opening window failed") as caught:
+        with pytest.raises(RuntimeError, match="ingest\\(s\\) failed with none landing") as caught:
             adapter.wait_first([("01N", 2024), ("02N", 2024)])
 
         message = str(caught.value)
