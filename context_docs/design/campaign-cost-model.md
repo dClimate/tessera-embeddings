@@ -424,6 +424,17 @@ same rate either way. What the ingest configuration decides is whether the fleet
 
 ### Size the fleet UNDER what ingest can feed
 
+> **MEASURED 2026-08-26: per-chunk cost varies ~7x BY ZONE, so a single per-zone-year figure
+> cannot size a fleet.** Marginal GPU-hours per 2048-px chunk, taken on legs with ZERO resumed
+> tiles so nothing is flattered by staged work resolving free: **37N 0.094, 32N-2018 0.199,
+> 34N 0.204**, against a reference of 0.104 implied by this section. Legs with partial resumption
+> read as low as 0.029 and that is an artefact — resumed tiles cost nothing and drag the average
+> down. Campaign-wide marginal cost over a 6.4 h window was 0.072, which is the flattered figure,
+> not the sustainable one.
+>
+> The spread is observation depth and it straddles the reference rather than sitting on it, so the
+> matched-fleet arithmetic below is right in form and needs a per-zone cost to be right in value.
+
 A zone-year costs **289.2 GPU-hours** at the planning basis. The *matched* fleet — the size
 at which the fleet exactly consumes what ingest produces — is `supply × 289.2`. Running at
 the matched size is the wrong target for two reasons: it leaves no absorber when supply dips,
@@ -757,6 +768,22 @@ question is whether assembly finishes before the next cell's inference does:
 |---|---|---|---|
 | dense cell (8,714 tiles) | 3.28 h | 3.61 h | **1.10×** |
 | average cell (3,222 tiles) | 1.21 h | 1.33 h | **1.10×** |
+
+> **SUPERSEDED 2026-08-26 by a second measured assembly, and the margin needs re-deriving.**
+> 48N-2017 assembled in **5.78 h** (`fill_wall_s` 20,815 s, 7,912 staged tiles, 6.42 TB), against
+> the 3.28 h above for a comparable cell. Two corrections follow.
+>
+> **Size assembly on LIVE tiles, not staged ones.** That cell wrote 8,803 shards, not 7,912: the
+> 891 tiles resolved as skips are still written, as fill, over the whole live footprint. An
+> estimate built on the staged count is short by however many were skipped — 10% here.
+>
+> **The 1.10× margin cannot be read off the table below any more.** Both of its terms moved and
+> not by the same factor. Measured on the same cell: assembly 5.78 h against inference of 9.3 h at
+> ~245 actors, so the margin was ~1.6× — wider than documented, but arrived at from two numbers
+> that are each ~1.7-2.6× the modelled ones. Re-derive it from a matched pair before quoting it.
+>
+> **The commit really is negligible, confirmed twice.** 0.77 s for the shard commit and 0.475 s for
+> the attrs commit, out of 20,815 s. Assembly IS the shard write.
 
 **1.10× at the campaign's 250 actors per cluster**, and scale-invariant because both terms are
 linear in tiles. (At 228 it was 1.21×; the two cross at **275**, which is what caps actors per
