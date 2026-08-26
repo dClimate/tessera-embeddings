@@ -538,10 +538,9 @@ def test_a_mismatched_run_does_not_deadlock_the_feeder():
 def test_systematic_failure_stops_feeder_at_retained_cap():
     """A run whose every INGEST fails must stop admitting at the cap.
 
-    This is the deterministic half of the cap. An ingest failure raises inside
-    ``inputs.wait`` on the feeder's own thread, so the cell is counted before the loop's
-    next cap check — the feeder therefore cannot get past the cap no matter how fast the
-    fake runs. ``look_ahead=1`` → cap = 3, so a 12-cell run must attempt far fewer.
+    The deterministic half: an ingest failure raises inside ``inputs.wait`` on the feeder's
+    own thread, so it is counted before the next cap check no matter how fast the fake runs.
+    ``look_ahead=1`` → cap 3.
     """
     events: list[str] = []
     inputs = FailingWaitInputs(events)
@@ -556,42 +555,27 @@ def test_systematic_failure_stops_feeder_at_retained_cap():
     assert "cleanup:" not in "".join(events)
 
 
-class _CountRetainedFailures(logging.Handler):
-    """Sets ``event`` once ``target`` cells have been counted against the failure cap."""
-
-    def __init__(self, target: int, event: threading.Event) -> None:
-        super().__init__()
-        self.n = 0
-        self._target, self._event = target, event
-
-    def emit(self, record: logging.LogRecord) -> None:
-        if "retained for resume" in record.getMessage():
-            self.n += 1
-            if self.n >= self._target:
-                self._event.set()
-
-
 def test_failed_cells_are_counted_while_an_assembly_is_stuck():
-    """An inference failure must not need the assembly thread to be counted.
+    """A failed tally needs bookkeeping, not assembly, so it must not queue behind one.
 
-    A failed tally requires no assembly, only bookkeeping. Submitting it to the serial
-    finalizer put the retained-failure cap behind the assembly backlog, so with admission
-    otherwise unbounded the cap went blind for as long as that backlog — in exactly the
-    systematic-failure case it exists for. It is now accounted on the caller's thread.
-
-    Held on the stable axis. HOW MANY cells the feeder admits before the cap trips is not
-    testable here: with instant fakes the feeder outruns the scheduler and the count ranged
-    4 to 12 across runs. WHICH THREAD does the accounting is exact — 01N succeeds and its
-    assembly is held by THIS thread for the duration, so a failure counted meanwhile cannot
-    have gone through the finalizer.
-
-    ``look_ahead=6`` so that neither the old admission bound (8) nor the failure cap (8)
-    stops the feeder first; the only thing under test is the accounting thread.
+    01N succeeds and its assembly is held by THIS thread for the whole run, so a failure
+    counted meanwhile cannot have gone through the finalizer. Asserting WHICH THREAD counts,
+    not how many cells were admitted — with instant fakes that count ranged 4 to 12.
+    ``look_ahead=6`` keeps the admission bound and failure cap from stopping the feeder first.
     """
     hold = threading.Event()  # released by the test, never by the assembly itself
     reached_cap = threading.Event()
-    handler = _CountRetainedFailures(3, reached_cap)
+    counted: list[int] = [0]
+
+    class _WatchCap(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if "retained for resume" in record.getMessage():
+                counted[0] += 1
+                if counted[0] >= 3:
+                    reached_cap.set()
+
     log = logging.getLogger("test-stuck-assembly")
+    handler = _WatchCap()
     log.addHandler(handler)
 
     def blocking_assemble(handoff, prep):
@@ -599,7 +583,7 @@ def test_failed_cells_are_counted_while_an_assembly_is_stuck():
         return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
 
     def run() -> None:
-        with contextlib.suppress(BaseException):  # the run is expected to fail its cells
+        with contextlib.suppress(BaseException):  # every cell but 01N is meant to fail
             _run(
                 _cells(8),
                 session=_sync_session(fail={f"{i + 2:02d}N" for i in range(7)}),
@@ -614,28 +598,23 @@ def test_failed_cells_are_counted_while_an_assembly_is_stuck():
     worker.start()
     try:
         counted_while_stuck = reached_cap.wait(timeout=10.0)
-        # Snapshot BEFORE releasing: once the assembly thread is free the queued tallies
-        # are counted after all, and reading it later reports a healthy-looking total for
-        # a run whose cap was blind throughout.
-        n_while_stuck = handler.n
+        # Snapshot BEFORE releasing: once the thread is free the queued tallies are counted
+        # after all, and reading it later reports a healthy total for a blind run.
+        n_while_stuck = counted[0]
     finally:
         hold.set()
         worker.join(timeout=30.0)
         log.removeHandler(handler)
 
-    assert counted_while_stuck, (
-        f"only {n_while_stuck} cell(s) reached the failure cap while the assembly thread "
-        "was held — the accounting is queued behind assembly"
-    )
+    assert counted_while_stuck, f"only {n_while_stuck} cell(s) reached the cap while the assembly thread was held"
 
 
 def test_inference_does_not_wait_for_assembly():
     """THE point of removing the admission bound: a stuck assembly must not stall inference.
 
-    The single assembly thread is held until every cell has finished inference, which can
-    only happen if admission is unbounded. On the pre-change code (``look_ahead=0`` → two
-    slots, released after assembly) the feeder stalls at cell 3 of 8, the hold times out,
-    and every streamed cell fails in assembly.
+    The assembly thread is held until every cell has inferred, which can only happen if
+    admission is unbounded. Pre-change (``look_ahead=0`` → two slots released after assembly)
+    the feeder stalls at cell 3 of 8 and every streamed cell fails in assembly.
     """
     n = 8
     all_streamed = threading.Event()
@@ -928,11 +907,10 @@ def test_attempts_per_cell_in_cluster_of_one_disables_the_retry():
 
 
 def test_the_queued_ingests_are_cancelled_before_the_retry_pass():
-    """The retry is only prompt if the ingest queue is cleared first.
+    """The retry is only prompt if the ingest queue is cleared FIRST.
 
-    The runner cannot see the pool, so the contract is an ORDERING one: it must ask the
-    adapter to drop unstarted ingests BEFORE the retry re-starts anything. Asking after
-    would leave the retry's own fresh `start` at the back of the queue it just cleared.
+    The runner cannot see the pool, so the contract is ordering: ask before the retry
+    re-starts anything, or the retry's own `start` lands at the back of the queue it cleared.
     """
     events: list[str] = []
     attempts: list[str] = []

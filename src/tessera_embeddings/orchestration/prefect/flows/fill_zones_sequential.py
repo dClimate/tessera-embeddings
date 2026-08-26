@@ -360,22 +360,13 @@ class _DeploymentCellInputs:
             return None
         deadline = None if timeout is None else time.monotonic() + timeout
         pending = set(futs)
-        # A fully-failed FIRST WAVE is the abort signal — not a fully-failed list, and not a
-        # running total of failures.
-        #
-        # Not the list: the caller offers every live cell now, so requiring all of them to
-        # fail would run a systematic failure through wave after wave before surfacing it.
-        #
-        # Not a running total either, which is the trap. The executor starts a queued cell the
-        # moment a worker frees, so `_max_parallel` FAST failures accumulate across successive
-        # waves while a slow cell from the first wave is still running and about to succeed.
-        # Counting cumulatively aborts on that, and the caller's `finally` then cancels the
-        # very ingest that was going to land — a false abort that makes no progress at all.
-        #
-        # These specific cells are the ones the pool starts first (submission follows `cells`
-        # order and the pool is FIFO), so "every one of them failed" cannot be true while any
-        # of them might still succeed. It is also the quorum that held when the caller passed
-        # a look-ahead window rather than the whole list.
+        # The abort signal is a fully-failed FIRST WAVE — not a fully-failed list (the caller
+        # offers every live cell, so that would run a doomed cluster through wave after wave),
+        # and not a running failure total. The total is the trap: the pool starts a queued cell
+        # as soon as a worker frees, so fast failures accumulate across waves while a slow
+        # first-wave cell is still running and about to succeed, and aborting cancels it.
+        # These cells are the ones the pool starts first, so "all failed" cannot be true while
+        # any might still succeed. Same quorum as when the caller passed a window.
         ordered = [c for c in cells if c in self._futures]
         first_wave = {self._futures[c] for c in ordered[: self._max_parallel]}
         failed_first_wave: set[Future[None]] = set()
@@ -508,14 +499,10 @@ class _DeploymentCellInputs:
         ``Future.cancel()`` succeeds only for a task still sitting in the pool's queue, so
         a running or finished ingest is untouched — this drops work, never interrupts it.
 
-        Called before the in-child retry pass. Every pending cell's ingest is submitted up
-        front, so after the feeder stops (it ran out of cells, or the retained-failure cap
-        tripped) the pool can still hold most of a cluster queued. A retry's fresh
-        ``start`` would go to the BACK of that FIFO queue and its ``wait`` would block for
-        hours — the retry exists precisely to be prompt, on a cluster that is still
-        provisioned and still billing. Those queued cells are unattempted either way and
-        stay pending for the next campaign pass, so cancelling them also saves the ingest
-        compute their abandoned mosaics would have cost.
+        Called before the in-child retry pass: every pending cell's ingest is submitted up
+        front, so a retry's fresh ``start`` would otherwise sit behind most of a cluster in
+        this FIFO queue and block for hours on a still-billing cluster. Those cells are
+        unattempted either way and stay pending for the next campaign pass.
         """
         cancelled = 0
         for key, fut in list(self._futures.items()):

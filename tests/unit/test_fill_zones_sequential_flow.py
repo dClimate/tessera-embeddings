@@ -920,12 +920,8 @@ def test_wait_first_skips_a_failed_cell_while_a_sibling_is_still_ingesting():
 def test_cancel_unstarted_drops_queued_ingests_but_not_running_ones():
     """A retry must not queue behind a cluster's worth of unattempted ingests.
 
-    Every pending cell's ingest is submitted up front, so after the feeder stops the pool
-    can still hold most of a cluster. A retry's fresh `start` would go to the BACK of that
-    FIFO queue and its `wait` would block for hours, on a cluster that is billing now.
-
-    ``Future.cancel()`` succeeds only for a task still in the queue, so this must drop the
-    queued ones and leave the RUNNING one alone — dropping work, never interrupting it.
+    Future.cancel() succeeds only for a task still queued, so this must drop the queued ones
+    and leave the RUNNING one alone — dropping work, never interrupting it.
     """
     adapter = _adapter(max_parallel=1)
     started = threading.Event()
@@ -955,15 +951,12 @@ def test_cancel_unstarted_drops_queued_ingests_but_not_running_ones():
 
 
 def test_wait_first_does_not_abort_while_a_first_wave_cell_can_still_land():
-    """The false abort a running failure COUNT introduces — the worst of both designs.
+    """The false abort a running failure COUNT introduces — worse than the bug it fixed.
 
-    The executor starts a queued cell the moment a worker frees, so with ``max_parallel=2``
-    a fast failure (01N) plus a later-wave fast failure (03N) reach two failures while 02N,
-    the other original worker, is still running and about to succeed. A cumulative quorum
-    aborts there, and the caller's ``finally`` shuts the adapter down and cancels 02N — so
-    the cluster makes no progress despite a real mosaic being produced.
-
-    The quorum is the first wave {01N, 02N}, so it cannot be met while 02N is unsettled.
+    The executor starts a queued cell as soon as a worker frees, so a fast failure (01N)
+    plus a later-wave one (03N) reach two while 02N, the other original worker, is still
+    running and about to succeed. A cumulative quorum aborts there and the caller cancels
+    02N. The quorum is the first wave {01N, 02N}, so it cannot be met while 02N is unsettled.
     """
     adapter = _adapter(max_parallel=2)
     slow_but_good: Future = Future()
@@ -989,18 +982,15 @@ def test_wait_first_does_not_abort_while_a_first_wave_cell_can_still_land():
         adapter.shutdown()
 
 
-def test_wait_first_aborts_on_a_pool_of_failures_not_the_whole_list():
-    """A systematic failure must surface after one pool, not after every wave.
+def test_the_priming_abort_quorum_is_the_first_wave():
+    """Abort when the opening pool has all failed — not the whole list, not a running count.
 
-    The caller offers EVERY live cell now (an ingest is started for all of them), so a
-    quorum of "all supplied futures failed" would hold the priming wait through wave after
-    wave of a doomed cluster — hours, when each ingest fails slowly — before anything
-    raised. One pool's worth of failures with nothing landing is already the whole signal.
-
-    Two failures against ``max_parallel=2`` with four cells still ingesting: must raise.
-    Pre-change this returns ``None`` at the timeout instead, because four futures are still
-    pending.
+    The list would hold a doomed cluster through wave after wave. A running count is the
+    subtler trap: the pool starts a queued cell as soon as a worker frees, so fast failures
+    accumulate across waves while a slow first-wave cell is still running and about to
+    succeed, and aborting there cancels it.
     """
+    # (a) first wave all failed, four cells still ingesting -> raise (pre-change: None).
     adapter = _adapter(max_parallel=2)
     try:
         adapter._futures = {
@@ -1008,11 +998,26 @@ def test_wait_first_aborts_on_a_pool_of_failures_not_the_whole_list():
             ("02N", 2024): _settled(RuntimeError("bad credentials")),
             **{(f"{i:02d}N", 2024): Future() for i in range(3, 7)},
         }
-        with pytest.raises(RuntimeError, match="ingest\\(s\\) failed with none landing") as caught:
+        with pytest.raises(RuntimeError, match=r"ingest\(s\) failed with none landing") as caught:
             adapter.wait_first([(f"{i:02d}N", 2024) for i in range(1, 7)], timeout=2.0)
-        named = str(caught.value)
-        assert "01N-2024" in named and "02N-2024" in named
-        assert "03N-2024" not in named, "a cell that never settled must not be reported as failed"
+        assert "01N-2024" in str(caught.value) and "02N-2024" in str(caught.value)
+        assert "03N-2024" not in str(caught.value), "a cell that never settled is not a failure"
+    finally:
+        adapter.shutdown()
+
+    # (b) a second-wave failure must NOT complete the quorum while 02N can still land.
+    adapter = _adapter(max_parallel=2)
+    slow_but_good: Future = Future()
+    try:
+        adapter._futures = {
+            ("01N", 2024): _settled(RuntimeError("fast failure, first wave")),
+            ("02N", 2024): slow_but_good,
+            ("03N", 2024): _settled(RuntimeError("fast failure, second wave")),
+            ("04N", 2024): Future(),
+        }
+        threading.Timer(0.3, lambda: slow_but_good.set_result(None)).start()
+        got = adapter.wait_first([(f"{i:02d}N", 2024) for i in range(1, 5)], timeout=5.0)
+        assert got == ("02N", 2024), f"a still-running first-wave cell must be allowed to land, got {got}"
     finally:
         adapter.shutdown()
 
