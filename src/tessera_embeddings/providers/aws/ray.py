@@ -118,6 +118,23 @@ LAUNCH_PACING_AUTOSCALER_ENV = {
     # count leaves exactly one pass over the zones: capacity failover is preserved and
     # the surplus no-delay attempts are not made.
     "BOTO_CREATE_MAX_RETRIES": "1",
+    # Seconds between autoscaler passes; Ray's default is 5. This is the only setting that
+    # bounds how OFTEN a cluster asks, as opposed to how much it asks for per call — and the
+    # request quota is a rate over calls. The two settings above make each call carry more and
+    # waste fewer attempts; neither reduces the calls per minute, so at fleet width the
+    # autoscalers still overshoot the account's shared bucket together.
+    #
+    # Why a fixed slowdown rather than backoff: botocore's adaptive mode is congestion control,
+    # and it converges only for a client that can see the whole pipe. Every cluster runs its own
+    # autoscaler with its own controller against ONE account-wide bucket, so each settles at a
+    # rate that is reasonable alone and collectively is not. A longer loop is the one lever that
+    # composes, because it divides every participant's rate by the same factor.
+    #
+    # Sized against the bucket rather than picked: at the default the fleet's aggregate call rate
+    # runs a small multiple of what the bucket admits, and this divides it by three. It costs
+    # latency in the autoscaler's OTHER duties — noticing a dead node, acting on a resource
+    # demand — which is why it is not longer.
+    "AUTOSCALER_UPDATE_INTERVAL_S": "15",
 }
 """Tuning for the AUTOSCALER's launch loop, and for nothing else.
 

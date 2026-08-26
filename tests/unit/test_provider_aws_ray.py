@@ -641,6 +641,31 @@ def test_the_head_bootstrap_keeps_its_launch_attempts(monkeypatch) -> None:
         assert name not in env, f"{name} tunes the autoscaler and must not reach the head bootstrap"
 
 
+#: Ray's own default for the autoscaler loop period, from
+#: ``ray.autoscaler._private.constants``. Named here so the test below states what it is
+#: comparing against instead of asserting a bare number.
+_RAY_DEFAULT_UPDATE_INTERVAL_S = 5
+
+
+def test_the_loop_interval_actually_slows_the_loop() -> None:
+    """The one setting that reduces how OFTEN a cluster asks, so a no-op value is a defect.
+
+    The other two pacing settings change what a call carries and how many attempts it spends;
+    neither reduces calls per minute, which is the axis the request quota is a rate over. This
+    one does, and only if it exceeds Ray's default — set to the default or below it is inert
+    while still reading like tuning.
+
+    Autoscaler-only, and that is not a preference: ``ray up`` runs no autoscaler loop, so the
+    name would be inert in the one-shot bootstrap's environment.
+    """
+    raw = LAUNCH_PACING_AUTOSCALER_ENV["AUTOSCALER_UPDATE_INTERVAL_S"]
+    assert int(raw) > _RAY_DEFAULT_UPDATE_INTERVAL_S, (
+        f"AUTOSCALER_UPDATE_INTERVAL_S={raw} is at or below Ray's default of "
+        f"{_RAY_DEFAULT_UPDATE_INTERVAL_S}s, so it slows nothing"
+    )
+    assert "AUTOSCALER_UPDATE_INTERVAL_S" not in LAUNCH_PACING_CLIENT_ENV
+
+
 def test_the_head_start_command_carries_both_halves() -> None:
     """The head both launches and hosts the autoscaler, so it wants everything.
 
