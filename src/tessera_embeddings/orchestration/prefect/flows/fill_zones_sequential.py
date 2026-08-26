@@ -1317,14 +1317,20 @@ def fill_zones_sequential_flow(
     # server-side that a prompt retry of this flow would then race.
     try:
         if inputs is not None:
-            ingest_window = live[: 1 + look_ahead]
+            # EVERY live cell, not a look-ahead window. The driver's `max_parallel` is what
+            # bounds concurrency; starting only a window meant a new ingest could not begin
+            # until the feeder admitted a cell, which waited on an assembly — so a cluster
+            # configured for 6 concurrent ingests ran 1.
+            ingest_window = live
             for cell in ingest_window:
                 inputs.start(cell.zone, cell.year)
 
             log.info(
-                "Ingesting %d UTM zone(s); GPUs are requested as soon as the first mosaic lands (sizes %s tiles)",
+                "Ingesting %d cell(s), %d at a time; GPUs are requested as soon as the first "
+                "mosaic lands (densest first: %s tiles)",
                 len(ingest_window),
-                ", ".join(f"{c.n_tiles:,}" for c in ingest_window),
+                1 + look_ahead,
+                ", ".join(f"{c.n_tiles:,}" for c in ingest_window[:6]),
             )
             t0 = time.monotonic()
             first = inputs.wait_first([(c.zone, c.year) for c in ingest_window])

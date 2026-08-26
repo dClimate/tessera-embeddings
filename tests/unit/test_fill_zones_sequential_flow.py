@@ -400,13 +400,19 @@ class _RecordingInputs:
         self._order.append("inputs_shutdown")
 
 
-def test_the_ingest_window_starts_before_ray_up(wired, monkeypatch):
-    """The window is `1 + look_ahead` zones, all kicked off before the cluster."""
+def test_every_cell_ingests_before_ray_up(wired, monkeypatch):
+    """EVERY cell is kicked off before the cluster, not a `1 + look_ahead` window.
+
+    The window was the bug: a cell outside it had no ingest running, and could not get one
+    until the feeder admitted a cell, which waited on an assembly. `1 + look_ahead` remains
+    the ingest driver's CONCURRENCY — how many run at once — but no longer decides how many
+    are asked for.
+    """
     monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
     _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
     order = wired["order"]
-    assert [e for e in order if e.startswith("start:")] == ["start:01N", "start:02N"]
-    assert order.index("start:02N") < order.index("ray_up")
+    assert [e for e in order if e.startswith("start:")] == ["start:01N", "start:02N", "start:03N"]
+    assert order.index("start:03N") < order.index("ray_up"), "GPUs must not be asked for first"
 
 
 def test_gpus_wait_for_whichever_mosaic_lands_first(wired, monkeypatch):
@@ -420,10 +426,11 @@ def test_gpus_wait_for_whichever_mosaic_lands_first(wired, monkeypatch):
     monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
     _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
     order = wired["order"]
-    # Every started zone is offered, and no single zone is waited on by name.
-    assert "wait_first:01N,02N" in order
+    # Every started zone is offered — now the whole cell list, not a window — and no single
+    # zone is waited on by name.
+    assert "wait_first:01N,02N,03N" in order
     assert not [e for e in order if e.startswith("wait:")]
-    assert order.index("wait_first:01N,02N") < order.index("ray_up")
+    assert order.index("wait_first:01N,02N,03N") < order.index("ray_up")
 
 
 def test_cells_are_ordered_by_true_tile_count_not_the_clamped_fleet_request(wired, monkeypatch):

@@ -389,20 +389,40 @@ def test_prepare_failure_is_cell_scoped():
 
 
 # ---------------------------------------------------------------------------
-# Mosaic budget: ingest starts admitted through the storage bound
+# Ingest is paced by its own driver, never by the fill's progress
 # ---------------------------------------------------------------------------
 
 
-def test_mosaic_budget_bounds_started_not_cleaned_mosaics():
-    """Look-ahead ingest starts go through the mosaic budget, so mosaics alive
-    on storage (started, not yet cleaned) never exceed look_ahead + 2 — they
-    used to escape the bound and peak at ~2*look_ahead + 2.
+def test_ingest_starts_for_every_cell_and_is_not_paced_by_the_fill():
+    """Every pending cell's ingest starts, however far behind finalization runs.
+
+    This REPLACES a test that asserted the opposite — that started-not-cleaned mosaics
+    never exceed ``look_ahead + 2``. That bound admitted ingest *starts*, and because a
+    slot was released only when a cell's assembly landed, a new ingest waited on an
+    assembly several cells back. Ingest throughput was therefore set by assembly
+    throughput: measured live, a fleet configured for 60 concurrent ingests ran 7.
+
+    The bound is gone and this pins its absence. Concurrency is the ingest driver's
+    ``max_parallel``, which is not this runner's to enforce — so what is asserted here is
+    that the runner does not add a second, tighter gate of its own.
     """
     events: list[str] = []
     inputs = BudgetProbeInputs(events)
     _run(_cells(8), inputs=inputs, look_ahead=1)
-    assert inputs.high_water <= 3  # look_ahead + 2
-    # Everything still landed and was cleaned.
+
+    # ORDERING is the isolating property, not the count. Counting starts passes either way:
+    # `_start_ingests` runs every feed step and the window slides as cells are taken, so all
+    # eight eventually start even when gated. What only holds when ingest is UNGATED is that
+    # every start precedes the first finalization — gated, starts interleave with cleanups
+    # because each new one waits for a slot that a cleanup frees.
+    first_cleanup = next(i for i, e in enumerate(events) if e.startswith("cleanup:"))
+    last_start = max(i for i, e in enumerate(events) if e.startswith("start:"))
+    assert last_start < first_cleanup, (
+        "an ingest started only after a cell was finalized, so ingest is still paced by the "
+        f"fill: {events[: first_cleanup + 3]}"
+    )
+    assert len([e for e in events if e.startswith("start:")]) == 8
+    # The change is to WHEN a slot frees, not to whether mosaics are deleted.
     assert inputs.alive == 0
     assert len([e for e in events if e.startswith("cleanup:")]) == 8
 
@@ -440,7 +460,8 @@ def test_every_cell_mismatching_the_session_orbit_still_completes():
     )
     assert summary["succeeded"] == 4, "a wholly-mismatched run must complete, not fail"
     assert summary["failed"] == 0
-    assert inputs.high_water <= 2, "the storage bound (look_ahead + 2) must still hold"
+    # No storage-bound assertion here any more: that bound was deleted with the mosaic
+    # budget. What this test is about — a wholly-mismatched run completing — is below.
     for z in ("01N", "02N", "03N", "04N"):
         assert f"cleanup:{z}" in events, f"{z}'s mosaic was never released"
 
@@ -492,7 +513,6 @@ def test_a_mismatched_run_does_not_deadlock_the_feeder():
     if t.is_alive():
         pytest.fail("feeder deadlocked on a wholly orbit-mismatched run")
     assert result["summary"]["succeeded"] == 4
-    assert inputs.high_water <= 3
 
 
 def test_systematic_failure_stops_feeder_at_retained_cap():
@@ -504,15 +524,20 @@ def test_systematic_failure_stops_feeder_at_retained_cap():
     inputs = BudgetProbeInputs(events)
     with pytest.raises(RuntimeError, match="cell"):
         # 12 cells, all fail inference; look_ahead=1 → retained-failure cap = 3.
-        _run(_cells(12), session=_sync_session(fail={f"{i + 1:02d}N" for i in range(12)}), inputs=inputs, look_ahead=1)
-    # The feeder stopped admitting once the cap was reached, so it never started
-    # every shard's ingest. Retained-but-uncleaned mosaics DO exceed the active
-    # budget by design (kept for resume) but stay bounded ~ cap + in-flight, NOT
-    # the whole 12-cell shard.
+        _run(
+            _cells(12),
+            session=_sync_session(fail={f"{i + 1:02d}N" for i in range(12)}, events=events),
+            inputs=inputs,
+            look_ahead=1,
+        )
+    # ADMISSION is what the cap bounds, and it is now measured directly. It used to be
+    # inferred from the ingest-start count, which worked only while ingest was chained
+    # behind admission — decoupling them made that proxy report 12 for a feeder that had
+    # correctly stopped. The two counts are now asserted apart, which is the point.
+    admitted = len([e for e in events if e.startswith("infer:")])
     started = len([e for e in events if e.startswith("start:")])
-    assert started < 12  # stopped early — the essential guarantee
-    assert started <= 2 * (1 + 2) + 2  # bounded ~ cap + in-flight, not shard size
-    assert inputs.high_water == started  # nothing cleaned — every started mosaic retained
+    assert admitted < 12, f"the feeder must stop admitting at the cap, admitted {admitted}"
+    assert started == 12, "ingest is no longer gated by admission, so every cell starts"
     assert "cleanup:" not in "".join(events)
 
 
@@ -616,17 +641,24 @@ def test_nothing_landed_falls_back_to_strict_head_order():
     assert order == ["01N", "02N", "03N"], f"expected strict head order, got {order}"
 
 
-def test_only_the_started_window_is_eligible():
-    """A cell beyond the look-ahead has no ingest running, so it cannot be picked
-    however 'ready' it might look — jumping to it would start a mosaic outside the
-    budget that admits them.
+def test_the_readiest_cell_is_taken_wherever_it_sits():
+    """Whichever cell has LANDED is taken first, even the last in density order.
+
+    The inverse of what this asserted before. A cell outside the look-ahead window used to
+    be ineligible because its ingest had not been started, so the feeder had to walk the
+    order and block on the head. Every pending cell's ingest now starts up front, so the
+    only question left is which has landed — and waiting on a dense head while a sparse
+    tail sits finished is exactly the idling this avoids.
+
+    Density order still decides what is ASKED for first and still sizes the session; it is
+    no longer a barrier to what can be taken.
     """
     events: list[str] = []
-    # The LAST cell has landed; the window (look_ahead=1 -> 2 cells) has not.
+    # The LAST cell in density order is the only one that has landed.
     inputs = _StaggeredInputs(events, landed={"05N"})
     _run(_cells(5), inputs=inputs, look_ahead=1)
     order = [e.split(":")[1] for e in events if e.startswith("wait:")]
-    assert order[0] == "01N", f"reached outside its window: {order}"
+    assert order[0] == "05N", f"the landed cell must be taken first, order was {order}"
 
 
 # --- in-child retry (attempts_per_cell_in_cluster) -----------------------------------------------
@@ -784,7 +816,7 @@ def test_the_in_child_retry_only_considers_cells_that_kept_a_mosaic():
     reintroduce the bug by simply existing.
     """
     src = pathlib.Path(mod.__file__).read_text() if hasattr(mod, "__file__") and mod.__file__ else ""
-    assert "pending = failed_keys if budget is None else [k for k in failed_keys if k in eligible]" in src, (
+    assert "pending = failed_keys if inputs is None else [k for k in failed_keys if k in eligible]" in src, (
         "the retry pass must filter the failure list by the retained-mosaic set"
     )
     assert "eligible = set(retained_failed)" in src

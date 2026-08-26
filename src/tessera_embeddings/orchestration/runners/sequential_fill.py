@@ -29,11 +29,16 @@ the flow and README point here):
   unchanged and still does its two jobs (sizing the session from the largest
   cell, putting the island tail last); it is simply no longer a barrier.
 - **Ingest look-ahead** (``inputs``): the next cells' mosaics are ingested
-  *while earlier cells infer*. Two gates cooperate: ``zone_slots`` admits at
-  most ``look_ahead + 2`` *un-finalized* zones (a zone holds its slot from
-  prepare until its assembly lands), and a mosaic budget
-  (:class:`_MosaicBudget`, same capacity) admits every ingest *start*.
-  Together they pace how far the feeder runs ahead of finalization.
+  *while earlier cells infer*. ONE gate remains: ``zone_slots`` admits at most
+  ``look_ahead + 2`` *un-finalized* cells (held from prepare until assembly
+  lands). It bounds how deep the inference stream runs, and deliberately does
+  NOT gate ingest — an ingest is started for every pending cell up front and its
+  concurrency is the ingest driver's own ``max_parallel``.
+
+  The mosaic budget that used to sit beside it is GONE. It admitted ingest
+  *starts* against the same ``look_ahead + 2`` capacity, so a new ingest waited
+  on an assembly several cells back: ingest throughput was set by assembly
+  throughput, and a fleet configured for 60 concurrent ingests ran 7.
 
   These were a STORAGE bound while the caller primed only a look-ahead window.
   They are not any more: the flow ingests its whole cluster before requesting
@@ -182,63 +187,6 @@ class CellInputs(Protocol):
         ...
 
 
-class _MosaicBudget:
-    """Paces mosaic admission: ingest *start* through cleanup.
-
-    ``zone_slots`` alone bounds only *admitted* zones — look-ahead ingest
-    starts happen before admission, so without this gate they escape the
-    pacing. A slot is acquired (idempotently, keyed by cell) before a
-    cell's ingest is started and released at its mosaic cleanup — or, for
-    mosaics deliberately retained past the run (failed cells kept for staged
-    resume), released explicitly with a warning so a permanently-held slot
-    can never starve the feeder into deadlock.
-
-    NOT a storage bound any more. It was one while the caller primed only a
-    look-ahead window, but the flow now ingests its ENTIRE cluster before asking
-    for GPUs, so every mosaic is already on storage before this gate sees it —
-    ``acquire`` finds each ingest already started and returns immediately. What
-    it still does is pace how far the feeder runs ahead of finalization, which
-    is what keeps `zone_slots` and the trailing assembly honest. Peak storage is
-    now the cluster, deliberately: see ADR-011 and
-    :mod:`...prefect.flows.fill_zones_sequential`.
-    """
-
-    def __init__(self, slots: int) -> None:
-        self._sem = threading.Semaphore(slots)
-        self._held: set[tuple[str, int]] = set()
-        self._lock = threading.Lock()
-
-    def acquire(self, key: tuple[str, int], stop: threading.Event, *, blocking: bool = True) -> bool:
-        """Admit ``key``'s mosaic; False = no slot (non-blocking) or ``stop`` set.
-
-        ``blocking=False`` is for LOOK-AHEAD admissions: the feeder must only
-        ever block on the CURRENT cell's slot (whose processing is what frees
-        slots) — blocking on a future cell's slot while the current one sits
-        unprocessed is a deadlock when retained mosaics hold the rest
-        of the budget. A denied look-ahead is retried on a later feed step.
-        """
-        with self._lock:
-            if key in self._held:
-                return True  # idempotent: look-ahead windows overlap
-        if blocking:
-            while not self._sem.acquire(timeout=1.0):
-                if stop.is_set():
-                    return False
-        elif not self._sem.acquire(blocking=False):
-            return False
-        with self._lock:
-            self._held.add(key)
-        return True
-
-    def release(self, key: tuple[str, int]) -> None:
-        """Release ``key``'s slot (idempotent no-op for keys never admitted)."""
-        with self._lock:
-            if key not in self._held:
-                return
-            self._held.discard(key)
-        self._sem.release()
-
-
 @dataclass
 class SequentialCell:
     """One (zone, year) work item, with its preflight-derived tile count.
@@ -376,9 +324,10 @@ def fill_zones_sequential(
             ``max_dispatch_rounds`` is for. The two are nested, not alternatives: a
             deterministic failure will burn both, and what actually stops that is the
             driver's no-progress check rather than either count.
-        look_ahead: Cells beyond the feed head to keep in ingest flight; also
-            sizes the un-finalized-zone bound AND the mosaic storage budget
-            (both ``look_ahead + 2`` — see :class:`_MosaicBudget`).
+        look_ahead: Depth of the inference stream — ``look_ahead + 2`` cells may be
+            admitted but not yet finalized. It no longer bounds ingest in any way:
+            every pending cell's ingest is started up front and paced by the ingest
+            driver's own concurrency.
         fault: Supervised-drill hook, consulted where prepared work crosses from the
             feeder to the scheduler. Inert unless the run was armed for the
             supply-withholding fault (:mod:`tessera_embeddings.config.fault_injection`).
@@ -398,8 +347,8 @@ def fill_zones_sequential(
             out of the next campaign pass).
     """
     if look_ahead < 0:
-        # Would size zone_slots/_MosaicBudget at <= 0 capacity → the feeder
-        # blocks forever on acquire. The flow validates this earlier too.
+        # Would size zone_slots at <= 0 capacity → the feeder blocks forever on
+        # acquire. The flow validates this earlier too.
         raise ValueError(f"look_ahead must be >= 0, got {look_ahead}")
     t0 = time.monotonic()
     lock = threading.Lock()
@@ -412,11 +361,11 @@ def fill_zones_sequential(
     stop = threading.Event()  # session crashed — unwind the feeder
     # Bounds un-finalized zones (mosaic held from prepare until assembly lands):
     # the current zone + one trailing assembly + the ingest look-ahead.
+    # Bounds cells admitted to the inference stream but not yet finalized. It does NOT
+    # gate ingest: an ingest is started for every pending cell up front, and its
+    # concurrency is the ingest driver's own `max_parallel`. Chaining ingest behind this
+    # gate is what collapsed a fleet-wide 60 to 7 — see `_start_ingests`.
     zone_slots = threading.Semaphore(look_ahead + 2)
-    # Bounds mosaics alive on storage (ingest START through cleanup) at the same
-    # capacity — look-ahead starts are admitted through it, so they can no longer
-    # escape the storage bound (see _MosaicBudget). No inputs → no mosaics.
-    budget = _MosaicBudget(look_ahead + 2) if inputs is not None else None
     # A FAILED cell keeps its mosaic (for the retry's staged resume) but frees
     # its budget slot — otherwise a systematic failure deadlocks the feeder (no
     # cell ever succeeds to free a slot). But freeing every failed slot lets a
@@ -431,10 +380,6 @@ def fill_zones_sequential(
     max_retained_failures = look_ahead + 2
     finalizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trailing-assembly")
 
-    def _release_mosaic(cell: SequentialCell) -> None:
-        if budget is not None:
-            budget.release((cell.zone, cell.year))
-
     def _leak_mosaic(cell: SequentialCell) -> None:
         """A LANDED cell whose mosaic delete failed: free the slot, do NOT count it.
 
@@ -445,12 +390,11 @@ def fill_zones_sequential(
         which had published correctly. Loud and counted separately instead, so an operator
         sees storage growing without the fill refusing to continue.
         """
-        if budget is None:
+        if inputs is None:
             return
         with lock:
             cleanup_leaked.add((cell.zone, cell.year))
             n = len(cleanup_leaked)
-        budget.release((cell.zone, cell.year))
         log.warning(
             "Mosaic for %s-%d could not be deleted after the cell landed (%d leaked so far). "
             "The cell is published and correct; its mosaics need sweeping.",
@@ -464,12 +408,11 @@ def fill_zones_sequential(
         (staged resume) — counted so a systematic failure can't accumulate every
         cluster's mosaic off-budget (the feeder stops at ``max_retained_failures``).
         """
-        if budget is None:
+        if inputs is None:
             return
         with lock:
             retained_failed.add((cell.zone, cell.year))
             n = len(retained_failed)
-        budget.release((cell.zone, cell.year))
         log.warning(
             "Cell %s-%d failed — mosaic retained for resume, off-budget (%d/%d retained-failure cap)",
             cell.zone,
@@ -492,23 +435,22 @@ def fill_zones_sequential(
         with lock:
             failures[:] = [f for f in failures if (f["zone"], f["year"]) != (cell.zone, cell.year)]
 
-    def _start_lookahead(pending: list[SequentialCell]) -> None:
-        """Keep ingests running ahead of the feed head (idempotent starts).
+    def _start_ingests(pending: list[SequentialCell]) -> None:
+        """Start an ingest for EVERY pending cell. Idempotent, so it is safe per feed step.
 
-        Every start is admitted through the mosaic budget first, so look-ahead
-        can never materialize more mosaics than the bound. Only the CURRENT
-        cell's admission may block (its processing is what frees slots —
-        blocking on a future cell's slot while the current one sits unprocessed
-        deadlocks once retained mosaics hold the rest of the budget);
-        look-ahead cells are admitted non-blocking and simply retried on later
-        feed steps when the budget is tight. That degradation IS the intended
-        backpressure: ingest paced by fill throughput (ADR-011).
+        **Ingest concurrency is the ingest driver's own ``max_parallel``, and nothing else.**
+        This used to start only ``1 + look_ahead`` cells, and because ``pending`` shrinks only
+        when the feeder ADMITS a cell — which needs a ``zone_slots`` slot, released after the
+        cell's assembly lands — every new ingest waited on an assembly six cells back. Ingest
+        throughput was therefore set by assembly throughput. Measured live: 7 ingests running
+        fleet-wide against a configured 60.
+
+        Density order is unaffected: this only decides WHEN an ingest starts, and the driver
+        works its queue in the order given, which is ``pending`` order — densest first.
         """
-        if inputs is None or budget is None:
+        if inputs is None:
             return
-        for offset, cell in enumerate(pending[: 1 + look_ahead]):
-            if not budget.acquire((cell.zone, cell.year), stop, blocking=offset == 0):
-                return  # stop set (current) or budget tight (look-ahead) — retry next step
+        for cell in pending:
             inputs.start(cell.zone, cell.year)
 
     def _finalize(tally: _ZoneTally) -> None:
@@ -559,12 +501,11 @@ def fill_zones_sequential(
             # every cluster's mosaic off-budget. LANDED cell whose delete failed → free
             # the slot and leak, uncounted: the cell is correct and must not consume the
             # cap that exists to stop the feeder. All three free the slot exactly once.
-            if cleaned:
-                _release_mosaic(cell)
-            elif tally.failed or failed_assembly:
-                _retain_failed_mosaic(cell)
-            else:
-                _leak_mosaic(cell)
+            if not cleaned:
+                if tally.failed or failed_assembly:
+                    _retain_failed_mosaic(cell)
+                else:
+                    _leak_mosaic(cell)
             zone_slots.release()
 
     def _take_next(pending: list[SequentialCell]) -> SequentialCell:
@@ -579,8 +520,8 @@ def fill_zones_sequential(
 
         TWO separate conditions, easily conflated. To be CONSIDERED, a cell must be
         in the look-ahead window — those are the only ones whose ingest has been
-        *started*, and reaching past them would begin a mosaic the budget has not
-        admitted. To be TAKEN, its ingest must have *completed* (``ready``). A
+        *started* -- which is now every pending cell. To be TAKEN, its ingest must have
+        *completed* (``ready``). A
         partial mosaic is never handed to inference under any branch: when nothing
         has landed this returns the head and the caller BLOCKS on it, which is
         exactly the previous behaviour, so an ingest-starved cluster is unaffected.
@@ -595,7 +536,7 @@ def fill_zones_sequential(
         island tail last. What changes is that it is no longer a barrier.
         """
         if inputs is not None:
-            for idx, cell in enumerate(pending[: 1 + look_ahead]):
+            for idx, cell in enumerate(pending):
                 try:
                     if inputs.ready(cell.zone, cell.year):
                         return pending.pop(idx)
@@ -615,7 +556,7 @@ def fill_zones_sequential(
                 # unattempted cells stay pending for the next campaign pass.
                 with lock:
                     n_failed = len(retained_failed)
-                if budget is not None and n_failed >= max_retained_failures:
+                if inputs is not None and n_failed >= max_retained_failures:
                     log.error(
                         "Retained-failure cap reached (%d failed cell(s) holding mosaics off-budget) — "
                         "stopping the feeder before admitting more ingests; %d cell(s) left unattempted "
@@ -642,7 +583,7 @@ def fill_zones_sequential(
                     return
                 # Start ingests for the window BEFORE choosing, so a cell can only
                 # be picked once its start has been admitted through the budget.
-                _start_lookahead(pending)
+                _start_ingests(pending)
                 # Bounded admission; poll so a crashed session unwinds us.
                 while not zone_slots.acquire(timeout=1.0):
                     if stop.is_set():
@@ -721,7 +662,6 @@ def fill_zones_sequential(
                     if inputs is not None:
                         try:
                             inputs.cleanup(cell.zone, cell.year)
-                            _release_mosaic(cell)
                         except Exception:
                             log.exception(
                                 "Mosaic cleanup failed for %s-%d after a TERMINAL plan; the cell "
@@ -730,8 +670,6 @@ def fill_zones_sequential(
                                 cell.year,
                             )
                             _leak_mosaic(cell)
-                    else:
-                        _release_mosaic(cell)
                     zone_slots.release()
                     continue
                 assert restored is not None  # only None on the terminal path, which continued
@@ -778,7 +716,7 @@ def fill_zones_sequential(
                     # Everything already staged — straight to assembly.
                     finalizer.submit(_finalize, tally)
         except BaseException as exc:
-            # An exception OUTSIDE the per-cell guards (e.g. in _start_lookahead,
+            # An exception OUTSIDE the per-cell guards (e.g. in _start_ingests,
             # the enqueue, or finalizer.submit) would otherwise just kill this
             # daemon thread: feeder_done fires, _more_work returns None, the
             # session drains the partially-fed queue, and the run returns as if
@@ -903,7 +841,7 @@ def fill_zones_sequential(
             # phase failed with a usable mosaic already on disk. See the discard
             # below for why the distinction matters.
             reingest = {(f["zone"], f["year"]) for f in failures if f["phase"] == "inputs/prepare"}
-        pending = failed_keys if budget is None else [k for k in failed_keys if k in eligible]
+        pending = failed_keys if inputs is None else [k for k in failed_keys if k in eligible]
         if skipped := [k for k in failed_keys if k not in pending]:
             log.warning(
                 "Not retrying %d cell(s) in-child — their mosaic slots were released, so a retry would "
