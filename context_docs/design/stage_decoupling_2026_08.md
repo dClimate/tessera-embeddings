@@ -47,7 +47,18 @@ depth, the storage bound and the fleet-fill parallelism.
 No failure path deletes one — ingests are idempotent and a retained mosaic is what lets the
 retry resume. The three delete sites are all success branches (`_finalize`'s `else`, a
 terminal `plan()`, and a recovered retry); failure paths only record and retain. Pinned by
-tests asserting no cleanup on a failing run.
+tests asserting no cleanup on a failing run. Owner, 2026-08-26: *"I want to retain the
+mosaics in case of any doubt."*
+
+**A cluster works until it is manually killed.** This is why the retained-failure cap is
+allowed to go quiet: when mosaics have already landed the feeder can admit the whole cluster
+before any inference failure is reported, so the cap observes zero and more than
+`look_ahead + 2` mosaics are retained. Reviewed twice as a P1 and declined both times — the
+proposed remedies are an admission bound released by inference (the coupling this change
+removes) or halting the run at the cap (which would destroy inference throughput that is
+wanted). A run that infers everything and fails everything is an acceptable outcome: the
+staged tiles are kept and a re-run assembles from staging. The cap still acts exactly where
+it can, on an ingest failure, which raises on the feeder's own thread.
 
 ## Accepted costs
 
