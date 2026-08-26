@@ -502,6 +502,30 @@ class _DeploymentCellInputs:
             f"mosaic prefix — those commits do not rebase, so the loser's failure is terminal."
         )
 
+    def cancel_unstarted(self) -> int:
+        """Cancel queued ingests that have not begun, and forget them. Returns how many.
+
+        ``Future.cancel()`` succeeds only for a task still sitting in the pool's queue, so
+        a running or finished ingest is untouched — this drops work, never interrupts it.
+
+        Called before the in-child retry pass. Every pending cell's ingest is submitted up
+        front, so after the feeder stops (it ran out of cells, or the retained-failure cap
+        tripped) the pool can still hold most of a cluster queued. A retry's fresh
+        ``start`` would go to the BACK of that FIFO queue and its ``wait`` would block for
+        hours — the retry exists precisely to be prompt, on a cluster that is still
+        provisioned and still billing. Those queued cells are unattempted either way and
+        stay pending for the next campaign pass, so cancelling them also saves the ingest
+        compute their abandoned mosaics would have cost.
+        """
+        cancelled = 0
+        for key, fut in list(self._futures.items()):
+            if fut.cancel():
+                self._futures.pop(key, None)
+                cancelled += 1
+        if cancelled:
+            self._log.info("Cancelled %d queued ingest(s) that had not started", cancelled)
+        return cancelled
+
     def shutdown(self) -> None:
         """Stop dispatching, cancel in-flight child ingest runs, and WAIT for them to stop.
 

@@ -917,6 +917,43 @@ def test_wait_first_skips_a_failed_cell_while_a_sibling_is_still_ingesting():
         adapter.shutdown()
 
 
+def test_cancel_unstarted_drops_queued_ingests_but_not_running_ones():
+    """A retry must not queue behind a cluster's worth of unattempted ingests.
+
+    Every pending cell's ingest is submitted up front, so after the feeder stops the pool
+    can still hold most of a cluster. A retry's fresh `start` would go to the BACK of that
+    FIFO queue and its `wait` would block for hours, on a cluster that is billing now.
+
+    ``Future.cancel()`` succeeds only for a task still in the queue, so this must drop the
+    queued ones and leave the RUNNING one alone — dropping work, never interrupting it.
+    """
+    adapter = _adapter(max_parallel=1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def _occupy(zone: str, year: int) -> None:
+        started.set()
+        release.wait(timeout=10.0)
+
+    adapter._run = _occupy  # the one worker is busy from here on
+    try:
+        for i in range(1, 6):
+            adapter.start(f"{i:02d}N", 2024)
+        assert started.wait(timeout=5.0), "the first ingest never started"
+
+        cancelled = adapter.cancel_unstarted()
+
+        assert cancelled == 4, f"the four queued ingests must be cancelled, got {cancelled}"
+        assert ("01N", 2024) in adapter._futures, "a RUNNING ingest must not be cancelled"
+        assert not adapter._futures[("01N", 2024)].cancelled()
+        # Forgotten, so a retry's `start` creates a fresh attempt rather than re-reading a
+        # cancelled future.
+        assert ("05N", 2024) not in adapter._futures
+    finally:
+        release.set()
+        adapter.shutdown()
+
+
 def test_wait_first_does_not_abort_while_a_first_wave_cell_can_still_land():
     """The false abort a running failure COUNT introduces — the worst of both designs.
 

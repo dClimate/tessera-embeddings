@@ -164,6 +164,12 @@ class CellInputs(Protocol):
         """
         ...
 
+    def cancel_unstarted(self) -> int:
+        """Cancel input production that has not begun yet; return how many. Never
+        touches work already running.
+        """
+        ...
+
     def ready(self, zone: str, year: int) -> bool:
         """True if :meth:`wait` would return immediately. Never blocks.
 
@@ -836,6 +842,16 @@ def fill_zones_sequential(
     # EVERY failing path retains its cell's mosaic, so every failed cell is retryable here.
     # `retained_failed` is that set; with no mosaic budget at all the inputs are upstream and
     # permanent, so everything is eligible.
+    # Clear the ingest queue before retrying. Every pending cell's ingest was submitted up
+    # front, so the pool can still hold most of a cluster; a retry's fresh `start` would
+    # queue behind all of it and wait hours on a cluster that is billing now. The cancelled
+    # cells are unattempted either way and stay pending for the next campaign pass.
+    if inputs is not None and failures:
+        try:
+            inputs.cancel_unstarted()
+        except Exception:
+            log.warning("Could not cancel queued ingests before the retry pass", exc_info=True)
+
     for attempt in range(2, attempts_per_cell_in_cluster + 1):
         with lock:
             # Cells the feeder never admitted are recorded as failures so the run

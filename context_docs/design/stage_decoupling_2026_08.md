@@ -163,6 +163,19 @@ situation (`staging-identity-and-resume.md`).
 Note also that assembly reads `mosaic_base` for projected coordinates and CRS
 (`assembly.py:339`), so a retained mosaic is REQUIRED for an assembly retry, not incidental.
 
+**Retries jump the ingest queue.** Every pending cell's ingest is submitted up front, so
+after the feeder stops — out of cells, or the retained-failure cap tripped — the pool can
+still hold most of a cluster queued. The in-child retry re-starts the ingest for a cell whose
+INPUTS failed, and that fresh `start` went to the back of the FIFO queue: the retry that
+exists to be prompt, on a cluster that is still provisioned and still billing, would have
+waited hours.
+
+`cancel_unstarted()` now runs before the retry pass. `Future.cancel()` succeeds only for a
+task still in the queue, so it drops queued work and never interrupts a running ingest. The
+cancelled cells are unattempted either way and stay pending for the next campaign pass, so
+this also saves the ingest compute their abandoned mosaics would have cost. Raised in review
+as P2 and approved by the owner.
+
 ## Verification
 
 Every behavioural test fails against the pre-change source and passes against the new one.
@@ -177,6 +190,7 @@ needed, which is what made this cheap:
 | `test_systematic_failure_stops_feeder_at_retained_cap` | ingest was gated by admission |
 | `test_failed_cells_are_counted_while_an_assembly_is_stuck` | 0 cells reached the cap while one assembly was held |
 | `test_wait_first_aborts_on_a_pool_of_failures_not_the_whole_list` | `DID NOT RAISE` — it waited on four still-pending cells |
+| `test_the_queued_ingests_are_cancelled_before_the_retry_pass` | (with the call removed) the retry queued behind the unattempted ingests |
 
 The last of the review fixes needed a different baseline, because the bug was in the fix
 rather than in the original. Restoring the cumulative-count logic makes

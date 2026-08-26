@@ -148,6 +148,14 @@ class RecordingInputs:
         with self._lock:
             self.events.append(f"discard:{zone}")
 
+    def cancel_unstarted(self) -> int:
+        """Recorded, not simulated: the fake has no queue, and what the runner's
+        contract requires is that it asks BEFORE retrying.
+        """
+        with self._lock:
+            self.events.append("cancel_unstarted")
+        return 0
+
 
 class MosaicCountingInputs(RecordingInputs):
     """RecordingInputs that also tracks the started-not-cleaned high-water mark —
@@ -917,6 +925,39 @@ def test_attempts_per_cell_in_cluster_of_one_disables_the_retry():
             attempts_per_cell_in_cluster=1,
         )
     assert attempts == [], "no retry may run at attempts_per_cell_in_cluster=1"
+
+
+def test_the_queued_ingests_are_cancelled_before_the_retry_pass():
+    """The retry is only prompt if the ingest queue is cleared first.
+
+    The runner cannot see the pool, so the contract is an ORDERING one: it must ask the
+    adapter to drop unstarted ingests BEFORE the retry re-starts anything. Asking after
+    would leave the retry's own fresh `start` at the back of the queue it just cleared.
+    """
+    events: list[str] = []
+    attempts: list[str] = []
+
+    class _ReingestFailing(RecordingInputs):
+        """01N's ingest fails, so the retry takes the re-ingest path."""
+
+        def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+            with self._lock:
+                self.events.append(f"wait:{zone}")
+            if zone == "01N" and "discard:01N" not in self.events:
+                raise RuntimeError("ingest failed for 01N")
+
+    with contextlib.suppress(RuntimeError):
+        _run(
+            _cells(2),
+            inputs=_ReingestFailing(events),
+            infer_single=_recovering_single(attempts),
+            attempts_per_cell_in_cluster=2,
+        )
+
+    assert "cancel_unstarted" in events, "the runner must clear the ingest queue before retrying"
+    assert events.index("cancel_unstarted") < events.index("discard:01N"), (
+        f"the queue must be cleared BEFORE the retry re-starts an ingest: {events}"
+    )
 
 
 def test_the_in_child_retry_only_considers_cells_that_kept_a_mosaic():
