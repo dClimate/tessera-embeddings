@@ -557,6 +557,22 @@ class TestAPinnedStagingIdentityReachesAnEarlierCampaignsPrefix:
         monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-FIXED")
         assert _chained_staging_identity(wired, staging_code_identity="") == "infcode-FIXED"
 
+    def test_the_identity_is_announced_so_a_later_campaign_can_state_it(self, wired, monkeypatch, caplog):
+        """The value has to be READABLE or the lever cannot be used.
+
+        A chained fill records it as a parameter, but that is not a general answer: a
+        `cluster-per-zone` campaign hashes it irreversibly into its children's run ids. The
+        driver's own log is the one source that answers for both strategies, and by the time
+        anyone wants it the code that produced it has moved.
+        """
+        monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-FIXED")
+        with caplog.at_level("INFO"):
+            _chained_staging_identity(wired)
+        announced = [r.getMessage() for r in caplog.records if "Staging code identity" in r.getMessage()]
+        assert announced, "the driver never said what identity it resolved"
+        assert "infcode-FIXED" in announced[0]
+        assert len(announced) == 1, f"announced once per campaign, not per cell: {len(announced)}"
+
     @pytest.mark.parametrize(
         ("kwargs", "needle"),
         [
@@ -576,6 +592,18 @@ class TestAPinnedStagingIdentityReachesAnEarlierCampaignsPrefix:
         # The message has to NAME the lever that conflicts: an operator restarting a campaign
         # passed three staging arguments and needs to know which one to drop.
         assert needle in str(excinfo.value)
+
+    def test_the_two_derived_hatches_are_refused_together_too(self, wired) -> None:
+        """The pair that predates this change, and the reason the rule is stated over all three.
+
+        Reuse collapsed the identity to a constant and simply ignored the restage token, so an
+        operator asking for FRESH staging during a dependency upgrade silently got the reused
+        prefix — the exact mixing the token exists to prevent. An enumeration that has to be
+        complete to be safe cannot stop at the pairs the newest lever happens to be in.
+        """
+        with pytest.raises(ValueError, match="Pass exactly one") as excinfo:
+            _chained_staging_identity(wired, force_staging_reuse=True, force_staging_restage="torch-2.9")
+        assert "force_staging_reuse and force_staging_restage" in str(excinfo.value)
 
 
 def test_force_staging_restage_forces_a_fresh_prefix(wired) -> None:

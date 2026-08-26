@@ -708,9 +708,11 @@ async def run_global_campaign(
             source tarball the term is doubly unforgiving, since re-uploading the tarball moves
             the fingerprint whatever the change was.
 
-            **Copy it from the run being resumed** — every fill records the value it used in
-            its own ``staging_code_identity`` parameter, so the string to pass is a read rather
-            than a reconstruction. A value that was never staged under simply starts a fresh
+            **Copy it from the driver's log.** The campaign announces the identity it resolved,
+            once, at the point of first use, and that is the general answer: a chained fill also
+            records it as its own ``staging_code_identity`` parameter, but a ``cluster-per-zone``
+            campaign hands its children a ``run_id`` with the identity already hashed
+            irreversibly into it. A value that was never staged under simply starts a fresh
             prefix, which costs re-inference and nothing else.
 
             **The judgement it rests on is the operator's, and it is the same one
@@ -867,11 +869,20 @@ async def run_global_campaign(
     # a prefix nobody chose. Refused rather than ordered by precedence: the cost of guessing
     # wrong is a whole campaign's re-inference in the cheap direction and mixed code versions in
     # the expensive one, and neither is worth inferring from a parameter the caller did not mean.
-    if staging_code_identity and (force_staging_reuse or force_staging_restage):
+    _staging_levers = [
+        name
+        for name, given in (
+            ("staging_code_identity", bool(staging_code_identity)),
+            ("force_staging_reuse", force_staging_reuse),
+            ("force_staging_restage", bool(force_staging_restage)),
+        )
+        if given
+    ]
+    if len(_staging_levers) > 1:
         raise ValueError(
-            f"staging_code_identity={staging_code_identity!r} states the staging identity outright, "
-            f"but force_staging_reuse={force_staging_reuse!r} / force_staging_restage="
-            f"{force_staging_restage!r} would derive a different one. Pass exactly one."
+            f"{' and '.join(_staging_levers)} each decide the staging identity, and they disagree. "
+            f"Pass exactly one (staging_code_identity={staging_code_identity!r}, "
+            f"force_staging_reuse={force_staging_reuse!r}, force_staging_restage={force_staging_restage!r})."
         )
 
     campaign_years = tuple(years) if years is not None else CAMPAIGN_YEARS
@@ -1028,6 +1039,7 @@ async def run_global_campaign(
         return optical_rule_cache[0]
 
     code_identity_cache: list[str] = []
+    staging_identity_cache: list[str] = []
 
     def _staging_code_identity() -> str:
         """The staging fingerprint's code component — narrowed, with two escape hatches.
@@ -1051,6 +1063,27 @@ async def run_global_campaign(
         computation over CHANGED code reproduces the identity that changed code replaced. The
         three are mutually exclusive, refused at preflight rather than ordered here.
         """
+        if staging_identity_cache:
+            return staging_identity_cache[0]
+        identity = _derive_staging_code_identity()
+        staging_identity_cache.append(identity)
+        # SAID ONCE, BY THE DRIVER, whatever the strategy. `staging_code_identity` can only be
+        # used to restart onto an earlier campaign's tiles if the earlier campaign's value can be
+        # read back, and the chained path's child parameters are not a general answer: a
+        # `cluster-per-zone` campaign hands its children a run_id with the identity already
+        # hashed irreversibly into it. This line is the one place the value survives in a form an
+        # operator can copy, and by then the code or the tarball that produced it has moved.
+        log.info(
+            "Staging code identity for this campaign: %s (%s). Pass this back as "
+            "`staging_code_identity` to restart onto the tiles this campaign stages; once the "
+            "inference source or the code tarball moves it cannot be recomputed.",
+            identity,
+            "stated by staging_code_identity" if staging_code_identity else "derived",
+        )
+        return identity
+
+    def _derive_staging_code_identity() -> str:
+        """:func:`_staging_code_identity` without the memo or the announcement."""
         if staging_code_identity:
             return staging_code_identity
         if force_staging_reuse:
@@ -1060,8 +1093,10 @@ async def run_global_campaign(
         # workers execute a tarball they download instead, and replacing that tarball changes
         # what runs without changing anything here — so a retry would resume tiles staged by
         # the old code and add new ones from the new. The tarball's ETag closes that, and it
-        # is EMPTY for a baked-AMI deploy (code_bucket=None), which is production: this term
-        # costs prod nothing and exists only where the exposure does.
+        # is EMPTY only when `code_bucket` is None. NOT a dev-only term, whatever this comment
+        # used to say: the global campaign runs with a code_bucket, so the ETag is in its
+        # identity and re-uploading the tarball abandons every staged tile whatever the change
+        # was. That is a large part of why `staging_code_identity` exists.
         #
         # Deliberately the tarball term ALONE, not resolve_code_artifact_identity's whole
         # string. Folding the AMI back in is what the 2026-07-30 narrowing removed, and for a

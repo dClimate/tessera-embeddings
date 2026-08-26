@@ -63,6 +63,9 @@ one rule cannot express both.
 **`staging_code_identity` is the campaign-level lever, and `run_id` the per-cell one.** Pass
 `run_global_campaign`'s `staging_code_identity` to state the fingerprint's code component outright
 instead of deriving it, or `fill-zone-year`'s explicit `run_id` to resume one specific prefix.
+**Read the value out of the driver's own log**, which announces it once per campaign: a chained
+fill records it as a parameter too, but a `cluster-per-zone` campaign hashes it irreversibly into
+its children's run ids, so the log is the only source that answers for both strategies.
 Everything else changes the prefix as a side effect of changing the fingerprint.
 
 **This paragraph used to say `run_id` was the only reliable lever, and that was true when it was
