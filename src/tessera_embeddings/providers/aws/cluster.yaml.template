@@ -222,6 +222,98 @@ available_node_types:
         min_workers: 0
         max_workers: 0
 
+    # A larger L4 rung, for when `g6.2xlarge` itself has no capacity ---------
+    #
+    # 16 vCPU / 64 GiB / one L4. Shipped only as a capacity fallback for
+    # `g6.2xlarge`: measured in us-west-2 on 2026-08-27, `g6.2xlarge` refused in
+    # all three AZs at a moment when `g6.4xlarge` launched in two of them, so
+    # size availability WITHIN a card family varies even though a hard shortage
+    # takes the whole family down together. 16 vCPU per actor is four times the
+    # `g6e.xlarge` baseline's CPU feed, which is worth up to 7-15% of GPU-hours
+    # (`inference-perf-run-ledger.md`) — so a throughput figure measured here
+    # FLATTERS the card relative to the production shape and must be reported
+    # with that caveat.
+    gpu-workers-ondemand-l4-4xl:
+        node_config:
+            InstanceType: g6.4xlarge
+            # INJECT: ImageId, KeyName, SecurityGroupIds, IamInstanceProfile,
+            # SubnetIds, TagSpecifications (same set as head)
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 80
+                      VolumeType: gp3
+        min_workers: 0
+        max_workers: 0
+
+    # --- A10G rungs, INERT as shipped -----------------------------------
+    #
+    # `g5.*` is the NVIDIA A10G: 22,888 MiB (22.4 GiB), the SAME VRAM as the L4,
+    # on the older Ampere generation (SM 8.6 against the L40S's and L4's 8.9).
+    # x86_64 and within the same CUDA regime, so the L40S AMI boots and runs
+    # unchanged; no re-bake. bfloat16 autocast is native on SM 8.0+.
+    #
+    # They exist to test ONE hypothesis that the L4 rungs cannot: that this
+    # workload is limited by GPU MEMORY BANDWIDTH rather than by tensor
+    # throughput. The two candidate cards are ordered OPPOSITELY on those two
+    # axes, from the vendors' own datasheets:
+    #
+    #                 BF16 dense TFLOPS
+    #     card    as quoted    FP32-accumulate    memory bandwidth
+    #     L40S       362             181            864 GB/s
+    #     L4         121              61            300 GB/s
+    #     A10G        70              35            600 GB/s
+    #
+    # (Every one of these cards runs FP32 accumulation at HALF the rate its spec
+    # sheet quotes, and autocast bf16 matmuls accumulate in FP32 — so the middle
+    # column is the comparable one. See `_CARD_CEILINGS` in
+    # `inference/profiling.py`.)
+    #
+    # The A10G is the decisive card because it is the ONLY one where the two
+    # hypotheses disagree. Against the L40S, compute predicts 0.19x and
+    # bandwidth 0.69x — a factor of 3.6 apart, and the break-even against
+    # `g6e.xlarge`'s price sits between them. Against the L4 — twice the
+    # bandwidth on 0.58x the compute — they predict opposite winners. The L4
+    # alone cannot settle anything: compute predicts 0.33x of an L40S and
+    # bandwidth 0.35x, indistinguishable, which is why the L4 measurement of
+    # 0.27-0.34x is consistent with both. Fleet telemetry points at bandwidth
+    # (SMACT ~0.99 with TENSO only 0.42-0.47), but that is an inference from two
+    # counters, not a ranking.
+    #
+    # `g5.xlarge` is deliberately NOT offered, for the same reason `g6.xlarge`
+    # is not: 16 GiB of host RAM against a measured ~17.7 GB per-actor
+    # requirement. `g5.2xlarge` gives 32 GiB, matching `g6e.xlarge` exactly, and
+    # is the shape to measure on. `g5.4xlarge` is its capacity fallback and
+    # carries the same CPU-feed caveat as `g6.4xlarge` above.
+    #
+    # NOT A PRODUCTION RECOMMENDATION. Per-GPU throughput against an L40S is
+    # what these rungs exist to measure.
+    gpu-workers-ondemand-a10g-2xl:
+        node_config:
+            InstanceType: g5.2xlarge
+            # INJECT: ImageId, KeyName, SecurityGroupIds, IamInstanceProfile,
+            # SubnetIds, TagSpecifications (same set as head)
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 80
+                      VolumeType: gp3
+        min_workers: 0
+        max_workers: 0
+
+    gpu-workers-ondemand-a10g-4xl:
+        node_config:
+            InstanceType: g5.4xlarge
+            # INJECT: ImageId, KeyName, SecurityGroupIds, IamInstanceProfile,
+            # SubnetIds, TagSpecifications (same set as head)
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 80
+                      VolumeType: gp3
+        min_workers: 0
+        max_workers: 0
+
     # Spot GPU workers (experimental — risk of interruption mid-chunk).
     # Set max_workers > 0 to enable.
     gpu-workers-spot:

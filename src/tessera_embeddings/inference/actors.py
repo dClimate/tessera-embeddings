@@ -740,7 +740,7 @@ class InferenceActor:
     ``providers.aws.credentials.iam_icechunk_credentials``.
     """
 
-    # Class-level defaults for the two attributes the per-chunk telemetry reads.
+    # Class-level defaults for the three attributes the per-chunk telemetry reads.
     # `__init__` always sets both, and these exist for the instance that does NOT
     # run it: several tests build the actor bare (`cls.__new__(cls)`) and drive
     # `_process_chunk` directly, because a real construction downloads a checkpoint
@@ -751,6 +751,7 @@ class InferenceActor:
     # defaults at each use, would hide a genuinely unset attribute on a real actor.
     _torch: types.ModuleType | None = None
     gpu_index: str | None = None
+    _resource_monitor: ResourceMonitor = ResourceMonitor(interval_sec=30)
 
     def __init__(
         self,
@@ -1141,11 +1142,21 @@ class InferenceActor:
         this breaks no parser. Off CUDA the VRAM keys are simply absent, which is
         the honest encoding — a zero would read as "measured, and it was nothing".
         """
-        return {
+        fields: dict[str, Any] = {
             "instance_id": self.instance_id,
             "gpu": self.gpu_index,
             **_vram_peak_fields(self._torch),
         }
+        # Host RAM is the term that disqualifies an instance SIZE, the way peak
+        # VRAM is the term that disqualifies a CARD, and until now the only
+        # reading of it was an instantaneous sample every 30 s on a prose log
+        # line. Whole-HOST and so shared on a packed host — see
+        # `ResourceMonitor.peak_host_ram_gib`. Absent (not zero) off Linux.
+        ram_peak = self._resource_monitor.peak_host_ram_gib()
+        if ram_peak is not None:
+            fields["host_ram_peak_gib"] = round(ram_peak[0], 2)
+            fields["host_ram_total_gib"] = round(ram_peak[1], 2)
+        return fields
 
     def get_instance_id(self) -> str:
         """Return the EC2 instance ID this actor is running on."""
@@ -1244,6 +1255,7 @@ class InferenceActor:
         # anything, so the figure the CHUNK_SUMMARY carries is this chunk's peak
         # and not the run's. See _reset_vram_peak.
         _reset_vram_peak(self._torch)
+        self._resource_monitor.reset_peak_host_ram()
         self._resource_monitor.set_context("work", f"{chunk.label}:prologue")
 
         # Progress is tracked by the run-qualified uid, not the bare label: labels

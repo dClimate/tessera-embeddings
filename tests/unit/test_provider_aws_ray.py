@@ -746,7 +746,7 @@ def test_pacing_off_leaves_the_bootstrap_environment_alone() -> None:
 #: OMITTING GpuInfo on the CPU-only types — Ray does ``.get("GpuInfo", {}).get(...)``,
 #: which raises on a key materialised as null. A `--query` projection that wrote it
 #: as null made an otherwise-faithful fixture crash the code it was meant to feed.
-EC2_TYPES_FIXTURE = Path(__file__).parents[1] / "fixtures" / "ec2_describe_instance_types_g6e.json"
+EC2_TYPES_FIXTURE = Path(__file__).parents[1] / "fixtures" / "ec2_describe_instance_types_gpu.json"
 
 #: The resource bundle one ``InferenceActor`` requests: one GPU, and the CPU Ray
 #: assigns an actor by default (nothing sets ``num_cpus``). Every score below is
@@ -1258,7 +1258,7 @@ class TestL4Rungs:
             for cfg in node_types.values()
             if cfg["node_config"]["InstanceType"].startswith("g6.")
         }
-        assert set(l4) == {"g6.2xlarge", "g6.12xlarge"}
+        assert set(l4) == {"g6.2xlarge", "g6.4xlarge", "g6.12xlarge"}
         for itype, cfg in l4.items():
             assert cfg["max_workers"] == 0, itype
             assert "resources" not in cfg, itype
@@ -1273,11 +1273,18 @@ class TestL4Rungs:
         """
         node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
         offered = {cfg["node_config"]["InstanceType"] for cfg in node_types.values()}
-        assert "g6.xlarge" not in offered
-
         catalogue = {t["InstanceType"]: t for t in _ec2_instance_types()}
         assert catalogue["g6.xlarge"]["MemoryInfo"]["SizeInMiB"] / 1024 == 16.0
         assert catalogue["g6.2xlarge"]["MemoryInfo"]["SizeInMiB"] / 1024 == 32.0
+
+        # Stated over the whole offer, not over `g6.*` alone: the omission is a
+        # property of the HOST RAM figure, so it has to hold for every card
+        # family we ever add a rung for. `g5.xlarge` is the same 16 GiB shape and
+        # the same trap, and it is the cheapest A10G size — which is exactly why
+        # a rule naming only `g6.xlarge` would not have stopped it.
+        thin = {t for t, e in catalogue.items() if e["MemoryInfo"]["SizeInMiB"] / 1024 < 18.0}
+        assert "g6.xlarge" in thin and "g5.xlarge" in thin, thin
+        assert not (offered & thin), f"a rung ships with under 18 GiB of host RAM: {offered & thin}"
 
     def test_the_l4_pair_has_the_same_per_actor_shape_as_the_l40s_pair(self) -> None:
         """What makes `g6.12xlarge` a valid vehicle for the host-sharing question.
@@ -1324,3 +1331,87 @@ class TestL4Rungs:
         chosen, residual = get_nodes_for(node_types, {}, "head", 600, [ACTOR_BUNDLE] * 28, _scorer())
         assert dict(chosen) == {"gpu-workers-ondemand-l4-12xl": 4, "gpu-workers-ondemand-l4-2xl": 12}
         assert residual == []
+
+
+class TestA10gRungs:
+    """The `g5.*` rungs, and the hypothesis they exist to test.
+
+    The A10G has the SAME 22,888 MiB of VRAM as the L4 but twice its memory
+    bandwidth on roughly half its BF16 tensor throughput. Fleet telemetry (SMACT
+    ~0.99 against TENSO 0.42-0.47, effective TFLOPS flat at 85) suggests this
+    workload is limited by bandwidth rather than by tensor pipes — and if that is
+    right the older card outruns the newer one. These rungs are how that gets
+    measured instead of argued.
+    """
+
+    def test_the_a10g_rungs_ship_unreachable_and_declare_no_resources(self) -> None:
+        node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
+        a10g = {
+            cfg["node_config"]["InstanceType"]: cfg
+            for cfg in node_types.values()
+            if cfg["node_config"]["InstanceType"].startswith("g5.")
+        }
+        assert set(a10g) == {"g5.2xlarge", "g5.4xlarge"}
+        for itype, cfg in a10g.items():
+            assert cfg["max_workers"] == 0, itype
+            assert "resources" not in cfg, itype
+
+    def test_the_a10g_carries_the_same_vram_as_the_l4(self) -> None:
+        """22,888 MiB on both, so VRAM cannot be what separates them.
+
+        It is worth asserting because it is the thing that makes the pair a clean
+        experiment: same VRAM, same host-RAM shape at the `2xlarge`, opposite
+        ordering on bandwidth and compute. Anything the run finds between them is
+        about the card's throughput, not about fit.
+        """
+        cat = {t["InstanceType"]: t for t in _ec2_instance_types()}
+        a10g = cat["g5.2xlarge"]["GpuInfo"]["Gpus"][0]
+        l4 = cat["g6.2xlarge"]["GpuInfo"]["Gpus"][0]
+        assert (a10g["Name"], a10g["MemoryInfo"]["SizeInMiB"]) == ("A10G", 22888)
+        assert a10g["MemoryInfo"]["SizeInMiB"] == l4["MemoryInfo"]["SizeInMiB"]
+
+    def test_the_2xlarge_of_every_card_family_is_the_ram_matched_shape(self) -> None:
+        """8 vCPU / 32 GiB / 1 GPU on all three, so only the card differs.
+
+        `g6e.xlarge` is the production shape at 4 vCPU / 32 GiB. The candidate
+        `2xlarge`s match its HOST RAM exactly — the term that disqualifies the
+        `xlarge` sizes — while giving twice its vCPU. That CPU surplus is worth up
+        to 7-15% of GPU-hours, so it flatters the candidates and any ratio taken
+        against `g6e.xlarge` must be reported with the caveat.
+        """
+        cat = {t["InstanceType"]: t for t in _ec2_instance_types()}
+        for t in ("g6e.2xlarge", "g6.2xlarge", "g5.2xlarge"):
+            assert cat[t]["VCpuInfo"]["DefaultVCpus"] == 8, t
+            assert cat[t]["GpuInfo"]["Gpus"][0]["Count"] == 1, t
+        assert cat["g6.2xlarge"]["MemoryInfo"]["SizeInMiB"] == cat["g6e.xlarge"]["MemoryInfo"]["SizeInMiB"]
+        assert cat["g5.2xlarge"]["MemoryInfo"]["SizeInMiB"] == cat["g6e.xlarge"]["MemoryInfo"]["SizeInMiB"]
+
+    def test_a_three_card_ladder_puts_all_three_arms_on_one_cluster(self) -> None:
+        """The card-comparison shape: one queue, three cards, one cell, same minutes.
+
+        Ray takes `g6e.xlarge` first (its 4 vCPU under a one-CPU bundle scores
+        above the 2xlarges' 8), then falls to the capped candidate rungs for the
+        rest — so the per-rung `max_workers` is what fixes the arm sizes. The two
+        candidate rungs have IDENTICAL autodetected resources, which is exactly
+        why neither can crowd the other out: the cap binds before the score does.
+        """
+        from ray.autoscaler._private.resource_demand_scheduler import get_nodes_for
+
+        node_types = _autodetected_node_types("g6e.xlarge:3,g6.2xlarge:3,g5.2xlarge:3")
+        chosen, residual = get_nodes_for(node_types, {}, "head", 600, [ACTOR_BUNDLE] * 9, _scorer())
+        assert dict(chosen) == {
+            "gpu-workers-ondemand": 3,
+            "gpu-workers-ondemand-l4-2xl": 3,
+            "gpu-workers-ondemand-a10g-2xl": 3,
+        }
+        assert residual == []
+
+    def test_a_ladder_can_name_the_capacity_fallback_sizes(self) -> None:
+        """`g6.2xlarge` and `g5.2xlarge` both refused in all three AZs on 2026-08-27.
+
+        The 4xlarge of each family launched when its 2xlarge did not, so the
+        fallback has to be nameable without a release. It is the same ladder key.
+        """
+        node_types = _autodetected_node_types("g6.4xlarge:3,g5.4xlarge:3")
+        opened = {name: cfg["max_workers"] for name, cfg in node_types.items() if cfg["max_workers"]}
+        assert opened == {"gpu-workers-ondemand-l4-4xl": 3, "gpu-workers-ondemand-a10g-4xl": 3}

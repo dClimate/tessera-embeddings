@@ -136,17 +136,19 @@ class TestResourceMonitorLine:
                 "_get_gpu_stats",
                 return_value={
                     "gpu_util": "97%",
+                    "mem_util": "44%",
                     "mem_used": "1 MiB",
                     "mem_total": "2 MiB",
                     "temp": "70C",
                     "power": "300W",
                 },
             ) as gpu,
+            patch.object(rm, "_get_gpu_extra_stats", return_value={}),
             patch.object(rm.logger, "info", lambda fmt, *a: logged.append(fmt % a)),
         ):
             monitor._emit_once()
         gpu.assert_called_once_with("3")
-        assert "gpu_idx=3" in logged[0]
+        assert "gpu_idx=3" in logged[-1]
 
     def test_no_index_means_no_stamp(self) -> None:
         """A one-GPU host gains nothing from the field, so it is not added."""
@@ -159,13 +161,118 @@ class TestResourceMonitorLine:
                 "_get_gpu_stats",
                 return_value={
                     "gpu_util": "97%",
+                    "mem_util": "44%",
                     "mem_used": "1 MiB",
                     "mem_total": "2 MiB",
                     "temp": "70C",
                     "power": "300W",
                 },
             ),
+            patch.object(rm, "_get_gpu_extra_stats", return_value={}),
             patch.object(rm.logger, "info", lambda fmt, *a: logged.append(fmt % a)),
         ):
             monitor._emit_once()
-        assert "gpu_idx" not in logged[0]
+        assert "gpu_idx" not in logged[-1]
+
+
+class TestGpuExtraStats:
+    """Clock, PCIe link and throttle state — each one optional, none load-bearing.
+
+    The whole point of the split from :func:`_get_gpu_stats` is that a driver
+    which rejects one of these field names must not cost us utilisation, VRAM,
+    temperature and power as collateral. nvidia-smi fails a whole query on one
+    unknown field name, so that collateral is the default behaviour unless the
+    calls are separated.
+    """
+
+    def setup_method(self) -> None:
+        rm._throttle_field = None
+
+    def teardown_method(self) -> None:
+        rm._throttle_field = None
+
+    def test_reports_clock_pcie_and_throttle_when_all_are_supported(self) -> None:
+        with patch.object(rm, "_query_gpu", side_effect=[["2100", "4", "16"], ["0x0000"], ["0x0000"]]):
+            stats = rm._get_gpu_extra_stats("0")
+        assert stats == {"sm_clock": "2100MHz", "pcie": "gen4x16", "throttle": "0x0000"}
+
+    def test_falls_back_to_the_older_throttle_field_name(self) -> None:
+        """nvidia-smi renamed `clocks_throttle_reasons.*` to `clocks_event_reasons.*`."""
+        calls: list[tuple[str, ...]] = []
+
+        def fake(_index, fields):
+            calls.append(fields)
+            if fields == ("clocks_event_reasons.active",):
+                return None
+            if fields == ("clocks_throttle_reasons.active",):
+                return ["0x0004"]
+            return ["1800", "4", "8"]
+
+        with patch.object(rm, "_query_gpu", side_effect=fake):
+            stats = rm._get_gpu_extra_stats(None)
+        assert stats["throttle"] == "0x0004"
+        assert ("clocks_event_reasons.active",) in calls
+        assert rm._throttle_field == "clocks_throttle_reasons.active"
+
+    def test_no_throttle_field_at_all_leaves_the_other_metrics_intact(self) -> None:
+        def fake(_index, fields):
+            return None if "reasons" in fields[0] else ["1800", "4", "8"]
+
+        with patch.object(rm, "_query_gpu", side_effect=fake):
+            stats = rm._get_gpu_extra_stats(None)
+        assert "throttle" not in stats
+        assert stats["sm_clock"] == "1800MHz"
+        assert rm._throttle_field == ""
+
+    def test_a_failing_extra_query_returns_an_empty_dict_not_an_error(self) -> None:
+        with patch.object(rm, "_query_gpu", return_value=None):
+            assert rm._get_gpu_extra_stats("0") == {}
+
+
+class TestHostRamPeak:
+    """A high-water mark, because the emitted instantaneous figure is not one.
+
+    The per-actor RAM budget is sized to leave ~0.9 GB under a 60% ceiling for
+    spikes SHORTER than the 30-second emit cadence — so the number the line has
+    always carried is systematically below the peak it is meant to police.
+    """
+
+    def test_the_peak_survives_a_later_lower_sample(self) -> None:
+        monitor = rm.ResourceMonitor(interval_sec=30)
+        with patch.object(rm, "read_host_ram_gib", side_effect=[(10.0, 32.0), (18.0, 32.0), (11.0, 32.0)]):
+            for _ in range(3):
+                monitor._sample_ram()
+        assert monitor.peak_host_ram_gib() == (18.0, 32.0)
+
+    def test_nothing_sampled_reads_as_none_not_zero(self) -> None:
+        """Zero would say "measured, and it was nothing" — the wrong claim off Linux."""
+        monitor = rm.ResourceMonitor(interval_sec=30)
+        assert monitor.peak_host_ram_gib() is None
+        with patch.object(rm, "read_host_ram_gib", return_value=None):
+            monitor._sample_ram()
+        assert monitor.peak_host_ram_gib() is None
+
+    def test_reset_drops_the_mark_but_keeps_the_total(self) -> None:
+        monitor = rm.ResourceMonitor(interval_sec=30)
+        with patch.object(rm, "read_host_ram_gib", return_value=(18.0, 32.0)):
+            monitor._sample_ram()
+        monitor.reset_peak_host_ram()
+        assert monitor.peak_host_ram_gib() == (0.0, 32.0)
+
+    def test_the_sampler_cannot_be_slower_than_the_emit_interval(self) -> None:
+        """A default sample_sec above a short interval would emit a stale peak."""
+        assert rm.ResourceMonitor(interval_sec=1)._sample_sec == 1
+        assert rm.ResourceMonitor(interval_sec=30)._sample_sec == 2.0
+
+    def test_the_peak_is_on_the_line(self) -> None:
+        monitor = rm.ResourceMonitor(interval_sec=1)
+        logged: list[str] = []
+        with patch.object(rm, "read_host_ram_gib", return_value=(19.2, 32.0)):
+            monitor._sample_ram()
+        with (
+            patch.object(rm, "_get_cpu_mem_stats", return_value={"load_avg": "1 2 3"}),
+            patch.object(rm, "_get_gpu_stats", return_value=None),
+            patch.object(rm.logger, "info", lambda fmt, *a: logged.append(fmt % a)),
+        ):
+            monitor._emit_once()
+        assert "RAMpeak=19.2/32.0 GB (60%)" in logged[0]

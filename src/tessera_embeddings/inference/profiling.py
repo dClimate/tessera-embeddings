@@ -18,6 +18,42 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: Per-card BF16 dense ceiling **with FP32 accumulation** (TFLOPS) and memory
+#: bandwidth (GB/s), keyed by a substring of ``torch.cuda.get_device_name``.
+#:
+#: **The accumulate mode is the whole reason this table exists rather than a
+#: literal.** Vendor spec sheets quote the FP16-ACCUMULATE rate for Ada and
+#: Ampere consumer silicon — L40S 362, L4 121, A10G 70 — and every one of those
+#: cards runs FP32 accumulation at HALF that. Autocast bf16 matmuls accumulate in
+#: FP32, so the halved figure is the only comparable ceiling, and mixing the two
+#: conventions makes an L4 look twice as capable as it is.
+#:
+#: Bandwidth is from the vendors' own datasheets (nvidia.com product pages for
+#: L40S and L4; the NVIDIA/AWS A10G datasheet, Feb 2022) because AWS does not
+#: publish it — ``ec2:describe-instance-types`` gives GPU name, count and VRAM
+#: size only. The two columns are ordered OPPOSITELY between the L4 and the A10G,
+#: which is what makes those two cards a test of which one binds.
+_CARD_CEILINGS: dict[str, tuple[float, float]] = {
+    "L40S": (181.0, 864.0),
+    "L4": (60.5, 300.0),
+    "A10G": (35.0, 600.0),
+    "T4": (32.5, 320.0),
+}
+
+
+def _card_ceiling(device_name: str) -> tuple[str, float, float] | None:
+    """``(card, bf16_tflops, bandwidth_gbs)`` for a device name, or ``None`` if unknown.
+
+    Matched on the LONGEST key that appears in the name, so ``"NVIDIA L40S"`` does
+    not resolve to the ``"L4"`` entry. An unknown card returns ``None`` and the
+    caller says so — a wrong ceiling would turn a saturated GPU into a "poor
+    utilization" verdict, or the reverse.
+    """
+    for key in sorted(_CARD_CEILINGS, key=len, reverse=True):
+        if key in device_name:
+            return (key, *_CARD_CEILINGS[key])
+    return None
+
 
 def log_cuda_diagnostics(device: torch.device) -> None:
     """Log GPU hardware, driver, and configuration details.
@@ -200,10 +236,10 @@ def log_effective_tflops(
     """Estimate effective TFLOPS from forward-pass timing and known model structure.
 
     Compares against GPU theoretical peaks to determine hardware utilization.
-    Reference hardware: L40S (g6e.xlarge production workers) — BF16 tensor
-    181 TFLOPS dense, memory bandwidth 864 GB/s.
-    Historical: A10G BF16 ~35 realistic (GA10x runs FP32-accumulate at half the
-    advertised 70 dense), T4 BF16=65 peak, L4 BF16=121 peak.
+    The ceiling and the verdict come from :data:`_CARD_CEILINGS`, keyed on the
+    live device name, so the line is right on whatever card it runs on. Every
+    entry there is BF16 dense **with FP32 accumulation** — the mode autocast
+    bf16 actually uses, and half what the vendor spec sheets quote.
 
     Only counts transformer layer FLOPs (attention + FFN) via
     :func:`transformer_flops`. ``seq_len`` is the S2 backbone's sequence length;
@@ -224,17 +260,39 @@ def log_effective_tflops(
 
     effective_tflops = total_flops / (forward_ms / 1000) / 1e12
 
+    ceiling = _card_ceiling(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else None
+    if ceiling is None:
+        logger.debug(
+            "EFFECTIVE TFLOPS: %.2f TFLOPS (transformer layers only) | forward=%.1fms | "
+            "effective_batch=%d | ceiling: UNKNOWN CARD (%s) — no fraction reported",
+            effective_tflops,
+            forward_ms,
+            effective_batch,
+            torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no cuda",
+        )
+        return
+
+    card, peak_tflops, bandwidth = ceiling
+    fraction = effective_tflops / peak_tflops
     logger.debug(
         "EFFECTIVE TFLOPS: %.2f TFLOPS (transformer layers only) | "
         "forward=%.1fms | effective_batch=%d | "
-        "ceiling: L40S BF16~181 TFLOPS dense, 864 GB/s | "
-        "verdict=%s",
+        "ceiling: %s BF16~%.1f TFLOPS dense FP32-accum, %.0f GB/s | frac=%.2f | verdict=%s",
         effective_tflops,
         forward_ms,
         effective_batch,
+        card,
+        peak_tflops,
+        bandwidth,
+        fraction,
+        # Graded as a FRACTION of the card's own ceiling, not against absolute
+        # TFLOPS bands. The old thresholds (>20 ACTIVE, <12 poor) were L40S
+        # numbers: an A10G at its 35-TFLOPS ceiling would score ~16 and be
+        # reported as "FP32 range or poor utilization" while being perfectly
+        # saturated. A fraction is the only form that transfers between cards.
         "BF16 tensor cores ACTIVE"
-        if effective_tflops > 20
+        if fraction > 0.11
         else "FP32 range or poor utilization"
-        if effective_tflops < 12
+        if fraction < 0.066
         else "PARTIAL — tensor cores engaged but below expected range",
     )
