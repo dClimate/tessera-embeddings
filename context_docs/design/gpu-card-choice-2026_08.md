@@ -438,8 +438,25 @@ In exactly the situation the fallback exists for, Ray fills the fleet with L4s: 
 L40S against the A10G's 0.459, and 1.65× the unit cost against 1.42×. **Operating rule: open
 at most ONE candidate rung, and make it `g5.2xlarge`.** A ladder is authoritative over its
 whole domain, so naming only `g6e.xlarge` and `g5.2xlarge` closes the L4 rungs by
-construction — no code change needed. This deserves a test pinning the tie-break, since it is
-another arithmetic accident of a vendored file.
+construction — no code change needed.
+
+**Pinned in code since 2026-08-27.** A guard forbidding both candidate rungs was written and then
+REMOVED: `test_a_three_card_ladder_puts_all_three_arms_on_one_cluster` refutes the premise as
+baldly stated, and it passes — two SMALL equal caps give both rungs work, because the cap binds
+before the score does. Both readings are true in different shapes, and measurement settled which
+applies where:
+
+| ladder | what Ray launches |
+|---|---|
+| `g6.2xlarge:100,g5.2xlarge:100` | 8 L4, **zero** A10G — the score decides |
+| `g6.2xlarge:3,g5.2xlarge:3` | 3 of each — the cap decides |
+| `g5.2xlarge:100` | 8 A10G |
+
+So the hazard is real but narrower than "never open both": **it bites when a fallback is opened
+WIDE, which is the shape a fallback is actually opened in.** Hence a rule plus two tests
+(`test_an_uncapped_pair_of_fallback_cards_goes_ENTIRELY_to_the_L4` and
+`test_the_a10g_rung_alone_takes_the_whole_fallback_fleet`) rather than a guard — the uncapped case
+is pinned so the rule's reason cannot silently stop being true.
 
 ## Verdict, unchanged in direction and now measured rather than inferred
 
@@ -448,9 +465,15 @@ well under its 0.651 break-even; the L4's (0.342) is well under its 0.526. Not m
 
 **As a capacity fallback: the A10G yes, the L4 no** — because when `g6e` refuses, the
 alternative is an idle fleet at infinite cost per token, and 1.42× beats that. Gated on two
-things that are not true today: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` must be set
-(without it both 22.4 GiB cards OOM at `t_s2` 208, and the campaign's deepest recorded
-`t_kept` of 206 presents as 208 — zero margin), and only the A10G rung may be open.
+things:
+
+1. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` — without it both 22.4 GiB cards OOM at
+   `t_s2` 208, and the campaign's deepest recorded `t_kept` of 206 presents as 208, i.e. **zero
+   margin**. **Corrected in place: this said "not true today". It ships in this branch**, set on
+   `InferenceActor`'s `runtime_env` so it is exported before torch builds the allocator (it is read
+   once, at allocator construction). It is worth having with no fallback open at all, because on the
+   L40S it also stops the reserved pool drifting to ~95% of the card to hold a <9 GB working set.
+2. Only the A10G rung may be open — see the tie-break above.
 
 **The failover is manual.** Ray's scorer ignores `node_availability_summary`, so a capacity
 refusal never moves it off the top-scored rung; an operator must lower `g6e.xlarge`'s
