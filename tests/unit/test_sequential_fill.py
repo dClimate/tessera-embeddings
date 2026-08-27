@@ -1234,3 +1234,43 @@ def test_a_cap_trip_drops_the_assembly_queue_but_waits_for_the_running_one():
     # contract worth pinning is the SAFETY one above: the run does not return while an assembly
     # is committing. The queue drop is a throughput property and `shutdown(cancel_futures=True)`
     # is the whole of its implementation.
+
+
+def test_the_cap_trips_on_a_failure_that_arrives_after_the_feeder_finishes():
+    """The trip must live where failures are COUNTED, not where admissions are checked.
+
+    A check that only runs before the next admission never fires for the cap-th failure if it
+    lands on the last pending cell, or arrives from an inference/assembly callback after the
+    feeder has drained `pending` — and the run then drains and retries exactly as if the cap
+    did not exist. Here every cell is admitted before any fails, so the feeder's loop is over
+    by the time the count is reached.
+    """
+    events: list[str] = []
+
+    class _FailOnFinish(RecordingInputs):
+        """Ingest always succeeds, so the feeder drains `pending` and exits; the failures
+        arrive later, from the inference path.
+        """
+
+    def failing_assemble(handoff, *a, **k):
+        raise RuntimeError("assembly failed")
+
+    with pytest.raises(RuntimeError):
+        _run(
+            _cells(4),
+            inputs=_FailOnFinish(events),
+            look_ahead=4,
+            max_retained_failures=2,
+            attempts_per_cell_in_cluster=1,
+            assemble=failing_assemble,
+        )
+
+
+def test_a_nonpositive_cap_is_refused_before_anything_expensive():
+    """`0 >= max_retained_failures` is true before any cell fails, so a non-positive cap would
+    tear the run down AFTER the ingests were primed and the Ray cluster started. Refused in the
+    runner, not just the flow, because the runner is callable directly.
+    """
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="max_retained_failures must be >= 1"):
+            _run(_cells(2), max_retained_failures=bad)

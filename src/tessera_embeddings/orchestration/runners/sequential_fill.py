@@ -372,6 +372,13 @@ def fill_zones_sequential(
     #: Set by the feeder when the cap trips, read by the teardown. A cap trip is now a FAST
     #: EXIT rather than a quiet stop: the point of stopping is to get these cells back to the
     #: driver, and draining first delays exactly the thing the stop is for.
+    if max_retained_failures < 1:
+        # `0 >= max_retained_failures` is true before any cell has failed, so a non-positive cap
+        # tears the run down after the ingests have been primed and the Ray cluster started —
+        # expensive, and silent about why. Refused here rather than at the flow, because the
+        # runner is callable directly.
+        msg = f"max_retained_failures must be >= 1, got {max_retained_failures}"
+        raise ValueError(msg)
     cap_tripped = False
     retained_failed: set[tuple[str, int]] = set()
     #: Cells that LANDED but whose mosaic delete failed. Tracked apart from
@@ -412,9 +419,27 @@ def fill_zones_sequential(
         """
         if inputs is None:
             return
+        nonlocal cap_tripped
         with lock:
             retained_failed.add((cell.zone, cell.year))
             n = len(retained_failed)
+            # THE trip, here rather than only in the feeder's admission check: this is the one
+            # place `retained_failed` grows, so it is the only place that sees every path. The
+            # cap-th failure can arrive from an inference or assembly callback after the feeder
+            # has drained `pending`, or on the last pending cell — and a check that only runs
+            # before the NEXT admission never fires for either, leaving the run to drain and
+            # retry exactly as if the cap did not exist.
+            newly_tripped = n >= max_retained_failures and not cap_tripped
+            if newly_tripped:
+                cap_tripped = True
+        if newly_tripped:
+            log.error(
+                "Retained-failure cap reached (%d/%d) — ending this run without draining so the "
+                "driver can re-dispatch. Likely a systematic failure — investigate.",
+                n,
+                max_retained_failures,
+            )
+            stop.set()
         log.warning(
             "Cell %s-%d failed — mosaic retained for resume, off-budget (%d/%d retained-failure cap)",
             cell.zone,
@@ -587,15 +612,9 @@ def fill_zones_sequential(
                         n_failed,
                         len(pending),
                     )
-                    nonlocal cap_tripped
-                    cap_tripped = True
-                    # Unwind the inference stream too. Without this the feeder returns and the
-                    # run still waits out every in-flight cell and every queued assembly before
-                    # the driver hears about it -- hours, during which nothing new is admitted
-                    # and the cells that need re-dispatching sit idle. Measured 2026-08-27: a
-                    # provider outage left 24 cells with a dead optical leg, each held open for
-                    # HOURS by radar legs that could not change the outcome.
-                    stop.set()
+                    # `cap_tripped` and `stop` are set by `_retain_failed_mosaic`, which sees
+                    # every failure path; this branch exists for the BOOKKEEPING below — the
+                    # cells this feeder will now never admit.
                     # Record them as failures, not just in the log. The cells that
                     # triggered this cap can RECOVER in the in-child retry pass, and if
                     # every one does, `failures` empties and this run reports clean —
