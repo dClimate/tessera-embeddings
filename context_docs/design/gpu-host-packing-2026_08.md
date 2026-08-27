@@ -553,6 +553,39 @@ different pool, and the sizes that would consume the extra quota are the least e
 GPU. If the ask is still wanted, the reason has to be eviction headroom or a genuinely mixed
 fleet spanning card families — and it should be stated as whichever it actually is.
 
+## To finish this: one command, when capacity returns
+
+Everything is shipped and verified except the hardware. The SSM ladder is already set to the
+minimal shape, and the deployment is already registered, so the `g6e` run is a single
+dispatch:
+
+```bash
+# ladder already set: g6e.xlarge:8,g6e.12xlarge:2  (8 + 2x4 = 16 actors)
+aws ssm get-parameter --profile global-tessera-dev --region us-west-2 \
+  --name /global-tessera-dev/ray/gpu-worker-ladder --query Parameter.Value --output text
+
+python scripts/run_campaign_cell.py --deployment global-tessera-dev \
+  --flow tessera-embeddings --branch global-tessera-gpu-packing \
+  --params-json params_g6e.json --run-name gpupack-mixed-g6e
+```
+
+with `params_g6e.json` carrying `roi_name=iowa_epsg5070`, `time_window_end="December 2024"`,
+`num_actors=16`, `s1_orbit=ascending`, `require_s1=false`, `allow_s2_only=true`,
+`dev_params={"skip_coverage_check": true}` and the branch-scoped `paths`. Then, once every
+actor has 3+ chunks:
+
+```bash
+python scripts/inference_profile.py --deployment global-tessera-dev --hours 2 \
+  --by-host --run-id <the run_id from the flow's first log line>
+```
+
+which prints the per-instance medians, the host spread within each type, and the
+`g6e.12xlarge / g6e.xlarge` ratio against the 0.95 floor. Repeat with
+`TESSERA_BAND_READ_CPUS=4` on the packed arm for arm C.
+
+**Reuse arm A's noise floor (4.3%) rather than re-running it** — it is a property of the
+`g6e.xlarge` population on this cell, and it is already measured.
+
 ## Spend
 
 | item | shape | approx cost |
