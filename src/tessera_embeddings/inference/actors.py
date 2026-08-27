@@ -622,6 +622,27 @@ def _coverage_record(
     }
 
 
+def _accelerator_index() -> str | None:
+    """This actor's own GPU index on its host, from Ray's assignment. ``None`` if unassigned.
+
+    Ray sets ``CUDA_VISIBLE_DEVICES`` per actor, so TORCH already sees only this
+    actor's device and calls it 0. ``nvidia-smi`` does NOT honour that variable —
+    it reports every GPU on the host — so anything shelling out to it needs the
+    real host-level index, and this is where it comes from. On a one-GPU host the
+    answer is always "0" and the distinction is invisible, which is why the bug it
+    exists to prevent survived until a 4-GPU host was tried.
+
+    Returns the FIRST assigned id as a string: an ``InferenceActor`` reserves
+    exactly one GPU (``num_gpus=1``), so a second id would mean the reservation
+    changed and a single-GPU reader would be wrong anyway.
+    """
+    try:
+        ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
+    except Exception:  # No Ray runtime (local runner, unit tests)
+        return None
+    return str(ids[0]) if ids else None
+
+
 @ray.remote(
     runtime_env={
         "env_vars": {
@@ -707,7 +728,12 @@ class InferenceActor:
         if self.device.type == "cuda":  # No-op on CPU
             _log_vram_breakdown(self.model, _torch)
 
-        self._resource_monitor = ResourceMonitor(interval_sec=30)
+        # This actor's GPU index ON THE HOST, which is not always 0: Ray packs one actor per
+        # GPU, so a 4-GPU host runs four actors holding indices 0-3. Without it the monitor
+        # queries every GPU, rejects the multi-row answer, and a packed actor emits neither
+        # GPU statistics nor attribution — the whole point of the index.
+        self.gpu_index = _accelerator_index()
+        self._resource_monitor = ResourceMonitor(interval_sec=30, gpu_index=self.gpu_index)
         self._resource_monitor.start()
         logger.info("InferenceActor ready on instance %s", self.instance_id)
 
@@ -1115,6 +1141,11 @@ class InferenceActor:
         from tessera_embeddings.inference.inference import run_inference
 
         t0 = time.monotonic()
+        # Per CHUNK, not per actor: host RAM scales with a chunk's optical depth, so a peak
+        # taken over the actor's life describes its deepest chunk and gets attached to every
+        # later one. Without this reset the RAMpeak on a chunk's lines can belong to an
+        # earlier chunk entirely.
+        self._resource_monitor.reset_peak_host_ram()
         self._resource_monitor.set_context("work", f"{chunk.label}:prologue")
 
         # Progress is tracked by the run-qualified uid, not the bare label: labels
