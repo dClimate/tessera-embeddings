@@ -12,8 +12,10 @@
 #   - `cluster_name`: prefix for EC2 ray-cluster-name tags
 #   - `provider.region`: AWS region (must match SSM region)
 #   - `available_node_types[*].node_config.InstanceType`: head and worker
-#     instance types (the defaults assume an L40S GPU with 48 GB VRAM —
-#     `g6e.xlarge` for workers, `m5.2xlarge` for the head)
+#     instance types (the defaults assume an L40S GPU with 45,776 MiB =
+#     44.7 GiB = 48.0 GB of VRAM — `g6e.xlarge` for workers, `m5.2xlarge`
+#     for the head). Two wider GPU rungs ship at `max_workers: 0`; release
+#     one with the `gpu-worker-ladder` SSM key rather than editing here.
 #   - `min_workers` / `max_workers`: pool sizing
 #   - `idle_timeout_minutes`: autoscaler idle-down delay
 #
@@ -91,6 +93,76 @@ available_node_types:
             GPU: 1
         min_workers: 0
         max_workers: 500
+
+    # --- Wider GPU rungs, INERT as shipped -------------------------------
+    #
+    # Both are `max_workers: 0`, which makes a rung completely unreachable to
+    # the autoscaler: node-type choice in Ray 2.55.1 has no feedback from
+    # capacity errors (`resource_demand_scheduler._resource_scores` takes a
+    # `node_availability_summary` and never reads it), so `max_workers` is the
+    # SOLE mechanism that moves it. Merging these therefore changes nothing
+    # about a campaign in flight, and releasing one needs no code change — see
+    # `gpu-worker-ladder` in `ray.py::_apply_gpu_worker_ladder`.
+    #
+    # They exist because a single instance type is a single capacity pool: a
+    # fleet pinned to `g6e.xlarge` stalls at whatever us-west-2 will sell of
+    # that one size, and Ray cannot express a fallback type list (its node
+    # provider passes ONE `InstanceType` to `create_instances`; only the SUBNET
+    # list rotates on retry). Every `g6e` size is the same L40S on x86_64, so
+    # no AMI re-bake is involved in moving between them.
+    #
+    # NO `resources:` BLOCK, deliberately, on both. Ray autodetects CPU and GPU
+    # counts for the instance type from the live EC2 catalogue; a declared key
+    # OVERRIDES that autodetection, so hardcoding one is a chance to be wrong
+    # about a vCPU or GPU count with no error — the autoscaler would simply
+    # scale against a fiction. (The two rungs above keep their declared 4/1
+    # because they are load-bearing for existing tests; they happen to match.)
+    #
+    # Read `available_node_types` order as a preference hint only. With the
+    # actor bundle `{CPU: 1, GPU: 1}` Ray's scorer ties at 0 on its utilisation
+    # term for every GPU type and falls through to the mean, where the GPU term
+    # is just the count — so a multi-GPU rung SCORES HIGHER than `g6e.xlarge`
+    # and demotes it to fallback. That is an arithmetic accident of one vendored
+    # Ray file, and it is pinned by
+    # `test_provider_aws_ray.py::TestRayNodeTypePreference`.
+
+    # One L40S, 8 vCPU / 64 GiB — twice the CPU and RAM per GPU of the
+    # `g6e.xlarge` at a ~30% per-GPU price premium, against the 7-15% of
+    # GPU-hours a CPU-richer host can recover. The most quota-efficient rung
+    # after `g6e.xlarge` (8 vCPU/GPU vs 4), and it carries no unmeasured risk:
+    # still ONE actor per host, so every host-sharing question below is moot.
+    gpu-workers-ondemand-2xl:
+        node_config:
+            InstanceType: g6e.2xlarge
+            # INJECT: ImageId, KeyName, SecurityGroupIds, IamInstanceProfile,
+            # SubnetIds, TagSpecifications (same set as head)
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 80
+                      VolumeType: gp3
+        min_workers: 0
+        max_workers: 0
+
+    # Four L40S on one host, 48 vCPU / 384 GiB. FOUR actors share the box, which
+    # is a configuration nothing in this repo had ever run before 2026-08-27 —
+    # see `context_docs/design/gpu-host-packing-2026_08.md` for what the dev
+    # measurement found. GPU, VRAM and PCIe are per-device and all bulk I/O goes
+    # to S3, so the shared resources are host CPU (12 vCPU/actor, up from 4) and
+    # the NIC (~950 MB/s per actor => ~30 Gbps for four, an order under the
+    # host's). Least quota-efficient of the candidate sizes at 12 vCPU/GPU.
+    gpu-workers-ondemand-12xl:
+        node_config:
+            InstanceType: g6e.12xlarge
+            # INJECT: ImageId, KeyName, SecurityGroupIds, IamInstanceProfile,
+            # SubnetIds, TagSpecifications (same set as head)
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 80
+                      VolumeType: gp3
+        min_workers: 0
+        max_workers: 0
 
     # Spot GPU workers (experimental — risk of interruption mid-chunk).
     # Set max_workers > 0 to enable.

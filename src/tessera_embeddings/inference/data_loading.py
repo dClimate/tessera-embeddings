@@ -14,6 +14,7 @@ loaded eagerly.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import logging
 import os
@@ -41,6 +42,90 @@ from tessera_embeddings.storage.zarr_store import (
 logger = logging.getLogger(__name__)
 
 
+BAND_READ_CPUS_ENV = "TESSERA_BAND_READ_CPUS"
+"""Env var that OVERRIDES the detected per-actor CPU budget for the S2 band read.
+
+Set it to a positive integer and :func:`_band_read_workers` uses that instead of
+detecting anything. Two uses:
+
+* an operator lever on a host shape the detection gets wrong, without a release;
+* the A/B arm that measures whether reader threads on a packed host contend. The
+  detected value cannot express "fewer readers than my share allows", and that is
+  the only direction worth testing on a 4-actor host (see the note in
+  :func:`_actor_cpu_budget`).
+
+Unset — the normal case — changes nothing.
+"""
+
+
+def _actor_cpu_budget() -> int:
+    """CPU cores this actor may use for decompression: its SHARE of the host.
+
+    Three sources, in order:
+
+    1. :data:`BAND_READ_CPUS_ENV`, if set to a positive integer.
+    2. **The host's cores divided by the host's GPUs**, read from Ray's view of
+       this actor's own node. One ``InferenceActor`` holds one GPU, so a host's
+       actors are equinumerous with its GPUs and an even split is each one's fair
+       share. On the 4-vCPU/1-GPU ``g6e.xlarge`` this is 4 — identical to what the
+       affinity mask gave, so the production shape is unchanged.
+    3. The affinity mask (then ``cpu_count``), for anything with no Ray runtime:
+       the local CPU runner, unit tests, a laptop.
+
+    **Why not Ray's assigned resources.** ``get_assigned_resources()`` reports
+    ``{"CPU": 1.0, "GPU": 1.0}`` for our actor — measured, not assumed — because
+    nothing sets ``num_cpus`` and Ray's actor default is 1. Sizing from it would
+    put ONE decompression thread on a ``g6e.xlarge`` where four run today: a
+    fourfold regression on the production host, dressed as a fix. The number Ray
+    holds is a scheduling reservation, not a permit; the actor is free to use the
+    host, and the question here is how much of it is fairly ITS.
+
+    **What this fix does and does not buy, measured.** The affinity mask returns
+    the HOST's cores, so on a 48-vCPU 4-GPU host every one of the four actors
+    read 48 and sized as though it owned the box. That is wrong, and this
+    corrects it to 12. But it changes no behaviour at any ``g6e`` multi-GPU size,
+    because the band-count cap below binds first: with ``reserve_cpus=2``,
+    ``min(10, 48-2)`` and ``min(10, 12-2)`` are BOTH 10. The smallest share among
+    the family's multi-GPU sizes is ``g6e.12xlarge``'s 12, and ``12-2 = 10`` sits
+    exactly on the cap. So four actors run 10 readers each — 40 reader threads on
+    48 vCPU — before and after. **The CPU-contention mechanism is real if it is
+    real, and no fair-share formula reaches it**; only a lower budget does, which
+    is what :data:`BAND_READ_CPUS_ENV` exists to supply.
+    """
+    override = os.environ.get(BAND_READ_CPUS_ENV)
+    if override and override.isdigit() and int(override) > 0:
+        return int(override)
+
+    with contextlib.suppress(Exception):
+        import ray
+
+        # `ray.is_initialized()` FIRST, and it is not a cheap-path optimisation:
+        # `ray.nodes()` and `get_runtime_context()` both AUTO-START a local Ray
+        # instance when none is running. Calling them unguarded from a laptop or a
+        # unit test spawns a real cluster as a side effect of asking how many CPUs
+        # to use — observed doing exactly that during this change. An actor always
+        # has a runtime, so the guard costs the production path nothing.
+        if not ray.is_initialized():
+            raise RuntimeError  # caught by the suppress; falls through to the mask
+        node_id = ray.get_runtime_context().get_node_id()
+        for node in ray.nodes():
+            if node.get("NodeID") != node_id:
+                continue
+            res = node.get("Resources", {})
+            cpus, gpus = int(res.get("CPU", 0)), int(res.get("GPU", 0))
+            # Both must be positive: a CPU-only node divides by zero, and a node
+            # reporting no CPU tells us nothing. Fall through to the mask instead
+            # of inventing a number.
+            if cpus > 0 and gpus > 0:
+                return max(1, cpus // gpus)
+            break
+
+    try:
+        return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except AttributeError:  # macOS/Windows: no affinity API
+        return os.cpu_count() or 4
+
+
 # Worker cap for the concurrent S2 band read (see ``_load_s2_bands``). The 10
 # bands are independent zarr arrays, so their reads fan out across a thread
 # pool. Unlike the latency-bound ROI probe (``chunk_spec._ROI_PROBE_WORKERS``,
@@ -48,10 +133,9 @@ logger = logging.getLogger(__name__)
 # each band's ``oindex`` already issues its per-timestep S3 GETs concurrently,
 # so the serial cost we remove is the 10 decompression waves, not GET latency.
 # Decompression runs in Rust with the GIL released, so it scales to cores — but
-# only to cores, so we cap at the allocated CPU count (never above the band
-# count) to keep decompression cores busy without oversubscribing. Uses
-# ``sched_getaffinity`` where available (Linux inference actors) so a
-# cgroup/affinity-pinned worker sees its real allocation, not the host's.
+# only to cores, so we cap at the actor's CPU budget (never above the band
+# count) to keep decompression cores busy without oversubscribing. The budget is
+# the actor's SHARE of the host, not the whole host — see ``_actor_cpu_budget``.
 def _band_read_workers(reserve_cpus: int = 0) -> int:
     """Decompression pool size for the concurrent S2 band read.
 
@@ -62,10 +146,7 @@ def _band_read_workers(reserve_cpus: int = 0) -> int:
     batch prep produced ~500 ms get_batch spikes that starved the GPU.
     Foreground loads (the serial chunk prologue, GPU idle) reserve nothing.
     """
-    try:
-        allocated = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
-    except AttributeError:  # macOS/Windows: no affinity API
-        allocated = os.cpu_count() or 4
+    allocated = _actor_cpu_budget()
     # Reserve cores from the ALLOCATION first, then cap at the band count, so a
     # host with more CPUs than bands still runs the full reader set (reserving
     # after the cap would needlessly drop readers, e.g. 12 CPUs, 2 reserved ->

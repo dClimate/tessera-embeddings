@@ -1,0 +1,390 @@
+[
+ {
+  "GpuInfo": {
+   "Gpus": [
+    {
+     "Count": 1,
+     "GpuPartitionSize": 1.0,
+     "LogicalGpuCount": 1,
+     "Manufacturer": "NVIDIA",
+     "MemoryInfo": {
+      "SizeInMiB": 45776
+     },
+     "Name": "L40S",
+     "Workloads": [
+      "ml-ai",
+      "graphics"
+     ]
+    }
+   ],
+   "TotalGpuMemoryInMiB": 45776
+  },
+  "InstanceType": "g6e.xlarge",
+  "MemoryInfo": {
+   "SizeInMiB": 32768
+  },
+  "NetworkInfo": {
+   "NetworkPerformance": "Up to 20 Gigabit"
+  },
+  "VCpuInfo": {
+   "DefaultCores": 2,
+   "DefaultThreadsPerCore": 2,
+   "DefaultVCpus": 4,
+   "ValidCores": [
+    1,
+    2
+   ],
+   "ValidThreadsPerCore": [
+    1,
+    2
+   ]
+  }
+ },
+ {
+  "GpuInfo": {
+   "Gpus": [
+    {
+     "Count": 1,
+     "GpuPartitionSize": 1.0,
+     "LogicalGpuCount": 1,
+     "Manufacturer": "NVIDIA",
+     "MemoryInfo": {
+      "SizeInMiB": 45776
+     },
+     "Name": "L40S",
+     "Workloads": [
+      "ml-ai",
+      "graphics"
+     ]
+    }
+   ],
+   "TotalGpuMemoryInMiB": 45776
+  },
+  "InstanceType": "g6e.2xlarge",
+  "MemoryInfo": {
+   "SizeInMiB": 65536
+  },
+  "NetworkInfo": {
+   "NetworkPerformance": "Up to 20 Gigabit"
+  },
+  "VCpuInfo": {
+   "DefaultCores": 4,
+   "DefaultThreadsPerCore": 2,
+   "DefaultVCpus": 8,
+   "ValidCores": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "ValidThreadsPerCore": [
+    1,
+    2
+   ]
+  }
+ },
+ {
+  "GpuInfo": {
+   "Gpus": [
+    {
+     "Count": 1,
+     "GpuPartitionSize": 1.0,
+     "LogicalGpuCount": 1,
+     "Manufacturer": "NVIDIA",
+     "MemoryInfo": {
+      "SizeInMiB": 45776
+     },
+     "Name": "L40S",
+     "Workloads": [
+      "ml-ai",
+      "graphics"
+     ]
+    }
+   ],
+   "TotalGpuMemoryInMiB": 45776
+  },
+  "InstanceType": "g6e.4xlarge",
+  "MemoryInfo": {
+   "SizeInMiB": 131072
+  },
+  "NetworkInfo": {
+   "NetworkPerformance": "20 Gigabit"
+  },
+  "VCpuInfo": {
+   "DefaultCores": 8,
+   "DefaultThreadsPerCore": 2,
+   "DefaultVCpus": 16,
+   "ValidCores": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+   ],
+   "ValidThreadsPerCore": [
+    1,
+    2
+   ]
+  }
+ },
+ {
+  "GpuInfo": {
+   "Gpus": [
+    {
+     "Count": 1,
+     "GpuPartitionSize": 1.0,
+     "LogicalGpuCount": 1,
+     "Manufacturer": "NVIDIA",
+     "MemoryInfo": {
+      "SizeInMiB": 45776
+     },
+     "Name": "L40S",
+     "Workloads": [
+      "graphics",
+      "ml-ai"
+     ]
+    }
+   ],
+   "TotalGpuMemoryInMiB": 45776
+  },
+  "InstanceType": "g6e.8xlarge",
+  "MemoryInfo": {
+   "SizeInMiB": 262144
+  },
+  "NetworkInfo": {
+   "NetworkPerformance": "25 Gigabit"
+  },
+  "VCpuInfo": {
+   "DefaultCores": 16,
+   "DefaultThreadsPerCore": 2,
+   "DefaultVCpus": 32,
+   "ValidCores": [
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14,
+    16
+   ],
+   "ValidThreadsPerCore": [
+    1,
+    2
+   ]
+  }
+ },
+ {
+  "GpuInfo": {
+   "Gpus": [
+    {
+     "Count": 4,
+     "GpuPartitionSize": 1.0,
+     "LogicalGpuCount": 4,
+     "Manufacturer": "NVIDIA",
+     "MemoryInfo": {
+      "SizeInMiB": 45776
+     },
+     "Name": "L40S",
+     "Workloads": [
+      "ml-ai",
+      "graphics"
+     ]
+    }
+   ],
+   "TotalGpuMemoryInMiB": 183104
+  },
+  "InstanceType": "g6e.12xlarge",
+  "MemoryInfo": {
+   "SizeInMiB": 393216
+  },
+  "NetworkInfo": {
+   "NetworkPerformance": "100 Gigabit"
+  },
+  "VCpuInfo": {
+   "DefaultCores": 24,
+   "DefaultThreadsPerCore": 2,
+   "DefaultVCpus": 48,
+   "ValidCores": [
+    3,
+    6,
+    9,
+    12,
+    15,
+    18,
+    21,
+    24
+   ],
+   "ValidThreadsPerCore": [
+    1,
+    2
+   ]
+  }
+ },
+ {
+  "GpuInfo": {
+   "Gpus": [
+    {
+     "Count": 1,
+     "GpuPartitionSize": 1.0,
+     "LogicalGpuCount": 1,
+     "Manufacturer": "NVIDIA",
+     "MemoryInfo": {
+      "SizeInMiB": 45776
+     },
+     "Name": "L40S",
+     "Workloads": [
+      "graphics",
+      "ml-ai"
+     ]
+    }
+   ],
+   "TotalGpuMemoryInMiB": 45776
+  },
+  "InstanceType": "g6e.16xlarge",
+  "MemoryInfo": {
+   "SizeInMiB": 524288
+  },
+  "NetworkInfo": {
+   "NetworkPerformance": "35 Gigabit"
+  },
+  "VCpuInfo": {
+   "DefaultCores": 32,
+   "DefaultThreadsPerCore": 2,
+   "DefaultVCpus": 64,
+   "ValidCores": [
+    4,
+    8,
+    12,
+    16,
+    20,
+    24,
+    28,
+    32
+   ],
+   "ValidThreadsPerCore": [
+    1,
+    2
+   ]
+  }
+ },
+ {
+  "GpuInfo": {
+   "Gpus": [
+    {
+     "Count": 4,
+     "GpuPartitionSize": 1.0,
+     "LogicalGpuCount": 4,
+     "Manufacturer": "NVIDIA",
+     "MemoryInfo": {
+      "SizeInMiB": 45776
+     },
+     "Name": "L40S",
+     "Workloads": [
+      "ml-ai",
+      "graphics"
+     ]
+    }
+   ],
+   "TotalGpuMemoryInMiB": 183104
+  },
+  "InstanceType": "g6e.24xlarge",
+  "MemoryInfo": {
+   "SizeInMiB": 786432
+  },
+  "NetworkInfo": {
+   "NetworkPerformance": "200 Gigabit"
+  },
+  "VCpuInfo": {
+   "DefaultCores": 48,
+   "DefaultThreadsPerCore": 2,
+   "DefaultVCpus": 96,
+   "ValidCores": [
+    6,
+    12,
+    18,
+    24,
+    30,
+    36,
+    42,
+    48
+   ],
+   "ValidThreadsPerCore": [
+    1,
+    2
+   ]
+  }
+ },
+ {
+  "GpuInfo": {
+   "Gpus": [
+    {
+     "Count": 8,
+     "GpuPartitionSize": 1.0,
+     "LogicalGpuCount": 8,
+     "Manufacturer": "NVIDIA",
+     "MemoryInfo": {
+      "SizeInMiB": 45776
+     },
+     "Name": "L40S",
+     "Workloads": [
+      "ml-ai",
+      "graphics"
+     ]
+    }
+   ],
+   "TotalGpuMemoryInMiB": 366208
+  },
+  "InstanceType": "g6e.48xlarge",
+  "MemoryInfo": {
+   "SizeInMiB": 1572864
+  },
+  "NetworkInfo": {
+   "NetworkPerformance": "400 Gigabit"
+  },
+  "VCpuInfo": {
+   "DefaultCores": 96,
+   "DefaultThreadsPerCore": 2,
+   "DefaultVCpus": 192,
+   "ValidCores": [
+    12,
+    24,
+    36,
+    48,
+    60,
+    72,
+    84,
+    96
+   ],
+   "ValidThreadsPerCore": [
+    1,
+    2
+   ]
+  }
+ },
+ {
+  "InstanceType": "m5.2xlarge",
+  "MemoryInfo": {
+   "SizeInMiB": 32768
+  },
+  "NetworkInfo": {
+   "NetworkPerformance": "Up to 10 Gigabit"
+  },
+  "VCpuInfo": {
+   "DefaultCores": 4,
+   "DefaultThreadsPerCore": 2,
+   "DefaultVCpus": 8,
+   "ValidCores": [
+    2,
+    4
+   ],
+   "ValidThreadsPerCore": [
+    1,
+    2
+   ]
+  }
+ }
+]

@@ -42,7 +42,7 @@ import pytest
 import ray
 from ray.util.placement_group import placement_group, remove_placement_group
 
-from tessera_embeddings.inference.scheduling import _joined_gpu_count
+from tessera_embeddings.inference.scheduling import _joined_gpu_count, _placed_actor_slots
 
 DECLARED_GPUS = 4
 
@@ -117,3 +117,45 @@ def test_cluster_total_holds_while_gpus_are_claimed(ray_instance: None) -> None:
         assert _joined_gpu_count(0.0, 1.0) == DECLARED_GPUS
     finally:
         remove_placement_group(group)
+
+
+@pytest.mark.integration
+def test_a_four_gpu_node_holds_four_actor_slots(ray_instance: None) -> None:
+    """**Slots, not nodes** — the unit an actor request is counted in, on a packed host.
+
+    This fixture declares ``DECLARED_GPUS`` GPUs on ONE node, which is exactly the
+    shape of a ``g6e.12xlarge``: four actors, one host. Until 2026-08-27 nothing in
+    either repo had run that shape, and the arithmetic that breaks in it breaks
+    silently — a rule that compared an actor request against a NODE count would
+    converge to a fixed point far below its target and then stop asking, for ever.
+    Nodes and slots coincide only at exactly one actor per node, which is the
+    production shape and is why the error is invisible there.
+
+    No GPU is needed: ``num_gpus`` is a scheduling resource Ray hands out on a
+    machine with no accelerator at all.
+    """
+    assert len(ray.nodes()) == 1, "the point of this test is FOUR GPUs on ONE node"
+    assert _placed_actor_slots(_joined_gpu_count(0.0, 1.0), 1.0) == DECLARED_GPUS
+
+    # Four one-GPU bundles all fit on the single node — the packing the design needs.
+    group = placement_group([{"GPU": 1}] * DECLARED_GPUS, strategy="PACK")
+    try:
+        ray.get(group.ready(), timeout=60)
+        assert _wait_for_available_gpus_below(1), "all four slots must be claimable at once"
+        assert _placed_actor_slots(_joined_gpu_count(0.0, 1.0), 1.0) == DECLARED_GPUS, (
+            "a claimed slot is still a placed slot"
+        )
+    finally:
+        remove_placement_group(group)
+
+
+@pytest.mark.integration
+def test_the_node_count_and_the_slot_count_disagree_on_a_packed_host(ray_instance: None) -> None:
+    """The defect this guards against, stated as the inequality that causes it.
+
+    One node, four slots. Any code that reads ``len(ray.nodes())`` where it means
+    "how many actors can be placed" is off by the host's GPU count — 4x on a
+    ``g6e.12xlarge``, 8x on a ``g6e.48xlarge``.
+    """
+    assert len(ray.nodes()) == 1
+    assert _placed_actor_slots(_joined_gpu_count(0.0, 1.0), 1.0) == 4 * len(ray.nodes())

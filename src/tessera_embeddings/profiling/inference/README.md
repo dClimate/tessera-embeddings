@@ -42,9 +42,13 @@ te-observe-cluster \
    poller ran, per-worker 1 s peak/p99 and the top-10 spike samples with
    timestamps and the processes holding the memory at that instant.
 4. Attribution: the actors tag every 30 s `RESOURCES` line with what they were
-   doing (`ctx=work:<chunk>:<phase> write:<chunk>`), and emit one
-   machine-readable `CHUNK_SUMMARY` JSON line per chunk — so any spike can be
-   tied to a chunk + phase without prose-log archaeology.
+   doing (`ctx=work:<chunk>:<phase> write:<chunk>`, plus `gpu_idx=<n>` where the
+   host holds several GPUs), and emit one machine-readable `CHUNK_SUMMARY` JSON
+   line per chunk — so any spike can be tied to a chunk + phase without prose-log
+   archaeology. The line also carries `instance_id` and `gpu`, which is what makes
+   a fleet decomposable per HOST: one CloudWatch log stream is one flow runner, so
+   the stream cannot tell four actors sharing a host apart, and a packed host
+   running slow would otherwise surface only as a marginally slower cell.
 
 ## Tools
 

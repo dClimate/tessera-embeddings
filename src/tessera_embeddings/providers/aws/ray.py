@@ -38,6 +38,7 @@ import stat
 import subprocess
 import tempfile
 import uuid
+from collections import defaultdict
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -161,6 +162,40 @@ Applied only when a caller asks for it (``launch_pacing=True``). Default-off
 because it changes how a live fleet grows.
 """
 
+GPU_WORKER_LADDER_SSM_KEY = "gpu-worker-ladder"
+"""OPTIONAL SSM key under ``ssm_prefix`` that releases the template's GPU rungs.
+
+Value is a comma-separated list of ``<instance-type>:<max_workers>`` pairs, e.g.::
+
+    g6e.xlarge:100,g6e.2xlarge:150
+
+**Absent means the template stands untouched**, which is today's behaviour
+byte-for-byte — that is the whole point of putting the switch here rather than on
+the flow. A flow parameter would change the deployment's schema, and a schema
+change forces every deployment to be re-registered, which drops hand-set
+parameters on a live campaign. An SSM key is read at ``ray up`` time by whatever
+code the runner already has, so a rung can be released mid-campaign with a
+`put-parameter` and no release, no re-registration and no AMI re-bake.
+
+Why ``max_workers`` and not a smarter switch: node-type choice in Ray 2.55.1
+has no feedback from capacity errors, so ``max_workers`` per node type is the
+only mechanism that moves the autoscaler. ``0`` makes a rung unreachable.
+"""
+
+GPU_WORKER_NODE_TYPE_PREFIX = "gpu-workers-ondemand"
+"""Prefix identifying the ON-DEMAND GPU worker node types the ladder governs.
+
+The ladder addresses node types by their EC2 instance type, but an instance type
+does not identify a node type on its own: the template ships ``g6e.xlarge`` twice,
+once on-demand and once spot. So the ladder's domain is fixed by NAME — every
+``available_node_types`` key with this prefix — and spot rungs are outside it and
+never touched. Keep this in lockstep with ``cluster.yaml.template``; a template
+rename that breaks the prefix makes the ladder silently govern nothing, which is
+why :func:`_apply_gpu_worker_ladder` refuses an empty domain rather than
+returning quietly.
+"""
+
+
 _RAY_START = "ray start"
 """The token in a ``*_start_ray_commands`` entry that :func:`_pace_ray_start` prefixes.
 
@@ -199,6 +234,132 @@ def _pace_ray_start(commands: list[str], pacing: dict[str, str]) -> list[str]:
         msg = f"launch pacing requested but no start command invokes {_RAY_START!r}: {commands}"
         raise ValueError(msg)
     return paced
+
+
+def _parse_gpu_worker_ladder(raw: str) -> list[tuple[str, int]]:
+    """Parse a ``gpu-worker-ladder`` value into ordered ``(instance_type, max_workers)`` pairs.
+
+    Args:
+        raw: The SSM parameter value, e.g. ``"g6e.xlarge:100,g6e.2xlarge:150"``.
+            Whitespace around any token is tolerated; empty entries (a trailing
+            comma) are dropped.
+
+    Returns:
+        Pairs in the order written. Order is preserved because it is what a human
+        reads back, NOT because it decides anything — Ray scores node types from
+        their resources and ignores declaration order entirely (see
+        ``TestRayNodeTypePreference``).
+
+    Raises:
+        RuntimeError: On any entry that is not exactly ``name:non-negative-int``,
+            or on a repeated instance type. Both REFUSE rather than warn: this
+            value sizes a GPU fleet, and the failure mode of a lenient parser is
+            a rung silently left at ``0`` (a campaign that never grows) or a
+            typo'd count read as capacity. A refusal at ``ray up`` costs one
+            corrected parameter; a silent misparse costs a run.
+    """
+    pairs: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, sep, count = entry.partition(":")
+        name, count = name.strip(), count.strip()
+        # Match the LEXICAL form, not a prefix of it: `partition` on a missing
+        # separator yields an empty tail, and `int("")` would raise a ValueError
+        # that reads as a bug rather than as bad configuration.
+        if not sep or not name or not count.isdigit():
+            msg = (
+                f"Malformed {GPU_WORKER_LADDER_SSM_KEY} entry {entry!r}: expected "
+                "'<instance-type>:<max_workers>' with a non-negative integer count"
+            )
+            raise RuntimeError(msg)
+        if name in seen:
+            msg = f"Duplicate instance type {name!r} in {GPU_WORKER_LADDER_SSM_KEY}: {raw!r}"
+            raise RuntimeError(msg)
+        seen.add(name)
+        pairs.append((name, int(count)))
+    if not pairs:
+        msg = f"{GPU_WORKER_LADDER_SSM_KEY} is set but names no rung: {raw!r}"
+        raise RuntimeError(msg)
+    return pairs
+
+
+def _apply_gpu_worker_ladder(config: dict[str, Any], raw: str) -> None:
+    """Rewrite the on-demand GPU rungs' ``max_workers`` from a ladder value, in place.
+
+    The ladder is AUTHORITATIVE over its domain, not additive to it: every
+    on-demand GPU node type (see :data:`GPU_WORKER_NODE_TYPE_PREFIX`) the value
+    does not name is set to ``0``. An additive reading would make
+    ``g6e.2xlarge:150`` mean "add 150 of these to the 500 g6e.xlarge already
+    allowed", so releasing a rung would also raise the fleet ceiling — two
+    changes from one edit, and the second one unstated. Naming every rung you
+    want makes the whole fleet shape readable from the parameter.
+
+    Args:
+        config: A loaded cluster config. Mutated in place.
+        raw: The raw SSM value; see :func:`_parse_gpu_worker_ladder`.
+
+    Raises:
+        RuntimeError: If the config declares no on-demand GPU node type (a
+            template drift that would otherwise make the ladder a no-op), or if
+            the ladder names an instance type no such node type offers, or if two
+            of them offer the same instance type so the target is ambiguous.
+            Refusing beats warning here for the reason a warn-and-continue guard
+            always loses: the run proceeds, and what it proceeds with is the
+            fleet shape the operator was trying to change.
+    """
+    node_types = config["available_node_types"]
+    domain = {name: cfg for name, cfg in node_types.items() if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX)}
+    if not domain:
+        msg = (
+            f"{GPU_WORKER_LADDER_SSM_KEY} is set but the cluster template declares no node type "
+            f"named {GPU_WORKER_NODE_TYPE_PREFIX!r}* — the ladder would govern nothing. "
+            f"Node types present: {sorted(node_types)}"
+        )
+        raise RuntimeError(msg)
+
+    by_instance_type: dict[str, list[str]] = defaultdict(list)
+    for name, cfg in domain.items():
+        by_instance_type[cfg["node_config"]["InstanceType"]].append(name)
+
+    pairs = _parse_gpu_worker_ladder(raw)
+    unknown = [t for t, _ in pairs if t not in by_instance_type]
+    if unknown:
+        msg = (
+            f"{GPU_WORKER_LADDER_SSM_KEY} names instance type(s) {unknown} with no on-demand GPU "
+            f"node type in the cluster template. Available: {sorted(by_instance_type)}. Add the "
+            "rung to cluster.yaml.template (at max_workers: 0) and ship it before releasing it."
+        )
+        raise RuntimeError(msg)
+    ambiguous = {t: names for t, names in by_instance_type.items() if len(names) > 1}
+    if ambiguous:
+        msg = (
+            f"Cannot apply {GPU_WORKER_LADDER_SSM_KEY}: instance type(s) {ambiguous} are offered by "
+            "more than one on-demand GPU node type, so a ladder entry has no single target"
+        )
+        raise RuntimeError(msg)
+
+    # Close every rung first, then open the named ones. Two passes, so an
+    # unnamed rung is closed whatever order the ladder lists things in.
+    for cfg in domain.values():
+        cfg["max_workers"] = 0
+    for instance_type, max_workers in pairs:
+        node_types[by_instance_type[instance_type][0]]["max_workers"] = max_workers
+
+    # `max_workers` per node type is a ceiling under the CLUSTER-wide ceiling, not
+    # beside it: Ray takes the min. A ladder summing above the global value would
+    # be capped there silently, so raise the global to fit the ladder it was given.
+    ladder_total = sum(count for _, count in pairs)
+    if ladder_total > config.get("max_workers", 0):
+        config["max_workers"] = ladder_total
+    logging.getLogger(__name__).info(
+        "Applied %s: %s (cluster max_workers=%d)",
+        GPU_WORKER_LADDER_SSM_KEY,
+        ", ".join(f"{t}={n}" for t, n in pairs),
+        config["max_workers"],
+    )
 
 
 def resolve_ami_id(ami_ssm_name: str, region: str = "us-west-2") -> str:
@@ -379,6 +540,10 @@ def _resolve_ray_config(
         ssm_prefix: Prefix under which Ray resource IDs are stored.
             Required keys: ``security-group-id``, ``instance-profile-arn``,
             ``private-subnet-ids``, ``key-pair-name``, ``key-pair-id``.
+            Optional key: ``gpu-worker-ladder`` (see
+            :data:`GPU_WORKER_LADDER_SSM_KEY`) — releases the template's wider
+            GPU rungs without a release or a deployment re-registration. Absent
+            leaves the template's node types untouched.
         cluster_name: Override the template's ``cluster_name``. Required
             for running multiple clusters concurrently.
         instance_tags: Extra EC2 tags to apply to every node, on top of
@@ -437,6 +602,12 @@ def _resolve_ray_config(
     if missing:
         msg = f"Missing required SSM parameters under {ssm_prefix!r}: {sorted(missing)}"
         raise RuntimeError(msg)
+
+    # OPTIONAL, and its absence is the default: no key means the template's rungs
+    # stand exactly as shipped. Applied before anything else touches the node
+    # types so a refusal costs no tempfiles.
+    if GPU_WORKER_LADDER_SSM_KEY in params:
+        _apply_gpu_worker_ladder(config, params[GPU_WORKER_LADDER_SSM_KEY])
 
     sg_ids = [params["security-group-id"]]
     all_subnet_ids = [s.strip() for s in params["private-subnet-ids"].split(",")]

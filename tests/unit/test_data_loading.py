@@ -1,5 +1,6 @@
 """Tests for data_loading: band stacking, SCL masking, DOY, and load_chunk orchestration."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import icechunk
@@ -622,3 +623,101 @@ class TestBandReadWorkerReservation:
         # Regression for the reserve-after-cap bug: 12 cores, reserve 2 →
         # min(10, 12-2)=10 readers (2 free for prep), NOT min(10,12)-2=8.
         assert self._workers(cores=12, reserve=2) == len(S2_BAND_ORDER)
+
+
+class TestActorCpuBudget:
+    """The actor's CPU budget is its SHARE of the host, not the whole host."""
+
+    def test_env_override_wins(self, monkeypatch):
+        monkeypatch.setenv(_dl_mod.BAND_READ_CPUS_ENV, "6")
+        assert _dl_mod._actor_cpu_budget() == 6
+
+    @pytest.mark.parametrize("bad", ["0", "-4", "x", "", "2.5"])
+    def test_a_nonsense_override_is_ignored_rather_than_obeyed(self, monkeypatch, bad):
+        """A malformed value must not become a pool size of 0 or a crash mid-chunk."""
+        monkeypatch.setenv(_dl_mod.BAND_READ_CPUS_ENV, bad)
+        with patch.object(_dl_mod.os, "sched_getaffinity", create=True, return_value=set(range(4))):
+            assert _dl_mod._actor_cpu_budget() == 4
+
+    def test_falls_back_to_the_affinity_mask_without_a_ray_runtime(self, monkeypatch):
+        """Local runner, unit tests, laptop: no Ray, so the host's mask is all there is."""
+        monkeypatch.delenv(_dl_mod.BAND_READ_CPUS_ENV, raising=False)
+        with patch.object(_dl_mod.os, "sched_getaffinity", create=True, return_value=set(range(11))):
+            assert _dl_mod._actor_cpu_budget() == 11
+
+    def test_never_asks_ray_anything_when_ray_is_not_running(self, monkeypatch):
+        """`ray.nodes()` AUTO-STARTS a local cluster, so it must be reached only behind the guard.
+
+        This is not hypothetical: calling it unguarded spun up a real Ray instance on
+        a laptop as a side effect of asking how many CPUs to use. The guard is the
+        fix; this test is what keeps it.
+        """
+        import ray
+
+        monkeypatch.delenv(_dl_mod.BAND_READ_CPUS_ENV, raising=False)
+        assert not ray.is_initialized(), "a leaked cluster invalidates this test"
+        with (
+            patch.object(ray, "nodes", side_effect=AssertionError("ray.nodes() must not be called")),
+            patch.object(_dl_mod.os, "sched_getaffinity", create=True, return_value=set(range(4))),
+        ):
+            assert _dl_mod._actor_cpu_budget() == 4
+        assert not ray.is_initialized()
+
+    def test_divides_the_hosts_cpus_by_its_gpus(self, monkeypatch):
+        """48 vCPU / 4 GPU = 12 per actor, where the affinity mask would have said 48."""
+        monkeypatch.delenv(_dl_mod.BAND_READ_CPUS_ENV, raising=False)
+        assert self._budget_with_node({"CPU": 48.0, "GPU": 4.0}) == 12
+        # And the production shape is unchanged, which is what makes the fix safe.
+        assert self._budget_with_node({"CPU": 4.0, "GPU": 1.0}) == 4
+
+    def test_a_gpuless_node_falls_back_rather_than_dividing_by_zero(self, monkeypatch):
+        monkeypatch.delenv(_dl_mod.BAND_READ_CPUS_ENV, raising=False)
+        assert self._budget_with_node({"CPU": 8.0}) == 4  # the mask below
+
+    @staticmethod
+    def _budget_with_node(resources: dict) -> int:
+        import ray
+
+        ctx = SimpleNamespace(get_node_id=lambda: "node-a")
+        with (
+            patch.object(ray, "is_initialized", return_value=True),
+            patch.object(ray, "get_runtime_context", return_value=ctx),
+            patch.object(ray, "nodes", return_value=[{"NodeID": "node-a", "Resources": resources}]),
+            patch.object(_dl_mod.os, "sched_getaffinity", create=True, return_value=set(range(4))),
+        ):
+            return _dl_mod._actor_cpu_budget()
+
+
+class TestBandReadWorkersOnAPackedHost:
+    """What the fair-share fix does and — importantly — does not change."""
+
+    def test_the_production_host_is_unchanged(self, monkeypatch):
+        monkeypatch.setenv(_dl_mod.BAND_READ_CPUS_ENV, "4")  # g6e.xlarge share
+        assert _dl_mod._band_read_workers(0) == 4
+        assert _dl_mod._band_read_workers(2) == 2
+
+    def test_the_fix_is_inert_at_every_g6e_multi_gpu_size(self, monkeypatch):
+        """The band-count cap binds before the CPU budget does, so nothing moves.
+
+        The affinity mask returned the host's 48 cores on a `g6e.12xlarge`, and the
+        fair share is 12. With the background reservation of 2, `min(10, 48-2)` and
+        `min(10, 12-2)` are BOTH 10 — the cap at the band count is what decides. The
+        smallest per-GPU share among the family's multi-GPU sizes is exactly 12, so
+        there is no size at which correcting the budget changes the pool.
+
+        That means the CPU-contention worry — four actors running 10 reader threads
+        each on 48 vCPU — is NOT addressed by this fix, and a report claiming it was
+        would be wrong. Only a budget below 12 changes the answer, which is what
+        :data:`BAND_READ_CPUS_ENV` is for.
+        """
+        for host_share in (12, 24):  # g6e.12xlarge, g6e.24xlarge
+            monkeypatch.setenv(_dl_mod.BAND_READ_CPUS_ENV, str(host_share))
+            fixed = _dl_mod._band_read_workers(2)
+            monkeypatch.setenv(_dl_mod.BAND_READ_CPUS_ENV, "48")  # the naive host reading
+            naive = _dl_mod._band_read_workers(2)
+            assert fixed == naive == len(S2_BAND_ORDER), (host_share, fixed, naive)
+
+    def test_a_lower_budget_is_the_only_lever_that_reduces_readers(self, monkeypatch):
+        """The A/B arm: force an xlarge-sized budget on a packed host and readers drop to 2."""
+        monkeypatch.setenv(_dl_mod.BAND_READ_CPUS_ENV, "4")
+        assert _dl_mod._band_read_workers(2) == 2

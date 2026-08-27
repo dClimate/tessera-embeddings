@@ -2390,3 +2390,40 @@ class TestChunkUid:
         )
         assert za.chunk.label == zb.chunk.label  # labels collide across zones...
         assert za.uid != zb.uid  # ...but the run-qualified uids do not
+
+
+class TestActorRequestOnPackedHosts:
+    """The request recurrence when a host holds FOUR actor slots, not one.
+
+    Every figure in ``TestActorRequestHeadroom`` was measured at one actor per node,
+    where the slot count and the node count are the same number. On a
+    ``g6e.12xlarge`` they differ by four, and the recurrence is driven by slots — so
+    these walk the same loop with a fleet that grows four slots per node.
+    """
+
+    def test_reaches_the_target_four_slots_per_node(self) -> None:
+        """A packed fleet must still converge, and to the same target."""
+        requested, placed, _ = _walk(headroom=25, placeable=250, target=250)
+        assert requested == 250
+        assert placed == 250
+
+    def test_a_packed_capacity_ceiling_stops_the_request_at_the_ceiling(self) -> None:
+        """62 four-GPU nodes place 248 slots; the request must settle there, not run away.
+
+        `placeable` is in SLOTS because that is the unit the decision reads. The
+        property under test is the same one as at one-actor-per-node: the request
+        never runs more than `headroom` ahead of what has actually been placed.
+        """
+        requested, placed, worst_excess = _walk(headroom=25, placeable=248, target=250)
+        assert placed == 248
+        assert worst_excess <= 50, worst_excess
+        assert requested <= 248 + 25
+
+    def test_the_bound_holds_when_the_shortage_lifts(self) -> None:
+        # 20 intervals, not the default 12: the fleet grows one batch per interval
+        # once the shortage lifts, so 12 is simply too few to reach 250 and a shorter
+        # walk would report "did not converge" for arithmetic reasons and not for the
+        # reason the test is about.
+        requested, placed, worst_excess = _walk(headroom=25, placeable=8, target=250, reopens_at=4, intervals=20)
+        assert placed == 250
+        assert worst_excess <= 50, worst_excess

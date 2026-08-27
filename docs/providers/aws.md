@@ -73,6 +73,37 @@ Plus an AMI parameter at the path you pass via `ami_ssm_name`,
 e.g. `/tessera/ray/ami-id`. The AMI ID points at the GPU AMI you've
 baked (see `gotchas.md` for the AMI-bake pattern).
 
+### Optional SSM key: `gpu-worker-ladder`
+
+| Key | Type | Purpose |
+|---|---|---|
+| `gpu-worker-ladder` | String | Per-instance-type GPU worker ceilings, e.g. `g6e.xlarge:100,g6e.2xlarge:150` |
+
+**Absent is the default, and it means the cluster template's node types stand
+exactly as shipped.** Set it and `_resolve_ray_config` rewrites the `max_workers`
+of each on-demand GPU rung from the value, letting you change which EC2 instance
+types a fleet may buy — and how many of each — without a release, a deployment
+re-registration, or an AMI re-bake. Every `g6e` size is the same L40S on x86_64,
+so one AMI serves all of them.
+
+Three properties worth knowing before you set it:
+
+- **It is authoritative, not additive.** A rung the value does not name is set to
+  `0`. So `g6e.2xlarge:150` alone also closes `g6e.xlarge`; name every rung you
+  want the fleet to use.
+- **It refuses rather than warns.** A malformed entry, a repeated instance type,
+  or an instance type no shipped rung offers fails the cluster launch. A ladder
+  that part-applied would grow a fleet nobody asked for.
+- **`max_workers` is the only mechanism that moves Ray's choice.** Ray's
+  autoscaler scores node types purely from their resources; its scorer takes a
+  `node_availability_summary` and never reads it, so an `InsufficientInstanceCapacity`
+  has *no* influence on which type it asks for next. Two consequences:
+  `max_workers: 0` makes a rung genuinely unreachable, and **opening a second rung
+  beside an unrestricted first one buys nothing** — you must lower the first rung's
+  count to push demand onto the second. See `TestRayNodeTypePreference`.
+
+Spot rungs are outside the ladder's domain and are never touched by it.
+
 Populate these with whatever IaC you use:
 
 ```
@@ -158,17 +189,24 @@ Default node config:
 ```
 head:        m5.2xlarge          (8 vCPU, 32 GB)   GCS + autoscaler
 workers:     g6e.xlarge          (4 vCPU, 32 GB,    1 InferenceActor each
-                                  1× L40S 48 GB,
+                                  1× L40S 45,776 MiB,
                                   250 GB NVMe)
 ```
 
-`g6e.xlarge` gives 48 GB VRAM (the Tessera model + working set fit
-with lots of headroom), 250 GB NVMe (fast enough for `torch.load` of
-the checkpoint without EBS stalls), and up to 20 Gbps network for the
-S3-heavy load phase. ~$1.86/hr on-demand at us-west-2; spot varies
-(~$0.5–0.9/hr). Scaling is horizontal — one GPU/actor per worker —
-so bigger instances don't help; note the 4 vCPUs make host-side data
-loading the tight resource per worker.
+The L40S carries **45,776 MiB — 44.7 GiB, or 48.0 GB decimal**. All three numbers
+name the same card; quote the unit, because dropping it has already put the figure
+in our docs two different ways. 250 GB NVMe is fast enough for `torch.load` of the
+checkpoint without EBS stalls, and the NIC is rated "up to 20 Gbps" — a burst
+credit, not a sustained floor — for the S3-heavy load phase. ~$1.86/hr on-demand
+at us-west-2; spot varies (~$0.5–0.9/hr).
+
+Scaling is horizontal: one GPU, one `InferenceActor`. The 4 vCPUs make host-side
+data loading the tight resource per worker, and the template ships two wider
+rungs — `g6e.2xlarge` (8 vCPU, one GPU) and `g6e.12xlarge` (48 vCPU, **four**
+GPUs, so four actors share a host) — both at `max_workers: 0` and both released
+only through `gpu-worker-ladder` above. Neither carries a bigger GPU: every `g6e`
+size is the same L40S, so a wider rung buys capacity in a different EC2 pool and a
+better-fed GPU, never a faster one.
 
 ## Region
 

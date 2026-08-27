@@ -132,7 +132,7 @@ The cluster is managed in a context manager so it automatically tears down after
 
 **Cluster topology:**
 - Head: m5.2xlarge — GCS + autoscaler, no inference work
-- Workers: g6e.xlarge (1× L40S 48 GB VRAM, 4 vCPU, 32 GB RAM) — on-demand, multi-AZ
+- Workers: g6e.xlarge (1× L40S, 45,776 MiB = 44.7 GiB = 48.0 GB VRAM; 4 vCPU, 32 GB RAM) — on-demand, multi-AZ
   (first-listed subnet preferred; Ray fails over across subnets on capacity errors)
 - Workers use a Packer-built AMI with all dependencies pre-installed; boot ready in ~1 minute
 
@@ -142,6 +142,21 @@ One `InferenceActor` (a Ray actor pinned to 1 GPU) is created per worker slot. O
 actor downloads the model checkpoint from S3 to the local NVMe instance store (~1.5 GB/s),
 loads `MultimodalBTInferenceModel`, and logs VRAM usage. A `ping()` call confirms readiness
 before work is dispatched.
+
+**Worker slots are GPUs, not hosts.** On a single-GPU worker type the two are the same
+number, but the template also offers a 4-GPU rung on which four actors share one host.
+Each actor then reports its own host and GPU on every `CHUNK_SUMMARY` line
+(`instance_id`, `gpu`) and sizes its S2 band-read pool from its SHARE of the host rather
+than the whole of it (`data_loading._actor_cpu_budget`). Anything shelling out to
+`nvidia-smi` must pass `-i` with the actor's own accelerator id, because `nvidia-smi`
+ignores `CUDA_VISIBLE_DEVICES` and would otherwise answer for every GPU on the box.
+
+**Per-chunk peak VRAM.** Each chunk resets `torch.cuda.reset_peak_memory_stats()` at its
+start and reports `vram_peak_gib` (`max_memory_allocated` — what live tensors needed),
+`vram_reserved_peak_gib` (`max_memory_reserved` — the caching allocator's pool, which is
+what `nvidia-smi` sees) and `vram_total_gib` on the `CHUNK_SUMMARY` line. Read the peak
+against `t_kept`: VRAM scales with optical depth, so a peak taken over shallow chunks is
+not the requirement.
 
 > **Why NVMe?** EBS sequential read saturates at ~42 MB/s. `torch.load` with mmap on EBS
 > causes multi-minute hangs. NVMe is ~35× faster.

@@ -11,8 +11,18 @@ telemetry (TIMING / RESOURCES / EFFECTIVE-TFLOPS lines) survives in CloudWatch
 (`/ec2/yield-embeddings/ray`); reproduce fleet stats with
 `te-observe-cluster` (`--report`, `--ram-report`).
 
-Hardware: g6e.xlarge — 1× L40S (181 TFLOPS BF16 dense, 46 GB VRAM, 864 GB/s),
-4 vCPU, 30.9 GB usable RAM, 250 GB NVMe. Iowa ROI, 2000×2000 chunks.
+Hardware: g6e.xlarge — 1× L40S (181 TFLOPS BF16 dense, **45,776 MiB = 44.7 GiB
+= 48.0 GB** VRAM, 864 GB/s), 4 vCPU, 30.9 GB usable RAM, 250 GB NVMe. Iowa ROI,
+2000×2000 chunks.
+
+> **Correction (2026-08-27).** This line previously read "46 GB VRAM". That was
+> wrong: 45,776 is the MiB figure `nvidia-smi` and `ec2:describe-instance-types`
+> both report, and it was rounded to 46 and relabelled GB. The card is 44.7 GiB
+> (48.0 GB decimal), verified against `describe-instance-types` in us-west-2 on
+> 2026-08-27. The error is small but it is in the denominator of every "% of the
+> card" figure below, and it mattered once: the L4 and A10G (`g6.*`/`g5.*`) hold
+> 22,888 MiB = 22.4 GiB, so this card is **1.94×** those, not "barely half again".
+> `inference/README.md`'s "48 GB" was correct all along.
 
 ## Headline numbers (final shipped state)
 

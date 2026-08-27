@@ -503,22 +503,104 @@ def _select_device(torch_mod: types.ModuleType, instance_id: str) -> torch.devic
     return device
 
 
+#: Bytes per GiB. Every VRAM figure this module reports is in GiB and says so in its
+#: name, because the alternative has already cost us a wrong number: an L40S is
+#: 45,776 MiB, which is 44.7 GiB and 48.0 GB, and reading the MiB figure as GB is
+#: exactly how the same card came to be recorded as "46 GB" in one design doc and
+#: "48 GB" in the inference README. A capacity question ("does the working set fit
+#: on a 24 GB card?") cannot be answered by a number whose unit is a guess.
+_GIB = 1024**3
+
+
 def _log_vram_breakdown(model: MultimodalBTInferenceModel, torch_mod: types.ModuleType) -> None:
     """Log VRAM usage breakdown after model loading."""
-    allocated = torch_mod.cuda.memory_allocated() / 1024**3
-    reserved = torch_mod.cuda.memory_reserved() / 1024**3
-    total = torch_mod.cuda.get_device_properties(0).total_memory / 1024**3
+    allocated = torch_mod.cuda.memory_allocated() / _GIB
+    reserved = torch_mod.cuda.memory_reserved() / _GIB
+    total = torch_mod.cuda.get_device_properties(0).total_memory / _GIB
     param_bytes = sum(p.nelement() * p.element_size() for p in model.parameters())
     buffer_bytes = sum(b.nelement() * b.element_size() for b in model.buffers())
     logger.info(
-        "VRAM after model load: allocated=%.2f GB, reserved=%.2f GB, total=%.2f GB, "
-        "model params=%.2f GB, model buffers=%.2f GB",
+        "VRAM after model load: allocated=%.2f GiB, reserved=%.2f GiB, total=%.2f GiB, "
+        "model params=%.2f GiB, model buffers=%.2f GiB",
         allocated,
         reserved,
         total,
-        param_bytes / 1024**3,
-        buffer_bytes / 1024**3,
+        param_bytes / _GIB,
+        buffer_bytes / _GIB,
     )
+
+
+def _reset_vram_peak(torch_mod: types.ModuleType | None) -> None:
+    """Zero the caching allocator's peak counters, so the next read is per-chunk.
+
+    Without the reset, ``max_memory_allocated`` is a process-lifetime high-water
+    mark and every chunk after the deepest one reports that chunk's peak. The
+    per-chunk figure is the one that answers a card-capacity question, because
+    VRAM scales with optical depth (``t_kept``) and a maximum taken over shallow
+    chunks understates the requirement by whatever the depth spread is — a 4x
+    spread within one cell is normal.
+
+    No-op off CUDA (``torch_mod`` is ``None`` on the CPU runner).
+    """
+    if torch_mod is None:
+        return
+    torch_mod.cuda.reset_peak_memory_stats()
+
+
+def _vram_peak_fields(torch_mod: types.ModuleType | None) -> dict[str, float]:
+    """Per-chunk peak VRAM, for the ``CHUNK_SUMMARY`` line. Empty dict off CUDA.
+
+    Reports BOTH numbers because they answer different questions and only one of
+    them is a requirement:
+
+    * ``vram_peak_gib`` — ``max_memory_allocated``: the high-water mark of bytes
+      live TENSORS actually held. This is what a smaller card would have to fit.
+    * ``vram_reserved_peak_gib`` — ``max_memory_reserved``: the high-water mark of
+      the caching allocator's pool. The allocator keeps freed blocks rather than
+      returning them to the driver, so this only ever rises and sits above the
+      first. **It is what nvidia-smi sees**, which is why the campaign's only
+      previous VRAM reading — "97% of the card" — is an upper bound on the
+      requirement and not the requirement. The gap between the two IS that
+      overstatement, measured.
+    * ``vram_total_gib`` — the device's own reported capacity, carried on the line
+      so a percentage can be computed against the card the chunk actually ran on
+      rather than against a remembered spec figure.
+
+    Read at chunk end, after :func:`_reset_vram_peak` at chunk start. The window
+    is not perfectly clean and cannot be: the deferred staging write runs on a
+    background thread and the cross-chunk prefetch stages the next chunk's
+    prologue during this one's tail. Both are HOST memory, so neither allocates
+    on the device — but a future change that moved either onto the GPU would
+    silently widen this window, so keep it host-side.
+    """
+    if torch_mod is None:
+        return {}
+    return {
+        "vram_peak_gib": round(torch_mod.cuda.max_memory_allocated() / _GIB, 2),
+        "vram_reserved_peak_gib": round(torch_mod.cuda.max_memory_reserved() / _GIB, 2),
+        "vram_total_gib": round(torch_mod.cuda.get_device_properties(0).total_memory / _GIB, 2),
+    }
+
+
+def _accelerator_index() -> str | None:
+    """This actor's own GPU index on its host, from Ray's assignment. ``None`` if unassigned.
+
+    Ray sets ``CUDA_VISIBLE_DEVICES`` per actor, so TORCH already sees only this
+    actor's device and calls it 0. ``nvidia-smi`` does NOT honour that variable —
+    it reports every GPU on the host — so anything shelling out to it needs the
+    real host-level index, and this is where it comes from. On a one-GPU host the
+    answer is always "0" and the distinction is invisible, which is why the bug it
+    exists to prevent survived until a 4-GPU host was tried.
+
+    Returns the FIRST assigned id as a string: an ``InferenceActor`` reserves
+    exactly one GPU (``num_gpus=1``), so a second id would mean the reservation
+    changed and a single-GPU reader would be wrong anyway.
+    """
+    try:
+        ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
+    except Exception:  # No Ray runtime (local runner, unit tests)
+        return None
+    return str(ids[0]) if ids else None
 
 
 # Host-RAM env vars, all set via runtime_env (not the decorator process) so Ray
@@ -701,9 +783,22 @@ class InferenceActor:
         if self.device.type == "cuda":  # No-op on CPU
             _log_vram_breakdown(self.model, _torch)
 
-        self._resource_monitor = ResourceMonitor(interval_sec=30)
+        # A torch handle for the per-chunk VRAM peak, or None off CUDA so every
+        # reader is a no-op on the CPU runner without repeating the device check.
+        # (torch is imported lazily in this method — see the module docstring —
+        # so there is no module-level name to reach for from _process_chunk.)
+        self._torch: types.ModuleType | None = _torch if self.device.type == "cuda" else None
+        # This actor's GPU index ON THE HOST, which is not always 0: Ray packs one
+        # actor per GPU, so a 4-GPU host runs four actors holding indices 0-3.
+        self.gpu_index = _accelerator_index()
+
+        self._resource_monitor = ResourceMonitor(interval_sec=30, gpu_index=self.gpu_index)
         self._resource_monitor.start()
-        logger.info("InferenceActor ready on instance %s", self.instance_id)
+        logger.info(
+            "InferenceActor ready on instance %s (GPU %s)",
+            self.instance_id,
+            self.gpu_index if self.gpu_index is not None else "n/a",
+        )
 
     def _open_and_plan(
         self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow
@@ -1016,6 +1111,30 @@ class InferenceActor:
         """
         return True
 
+    def _host_fields(self) -> dict[str, Any]:
+        """Host, GPU and peak-VRAM fields common to every ``CHUNK_SUMMARY`` line.
+
+        **``instance_id`` is on the line because the log stream cannot answer a
+        per-host question.** ``CHUNK_SUMMARY`` is attributed by CloudWatch log
+        stream, and one stream is one ECS flow runner — the whole FLEET's chunks
+        share it, so nothing in the telemetry said which of a run's workers did a
+        given chunk. That was invisible while every host held exactly one actor,
+        because the host axis was the actor axis and neither was needed. It stops
+        being invisible the moment a host holds four: a packed host running 15%
+        slow surfaces as a marginally slower cell and nothing else. Ray's log
+        prefix carries ``ip=``, which separates HOSTS but not the actors on one,
+        so the pair here is the minimum that decomposes a packed fleet.
+
+        Every field is additive and every consumer reads by name (``.get()``), so
+        this breaks no parser. Off CUDA the VRAM keys are simply absent, which is
+        the honest encoding — a zero would read as "measured, and it was nothing".
+        """
+        return {
+            "instance_id": self.instance_id,
+            "gpu": self.gpu_index,
+            **_vram_peak_fields(self._torch),
+        }
+
     def get_instance_id(self) -> str:
         """Return the EC2 instance ID this actor is running on."""
         return self.instance_id
@@ -1109,6 +1228,10 @@ class InferenceActor:
         from tessera_embeddings.inference.inference import run_inference
 
         t0 = time.monotonic()
+        # Zero the allocator's peak counters HERE, before this chunk allocates
+        # anything, so the figure the CHUNK_SUMMARY carries is this chunk's peak
+        # and not the run's. See _reset_vram_peak.
+        _reset_vram_peak(self._torch)
         self._resource_monitor.set_context("work", f"{chunk.label}:prologue")
 
         # Progress is tracked by the run-qualified uid, not the bare label: labels
@@ -1492,6 +1615,7 @@ class InferenceActor:
                         t_kept=t_kept,
                         rung=rung,
                         x_crop_w=(x_sub.stop - x_sub.start) if x_sub is not None else None,
+                        **self._host_fields(),
                     ),
                 )
                 return {
@@ -1631,6 +1755,7 @@ class InferenceActor:
                     t_s1_desc=t_s1_desc,
                     rung=rung,
                     x_crop_w=(x_sub.stop - x_sub.start) if x_sub is not None else None,
+                    **self._host_fields(),
                 ),
             )
 
@@ -1669,6 +1794,7 @@ class InferenceActor:
                     status="failed",
                     total_s=round(elapsed, 1),
                     error=str(e)[:200],
+                    **self._host_fields(),
                 ),
             )
             return {
