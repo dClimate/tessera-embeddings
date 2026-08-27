@@ -32,7 +32,7 @@ from tessera_embeddings.config import (
     CollectionConfig,
     STACProvider,
 )
-from tessera_embeddings.config.environment import configure_gdal_environment, configure_odc_rio
+from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.asset_locations import (
@@ -71,16 +71,6 @@ configure_gdal_environment()
 
 import odc.stac  # noqa: E402
 from odc.loader import RioDriver, RioReader  # noqa: E402
-
-# AND AGAIN, THROUGH ODC. `odc.loader.capture_rio_env()` builds its readers' GDAL environment
-# from odc's own config and the active rasterio Env, never from `os.environ`, and falls back to
-# odc's three-entry GDAL_CLOUD_DEFAULTS when both are empty. Until this call, odc NAMED three of
-# our eight read options to its readers and pinned GDAL_HTTP_RETRY_DELAY to its own 0.5 s; the
-# other five reached GDAL only through the process environment the line above sets, which GDAL
-# consults for any option the active Env leaves out. Naming them here is what makes the read path
-# state its own configuration instead of inheriting one -- see
-# `context_docs/design/gdal-read-config-2026_08.md`. Must follow the odc.stac import.
-configure_odc_rio()
 
 # Private, and the only private odc import here. `_resolve_driver` uses a driver's own `md_parser`
 # when it supplies one, so stamping the per-source offset at parse time means subclassing odc's

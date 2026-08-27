@@ -7,11 +7,7 @@ import os
 
 import pytest
 
-from tessera_embeddings.config.environment import (
-    GDAL_READ_OPTIONS,
-    configure_gdal_environment,
-    configure_odc_rio,
-)
+from tessera_embeddings.config.environment import configure_gdal_environment
 
 # Every var configure_gdal_environment sets, with its expected default value.
 EXPECTED_GDAL_VARS = {
@@ -159,47 +155,3 @@ class TestPkgLoggerSetup:
         configure_gdal_environment()
         configure_gdal_environment()
         assert len(restore_pkg_logger.handlers) == 1
-
-
-class TestOperatorOverridesReachTheOdcReader:
-    """odc applies its own three GDAL options as an EXPLICIT rasterio Env, which beats the
-    process environment — so an operator's override of those three was silently ignored on the
-    imagery-read path while appearing to work everywhere else.
-
-    The other five options were never affected: GDAL falls back to the environment for anything
-    odc does not name. An earlier version of this change claimed otherwise and was wrong.
-    """
-
-    def test_no_override_means_no_change_at_all(self, monkeypatch):
-        """The regression guard, and the reason this is safe to ship mid-campaign."""
-        for name in GDAL_READ_OPTIONS:
-            monkeypatch.setenv(name, GDAL_READ_OPTIONS[name])
-        called: list[dict] = []
-        monkeypatch.setattr("odc.stac.configure_rio", lambda **kw: called.append(kw), raising=False)
-        configure_odc_rio()
-        assert called == [], "odc must be left alone when nothing was deliberately overridden"
-
-    def test_a_deliberate_override_is_forwarded(self, monkeypatch):
-        monkeypatch.setenv("GDAL_HTTP_RETRY_DELAY", "0.5")
-        called: list[dict] = []
-        monkeypatch.setattr("odc.stac.configure_rio", lambda **kw: called.append(kw), raising=False)
-        configure_odc_rio()
-        assert called and called[0]["GDAL_HTTP_RETRY_DELAY"] == "0.5"
-        assert "GDAL_HTTP_TIMEOUT" not in called[0], "only the differing option is forwarded"
-
-    def test_an_inherited_default_is_not_mistaken_for_an_override(self, monkeypatch):
-        """A worker inherits our defaults from its parent's environment, so presence cannot
-        distinguish operator from ancestor — only DIFFERENCE can. Without this, every worker
-        would push our values into odc and change the read path by accident.
-        """
-        monkeypatch.setenv("GDAL_HTTP_MAX_RETRY", GDAL_READ_OPTIONS["GDAL_HTTP_MAX_RETRY"])
-        called: list[dict] = []
-        monkeypatch.setattr("odc.stac.configure_rio", lambda **kw: called.append(kw), raising=False)
-        configure_odc_rio()
-        assert called == []
-
-    def test_the_retry_budget_is_not_raised_by_this_change(self):
-        """`MAX_RETRY` stays at its pre-existing 5 rather than adopting odc's 10: the delay is
-        the base of an uncapped doubling ladder, so the two values multiply into wall clock.
-        """
-        assert GDAL_READ_OPTIONS["GDAL_HTTP_MAX_RETRY"] == "5"

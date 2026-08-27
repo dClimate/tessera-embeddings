@@ -1,55 +1,16 @@
 """Environment configuration for GDAL and logging.
 
+Must be called BEFORE importing rasterio/odc.stac to take effect.
+
 Usage:
     from tessera_embeddings.config.environment import configure_gdal_environment
 
     # Must be called before importing rasterio, odc.stac, etc.
     configure_gdal_environment()
-
-**The odc read path ignores three of these, and only three.** ``odc.loader``'s
-``capture_rio_env()`` builds its readers' GDAL environment from odc's own config and the active
-rasterio ``Env``, never from ``os.environ``, and applies it as an EXPLICIT ``Env`` — which beats
-the process environment. But an explicit ``Env`` wins only for the options it NAMES, and GDAL
-resolves the rest through the environment, which :func:`configure_gdal_environment` populates on
-workers as well as clients. So five of the eight were in force at our values all along; the three
-odc names (``GDAL_DISABLE_READDIR_ON_OPEN``, ``GDAL_HTTP_MAX_RETRY``, ``GDAL_HTTP_RETRY_DELAY``)
-ran at odc's, and an operator override of those was silently ignored on the imagery path.
-
-:func:`configure_odc_rio` closes exactly that gap and **changes no default** — see its docstring.
-Context, including the measured retry ladder: ``context_docs/design/gdal-read-config-2026_08.md``.
 """
 
 import logging
 import os
-
-#: GDAL options that must be in force wherever SOURCE IMAGERY is read.
-#:
-#: One definition, consumed twice: :func:`configure_gdal_environment` puts it in the process
-#: environment (for direct rasterio use), and :func:`configure_odc_rio` hands the same dict to
-#: odc, which does not read the environment. Two lists kept in step is how the read path came to
-#: run a configuration nobody had written down.
-GDAL_READ_OPTIONS: dict[str, str] = {
-    # RETRY_DELAY is the BASE of an exponential ladder, not a fixed wait: GDAL roughly doubles
-    # it per attempt and does not cap it, so give-up time scales with BOTH values and is
-    # dominated by the last rung. Measured 2026-08-27 against a server refusing everything:
-    # 0.5, 1.01, 2.07, 4.92, 10.96, 24.82, 52.36, 105.94 s. At 5 s x 10 retries that is ~85 min
-    # for ONE unreadable object, and the S2 coverage gate wraps the read in 8 more attempts.
-    # These two values are therefore a wall-clock budget, not a politeness setting.
-    "GDAL_HTTP_MAX_RETRY": "5",
-    "GDAL_HTTP_RETRY_DELAY": "5",
-    # Per-REQUEST cap, not a cap on the retry ladder above.
-    "GDAL_HTTP_TIMEOUT": "120",
-    # Kill hung connections that stall for 60 s. Named here so it no longer reaches the reader
-    # only as a process-environment fallback; it was already firing on that path.
-    "GDAL_HTTP_LOW_SPEED_LIMIT": "1",
-    "GDAL_HTTP_LOW_SPEED_TIME": "60",
-    # HTTP/2 multiplexing: many range requests over one connection.
-    "GDAL_HTTP_MULTIPLEX": "YES",
-    # Merge adjacent byte ranges into one request.
-    "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
-    # Skip sidecar probes (.aux.xml, .ovr) on open.
-    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-}
 
 
 def configure_gdal_environment() -> None:
@@ -58,18 +19,50 @@ def configure_gdal_environment() -> None:
     Must be called BEFORE importing rasterio/odc.stac to take effect.
     These settings optimize Cloud Optimized GeoTIFF (COG) access from S3/HTTP.
     """
-    # The read-path options, from the one definition above.
-    for name, value in GDAL_READ_OPTIONS.items():
-        os.environ.setdefault(name, value)
+    # EXTRACTION SETTINGS
+
+    # Retry settings for transient network failures (DNS, connection, timeout).
+    #
+    # RETRY_DELAY is the BASE of an exponential ladder, not a fixed wait: GDAL multiplies it
+    # by ~2 after each failure and does not cap it, so give-up time scales with BOTH values
+    # and is dominated by the last rung. Measured 2026-08-27 server-side at base 0.5:
+    # 0.5, 1.01, 2.07, 4.92, 10.96, 24.82, 52.36, 105.94 s. These five retries at base 5 are
+    # ~3 min per unreadable object; TEN would be ~2.5 h, and the S2 coverage gate wraps the
+    # read in 8 further attempts. Treat the pair as a wall-clock budget before changing either.
+    #
+    # NOTE the odc read path does not use these two, nor GDAL_DISABLE_READDIR_ON_OPEN:
+    # `odc.loader.capture_rio_env()` applies its own values as an EXPLICIT rasterio Env, which
+    # beats the process environment. GDAL falls back to the environment for every option odc
+    # does NOT name, so the rest of this function does reach it. See
+    # `context_docs/design/gdal-read-config-2026_08.md`.
+    os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "5")  # Default: 0 (no retries)
+    os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "5")  # Default: 30 seconds
+    os.environ.setdefault("GDAL_HTTP_TIMEOUT", "120")  # Connection timeout in seconds
+
+    # Kill hung connections that stall for 60 seconds
+    os.environ.setdefault("GDAL_HTTP_LOW_SPEED_LIMIT", "1")  # bytes/sec threshold
+    os.environ.setdefault("GDAL_HTTP_LOW_SPEED_TIME", "60")  # seconds below threshold
 
     # PROCESSING SETTINGS
 
     # Use all available CPU cores for GDAL operations (decompression, resampling)
     os.environ.setdefault("GDAL_NUM_THREADS", "ALL_CPUS")
 
+    # Enable HTTP/2 multiplexing - allows multiple range requests over a single
+    # connection, reducing connection overhead when reading many COG chunks
+    os.environ.setdefault("GDAL_HTTP_MULTIPLEX", "YES")
+
+    # Merge consecutive byte range requests into single requests - reduces the
+    # number of HTTP round-trips when reading adjacent chunks
+    os.environ.setdefault("GDAL_HTTP_MERGE_CONSECUTIVE_RANGES", "YES")
+
     # Increase the GDAL block cache to 1GB (default is 5% of RAM, often too small)
     # This cache stores decompressed raster blocks, reducing repeated decompression
     os.environ.setdefault("GDAL_CACHEMAX", "1024")
+
+    # Disable GDAL's directory listing on open - speeds up access to remote files
+    # by skipping sidecar file checks (.aux.xml, .ovr, etc.)
+    os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
 
     # # Useful for local dev - prevents intermittent failures on MacOS
     # os.environ.setdefault("GDAL_HTTP_MULTIPLEX", "NO")
@@ -166,34 +159,3 @@ def code_identity() -> dict | None:
         return identity
     except Exception:
         return None
-
-
-def configure_odc_rio() -> None:
-    """Forward DELIBERATE operator overrides of :data:`GDAL_READ_OPTIONS` to the odc reader.
-
-    odc composes its readers' GDAL environment from its own config and the active rasterio
-    ``Env`` — never from ``os.environ`` — and applies it as an EXPLICIT ``Env``, which beats
-    process environment variables. GDAL still falls back to the environment for anything odc
-    does not name, so all of :data:`GDAL_READ_OPTIONS` already reaches the reader EXCEPT the
-    three odc names itself (``GDAL_DISABLE_READDIR_ON_OPEN``, ``GDAL_HTTP_MAX_RETRY``,
-    ``GDAL_HTTP_RETRY_DELAY``). For those three an operator's environment override was silently
-    ignored on the imagery-read path while appearing to work everywhere else.
-
-    **This changes no default.** Only a value that DIFFERS from our own default is forwarded,
-    which is the signal that a human set it deliberately — and the test that difference survives
-    process inheritance, where a worker's environment carries our defaults down from its parent
-    and "was it in the environment already" cannot tell operator from ancestor.
-    """
-    overrides = {
-        name: os.environ[name]
-        for name, default in GDAL_READ_OPTIONS.items()
-        if os.environ.get(name, default) != default
-    }
-    if not overrides:
-        return
-    # Imported here, not at module scope: this module's contract is that
-    # `configure_gdal_environment()` runs BEFORE rasterio/odc.stac are imported, and
-    # `odc.stac` pulls in rasterio.
-    import odc.stac
-
-    odc.stac.configure_rio(cloud_defaults=True, **overrides)  # type: ignore[arg-type]

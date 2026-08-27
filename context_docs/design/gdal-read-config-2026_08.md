@@ -38,21 +38,29 @@ against a server refusing every request, arrival times recorded server-side:
 ```
 
 Total scales linearly in the base (confirmed at a ratio of 9.99 for a tenfold change). At odc's
-`MAX_RETRY=10`, a base of 5 s gives roughly **85 minutes for ONE unreadable object** — and the S2
+`MAX_RETRY=10`, a base of 5 s gives roughly **2.5 hours for ONE unreadable object** — and the S2
 coverage gate wraps that read in `source_read_retrying()` for 8 more attempts. **These two values
 are a wall-clock budget, not a politeness setting.**
 
-## What shipped
+## What shipped: nothing but this record
 
-**No default changed.** `configure_odc_rio()` forwards to odc only an option whose environment
-value DIFFERS from our own default — the signal that a human set it deliberately. With no override
-present it does nothing, and odc behaves exactly as before.
+**No code change.** The gap is real — an operator's override of the three odc-shadowed options
+never reaches the imagery path — but every way of closing it is worse than leaving it open:
 
-The difference test is what makes this survive process inheritance: a worker's environment carries
-our defaults down from its parent, so "was it in the environment already" cannot tell an operator
-from an ancestor, while "does it differ from our default" can.
+* **Forward options whose value differs from our default.** Breaks for the most likely override
+  there is: an operator setting `GDAL_HTTP_RETRY_DELAY=5`, our own documented default, is
+  indistinguishable from no override at all.
+* **Record provenance before `setdefault()`.** Breaks across process boundaries. A worker inherits
+  our defaults from its parent's environment, so at the moment it runs, every option is already
+  present and would read as operator-supplied — pushing our values into odc on every worker and
+  changing the read path by accident.
+* **A dedicated override interface.** Works, and is a new public knob plus its plumbing, for a
+  capability nobody has yet needed: no incident so far has been handled by tuning GDAL at runtime.
 
-`GDAL_HTTP_MAX_RETRY` stays at **5**, its pre-existing value, rather than adopting odc's 10.
+So the honest outcome is the knowledge, not the code. `config/environment.py` carries a comment
+where someone would go to change these values, saying which three odc shadows and what the ladder
+costs. **Reopen this if an incident is ever actually blocked on tuning one of the three** — that
+is the evidence the dedicated interface would need, and it does not exist yet.
 
 ## Validation
 
