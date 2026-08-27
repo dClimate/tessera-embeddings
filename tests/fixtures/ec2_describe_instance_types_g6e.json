@@ -8,6 +8,139 @@
      "LogicalGpuCount": 1,
      "Manufacturer": "NVIDIA",
      "MemoryInfo": {
+      "SizeInMiB": 22888
+     },
+     "Name": "L4",
+     "Workloads": [
+      "ml-ai",
+      "graphics"
+     ]
+    }
+   ],
+   "TotalGpuMemoryInMiB": 22888
+  },
+  "InstanceType": "g6.xlarge",
+  "MemoryInfo": {
+   "SizeInMiB": 16384
+  },
+  "NetworkInfo": {
+   "NetworkPerformance": "Up to 10 Gigabit"
+  },
+  "VCpuInfo": {
+   "DefaultCores": 2,
+   "DefaultThreadsPerCore": 2,
+   "DefaultVCpus": 4,
+   "ValidCores": [
+    1,
+    2
+   ],
+   "ValidThreadsPerCore": [
+    1,
+    2
+   ]
+  }
+ },
+ {
+  "GpuInfo": {
+   "Gpus": [
+    {
+     "Count": 1,
+     "GpuPartitionSize": 1.0,
+     "LogicalGpuCount": 1,
+     "Manufacturer": "NVIDIA",
+     "MemoryInfo": {
+      "SizeInMiB": 22888
+     },
+     "Name": "L4",
+     "Workloads": [
+      "graphics",
+      "ml-ai"
+     ]
+    }
+   ],
+   "TotalGpuMemoryInMiB": 22888
+  },
+  "InstanceType": "g6.2xlarge",
+  "MemoryInfo": {
+   "SizeInMiB": 32768
+  },
+  "NetworkInfo": {
+   "NetworkPerformance": "Up to 10 Gigabit"
+  },
+  "VCpuInfo": {
+   "DefaultCores": 4,
+   "DefaultThreadsPerCore": 2,
+   "DefaultVCpus": 8,
+   "ValidCores": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "ValidThreadsPerCore": [
+    1,
+    2
+   ]
+  }
+ },
+ {
+  "GpuInfo": {
+   "Gpus": [
+    {
+     "Count": 4,
+     "GpuPartitionSize": 1.0,
+     "LogicalGpuCount": 4,
+     "Manufacturer": "NVIDIA",
+     "MemoryInfo": {
+      "SizeInMiB": 22888
+     },
+     "Name": "L4",
+     "Workloads": [
+      "graphics",
+      "ml-ai"
+     ]
+    }
+   ],
+   "TotalGpuMemoryInMiB": 91552
+  },
+  "InstanceType": "g6.12xlarge",
+  "MemoryInfo": {
+   "SizeInMiB": 196608
+  },
+  "NetworkInfo": {
+   "NetworkPerformance": "40 Gigabit"
+  },
+  "VCpuInfo": {
+   "DefaultCores": 24,
+   "DefaultThreadsPerCore": 2,
+   "DefaultVCpus": 48,
+   "ValidCores": [
+    1,
+    2,
+    3,
+    6,
+    9,
+    12,
+    15,
+    18,
+    21,
+    24
+   ],
+   "ValidThreadsPerCore": [
+    1,
+    2
+   ]
+  }
+ },
+ {
+  "GpuInfo": {
+   "Gpus": [
+    {
+     "Count": 1,
+     "GpuPartitionSize": 1.0,
+     "LogicalGpuCount": 1,
+     "Manufacturer": "NVIDIA",
+     "MemoryInfo": {
       "SizeInMiB": 45776
      },
      "Name": "L40S",
@@ -143,8 +276,8 @@
      },
      "Name": "L40S",
      "Workloads": [
-      "graphics",
-      "ml-ai"
+      "ml-ai",
+      "graphics"
      ]
     }
    ],
@@ -237,8 +370,8 @@
      },
      "Name": "L40S",
      "Workloads": [
-      "graphics",
-      "ml-ai"
+      "ml-ai",
+      "graphics"
      ]
     }
    ],
@@ -284,8 +417,8 @@
      },
      "Name": "L40S",
      "Workloads": [
-      "ml-ai",
-      "graphics"
+      "graphics",
+      "ml-ai"
      ]
     }
    ],
@@ -331,8 +464,8 @@
      },
      "Name": "L40S",
      "Workloads": [
-      "ml-ai",
-      "graphics"
+      "graphics",
+      "ml-ai"
      ]
     }
    ],

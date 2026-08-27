@@ -164,6 +164,64 @@ available_node_types:
         min_workers: 0
         max_workers: 0
 
+    # --- L4 rungs, INERT as shipped, and a DIFFERENT capacity pool ------
+    #
+    # `g6.*` is the NVIDIA L4 at 22,888 MiB (22.4 GiB) — half the L40S's
+    # 45,776 MiB. Same Ada Lovelace generation (SM 8.9) and same x86_64, so the
+    # L40S AMI boots and runs on these unchanged; no re-bake.
+    #
+    # They exist because **the `g6e` family shares ONE capacity pool.** Measured
+    # in us-west-2 on 2026-08-27: every `g6e` size from `xlarge` to `48xlarge`
+    # refused with `InsufficientInstanceCapacity` in all three of our AZs at the
+    # same moment, while `g6.xlarge`, `g6.2xlarge` and `g5.xlarge` launched. So
+    # moving between `g6e` SIZES does not move to a different pool — the pool is
+    # the CARD. Reaching a genuinely different pool means a different card.
+    #
+    # What makes a 22.4 GiB card arguable at all is the per-chunk peak-VRAM
+    # measurement this branch added: `max_memory_allocated` is **7.5 GiB** on a
+    # real chunk at B=7168, not the ~43 GiB the earlier nvidia-smi reading
+    # implied. That reading was the caching allocator's RESERVED pool, which runs
+    # 3x the live requirement and sizes itself to the card it is given.
+    #
+    # `g6.xlarge` is deliberately NOT offered: 16 GiB of host RAM against a
+    # measured ~17.7 GB per-actor requirement is the exact shape that OOMed the
+    # loader before inference on the earlier 16 GB g5-class workers.
+    # `g6.2xlarge` gives 32 GiB, matching `g6e.xlarge`.
+    #
+    # NOT YET A PRODUCTION RECOMMENDATION. Per-GPU throughput on an L4 against
+    # an L40S has not been measured, and the L4 is the smaller part in every
+    # dimension. These rungs were shipped so the host-packing question could be
+    # measured on hardware that could actually be rented.
+    gpu-workers-ondemand-l4-2xl:
+        node_config:
+            InstanceType: g6.2xlarge
+            # INJECT: ImageId, KeyName, SecurityGroupIds, IamInstanceProfile,
+            # SubnetIds, TagSpecifications (same set as head)
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 80
+                      VolumeType: gp3
+        min_workers: 0
+        max_workers: 0
+
+    # Four L4 on one host, 48 vCPU / 192 GiB — 12 vCPU and 48 GiB per actor,
+    # the same per-actor shape as `g6e.12xlarge`. That is what makes it a valid
+    # vehicle for the host-sharing question: the mechanism under test is four
+    # actors contending for one host's CPU and NIC, and that is identical here.
+    gpu-workers-ondemand-l4-12xl:
+        node_config:
+            InstanceType: g6.12xlarge
+            # INJECT: ImageId, KeyName, SecurityGroupIds, IamInstanceProfile,
+            # SubnetIds, TagSpecifications (same set as head)
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 80
+                      VolumeType: gp3
+        min_workers: 0
+        max_workers: 0
+
     # Spot GPU workers (experimental — risk of interruption mid-chunk).
     # Set max_workers > 0 to enable.
     gpu-workers-spot:

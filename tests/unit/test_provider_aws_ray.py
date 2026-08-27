@@ -881,13 +881,16 @@ class TestGpuWorkerLadderApplication:
             for name, nt in cfg["available_node_types"].items()
             if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX)
         }
-        assert sorted(got.values()) == [0, 4, 16]
+        # Named rungs get their counts; every other on-demand GPU rung is closed.
+        assert sorted(v for v in got.values() if v) == [4, 16]
         by_type = {
             nt["node_config"]["InstanceType"]: nt["max_workers"]
             for name, nt in cfg["available_node_types"].items()
             if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX)
         }
-        assert by_type == {"g6e.xlarge": 16, "g6e.2xlarge": 0, "g6e.12xlarge": 4}
+        assert by_type["g6e.xlarge"] == 16
+        assert by_type["g6e.12xlarge"] == 4
+        assert all(v == 0 for t, v in by_type.items() if t not in ("g6e.xlarge", "g6e.12xlarge")), by_type
 
     def test_is_authoritative_not_additive(self) -> None:
         """A rung the ladder does not name is CLOSED, including the shipped default.
@@ -966,7 +969,9 @@ def test_resolve_ray_config_reads_the_ladder_from_ssm() -> None:
         for name, nt in node_types.items()
         if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX)
     }
-    assert by_type == {"g6e.xlarge": 16, "g6e.2xlarge": 0, "g6e.12xlarge": 4}
+    assert by_type["g6e.xlarge"] == 16
+    assert by_type["g6e.12xlarge"] == 4
+    assert all(v == 0 for t, v in by_type.items() if t not in ("g6e.xlarge", "g6e.12xlarge")), by_type
     cleanup_ray_tempfiles(resolved)
 
 
@@ -1234,3 +1239,88 @@ class TestEc2CatalogueArithmetic:
                 assert declared["GPU"] == entry["GpuInfo"]["Gpus"][0]["Count"], name
             checked += 1
         assert checked == 3, "expected head + two single-GPU rungs to declare resources"
+
+
+class TestL4Rungs:
+    """The `g6.*` rungs, and the host-RAM line that decides which of them ship.
+
+    They exist because the `g6e` family shares ONE capacity pool: measured in
+    us-west-2 on 2026-08-27, every `g6e` size refused with
+    `InsufficientInstanceCapacity` in all three of our AZs at the same moment while
+    `g6.xlarge`, `g6.2xlarge` and `g5.xlarge` launched. Moving between `g6e` sizes
+    therefore does not reach a different pool — the pool is the card.
+    """
+
+    def test_both_l4_rungs_ship_unreachable_and_declare_no_resources(self) -> None:
+        node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
+        l4 = {
+            cfg["node_config"]["InstanceType"]: cfg
+            for cfg in node_types.values()
+            if cfg["node_config"]["InstanceType"].startswith("g6.")
+        }
+        assert set(l4) == {"g6.2xlarge", "g6.12xlarge"}
+        for itype, cfg in l4.items():
+            assert cfg["max_workers"] == 0, itype
+            assert "resources" not in cfg, itype
+
+    def test_g6_xlarge_is_deliberately_not_offered(self) -> None:
+        """16 GiB of host RAM against a measured ~17.7 GB per-actor requirement.
+
+        That is the exact shape that OOMed the loader BEFORE inference on the earlier
+        16 GB g5-class workers (`inference/README.md`). `g6.2xlarge` gives 32 GiB,
+        matching `g6e.xlarge`, and is the smallest L4 size that clears the line — so
+        the omission is the whole reason the rung is a `2xlarge`.
+        """
+        node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
+        offered = {cfg["node_config"]["InstanceType"] for cfg in node_types.values()}
+        assert "g6.xlarge" not in offered
+
+        catalogue = {t["InstanceType"]: t for t in _ec2_instance_types()}
+        assert catalogue["g6.xlarge"]["MemoryInfo"]["SizeInMiB"] / 1024 == 16.0
+        assert catalogue["g6.2xlarge"]["MemoryInfo"]["SizeInMiB"] / 1024 == 32.0
+
+    def test_the_l4_pair_has_the_same_per_actor_shape_as_the_l40s_pair(self) -> None:
+        """What makes `g6.12xlarge` a valid vehicle for the host-sharing question.
+
+        The mechanism under test is four actors contending for one host's CPU and
+        NIC. `g6.12xlarge` and `g6e.12xlarge` are both 48 vCPU and 4 GPUs, so each
+        actor's share is identical — 12 vCPU — and only the card differs.
+        """
+        cat = {t["InstanceType"]: t for t in _ec2_instance_types()}
+
+        def shape(t):
+            n = cat[t]["GpuInfo"]["Gpus"][0]["Count"]
+            return cat[t]["VCpuInfo"]["DefaultVCpus"] // n, n
+
+        assert shape("g6.12xlarge") == shape("g6e.12xlarge") == (12, 4)
+
+    def test_the_l4_is_half_the_l40s_and_both_figures_are_named_in_mib(self) -> None:
+        """22,888 MiB vs 45,776 MiB — exactly 2x, and the ratio that matters.
+
+        Quoted in MiB because that is what both `nvidia-smi` and
+        `describe-instance-types` report, and because relabelling the MiB figure as
+        GB is how the L40S came to be recorded as "46 GB".
+        """
+        cat = {t["InstanceType"]: t for t in _ec2_instance_types()}
+        l4 = cat["g6.2xlarge"]["GpuInfo"]["Gpus"][0]
+        l40s = cat["g6e.2xlarge"]["GpuInfo"]["Gpus"][0]
+        assert (l4["Name"], l4["MemoryInfo"]["SizeInMiB"]) == ("L4", 22888)
+        assert (l40s["Name"], l40s["MemoryInfo"]["SizeInMiB"]) == ("L40S", 45776)
+        assert l40s["MemoryInfo"]["SizeInMiB"] == 2 * l4["MemoryInfo"]["SizeInMiB"]
+        assert round(l4["MemoryInfo"]["SizeInMiB"] / 1024, 1) == 22.4
+
+    def test_a_ladder_can_select_the_l4_pair_and_closes_the_l40s_rungs(self) -> None:
+        """The all-L4 experiment shape: both arms on one card, only host sharing differs."""
+        from ray.autoscaler._private.resource_demand_scheduler import get_nodes_for
+
+        node_types = _autodetected_node_types("g6.2xlarge:12,g6.12xlarge:4")
+        closed = {
+            name: cfg["max_workers"]
+            for name, cfg in node_types.items()
+            if cfg["node_config"]["InstanceType"].startswith("g6e.")
+        }
+        assert set(closed.values()) == {0}, closed
+
+        chosen, residual = get_nodes_for(node_types, {}, "head", 600, [ACTOR_BUNDLE] * 28, _scorer())
+        assert dict(chosen) == {"gpu-workers-ondemand-l4-12xl": 4, "gpu-workers-ondemand-l4-2xl": 12}
+        assert residual == []
