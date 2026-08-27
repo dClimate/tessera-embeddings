@@ -7,11 +7,15 @@ import os
 
 import pytest
 
-from tessera_embeddings.config.environment import configure_gdal_environment
+from tessera_embeddings.config.environment import (
+    GDAL_READ_OPTIONS,
+    configure_gdal_environment,
+    configure_odc_rio,
+)
 
 # Every var configure_gdal_environment sets, with its expected default value.
 EXPECTED_GDAL_VARS = {
-    "GDAL_HTTP_MAX_RETRY": "5",
+    "GDAL_HTTP_MAX_RETRY": "10",
     "GDAL_HTTP_RETRY_DELAY": "5",
     "GDAL_HTTP_TIMEOUT": "120",
     "GDAL_HTTP_LOW_SPEED_LIMIT": "1",
@@ -155,3 +159,55 @@ class TestPkgLoggerSetup:
         configure_gdal_environment()
         configure_gdal_environment()
         assert len(restore_pkg_logger.handlers) == 1
+
+
+class TestTheReadOptionsReachTheOdcReader:
+    """The defect this class exists for: setting GDAL options in the ENVIRONMENT does not
+    configure the odc read path, which is where essentially every source byte is read.
+
+    ``odc.loader.capture_rio_env()`` composes its readers' GDAL environment from odc's own config
+    object and the active rasterio ``Env``, and returns ``GDAL_CLOUD_DEFAULTS`` when both are
+    empty. It never consults ``os.environ``. So until ``configure_odc_rio()`` existed, optical
+    reads ran three options instead of eight, with ``GDAL_HTTP_RETRY_DELAY`` at odc's 0.5 s
+    instead of our 5 s and NO hung-connection watchdog — while the repo, its tests and its docs
+    all said otherwise.
+    """
+
+    def test_the_odc_defaults_alone_would_not_carry_our_options(self):
+        """Pins WHAT WAS WRONG, from odc's own constant, so the gap cannot quietly return.
+
+        If a future odc bundles our settings itself this fails, and the fix becomes a smaller
+        override rather than a silent no-op.
+        """
+        from odc.loader._rio import GDAL_CLOUD_DEFAULTS
+
+        assert GDAL_CLOUD_DEFAULTS.get("GDAL_HTTP_RETRY_DELAY") == "0.5", (
+            "odc's default retry delay changed; re-derive the gap this guards"
+        )
+        missing = set(GDAL_READ_OPTIONS) - set(GDAL_CLOUD_DEFAULTS)
+        assert "GDAL_HTTP_LOW_SPEED_LIMIT" in missing
+        assert "GDAL_HTTP_TIMEOUT" in missing
+
+    def test_configure_odc_rio_puts_every_read_option_in_the_captured_env(self):
+        """The fix, asserted where it has to be true: the env odc SHIPS TO ITS READERS."""
+        from odc.loader._rio import capture_rio_env
+
+        configure_odc_rio()
+        env = capture_rio_env()
+        for name, value in GDAL_READ_OPTIONS.items():
+            assert env.get(name) == value, f"{name} did not reach the odc reader: {env.get(name)!r}"
+
+    def test_our_retry_delay_beats_odc_s(self):
+        """Merge order is `{**GDAL_CLOUD_DEFAULTS, **ours}`, so ours must win — a 0.5 s retry
+        against a sustained burst of HTTP 500s exhausts the budget in about five seconds.
+        """
+        from odc.loader._rio import capture_rio_env
+
+        configure_odc_rio()
+        assert capture_rio_env()["GDAL_HTTP_RETRY_DELAY"] == "5"
+
+    def test_the_environment_still_carries_them_too(self):
+        """Both consumers, one definition: direct rasterio use reads the environment."""
+        configure_gdal_environment()
+        for name, value in GDAL_READ_OPTIONS.items():
+            assert os.environ.get(name) == value
