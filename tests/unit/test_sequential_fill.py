@@ -1168,49 +1168,50 @@ def test_the_cap_is_not_derived_from_look_ahead():
     assert waited == 6, f"the cap must be the one passed, not look_ahead + 2; admitted {waited}"
 
 
-def test_hitting_the_cap_ends_the_run_without_draining_the_assembly_queue():
-    """A cap trip ENDS the run instead of draining it — asserted by the CLOCK.
+def test_a_cap_trip_drops_the_assembly_queue_but_waits_for_the_running_one():
+    """Both halves, because they pull in opposite directions and review caught me taking only one.
 
-    The point of stopping is to get the unattempted cells back to the driver for
-    re-dispatch, and draining first delays exactly that: measured 2026-08-27, cells whose
-    optical leg had died stayed open for HOURS behind work that could not change the
-    outcome. Mosaics and staged tiles are retained, so a re-dispatch resumes rather than
-    rebuilds — which is what makes abandoning the queue cheap enough to be right.
+    DROP THE QUEUE: that is where the hours are, and those cells are being handed back anyway.
 
-    Asserted by finishing while an assembly is STILL BLOCKED: if the run drained, it could
-    not have returned. A timing assertion is used because "did not wait" has no other
-    observable — the executor's shutdown arguments are not visible from here.
+    WAIT FOR THE RUNNING ONE: it may be mid-commit. Returning without it lets that thread
+    publish and then delete a mosaic after the flow has torn down its inputs — potentially
+    after the driver has already re-dispatched the same cell — racing publication against
+    cleanup and breaking the single-finalizer invariant that keeps two commits off one zone
+    group. My first version asserted the opposite (that the run returns while an assembly is
+    still blocked) and was wrong.
     """
-    release = threading.Event()  # never set until the run has already returned
-    entered = threading.Event()
+    entered: list[int] = []
+    release = threading.Event()
+    gate = threading.Event()
 
     def blocking_assemble(handoff, *a, **k):
-        entered.set()
-        release.wait(timeout=30)
+        entered.append(1)
+        if len(entered) == 1:
+            gate.set()
+            release.wait(timeout=30)  # still running when the cap trips
         return _assemble()(handoff, *a, **k)
 
     class _FailAfter(RecordingInputs):
-        """Succeeds for the first two cells so assemblies actually QUEUE, then fails —
-        which is what lets a cap trip and a non-empty assembly queue coexist.
+        """Five cells succeed so a real assembly QUEUE forms behind the blocked one, then
+        every later cell fails so the cap can trip with that queue outstanding.
         """
 
         def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
             with self._lock:
                 self.events.append(f"wait:{zone}")
                 n = len([e for e in self.events if e.startswith("wait:")])
-            if n > 2:
+            if n > 5:
                 raise RuntimeError(f"ingest failed for {zone}-{year}")
 
     events: list[str] = []
-    inputs = _FailAfter(events)
-    done = threading.Event()
     box: list[BaseException] = []
+    done = threading.Event()
 
     def go():
         try:
             _run(
                 _cells(8),
-                inputs=inputs,
+                inputs=_FailAfter(events),
                 look_ahead=1,
                 max_retained_failures=2,
                 attempts_per_cell_in_cluster=1,
@@ -1222,7 +1223,14 @@ def test_hitting_the_cap_ends_the_run_without_draining_the_assembly_queue():
             done.set()
 
     threading.Thread(target=go, daemon=True).start()
-    finished = done.wait(timeout=15)
+    gate.wait(timeout=10)  # an assembly is running
+    assert not done.is_set(), "the run must NOT return while an assembly is still committing"
     release.set()
-    assert finished, "the run drained the assembly queue instead of ending at the cap"
+    assert done.wait(timeout=20), "the run must finish once the running assembly completes"
     assert box and isinstance(box[0], RuntimeError)
+    # NOT asserted: exactly how many queued assemblies were cancelled. `cancel_futures` only
+    # cancels futures the executor has not started, so the count depends on how far the single
+    # finalizer thread got before the cap tripped — real scheduling, not our contract. The
+    # contract worth pinning is the SAFETY one above: the run does not return while an assembly
+    # is committing. The queue drop is a throughput property and `shutdown(cancel_futures=True)`
+    # is the whole of its implementation.

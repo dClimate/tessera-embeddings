@@ -771,6 +771,12 @@ def fill_zones_sequential(
         # finalize the run, which is a teardown, not a pause. This is the same site and the
         # same contract the starvation drill withholds from, which is what makes the
         # "actors stay, nothing fails" property tested rather than hoped for.
+        # A cap trip is EXHAUSTION, not a pause: `None` retires the actors and finalises the
+        # run, which is exactly what is wanted. Without this the feeder's `stop` only unwound
+        # the ingest wait, while `_prepared_zone()` kept handing out every zone already in
+        # `ready` -- hours of further inference after the run had decided to give up.
+        if cap_tripped:
+            return None
         if paused is not None and paused():
             return []
         # The fault takes the source as a CALLABLE, so a withheld poll never asks for a
@@ -831,10 +837,18 @@ def fill_zones_sequential(
             # rebuilds -- the cost is bounded to whatever the one running assembly loses, and
             # even that re-stages rather than re-infers.
             log.warning(
-                "Cap trip: abandoning the assembly queue so the driver can re-dispatch now. "
-                "Mosaics and staged tiles are retained; a re-run resumes from them."
+                "Cap trip: dropping the assembly QUEUE so the driver can re-dispatch now, and "
+                "waiting out the one assembly already running. Mosaics and staged tiles are "
+                "retained; a re-run resumes from them."
             )
-            finalizer.shutdown(wait=False, cancel_futures=True)
+            # `wait=True`, deliberately. `cancel_futures` drops the QUEUE, which is the part
+            # worth abandoning. The RUNNING assembly must be waited out: it may be mid-commit,
+            # and returning without it lets that thread publish and then delete a mosaic after
+            # the flow has torn down its inputs -- potentially after the driver has already
+            # re-dispatched the same cell. That races publication against cleanup and breaks
+            # the single-finalizer-thread invariant that keeps two commits off one zone group.
+            # The saving is the queue, which is where the hours are; the running assembly is one.
+            finalizer.shutdown(wait=True, cancel_futures=True)
         else:
             finalizer.shutdown(wait=True)
 
@@ -886,7 +900,13 @@ def fill_zones_sequential(
         except Exception:
             log.warning("Could not cancel queued ingests before the retry pass", exc_info=True)
 
-    for attempt in range(2, attempts_per_cell_in_cluster + 1):
+    # A cap trip means GIVE THE CELLS BACK, so the in-child retry pass is skipped outright.
+    # Running it would sequentially re-attempt up to `max_retained_failures` cells -- hours,
+    # against the systematic fault that tripped the cap in the first place -- and every input
+    # retry would dispatch a fresh ingest only to abort on `stop`. That is the opposite of the
+    # immediate re-dispatch this trip exists to trigger.
+    attempts = 1 if cap_tripped else attempts_per_cell_in_cluster
+    for attempt in range(2, attempts + 1):
         with lock:
             # Cells the feeder never admitted are recorded as failures so the run
             # REPORTS them, but they are not retry candidates: the feeder stopped
