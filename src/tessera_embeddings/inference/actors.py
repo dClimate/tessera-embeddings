@@ -628,6 +628,12 @@ def _coverage_record(
             "CUBLAS_WORKSPACE_CONFIG": ":16:8",
             "MALLOC_ARENA_MAX": "2",
             "MALLOC_TRIM_THRESHOLD_": "0",
+            # Segment-backed allocation, so the caching allocator GROWS a segment instead of
+            # reserving a fresh larger one and stranding the old. Read once when the allocator
+            # is built, which is why it rides on runtime_env with the rest. On the L40S it stops
+            # the reserved pool drifting to ~95% of the card to hold a <9 GB working set --
+            # measured 42.2 GB reserved for a chunk whose real need was 8.99 GB.
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         }
     }
 )
