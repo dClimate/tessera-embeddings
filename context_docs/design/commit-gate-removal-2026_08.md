@@ -120,14 +120,31 @@ forward, for a human to choose:
 every option, and a genuine chunk conflict still raises `RebaseFailedError` rather than being
 masked — so the failure mode of getting this wrong is a slower commit, not a torn one.
 
-## When to put it back
+## The threshold, in cluster counts
 
-Reopen if simultaneous committers can approach **16**, since that is where run 1 breached its own
-acceptance bar. Concretely, that means any of:
+Run 1 breached its own <=2x-serial acceptance bar at **16 simultaneous committers**. The fleet's
+committer ceiling is **2N** in `max_parallel_clusters`, because a cluster's feeder can commit a
+terminal plan inside `plan()` while its trailing-assembly thread commits a cell. So:
 
-* `max_parallel_clusters` above ~12 (the fleet's true committer ceiling is ~2N, because a cluster's
-  feeder can also commit a terminal plan inside `plan()`);
-* more than one cluster owning the same zone, which would put two committers on one store;
+| `max_parallel_clusters` | committer ceiling (2N) | versus the N>=16 breach |
+|---:|---:|---|
+| 7 | 14 | below — safe |
+| **8** | **16** | **AT the breach** |
+| 10 (the default) | 20 | above |
+| 16 | 32 | far above |
+
+**So the boundary is `max_parallel_clusters` >= 8, and the safe cap is <= 7.**
+
+**Corrected in place: this section first said "`max_parallel_clusters` above ~12", which is
+arithmetically wrong** — 2N reaches 16 at N=8, not N=12, so it would have left every configuration
+from 8 to 12 at or above the breach with no gate. Caught in review. It also contradicted the `<= 7`
+bound stated in the options above, inside this same document: **I swept the withdrawn premise but
+did not re-check the arithmetic that depended on it**, which is exactly the failure mode a sweep is
+supposed to prevent.
+
+Two other conditions would also put committers back in contention regardless of N:
+
+* more than one cluster owning the same zone, which would put two committers on one zone group;
 * a change making assembly commit per-shard or per-tile rather than once per zone-year.
 
 The cheap detector is already in the telemetry: **`commit_s` in `ASSEMBLY_SUMMARY`.** It includes
