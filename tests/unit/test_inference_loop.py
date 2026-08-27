@@ -330,3 +330,49 @@ class TestPipelinedGpuLoop:
         # Same ops, same order, same stream → bit-identical int8 and scales.
         np.testing.assert_array_equal(pipelined.embeddings, serial.embeddings)
         np.testing.assert_array_equal(pipelined.scales, serial.scales)
+
+
+class TestCardCeilings:
+    """The per-card ceiling behind the EFFECTIVE TFLOPS line's verdict.
+
+    The line used to hardcode the L40S's numbers and grade against absolute
+    TFLOPS bands, which mislabels any other card: an A10G doing respectable work
+    lands near 26 TFLOPS and the old `<12 poor / >20 active` bands would have
+    called that saturated while calling a starved L40S the same.
+    """
+
+    def test_the_longest_matching_card_name_wins(self) -> None:
+        """`"NVIDIA L40S"` contains `"L4"`, and resolving it to the L4 entry would
+        understate the card's ceiling by 3x and its bandwidth by 2.9x."""
+        from tessera_embeddings.inference.profiling import _card_ceiling
+
+        assert _card_ceiling("NVIDIA L40S")[0] == "L40S"
+        assert _card_ceiling("NVIDIA L4")[0] == "L4"
+        assert _card_ceiling("NVIDIA A10G")[0] == "A10G"
+
+    def test_an_unknown_card_returns_none_rather_than_a_default(self) -> None:
+        """A wrong ceiling turns a saturated GPU into "poor utilization", or the reverse."""
+        from tessera_embeddings.inference.profiling import _card_ceiling
+
+        assert _card_ceiling("NVIDIA H100 80GB HBM3") is None
+
+    def test_the_verified_bandwidth_figures(self) -> None:
+        """AWS publishes no GPU memory bandwidth at all, so these came from the
+        vendors' datasheets and are the load-bearing half of the table."""
+        from tessera_embeddings.inference.profiling import _CARD_CEILINGS
+
+        assert _CARD_CEILINGS["L40S"][1] == 864.0
+        assert _CARD_CEILINGS["A10G"][1] == 600.0
+        assert _CARD_CEILINGS["L4"][1] == 300.0
+
+    def test_the_ceiling_is_the_figure_that_cannot_be_exceeded(self) -> None:
+        """A measured A10G reached 35.9 TFLOPS against a halved (FP32-accumulate)
+        figure of 35.0, which cannot happen — so the table carries the vendor's
+        quoted dense figure instead, and the fraction is an index, not a
+        utilisation. Pinned so a future 'correction' back to the halved values
+        has to argue with this."""
+        from tessera_embeddings.inference.profiling import _CARD_CEILINGS
+
+        assert _CARD_CEILINGS["A10G"][0] == 70.0
+        assert _CARD_CEILINGS["L4"][0] == 121.0
+        assert _CARD_CEILINGS["L40S"][0] == 362.0

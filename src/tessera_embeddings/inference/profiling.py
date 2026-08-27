@@ -18,26 +18,37 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: Per-card BF16 dense ceiling **with FP32 accumulation** (TFLOPS) and memory
-#: bandwidth (GB/s), keyed by a substring of ``torch.cuda.get_device_name``.
-#:
-#: **The accumulate mode is the whole reason this table exists rather than a
-#: literal.** Vendor spec sheets quote the FP16-ACCUMULATE rate for Ada and
-#: Ampere consumer silicon — L40S 362, L4 121, A10G 70 — and every one of those
-#: cards runs FP32 accumulation at HALF that. Autocast bf16 matmuls accumulate in
-#: FP32, so the halved figure is the only comparable ceiling, and mixing the two
-#: conventions makes an L4 look twice as capable as it is.
+#: Per-card BF16 dense tensor ceiling (TFLOPS, **as the vendor quotes it**) and
+#: memory bandwidth (GB/s), keyed by a substring of ``torch.cuda.get_device_name``.
 #:
 #: Bandwidth is from the vendors' own datasheets (nvidia.com product pages for
 #: L40S and L4; the NVIDIA/AWS A10G datasheet, Feb 2022) because AWS does not
-#: publish it — ``ec2:describe-instance-types`` gives GPU name, count and VRAM
-#: size only. The two columns are ordered OPPOSITELY between the L4 and the A10G,
-#: which is what makes those two cards a test of which one binds.
+#: publish it at all — ``ec2:describe-instance-types`` gives GPU name, count and
+#: VRAM size only. **These three figures are load-bearing and were verified**:
+#: L40S 864, A10G 600, L4 300 GB/s. The two columns are ordered OPPOSITELY
+#: between the L4 and the A10G, which is what makes that pair a test of which
+#: resource binds.
+#:
+#: **Read the TFLOPS fraction as an index, not as a utilisation**, for two
+#: reasons that could not be resolved from the outside:
+#:
+#: * The quoted figure is the FP16-ACCUMULATE rate on Ada and Ampere consumer
+#:   silicon, and autocast bf16 matmuls accumulate in FP32 — nominally half. But
+#:   a measured A10G reached 35.9 TFLOPS against a halved figure of 35.0, which
+#:   cannot happen, so either the halving does not apply to this part or
+#:   :func:`transformer_flops` overstates the work. Unresolved, so the table
+#:   carries the figure that CANNOT be exceeded.
+#: * :func:`transformer_flops` counts attention analytically at full T-squared;
+#:   a fused attention kernel does less arithmetic than that.
+#:
+#: So a rising fraction means "more of this card's arithmetic capability in use"
+#: and the fractions are comparable BETWEEN CARDS only loosely. The verdict bands
+#: below are calibrated on the L40S fleet's own history, not on physics.
 _CARD_CEILINGS: dict[str, tuple[float, float]] = {
-    "L40S": (181.0, 864.0),
-    "L4": (60.5, 300.0),
-    "A10G": (35.0, 600.0),
-    "T4": (32.5, 320.0),
+    "L40S": (362.0, 864.0),
+    "L4": (121.0, 300.0),
+    "A10G": (70.0, 600.0),
+    "T4": (65.0, 320.0),
 }
 
 
@@ -237,9 +248,9 @@ def log_effective_tflops(
 
     Compares against GPU theoretical peaks to determine hardware utilization.
     The ceiling and the verdict come from :data:`_CARD_CEILINGS`, keyed on the
-    live device name, so the line is right on whatever card it runs on. Every
-    entry there is BF16 dense **with FP32 accumulation** — the mode autocast
-    bf16 actually uses, and half what the vendor spec sheets quote.
+    live device name, so the line is right on whatever card it runs on. Read the
+    fraction as an index of arithmetic engagement rather than a true utilisation
+    — see that table for the two reasons it cannot be one.
 
     Only counts transformer layer FLOPs (attention + FFN) via
     :func:`transformer_flops`. ``seq_len`` is the S2 backbone's sequence length;
@@ -277,7 +288,7 @@ def log_effective_tflops(
     logger.debug(
         "EFFECTIVE TFLOPS: %.2f TFLOPS (transformer layers only) | "
         "forward=%.1fms | effective_batch=%d | "
-        "ceiling: %s BF16~%.1f TFLOPS dense FP32-accum, %.0f GB/s | frac=%.2f | verdict=%s",
+        "ceiling: %s BF16~%.0f TFLOPS dense as quoted, %.0f GB/s | frac=%.2f | verdict=%s",
         effective_tflops,
         forward_ms,
         effective_batch,
@@ -287,12 +298,14 @@ def log_effective_tflops(
         fraction,
         # Graded as a FRACTION of the card's own ceiling, not against absolute
         # TFLOPS bands. The old thresholds (>20 ACTIVE, <12 poor) were L40S
-        # numbers: an A10G at its 35-TFLOPS ceiling would score ~16 and be
-        # reported as "FP32 range or poor utilization" while being perfectly
-        # saturated. A fraction is the only form that transfers between cards.
+        # numbers: an A10G doing perfectly respectable work scores ~16 and would
+        # have been reported as "FP32 range or poor utilization". A fraction is
+        # the only form that transfers between cards at all. The bands are the
+        # old L40S ones divided by its quoted 362, so an L40S grades exactly as
+        # before and another card is graded on the same relative scale.
         "BF16 tensor cores ACTIVE"
-        if fraction > 0.11
+        if fraction > 0.055
         else "FP32 range or poor utilization"
-        if fraction < 0.066
+        if fraction < 0.033
         else "PARTIAL — tensor cores engaged but below expected range",
     )
