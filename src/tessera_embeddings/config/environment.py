@@ -11,12 +11,18 @@ almost every source byte is read. ``odc.loader``'s ``capture_rio_env()`` builds 
 environment it ships to its readers from its own config object and the *active rasterio Env* —
 it never consults ``os.environ`` — and when both are empty it returns ``GDAL_CLOUD_DEFAULTS``:
 just ``GDAL_DISABLE_READDIR_ON_OPEN``, ``GDAL_HTTP_MAX_RETRY=10`` and
-``GDAL_HTTP_RETRY_DELAY=0.5``. Every other option below was silently absent from optical reads,
-and the two that were present ran at odc's values rather than ours.
+``GDAL_HTTP_RETRY_DELAY=0.5``.
 
-:data:`GDAL_READ_OPTIONS` is therefore the single source of truth, and
-:func:`configure_odc_rio` is what makes it reach the reader. See
-``context_docs/design/gdal-read-config-2026_08.md``.
+An explicit rasterio ``Env`` wins **only for the options it names**. GDAL resolves anything the
+Env leaves out through the process environment, which :func:`configure_gdal_environment` had
+already populated — on the worker as well as the client, because the read task carries a driver
+class defined in :mod:`tessera_embeddings.ingest.stac` and unpickling it executes that module.
+So the five options odc does not name were in force at our values all along, and the one value
+this changes on the read path is ``GDAL_HTTP_RETRY_DELAY``, which odc pinned to its own 0.5 s.
+
+:data:`GDAL_READ_OPTIONS` is nevertheless the single source of truth, and
+:func:`configure_odc_rio` is what stops the read path depending on a fallback nobody had written
+down. See ``context_docs/design/gdal-read-config-2026_08.md``.
 """
 
 import logging
@@ -29,15 +35,19 @@ import os
 #: odc, which does not read the environment. Two lists kept in step is how the read path came to
 #: run a configuration nobody had written down.
 GDAL_READ_OPTIONS: dict[str, str] = {
-    # Retries for transient network failures. RETRY_DELAY matters more than it looks: odc's
-    # default is 0.5 s, so a burst of HTTP 500s outlasting ~5 s exhausted the budget and failed
-    # the date. Measured 2026-08-27: 2,120 HTTP 500 and 174 HTTP 503 from S3 us-west-2 in 90
-    # minutes, every one retried at 0.5 s.
+    # Retries for transient network failures. RETRY_DELAY is the BASE of an exponential ladder,
+    # not a fixed wait: GDAL roughly doubles it per attempt, so the give-up time is dominated by
+    # the last rung and scales linearly in this value. Raising it from odc's 0.5 s therefore buys
+    # an order of magnitude more patience per object -- and costs the same order of magnitude in
+    # wall clock when the object is unreadable. The measured ladder and what it does to the leg
+    # budget are in ``context_docs/design/gdal-read-config-2026_08.md``; read that before tuning
+    # either of the next two lines.
     "GDAL_HTTP_MAX_RETRY": "10",
     "GDAL_HTTP_RETRY_DELAY": "5",
+    # Per-REQUEST cap, not a cap on the retry ladder above.
     "GDAL_HTTP_TIMEOUT": "120",
-    # Kill hung connections that stall for 60 s. Absent from the odc path entirely until now,
-    # which is why no `Operation too slow` or CURL error ever appeared in a read failure.
+    # Kill hung connections that stall for 60 s. Named here so it no longer reaches the reader
+    # only as a process-environment fallback; it was already firing on that path.
     "GDAL_HTTP_LOW_SPEED_LIMIT": "1",
     "GDAL_HTTP_LOW_SPEED_TIME": "60",
     # HTTP/2 multiplexing: many range requests over one connection.
@@ -171,8 +181,13 @@ def configure_odc_rio() -> None:
     ``odc.loader``'s ``capture_rio_env()`` builds the GDAL environment for its readers from its
     own config object and the active rasterio ``Env``, and falls back to ``GDAL_CLOUD_DEFAULTS``
     when both are empty. Nothing in that path looks at ``os.environ``, so
-    :func:`configure_gdal_environment` alone left optical reads running three options instead of
-    eight — with ``GDAL_HTTP_RETRY_DELAY`` at odc's 0.5 s rather than ours.
+    :func:`configure_gdal_environment` alone left odc *naming* three of our options rather than
+    eight, with ``GDAL_HTTP_RETRY_DELAY`` pinned to odc's 0.5 s rather than ours.
+
+    The other five still reached GDAL, via the process environment it consults for any option the
+    active ``Env`` does not name. This call ends that dependency: an option only the environment
+    carries is one a future odc release, or any caller that opens its own ``Env``, can displace
+    without a word.
 
     ``configure_rio(cloud_defaults=True, **opts)`` merges as ``{**GDAL_CLOUD_DEFAULTS, **opts}``,
     so our values win and odc's remain as the base for anything we do not name.

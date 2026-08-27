@@ -167,10 +167,16 @@ class TestTheReadOptionsReachTheOdcReader:
 
     ``odc.loader.capture_rio_env()`` composes its readers' GDAL environment from odc's own config
     object and the active rasterio ``Env``, and returns ``GDAL_CLOUD_DEFAULTS`` when both are
-    empty. It never consults ``os.environ``. So until ``configure_odc_rio()`` existed, optical
-    reads ran three options instead of eight, with ``GDAL_HTTP_RETRY_DELAY`` at odc's 0.5 s
-    instead of our 5 s and NO hung-connection watchdog — while the repo, its tests and its docs
-    all said otherwise.
+    empty. It never consults ``os.environ``. So until ``configure_odc_rio()`` existed, odc named
+    three of our eight options to its readers and pinned ``GDAL_HTTP_RETRY_DELAY`` to its own
+    0.5 s instead of our 5 s — while the repo, its tests and its docs all said otherwise.
+
+    The other five were not absent from the read path: GDAL consults the process environment for
+    any option the active ``Env`` leaves out, and
+    :func:`~tessera_embeddings.config.environment.configure_gdal_environment` had set them there.
+    ``test_gdal_falls_back_to_the_environment_for_options_odc_omits`` pins that, because it is the
+    fact that decides how much of this file's premise is about a live defect and how much is about
+    not depending on a fallback.
     """
 
     def test_the_odc_defaults_alone_would_not_carry_our_options(self):
@@ -198,8 +204,10 @@ class TestTheReadOptionsReachTheOdcReader:
             assert env.get(name) == value, f"{name} did not reach the odc reader: {env.get(name)!r}"
 
     def test_our_retry_delay_beats_odc_s(self):
-        """Merge order is `{**GDAL_CLOUD_DEFAULTS, **ours}`, so ours must win — a 0.5 s retry
-        against a sustained burst of HTTP 500s exhausts the budget in about five seconds.
+        """Merge order is `{**GDAL_CLOUD_DEFAULTS, **ours}`, so ours must win.
+
+        This is the one value on the odc read path that this change actually moves: odc names
+        ``GDAL_HTTP_RETRY_DELAY``, so its 0.5 s displaced ours no matter what the environment said.
         """
         from odc.loader._rio import capture_rio_env
 
@@ -211,3 +219,35 @@ class TestTheReadOptionsReachTheOdcReader:
         configure_gdal_environment()
         for name, value in GDAL_READ_OPTIONS.items():
             assert os.environ.get(name) == value
+
+    def test_gdal_falls_back_to_the_environment_for_options_odc_omits(self, monkeypatch):
+        """An explicit rasterio ``Env`` displaces the environment ONLY for the keys it names.
+
+        Reconstructs the pre-fix read path — odc's three-entry env applied as an explicit ``Env``,
+        with our options in ``os.environ`` — and asks GDAL what it would use. The option odc names
+        comes back as odc's; the ones it omits come back as ours. That is why five of the eight
+        were never absent from optical reads, and why removing one from
+        :data:`~tessera_embeddings.config.environment.GDAL_READ_OPTIONS` is a behaviour change
+        rather than a revert: the same constant fills the environment.
+
+        Pins GDAL's behaviour, not ours. If a GDAL release stops consulting the environment, the
+        "before" state of this change becomes the one the plan originally assumed, and this fails.
+        """
+        from odc.loader._rio import GDAL_CLOUD_DEFAULTS, rio_env
+        from rasterio._env import get_gdal_config
+
+        for name, value in GDAL_READ_OPTIONS.items():
+            monkeypatch.setenv(name, value)
+
+        with rio_env(**GDAL_CLOUD_DEFAULTS):
+            named = str(get_gdal_config("GDAL_HTTP_RETRY_DELAY"))
+            omitted = {
+                name: str(get_gdal_config(name)) for name in GDAL_READ_OPTIONS if name not in GDAL_CLOUD_DEFAULTS
+            }
+
+        assert named == GDAL_CLOUD_DEFAULTS["GDAL_HTTP_RETRY_DELAY"], (
+            "odc names this one, so its value must displace the environment's"
+        )
+        assert omitted == {
+            name: value for name, value in GDAL_READ_OPTIONS.items() if name not in GDAL_CLOUD_DEFAULTS
+        }, f"GDAL no longer falls back to the environment: {omitted}"
