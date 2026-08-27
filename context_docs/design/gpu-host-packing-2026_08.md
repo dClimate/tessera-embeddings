@@ -473,20 +473,22 @@ the `total_s` ratios, which points at the GPU rather than at I/O.
 
 **The number the plan asked for does not exist yet, and the reason is the finding.**
 
-`g6e.12xlarge` could not be bought in the dev account at any point during the attempt. Two
-probe rounds 28 minutes apart, each covering all three AZs, refused every `g6e` size — and
-by the second round `g6e.xlarge` and `g6e.2xlarge` refused too, so **no `g6e` experiment of
-any kind was runnable**, including the 1-GPU CPU-feed comparison that would otherwise be the
-fallback. The control arm's own fleet is the same evidence from the other side: it reached 3
-of 12 requested `g6e.xlarge` workers in 20 minutes, against a fleet that normally fills in
-about two.
+`g6e.12xlarge` could not be bought in the dev account at any point during the attempt.
+**Four probe rounds spanning 17:14 to 17:49 UTC**, each covering all three AZs, refused every
+`g6e` size — and from the second round on, `g6e.xlarge` and `g6e.2xlarge` refused too, so
+**no `g6e` experiment of any kind was runnable**, including the 1-GPU CPU-feed comparison
+that would otherwise be the fallback. The control arm's own fleet is the same evidence from
+the other side: it reached 3 of 12 requested `g6e.xlarge` workers in 20 minutes, against a
+fleet that normally fills in about two.
 
 What remains to run, unchanged, the moment `g6e` capacity returns:
 
 1. `g6e.xlarge` control arm for the noise floor — **already done at 4.3%**, and reusable.
-2. `g6e.xlarge` + `g6e.12xlarge` on one queue via `gpu-worker-ladder`, which is now proven
-   to produce exactly that shape (the autoscaler asked for 4 × 4-GPU and 8 × 1-GPU from one
-   SSM key, with no re-registration).
+2. `g6e.xlarge` + `g6e.12xlarge` on one queue via `gpu-worker-ladder`. The mechanism is
+   proven: with the L4 pair named, one SSM key made the autoscaler ask for exactly
+   `4 × gpu-workers-ondemand-l4-12xl` and `8 × gpu-workers-ondemand-l4-2xl`, with no release
+   and no re-registration. The key is already set to the `g6e` shape
+   (`g6e.xlarge:8,g6e.12xlarge:2`); only the launches were refused, not the configuration.
 3. The same run with `TESSERA_BAND_READ_CPUS=4` on the packed arm.
 
 Everything needed for it is shipped and verified except the hardware.
