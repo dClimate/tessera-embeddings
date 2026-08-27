@@ -59,8 +59,18 @@ partitions zones across clusters, and within a cluster the trailing assembly is 
 **4. The observability cost was real.** The gate's `active_slots` was read as a progress signal on
 the night of 2026-08-27 and gave a wrong answer twice — first as "four cells stuck in hours-long
 commits", then as evidence about which cluster was assembling. Both were wrong, because a commit
-lasts ~1 s and the counter lags (the sibling ingest gate read 51 held against 45 actually live). A
-control that cannot bind but can still mislead is worse than no control.
+lasts ~1 s while only ONE cluster had an assembly in flight (verified from per-worker shard counts
+in CloudWatch, and from all ten clusters' inference progress).
+
+**Corrected in place: I first attributed this to a lagging counter**, citing the sibling ingest gate
+as reading "51 held against 45 actually live". That comparison was wrong — it used a monitoring
+query with the wrong flow name. Queried correctly, the ingest gate read **56 held against 56
+genuinely RUNNING cells**, i.e. exactly right. So the gates' counters are accurate, and what the
+commit gate's `active=4` was holding is **unexplained**, not stale: with one assembly in flight, the
+candidates are Prefect lease-held slots from a holder that died without releasing, or the terminal
+cells a feeder commits through `mark_zone_year_empty`. Either way the point stands for removal — a
+1 s commit with zero measured queueing cannot be bound by a limit — but the "counter lags" reason is
+withdrawn and should not be repeated.
 
 ## What replaces it
 
