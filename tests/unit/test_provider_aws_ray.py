@@ -1406,6 +1406,44 @@ class TestA10gRungs:
         }
         assert residual == []
 
+    def test_an_uncapped_pair_of_fallback_cards_goes_ENTIRELY_to_the_L4(self) -> None:
+        """The operational trap, and the reason the fallback opens ONE card and not both.
+
+        Companion to `test_a_three_card_ladder_puts_all_three_arms_on_one_cluster`, which
+        shows that two SMALL equal caps give both rungs work because the cap binds before
+        the score does. That is true, and it is the measurement shape — but it is not the
+        shape a fallback is opened in. A fallback is opened wide, to absorb whatever the
+        L40S could not place, and at that point the cap stops binding and the score
+        decides: the two rungs autodetect IDENTICAL resources, so Ray breaks the tie on
+        node-type NAME in reverse alphabetical order and `...-l4-2xl` beats `...-a10g-2xl`.
+
+        Every actor then lands on the SLOWER card: measured 2026-08-27, the L4 runs at
+        0.32x an L40S against the A10G's 0.46x, and costs +65% per unit of work against
+        the A10G's +42%. Nothing in the design chose that; a letter in a name did.
+
+        So `gpu-card-choice-2026_08.md` records the rule as: open the A10G rung alone.
+        This test exists so that rule is not merely written down — if a future rename
+        flipped the tie the other way, or Ray started reading a resource that separates
+        the cards, the reason for the rule would be gone and this would say so.
+        """
+        from ray.autoscaler._private.resource_demand_scheduler import get_nodes_for
+
+        node_types = _autodetected_node_types("g6.2xlarge:100,g5.2xlarge:100")
+        chosen, residual = get_nodes_for(node_types, {}, "head", 600, [ACTOR_BUNDLE] * 8, _scorer())
+        assert dict(chosen) == {"gpu-workers-ondemand-l4-2xl": 8}, (
+            f"expected the whole fleet on the L4 by name tie-break; got {dict(chosen)}"
+        )
+        assert residual == []
+
+    def test_the_a10g_rung_alone_takes_the_whole_fallback_fleet(self) -> None:
+        """The recommended shape: one cheaper card open, so there is no tie to lose."""
+        from ray.autoscaler._private.resource_demand_scheduler import get_nodes_for
+
+        node_types = _autodetected_node_types("g5.2xlarge:100")
+        chosen, residual = get_nodes_for(node_types, {}, "head", 600, [ACTOR_BUNDLE] * 8, _scorer())
+        assert dict(chosen) == {"gpu-workers-ondemand-a10g-2xl": 8}
+        assert residual == []
+
     def test_a_ladder_can_name_the_capacity_fallback_sizes(self) -> None:
         """`g6.2xlarge` and `g5.2xlarge` both refused in all three AZs on 2026-08-27.
 

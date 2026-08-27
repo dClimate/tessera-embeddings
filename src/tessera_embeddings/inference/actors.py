@@ -710,6 +710,16 @@ def _coverage_record(
             "CUBLAS_WORKSPACE_CONFIG": ":16:8",
             "MALLOC_ARENA_MAX": "2",
             "MALLOC_TRIM_THRESHOLD_": "0",
+            # Segment-backed allocation, so the caching allocator can GROW a segment
+            # instead of reserving a fresh larger one and stranding the old. Required
+            # before any 24 GB card is opened: on both the A10G and the L4 the default
+            # allocator walls at an observation depth of 208, and the deepest region
+            # this campaign has already processed presents at exactly 208 — zero margin.
+            # Measured to move the wall to 232 on both cards at no throughput cost. On
+            # the L40S it also stops the reserved pool drifting to ~95% of the card to
+            # hold a <9 GB working set. Read once when the allocator is built, which is
+            # why it rides on runtime_env with the rest.
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         }
     }
 )

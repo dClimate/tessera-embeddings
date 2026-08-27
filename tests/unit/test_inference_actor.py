@@ -34,6 +34,22 @@ def test_actor_class_has_no_static_gpu_reservation() -> None:
     )
 
 
+def test_the_cuda_allocator_is_configured_before_torch_loads() -> None:
+    """``PYTORCH_CUDA_ALLOC_CONF`` must ride on ``runtime_env``, not be set in-process.
+
+    The allocator reads it once, when it is built, and ignores it afterwards — so
+    setting it anywhere inside this module would be too late. It is the precondition for
+    opening any 24 GB card: with the default allocator both the A10G and the L4 wall at
+    an observation depth of 208, and the deepest region already processed presents at
+    exactly 208.
+    """
+    default_options = getattr(InferenceActor, "_default_options", None) or {}
+    env_vars = (default_options.get("runtime_env") or {}).get("env_vars") or {}
+    assert env_vars.get("PYTORCH_CUDA_ALLOC_CONF") == "expandable_segments:True", (
+        f"expected expandable_segments on the actor's runtime_env; got {env_vars!r}"
+    )
+
+
 def test_actor_options_accepts_cpu_and_gpu() -> None:
     """``.options(num_gpus=0)`` and ``.options(num_gpus=1)`` both bind cleanly.
 
