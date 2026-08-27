@@ -26,9 +26,11 @@ def configure_gdal_environment() -> None:
     # RETRY_DELAY is the BASE of an exponential ladder, not a fixed wait: GDAL multiplies it
     # by ~2 after each failure and does not cap it, so give-up time scales with BOTH values
     # and is dominated by the last rung. Measured 2026-08-27 server-side at base 0.5:
-    # 0.5, 1.01, 2.07, 4.92, 10.96, 24.82, 52.36, 105.94 s. These five retries at base 5 are
-    # ~3 min per unreadable object; TEN would be ~2.5 h, and the S2 coverage gate wraps the
-    # read in 8 further attempts. Treat the pair as a wall-clock budget before changing either.
+    # 0.5, 1.01, 2.07, 4.92, 10.96, 24.82, 52.36, 105.94 s. READ THE PAIR TOGETHER: these five
+    # retries at base 5 give ~3 min per unreadable object, while odc's ten at base 0.5 give ~14
+    # min — odc's read path is ~5x MORE patient than these values, not less. Ten at base 5 would
+    # be ~2.5 h, and the S2 coverage gate adds seven further attempts (SOURCE_READ_ATTEMPTS = 8)
+    # while max_leg_wall_clock_s cannot interrupt a running leg.
     #
     # NOTE the odc read path does not use these two, nor GDAL_DISABLE_READDIR_ON_OPEN:
     # `odc.loader.capture_rio_env()` applies its own values as an EXPLICIT rasterio Env, which

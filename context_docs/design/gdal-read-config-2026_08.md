@@ -28,7 +28,7 @@ only have come from our own setup code running there.
 
 So the affected set is exactly the three odc names. Everything else already reached the reader.
 
-## Correction 2: the retry delay is exponential, and the budget is large
+## Correction 2: the ladder is exponential — and odc's config is MORE patient than ours
 
 `GDAL_HTTP_RETRY_DELAY` is the BASE of a doubling ladder with no cap, not a fixed wait. Measured
 against a server refusing every request, arrival times recorded server-side:
@@ -37,10 +37,22 @@ against a server refusing every request, arrival times recorded server-side:
 0.5, 1.01, 2.07, 4.92, 10.96, 24.82, 52.36, 105.94 s
 ```
 
-Total scales linearly in the base (confirmed at a ratio of 9.99 for a tenfold change). At odc's
-`MAX_RETRY=10`, a base of 5 s gives roughly **2.5 hours for ONE unreadable object** — and the S2
-coverage gate wraps that read in `source_read_retrying()` for 8 more attempts. **These two values
-are a wall-clock budget, not a politeness setting.**
+Total scales linearly in the base (confirmed at a ratio of 9.99 for a tenfold change). **The two
+shadowed settings must be read together, and doing so reverses the obvious conclusion:**
+
+| config | retries | base | give-up per unreadable object |
+|---|---:|---:|---:|
+| **odc** (what the read path runs) | 10 | 0.5 s | **~14 min** |
+| **ours** (what the environment carries) | 5 | 5 s | **~3 min** |
+
+**odc is ~5x MORE patient than our own defaults.** Forcing our values onto the read path would have
+REDUCED patience there — the opposite of what the outage that prompted this wanted. That is the
+strongest argument for the no-code outcome below, and I had it backwards until review.
+
+For scale: ten retries at a base of **5 s** would be ~2.5 h per object, and the S2 coverage gate
+wraps the read in `source_read_retrying()` (`SOURCE_READ_ATTEMPTS = 8`, so **seven** further
+attempts after the first) while `max_leg_wall_clock_s` cannot interrupt a running leg. **The pair is
+a wall-clock budget, and the two settings move it in opposite directions.**
 
 ## What shipped: nothing but this record
 
@@ -77,5 +89,7 @@ measurement anywhere near the cap.
 
 Whether the 5 s base is right at all. It buys patience through an outage — the one that prompted
 this lasted 90 minutes — and costs a run that could absorb roughly two dozen unreadable dates the
-ability to absorb more than about two. Nothing measured settles it. Changing it is a one-line edit
-to `GDAL_READ_OPTIONS`, and this document is the context for whoever makes that call.
+ability to absorb more than about two. Nothing measured settles it. Changing it is a one-line edit to the
+`os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", ...)` call in `config/environment.py` — there is no
+`GDAL_READ_OPTIONS` collection, this change having shipped no code — and this document is the
+context for whoever makes that call.
