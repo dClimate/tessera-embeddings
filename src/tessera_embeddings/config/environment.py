@@ -6,23 +6,17 @@ Usage:
     # Must be called before importing rasterio, odc.stac, etc.
     configure_gdal_environment()
 
-**Setting these in the environment is NOT sufficient for the odc read path**, which is where
-almost every source byte is read. ``odc.loader``'s ``capture_rio_env()`` builds the GDAL
-environment it ships to its readers from its own config object and the *active rasterio Env* —
-it never consults ``os.environ`` — and when both are empty it returns ``GDAL_CLOUD_DEFAULTS``:
-just ``GDAL_DISABLE_READDIR_ON_OPEN``, ``GDAL_HTTP_MAX_RETRY=10`` and
-``GDAL_HTTP_RETRY_DELAY=0.5``.
+**The odc read path ignores three of these, and only three.** ``odc.loader``'s
+``capture_rio_env()`` builds its readers' GDAL environment from odc's own config and the active
+rasterio ``Env``, never from ``os.environ``, and applies it as an EXPLICIT ``Env`` — which beats
+the process environment. But an explicit ``Env`` wins only for the options it NAMES, and GDAL
+resolves the rest through the environment, which :func:`configure_gdal_environment` populates on
+workers as well as clients. So five of the eight were in force at our values all along; the three
+odc names (``GDAL_DISABLE_READDIR_ON_OPEN``, ``GDAL_HTTP_MAX_RETRY``, ``GDAL_HTTP_RETRY_DELAY``)
+ran at odc's, and an operator override of those was silently ignored on the imagery path.
 
-An explicit rasterio ``Env`` wins **only for the options it names**. GDAL resolves anything the
-Env leaves out through the process environment, which :func:`configure_gdal_environment` had
-already populated — on the worker as well as the client, because the read task carries a driver
-class defined in :mod:`tessera_embeddings.ingest.stac` and unpickling it executes that module.
-So the five options odc does not name were in force at our values all along, and the one value
-this changes on the read path is ``GDAL_HTTP_RETRY_DELAY``, which odc pinned to its own 0.5 s.
-
-:data:`GDAL_READ_OPTIONS` is nevertheless the single source of truth, and
-:func:`configure_odc_rio` is what stops the read path depending on a fallback nobody had written
-down. See ``context_docs/design/gdal-read-config-2026_08.md``.
+:func:`configure_odc_rio` closes exactly that gap and **changes no default** — see its docstring.
+Context, including the measured retry ladder: ``context_docs/design/gdal-read-config-2026_08.md``.
 """
 
 import logging
@@ -35,14 +29,13 @@ import os
 #: odc, which does not read the environment. Two lists kept in step is how the read path came to
 #: run a configuration nobody had written down.
 GDAL_READ_OPTIONS: dict[str, str] = {
-    # Retries for transient network failures. RETRY_DELAY is the BASE of an exponential ladder,
-    # not a fixed wait: GDAL roughly doubles it per attempt, so the give-up time is dominated by
-    # the last rung and scales linearly in this value. Raising it from odc's 0.5 s therefore buys
-    # an order of magnitude more patience per object -- and costs the same order of magnitude in
-    # wall clock when the object is unreadable. The measured ladder and what it does to the leg
-    # budget are in ``context_docs/design/gdal-read-config-2026_08.md``; read that before tuning
-    # either of the next two lines.
-    "GDAL_HTTP_MAX_RETRY": "10",
+    # RETRY_DELAY is the BASE of an exponential ladder, not a fixed wait: GDAL roughly doubles
+    # it per attempt and does not cap it, so give-up time scales with BOTH values and is
+    # dominated by the last rung. Measured 2026-08-27 against a server refusing everything:
+    # 0.5, 1.01, 2.07, 4.92, 10.96, 24.82, 52.36, 105.94 s. At 5 s x 10 retries that is ~85 min
+    # for ONE unreadable object, and the S2 coverage gate wraps the read in 8 more attempts.
+    # These two values are therefore a wall-clock budget, not a politeness setting.
+    "GDAL_HTTP_MAX_RETRY": "5",
     "GDAL_HTTP_RETRY_DELAY": "5",
     # Per-REQUEST cap, not a cap on the retry ladder above.
     "GDAL_HTTP_TIMEOUT": "120",
@@ -176,33 +169,31 @@ def code_identity() -> dict | None:
 
 
 def configure_odc_rio() -> None:
-    """Make :data:`GDAL_READ_OPTIONS` reach the odc reader, which ignores the environment.
+    """Forward DELIBERATE operator overrides of :data:`GDAL_READ_OPTIONS` to the odc reader.
 
-    ``odc.loader``'s ``capture_rio_env()`` builds the GDAL environment for its readers from its
-    own config object and the active rasterio ``Env``, and falls back to ``GDAL_CLOUD_DEFAULTS``
-    when both are empty. Nothing in that path looks at ``os.environ``, so
-    :func:`configure_gdal_environment` alone left odc *naming* three of our options rather than
-    eight, with ``GDAL_HTTP_RETRY_DELAY`` pinned to odc's 0.5 s rather than ours.
+    odc composes its readers' GDAL environment from its own config and the active rasterio
+    ``Env`` — never from ``os.environ`` — and applies it as an EXPLICIT ``Env``, which beats
+    process environment variables. GDAL still falls back to the environment for anything odc
+    does not name, so all of :data:`GDAL_READ_OPTIONS` already reaches the reader EXCEPT the
+    three odc names itself (``GDAL_DISABLE_READDIR_ON_OPEN``, ``GDAL_HTTP_MAX_RETRY``,
+    ``GDAL_HTTP_RETRY_DELAY``). For those three an operator's environment override was silently
+    ignored on the imagery-read path while appearing to work everywhere else.
 
-    The other five still reached GDAL, via the process environment it consults for any option the
-    active ``Env`` does not name. This call ends that dependency: an option only the environment
-    carries is one a future odc release, or any caller that opens its own ``Env``, can displace
-    without a word.
-
-    ``configure_rio(cloud_defaults=True, **opts)`` merges as ``{**GDAL_CLOUD_DEFAULTS, **opts}``,
-    so our values win and odc's remain as the base for anything we do not name.
-
-    Idempotent, and safe to call before or after a Dask cluster exists: odc propagates the captured
-    environment to its workers itself.
+    **This changes no default.** Only a value that DIFFERS from our own default is forwarded,
+    which is the signal that a human set it deliberately — and the test that difference survives
+    process inheritance, where a worker's environment carries our defaults down from its parent
+    and "was it in the environment already" cannot tell operator from ancestor.
     """
-    # Imported HERE rather than at module scope, and not as an oversight: this module's whole
-    # contract is that `configure_gdal_environment()` runs BEFORE rasterio/odc.stac are imported,
-    # and `odc.stac` pulls in rasterio. A top-level import would make importing the config module
-    # import rasterio, breaking the ordering the file exists to enforce.
+    overrides = {
+        name: os.environ[name]
+        for name, default in GDAL_READ_OPTIONS.items()
+        if os.environ.get(name, default) != default
+    }
+    if not overrides:
+        return
+    # Imported here, not at module scope: this module's contract is that
+    # `configure_gdal_environment()` runs BEFORE rasterio/odc.stac are imported, and
+    # `odc.stac` pulls in rasterio.
     import odc.stac
 
-    # `configure_rio(*, cloud_defaults, verbose, aws, **params)` declares typed keyword
-    # parameters beside its catch-all, so mypy cannot prove a `dict[str, str]` splat will not
-    # land on `verbose: bool` or `aws: dict | None`. Every key here is a GDAL_* option name, so
-    # the collision it is guarding against cannot occur.
-    odc.stac.configure_rio(cloud_defaults=True, **GDAL_READ_OPTIONS)  # type: ignore[arg-type]
+    odc.stac.configure_rio(cloud_defaults=True, **overrides)  # type: ignore[arg-type]

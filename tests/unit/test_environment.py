@@ -15,7 +15,7 @@ from tessera_embeddings.config.environment import (
 
 # Every var configure_gdal_environment sets, with its expected default value.
 EXPECTED_GDAL_VARS = {
-    "GDAL_HTTP_MAX_RETRY": "10",
+    "GDAL_HTTP_MAX_RETRY": "5",
     "GDAL_HTTP_RETRY_DELAY": "5",
     "GDAL_HTTP_TIMEOUT": "120",
     "GDAL_HTTP_LOW_SPEED_LIMIT": "1",
@@ -161,93 +161,45 @@ class TestPkgLoggerSetup:
         assert len(restore_pkg_logger.handlers) == 1
 
 
-class TestTheReadOptionsReachTheOdcReader:
-    """The defect this class exists for: setting GDAL options in the ENVIRONMENT does not
-    configure the odc read path, which is where essentially every source byte is read.
+class TestOperatorOverridesReachTheOdcReader:
+    """odc applies its own three GDAL options as an EXPLICIT rasterio Env, which beats the
+    process environment — so an operator's override of those three was silently ignored on the
+    imagery-read path while appearing to work everywhere else.
 
-    ``odc.loader.capture_rio_env()`` composes its readers' GDAL environment from odc's own config
-    object and the active rasterio ``Env``, and returns ``GDAL_CLOUD_DEFAULTS`` when both are
-    empty. It never consults ``os.environ``. So until ``configure_odc_rio()`` existed, odc named
-    three of our eight options to its readers and pinned ``GDAL_HTTP_RETRY_DELAY`` to its own
-    0.5 s instead of our 5 s — while the repo, its tests and its docs all said otherwise.
-
-    The other five were not absent from the read path: GDAL consults the process environment for
-    any option the active ``Env`` leaves out, and
-    :func:`~tessera_embeddings.config.environment.configure_gdal_environment` had set them there.
-    ``test_gdal_falls_back_to_the_environment_for_options_odc_omits`` pins that, because it is the
-    fact that decides how much of this file's premise is about a live defect and how much is about
-    not depending on a fallback.
+    The other five options were never affected: GDAL falls back to the environment for anything
+    odc does not name. An earlier version of this change claimed otherwise and was wrong.
     """
 
-    def test_the_odc_defaults_alone_would_not_carry_our_options(self):
-        """Pins WHAT WAS WRONG, from odc's own constant, so the gap cannot quietly return.
-
-        If a future odc bundles our settings itself this fails, and the fix becomes a smaller
-        override rather than a silent no-op.
-        """
-        from odc.loader._rio import GDAL_CLOUD_DEFAULTS
-
-        assert GDAL_CLOUD_DEFAULTS.get("GDAL_HTTP_RETRY_DELAY") == "0.5", (
-            "odc's default retry delay changed; re-derive the gap this guards"
-        )
-        missing = set(GDAL_READ_OPTIONS) - set(GDAL_CLOUD_DEFAULTS)
-        assert "GDAL_HTTP_LOW_SPEED_LIMIT" in missing
-        assert "GDAL_HTTP_TIMEOUT" in missing
-
-    def test_configure_odc_rio_puts_every_read_option_in_the_captured_env(self):
-        """The fix, asserted where it has to be true: the env odc SHIPS TO ITS READERS."""
-        from odc.loader._rio import capture_rio_env
-
+    def test_no_override_means_no_change_at_all(self, monkeypatch):
+        """The regression guard, and the reason this is safe to ship mid-campaign."""
+        for name in GDAL_READ_OPTIONS:
+            monkeypatch.setenv(name, GDAL_READ_OPTIONS[name])
+        called: list[dict] = []
+        monkeypatch.setattr("odc.stac.configure_rio", lambda **kw: called.append(kw), raising=False)
         configure_odc_rio()
-        env = capture_rio_env()
-        for name, value in GDAL_READ_OPTIONS.items():
-            assert env.get(name) == value, f"{name} did not reach the odc reader: {env.get(name)!r}"
+        assert called == [], "odc must be left alone when nothing was deliberately overridden"
 
-    def test_our_retry_delay_beats_odc_s(self):
-        """Merge order is `{**GDAL_CLOUD_DEFAULTS, **ours}`, so ours must win.
-
-        This is the one value on the odc read path that this change actually moves: odc names
-        ``GDAL_HTTP_RETRY_DELAY``, so its 0.5 s displaced ours no matter what the environment said.
-        """
-        from odc.loader._rio import capture_rio_env
-
+    def test_a_deliberate_override_is_forwarded(self, monkeypatch):
+        monkeypatch.setenv("GDAL_HTTP_RETRY_DELAY", "0.5")
+        called: list[dict] = []
+        monkeypatch.setattr("odc.stac.configure_rio", lambda **kw: called.append(kw), raising=False)
         configure_odc_rio()
-        assert capture_rio_env()["GDAL_HTTP_RETRY_DELAY"] == "5"
+        assert called and called[0]["GDAL_HTTP_RETRY_DELAY"] == "0.5"
+        assert "GDAL_HTTP_TIMEOUT" not in called[0], "only the differing option is forwarded"
 
-    def test_the_environment_still_carries_them_too(self):
-        """Both consumers, one definition: direct rasterio use reads the environment."""
-        configure_gdal_environment()
-        for name, value in GDAL_READ_OPTIONS.items():
-            assert os.environ.get(name) == value
-
-    def test_gdal_falls_back_to_the_environment_for_options_odc_omits(self, monkeypatch):
-        """An explicit rasterio ``Env`` displaces the environment ONLY for the keys it names.
-
-        Reconstructs the pre-fix read path — odc's three-entry env applied as an explicit ``Env``,
-        with our options in ``os.environ`` — and asks GDAL what it would use. The option odc names
-        comes back as odc's; the ones it omits come back as ours. That is why five of the eight
-        were never absent from optical reads, and why removing one from
-        :data:`~tessera_embeddings.config.environment.GDAL_READ_OPTIONS` is a behaviour change
-        rather than a revert: the same constant fills the environment.
-
-        Pins GDAL's behaviour, not ours. If a GDAL release stops consulting the environment, the
-        "before" state of this change becomes the one the plan originally assumed, and this fails.
+    def test_an_inherited_default_is_not_mistaken_for_an_override(self, monkeypatch):
+        """A worker inherits our defaults from its parent's environment, so presence cannot
+        distinguish operator from ancestor — only DIFFERENCE can. Without this, every worker
+        would push our values into odc and change the read path by accident.
         """
-        from odc.loader._rio import GDAL_CLOUD_DEFAULTS, rio_env
-        from rasterio._env import get_gdal_config
+        monkeypatch.setenv("GDAL_HTTP_MAX_RETRY", GDAL_READ_OPTIONS["GDAL_HTTP_MAX_RETRY"])
+        called: list[dict] = []
+        monkeypatch.setattr("odc.stac.configure_rio", lambda **kw: called.append(kw), raising=False)
+        configure_odc_rio()
+        assert called == []
 
-        for name, value in GDAL_READ_OPTIONS.items():
-            monkeypatch.setenv(name, value)
-
-        with rio_env(**GDAL_CLOUD_DEFAULTS):
-            named = str(get_gdal_config("GDAL_HTTP_RETRY_DELAY"))
-            omitted = {
-                name: str(get_gdal_config(name)) for name in GDAL_READ_OPTIONS if name not in GDAL_CLOUD_DEFAULTS
-            }
-
-        assert named == GDAL_CLOUD_DEFAULTS["GDAL_HTTP_RETRY_DELAY"], (
-            "odc names this one, so its value must displace the environment's"
-        )
-        assert omitted == {
-            name: value for name, value in GDAL_READ_OPTIONS.items() if name not in GDAL_CLOUD_DEFAULTS
-        }, f"GDAL no longer falls back to the environment: {omitted}"
+    def test_the_retry_budget_is_not_raised_by_this_change(self):
+        """`MAX_RETRY` stays at its pre-existing 5 rather than adopting odc's 10: the delay is
+        the base of an uncapped doubling ladder, so the two values multiply into wall clock.
+        """
+        assert GDAL_READ_OPTIONS["GDAL_HTTP_MAX_RETRY"] == "5"
