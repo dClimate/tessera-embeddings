@@ -125,15 +125,6 @@ def test_commit_with_rebase_resolves_concurrent_disjoint_commits(tmp_path):
     assert id1 and id2 and id1 != id2
 
 
-def test_write_year_shards_behind_gate(tmp_path):
-    store, repo = _seed(tmp_path)
-    gate = threading.Semaphore(2)
-    sid = write_year_shards(
-        repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, gate=gate, shard_px=_SHARD
-    )
-    assert isinstance(sid, str) and sid
-
-
 class TestPhaseTimer:
     """The wall/CPU phase accumulator behind the ASSEMBLY_SUMMARY record."""
 

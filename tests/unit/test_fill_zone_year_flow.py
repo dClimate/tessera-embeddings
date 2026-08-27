@@ -19,7 +19,6 @@ import tessera_embeddings.orchestration.prefect.flows.fill_zone_year as mod
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.conventions import expected_model_url
-from tessera_embeddings.orchestration.prefect import _fleet_gate as fleet_gate
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
@@ -298,84 +297,6 @@ class TestPerCellValidation:
             zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami", validation_deployment="v/v"
         )
         assert summary == {"tag": "zone-33N-2025"}
-
-
-def test_commit_gate_is_thread_safe(monkeypatch):
-    """The chained fill shares ONE _PrefectCommitGate between its feeder thread
-    (terminal plans commit inside plan()) and its trailing-assembly thread. The
-    gate must pair each exit with the SAME thread's entered context — an
-    instance slot let a concurrent enter overwrite the other thread's context
-    and release the wrong Prefect concurrency slot.
-    """
-    import threading
-
-    class _RecordingCM:
-        def __init__(self):
-            self.entered = 0
-            self.exited = 0
-
-        def __enter__(self):
-            self.entered += 1
-            return self
-
-        def __exit__(self, *a):
-            self.exited += 1
-            return False
-
-    cms: list[_RecordingCM] = []
-
-    def fake_concurrency(name, occupy=1, strict=True, **kw):
-        cm = _RecordingCM()
-        cms.append(cm)
-        return cm
-
-    monkeypatch.setattr(fleet_gate, "concurrency", fake_concurrency)
-    gate = mod._PrefectCommitGate("limit")
-    barrier = threading.Barrier(2)
-    errors: list[BaseException] = []
-
-    def worker():
-        try:
-            for _ in range(50):
-                gate.__enter__()
-                barrier.wait(timeout=10)  # force overlapping occupancy each round
-                gate.__exit__(None, None, None)
-        except BaseException as exc:  # surface thread failures to the main thread
-            errors.append(exc)
-
-    threads = [threading.Thread(target=worker) for _ in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30)
-    assert not errors
-    # Every context entered exactly once and exited exactly once — no context
-    # was double-exited (stolen by the other thread) or leaked (never exited).
-    assert len(cms) == 100  # 2 threads x 50 rounds
-    assert all(cm.entered == 1 and cm.exited == 1 for cm in cms)
-
-
-def test_commit_gate_is_reentrant_within_a_thread(monkeypatch):
-    entered: list[str] = []
-
-    class _CM:
-        def __init__(self, tag):
-            self.tag = tag
-
-        def __enter__(self):
-            entered.append(f"enter:{self.tag}")
-
-        def __exit__(self, *a):
-            entered.append(f"exit:{self.tag}")
-            return False
-
-    tags = iter(["outer", "inner"])
-    monkeypatch.setattr(fleet_gate, "concurrency", lambda name, occupy=1, strict=True, **kw: _CM(next(tags)))
-    gate = mod._PrefectCommitGate("limit")
-    with gate, gate:
-        pass
-    # LIFO pairing: the inner exit releases the inner context, not the outer.
-    assert entered == ["enter:outer", "enter:inner", "exit:inner", "exit:outer"]
 
 
 class TestTheMinimumDepthRuleComesFromTheStore:

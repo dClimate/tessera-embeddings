@@ -50,6 +50,7 @@ context_docs/
     ├── inference-perf-run-ledger.md              raw per-run measurements
     ├── campaign-monitoring-plan.md               what is watched while it runs, and how
     ├── immediate-refill-of-a-settled-fill.md      how a dead fill's roster is recovered without waiting for the round
+    ├── commit-gate-removal-2026_08.md            why the fleet-wide committer limit is gone, and when to put it back
     ├── final-data-validation-plan.md             the closing gate over every published cell
     ├── optical-registry-2026-08-19.md            the published per-tile index: schema, and what the first live run corrected
     │

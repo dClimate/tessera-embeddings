@@ -44,10 +44,11 @@ older shape: **year by year** in an outer serial loop, dispatching each year's z
 concurrently, where distinct zones make same-zone overlap impossible by construction.
 Either way concurrency is bounded by ``max_parallel_clusters``.
 
-The fleet-wide committer bound is a separate knob: ``commit_limit_name`` (a Prefect
-global concurrency limit) is passed to every fill so commits stay under the storm
-threshold while inference runs free. ``pending()`` is year-major, which is the drain
-pattern the barrier path relies on.
+Commits are UNGATED. A fleet-wide committer limit used to be forwarded to every
+fill; it was removed because at campaign scale there was nothing for it to bound —
+see ``context_docs/design/commit-gate-removal-2026_08.md``, which keeps the run-1
+contention curve and the scale at which it would matter again. ``pending()`` is
+year-major, which is the drain pattern the barrier path relies on.
 """
 
 from __future__ import annotations
@@ -126,16 +127,6 @@ def _child_tag(flow_run_id: object) -> str | None:
 #: one. The child flows keep their OWN teardown hooks; this one stops the runs those
 #: hooks then clean up after.
 _cancel_children_on_cancellation = make_child_cancel_hook(_CHILD_TAG_PREFIX, "campaign child run")
-
-
-#: Ceiling on simultaneous zone-year committers, from ADR-008 D5/D6 run 1. Commit
-#: contention is on the branch-tip CAS — every commit re-serialises the repo-global
-#: snapshot — so rebase retries scale with the number of racing writers and the
-#: aggregate wasted work with its square. Measured: N=2 -> 0.5 retries / 0.5 s,
-#: N=8 -> 3.5 / 1.3 s, N=16 -> 7.5 / 2.2 s (which BREACHED the run's own
-#: <=2x-serial acceptance criterion), N=120 -> 58 / 15 s. The recorded firm
-#: constraint is 4-8; this is its upper end.
-MAX_SIMULTANEOUS_COMMITTERS = 8
 
 
 #: Terminal states after which a chained fill has PROVABLY stopped writing, and is
@@ -576,7 +567,6 @@ async def run_global_campaign(
     actor_request_batch_size: int | None = None,
     fill_strategy: str = "chained-clusters",
     chained_fill_deployment: str | None = None,
-    commit_limit_name: str = "tessera-global-commits",
     num_actors: int = 250,
     s1_orbit: str = "both",
     s3_region: str | None = None,
@@ -704,15 +694,6 @@ async def run_global_campaign(
             fill deployment (``fill_strategy="chained-clusters"`` only). ``None``
             (default) derives ``fill-zones-sequential/fill-zones-sequential``
             routed by ``branch``; an explicit value is used verbatim.
-        commit_limit_name: Prefect global concurrency limit bounding fleet-wide
-            simultaneous committers to the global store (ADR-008 D6); forwarded to
-            every fill, which holds one slot for the duration of each zone-year
-            commit. Its VALUE is derived, not a parameter: the campaign upserts it
-            to ``min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS)`` at
-            preflight — a cluster's trailing assembly is single-threaded, so more
-            slots than clusters could never be used, and the run-1 curve caps it at
-            8 however many clusters run. Set to ``""`` to disable the gate; the
-            fills then commit ungated, which the run-1 storm makes a bad idea.
         num_actors: GPU actor count, forwarded to each fill.
         s1_orbit: S1 orbit selection, forwarded to both ingest and fill.
         s3_region: Optional S3 region for the global store, forwarded to the driver's
@@ -1085,18 +1066,6 @@ async def run_global_campaign(
             # is not a lever they can reach at 3 a.m. — and reset to running at every start that
             # has work, so a campaign can never inherit a pause somebody left behind.
             _upsert_limit(inference_pause_gate, 1, what="inference pause (1 = running)", log=log)
-        if commit_limit_name:
-            # DERIVED, not a parameter. A cluster's trailing assembly is a single
-            # thread, so N clusters can produce at most N assembly commits at once —
-            # a larger limit would be a number that never binds. And the run-1 curve
-            # says never exceed MAX_SIMULTANEOUS_COMMITTERS however many clusters run.
-            #
-            # A cluster's FEEDER can also commit (a terminal plan inside `plan()`),
-            # so the fleet's true ceiling is 2N and the gate can briefly queue those.
-            # That is the intent: the gate is a bound, not an operating point, and a
-            # queued commit costs seconds against zones that run for hours.
-            commit_limit = min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS)
-            _upsert_limit(commit_limit_name, commit_limit, what="commit", log=log)
 
     # Orphan-mosaic recovery: a per-cell cleanup that failed after tagging leaves
     # the mosaic behind, and that cell is no longer in `work`, so it is never
@@ -1114,11 +1083,10 @@ async def run_global_campaign(
         log.info("Orphan-mosaic sweep: reclaimed %d completed-cell mosaic prefix(es)", swept)
 
     log.info(
-        "Campaign: %d (zone, year) cell(s) need work across %d year(s); <=%d concurrent fills/year, commit limit %r",
+        "Campaign: %d (zone, year) cell(s) need work across %d year(s); <=%d concurrent fills/year",
         len(work),
         len({y for _, y in work}),
         max_parallel_clusters,
-        commit_limit_name,
     )
 
     optical_rule_cache: list[int | None] = []
@@ -1272,7 +1240,6 @@ async def run_global_campaign(
             "num_actors": num_actors,
             "s1_orbit": s1_orbit,
             "s3_region": s3_region,
-            "commit_limit_name": commit_limit_name,
             "allow_partial_window": allow_partial_window,
             "allow_s2_only": allow_s2_only,
             # Explicit, and it must stay explicit: `fill-zone-year` DEMANDS radar by
@@ -1564,7 +1531,6 @@ async def run_global_campaign(
                         "num_actors": num_actors,
                         "s1_orbit": s1_orbit,
                         "s3_region": s3_region,
-                        "commit_limit_name": commit_limit_name,
                         "allow_partial_window": allow_partial_window,
                         "allow_ingest_code_mismatch": allow_ingest_code_mismatch,
                         "allow_s2_only": allow_s2_only,

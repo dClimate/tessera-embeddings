@@ -364,3 +364,85 @@ def test_entering_and_leaving_a_pause_are_both_logged(monkeypatch, caplog) -> No
     messages = [r.getMessage() for r in caplog.records]
     assert any("PAUSED" in m and "global-concurrency-limit update" in m for m in messages), messages
     assert any("cleared after" in m for m in messages), messages
+
+
+def test_the_gate_is_thread_safe(monkeypatch):
+    """One FleetGate is shared across threads, and each exit must pair with the SAME
+    thread's entered context — an instance slot let a concurrent enter overwrite the
+    other thread's context and release the wrong Prefect concurrency slot.
+
+    These two tests moved here from ``test_fill_zone_year_flow.py`` when the commit gate
+    was removed. They were written against ``_PrefectCommitGate``, but everything they
+    exercise lives in :class:`FleetGate`, which the INGEST gate still uses as the
+    campaign's pause lever — so the coverage follows the mechanism rather than being
+    deleted with its former caller.
+    """
+    import threading
+
+    class _RecordingCM:
+        def __init__(self):
+            self.entered = 0
+            self.exited = 0
+
+        def __enter__(self):
+            self.entered += 1
+            return self
+
+        def __exit__(self, *a):
+            self.exited += 1
+            return False
+
+    cms: list[_RecordingCM] = []
+
+    def fake_concurrency(name, occupy=1, strict=True, **kw):
+        cm = _RecordingCM()
+        cms.append(cm)
+        return cm
+
+    monkeypatch.setattr(mod, "concurrency", fake_concurrency)
+    gate = FleetGate("limit")
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def worker():
+        try:
+            for _ in range(50):
+                gate.__enter__()
+                barrier.wait(timeout=10)  # force overlapping occupancy each round
+                gate.__exit__(None, None, None)
+        except BaseException as exc:  # surface thread failures to the main thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not errors
+    # Every context entered exactly once and exited exactly once — no context
+    # was double-exited (stolen by the other thread) or leaked (never exited).
+    assert len(cms) == 100  # 2 threads x 50 rounds
+    assert all(cm.entered == 1 and cm.exited == 1 for cm in cms)
+
+
+def test_the_gate_is_reentrant_within_a_thread(monkeypatch):
+    entered: list[str] = []
+
+    class _CM:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def __enter__(self):
+            entered.append(f"enter:{self.tag}")
+
+        def __exit__(self, *a):
+            entered.append(f"exit:{self.tag}")
+            return False
+
+    tags = iter(["outer", "inner"])
+    monkeypatch.setattr(mod, "concurrency", lambda name, occupy=1, strict=True, **kw: _CM(next(tags)))
+    gate = FleetGate("limit")
+    with gate, gate:
+        pass
+    # LIFO pairing: the inner exit releases the inner context, not the outer.
+    assert entered == ["enter:outer", "enter:inner", "exit:inner", "exit:outer"]

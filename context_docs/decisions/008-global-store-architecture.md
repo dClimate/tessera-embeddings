@@ -289,9 +289,21 @@ held: zero unresolvable conflicts at every N.
 > the same gate and so concurrent committers can exceed the cluster count. Kept for those
 > reasons, not for throughput.
 
-**Enforced in code since 2026-07-28.** The cap is a Prefect global concurrency
-limit (`commit_limit_name`) held around each commit, and `run_global_campaign`
-upserts its VALUE at preflight to
+> **REMOVED 2026-08-27. The cap no longer exists in code.** The note above got as far as
+> "at the shipped 8 clusters the limit equals the number of possible committers, so **it
+> cannot bind at all**", and then kept it for configurations we do not run. It has now
+> been removed outright, on a live measurement: `commit_s` **1.0 s** and
+> `attrs_commit_s` **0.3 s** against a `fill_wall_s` of **21,447 s** — and because the
+> gate wait is measured *inside* `commit_s`, that 1.0 s is also proof of **zero
+> queueing**. The contention curve below is not retracted and is the reopen criterion:
+> it only breached its own acceptance bar at **N≥16** simultaneous committers, which is
+> twice the cluster count this campaign runs. See
+> [`design/commit-gate-removal-2026_08.md`](../design/commit-gate-removal-2026_08.md).
+> The paragraph below describes what the code did until 2026-08-27.
+
+**Enforced in code from 2026-07-28 until 2026-08-27.** The cap was a Prefect global
+concurrency limit (`commit_limit_name`) held around each commit, and `run_global_campaign`
+upserted its VALUE at preflight to
 `min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS=8)`. Previously only the
 limit's *name* was threaded through and the number lived on the server, where it
 could silently drift from this constraint. Duty-cycle measurements showing how

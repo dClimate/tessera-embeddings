@@ -87,7 +87,6 @@ from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
 from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
     _assert_seeded_model_matches,
     _optical_min_obs_from_store,
-    _PrefectCommitGate,
 )
 from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import (
     _ingest_dispatch_params,
@@ -203,7 +202,7 @@ class _DeploymentCellInputs:
 
         A Prefect GLOBAL concurrency limit rather than a local semaphore: the
         clusters are separate flow runs on separate machines, so nothing
-        in-process can see across them. Same mechanism as the commit gate.
+        in-process can see across them.
 
         **This is also the campaign's pause lever.** Lowering the limit to zero
         makes every stream HOLD here — the cell in flight finishes, no new cell is
@@ -640,7 +639,6 @@ def fill_zones_sequential_flow(
     s1_orbit: str = "both",
     require_s1: bool = False,
     s3_region: str | None = None,
-    commit_limit_name: str | None = None,
     cleanup_staging: bool = True,
     n_assembly_workers: int | None = None,
     allow_partial_window: bool = False,
@@ -709,8 +707,6 @@ def fill_zones_sequential_flow(
             radar-free in principle and a global run cannot refuse them. Set this only
             where every cell in the sweep is known to be imaged.
         s3_region: Optional S3 region for the global store + mosaics.
-        commit_limit_name: Prefect global concurrency limit bounding fleet-wide
-            simultaneous committers (D6). ``None`` = ungated.
         cleanup_staging: Delete each cell's staged tiles after it lands.
         n_assembly_workers: Override the assembly process-pool size for every cell in this
             run; ``None`` uses ``AssemblyConfig``'s sizing. Applies per cell, not per run —
@@ -858,7 +854,6 @@ def fill_zones_sequential_flow(
     store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
     checkpoint_path = f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}"
-    gate = _PrefectCommitGate(commit_limit_name, log=log) if commit_limit_name else None
 
     @cache
     def _window_for(cell_year: int) -> TimeWindow:
@@ -992,7 +987,6 @@ def fill_zones_sequential_flow(
                 num_actors=1,
                 log=log,
                 run_id=run_id,
-                gate=gate,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
             ),
@@ -1221,7 +1215,6 @@ def fill_zones_sequential_flow(
             config=prep.config,
             log=log,
             run_id=prep.run_id,
-            gate=gate,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
         )
@@ -1288,7 +1281,6 @@ def fill_zones_sequential_flow(
             num_actors=cell.num_actors,
             log=log,
             run_id=prep.run_id,
-            gate=gate,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
             on_actor_retire=terminator,
@@ -1324,7 +1316,6 @@ def fill_zones_sequential_flow(
                 optical_min_obs=_store_optical_min_obs(),
                 input_coverage=prep.input_coverage,
                 log=log,
-                gate=gate,
                 s3_concurrency=s3_concurrency,
                 cleanup_staging=cleanup_staging,
                 n_assembly_workers=n_assembly_workers,

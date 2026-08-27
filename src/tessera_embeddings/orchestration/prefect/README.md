@@ -179,7 +179,7 @@ are running. With `max_parallel_clusters` at 8 that is 5 zones per cluster.
 
 Because the clusters are separate Prefect flow runs on separate machines, no
 in-process semaphore can see across them, so the cap is a **Prefect global
-concurrency limit** — the same mechanism as the commit gate. Each zone's ingest
+concurrency limit**. Each zone's ingest
 holds one slot for its whole duration. The campaign upserts the limit to
 `max_parallel_ingest` at start, so the parameter is the only place the number is
 written and it cannot drift from the server's. Each cluster also takes an even
@@ -257,10 +257,12 @@ Zone-parallelism (either flavor) is safe because inference is independent
 across zones and only *same-zone* fills conflict (shared group attrs →
 `RebaseFailedError`) — the year-serial loop guarantees a zone never fills two
 years at once, and within a sequential run the depth-1 trailing assembly can
-never overlap a commit for the same zone group. The fleet-wide **committer
-bound is a Prefect global concurrency limit** (`commit_limit_name`, ADR-008 D6),
-passed to every fill so commits stay under the storm threshold while GPU
-inference runs unbounded. `build_land_mask` and `seed_global_store` are
+never overlap a commit for the same zone group. **Commits are otherwise
+ungated.** A fleet-wide committer limit was removed once measured: a commit is
+~1 s against a ~6 h fill, with no observed queueing, and concurrent commits go
+to disjoint per-zone stores. See
+`context_docs/design/commit-gate-removal-2026_08.md`, which keeps the run-1
+contention curve and the scale at which it would matter again. `build_land_mask` and `seed_global_store` are
 cluster-less (they run on the flow runner like `generate_roi`); only
 `fill_zone_year` / `fill_zones_sequential` provision Ray.
 
