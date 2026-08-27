@@ -199,23 +199,35 @@ loader before inference in an earlier run.
    logged GPU 0 with fields out of alignment. It now passes the actor's own accelerator id
    and refuses multi-row output rather than misattributing it.
 
-## Arms
+## Arms — planned, and what actually ran
 
-| arm | ladder | shape | purpose |
+| arm | ladder | intended shape | outcome |
 |---|---|---|---|
-| **control** | none | 12 × `g6e.xlarge` | host-to-host spread = the noise floor |
-| **mixed** | `g6e.xlarge:16,g6e.12xlarge:4` | 16 × 1-GPU + 4 × 4-GPU, one queue | the ratio, and a second noise-floor reading |
-| **mixed, readers capped** | same + `TESSERA_BAND_READ_CPUS=4` | as above | whether reader-thread contention is real |
+| **A. control** | none | 12 × `g6e.xlarge` | **ran** — reached 3 of 12 workers in 20 min; gave the noise floor and the VRAM curve |
+| **B. packed** | `g6e.xlarge:16,g6e.12xlarge:4` | 16 × 1-GPU + 4 × 4-GPU, one queue | **NOT RUN — no `g6e.12xlarge` capacity** |
+| **C. readers capped** | B + `TESSERA_BAND_READ_CPUS=4` | as B | not reached |
 
-The third arm exists because of correction 4: the fair-share fix cannot change the reader
-pool at these sizes, so the only way to test the CPU-contention mechanism is to force a
-budget below the band-count cap. It is also the cheapest possible test of "scale the
-workload per instance type": the delta between arms 2 and 3 is the measured value of that
-idea on the one axis where it plausibly exists.
+Arm C exists because of correction 4: the fair-share fix cannot change the reader pool at
+these sizes, so the only way to test the CPU-contention mechanism is to force a budget below
+the band-count cap. It is also the cheapest test of "scale the workload per instance type" —
+the delta between B and C is the measured value of that idea on the one axis where it
+plausibly exists.
 
-**No run is allowed to complete.** Each arm runs long enough for every actor to pay its
-~36 s cold start once and give a stable median, then the cluster is torn down. A full
-`iowa_epsg5070` pass is hours of GPU time and would buy nothing this question needs.
+**No run was allowed to complete.** Each arm ran only long enough for its actors to pay the
+~36 s cold start and give a median, then the cluster was torn down. A full `iowa_epsg5070`
+pass is hours of GPU time and would buy nothing this question needs.
+
+### A substitution that was tried and then RULED OUT
+
+With no `g6e.12xlarge` obtainable, an all-L4 pair (`g6.12xlarge` against `g6.2xlarge`) was
+dispatched on the reasoning that it holds the CARD constant within the comparison and so
+isolates actors-per-host — the mechanism under test. **Robert ruled it out and it was torn
+down**, on grounds that stand: the production fleet is L40S, so a ratio measured on L4 does
+not transfer to `g6e.12xlarge`, which is the instance the plan actually recommends. A
+substitution that changes the hardware also changes what a pass or a failure would license.
+
+What that arm did produce is recorded below under "L4 findings", explicitly **not** as the
+packing answer. It ran for about 12 minutes and cost roughly $3.
 
 ## Results
 
@@ -335,23 +347,210 @@ Two corollaries:
   was refusing anyway.** Worth a look if a future fleet stalls in one AZ while another has
   capacity.
 
-### The packing ratio
+### Price per GPU-hour — the plan's "term most likely to change the recommendation"
 
-**Not obtained on `g6e`.** The dev account could not buy a single 4-GPU host of either
-family for the duration of the attempt. The control arm reached only 3 of 12 requested
-`g6e.xlarge` workers in 20 minutes, against a fleet that normally fills in about two.
+From the AWS Pricing API, us-west-2, on-demand Linux shared tenancy, 2026-08-27. The plan
+had exactly one price ($1.861) and one inherited relative premium ("~30%").
 
-Because `g6.12xlarge` is 48 vCPU and 4 GPUs — **12 vCPU per actor, identical to
-`g6e.12xlarge`** — the host-sharing mechanism can be tested on the L4 family instead, with
-`g6.2xlarge` (8 vCPU, 32 GiB, one L4) as the 1-GPU arm. Both arms then run the same card
-and the only difference is host sharing, which is what the question is about. The peak-VRAM
-measurement above is what makes that substitution legitimate: 7.5 GiB fits a 22.4 GiB card.
-Absolute tok/sec on an L4 is NOT comparable to production and no such comparison is made
-here.
+| type | $/hr | GPUs | **$/GPU-hr** | vs `g6e.xlarge` | vCPU/GPU |
+|---|---:|---:|---:|---:|---:|
+| `g6e.xlarge` | 1.861 | 1 | **1.861** | — | 4 |
+| `g6e.2xlarge` | 2.242 | 1 | **2.242** | **+20.5%** | 8 |
+| `g6e.12xlarge` | 10.493 | 4 | **2.623** | **+40.9%** | 12 |
+| `g6e.24xlarge` | 15.066 | 4 | **3.766** | +102% | 24 |
+| `g6e.48xlarge` | 30.131 | 8 | **3.766** | +102% | 24 |
+| `g6.2xlarge` | 0.978 | 1 | **0.978** | **−47.5%** | 8 |
+| `g6.12xlarge` | 4.602 | 4 | **1.150** | **−38.2%** | 12 |
 
-### Control-arm noise floor
+Three things follow, and two of them are decisions.
 
-Two `g6e.xlarge` hosts with 4–5 chunks each, one-orbit stratum, median per-host combined
-tok/sec of **1.79M and 1.67M** — a 7% spread on very few chunks per host. Below the sample
-count the acceptance threshold needs, and above the 5% the threshold assumes; both readings
-are provisional.
+**1. `g6e.2xlarge` is cheaper than assumed: +20.5%, not ~30%.** Against 7–15% recoverable
+feed that is a net +5% to +13% on hours that land there, not +13% to +21%.
+
+**2. The multi-GPU L40S rung fails the plan's own test.** The plan wrote: *"If
+`g6e.12xlarge` carries a per-GPU premium much above `g6e.2xlarge`'s ~30%, the multi-GPU rung
+is not worth the unmeasured risk and the plan collapses to '`g6e.2xlarge` only'."* It is
+**+40.9% against +20.5% — double the premium** — and it is simultaneously the worse option
+on quota efficiency (12 vCPU/GPU against 8). So `g6e.12xlarge` is dominated by
+`g6e.2xlarge` on price AND on quota, before any throughput question is asked. **Even a
+packing ratio of exactly 1.000 would not make it the better rung.**
+
+**3. The L4 is 38–47% cheaper per GPU-hour.** That turns the L4 from a substitute-hardware
+convenience into a live production candidate: if an L4 delivers even ~62% of an L40S's
+throughput, `g6.12xlarge` is cost-neutral, and `g6.2xlarge` breaks even at ~53%. Combined
+with the capacity finding above — the L4 pool was buyable when the entire L40S family was
+not — **the throughput of the Tessera model on an L4 is now the most valuable unmeasured
+number in this area.** It is NOT measured here: this exercise held the card constant within
+each comparison precisely so the packing result would not be confounded, and no L4-vs-L40S
+throughput claim is made.
+
+### Four actors on one host: it works, and the GPU-index fix is what makes it readable
+
+**This one does transfer**, because it is about Ray placement and this repository's own
+instrumentation, not about the card. It was observed on `g6.12xlarge`; the placement,
+the per-actor GPU assignment and the logging are identical on `g6e.12xlarge`.
+
+Confirmed at 17:37 UTC on 2026-08-27, from the actors' own ready lines:
+
+```
+2 instance i-02a0fcb4aa551767c (GPU 0)   \
+2 instance i-02a0fcb4aa551767c (GPU 1)    |  g6.12xlarge — FOUR actors, one host
+2 instance i-02a0fcb4aa551767c (GPU 2)    |
+2 instance i-02a0fcb4aa551767c (GPU 3)   /
+2 instance i-0d262da5050224468 (GPU 0..3)   the second g6.12xlarge
+2 instance i-03c3640a65e503ee3 (GPU 0)   \
+2 instance i-0cab65709bcdc719f (GPU 0)    |  four g6.2xlarge — one actor each
+2 instance i-0dc2a0170c4076608 (GPU 0)    |
+2 instance i-0ed83ea5656064e5a (GPU 0)   /
+```
+
+**This is the first time two `InferenceActor`s have run on one host in this codebase**, which
+answers the plan's open question 5 directly: nobody had, and now it works — twelve actors
+placed across six hosts, no OOM, no crash, chunks in flight on all of them. (The `2 ` prefix
+is the double-logging of every event, deduped elsewhere.)
+
+It also demonstrates the accelerator-id fix in the condition it was written for. Each of the
+four actors on a packed host reports its OWN GPU index, 0 through 3. Before the fix all four
+would have logged GPU 0 with `nvidia-smi` fields sliding out of alignment, and no reader
+could have told them apart.
+
+It also gave the first per-actor CPU reading on a packed host. From the `RESOURCES` lines
+mid-chunk: the two 4-GPU hosts ran **load 11.35 and 12.40 on 48 vCPU** (24–26% of the box)
+with **all four GPUs at 100% utilisation**, while the 1-GPU hosts ran load 1.04–1.27 on
+8 vCPU. So a packed host was not CPU-saturated and its GPUs were not idling — but load per
+actor was ~2.9 against ~1.1, which is the `_band_read_workers` asymmetry doing exactly what
+correction 4 describes (10 readers per actor at a 12-vCPU share, 6 at an 8-vCPU share).
+**This is suggestive and is not the ratio**; utilisation at 100% is consistent with both a
+fed GPU and a GPU spending time on smaller kernels.
+
+### L4 findings — a separate question, not the packing answer
+
+**Read this as capacity-and-cost evidence about a different card, nothing more.** It cannot
+speak to `g6e.12xlarge` packing, for the reason in the ruling above.
+
+The substitution produced a number nobody had: **the Tessera model runs on a 22.4 GiB L4**,
+no OOM, at B=7168. Peak allocated is **7.52 GiB — identical to the L40S on the same chunk**,
+which is the expected answer (the working set is a property of the work, not the card) and is
+the control that says the VRAM figures above are real.
+
+The reserved pool, though, went straight to **21.71 of 22.04 GiB — 98.5% of the card**. That
+is the allocator doing exactly what it does on the L40S (reserve against what is available)
+with no room left over. The model works; the fragmentation headroom is gone. If a 24 GB-class
+card is ever adopted, `PYTORCH_CUDA_ALLOC_CONF` is not optional.
+
+And because both runs processed the same cell, two chunks came out **exactly matched** — same
+label, same `t_kept`, same `valid_px`, so same geography and same depth:
+
+| chunk | `t_kept` | L40S `total_s` | L4 `total_s` | ratio | L40S `infer_s` | L4 `infer_s` | ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `chunk_0_0` | 108 | 148.0 | 330.9 | **2.24×** | 101.1 | 299.0 | **2.96×** |
+| `chunk_0_6` | 57 | 115.1 | 351.6 | **3.05×** | 86.7 | 324.9 | **3.75×** |
+
+**The L4 is 2.2–3.1× slower per chunk at 0.525× the price per GPU-hour, so it costs 1.18× to
+1.60× as much per unit of work.** The door the capacity finding appeared to open is therefore
+mostly shut again — not by VRAM, which is fine, but by throughput. What the L4 offers is
+capacity that can actually be bought, at an 18–60% cost premium.
+
+Two honest limits on this. **n = 2**, though exactly-matched pairs are worth far more than two
+medians would be. And the L4 arm ran with six hosts pulling from S3 concurrently against the
+control's three, so some of the gap could be read contention — but a 2–3× gap is far too
+large for that to be the mechanism, and the `infer_s` ratios (2.96×, 3.75×) are larger than
+the `total_s` ratios, which points at the GPU rather than at I/O.
+
+### The packing ratio: NOT MEASURED
+
+**The number the plan asked for does not exist yet, and the reason is the finding.**
+
+`g6e.12xlarge` could not be bought in the dev account at any point during the attempt. Two
+probe rounds 28 minutes apart, each covering all three AZs, refused every `g6e` size — and
+by the second round `g6e.xlarge` and `g6e.2xlarge` refused too, so **no `g6e` experiment of
+any kind was runnable**, including the 1-GPU CPU-feed comparison that would otherwise be the
+fallback. The control arm's own fleet is the same evidence from the other side: it reached 3
+of 12 requested `g6e.xlarge` workers in 20 minutes, against a fleet that normally fills in
+about two.
+
+What remains to run, unchanged, the moment `g6e` capacity returns:
+
+1. `g6e.xlarge` control arm for the noise floor — **already done at 4.3%**, and reusable.
+2. `g6e.xlarge` + `g6e.12xlarge` on one queue via `gpu-worker-ladder`, which is now proven
+   to produce exactly that shape (the autoscaler asked for 4 × 4-GPU and 8 × 1-GPU from one
+   SSM key, with no re-registration).
+3. The same run with `TESSERA_BAND_READ_CPUS=4` on the packed arm.
+
+Everything needed for it is shipped and verified except the hardware.
+
+### Control-arm noise floor: 4.3%
+
+Three `g6e.xlarge` hosts, 4–7 chunks each, one-orbit stratum, 18 successful chunks over
+`t_kept` 54–123. Median per-host combined tok/sec:
+
+| instance | chunks | median combined tok/sec |
+|---|---:|---:|
+| `i-03ccb860224f06194` | 7 | 1.829M |
+| `i-0d67a26298df43c3d` | 4 | 1.793M |
+| `i-0687d74c32bf43230` | 7 | 1.752M |
+
+**Host-to-host spread 4.3%**, against the acceptance criterion's requirement of under 5%. So
+the threshold has a floor under it, and a packed-host reading below 0.95 would be outside
+the noise.
+
+One methodological note that cost a wrong number before it was caught: an earlier reading of
+the same arm gave 7.1% over two hosts, and 26.7% once a host with a single chunk was
+included. **A host's first chunk carries its ~36 s cold start**, so a barely-started host
+reads slow and one that drew a shallow chunk reads fast. `inference_profile.py --by-host` now
+excludes hosts below three chunks and says that it has.
+
+## What this changes about the plan
+
+The plan's shape survives; three of its steps do not.
+
+**1. `g6e.12xlarge` is dominated before the packing question is asked.** At **+40.9%** per
+GPU-hour against `g6e.2xlarge`'s **+20.5%**, and at 12 vCPU/GPU against 8, it is worse on
+both price and quota. The plan's own criterion — *"if `g6e.12xlarge` carries a per-GPU premium
+much above `g6e.2xlarge`'s ~30%, the multi-GPU rung is not worth the unmeasured risk"* — is
+met. Even a packing ratio of exactly 1.000 would not make it the better rung. **Measuring
+the ratio is still worth doing**, because it is the only thing standing between us and ever
+using a multi-GPU host, and because the 4-GPU sizes are the only way to add GPUs without
+adding node count to the Ray head. But it is no longer a step on the critical path to more
+capacity.
+
+**2. "Turn on the `g6e.2xlarge` rung in prod" does nothing on its own.** Ray's scorer never
+reads capacity availability, and `g6e.2xlarge` scores *below* `g6e.xlarge`, so an unrestricted
+`g6e.xlarge` rung absorbs all demand. The step must be "set
+`gpu-worker-ladder = g6e.xlarge:<N>,g6e.2xlarge:<M>` with N *below* today's ceiling."
+
+**3. The premise that diversification buys capacity is void within `g6e`.** All eight sizes
+share one pool. So the real options for capacity are, in order of what the evidence supports:
+
+- **An on-demand capacity reservation on `g6e.xlarge`.** The plan already names this as
+  co-equal and it now looks strictly better: it preserves 4 vCPU/GPU, every measured
+  invariant, and the single-price cost basis, and it is the only option that addresses a
+  card-level shortage. **Price it first.**
+- **A second region.** Untouched by any of this work and the only true pool diversification.
+- **A different card.** `g6`/`g5` are buyable and are no longer disqualified by VRAM — that
+  objection is measured away. They are disqualified on throughput instead: the L4 is 2.2–3.1×
+  slower at 0.525× the price, so ~1.18–1.60× the cost per unit work. Whether that trade is
+  worth taking depends on how much a GPU we cannot rent is costing, which is a question about
+  the campaign's schedule rather than about hardware.
+- **`g6e.2xlarge`** remains worth having as a rung — but it buys a better-fed GPU at +20.5%,
+  not capacity.
+
+**4. The quota ask.** The pending 16,000 vCPU request was justified on instance-type
+diversity. Nothing here supports that justification: within `g6e`, diversity does not reach a
+different pool, and the sizes that would consume the extra quota are the least efficient per
+GPU. If the ask is still wanted, the reason has to be eviction headroom or a genuinely mixed
+fleet spanning card families — and it should be stated as whichever it actually is.
+
+## Spend
+
+| item | shape | approx cost |
+|---|---|---|
+| Arm A (`g6e.xlarge` control) | 3 GPU workers + head, ~33 min | ~$3.0 |
+| Ruled-out L4 arm | 6 × `g6.2xlarge` + 2 × `g6.12xlarge` + head, ~12 min | ~$3.2 |
+| Capacity probes | ~25 single launches, most refused; successes terminated at once | ~$0.6 |
+| **total** | | **~$7** |
+
+No cluster was left idle: the control arm was torn down the moment its noise floor and VRAM
+curve were in hand, the L4 arm within four minutes of the ruling, and the account was verified
+at zero GPU instances afterwards. The `g6e` re-run is **blocked on capacity, holding nothing**
+— a probe loop watches for `g6e` to return rather than a warm cluster waiting for it.
