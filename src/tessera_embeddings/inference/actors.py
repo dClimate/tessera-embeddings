@@ -740,7 +740,7 @@ class InferenceActor:
     ``providers.aws.credentials.iam_icechunk_credentials``.
     """
 
-    # Class-level defaults for the three attributes the per-chunk telemetry reads.
+    # Class-level defaults for the two attributes the per-chunk telemetry reads.
     # `__init__` always sets both, and these exist for the instance that does NOT
     # run it: several tests build the actor bare (`cls.__new__(cls)`) and drive
     # `_process_chunk` directly, because a real construction downloads a checkpoint
@@ -749,9 +749,17 @@ class InferenceActor:
     # `_reset_vram_peak` already take, so a bare instance reports no VRAM rather
     # than raising inside a chunk. The alternative, reading them with `getattr`
     # defaults at each use, would hide a genuinely unset attribute on a real actor.
+    #
+    # **A default here must be PICKLABLE**, which is why `_resource_monitor` is NOT
+    # one. Ray's client pickler serialises the actor class, class attributes
+    # included, when the driver first submits it. A `ResourceMonitor()` default —
+    # holding a `threading.Event` and two `threading.Lock`s — killed a whole run at
+    # actor-class submission with `TypeError: cannot pickle '_thread.lock' object`,
+    # before a single node launched. `_host_fields` reads it through `getattr`
+    # instead: one guarded read in the telemetry path, rather than a class
+    # attribute the driver has to serialise.
     _torch: types.ModuleType | None = None
     gpu_index: str | None = None
-    _resource_monitor: ResourceMonitor = ResourceMonitor(interval_sec=30)
 
     def __init__(
         self,
@@ -1152,7 +1160,11 @@ class InferenceActor:
         # reading of it was an instantaneous sample every 30 s on a prose log
         # line. Whole-HOST and so shared on a packed host — see
         # `ResourceMonitor.peak_host_ram_gib`. Absent (not zero) off Linux.
-        ram_peak = self._resource_monitor.peak_host_ram_gib()
+        # `getattr` because this is the one telemetry read a bare test instance
+        # reaches, and the attribute cannot have a class-level default — see the
+        # picklability note on `_torch` above.
+        monitor = getattr(self, "_resource_monitor", None)
+        ram_peak = monitor.peak_host_ram_gib() if monitor is not None else None
         if ram_peak is not None:
             fields["host_ram_peak_gib"] = round(ram_peak[0], 2)
             fields["host_ram_total_gib"] = round(ram_peak[1], 2)
@@ -1255,6 +1267,9 @@ class InferenceActor:
         # anything, so the figure the CHUNK_SUMMARY carries is this chunk's peak
         # and not the run's. See _reset_vram_peak.
         _reset_vram_peak(self._torch)
+        # Unguarded, like the `set_context` below it: anything reaching this line is
+        # a constructed actor. `_host_fields` guards its read instead, because the
+        # bare instances the unit tests build DO call that one.
         self._resource_monitor.reset_peak_host_ram()
         self._resource_monitor.set_context("work", f"{chunk.label}:prologue")
 

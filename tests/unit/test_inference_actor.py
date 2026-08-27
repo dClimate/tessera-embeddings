@@ -300,3 +300,22 @@ class TestAcceleratorIndex:
         """The local CPU runner and unit tests have no runtime; that is not an error."""
         with patch.object(ray, "get_runtime_context", side_effect=RuntimeError("no runtime")):
             assert actors_mod._accelerator_index() is None
+
+
+def test_the_actor_class_survives_cloudpickle() -> None:
+    """Ray serialises the actor CLASS at first submission, class attributes included.
+
+    So an attribute default that is a live object rather than a sentinel fails the
+    whole run before a single node launches, in the driver, with a
+    ``TypeError: cannot pickle '_thread.lock' object`` that names neither the class
+    nor the attribute. A `ResourceMonitor()` default did exactly that — it holds a
+    `threading.Event` and two `threading.Lock`s — and no unit test noticed, because
+    every other test either constructs the actor or drives its methods, and neither
+    of those serialises anything.
+
+    This is the cheapest possible guard on the whole class of defect: one dump of
+    the underlying class, which is what Ray's client pickler does to it.
+    """
+    from ray.cloudpickle import dumps
+
+    dumps(InferenceActor.__ray_metadata__.modified_class)
