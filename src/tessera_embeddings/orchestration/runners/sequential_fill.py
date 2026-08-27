@@ -253,6 +253,7 @@ def fill_zones_sequential(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     inputs: CellInputs | None = None,
     look_ahead: int = 2,
+    max_retained_failures: int = 30,
     attempts_per_cell_in_cluster: int = 2,
     fault: ArmedFault | None = None,
     paused: Callable[[], bool] | None = None,
@@ -321,8 +322,17 @@ def fill_zones_sequential(
             deterministic failure will burn both, and what actually stops that is the
             driver's no-progress check rather than either count.
         look_ahead: Sizes INGEST width only — the driver runs ``1 + look_ahead`` cells
-            at a time. It bounds neither inference nor assembly. It also sets
-            ``max_retained_failures``, which caps failures rather than throughput.
+            at a time. It bounds neither inference nor assembly, and since 2026-08-27 it no
+            longer sets ``max_retained_failures`` either: that was its last implicit job, and
+            coupling a failure budget to an ingest width meant neither could be tuned alone.
+        max_retained_failures: How many failed cells may hold mosaics off-budget before the
+            feeder gives up and ENDS THE RUN. **A ceiling against a systematic fault, not a
+            tripwire for a bad hour.** At the old ``look_ahead + 2`` it was 7, and a single
+            provider outage on 2026-08-27 put nine of ten clusters over it — turning an
+            exogenous failure wave into a fleet-wide teardown. Failure waves are a fact of
+            life against remote archives; what the campaign needs from them is fast recovery,
+            not a hair trigger. Reaching this now exits IMMEDIATELY rather than draining, for
+            the same reason: the cells want re-dispatching, and waiting delays it.
         fault: Supervised-drill hook, consulted where prepared work crosses from the
             feeder to the scheduler. Inert unless the run was armed for the
             supply-withholding fault (:mod:`tessera_embeddings.config.fault_injection`).
@@ -359,6 +369,10 @@ def fill_zones_sequential(
     # are counted, and once they reach this cap the feeder stops admitting new cells (the
     # run then winds down and fails on the recorded failures) — otherwise a systematic
     # failure would retain every cluster's multi-TB mosaic.
+    #: Set by the feeder when the cap trips, read by the teardown. A cap trip is now a FAST
+    #: EXIT rather than a quiet stop: the point of stopping is to get these cells back to the
+    #: driver, and draining first delays exactly the thing the stop is for.
+    cap_tripped = False
     retained_failed: set[tuple[str, int]] = set()
     #: Cells that LANDED but whose mosaic delete failed. Tracked apart from
     #: ``retained_failed`` because these must not stop the feeder — see ``_leak_mosaic``.
@@ -366,7 +380,6 @@ def fill_zones_sequential(
     #: Cells submitted to the trailing finalizer and not yet assembled. Reported at the
     #: drain, where the backlog can be most of a cluster's cells and take hours.
     assembly_pending = 0
-    max_retained_failures = look_ahead + 2
     finalizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trailing-assembly")
 
     def _leak_mosaic(cell: SequentialCell) -> None:
@@ -568,11 +581,21 @@ def fill_zones_sequential(
                 if inputs is not None and n_failed >= max_retained_failures:
                     log.error(
                         "Retained-failure cap reached (%d failed cell(s) holding mosaics off-budget) — "
-                        "stopping the feeder before admitting more ingests; %d cell(s) left unattempted "
-                        "(they stay pending for the next campaign pass). Likely a systematic failure — investigate.",
+                        "stopping the feeder and ENDING THIS RUN NOW without draining; %d cell(s) left "
+                        "unattempted (they go back to the driver, which re-dispatches them). Likely a "
+                        "systematic failure — investigate.",
                         n_failed,
                         len(pending),
                     )
+                    nonlocal cap_tripped
+                    cap_tripped = True
+                    # Unwind the inference stream too. Without this the feeder returns and the
+                    # run still waits out every in-flight cell and every queued assembly before
+                    # the driver hears about it -- hours, during which nothing new is admitted
+                    # and the cells that need re-dispatching sit idle. Measured 2026-08-27: a
+                    # provider outage left 24 cells with a dead optical leg, each held open for
+                    # HOURS by radar legs that could not change the outcome.
+                    stop.set()
                     # Record them as failures, not just in the log. The cells that
                     # triggered this cap can RECOVER in the in-child retry pass, and if
                     # every one does, `failures` empties and this run reports clean —
@@ -802,7 +825,18 @@ def fill_zones_sequential(
                 "Actors are already retired, so GPU workers idle down while this runs.",
                 n_pending,
             )
-        finalizer.shutdown(wait=True)
+        if cap_tripped:
+            # Drop QUEUED assemblies rather than working through them. Their mosaics are
+            # retained and their staged tiles survive, so a re-dispatch RESUMES rather than
+            # rebuilds -- the cost is bounded to whatever the one running assembly loses, and
+            # even that re-stages rather than re-infers.
+            log.warning(
+                "Cap trip: abandoning the assembly queue so the driver can re-dispatch now. "
+                "Mosaics and staged tiles are retained; a re-run resumes from them."
+            )
+            finalizer.shutdown(wait=False, cancel_futures=True)
+        else:
+            finalizer.shutdown(wait=True)
 
     # A feeder crash (captured above) means the session drained only a partial
     # queue and would otherwise look complete — surface it. Committed cells stay

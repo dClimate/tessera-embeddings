@@ -656,6 +656,7 @@ def fill_zones_sequential_flow(
     ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
     branch: str | None = None,
     look_ahead: int = 2,
+    max_retained_failures: int = 30,
     attempts_per_cell_in_cluster: int = 2,
     inference_pause_gate: str | None = None,
     ingest_limit_name: str | None = None,
@@ -778,9 +779,17 @@ def fill_zones_sequential_flow(
             the campaign driver's `max_dispatch_rounds`, which counts whole-dispatch
             rounds — see `sequential_fill.fill_zones_sequential`.
         look_ahead: Sizes INGEST width only — the ingest driver runs ``1 + look_ahead``
-            cells at a time, which also sets the priming abort quorum and the runner's
-            retained-failure cap. It no longer bounds in-flight mosaics: peak storage is a
-            cluster's mosaics by design (ADR-011).
+            cells at a time, which also sets the priming abort quorum. It no longer bounds
+            in-flight mosaics (peak storage is a cluster's mosaics by design, ADR-011), and
+            since 2026-08-27 it no longer sets the retained-failure cap either — see
+            ``max_retained_failures``.
+        max_retained_failures: Failed cells holding mosaics off-budget before the feeder
+            gives up and ends the run IMMEDIATELY. A ceiling against a SYSTEMATIC fault,
+            not a tripwire for a bad hour. At the old ``look_ahead + 2`` it was 7, and one
+            provider outage on 2026-08-27 put nine of ten clusters over it — converting an
+            exogenous failure wave into a fleet-wide teardown. Failure waves against remote
+            archives are a fact of life; what the campaign needs from them is fast recovery,
+            not a hair trigger.
         cleanup_mosaics: Delete each campaign-ingested mosaic after its cell
             lands (transient input). Ignored for ``ingest=False`` mosaics.
         ingest_settings: Grouped ingest tuning knobs (worker bounds, S2
@@ -1417,6 +1426,7 @@ def fill_zones_sequential_flow(
                 log=log,
                 inputs=inputs,
                 look_ahead=look_ahead,
+                max_retained_failures=max_retained_failures,
                 attempts_per_cell_in_cluster=attempts_per_cell_in_cluster,
                 fault=fault,
                 # Built here rather than in the runner: the runner is Prefect-free, so the

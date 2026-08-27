@@ -540,14 +540,18 @@ def test_systematic_failure_stops_feeder_at_retained_cap():
 
     The deterministic half: an ingest failure raises inside ``inputs.wait`` on the feeder's
     own thread, so it is counted before the next cap check no matter how fast the fake runs.
-    ``look_ahead=1`` → cap 3.
+
+    The cap is passed EXPLICITLY. It used to be ``look_ahead + 2``, and this test set
+    ``look_ahead=1`` to get a cap of 3 — which is precisely the coupling removed on
+    2026-08-27, when a failure budget of 7 derived from an ingest width took nine of ten
+    clusters down in one provider outage.
     """
     events: list[str] = []
     inputs = FailingWaitInputs(events)
     with pytest.raises(RuntimeError, match="cell"):
         # attempts=1 disables the in-child retry pass, which calls `inputs.wait` too —
         # counting its attempts as admissions reported 6 for a feeder that stopped at 3.
-        _run(_cells(12), inputs=inputs, look_ahead=1, attempts_per_cell_in_cluster=1)
+        _run(_cells(12), inputs=inputs, look_ahead=1, max_retained_failures=3, attempts_per_cell_in_cluster=1)
     waited = len([e for e in events if e.startswith("wait:")])
     started = len([e for e in events if e.startswith("start:")])
     assert waited == 3, f"the feeder must stop admitting at the cap of 3, admitted {waited}"
@@ -1140,3 +1144,85 @@ def test_no_pause_callable_means_no_check_at_all():
     out = _run(_cells(1), session=_pausing_session(0, seen))
     assert out["succeeded"] == 1
     assert "empty" not in seen[:1]
+
+
+def test_the_cap_is_not_derived_from_look_ahead():
+    """The decoupling itself. `look_ahead` sizes INGEST WIDTH; the cap is a FAILURE BUDGET.
+
+    Tying them meant a fleet configured for 3-wide ingest silently accepted a failure budget
+    of 5, and one exogenous provider outage on 2026-08-27 then converted into a fleet-wide
+    teardown. A wide ingest and a patient failure budget are different decisions.
+    """
+    import inspect
+
+    params = inspect.signature(mod.fill_zones_sequential).parameters
+    assert params["max_retained_failures"].default == 30, (
+        "the default is a deliberate ceiling against a SYSTEMATIC fault, not a bad hour"
+    )
+    events: list[str] = []
+    inputs = FailingWaitInputs(events)
+    # look_ahead=1 would have forced a cap of 3 under the old derivation; it must not now.
+    with pytest.raises(RuntimeError, match="cell"):
+        _run(_cells(8), inputs=inputs, look_ahead=1, max_retained_failures=6, attempts_per_cell_in_cluster=1)
+    waited = len([e for e in events if e.startswith("wait:")])
+    assert waited == 6, f"the cap must be the one passed, not look_ahead + 2; admitted {waited}"
+
+
+def test_hitting_the_cap_ends_the_run_without_draining_the_assembly_queue():
+    """A cap trip ENDS the run instead of draining it — asserted by the CLOCK.
+
+    The point of stopping is to get the unattempted cells back to the driver for
+    re-dispatch, and draining first delays exactly that: measured 2026-08-27, cells whose
+    optical leg had died stayed open for HOURS behind work that could not change the
+    outcome. Mosaics and staged tiles are retained, so a re-dispatch resumes rather than
+    rebuilds — which is what makes abandoning the queue cheap enough to be right.
+
+    Asserted by finishing while an assembly is STILL BLOCKED: if the run drained, it could
+    not have returned. A timing assertion is used because "did not wait" has no other
+    observable — the executor's shutdown arguments are not visible from here.
+    """
+    release = threading.Event()  # never set until the run has already returned
+    entered = threading.Event()
+
+    def blocking_assemble(handoff, *a, **k):
+        entered.set()
+        release.wait(timeout=30)
+        return _assemble()(handoff, *a, **k)
+
+    class _FailAfter(RecordingInputs):
+        """Succeeds for the first two cells so assemblies actually QUEUE, then fails —
+        which is what lets a cap trip and a non-empty assembly queue coexist.
+        """
+
+        def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+            with self._lock:
+                self.events.append(f"wait:{zone}")
+                n = len([e for e in self.events if e.startswith("wait:")])
+            if n > 2:
+                raise RuntimeError(f"ingest failed for {zone}-{year}")
+
+    events: list[str] = []
+    inputs = _FailAfter(events)
+    done = threading.Event()
+    box: list[BaseException] = []
+
+    def go():
+        try:
+            _run(
+                _cells(8),
+                inputs=inputs,
+                look_ahead=1,
+                max_retained_failures=2,
+                attempts_per_cell_in_cluster=1,
+                assemble=blocking_assemble,
+            )
+        except BaseException as exc:
+            box.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=go, daemon=True).start()
+    finished = done.wait(timeout=15)
+    release.set()
+    assert finished, "the run drained the assembly queue instead of ending at the cap"
+    assert box and isinstance(box[0], RuntimeError)
