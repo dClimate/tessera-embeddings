@@ -127,7 +127,9 @@ gaps between successive requests, seconds:
 ```
 
 The total is dominated by the last rung and scales linearly in the base, confirmed at
-`MAX_RETRY=6`: 44.3 s at base 0.5, 442.5 s at base 5 — a ratio of 9.99 for a 10x base.
+`MAX_RETRY=6`: 44.3 s at base 0.5, 442.5 s at base 5 — a ratio of 9.99 for a 10x base. **The
+doubling is not capped**: base 0.5 at `MAX_RETRY=10` had not given up after 900 s, and base 5 at
+`MAX_RETRY=8` had not given up after 1,600 s. Both are measured lower bounds, not estimates.
 
 Extending the measured ladder to the `MAX_RETRY=10` that is actually in force:
 
