@@ -423,6 +423,18 @@ correction 4 describes (10 readers per actor at a 12-vCPU share, 6 at an 8-vCPU 
 **This is suggestive and is not the ratio**; utilisation at 100% is consistent with both a
 fed GPU and a GPU spending time on smaller kernels.
 
+### Per-actor VRAM is unaffected by host sharing
+
+Also transferable, because VRAM is a per-device resource and the mechanism is
+card-independent. On a packed host an actor reported `vram_peak_gib = 5.31` at `t_kept = 54`;
+single-GPU hosts at the same depth reported 4.55 and 5.31. The variation is inside what one
+card shows across chunks, so **four actors sharing a host do not affect each other's VRAM** —
+which is the expected answer, and worth having as a control rather than an assumption. Had it
+moved, that would have been a finding in itself and a reason to stop.
+
+The reserved pool behaves the same way per actor: 19.7 of 22.04 GiB on the packed host's
+actor, against 21.7 on the singles. Each actor's allocator sizes itself to its own card.
+
 ### L4 findings — a separate question, not the packing answer
 
 **Read this as capacity-and-cost evidence about a different card, nothing more.** It cannot
