@@ -3,12 +3,30 @@
 **The question.** Widening the GPU instance pool beyond `g6e.xlarge` was settled by
 reading, with one exception: every candidate multi-GPU size puts several
 `InferenceActor`s on one machine, and **nothing in either repository had ever run two
-actors on one host.** No document, log or test recorded it. This is the record of the
-dev-account measurement that settled it, and of several things the plan had wrong that
-the measurement found on the way.
+actors on one host.** No document, log or test recorded it.
+
+**Status: the throughput ratio is NOT measured, and why is the most important finding
+here.** Every `g6e` size was unbuyable in us-west-2 for the whole attempt — the pool is
+the card, not the instance size — so the packed arm never launched. What the attempt did
+produce is a peak-VRAM measurement that retires a two-year-old wrong number, real
+per-GPU prices that kill the multi-GPU rung on cost before throughput is asked about, a
+4.3% noise floor the ratio can be judged against when it is measured, and the first
+confirmation that four actors DO co-exist on one host. Plus six corrections to the plan.
 
 Read `yield-embeddings/temp/gpu-instance-diversity-plan.md` for the case being tested.
-This document is the evidence, including the corrections.
+This document is the evidence, including the corrections and two claims of my own that
+are withdrawn in place.
+
+| deliverable | status |
+|---|---|
+| Peak VRAM per chunk, against optical depth | **measured** — 4.6–9.0 GiB, 10–20% of the card |
+| Control-arm noise floor | **measured** — 4.3% over three hosts |
+| Per-actor VRAM unaffected by host sharing | **measured** |
+| Four actors on one host at all | **confirmed**, with correct per-actor GPU indices |
+| $/GPU-hour for every candidate size | **measured** |
+| `g6e` capacity across sizes and AZs | **measured** — one pool, all refused |
+| **Packed-vs-unpacked throughput ratio** | **BLOCKED on `g6e` capacity** |
+| Whether the `_band_read_workers` fix was needed to pass | **unanswerable until the ratio is** |
 
 ## What is being compared, and why it must be one run
 
