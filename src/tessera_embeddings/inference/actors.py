@@ -740,6 +740,18 @@ class InferenceActor:
     ``providers.aws.credentials.iam_icechunk_credentials``.
     """
 
+    # Class-level defaults for the two attributes the per-chunk telemetry reads.
+    # `__init__` always sets both, and these exist for the instance that does NOT
+    # run it: several tests build the actor bare (`cls.__new__(cls)`) and drive
+    # `_process_chunk` directly, because a real construction downloads a checkpoint
+    # and loads a model onto a GPU. `None` is not a placeholder here — it is the
+    # documented "no CUDA / no assigned GPU" value that `_vram_peak_fields` and
+    # `_reset_vram_peak` already take, so a bare instance reports no VRAM rather
+    # than raising inside a chunk. The alternative, reading them with `getattr`
+    # defaults at each use, would hide a genuinely unset attribute on a real actor.
+    _torch: types.ModuleType | None = None
+    gpu_index: str | None = None
+
     def __init__(
         self,
         config: InferenceConfig,
@@ -787,7 +799,7 @@ class InferenceActor:
         # reader is a no-op on the CPU runner without repeating the device check.
         # (torch is imported lazily in this method — see the module docstring —
         # so there is no module-level name to reach for from _process_chunk.)
-        self._torch: types.ModuleType | None = _torch if self.device.type == "cuda" else None
+        self._torch = _torch if self.device.type == "cuda" else None
         # This actor's GPU index ON THE HOST, which is not always 0: Ray packs one
         # actor per GPU, so a 4-GPU host runs four actors holding indices 0-3.
         self.gpu_index = _accelerator_index()
