@@ -219,4 +219,139 @@ idea on the one axis where it plausibly exists.
 
 ## Results
 
-<!-- filled in from the runs; see the RESULTS section appended below -->
+### One card, three different capacities — name the source
+
+Before any VRAM figure, the denominator. The same L40S reports:
+
+| source | figure | as GiB |
+|---|---:|---:|
+| `ec2:describe-instance-types` | 45,776 MiB | 44.70 |
+| `nvidia-smi memory.total` (live worker) | 46,068 MiB | 45.00 |
+| `torch.cuda.get_device_properties().total_memory` | — | **44.39** |
+
+All three are correct for their own definition and none is 46 GB. **"46 GB" in the earlier
+design note is `nvidia-smi`'s 46,068 MiB read as MB** — that is the provenance, now
+identified rather than guessed. Every percentage below uses torch's 44.39 GiB, because that
+is the number the same API produces the peak figures in.
+
+### Peak VRAM — the first real measurement, and it moves a decision
+
+From the control run on `g6e.xlarge` (L40S, 45,776 MiB = 44.39 GiB as torch reports it),
+`iowa_epsg5070`, one-orbit chunks, B=7168:
+
+| `t_kept` | `max_memory_allocated` | % of card | `max_memory_reserved` | % of card |
+|---:|---:|---:|---:|---:|
+| 54 | **4.55** GiB | 10% | 22.24 GiB | 50% |
+| 54 | **5.31** GiB | 12% | 28.40 GiB | 64% |
+| 57 | **4.55** GiB | 10% | 25.53 GiB | 58% |
+| 62 | **5.29** GiB | 12% | 39.56 GiB | 89% |
+| 93 | **5.29** GiB | 12% | 22.24 GiB | 50% |
+| 108–110 | **7.52** GiB | 17% | 22.19–25.53 GiB | 50–58% |
+| 113–115 | **7.52–8.27** GiB | 17–19% | 25.53–39.56 GiB | 58–89% |
+
+**The live tensor requirement is 4.6–8.3 GiB — 10% to 19% of the card — not the ~43 GiB the
+campaign's only prior reading implied.** The two columns behave completely differently, and
+that difference is the whole answer:
+
+* **Allocated** tracks optical depth cleanly and is quantised by the strip planner's buffer
+  sizes (4.55 / 5.3 / 7.52 / 8.27). A straight fit over the range gives about
+  **1.3 GiB fixed + 0.061 GiB per optical timestep**.
+* **Reserved** does NOT track depth. It tracks the actor's AGE: a 62-timestep chunk late in
+  a worker's life reserved 39.56 GiB while a 93-timestep chunk early in another's reserved
+  22.24 GiB. It is the caching allocator's pool drifting upward with fragmentation, and it
+  runs **2.7× to 7.5×** the live requirement.
+
+**That is where "97% of the card" came from, now confirmed live.** A `RESOURCES` line from a
+worker mid-chunk reads `VRAM=42171 MiB/46068 MiB` — 91.5%. `nvidia-smi` sees the reserved
+pool, so the campaign's headline VRAM figure was measuring allocator slack, not need.
+
+**A finding worth acting on independently of any instance-type decision.** The allocator is
+drifting to ~89% of a 44 GiB card to hold a working set of 8 GiB. Nothing bounds it: a
+chunk deeper than any yet seen could OOM a worker that has plenty of genuinely free VRAM.
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, or a periodic `empty_cache()`, would
+reclaim it. Untested here; the measurement is what makes it visible.
+
+**What it settles for smaller cards.** A 22.4 GiB card (L4, A10G) is **not disqualified by
+VRAM**. At the deepest depth observed (115) the requirement is 8.27 GiB — 37% of a 22.4 GiB
+card. Extrapolated to the deepest a 2024 window could hold (263 optical timesteps) it is
+**~17.3 GiB, or 77%** of such a card. Two honest caveats: that extrapolation rests on
+depths up to 115 and wants deeper chunks before being quoted as a bound; and the reserved
+pool's behaviour on a card that physically cannot over-reserve is **untested**. The
+allocator would necessarily recycle rather than hoard, but whether it does so without
+fragmentation-driven OOM at 77% occupancy is exactly the thing to measure before adopting a
+24 GB-class card.
+
+**Peak VRAM was identical per actor across hosts** (7.52 GiB on every deep chunk, on three
+different instances), which is the expected answer — VRAM is per device and is not shared —
+and is the control for the packed-host reading.
+
+### Capacity: the `g6e` family is ONE pool, and that voids the plan's premise
+
+Measured by real single launches in the dev account on 2026-08-27, ~17:14–17:19 UTC. (A
+first attempt used `ec2 run-instances --dry-run`, which returns `DryRunOperation` after the
+permission check and **never consults capacity** — a probe that would have reported every
+type as available.)
+
+| type | card | us-west-2a | us-west-2b | us-west-2c |
+|---|---|---|---|---|
+| `g6e.xlarge` … `g6e.48xlarge` (all 8 sizes) | L40S | refused | refused | refused |
+| `g6.xlarge` | L4 | — | — | **launched** |
+| `g6.2xlarge` | L4 | refused | **launched** | **launched** |
+| `g6.12xlarge` | L4 | refused | refused | **launched at 17:14, refused at 17:19** |
+| `g5.xlarge` | A10G | — | — | **launched** |
+| `g5.12xlarge` | A10G | — | — | refused |
+| `g4dn.xlarge` | T4 | — | — | **launched** |
+
+Every refusal was `InsufficientInstanceCapacity`, not `VcpuLimitExceeded` — the applied
+G-and-VT quota in this account is 10,000 vCPU, so quota is not the constraint.
+
+**All eight `g6e` sizes refused together, in all three AZs, at the same moment, while three
+other GPU families launched.** So a different `g6e` SIZE is not a different capacity pool.
+**The pool is the card.** This is exactly the plan's own kill condition — *"if another `g6e`
+size draws on the SAME constrained pool in us-west-2, the premise is void and the answer is
+a capacity reservation or a second region"* — and it is now measured rather than assumed.
+
+Two corollaries:
+
+- **The 4-GPU boxes are the scarcest thing, not the easiest.** `g6.12xlarge` and
+  `g6e.12xlarge` refused when their 1-GPU siblings launched. A 4-GPU host needs four
+  contiguous GPUs on one machine, so a squeeze bites it first. That runs against the
+  "fewer, bigger boxes" instinct as well as against diversification.
+- **A withdrawn reading, and one open question left open.** For about ten minutes I read 50
+  launch failures all naming `us-west-2b` as evidence that Ray's v2 autoscaler path does not
+  rotate subnets. Then a worker appeared in `us-west-2a`, so **rotation does happen and that
+  reading is withdrawn**; the AZ-failover behaviour the cluster template documents is intact,
+  and what I was looking at was a region-wide shortage.
+
+  What remains genuinely unexplained: across ~140 logged `InsufficientInstanceCapacity`
+  failures, **every single one named `us-west-2b`** as the zone requested, and 2b is the
+  first subnet in the SSM list. Ray's v1 `_create_node` rotates `subnet_idx` on each
+  `ClientError` with `max_tries = max(BOTO_CREATE_MAX_RETRIES, len(subnet_ids))` ≥ 3, and the
+  exception it reports is the last attempt's — so the reported zone should vary. It does not.
+  I could not settle from logs whether later attempts happen and are unreported, or whether
+  the v2 path's cached `launch_config` interacts badly with `_create_node`'s
+  `conf.pop("SubnetIds")` (which mutates the dict it is given). **Not investigated further —
+  it is outside this measurement's scope, and it did not block anything, because every zone
+  was refusing anyway.** Worth a look if a future fleet stalls in one AZ while another has
+  capacity.
+
+### The packing ratio
+
+**Not obtained on `g6e`.** The dev account could not buy a single 4-GPU host of either
+family for the duration of the attempt. The control arm reached only 3 of 12 requested
+`g6e.xlarge` workers in 20 minutes, against a fleet that normally fills in about two.
+
+Because `g6.12xlarge` is 48 vCPU and 4 GPUs — **12 vCPU per actor, identical to
+`g6e.12xlarge`** — the host-sharing mechanism can be tested on the L4 family instead, with
+`g6.2xlarge` (8 vCPU, 32 GiB, one L4) as the 1-GPU arm. Both arms then run the same card
+and the only difference is host sharing, which is what the question is about. The peak-VRAM
+measurement above is what makes that substitution legitimate: 7.5 GiB fits a 22.4 GiB card.
+Absolute tok/sec on an L4 is NOT comparable to production and no such comparison is made
+here.
+
+### Control-arm noise floor
+
+Two `g6e.xlarge` hosts with 4–5 chunks each, one-orbit stratum, median per-host combined
+tok/sec of **1.79M and 1.67M** — a 7% spread on very few chunks per host. Below the sample
+count the acceptance threshold needs, and above the 5% the threshold assumes; both readings
+are provisional.

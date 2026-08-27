@@ -80,6 +80,15 @@ census's 143 tokens, so had `t_kept` included radar the two could not have agree
 **They agreed *because* both were optical.** An agreement that a hypothesis predicts should
 be impossible is evidence against the hypothesis, not for it.
 
+- **The L40S recorded as "46 GB VRAM".** 46,068 MiB is what `nvidia-smi memory.total`
+  reports; read as GB and rounded, it became "46 GB". The card is **45,776 MiB** by
+  `describe-instance-types` and **44.39 GiB** by
+  `torch.cuda.get_device_properties().total_memory` — three figures, one card, all correct
+  for their own definition, and none of them 46 GB. It mattered twice: it is the denominator
+  of every "% of the card" figure, and it made the 22,888 MiB L4/A10G look like "barely half"
+  when the real ratio is **1.94×**. `inference/README.md`'s "48 GB" (vendor decimal) was
+  right all along. (`inference_gpu_saturation_profile_2026_07.md:14`, corrected 2026-08-27)
+
 ### 3. Presence counted where coverage was meant
 
 Three withdrawals, one instrument, and the error is always in the same direction: an
@@ -98,6 +107,14 @@ aggregate unit too coarse to see the thing being measured.
 
 **The cure:** state the unit of aggregation in the claim itself. "Per zone" and "per pixel"
 are different questions, and a percentage that does not say which is not yet a finding.
+
+- **"Peak VRAM is 97% of the card."** `nvidia-smi` reports the CUDA caching allocator's
+  RESERVED pool, not what live tensors hold. Measured per chunk with
+  `max_memory_allocated`, the requirement is **4.6–8.3 GiB (10–19% of the card)** while the
+  reserved pool drifts to **89%** — 2.7× to 7.5× the live figure, and drifting with the
+  actor's AGE rather than with the work. A capacity question ("does this fit a 24 GB card?")
+  answered from the reserved figure is answered from allocator slack.
+  (`gpu-host-packing-2026_08.md`, measured 2026-08-27)
 
 ### 4. An in-flight measurement read as a finished one
 
@@ -169,6 +186,18 @@ needs enough points to show it is monotonic before one of them becomes a recomme
 **The cure:** an unexplained result is a publishable state. Recording "the effect is real
 and the mechanism is unknown" costs nothing and blocks nothing; a mechanism invented to
 close the gap becomes load-bearing for later decisions and then has to be dug out of them.
+
+- **"Ray's v2 autoscaler path does not rotate subnets."** Asserted from 50 launch failures
+  all naming `us-west-2b`. Withdrawn ten minutes later when a worker appeared in
+  `us-west-2a` and, shortly after, three `g6.2xlarge` landed one in each of the three AZs.
+  Rotation works. What the failures actually showed was a **region-wide** GPU shortage, and
+  the invariant reading of one AZ in the error text remains unexplained and is recorded as
+  unexplained rather than as a mechanism. (`gpu-host-packing-2026_08.md`, 2026-08-27)
+- **"A different `g6e` size is a different capacity pool."** Not a measurement at all when
+  first written — the plan said so, calling it "normally true, but an assumption about AWS".
+  Measured: all eight `g6e` sizes refused `InsufficientInstanceCapacity` in all three AZs at
+  the same moment while `g6.xlarge`, `g6.2xlarge`, `g5.xlarge` and `g4dn.xlarge` launched.
+  **The pool is the card.** (`gpu-host-packing-2026_08.md`, 2026-08-27)
 
 ### 8. A correction applied in one place and not the others
 
