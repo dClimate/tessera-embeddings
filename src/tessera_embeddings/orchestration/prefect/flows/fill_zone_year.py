@@ -8,10 +8,10 @@ context manager; the cancellation hook is shared via :mod:`._ray_lifecycle`).
 
 **Concurrency model (ADR-008 D6).** Inference is embarrassingly parallel across
 zones — nothing is shared and nothing commits — so many of these flow runs can
-do GPU work at once. Commits are UNGATED: a fleet-wide committer limit was
-removed after measurement showed nothing for it to bound (a commit is ~1 s
-against a ~6 h fill, with zero observed queueing, and concurrent commits touch
-disjoint zone stores). See ``context_docs/design/commit-gate-removal-2026_08.md``.
+do GPU work at once. Commits are UNGATED here, and whether that is correct is
+UNRESOLVED: the measured 1 s commit was taken with one assembly in flight, and the
+campaign writes every zone group into ONE repo, so commits share a branch tip. See
+``context_docs/design/commit-gate-removal-2026_08.md``.
 Same-zone serialization (whose attr commits genuinely conflict) is the campaign
 driver's job, not this flow's.
 """

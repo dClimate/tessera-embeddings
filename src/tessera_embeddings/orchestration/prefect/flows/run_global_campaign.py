@@ -44,11 +44,11 @@ older shape: **year by year** in an outer serial loop, dispatching each year's z
 concurrently, where distinct zones make same-zone overlap impossible by construction.
 Either way concurrency is bounded by ``max_parallel_clusters``.
 
-Commits are UNGATED. A fleet-wide committer limit used to be forwarded to every
-fill; it was removed because at campaign scale there was nothing for it to bound —
-see ``context_docs/design/commit-gate-removal-2026_08.md``, which keeps the run-1
-contention curve and the scale at which it would matter again. ``pending()`` is
-year-major, which is the drain pattern the barrier path relies on.
+Commits are UNGATED in this branch, and that is UNRESOLVED: at
+``max_parallel_clusters=10`` the committer ceiling is ~2N=20 on a SINGLE repo branch
+tip, against a run-1 breach at N>=16. See
+``context_docs/design/commit-gate-removal-2026_08.md``. ``pending()`` is year-major,
+which is the drain pattern the barrier path relies on.
 """
 
 from __future__ import annotations

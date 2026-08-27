@@ -49,12 +49,36 @@ The commit is **1.3 s out of a six-hour assembly** — 0.006% of it. And because
 measured *around* the gated call, **the gate wait is inside that 1.0 s**, which makes it direct
 evidence of zero queueing rather than an inference.
 
-**3. There is structurally almost nothing to contend for.** The embeddings store is **per ROI** —
-`{bucket}/embeddings/{roi_name}.zarr` — so concurrent commits from different zones land in
-different Icechunk repositories and cannot share a branch tip at all. The registry is **one Parquet
-part per cell**, write-once objects rather than a shared mutable dataset. The residual same-store
-case is same-zone/different-year, and that is serialised by other means: the campaign driver
-partitions zones across clusters, and within a cluster the trailing assembly is a single thread.
+**3. ~~There is structurally almost nothing to contend for.~~ WITHDRAWN 2026-08-27 — this was
+false, and it was the load-bearing half of the argument.**
+
+I wrote that the embeddings store is "per ROI — `{bucket}/embeddings/{roi_name}.zarr` — so
+concurrent commits from different zones land in different Icechunk repositories and cannot share a
+branch tip at all." **That describes `BucketPaths.store_for()`, the SINGLE-ROI path. The global
+campaign uses `BucketPaths.global_store()`, whose own docstring says the opposite:** "the **single**
+global-embeddings Icechunk repo… all 120 UTM-zone groups into one repo (ADR-008 D5), addressed by
+zone group name — **unlike `store_for`**, which is one `.zarr` per (roi, kind)". The docstring
+contrasts the two functions explicitly. I read the wrong one and did not check.
+
+Two reviewers found this independently, which is the correct outcome and the reason it is recorded
+here rather than quietly patched.
+
+**What is actually true.** All 120 zone groups live in ONE repo on ONE `main` branch tip. Commits
+touch **disjoint groups**, so there are no DATA conflicts — that part of the original design note
+holds and run 1 measured zero unresolvable conflicts at every N. But every commit re-serialises the
+repo-global snapshot through a branch-tip compare-and-swap, so **rebase retries scale with the
+number of racing writers regardless of how disjoint their data is.** Disjoint groups and a shared
+CAS are different things, and conflating them is the whole error.
+
+**The exposure at the configured width.** `max_parallel_clusters` defaults to **10**, and each
+chained cluster can have a feeder committing a terminal plan (`mark_zone_year_empty`) while its
+trailing-assembly thread commits a cell — so the ceiling is roughly **2N = 20 concurrent
+committers**. Run 1 breached its own <=2x-serial acceptance criterion at **N>=16**. The default
+configuration's ceiling therefore sits ABOVE the measured threshold, and supported wider
+configurations sit far above it.
+
+The registry point stands and is unaffected: one Parquet part per cell, write-once objects rather
+than a shared mutable dataset.
 
 **4. The observability cost was real.** The gate's `active_slots` was read as a progress signal on
 the night of 2026-08-27 and gave a wrong answer twice — first as "four cells stuck in hours-long
@@ -72,12 +96,29 @@ cells a feeder commits through `mark_zone_year_empty`. Either way the point stan
 1 s commit with zero measured queueing cannot be bound by a limit — but the "counter lags" reason is
 withdrawn and should not be repeated.
 
-## What replaces it
+## Where this leaves the change — NOT MERGEABLE AS IT STANDS
 
-Nothing. Commits proceed directly, with `icechunk`'s own rebase loop
-(`ConflictDetector`, `rebase_tries=1000`) as the only protection — which is what actually resolved
-the run-1 contention. A real chunk conflict still surfaces as `RebaseFailedError` rather than being
-masked.
+**The measurement survives; the argument built on it does not.** `commit_s` of 1.0 s with the gate
+wait measured inside it is a real observation of **zero queueing** — but it was taken with exactly
+**ONE assembly in flight fleet-wide** (verified from per-worker shard counts and from all ten
+clusters' inference progress). That is a measurement at LOW concurrency. It says nothing about the
+N=16-20 case the gate exists for, and I presented it as though it did.
+
+So the honest position: **removing the gate is not justified by anything measured here.** Three ways
+forward, for a human to choose:
+
+1. **Keep the gate.** Costs a ~1 s slot acquisition per commit, measured, with zero observed queueing
+   at current load. This is the conservative option and the evidence does not argue against it.
+2. **Keep a bound but simplify it.** The gate's real defect was never that it was a bound; it was
+   that its value derived from `min(max_parallel_clusters, 8)` and its `active_slots` counter misled
+   me twice as a progress signal. A fixed bound with no telemetry pretensions addresses both.
+3. **Remove it AND cap campaign width** so that `2 * max_parallel_clusters < 16`, i.e.
+   `max_parallel_clusters <= 7`. That trades committer safety for cluster count, which is a
+   throughput decision, not a correctness one.
+
+`icechunk`'s own rebase loop (`ConflictDetector`, `rebase_tries=1000`) remains the backstop under
+every option, and a genuine chunk conflict still raises `RebaseFailedError` rather than being
+masked — so the failure mode of getting this wrong is a slower commit, not a torn one.
 
 ## When to put it back
 
