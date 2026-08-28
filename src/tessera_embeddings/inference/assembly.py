@@ -56,7 +56,7 @@ import numpy as np
 import xarray as xr
 import zarr
 
-from tessera_embeddings.config.environment import code_identity, configure_logging
+from tessera_embeddings.config.environment import code_identity
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import (
     EMBEDDING_DIM,
@@ -517,13 +517,6 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     fused, see ``_assembly_summary_line``; clear-to-fill assignments count in
     ``write`` too, since they emit output objects like any other write).
     """
-    # FIRST, before anything that might log. `run_forked` ships this to a SPAWNED process,
-    # which inherits no logging configuration at all -- so without this the root WARNING
-    # default silently discards every INFO record the worker produces, including the
-    # credential lines that exist to make a published-store write diagnosable. The sibling
-    # worker (`shard_writer._write_shards_worker`) has always done this; this one did not,
-    # which is a detector that could not see its own subject.
-    configure_logging()
     fork = payload["fork"]
     t = int(payload["time_index"])
     y0b, y1b = payload["band"]
@@ -2040,11 +2033,7 @@ class ZarrWriter:
                 max_concurrent_requests=per_worker_cap,
                 get_credentials=get_credentials,
                 region=s3_region,
-                # True unconditionally, for the reason given at the `assemble_global` call
-                # site: `_create_storage` supplies a default provider when this is None, and
-                # omits the option when there is genuinely no provider, so the guard only ever
-                # disabled the scatter on the fallback path.
-                scatter_initial_credentials=True,
+                scatter_initial_credentials=True,  # see assemble_global's call site
             )
             # Persist the split on create so a later COLD writer (one that opens
             # the store outside this manifest_split block) keeps splitting rather
@@ -2506,22 +2495,12 @@ class ZarrWriter:
             get_credentials=get_credentials,
             region=s3_region,
             max_concurrent_requests=per_worker_cap,
-            # This session is PICKLED to `n_workers` spawned children by `write_year_shards`
-            # below. Without this, each child's icechunk deserialises with no credential and
-            # calls back per S3 request for the life of the fork (icechunk#2077: the fetcher's
-            # `initial` cache takes `&self`, so it is never refilled). `assemble()` already
-            # sets this on the standalone-store path; this is the same fork shape writing the
-            # GLOBAL store, and the two disagreed. The pickle carries a live secret, which is
-            # why it is opt-in per call site — here the transport is a local spawn pipe to a
-            # child of this process, not the network. Buys ~one credential TTL, not the whole
-            # assembly: icechunk stops using the cached value once it expires.
-            #
-            # Unconditionally True, NOT `get_credentials is not None`: when the caller passes
-            # None, `_create_storage` falls back to `_default_credentials_provider`, so the
-            # children would still deserialise with an empty cache on the very path the
-            # fallback exists to serve. `_create_storage` omits the option entirely when no
-            # provider is in play, so True is safe to state here and says what is meant --
-            # this call site forks.
+            # `write_year_shards` PICKLES this session to spawned children; without it each
+            # deserialises with no credential and calls back per S3 request for the life of the
+            # fork (icechunk#2077). Opt-in per call site because the pickle carries a live
+            # secret -- safe across a local spawn pipe, not over a network transport. True
+            # unconditionally, since `_create_storage` substitutes a default provider when
+            # `get_credentials` is None and omits the option when there is no provider at all.
             scatter_initial_credentials=True,
         )
 

@@ -16,9 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-import threading
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 
 import icechunk
 import pytest
@@ -373,12 +371,10 @@ class TestTheWiringReachesTheStore:
 
 
 class TestIcechunkCredentialVisibility:
-    """Why this exists: on 2026-08-28 the fleet took 516 `SignatureDoesNotMatch` refusals
-    across 1h45m — 494 on ingest, 22 on assembly, the latter costing four cells.
+    """The boundary that records WHICH credential icechunk is using.
 
-    The providers proved CORRECT on inspection, so the gap was never a defect to fix: nothing
-    recorded WHICH credential was in play, so a recurrence could only be inferred from the
-    shape of the failure rather than lined up against a rotation.
+    Rationale and the incident behind it:
+    ``context_docs/design/icechunk-credential-stampede-2026_08.md``.
     """
 
     @staticmethod
@@ -394,243 +390,117 @@ class TestIcechunkCredentialVisibility:
             expires_after=expires_after or datetime(2026, 8, 28, 12, tzinfo=UTC),
         )
 
-    def test_the_first_credential_a_process_serves_is_info(self, caplog) -> None:
-        """A process that fails before it ever rotates — the common case for these failures —
-        would otherwise carry no access-key id at production log level, and could not be
-        correlated against CloudTrail.
+    def test_first_then_new_then_steady(self, caplog) -> None:
+        """The level ladder, and that every line carries the pid and an ordering stamp.
+
+        A process that fails before it ever changes credential must still name one at production
+        level; a change is the event a signature failure is lined up against; a routine re-serve
+        must not be, since icechunk asks per request once its cache lapses.
         """
         self._reset()
         with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            self._serve("task-role", "ASIAFIRST")
-        assert [r.levelname for r in caplog.records] == ["INFO"]
-        assert "FIRST" in caplog.records[0].message
+            self._serve("task-role", "ASIAONE")
+            self._serve("task-role", "ASIATWO")
+            self._serve("task-role", "ASIATWO")
+        assert [r.levelname for r in caplog.records] == ["INFO", "INFO", "DEBUG"]
+        msgs = [r.getMessage() for r in caplog.records]
+        assert "FIRST: ASIAONE" in msgs[0]
+        assert " NEW: ASIATWO" in msgs[1]
+        assert "served: ASIATWO" in msgs[2]
+        seqs = [int(re.search(r"seq=(\d+)", m).group(1)) for m in msgs]
+        assert seqs == sorted(seqs) and len(set(seqs)) == 3
+        assert all(f"pid={os.getpid()}" in m for m in msgs)
+        # No record claims a transition: see the boundary docstring on why order is undecidable.
+        assert not any("->" in m for m in msgs)
 
-    def test_a_steady_reserve_drops_to_debug(self, caplog) -> None:
-        """Icechunk re-invokes the callback every TTL per client and a campaign runs on the
-        order of a hundred clients, so this is the one that would be a drip saying nothing.
-        """
-        self._reset()
-        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            self._serve("task-role", "ASIASTEADY")
-            self._serve("task-role", "ASIASTEADY")
-            self._serve("task-role", "ASIASTEADY")
-        assert [r.levelname for r in caplog.records] == ["INFO", "DEBUG", "DEBUG"]
-
-    def test_each_further_distinct_credential_is_info(self, caplog) -> None:
-        """The event a signature failure has to be lined up against."""
-        self._reset()
-        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            self._serve("task-role", "ASIAOLD")
-            self._serve("task-role", "ASIANEW")
-        new = [r for r in caplog.records if " NEW: " in r.getMessage()]
-        assert len(new) == 1 and new[0].levelname == "INFO"
-        # The new key is named; the OLD one deliberately is not. A from/to pair would be an
-        # ordering claim this boundary cannot make — at a refresh boundary it can be exactly
-        # backwards. The per-pid INFO lines in `seq` order are the history instead.
-        assert "ASIANEW" in new[0].getMessage()
-        assert "ASIAOLD" not in new[0].getMessage()
-
-    def test_two_providers_in_one_process_do_not_read_as_rotation(self, caplog) -> None:
-        """A fill legitimately uses BOTH — the task role to read our buckets, an assumed role
-        to write the partner's. A single last-seen slot would read those alternating calls as
-        constant rotation and bury the real event.
-        """
+    @pytest.mark.parametrize(
+        ("first_source", "second_source"),
+        [
+            # One fill uses BOTH providers; a single slot would read the alternation as rotation.
+            ("task-role", "assumed-role:arn:aws:iam::1:role/W"),
+            # A role NAME is not unique — the same name in two partner accounts is real, and
+            # merging them reports one provider's rotation as the other's.
+            ("assumed-role:arn:aws:iam::111111111111:role/W", "assumed-role:arn:aws:iam::222222222222:role/W"),
+        ],
+    )
+    def test_distinct_sources_do_not_read_as_one_provider(self, caplog, first_source, second_source) -> None:
         self._reset()
         with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
             for _ in range(3):
-                self._serve("task-role", "ASIATASK")
-                self._serve("assumed-role:writer", "ASIAWRITER")
-        assert not [r for r in caplog.records if " NEW: " in r.getMessage()]
+                self._serve(first_source, "ASIAA")
+                self._serve(second_source, "ASIAB")
+        assert len([r for r in caplog.records if " NEW: " in r.getMessage()]) == 0
+        assert len([r for r in caplog.records if "FIRST" in r.getMessage()]) == 2
 
-    def test_the_same_role_name_in_two_accounts_is_not_one_provider(self, caplog, monkeypatch) -> None:
-        """The identity is the full arn, because a role NAME is not unique.
+    @pytest.mark.parametrize("straggler_was_announced", [True, False])
+    def test_a_late_callback_is_neither_a_change_nor_new_state(self, caplog, straggler_was_announced) -> None:
+        """Acquisition happens before this boundary and outside its lock.
 
-        Two partner accounts may each hold a `Writer` role, and those are different credentials
-        that rotate independently. Keyed on the name alone they share one last-seen slot, so
-        every alternating call reads as a rotation — burying the real event in noise, which is
-        the one thing this instrumentation exists to make findable.
+        So a thread can freeze the old credential, be descheduled past a refresh, and arrive
+        after a faster thread recorded the new one — **carrying a LATER expiry**, since the
+        expiry is computed after the freeze. Both shapes are covered: a straggler whose key was
+        already announced, and one at process start with no history to be matched against, which
+        novelty alone cannot suppress. Neither may report a change or leave the superseded key
+        looking current.
         """
         self._reset()
-        monkeypatch.setattr(
-            creds_mod,
-            "_assumed_role_credentials",
-            lambda arn, ext: SimpleNamespace(
-                get_frozen_credentials=lambda: SimpleNamespace(
-                    # A distinct key per account, so a shared slot WOULD show as rotation.
-                    access_key="ASIA" + arn.split("::")[1][:3],
-                    secret_key="s",
-                    token="t",
-                )
-            ),
-        )
-        monkeypatch.setattr(creds_mod, "_expires_after", lambda creds, ttl: datetime(2026, 8, 28, 12, tzinfo=UTC))
-        first = creds_mod.AssumedRoleIcechunkCredentials("arn:aws:iam::111111111111:role/Writer")
-        second = creds_mod.AssumedRoleIcechunkCredentials("arn:aws:iam::222222222222:role/Writer")
-
+        base = datetime(2026, 8, 28, 12, tzinfo=UTC)
         with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            for _ in range(3):
-                first()
-                second()
+            if straggler_was_announced:
+                self._serve("task-role", "ASIAPRIOR", base)
+            self._serve("task-role", "ASIAFRESH", base + timedelta(minutes=5))
+            self._serve("task-role", "ASIAPRIOR", base + timedelta(minutes=10))
+            # The real credential again: must be steady, which asserts the straggler changed
+            # nothing rather than merely that it stayed quiet.
+            self._serve("task-role", "ASIAFRESH", base + timedelta(minutes=11))
+        msgs = [r.getMessage() for r in caplog.records]
+        assert "served: ASIAFRESH" in msgs[-1]
+        assert not any("->" in m for m in msgs)
+        # One INFO per credential the process really used, and never more.
+        assert len([r for r in caplog.records if r.levelname == "INFO"]) == 2
 
-        assert not [r for r in caplog.records if " NEW: " in r.getMessage()]
-        assert len([r for r in caplog.records if "FIRST" in r.message]) == 2
-        text = " ".join(r.getMessage() for r in caplog.records)
-        # The account id is in the line, which is also what makes it correlatable against the
-        # other account's CloudTrail.
-        assert "111111111111" in text and "222222222222" in text
-
-    def test_the_bookkeeping_is_locked_and_the_log_is_not(self, caplog, monkeypatch) -> None:
-        """Pins BOTH halves of the concurrency design, deterministically.
-
-        icechunk invokes this callback from its own Rust threads. An unguarded read-then-write
-        lets two of them both find a key novel and both announce it — but a racing test can only
-        fail probabilistically, so the invariant is asserted directly instead. The second half
-        matters just as much: holding the lock across the log call would serialise every
-        icechunk request in the process behind it, and per-request callback volume is the very
-        thing being observed.
+    def test_a_workers_first_line_says_it_is_probably_a_change(self, caplog, monkeypatch) -> None:
+        """A spawned worker inherits a scattered credential without asking, so its first call
+        lands only once that credential lapses — the line is a change wearing the word FIRST.
+        Anyone reading these logs cold would misread it, so it says so in its own text.
         """
         self._reset()
-        lock = creds_mod._LAST_ACCESS_KEY_LOCK
+        with caplog.at_level(logging.INFO, logger=creds_mod.__name__):
+            self._serve("task-role", "ASIAPARENT")
+        assert "this worker" not in caplog.records[0].getMessage()
+
+        caplog.clear()
+        self._reset()
+        monkeypatch.setattr(creds_mod.multiprocessing, "parent_process", lambda: object())
+        with caplog.at_level(logging.INFO, logger=creds_mod.__name__):
+            self._serve("task-role", "ASIACHILD")
+        msg = caplog.records[0].getMessage()
+        assert "FIRST in this worker" in msg and "CHANGE" in msg and "not a start" in msg
+        assert "ASIACHILD" in msg
+
+    def test_the_bookkeeping_is_locked_and_the_log_is_not(self, monkeypatch) -> None:
+        """Icechunk calls this from its own threads, so an unguarded read-then-write lets two of
+        them both announce the same key. Asserted directly because a racing test can only fail
+        probabilistically. The second half matters as much: holding the lock across the log would
+        serialise every icechunk request behind a log write.
+        """
+        self._reset()
+        lock = creds_mod._ANNOUNCE_LOCK
+        held: list[bool] = []
 
         class _Watched(dict):
-            def __init__(self) -> None:
-                super().__init__()
-                self.held: list[bool] = []
-
             def setdefault(self, key, default=None):  # type: ignore[override]
-                self.held.append(lock.locked())
+                held.append(lock.locked())
                 return super().setdefault(key, default)
 
-        watched = _Watched()
-        monkeypatch.setattr(creds_mod, "_announced_access_keys", watched)
+        monkeypatch.setattr(creds_mod, "_announced_access_keys", _Watched())
         logged_under_lock: list[bool] = []
-        monkeypatch.setattr(creds_mod._LOG, "info", lambda *a, **k: logged_under_lock.append(lock.locked()))
-
+        monkeypatch.setattr(creds_mod._LOG, "log", lambda *a, **k: logged_under_lock.append(lock.locked()))
         self._serve("task-role", "ASIALOCKED")
-
-        assert watched.held == [True], "the novelty check must happen under the lock"
+        assert held == [True], "the novelty check must happen under the lock"
         assert logged_under_lock == [False], "the log must not run inside the lock"
 
-    def test_concurrent_serves_announce_the_first_exactly_once(self, caplog) -> None:
-        """The realistic companion: eight threads racing one new key produce one FIRST line."""
-        self._reset()
-        barrier = threading.Barrier(8)
-
-        def serve() -> None:
-            barrier.wait()
-            self._serve("task-role", "ASIACONCURRENT")
-
-        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            threads = [threading.Thread(target=serve) for _ in range(8)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-
-        assert len([r for r in caplog.records if "FIRST" in r.message]) == 1
-        assert len(caplog.records) == 8
-
-    def test_every_credential_event_carries_the_process_id(self, caplog) -> None:
-        """The state this decides against is process-local; the log stream is not.
-
-        An assembly's spawned workers and their parent share one container stream, and the
-        formatter carries no process field, so without a pid a rotation seen in one worker
-        reads as though it belonged to whichever process reported the adjacent failure. All
-        three levels carry it, because the level that matters is whichever one is next to the
-        failure.
-        """
-        self._reset()
-        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            self._serve("task-role", "ASIAONE")  # FIRST
-            self._serve("task-role", "ASIATWO")  # NEW
-            self._serve("task-role", "ASIATWO")  # steady, DEBUG
-        assert [r.levelname for r in caplog.records] == ["INFO", "INFO", "DEBUG"]
-        for record in caplog.records:
-            assert f"pid={os.getpid()}" in record.getMessage(), record.getMessage()
-
-    def test_a_late_callback_carrying_the_old_credential_is_not_a_rotation(self, caplog) -> None:
-        """Acquisition happens before this call and outside the lock, so a thread can freeze the
-        old credential, be descheduled past a refresh, and arrive after a faster thread recorded
-        the new one. Announcing unconditionally would put the old key back and manufacture TWO
-        false rotations — one backwards, one forwards again — in the one signal a real failure
-        has to be lined up against.
-
-        **The straggler here carries a LATER expiry than the key already recorded**, which is
-        the case an order-based test gets wrong: the expiry is computed AFTER the credential is
-        frozen, so it dates callback completion, not acquisition. Novelty is decidable from the
-        state; order is not.
-        """
-        self._reset()
-        base = datetime(2026, 8, 28, 12, tzinfo=UTC)
-        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            self._serve("task-role", "ASIAOLD", base)
-            self._serve("task-role", "ASIANEW", base + timedelta(minutes=5))
-            # The straggler — old key, and a LATER expiry than the new key was given.
-            self._serve("task-role", "ASIAOLD", base + timedelta(minutes=10))
-            # The state it must not have clobbered: a later new-key serve stays steady, which
-            # asserts the straggler changed nothing rather than merely that it stayed quiet.
-            self._serve("task-role", "ASIANEW", base + timedelta(minutes=11))
-
-        assert len([r for r in caplog.records if " NEW: " in r.getMessage()]) == 1
-        assert [r.levelname for r in caplog.records] == ["INFO", "INFO", "DEBUG", "DEBUG"]
-        # Both late lines are ordinary steady-state re-serves: the boundary makes no claim
-        # about which key is "current", so there is nothing for a straggler to contradict.
-        assert "served" in caplog.records[2].getMessage()
-        assert "served" in caplog.records[3].getMessage()
-
-    def test_a_straggler_at_process_start_cannot_invert_the_history(self, caplog) -> None:
-        """The case novelty alone does not suppress, and why no pairing is reported.
-
-        A spawned assembly worker begins with a credential it never asked this callback for
-        (``scatter_initial_credentials``), so its FIRST callbacks land exactly at an expiry
-        boundary — the one moment a refresh can interleave with them. One thread can freeze the
-        old credential, be descheduled while a faster thread announces the NEW one, and arrive
-        with a key that has no history to be suppressed against.
-
-        Reporting a from/to pair here produced ``NEW -> OLD`` and then left the superseded key
-        standing as "current", so every later serve of the real credential was mislabelled. With
-        no pairing the worst case is one extra INFO line naming a credential the process genuinely
-        did use, and the current credential is never misdescribed.
-        """
-        self._reset()
-        base = datetime(2026, 8, 28, 12, tzinfo=UTC)
-        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            # The faster thread, carrying the post-refresh credential, arrives first.
-            self._serve("task-role", "ASIAFRESH", base + timedelta(minutes=5))
-            # The straggler, carrying the pre-refresh credential and no history to match.
-            self._serve("task-role", "ASIAPRIOR", base)
-            # The real credential again: already announced, so steady — NOT "stale", and not a
-            # second transition. This is the assertion the pairing version failed.
-            self._serve("task-role", "ASIAFRESH", base + timedelta(minutes=6))
-
-        assert [r.levelname for r in caplog.records] == ["INFO", "INFO", "DEBUG"]
-        assert "FIRST: ASIAFRESH" in caplog.records[0].getMessage()
-        assert "NEW: ASIAPRIOR" in caplog.records[1].getMessage()
-        assert "served: ASIAFRESH" in caplog.records[2].getMessage()
-        # Nothing anywhere claims a transition, which is the whole point.
-        for record in caplog.records:
-            assert "->" not in record.getMessage()
-
-    def test_every_event_carries_an_in_lock_sequence_number(self, caplog) -> None:
-        """The records are emitted OUTSIDE the lock, so two threads can emit out of order and a
-        NEW can reach the stream before the FIRST it followed. The sequence number is
-        stamped while the lock is held, so a reader can always put the stream back in order.
-        """
-        self._reset()
-        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            self._serve("task-role", "ASIASEQA")
-            self._serve("task-role", "ASIASEQB")
-            self._serve("assumed-role:arn:aws:iam::1:role/W", "ASIASEQC")
-        seqs = [int(re.search(r"seq=(\d+)", r.getMessage()).group(1)) for r in caplog.records]
-        assert len(seqs) == 3
-        # Process-wide and strictly increasing, so it orders ACROSS sources too — a fill uses
-        # both providers and the interleaving between them is what a correlation reads.
-        assert seqs == sorted(seqs) and len(set(seqs)) == 3
-
     def test_it_never_logs_the_secret_or_the_token(self, caplog) -> None:
-        """The access-key id is an identifier and is what CloudTrail indexes on. The secret key
-        and the session token are credentials and must never reach a log.
-        """
         self._reset()
         with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
             creds_mod._serve_icechunk_credential(
@@ -642,21 +512,19 @@ class TestIcechunkCredentialVisibility:
             )
         text = " ".join(r.getMessage() for r in caplog.records)
         assert "ASIAVISIBLE" in text
-        assert "SECRETVALUE" not in text
-        assert "TOKENVALUE" not in text
+        assert "SECRETVALUE" not in text and "TOKENVALUE" not in text
 
     def test_both_providers_are_instrumented(self) -> None:
-        """The one that matters is the ASSUMED-ROLE callback: it is what serves the published
-        store, whose writes motivated this. Instrumenting only the task-role provider would
-        have left the credential behind the real failures invisible — which is exactly the
-        defect review caught in the first version of this change.
+        """The published store is served by the ASSUMED-ROLE callback, so instrumenting only the
+        task-role one would leave the credential behind the real failures invisible.
         """
         import inspect
 
-        task_src = inspect.getsource(creds_mod.iam_icechunk_credentials)
-        role_src = inspect.getsource(creds_mod.AssumedRoleIcechunkCredentials.__call__)
-        for name, src in (("task-role", task_src), ("assumed-role", role_src)):
+        for name, src in (
+            ("task-role", inspect.getsource(creds_mod.iam_icechunk_credentials)),
+            ("assumed-role", inspect.getsource(creds_mod.AssumedRoleIcechunkCredentials.__call__)),
+        ):
             assert "_serve_icechunk_credential(" in src, f"{name} bypasses the boundary"
             assert "icechunk.S3StaticCredentials(" not in src, (
-                f"{name} constructs its own credential, so it can drift from the boundary"
+                f"{name} builds its own credential, so it can drift from the boundary"
             )

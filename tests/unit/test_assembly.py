@@ -2104,19 +2104,14 @@ class TestAssembleGlobal:
 
     @pytest.mark.parametrize("credentialled", [True, False])
     def test_the_forking_write_asks_icechunk_to_cache_the_credential(self, tmp_path, monkeypatch, credentialled):
-        """`assemble_global` sets scatter_initial_credentials; the sibling `assemble` already did.
-
-        `write_year_shards` PICKLES this session to spawned children, and an icechunk
-        credential fetcher's `initial` cache takes `&self` so it can never be refilled
-        (icechunk#2077). A child that deserialises with no cached credential therefore calls
-        back on every S3 request for the life of the fork. Asserted at the call site because
-        that is where the decision lives: the flag puts a live secret into the pickle, so it is
-        right for a forking writer and pointless for the read/commit sites that never pickle.
-        **True regardless of whether the caller passes a callback**, which is why this stays
-        parameterised. `_create_storage` falls back to `_default_credentials_provider` when
-        `get_credentials` is None, so a `get_credentials is not None` guard would leave the
-        children stampeding on exactly the fallback path — and `_create_storage` omits the
-        option entirely when there is genuinely no provider, so stating True here is safe.
+        """`write_year_shards` PICKLES this session to spawned children, and an icechunk
+        credential fetcher's `initial` cache can never be refilled (icechunk#2077), so a child
+        that deserialises without one calls back on every S3 request for the life of the fork.
+        Asserted at the call site because that is where the decision lives — the flag puts a
+        live secret in the pickle, so it is right for a forking writer and pointless elsewhere.
+        True regardless of whether a callback is passed (hence the parameterisation):
+        `_create_storage` substitutes a default provider when it is None, so a
+        `get_credentials is not None` guard would disable the scatter on exactly that path.
         """
         dim = 8
         store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim)

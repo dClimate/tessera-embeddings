@@ -286,7 +286,12 @@ def run_forked(
         results = [worker_fn(payloads[0])]
     else:
         ctx = multiprocessing.get_context("spawn")
-        ex = ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx)
+        # `initializer` runs once per spawned child before any payload. A spawned process
+        # inherits no logging config, so without it the root WARNING default discards every
+        # INFO record a worker produces. Set HERE rather than in each worker body so a worker
+        # added later cannot omit it. The single-payload path above needs nothing: it runs in
+        # the coordinator, which is already configured.
+        ex = ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx, initializer=configure_logging)
         try:
             futures = [ex.submit(worker_fn, payload) for payload in payloads]
             results = _await_forks(futures, progress_interval_s, unit=unit, log=log)
@@ -529,13 +534,11 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
     varies — a count-based cadence would speed up and slow down with the very
     thing an operator is trying to observe. Workers are separate spawned
     processes with no shared counter, so each line carries the worker's own
-    index and done/total for a reader to aggregate. Logging is configured at
-    entry: a spawned process inherits none, and an unconfigured worker's reports
-    would not exist (:func:`~tessera_embeddings.config.environment.configure_logging`).
-    These lines reach the process's log stream only, never the Prefect API — a
-    spawned worker has no run logger to route through.
+    index and done/total for a reader to aggregate. These lines reach the
+    process's log stream only, never the Prefect API — a spawned worker has no
+    run logger to route through; :func:`run_forked` configures logging in each
+    child, without which none of them would exist.
     """
-    configure_logging()
     fork = payload["fork"]
     group = payload["group"]
     year = int(payload["year_index"])

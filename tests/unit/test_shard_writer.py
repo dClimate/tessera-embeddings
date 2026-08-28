@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 import threading
@@ -13,6 +12,7 @@ import numpy as np
 import pytest
 import zarr
 
+from tessera_embeddings.config.environment import configure_logging
 from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, DRILL_EXIT_STATUS, FaultInjection
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import global_store, shard_writer, zarr_store
@@ -568,66 +568,26 @@ def test_every_commit_is_timed_including_the_terminal_path(tmp_path, caplog):
     assert "mark 01N year 2020 complete" in lines[0]
 
 
-class TestEverySpawnedWorkerConfiguresLogging:
-    """`run_forked` ships its worker to a SPAWNED process, which inherits no logging
-    configuration — so a worker that does not call `configure_logging()` first has every
-    INFO record it produces silently discarded by the root WARNING default.
-
-    This is not hypothetical. `_fill_band_worker` shipped without it, which made the
-    published-store assembly workers invisible to the credential instrumentation added to
-    diagnose exactly those workers — a detector that could not see its own subject.
-
-    Scans for the CALL SITES rather than checking the two workers we know about, so a third
-    worker added later cannot repeat it.
+class TestForkedWorkersGetLoggingConfigured:
+    """A spawned process inherits no logging config, so an unconfigured worker's INFO records are
+    discarded by the root WARNING default — which once made the assembly workers invisible to the
+    instrumentation added to diagnose them. Set on the POOL, so a worker added later cannot omit
+    it; that is what this pins. The pool is built before `run_forked`'s try block, so raising in
+    the constructor captures the kwargs without spawning anything.
     """
 
-    @staticmethod
-    def _worker_names_passed_to_run_forked() -> dict[str, set[str]]:
-        """Every identifier passed as `run_forked`'s worker argument, by module path."""
-        import ast
-        from pathlib import Path
+    def test_the_pool_configures_logging_in_every_child(self, tmp_path, monkeypatch) -> None:
+        seen: dict[str, object] = {}
 
-        root = Path(shard_writer.__file__).parents[1]
-        found: dict[str, set[str]] = {}
-        for path in root.rglob("*.py"):
-            try:
-                tree = ast.parse(path.read_text())
-            except SyntaxError:  # pragma: no cover - not our source if it does not parse
-                continue
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                fn = node.func
-                name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
-                if name != "run_forked" or len(node.args) < 2:
-                    continue
-                worker = node.args[1]
-                if isinstance(worker, ast.Name):
-                    found.setdefault(str(path), set()).add(worker.id)
-        return found
+        class _Boom:
+            def __init__(self, *args, **kwargs):
+                seen.update(kwargs)
+                raise RuntimeError("pool not built")
 
-    def test_at_least_the_two_known_workers_are_found(self) -> None:
-        """Guards the scanner itself: a scan that finds nothing would pass vacuously."""
-        names = {n for s in self._worker_names_passed_to_run_forked().values() for n in s}
-        assert {"_write_shards_worker", "_fill_band_worker"} <= names, names
-
-    def test_each_one_configures_logging_before_anything_else(self) -> None:
-        import ast
-        import importlib
-        from pathlib import Path
-
-        root = Path(shard_writer.__file__).parents[1]
-        for path_str, workers in self._worker_names_passed_to_run_forked().items():
-            module_path = Path(path_str).relative_to(root).with_suffix("").as_posix().replace("/", ".")
-            module = importlib.import_module(f"tessera_embeddings.{module_path}")
-            for worker_name in workers:
-                fn = getattr(module, worker_name, None)
-                assert fn is not None, f"{module_path}.{worker_name} not importable"
-                body = ast.parse(inspect.getsource(fn).lstrip()).body[0].body  # type: ignore[union-attr]
-                stmts = [n for n in body if not isinstance(n, ast.Expr) or not isinstance(n.value, ast.Constant)]
-                first = stmts[0] if stmts else None
-                call = getattr(getattr(first, "value", None), "func", None)
-                assert getattr(call, "id", None) == "configure_logging", (
-                    f"{module_path}.{worker_name} must call configure_logging() FIRST — a spawned "
-                    "process inherits no logging config, so its INFO records are discarded"
-                )
+        monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", _Boom)
+        store, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        # Two payloads, so the pool path is taken rather than the in-process one.
+        with pytest.raises(RuntimeError, match="pool not built"):
+            run_forked(session, lambda p: p, [{"tag": "a"}, {"tag": "b"}])
+        assert seen.get("initializer") is configure_logging
