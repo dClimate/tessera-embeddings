@@ -29,10 +29,17 @@ Cross-group conflict-freedom held at every N: **zero unresolvable conflicts.**
 
 ## Why it goes
 
-**1. It could not bind, and that was already written down.** ADR-008 carries a note from
-2026-07-30: the gate wraps `session.commit` only, so at the shipped 8 clusters "the limit equals
-the number of possible committers, so **it cannot bind at all**". It was kept then for
-configurations we do not run. That is the definition of speculative complexity in a live system.
+**1. What it actually bound was queueing, not risk.** ADR-008 carries a note from 2026-07-30
+saying that at the shipped 8 clusters "the limit equals the number of possible committers, so **it
+cannot bind at all**". **That note is wrong, and this document supplies the evidence against it:**
+the ceiling is `2N`, because a cluster's feeder can commit a terminal plan while its trailing
+assembly commits a cell — so 8 clusters reach 16 committers against a limit of 8, and the gate
+could queue about half of them.
+
+Correcting it does not weaken the case; it sharpens what was removed. **A queued committer waits
+for a commit, and a commit is the 0.5-2.2 s measured above.** So the protection given up is a short
+wait on a sub-second-to-seconds operation that happens once or twice per zone-year, inside an
+assembly measured in hours.
 
 **2. Measured live, 2026-08-27.** One completed assembly (`steady-otter`, 19:03:20Z — the
 publication that took the store from 77 to 78 zone-years):
@@ -169,8 +176,14 @@ reaching `assemble_global`, so the summary never fires for it. Since terminal ce
 first 78 completions, that detector would have missed the dominant source of concurrent commits and
 stayed silent exactly when the gate should be restored.
 
-A commit time drifting above a couple of seconds is the signal. One line per commit, so one per
-zone-year.
+A commit time drifting above a couple of seconds is the signal.
+
+**One line per COMMIT, which is not one per zone-year.** An assembled cell emits **two**:
+`write_year_shards` commits the shard data, then `commit_year_attrs` commits the completion attrs.
+A terminal cell emits **one**, since it reaches `commit_year_attrs` directly through
+`mark_zone_year_empty`. So the line is a reliable signal of commit LATENCY, which is what the reopen
+criterion needs, but raw line counts must not be read as cell counts — the ratio moves with how much
+of the workload is terminal.
 
 ## What was removed
 

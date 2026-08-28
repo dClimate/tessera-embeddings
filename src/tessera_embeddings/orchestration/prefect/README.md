@@ -292,7 +292,7 @@ override.
 | `tessera_full_pipeline.py` | Async master flow chaining the four above via `arun_deployment`. |
 | `build_land_mask.py` | Global campaign: build per-zone coverage bitmaps from the partner delivery registry (ADR-010). Optional pre-build delivery verification + post-build validation. No cluster. |
 | `seed_global_store.py` | Global campaign: create the global-store repo and seed every unseeded UTM-zone group (metadata-only, ADR-008 D1). Idempotent. No cluster. |
-| `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commit gate = a Prefect global concurrency limit. |
+| `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commits are ungated. |
 | `fill_zones_sequential.py` | Global campaign: fill one cluster's zones sequentially on a SINGLE shared Ray cluster (densest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Waits for its densest zone's mosaic before requesting GPUs. Pre-cluster triage settles retag/all-ocean cells. |
 | `ingest_zone_year.py` | Global campaign: build one cell's S1/S2 mosaics on the fixed zone grid by dispatching the ROI ingest deployments onto a synthesised zone-shaped ROI. Marker-gated and crash-safe: a stale or half-written mosaic is cleared and rebuilt, never appended onto. |
 | `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="cluster-per-zone"`), or size-balanced `fill-zones-sequential` runs on long-lived clusters (`"chained-clusters"`). |

@@ -349,7 +349,9 @@ fourth):
 3. **region overwrite** — rewrite a temporal/spatial slice in place;
 4. **shard-assemble** — staged inference tiles written as whole, lean
    2048-px shards into a pre-allocated zone group, one fork/merge commit
-   per (zone, year), gated to a handful of concurrent committers.
+   per (zone, year). Commits are ungated: they contend on the repo's single
+   branch tip, but that costs seconds and never a conflict — see
+   `context_docs/design/commit-gate-removal-2026_08.md`.
 
 ### Anatomy of a shard: what a write emits, what a read fetches
 
