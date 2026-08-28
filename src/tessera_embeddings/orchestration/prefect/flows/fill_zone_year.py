@@ -161,6 +161,7 @@ def fill_zone_year_flow(
     mosaic_base: str | None = None,
     s3_concurrency: int | None = None,
     launch_pacing: bool = False,
+    gpu_fallback_cards: list[str] | None = None,
     actor_request_headroom: int | None = None,
     actor_request_batch_size: int | None = None,
     run_id: str | None = None,
@@ -231,6 +232,10 @@ def fill_zone_year_flow(
             ``target // max_parallel_zones`` so K concurrent fills stay near target.
         launch_pacing: Pace this cluster's EC2 launch requests against the account's
             shared RunInstances quota. Same shape as ``s3_concurrency``: a budget that
+        gpu_fallback_cards: GPU cards this fill may fall back to when the production rung
+            has no capacity (e.g. ``["A10G"]``). ``None`` keeps today's behaviour. Opens
+            the card's rung AND installs the capacity-aware autoscaler scorer -- see
+            ``providers.aws.ray._apply_gpu_fallback``.
             concurrent fills share, except this one is a request RATE and the
             enforcement lives in the client rather than in a count we divide. Default
             ``False`` keeps today's launch behaviour; the campaign turns it on when it
@@ -527,6 +532,7 @@ def fill_zone_year_flow(
             code_suffix=code_suffix,
             cluster_name=cluster_name_for_flow_run(flow_run_ctx.id),
             launch_pacing=launch_pacing,
+            gpu_fallback_cards=gpu_fallback_cards or (),
         ) as resolved_yaml:
             activate(resolved_yaml)
             summary = fill_zone_year(**fill_kwargs)

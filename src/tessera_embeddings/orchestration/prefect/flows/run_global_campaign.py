@@ -561,6 +561,7 @@ async def run_global_campaign(
     zones: list[str] | None = None,
     max_parallel_clusters: int = 10,
     launch_pacing: bool = False,
+    gpu_fallback_cards: list[str] | None = None,
     actor_request_headroom: int | None = None,
     actor_request_batch_size: int | None = None,
     fill_strategy: str = "chained-clusters",
@@ -646,6 +647,20 @@ async def run_global_campaign(
             symptom but a wall clock nobody has a baseline for.
         launch_pacing: Pace every fill's EC2 launch requests against the account's
             shared RunInstances quota, which is a small burst capacity refilled at a
+        gpu_fallback_cards: GPU cards this campaign may fall back to when the production
+            rung has no capacity, e.g. ``["A10G"]``. ``None`` -- the default -- keeps the
+            fleet on ``g6e.xlarge`` alone and behaves exactly as before.
+
+            Naming a card does two things per fill: it opens that card's rung, and it
+            installs an autoscaler scorer that demotes a rung AWS has just refused for
+            want of capacity. Ray's stock scorer cannot see capacity at all, so without
+            the scorer an open rung is never reached; without the rung the scorer has
+            nothing to promote.
+
+            The fleet does not get bigger -- ``num_actors`` still bounds it -- only
+            differently made. Note the price: the fallback sizes are 8 vCPU per GPU
+            against ``g6e.xlarge``'s 4, so each fallback GPU spends twice the G-and-VT
+            quota, and they run at 0.46 (A10G) or 0.32 (L4) of an L40S.
             fixed rate and is not adjustable. This is where the setting belongs
             because contention is a property of the CAMPAIGN, not of a fill: one
             cluster growing alone contends with nothing, while ``n`` autoscalers
@@ -1260,6 +1275,7 @@ async def run_global_campaign(
             # limiter each autoscaler runs for itself — so what the campaign passes is
             # whether to run it at all.
             "launch_pacing": launch_pacing,
+            "gpu_fallback_cards": gpu_fallback_cards,
             # The other half of the same problem, one layer up: pacing makes a launch
             # request cheaper, this bounds how many of them a fill makes at all. Both are
             # OMITTED when unset so the fill's own default decides — keyed on None rather
@@ -1562,6 +1578,7 @@ async def run_global_campaign(
                         # enforces its own share client-side rather than being handed a
                         # divided count.
                         "launch_pacing": launch_pacing,
+                        "gpu_fallback_cards": gpu_fallback_cards,
                         # And as in _fill_params, the bound on how many launch requests
                         # a cluster makes, beside the pacing that makes each one cheaper.
                         # Omitted when unset so the child's own default stands.

@@ -12,8 +12,11 @@
 #   - `cluster_name`: prefix for EC2 ray-cluster-name tags
 #   - `provider.region`: AWS region (must match SSM region)
 #   - `available_node_types[*].node_config.InstanceType`: head and worker
-#     instance types (the defaults assume an L40S GPU with 48 GB VRAM —
-#     `g6e.xlarge` for workers, `m5.2xlarge` for the head)
+#     instance types (the defaults assume an L40S GPU with 45,776 MiB =
+#     44.7 GiB = 48.0 GB of VRAM — `g6e.xlarge` for workers, `m5.2xlarge`
+#     for the head). Two CAPACITY-FALLBACK rungs ship at `max_workers: 0`;
+#     open one with the campaign's `gpu_fallback_cards` parameter, or name it
+#     in the `gpu-worker-ladder` SSM key, rather than editing here.
 #   - `min_workers` / `max_workers`: pool sizing
 #   - `idle_timeout_minutes`: autoscaler idle-down delay
 #
@@ -92,8 +95,90 @@ available_node_types:
         min_workers: 0
         max_workers: 500
 
-    # Spot GPU workers (experimental — risk of interruption mid-chunk).
-    # Set max_workers > 0 to enable.
+    # --- CAPACITY FALLBACK rungs, INERT as shipped -----------------------
+    #
+    # Both ship at `max_workers: 0`, which makes a rung completely unreachable to the
+    # autoscaler. Merging them therefore changes nothing about a campaign in flight.
+    # They are opened by the `gpu_fallback_cards` campaign parameter, which also
+    # installs the capacity-aware scorer — see `ray.py::_apply_gpu_fallback`.
+    #
+    # WHY A FALLBACK IS NEEDED AT ALL. A single instance type is a single capacity
+    # pool. Measured in us-west-2 on 2026-08-27, every `g6e` size refused with
+    # `InsufficientInstanceCapacity` in all three of our AZs at the same moment, while
+    # `g6.xlarge`, `g6.2xlarge` and `g5.xlarge` launched. Ray cannot express a fallback
+    # type list of its own: its node provider passes ONE `InstanceType` to
+    # `create_instances`, and only the SUBNET list rotates on retry.
+    #
+    # WHY OPENING A RUNG IS NOT ENOUGH. Ray's default node-type scorer cannot see
+    # capacity — `_resource_based_utilization_scorer` takes a `node_availability_summary`
+    # and never reads it — so a refusing rung stays top-scored and is re-requested
+    # indefinitely while an open fallback sits idle. The scorer we install reads that
+    # summary and demotes a capacity-refused type. Neither half works alone.
+    #
+    # WHY THE `2xlarge` OF EACH FAMILY. Host RAM, not price. The vCPU-matched
+    # `g5.xlarge` and `g6.xlarge` carry 16 GiB against a measured ~17.7 GB per-actor
+    # requirement — the exact shape that OOMed the loader before inference on the
+    # earlier 16 GB g5-class workers. The `2xlarge` gives 32 GiB, matching `g6e.xlarge`.
+    #
+    # WHAT THAT COSTS. The G-and-VT quota is counted in vCPU, and these sizes are 8 vCPU
+    # per GPU against `g6e.xlarge`'s 4 — so a fallback GPU spends TWICE the quota of a
+    # production one. At the applied 10,000 vCPU that is 2,500 L40S or 1,250 A10G. A
+    # fleet fully on fallback is half the card count, before any throughput difference.
+    #
+    # WHICH CARD. Measured on one cluster, same minutes, same work: against the L40S the
+    # A10G reaches 0.46 and the L4 0.32 of its throughput. Both cost more per unit of
+    # work than what we already run, so neither is a preferred type — but an idle fleet
+    # costs infinitely more per token, which is what makes the A10G worth opening under
+    # capacity pressure. The L4 ships here so the ladder can name it, and is NOT
+    # recommended. Full comparison: `context_docs/design/gpu-card-choice-2026_08.md`.
+    #
+    # EVERY rung DECLARES `resources:`, including these inert ones, and it is not
+    # optional. Ray's schema lists `resources` as REQUIRED; it autofills the block from
+    # the live EC2 catalogue, but that autodetection is wrapped in a bare
+    # `except Exception` that downgrades failure to a WARNING, and `validate_config` then
+    # rejects a node type with no `resources` key and fails the whole `ray up`. An
+    # omission would make every cluster's bootstrap — including the `g6e.xlarge` the
+    # campaign runs on — depend on one EC2 API call succeeding. A declared key overrides
+    # autodetection silently, so `test_declared_resources_match_the_ec2_catalogue` checks
+    # every block against a captured `DescribeInstanceTypes` response.
+
+    # NVIDIA A10G, 22,888 MiB. Ampere (SM 8.6) against the L40S's Ada (8.9); x86_64 and
+    # the same CUDA regime, so the L40S AMI boots unchanged and bf16 autocast is native.
+    # THE capacity fallback: 0.46 of an L40S, the best of the alternatives measured.
+    gpu-workers-ondemand-a10g-2xl:
+        node_config:
+            InstanceType: g5.2xlarge
+            # INJECT: ImageId, KeyName, SecurityGroupIds, IamInstanceProfile,
+            # SubnetIds, TagSpecifications (same set as head)
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 80
+                      VolumeType: gp3
+        resources:
+            CPU: 8
+            GPU: 1
+        min_workers: 0
+        max_workers: 0
+
+    # NVIDIA L4, 22,888 MiB — same VRAM as the A10G, same Ada generation as the L40S.
+    # Shipped so the ladder can name it; NOT a recommendation at 0.32 of an L40S.
+    gpu-workers-ondemand-l4-2xl:
+        node_config:
+            InstanceType: g6.2xlarge
+            # INJECT: ImageId, KeyName, SecurityGroupIds, IamInstanceProfile,
+            # SubnetIds, TagSpecifications (same set as head)
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 80
+                      VolumeType: gp3
+        resources:
+            CPU: 8
+            GPU: 1
+        min_workers: 0
+        max_workers: 0
+
     gpu-workers-spot:
         node_config:
             InstanceType: g6e.xlarge
