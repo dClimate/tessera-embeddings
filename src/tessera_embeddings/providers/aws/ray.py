@@ -47,8 +47,6 @@ import boto3
 import ray
 import yaml
 
-from tessera_embeddings.providers.aws import autoscaler_scorer
-
 DEFAULT_CLUSTER_TEMPLATE = Path(__file__).parent / "cluster.yaml.template"
 """Path to the cluster YAML template shipped with this provider."""
 
@@ -213,8 +211,6 @@ returning quietly.
 #: in vCPU, and these are 8 vCPU per GPU against `g6e.xlarge`'s 4. A fallback GPU spends
 #: TWICE the quota of a production one -- 10,000 vCPU buys 2,500 L40S or 1,250 A10G.
 GPU_FALLBACK_INSTANCE_TYPES: frozenset[str] = frozenset({"g5.2xlarge", "g6.2xlarge"})
-
-GPU_FALLBACK_SCORER_ENV = {"RAY_AUTOSCALER_UTILIZATION_SCORER": autoscaler_scorer.SCORER_PATH}
 
 
 _RAY_START = "ray start"
@@ -484,13 +480,18 @@ def _apply_gpu_vcpu_budget(config: dict[str, Any], vcpu_budget: int) -> None:
 def _apply_gpu_fallback(
     config: dict[str, Any], instance_types: Sequence[str], vcpu_budget: int | None = None
 ) -> list[str]:
-    """Open a fallback rung per named instance type and make the autoscaler use it.
+    """Open a fallback rung per named instance type.
 
-    Two halves, and NEITHER works alone. Opening a rung gives the autoscaler somewhere
-    to go; the scorer is what sends it there, because Ray's default scoring cannot see
-    capacity at all (see :mod:`~tessera_embeddings.providers.aws.autoscaler_scorer`).
-    Opening rungs without the scorer leaves them idle forever, and the scorer without
-    open rungs has nothing to promote.
+    Opening a rung only makes it REACHABLE. It does not make the autoscaler use it:
+    while demand stays under the production rung's ceiling, Ray keeps choosing that
+    rung and an open fallback sits idle however long the primary has been refusing.
+    What sends work to it is the standing per-rung request published by
+    :mod:`~tessera_embeddings.providers.aws.fleet_mix`. Neither half works alone.
+
+    More than one fallback may be opened at once. That used to be refused, because
+    equally-scored rungs made Ray break the tie on node-type name — an alphabetical
+    choice of card. The mix is now stated rather than inferred, so the tie no longer
+    decides anything.
 
     Each fallback rung is opened to the SAME ceiling as the production rung, so either
     card can carry the whole fleet. That does not make the fleet bigger: the cluster's
@@ -521,17 +522,6 @@ def _apply_gpu_fallback(
         _apply_gpu_vcpu_budget(config, vcpu_budget)
     if not instance_types:
         return []
-
-    if len(set(instance_types)) > 1:
-        msg = (
-            f"Only one GPU fallback instance type may be opened at a time, got "
-            f"{sorted(set(instance_types))}. The supported fallbacks are all 8 vCPU / 1 GPU "
-            "with identical declared resources, so Ray scores them EQUALLY and breaks the "
-            "tie on node-type name, descending -- which would pick a card on alphabetical "
-            "order rather than on throughput. Ray's scorer has no priority concept to "
-            "express the preference with, so the choice is made here, by naming one type."
-        )
-        raise RuntimeError(msg)
 
     unknown = [t for t in instance_types if t not in GPU_FALLBACK_INSTANCE_TYPES]
     if unknown:
@@ -601,11 +591,10 @@ def _apply_gpu_fallback(
 
     widest = max(node_types[n]["max_workers"] for n in opened)
     logging.getLogger(__name__).info(
-        "GPU fallback enabled for %s: opened %s at max_workers=%d, scorer=%s",
+        "GPU fallback enabled for %s: opened %s at max_workers=%d",
         ", ".join(instance_types),
         ", ".join(opened),
         widest,
-        autoscaler_scorer.SCORER_PATH,
     )
     return opened
 
@@ -871,7 +860,7 @@ def _resolve_ray_config(
 
     # AFTER the ladder, so a ladder that narrows the production rung narrows the
     # fallbacks with it. Empty is the default and changes nothing.
-    fallback_opened = _apply_gpu_fallback(config, gpu_fallback_instance_types, gpu_fallback_vcpu_budget)
+    _apply_gpu_fallback(config, gpu_fallback_instance_types, gpu_fallback_vcpu_budget)
 
     sg_ids = [params["security-group-id"]]
     all_subnet_ids = [s.strip() for s in params["private-subnet-ids"].split(",")]
@@ -965,13 +954,6 @@ def _resolve_ray_config(
     # starts Ray is the one that gets the assignments.
     if launch_pacing:
         config["head_start_ray_commands"] = _pace_ray_start(config["head_start_ray_commands"], LAUNCH_PACING_ENV)
-
-    # The other half of GPU fallback, and it rides here for the same reason the pacing
-    # does: Ray reads this when the autoscaler is constructed, and the autoscaler is a
-    # child of the head's `ray start`. Assigned only when a rung was actually opened, so
-    # a run without fallback gets Ray's stock scorer and behaves exactly as before.
-    if fallback_opened:
-        config["head_start_ray_commands"] = _pace_ray_start(config["head_start_ray_commands"], GPU_FALLBACK_SCORER_ENV)
 
     # Substitute {CODE_BUCKET} and {CODE_SUFFIX} in setup_commands. With no bucket the
     # command is DROPPED, not left alone: an unsubstituted `aws s3 cp

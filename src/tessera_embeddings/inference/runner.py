@@ -59,6 +59,7 @@ def run_inference(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     *,
     on_actor_retire: Callable[[str], None] | None = None,
+    on_fleet_demand: Callable[[int], None] | None = None,
     get_credentials: Callable[[], Any] | None = None,
     s3_region: str | None = None,
     retire_idle_actors: bool = True,
@@ -90,6 +91,9 @@ def run_inference(
             is documented in ``docs/public-api.md`` and dropping a parameter there is a breaking
             change — remove it on the next deliberate pass at that API.
         log: Logger.
+        on_fleet_demand: Optional callback ``(want_gpus) -> None`` letting the AWS
+            provider publish a per-instance-type fleet request each scheduling
+            round; see ``providers.aws.fleet_mix``.
         on_actor_retire: Optional callback ``(instance_id) -> None`` invoked
             when a misbehaving actor is removed from the pool. The AWS
             provider injects an EC2-terminator here so dead instances stop
@@ -231,6 +235,7 @@ def run_inference(
             tracker=progress_tracker,
             still_initializing=still_initializing,
             on_actor_retire=on_actor_retire,
+            on_fleet_demand=on_fleet_demand,
             get_credentials=get_credentials,
             s3_region=s3_region,
             actor_factory=actor_factory,

@@ -222,18 +222,48 @@ and neither works without the other:
 
 1. **Opens the card's rung** at the same ceiling as the production rung, so either card
    can carry the whole fleet.
-2. **Installs a capacity-aware autoscaler scorer.** Ray's stock scorer *cannot see
-   capacity* — `_resource_based_utilization_scorer` takes a `node_availability_summary`
-   and never reads it — so a rung refusing with `InsufficientInstanceCapacity` stays
-   top-scored and is re-requested indefinitely while an open fallback sits idle.
+2. **Starts publishing a per-rung fleet request.** Opening a rung only makes it
+   *reachable*; it does not make the autoscaler use it. Ray picks node types with a
+   greedy loop and stops choosing a type only when that type's own `max_workers` is
+   exhausted — so while demand stays under the production rung's ceiling, an open
+   fallback is **never asked for at all**, however long the primary has been refusing.
+   Measured on dev on 2026-08-28: 18 consecutive launch attempts, every one for the
+   L40S, every one refused, and not one attempt at the A10G sitting open at a ceiling
+   of 25. What breaks that is `providers/aws/fleet_mix.py`, which states how many of
+   each card the fleet should hold through `request_resources`. Autoscaler v2 satisfies
+   that request in the **same scheduling pass** as ordinary actor demand, so both pools
+   are asked for at once.
 
-With both in place the fleet prefers the L40S whenever AWS will sell one and moves to
-the A10G when it will not. Recovery applies to NEW demand, not to nodes already running:
-Ray clears the unavailability record on the next successful launch of that type (and in
-any case after 30 minutes), after which fresh bundles go back to the L40S — but nothing
-evicts a running A10G to make room for one. A fleet whose demand is already satisfied by
-fallback nodes stays on them until those nodes idle out and retire. **The fleet never gets bigger**, only differently made: `num_actors` bounds
-it exactly as before.
+**There is no capacity-aware scorer any more, and there was never a working one in
+production.** The `RAY_AUTOSCALER_UTILIZATION_SCORER` hook belongs to autoscaler **v1**,
+and `ray up` has started **v2** by default since Ray 2.50 — which every one of our
+clusters runs. v2 has no plugin point for a scoring function at all, so that module was
+dead code and has been deleted. v2's own capacity signal is unreachable twice over: it
+is only the tiebreak *after* the utilisation score, which our rungs never tie on
+(`g6e.xlarge` at 4 vCPU packs a one-CPU one-GPU actor more tightly than any 8 vCPU
+fallback), and it is only populated on `ALLOCATION_TIMEOUT` while our refusals arrive as
+`ALLOCATION_FAILED`. The mix is therefore **stated rather than inferred**, which is also
+why more than one fallback may now be opened at once — the tie Ray used to break on
+node-type name no longer decides anything.
+
+**How the ask is sized.** Rungs are ranked by throughput per vCPU, because the quota is
+counted in vCPU and the cards are not equally priced in it (0.250, 0.0575 and 0.040 of
+an L40S-equivalent per vCPU). Each rung in turn takes what the remaining demand and
+budget afford, bounded by its ceiling. The **best** rung is asked for what it currently
+holds plus a small probe rather than for its ceiling: a ceiling-sized ask would reserve
+budget for machines AWS is refusing, and a live-sized ask would never grow.
+
+**Two behaviours to know, both measured rather than assumed.** An ask above a rung's
+ceiling provisions **nothing at all** — a partially infeasible constraint is discarded
+whole rather than filled as far as it goes, so the ceiling clamp is load-bearing. And
+machines held by a standing request are exempt from the idle timeout, which is why the
+ask is recomputed every round and allowed to fall.
+
+**An ask is a floor, not a delivery.** Ray launches with `MinCount=1`, so AWS fills what
+it can and reports success: one measured call asked for six A10G and got one, with a
+launch-failure count of zero throughout. **The fallback pool is supply-constrained too**
+— opening it buys a second pool, not an unlimited one — and anything monitoring this
+must compare asked against live, because a failure count cannot see partial fulfilment.
 
 Three things to know before you turn it on.
 
@@ -242,12 +272,12 @@ sizes are 8 vCPU per GPU against `g6e.xlarge`'s 4, so the applied 10,000 vCPU bu
 either 2,500 L40S or 1,250 A10G. A fleet fully on fallback is half the card count
 *before* the 0.46 throughput factor.
 
-**A cluster that fails over stays failed over.** Recovery applies to new demand only.
-Once the fallback has satisfied every actor bundle there is no unfulfilled demand, so
-the scorer is not consulted and nothing evicts a running A10G to make room for an L40S
-— the fleet holds its composition until those actors go idle and retire. Under the
-chained-cluster strategy actors are long-lived, so a cluster that failed over early can
-spend its whole roster on the 0.46-throughput card at twice the quota per GPU.
+**Recovery applies to new demand, not to running nodes.** When L40S supply returns the
+published ask shifts back toward it, and fallback machines above the new ask lose their
+constraint protection and drain on the idle timeout — but nothing evicts a *busy* A10G
+to make room for an L40S. Under the chained-cluster strategy actors are long-lived, so a
+cluster that filled with fallback early holds that composition until those actors go
+idle.
 
 That is deliberate rather than an oversight: draining healthy workers mid-chunk to trade
 cards would discard the work in flight. But it is a real operational cost, and the
@@ -278,8 +308,7 @@ L40S trickles: `39x4 + 105x8 = 996` vCPU per cluster, **9,960 across ten, inside
 
 Both rungs full would be 1,244 vCPU per cluster and over quota. That is the accepted
 limitation — Ray's ceilings count nodes and cannot be jointly weighted — and AWS
-enforces the real line by refusing, which the scorer correctly declines to treat as a
-reason to fall back further. `TestTheCampaignRestartConfiguration` pins all of it.
+enforces the real line by refusing. `TestTheCampaignRestartConfiguration` pins all of it.
 
 **The vCPU-matched sizes are deliberately not offered.** `g5.xlarge` and `g6.xlarge` are
 4 vCPU per GPU like the production rung, but carry 16 GiB of host RAM against a measured

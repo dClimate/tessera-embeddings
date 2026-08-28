@@ -987,12 +987,6 @@ async def run_global_campaign(
                 f"{sorted(GPU_FALLBACK_INSTANCE_TYPES)}. Sizes are restricted on HOST RAM - the "
                 "vCPU-matched `xlarge` of each family would OOM the loader before inference."
             )
-        if len(set(gpu_fallback_instance_types)) > 1:
-            raise ValueError(
-                f"Only one GPU fallback instance type may be opened at a time, got "
-                f"{sorted(set(gpu_fallback_instance_types))} - they score identically and Ray "
-                "breaks the tie on node-type name, not on throughput."
-            )
         if gpu_fallback_vcpu_budget is not None:
             if gpu_fallback_vcpu_budget <= 0:
                 raise ValueError(f"gpu_fallback_vcpu_budget must be > 0, got {gpu_fallback_vcpu_budget}")

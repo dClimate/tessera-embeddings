@@ -540,6 +540,9 @@ def fill_zone_year_flow(
             gpu_fallback_vcpu_budget=gpu_fallback_vcpu_budget,
         ) as resolved_yaml:
             activate(resolved_yaml)
+            from tessera_embeddings.providers.aws.fleet_mix import publisher_for_resolved_yaml
+
+            fill_kwargs["on_fleet_demand"] = publisher_for_resolved_yaml(resolved_yaml, gpu_fallback_vcpu_budget, log)
             summary = fill_zone_year(**fill_kwargs)
     finally:
         # Clear the hook state only AFTER the context manager's teardown has

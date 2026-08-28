@@ -906,6 +906,7 @@ def _process_chunks_work_stealing(
     max_chunk_retries: int = 2,
     still_initializing: set[int] | None = None,
     on_actor_retire: Callable[[str], None] | None = None,
+    on_fleet_demand: Callable[[int], None] | None = None,
     get_credentials: Callable[[], Any] | None = None,
     s3_region: str | None = None,
     actor_factory: Callable[[int], list[ray.actor.ActorHandle]] | None = None,
@@ -945,6 +946,14 @@ def _process_chunks_work_stealing(
             will pick up work via ``dispatch_idle`` once they come online.
         on_actor_retire: Callback to be triggered when the actor is removed from the pool.
             Used to consistently and swiftly terminate EC2 instances and save compute costs
+        on_fleet_demand: Optional callback ``(want_gpus) -> None`` invoked once per
+            scheduling round with the GPUs this run actually wants — the smaller of
+            the actor target and the outstanding work. The AWS provider uses it to
+            publish a per-instance-type request so a capacity-refused rung does not
+            starve the fleet; see ``providers.aws.fleet_mix``. Bounding it by
+            OUTSTANDING WORK is what stops a standing request from buying machines
+            this pool would then idle-retire, which the request would re-buy.
+            It runs on the scheduler thread, so it must not block.
         get_credentials: Optional icechunk S3 credential provider injected into
             every actor (seeded and replacement) so store opens refresh creds.
         s3_region: Optional S3 region injected into every actor (seeded and
@@ -1057,6 +1066,11 @@ def _process_chunks_work_stealing(
 
     def _maybe_request_next_batch() -> None:
         nonlocal last_batch_at, nodes_at_last_batch, last_batch_size, last_joined_gpus
+        if on_fleet_demand is not None and total_actors_target is not None:
+            # Published from here because this is the one place that already knows
+            # both halves of the answer, once per round, at no extra cost.
+            with contextlib.suppress(Exception):
+                on_fleet_demand(min(total_actors_target, pool.outstanding_work(len(chunk_queue))))
         if not batching_enabled:
             return
         assert actor_factory is not None and total_actors_target is not None  # narrowed by batching_enabled
