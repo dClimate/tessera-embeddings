@@ -86,8 +86,12 @@ be impossible is evidence against the hypothesis, not for it.
   `torch.cuda.get_device_properties().total_memory` — three figures, one card, all correct
   for their own definition, and none of them 46 GB. It mattered twice: it is the denominator
   of every "% of the card" figure, and it made the 22,888 MiB L4/A10G look like "barely half"
-  when the real ratio is **1.94×**. `inference/README.md`'s "48 GB" (vendor decimal) was
-  right all along. (`inference_gpu_saturation_profile_2026_07.md:14`, corrected 2026-08-27)
+  when the real ratio is **exactly 2.0×** on the catalogue figures (45,776 / 22,888). A
+  "1.94×" stood here until 2026-08-28; it was arithmetic on rounded GiB values, and a ratio
+  must be taken on ONE source's numbers — mixing them is what produced it.
+  `inference/README.md`'s "48 GB" (vendor decimal) was right all along.
+  (`inference_gpu_saturation_profile_2026_07.md:14`, corrected 2026-08-27, ratio amended
+  2026-08-28)
 
 ### 3. Presence counted where coverage was meant
 

@@ -351,9 +351,22 @@ def _apply_gpu_worker_ladder(config: dict[str, Any], raw: str) -> None:
     # `max_workers` per node type is a ceiling under the CLUSTER-wide ceiling, not
     # beside it: Ray takes the min. A ladder summing above the global value would
     # be capped there silently, so raise the global to fit the ladder it was given.
+    #
+    # And size it for EVERY open worker type, not just the ladder's. The cluster
+    # ceiling is one budget shared by all of them, so a bundled spot rung — or any
+    # custom type a template adds — left open at N consumes N of it and leaves the
+    # ladder's own per-rung ceilings unreachable by exactly that much. The head node
+    # is not a worker and does not count.
     ladder_total = sum(count for _, count in pairs)
-    if ladder_total > config.get("max_workers", 0):
-        config["max_workers"] = ladder_total
+    head_node_type = config.get("head_node_type")
+    non_ladder_workers = sum(
+        int(cfg.get("max_workers", 0) or 0)
+        for name, cfg in node_types.items()
+        if name != head_node_type and name not in domain
+    )
+    needed = ladder_total + non_ladder_workers
+    if needed > config.get("max_workers", 0):
+        config["max_workers"] = needed
     logging.getLogger(__name__).info(
         "Applied %s: %s (cluster max_workers=%d)",
         GPU_WORKER_LADDER_SSM_KEY,

@@ -9,6 +9,7 @@ adding negligible overhead to the overall run.
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING
 
 import torch
@@ -55,13 +56,18 @@ _CARD_CEILINGS: dict[str, tuple[float, float]] = {
 def _card_ceiling(device_name: str) -> tuple[str, float, float] | None:
     """``(card, bf16_tflops, bandwidth_gbs)`` for a device name, or ``None`` if unknown.
 
-    Matched on the LONGEST key that appears in the name, so ``"NVIDIA L40S"`` does
-    not resolve to the ``"L4"`` entry. An unknown card returns ``None`` and the
-    caller says so — a wrong ceiling would turn a saturated GPU into a "poor
-    utilization" verdict, or the reverse.
+    Matched on a WORD BOUNDARY, not a substring, and longest key first. Substring
+    matching was wrong in a way length ordering could not fix: ``"L4"`` is a substring
+    of ``"NVIDIA L40"``, a real and distinct card that has no entry here, so an L40
+    silently drew the L4's 121 TFLOPS / 300 GB/s. Length ordering only saved the L40S
+    because the L40S has an entry of its own.
+
+    An unknown card returns ``None`` and the caller says so — a wrong ceiling would
+    turn a saturated GPU into a "poor utilization" verdict, or the reverse, which is
+    strictly worse than admitting the card is unrecognised.
     """
     for key in sorted(_CARD_CEILINGS, key=len, reverse=True):
-        if key in device_name:
+        if re.search(rf"\b{re.escape(key)}\b", device_name):
             return (key, *_CARD_CEILINGS[key])
     return None
 

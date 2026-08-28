@@ -345,8 +345,6 @@ class ResourceMonitor:
             parts.append(f"gpu_idx={self._gpu_index}")
         gpu = _get_gpu_stats(self._gpu_index)
         if gpu:
-            if self._gpu_index is not None:
-                parts.append(f"gpu_idx={self._gpu_index}")
             parts.append(f"GPU={gpu['gpu_util']}")
             parts.append(f"memio={gpu['mem_util']}")
             parts.append(f"VRAM={gpu['mem_used']}/{gpu['mem_total']}")

@@ -940,6 +940,26 @@ class TestGpuWorkerLadderApplication:
         _apply_gpu_worker_ladder(cfg, "g6e.xlarge:10")
         assert cfg["max_workers"] == 500
 
+    def test_an_open_spot_rung_is_counted_in_the_cluster_ceiling(self) -> None:
+        """The cluster ceiling is ONE budget shared by every worker type, so a rung the
+        ladder does not govern still consumes it.
+
+        With the spot rung open at 100, a 500-node ladder needs a ceiling of 600 — at
+        500 the last 100 on-demand workers can never launch, and the failure is silent
+        because each per-type ceiling still reads as satisfied.
+        """
+        cfg = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())
+        cfg["available_node_types"]["gpu-workers-spot"]["max_workers"] = 100
+        _apply_gpu_worker_ladder(cfg, "g6e.xlarge:500")
+        assert cfg["max_workers"] == 600
+
+    def test_a_closed_spot_rung_adds_nothing(self) -> None:
+        """The shipped default: spot is at 0, so the ceiling is the ladder alone."""
+        cfg = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())
+        assert cfg["available_node_types"]["gpu-workers-spot"]["max_workers"] == 0
+        _apply_gpu_worker_ladder(cfg, "g6e.xlarge:600")
+        assert cfg["max_workers"] == 600
+
     def test_refuses_an_instance_type_no_rung_offers(self) -> None:
         """A typo, or a rung that was never shipped — either way the fleet is not what was asked for."""
         cfg = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())

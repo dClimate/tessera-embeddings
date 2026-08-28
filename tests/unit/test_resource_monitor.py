@@ -293,6 +293,33 @@ class TestHostRamPeak:
 class TestAttributionAndResetSurviveFailure:
     """Two findings from review of PR #150, both about a value that LOOKS measured but is not."""
 
+    def test_the_index_appears_exactly_once_when_the_gpu_sample_succeeds(self) -> None:
+        """`RESOURCES` is a key=value line that monitoring parses, so a repeated key is
+        a defect: strict parsers break on it and GPU attribution reads as ambiguous.
+
+        The field is appended OUTSIDE the `if gpu` block so a failed nvidia-smi still
+        carries attribution. A second append inside that block — which is what a merge
+        left here — duplicates it on every successful sample, i.e. almost always.
+        """
+        monitor = rm.ResourceMonitor(interval_sec=1, gpu_index="2")
+        logged: list[str] = []
+        stats = {
+            "gpu_util": "50%",
+            "mem_util": "10%",
+            "mem_used": "1 MiB",
+            "mem_total": "2 MiB",
+            "temp": "40",
+            "power": "70 W",
+        }
+        with (
+            patch.object(rm, "_get_cpu_mem_stats", return_value={"load_avg": "1 2 3"}),
+            patch.object(rm, "_get_gpu_stats", return_value=stats),
+            patch.object(rm, "_get_gpu_extra_stats", return_value={}),
+            patch.object(rm.logger, "info", lambda fmt, *a: logged.append(fmt % a)),
+        ):
+            monitor._emit_once()
+        assert logged[-1].count("gpu_idx=") == 1, logged[-1]
+
     def test_the_gpu_index_survives_a_failed_gpu_sample(self) -> None:
         """Attribution matters MOST when sampling fails: four actors on one packed host would
         otherwise emit indistinguishable CPU/RAM lines for exactly that interval.

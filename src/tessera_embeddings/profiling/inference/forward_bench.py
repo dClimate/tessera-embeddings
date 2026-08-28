@@ -36,14 +36,23 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
+
+# BEFORE `import torch`, because the caching allocator reads this once when it is
+# built and ignores it afterwards. Production sets it on `InferenceActor`'s
+# `runtime_env`; this entry point is standalone and would otherwise sweep the VRAM
+# ceiling under the DEFAULT allocator — reporting an OOM boundary for a
+# configuration the campaign does not run, on the one question this tool exists to
+# answer. `setdefault`, so an operator can still A/B the allocator deliberately.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
 from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.inference.models.builder import _build_inference_model
+from tessera_embeddings.inference.models.builder import _build_inference_model, _fuse_custom_gru
 from tessera_embeddings.inference.profiling import _card_ceiling, transformer_flops
 
 logger = logging.getLogger(__name__)
@@ -74,8 +83,14 @@ def _one_rung(
     it. The caching allocator's pool is dropped after one so the next rung starts
     from a clean device.
     """
-    torch.cuda.reset_peak_memory_stats()
+    # `empty_cache()` FIRST. `reset_peak_memory_stats` re-seeds the peak from the
+    # allocator's CURRENT reserved pool, so resetting before releasing it records
+    # whatever model construction, the bf16 cast, or the previous rung left behind as
+    # this rung's peak. Freeing afterwards lowers current reserved but cannot lower a
+    # peak already taken -- so every rung reported the high-water mark of its
+    # predecessor, which is exactly the figure a capacity sweep must not inherit.
     torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
     try:
         s2 = torch.randn(batch_size, t_s2, 11, device=device, dtype=dtype)
         # The merged S1 stream is 2 bands + DOY. A radar-free chunk still runs the
@@ -179,7 +194,26 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     dtype = torch.bfloat16
 
-    model = _build_inference_model(config, device).to(dtype).eval()
+    # Mirror production's GRAPH, not just its architecture. `build_inference_model`
+    # needs a checkpoint this benchmark has no use for -- random weights time the same
+    # compute -- so apply the transformations it applies. Two of them decide which
+    # kernels run: `_fuse_custom_gru` swaps the Python CustomGRU loop for cuDNN
+    # `nn.GRU`, and zeroing TransformerEncoderLayer dropout lets SDPA take its fused
+    # attention path. Timing the raw constructor measured neither, which is not a
+    # basis for ranking cards.
+    #
+    # On CPU, BEFORE `.to(device)` and the bf16 cast, for the reason
+    # `build_inference_model` gives: a fused nn.GRU built after the move inherits the
+    # wrong weights.
+    cpu = torch.device("cpu")
+    model = _build_inference_model(config, cpu)
+    _fuse_custom_gru(model)
+    for param in model.parameters():
+        param.requires_grad = False
+    for mod in model.modules():
+        if isinstance(mod, torch.nn.TransformerEncoderLayer):
+            mod.dropout.p = 0.0
+    model = model.to(device=device, dtype=dtype).eval()
     name = torch.cuda.get_device_name(0)
     ceiling = _card_ceiling(name)
     header = {
@@ -189,19 +223,34 @@ def main(argv: list[str] | None = None) -> int:
         "torch": torch.__version__,
         "batch_size": batch_size,
         "dtype": "bfloat16",
+        "alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
         "model_params_m": round(sum(p.numel() for p in model.parameters()) / 1e6, 2),
         "card_bf16_tflops": ceiling[1] if ceiling else None,
         "card_bandwidth_gbs": ceiling[2] if ceiling else None,
     }
     print("FORWARD_BENCH_HEADER: " + json.dumps(header, sort_keys=True))
 
-    for t_s2 in (int(t) for t in args.seq_lens.split(",") if t.strip()):
+    # The sweep is `--s1-frac` of the S2 depth, which is the CAMPAIGN's shape. It is
+    # not the model's worst case: production buckets S2 and merged S1 INDEPENDENTLY
+    # against the same checkpoint list, so `(256, 256)` is a legal input while the
+    # deepest swept rung at the 0.4 default is `(256, 102)`. A card can clear the whole
+    # sweep and still OOM on a valid bucket, which is the one thing a capacity sweep
+    # exists to rule out — so the both-maxima rung is appended, last, after the
+    # campaign-shaped rungs have been measured.
+    seq_lens = [int(t) for t in args.seq_lens.split(",") if t.strip()]
+    rungs = [(t, max(round(t * args.s1_frac), 1)) for t in seq_lens]
+    if seq_lens:
+        deepest = max(seq_lens)
+        if (deepest, deepest) not in rungs:
+            rungs.append((deepest, deepest))
+
+    for t_s2, t_s1 in rungs:
         row = _one_rung(
             model,
             config,
             batch_size=batch_size,
             t_s2=t_s2,
-            t_s1=max(round(t_s2 * args.s1_frac), 1),
+            t_s1=t_s1,
             dtype=dtype,
             device=device,
             warmup=args.warmup,
@@ -215,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
         if row["status"] == "oom":
             # Deeper rungs would OOM too, and each one costs a minute of GPU time
             # to prove it. The first refusal is the answer.
-            print(f"FORWARD_BENCH_STOP: OOM at t_s2={t_s2}; deeper rungs not attempted")
+            print(f"FORWARD_BENCH_STOP: OOM at t_s2={t_s2}, t_s1={t_s1}; deeper rungs not attempted")
             break
     return 0
 

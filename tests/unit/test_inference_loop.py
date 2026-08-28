@@ -350,6 +350,12 @@ class TestCardCeilings:
         assert _card_ceiling("NVIDIA L40S")[0] == "L40S"
         assert _card_ceiling("NVIDIA L4")[0] == "L4"
         assert _card_ceiling("NVIDIA A10G")[0] == "A10G"
+        # The L40 is a REAL card with no entry here, and "L4" is a substring of its
+        # name — so substring matching handed it the L4's 121 TFLOPS / 300 GB/s and
+        # graded it against a ceiling a third of its own. Length ordering could not
+        # fix this: it saved the L40S only because the L40S has an entry.
+        assert _card_ceiling("NVIDIA L40") is None
+        assert _card_ceiling("NVIDIA H100") is None
 
     def test_an_unknown_card_returns_none_rather_than_a_default(self) -> None:
         """A wrong ceiling turns a saturated GPU into "poor utilization", or the reverse."""

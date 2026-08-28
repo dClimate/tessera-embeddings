@@ -201,16 +201,20 @@ credit, not a sustained floor — for the S3-heavy load phase. ~$1.86/hr on-dema
 at us-west-2; spot varies (~$0.5–0.9/hr).
 
 Scaling is horizontal: one GPU, one `InferenceActor`. The 4 vCPUs make host-side
-data loading the tight resource per worker, and the template ships four further
+data loading the tight resource per worker, and the template ships seven further
 rungs, all at `max_workers: 0` and all released only through `gpu-worker-ladder`
-above:
+above. Every rung the ladder will accept is listed here — a name absent from this
+table is one `_apply_gpu_worker_ladder` refuses:
 
 | rung | card | vCPU/GPU | host GiB/GPU |
 |---|---|---:|---:|
 | `g6e.2xlarge` | L40S 45,776 MiB | 8 | 64 |
 | `g6e.12xlarge` (4 GPU) | L40S 45,776 MiB | 12 | 96 |
 | `g6.2xlarge` | L4 22,888 MiB | 8 | 32 |
+| `g6.4xlarge` | L4 22,888 MiB | 16 | 64 |
 | `g6.12xlarge` (4 GPU) | L4 22,888 MiB | 12 | 48 |
+| `g5.2xlarge` | A10G 22,888 MiB | 8 | 32 |
+| `g5.4xlarge` | A10G 22,888 MiB | 16 | 64 |
 
 Two things to know before choosing one.
 
@@ -219,15 +223,26 @@ in vCPU and host RAM per GPU and in how many GPUs share a host. A wider `g6e` ru
 buys a better-fed GPU, never a faster one, and our own ledger bounds the CPU-feed
 recovery at 7–15% of GPU-hours.
 
-**`g6e` sizes share ONE capacity pool.** Measured in us-west-2 on 2026-08-27: all
-eight `g6e` sizes refused with `InsufficientInstanceCapacity` in all three of the
-dev account's AZs at the same moment, while `g6.xlarge`, `g6.2xlarge` and
-`g5.xlarge` launched. So moving between `g6e` sizes does not reach a different
-pool — the pool is the card. The `g6.*` rungs exist for that reason. They are
-**not yet a production recommendation**: per-GPU throughput on an L4 against an
-L40S has not been measured. `g6.xlarge` is deliberately not offered — 16 GiB of
-host RAM against a measured ~17.7 GB per-actor requirement is what OOMed the
-loader on the earlier 16 GB `g5`-class workers.
+**A `g6e` shortage tends to be family-wide.** Measured in us-west-2 on 2026-08-27:
+all eight `g6e` sizes refused with `InsufficientInstanceCapacity` in all three of
+the dev account's AZs at the same moment, while `g6.xlarge`, `g6.2xlarge` and
+`g5.xlarge` launched. That is why the `g6.*` and `g5.*` rungs exist.
+
+Do **not** read that as "a different `g6e` size is never worth trying". An earlier
+"the pool is the card" was too strong and is corrected in
+`context_docs/design/gpu-card-choice-2026_08.md`: measured across the same day,
+availability varies by size *within* a family — `g6e.xlarge` launched at 18:59
+after the family-wide refusal cleared, and the `g5.*` and `g6.*` sizes each
+refused in some AZs while launching in others. Under capacity pressure, another
+size in the same family is worth one attempt; it is just not a reliable answer.
+
+Per-GPU throughput has now been measured (`gpu-card-choice-2026_08.md`): against
+the L40S the A10G reaches 0.46 and the L4 0.32, so **neither is preferred on cost
+per unit of work** — each is dearer per unit than what we already run. The A10G is
+worth opening as a capacity fallback, where the alternative is an idle fleet; the
+L4 is not. `g6.xlarge` is deliberately not offered — 16 GiB of host RAM against a
+measured ~17.7 GB per-actor requirement is what OOMed the loader on the earlier
+16 GB `g5`-class workers.
 
 The L4 is half the L40S's VRAM. What makes it arguable at all is the per-chunk
 peak-VRAM telemetry on the `CHUNK_SUMMARY` line: `max_memory_allocated` measured

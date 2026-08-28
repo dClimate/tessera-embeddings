@@ -15,13 +15,18 @@ Hardware: g6e.xlarge — 1× L40S (181 TFLOPS BF16 dense, **45,776 MiB = 44.7 Gi
 = 48.0 GB** VRAM, 864 GB/s), 4 vCPU, 30.9 GB usable RAM, 250 GB NVMe. Iowa ROI,
 2000×2000 chunks.
 
-> **Correction (2026-08-27).** This line previously read "46 GB VRAM". That was
-> wrong: 45,776 is the MiB figure `nvidia-smi` and `ec2:describe-instance-types`
-> both report, and it was rounded to 46 and relabelled GB. The card is 44.7 GiB
-> (48.0 GB decimal), verified against `describe-instance-types` in us-west-2 on
-> 2026-08-27. The error is small but it is in the denominator of every "% of the
-> card" figure below, and it mattered once: the L4 and A10G (`g6.*`/`g5.*`) hold
-> 22,888 MiB = 22.4 GiB, so this card is **1.94×** those, not "barely half again".
+> **Correction (2026-08-27, amended 2026-08-28).** This line previously read
+> "46 GB VRAM". That came from `nvidia-smi memory.total`, which reports **46,068
+> MiB**, rounded to 46 and relabelled GB. The two sources do not agree and the
+> earlier wording wrongly said they did: `ec2:describe-instance-types` reports
+> **45,776 MiB**, and that is the figure used here — 44.70 GiB, 48.0 GB decimal —
+> because it is the vendor's own catalogue value and is what the fixture in
+> `tests/fixtures/ec2_describe_instance_types_gpu.json` captures.
+>
+> The error is small but it sits in the denominator of every "% of the card"
+> figure below. The L4 and A10G (`g6.*`/`g5.*`) hold 22,888 MiB = 22.35 GiB, so
+> this card is **exactly 2.0×** those — the earlier "1.94×" was arithmetic on the
+> rounded GiB values and does not survive the catalogue figures.
 > `inference/README.md`'s "48 GB" was correct all along.
 
 ## Headline numbers (final shipped state)
