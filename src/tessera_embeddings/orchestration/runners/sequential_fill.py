@@ -322,14 +322,13 @@ def fill_zones_sequential(
             deterministic failure will burn both, and what actually stops that is the
             driver's no-progress check rather than either count.
         look_ahead: Sizes INGEST width only — the driver runs ``1 + look_ahead`` cells
-            at a time. It bounds neither inference nor assembly, and since 2026-08-27 it no
-            longer sets ``max_retained_failures`` either: that was its last implicit job, and
-            coupling a failure budget to an ingest width meant neither could be tuned alone.
+            at a time. It bounds neither inference nor assembly, and it does not set
+            ``max_retained_failures``: coupling a failure budget to an ingest width
+            meant neither could be tuned alone.
         max_retained_failures: How many failed cells may hold mosaics off-budget before the
             feeder stops admitting. **A ceiling against a systematic fault, not a tripwire for a
-            bad hour.** At the old ``look_ahead + 2`` it was 7, and a single provider outage on
-            2026-08-27 put nine of ten clusters over it — turning an exogenous failure wave into
-            a fleet-wide teardown that cost every cluster's GPU actors.
+            bad hour** — set it near the roster size, because a value low enough for a bad hour
+            to reach turns an exogenous failure wave into a fleet-wide teardown.
 
             Reaching it **alerts and continues**: the run logs ``FAILURE CAP EXCEEDED``, stops
             admitting, and finishes its in-flight work normally. It does NOT tear itself down.

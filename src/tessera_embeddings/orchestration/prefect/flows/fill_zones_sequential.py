@@ -781,14 +781,13 @@ def fill_zones_sequential_flow(
         look_ahead: Sizes INGEST width only — the ingest driver runs ``1 + look_ahead``
             cells at a time, which also sets the priming abort quorum. It no longer bounds
             in-flight mosaics (peak storage is a cluster's mosaics by design, ADR-011), and
-            since 2026-08-27 it no longer sets the retained-failure cap either — see
-            ``max_retained_failures``.
+            it does not set the retained-failure cap — see ``max_retained_failures``.
         max_retained_failures: Failed cells holding mosaics off-budget before the feeder stops
             admitting and the run logs ``FAILURE CAP EXCEEDED``. A ceiling against a SYSTEMATIC
-            fault, not a tripwire for a bad hour: at the old ``look_ahead + 2`` it was 7, and one
-            provider outage on 2026-08-27 put nine of ten clusters over it. The run alerts and
-            finishes its in-flight work; it does not restart itself, because ending a fill costs
-            its GPU actors and that is a campaign-manager decision.
+            fault, not a tripwire for a bad hour, so set it near the roster size: a value a bad
+            hour can reach turns an exogenous failure wave into a fleet-wide teardown. The run
+            alerts and finishes its in-flight work; it does not restart itself, because ending a
+            fill costs its GPU actors and that is a campaign-manager decision.
         cleanup_mosaics: Delete each campaign-ingested mosaic after its cell
             lands (transient input). Ignored for ``ingest=False`` mosaics.
         ingest_settings: Grouped ingest tuning knobs (worker bounds, S2
