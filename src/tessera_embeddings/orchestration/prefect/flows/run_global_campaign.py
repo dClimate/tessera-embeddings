@@ -562,6 +562,7 @@ async def run_global_campaign(
     max_parallel_clusters: int = 10,
     launch_pacing: bool = False,
     gpu_fallback_cards: list[str] | None = None,
+    gpu_fallback_vcpu_budget: int | None = None,
     actor_request_headroom: int | None = None,
     actor_request_batch_size: int | None = None,
     fill_strategy: str = "chained-clusters",
@@ -661,6 +662,13 @@ async def run_global_campaign(
             differently made. Note the price: the fallback sizes are 8 vCPU per GPU
             against ``g6e.xlarge``'s 4, so each fallback GPU spends twice the G-and-VT
             quota, and they run at 0.46 (A10G) or 0.32 (L4) of an L40S.
+        gpu_fallback_vcpu_budget: Optional per-cluster vCPU budget for the GPU fleet.
+            The G-and-VT quota is counted in vCPU, and the fallback cards spend twice as
+            much of it per GPU, so a ceiling in cards means a different quota bill
+            depending on which card the fleet ends up on. Given a budget, each rung is
+            ceilinged at what the budget affords it -- 250 cards at 4 vCPU/GPU, 125 at 8.
+            It bounds each PURE fleet exactly; a mixture can still exceed it, because
+            Ray's ceilings count nodes and carry no weight.
             fixed rate and is not adjustable. This is where the setting belongs
             because contention is a property of the CAMPAIGN, not of a fill: one
             cluster growing alone contends with nothing, while ``n`` autoscalers
@@ -1276,6 +1284,7 @@ async def run_global_campaign(
             # whether to run it at all.
             "launch_pacing": launch_pacing,
             "gpu_fallback_cards": gpu_fallback_cards,
+            "gpu_fallback_vcpu_budget": gpu_fallback_vcpu_budget,
             # The other half of the same problem, one layer up: pacing makes a launch
             # request cheaper, this bounds how many of them a fill makes at all. Both are
             # OMITTED when unset so the fill's own default decides — keyed on None rather
@@ -1579,6 +1588,7 @@ async def run_global_campaign(
                         # divided count.
                         "launch_pacing": launch_pacing,
                         "gpu_fallback_cards": gpu_fallback_cards,
+                        "gpu_fallback_vcpu_budget": gpu_fallback_vcpu_budget,
                         # And as in _fill_params, the bound on how many launch requests
                         # a cluster makes, beside the pacing that makes each one cheaper.
                         # Omitted when unset so the child's own default stands.

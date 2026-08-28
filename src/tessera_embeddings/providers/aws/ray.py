@@ -403,7 +403,62 @@ def _apply_gpu_worker_ladder(config: dict[str, Any], raw: str) -> None:
     )
 
 
-def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str]) -> list[str]:
+def _vcpu_per_gpu(node_type: dict[str, Any]) -> int:
+    """How much vCPU this rung spends per GPU, from its DECLARED resources.
+
+    Read from the config rather than the EC2 catalogue because the declaration is what
+    the autoscaler itself scales against, and because it needs no API call at resolve
+    time. `test_declared_resources_match_the_ec2_catalogue` is what keeps the two honest.
+    """
+    resources = node_type.get("resources") or {}
+    cpu, gpu = int(resources.get("CPU", 0)), int(resources.get("GPU", 0))
+    if cpu <= 0 or gpu <= 0:
+        msg = (
+            f"Cannot price node type {node_type.get('node_config', {}).get('InstanceType')!r} "
+            f"against a vCPU budget: it declares CPU={cpu}, GPU={gpu}. Every GPU rung must "
+            "declare both -- see the resources block in cluster.yaml.template."
+        )
+        raise RuntimeError(msg)
+    return max(1, cpu // gpu)
+
+
+def _vcpu_budget_ceiling(node_type: dict[str, Any], vcpu_budget: int) -> int:
+    """How many of this rung the vCPU budget affords. At least 1, so a budget can
+    narrow a fleet but never close it silently.
+    """
+    return max(1, vcpu_budget // _vcpu_per_gpu(node_type))
+
+
+def _apply_gpu_vcpu_budget(config: dict[str, Any], vcpu_budget: int) -> None:
+    """Re-ceiling every OPEN on-demand GPU rung to what ``vcpu_budget`` affords.
+
+    The G-and-VT service quota is counted in vCPU, not in cards, and rungs are not
+    equally priced: the fallback sizes are 8 vCPU per GPU against the production rung's
+    4. A ceiling expressed in NODES therefore means a different quota bill depending on
+    which card wins, and an all-fallback fleet at the production node count quietly
+    spends twice the quota.
+
+    So each rung gets the count the budget affords IT -- 250 at 4 vCPU/GPU, 125 at 8.
+    That is the honest statement of "as many of this card as the quota allows".
+
+    **It does not bound a MIXTURE, and cannot.** Ray's ceilings count nodes and carry no
+    weight (`resource_demand_scheduler` has no cost concept at all), so a fleet that is
+    part production and part fallback can exceed the budget -- bounded by the widest
+    per-rung ceiling, not equal to it. Making it exact would need a controller outside
+    Ray adjusting demand as the mix shifts. What this does remove is the worst case: a
+    fleet that has fallen over entirely can no longer run at the production node count.
+    """
+    if vcpu_budget <= 0:
+        msg = f"gpu_fallback_vcpu_budget must be > 0, got {vcpu_budget}"
+        raise ValueError(msg)
+    node_types = config["available_node_types"]
+    for name, cfg in node_types.items():
+        if not name.startswith(GPU_WORKER_NODE_TYPE_PREFIX) or cfg.get("max_workers", 0) <= 0:
+            continue
+        cfg["max_workers"] = _vcpu_budget_ceiling(cfg, vcpu_budget)
+
+
+def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str], vcpu_budget: int | None = None) -> list[str]:
     """Open a fallback rung per named card and make the autoscaler use it on refusal.
 
     Two halves, and NEITHER works alone. Opening a rung gives the autoscaler somewhere
@@ -420,7 +475,12 @@ def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str]) -> list[st
     Args:
         config: A loaded cluster config. Mutated in place.
         cards: Card names from :data:`GPU_FALLBACK_CARDS` (e.g. ``["A10G"]``). Empty
-            disables the feature entirely and touches nothing.
+            opens no rung and installs no scorer.
+        vcpu_budget: Optional G-and-VT vCPU budget for this cluster's GPU fleet. When
+            given, every open GPU rung -- production included -- is ceilinged at what the
+            budget affords IT rather than at a flat node count, which is the only way a
+            heterogeneous fleet can be held to a quota counted in vCPU. See
+            :func:`_apply_gpu_vcpu_budget` for what it does and does not bound.
 
     Returns:
         The node type names opened, for logging by the caller.
@@ -431,9 +491,11 @@ def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str]) -> list[st
             would otherwise leave the fleet quietly unable to fail over -- which is only
             discovered during the capacity event the feature exists for.
     """
+    node_types = config["available_node_types"]
+    if vcpu_budget is not None:
+        _apply_gpu_vcpu_budget(config, vcpu_budget)
     if not cards:
         return []
-    node_types = config["available_node_types"]
 
     unknown = [c for c in cards if c not in GPU_FALLBACK_CARDS]
     if unknown:
@@ -475,14 +537,19 @@ def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str]) -> list[st
                 f"cluster template offers. Available: {sorted(by_instance_type)}."
             )
             raise RuntimeError(msg)
-        node_types[name]["max_workers"] = ceiling
+        node_types[name]["max_workers"] = (
+            _vcpu_budget_ceiling(node_types[name], vcpu_budget) if vcpu_budget is not None else ceiling
+        )
         opened.append(name)
 
+    widest = max(node_types[n]["max_workers"] for n in opened)
+    if widest > config.get("max_workers", 0):
+        config["max_workers"] = widest
     logging.getLogger(__name__).info(
         "GPU fallback enabled for %s: opened %s at max_workers=%d, scorer=%s",
         ", ".join(cards),
         ", ".join(opened),
-        ceiling,
+        widest,
         autoscaler_scorer.SCORER_PATH,
     )
     return opened
@@ -643,6 +710,7 @@ def _resolve_ray_config(
     idle_timeout_minutes: int | None = None,
     launch_pacing: bool = False,
     gpu_fallback_cards: Sequence[str] = (),
+    gpu_fallback_vcpu_budget: int | None = None,
 ) -> str:
     """Inject AWS resource IDs from SSM into a Ray cluster YAML template.
 
@@ -699,6 +767,11 @@ def _resolve_ray_config(
             leaves the cluster exactly as it is today. Naming a card opens its rung AND
             installs the capacity-aware autoscaler scorer; see :func:`_apply_gpu_fallback`
             for why both are needed and neither is sufficient.
+        gpu_fallback_vcpu_budget: Optional G-and-VT vCPU budget for this cluster's GPU
+            fleet. Rungs are not equally priced -- the fallback sizes are 8 vCPU per GPU
+            against the production rung's 4 -- so a ceiling in NODES means a different
+            quota bill depending on which card wins. Given a budget, each rung is
+            ceilinged at what the budget affords IT.
             against the account's shared request quota. ``False`` leaves the
             template's commands untouched; pass ``True`` when several clusters
             will be growing at once. Worker start commands are never touched —
@@ -743,7 +816,7 @@ def _resolve_ray_config(
 
     # AFTER the ladder, so a ladder that narrows the production rung narrows the
     # fallbacks with it. Empty is the default and changes nothing.
-    fallback_opened = _apply_gpu_fallback(config, gpu_fallback_cards)
+    fallback_opened = _apply_gpu_fallback(config, gpu_fallback_cards, gpu_fallback_vcpu_budget)
 
     sg_ids = [params["security-group-id"]]
     all_subnet_ids = [s.strip() for s in params["private-subnet-ids"].split(",")]
@@ -1160,6 +1233,7 @@ def ray_cluster(
     idle_timeout_minutes: int | None = None,
     launch_pacing: bool = False,
     gpu_fallback_cards: Sequence[str] = (),
+    gpu_fallback_vcpu_budget: int | None = None,
 ) -> Iterator[str | None]:
     """Provision an AWS-backed Ray cluster; tear it down on exit.
 
@@ -1208,6 +1282,11 @@ def ray_cluster(
         gpu_fallback_cards: Card names this cluster may fall back to when the production
             GPU rung has no capacity -- see :data:`GPU_FALLBACK_CARDS`. Empty (the
             default) leaves behaviour exactly as it is today.
+        gpu_fallback_vcpu_budget: Optional G-and-VT vCPU budget for this cluster's GPU
+            fleet. Rungs are not equally priced -- the fallback sizes are 8 vCPU per GPU
+            against the production rung's 4 -- so a ceiling in NODES means a different
+            quota bill depending on which card wins. Given a budget, each rung is
+            ceilinged at what the budget affords IT.
             Default ``False`` keeps today's launch behaviour. Pass ``True`` when
             several clusters grow concurrently; one cluster alone contends with
             nothing and gains only a smaller call count. Ignored in the
@@ -1265,6 +1344,7 @@ def ray_cluster(
                 idle_timeout_minutes=idle_timeout_minutes,
                 launch_pacing=launch_pacing,
                 gpu_fallback_cards=gpu_fallback_cards,
+                gpu_fallback_vcpu_budget=gpu_fallback_vcpu_budget,
             )
             head_ip = _start_ray_cluster(resolved_yaml, log, launch_pacing=launch_pacing)
             head_address = f"ray://{head_ip}:10001"

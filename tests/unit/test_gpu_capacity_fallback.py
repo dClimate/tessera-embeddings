@@ -173,6 +173,84 @@ class TestApplyGpuFallback:
         assert set(tray.GPU_FALLBACK_CARDS.values()) <= offered
 
 
+class TestVcpuBudget:
+    """Ceilings priced in vCPU, because the quota is.
+
+    The G-and-VT quota counts vCPU, not cards, and the rungs are not equally priced --
+    the fallback sizes are 8 vCPU per GPU against production's 4. A ceiling expressed in
+    NODES therefore means a different quota bill depending on which card wins.
+    """
+
+    def test_each_rung_is_ceilinged_at_what_the_budget_affords_it(self) -> None:
+        """1,000 vCPU is 250 cards at 4 vCPU/GPU and 125 at 8 -- the honest statement of
+        "as many of this card as the quota allows".
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_fallback(config, ["A10G"], 1000)
+        types = config["available_node_types"]
+        assert types[PRODUCTION]["max_workers"] == 250
+        assert types[A10G]["max_workers"] == 125
+
+    def test_the_budget_reprices_production_too(self) -> None:
+        """Not only the fallback. A budget that bound one rung and not the other would
+        describe a fleet nobody asked for.
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_fallback(config, [], 1000)
+        assert config["available_node_types"][PRODUCTION]["max_workers"] == 250
+
+    def test_each_pure_fleet_lands_exactly_on_the_budget(self) -> None:
+        """What the feature actually guarantees: a fleet entirely on either card spends
+        the budget and no more. A MIXTURE can still exceed it -- Ray's ceilings count
+        nodes and carry no weight -- and that is stated rather than tested, because it
+        is a property of Ray's scheduler, not of this code.
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_fallback(config, ["A10G"], 1000)
+        types = config["available_node_types"]
+        for name in (PRODUCTION, A10G):
+            res = types[name]["resources"]
+            assert types[name]["max_workers"] * (res["CPU"] // res["GPU"]) == 1000
+
+    def test_absent_budget_keeps_the_production_ceiling(self) -> None:
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_fallback(config, ["A10G"])
+        types = config["available_node_types"]
+        assert types[A10G]["max_workers"] == types[PRODUCTION]["max_workers"] == 500
+
+    def test_it_composes_with_a_ladder(self) -> None:
+        """Ladder first, then the budget -- so the budget has the last word on ceilings
+        and an operator cannot accidentally out-argue the quota with an SSM value.
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_worker_ladder(config, "g6e.xlarge:500")
+        tray._apply_gpu_fallback(config, ["A10G"], 1000)
+        assert config["available_node_types"][PRODUCTION]["max_workers"] == 250
+
+    def test_refuses_a_nonpositive_budget(self) -> None:
+        config = yaml.safe_load(TEMPLATE.read_text())
+        with pytest.raises(ValueError, match="must be > 0"):
+            tray._apply_gpu_fallback(config, ["A10G"], 0)
+
+    def test_refuses_a_rung_it_cannot_price(self) -> None:
+        """A rung with no declared resources cannot be costed against a vCPU budget, and
+        guessing would size the fleet against a fiction.
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        config["available_node_types"][PRODUCTION].pop("resources")
+        with pytest.raises(RuntimeError, match="Cannot price node type"):
+            tray._apply_gpu_fallback(config, ["A10G"], 1000)
+
+    def test_a_budget_never_closes_a_rung_silently(self) -> None:
+        """Floors at 1. A budget too small for even one card should narrow the fleet, not
+        produce a cluster that looks configured and can launch nothing.
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_fallback(config, ["A10G"], 1)
+        types = config["available_node_types"]
+        assert types[PRODUCTION]["max_workers"] == types[A10G]["max_workers"] == 1
+
+
 class TestScorerInstallation:
     """The scorer only works if Ray can find it on the head node."""
 
