@@ -704,21 +704,43 @@ def _coverage_record(
     }
 
 
+def _accelerator_index() -> str | None:
+    """This actor's own GPU index on its host, from Ray's assignment. ``None`` if unassigned.
+
+    Ray sets ``CUDA_VISIBLE_DEVICES`` per actor, so TORCH already sees only this
+    actor's device and calls it 0. ``nvidia-smi`` does NOT honour that variable —
+    it reports every GPU on the host — so anything shelling out to it needs the
+    real host-level index, and this is where it comes from. On a one-GPU host the
+    answer is always "0" and the distinction is invisible, which is why the bug it
+    exists to prevent survived until a 4-GPU host was tried.
+
+    Returns the FIRST assigned id as a string: an ``InferenceActor`` reserves
+    exactly one GPU (``num_gpus=1``), so a second id would mean the reservation
+    changed and a single-GPU reader would be wrong anyway.
+    """
+    try:
+        ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
+    except Exception:  # No Ray runtime (local runner, unit tests)
+        return None
+    return str(ids[0]) if ids else None
+
+
 @ray.remote(
     runtime_env={
         "env_vars": {
             "CUBLAS_WORKSPACE_CONFIG": ":16:8",
             "MALLOC_ARENA_MAX": "2",
             "MALLOC_TRIM_THRESHOLD_": "0",
-            # Segment-backed allocation, so the caching allocator can GROW a segment
-            # instead of reserving a fresh larger one and stranding the old. Required
-            # before any 24 GB card is opened: on both the A10G and the L4 the default
-            # allocator walls at an observation depth of 208, and the deepest region
-            # this campaign has already processed presents at exactly 208 — zero margin.
-            # Measured to move the wall to 232 on both cards at no throughput cost. On
-            # the L40S it also stops the reserved pool drifting to ~95% of the card to
-            # hold a <9 GB working set. Read once when the allocator is built, which is
-            # why it rides on runtime_env with the rest.
+            # Segment-backed allocation, so the caching allocator GROWS a segment instead of
+            # reserving a fresh larger one and stranding the old. Read once when the allocator
+            # is built, which is why it rides on runtime_env with the rest. On the L40S it stops
+            # the reserved pool drifting to ~95% of the card to hold a <9 GB working set --
+            # measured 42.2 GB reserved for a chunk whose real need was 8.99 GB.
+            #
+            # It is also a PREREQUISITE for any 24 GB rung: without it the default allocator
+            # walls below the observation depth this campaign already meets, so the A10G and L4
+            # rungs cannot be opened until this is in place. Both cards' walls and the depth
+            # census: `context_docs/design/gpu-card-choice-2026_08.md`.
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         }
     }
@@ -819,10 +841,11 @@ class InferenceActor:
         # (torch is imported lazily in this method — see the module docstring —
         # so there is no module-level name to reach for from _process_chunk.)
         self._torch = _torch if self.device.type == "cuda" else None
-        # This actor's GPU index ON THE HOST, which is not always 0: Ray packs one
-        # actor per GPU, so a 4-GPU host runs four actors holding indices 0-3.
+        # This actor's GPU index ON THE HOST, which is not always 0: Ray packs one actor per
+        # GPU, so a 4-GPU host runs four actors holding indices 0-3. Without it the monitor
+        # queries every GPU, rejects the multi-row answer, and a packed actor emits neither
+        # GPU statistics nor attribution — the whole point of the index.
         self.gpu_index = _accelerator_index()
-
         self._resource_monitor = ResourceMonitor(interval_sec=30, gpu_index=self.gpu_index)
         self._resource_monitor.start()
         logger.info(
@@ -1277,9 +1300,10 @@ class InferenceActor:
         # anything, so the figure the CHUNK_SUMMARY carries is this chunk's peak
         # and not the run's. See _reset_vram_peak.
         _reset_vram_peak(self._torch)
-        # Unguarded, like the `set_context` below it: anything reaching this line is
-        # a constructed actor. `_host_fields` guards its read instead, because the
-        # bare instances the unit tests build DO call that one.
+        # Per CHUNK, not per actor: host RAM scales with a chunk's optical depth, so a peak
+        # taken over the actor's life describes its deepest chunk and gets attached to every
+        # later one. Without this reset the RAMpeak on a chunk's lines can belong to an
+        # earlier chunk entirely.
         self._resource_monitor.reset_peak_host_ram()
         self._resource_monitor.set_context("work", f"{chunk.label}:prologue")
 

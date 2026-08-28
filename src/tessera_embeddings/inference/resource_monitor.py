@@ -300,6 +300,12 @@ class ResourceMonitor:
         """
         with self._ram_lock:
             self._peak_ram_gb = 0.0
+            # Cleared TOO, because `peak_host_ram_gib` reports "not sampled" as a zero TOTAL.
+            # Leaving the total set makes a just-reset monitor return `(0.0, total)`, which
+            # `_host_fields` publishes as a measured-looking `host_ram_peak_gib: 0.0` — so a
+            # chunk that finished inside one 2 s sampling interval, or was skipped outright,
+            # wrote a false zero into the per-chunk RAM record instead of nothing at all.
+            self._ram_total_gb = 0.0
 
     def _sample_ram(self) -> None:
         ram = read_host_ram_gib()
@@ -332,6 +338,11 @@ class ResourceMonitor:
         if peak is not None:
             parts.append(f"RAMpeak={peak[0]:.1f}/{peak[1]:.1f} GB ({100 * peak[0] / max(peak[1], 0.1):.0f}%)")
 
+        # OUTSIDE the `if gpu` below: a transient nvidia-smi timeout or malformed response
+        # returns None, and dropping the index there would make four packed actors' CPU/RAM
+        # lines indistinguishable during exactly the interval a reader needs to tell them apart.
+        if self._gpu_index is not None:
+            parts.append(f"gpu_idx={self._gpu_index}")
         gpu = _get_gpu_stats(self._gpu_index)
         if gpu:
             if self._gpu_index is not None:

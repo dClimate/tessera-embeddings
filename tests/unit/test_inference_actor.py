@@ -335,3 +335,33 @@ def test_the_actor_class_survives_cloudpickle() -> None:
     from ray.cloudpickle import dumps
 
     dumps(InferenceActor.__ray_metadata__.modified_class)
+
+
+def test_the_actor_hands_its_own_gpu_index_to_the_monitor() -> None:
+    """Review of #154 found the capability unwired: the actor built `ResourceMonitor(30)` with
+    no index, so on a packed host the monitor queried every GPU, rejected the multi-row answer,
+    and emitted neither statistics nor attribution — the whole point of the index.
+    """
+    import inspect
+
+    src = inspect.getsource(actors_mod)
+    assert "ResourceMonitor(interval_sec=30, gpu_index=self.gpu_index)" in src, (
+        "the monitor must be given THIS actor's host GPU index, or it queries every GPU on a "
+        "packed host, rejects the multi-row answer, and emits neither stats nor attribution"
+    )
+    assert "self.gpu_index = _accelerator_index()" in src
+
+
+def test_the_ram_peak_is_reset_at_each_chunk_not_once_per_actor() -> None:
+    """Also unwired: `reset_peak_host_ram()` existed but nothing called it, so `RAMpeak` was the
+    maximum since actor startup and a deep chunk's peak was reported against every later chunk.
+    """
+    import inspect
+
+    src = inspect.getsource(actors_mod)
+    assert "self._resource_monitor.reset_peak_host_ram()" in src, (
+        "nothing called it, so RAMpeak was the maximum since actor startup"
+    )
+    reset = src.index("self._resource_monitor.reset_peak_host_ram()")
+    prologue = src.index('set_context("work", f"{chunk.label}:prologue")')
+    assert reset < prologue, "the reset must precede the chunk's own context, not follow it"

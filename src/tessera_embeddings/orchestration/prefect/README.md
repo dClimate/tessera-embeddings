@@ -179,7 +179,7 @@ are running. With `max_parallel_clusters` at 8 that is 5 zones per cluster.
 
 Because the clusters are separate Prefect flow runs on separate machines, no
 in-process semaphore can see across them, so the cap is a **Prefect global
-concurrency limit** — the same mechanism as the commit gate. Each zone's ingest
+concurrency limit**. Each zone's ingest
 holds one slot for its whole duration. The campaign upserts the limit to
 `max_parallel_ingest` at start, so the parameter is the only place the number is
 written and it cannot drift from the server's. Each cluster also takes an even
@@ -257,10 +257,10 @@ Zone-parallelism (either flavor) is safe because inference is independent
 across zones and only *same-zone* fills conflict (shared group attrs →
 `RebaseFailedError`) — the year-serial loop guarantees a zone never fills two
 years at once, and within a sequential run the depth-1 trailing assembly can
-never overlap a commit for the same zone group. The fleet-wide **committer
-bound is a Prefect global concurrency limit** (`commit_limit_name`, ADR-008 D6),
-passed to every fill so commits stay under the storm threshold while GPU
-inference runs unbounded. `build_land_mask` and `seed_global_store` are
+never overlap a commit for the same zone group. **Commits are otherwise ungated.**
+They contend on the branch-tip CAS, since all 120 zone groups share one repo, but
+run 1 measured that as 2.2 s at 16 committers and 15 s at 120 with zero
+unresolvable conflicts. See `context_docs/design/commit-gate-removal-2026_08.md`. `build_land_mask` and `seed_global_store` are
 cluster-less (they run on the flow runner like `generate_roi`); only
 `fill_zone_year` / `fill_zones_sequential` provision Ray.
 
@@ -292,7 +292,7 @@ override.
 | `tessera_full_pipeline.py` | Async master flow chaining the four above via `arun_deployment`. |
 | `build_land_mask.py` | Global campaign: build per-zone coverage bitmaps from the partner delivery registry (ADR-010). Optional pre-build delivery verification + post-build validation. No cluster. |
 | `seed_global_store.py` | Global campaign: create the global-store repo and seed every unseeded UTM-zone group (metadata-only, ADR-008 D1). Idempotent. No cluster. |
-| `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commit gate = a Prefect global concurrency limit. |
+| `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commits are ungated. |
 | `fill_zones_sequential.py` | Global campaign: fill one cluster's zones sequentially on a SINGLE shared Ray cluster (densest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Waits for its densest zone's mosaic before requesting GPUs. Pre-cluster triage settles retag/all-ocean cells. |
 | `ingest_zone_year.py` | Global campaign: build one cell's S1/S2 mosaics on the fixed zone grid by dispatching the ROI ingest deployments onto a synthesised zone-shaped ROI. Marker-gated and crash-safe: a stale or half-written mosaic is cleared and rebuilt, never appended onto. |
 | `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="cluster-per-zone"`), or size-balanced `fill-zones-sequential` runs on long-lived clusters (`"chained-clusters"`). |

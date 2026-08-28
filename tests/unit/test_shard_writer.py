@@ -125,15 +125,6 @@ def test_commit_with_rebase_resolves_concurrent_disjoint_commits(tmp_path):
     assert id1 and id2 and id1 != id2
 
 
-def test_write_year_shards_behind_gate(tmp_path):
-    store, repo = _seed(tmp_path)
-    gate = threading.Semaphore(2)
-    sid = write_year_shards(
-        repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, gate=gate, shard_px=_SHARD
-    )
-    assert isinstance(sid, str) and sid
-
-
 class TestPhaseTimer:
     """The wall/CPU phase accumulator behind the ASSEMBLY_SUMMARY record."""
 
@@ -556,3 +547,21 @@ class TestTheDrillDeathBetweenTheTwoCommits:
         assert events == [], "nothing may flush or exit when no fault was requested"
         g = zarr_store.open_store_as_zarr_group(store, group="01N")
         assert g.attrs["years_complete"] == [2025]
+
+
+def test_every_commit_is_timed_including_the_terminal_path(tmp_path, caplog):
+    """The removal's reopen criterion is commit LATENCY, so the detector has to see every commit.
+
+    `commit_s` in ASSEMBLY_SUMMARY was the obvious candidate and misses the dominant source: a
+    terminal cell marks itself through `mark_zone_year_empty` and returns without ever reaching
+    `assemble_global`, and terminal cells were 72 of the first 78 completions. `commit_with_rebase`
+    is the one site both paths pass through.
+    """
+    store, repo = _seed(tmp_path)
+    session = repo.writable_session("main")
+    zarr.open_group(session.store, mode="a")["01N"]["embeddings"][2, 0:_CHUNK, 0:_CHUNK, :] = 1
+    with caplog.at_level("INFO", logger="tessera_embeddings.storage.shard_writer"):
+        commit_with_rebase(session, "mark 01N year 2020 complete")
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("COMMIT ")]
+    assert lines, "every commit must emit a COMMIT <secs> line; it is the reopen detector"
+    assert "mark 01N year 2020 complete" in lines[0]

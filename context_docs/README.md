@@ -50,12 +50,14 @@ context_docs/
     ├── inference-perf-run-ledger.md              raw per-run measurements
     ├── campaign-monitoring-plan.md               what is watched while it runs, and how
     ├── immediate-refill-of-a-settled-fill.md      how a dead fill's roster is recovered without waiting for the round
+    ├── commit-gate-removal-2026_08.md            why the fleet-wide committer limit is gone, and when to put it back
     ├── final-data-validation-plan.md             the closing gate over every published cell
     ├── optical-registry-2026-08-19.md            the published per-tile index: schema, and what the first live run corrected
     │
     │  INGEST
     ├── ingest_optimization_campaign_2026_07.md   every ingest measurement
     ├── ingest_concurrency_investigation_2026_08.md
+    ├── gdal-read-config-2026_08.md               odc shadows three GDAL options on the imagery read path; no knob overrides them
     ├── ingest_read_failure_causes_2026_08.md     five source-read failure causes, and the retry budget they share
     ├── solar_day_fusion_order_2026_08.md         which scene wins a contested pixel, and why it was inverted
     ├── ingest-live-tile-cropping.md              + appendix A, the multi-write-per-commit test

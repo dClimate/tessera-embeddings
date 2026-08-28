@@ -28,10 +28,7 @@ from typing import cast
 import icechunk
 import zarr
 
-from tessera_embeddings.storage.shard_writer import (
-    CommitGate,
-    commit_year_attrs,
-)
+from tessera_embeddings.storage.shard_writer import commit_year_attrs
 from tessera_embeddings.storage.zarr_store import time_index_of
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES, year_timestamp
 
@@ -163,7 +160,6 @@ def mark_zone_year_empty(
     year: int,
     *,
     run_id: str | None = None,
-    gate: CommitGate | None = None,
 ) -> str:
     """Mark a ``(zone, year)`` complete with **no data** — an all-ocean cell.
 
@@ -171,7 +167,7 @@ def mark_zone_year_empty(
     contain no land at all, so there is nothing to stage or shard-write — but
     the campaign work list (:meth:`CampaignStatus.pending`) must still see them
     land. This advances ``years_complete`` (and ``runs`` provenance when
-    ``run_id`` is given) in one gated commit, exactly as
+    ``run_id`` is given) in one commit, exactly as
     :func:`~tessera_embeddings.storage.shard_writer.write_year_shards` would,
     minus the shards. ``year`` must be on the group's pre-allocated time axis
     (D1) — an off-axis year must never enter ``years_complete``. Idempotent: a
@@ -192,7 +188,7 @@ def mark_zone_year_empty(
     # Delegated so there is exactly ONE writer of years_complete/runs, with one
     # retry-on-conflict policy. That is what makes a no-land mark safe to run
     # concurrently with another year of the same zone.
-    return commit_year_attrs(repo, zone, year, run_id=run_id, empty=True, gate=gate, skip_if_marked=True)
+    return commit_year_attrs(repo, zone, year, run_id=run_id, empty=True, skip_if_marked=True)
 
 
 @dataclass(frozen=True)

@@ -85,7 +85,6 @@ from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manif
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.registry import part_uri, registry_rows, write_registry_part
 from tessera_embeddings.storage.shard_writer import (
-    CommitGate,
     PhaseTimer,
     commit_with_rebase,
     run_forked,
@@ -294,8 +293,8 @@ def _assembly_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogene
       from these without a store listing. ``tiles_staged``/``tiles_cleared``
       are the caller's intent (real data vs fill-over-skip footprints).
     * ``fill_wall_s``/``merge_s`` — the fork-to-merge span and the merge alone;
-      ``commit_s``/``attrs_commit_s`` — the data and attrs commits (gate wait
-      included); ``total_s`` — the whole assembly call.
+      ``commit_s``/``attrs_commit_s`` — the data and attrs commits;
+      ``total_s`` — the whole assembly call.
     """
     return "ASSEMBLY_SUMMARY: " + json.dumps(fields, sort_keys=True)
 
@@ -2331,7 +2330,6 @@ class ZarrWriter:
         year: int,
         run_id: str,
         n_workers: int = 8,
-        gate: CommitGate | None = None,
         staged_labels: Iterable[str] | None = None,
         skipped_labels: Iterable[str] | None = None,
         s3_concurrency: int | None = None,
@@ -2353,9 +2351,8 @@ class ZarrWriter:
         The global write path (ADR-008 D3/D6): every staged tile is exactly one
         output shard, written whole and lean by
         :func:`~tessera_embeddings.storage.shard_writer.write_year_shards` —
-        fork/merge across ``n_workers`` processes, one commit per (zone, year)
-        behind ``gate``, ``years_complete`` and per-year run provenance updated
-        in the same commit. The zone group must already be seeded
+        fork/merge across ``n_workers`` processes, one commit per (zone, year),
+        ``years_complete`` and per-year run provenance updated in the same commit. The zone group must already be seeded
         (:func:`~tessera_embeddings.storage.global_store.seed_zone_groups`);
         nothing is ever created or resized here (D1). Emits one
         ``ASSEMBLY_SUMMARY`` record (:func:`_assembly_summary_line`) with the
@@ -2399,8 +2396,6 @@ class ZarrWriter:
                 in both takes the marker, which is written at the end of a wholly refused shard.
             n_workers: Worker process count; also divides
                 ``TARGET_AGGREGATE_S3_CONCURRENCY`` into the per-fork cap.
-            gate: Optional commit gate shared across the zone-year fills this
-                process drives (fleet-wide gating is the orchestrator's job).
             staged_labels: Pre-listed staged tile labels (e.g. the return of
                 :meth:`verify_staged_completeness`); ``None`` lists the prefix.
             radar_coverage: This YEAR's radar-coverage summary, from
@@ -2605,7 +2600,6 @@ class ZarrWriter:
             year_index,
             source,
             n_workers=n_workers,
-            gate=gate,
             shard_px=shard_px,
             commit_msg=f"Run {run_id}: fill {zone} year {year}",
             run_id=run_id,

@@ -252,12 +252,24 @@ class TestHostRamPeak:
             monitor._sample_ram()
         assert monitor.peak_host_ram_gib() is None
 
-    def test_reset_drops_the_mark_but_keeps_the_total(self) -> None:
+    def test_reset_reports_not_sampled_rather_than_a_measured_zero(self) -> None:
+        """REPLACES ``test_reset_drops_the_mark_but_keeps_the_total``, which asserted the
+        opposite — that a reset leaves ``(0.0, total)`` readable.
+
+        That was the defect written down as the contract. ``peak_host_ram_gib`` signals "not
+        sampled" with a zero TOTAL and its docstring says a caller "must not read that as
+        zero", but a reset produced exactly the state the docstring forbids: peak cleared,
+        total retained. ``_host_fields`` then published a measured-looking
+        ``host_ram_peak_gib: 0.0`` for any chunk that finished inside one 2 s sampling
+        interval or was skipped outright, writing false zeros into the per-chunk RAM record.
+        Raised in review of PR #150 by four independent readers.
+        """
         monitor = rm.ResourceMonitor(interval_sec=30)
         with patch.object(rm, "read_host_ram_gib", return_value=(18.0, 32.0)):
             monitor._sample_ram()
+        assert monitor.peak_host_ram_gib() == (18.0, 32.0)
         monitor.reset_peak_host_ram()
-        assert monitor.peak_host_ram_gib() == (0.0, 32.0)
+        assert monitor.peak_host_ram_gib() is None
 
     def test_the_sampler_cannot_be_slower_than_the_emit_interval(self) -> None:
         """A default sample_sec above a short interval would emit a stale peak."""
@@ -276,3 +288,23 @@ class TestHostRamPeak:
         ):
             monitor._emit_once()
         assert "RAMpeak=19.2/32.0 GB (60%)" in logged[0]
+
+
+class TestAttributionAndResetSurviveFailure:
+    """Two findings from review of PR #150, both about a value that LOOKS measured but is not."""
+
+    def test_the_gpu_index_survives_a_failed_gpu_sample(self) -> None:
+        """Attribution matters MOST when sampling fails: four actors on one packed host would
+        otherwise emit indistinguishable CPU/RAM lines for exactly that interval.
+        """
+        monitor = rm.ResourceMonitor(interval_sec=1, gpu_index="3")
+        logged: list[str] = []
+        with (
+            patch.object(rm, "_get_cpu_mem_stats", return_value={"load_avg": "1 2 3"}),
+            patch.object(rm, "_get_gpu_stats", return_value=None),
+            patch.object(rm, "_get_gpu_extra_stats", return_value={}),
+            patch.object(rm.logger, "info", lambda fmt, *a: logged.append(fmt % a)),
+        ):
+            monitor._emit_once()
+        assert "gpu_idx=3" in logged[-1], logged[-1]
+        assert "GPU=" not in logged[-1], "no GPU stats were available, so none may be claimed"
