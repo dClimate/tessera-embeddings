@@ -161,9 +161,16 @@ Two other conditions would also put committers back in contention regardless of 
 * more than one cluster owning the same zone, which would put two committers on one zone group;
 * a change making assembly commit per-shard or per-tile rather than once per zone-year.
 
-The cheap detector is already in the telemetry: **`commit_s` in `ASSEMBLY_SUMMARY`.** It includes
-gate wait by construction, so a commit time drifting above a couple of seconds is the signal, and it
-needs no new instrumentation.
+**The detector is the `COMMIT <secs>: <message>` line in `commit_with_rebase`.** Every commit goes
+through that function — the assembly path and the terminal path both — so it is the only place that
+sees all of them. `commit_s` in `ASSEMBLY_SUMMARY` was the obvious candidate and is **not
+sufficient**: a terminal cell marks itself through `mark_zone_year_empty` and returns without ever
+reaching `assemble_global`, so the summary never fires for it. Since terminal cells were 72 of the
+first 78 completions, that detector would have missed the dominant source of concurrent commits and
+stayed silent exactly when the gate should be restored.
+
+A commit time drifting above a couple of seconds is the signal. One line per commit, so one per
+zone-year.
 
 ## What was removed
 

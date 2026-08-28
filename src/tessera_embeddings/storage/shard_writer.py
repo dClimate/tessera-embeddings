@@ -169,8 +169,18 @@ def commit_with_rebase(
     removed because what it bounded is a SLOWDOWN, not a failure -- run 1 measured 2.2 s
     commits at 16 concurrent committers and 15 s at 120, with zero unresolvable
     conflicts at every N. See ``context_docs/design/commit-gate-removal-2026_08.md``.
+
+    **Timed here, and here is the only place that sees every commit.** The removal's
+    reopen criterion is commit LATENCY, and the obvious detector -- ``commit_s`` in
+    ``ASSEMBLY_SUMMARY`` -- cannot see the dominant source of concurrent commits: a
+    terminal cell marks itself through ``mark_zone_year_empty`` and returns without ever
+    reaching ``assemble_global``, and terminal cells were **72 of the first 78**
+    completions. One line per commit, so the volume is one per zone-year.
     """
-    return session.commit(message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries)
+    started = time.monotonic()
+    snapshot = session.commit(message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries)
+    _log.info("COMMIT %.2fs: %s", time.monotonic() - started, message)
+    return snapshot
 
 
 def shard_pitch(arr: zarr.Array) -> int:

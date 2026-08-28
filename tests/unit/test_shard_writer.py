@@ -547,3 +547,21 @@ class TestTheDrillDeathBetweenTheTwoCommits:
         assert events == [], "nothing may flush or exit when no fault was requested"
         g = zarr_store.open_store_as_zarr_group(store, group="01N")
         assert g.attrs["years_complete"] == [2025]
+
+
+def test_every_commit_is_timed_including_the_terminal_path(tmp_path, caplog):
+    """The removal's reopen criterion is commit LATENCY, so the detector has to see every commit.
+
+    `commit_s` in ASSEMBLY_SUMMARY was the obvious candidate and misses the dominant source: a
+    terminal cell marks itself through `mark_zone_year_empty` and returns without ever reaching
+    `assemble_global`, and terminal cells were 72 of the first 78 completions. `commit_with_rebase`
+    is the one site both paths pass through.
+    """
+    store, repo = _seed(tmp_path)
+    session = repo.writable_session("main")
+    zarr.open_group(session.store, mode="a")["01N"]["embeddings"][2, 0:_CHUNK, 0:_CHUNK, :] = 1
+    with caplog.at_level("INFO", logger="tessera_embeddings.storage.shard_writer"):
+        commit_with_rebase(session, "mark 01N year 2020 complete")
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("COMMIT ")]
+    assert lines, "every commit must emit a COMMIT <secs> line; it is the reopen detector"
+    assert "mark 01N year 2020 complete" in lines[0]

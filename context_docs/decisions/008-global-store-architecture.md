@@ -289,26 +289,26 @@ held: zero unresolvable conflicts at every N.
 > the same gate and so concurrent committers can exceed the cluster count. Kept for those
 > reasons, not for throughput.
 
-> **A removal was PROPOSED 2026-08-27 and is NOT settled. The cap stands in `main`.**
-> A live measurement showed `commit_s` **1.0 s** and `attrs_commit_s` **0.3 s** against a
-> `fill_wall_s` of **21,447 s**, with the gate wait measured *inside* `commit_s`, so **zero
-> queueing** at the load observed. That reading is sound but NARROW: it was taken with **one
-> assembly in flight fleet-wide**, so it measures low concurrency, not the case this cap exists
-> for.
+> **REMOVED 2026-08-27. The cap no longer exists in code**, and the paragraph below describes
+> what it did until then.
 >
-> **And a correction to this note's own arithmetic, which I got backwards.** I first wrote that
-> the N≥16 breach threshold is "twice the cluster count this campaign runs", as reassurance. It
-> is the other way round: `max_parallel_clusters` defaults to **10**, and the paragraph below
-> already records that a cluster's feeder can commit alongside its trailing assembly, making the
-> fleet's true ceiling **2N = 20**. **20 exceeds 16.** The default configuration's ceiling sits
-> above the measured threshold, and the curve below is therefore live evidence AGAINST removal at
-> this width rather than a distant reopen criterion.
+> The curve below is NOT retracted — it is the reason the removal is safe rather than an argument
+> against it. What it measures is LATENCY: `N=16` is where a commit reaches **2.2 s** against ~1 s
+> serial, and `N=120` where it reaches **15 s**. "Cross-group conflict-freedom held: zero
+> unresolvable conflicts at every N", including 120 — six times this campaign's `2N=20` ceiling at
+> `max_parallel_clusters=10`. So the gate bounded a slowdown measured in seconds, not a failure.
 >
-> The proposal also rested on a claim that the campaign writes per-ROI stores. **That was false**
-> — `global_store()` returns one repo holding all 120 zone groups, so commits share a branch tip.
-> See [`design/commit-gate-removal-2026_08.md`](../design/commit-gate-removal-2026_08.md).
+> **Two corrections to my own reasoning, recorded because both were load-bearing.** The removal was
+> first argued from a claim that the campaign writes per-ROI stores; it does not, and that premise
+> is withdrawn — `global_store()` returns one repo holding all 120 zone groups, and commits share a
+> branch tip. And this note first said N≥16 was "twice the cluster count this campaign runs", as
+> reassurance; it is the reverse — the fleet's ceiling is 2N, so 10 clusters reach 20.
+>
+> Reopen criterion is now **N ≥ 120**, detected by the `COMMIT <secs>` line in
+> `commit_with_rebase`, which is the only site every commit passes through. See
+> [`design/commit-gate-removal-2026_08.md`](../design/commit-gate-removal-2026_08.md).
 
-**Enforced in code since 2026-07-28.** The cap is a Prefect global
+**Enforced in code from 2026-07-28 until 2026-08-27.** The cap was a Prefect global
 concurrency limit (`commit_limit_name`) held around each commit, and `run_global_campaign`
 upserted its VALUE at preflight to
 `min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS=8)`. Previously only the
