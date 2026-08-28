@@ -373,6 +373,10 @@ def _serve_icechunk_credential(
     same name in two partner accounts is a real configuration -- and merging them would report
     one provider's rotation as the other's.
 
+    The timestamp is icechunk's REUSE deadline, not the token's validity limit -- the task-role
+    path passes ``now + TTL`` outright, and only the assumed-role path caps it by the real expiry.
+    Labelled "reuse until" so a responder does not read it as when the credential died.
+
     Levels: a process's first credential and each further distinct one are INFO, the events a
     signature failure is lined up against. Routine re-serves are DEBUG, because icechunk asks
     per request once its cached credential lapses (icechunk#2077) and a campaign runs on the
@@ -406,7 +410,7 @@ def _serve_icechunk_credential(
         )
     _LOG.log(
         level,
-        "icechunk credential [%s] pid=%d seq=%d %s: %s, valid until %s",
+        "icechunk credential [%s] pid=%d seq=%d %s: %s, reuse until %s",
         source,
         os.getpid(),
         order,
