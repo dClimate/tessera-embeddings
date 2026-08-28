@@ -255,16 +255,16 @@ def _await_forks(
             # return at the end, so the payload figure read 0/N for the whole write. `slots` is what
             # the workers have actually written; empty until the first of them reports.
             n = len(futures)
-            totals = [slots[2 * i + 1] for i in range(n)] if slots is not None else []
-            # EVERY worker's total, or none of them. Workers start staggered, so a denominator
-            # summed over only those that have reported yet is short -- and a short denominator
-            # reports near-completion while most of the write is still outstanding.
-            if totals and all(totals):
-                got = sum(slots[2 * i] for i in range(n))
-                want = sum(totals)
-                shards = f"{got}/{want} shards written ({100.0 * got / want:.0f}%), "
-            else:
-                shards = ""
+            shards = ""
+            if slots is not None:
+                totals = [slots[2 * i + 1] for i in range(n)]
+                # EVERY worker's total, or none. Workers start staggered, so a denominator summed
+                # over only those that have reported is short -- and a short denominator reports
+                # near-completion while most of the write is still outstanding.
+                if all(t > 0 for t in totals):
+                    got = sum(slots[2 * i] for i in range(n))
+                    want = sum(totals)
+                    shards = f"{got}/{want} shards written ({100.0 * got / want:.0f}%), "
             logger.info(
                 "Assembly progress: %s%d/%d %s outstanding after %.0f min",
                 shards,
