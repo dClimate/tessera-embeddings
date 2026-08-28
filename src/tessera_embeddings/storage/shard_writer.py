@@ -253,7 +253,7 @@ def _await_forks(
         if pending:
             # SHARDS, not payloads: a payload completes only when its worker returns and they all
             # return at the end, so the payload figure read 0/N for the whole write. `slots` is what
-            # the workers have actually written; empty until the first of them reports.
+            # the workers have actually written; withheld until ALL of them have reported a total.
             n = len(futures)
             shards = ""
             if slots is not None:
