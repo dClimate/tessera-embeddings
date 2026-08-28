@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -208,7 +209,14 @@ class AssumedRoleIcechunkCredentials:
         # serves the published store, so instrumenting only the other one would have left the
         # credential behind the assembly failures invisible.
         return _serve_icechunk_credential(
-            source=f"assumed-role:{self.role_arn.rsplit('/', 1)[-1]}",
+            # The FULL arn, not the role name. The name alone is not unique -- the same role
+            # name in two partner accounts is a real configuration, and collapsing them would
+            # both mislabel the log line and merge two providers' rotation history into one
+            # map entry, so a rotation on either would read as a rotation on both. The arn
+            # carries the account id, which is also what makes the line correlatable against
+            # the other account's CloudTrail. An external id never disambiguates an arn (one
+            # role has one), so it is recorded as presence only and its value is never logged.
+            source=f"assumed-role:{self.role_arn}" + ("+external-id" if self.external_id else ""),
             access_key=frozen.access_key,
             secret_key=frozen.secret_key,
             session_token=frozen.token,
@@ -328,6 +336,11 @@ def iam_s3_storage_options() -> dict[str, str]:
 #: its own icechunk client, so knowing WHICH process rotated when is the correlation a
 #: signature failure needs.
 _last_icechunk_access_key: dict[str, str] = {}
+#: Guards the compare-and-swap in :func:`_serve_icechunk_credential` only. icechunk invokes the
+#: callback from its own Rust threads, so an unguarded read-then-write lets two threads both read
+#: ``None`` and both announce a FIRST -- or, worse, both miss a rotation. See that function for why
+#: the LOGGING deliberately sits outside this lock.
+_LAST_ACCESS_KEY_LOCK = threading.Lock()
 
 
 def _serve_icechunk_credential(
@@ -369,8 +382,16 @@ def _serve_icechunk_credential(
     Logs the access-key id, which is an identifier rather than a secret and is what CloudTrail
     indexes on. **Never the secret key or the session token.**
     """
-    previous = _last_icechunk_access_key.get(source)
-    _last_icechunk_access_key[source] = access_key
+    # ATOMIC SWAP, and nothing else inside the lock. The swap is what makes each transition
+    # announced exactly once: of two threads arriving with the same new key, one reads the old
+    # value and reports the transition while the other reads the value just written and falls
+    # through to the steady-state branch. Emitting the log inside the lock would serialise every
+    # icechunk request in the process behind it -- and the per-request callback volume is the
+    # very thing this instrumentation exists to observe (see icechunk#2077), so the critical
+    # section is one dict get and one dict set.
+    with _LAST_ACCESS_KEY_LOCK:
+        previous = _last_icechunk_access_key.get(source)
+        _last_icechunk_access_key[source] = access_key
     if previous is None:
         _LOG.info(
             "icechunk credential [%s] FIRST: %s, valid until %s",

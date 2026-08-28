@@ -14,7 +14,9 @@ covered is the arithmetic and the branching, which is where the mistakes actuall
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import icechunk
 import pytest
@@ -432,6 +434,98 @@ class TestIcechunkCredentialVisibility:
                 self._serve("task-role", "ASIATASK")
                 self._serve("assumed-role:writer", "ASIAWRITER")
         assert not [r for r in caplog.records if "ROTATED" in r.message]
+
+    def test_the_same_role_name_in_two_accounts_is_not_one_provider(self, caplog, monkeypatch) -> None:
+        """The identity is the full arn, because a role NAME is not unique.
+
+        Two partner accounts may each hold a `Writer` role, and those are different credentials
+        that rotate independently. Keyed on the name alone they share one last-seen slot, so
+        every alternating call reads as a rotation — burying the real event in noise, which is
+        the one thing this instrumentation exists to make findable.
+        """
+        self._reset()
+        monkeypatch.setattr(
+            creds_mod,
+            "_assumed_role_credentials",
+            lambda arn, ext: SimpleNamespace(
+                get_frozen_credentials=lambda: SimpleNamespace(
+                    # A distinct key per account, so a shared slot WOULD show as rotation.
+                    access_key="ASIA" + arn.split("::")[1][:3],
+                    secret_key="s",
+                    token="t",
+                )
+            ),
+        )
+        monkeypatch.setattr(creds_mod, "_expires_after", lambda creds, ttl: datetime(2026, 8, 28, 12, tzinfo=UTC))
+        first = creds_mod.AssumedRoleIcechunkCredentials("arn:aws:iam::111111111111:role/Writer")
+        second = creds_mod.AssumedRoleIcechunkCredentials("arn:aws:iam::222222222222:role/Writer")
+
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            for _ in range(3):
+                first()
+                second()
+
+        assert not [r for r in caplog.records if "ROTATED" in r.message]
+        assert len([r for r in caplog.records if "FIRST" in r.message]) == 2
+        text = " ".join(r.getMessage() for r in caplog.records)
+        # The account id is in the line, which is also what makes it correlatable against the
+        # other account's CloudTrail.
+        assert "111111111111" in text and "222222222222" in text
+
+    def test_the_swap_is_locked_and_the_log_is_not(self, caplog, monkeypatch) -> None:
+        """Pins BOTH halves of the concurrency design, deterministically.
+
+        icechunk invokes this callback from its own Rust threads. An unguarded read-then-write
+        lets two of them both read `None` and both announce a FIRST, or both miss a rotation —
+        but a racing test can only fail probabilistically, so the invariant is asserted directly
+        instead. The second half matters just as much: holding the lock across the log call
+        would serialise every icechunk request in the process behind it, and per-request
+        callback volume is the very thing being observed.
+        """
+        self._reset()
+        lock = creds_mod._LAST_ACCESS_KEY_LOCK
+
+        class _Watched(dict):
+            def __init__(self) -> None:
+                super().__init__()
+                self.held: list[bool] = []
+
+            def get(self, key, *args):  # type: ignore[override]
+                self.held.append(lock.locked())
+                return super().get(key, *args)
+
+            def __setitem__(self, key, value) -> None:
+                self.held.append(lock.locked())
+                super().__setitem__(key, value)
+
+        watched = _Watched()
+        monkeypatch.setattr(creds_mod, "_last_icechunk_access_key", watched)
+        logged_under_lock: list[bool] = []
+        monkeypatch.setattr(creds_mod._LOG, "info", lambda *a, **k: logged_under_lock.append(lock.locked()))
+
+        self._serve("task-role", "ASIALOCKED")
+
+        assert watched.held == [True, True], "the get and the set must be one atomic swap"
+        assert logged_under_lock == [False], "the log must not run inside the lock"
+
+    def test_concurrent_serves_announce_the_first_exactly_once(self, caplog) -> None:
+        """The realistic companion: eight threads racing one new key produce one FIRST line."""
+        self._reset()
+        barrier = threading.Barrier(8)
+
+        def serve() -> None:
+            barrier.wait()
+            self._serve("task-role", "ASIACONCURRENT")
+
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            threads = [threading.Thread(target=serve) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert len([r for r in caplog.records if "FIRST" in r.message]) == 1
+        assert len(caplog.records) == 8
 
     def test_it_never_logs_the_secret_or_the_token(self, caplog) -> None:
         """The access-key id is an identifier and is what CloudTrail indexes on. The secret key
