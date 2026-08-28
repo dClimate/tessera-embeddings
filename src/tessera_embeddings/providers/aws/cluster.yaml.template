@@ -111,12 +111,25 @@ available_node_types:
     # list rotates on retry). Every `g6e` size is the same L40S on x86_64, so
     # no AMI re-bake is involved in moving between them.
     #
-    # NO `resources:` BLOCK, deliberately, on both. Ray autodetects CPU and GPU
-    # counts for the instance type from the live EC2 catalogue; a declared key
-    # OVERRIDES that autodetection, so hardcoding one is a chance to be wrong
-    # about a vCPU or GPU count with no error — the autoscaler would simply
-    # scale against a fiction. (The two rungs above keep their declared 4/1
-    # because they are load-bearing for existing tests; they happen to match.)
+    # EVERY rung DECLARES `resources:`, including the inert ones, and this is not
+    # optional. Ray's config schema lists `resources` as REQUIRED. It autofills the
+    # block from the live EC2 catalogue, but that autodetection is wrapped in a bare
+    # `except Exception` that downgrades any failure to a WARNING
+    # (`commands.py::_bootstrap_config`) — and `validate_config` then runs against a
+    # node type that still has no `resources` key and fails the whole `ray up`.
+    #
+    # So an omitted block makes the cluster's bootstrap depend on one EC2 API call
+    # succeeding: a throttled or denied `DescribeInstanceTypes`, or an instance type
+    # absent from the configured region, takes down the launch of EVERY rung —
+    # including the `g6e.xlarge` the campaign actually runs on. The call itself is
+    # unconditional and predates these rungs; what an omission adds is a DEPENDENCE
+    # on its success.
+    #
+    # A declared key does override autodetection, so a wrong vCPU or GPU count would
+    # have the autoscaler scale against a fiction with no error. That risk is real
+    # and is why omission was tried first; it is closed by
+    # `test_declared_resources_match_the_ec2_catalogue`, which checks every declared
+    # block against a captured `DescribeInstanceTypes` response.
     #
     # Read `available_node_types` order as a preference hint only. With the
     # actor bundle `{CPU: 1, GPU: 1}` Ray's scorer ties at 0 on its utilisation
@@ -141,6 +154,9 @@ available_node_types:
                   Ebs:
                       VolumeSize: 80
                       VolumeType: gp3
+        resources:
+            CPU: 8
+            GPU: 1
         min_workers: 0
         max_workers: 0
 
@@ -161,6 +177,9 @@ available_node_types:
                   Ebs:
                       VolumeSize: 80
                       VolumeType: gp3
+        resources:
+            CPU: 48
+            GPU: 4
         min_workers: 0
         max_workers: 0
 
@@ -202,6 +221,9 @@ available_node_types:
                   Ebs:
                       VolumeSize: 80
                       VolumeType: gp3
+        resources:
+            CPU: 8
+            GPU: 1
         min_workers: 0
         max_workers: 0
 
@@ -219,6 +241,9 @@ available_node_types:
                   Ebs:
                       VolumeSize: 80
                       VolumeType: gp3
+        resources:
+            CPU: 48
+            GPU: 4
         min_workers: 0
         max_workers: 0
 
@@ -243,6 +268,9 @@ available_node_types:
                   Ebs:
                       VolumeSize: 80
                       VolumeType: gp3
+        resources:
+            CPU: 16
+            GPU: 1
         min_workers: 0
         max_workers: 0
 
@@ -298,6 +326,9 @@ available_node_types:
                   Ebs:
                       VolumeSize: 80
                       VolumeType: gp3
+        resources:
+            CPU: 8
+            GPU: 1
         min_workers: 0
         max_workers: 0
 
@@ -311,6 +342,9 @@ available_node_types:
                   Ebs:
                       VolumeSize: 80
                       VolumeType: gp3
+        resources:
+            CPU: 16
+            GPU: 1
         min_workers: 0
         max_workers: 0
 

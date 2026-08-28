@@ -557,6 +557,36 @@ class TestRetireIdle:
             pool.retire_idle(outstanding_work=1)
         callback.assert_called_once_with("i-0000")
 
+    def test_a_packed_host_is_kept_while_a_sibling_actor_is_live(self) -> None:
+        """The callback terminates an EC2 INSTANCE, and a packed rung puts four actors
+        on one. Retiring the first idle actor must not kill the other three mid-chunk.
+
+        The multi-GPU rungs ship at `max_workers: 0`, so this is latent rather than
+        live — but opening one is a config key, not a code change, and this is the
+        interlock that makes doing so safe.
+        """
+        callback = MagicMock()
+        pool = _make_pool(4, idle_grace_sec=1, on_retire=callback)
+        pool.actor_instance_ids[:] = ["i-packed"] * 4  # one host, four GPUs
+        pool._idle_since[0] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=1)
+        assert 0 in pool._retired, "the ACTOR still retires"
+        callback.assert_not_called()  # ...but the host lives while siblings work
+
+    def test_the_last_actor_off_a_packed_host_terminates_it(self) -> None:
+        """The other half: once every sibling has retired, the instance must go, or a
+        packed host outlives its work and bills until the autoscaler notices.
+        """
+        callback = MagicMock()
+        pool = _make_pool(4, idle_grace_sec=1, on_retire=callback)
+        pool.actor_instance_ids[:] = ["i-packed"] * 4
+        pool._retired.update({1, 2, 3})
+        pool._idle_since[0] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=0)
+        callback.assert_called_once_with("i-packed")
+
     def test_on_retire_skipped_for_placeholder_ids(self) -> None:
         """on_retire is NOT called when the instance ID is a placeholder."""
         callback = MagicMock()

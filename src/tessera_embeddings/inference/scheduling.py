@@ -541,8 +541,29 @@ class ActorPool:
             live -= 1
             self.log.info("Killed idle actor %d (instance %s) — releasing GPU node", actor_idx, instance_id)
             if self._on_retire is not None and instance_id.startswith("i-"):
-                with contextlib.suppress(Exception):
-                    self._on_retire(instance_id)
+                # ONLY when this was the last actor on the host. The callback terminates
+                # a whole EC2 INSTANCE, and a packed rung puts four actors on one — so
+                # retiring the first idle actor would kill up to three siblings mid-chunk
+                # and force their chunks through the replacement path. Retired actors are
+                # already in `self._retired`, so a sibling still counted here is live.
+                #
+                # A no-op on one-actor-per-host, which is every rung the campaign has run:
+                # a slot can never be its own sibling, so the list is always empty there.
+                siblings = [
+                    idx
+                    for idx, iid in enumerate(self.actor_instance_ids)
+                    if idx != actor_idx and iid == instance_id and idx not in self._retired
+                ]
+                if siblings:
+                    self.log.info(
+                        "Actor %d retired but instance %s kept: %d actor(s) still on it",
+                        actor_idx,
+                        instance_id,
+                        len(siblings),
+                    )
+                else:
+                    with contextlib.suppress(Exception):
+                        self._on_retire(instance_id)
 
 
 # ---------------------------------------------------------------------------

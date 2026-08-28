@@ -866,12 +866,28 @@ class TestGpuWorkerLadderApplication:
         }
         assert found == dict.fromkeys(wider, 0), f"a wider rung ships reachable: {found}"
 
-    def test_the_wider_rungs_declare_no_resources(self) -> None:
-        """No `resources:` block means Ray autodetects, so no hardcoded vCPU can be wrong."""
+    def test_the_wider_rungs_declare_resources_matching_the_catalogue(self) -> None:
+        """REPLACES `test_the_wider_rungs_declare_no_resources`.
+
+        That test asserted the absence of a block that Ray's schema REQUIRES, on the
+        reasoning that autodetection would supply it. Autodetection is wrapped in a
+        bare `except Exception` that only warns, so a denied or throttled
+        `DescribeInstanceTypes` left these rungs unfilled and failed `validate_config`
+        for the entire cluster. Declaring the values and checking them against the
+        vendor catalogue gets the safety without the bootstrap dependency.
+        """
         node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
+        catalogue = {t["InstanceType"]: t for t in _ec2_instance_types()}
+        seen = 0
         for name, cfg in node_types.items():
-            if cfg["node_config"]["InstanceType"] in ("g6e.2xlarge", "g6e.12xlarge"):
-                assert "resources" not in cfg, f"{name} overrides Ray's autodetection"
+            itype = cfg["node_config"]["InstanceType"]
+            if itype not in ("g6e.2xlarge", "g6e.12xlarge"):
+                continue
+            entry = catalogue[itype]
+            assert cfg["resources"]["CPU"] == entry["VCpuInfo"]["DefaultVCpus"], name
+            assert cfg["resources"]["GPU"] == entry["GpuInfo"]["Gpus"][0]["Count"], name
+            seen += 1
+        assert seen == 2
 
     def test_applies_counts_to_the_named_rungs(self) -> None:
         cfg = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())
@@ -1218,12 +1234,13 @@ class TestEc2CatalogueArithmetic:
         assert all(v >= 18.0 for v in per_gpu_gib.values())
 
     def test_declared_resources_match_the_ec2_catalogue(self) -> None:
-        """Where the template DOES declare resources, the declaration must be true.
+        """Every declared resource block must be true to the vendor catalogue.
 
         A declared key overrides Ray's autodetection with no error, so a wrong vCPU
-        count would make the autoscaler scale against a fiction. The two wider rungs
-        avoid the risk by declaring nothing; the two older rungs declare `{CPU: 4,
-        GPU: 1}` and this is the check that they still agree with the vendor.
+        count would make the autoscaler scale against a fiction. This check is what
+        makes declaring them safe — and declaring them is not optional, because Ray's
+        schema requires the block and its autofill can silently fail (see
+        `test_every_node_type_declares_its_resources`).
         """
         catalogue = {t["InstanceType"]: t for t in _ec2_instance_types()}
         node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
@@ -1238,7 +1255,25 @@ class TestEc2CatalogueArithmetic:
             if "GPU" in declared:
                 assert declared["GPU"] == entry["GpuInfo"]["Gpus"][0]["Count"], name
             checked += 1
-        assert checked == 3, "expected head + two single-GPU rungs to declare resources"
+        assert checked == 10, "every node type in the template must declare resources"
+
+    def test_every_node_type_declares_its_resources(self) -> None:
+        """A missing block makes `ray up` depend on ONE EC2 API call succeeding.
+
+        Ray's schema lists `resources` as required. It autofills the block from
+        `DescribeInstanceTypes`, but that call is wrapped in a bare `except Exception`
+        that downgrades failure to a warning, and `validate_config` then rejects the
+        config. So a throttled or denied catalogue call — or an instance type absent
+        from the configured region — fails the bootstrap of EVERY rung, including the
+        one the campaign actually runs on, because of a rung pinned at `max_workers: 0`
+        that nothing was going to launch.
+
+        Regression test: seven inert rungs shipped without the block on the strength of
+        "Ray autodetects it", which is true right up until it isn't.
+        """
+        node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
+        missing = sorted(n for n, cfg in node_types.items() if not cfg.get("resources"))
+        assert not missing, f"node types with no declared resources: {missing}"
 
 
 class TestL4Rungs:
@@ -1251,7 +1286,7 @@ class TestL4Rungs:
     therefore does not reach a different pool — the pool is the card.
     """
 
-    def test_both_l4_rungs_ship_unreachable_and_declare_no_resources(self) -> None:
+    def test_both_l4_rungs_ship_unreachable_with_catalogue_true_resources(self) -> None:
         node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
         l4 = {
             cfg["node_config"]["InstanceType"]: cfg
@@ -1259,9 +1294,15 @@ class TestL4Rungs:
             if cfg["node_config"]["InstanceType"].startswith("g6.")
         }
         assert set(l4) == {"g6.2xlarge", "g6.4xlarge", "g6.12xlarge"}
+        catalogue = {t["InstanceType"]: t for t in _ec2_instance_types()}
         for itype, cfg in l4.items():
             assert cfg["max_workers"] == 0, itype
-            assert "resources" not in cfg, itype
+            # DECLARED, not autodetected: Ray's schema requires the block and its
+            # autofill failure is only a warning, so an omission makes every rung's
+            # bootstrap depend on one EC2 call. Checked against the vendor catalogue.
+            entry = catalogue[itype]
+            assert cfg["resources"]["CPU"] == entry["VCpuInfo"]["DefaultVCpus"], itype
+            assert cfg["resources"]["GPU"] == entry["GpuInfo"]["Gpus"][0]["Count"], itype
 
     def test_g6_xlarge_is_deliberately_not_offered(self) -> None:
         """16 GiB of host RAM against a measured ~17.7 GB per-actor requirement.
@@ -1344,7 +1385,7 @@ class TestA10gRungs:
     measured instead of argued.
     """
 
-    def test_the_a10g_rungs_ship_unreachable_and_declare_no_resources(self) -> None:
+    def test_the_a10g_rungs_ship_unreachable_with_catalogue_true_resources(self) -> None:
         node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
         a10g = {
             cfg["node_config"]["InstanceType"]: cfg
@@ -1352,9 +1393,15 @@ class TestA10gRungs:
             if cfg["node_config"]["InstanceType"].startswith("g5.")
         }
         assert set(a10g) == {"g5.2xlarge", "g5.4xlarge"}
+        catalogue = {t["InstanceType"]: t for t in _ec2_instance_types()}
         for itype, cfg in a10g.items():
             assert cfg["max_workers"] == 0, itype
-            assert "resources" not in cfg, itype
+            # DECLARED, not autodetected: Ray's schema requires the block and its
+            # autofill failure is only a warning, so an omission makes every rung's
+            # bootstrap depend on one EC2 call. Checked against the vendor catalogue.
+            entry = catalogue[itype]
+            assert cfg["resources"]["CPU"] == entry["VCpuInfo"]["DefaultVCpus"], itype
+            assert cfg["resources"]["GPU"] == entry["GpuInfo"]["Gpus"][0]["Count"], itype
 
     def test_the_a10g_carries_the_same_vram_as_the_l4(self) -> None:
         """22,888 MiB on both, so VRAM cannot be what separates them.
