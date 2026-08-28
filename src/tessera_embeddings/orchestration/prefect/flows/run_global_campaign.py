@@ -561,6 +561,8 @@ async def run_global_campaign(
     zones: list[str] | None = None,
     max_parallel_clusters: int = 10,
     launch_pacing: bool = False,
+    gpu_fallback_instance_types: list[str] | None = None,
+    gpu_fallback_vcpu_budget: int | None = None,
     actor_request_headroom: int | None = None,
     actor_request_batch_size: int | None = None,
     fill_strategy: str = "chained-clusters",
@@ -646,6 +648,31 @@ async def run_global_campaign(
             symptom but a wall clock nobody has a baseline for.
         launch_pacing: Pace every fill's EC2 launch requests against the account's
             shared RunInstances quota, which is a small burst capacity refilled at a
+        gpu_fallback_instance_types: EC2 instance types this campaign may fall back to when
+            the production rung has no capacity, e.g. ``["g5.2xlarge"]``. Named as instance
+            types rather than card names so this and the ``gpu-worker-ladder`` key speak one
+            vocabulary, and so the size -- a host-RAM safety decision -- is explicit.
+
+            ``None`` -- the default -- keeps the fleet on ``g6e.xlarge`` alone and behaves
+            exactly as before.
+
+            Naming a card does two things per fill: it opens that card's rung, and it
+            installs an autoscaler scorer that demotes a rung AWS has just refused for
+            want of capacity. Ray's stock scorer cannot see capacity at all, so without
+            the scorer an open rung is never reached; without the rung the scorer has
+            nothing to promote.
+
+            The fleet does not get bigger -- ``num_actors`` still bounds it -- only
+            differently made. Note the price: the fallback sizes are 8 vCPU per GPU
+            against ``g6e.xlarge``'s 4, so each fallback GPU spends twice the G-and-VT
+            quota, and they run at 0.46 (A10G) or 0.32 (L4) of an L40S.
+        gpu_fallback_vcpu_budget: Optional per-cluster vCPU budget for the GPU fleet.
+            The G-and-VT quota is counted in vCPU, and the fallback cards spend twice as
+            much of it per GPU, so a ceiling in cards means a different quota bill
+            depending on which card the fleet ends up on. Given a budget, each rung is
+            ceilinged at what the budget affords it -- 250 cards at 4 vCPU/GPU, 125 at 8.
+            It bounds each PURE fleet exactly; a mixture can still exceed it, because
+            Ray's ceilings count nodes and carry no weight.
             fixed rate and is not adjustable. This is where the setting belongs
             because contention is a property of the CAMPAIGN, not of a fill: one
             cluster growing alone contends with nothing, while ``n`` autoscalers
@@ -941,6 +968,41 @@ async def run_global_campaign(
     # gave and which turned out to cover more cases than it named — see there.
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
+    # HERE, before any dispatch. `_apply_gpu_fallback` refuses the same values, but it runs
+    # inside the child, AFTER that child has upserted shared limits and primed its look-ahead
+    # mosaics. A deterministic configuration error would therefore spend real ingest work per
+    # cluster before anything said so, on a campaign that cannot succeed as configured.
+    if gpu_fallback_instance_types:
+        # Imported HERE, not at module scope. `providers.aws.ray` pulls boto3 and ray, which
+        # live in the `aws` and `inference` extras -- a module-level import would stop a
+        # `tessera_embeddings[prefect]` install from importing or registering this flow, and
+        # would defeat the deferred AWS imports this module already uses to stay
+        # dependency-neutral for inspection and local runs.
+        from tessera_embeddings.providers.aws.ray import GPU_FALLBACK_INSTANCE_TYPES
+
+        unknown = sorted(set(gpu_fallback_instance_types) - GPU_FALLBACK_INSTANCE_TYPES)
+        if unknown:
+            raise ValueError(
+                f"gpu_fallback_instance_types names unsupported type(s) {unknown}. Supported: "
+                f"{sorted(GPU_FALLBACK_INSTANCE_TYPES)}. Sizes are restricted on HOST RAM - the "
+                "vCPU-matched `xlarge` of each family would OOM the loader before inference."
+            )
+        if len(set(gpu_fallback_instance_types)) > 1:
+            raise ValueError(
+                f"Only one GPU fallback instance type may be opened at a time, got "
+                f"{sorted(set(gpu_fallback_instance_types))} - they score identically and Ray "
+                "breaks the tie on node-type name, not on throughput."
+            )
+        if gpu_fallback_vcpu_budget is not None:
+            if gpu_fallback_vcpu_budget <= 0:
+                raise ValueError(f"gpu_fallback_vcpu_budget must be > 0, got {gpu_fallback_vcpu_budget}")
+            # 8 vCPU is the cheapest supported fallback instance, so a budget below it cannot
+            # seat one node of the rung it is about to open.
+            if gpu_fallback_vcpu_budget < 8:
+                raise ValueError(
+                    f"gpu_fallback_vcpu_budget={gpu_fallback_vcpu_budget} cannot afford one "
+                    "fallback instance (8 vCPU). Raise it, or drop the fallback request."
+                )
     if fill_strategy not in ("cluster-per-zone", "chained-clusters"):
         raise ValueError(f"fill_strategy must be 'cluster-per-zone' or 'chained-clusters', got {fill_strategy!r}")
     # Each of the three staging levers CLAIMS the identity, so any pair of them is a
@@ -1260,6 +1322,8 @@ async def run_global_campaign(
             # limiter each autoscaler runs for itself — so what the campaign passes is
             # whether to run it at all.
             "launch_pacing": launch_pacing,
+            "gpu_fallback_instance_types": gpu_fallback_instance_types,
+            "gpu_fallback_vcpu_budget": gpu_fallback_vcpu_budget,
             # The other half of the same problem, one layer up: pacing makes a launch
             # request cheaper, this bounds how many of them a fill makes at all. Both are
             # OMITTED when unset so the fill's own default decides — keyed on None rather
@@ -1562,6 +1626,8 @@ async def run_global_campaign(
                         # enforces its own share client-side rather than being handed a
                         # divided count.
                         "launch_pacing": launch_pacing,
+                        "gpu_fallback_instance_types": gpu_fallback_instance_types,
+                        "gpu_fallback_vcpu_budget": gpu_fallback_vcpu_budget,
                         # And as in _fill_params, the bound on how many launch requests
                         # a cluster makes, beside the pacing that makes each one cheaper.
                         # Omitted when unset so the child's own default stands.

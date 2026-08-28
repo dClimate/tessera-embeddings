@@ -232,6 +232,12 @@ class TestCampaignDefaults:
         [
             ({"num_actors": 0}, "num_actors must be >= 1"),
             ({"fill_strategy": "cluster-per-zne"}, "fill_strategy must be"),
+            # A card name is checked HERE and not only inside the child. The child's own
+            # refusal arrives after it has primed its look-ahead mosaics and entered
+            # `ray_cluster`, so a typo would spend real ingest work per cluster before
+            # anything said so.
+            ({"gpu_fallback_instance_types": ["g5.xlarge"]}, "unsupported type"),
+            ({"gpu_fallback_instance_types": ["g5.2xlarge", "g6.2xlarge"]}, "Only one GPU fallback instance type"),
         ],
     )
     def test_a_doomed_invocation_touches_no_shared_limit(self, wired, kwargs, match):

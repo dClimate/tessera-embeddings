@@ -647,6 +647,8 @@ def fill_zones_sequential_flow(
     allow_ingest_code_mismatch: bool = False,
     s3_concurrency: int | None = None,
     launch_pacing: bool = False,
+    gpu_fallback_instance_types: list[str] | None = None,
+    gpu_fallback_vcpu_budget: int | None = None,
     actor_request_headroom: int | None = None,
     actor_request_batch_size: int | None = None,
     idle_timeout_minutes: int = 10,
@@ -729,6 +731,13 @@ def fill_zones_sequential_flow(
             for the live cell's concurrent staging writes.
         launch_pacing: Pace this cluster's EC2 launch requests against the
             account's shared RunInstances quota. Same shape as ``s3_concurrency``:
+        gpu_fallback_instance_types: EC2 instance types this fill may fall back to when the
+            production rung has no capacity (e.g. ``["g5.2xlarge"]``). ``None`` keeps today's behaviour. Opens
+            the card's rung AND installs the capacity-aware autoscaler scorer -- see
+            ``providers.aws.ray._apply_gpu_fallback``.
+        gpu_fallback_vcpu_budget: Optional vCPU budget for this cluster's GPU fleet, used
+            to ceiling each rung at what the G-and-VT quota affords IT rather than at a
+            flat node count.
             a budget concurrent clusters share, except this one is a request RATE
             and the enforcement lives in the client rather than in a count we
             divide. Default ``False`` keeps today's launch behaviour; the campaign
@@ -1411,6 +1420,8 @@ def fill_zones_sequential_flow(
             idle_timeout_minutes=idle_timeout_minutes,
             cluster_name=cluster_name_for_flow_run(flow_run_ctx.id),
             launch_pacing=launch_pacing,
+            gpu_fallback_instance_types=gpu_fallback_instance_types or (),
+            gpu_fallback_vcpu_budget=gpu_fallback_vcpu_budget,
         ) as resolved_yaml:
             activate(resolved_yaml)
             seq = fill_zones_sequential(
