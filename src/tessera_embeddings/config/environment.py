@@ -21,7 +21,21 @@ def configure_gdal_environment() -> None:
     """
     # EXTRACTION SETTINGS
 
-    # Retry settings for transient network failures (DNS, connection, timeout)
+    # Retry settings for transient network failures (DNS, connection, timeout).
+    #
+    # RETRY_DELAY is the BASE of an exponential ladder, not a fixed wait: GDAL roughly doubles
+    # it after each failure and does not cap it. So these two multiply into a WALL-CLOCK BUDGET
+    # per unreadable object, and the coverage gate then wraps that read in more attempts of its
+    # own. Read them as a pair, and read the measured ladder before changing either.
+    #
+    # THREE of the options in this function never reach the odc read path -- MAX_RETRY,
+    # RETRY_DELAY and DISABLE_READDIR_ON_OPEN -- because odc applies its own values as an
+    # explicit rasterio Env, which beats the process environment. The rest do reach it, through
+    # GDAL's fallback to the environment. There is currently NO knob that changes those three
+    # on the imagery path.
+    #
+    # Measurements, the ladder, and why closing that gap was rejected:
+    # `context_docs/design/gdal-read-config-2026_08.md`.
     os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "5")  # Default: 0 (no retries)
     os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "5")  # Default: 30 seconds
     os.environ.setdefault("GDAL_HTTP_TIMEOUT", "120")  # Connection timeout in seconds
