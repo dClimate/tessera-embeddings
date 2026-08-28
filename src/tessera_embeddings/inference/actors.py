@@ -42,7 +42,12 @@ from tessera_embeddings.config.store_layout import MONTH_COVERED_VARS, MONTHS_IN
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.inference.data_loading import load_chunk, load_s2_mask_bundle, make_store_opener
+from tessera_embeddings.inference.data_loading import (
+    BAND_READ_CPUS_ENV,
+    load_chunk,
+    load_s2_mask_bundle,
+    make_store_opener,
+)
 from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 from tessera_embeddings.storage.zarr_store import credentials_provider
@@ -704,26 +709,45 @@ def _coverage_record(
     }
 
 
-@ray.remote(
-    runtime_env={
-        "env_vars": {
-            "CUBLAS_WORKSPACE_CONFIG": ":16:8",
-            "MALLOC_ARENA_MAX": "2",
-            "MALLOC_TRIM_THRESHOLD_": "0",
-            # Segment-backed allocation, so the caching allocator GROWS a segment instead of
-            # reserving a fresh larger one and stranding the old. Read once when the allocator
-            # is built, which is why it rides on runtime_env with the rest. On the L40S it stops
-            # the reserved pool drifting to ~95% of the card to hold a <9 GB working set --
-            # measured 42.2 GB reserved for a chunk whose real need was 8.99 GB.
-            #
-            # It is also a PREREQUISITE for any 24 GB rung: without it the default allocator
-            # walls below the observation depth this campaign already meets, so the A10G and L4
-            # rungs cannot be opened until this is in place. Both cards' walls and the depth
-            # census: `context_docs/design/gpu-card-choice-2026_08.md`.
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        }
-    }
-)
+#: Fixed worker environment. Everything here is read once when the process or its
+#: allocator is built, which is why it must ride on ``runtime_env`` rather than be
+#: set inside the module.
+_STATIC_ACTOR_ENV = {
+    "CUBLAS_WORKSPACE_CONFIG": ":16:8",
+    "MALLOC_ARENA_MAX": "2",
+    "MALLOC_TRIM_THRESHOLD_": "0",
+    # Segment-backed allocation, so the caching allocator GROWS a segment instead of
+    # reserving a fresh larger one and stranding the old. Read once when the allocator
+    # is built, which is why it rides on runtime_env with the rest. On the L40S it stops
+    # the reserved pool drifting to ~95% of the card to hold a <9 GB working set --
+    # measured 42.2 GB reserved for a chunk whose real need was 8.99 GB.
+    #
+    # It is also a PREREQUISITE for any 24 GB rung: without it the default allocator
+    # walls below the observation depth this campaign already meets, so the A10G and L4
+    # rungs cannot be opened until this is in place. Both cards' walls and the depth
+    # census: `context_docs/design/gpu-card-choice-2026_08.md`.
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+}
+
+
+def _actor_env_vars() -> dict[str, str]:
+    """The environment a worker gets, resolved on the DRIVER at import time.
+
+    A Ray worker does NOT inherit the driver's environment, so anything an operator
+    sets on the flow runner reaches an actor only if it is named here. That is why
+    ``BAND_READ_CPUS_ENV`` is forwarded: it is read inside the actor
+    (``data_loading._actor_cpu_budget``) and, per that function's own docstring, is
+    the only knob that reaches the CPU-contention mechanism on a packed host — so
+    dropping it silently made the capped arm of an A/B identical to the uncapped one.
+    """
+    env = dict(_STATIC_ACTOR_ENV)
+    override = os.environ.get(BAND_READ_CPUS_ENV)
+    if override:
+        env[BAND_READ_CPUS_ENV] = override
+    return env
+
+
+@ray.remote(runtime_env={"env_vars": _actor_env_vars()})
 class InferenceActor:
     """Ray actor that runs embedding inference on a single GPU or CPU.
 

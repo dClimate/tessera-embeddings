@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import functools
 import logging
 import os
 from collections.abc import Callable
@@ -96,6 +97,25 @@ def _actor_cpu_budget() -> int:
     if override and override.isdigit() and int(override) > 0:
         return int(override)
 
+    resolved = _ray_cpu_share()
+    if resolved is not None:
+        return resolved
+    return _affinity_cpus()
+
+
+@functools.lru_cache(maxsize=1)
+def _ray_cpu_share() -> int | None:
+    """This actor's fair share of its host's CPUs, or ``None`` if Ray cannot say.
+
+    Cached for the PROCESS, and that is the point rather than a nicety. An actor's
+    host CPU/GPU counts and its own reservation are all fixed for its lifetime, while
+    ``ray.nodes()`` is a synchronous GCS query that returns the WHOLE cluster node
+    table. Called per band read it put O(fleet size) control-plane work directly on
+    the GPU-feeding path, with up to 500 workers doing it at once.
+
+    Tests clear it with ``_ray_cpu_share.cache_clear()``.
+    """
+    resolved: int | None = None
     with contextlib.suppress(Exception):
         import ray
 
@@ -107,7 +127,15 @@ def _actor_cpu_budget() -> int:
         # has a runtime, so the guard costs the production path nothing.
         if not ray.is_initialized():
             raise RuntimeError  # caught by the suppress; falls through to the mask
-        node_id = ray.get_runtime_context().get_node_id()
+        ctx = ray.get_runtime_context()
+        node_id = ctx.get_node_id()
+        # This actor's OWN GPU reservation, which need not be a whole card:
+        # `num_gpus` is a float and the scheduler supports fractional slots, so the
+        # actors sharing a host is `node GPUs / this actor's share`, not `node GPUs`.
+        # At the production `num_gpus=1.0` the two are equal and nothing changes.
+        assigned_gpu = 0.0
+        with contextlib.suppress(Exception):
+            assigned_gpu = float(ctx.get_assigned_resources().get("GPU", 0.0) or 0.0)
         for node in ray.nodes():
             if node.get("NodeID") != node_id:
                 continue
@@ -117,9 +145,14 @@ def _actor_cpu_budget() -> int:
             # reporting no CPU tells us nothing. Fall through to the mask instead
             # of inventing a number.
             if cpus > 0 and gpus > 0:
-                return max(1, cpus // gpus)
+                actors_here = gpus / assigned_gpu if assigned_gpu > 0 else float(gpus)
+                resolved = max(1, int(cpus // max(1.0, actors_here)))
             break
+    return resolved
 
+
+def _affinity_cpus() -> int:
+    """CPUs this process may run on — the mask, not the machine's core count."""
     try:
         return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
     except AttributeError:  # macOS/Windows: no affinity API

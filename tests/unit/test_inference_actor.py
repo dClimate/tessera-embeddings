@@ -337,6 +337,29 @@ def test_the_actor_class_survives_cloudpickle() -> None:
     dumps(InferenceActor.__ray_metadata__.modified_class)
 
 
+def test_the_band_read_override_is_forwarded_to_workers() -> None:
+    """A Ray worker does not inherit the driver's environment.
+
+    `TESSERA_BAND_READ_CPUS` is read INSIDE the actor, and `_actor_cpu_budget`'s own
+    docstring says it is the only knob that reaches the CPU-contention mechanism on a
+    packed host. Left out of `runtime_env` it silently did nothing, so the capped arm
+    of the documented A/B was identical to the uncapped arm.
+    """
+    import os
+    from unittest.mock import patch
+
+    from tessera_embeddings.inference.data_loading import BAND_READ_CPUS_ENV
+
+    with patch.dict(os.environ, {BAND_READ_CPUS_ENV: "4"}):
+        env = actors_mod._actor_env_vars()
+    assert env[BAND_READ_CPUS_ENV] == "4"
+    assert env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True", "the fixed vars survive"
+
+    with patch.dict(os.environ, {}, clear=True):
+        env = actors_mod._actor_env_vars()
+    assert BAND_READ_CPUS_ENV not in env, "unset on the driver means unset on the worker"
+
+
 def test_the_actor_hands_its_own_gpu_index_to_the_monitor() -> None:
     """Review of #154 found the capability unwired: the actor built `ResourceMonitor(30)` with
     no index, so on a packed host the monitor queried every GPU, rejected the multi-row answer,

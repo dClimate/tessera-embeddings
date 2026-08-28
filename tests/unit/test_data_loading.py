@@ -1,7 +1,7 @@
 """Tests for data_loading: band stacking, SCL masking, DOY, and load_chunk orchestration."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import icechunk
 import numpy as np
@@ -674,11 +674,48 @@ class TestActorCpuBudget:
         monkeypatch.delenv(_dl_mod.BAND_READ_CPUS_ENV, raising=False)
         assert self._budget_with_node({"CPU": 8.0}) == 4  # the mask below
 
-    @staticmethod
-    def _budget_with_node(resources: dict) -> int:
+    def test_a_fractional_gpu_reservation_gets_a_fractional_share(self, monkeypatch):
+        """`num_gpus` is a float and the scheduler places fractional slots, so dividing
+        by the host's GPU count alone assumes one actor per card.
+
+        Two half-GPU actors on a 4-vCPU/1-GPU host would each claim the whole 4 and
+        together oversubscribe decompression 2x. Inert at the production `num_gpus=1.0`,
+        where actors-per-host and GPUs-per-host are the same number.
+        """
+        monkeypatch.delenv(_dl_mod.BAND_READ_CPUS_ENV, raising=False)
+        assert self._budget_with_node({"CPU": 4.0, "GPU": 1.0}, assigned_gpu=0.5) == 2
+        assert self._budget_with_node({"CPU": 4.0, "GPU": 1.0}, assigned_gpu=1.0) == 4
+
+    def test_the_node_table_is_read_once_per_process(self, monkeypatch):
+        """`ray.nodes()` is a synchronous GCS query returning the whole cluster table,
+        and this sits on the per-strip GPU-feeding path with up to 500 actors on it.
+
+        The values it reads — host CPU/GPU counts, this actor's own reservation — are
+        all fixed for the actor's lifetime, so one call per process is enough.
+        """
         import ray
 
+        monkeypatch.delenv(_dl_mod.BAND_READ_CPUS_ENV, raising=False)
+        _dl_mod._ray_cpu_share.cache_clear()
+        ctx = SimpleNamespace(get_node_id=lambda: "node-a", get_assigned_resources=lambda: {"GPU": 1.0})
+        nodes = MagicMock(return_value=[{"NodeID": "node-a", "Resources": {"CPU": 48.0, "GPU": 4.0}}])
+        with (
+            patch.object(ray, "is_initialized", return_value=True),
+            patch.object(ray, "get_runtime_context", return_value=ctx),
+            patch.object(ray, "nodes", nodes),
+        ):
+            first = [_dl_mod._actor_cpu_budget() for _ in range(5)]
+        assert first == [12] * 5
+        assert nodes.call_count == 1, "the cluster node table must be read once, not per band read"
+
+    @staticmethod
+    def _budget_with_node(resources: dict, assigned_gpu: float | None = None) -> int:
+        import ray
+
+        _dl_mod._ray_cpu_share.cache_clear()
         ctx = SimpleNamespace(get_node_id=lambda: "node-a")
+        if assigned_gpu is not None:
+            ctx.get_assigned_resources = lambda: {"GPU": assigned_gpu}
         with (
             patch.object(ray, "is_initialized", return_value=True),
             patch.object(ray, "get_runtime_context", return_value=ctx),
