@@ -56,7 +56,7 @@ import numpy as np
 import xarray as xr
 import zarr
 
-from tessera_embeddings.config.environment import code_identity
+from tessera_embeddings.config.environment import code_identity, configure_logging
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import (
     EMBEDDING_DIM,
@@ -517,6 +517,13 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     fused, see ``_assembly_summary_line``; clear-to-fill assignments count in
     ``write`` too, since they emit output objects like any other write).
     """
+    # FIRST, before anything that might log. `run_forked` ships this to a SPAWNED process,
+    # which inherits no logging configuration at all -- so without this the root WARNING
+    # default silently discards every INFO record the worker produces, including the
+    # credential lines that exist to make a published-store write diagnosable. The sibling
+    # worker (`shard_writer._write_shards_worker`) has always done this; this one did not,
+    # which is a detector that could not see its own subject.
+    configure_logging()
     fork = payload["fork"]
     t = int(payload["time_index"])
     y0b, y1b = payload["band"]

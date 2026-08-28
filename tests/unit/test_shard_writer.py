@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import threading
@@ -565,3 +566,68 @@ def test_every_commit_is_timed_including_the_terminal_path(tmp_path, caplog):
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("COMMIT ")]
     assert lines, "every commit must emit a COMMIT <secs> line; it is the reopen detector"
     assert "mark 01N year 2020 complete" in lines[0]
+
+
+class TestEverySpawnedWorkerConfiguresLogging:
+    """`run_forked` ships its worker to a SPAWNED process, which inherits no logging
+    configuration — so a worker that does not call `configure_logging()` first has every
+    INFO record it produces silently discarded by the root WARNING default.
+
+    This is not hypothetical. `_fill_band_worker` shipped without it, which made the
+    published-store assembly workers invisible to the credential instrumentation added to
+    diagnose exactly those workers — a detector that could not see its own subject.
+
+    Scans for the CALL SITES rather than checking the two workers we know about, so a third
+    worker added later cannot repeat it.
+    """
+
+    @staticmethod
+    def _worker_names_passed_to_run_forked() -> dict[str, set[str]]:
+        """Every identifier passed as `run_forked`'s worker argument, by module path."""
+        import ast
+        from pathlib import Path
+
+        root = Path(shard_writer.__file__).parents[1]
+        found: dict[str, set[str]] = {}
+        for path in root.rglob("*.py"):
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:  # pragma: no cover - not our source if it does not parse
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                fn = node.func
+                name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+                if name != "run_forked" or len(node.args) < 2:
+                    continue
+                worker = node.args[1]
+                if isinstance(worker, ast.Name):
+                    found.setdefault(str(path), set()).add(worker.id)
+        return found
+
+    def test_at_least_the_two_known_workers_are_found(self) -> None:
+        """Guards the scanner itself: a scan that finds nothing would pass vacuously."""
+        names = {n for s in self._worker_names_passed_to_run_forked().values() for n in s}
+        assert {"_write_shards_worker", "_fill_band_worker"} <= names, names
+
+    def test_each_one_configures_logging_before_anything_else(self) -> None:
+        import ast
+        import importlib
+        from pathlib import Path
+
+        root = Path(shard_writer.__file__).parents[1]
+        for path_str, workers in self._worker_names_passed_to_run_forked().items():
+            module_path = Path(path_str).relative_to(root).with_suffix("").as_posix().replace("/", ".")
+            module = importlib.import_module(f"tessera_embeddings.{module_path}")
+            for worker_name in workers:
+                fn = getattr(module, worker_name, None)
+                assert fn is not None, f"{module_path}.{worker_name} not importable"
+                body = ast.parse(inspect.getsource(fn).lstrip()).body[0].body  # type: ignore[union-attr]
+                stmts = [n for n in body if not isinstance(n, ast.Expr) or not isinstance(n.value, ast.Constant)]
+                first = stmts[0] if stmts else None
+                call = getattr(getattr(first, "value", None), "func", None)
+                assert getattr(call, "id", None) == "configure_logging", (
+                    f"{module_path}.{worker_name} must call configure_logging() FIRST — a spawned "
+                    "process inherits no logging config, so its INFO records are discarded"
+                )
