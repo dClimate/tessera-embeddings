@@ -335,8 +335,10 @@ def iam_s3_storage_options() -> dict[str, str]:
 #: A set, not a sequence: see :func:`_serve_icechunk_credential` on why no ordering claim made
 #: here can be trusted. Bounded by the number of real rotations a process lives through.
 _announced_access_keys: dict[str, set[str]] = {}
-#: Stamped inside the lock. Records are emitted OUTSIDE it, so two threads can emit out of order;
-#: this is what lets a reader put the stream back in order.
+#: Stamped inside the lock, so it totally orders the SERVE DECISIONS. Records are emitted outside
+#: the lock and can therefore reach the stream out of order; this recovers that order. It is NOT
+#: the order the credentials were used: a thread can take its number and be descheduled before
+#: returning, while a later one returns and its credential is used first.
 _announce_sequence = itertools.count(1)
 _ANNOUNCE_LOCK = threading.Lock()
 
@@ -362,8 +364,10 @@ def _serve_icechunk_credential(
     ACQUIRED -- the expiry is computed after it is frozen -- so a thread descheduled past a
     refresh arrives with an old key bearing a LATER expiry, and any "which is newer" test is
     wrong in the one case it exists for. So no record says one credential replaced another; the
-    INFO lines for one pid in ``seq`` order are that process's history. A late callback costs at
-    most one extra line naming a credential the process genuinely used.
+    INFO lines for one pid in ``seq`` order are the credentials this process served, in the order
+    it decided to serve them -- which is not necessarily the order they were USED, since a thread
+    can be descheduled between taking its number and returning. A late callback costs at most one
+    extra line naming a credential the process genuinely served.
 
     ``source`` must be fully qualified (the whole role arn). A role NAME is not unique -- the
     same name in two partner accounts is a real configuration -- and merging them would report

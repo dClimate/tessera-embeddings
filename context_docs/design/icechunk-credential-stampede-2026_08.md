@@ -256,7 +256,9 @@ straggler can now cost is one extra line naming a credential the process genuine
 record can describe the current credential wrongly.
 
 Ordering of the log lines themselves is handled separately by a counter stamped at the moment the
-note is updated.
+note is updated. That counter orders the moments the code *decided* to hand over a credential — it
+recovers the sequence when two lines reach the log out of order. It is not proof of the order the
+credentials were *used*, because a thread can be paused between taking its number and returning.
 
 The reviewer's alternative — hold a lock across the credential fetch — was declined: that fetch can
 block on a network call, so holding a lock across it would put every storage request in the process
