@@ -182,13 +182,26 @@ a cell that has already run once (`38N`-2021).
 throughput cost — A10G 27.2 vs 27.8 TFLOPS and L4 22.2 vs 23.2 at matched depth, inside
 run-to-run noise. That is a **24-timestep margin over the deepest depth observed** — but it
 is still short of the model's own `max(num_obs_checkpoints) = 256` ceiling, which no
-configuration tested can reach on a 22.4 GiB card. And the flag is not set anywhere today.
+configuration tested can reach on a 22.4 GiB card.
 
-So the honest statement of the crash verdict has three parts. **As configured today, both
-candidate cards will OOM on the deepest cell the campaign has already run.** With one
-allocator flag they clear it with a 24-timestep margin. Neither can reach the sequence
-length the model declares it supports, on any setting tested — which is a statement about
-the card, not about the flag.
+**Correction (2026-08-28).** This paragraph previously ended "And the flag is not set
+anywhere today." That was true when written and is no longer: `PYTORCH_CUDA_ALLOC_CONF=
+expandable_segments:True` ships on `InferenceActor`'s `runtime_env` and merged to `main`
+in #154. The prerequisite for opening either 24 GB rung is therefore already met, and the
+crash verdict below should be read with the flag in force.
+
+So the honest statement of the crash verdict has three parts. **Under the DEFAULT
+allocator, both candidate cards OOM on the deepest cell the campaign has already run** —
+which is why `expandable_segments` was a precondition for opening either rung rather than
+a tuning nicety. **With the flag, now merged, they clear that cell with a 24-timestep
+margin** (wall at 232, deepest observed depth presenting as 208). And neither can reach
+the sequence length the model declares it supports, `max(num_obs_checkpoints) = 256`, on
+any setting tested — which is a statement about the card, not about the flag.
+
+**The residual risk, stated plainly:** a cell deeper than 232 would OOM on a fallback
+worker. None has ever been observed — the deepest `t_kept` on record is 206 — but the
+margin is three buckets, not a comfortable multiple, and it is the reason to watch the
+first fills that run on a fallback rung.
 
 **What did NOT go wrong**, recorded because absence of failure is also evidence: across the
 live cluster run no OOM, no CUDA error, no worker replacement and no actor restart, at
