@@ -656,7 +656,7 @@ def fill_zones_sequential_flow(
     ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
     branch: str | None = None,
     look_ahead: int = 2,
-    max_retained_failures: int = 30,
+    max_retained_failures: int = 100,
     attempts_per_cell_in_cluster: int = 2,
     inference_pause_gate: str | None = None,
     ingest_limit_name: str | None = None,
@@ -825,6 +825,15 @@ def fill_zones_sequential_flow(
         raise ValueError(
             f"attempts_per_cell_in_cluster must be >= 1, got {attempts_per_cell_in_cluster} "
             "(no cell would be attempted)"
+        )
+    # HERE and not only in the runner, for the reason the block exists: `0 >= cap` is true before
+    # any cell has failed, so a non-positive value stops the feeder immediately -- but the runner
+    # is not reached until every live ingest has been primed and `ray_cluster` entered, so the
+    # cheap refusal would arrive after the expensive part.
+    if max_retained_failures < 1:
+        raise ValueError(
+            f"max_retained_failures must be >= 1, got {max_retained_failures} "
+            "(the cap would trip before any cell failed)"
         )
     # Same rule, same reason: on a direct invocation nothing else rejects this until
     # run_inference validates `session_actors`, by which point triage has run, the

@@ -615,10 +615,13 @@ def fill_zones_sequential(
                 with lock:
                     n_failed = len(retained_failed)
                 if inputs is not None and n_failed >= max_retained_failures:
+                    # NOT the `FAILURE CAP EXCEEDED` prefix: `_retain_failed_mosaic` already
+                    # emitted that once for this event, and monitoring matches on the text — a
+                    # second line with the same prefix would double-count one cap event.
                     log.error(
-                        "FAILURE CAP EXCEEDED — feeder stopping with %d failed cell(s) holding "
-                        "mosaics off-budget; %d cell(s) left unattempted, which stay pending for "
-                        "the next campaign pass. This run finishes its in-flight work normally.",
+                        "Feeder stopping at the failure cap with %d failed cell(s) holding mosaics "
+                        "off-budget; %d cell(s) left unattempted, which stay pending for the next "
+                        "campaign pass. This run finishes its in-flight work normally.",
                         n_failed,
                         len(pending),
                     )
