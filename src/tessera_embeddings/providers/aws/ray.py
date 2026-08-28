@@ -198,29 +198,22 @@ returning quietly.
 """
 
 
-#: Card name -> the instance type this campaign will actually rent for it. One size per
-#: card, chosen on HOST RAM rather than price: the vCPU-matched `g5.xlarge` and
-#: `g6.xlarge` carry 16 GiB against a measured ~17.7 GB per-actor requirement, which is
-#: the exact shape that OOMed the loader on the earlier 16 GB g5-class workers. The
-#: `2xlarge` of each family gives 32 GiB, matching `g6e.xlarge`.
+#: Instance types this campaign will accept as a capacity fallback. Named the way the
+#: `gpu-worker-ladder` key names them, because two vocabularies for one domain is how a
+#: template edit and an operator's value drift apart.
 #:
-#: The cost of that choice is quota, and it is not small: the G-and-VT quota is counted
-#: in vCPU, and these sizes are 8 vCPU per GPU against `g6e.xlarge`'s 4. A fallback GPU
-#: therefore spends TWICE the quota of a production one. At the applied 10,000 vCPU that
-#: is 2,500 L40S or 1,250 A10G, so a fleet fully on fallback is half the card count.
-GPU_FALLBACK_CARDS: dict[str, str] = {
-    "A10G": "g5.2xlarge",
-    "L4": "g6.2xlarge",
-}
+#: One size per card, chosen on HOST RAM rather than price: the vCPU-matched `g5.xlarge`
+#: and `g6.xlarge` carry 16 GiB against a measured ~17.7 GB per-actor requirement, which
+#: is the exact shape that OOMed the loader on the earlier 16 GB g5-class workers. The
+#: `2xlarge` of each family gives 32 GiB, matching `g6e.xlarge`. Sizes outside this set
+#: are refused rather than trusted -- an operator naming `g5.xlarge` under capacity
+#: pressure would get a fleet that cannot run the work.
+#:
+#: The cost of the safe size is quota, and it is not small: the G-and-VT quota is counted
+#: in vCPU, and these are 8 vCPU per GPU against `g6e.xlarge`'s 4. A fallback GPU spends
+#: TWICE the quota of a production one -- 10,000 vCPU buys 2,500 L40S or 1,250 A10G.
+GPU_FALLBACK_INSTANCE_TYPES: frozenset[str] = frozenset({"g5.2xlarge", "g6.2xlarge"})
 
-#: Installs :mod:`tessera_embeddings.providers.aws.autoscaler_scorer` as the autoscaler's
-#: node-type scorer. Ray reads this in `ResourceDemandScheduler.__init__` and resolves it
-#: with `load_function_or_class`, so the value must be an importable dotted path -- the
-#: head's `ray start` already carries `PYTHONPATH=$HOME/tessera-embeddings`, which is what
-#: makes ours importable there.
-#:
-#: HEAD ONLY, and assigned on `ray start` itself, for the same reason the launch pacing is:
-#: the autoscaler is a child of that process and a worker runs none.
 GPU_FALLBACK_SCORER_ENV = {"RAY_AUTOSCALER_UTILIZATION_SCORER": autoscaler_scorer.SCORER_PATH}
 
 
@@ -488,8 +481,10 @@ def _apply_gpu_vcpu_budget(config: dict[str, Any], vcpu_budget: int) -> None:
         cfg["max_workers"] = min(cfg["max_workers"], _vcpu_budget_ceiling(cfg, vcpu_budget))
 
 
-def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str], vcpu_budget: int | None = None) -> list[str]:
-    """Open a fallback rung per named card and make the autoscaler use it on refusal.
+def _apply_gpu_fallback(
+    config: dict[str, Any], instance_types: Sequence[str], vcpu_budget: int | None = None
+) -> list[str]:
+    """Open a fallback rung per named instance type and make the autoscaler use it.
 
     Two halves, and NEITHER works alone. Opening a rung gives the autoscaler somewhere
     to go; the scorer is what sends it there, because Ray's default scoring cannot see
@@ -504,8 +499,8 @@ def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str], vcpu_budge
 
     Args:
         config: A loaded cluster config. Mutated in place.
-        cards: Card names from :data:`GPU_FALLBACK_CARDS` (e.g. ``["A10G"]``). Empty
-            opens no rung and installs no scorer.
+        instance_types: EC2 instance types from :data:`GPU_FALLBACK_INSTANCE_TYPES`
+            (e.g. ``["g5.2xlarge"]``). Empty opens no rung and installs no scorer.
         vcpu_budget: Optional G-and-VT vCPU budget for this cluster's GPU fleet. When
             given, every open GPU rung -- production included -- is ceilinged at what the
             budget affords IT rather than at a flat node count, which is the only way a
@@ -524,68 +519,80 @@ def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str], vcpu_budge
     node_types = config["available_node_types"]
     if vcpu_budget is not None:
         _apply_gpu_vcpu_budget(config, vcpu_budget)
-    if not cards:
+    if not instance_types:
         return []
 
-    if len(set(cards)) > 1:
+    if len(set(instance_types)) > 1:
         msg = (
-            f"Only one GPU fallback card may be opened at a time, got {sorted(set(cards))}. "
-            "Both supported cards are 8 vCPU / 1 GPU with identical declared resources, so "
-            "Ray scores them EQUALLY and breaks the tie on node-type name, descending -- "
-            "'gpu-workers-ondemand-l4-2xl' beats 'gpu-workers-ondemand-a10g-2xl' and the "
-            "slower card would win every request. Ray's scorer has no priority concept to "
-            "express the preference with, so the choice is made here, by naming one card."
+            f"Only one GPU fallback instance type may be opened at a time, got "
+            f"{sorted(set(instance_types))}. The supported fallbacks are all 8 vCPU / 1 GPU "
+            "with identical declared resources, so Ray scores them EQUALLY and breaks the "
+            "tie on node-type name, descending -- which would pick a card on alphabetical "
+            "order rather than on throughput. Ray's scorer has no priority concept to "
+            "express the preference with, so the choice is made here, by naming one type."
         )
         raise RuntimeError(msg)
 
-    unknown = [c for c in cards if c not in GPU_FALLBACK_CARDS]
+    unknown = [t for t in instance_types if t not in GPU_FALLBACK_INSTANCE_TYPES]
     if unknown:
         msg = (
-            f"Unknown GPU fallback card(s) {unknown}. Known: {sorted(GPU_FALLBACK_CARDS)}. "
-            "Add the card to GPU_FALLBACK_CARDS with the instance size whose HOST RAM "
-            "clears the per-actor requirement, and ship the rung in cluster.yaml.template."
+            f"Unsupported GPU fallback instance type(s) {unknown}. Supported: "
+            f"{sorted(GPU_FALLBACK_INSTANCE_TYPES)}. Sizes are restricted on HOST RAM: the "
+            "vCPU-matched `xlarge` of each family carries 16 GiB against a measured ~17.7 GB "
+            "per-actor requirement and would OOM the loader before inference."
         )
         raise RuntimeError(msg)
 
-    by_instance_type = {
-        cfg["node_config"]["InstanceType"]: name
-        for name, cfg in node_types.items()
-        if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX)
-    }
-    # The production ceiling every fallback is matched to, from the widest open
-    # PRODUCTION rung. Fallback rungs are excluded by instance type, not by ceiling:
-    # they share the node-type prefix, so a ladder that had already opened one would
-    # otherwise contribute its own ceiling here -- and, worse, an all-fallback ladder
-    # would satisfy the "something to fall back FROM" guard with nothing to fall back
-    # from at all.
-    fallback_types = set(GPU_FALLBACK_CARDS.values())
+    # ALL names per instance type, not the last one. An instance type does not identify a
+    # node type -- a template may offer the same type twice under different launch config,
+    # which is why the ladder refuses the same ambiguity rather than picking one.
+    by_instance_type: dict[str, list[str]] = defaultdict(list)
+    for name, cfg in node_types.items():
+        if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX):
+            by_instance_type[cfg["node_config"]["InstanceType"]].append(name)
+    ambiguous = {t: n for t, n in by_instance_type.items() if t in instance_types and len(n) > 1}
+    if ambiguous:
+        msg = (
+            f"Cannot open a GPU fallback: instance type(s) {ambiguous} are offered by more "
+            "than one on-demand GPU node type, so the request has no single target."
+        )
+        raise RuntimeError(msg)
+
+    # The production ceiling every fallback is matched to, from the widest open PRODUCTION
+    # rung. Fallbacks are excluded by instance type, not by ceiling: they share the
+    # node-type prefix, so a ladder that had already opened one would otherwise contribute
+    # its own ceiling here -- and an all-fallback ladder would satisfy the "something to
+    # fall back FROM" guard with nothing to fall back from at all.
     open_ceilings = [
         cfg["max_workers"]
         for name, cfg in node_types.items()
         if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX)
-        and cfg["node_config"]["InstanceType"] not in fallback_types
+        and cfg["node_config"]["InstanceType"] not in GPU_FALLBACK_INSTANCE_TYPES
         and cfg.get("max_workers", 0) > 0
     ]
     if not open_ceilings:
         msg = (
-            "GPU fallback was requested but no PRODUCTION GPU rung is open, so there is "
-            "no ceiling to match and nothing to fall back FROM. Open one with the "
+            "GPU fallback was requested but no PRODUCTION GPU rung is open, so there is no "
+            "ceiling to match and nothing to fall back FROM. Open one with the "
             f"{GPU_WORKER_LADDER_SSM_KEY} key, or drop the fallback request."
         )
         raise RuntimeError(msg)
     ceiling = max(open_ceilings)
 
+    # NEVER above the cluster-wide ceiling. A fallback changes what the fleet is made of,
+    # not how big it is, so a template that deliberately caps the aggregate at 100 must
+    # keep that cap -- raising the global to fit a fallback would grow the fleet by exactly
+    # the amount the operator said no to.
+    global_ceiling = config.get("max_workers")
+    if isinstance(global_ceiling, int) and global_ceiling > 0:
+        ceiling = min(ceiling, global_ceiling)
+
     opened = []
-    for card in cards:
-        instance_type = GPU_FALLBACK_CARDS[card]
-        name = by_instance_type.get(instance_type)
-        if name is None:
-            msg = (
-                f"GPU fallback card {card!r} maps to {instance_type}, which no rung in the "
-                f"cluster template offers. Available: {sorted(by_instance_type)}."
-            )
-            raise RuntimeError(msg)
+    for instance_type in instance_types:
+        name = by_instance_type[instance_type][0]
         want = _vcpu_budget_ceiling(node_types[name], vcpu_budget) if vcpu_budget is not None else ceiling
+        if isinstance(global_ceiling, int) and global_ceiling > 0:
+            want = min(want, global_ceiling)
         # A ladder that already opened this rung chose its ceiling on purpose; opening it
         # again must not widen it. Same rule as the budget's, for the same reason.
         current = node_types[name].get("max_workers", 0)
@@ -593,11 +600,9 @@ def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str], vcpu_budge
         opened.append(name)
 
     widest = max(node_types[n]["max_workers"] for n in opened)
-    if widest > config.get("max_workers", 0):
-        config["max_workers"] = widest
     logging.getLogger(__name__).info(
         "GPU fallback enabled for %s: opened %s at max_workers=%d, scorer=%s",
-        ", ".join(cards),
+        ", ".join(instance_types),
         ", ".join(opened),
         widest,
         autoscaler_scorer.SCORER_PATH,
@@ -759,7 +764,7 @@ def _resolve_ray_config(
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
     idle_timeout_minutes: int | None = None,
     launch_pacing: bool = False,
-    gpu_fallback_cards: Sequence[str] = (),
+    gpu_fallback_instance_types: Sequence[str] = (),
     gpu_fallback_vcpu_budget: int | None = None,
 ) -> str:
     """Inject AWS resource IDs from SSM into a Ray cluster YAML template.
@@ -812,7 +817,7 @@ def _resolve_ray_config(
             a larger value. ``None`` keeps the template's value.
         launch_pacing: Assign :data:`LAUNCH_PACING_ENV` on the head's ``ray start``
             command, so the autoscaler it spawns paces its EC2 launch requests
-        gpu_fallback_cards: Card names (see :data:`GPU_FALLBACK_CARDS`) this run may fall
+        gpu_fallback_instance_types: Card names (see :data:`GPU_FALLBACK_CARDS`) this run may fall
             back to when the production rung has no capacity. Empty -- the default --
             leaves the cluster exactly as it is today. Naming a card opens its rung AND
             installs the capacity-aware autoscaler scorer; see :func:`_apply_gpu_fallback`
@@ -866,7 +871,7 @@ def _resolve_ray_config(
 
     # AFTER the ladder, so a ladder that narrows the production rung narrows the
     # fallbacks with it. Empty is the default and changes nothing.
-    fallback_opened = _apply_gpu_fallback(config, gpu_fallback_cards, gpu_fallback_vcpu_budget)
+    fallback_opened = _apply_gpu_fallback(config, gpu_fallback_instance_types, gpu_fallback_vcpu_budget)
 
     sg_ids = [params["security-group-id"]]
     all_subnet_ids = [s.strip() for s in params["private-subnet-ids"].split(",")]
@@ -1282,7 +1287,7 @@ def ray_cluster(
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
     idle_timeout_minutes: int | None = None,
     launch_pacing: bool = False,
-    gpu_fallback_cards: Sequence[str] = (),
+    gpu_fallback_instance_types: Sequence[str] = (),
     gpu_fallback_vcpu_budget: int | None = None,
 ) -> Iterator[str | None]:
     """Provision an AWS-backed Ray cluster; tear it down on exit.
@@ -1329,7 +1334,7 @@ def ray_cluster(
             :func:`_resolve_ray_config`.
         launch_pacing: Pace this cluster's EC2 launch requests against the
             account's shared RunInstances quota — see :data:`LAUNCH_PACING_ENV`.
-        gpu_fallback_cards: Card names this cluster may fall back to when the production
+        gpu_fallback_instance_types: Card names this cluster may fall back to when the production
             GPU rung has no capacity -- see :data:`GPU_FALLBACK_CARDS`. Empty (the
             default) leaves behaviour exactly as it is today.
         gpu_fallback_vcpu_budget: Optional G-and-VT vCPU budget for this cluster's GPU
@@ -1393,7 +1398,7 @@ def ray_cluster(
                 cloudwatch_template=cloudwatch_template,
                 idle_timeout_minutes=idle_timeout_minutes,
                 launch_pacing=launch_pacing,
-                gpu_fallback_cards=gpu_fallback_cards,
+                gpu_fallback_instance_types=gpu_fallback_instance_types,
                 gpu_fallback_vcpu_budget=gpu_fallback_vcpu_budget,
             )
             head_ip = _start_ray_cluster(resolved_yaml, log, launch_pacing=launch_pacing)

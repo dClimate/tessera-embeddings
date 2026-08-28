@@ -217,7 +217,7 @@ data loading the tight resource per worker, and the template ships two
 | `g6.2xlarge` | L4 | 8 | 32 | 0.32 |
 
 **Opening one is a campaign parameter, not a release.** Pass
-`gpu_fallback_cards=["A10G"]` to `run-global-campaign`. That does two things per fill,
+`gpu_fallback_instance_types=["g5.2xlarge"]` to `run-global-campaign`. That does two things per fill,
 and neither works without the other:
 
 1. **Opens the card's rung** at the same ceiling as the production rung, so either card
@@ -264,9 +264,9 @@ rung that spends more quota — so neither demotes.
 supply:
 
 ```
-gpu_fallback_cards       = ["A10G"]
-gpu_fallback_vcpu_budget = 840
-gpu-worker-ladder (SSM)  = g6e.xlarge:101
+gpu_fallback_instance_types = ["g5.2xlarge"]
+gpu_fallback_vcpu_budget    = 840
+gpu-worker-ladder (SSM)     = g6e.xlarge:101
 ```
 
 That yields ceilings of **101 L40S and 105 A10G** per cluster. The L40S ceiling sits

@@ -488,7 +488,21 @@ things:
    L40S it also stops the reserved pool drifting to ~95% of the card to hold a <9 GB working set.
 2. Only the A10G rung may be open — see the tie-break above.
 
-**The failover is manual.** Ray's scorer ignores `node_availability_summary`, so a capacity
-refusal never moves it off the top-scored rung; an operator must lower `g6e.xlarge`'s
-`max_workers` for a fallback rung to be reached at all. The ladder makes that one SSM key, but
-nothing here measured the latency of a human in that loop.
+**The failover was manual when this was written. It is not any more** — corrected here
+rather than left to mislead, because an operator following the old verdict would edit the
+SSM ladder and reprovision when a campaign parameter would do.
+
+The observation behind it still holds: Ray's DEFAULT scorer accepts a
+`node_availability_summary` and never reads it, so a capacity refusal never moves it off
+the top-scored rung. What changed is that Ray lets you replace that scorer
+(`RAY_AUTOSCALER_UTILIZATION_SCORER`), and `providers.aws.autoscaler_scorer` now does,
+demoting a rung AWS last refused for want of capacity. Enabling it is
+`gpu_fallback_instance_types=["g5.2xlarge"]` on the campaign, which opens the rung and
+installs the scorer together.
+
+**One case remains manual, and it is the common one.** A launch that returns FEWER
+instances than requested is a success — `MinCount: 1` — so a production rung that is
+trickling rather than refusing outright is never marked unavailable and the scorer never
+fires. Releasing demand to the fallback under a trickle still means capping the production
+rung, which is still one SSM key. The automatic path covers a hard outage; the cap covers
+a slow one.

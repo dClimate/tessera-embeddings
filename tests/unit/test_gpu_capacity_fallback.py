@@ -72,7 +72,7 @@ def _refused(*node_types: str, category: str = "InsufficientInstanceCapacity") -
 def _launched(summary: NodeAvailabilitySummary, *, scorer=capacity_aware_scorer, demand: int = 250) -> dict[str, int]:
     """What Ray would launch for ``demand`` actors, given that availability picture."""
     chosen, _ = get_nodes_for(
-        _node_types("g6e.xlarge:250", fallback=["A10G"]),
+        _node_types("g6e.xlarge:250", fallback=["g5.2xlarge"]),
         {},
         "head",
         9999,
@@ -136,7 +136,7 @@ class TestApplyGpuFallback:
         make the fleet bigger — the global ceiling and inference demand still bound it.
         """
         config = yaml.safe_load(TEMPLATE.read_text())
-        assert tray._apply_gpu_fallback(config, ["A10G"]) == [A10G]
+        assert tray._apply_gpu_fallback(config, ["g5.2xlarge"]) == [A10G]
         types = config["available_node_types"]
         assert types[A10G]["max_workers"] == types[PRODUCTION]["max_workers"] == 500
 
@@ -146,7 +146,7 @@ class TestApplyGpuFallback:
         """
         config = yaml.safe_load(TEMPLATE.read_text())
         tray._apply_gpu_worker_ladder(config, "g6e.xlarge:250")
-        tray._apply_gpu_fallback(config, ["A10G"])
+        tray._apply_gpu_fallback(config, ["g5.2xlarge"])
         assert config["available_node_types"][A10G]["max_workers"] == 250
 
     def test_refuses_an_unknown_card(self) -> None:
@@ -154,15 +154,15 @@ class TestApplyGpuFallback:
         is only discovered during the capacity event the feature exists for.
         """
         config = yaml.safe_load(TEMPLATE.read_text())
-        with pytest.raises(RuntimeError, match="Unknown GPU fallback card"):
-            tray._apply_gpu_fallback(config, ["H100"])
+        with pytest.raises(RuntimeError, match="Unsupported GPU fallback instance type"):
+            tray._apply_gpu_fallback(config, ["p5.48xlarge"])
 
     def test_refuses_when_no_production_rung_is_open(self) -> None:
         config = yaml.safe_load(TEMPLATE.read_text())
         for cfg in config["available_node_types"].values():
             cfg["max_workers"] = 0
         with pytest.raises(RuntimeError, match="nothing to fall back FROM"):
-            tray._apply_gpu_fallback(config, ["A10G"])
+            tray._apply_gpu_fallback(config, ["g5.2xlarge"])
 
     def test_every_known_card_has_a_rung_in_the_template(self) -> None:
         """`GPU_FALLBACK_CARDS` and the template must not drift: a card that names an
@@ -170,7 +170,7 @@ class TestApplyGpuFallback:
         """
         config = yaml.safe_load(TEMPLATE.read_text())
         offered = {c["node_config"]["InstanceType"] for c in config["available_node_types"].values()}
-        assert set(tray.GPU_FALLBACK_CARDS.values()) <= offered
+        assert set(tray.GPU_FALLBACK_INSTANCE_TYPES) <= offered
 
 
 class TestVcpuBudget:
@@ -186,7 +186,7 @@ class TestVcpuBudget:
         "as many of this card as the quota allows".
         """
         config = yaml.safe_load(TEMPLATE.read_text())
-        tray._apply_gpu_fallback(config, ["A10G"], 1000)
+        tray._apply_gpu_fallback(config, ["g5.2xlarge"], 1000)
         types = config["available_node_types"]
         assert types[PRODUCTION]["max_workers"] == 250
         assert types[A10G]["max_workers"] == 125
@@ -206,7 +206,7 @@ class TestVcpuBudget:
         is a property of Ray's scheduler, not of this code.
         """
         config = yaml.safe_load(TEMPLATE.read_text())
-        tray._apply_gpu_fallback(config, ["A10G"], 1000)
+        tray._apply_gpu_fallback(config, ["g5.2xlarge"], 1000)
         types = config["available_node_types"]
         for name in (PRODUCTION, A10G):
             res = types[name]["resources"]
@@ -227,21 +227,21 @@ class TestVcpuBudget:
     def test_single_gpu_rungs_are_unaffected_by_the_per_instance_rule(self) -> None:
         """The two readings agree at one GPU per node, so the production numbers hold."""
         config = yaml.safe_load(TEMPLATE.read_text())
-        tray._apply_gpu_fallback(config, ["A10G"], 840)
+        tray._apply_gpu_fallback(config, ["g5.2xlarge"], 840)
         types = config["available_node_types"]
         assert types[PRODUCTION]["max_workers"] == 210
         assert types[A10G]["max_workers"] == 105
 
     def test_absent_budget_keeps_the_production_ceiling(self) -> None:
         config = yaml.safe_load(TEMPLATE.read_text())
-        tray._apply_gpu_fallback(config, ["A10G"])
+        tray._apply_gpu_fallback(config, ["g5.2xlarge"])
         types = config["available_node_types"]
         assert types[A10G]["max_workers"] == types[PRODUCTION]["max_workers"] == 500
 
     def test_the_budget_narrows_a_wider_ladder(self) -> None:
         config = yaml.safe_load(TEMPLATE.read_text())
         tray._apply_gpu_worker_ladder(config, "g6e.xlarge:500")
-        tray._apply_gpu_fallback(config, ["A10G"], 1000)
+        tray._apply_gpu_fallback(config, ["g5.2xlarge"], 1000)
         assert config["available_node_types"][PRODUCTION]["max_workers"] == 250
 
     def test_the_budget_never_widens_a_deliberate_cap(self) -> None:
@@ -253,7 +253,7 @@ class TestVcpuBudget:
         """
         config = yaml.safe_load(TEMPLATE.read_text())
         tray._apply_gpu_worker_ladder(config, "g6e.xlarge:50")
-        tray._apply_gpu_fallback(config, ["A10G"], 1000)
+        tray._apply_gpu_fallback(config, ["g5.2xlarge"], 1000)
         types = config["available_node_types"]
         assert types[PRODUCTION]["max_workers"] == 50, "the deliberate cap must stand"
         assert types[A10G]["max_workers"] == 125
@@ -261,7 +261,7 @@ class TestVcpuBudget:
     def test_refuses_a_nonpositive_budget(self) -> None:
         config = yaml.safe_load(TEMPLATE.read_text())
         with pytest.raises(ValueError, match="must be > 0"):
-            tray._apply_gpu_fallback(config, ["A10G"], 0)
+            tray._apply_gpu_fallback(config, ["g5.2xlarge"], 0)
 
     def test_refuses_a_rung_it_cannot_price(self) -> None:
         """A rung with no declared resources cannot be costed against a vCPU budget, and
@@ -270,7 +270,7 @@ class TestVcpuBudget:
         config = yaml.safe_load(TEMPLATE.read_text())
         config["available_node_types"][PRODUCTION].pop("resources")
         with pytest.raises(RuntimeError, match="Cannot price node type"):
-            tray._apply_gpu_fallback(config, ["A10G"], 1000)
+            tray._apply_gpu_fallback(config, ["g5.2xlarge"], 1000)
 
     def test_a_budget_too_small_to_seat_a_node_is_refused(self) -> None:
         """REPLACES a test that asserted a floor of 1, which was the defect: a budget of
@@ -281,7 +281,7 @@ class TestVcpuBudget:
         """
         config = yaml.safe_load(TEMPLATE.read_text())
         with pytest.raises(ValueError, match="cannot afford a single"):
-            tray._apply_gpu_fallback(config, ["A10G"], 1)
+            tray._apply_gpu_fallback(config, ["g5.2xlarge"], 1)
 
     def test_a_budget_that_seats_production_but_not_the_fallback_is_refused(self) -> None:
         """4 vCPU seats one production GPU and zero fallback GPUs. Opening the fallback
@@ -289,7 +289,7 @@ class TestVcpuBudget:
         """
         config = yaml.safe_load(TEMPLATE.read_text())
         with pytest.raises(ValueError, match="cannot afford a single"):
-            tray._apply_gpu_fallback(config, ["A10G"], 4)
+            tray._apply_gpu_fallback(config, ["g5.2xlarge"], 4)
 
 
 class TestTheCampaignRestartConfiguration:
@@ -313,7 +313,7 @@ class TestTheCampaignRestartConfiguration:
     def _ceilings(self) -> dict[str, int]:
         config = yaml.safe_load(TEMPLATE.read_text())
         tray._apply_gpu_worker_ladder(config, self.LADDER)
-        tray._apply_gpu_fallback(config, ["A10G"], self.VCPU_BUDGET)
+        tray._apply_gpu_fallback(config, ["g5.2xlarge"], self.VCPU_BUDGET)
         return {n: c["max_workers"] for n, c in config["available_node_types"].items()}
 
     def test_it_yields_101_l40s_and_105_a10g(self) -> None:
@@ -358,7 +358,7 @@ class TestCeilingsAreDerivedFromProductionOnly:
         """
         config = yaml.safe_load(TEMPLATE.read_text())
         tray._apply_gpu_worker_ladder(config, "g6e.xlarge:250,g5.2xlarge:50")
-        tray._apply_gpu_fallback(config, ["A10G"])
+        tray._apply_gpu_fallback(config, ["g5.2xlarge"])
         assert config["available_node_types"][A10G]["max_workers"] == 50, (
             "an explicit ladder ceiling on the fallback must not be widened"
         )
@@ -371,7 +371,7 @@ class TestCeilingsAreDerivedFromProductionOnly:
         config = yaml.safe_load(TEMPLATE.read_text())
         tray._apply_gpu_worker_ladder(config, "g5.2xlarge:50")
         with pytest.raises(RuntimeError, match="no PRODUCTION GPU rung is open"):
-            tray._apply_gpu_fallback(config, ["A10G"])
+            tray._apply_gpu_fallback(config, ["g5.2xlarge"])
 
 
 class TestOnlyOneCardAtATime:
@@ -383,12 +383,12 @@ class TestOnlyOneCardAtATime:
         would win every request despite being measurably the slower card.
         """
         config = yaml.safe_load(TEMPLATE.read_text())
-        with pytest.raises(RuntimeError, match="Only one GPU fallback card"):
-            tray._apply_gpu_fallback(config, ["A10G", "L4"])
+        with pytest.raises(RuntimeError, match="Only one GPU fallback instance type"):
+            tray._apply_gpu_fallback(config, ["g5.2xlarge", "g6.2xlarge"])
 
     def test_the_same_card_twice_is_not_two_cards(self) -> None:
         config = yaml.safe_load(TEMPLATE.read_text())
-        assert tray._apply_gpu_fallback(config, ["A10G", "A10G"]) == [A10G, A10G]
+        assert tray._apply_gpu_fallback(config, ["g5.2xlarge", "g5.2xlarge"]) == [A10G, A10G]
 
 
 class TestScorerInstallation:
