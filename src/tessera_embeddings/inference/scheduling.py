@@ -560,9 +560,7 @@ class ActorPool:
                 # cannot tell until the id arrives — terminating first would kill an actor
                 # mid-initialisation. Scoped to packed hosts so the one-actor-per-host case
                 # the campaign actually runs is never delayed by an unrelated actor starting.
-                unresolved = [
-                    idx for idx in self._initializing if not self.actor_instance_ids[idx].startswith("i-")
-                ]
+                unresolved = [idx for idx in self._initializing if not self.actor_instance_ids[idx].startswith("i-")]
                 if siblings or (len(on_host) > 1 and unresolved):
                     self.log.info(
                         "Actor %d retired but instance %s kept: %d live, %d unresolved",
