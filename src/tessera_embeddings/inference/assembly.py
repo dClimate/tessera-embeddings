@@ -234,9 +234,10 @@ icechunk writes chunk objects to a flat ``chunks/<random-id>`` keyspace, so the
 keys spread across S3 partitions well — but partition splitting is adaptive and a
 hard burst overruns the per-prefix rate before (and even after) S3 adapts, which
 is exactly the SlowDown observed at 800 concurrent PUTs. Because
-``per_worker_cap`` floors at 1, :func:`_s3_budget_split` also caps the worker
-count at the budget so the ``n_workers * per_worker_cap`` product can never
-exceed it (``AssemblyConfig`` caps workers far lower in the common case).
+``per_worker_cap`` floors at 1, a fill's aggregate is ``max(budget, n_workers)``
+rather than ``<= budget``: the floor and the ceiling cannot both hold, and the
+ceiling is the one that gives way. ``AssemblyConfig.max_workers`` bounds the
+overshoot -- see :func:`_s3_budget_split` for why that is the right way round.
 """
 
 
@@ -244,15 +245,30 @@ def _s3_budget_split(s3_concurrency: int | None, n_workers: int) -> tuple[int, i
     """``(effective_workers, per_worker_cap)`` honoring the fleet S3-PUT budget.
 
     Each fork worker opens its own repo capped at ``per_worker_cap``, so a fill
-    issues up to ``effective_workers * per_worker_cap`` concurrent requests. When
-    the budget is smaller than the requested worker count, flooring the cap at 1
-    would let ``n_workers`` alone exceed it (e.g. budget 5, 8 workers → 8 > 5), so
-    the worker count is capped at the budget too — fewer concurrent forks, but the
-    fleet target holds. ``s3_concurrency=None`` uses the full aggregate target (a
-    lone fill). Both returned values are ``>= 1``, and their product ``<= budget``.
+    issues up to ``effective_workers * per_worker_cap`` concurrent requests.
+    ``s3_concurrency=None`` uses the full aggregate target (a lone fill). Both
+    returned values are ``>= 1``.
+
+    **The worker count is NOT reduced to fit the budget**, and that is the whole
+    point of this function. A per-fill budget is the fleet target divided by the
+    cluster count, so on a wide campaign it lands well below the requested worker
+    count — and clamping to it silently costs most of the fork pool on every
+    assembly, which is the campaign's longest stage.
+
+    Because ``per_worker_cap`` floors at 1, a worker count above the budget makes
+    the aggregate ``max(budget, n_workers)``. The floor and the ceiling cannot
+    both hold; the ceiling gives way, because the costs are asymmetric.
+    Overshooting the target risks 503s, which retry, and the target sits far below
+    the concurrency at which SlowDown was actually observed. Holding the target by
+    dropping forks costs wall-clock unconditionally, on every cell, whether or not
+    the service was ever going to complain. The overshoot is bounded by
+    ``AssemblyConfig.max_workers`` times the fleet's cluster count.
+
+    The measured cost of the clamp, and the concurrency evidence:
+    ``context_docs/design/assembly-worker-clamp-2026_08.md``.
     """
     budget = s3_concurrency if s3_concurrency is not None else TARGET_AGGREGATE_S3_CONCURRENCY
-    workers = min(n_workers, max(1, budget))
+    workers = max(1, n_workers)
     return workers, max(1, budget // workers)
 
 
@@ -2467,7 +2483,12 @@ class ZarrWriter:
         # fill's forks. TARGET_AGGREGATE_S3_CONCURRENCY // n_workers alone bounds one
         # fill to ~target, so K concurrent fills burst K times the target PUTs (the
         # 800-req SlowDown). The campaign passes `s3_concurrency = target //
-        # max_parallel_zones` so the fleet stays near target; None = full target.
+        # max_parallel_zones`; None = full target.
+        #
+        # The budget sets the per-fork REQUEST CAP only -- it does not reduce the fork
+        # count, which is why a wide campaign no longer runs its assemblies on a
+        # fraction of their workers. Since that cap floors at 1, the fleet may exceed
+        # the target by up to `max_workers * n_clusters`; see `_s3_budget_split`.
         n_workers, per_worker_cap = _s3_budget_split(s3_concurrency, n_workers)
         repo = open_global_repo(
             store_path,

@@ -67,6 +67,7 @@ context_docs/
     │  INFERENCE + STORE
     ├── inference_gpu_saturation_profile_2026_07.md
     ├── stage_decoupling_2026_08.md              why ingest/inference/assembly are ungated
+    ├── assembly-worker-clamp-2026_08.md          why assembly ran 5 of its 16 forks
     ├── single-global-alignment.md                why single-ROI was aligned to the campaign
     ├── staging-identity-and-resume.md            what a run_id identifies, and what resumes
     ├── d3-sharding-plan.md                       settled ADR-008 D3; spec for scale_tests/t8

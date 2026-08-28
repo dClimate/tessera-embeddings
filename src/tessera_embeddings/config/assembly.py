@@ -25,11 +25,16 @@ class AssemblyConfig:
     ``max_workers`` defaults to 16: each worker holds at most one staged-tile
     slice in memory (~1-1.5 GB at a 2048-px full-band tile), so the pool peaks
     around ~24 GB — inside the flow runner's 64 GiB, and measured at 20 GB peak
-    when the pool was 8. It also keeps aggregate S3
-    PUT concurrency trivially under
-    ``assembly.TARGET_AGGREGATE_S3_CONCURRENCY`` (the per-fork request cap is
-    ``target // n_workers``, so aggregate <= target whenever
-    ``max_workers <= target``).
+    when the pool was 8.
+
+    It also bounds this fill's S3 PUT concurrency. For a LONE fill the per-fork cap
+    is ``TARGET_AGGREGATE_S3_CONCURRENCY // n_workers``, so aggregate stays at or
+    under the target whenever ``max_workers <= target``. A campaign fill is passed a
+    DIVIDED budget instead, which can fall below the worker count; the per-fork cap
+    then floors at 1 and aggregate is the worker count itself. That is deliberate --
+    the fork pool is not sacrificed to the request ceiling -- so ``max_workers`` is
+    also what bounds a fill's contribution to the fleet's PUT rate. See
+    ``assembly._s3_budget_split``.
     """
 
     chunks_per_worker: int = 10
