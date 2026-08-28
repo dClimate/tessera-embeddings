@@ -372,9 +372,6 @@ def fill_zones_sequential(
     # are counted, and once they reach this cap the feeder stops admitting new cells (the
     # run then winds down and fails on the recorded failures) — otherwise a systematic
     # failure would retain every cluster's multi-TB mosaic.
-    #: Set by the feeder when the cap trips, read by the teardown. A cap trip is now a FAST
-    #: EXIT rather than a quiet stop: the point of stopping is to get these cells back to the
-    #: driver, and draining first delays exactly the thing the stop is for.
     if max_retained_failures < 1:
         # `0 >= max_retained_failures` is true before any cell has failed, so a non-positive cap
         # tears the run down after the ingests have been primed and the Ray cluster started —
@@ -382,6 +379,9 @@ def fill_zones_sequential(
         # runner is callable directly.
         msg = f"max_retained_failures must be >= 1, got {max_retained_failures}"
         raise ValueError(msg)
+    #: One-shot latch so the cap alert is logged once, not once per later failure. NOTHING
+    #: else reads it: a cap trip does not signal teardown and does not abandon queued work.
+    #: See ``_retain_failed_mosaic`` for why ending a fill is a campaign-manager decision.
     cap_alerted = False
     retained_failed: set[tuple[str, int]] = set()
     #: Cells that LANDED but whose mosaic delete failed. Tracked apart from
