@@ -2033,7 +2033,7 @@ class ZarrWriter:
                 max_concurrent_requests=per_worker_cap,
                 get_credentials=get_credentials,
                 region=s3_region,
-                scatter_initial_credentials=get_credentials is not None,
+                scatter_initial_credentials=True,  # see assemble_global's call site
             )
             # Persist the split on create so a later COLD writer (one that opens
             # the store outside this manifest_split block) keeps splitting rather
@@ -2495,6 +2495,13 @@ class ZarrWriter:
             get_credentials=get_credentials,
             region=s3_region,
             max_concurrent_requests=per_worker_cap,
+            # `write_year_shards` PICKLES this session to spawned children; without it each
+            # deserialises with no credential and calls back per S3 request for the life of the
+            # fork (icechunk#2077). Opt-in per call site because the pickle carries a live
+            # secret -- safe across a local spawn pipe, not over a network transport. True
+            # unconditionally, since `_create_storage` substitutes a default provider when
+            # `get_credentials` is None and omits the option when there is no provider at all.
+            scatter_initial_credentials=True,
         )
 
         # One readonly probe of the zone group: year index, shard pitch, variables.

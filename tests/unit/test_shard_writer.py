@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import os
 import threading
 import time
@@ -270,7 +271,7 @@ class TestForkProgressReporting:
             assert _await_forks([outstanding], 0.01) == ["done"]
         lines = self._progress_lines(caplog)
         assert len(lines) >= 2, f"a single long band reported {len(lines)} progress line(s)"
-        assert "1 outstanding" in lines[0]
+        assert "1/1 partitions outstanding" in lines[0]
 
     def test_nothing_outstanding_reports_nothing(self, caplog):
         with caplog.at_level(logging.INFO, logger="tessera_embeddings.storage.shard_writer"):
@@ -349,9 +350,9 @@ class TestForkProgressReporting:
                 _await_forks([outstanding], 0.01, **kwargs)
             return self._progress_lines(caplog)[0]
 
-        assert "band writes done" in _one_line(unit="band writes")
+        assert "band writes outstanding" in _one_line(unit="band writes")
         default_line = _one_line()
-        assert "partitions done" in default_line
+        assert "partitions outstanding" in default_line
         assert "band writes" not in default_line
 
     def test_progress_lines_go_to_the_callers_logger(self, caplog):
@@ -565,3 +566,121 @@ def test_every_commit_is_timed_including_the_terminal_path(tmp_path, caplog):
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("COMMIT ")]
     assert lines, "every commit must emit a COMMIT <secs> line; it is the reopen detector"
     assert "mark 01N year 2020 complete" in lines[0]
+
+
+class TestAssemblyProgressReportsShards:
+    """The only progress a flow run can see. It counted PAYLOADS, which read `0/16` for the
+    entire write since all workers return at the end; shard counts come through shared memory.
+    """
+
+    def test_the_worker_publishes_into_the_slots_it_was_initialised_with(self) -> None:
+        slots = multiprocessing.get_context("spawn").Array("l", 4, lock=False)
+        shard_writer._init_fork_worker(slots)
+        try:
+            shard_writer.report_shard_progress(0, 7, 100)
+            shard_writer.report_shard_progress(1, 9, 50)
+            assert list(slots) == [7, 100, 9, 50]
+        finally:
+            shard_writer._PROGRESS_SLOTS = None
+
+    def test_reporting_off_the_pool_path_is_a_no_op(self) -> None:
+        """The single-payload path runs in the coordinator, which has no slots."""
+        shard_writer._PROGRESS_SLOTS = None
+        shard_writer.report_shard_progress(0, 1, 2)  # must not raise
+
+    def test_the_coordinator_logs_shards_and_a_percentage(self, caplog) -> None:
+        slots = multiprocessing.get_context("spawn").Array("l", 4, lock=False)
+        slots[0], slots[1], slots[2], slots[3] = 30, 100, 20, 100
+        futures: list[Future] = []
+        for _ in range(2):
+            f: Future = Future()
+            f.set_running_or_notify_cancel()
+            threading.Timer(0.05, lambda fut=f: fut.set_result("done")).start()
+            futures.append(f)
+        with caplog.at_level(logging.INFO, logger=shard_writer.__name__):
+            shard_writer._await_forks(futures, 0.01, unit="tile partitions", slots=slots)
+        line = next(r.getMessage() for r in caplog.records if "Assembly progress" in r.getMessage())
+        # Summed across BOTH workers, which is the point — one worker's share is not progress.
+        assert "50/200 shards written (25%)" in line
+        assert "tile partitions outstanding" in line
+
+    def test_before_any_worker_reports_it_falls_back_to_payloads(self, caplog) -> None:
+        """A zeroed total must not divide, and a caller whose worker never reports still gets a
+        line — it just cannot claim a shard count it does not have.
+        """
+        slots = multiprocessing.get_context("spawn").Array("l", 2, lock=False)
+        future: Future = Future()
+        future.set_running_or_notify_cancel()
+        threading.Timer(0.05, lambda: future.set_result("done")).start()
+        with caplog.at_level(logging.INFO, logger=shard_writer.__name__):
+            shard_writer._await_forks([future], 0.01, unit="bands", slots=slots)
+        line = next(r.getMessage() for r in caplog.records if "Assembly progress" in r.getMessage())
+        assert "shards" not in line
+        assert "1/1 bands outstanding" in line
+
+
+class TestShardCountsArePublishedAtBothEnds:
+    """The timed checkpoint sits at the TOP of the loop, so alone it publishes neither the
+    denominator before the first shard nor the final count after the last. The coordinator sums
+    totals across workers, so a worker yet to report shortens the denominator, and a finished
+    one would sit at its last checkpoint understating progress.
+    """
+
+    def test_the_worker_reports_the_total_first_and_the_count_last(self, tmp_path, monkeypatch):
+        calls: list[tuple[int, int, int]] = []
+        monkeypatch.setattr(
+            shard_writer,
+            "report_shard_progress",
+            lambda w, done, total: calls.append((w, done, total)),
+        )
+        store, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        payload = {
+            "fork": session.fork(),
+            "group": "01N",
+            "year_index": 2,
+            "shard_px": _SHARD,
+            "source": _SlowLoadSource(),
+            "shards": [(0, 0), (1, 0)],
+            "worker_index": 3,
+            # Long enough that no timed checkpoint fires, so only the two ends can report.
+            "progress_interval_s": 3600.0,
+        }
+        _write_shards_worker(payload)
+        assert calls[0] == (3, 0, 2), "the denominator must be published before the first shard"
+        assert calls[-1] == (3, 2, 2), "the final count must be published after the last"
+
+
+class TestForkedWorkersGetLoggingConfigured:
+    """A spawned process inherits no logging config, so an unconfigured worker's records are
+    discarded. Set on the POOL so a worker added later cannot omit it, which is what this pins.
+    """
+
+    def test_the_pool_configures_logging_in_every_child(self, tmp_path, monkeypatch) -> None:
+        seen: dict[str, object] = {}
+
+        class _Boom:
+            def __init__(self, *args, **kwargs):
+                seen.update(kwargs)
+                raise RuntimeError("pool not built")
+
+        monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", _Boom)
+        store, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        # Two payloads, so the pool path is taken rather than the in-process one.
+        with pytest.raises(RuntimeError, match="pool not built"):
+            run_forked(session, lambda p: p, [{"tag": "a"}, {"tag": "b"}])
+        assert seen.get("initializer") is shard_writer._init_fork_worker
+        assert seen.get("initargs")  # the shared progress slots travel with it
+
+    def test_the_initializer_configures_logging(self, monkeypatch) -> None:
+        """The initializer is where it happens now, so pin that it still does."""
+        called: list[bool] = []
+        monkeypatch.setattr(shard_writer, "configure_logging", lambda: called.append(True))
+        slots = multiprocessing.get_context("spawn").Array("l", 2, lock=False)
+        try:
+            shard_writer._init_fork_worker(slots)
+            assert called == [True]
+            assert shard_writer._PROGRESS_SLOTS is slots
+        finally:
+            shard_writer._PROGRESS_SLOTS = None

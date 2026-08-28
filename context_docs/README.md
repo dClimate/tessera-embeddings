@@ -68,6 +68,7 @@ context_docs/
     ├── inference_gpu_saturation_profile_2026_07.md
     ├── gpu-card-choice-2026_08.md                which GPU rungs the campaign may open, and why
     ├── stage_decoupling_2026_08.md              why ingest/inference/assembly are ungated
+    ├── icechunk-credential-stampede-2026_08.md   the 28 Aug storage-credential incident (written for a general reader)
     ├── assembly-worker-clamp-2026_08.md          why assembly ran 5 of its 16 forks
     ├── single-global-alignment.md                why single-ROI was aligned to the campaign
     ├── staging-identity-and-resume.md            what a run_id identifies, and what resumes

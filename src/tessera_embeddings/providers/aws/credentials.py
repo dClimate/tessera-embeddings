@@ -17,7 +17,11 @@ Usage in the S1 ingest flow::
 
 from __future__ import annotations
 
+import itertools
+import logging
+import multiprocessing
 import os
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -36,6 +40,8 @@ if TYPE_CHECKING:
 # refresh window — botocore auto-refreshes the underlying token on the next
 # get_frozen_credentials() call, so we never serve a stale one.
 _ICECHUNK_CRED_TTL = timedelta(minutes=15)
+
+_LOG = logging.getLogger(__name__)
 
 #: The same interval for an ASSUMED-ROLE credential, and shorter for a measured reason.
 #:
@@ -201,9 +207,20 @@ class AssumedRoleIcechunkCredentials:
         """A freshly-read credential for the assumed role, with its capped expiry."""
         creds = _assumed_role_credentials(self.role_arn, self.external_id)
         frozen = creds.get_frozen_credentials()
-        return icechunk.S3StaticCredentials(
-            access_key_id=frozen.access_key,
-            secret_access_key=frozen.secret_key,
+        # Through the shared boundary, like the task-role provider: THIS is the callback that
+        # serves the published store, so instrumenting only the other one would have left the
+        # credential behind the assembly failures invisible.
+        return _serve_icechunk_credential(
+            # The FULL arn, not the role name. The name alone is not unique -- the same role
+            # name in two partner accounts is a real configuration, and collapsing them would
+            # both mislabel the log line and merge two providers' rotation history into one
+            # map entry, so a rotation on either would read as a rotation on both. The arn
+            # carries the account id, which is also what makes the line correlatable against
+            # the other account's CloudTrail. An external id never disambiguates an arn (one
+            # role has one), so it is recorded as presence only and its value is never logged.
+            source=f"assumed-role:{self.role_arn}" + ("+external-id" if self.external_id else ""),
+            access_key=frozen.access_key,
+            secret_key=frozen.secret_key,
             session_token=frozen.token,
             expires_after=_expires_after(creds, _ASSUMED_ROLE_CRED_TTL),
         )
@@ -312,6 +329,103 @@ def iam_s3_storage_options() -> dict[str, str]:
     return opts
 
 
+#: Access keys this process has ANNOUNCED, per source. Keyed by source because one process
+#: legitimately uses both providers -- a fill reads our buckets with the task role and writes the
+#: partner's with an assumed role -- and one slot would read the alternation as constant rotation.
+#: A set, not a sequence: see :func:`_serve_icechunk_credential` on why no ordering claim made
+#: here can be trusted. Bounded by the number of real rotations a process lives through.
+_announced_access_keys: dict[str, set[str]] = {}
+#: Stamped inside the lock, so it totally orders the SERVE DECISIONS. Records are emitted outside
+#: the lock and can therefore reach the stream out of order; this recovers that order. It is NOT
+#: the order the credentials were used: a thread can take its number and be descheduled before
+#: returning, while a later one returns and its credential is used first.
+_announce_sequence = itertools.count(1)
+_ANNOUNCE_LOCK = threading.Lock()
+
+
+def _serve_icechunk_credential(
+    *,
+    source: str,
+    access_key: str,
+    secret_key: str,
+    session_token: str | None,
+    expires_after: datetime,
+) -> icechunk.S3StaticCredentials:
+    """Build the credential icechunk will use, and announce it once per process.
+
+    The single construction point for every icechunk credential in this module, so BOTH
+    providers are visible -- the task role and the published store's assumed role. The published
+    store is served by the second, so instrumenting either alone leaves the other's failures
+    unexplained. Records the access-key id, which is an identifier rather than a secret and is
+    what CloudTrail indexes on, plus the pid and a sequence number. **Never the secret key or
+    the session token.** Background: ``context_docs/design/icechunk-credential-stampede-2026_08.md``.
+
+    Announces NOVELTY, never a transition. Nothing reaching here records when a credential was
+    ACQUIRED -- the expiry is computed after it is frozen -- so a thread descheduled past a
+    refresh arrives with an old key bearing a LATER expiry, and any "which is newer" test is
+    wrong in the one case it exists for. So no record says one credential replaced another; the
+    INFO lines for one pid in ``seq`` order are the credentials this process served, in the order
+    it decided to serve them -- which is not necessarily the order they were USED, since a thread
+    can be descheduled between taking its number and returning. A late callback costs at most one
+    extra line naming a credential the process genuinely served.
+
+    ``source`` must be fully qualified (the whole role arn). A role NAME is not unique -- the
+    same name in two partner accounts is a real configuration -- and merging them would report
+    one provider's rotation as the other's.
+
+    The timestamp is icechunk's REUSE deadline, not the token's validity limit -- the task-role
+    path passes ``now + TTL`` outright, and only the assumed-role path caps it by the real expiry.
+    Labelled "reuse until" so a responder does not read it as when the credential died.
+
+    Levels: a process's first credential and each further distinct one are INFO, the events a
+    signature failure is lined up against. Routine re-serves are DEBUG, because icechunk asks
+    per request once its cached credential lapses (icechunk#2077) and a campaign runs on the
+    order of a hundred clients. Where a caller scatters, a spawned worker inherits a
+    credential without asking and its first call lands only after that lapses -- so a child's line
+    names that possibility rather than implying a start. Phrased as a possibility because being a
+    multiprocessing child does not prove the storage scattered.
+    """
+    with _ANNOUNCE_LOCK:  # bookkeeping only: logging in here would serialise every request
+        announced = _announced_access_keys.setdefault(source, set())
+        novel, first = access_key not in announced, not announced
+        announced.add(access_key)
+        order = next(_announce_sequence)
+
+    if not novel:
+        level, label = logging.DEBUG, "served"
+    elif not first:
+        level, label = logging.INFO, "NEW"
+    elif multiprocessing.parent_process() is None:
+        level, label = logging.INFO, "FIRST"
+    else:
+        # `parent_process()` says only that this is a multiprocessing child -- a Dask nanny's
+        # worker is one too, and its storage may never have scattered. So the line names the
+        # possibility rather than asserting inheritance, which would be wrong on those paths.
+        level, label = (
+            logging.INFO,
+            (
+                "FIRST in this child process (if it inherited a scattered credential the parent "
+                "announced that one, making this a change and not a start)"
+            ),
+        )
+    _LOG.log(
+        level,
+        "icechunk credential [%s] pid=%d seq=%d %s: %s, reuse until %s",
+        source,
+        os.getpid(),
+        order,
+        label,
+        access_key,
+        expires_after.isoformat(timespec="seconds"),
+    )
+    return icechunk.S3StaticCredentials(
+        access_key_id=access_key,
+        secret_access_key=secret_key,
+        session_token=session_token,
+        expires_after=expires_after,
+    )
+
+
 def iam_icechunk_credentials() -> icechunk.S3StaticCredentials:
     """Resolve IAM credentials as ``S3StaticCredentials`` for icechunk's S3 client.
 
@@ -335,10 +449,10 @@ def iam_icechunk_credentials() -> icechunk.S3StaticCredentials:
         RuntimeError: If no AWS credentials are found outside env vars.
     """
     frozen = _resolve_iam_credentials().get_frozen_credentials()
-    expires_after = datetime.now(UTC) + _ICECHUNK_CRED_TTL
-    return icechunk.S3StaticCredentials(
-        access_key_id=frozen.access_key,
-        secret_access_key=frozen.secret_key,
+    return _serve_icechunk_credential(
+        source="task-role",
+        access_key=frozen.access_key,
+        secret_key=frozen.secret_key,
         session_token=frozen.token,
-        expires_after=expires_after,
+        expires_after=datetime.now(UTC) + _ICECHUNK_CRED_TTL,
     )

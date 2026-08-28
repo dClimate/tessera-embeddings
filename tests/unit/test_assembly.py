@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import icechunk
 import numpy as np
 import pytest
 import xarray as xr
@@ -2100,6 +2101,49 @@ class TestAssembleGlobal:
         for name, arr in (extra or {}).items():
             g.create_array(name, data=arr)
         _mark_staged_complete(path)  # assembly requires both completion signals
+
+    @pytest.mark.parametrize("credentialled", [True, False])
+    def test_the_forking_write_asks_icechunk_to_cache_the_credential(self, tmp_path, monkeypatch, credentialled):
+        """`write_year_shards` PICKLES this session to spawned children, and an icechunk
+        credential fetcher's `initial` cache can never be refilled (icechunk#2077), so a child
+        that deserialises without one calls back on every S3 request for the life of the fork.
+        Asserted at the call site because that is where the decision lives — the flag puts a
+        live secret in the pickle, so it is right for a forking writer and pointless elsewhere.
+        True regardless of whether a callback is passed (hence the parameterisation):
+        `_create_storage` substitutes a default provider when it is None, so a
+        `get_credentials is not None` guard would disable the scatter on exactly that path.
+        """
+        dim = 8
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        writer.write_chunk(
+            ChunkSpec(row=0, col=0, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE),
+            np.ones((self.TILE, self.TILE, dim), dtype=np.int8),
+            "runS",
+            scales=np.ones((self.TILE, self.TILE), dtype=np.float32),
+        )
+
+        requested: list[bool] = []
+        real_open = _assembly_mod.open_global_repo
+
+        def spy(path, **kwargs):
+            requested.append(kwargs["scatter_initial_credentials"])
+            return real_open(path, **kwargs)
+
+        monkeypatch.setattr(_assembly_mod, "open_global_repo", spy)
+
+        def credentials() -> icechunk.S3StaticCredentials:
+            return icechunk.S3StaticCredentials(access_key_id="k", secret_access_key="s")
+
+        writer.assemble_global(
+            store_path,
+            self.ZONE,
+            year=2025,
+            run_id="runS",
+            n_workers=1,
+            get_credentials=credentials if credentialled else None,
+        )
+        assert requested == [True]
 
     def test_fills_year_from_staged_tiles(self, tmp_path):
         """Staged tiles land as whole shards at the right year index; provenance attrs update."""
