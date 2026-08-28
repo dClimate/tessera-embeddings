@@ -507,96 +507,6 @@ def partition_round_robin(items: list, n: int) -> list[list]:
     return [p for p in parts if p]
 
 
-#: Object-store conditions worth another attempt on a shard write.
-#:
-#: Matched on the message TEXT because icechunk surfaces every Rust-side failure as one
-#: `IcechunkError` -- there is no exception class per condition -- so the code string it
-#: embeds is the only discriminator available. Matched on NAMED codes only, never on bare
-#: status numbers: a bare "500" or "416" also matches the hex in an ECS task ARN, which has
-#: produced phantom findings in this repo before.
-#:
-#: `SignatureDoesNotMatch` leads the list because it is what actually cost us four cells on
-#: 2026-08-28. It means the secret did not match the access key, which for a role credential
-#: is a refresh race rather than a permissions problem -- and a permissions problem would
-#: fail every attempt in a few seconds, which is a cheap price for not losing a three-hour
-#: assembly to a transient.
-#:
-#: Deliberately EXCLUDES the permanent refusals -- `AccessDenied`, `InvalidAccessKeyId`,
-#: `NoSuchBucket` -- because retrying those buys nothing and delays a real diagnosis.
-_RETRYABLE_STORE_CODES = (
-    "SignatureDoesNotMatch",
-    "ExpiredToken",
-    "TokenRefreshRequired",
-    "SlowDown",
-    "RequestLimitExceeded",
-    "ServiceUnavailable",
-    "InternalError",
-    "RequestTimeout",
-    "RequestTimeTooSkewed",
-)
-
-#: Attempts per block write, and the base of the backoff. Five attempts at 0.5 s doubling
-#: spends at most ~7.5 s of sleep on a block -- negligible against a shard's own read+encode,
-#: and bounded so a genuinely broken credential still fails the assembly promptly.
-_WRITE_ATTEMPTS = 5
-_WRITE_BACKOFF_BASE_S = 0.5
-
-
-def _is_retryable_store_error(exc: BaseException) -> bool:
-    """True if ``exc`` names a transient object-store condition."""
-    text = str(exc)
-    return any(code in text for code in _RETRYABLE_STORE_CODES)
-
-
-def _assign_block_with_retry(
-    arr: zarr.Array,
-    selection: tuple[slice, slice, slice],
-    block: Any,  # noqa: ANN401 - a numpy array or anything zarr accepts
-    *,
-    worker_index: int,
-    group: str,
-) -> None:
-    """Assign one block, retrying a transient object-store refusal.
-
-    **Why this exists, and why the read path already had it.** Staged READS during assembly
-    are configured with botocore ``max_attempts: 10, mode: adaptive`` for exactly this reason
-    -- see ``assembly.STAGED_READ_CONFIG_KWARGS``, whose docstring explains that a momentary
-    burst "exhausts retries and fails the block". Writes go through icechunk's own Rust S3
-    client instead, which exposes no retry knob at all (``RepositoryConfig`` offers only
-    ``repo_update_retries``, for rebases). So the same reasoning that hardened reads had no
-    way to reach writes, and a single transient refusal killed a whole assembly.
-
-    Measured on 2026-08-28: 22 ``SignatureDoesNotMatch`` refusals on the assembly path cost
-    FOUR cells (47N-2018, 35N-2017, 35N-2018, 47N-2019), while 494 of the same refusal on the
-    ingest path cost none -- because ingest writes sit under Prefect task retries and these
-    did not.
-
-    **Retrying is safe here specifically because this is a FORK.** A worker writes into a
-    forked session, and a fork joins the repository only when the coordinator merges and
-    commits. A re-attempted assignment therefore cannot double-write anything a reader can
-    see; it orphans the first attempt's chunk objects, which garbage collection reclaims.
-    """
-    for attempt in range(1, _WRITE_ATTEMPTS + 1):
-        try:
-            arr[selection] = block
-            return
-        except Exception as exc:
-            if attempt == _WRITE_ATTEMPTS or not _is_retryable_store_error(exc):
-                raise
-            delay = _WRITE_BACKOFF_BASE_S * (2 ** (attempt - 1))
-            _log.warning(
-                "Assembly worker %d (%s): transient store refusal on a block write, "
-                "attempt %d/%d, retrying in %.1fs — %s",
-                worker_index,
-                group,
-                attempt,
-                _WRITE_ATTEMPTS,
-                delay,
-                str(exc)[:200],
-            )
-            time.sleep(delay)
-
-
 def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - returns (ForkSession, stats)
     """Write assigned shards into a forked session; return ``(fork, stats)`` for merge.
 
@@ -656,13 +566,7 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
             # Trailing dims (band) not indexed are written in full, so one
             # assignment covers both the 3-D and 4-D arrays.
             with timer.phase("write"):
-                _assign_block_with_retry(
-                    arr,
-                    (slice(year, year + 1), slice(y0, y0 + h), slice(x0, x0 + w)),
-                    block,
-                    worker_index=worker_index,
-                    group=group,
-                )
+                arr[year : year + 1, y0 : y0 + h, x0 : x0 + w] = block
             writes += 1
             nbytes += block.nbytes
     return fork, {"tiles": tiles, "writes": writes, "bytes": nbytes, **timer.stats()}

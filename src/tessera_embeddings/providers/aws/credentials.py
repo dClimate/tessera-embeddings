@@ -204,9 +204,13 @@ class AssumedRoleIcechunkCredentials:
         """A freshly-read credential for the assumed role, with its capped expiry."""
         creds = _assumed_role_credentials(self.role_arn, self.external_id)
         frozen = creds.get_frozen_credentials()
-        return icechunk.S3StaticCredentials(
-            access_key_id=frozen.access_key,
-            secret_access_key=frozen.secret_key,
+        # Through the shared boundary, like the task-role provider: THIS is the callback that
+        # serves the published store, so instrumenting only the other one would have left the
+        # credential behind the assembly failures invisible.
+        return _serve_icechunk_credential(
+            source=f"assumed-role:{self.role_arn.rsplit('/', 1)[-1]}",
+            access_key=frozen.access_key,
+            secret_key=frozen.secret_key,
             session_token=frozen.token,
             expires_after=_expires_after(creds, _ASSUMED_ROLE_CRED_TTL),
         )
@@ -315,49 +319,86 @@ def iam_s3_storage_options() -> dict[str, str]:
     return opts
 
 
-#: Last access-key id this PROCESS served to icechunk, so a rotation can be logged as an
-#: event rather than as a poll. Per-process by nature, which is what we want: an assembly
-#: forks sixteen workers and each holds its own icechunk client, so knowing WHICH process
-#: rotated when is exactly the correlation a signature failure needs.
-_last_icechunk_access_key: str | None = None
+#: Last access-key id served per SOURCE, so a rotation is logged as an event rather than a
+#: poll. Keyed by source because one process legitimately uses BOTH providers -- a fill reads
+#: our buckets with the task role and writes the partner's with an assumed role -- and a single
+#: slot would read those alternating calls as constant rotation.
+#:
+#: Per-process by nature, which is what we want: an assembly forks sixteen workers, each with
+#: its own icechunk client, so knowing WHICH process rotated when is the correlation a
+#: signature failure needs.
+_last_icechunk_access_key: dict[str, str] = {}
 
 
-def _record_icechunk_credential(access_key: str, expires_after: datetime) -> None:
-    """Make the credential icechunk is about to use observable.
+def _serve_icechunk_credential(
+    *,
+    source: str,
+    access_key: str,
+    secret_key: str,
+    session_token: str | None,
+    expires_after: datetime,
+) -> icechunk.S3StaticCredentials:
+    """Build the credential icechunk will use, and make it observable.
 
-    **Why this exists.** On 2026-08-28 the fleet took 516 `SignatureDoesNotMatch` refusals
-    from S3 across a 1h45m window -- 494 on the ingest path, 22 on assembly, the latter
-    costing four cells. `SignatureDoesNotMatch` means the secret did not match the access
-    key, which for a role credential is a refresh race rather than a permissions problem.
-    The provider itself proved correct on inspection, so the gap was not a defect to fix but
-    a blind spot: nothing recorded WHICH credential was in play, so a recurrence could only
-    be inferred from the shape of the failure. This closes that.
+    **The single construction point for every icechunk credential in this module**, and that is
+    the point rather than tidiness. There are two providers -- the task role
+    (:func:`iam_icechunk_credentials`) and the assumed role
+    (:class:`AssumedRoleIcechunkCredentials`) -- and the published store, whose writes motivated
+    this instrumentation, is served by the SECOND one. Instrumenting either provider alone
+    leaves the credential behind the real failures invisible, so both go through here.
 
-    **Two levels, deliberately.** The per-invocation line is DEBUG, because icechunk
-    re-invokes the callback every :data:`_ICECHUNK_CRED_TTL` per client and a campaign runs
-    on the order of a hundred clients -- INFO would add a steady drip that says nothing on
-    the overwhelming majority of days. A key-id CHANGE is INFO, because a rotation is the
-    event a signature failure has to be correlated against, and there are only a handful of
-    those per process per run.
+    **Why any of this exists.** On 2026-08-28 the fleet took 516 `SignatureDoesNotMatch`
+    refusals from S3 across 1h45m -- 494 on the ingest path, 22 on assembly, the latter costing
+    four cells. `SignatureDoesNotMatch` means the secret did not match the access key, which for
+    a role credential is a torn triple rather than a permissions problem. The providers proved
+    CORRECT on inspection, so the gap was never a defect to fix: nothing recorded WHICH
+    credential was in play, so a recurrence could only be inferred from the shape of the
+    failure. This closes that, and closing it is the prerequisite for designing a real fix.
+
+    **Three levels, each for a reason.**
+
+    * The FIRST credential a process serves is INFO. A process that fails before it ever
+      rotates -- which is the common case for these failures -- would otherwise carry no
+      access-key id at production log level, and could not be correlated against CloudTrail.
+    * A ROTATION is INFO. It is the event a signature failure has to be lined up against, and
+      there are a handful per process per run.
+    * A STEADY re-serve is DEBUG. icechunk re-invokes the callback every TTL per client and a
+      campaign runs on the order of a hundred clients, so this is the one that would be a drip
+      saying nothing on almost every day.
 
     Logs the access-key id, which is an identifier rather than a secret and is what CloudTrail
     indexes on. **Never the secret key or the session token.**
     """
-    global _last_icechunk_access_key
-    previous, _last_icechunk_access_key = _last_icechunk_access_key, access_key
-    if previous is not None and previous != access_key:
+    previous = _last_icechunk_access_key.get(source)
+    _last_icechunk_access_key[source] = access_key
+    if previous is None:
         _LOG.info(
-            "icechunk credential ROTATED: %s -> %s, valid until %s",
+            "icechunk credential [%s] FIRST: %s, valid until %s",
+            source,
+            access_key,
+            expires_after.isoformat(timespec="seconds"),
+        )
+    elif previous != access_key:
+        _LOG.info(
+            "icechunk credential [%s] ROTATED: %s -> %s, valid until %s",
+            source,
             previous,
             access_key,
             expires_after.isoformat(timespec="seconds"),
         )
     else:
         _LOG.debug(
-            "icechunk credential served: %s, valid until %s",
+            "icechunk credential [%s] served: %s, valid until %s",
+            source,
             access_key,
             expires_after.isoformat(timespec="seconds"),
         )
+    return icechunk.S3StaticCredentials(
+        access_key_id=access_key,
+        secret_access_key=secret_key,
+        session_token=session_token,
+        expires_after=expires_after,
+    )
 
 
 def iam_icechunk_credentials() -> icechunk.S3StaticCredentials:
@@ -383,11 +424,10 @@ def iam_icechunk_credentials() -> icechunk.S3StaticCredentials:
         RuntimeError: If no AWS credentials are found outside env vars.
     """
     frozen = _resolve_iam_credentials().get_frozen_credentials()
-    expires_after = datetime.now(UTC) + _ICECHUNK_CRED_TTL
-    _record_icechunk_credential(frozen.access_key, expires_after)
-    return icechunk.S3StaticCredentials(
-        access_key_id=frozen.access_key,
-        secret_access_key=frozen.secret_key,
+    return _serve_icechunk_credential(
+        source="task-role",
+        access_key=frozen.access_key,
+        secret_key=frozen.secret_key,
         session_token=frozen.token,
-        expires_after=expires_after,
+        expires_after=datetime.now(UTC) + _ICECHUNK_CRED_TTL,
     )

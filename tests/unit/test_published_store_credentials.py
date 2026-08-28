@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 
 import icechunk
 import pytest
@@ -373,63 +372,97 @@ class TestIcechunkCredentialVisibility:
     """Why this exists: on 2026-08-28 the fleet took 516 `SignatureDoesNotMatch` refusals
     across 1h45m — 494 on ingest, 22 on assembly, the latter costing four cells.
 
-    The provider proved CORRECT on inspection, so the gap was not a defect but a blind spot:
-    nothing recorded which credential was in play, so a recurrence could only be inferred
-    from the shape of the failure rather than correlated against a rotation.
+    The providers proved CORRECT on inspection, so the gap was never a defect to fix: nothing
+    recorded WHICH credential was in play, so a recurrence could only be inferred from the
+    shape of the failure rather than lined up against a rotation.
     """
 
     @staticmethod
     def _reset() -> None:
-        creds_mod._last_icechunk_access_key = None
+        creds_mod._last_icechunk_access_key.clear()
 
-    def test_a_steady_credential_logs_at_debug_not_info(self, caplog) -> None:
-        """The callback fires every TTL per icechunk client, and a campaign runs on the order
-        of a hundred clients — at INFO that is a steady drip saying nothing on almost every day.
+    def _serve(self, source: str, key: str) -> None:
+        creds_mod._serve_icechunk_credential(
+            source=source,
+            access_key=key,
+            secret_key="s",
+            session_token="t",
+            expires_after=datetime(2026, 8, 28, 12, tzinfo=UTC),
+        )
+
+    def test_the_first_credential_a_process_serves_is_info(self, caplog) -> None:
+        """A process that fails before it ever rotates — the common case for these failures —
+        would otherwise carry no access-key id at production log level, and could not be
+        correlated against CloudTrail.
         """
         self._reset()
         with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            creds_mod._record_icechunk_credential("ASIAEXAMPLE1", datetime(2026, 8, 28, 12, tzinfo=UTC))
-            creds_mod._record_icechunk_credential("ASIAEXAMPLE1", datetime(2026, 8, 28, 12, tzinfo=UTC))
-        assert [r.levelname for r in caplog.records] == ["DEBUG", "DEBUG"]
+            self._serve("task-role", "ASIAFIRST")
+        assert [r.levelname for r in caplog.records] == ["INFO"]
+        assert "FIRST" in caplog.records[0].message
 
-    def test_a_rotation_logs_at_info(self, caplog) -> None:
-        """The event a signature failure has to be correlated against, and there are only a
-        handful per process per run — so INFO costs nothing and carries the whole signal.
+    def test_a_steady_reserve_drops_to_debug(self, caplog) -> None:
+        """Icechunk re-invokes the callback every TTL per client and a campaign runs on the
+        order of a hundred clients, so this is the one that would be a drip saying nothing.
         """
         self._reset()
         with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            creds_mod._record_icechunk_credential("ASIAOLDKEY", datetime(2026, 8, 28, 12, tzinfo=UTC))
-            creds_mod._record_icechunk_credential("ASIANEWKEY", datetime(2026, 8, 28, 13, tzinfo=UTC))
-        rotations = [r for r in caplog.records if r.levelname == "INFO"]
-        assert len(rotations) == 1
-        assert "ROTATED" in rotations[0].message
-        assert "ASIAOLDKEY" in rotations[0].getMessage()
-        assert "ASIANEWKEY" in rotations[0].getMessage()
+            self._serve("task-role", "ASIASTEADY")
+            self._serve("task-role", "ASIASTEADY")
+            self._serve("task-role", "ASIASTEADY")
+        assert [r.levelname for r in caplog.records] == ["INFO", "DEBUG", "DEBUG"]
+
+    def test_a_rotation_is_info(self, caplog) -> None:
+        self._reset()
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            self._serve("task-role", "ASIAOLD")
+            self._serve("task-role", "ASIANEW")
+        rot = [r for r in caplog.records if "ROTATED" in r.message]
+        assert len(rot) == 1 and rot[0].levelname == "INFO"
+        assert "ASIAOLD" in rot[0].getMessage() and "ASIANEW" in rot[0].getMessage()
+
+    def test_two_providers_in_one_process_do_not_read_as_rotation(self, caplog) -> None:
+        """A fill legitimately uses BOTH — the task role to read our buckets, an assumed role
+        to write the partner's. A single last-seen slot would read those alternating calls as
+        constant rotation and bury the real event.
+        """
+        self._reset()
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            for _ in range(3):
+                self._serve("task-role", "ASIATASK")
+                self._serve("assumed-role:writer", "ASIAWRITER")
+        assert not [r for r in caplog.records if "ROTATED" in r.message]
 
     def test_it_never_logs_the_secret_or_the_token(self, caplog) -> None:
-        """The access-key id is an identifier and is what CloudTrail indexes on. The secret
-        key and the session token are credentials and must never reach a log.
+        """The access-key id is an identifier and is what CloudTrail indexes on. The secret key
+        and the session token are credentials and must never reach a log.
         """
         self._reset()
         with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            creds_mod._record_icechunk_credential("ASIAEXAMPLE1", datetime(2026, 8, 28, 12, tzinfo=UTC))
+            creds_mod._serve_icechunk_credential(
+                source="task-role",
+                access_key="ASIAVISIBLE",
+                secret_key="SECRETVALUE",
+                session_token="TOKENVALUE",
+                expires_after=datetime(2026, 8, 28, 12, tzinfo=UTC),
+            )
         text = " ".join(r.getMessage() for r in caplog.records)
-        assert "ASIAEXAMPLE1" in text
-        for forbidden in ("secret", "session_token", "SECRETVALUE"):
-            assert forbidden not in text
+        assert "ASIAVISIBLE" in text
+        assert "SECRETVALUE" not in text
+        assert "TOKENVALUE" not in text
 
-    def test_the_provider_records_what_it_serves(self, caplog, monkeypatch) -> None:
-        """The record must come from the SAME frozen snapshot icechunk is handed, or it would
-        describe a credential other than the one in use — which is the whole point.
+    def test_both_providers_are_instrumented(self) -> None:
+        """The one that matters is the ASSUMED-ROLE callback: it is what serves the published
+        store, whose writes motivated this. Instrumenting only the task-role provider would
+        have left the credential behind the real failures invisible — which is exactly the
+        defect review caught in the first version of this change.
         """
-        self._reset()
-        frozen = SimpleNamespace(access_key="ASIASERVED", secret_key="s", token="t")
-        monkeypatch.setattr(
-            creds_mod,
-            "_resolve_iam_credentials",
-            lambda: SimpleNamespace(get_frozen_credentials=lambda: frozen),
-        )
-        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            out = creds_mod.iam_icechunk_credentials()
-        assert out.access_key_id == "ASIASERVED"
-        assert "ASIASERVED" in " ".join(r.getMessage() for r in caplog.records)
+        import inspect
+
+        task_src = inspect.getsource(creds_mod.iam_icechunk_credentials)
+        role_src = inspect.getsource(creds_mod.AssumedRoleIcechunkCredentials.__call__)
+        for name, src in (("task-role", task_src), ("assumed-role", role_src)):
+            assert "_serve_icechunk_credential(" in src, f"{name} bypasses the boundary"
+            assert "icechunk.S3StaticCredentials(" not in src, (
+                f"{name} constructs its own credential, so it can drift from the boundary"
+            )
