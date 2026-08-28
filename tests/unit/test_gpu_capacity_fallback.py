@@ -218,14 +218,25 @@ class TestVcpuBudget:
         types = config["available_node_types"]
         assert types[A10G]["max_workers"] == types[PRODUCTION]["max_workers"] == 500
 
-    def test_it_composes_with_a_ladder(self) -> None:
-        """Ladder first, then the budget -- so the budget has the last word on ceilings
-        and an operator cannot accidentally out-argue the quota with an SSM value.
-        """
+    def test_the_budget_narrows_a_wider_ladder(self) -> None:
         config = yaml.safe_load(TEMPLATE.read_text())
         tray._apply_gpu_worker_ladder(config, "g6e.xlarge:500")
         tray._apply_gpu_fallback(config, ["A10G"], 1000)
         assert config["available_node_types"][PRODUCTION]["max_workers"] == 250
+
+    def test_the_budget_never_widens_a_deliberate_cap(self) -> None:
+        """Capping the production rung at what it can actually BE SUPPLIED is what
+        pushes surplus demand onto the fallback -- and it is the only lever that works
+        when the production card is trickling rather than refusing outright, because a
+        partially filled launch counts as a success and never marks the type
+        unavailable. A budget that raised that cap back up would silently undo it.
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_worker_ladder(config, "g6e.xlarge:50")
+        tray._apply_gpu_fallback(config, ["A10G"], 1000)
+        types = config["available_node_types"]
+        assert types[PRODUCTION]["max_workers"] == 50, "the deliberate cap must stand"
+        assert types[A10G]["max_workers"] == 125
 
     def test_refuses_a_nonpositive_budget(self) -> None:
         config = yaml.safe_load(TEMPLATE.read_text())

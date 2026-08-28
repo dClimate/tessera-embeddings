@@ -441,6 +441,9 @@ def _apply_gpu_vcpu_budget(config: dict[str, Any], vcpu_budget: int) -> None:
     So each rung gets the count the budget affords IT -- 250 at 4 vCPU/GPU, 125 at 8.
     That is the honest statement of "as many of this card as the quota allows".
 
+    It NARROWS only, never widens: a ceiling already lower than the budget affords was
+    set deliberately and stands.
+
     **It does not bound a MIXTURE, and cannot.** Ray's ceilings count nodes and carry no
     weight (`resource_demand_scheduler` has no cost concept at all), so a fleet that is
     part production and part fallback can exceed the budget -- bounded by the widest
@@ -455,7 +458,12 @@ def _apply_gpu_vcpu_budget(config: dict[str, Any], vcpu_budget: int) -> None:
     for name, cfg in node_types.items():
         if not name.startswith(GPU_WORKER_NODE_TYPE_PREFIX) or cfg.get("max_workers", 0) <= 0:
             continue
-        cfg["max_workers"] = _vcpu_budget_ceiling(cfg, vcpu_budget)
+        # NARROWS ONLY. A budget must never RAISE a ceiling someone set deliberately:
+        # capping the production rung at what it can actually be supplied is the lever
+        # that pushes surplus demand onto the fallback, and a budget that overrode it
+        # would quietly undo the operator's decision. The budget is a maximum, not a
+        # target.
+        cfg["max_workers"] = min(cfg["max_workers"], _vcpu_budget_ceiling(cfg, vcpu_budget))
 
 
 def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str], vcpu_budget: int | None = None) -> list[str]:
