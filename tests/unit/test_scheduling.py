@@ -574,6 +574,49 @@ class TestRetireIdle:
         assert 0 in pool._retired, "the ACTOR still retires"
         callback.assert_not_called()  # ...but the host lives while siblings work
 
+    def test_a_replacement_being_rebuilt_on_the_host_counts_as_a_sibling(self) -> None:
+        """`replace()` parks `pending-replacement-of-<iid>` until the new actor reports
+        its own id, so an equality test on the instance id misses it.
+
+        The sibling is being rebuilt on this very host; terminating the box because the
+        only slot that still matches by equality has retired would kill it mid-init.
+        """
+        callback = MagicMock()
+        pool = _make_pool(2, idle_grace_sec=1, on_retire=callback)
+        pool.actor_instance_ids[:] = ["i-packed", "pending-replacement-of-i-packed"]
+        pool._idle_since[0] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=0)
+        callback.assert_not_called()
+
+    def test_a_packed_host_waits_on_an_unresolved_placement(self) -> None:
+        """Ray may place an initialising actor on the GPU this retirement just freed, and
+        the id does not arrive until it reports. A packed host defers rather than guess.
+
+        Scoped to packed hosts: an unrelated actor starting elsewhere must not delay the
+        one-actor-per-host teardown the campaign actually runs.
+        """
+        callback = MagicMock()
+        pool = _make_pool(3, idle_grace_sec=1, on_retire=callback)
+        pool.actor_instance_ids[:] = ["i-packed", "i-packed", "pending-init"]
+        pool._retired.add(1)
+        pool._initializing.add(2)
+        pool._idle_since[0] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=0)
+        callback.assert_not_called()
+
+    def test_an_unresolved_placement_elsewhere_does_not_delay_a_single_actor_host(self) -> None:
+        """The complement, and the one that matters for production."""
+        callback = MagicMock()
+        pool = _make_pool(2, idle_grace_sec=1, on_retire=callback)
+        pool.actor_instance_ids[:] = ["i-solo", "pending-init"]
+        pool._initializing.add(1)
+        pool._idle_since[0] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=0)
+        callback.assert_called_once_with("i-solo")
+
     def test_the_last_actor_off_a_packed_host_terminates_it(self) -> None:
         """The other half: once every sibling has retired, the instance must go, or a
         packed host outlives its work and bills until the autoscaler notices.

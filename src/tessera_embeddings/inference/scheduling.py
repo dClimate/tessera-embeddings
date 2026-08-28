@@ -549,17 +549,27 @@ class ActorPool:
                 #
                 # A no-op on one-actor-per-host, which is every rung the campaign has run:
                 # a slot can never be its own sibling, so the list is always empty there.
-                siblings = [
-                    idx
-                    for idx, iid in enumerate(self.actor_instance_ids)
-                    if idx != actor_idx and iid == instance_id and idx not in self._retired
+                # `in`, not `==`: a replacement actor carries the placeholder
+                # `pending-replacement-of-<iid>` until its own id resolves, so an equality
+                # test would miss a sibling that is being rebuilt on this very host. EC2
+                # ids are fixed length, so no id is a substring of another.
+                on_host = [idx for idx, iid in enumerate(self.actor_instance_ids) if instance_id in iid]
+                siblings = [idx for idx in on_host if idx != actor_idx and idx not in self._retired]
+                # A PACKED host additionally waits on any slot whose id has not resolved
+                # yet. Ray may have placed it on the GPU this retirement just freed, and we
+                # cannot tell until the id arrives — terminating first would kill an actor
+                # mid-initialisation. Scoped to packed hosts so the one-actor-per-host case
+                # the campaign actually runs is never delayed by an unrelated actor starting.
+                unresolved = [
+                    idx for idx in self._initializing if not self.actor_instance_ids[idx].startswith("i-")
                 ]
-                if siblings:
+                if siblings or (len(on_host) > 1 and unresolved):
                     self.log.info(
-                        "Actor %d retired but instance %s kept: %d actor(s) still on it",
+                        "Actor %d retired but instance %s kept: %d live, %d unresolved",
                         actor_idx,
                         instance_id,
                         len(siblings),
+                        len(unresolved),
                     )
                 else:
                     with contextlib.suppress(Exception):

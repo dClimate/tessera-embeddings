@@ -83,11 +83,18 @@ baked (see `gotchas.md` for the AMI-bake pattern).
 exactly as shipped.** Set it and `_resolve_ray_config` rewrites the `max_workers`
 of each on-demand GPU rung from the value, letting you change which EC2 instance
 types a fleet may buy — and how many of each — without a release, a deployment
-re-registration, or an AMI re-bake. Every `g6e` size is the same L40S on x86_64,
+re-registration, or an AMI re-bake. It does still require provisioning a cluster
+after the edit; see the first bullet below. Every `g6e` size is the same L40S on x86_64,
 so one AMI serves all of them.
 
-Three properties worth knowing before you set it:
+Four properties worth knowing before you set it:
 
+- **It is read ONCE, when a cluster's config is resolved before `ray up`.** The
+  running autoscaler never re-reads it, so editing the parameter does nothing to a
+  fleet that is already up: it keeps requesting the rung it launched with, however
+  long the capacity refusal lasts. **Failover therefore requires a new cluster**,
+  not a parameter edit — set the value first, then provision. Treat this as the
+  operational cost of the mechanism: it is a pre-launch knob, not a live one.
 - **It is authoritative, not additive.** A rung the value does not name is set to
   `0`. So `g6e.2xlarge:150` alone also closes `g6e.xlarge`; name every rung you
   want the fleet to use.

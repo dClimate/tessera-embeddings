@@ -104,6 +104,12 @@ available_node_types:
     # about a campaign in flight, and releasing one needs no code change — see
     # `gpu-worker-ladder` in `ray.py::_apply_gpu_worker_ladder`.
     #
+    # It does need a NEW CLUSTER. The ladder is read once while resolving this
+    # config before `ray up`, and the running autoscaler never re-reads it, so
+    # editing the parameter cannot retarget a fleet that is already provisioned —
+    # it goes on requesting the rung it launched with for as long as the refusal
+    # lasts. Set the value, then provision; the knob is pre-launch, not live.
+    #
     # They exist because a single instance type is a single capacity pool: a
     # fleet pinned to `g6e.xlarge` stalls at whatever us-west-2 will sell of
     # that one size, and Ray cannot express a fallback type list (its node
