@@ -540,14 +540,18 @@ def test_systematic_failure_stops_feeder_at_retained_cap():
 
     The deterministic half: an ingest failure raises inside ``inputs.wait`` on the feeder's
     own thread, so it is counted before the next cap check no matter how fast the fake runs.
-    ``look_ahead=1`` → cap 3.
+
+    The cap is passed EXPLICITLY. It used to be ``look_ahead + 2``, and this test set
+    ``look_ahead=1`` to get a cap of 3 — which is precisely the coupling removed on
+    2026-08-27, when a failure budget of 7 derived from an ingest width took nine of ten
+    clusters down in one provider outage.
     """
     events: list[str] = []
     inputs = FailingWaitInputs(events)
     with pytest.raises(RuntimeError, match="cell"):
         # attempts=1 disables the in-child retry pass, which calls `inputs.wait` too —
         # counting its attempts as admissions reported 6 for a feeder that stopped at 3.
-        _run(_cells(12), inputs=inputs, look_ahead=1, attempts_per_cell_in_cluster=1)
+        _run(_cells(12), inputs=inputs, look_ahead=1, max_retained_failures=3, attempts_per_cell_in_cluster=1)
     waited = len([e for e in events if e.startswith("wait:")])
     started = len([e for e in events if e.startswith("start:")])
     assert waited == 3, f"the feeder must stop admitting at the cap of 3, admitted {waited}"
@@ -1140,3 +1144,83 @@ def test_no_pause_callable_means_no_check_at_all():
     out = _run(_cells(1), session=_pausing_session(0, seen))
     assert out["succeeded"] == 1
     assert "empty" not in seen[:1]
+
+
+def test_the_cap_is_not_derived_from_look_ahead():
+    """The decoupling itself. `look_ahead` sizes INGEST WIDTH; the cap is a FAILURE BUDGET.
+
+    Tying them meant a fleet configured for 3-wide ingest silently accepted a failure budget
+    of 5, and one exogenous provider outage on 2026-08-27 then converted into a fleet-wide
+    teardown. A wide ingest and a patient failure budget are different decisions.
+    """
+    import inspect
+
+    params = inspect.signature(mod.fill_zones_sequential).parameters
+    assert params["max_retained_failures"].default == 100, (
+        "a ceiling against a SYSTEMATIC fault only. Losing a fill costs its Ray cluster and every "
+        "actor on it, so this must not be reachable by a bad few hours: on 2026-08-27 a cap of 7 "
+        "put nine of ten clusters over the line on ONE provider outage"
+    )
+    events: list[str] = []
+    inputs = FailingWaitInputs(events)
+    # look_ahead=1 would have forced a cap of 3 under the old derivation; it must not now.
+    with pytest.raises(RuntimeError, match="cell"):
+        _run(_cells(8), inputs=inputs, look_ahead=1, max_retained_failures=6, attempts_per_cell_in_cluster=1)
+    waited = len([e for e in events if e.startswith("wait:")])
+    assert waited == 6, f"the cap must be the one passed, not look_ahead + 2; admitted {waited}"
+
+
+def test_exceeding_the_cap_alerts_but_does_not_tear_the_run_down():
+    """The cap ALERTS; it does not restart anything.
+
+    Ending a fill costs its Ray cluster and every actor on it — hours to rebuild, and the most
+    expensive thing the campaign owns. An earlier version of this change made a cap trip exit
+    immediately without draining; that is withdrawn. A child process must not spend the fleet's
+    actors on its own judgement, so it says so loudly and a human decides.
+    """
+    events: list[str] = []
+    inputs = FailingWaitInputs(events)
+    with pytest.raises(RuntimeError, match="cell"):
+        _run(_cells(6), inputs=inputs, look_ahead=1, max_retained_failures=2, attempts_per_cell_in_cluster=1)
+    # The feeder still stops admitting at the cap — that half is unchanged.
+    waited = len([e for e in events if e.startswith("wait:")])
+    assert waited == 2, f"the feeder must stop admitting at the cap of 2, admitted {waited}"
+
+
+def test_the_cap_alert_fires_for_a_failure_that_arrives_after_the_feeder_finishes():
+    """The ALERT must live where failures are COUNTED, not where admissions are checked.
+
+    A check that only runs before the next admission never fires for the cap-th failure if it
+    lands on the last pending cell, or arrives from an inference/assembly callback after the
+    feeder has drained `pending` — so the operator would never be told. Here every cell is
+    admitted before any fails, so the feeder's loop is over by the time the count is reached.
+    """
+    events: list[str] = []
+
+    class _FailOnFinish(RecordingInputs):
+        """Ingest always succeeds, so the feeder drains `pending` and exits; the failures
+        arrive later, from the inference path.
+        """
+
+    def failing_assemble(handoff, *a, **k):
+        raise RuntimeError("assembly failed")
+
+    with pytest.raises(RuntimeError):
+        _run(
+            _cells(4),
+            inputs=_FailOnFinish(events),
+            look_ahead=4,
+            max_retained_failures=2,
+            attempts_per_cell_in_cluster=1,
+            assemble=failing_assemble,
+        )
+
+
+def test_a_nonpositive_cap_is_refused_before_anything_expensive():
+    """`0 >= max_retained_failures` is true before any cell fails, so a non-positive cap would
+    tear the run down AFTER the ingests were primed and the Ray cluster started. Refused in the
+    runner, not just the flow, because the runner is callable directly.
+    """
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="max_retained_failures must be >= 1"):
+            _run(_cells(2), max_retained_failures=bad)

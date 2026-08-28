@@ -866,6 +866,38 @@ def test_poll_error_keeps_id_registered_for_shutdown(monkeypatch):
     assert ("fr-5", StateType.CANCELLING) in client.cancelled
 
 
+def test_a_nonpositive_failure_cap_is_rejected_before_any_side_effect(wired):
+    """Same block, same reason as `look_ahead`: `0 >= cap` is true before any cell has failed, so
+    a non-positive value stops the feeder immediately — but the runner that used to be the only
+    place checking it is not reached until every live ingest is primed and `ray_cluster` entered.
+    The cheap refusal would arrive after the expensive part.
+    """
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="max_retained_failures must be >= 1"):
+            _run(max_retained_failures=bad)
+        assert wired["ray_kwargs"] is None, "no cluster may be provisioned"
+        assert wired["seq_kwargs"] is None, "the runner must never be entered"
+
+
+def test_the_flow_default_matches_the_runner_default(wired):
+    """The flow ALWAYS forwards its own value, so its default is what production runs.
+
+    Left at 30 while the runner said 100, every campaign launch would have used 30 — the raised
+    cap would have existed only for direct callers, which is nobody in production. Found in review.
+    """
+    import inspect
+
+    from tessera_embeddings.orchestration.runners import sequential_fill as runner_mod
+
+    flow = getattr(mod.fill_zones_sequential_flow, "fn", mod.fill_zones_sequential_flow)
+    flow_default = inspect.signature(flow).parameters["max_retained_failures"].default
+    runner_default = inspect.signature(runner_mod.fill_zones_sequential).parameters["max_retained_failures"].default
+    assert flow_default == runner_default == 100, (
+        f"flow={flow_default} runner={runner_default} — a divergence here is invisible in "
+        "production because the flow always forwards its own value"
+    )
+
+
 def test_negative_look_ahead_rejected_before_any_side_effect(wired):
     """look_ahead < 0 is rejected before triage / priming / `ray up` — a
     deadlock that only manifested after the GPU cluster was provisioned.

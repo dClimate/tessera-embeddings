@@ -654,6 +654,7 @@ def fill_zones_sequential_flow(
     ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
     branch: str | None = None,
     look_ahead: int = 2,
+    max_retained_failures: int = 100,
     attempts_per_cell_in_cluster: int = 2,
     inference_pause_gate: str | None = None,
     ingest_limit_name: str | None = None,
@@ -774,9 +775,15 @@ def fill_zones_sequential_flow(
             the campaign driver's `max_dispatch_rounds`, which counts whole-dispatch
             rounds — see `sequential_fill.fill_zones_sequential`.
         look_ahead: Sizes INGEST width only — the ingest driver runs ``1 + look_ahead``
-            cells at a time, which also sets the priming abort quorum and the runner's
-            retained-failure cap. It no longer bounds in-flight mosaics: peak storage is a
-            cluster's mosaics by design (ADR-011).
+            cells at a time, which also sets the priming abort quorum. It no longer bounds
+            in-flight mosaics (peak storage is a cluster's mosaics by design, ADR-011), and
+            it does not set the retained-failure cap — see ``max_retained_failures``.
+        max_retained_failures: Failed cells holding mosaics off-budget before the feeder stops
+            admitting and the run logs ``FAILURE CAP EXCEEDED``. A ceiling against a SYSTEMATIC
+            fault, not a tripwire for a bad hour, so set it near the roster size: a value a bad
+            hour can reach turns an exogenous failure wave into a fleet-wide teardown. The run
+            alerts and finishes its in-flight work; it does not restart itself, because ending a
+            fill costs its GPU actors and that is a campaign-manager decision.
         cleanup_mosaics: Delete each campaign-ingested mosaic after its cell
             lands (transient input). Ignored for ``ingest=False`` mosaics.
         ingest_settings: Grouped ingest tuning knobs (worker bounds, S2
@@ -813,6 +820,15 @@ def fill_zones_sequential_flow(
         raise ValueError(
             f"attempts_per_cell_in_cluster must be >= 1, got {attempts_per_cell_in_cluster} "
             "(no cell would be attempted)"
+        )
+    # HERE and not only in the runner, for the reason the block exists: `0 >= cap` is true before
+    # any cell has failed, so a non-positive value stops the feeder immediately -- but the runner
+    # is not reached until every live ingest has been primed and `ray_cluster` entered, so the
+    # cheap refusal would arrive after the expensive part.
+    if max_retained_failures < 1:
+        raise ValueError(
+            f"max_retained_failures must be >= 1, got {max_retained_failures} "
+            "(the cap would trip before any cell failed)"
         )
     # Same rule, same reason: on a direct invocation nothing else rejects this until
     # run_inference validates `session_actors`, by which point triage has run, the
@@ -1408,6 +1424,7 @@ def fill_zones_sequential_flow(
                 log=log,
                 inputs=inputs,
                 look_ahead=look_ahead,
+                max_retained_failures=max_retained_failures,
                 attempts_per_cell_in_cluster=attempts_per_cell_in_cluster,
                 fault=fault,
                 # Built here rather than in the runner: the runner is Prefect-free, so the

@@ -253,6 +253,7 @@ def fill_zones_sequential(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     inputs: CellInputs | None = None,
     look_ahead: int = 2,
+    max_retained_failures: int = 100,
     attempts_per_cell_in_cluster: int = 2,
     fault: ArmedFault | None = None,
     paused: Callable[[], bool] | None = None,
@@ -321,8 +322,19 @@ def fill_zones_sequential(
             deterministic failure will burn both, and what actually stops that is the
             driver's no-progress check rather than either count.
         look_ahead: Sizes INGEST width only — the driver runs ``1 + look_ahead`` cells
-            at a time. It bounds neither inference nor assembly. It also sets
-            ``max_retained_failures``, which caps failures rather than throughput.
+            at a time. It bounds neither inference nor assembly, and it does not set
+            ``max_retained_failures``: coupling a failure budget to an ingest width
+            meant neither could be tuned alone.
+        max_retained_failures: How many failed cells may hold mosaics off-budget before the
+            feeder stops admitting. **A ceiling against a systematic fault, not a tripwire for a
+            bad hour** — set it near the roster size, because a value low enough for a bad hour
+            to reach turns an exogenous failure wave into a fleet-wide teardown.
+
+            Reaching it **alerts and continues**: the run logs ``FAILURE CAP EXCEEDED``, stops
+            admitting, and finishes its in-flight work normally. It does NOT tear itself down.
+            Ending a fill spends its Ray cluster and every actor on it — hours to rebuild, and
+            the most expensive thing the campaign owns — so that is a campaign-manager decision,
+            not one a child process takes on its own judgement.
         fault: Supervised-drill hook, consulted where prepared work crosses from the
             feeder to the scheduler. Inert unless the run was armed for the
             supply-withholding fault (:mod:`tessera_embeddings.config.fault_injection`).
@@ -359,6 +371,17 @@ def fill_zones_sequential(
     # are counted, and once they reach this cap the feeder stops admitting new cells (the
     # run then winds down and fails on the recorded failures) — otherwise a systematic
     # failure would retain every cluster's multi-TB mosaic.
+    if max_retained_failures < 1:
+        # `0 >= max_retained_failures` is true before any cell has failed, so a non-positive cap
+        # tears the run down after the ingests have been primed and the Ray cluster started —
+        # expensive, and silent about why. Refused here rather than at the flow, because the
+        # runner is callable directly.
+        msg = f"max_retained_failures must be >= 1, got {max_retained_failures}"
+        raise ValueError(msg)
+    #: One-shot latch so the cap alert is logged once, not once per later failure. NOTHING
+    #: else reads it: a cap trip does not signal teardown and does not abandon queued work.
+    #: See ``_retain_failed_mosaic`` for why ending a fill is a campaign-manager decision.
+    cap_alerted = False
     retained_failed: set[tuple[str, int]] = set()
     #: Cells that LANDED but whose mosaic delete failed. Tracked apart from
     #: ``retained_failed`` because these must not stop the feeder — see ``_leak_mosaic``.
@@ -366,7 +389,6 @@ def fill_zones_sequential(
     #: Cells submitted to the trailing finalizer and not yet assembled. Reported at the
     #: drain, where the backlog can be most of a cluster's cells and take hours.
     assembly_pending = 0
-    max_retained_failures = look_ahead + 2
     finalizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trailing-assembly")
 
     def _leak_mosaic(cell: SequentialCell) -> None:
@@ -399,9 +421,35 @@ def fill_zones_sequential(
         """
         if inputs is None:
             return
+        nonlocal cap_alerted
         with lock:
             retained_failed.add((cell.zone, cell.year))
             n = len(retained_failed)
+            # Alerted from HERE, not from the feeder's admission check: this is the one place
+            # `retained_failed` grows, so it is the only place that sees every path. The cap-th
+            # failure can arrive from an inference or assembly callback after the feeder has
+            # drained `pending`, or on the last pending cell, and a check that only runs before
+            # the NEXT admission never fires for either.
+            newly_alerted = n >= max_retained_failures and not cap_alerted
+            if newly_alerted:
+                cap_alerted = True
+        if newly_alerted:
+            # A DISTINCTIVE, GREPPABLE PREFIX, because there is no alerting transport in this
+            # repo and monitoring matches on the text — the same convention `DATA LOSS` uses.
+            #
+            # This run does NOT tear itself down. Ending a fill costs its Ray cluster and every
+            # actor on it, which is the most expensive thing the campaign owns and takes hours to
+            # rebuild; that is a decision for whoever is watching, not one to take automatically
+            # from inside a child. The fill therefore behaves exactly as before — stops
+            # admitting, drains, retries — and says so loudly enough to be acted on.
+            log.error(
+                "FAILURE CAP EXCEEDED failed=%d/%d — this fill has stopped admitting new cells "
+                "and will finish its in-flight work. It will NOT restart itself. A hard restart "
+                "is a campaign-manager decision: it re-dispatches the remaining roster at the "
+                "cost of this cluster's GPU actors, which take hours to re-gather.",
+                n,
+                max_retained_failures,
+            )
         log.warning(
             "Cell %s-%d failed — mosaic retained for resume, off-budget (%d/%d retained-failure cap)",
             cell.zone,
@@ -566,10 +614,13 @@ def fill_zones_sequential(
                 with lock:
                     n_failed = len(retained_failed)
                 if inputs is not None and n_failed >= max_retained_failures:
+                    # NOT the `FAILURE CAP EXCEEDED` prefix: `_retain_failed_mosaic` already
+                    # emitted that once for this event, and monitoring matches on the text — a
+                    # second line with the same prefix would double-count one cap event.
                     log.error(
-                        "Retained-failure cap reached (%d failed cell(s) holding mosaics off-budget) — "
-                        "stopping the feeder before admitting more ingests; %d cell(s) left unattempted "
-                        "(they stay pending for the next campaign pass). Likely a systematic failure — investigate.",
+                        "Feeder stopping at the failure cap with %d failed cell(s) holding mosaics "
+                        "off-budget; %d cell(s) left unattempted, which stay pending for the next "
+                        "campaign pass. This run finishes its in-flight work normally.",
                         n_failed,
                         len(pending),
                     )
