@@ -17,6 +17,7 @@ Usage in the S1 ingest flow::
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ if TYPE_CHECKING:
 # refresh window — botocore auto-refreshes the underlying token on the next
 # get_frozen_credentials() call, so we never serve a stale one.
 _ICECHUNK_CRED_TTL = timedelta(minutes=15)
+
+_LOG = logging.getLogger(__name__)
 
 #: The same interval for an ASSUMED-ROLE credential, and shorter for a measured reason.
 #:
@@ -312,6 +315,51 @@ def iam_s3_storage_options() -> dict[str, str]:
     return opts
 
 
+#: Last access-key id this PROCESS served to icechunk, so a rotation can be logged as an
+#: event rather than as a poll. Per-process by nature, which is what we want: an assembly
+#: forks sixteen workers and each holds its own icechunk client, so knowing WHICH process
+#: rotated when is exactly the correlation a signature failure needs.
+_last_icechunk_access_key: str | None = None
+
+
+def _record_icechunk_credential(access_key: str, expires_after: datetime) -> None:
+    """Make the credential icechunk is about to use observable.
+
+    **Why this exists.** On 2026-08-28 the fleet took 516 `SignatureDoesNotMatch` refusals
+    from S3 across a 1h45m window -- 494 on the ingest path, 22 on assembly, the latter
+    costing four cells. `SignatureDoesNotMatch` means the secret did not match the access
+    key, which for a role credential is a refresh race rather than a permissions problem.
+    The provider itself proved correct on inspection, so the gap was not a defect to fix but
+    a blind spot: nothing recorded WHICH credential was in play, so a recurrence could only
+    be inferred from the shape of the failure. This closes that.
+
+    **Two levels, deliberately.** The per-invocation line is DEBUG, because icechunk
+    re-invokes the callback every :data:`_ICECHUNK_CRED_TTL` per client and a campaign runs
+    on the order of a hundred clients -- INFO would add a steady drip that says nothing on
+    the overwhelming majority of days. A key-id CHANGE is INFO, because a rotation is the
+    event a signature failure has to be correlated against, and there are only a handful of
+    those per process per run.
+
+    Logs the access-key id, which is an identifier rather than a secret and is what CloudTrail
+    indexes on. **Never the secret key or the session token.**
+    """
+    global _last_icechunk_access_key
+    previous, _last_icechunk_access_key = _last_icechunk_access_key, access_key
+    if previous is not None and previous != access_key:
+        _LOG.info(
+            "icechunk credential ROTATED: %s -> %s, valid until %s",
+            previous,
+            access_key,
+            expires_after.isoformat(timespec="seconds"),
+        )
+    else:
+        _LOG.debug(
+            "icechunk credential served: %s, valid until %s",
+            access_key,
+            expires_after.isoformat(timespec="seconds"),
+        )
+
+
 def iam_icechunk_credentials() -> icechunk.S3StaticCredentials:
     """Resolve IAM credentials as ``S3StaticCredentials`` for icechunk's S3 client.
 
@@ -336,6 +384,7 @@ def iam_icechunk_credentials() -> icechunk.S3StaticCredentials:
     """
     frozen = _resolve_iam_credentials().get_frozen_credentials()
     expires_after = datetime.now(UTC) + _ICECHUNK_CRED_TTL
+    _record_icechunk_credential(frozen.access_key, expires_after)
     return icechunk.S3StaticCredentials(
         access_key_id=frozen.access_key,
         secret_access_key=frozen.secret_key,

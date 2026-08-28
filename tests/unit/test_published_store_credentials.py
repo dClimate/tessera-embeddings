@@ -13,13 +13,16 @@ covered is the arithmetic and the branching, which is where the mistakes actuall
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import icechunk
 import pytest
 from dateutil.tz import tzutc
 
 from tessera_embeddings.providers.aws import credentials as cred
+from tessera_embeddings.providers.aws import credentials as creds_mod
 
 _OURS = "s3://global-tessera-embeddings/global-tessera/global/tessera.icechunk"
 _THEIRS = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
@@ -359,3 +362,74 @@ class TestTheWiringReachesTheStore:
         src = inspect.getsource(ZarrWriter.publish_registry_part)
         assert "plain_zarr_storage_options(uri, get_credentials, s3_region)" in src
         assert "_fs_for(uri)" not in src, "a bare _fs_for falls back to the ambient chain"
+
+
+# ---------------------------------------------------------------------------
+# Making the credential icechunk uses observable.
+# ---------------------------------------------------------------------------
+
+
+class TestIcechunkCredentialVisibility:
+    """Why this exists: on 2026-08-28 the fleet took 516 `SignatureDoesNotMatch` refusals
+    across 1h45m — 494 on ingest, 22 on assembly, the latter costing four cells.
+
+    The provider proved CORRECT on inspection, so the gap was not a defect but a blind spot:
+    nothing recorded which credential was in play, so a recurrence could only be inferred
+    from the shape of the failure rather than correlated against a rotation.
+    """
+
+    @staticmethod
+    def _reset() -> None:
+        creds_mod._last_icechunk_access_key = None
+
+    def test_a_steady_credential_logs_at_debug_not_info(self, caplog) -> None:
+        """The callback fires every TTL per icechunk client, and a campaign runs on the order
+        of a hundred clients — at INFO that is a steady drip saying nothing on almost every day.
+        """
+        self._reset()
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            creds_mod._record_icechunk_credential("ASIAEXAMPLE1", datetime(2026, 8, 28, 12, tzinfo=UTC))
+            creds_mod._record_icechunk_credential("ASIAEXAMPLE1", datetime(2026, 8, 28, 12, tzinfo=UTC))
+        assert [r.levelname for r in caplog.records] == ["DEBUG", "DEBUG"]
+
+    def test_a_rotation_logs_at_info(self, caplog) -> None:
+        """The event a signature failure has to be correlated against, and there are only a
+        handful per process per run — so INFO costs nothing and carries the whole signal.
+        """
+        self._reset()
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            creds_mod._record_icechunk_credential("ASIAOLDKEY", datetime(2026, 8, 28, 12, tzinfo=UTC))
+            creds_mod._record_icechunk_credential("ASIANEWKEY", datetime(2026, 8, 28, 13, tzinfo=UTC))
+        rotations = [r for r in caplog.records if r.levelname == "INFO"]
+        assert len(rotations) == 1
+        assert "ROTATED" in rotations[0].message
+        assert "ASIAOLDKEY" in rotations[0].getMessage()
+        assert "ASIANEWKEY" in rotations[0].getMessage()
+
+    def test_it_never_logs_the_secret_or_the_token(self, caplog) -> None:
+        """The access-key id is an identifier and is what CloudTrail indexes on. The secret
+        key and the session token are credentials and must never reach a log.
+        """
+        self._reset()
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            creds_mod._record_icechunk_credential("ASIAEXAMPLE1", datetime(2026, 8, 28, 12, tzinfo=UTC))
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "ASIAEXAMPLE1" in text
+        for forbidden in ("secret", "session_token", "SECRETVALUE"):
+            assert forbidden not in text
+
+    def test_the_provider_records_what_it_serves(self, caplog, monkeypatch) -> None:
+        """The record must come from the SAME frozen snapshot icechunk is handed, or it would
+        describe a credential other than the one in use — which is the whole point.
+        """
+        self._reset()
+        frozen = SimpleNamespace(access_key="ASIASERVED", secret_key="s", token="t")
+        monkeypatch.setattr(
+            creds_mod,
+            "_resolve_iam_credentials",
+            lambda: SimpleNamespace(get_frozen_credentials=lambda: frozen),
+        )
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            out = creds_mod.iam_icechunk_credentials()
+        assert out.access_key_id == "ASIASERVED"
+        assert "ASIASERVED" in " ".join(r.getMessage() for r in caplog.records)
