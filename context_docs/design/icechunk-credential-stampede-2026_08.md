@@ -1,184 +1,292 @@
-# The 516 signature refusals, and the one credential mechanism both accounts share
+# The 28 August 2026 storage-credential incident
 
-**2026-08-28.** Four zone-years lost their assemblies to `SignatureDoesNotMatch` refusals from
-S3. This records what is established, what is ruled out, what changed as a result, and — because
-three of my own intermediate claims here were wrong — which of them to distrust if you find them
-quoted elsewhere.
+**Audience:** anyone who wants to understand this incident, including people who have never worked
+on this pipeline. Terms are defined where they first appear. Code locations are collected in an
+appendix at the end so the explanation does not depend on them.
 
-**The root cause is not proven.** Read the last section before acting on this.
+**One-paragraph summary.** For about an hour and three quarters on the morning of 28 August 2026,
+Amazon's storage service rejected a large number of our write requests, saying the requests were not
+correctly signed. Four units of work lost their output and had to be redone; no data was corrupted
+and nothing was permanently lost, so the cost was time rather than data. We can prove the problem
+was confined to one of the several software libraries we use to talk to storage, which rules out a
+general fault at Amazon. **We have not established the root cause.** We did find and fix a related
+configuration mistake of our own, and we added logging that will identify the cause if it recurs.
 
-## What happened
+---
 
-Between 07:04:28 and 08:48:21Z the fleet took **516 `SignatureDoesNotMatch` refusals**. Cells
-`47N-2018`, `35N-2017`, `35N-2018` and `47N-2019` lost their assemblies. Staged tiles survived, so
-the cost was wall clock, not data.
+## 1. Background: what has to go right for one write to succeed
 
-**Every refusal was an icechunk chunk write.** 227 events name `icechunk`, `write_chunk` and
-`store::set` — all three counts identical — and the remainder are their continuation lines. In the
-same window, across clients that were all busy throughout:
+The pipeline builds a global dataset. It runs on the order of four thousand small machines at once,
+and they all write their results into cloud storage — Amazon S3.
 
-| client | auth failures |
+Three things in that sentence matter for this incident.
+
+**Credentials.** Nothing writes to S3 without proving who it is. The proof is a set of three short
+strings: an **access key** (a public identifier, safe to write in a log), a **secret key**, and a
+**session token**. They are issued together, they expire after a set period, and they must be used
+as a matching set. Our processes fetch fresh ones automatically as the old ones lapse.
+
+**Request signing.** Every request to S3 is signed: the sender combines the request with its secret
+key to produce a signature, and Amazon recomputes that signature to check it. If the two do not
+match, Amazon rejects the request with the error **`SignatureDoesNotMatch`**. Importantly, that
+error does not mean "you lack permission" — it means the arithmetic did not agree, which for
+automatically-issued credentials usually means the three strings were not a matching set.
+
+**Several libraries, one destination.** Different parts of the pipeline reach S3 through different
+software libraries. Four are relevant here: **Icechunk** (the library that stores the actual
+dataset), and **boto3**, **s3fs** and **GDAL** (used for reading source imagery and other
+supporting files). They all talk to the same storage service, in the same processes, at the same
+time — which turns out to be the key to interpreting what happened.
+
+---
+
+## 2. What happened
+
+Between 07:04 and 08:49 UTC, the fleet received **516 `SignatureDoesNotMatch` rejections**. Four
+units of work — each one a region-and-year combination — lost their output and will be redone
+automatically. Their inputs were untouched, so the loss was compute time.
+
+### The decisive observation
+
+**Every one of the 516 rejections came from Icechunk, and specifically from Icechunk writing data.**
+None came from the other three libraries, which were all working hard throughout the same period.
+
+| library | rejections in the window |
 |---|---:|
-| icechunk | **516** |
+| **Icechunk** (dataset writes) | **516** |
 | boto3 | 0 |
-| s3fs / fsspec | 0 |
-| GDAL | 1 (incidental) |
+| s3fs | 0 |
+| GDAL | 1 (unrelated, incidental) |
 
-That asymmetry is what rules out a service-side signing fault. An AWS problem in us-west-2 would
-not spare boto3, s3fs and GDAL while hitting one client's writes.
+This is what rules out a general fault at Amazon. A signing or validation problem in Amazon's
+storage service would not single out one library's writes while sparing three other libraries
+running in the same processes against the same service.
 
-**And these absences rule out expiry, throttling and clock skew**, all checked over the same
-window: `SlowDown` 0, `ThrottlingException` 0, `ExpiredToken` 0, `TokenRefreshRequired` 0,
-`InvalidClientTokenId` 0, `RequestTimeTooSkewed` 0, `InvalidAccessKeyId` 0.
+### What else was ruled out
 
-So: valid unexpired credentials, correct key ids, no clock complaint, no throttling, one single
-error type, 272 distinct Fargate tasks, self-resolving.
+Four other explanations were checked directly and all came back at zero for the same period.
 
-## Why two accounts failed at once
+| explanation | how it would appear | count |
+|---|---|---:|
+| Our credentials had expired | `ExpiredToken`, `TokenRefreshRequired` | 0 |
+| We used a credential Amazon did not recognise | `InvalidAccessKeyId`, `InvalidClientTokenId` | 0 |
+| Our machines' clocks had drifted | `RequestTimeTooSkewed` | 0 |
+| Amazon was rate-limiting us | `SlowDown`, `ThrottlingException` | 0 |
+| — | **`SignatureDoesNotMatch`** | **516** |
 
-This was the most puzzling part of the incident — the refusals span **two buckets in two AWS
-accounts**, one written with the task role and one with an assumed cross-account role. A
-coincidence across two independent credential sources would be remarkable.
+So: valid, unexpired credentials; identifiers Amazon recognised; no complaint about our clocks; no
+rate-limiting; a single error type; spread across 272 separate machines; and it stopped on its own.
 
-It is not a coincidence, because **both destinations are written by the same code path.**
-`GlobalAssembler.assemble_global` opens one store — ours or the partner-owned published one,
-decided only by `store_path` — and hands the session to `write_year_shards`, which forks
-`n_workers` spawned children. The credential *source* differs per destination; the credential
-*delivery mechanism* is one piece of icechunk code shared by both.
+---
 
-So a defect in that mechanism produces simultaneous failures in two accounts with no AWS-side
-event required. That is the strongest structural fact the incident yields, and it is what makes
-the next section worth reading rather than a curiosity.
+## 3. Why two separate accounts failed at the same moment
 
-## The mechanism: the callback is invoked per request, forever
+This was the most puzzling feature of the incident, and the part most likely to mislead.
 
-icechunk issue [#2077](https://github.com/earth-mover/icechunk/issues/2077), open since
-2026-04-15: `PythonCredentialsFetcher<S3StaticCredentials>` holds `initial: Option<CredType>` as a
-one-shot cache, and its `get()` takes `&self` rather than `&mut self`, so **it can never be
-refilled once the first credential expires.** From that moment every S3 operation falls through to
-the Python callback. The reporter measured **301,000 credential requests in four hours** from one
-workload. An icechunk maintainer replied that this "sounds like intended behavior", so it is
-disputed as a bug and any mitigation is ours.
+The failures spanned **two storage buckets in two different AWS accounts** — one of ours, and one
+belonging to a delivery partner. Those two destinations use *completely different credentials*, from
+different sources. Two independent credential systems failing in the same window would be a
+remarkable coincidence.
 
-`scatter_initial_credentials=True` asks icechunk to populate that `initial` cache eagerly, so a
-deserialised child starts with a credential instead of calling back from its first request.
+It is not a coincidence, because **the same piece of our code writes to both.** One function opens
+whichever destination it has been pointed at and writes to it; only the target address and the
+credentials differ. The credential *source* differs per destination. The credential *delivery
+mechanism* — the Icechunk code that asks for a credential and attaches it to each request — is one
+shared piece of software used by both.
 
-## What was actually wrong in our code, and what changed
+That means a defect in the shared mechanism explains simultaneous failures in two accounts with no
+Amazon-side event required. This is the strongest structural conclusion the incident supports, and
+it is why the next section is worth reading.
 
-**Our two fork paths disagreed.** Both pickle an icechunk session to spawned children:
+---
 
-| path | store | flag before | flag after |
+## 4. What we found in the storage library
+
+Icechunk lets an application supply a small function that hands over a fresh credential whenever one
+is needed. Icechunk is supposed to hold on to the credential and reuse it until it expires.
+
+There is an open bug report against Icechunk — [issue #2077][2077], filed 15 April 2026 — showing
+that this holding-on works **only once**. Because of how the caching code is written, the stored
+credential can never be replaced after the first one expires. From that moment onward, Icechunk asks
+the application for a credential **on every single storage request**, for the remaining life of the
+process. The person who filed the report measured **301,000 credential requests in four hours** from
+a single workload.
+
+An Icechunk maintainer replied that this "sounds like intended behavior," so it is disputed as a bug
+and any mitigation has to be ours.
+
+Icechunk does offer a setting that reduces the damage: it can be told to fetch a credential
+immediately and keep it, so that copies of the connection sent to worker processes start with a
+credential in hand rather than asking for one on their first request.
+
+[2077]: https://github.com/earth-mover/icechunk/issues/2077
+
+---
+
+## 5. What was wrong on our side, and what we changed
+
+The final stage of the pipeline assembles finished results and writes them into the dataset. It does
+this by splitting the work across sixteen separate worker processes, each of which receives a copy
+of the storage connection.
+
+**We have two code paths that do this**, one for each of two kinds of destination. They should have
+been configured identically. They were not:
+
+| code path | destination | setting before | setting after |
 |---|---|---|---|
-| `assemble()` → `open_or_create_repo` | standalone zone-year store | **True** | True |
-| `assemble_global()` → `open_global_repo` | **the global / published store** | *unset → False* | **True** |
+| assembling into a standalone store | an interim dataset | **on** | on |
+| assembling into the main dataset | **the published dataset** | **off** | **on** |
 
-The campaign runs the second one. `open_global_repo` did not accept the parameter at all, so the
-sixteen children of every global assembly deserialised with an empty credential cache.
+The second path is the one the production campaign actually uses, and it was the one with the
+setting switched off — so each of its sixteen worker processes started with no credential and then
+asked for one on every storage request for its entire life.
 
-The fix adds the parameter to `open_global_repo` and sets it at that single call site. **It is set
-unconditionally, not guarded on whether the caller supplied a credential callback** — `assemble()`
-carried such a guard and it was wrong in the same direction: `_create_storage` falls back to
-`_default_credentials_provider` when the argument is None, so the guard disabled the scatter on
-exactly the fallback path, while `_create_storage` already omits the option when no provider exists
-at all. Both call sites now state True. It is
-**opt-in per call site, not defaulted**, because the flag has a cost (next section) and the ten
-other `open_global_repo` callers read or commit in-process and never pickle anything — for them an
-eagerly cached credential buys nothing.
+The setting is now switched on for both paths. It is switched on **explicitly at each of these two
+places rather than made the default**, because it has a real cost, explained next, and about ten
+other places in the code open the same dataset without ever copying the connection to a worker; for
+those, switching it on would pay the cost for no benefit.
 
-> **Distrust this if you see it quoted:** I stated during the investigation that "no caller ever
-> sets this flag." That was wrong. I had audited `open_global_repo`'s callers and missed that
-> assembly's sibling path uses `open_or_create_repo`, where it was already set and already
-> correct. The real defect was an inconsistency between two paths, not a blanket omission.
+> **A correction, in case you see the earlier version quoted.** While investigating I stated that
+> *no* part of our code switched this setting on. That was wrong — the first of the two paths above
+> always had. I had checked the callers of one function and missed that a sibling path reaches the
+> same setting through a differently-named one. The real defect was an inconsistency between two
+> nearly identical paths, which is a sharper finding than the one I reported.
 
-## The cost of the flag, and why it is set per call site
+### The cost of the setting, and why it is applied per location
 
-From icechunk's own docstring: "credentials obtained are stored, and **they can be sent over the
-network if you pickle the session/repo**." With the flag set, the live secret access key and
-session token sit inside the pickled `Storage`. Where that pickle travels is therefore the whole
-question:
+Icechunk's own documentation warns that with this setting on, the credential is stored inside the
+connection object — and "they can be sent over the network if you pickle the session/repo."
+("Pickling" is Python's term for turning an object into bytes so it can be sent somewhere else.) In
+other words, switching this on puts a live secret key and session token inside something that gets
+copied elsewhere. Where that copy travels is the whole question:
 
-| transport | exposure |
+| how the copy travels | exposure |
 |---|---|
-| `run_forked` — `multiprocessing.get_context("spawn")` + `ProcessPoolExecutor` | a local OS pipe to a child of this process, on this host, whose parent already holds the credential in memory. **No new exposure.** |
-| a Dask or Ray worker over the network | a live secret in flight, and those object stores can spill to disk under memory pressure — a credential at rest |
+| **to a worker process on the same machine** (what both changed paths do) | The copy goes through an operating-system pipe to a child of the same process, on the same machine, which already holds the credential in memory. **No new exposure.** |
+| to a worker on another machine, over the network | A live secret in transit — and those systems can also spill data to disk under memory pressure, leaving a credential written down. |
 
-Both changed paths are the first kind. The blanket default is the tempting version and it is the
-one that would put a secret on the wire for paths that gain nothing.
+Both changed paths are the first kind. Making the setting a global default is the tempting shortcut
+and it is the one that would put secrets on the network for paths that gain nothing from it.
 
-## Two more corrections to my own reasoning
+---
 
-**1. It cannot cause credentials to expire.** This was the specific worry that prompted the
-research. icechunk's docstring: "After the initial set of credentials has expired, the cached
-value is no longer used." The fallback to the live callback is unconditional and expiry-aware, so
-a long session cannot be pinned to a stale credential.
+## 6. What this change does and does not do
 
-**2. But it therefore only covers one TTL.** Our `expires_after` is 15 minutes, so a three-hour
-assembly gets roughly 15 minutes of relief and 2h45m of the original per-request behaviour.
-Because `initial` can never be refilled (#2077), a longer TTL delays the onset without preventing
-it. **This is a consistency fix and a reduction in callback volume — it is not a fix for a
-long-running session,** and I described it as one before reading the docstring properly.
+Stated plainly, because the fix is easy to over-read.
 
-## Why the stampede is NOT the leading explanation
+- **It does not risk credentials going stale.** This was the specific concern raised. Icechunk's
+  documentation is explicit that once the stored credential expires, the stored copy is no longer
+  used and the live fetch takes over. The fallback is automatic and expiry-aware.
+- **It only helps for one credential lifetime.** Ours last fifteen minutes, and an assembly runs for
+  about three hours. So the setting covers roughly fifteen minutes and the remaining two and three
+  quarter hours behave as before. Because of the Icechunk bug above, giving credentials a longer life
+  would delay this rather than prevent it. **This is a consistency fix and a reduction in wasted
+  work — it is not a cure for a long-running job**, and I described it as one before reading the
+  documentation carefully.
+- **It is not the established cause of the incident.** See the next section.
 
-Ranking this hypothesis first was an overreach, for a reason worth recording.
+---
 
-The reporter's 301,000 figure came from a callback that made a network request per call. **Ours
-does not.** `_resolve_iam_credentials` is `lru_cache(maxsize=1)` and `get_frozen_credentials()` is
-a lock and a return on an already-resolved botocore credential, with refresh happening in the
-background. Our per-request cost is a GIL attach, not an HTTP round trip — and **GIL contention
-produces latency, not malformed signatures.**
+## 7. Why the "too many credential requests" theory is not the leading explanation
 
-Three candidates remain, none proven:
+Ranking this first was an overreach on my part, and the reason is worth recording.
 
-1. **A defect in icechunk's Rust S3 signing under this concurrency.** icechunk's internal async
-   concurrency defaults to 256 per repo, across sixteen forks per cell, across ten cells. This
-   campaign applies more pressure to that code than the reporter's workload did.
-2. **A race in the credential handoff**, which the instrumentation below discriminates directly.
-3. **A service-side fault** — weakest, for the client-asymmetry reason above.
+The 301,000 figure in the Icechunk bug report came from an application whose credential function
+made a network call every time it was asked. **Ours does not.** Ours reads an already-fetched
+credential out of a small in-memory cache, with refreshes happening quietly in the background. So
+the cost of being asked repeatedly is, for us, acquiring a lock inside the process — not a network
+round trip. **Lock contention makes things slow; it does not produce incorrectly signed requests.**
 
-## A note on the instrumentation's own concurrency
+Three candidate explanations remain, and none is proven:
 
-Review found three defects in the first version of the credential boundary, all one shape: **it
-tried to reason about ORDER using values that do not carry it.**
+1. **A defect in Icechunk's own request-signing code under heavy parallel use.** Icechunk allows a
+   large number of storage operations in flight at once, multiplied by sixteen worker processes,
+   multiplied by ten simultaneous regions. This campaign puts far more pressure on that code than
+   the workload in the bug report did.
+2. **A race in the handoff of credentials** between the part that refreshes them and the part that
+   attaches them to requests. The new logging (next section) tests this one directly.
+3. **A transient fault on Amazon's side.** Weakest, for the reason in section 2 — but see the
+   follow-up reading below, which has since strengthened it.
 
-The boundary keeps per-process state so it can log a credential the first time it is used and stay
-quiet afterwards. The first version compared the incoming access key against the last one recorded;
-the second compared expiries as a generation marker. Both are wrong, because **acquisition happens
-before the boundary is reached and outside its lock.** A thread can freeze the old credential, be
-descheduled past a refresh, and arrive after a faster thread recorded the new one — carrying an old
-key with a *later* expiry, since the expiry is computed after the freeze. Either version then
-announced a rotation backwards and a second one forwards: three rotation records for one real
-rotation, in the exact signal an incident has to be lined up against.
+### A later reading that shifts the ranking
 
-The resolution was to stop deciding order. The state is now the set of keys this process has
-already announced, so a late callback carrying a superseded key is simply not novel and says
-nothing. Ordering of the emitted records — which can still interleave, because the logging is
-deliberately outside the lock — is carried by a sequence number stamped while the lock is held.
+At 16:20 UTC the same day, the campaign was running **five** simultaneous assemblies rather than the
+four it had during the incident, and — because of a separate performance fix — each was using
+sixteen worker processes rather than five. Storage write concurrency was therefore **higher than
+during the incident**. Across the following hour and 1,041,266 log lines there were **zero**
+`SignatureDoesNotMatch` rejections.
 
-Serialising acquisition under the lock was the suggested alternative and was declined:
-`get_frozen_credentials()` takes botocore's lock and can block on a refresh that makes an STS call,
-so it would put every icechunk request in the process behind a network round trip — the same
-serialisation the design exists to avoid.
+That is real evidence against explanation 1 and for explanation 3. One hour is only one hour, so it
+is not conclusive, but it is the first independent measurement that separates the candidates.
 
-## What would settle it
+---
 
-The instrumentation shipped alongside this change (`_serve_icechunk_credential`) records the
-access-key id and expiry at the single point where every icechunk credential is constructed:
-first serve at INFO, rotations at INFO, steady re-serves at DEBUG. On the next occurrence it
-answers the one question this evidence cannot:
+## 8. A note on the new logging's own concurrency
 
-* **One steady key across the failure** → the credential never changed, no retry could ever have
-  helped, and the cause is upstream of our credential path entirely. Candidate 1.
-* **A rotation seconds before the first refusal** → candidate 2, and a retry on a *fresh* session
-  becomes arguable — with jitter, because sixteen forks sharing a fixed backoff synchronise their
-  bursts.
+Worth recording because the same mistake was made three times, in a small piece of code, and review
+caught all three.
 
-Until one of those is observed, do not add retries here. A retry premised on "assembly writes have
-no retry" was drafted during this investigation and **withdrawn**: `StorageRetriesSettings(max_tries=10,
-initial_backoff_ms=200, max_backoff_ms=30_000)` plus `operation_attempt_timeout_ms=180_000` already
-wrap every chunk write, and the refusals exhausted that ladder rather than arriving unprotected.
+The new logging keeps a small note of which credentials a process has already reported, so that a
+credential is announced once rather than on every request. The first version compared the incoming
+credential against the last one recorded. The second compared expiry times, on the theory that a
+later expiry meant a newer credential.
 
-## Version notes
+**Both were wrong, for the same reason: nothing available at that point in the code records when a
+credential was obtained.** A thread can pick up the old credential, be paused by the operating
+system while another thread fetches and records a newer one, and then arrive carrying the old
+credential *with a later expiry stamped on it* — because the expiry is calculated after the
+credential is picked up. Either version would then report a credential change backwards and another
+one forwards: three change records for one real change, corrupting exactly the signal the logging
+exists to provide.
 
-We run icechunk **2.1.1**. The only later release is **2.1.2** (2026-07-29) and its notes carry no
-credential-fetcher change, so upgrading does not address #2077, which has no linked fix PR.
+The fix was to stop trying to establish order. The code now simply records which credentials a
+process has already announced; a late arrival carrying an already-announced credential says nothing.
+Ordering of the log lines themselves is handled separately by a counter stamped at the moment the
+note is updated.
+
+The reviewer's alternative — hold a lock across the credential fetch — was declined: that fetch can
+block on a network call, so holding a lock across it would put every storage request in the process
+behind a network round trip. That is a worse problem than the one being fixed.
+
+---
+
+## 9. What would settle the root cause
+
+Alongside the fix, every process now records **which credential it is using**: the access key (a
+public identifier, and the one Amazon's own audit log indexes on), the expiry, the process id, and a
+sequence number. The first credential a process uses and every subsequent change are recorded at
+normal log level; routine repeats are recorded at debug level so they do not flood the logs. The
+secret key and session token are **never** logged.
+
+If this recurs, that record answers the one question the current evidence cannot — whether the
+credential in use changed at the moment of failure:
+
+- **One unchanged credential across the failure** means no credential change was involved, no retry
+  could ever have helped, and the cause lies inside the storage library. Candidate 1.
+- **A change moments before the first rejection** implicates the handoff. Candidate 2 — and only
+  then does adding a retry make sense, with randomised delays, because sixteen workers sharing a
+  fixed delay would retry in synchronised bursts.
+
+Until one of those is observed, **do not add retries here.** A retry was drafted during this
+investigation on the belief that these writes had none, and **withdrawn**: they already retry up to
+ten times with increasing delays, and these rejections exhausted that allowance rather than arriving
+unprotected. A second layer of retries on top would have added delay and hidden the signal.
+
+---
+
+## Appendix A: where this lives in the code
+
+| thing described above | where |
+|---|---|
+| the single place every storage credential is built and logged | `providers/aws/credentials.py`, `_serve_icechunk_credential` |
+| the two credential sources (our account; the partner's) | same file: `iam_icechunk_credentials`, `AssumedRoleIcechunkCredentials` |
+| the setting discussed in section 5 | `scatter_initial_credentials`, threaded through `storage/zarr_store.py` |
+| the two assembly paths that copy a connection to workers | `inference/assembly.py`, `assemble` and `assemble_global` |
+| the sixteen-worker split | `storage/shard_writer.py`, `run_forked` and `write_year_shards` |
+| the existing retry allowance | `storage/zarr_store.py`, `StorageRetriesSettings` |
+
+## Appendix B: versions
+
+We run Icechunk **2.1.1**. The only later release is **2.1.2** (29 July 2026), and its release notes
+contain no change to the credential-caching code, so upgrading does not address issue #2077. That
+issue has no linked fix.
