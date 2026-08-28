@@ -81,10 +81,24 @@ def open_global_repo(
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     region: str | None = None,
     max_concurrent_requests: int | None = None,
+    scatter_initial_credentials: bool = False,
 ) -> icechunk.Repository:
-    """Open the global-store repo with the global config layered on."""
+    """Open the global-store repo with the global config layered on.
+
+    ``scatter_initial_credentials`` belongs to the CALLER because only the caller knows whether
+    it will pickle this repo. Set it on a site that forks (see
+    :meth:`~tessera_embeddings.inference.assembly.GlobalAssembler.assemble_global`, whose
+    ``write_year_shards`` ships the session to spawned workers); leave it off on the many sites
+    that just read or commit in-process, where an eagerly cached credential buys nothing and the
+    live secret would sit in a pickle for no reason.
+    """
     return icechunk.Repository.open(
-        _create_storage(store_path, get_credentials=get_credentials, region=region),
+        _create_storage(
+            store_path,
+            get_credentials=get_credentials,
+            region=region,
+            scatter_initial_credentials=scatter_initial_credentials,
+        ),
         config=global_store_config(max_concurrent_requests),
     )
 

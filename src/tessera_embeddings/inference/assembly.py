@@ -2502,6 +2502,16 @@ class ZarrWriter:
             get_credentials=get_credentials,
             region=s3_region,
             max_concurrent_requests=per_worker_cap,
+            # This session is PICKLED to `n_workers` spawned children by `write_year_shards`
+            # below. Without this, each child's icechunk deserialises with no credential and
+            # calls back per S3 request for the life of the fork (icechunk#2077: the fetcher's
+            # `initial` cache takes `&self`, so it is never refilled). `assemble()` already
+            # sets this on the standalone-store path; this is the same fork shape writing the
+            # GLOBAL store, and the two disagreed. The pickle carries a live secret, which is
+            # why it is opt-in per call site — here the transport is a local spawn pipe to a
+            # child of this process, not the network. Buys ~one credential TTL, not the whole
+            # assembly: icechunk stops using the cached value once it expires.
+            scatter_initial_credentials=get_credentials is not None,
         )
 
         # One readonly probe of the zone group: year index, shard pitch, variables.
