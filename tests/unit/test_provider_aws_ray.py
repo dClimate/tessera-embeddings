@@ -1406,7 +1406,7 @@ class TestA10gRungs:
         }
         assert residual == []
 
-    def test_an_uncapped_pair_of_fallback_cards_goes_ENTIRELY_to_the_L4(self) -> None:
+    def test_an_uncapped_pair_of_fallback_cards_goes_entirely_to_the_l4(self) -> None:
         """The operational trap, and the reason the fallback opens ONE card and not both.
 
         Companion to `test_a_three_card_ladder_puts_all_three_arms_on_one_cluster`, which

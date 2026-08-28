@@ -343,7 +343,8 @@ class TestCardCeilings:
 
     def test_the_longest_matching_card_name_wins(self) -> None:
         """`"NVIDIA L40S"` contains `"L4"`, and resolving it to the L4 entry would
-        understate the card's ceiling by 3x and its bandwidth by 2.9x."""
+        understate the card's ceiling by 3x and its bandwidth by 2.9x.
+        """
         from tessera_embeddings.inference.profiling import _card_ceiling
 
         assert _card_ceiling("NVIDIA L40S")[0] == "L40S"
@@ -358,7 +359,8 @@ class TestCardCeilings:
 
     def test_the_verified_bandwidth_figures(self) -> None:
         """AWS publishes no GPU memory bandwidth at all, so these came from the
-        vendors' datasheets and are the load-bearing half of the table."""
+        vendors' datasheets and are the load-bearing half of the table.
+        """
         from tessera_embeddings.inference.profiling import _CARD_CEILINGS
 
         assert _CARD_CEILINGS["L40S"][1] == 864.0
@@ -370,7 +372,8 @@ class TestCardCeilings:
         figure of 35.0, which cannot happen — so the table carries the vendor's
         quoted dense figure instead, and the fraction is an index, not a
         utilisation. Pinned so a future 'correction' back to the halved values
-        has to argue with this."""
+        has to argue with this.
+        """
         from tessera_embeddings.inference.profiling import _CARD_CEILINGS
 
         assert _CARD_CEILINGS["A10G"][0] == 70.0
