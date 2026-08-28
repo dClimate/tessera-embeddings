@@ -64,9 +64,11 @@ storage service would not single out one library's writes while sparing three ot
 running in the same processes against the same service.
 
 > **How the count was reached, and two numbers withdrawn.** 227 is the number of log lines naming a
-> refused chunk write (`write_chunk`, and `store::set`, which agree exactly), across **272 separate
-> machines**. 805 lines mention the error in total, because each failure emits several lines of
-> context and this log group sometimes writes a line twice.
+> refused chunk write (`write_chunk`, and `store::set`, which agree exactly), and those came from
+> **210 separate machines**. Counting more broadly, 805 lines mention the error at all — each
+> failure emits several lines of context, and this log group sometimes writes a line twice — and
+> those span 272 machines. **The two figures pair with different populations**, so quoting 227
+> against 272, as an earlier version did, is arithmetically impossible.
 > **An earlier version of this document said 516 rejections. That figure was the non-event
 > remainder — the context lines — not a count of failures.**
 > It also credited GDAL with one incidental rejection. **There were none:** the line matched a
@@ -99,11 +101,12 @@ belonging to a delivery partner. Those two destinations use *completely differen
 different sources. Two independent credential systems failing in the same window would be a
 remarkable coincidence.
 
-It is not a coincidence, because **the same piece of our code writes to both.** One function opens
-whichever destination it has been pointed at and writes to it; only the target address and the
-credentials differ. The credential *source* differs per destination. The credential *delivery
-mechanism* — the Icechunk code that asks for a credential and attaches it to each request — is one
-shared piece of software used by both.
+It is not a coincidence, because **both destinations are written through the same layer.** They are
+reached by different application code — the standalone store by one assembly entry point, the
+published store by another — but both hand the work to the same storage library, and both obtain
+their credentials through the same single function in our code, which serves whichever role the
+destination requires. The credential *source* differs per destination; the credential *delivery
+mechanism* does not.
 
 That means a defect in the shared mechanism explains simultaneous failures in two accounts with no
 Amazon-side event required. This is the strongest structural conclusion the incident supports, and
@@ -157,8 +160,10 @@ been configured identically. They were not:
 | assembling into the main dataset | **the published dataset** | **off** | **on** |
 
 The second path is the one the production campaign actually uses, and it was the one with the
-setting switched off — so each of its sixteen worker processes started with no credential and then
-asked for one on every storage request for its entire life.
+setting switched off — so each of its sixteen worker processes started with no cached credential and
+had to fetch one before it could write. **How often they then kept asking is the open question of
+section 4**, not something measured here; what is certain is that the fetch a freshly deserialised
+session makes was not being avoided.
 
 The setting is now switched on for both paths. It is switched on **explicitly at each of these two
 places rather than made the default**, because it has a real cost, explained next, and about ten
@@ -303,8 +308,10 @@ secret key and session token are **never** logged.
 If this recurs, that record answers the one question the current evidence cannot — whether the
 credential in use changed at the moment of failure:
 
-- **One unchanged credential across the failure** means no credential change was involved, no retry
-  could ever have helped, and the cause lies inside the storage library. Candidate 1.
+- **One unchanged credential across the failure** rules out the handoff — candidate 2 — and means no
+  retry could have helped. It does **not** choose between the other two: a signing or
+  canonicalisation defect in the library and a transient fault on Amazon's side both survive an
+  unchanged key, and separating those needs the request ids taken to AWS support.
 - **A different credential appearing moments before the first rejection** implicates the handoff.
   Candidate 2 — and only
   then does adding a retry make sense, with randomised delays, because sixteen workers sharing a
