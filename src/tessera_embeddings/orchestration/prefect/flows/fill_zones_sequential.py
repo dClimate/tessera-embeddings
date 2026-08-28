@@ -783,13 +783,12 @@ def fill_zones_sequential_flow(
             in-flight mosaics (peak storage is a cluster's mosaics by design, ADR-011), and
             since 2026-08-27 it no longer sets the retained-failure cap either — see
             ``max_retained_failures``.
-        max_retained_failures: Failed cells holding mosaics off-budget before the feeder
-            gives up and ends the run IMMEDIATELY. A ceiling against a SYSTEMATIC fault,
-            not a tripwire for a bad hour. At the old ``look_ahead + 2`` it was 7, and one
-            provider outage on 2026-08-27 put nine of ten clusters over it — converting an
-            exogenous failure wave into a fleet-wide teardown. Failure waves against remote
-            archives are a fact of life; what the campaign needs from them is fast recovery,
-            not a hair trigger.
+        max_retained_failures: Failed cells holding mosaics off-budget before the feeder stops
+            admitting and the run logs ``FAILURE CAP EXCEEDED``. A ceiling against a SYSTEMATIC
+            fault, not a tripwire for a bad hour: at the old ``look_ahead + 2`` it was 7, and one
+            provider outage on 2026-08-27 put nine of ten clusters over it. The run alerts and
+            finishes its in-flight work; it does not restart itself, because ending a fill costs
+            its GPU actors and that is a campaign-manager decision.
         cleanup_mosaics: Delete each campaign-ingested mosaic after its cell
             lands (transient input). Ignored for ``ingest=False`` mosaics.
         ingest_settings: Grouped ingest tuning knobs (worker bounds, S2

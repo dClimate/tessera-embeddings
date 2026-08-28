@@ -1156,8 +1156,10 @@ def test_the_cap_is_not_derived_from_look_ahead():
     import inspect
 
     params = inspect.signature(mod.fill_zones_sequential).parameters
-    assert params["max_retained_failures"].default == 30, (
-        "the default is a deliberate ceiling against a SYSTEMATIC fault, not a bad hour"
+    assert params["max_retained_failures"].default == 100, (
+        "a ceiling against a SYSTEMATIC fault only. Losing a fill costs its Ray cluster and every "
+        "actor on it, so this must not be reachable by a bad few hours: on 2026-08-27 a cap of 7 "
+        "put nine of ten clusters over the line on ONE provider outage"
     )
     events: list[str] = []
     inputs = FailingWaitInputs(events)
@@ -1168,82 +1170,30 @@ def test_the_cap_is_not_derived_from_look_ahead():
     assert waited == 6, f"the cap must be the one passed, not look_ahead + 2; admitted {waited}"
 
 
-def test_a_cap_trip_drops_the_assembly_queue_but_waits_for_the_running_one():
-    """Both halves, because they pull in opposite directions and review caught me taking only one.
+def test_exceeding_the_cap_alerts_but_does_not_tear_the_run_down():
+    """The cap ALERTS; it does not restart anything.
 
-    DROP THE QUEUE: that is where the hours are, and those cells are being handed back anyway.
-
-    WAIT FOR THE RUNNING ONE: it may be mid-commit. Returning without it lets that thread
-    publish and then delete a mosaic after the flow has torn down its inputs — potentially
-    after the driver has already re-dispatched the same cell — racing publication against
-    cleanup and breaking the single-finalizer invariant that keeps two commits off one zone
-    group. My first version asserted the opposite (that the run returns while an assembly is
-    still blocked) and was wrong.
+    Ending a fill costs its Ray cluster and every actor on it — hours to rebuild, and the most
+    expensive thing the campaign owns. An earlier version of this change made a cap trip exit
+    immediately without draining; that is withdrawn. A child process must not spend the fleet's
+    actors on its own judgement, so it says so loudly and a human decides.
     """
-    entered: list[int] = []
-    release = threading.Event()
-    gate = threading.Event()
-
-    def blocking_assemble(handoff, *a, **k):
-        entered.append(1)
-        if len(entered) == 1:
-            gate.set()
-            release.wait(timeout=30)  # still running when the cap trips
-        return _assemble()(handoff, *a, **k)
-
-    class _FailAfter(RecordingInputs):
-        """Five cells succeed so a real assembly QUEUE forms behind the blocked one, then
-        every later cell fails so the cap can trip with that queue outstanding.
-        """
-
-        def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
-            with self._lock:
-                self.events.append(f"wait:{zone}")
-                n = len([e for e in self.events if e.startswith("wait:")])
-            if n > 5:
-                raise RuntimeError(f"ingest failed for {zone}-{year}")
-
     events: list[str] = []
-    box: list[BaseException] = []
-    done = threading.Event()
-
-    def go():
-        try:
-            _run(
-                _cells(8),
-                inputs=_FailAfter(events),
-                look_ahead=1,
-                max_retained_failures=2,
-                attempts_per_cell_in_cluster=1,
-                assemble=blocking_assemble,
-            )
-        except BaseException as exc:
-            box.append(exc)
-        finally:
-            done.set()
-
-    threading.Thread(target=go, daemon=True).start()
-    gate.wait(timeout=10)  # an assembly is running
-    assert not done.is_set(), "the run must NOT return while an assembly is still committing"
-    release.set()
-    assert done.wait(timeout=20), "the run must finish once the running assembly completes"
-    assert box and isinstance(box[0], RuntimeError)
-    # NOT asserted: exactly how many queued assemblies were cancelled. `cancel_futures` only
-    # cancels futures the executor has not started, so the count depends on how far the single
-    # finalizer thread got before the cap tripped — real scheduling, not our contract. The
-    # contract worth pinning is the SAFETY one above: the run does not return while an assembly
-    # is committing. The queue drop is a throughput property and `shutdown(cancel_futures=True)`
-    # is the whole of its implementation.
+    inputs = FailingWaitInputs(events)
+    with pytest.raises(RuntimeError, match="cell"):
+        _run(_cells(6), inputs=inputs, look_ahead=1, max_retained_failures=2, attempts_per_cell_in_cluster=1)
+    # The feeder still stops admitting at the cap — that half is unchanged.
+    waited = len([e for e in events if e.startswith("wait:")])
+    assert waited == 2, f"the feeder must stop admitting at the cap of 2, admitted {waited}"
 
 
-def test_the_cap_trips_on_a_failure_that_arrives_after_the_feeder_finishes():
-    """The trip must live where failures are COUNTED, not where admissions are checked.
+def test_the_cap_alert_fires_for_a_failure_that_arrives_after_the_feeder_finishes():
+    """The ALERT must live where failures are COUNTED, not where admissions are checked.
 
     A check that only runs before the next admission never fires for the cap-th failure if it
     lands on the last pending cell, or arrives from an inference/assembly callback after the
-    feeder has drained `pending` — and the run then drains and retries exactly as if the cap
-    did not exist. Here every cell is admitted before any fails, so the feeder's loop is over
-    by the time the count is reached.
+    feeder has drained `pending` — so the operator would never be told. Here every cell is
+    admitted before any fails, so the feeder's loop is over by the time the count is reached.
     """
     events: list[str] = []
 
