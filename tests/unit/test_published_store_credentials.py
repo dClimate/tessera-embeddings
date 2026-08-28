@@ -467,7 +467,7 @@ class TestIcechunkCredentialVisibility:
         self._reset()
         with caplog.at_level(logging.INFO, logger=creds_mod.__name__):
             self._serve("task-role", "ASIAPARENT")
-        assert "this worker" not in caplog.records[0].getMessage()
+        assert "child process" not in caplog.records[0].getMessage()
 
         caplog.clear()
         self._reset()
@@ -475,7 +475,10 @@ class TestIcechunkCredentialVisibility:
         with caplog.at_level(logging.INFO, logger=creds_mod.__name__):
             self._serve("task-role", "ASIACHILD")
         msg = caplog.records[0].getMessage()
-        assert "FIRST in this worker" in msg and "CHANGE" in msg and "not a start" in msg
+        assert "FIRST in this child process" in msg and "not a start" in msg
+        # Phrased as a possibility: being a multiprocessing child (a Dask nanny worker is one)
+        # does not prove the storage scattered, so the line must not assert inheritance.
+        assert "if it inherited" in msg
         assert "ASIACHILD" in msg
 
     def test_the_bookkeeping_is_locked_and_the_log_is_not(self, monkeypatch) -> None:

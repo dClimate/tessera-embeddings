@@ -376,9 +376,10 @@ def _serve_icechunk_credential(
     Levels: a process's first credential and each further distinct one are INFO, the events a
     signature failure is lined up against. Routine re-serves are DEBUG, because icechunk asks
     per request once its cached credential lapses (icechunk#2077) and a campaign runs on the
-    order of a hundred clients. A spawned worker inherits a scattered credential without asking,
-    so its first call lands only after that credential lapses; its line says so rather than
-    implying a start, since that is the one thing a reader cannot be expected to know.
+    order of a hundred clients. Where a caller scatters, a spawned worker inherits a
+    credential without asking and its first call lands only after that lapses -- so a child's line
+    names that possibility rather than implying a start. Phrased as a possibility because being a
+    multiprocessing child does not prove the storage scattered.
     """
     with _ANNOUNCE_LOCK:  # bookkeeping only: logging in here would serialise every request
         announced = _announced_access_keys.setdefault(source, set())
@@ -393,11 +394,14 @@ def _serve_icechunk_credential(
     elif multiprocessing.parent_process() is None:
         level, label = logging.INFO, "FIRST"
     else:
+        # `parent_process()` says only that this is a multiprocessing child -- a Dask nanny's
+        # worker is one too, and its storage may never have scattered. So the line names the
+        # possibility rather than asserting inheritance, which would be wrong on those paths.
         level, label = (
             logging.INFO,
             (
-                "FIRST in this worker -- an inherited credential is announced by the parent, "
-                "so this is probably a CHANGE and not a start"
+                "FIRST in this child process (if it inherited a scattered credential the parent "
+                "announced that one, making this a change and not a start)"
             ),
         )
     _LOG.log(

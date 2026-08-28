@@ -42,25 +42,36 @@ time — which turns out to be the key to interpreting what happened.
 
 ## 2. What happened
 
-Between 07:04 and 08:49 UTC, the fleet received **516 `SignatureDoesNotMatch` rejections**. Four
+Between 07:04 and 08:49 UTC, the fleet took **227 refused writes**, each reported as
+`SignatureDoesNotMatch`. Four
 units of work — each one a region-and-year combination — lost their output and will be redone
 automatically. Their inputs were untouched, so the loss was compute time.
 
 ### The decisive observation
 
-**Every one of the 516 rejections came from Icechunk, and specifically from Icechunk writing data.**
+**Every one came from Icechunk, and specifically from Icechunk writing data.**
 None came from the other three libraries, which were all working hard throughout the same period.
 
 | library | rejections in the window |
 |---|---:|
-| **Icechunk** (dataset writes) | **516** |
+| **Icechunk** (dataset writes) | **227** |
 | boto3 | 0 |
 | s3fs | 0 |
-| GDAL | 1 (unrelated, incidental) |
+| GDAL | 0 |
 
 This is what rules out a general fault at Amazon. A signing or validation problem in Amazon's
 storage service would not single out one library's writes while sparing three other libraries
 running in the same processes against the same service.
+
+> **How the count was reached, and two numbers withdrawn.** 227 is the number of log lines naming a
+> refused chunk write (`write_chunk`, and `store::set`, which agree exactly), across **272 separate
+> machines**. 805 lines mention the error in total, because each failure emits several lines of
+> context and this log group sometimes writes a line twice.
+> **An earlier version of this document said 516 rejections. That figure was the non-event
+> remainder — the context lines — not a count of failures.**
+> It also credited GDAL with one incidental rejection. **There were none:** the line matched a
+> search for "gdal" only because that substring appears by chance inside an S3 extended request id
+> (`...HoEH7GtwggdalSnjlC4Q...`). The line was itself an Icechunk chunk write.
 
 ### What else was ruled out
 
@@ -72,7 +83,7 @@ Four other explanations were checked directly and all came back at zero for the 
 | We used a credential Amazon did not recognise | `InvalidAccessKeyId`, `InvalidClientTokenId` | 0 |
 | Our machines' clocks had drifted | `RequestTimeTooSkewed` | 0 |
 | Amazon was rate-limiting us | `SlowDown`, `ThrottlingException` | 0 |
-| — | **`SignatureDoesNotMatch`** | **516** |
+| — | **`SignatureDoesNotMatch`** | **227** |
 
 So: valid, unexpired credentials; identifiers Amazon recognised; no complaint about our clocks; no
 rate-limiting; a single error type; spread across 272 separate machines; and it stopped on its own.
@@ -106,11 +117,19 @@ Icechunk lets an application supply a small function that hands over a fresh cre
 is needed. Icechunk is supposed to hold on to the credential and reuse it until it expires.
 
 There is an open bug report against Icechunk — [issue #2077][2077], filed 15 April 2026 — showing
-that this holding-on works **only once**. Because of how the caching code is written, the stored
-credential can never be replaced after the first one expires. From that moment onward, Icechunk asks
-the application for a credential **on every single storage request**, for the remaining life of the
-process. The person who filed the report measured **301,000 credential requests in four hours** from
-a single workload.
+that this holding-on works **only once**: because of how the caching code is written, the stored
+credential can never be replaced after the first one expires. The report describes Icechunk then
+asking the application for a credential on **every storage request** for the remaining life of the
+process, and its author measured **301,000 credential requests in four hours** from a single
+workload.
+
+> **We have not verified that frequency for our own workload, and it is disputed.** Review here
+> argued that Icechunk's S3 client caches the credential between requests, which would make the
+> re-fetching happen per *deserialisation* of a session — often, in a workload that ships a session
+> per task, but not once per request inside one long-lived worker like ours. Settling it needs a
+> reading from inside a running assembly, which the instrumentation shipped alongside this change
+> can now provide. **What the flag does is not in doubt** — it removes the credential fetch a freshly
+> deserialised session would otherwise make — only how much that saves.
 
 An Icechunk maintainer replied that this "sounds like intended behavior," so it is disputed as a bug
 and any mitigation has to be ours.
@@ -177,9 +196,11 @@ Stated plainly, because the fix is easy to over-read.
 - **It does not risk credentials going stale.** This was the specific concern raised. Icechunk's
   documentation is explicit that once the stored credential expires, the stored copy is no longer
   used and the live fetch takes over. The fallback is automatic and expiry-aware.
-- **It only helps for one credential lifetime.** Ours last fifteen minutes, and an assembly runs for
-  about three hours. So the setting covers roughly fifteen minutes and the remaining two and three
-  quarter hours behave as before. Because of the Icechunk bug above, giving credentials a longer life
+- **It only helps for one credential lifetime, and that is shorter than it sounds.** The task-role
+  path promises fifteen minutes; **the published-store path promises five** (its interval is
+  deliberately short so that a callback lands inside the credential library's mandatory-refresh
+  window). Against an assembly of about three and a half hours, that is roughly 2% of the run for
+  the destination this incident actually concerned. Because of the Icechunk bug above, giving credentials a longer life
   would delay this rather than prevent it. **This is a consistency fix and a reduction in wasted
   work — it is not a cure for a long-running job**, and I described it as one before reading the
   documentation carefully.
@@ -192,10 +213,15 @@ Stated plainly, because the fix is easy to over-read.
 Ranking this first was an overreach on my part, and the reason is worth recording.
 
 The 301,000 figure in the Icechunk bug report came from an application whose credential function
-made a network call every time it was asked. **Ours does not.** Ours reads an already-fetched
-credential out of a small in-memory cache, with refreshes happening quietly in the background. So
-the cost of being asked repeatedly is, for us, acquiring a lock inside the process — not a network
-round trip. **Lock contention makes things slow; it does not produce incorrectly signed requests.**
+made a network call every time it was asked. **Ours usually does not** — it reads an
+already-fetched credential out of a small in-memory cache, with refreshes happening quietly in the
+background, so the cost of being asked repeatedly is normally acquiring a lock inside the process
+rather than a network round trip. **Two exceptions matter and an earlier version of this document
+missed them:** the very first call in a process performs the role assumption, and a call landing in
+the credential library's mandatory-refresh window blocks on a real token-service request. Those are
+a handful of calls per process, not one per storage operation. **Lock contention makes things slow;
+it does not produce incorrectly signed requests**, which is the reason this is not the leading
+explanation.
 
 Three candidate explanations remain, and none is proven:
 
