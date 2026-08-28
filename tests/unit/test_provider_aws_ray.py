@@ -855,40 +855,6 @@ class TestGpuWorkerLadderApplication:
             shipped["available_node_types"], sort_keys=True
         )
 
-    def test_both_wider_rungs_ship_unreachable(self) -> None:
-        """Merging this change must not alter a campaign in flight."""
-        node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
-        wider = {"g6e.2xlarge", "g6e.12xlarge"}
-        found = {
-            cfg["node_config"]["InstanceType"]: cfg["max_workers"]
-            for cfg in node_types.values()
-            if cfg["node_config"]["InstanceType"] in wider
-        }
-        assert found == dict.fromkeys(wider, 0), f"a wider rung ships reachable: {found}"
-
-    def test_the_wider_rungs_declare_resources_matching_the_catalogue(self) -> None:
-        """REPLACES `test_the_wider_rungs_declare_no_resources`.
-
-        That test asserted the absence of a block that Ray's schema REQUIRES, on the
-        reasoning that autodetection would supply it. Autodetection is wrapped in a
-        bare `except Exception` that only warns, so a denied or throttled
-        `DescribeInstanceTypes` left these rungs unfilled and failed `validate_config`
-        for the entire cluster. Declaring the values and checking them against the
-        vendor catalogue gets the safety without the bootstrap dependency.
-        """
-        node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
-        catalogue = {t["InstanceType"]: t for t in _ec2_instance_types()}
-        seen = 0
-        for name, cfg in node_types.items():
-            itype = cfg["node_config"]["InstanceType"]
-            if itype not in ("g6e.2xlarge", "g6e.12xlarge"):
-                continue
-            entry = catalogue[itype]
-            assert cfg["resources"]["CPU"] == entry["VCpuInfo"]["DefaultVCpus"], name
-            assert cfg["resources"]["GPU"] == entry["GpuInfo"]["Gpus"][0]["Count"], name
-            seen += 1
-        assert seen == 2
-
     def test_applies_counts_to_the_named_rungs(self) -> None:
         cfg = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())
         _apply_gpu_worker_ladder(cfg, "g6e.xlarge:16,g6e.12xlarge:4")
@@ -1196,22 +1162,37 @@ class TestEc2CatalogueArithmetic:
         assert len(gpus) == 8, sorted(gpus)
         assert {(g["Name"], g["MemoryInfo"]["SizeInMiB"]) for g in gpus.values()} == {("L40S", 45776)}
 
-    def test_the_l40s_is_44_7_gib_not_46_gb(self) -> None:
-        """The denominator of every "% of the card" figure we quote.
+    @pytest.mark.parametrize(
+        ("instance_type", "card", "mib"),
+        [("g6e.xlarge", "L40S", 45776), ("g6.2xlarge", "L4", 22888), ("g5.2xlarge", "A10G", 22888)],
+    )
+    def test_each_card_carries_the_vram_the_catalogue_states(self, instance_type: str, card: str, mib: int) -> None:
+        """Named in MiB because that is the unit `describe-instance-types` reports.
 
-        45,776 MiB is 44.7 GiB and 48.0 GB decimal. It was once recorded as "46 GB"
-        — the MiB figure rounded and relabelled — which understates the card by ~3%
-        in GiB terms and, more importantly, made the L4/A10G at 22,888 MiB look like
-        "barely half" when the real ratio is 1.94x.
+        Relabelling a MiB figure as GB is exactly how the L40S came to be recorded as
+        "46 GB" — see the corrections register. (`nvidia-smi memory.total` reports a
+        THIRD figure, 46,068 MiB; the catalogue is the source used throughout.)
         """
-        card_mib = next(
-            t["GpuInfo"]["Gpus"][0]["MemoryInfo"]["SizeInMiB"]
-            for t in _ec2_instance_types()
-            if t["InstanceType"] == "g6e.xlarge"
-        )
-        assert card_mib == 45776
-        assert round(card_mib / 1024, 1) == 44.7
-        assert round(card_mib * 1024 * 1024 / 1e9, 1) == 48.0
+        gpu = {t["InstanceType"]: t for t in _ec2_instance_types()}[instance_type]["GpuInfo"]["Gpus"][0]
+        assert (gpu["Name"], gpu["MemoryInfo"]["SizeInMiB"]) == (card, mib)
+
+    def test_the_l40s_carries_exactly_twice_the_vram_of_the_24gb_cards(self) -> None:
+        """The ratio, in one place, because it was wrong in two documents.
+
+        45,776 / 22,888 is exactly 2.0. A "1.94x" stood in the saturation profile and
+        the corrections register until it was traced to arithmetic on ROUNDED GiB
+        values — a ratio has to be taken on one source's numbers. The same figure is
+        the denominator of every "% of the card" we quote, and it makes the L4 and
+        A10G exactly half the L40S rather than "barely half".
+        """
+        cat = {t["InstanceType"]: t for t in _ec2_instance_types()}
+        mib = {
+            k: cat[k]["GpuInfo"]["Gpus"][0]["MemoryInfo"]["SizeInMiB"]
+            for k in ("g6e.xlarge", "g6.2xlarge", "g5.2xlarge")
+        }
+        assert mib["g6e.xlarge"] == 2 * mib["g6.2xlarge"] == 2 * mib["g5.2xlarge"]
+        assert round(mib["g6e.xlarge"] / 1024, 2) == 44.70
+        assert round(mib["g6e.xlarge"] * 1024**2 / 1e9, 1) == 48.0
 
     def test_vcpu_per_gpu_ranks_the_candidate_sizes(self) -> None:
         """`g6e.2xlarge` is the most quota-efficient rung after `g6e.xlarge`.
@@ -1277,6 +1258,42 @@ class TestEc2CatalogueArithmetic:
             checked += 1
         assert checked == 10, "every node type in the template must declare resources"
 
+    @pytest.mark.parametrize(
+        ("family", "expected"),
+        [
+            ("g6e.", {"g6e.xlarge", "g6e.2xlarge", "g6e.12xlarge"}),
+            ("g6.", {"g6.2xlarge", "g6.4xlarge", "g6.12xlarge"}),
+            ("g5.", {"g5.2xlarge", "g5.4xlarge"}),
+        ],
+    )
+    def test_each_family_offers_exactly_its_shipped_rungs_and_only_g6e_xlarge_is_reachable(
+        self, family: str, expected: set[str]
+    ) -> None:
+        """Which sizes each card family offers, and that merging cannot move a fleet.
+
+        `g6e.xlarge` is the campaign's production rung and carries a real ceiling; every
+        other rung in every family ships at `max_workers: 0`, which is the sole mechanism
+        that makes one unreachable — Ray's node-type scorer never reads capacity errors.
+
+        Replaces three near-identical per-family tests. Their resource-block assertions
+        are dropped rather than repeated: `test_declared_resources_match_the_ec2_catalogue`
+        already checks EVERY declared block against the vendor catalogue, and
+        `test_every_node_type_declares_its_resources` guarantees every type has one.
+        """
+        node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
+        # ON-DEMAND rungs only. `g6e.xlarge` is offered by two node types — the
+        # production rung and the spot one — so keying by instance type alone lets
+        # the spot entry's `max_workers: 0` overwrite the real ceiling.
+        by_type = {
+            cfg["node_config"]["InstanceType"]: cfg
+            for name, cfg in node_types.items()
+            if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX) and cfg["node_config"]["InstanceType"].startswith(family)
+        }
+        assert set(by_type) == expected
+        for itype, cfg in by_type.items():
+            want = 500 if itype == "g6e.xlarge" else 0
+            assert cfg["max_workers"] == want, f"{itype} ships max_workers={cfg['max_workers']}"
+
     def test_every_node_type_declares_its_resources(self) -> None:
         """A missing block makes `ray up` depend on ONE EC2 API call succeeding.
 
@@ -1305,24 +1322,6 @@ class TestL4Rungs:
     `g6.xlarge`, `g6.2xlarge` and `g5.xlarge` launched. Moving between `g6e` sizes
     therefore does not reach a different pool — the pool is the card.
     """
-
-    def test_both_l4_rungs_ship_unreachable_with_catalogue_true_resources(self) -> None:
-        node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
-        l4 = {
-            cfg["node_config"]["InstanceType"]: cfg
-            for cfg in node_types.values()
-            if cfg["node_config"]["InstanceType"].startswith("g6.")
-        }
-        assert set(l4) == {"g6.2xlarge", "g6.4xlarge", "g6.12xlarge"}
-        catalogue = {t["InstanceType"]: t for t in _ec2_instance_types()}
-        for itype, cfg in l4.items():
-            assert cfg["max_workers"] == 0, itype
-            # DECLARED, not autodetected: Ray's schema requires the block and its
-            # autofill failure is only a warning, so an omission makes every rung's
-            # bootstrap depend on one EC2 call. Checked against the vendor catalogue.
-            entry = catalogue[itype]
-            assert cfg["resources"]["CPU"] == entry["VCpuInfo"]["DefaultVCpus"], itype
-            assert cfg["resources"]["GPU"] == entry["GpuInfo"]["Gpus"][0]["Count"], itype
 
     def test_g6_xlarge_is_deliberately_not_offered(self) -> None:
         """16 GiB of host RAM against a measured ~17.7 GB per-actor requirement.
@@ -1362,21 +1361,6 @@ class TestL4Rungs:
 
         assert shape("g6.12xlarge") == shape("g6e.12xlarge") == (12, 4)
 
-    def test_the_l4_is_half_the_l40s_and_both_figures_are_named_in_mib(self) -> None:
-        """22,888 MiB vs 45,776 MiB — exactly 2x, and the ratio that matters.
-
-        Quoted in MiB because that is what both `nvidia-smi` and
-        `describe-instance-types` report, and because relabelling the MiB figure as
-        GB is how the L40S came to be recorded as "46 GB".
-        """
-        cat = {t["InstanceType"]: t for t in _ec2_instance_types()}
-        l4 = cat["g6.2xlarge"]["GpuInfo"]["Gpus"][0]
-        l40s = cat["g6e.2xlarge"]["GpuInfo"]["Gpus"][0]
-        assert (l4["Name"], l4["MemoryInfo"]["SizeInMiB"]) == ("L4", 22888)
-        assert (l40s["Name"], l40s["MemoryInfo"]["SizeInMiB"]) == ("L40S", 45776)
-        assert l40s["MemoryInfo"]["SizeInMiB"] == 2 * l4["MemoryInfo"]["SizeInMiB"]
-        assert round(l4["MemoryInfo"]["SizeInMiB"] / 1024, 1) == 22.4
-
     def test_a_ladder_can_select_the_l4_pair_and_closes_the_l40s_rungs(self) -> None:
         """The all-L4 experiment shape: both arms on one card, only host sharing differs."""
         from ray.autoscaler._private.resource_demand_scheduler import get_nodes_for
@@ -1404,38 +1388,6 @@ class TestA10gRungs:
     right the older card outruns the newer one. These rungs are how that gets
     measured instead of argued.
     """
-
-    def test_the_a10g_rungs_ship_unreachable_with_catalogue_true_resources(self) -> None:
-        node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
-        a10g = {
-            cfg["node_config"]["InstanceType"]: cfg
-            for cfg in node_types.values()
-            if cfg["node_config"]["InstanceType"].startswith("g5.")
-        }
-        assert set(a10g) == {"g5.2xlarge", "g5.4xlarge"}
-        catalogue = {t["InstanceType"]: t for t in _ec2_instance_types()}
-        for itype, cfg in a10g.items():
-            assert cfg["max_workers"] == 0, itype
-            # DECLARED, not autodetected: Ray's schema requires the block and its
-            # autofill failure is only a warning, so an omission makes every rung's
-            # bootstrap depend on one EC2 call. Checked against the vendor catalogue.
-            entry = catalogue[itype]
-            assert cfg["resources"]["CPU"] == entry["VCpuInfo"]["DefaultVCpus"], itype
-            assert cfg["resources"]["GPU"] == entry["GpuInfo"]["Gpus"][0]["Count"], itype
-
-    def test_the_a10g_carries_the_same_vram_as_the_l4(self) -> None:
-        """22,888 MiB on both, so VRAM cannot be what separates them.
-
-        It is worth asserting because it is the thing that makes the pair a clean
-        experiment: same VRAM, same host-RAM shape at the `2xlarge`, opposite
-        ordering on bandwidth and compute. Anything the run finds between them is
-        about the card's throughput, not about fit.
-        """
-        cat = {t["InstanceType"]: t for t in _ec2_instance_types()}
-        a10g = cat["g5.2xlarge"]["GpuInfo"]["Gpus"][0]
-        l4 = cat["g6.2xlarge"]["GpuInfo"]["Gpus"][0]
-        assert (a10g["Name"], a10g["MemoryInfo"]["SizeInMiB"]) == ("A10G", 22888)
-        assert a10g["MemoryInfo"]["SizeInMiB"] == l4["MemoryInfo"]["SizeInMiB"]
 
     def test_the_2xlarge_of_every_card_family_is_the_ram_matched_shape(self) -> None:
         """8 vCPU / 32 GiB / 1 GPU on all three, so only the card differs.

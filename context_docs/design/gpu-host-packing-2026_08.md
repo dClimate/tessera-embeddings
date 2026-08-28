@@ -156,9 +156,11 @@ figure rounded and relabelled. The README was right; the design doc has been cor
 place.
 
 It matters twice. It is the denominator of every "% of the card" figure, and it changes a
-conclusion about the smaller cards: the L4 and A10G hold 22,888 MiB = 22.4 GiB, so this card
-is **1.94×** them, not "barely half again". The campaign's only prior VRAM reading — 97% of
-the card — is therefore ~43.4 GiB against 22.4 GiB available on a 24 GB-class card. For such
+conclusion about the smaller cards: the L4 and A10G hold 22,888 MiB = 22.35 GiB, so this
+card is **exactly 2.0×** them, not "barely half again". (A "1.94×" stood here until
+2026-08-28; it was arithmetic on rounded GiB values, and a ratio must be taken on one
+source's numbers.) The campaign's only prior VRAM reading — 97% of the card — is therefore
+~43.4 GiB against 22.35 GiB available on a 24 GB-class card. For such
 a card to be viable, that reading would have to be overstating the true requirement by more
 than 2×; and it IS an overstatement, because nvidia-smi reports the caching allocator's
 *reserved* pool rather than what live tensors needed. How large the overstatement is, is
