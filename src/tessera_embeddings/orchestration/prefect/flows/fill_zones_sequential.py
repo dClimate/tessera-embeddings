@@ -1310,6 +1310,7 @@ def fill_zones_sequential_flow(
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
             on_actor_retire=terminator,
+            on_fleet_demand=publish_fleet_mix,
             retire_idle_actors=final,
         )
 

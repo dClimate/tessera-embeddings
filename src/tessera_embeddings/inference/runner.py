@@ -185,6 +185,15 @@ def run_inference(
     # what the scheduler will go on to do.
     batch_size = config.actor_request_batch_size
     first_batch = config.initial_actor_request(num_actors)
+    # BEFORE the first batch, not with it. The scheduler republishes this every round,
+    # but it does not start until `wait_for_actors` returns — and under a total primary
+    # drought no first-batch actor ever initializes, so that wait runs to its (hours
+    # long) timeout and the run dies having never once asked for the fallback. Which is
+    # precisely the starvation this exists to prevent. Nothing is live yet and all the
+    # work is outstanding, so the whole target is the honest ask.
+    if on_fleet_demand is not None:
+        with contextlib.suppress(Exception):
+            on_fleet_demand(num_actors)
     actors = actor_factory(first_batch)
     if batch_size > 0 and first_batch < num_actors:
         log.info(

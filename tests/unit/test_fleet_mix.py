@@ -36,6 +36,24 @@ def _vcpu(asks: dict[str, int]) -> int:
     return sum(n * fleet_mix.RUNGS_BY_INSTANCE_TYPE[t].vcpu_per_node for t, n in asks.items())
 
 
+def _config():
+    """A minimal InferenceConfig; only the actor-request knobs matter here."""
+    from tessera_embeddings.config.inference import InferenceConfig
+    from tessera_embeddings.config.time_windows import parse_time_window
+
+    return InferenceConfig(
+        time_window=parse_time_window("December 2024"),
+        checkpoint_path="s3://ckpt/model.pt",
+        actor_request_batch_size=4,
+    )
+
+
+def _log():
+    import logging
+
+    return logging.getLogger("test-fleet-mix")
+
+
 class TestTheCampaignShape:
     """The four states the running campaign actually moves between."""
 
@@ -294,3 +312,74 @@ class TestRefusals:
 
     def test_no_open_rung_asks_for_nothing(self) -> None:
         assert fleet_mix.fleet_asks(want_gpus=250, live_by_instance_type={}, ceilings={}) == {}
+
+
+class TestTheDemandIsPublishedBeforeTheFleetIsWaitedOn:
+    """The initial ask must precede `wait_for_actors`, not follow it.
+
+    The scheduler republishes the demand every round, but it does not start until
+    `wait_for_actors` returns. Under a TOTAL primary-capacity drought no first-batch
+    actor ever initializes, so that wait runs to its hours-long timeout and the run
+    dies having never once asked for the fallback — reproducing exactly the starvation
+    this machinery exists to prevent. Found in review of PR #159.
+    """
+
+    @staticmethod
+    def _run(published: list[int], *, wait_raises: bool) -> None:
+        from unittest.mock import patch
+
+        from tessera_embeddings.inference import runner as runner_mod
+
+        def _wait(*_args: object, **_kwargs: object) -> tuple:
+            if wait_raises:
+                raise RuntimeError("Only 0 / 8 actors initialized within 600s")
+            return ([], [], set())
+
+        with (
+            patch.object(runner_mod, "InferenceActor") as actor,
+            patch.object(runner_mod, "wait_for_actors", side_effect=_wait),
+            patch.object(runner_mod, "ZarrWriter"),
+        ):
+            actor.options.return_value.remote.return_value = object()
+            with pytest.raises(RuntimeError):
+                runner_mod.run_inference(
+                    8,
+                    _config(),
+                    [],
+                    "m",
+                    "s",
+                    "r",
+                    0.0,
+                    _log(),
+                    on_fleet_demand=published.append,
+                )
+
+    def test_a_drought_that_kills_the_actor_wait_has_still_asked_for_the_fallback(self) -> None:
+        published: list[int] = []
+        self._run(published, wait_raises=True)
+        assert published == [8], "the whole target: nothing is live and all work is outstanding"
+
+    def test_every_session_that_gets_a_terminator_also_gets_the_publisher(self) -> None:
+        """Structural, because both reviewers missed the same call site independently.
+
+        `fill_zones_sequential` starts inference from two places — the shared stream and
+        the per-cell retry. Wiring only the first leaves a retry cold-starting on Ray's
+        primary-only greedy choice, which starves exactly as before. The invariant is
+        "wherever a fleet is driven, its shape is published", so assert it over the call
+        sites rather than over one of them.
+        """
+        import ast
+        import inspect
+
+        from tessera_embeddings.orchestration.prefect.flows import fill_zones_sequential as mod
+
+        tree = ast.parse(inspect.getsource(mod))
+        sites = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and any(kw.arg == "on_actor_retire" for kw in node.keywords)
+        ]
+        assert len(sites) >= 2, "expected the shared session and the per-cell retry"
+        for site in sites:
+            passed = {kw.arg for kw in site.keywords}
+            assert "on_fleet_demand" in passed, f"line {site.lineno} drives a fleet without publishing its shape"
