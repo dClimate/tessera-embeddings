@@ -294,15 +294,16 @@ is in this table because it is the most consequential value in it.
 | pause between leg tries | **30 s, doubling to a 2-minute ceiling** (`leg_retry_backoff_s`) | Deliberately short. A retry picks up from the dates already committed, so it costs only the work actually lost, and the campaign's pace depends on legs landing — a long pause leaves a GPU fleet waiting on a mosaic. The pause exists only to tell a momentary refusal from a permanent one, which does not take minutes; a failure no retry can fix waits not at all (§8) |
 | Earth Search page size | 100 | Set per provider. This catalogue refuses some (area, window) pairs at 250 and answers the same query at 100 — see the note below |
 
-The commit gate and the ingest gate are both **Prefect global concurrency limits**, because
-clusters are separate flow runs on separate machines and only a server-side gate can bound them
-together. **They are provisioned differently, and conflating them sends an operator hunting a problem that
-is not there:**
+The remaining gates are **Prefect global concurrency limits**, because clusters are separate flow
+runs on separate machines and only a server-side gate can bound them together.
+
+**There used to be a third, `tessera-global-commits`, and it is gone** — see
+`commit-gate-removal-2026_08.md`. Nothing bounds committers now, and no pre-launch provisioning
+step is needed for one.
 
 | gate | who creates it | if it is absent |
 |---|---|---|
 | `tessera-global-ingests` | **the campaign, at start.** `run_global_campaign` upserts it from `max_parallel_ingest`, so that parameter is the single place the number lives | nothing to fix. Absent is the expected state on an account no campaign has run on |
-| `tessera-global-commits` | **a human, before launch:** `register_work_pool.py --commit-limit N` | fills fail closed — `prefect.concurrency` does not auto-create it |
 | `tessera-global-inference` | **the campaign, at start**, always at 1 | inference simply runs. It is a pause flag, not a cap, so its absence removes a lever rather than a limit |
 
 So the ingest gate needs no pre-provisioning and **should not be created by hand**: a hand-set
@@ -460,9 +461,9 @@ answer — cost-model §4.
    cells provisions all 2,500 actors, so the two are matched exactly, with no slack.
    Read the applied value in the account before relying on either; the request history lags
    amendments to an open case.
-2. **The commit gate provisioned** — `tessera-global-commits`, via
-   `register_work_pool.py --commit-limit N`. Fills fail closed without it. The ingest gate is
-   NOT a pre-launch item: the campaign upserts it from `max_parallel_ingest` at start (§3).
+2. *(Removed.)* The commit gate used to be provisioned here. Commits are ungated now
+   (`commit-gate-removal-2026_08.md`), and the ingest gate was never a pre-launch item: the
+   campaign upserts it from `max_parallel_ingest` at start (§3).
 3. **Coverage/land mask built** for all 120 zones, and its `registry_sha256` frozen. A
    mask rebuild mid-campaign invalidates every completed zone-year's fingerprint.
 4. **Store seeded** — all zone groups, all 9 year slots, `geoemb:model` and `checkpoint_id`

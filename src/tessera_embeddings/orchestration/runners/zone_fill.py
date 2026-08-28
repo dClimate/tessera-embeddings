@@ -4,9 +4,8 @@ The orchestration-facing composition for the global campaign (ADR-008,
 implementation plan W5): enumerate the zone's shard-aligned tile grid against
 the **campaign land-mask coverage bitmap**, run Ray inference over the live
 tiles, assemble the staged tiles into whole shards of the pre-seeded zone
-group, and tag the landed commit. The Prefect/AWS wiring (work queues, the
-fleet-wide commit gate as a Prefect global concurrency limit, credentials)
-lives downstream — this module ships the plain callable it wraps.
+group, and tag the landed commit. The Prefect/AWS wiring (work queues,
+credentials) lives downstream — this module ships the plain callable it wraps.
 
 Contracts (all caller-owned):
 
@@ -27,9 +26,6 @@ Contracts (all caller-owned):
   group's array shape and shard size are the grid authority. Nothing is
   created or resized here (D1).
 - **Ingest mosaics**: cover the zone grid exactly; a mismatch is a loud error.
-- **Commit gating**: ``gate`` bounds concurrent commits within this process;
-  fleet-wide gating across machines is the orchestrator's job (D6, ≤4-8
-  simultaneous committers).
 - **One fill per zone at a time**: concurrent fills of *different* zones
   commit to disjoint groups and rebase cleanly, but two concurrent fills of
   the *same* zone (different years) both rewrite that group's
@@ -78,7 +74,7 @@ from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
-from tessera_embeddings.storage.shard_writer import CommitGate, read_years_complete, shard_pitch
+from tessera_embeddings.storage.shard_writer import read_years_complete, shard_pitch
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, time_index_of
 from tessera_embeddings.storage.zone_grid import (
     PIXEL_M,
@@ -357,7 +353,6 @@ def fill_zone_year(
     num_actors: int,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     run_id: str | None = None,
-    gate: CommitGate | None = None,
     n_assembly_workers: int | None = None,
     s3_concurrency: int | None = None,
     cleanup_staging: bool = True,
@@ -392,7 +387,6 @@ def fill_zone_year(
         run_id: Run identifier; a fresh one is minted when omitted. Reuse a
             prior run's id to resume it (staged tiles are skipped, the year
             index is overwritten idempotently).
-        gate: Optional in-process commit gate shared across concurrent fills.
         n_assembly_workers: Assembly worker-process count; defaults to
             ``AssemblyConfig`` sizing from the live-tile count.
         s3_concurrency: This fill's slice of the fleet S3-PUT budget, forwarded to
@@ -425,7 +419,6 @@ def fill_zone_year(
         num_actors=num_actors,
         log=log,
         run_id=run_id,
-        gate=gate,
         get_credentials=get_credentials,
         s3_region=s3_region,
         on_actor_retire=on_actor_retire,
@@ -437,7 +430,6 @@ def fill_zone_year(
         registry_root=registry_root,
         optical_min_obs=config.optical_min_obs,
         log=log,
-        gate=gate,
         n_assembly_workers=n_assembly_workers,
         s3_concurrency=s3_concurrency,
         cleanup_staging=cleanup_staging,
@@ -527,7 +519,6 @@ def plan_zone_inference(
     config: InferenceConfig,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     run_id: str | None = None,
-    gate: CommitGate | None = None,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
 ) -> ZonePlan:
@@ -693,7 +684,7 @@ def plan_zone_inference(
         # A no-data cell (all-ocean) still lands: years_complete + provenance
         # in one commit, then the zone-year tag. Terminal here — no staging
         # exists, so there is nothing for the assembly phase to do.
-        snapshot = mark_zone_year_empty(repo, zone, year, run_id=run_id, gate=gate)
+        snapshot = mark_zone_year_empty(repo, zone, year, run_id=run_id)
         tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
         result = {**summary, "empty": True, "snapshot_id": snapshot, "tag": tag, "elapsed_sec": time.monotonic() - t0}
         log.info("Zone %s year %d has no land under the mask — marked complete empty (%s)", zone, year, result["tag"])
@@ -806,7 +797,6 @@ def infer_zone_year(
     num_actors: int,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     run_id: str | None = None,
-    gate: CommitGate | None = None,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
     on_actor_retire: Callable[[str], None] | None = None,
@@ -836,7 +826,6 @@ def infer_zone_year(
         config=config,
         log=log,
         run_id=run_id,
-        gate=gate,
         get_credentials=get_credentials,
         s3_region=s3_region,
     )
@@ -939,7 +928,6 @@ def assemble_zone_year(
     # staged tile — must still be able to state it.
     optical_min_obs: int | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
-    gate: CommitGate | None = None,
     n_assembly_workers: int | None = None,
     s3_concurrency: int | None = None,
     cleanup_staging: bool = True,
@@ -1002,7 +990,6 @@ def assemble_zone_year(
                 year=year,
                 run_id=run_id,
                 n_workers=n_assembly_workers or AssemblyConfig().compute_n_workers(len(live)),
-                gate=gate,
                 staged_labels=(),
                 skipped_labels=sorted(c.label for c in live),
                 # THE CELL WITH THE MOST TO SAY, and it was the one saying nothing. Every live tile
@@ -1032,7 +1019,6 @@ def assemble_zone_year(
                 zone,
                 year,
                 run_id=run_id,
-                gate=gate,
             )
         repo = open_global_repo(
             store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
@@ -1102,7 +1088,6 @@ def assemble_zone_year(
         embedded_records=embedded_records,
         run_id=run_id,
         n_workers=n_workers,
-        gate=gate,
         staged_labels=staged_labels,
         skipped_labels=skipped_labels,
         s3_concurrency=s3_concurrency,

@@ -8,11 +8,11 @@ emitted once, no read-modify-write, no dense nodata.
 
 Cooperative fork/merge: the coordinator forks the session, workers write into
 their fork, the coordinator merges and makes **one commit per (zone, year)**,
-updating ``years_complete`` in the same commit (D1). Commits go behind a
-``gate`` (any context manager — e.g. ``threading.Semaphore(DEFAULT_COMMIT_CAP)``)
-so no more than a handful land at once - uncoordinated concurrent commits storm
-(run-1 T5). Fleet-wide gating is the orchestrator's job (Prefect global
-concurrency limit); the gate enforces it within a process.
+updating ``years_complete`` in the same commit (D1). Commits are UNGATED. They do
+contend on the branch-tip CAS -- all 120 zone groups share one repo -- but run 1
+measured that as 2.2 s at 16 simultaneous committers and 15 s at 120, with zero
+unresolvable conflicts at every N. See
+``context_docs/design/commit-gate-removal-2026_08.md``.
 
 A :class:`ShardSource` decouples the writer from *where* shard data comes from
 (staged inference files in production; synthetic in tests), and must be picklable
@@ -42,7 +42,6 @@ import multiprocessing
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
-from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
@@ -65,10 +64,6 @@ _log = logging.getLogger(__name__)
 #: log — and the operator's only recourse is to guess. Set far enough apart to stay
 #: quiet for short writes and close enough to bound how long a stall hides.
 PROGRESS_INTERVAL_S = 300.0
-
-#: Any context manager works as a commit gate (``threading.Semaphore`` is the
-#: canonical in-process one — acquire on enter, release on exit).
-CommitGate = AbstractContextManager
 
 
 class PhaseTimer:
@@ -138,14 +133,6 @@ class PhaseTimer:
         return out
 
 
-#: Default in-process commit cap: the middle of the run-1-mandated 4-8
-#: simultaneous committers (ADR-008 D6). Share one
-#: ``threading.Semaphore(DEFAULT_COMMIT_CAP)`` across the zone-year fills a
-#: single process drives; the campaign's cross-machine gate is a Prefect
-#: global concurrency limit (Q5).
-DEFAULT_COMMIT_CAP = 6
-
-
 class ShardSource(Protocol):
     """Supplies the shard data for one (zone, year) fill.
 
@@ -170,7 +157,6 @@ def commit_with_rebase(
     message: str,
     *,
     tries: int = 1000,
-    gate: CommitGate | None = None,
 ) -> str:
     """Commit, auto-rebasing on a moved branch tip; return the snapshot id.
 
@@ -178,11 +164,23 @@ def commit_with_rebase(
     for our write model, where concurrent commits touch disjoint groups/regions
     and always rebase cleanly (run-1 T0/T5: zero unresolvable conflicts). A real
     chunk conflict surfaces as ``RebaseFailedError`` rather than being masked.
-    When ``gate`` is given the commit proceeds inside it, bounding how many
-    commits are in flight at once.
+
+    Commits are UNGATED. A fleet-wide committer limit used to wrap this call; it was
+    removed because what it bounded is a SLOWDOWN, not a failure -- run 1 measured 2.2 s
+    commits at 16 concurrent committers and 15 s at 120, with zero unresolvable
+    conflicts at every N. See ``context_docs/design/commit-gate-removal-2026_08.md``.
+
+    **Timed here, and here is the only place that sees every commit.** The removal's
+    reopen criterion is commit LATENCY, and the obvious detector -- ``commit_s`` in
+    ``ASSEMBLY_SUMMARY`` -- cannot see the dominant source of concurrent commits: a
+    terminal cell marks itself through ``mark_zone_year_empty`` and returns without ever
+    reaching ``assemble_global``, and terminal cells were **72 of the first 78**
+    completions. One line per commit, so the volume is one per zone-year.
     """
-    with gate if gate is not None else nullcontext():
-        return session.commit(message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries)
+    started = time.monotonic()
+    snapshot = session.commit(message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries)
+    _log.info("COMMIT %.2fs: %s", time.monotonic() - started, message)
+    return snapshot
 
 
 def shard_pitch(arr: zarr.Array) -> int:
@@ -432,7 +430,6 @@ def commit_year_attrs(
     radar_coverage: dict | None = None,
     optical_skips: dict | None = None,
     input_coverage: dict | None = None,
-    gate: CommitGate | None = None,
     tries: int = 8,
     skip_if_marked: bool = False,
 ) -> str:
@@ -485,7 +482,7 @@ def commit_year_attrs(
                 input_coverage=input_coverage,
             )
         try:
-            return commit_with_rebase(session, f"mark {group} year {year_label} complete", gate=gate)
+            return commit_with_rebase(session, f"mark {group} year {year_label} complete")
         except icechunk.RebaseFailedError:
             if attempt == tries:
                 raise
@@ -582,7 +579,6 @@ def write_year_shards(
     source: ShardSource,
     *,
     n_workers: int = 1,
-    gate: CommitGate | None = None,
     shard_px: int = SHARD_PX,
     commit_msg: str | None = None,
     run_id: str | None = None,
@@ -598,7 +594,7 @@ def write_year_shards(
 
     Forks the session, writes the source's live shards across ``n_workers``
     (in-process when 1, else spawned processes), merges, advances
-    ``years_complete``, and commits behind ``gate`` via :func:`commit_with_rebase`.
+    ``years_complete``, and commits via :func:`commit_with_rebase`.
     When ``run_id`` is given, per-year run provenance (:func:`run_provenance`)
     is merged into the group's ``runs`` attr in the same commit — read and
     written inside THIS writable session, so a commit landing between a
@@ -635,8 +631,7 @@ def write_year_shards(
     ``telemetry`` is an out-parameter: pass a dict to receive the fill's timing
     facts — the per-worker stats and ``wall_s``/``merge_s`` from
     :func:`run_forked`, plus ``commit_s`` and ``attrs_commit_s`` (each measured
-    around its commit, so gate wait is included — to a caller asking where the
-    time went, waiting for the commit gate IS commit time). An out-parameter
+    around its commit). An out-parameter
     rather than a changed return, so the snapshot id the callers and tags key on
     stays a plain string; the caller that wants a summary record owns emitting it.
 
@@ -672,7 +667,7 @@ def write_year_shards(
 
     year_label = _year_label(_group_node(session.store, group), year_index)
     t_commit = time.monotonic()
-    commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}", gate=gate)
+    commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}")
     if fault is not None:
         # The drill's death lands HERE, between the two commits, and nowhere else can
         # produce this state on purpose. Inert for any other fault or any other cell.
@@ -690,7 +685,6 @@ def write_year_shards(
         radar_coverage=radar_coverage,
         optical_skips=optical_skips,
         input_coverage=input_coverage,
-        gate=gate,
         empty=empty,
     )
     if telemetry is not None:
