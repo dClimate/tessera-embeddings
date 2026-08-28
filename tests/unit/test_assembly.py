@@ -2112,8 +2112,11 @@ class TestAssembleGlobal:
         back on every S3 request for the life of the fork. Asserted at the call site because
         that is where the decision lives: the flag puts a live secret into the pickle, so it is
         right for a forking writer and pointless for the read/commit sites that never pickle.
-        Parameterised on the credential because a store opened without one has nothing to
-        cache, and requesting the scatter there would be a promise about nothing.
+        **True regardless of whether the caller passes a callback**, which is why this stays
+        parameterised. `_create_storage` falls back to `_default_credentials_provider` when
+        `get_credentials` is None, so a `get_credentials is not None` guard would leave the
+        children stampeding on exactly the fallback path — and `_create_storage` omits the
+        option entirely when there is genuinely no provider, so stating True here is safe.
         """
         dim = 8
         store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim)
@@ -2145,7 +2148,7 @@ class TestAssembleGlobal:
             n_workers=1,
             get_credentials=credentials if credentialled else None,
         )
-        assert requested == [credentialled]
+        assert requested == [True]
 
     def test_fills_year_from_staged_tiles(self, tmp_path):
         """Staged tiles land as whole shards at the right year index; provenance attrs update."""

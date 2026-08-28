@@ -75,7 +75,12 @@ deserialised child starts with a credential instead of calling back from its fir
 The campaign runs the second one. `open_global_repo` did not accept the parameter at all, so the
 sixteen children of every global assembly deserialised with an empty credential cache.
 
-The fix adds the parameter to `open_global_repo` and sets it at that single call site. It is
+The fix adds the parameter to `open_global_repo` and sets it at that single call site. **It is set
+unconditionally, not guarded on whether the caller supplied a credential callback** — `assemble()`
+carried such a guard and it was wrong in the same direction: `_create_storage` falls back to
+`_default_credentials_provider` when the argument is None, so the guard disabled the scatter on
+exactly the fallback path, while `_create_storage` already omits the option when no provider exists
+at all. Both call sites now state True. It is
 **opt-in per call site, not defaulted**, because the flag has a cost (next section) and the ten
 other `open_global_repo` callers read or commit in-process and never pickle anything — for them an
 eagerly cached credential buys nothing.
@@ -130,6 +135,30 @@ Three candidates remain, none proven:
    campaign applies more pressure to that code than the reporter's workload did.
 2. **A race in the credential handoff**, which the instrumentation below discriminates directly.
 3. **A service-side fault** — weakest, for the client-asymmetry reason above.
+
+## A note on the instrumentation's own concurrency
+
+Review found three defects in the first version of the credential boundary, all one shape: **it
+tried to reason about ORDER using values that do not carry it.**
+
+The boundary keeps per-process state so it can log a credential the first time it is used and stay
+quiet afterwards. The first version compared the incoming access key against the last one recorded;
+the second compared expiries as a generation marker. Both are wrong, because **acquisition happens
+before the boundary is reached and outside its lock.** A thread can freeze the old credential, be
+descheduled past a refresh, and arrive after a faster thread recorded the new one — carrying an old
+key with a *later* expiry, since the expiry is computed after the freeze. Either version then
+announced a rotation backwards and a second one forwards: three rotation records for one real
+rotation, in the exact signal an incident has to be lined up against.
+
+The resolution was to stop deciding order. The state is now the set of keys this process has
+already announced, so a late callback carrying a superseded key is simply not novel and says
+nothing. Ordering of the emitted records — which can still interleave, because the logging is
+deliberately outside the lock — is carried by a sequence number stamped while the lock is held.
+
+Serialising acquisition under the lock was the suggested alternative and was declined:
+`get_frozen_credentials()` takes botocore's lock and can block on a refresh that makes an STS call,
+so it would put every icechunk request in the process behind a network round trip — the same
+serialisation the design exists to avoid.
 
 ## What would settle it
 

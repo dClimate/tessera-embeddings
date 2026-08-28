@@ -2040,7 +2040,11 @@ class ZarrWriter:
                 max_concurrent_requests=per_worker_cap,
                 get_credentials=get_credentials,
                 region=s3_region,
-                scatter_initial_credentials=get_credentials is not None,
+                # True unconditionally, for the reason given at the `assemble_global` call
+                # site: `_create_storage` supplies a default provider when this is None, and
+                # omits the option when there is genuinely no provider, so the guard only ever
+                # disabled the scatter on the fallback path.
+                scatter_initial_credentials=True,
             )
             # Persist the split on create so a later COLD writer (one that opens
             # the store outside this manifest_split block) keeps splitting rather
@@ -2511,7 +2515,14 @@ class ZarrWriter:
             # why it is opt-in per call site — here the transport is a local spawn pipe to a
             # child of this process, not the network. Buys ~one credential TTL, not the whole
             # assembly: icechunk stops using the cached value once it expires.
-            scatter_initial_credentials=get_credentials is not None,
+            #
+            # Unconditionally True, NOT `get_credentials is not None`: when the caller passes
+            # None, `_create_storage` falls back to `_default_credentials_provider`, so the
+            # children would still deserialise with an empty cache on the very path the
+            # fallback exists to serve. `_create_storage` omits the option entirely when no
+            # provider is in play, so True is safe to state here and says what is meant --
+            # this call site forks.
+            scatter_initial_credentials=True,
         )
 
         # One readonly probe of the zone group: year index, shard pitch, variables.

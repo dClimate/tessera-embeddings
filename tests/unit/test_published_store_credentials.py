@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -382,7 +383,7 @@ class TestIcechunkCredentialVisibility:
 
     @staticmethod
     def _reset() -> None:
-        creds_mod._last_icechunk_access_key.clear()
+        creds_mod._announced_access_keys.clear()
 
     def _serve(self, source: str, key: str, expires_after: datetime | None = None) -> None:
         creds_mod._serve_icechunk_credential(
@@ -473,15 +474,15 @@ class TestIcechunkCredentialVisibility:
         # other account's CloudTrail.
         assert "111111111111" in text and "222222222222" in text
 
-    def test_the_swap_is_locked_and_the_log_is_not(self, caplog, monkeypatch) -> None:
+    def test_the_bookkeeping_is_locked_and_the_log_is_not(self, caplog, monkeypatch) -> None:
         """Pins BOTH halves of the concurrency design, deterministically.
 
         icechunk invokes this callback from its own Rust threads. An unguarded read-then-write
-        lets two of them both read `None` and both announce a FIRST, or both miss a rotation —
-        but a racing test can only fail probabilistically, so the invariant is asserted directly
-        instead. The second half matters just as much: holding the lock across the log call
-        would serialise every icechunk request in the process behind it, and per-request
-        callback volume is the very thing being observed.
+        lets two of them both find a key novel and both announce it — but a racing test can only
+        fail probabilistically, so the invariant is asserted directly instead. The second half
+        matters just as much: holding the lock across the log call would serialise every
+        icechunk request in the process behind it, and per-request callback volume is the very
+        thing being observed.
         """
         self._reset()
         lock = creds_mod._LAST_ACCESS_KEY_LOCK
@@ -491,22 +492,18 @@ class TestIcechunkCredentialVisibility:
                 super().__init__()
                 self.held: list[bool] = []
 
-            def get(self, key, *args):  # type: ignore[override]
+            def setdefault(self, key, default=None):  # type: ignore[override]
                 self.held.append(lock.locked())
-                return super().get(key, *args)
-
-            def __setitem__(self, key, value) -> None:
-                self.held.append(lock.locked())
-                super().__setitem__(key, value)
+                return super().setdefault(key, default)
 
         watched = _Watched()
-        monkeypatch.setattr(creds_mod, "_last_icechunk_access_key", watched)
+        monkeypatch.setattr(creds_mod, "_announced_access_keys", watched)
         logged_under_lock: list[bool] = []
         monkeypatch.setattr(creds_mod._LOG, "info", lambda *a, **k: logged_under_lock.append(lock.locked()))
 
         self._serve("task-role", "ASIALOCKED")
 
-        assert watched.held == [True, True], "the get and the set must be one atomic swap"
+        assert watched.held == [True], "the novelty check must happen under the lock"
         assert logged_under_lock == [False], "the log must not run inside the lock"
 
     def test_concurrent_serves_announce_the_first_exactly_once(self, caplog) -> None:
@@ -547,31 +544,48 @@ class TestIcechunkCredentialVisibility:
             assert f"pid={os.getpid()}" in record.getMessage(), record.getMessage()
 
     def test_a_late_callback_carrying_the_old_credential_is_not_a_rotation(self, caplog) -> None:
-        """Credential acquisition happens before this call and outside the lock.
+        """Acquisition happens before this call and outside the lock, so a thread can freeze the
+        old credential, be descheduled past a refresh, and arrive after a faster thread recorded
+        the new one. Announcing unconditionally would put the old key back and manufacture TWO
+        false rotations — one backwards, one forwards again — in the one signal a real failure
+        has to be lined up against.
 
-        So a thread can read the old credential, be descheduled, and arrive after another
-        thread has recorded the refreshed one. Writing unconditionally would put the old key
-        back and manufacture TWO false rotations — one backwards, one forwards again — in the
-        one signal a real failure has to be lined up against. The expiry is the generation
-        marker that settles the order; serialising acquisition instead would put every icechunk
-        request behind a botocore refresh that can make an STS call.
+        **The straggler here carries a LATER expiry than the key already recorded**, which is
+        the case an order-based test gets wrong: the expiry is computed AFTER the credential is
+        frozen, so it dates callback completion, not acquisition. Novelty is decidable from the
+        state; order is not.
         """
         self._reset()
         base = datetime(2026, 8, 28, 12, tzinfo=UTC)
         with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
             self._serve("task-role", "ASIAOLD", base)
             self._serve("task-role", "ASIANEW", base + timedelta(minutes=5))
-            # The straggler: acquired BEFORE the refresh, delivered after it.
-            self._serve("task-role", "ASIAOLD", base + timedelta(minutes=1))
-            # And the state it must not have clobbered — a later new-key serve is steady, so
-            # this asserts the straggler changed nothing, not merely that it stayed quiet.
-            self._serve("task-role", "ASIANEW", base + timedelta(minutes=6))
+            # The straggler — old key, and a LATER expiry than the new key was given.
+            self._serve("task-role", "ASIAOLD", base + timedelta(minutes=10))
+            # The state it must not have clobbered: a later new-key serve stays steady, which
+            # asserts the straggler changed nothing rather than merely that it stayed quiet.
+            self._serve("task-role", "ASIANEW", base + timedelta(minutes=11))
 
         assert len([r for r in caplog.records if "ROTATED" in r.message]) == 1
-        levels = [r.levelname for r in caplog.records]
-        assert levels == ["INFO", "INFO", "DEBUG", "DEBUG"]
-        assert "superseded" in caplog.records[2].getMessage()
+        assert [r.levelname for r in caplog.records] == ["INFO", "INFO", "DEBUG", "DEBUG"]
+        assert "stale" in caplog.records[2].getMessage()
         assert "served" in caplog.records[3].getMessage()
+
+    def test_every_event_carries_an_in_lock_sequence_number(self, caplog) -> None:
+        """The records are emitted OUTSIDE the lock, so two threads can emit out of order and a
+        ROTATED can reach the stream before the FIRST it followed. The sequence number is
+        stamped while the lock is held, so a reader can always put the stream back in order.
+        """
+        self._reset()
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            self._serve("task-role", "ASIASEQA")
+            self._serve("task-role", "ASIASEQB")
+            self._serve("assumed-role:arn:aws:iam::1:role/W", "ASIASEQC")
+        seqs = [int(re.search(r"seq=(\d+)", r.getMessage()).group(1)) for r in caplog.records]
+        assert len(seqs) == 3
+        # Process-wide and strictly increasing, so it orders ACROSS sources too — a fill uses
+        # both providers and the interleaving between them is what a correlation reads.
+        assert seqs == sorted(seqs) and len(set(seqs)) == 3
 
     def test_it_never_logs_the_secret_or_the_token(self, caplog) -> None:
         """The access-key id is an identifier and is what CloudTrail indexes on. The secret key

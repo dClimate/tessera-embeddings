@@ -17,6 +17,7 @@ Usage in the S1 ingest flow::
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import threading
@@ -336,15 +337,18 @@ def iam_s3_storage_options() -> dict[str, str]:
 #: its own icechunk client, so knowing WHICH process rotated when is the correlation a
 #: signature failure needs.
 #:
-#: Value is ``(access_key, expires_after)``. The expiry is kept because it is a GENERATION
-#: MARKER: both providers derive it from the moment of the call, so of two credentials the one
-#: with the later expiry was acquired later. That is what lets a stale callback be recognised
-#: without serialising credential acquisition -- see :func:`_serve_icechunk_credential`.
-_last_icechunk_access_key: dict[str, tuple[str, datetime]] = {}
-#: Guards the compare-and-swap in :func:`_serve_icechunk_credential` only. icechunk invokes the
-#: callback from its own Rust threads, so an unguarded read-then-write lets two threads both read
-#: ``None`` and both announce a FIRST -- or, worse, both miss a rotation. See that function for why
-#: the LOGGING deliberately sits outside this lock.
+#: Value is the access keys this process has ANNOUNCED for that source, in announcement order.
+#: Novelty rather than order is what the log needs, and novelty is the only question that can be
+#: answered correctly here: nothing available at this boundary records when a credential was
+#: ACQUIRED (see :func:`_serve_icechunk_credential`). Bounded by the number of real rotations a
+#: process lives through -- a handful over a long assembly, since each entry is one key id.
+_announced_access_keys: dict[str, list[str]] = {}
+#: Ordering for the log stream, stamped inside the lock. The records are emitted OUTSIDE it, so
+#: two threads can emit out of order; this is what lets a reader put them back in order.
+_announce_sequence = itertools.count(1)
+#: Guards the novelty check in :func:`_serve_icechunk_credential` only. icechunk invokes the
+#: callback from its own Rust threads, so an unguarded read-then-write lets two threads both find
+#: a key novel and both announce it. See that function for why the LOGGING sits outside this lock.
 _LAST_ACCESS_KEY_LOCK = threading.Lock()
 
 
@@ -384,6 +388,16 @@ def _serve_icechunk_credential(
       campaign runs on the order of a hundred clients, so this is the one that would be a drip
       saying nothing on almost every day.
 
+    **Announces NOVELTY, not transitions.** A record is emitted the first time this process
+    serves a given access key and never again, which is what makes a late callback harmless:
+    a thread can freeze the old credential, be descheduled past a refresh, and arrive after a
+    faster thread recorded the new one -- and because its key is already announced it says
+    nothing rather than reporting a rotation backwards. Ordering cannot be decided here at all:
+    the expiry is computed AFTER the credential is frozen, so an old key can carry a later
+    expiry than a newer one. Every line therefore carries a sequence number stamped while the
+    lock is held, which is what puts the stream back in order when two records are emitted
+    concurrently.
+
     **"FIRST" means the first credential THIS PROCESS served, and on a scattered path that is
     not the first credential the process USED.** Where the caller passes
     ``scatter_initial_credentials=True`` (assembly's fork paths), icechunk caches a credential
@@ -397,28 +411,27 @@ def _serve_icechunk_credential(
     Logs the access-key id, which is an identifier rather than a secret and is what CloudTrail
     indexes on. **Never the secret key or the session token.**
     """
-    # ATOMIC SWAP, and nothing else inside the lock. The swap is what makes each transition
-    # announced exactly once: of two threads arriving with the same new key, one reads the old
-    # value and reports the transition while the other reads the value just written and falls
-    # through to the steady-state branch. Emitting the log inside the lock would serialise every
-    # icechunk request in the process behind it -- and the per-request callback volume is the
-    # very thing this instrumentation exists to observe (see icechunk#2077), so the critical
-    # section is one dict get and one dict set.
+    # NOVELTY, not order. Nothing reaching this boundary records when a credential was ACQUIRED:
+    # the caller freezes it and only then computes an expiry, so a thread descheduled between
+    # those two steps arrives with an OLD key carrying a LATER expiry than one a faster thread
+    # already recorded. Any "which is newer" test built from what is passed in here is therefore
+    # wrong in the one case it exists for. Asking instead whether this process has already
+    # announced this key is a question the state can answer exactly, and it gives the same
+    # protection: a late callback carrying a superseded key is not novel, so it announces
+    # nothing and cannot manufacture a rotation. The alternative -- serialising acquisition
+    # under this lock -- would put every icechunk request in the process behind a botocore
+    # refresh that can make an STS call, which is worse than what it fixes.
+    #
+    # Nothing but this bookkeeping is inside the lock. Emitting the log here would serialise
+    # every icechunk request behind a log write, and per-request callback volume is the very
+    # thing this instrumentation exists to observe (icechunk#2077).
     with _LAST_ACCESS_KEY_LOCK:
-        prior = _last_icechunk_access_key.get(source)
-        # OUT-OF-ORDER REJECTION. Acquisition happens before this call and outside the lock, so
-        # a thread can read the old credential, be descheduled, and arrive after another thread
-        # has already recorded the refreshed one. An unconditional write would put the old key
-        # back and manufacture TWO false rotations -- one backwards, one forwards again -- in
-        # the signal a real failure has to be lined up against. Serialising acquisition instead
-        # would put every icechunk request in the process behind a botocore refresh that can
-        # make an STS call, which is the cure being worse than the disease. Comparing the
-        # generation costs nothing and needs no extra state. `>=` so that a genuine rotation
-        # landing inside one clock tick is still recorded.
-        superseded = prior is not None and expires_after < prior[1]
-        if not superseded:
-            _last_icechunk_access_key[source] = (access_key, expires_after)
-    previous = None if prior is None else prior[0]
+        announced = _announced_access_keys.setdefault(source, [])
+        novel = access_key not in announced
+        previous = announced[-1] if announced else None
+        if novel:
+            announced.append(access_key)
+        order = next(_announce_sequence)
     # PROCESS IDENTITY on every line, because the state this decides against is process-local
     # while the log stream is not. An assembly's spawned workers and their parent write to one
     # container stream, and `configure_logging()`'s formatter carries no process field, so
@@ -426,13 +439,14 @@ def _serve_icechunk_credential(
     # process reported the adjacent failure -- the exact correlation this instrumentation is
     # for. The pid is the discriminator because it is what the OS guarantees unique among live
     # processes and what a crash dump or a `ps` line can be matched against.
-    where = f"[{source}] pid={os.getpid()}"
+    where = f"[{source}] pid={os.getpid()} seq={order}"
     until = expires_after.isoformat(timespec="seconds")
-    if superseded:
-        # A late arrival carrying an older credential. Not a rotation, and not the current
-        # state, so it must not be announced as either.
+    if not novel and previous != access_key:
+        # A late callback carrying a key this process has already moved past. Worth seeing at
+        # DEBUG -- it is evidence of exactly the refresh-boundary interleaving that made an
+        # order-based test unworkable -- but it is neither new state nor a rotation.
         _LOG.debug(
-            "icechunk credential %s superseded: %s, valid until %s (kept %s)",
+            "icechunk credential %s stale: %s, valid until %s (current %s)",
             where,
             access_key,
             until,
@@ -440,7 +454,7 @@ def _serve_icechunk_credential(
         )
     elif previous is None:
         _LOG.info("icechunk credential %s FIRST: %s, valid until %s", where, access_key, until)
-    elif previous != access_key:
+    elif novel:
         _LOG.info(
             "icechunk credential %s ROTATED: %s -> %s, valid until %s",
             where,
