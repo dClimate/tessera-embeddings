@@ -335,7 +335,12 @@ def iam_s3_storage_options() -> dict[str, str]:
 #: Per-process by nature, which is what we want: an assembly forks sixteen workers, each with
 #: its own icechunk client, so knowing WHICH process rotated when is the correlation a
 #: signature failure needs.
-_last_icechunk_access_key: dict[str, str] = {}
+#:
+#: Value is ``(access_key, expires_after)``. The expiry is kept because it is a GENERATION
+#: MARKER: both providers derive it from the moment of the call, so of two credentials the one
+#: with the later expiry was acquired later. That is what lets a stale callback be recognised
+#: without serialising credential acquisition -- see :func:`_serve_icechunk_credential`.
+_last_icechunk_access_key: dict[str, tuple[str, datetime]] = {}
 #: Guards the compare-and-swap in :func:`_serve_icechunk_credential` only. icechunk invokes the
 #: callback from its own Rust threads, so an unguarded read-then-write lets two threads both read
 #: ``None`` and both announce a FIRST -- or, worse, both miss a rotation. See that function for why
@@ -400,8 +405,20 @@ def _serve_icechunk_credential(
     # very thing this instrumentation exists to observe (see icechunk#2077), so the critical
     # section is one dict get and one dict set.
     with _LAST_ACCESS_KEY_LOCK:
-        previous = _last_icechunk_access_key.get(source)
-        _last_icechunk_access_key[source] = access_key
+        prior = _last_icechunk_access_key.get(source)
+        # OUT-OF-ORDER REJECTION. Acquisition happens before this call and outside the lock, so
+        # a thread can read the old credential, be descheduled, and arrive after another thread
+        # has already recorded the refreshed one. An unconditional write would put the old key
+        # back and manufacture TWO false rotations -- one backwards, one forwards again -- in
+        # the signal a real failure has to be lined up against. Serialising acquisition instead
+        # would put every icechunk request in the process behind a botocore refresh that can
+        # make an STS call, which is the cure being worse than the disease. Comparing the
+        # generation costs nothing and needs no extra state. `>=` so that a genuine rotation
+        # landing inside one clock tick is still recorded.
+        superseded = prior is not None and expires_after < prior[1]
+        if not superseded:
+            _last_icechunk_access_key[source] = (access_key, expires_after)
+    previous = None if prior is None else prior[0]
     # PROCESS IDENTITY on every line, because the state this decides against is process-local
     # while the log stream is not. An assembly's spawned workers and their parent write to one
     # container stream, and `configure_logging()`'s formatter carries no process field, so
@@ -411,7 +428,17 @@ def _serve_icechunk_credential(
     # processes and what a crash dump or a `ps` line can be matched against.
     where = f"[{source}] pid={os.getpid()}"
     until = expires_after.isoformat(timespec="seconds")
-    if previous is None:
+    if superseded:
+        # A late arrival carrying an older credential. Not a rotation, and not the current
+        # state, so it must not be announced as either.
+        _LOG.debug(
+            "icechunk credential %s superseded: %s, valid until %s (kept %s)",
+            where,
+            access_key,
+            until,
+            previous,
+        )
+    elif previous is None:
         _LOG.info("icechunk credential %s FIRST: %s, valid until %s", where, access_key, until)
     elif previous != access_key:
         _LOG.info(

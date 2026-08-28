@@ -384,13 +384,13 @@ class TestIcechunkCredentialVisibility:
     def _reset() -> None:
         creds_mod._last_icechunk_access_key.clear()
 
-    def _serve(self, source: str, key: str) -> None:
+    def _serve(self, source: str, key: str, expires_after: datetime | None = None) -> None:
         creds_mod._serve_icechunk_credential(
             source=source,
             access_key=key,
             secret_key="s",
             session_token="t",
-            expires_after=datetime(2026, 8, 28, 12, tzinfo=UTC),
+            expires_after=expires_after or datetime(2026, 8, 28, 12, tzinfo=UTC),
         )
 
     def test_the_first_credential_a_process_serves_is_info(self, caplog) -> None:
@@ -545,6 +545,33 @@ class TestIcechunkCredentialVisibility:
         assert [r.levelname for r in caplog.records] == ["INFO", "INFO", "DEBUG"]
         for record in caplog.records:
             assert f"pid={os.getpid()}" in record.getMessage(), record.getMessage()
+
+    def test_a_late_callback_carrying_the_old_credential_is_not_a_rotation(self, caplog) -> None:
+        """Credential acquisition happens before this call and outside the lock.
+
+        So a thread can read the old credential, be descheduled, and arrive after another
+        thread has recorded the refreshed one. Writing unconditionally would put the old key
+        back and manufacture TWO false rotations — one backwards, one forwards again — in the
+        one signal a real failure has to be lined up against. The expiry is the generation
+        marker that settles the order; serialising acquisition instead would put every icechunk
+        request behind a botocore refresh that can make an STS call.
+        """
+        self._reset()
+        base = datetime(2026, 8, 28, 12, tzinfo=UTC)
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            self._serve("task-role", "ASIAOLD", base)
+            self._serve("task-role", "ASIANEW", base + timedelta(minutes=5))
+            # The straggler: acquired BEFORE the refresh, delivered after it.
+            self._serve("task-role", "ASIAOLD", base + timedelta(minutes=1))
+            # And the state it must not have clobbered — a later new-key serve is steady, so
+            # this asserts the straggler changed nothing, not merely that it stayed quiet.
+            self._serve("task-role", "ASIANEW", base + timedelta(minutes=6))
+
+        assert len([r for r in caplog.records if "ROTATED" in r.message]) == 1
+        levels = [r.levelname for r in caplog.records]
+        assert levels == ["INFO", "INFO", "DEBUG", "DEBUG"]
+        assert "superseded" in caplog.records[2].getMessage()
+        assert "served" in caplog.records[3].getMessage()
 
     def test_it_never_logs_the_secret_or_the_token(self, caplog) -> None:
         """The access-key id is an identifier and is what CloudTrail indexes on. The secret key
