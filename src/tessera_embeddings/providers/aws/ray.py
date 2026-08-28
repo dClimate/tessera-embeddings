@@ -403,8 +403,14 @@ def _apply_gpu_worker_ladder(config: dict[str, Any], raw: str) -> None:
     )
 
 
-def _vcpu_per_gpu(node_type: dict[str, Any]) -> int:
-    """How much vCPU this rung spends per GPU, from its DECLARED resources.
+def _vcpu_per_node(node_type: dict[str, Any]) -> int:
+    """What one INSTANCE of this rung costs in vCPU, from its DECLARED resources.
+
+    Per instance, not per GPU, because ``max_workers`` counts instances. The two are the
+    same number only while every rung is single-GPU, which is true of everything shipped
+    today and is exactly the assumption that makes the difference invisible: a rung
+    declaring 96 CPU and 8 GPU priced per-GPU reads as 12, and a 960-vCPU budget would
+    then permit 80 instances -- 7,680 vCPU, eight times the budget.
 
     Read from the config rather than the EC2 catalogue because the declaration is what
     the autoscaler itself scales against, and because it needs no API call at resolve
@@ -419,7 +425,7 @@ def _vcpu_per_gpu(node_type: dict[str, Any]) -> int:
             "declare both -- see the resources block in cluster.yaml.template."
         )
         raise RuntimeError(msg)
-    return max(1, cpu // gpu)
+    return cpu
 
 
 def _vcpu_budget_ceiling(node_type: dict[str, Any], vcpu_budget: int) -> int:
@@ -431,14 +437,14 @@ def _vcpu_budget_ceiling(node_type: dict[str, Any], vcpu_budget: int) -> int:
     rung is a configuration error, and it is cheaper to say so here than to discover it
     as an unexplained `InstanceLimitExceeded` during a capacity event.
     """
-    per_gpu = _vcpu_per_gpu(node_type)
-    affords = vcpu_budget // per_gpu
+    per_node = _vcpu_per_node(node_type)
+    affords = vcpu_budget // per_node
     if affords < 1:
         instance = node_type.get("node_config", {}).get("InstanceType")
         msg = (
             f"gpu_fallback_vcpu_budget={vcpu_budget} cannot afford a single {instance!r} "
-            f"at {per_gpu} vCPU per GPU. Raise the budget to at least {per_gpu}, or close "
-            "that rung."
+            f"at {per_node} vCPU per instance. Raise the budget to at least {per_node}, or "
+            "close that rung."
         )
         raise ValueError(msg)
     return affords
@@ -453,7 +459,8 @@ def _apply_gpu_vcpu_budget(config: dict[str, Any], vcpu_budget: int) -> None:
     which card wins, and an all-fallback fleet at the production node count quietly
     spends twice the quota.
 
-    So each rung gets the count the budget affords IT -- 250 at 4 vCPU/GPU, 125 at 8.
+    So each rung gets the count the budget affords IT -- 250 instances at 4 vCPU each,
+    125 at 8. Priced PER INSTANCE, because that is what ``max_workers`` counts.
     That is the honest statement of "as many of this card as the quota allows".
 
     It NARROWS only, never widens: a ceiling already lower than the budget affords was

@@ -242,6 +242,20 @@ sizes are 8 vCPU per GPU against `g6e.xlarge`'s 4, so the applied 10,000 vCPU bu
 either 2,500 L40S or 1,250 A10G. A fleet fully on fallback is half the card count
 *before* the 0.46 throughput factor.
 
+**A cluster that fails over stays failed over.** Recovery applies to new demand only.
+Once the fallback has satisfied every actor bundle there is no unfulfilled demand, so
+the scorer is not consulted and nothing evicts a running A10G to make room for an L40S
+— the fleet holds its composition until those actors go idle and retire. Under the
+chained-cluster strategy actors are long-lived, so a cluster that failed over early can
+spend its whole roster on the 0.46-throughput card at twice the quota per GPU.
+
+That is deliberate rather than an oversight: draining healthy workers mid-chunk to trade
+cards would discard the work in flight. But it is a real operational cost, and the
+practical remedy is that **the next cluster starts fresh** — ceilings and preference are
+resolved per provision. If a long-running cluster is stuck on the fallback while L40S
+capacity has visibly returned, the lever is to let that fill finish rather than to fight
+it. An explicit probe-and-drain would be a feature, and is not here.
+
 **Only genuine capacity refusals move the fleet.** A throttle (`RequestLimitExceeded`)
 clears in seconds, and a quota refusal (`InstanceLimitExceeded`) only gets worse on a
 rung that spends more quota — so neither demotes.

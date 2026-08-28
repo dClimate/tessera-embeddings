@@ -212,6 +212,26 @@ class TestVcpuBudget:
             res = types[name]["resources"]
             assert types[name]["max_workers"] * (res["CPU"] // res["GPU"]) == 1000
 
+    def test_a_multi_gpu_rung_is_priced_per_instance(self) -> None:
+        """`max_workers` counts instances, not cards.
+
+        Pricing per GPU reads a 96-CPU/8-GPU rung as 12 vCPU, so a 960-vCPU budget would
+        permit 80 instances -- 7,680 vCPU, eight times the budget. Invisible while every
+        shipped rung is single-GPU, which is exactly why it needs a test: the wider rungs
+        arrive in the follow-up PR.
+        """
+        rung = {"resources": {"CPU": 96, "GPU": 8}, "node_config": {"InstanceType": "g6e.48xlarge"}}
+        assert tray._vcpu_per_node(rung) == 96
+        assert tray._vcpu_budget_ceiling(rung, 960) == 10  # 10 x 96 = 960, exactly
+
+    def test_single_gpu_rungs_are_unaffected_by_the_per_instance_rule(self) -> None:
+        """The two readings agree at one GPU per node, so the production numbers hold."""
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_fallback(config, ["A10G"], 840)
+        types = config["available_node_types"]
+        assert types[PRODUCTION]["max_workers"] == 210
+        assert types[A10G]["max_workers"] == 105
+
     def test_absent_budget_keeps_the_production_ceiling(self) -> None:
         config = yaml.safe_load(TEMPLATE.read_text())
         tray._apply_gpu_fallback(config, ["A10G"])
