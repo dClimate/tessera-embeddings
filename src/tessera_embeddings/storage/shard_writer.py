@@ -37,6 +37,7 @@ so worker lines appear in the container's log stream alone.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import multiprocessing
 import time
@@ -188,12 +189,43 @@ def shard_pitch(arr: zarr.Array) -> int:
     return (arr.shards or arr.chunks)[1]
 
 
+#: Live shard counts, ``[done_0, total_0, ...]`` by worker index. Shared memory reaches a spawned
+#: child only through the pool INITIALIZER -- it cannot be pickled into a submitted payload.
+#: ``None`` off the pool path, which includes the single-payload in-process run.
+_PROGRESS_SLOTS: ctypes.Array[ctypes.c_long] | None = None
+
+
+def _init_fork_worker(slots: ctypes.Array[ctypes.c_long]) -> None:
+    """Runs once per spawned child, before any payload: configure logging (a spawned process
+    inherits none, so the root WARNING default would discard the worker's own records) and stash
+    the slots it publishes shard counts into.
+    """
+    global _PROGRESS_SLOTS
+    configure_logging()
+    _PROGRESS_SLOTS = slots
+
+
+def report_shard_progress(worker_index: int, done: int, total: int) -> None:
+    """Publish a worker's shard counts where the COORDINATOR can read them.
+
+    A worker's own log line reaches its process's stream and never the orchestrator, so the flow
+    run could see how many payloads were outstanding but not how much of the write was done.
+    Unlocked on purpose: monotone telemetry counters, where a torn read costs one stale progress
+    line and a lock would be taken on every shard by every worker. No-op off the pool path.
+    """
+    if _PROGRESS_SLOTS is None:
+        return
+    _PROGRESS_SLOTS[2 * worker_index] = done
+    _PROGRESS_SLOTS[2 * worker_index + 1] = total
+
+
 def _await_forks(
     futures: list[Future],
     progress_interval_s: float,
     *,
     unit: str = "partitions",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+    slots: ctypes.Array[ctypes.c_long] | None = None,
 ) -> list[Any]:
     """Collect ``futures`` in submission order, logging what is still outstanding.
 
@@ -223,14 +255,32 @@ def _await_forks(
             if future.exception() is not None:
                 future.result()  # re-raises, with the worker's traceback attached
         if pending:
-            logger.info(
-                "Assembly progress: %d/%d %s done, %d outstanding after %.0f min",
-                len(futures) - len(pending),
-                len(futures),
-                unit,
-                len(pending),
-                (time.monotonic() - started) / 60.0,
-            )
+            mins = (time.monotonic() - started) / 60.0
+            # SHARDS, not payloads. A payload counts as done only when its worker returns and
+            # they all return at the end, so the payload figure read 0/N for the whole write and
+            # said nothing. `slots` carries what the workers have actually written.
+            written = sum(slots[2 * i] for i in range(len(futures))) if slots is not None else 0
+            expected = sum(slots[2 * i + 1] for i in range(len(futures))) if slots is not None else 0
+            if expected:
+                logger.info(
+                    "Assembly progress: %d/%d shards written (%.0f%%), %d/%d %s outstanding after %.0f min",
+                    written,
+                    expected,
+                    100.0 * written / expected,
+                    len(pending),
+                    len(futures),
+                    unit,
+                    mins,
+                )
+            else:
+                # Before the first worker reports, and on any caller whose worker does not.
+                logger.info(
+                    "Assembly progress: %d/%d %s outstanding after %.0f min",
+                    len(pending),
+                    len(futures),
+                    unit,
+                    mins,
+                )
     return [future.result() for future in futures]
 
 
@@ -291,10 +341,16 @@ def run_forked(
         # INFO record a worker produces. Set HERE rather than in each worker body so a worker
         # added later cannot omit it. The single-payload path above needs nothing: it runs in
         # the coordinator, which is already configured.
-        ex = ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx, initializer=configure_logging)
+        slots = ctx.Array("l", 2 * len(payloads), lock=False)
+        ex = ProcessPoolExecutor(
+            max_workers=len(payloads),
+            mp_context=ctx,
+            initializer=_init_fork_worker,
+            initargs=(slots,),
+        )
         try:
             futures = [ex.submit(worker_fn, payload) for payload in payloads]
-            results = _await_forks(futures, progress_interval_s, unit=unit, log=log)
+            results = _await_forks(futures, progress_interval_s, unit=unit, log=log, slots=slots)
         except BaseException:
             # Cancel what has not started, then TERMINATE what has. `cancel_futures` only
             # reaches queued work, so without the second step a multi-hour shard writer keeps
@@ -556,6 +612,7 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
     for sy, sx in payload["shards"]:
         if time.monotonic() - last_report >= progress_interval_s:
             _log.info("Assembly worker %d progress: %d/%d shards written (%s)", worker_index, tiles, total, group)
+            report_shard_progress(worker_index, tiles, total)
             last_report = time.monotonic()
         with timer.phase("read"):
             blocks = source.load((sy, sx))
