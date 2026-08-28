@@ -29,8 +29,11 @@ as a matching set. Our processes fetch fresh ones automatically as the old ones 
 **Request signing.** Every request to S3 is signed: the sender combines the request with its secret
 key to produce a signature, and Amazon recomputes that signature to check it. If the two do not
 match, Amazon rejects the request with the error **`SignatureDoesNotMatch`**. Importantly, that
-error does not mean "you lack permission" — it means the arithmetic did not agree, which for
-automatically-issued credentials usually means the three strings were not a matching set.
+error does not mean "you lack permission" — it means only that the two signatures did not agree.
+**It does not say why**, and the possible causes are genuinely different in kind: the three strings
+may not have been a matching set, or the request may have been assembled or signed in a way the
+service computed differently. Keeping both in view matters, because this document's remaining
+candidates include a defect in the signing code itself.
 
 **Several libraries, one destination.** Different parts of the pipeline reach S3 through different
 software libraries. Four are relevant here: **Icechunk** (the library that stores the actual
@@ -88,7 +91,8 @@ Four other explanations were checked directly and all came back at zero for the 
 | — | **`SignatureDoesNotMatch`** | **227** |
 
 So: valid, unexpired credentials; identifiers Amazon recognised; no complaint about our clocks; no
-rate-limiting; a single error type; spread across 272 separate machines; and it stopped on its own.
+rate-limiting; a single error type; refused writes on 210 separate machines; and it stopped on its
+own.
 
 ---
 
