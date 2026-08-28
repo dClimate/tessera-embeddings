@@ -23,19 +23,18 @@ def configure_gdal_environment() -> None:
 
     # Retry settings for transient network failures (DNS, connection, timeout).
     #
-    # RETRY_DELAY is the BASE of an exponential ladder, not a fixed wait: GDAL multiplies it
-    # by ~2 after each failure and does not cap it, so give-up time scales with BOTH values
-    # and is dominated by the last rung. Measured 2026-08-27 server-side at base 0.5:
-    # 0.5, 1.01, 2.07, 4.92, 10.96, 24.82, 52.36, 105.94 s. READ THE PAIR TOGETHER: these five
-    # retries at base 5 give ~3 min per unreadable object, while odc's ten at base 0.5 give ~14
-    # min — odc's read path is ~5x MORE patient than these values, not less. Ten at base 5 would
-    # be ~2.5 h, and the S2 coverage gate adds seven further attempts (SOURCE_READ_ATTEMPTS = 8)
-    # while max_leg_wall_clock_s cannot interrupt a running leg.
+    # RETRY_DELAY is the BASE of an exponential ladder, not a fixed wait: GDAL roughly doubles
+    # it after each failure and does not cap it. So these two multiply into a WALL-CLOCK BUDGET
+    # per unreadable object, and the coverage gate then wraps that read in more attempts of its
+    # own. Read them as a pair, and read the measured ladder before changing either.
     #
-    # NOTE the odc read path does not use these two, nor GDAL_DISABLE_READDIR_ON_OPEN:
-    # `odc.loader.capture_rio_env()` applies its own values as an EXPLICIT rasterio Env, which
-    # beats the process environment. GDAL falls back to the environment for every option odc
-    # does NOT name, so the rest of this function does reach it. See
+    # THREE of the options in this function never reach the odc read path -- MAX_RETRY,
+    # RETRY_DELAY and DISABLE_READDIR_ON_OPEN -- because odc applies its own values as an
+    # explicit rasterio Env, which beats the process environment. The rest do reach it, through
+    # GDAL's fallback to the environment. There is currently NO knob that changes those three
+    # on the imagery path.
+    #
+    # Measurements, the ladder, and why closing that gap was rejected:
     # `context_docs/design/gdal-read-config-2026_08.md`.
     os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "5")  # Default: 0 (no retries)
     os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "5")  # Default: 30 seconds
