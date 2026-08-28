@@ -337,12 +337,12 @@ def iam_s3_storage_options() -> dict[str, str]:
 #: its own icechunk client, so knowing WHICH process rotated when is the correlation a
 #: signature failure needs.
 #:
-#: Value is the access keys this process has ANNOUNCED for that source, in announcement order.
-#: Novelty rather than order is what the log needs, and novelty is the only question that can be
-#: answered correctly here: nothing available at this boundary records when a credential was
-#: ACQUIRED (see :func:`_serve_icechunk_credential`). Bounded by the number of real rotations a
-#: process lives through -- a handful over a long assembly, since each entry is one key id.
-_announced_access_keys: dict[str, list[str]] = {}
+#: Value is the SET of access keys this process has already announced for that source. A set and
+#: not a sequence: nothing reaching this boundary records when a credential was ACQUIRED, so no
+#: ordering claim made here can be trusted (see :func:`_serve_icechunk_credential`). "Have I
+#: mentioned this one yet" is the only question the state can answer, and it is enough. Bounded
+#: by the number of real rotations a process lives through -- a handful over a long assembly.
+_announced_access_keys: dict[str, set[str]] = {}
 #: Ordering for the log stream, stamped inside the lock. The records are emitted OUTSIDE it, so
 #: two threads can emit out of order; this is what lets a reader put them back in order.
 _announce_sequence = itertools.count(1)
@@ -371,32 +371,38 @@ def _serve_icechunk_credential(
 
     **Why any of this exists.** On 2026-08-28 the fleet took 516 `SignatureDoesNotMatch`
     refusals from S3 across 1h45m -- 494 on the ingest path, 22 on assembly, the latter costing
-    four cells. `SignatureDoesNotMatch` means the secret did not match the access key, which for
-    a role credential is a torn triple rather than a permissions problem. The providers proved
-    CORRECT on inspection, so the gap was never a defect to fix: nothing recorded WHICH
-    credential was in play, so a recurrence could only be inferred from the shape of the
-    failure. This closes that, and closing it is the prerequisite for designing a real fix.
+    four cells. `SignatureDoesNotMatch` establishes only that S3's computed signature differed
+    from the one sent. It does NOT establish that the secret and the access key came from
+    different credentials: canonicalisation, signing scope and a defect in the signer itself all
+    produce the same response, and a defect in icechunk's own signing path remains an open
+    candidate (`context_docs/design/icechunk-credential-stampede-2026_08.md`). Stated neutrally
+    on purpose -- naming a mechanism here would steer a responder toward one candidate during
+    the next occurrence. The providers proved correct on inspection, so the gap was never a
+    defect to fix: nothing recorded WHICH credential was in play, so a recurrence could only be
+    inferred from the shape of the failure. This closes that.
 
     **Three levels, each for a reason.**
 
     * The FIRST credential a process serves is INFO. A process that fails before it ever
       rotates -- which is the common case for these failures -- would otherwise carry no
       access-key id at production log level, and could not be correlated against CloudTrail.
-    * A ROTATION is INFO. It is the event a signature failure has to be lined up against, and
-      there are a handful per process per run.
+    * Each SUBSEQUENT distinct credential is INFO ("NEW"). This is the event a signature failure
+      has to be lined up against, and there are a handful per process per run. It is not
+      reported as a from/to pair, because that would be an ordering claim this boundary cannot
+      make -- see the branch itself.
     * A STEADY re-serve is DEBUG. icechunk re-invokes the callback every TTL per client and a
       campaign runs on the order of a hundred clients, so this is the one that would be a drip
       saying nothing on almost every day.
 
     **Announces NOVELTY, not transitions.** A record is emitted the first time this process
-    serves a given access key and never again, which is what makes a late callback harmless:
-    a thread can freeze the old credential, be descheduled past a refresh, and arrive after a
-    faster thread recorded the new one -- and because its key is already announced it says
-    nothing rather than reporting a rotation backwards. Ordering cannot be decided here at all:
-    the expiry is computed AFTER the credential is frozen, so an old key can carry a later
-    expiry than a newer one. Every line therefore carries a sequence number stamped while the
-    lock is held, which is what puts the stream back in order when two records are emitted
-    concurrently.
+    serves a given access key and never again. Ordering cannot be decided here at all -- the
+    expiry is computed AFTER the credential is frozen, so an old key can arrive carrying a later
+    expiry than a newer one -- so no record claims a transition FROM one credential TO another.
+    A late callback bearing a superseded key therefore costs at most one extra INFO line naming
+    a credential this process really did use; it can never invert a pairing or leave a
+    superseded key standing as the current one. Every line carries a sequence number stamped
+    while the lock is held, and the INFO lines for one pid in `seq` order are the process's
+    credential history.
 
     **"FIRST" means the first credential THIS PROCESS served, and on a scattered path that is
     not the first credential the process USED.** Where the caller passes
@@ -426,11 +432,10 @@ def _serve_icechunk_credential(
     # every icechunk request behind a log write, and per-request callback volume is the very
     # thing this instrumentation exists to observe (icechunk#2077).
     with _LAST_ACCESS_KEY_LOCK:
-        announced = _announced_access_keys.setdefault(source, [])
+        announced = _announced_access_keys.setdefault(source, set())
         novel = access_key not in announced
-        previous = announced[-1] if announced else None
-        if novel:
-            announced.append(access_key)
+        first = novel and not announced
+        announced.add(access_key)
         order = next(_announce_sequence)
     # PROCESS IDENTITY on every line, because the state this decides against is process-local
     # while the log stream is not. An assembly's spawned workers and their parent write to one
@@ -441,27 +446,17 @@ def _serve_icechunk_credential(
     # processes and what a crash dump or a `ps` line can be matched against.
     where = f"[{source}] pid={os.getpid()} seq={order}"
     until = expires_after.isoformat(timespec="seconds")
-    if not novel and previous != access_key:
-        # A late callback carrying a key this process has already moved past. Worth seeing at
-        # DEBUG -- it is evidence of exactly the refresh-boundary interleaving that made an
-        # order-based test unworkable -- but it is neither new state nor a rotation.
-        _LOG.debug(
-            "icechunk credential %s stale: %s, valid until %s (current %s)",
-            where,
-            access_key,
-            until,
-            previous,
-        )
-    elif previous is None:
+    if first:
         _LOG.info("icechunk credential %s FIRST: %s, valid until %s", where, access_key, until)
     elif novel:
-        _LOG.info(
-            "icechunk credential %s ROTATED: %s -> %s, valid until %s",
-            where,
-            previous,
-            access_key,
-            until,
-        )
+        # NEW, deliberately not "ROTATED old -> new". A pairing would be an ordering claim, and
+        # at a refresh boundary it can be exactly backwards: a thread can freeze the old
+        # credential, be descheduled while a faster thread announces the new one, and arrive
+        # afterwards -- so the pair would read new -> old and then leave the superseded key
+        # standing as "current". The INFO lines for one pid, read in `seq` order, already give
+        # the process's credential history; that is what can be established, so it is what is
+        # said.
+        _LOG.info("icechunk credential %s NEW: %s, valid until %s", where, access_key, until)
     else:
         _LOG.debug("icechunk credential %s served: %s, valid until %s", where, access_key, until)
     return icechunk.S3StaticCredentials(

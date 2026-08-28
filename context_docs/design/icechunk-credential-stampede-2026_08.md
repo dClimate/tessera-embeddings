@@ -223,8 +223,9 @@ is not conclusive, but it is the first independent measurement that separates th
 
 ## 8. A note on the new logging's own concurrency
 
-Worth recording because the same mistake was made three times, in a small piece of code, and review
-caught all three.
+Worth recording because the same mistake was made three times over, in a small piece of code, and
+review caught every one of them. The pattern is a useful one to recognise: **each version tried to
+say something about the order of events using information that did not record it.**
 
 The new logging keeps a small note of which credentials a process has already reported, so that a
 credential is announced once rather than on every request. The first version compared the incoming
@@ -239,8 +240,21 @@ credential is picked up. Either version would then report a credential change ba
 one forwards: three change records for one real change, corrupting exactly the signal the logging
 exists to provide.
 
-The fix was to stop trying to establish order. The code now simply records which credentials a
-process has already announced; a late arrival carrying an already-announced credential says nothing.
+A third version kept the "have I mentioned this one yet" test but still reported each new
+credential as a change *from* the previous one. Review found that this breaks in the one case the
+first two did not cover: at the very start of a process there is no history to match against, so a
+straggler carrying the old credential is treated as new, the record reads "changed from the new
+credential to the old one", and the superseded credential is then left standing as the apparent
+current one — mislabelling every later use of the real credential. This case is not hypothetical on
+the path we changed: a worker process that inherits a credential only calls the credential function
+once that credential expires, which is exactly the moment a refresh can interleave.
+
+The fix was to stop making ordering claims of any kind. Each record now says only "this process
+began using credential X", never "X replaced Y". Read in sequence order for one process, those
+records *are* its credential history — which is what can honestly be established. The worst a
+straggler can now cost is one extra line naming a credential the process genuinely did use, and no
+record can describe the current credential wrongly.
+
 Ordering of the log lines themselves is handled separately by a counter stamped at the moment the
 note is updated.
 
@@ -263,7 +277,8 @@ credential in use changed at the moment of failure:
 
 - **One unchanged credential across the failure** means no credential change was involved, no retry
   could ever have helped, and the cause lies inside the storage library. Candidate 1.
-- **A change moments before the first rejection** implicates the handoff. Candidate 2 — and only
+- **A different credential appearing moments before the first rejection** implicates the handoff.
+  Candidate 2 — and only
   then does adding a retry make sense, with randomised delays, because sixteen workers sharing a
   fixed delay would retry in synchronised bursts.
 

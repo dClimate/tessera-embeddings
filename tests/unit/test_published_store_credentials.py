@@ -416,14 +416,19 @@ class TestIcechunkCredentialVisibility:
             self._serve("task-role", "ASIASTEADY")
         assert [r.levelname for r in caplog.records] == ["INFO", "DEBUG", "DEBUG"]
 
-    def test_a_rotation_is_info(self, caplog) -> None:
+    def test_each_further_distinct_credential_is_info(self, caplog) -> None:
+        """The event a signature failure has to be lined up against."""
         self._reset()
         with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
             self._serve("task-role", "ASIAOLD")
             self._serve("task-role", "ASIANEW")
-        rot = [r for r in caplog.records if "ROTATED" in r.message]
-        assert len(rot) == 1 and rot[0].levelname == "INFO"
-        assert "ASIAOLD" in rot[0].getMessage() and "ASIANEW" in rot[0].getMessage()
+        new = [r for r in caplog.records if " NEW: " in r.getMessage()]
+        assert len(new) == 1 and new[0].levelname == "INFO"
+        # The new key is named; the OLD one deliberately is not. A from/to pair would be an
+        # ordering claim this boundary cannot make — at a refresh boundary it can be exactly
+        # backwards. The per-pid INFO lines in `seq` order are the history instead.
+        assert "ASIANEW" in new[0].getMessage()
+        assert "ASIAOLD" not in new[0].getMessage()
 
     def test_two_providers_in_one_process_do_not_read_as_rotation(self, caplog) -> None:
         """A fill legitimately uses BOTH — the task role to read our buckets, an assumed role
@@ -435,7 +440,7 @@ class TestIcechunkCredentialVisibility:
             for _ in range(3):
                 self._serve("task-role", "ASIATASK")
                 self._serve("assumed-role:writer", "ASIAWRITER")
-        assert not [r for r in caplog.records if "ROTATED" in r.message]
+        assert not [r for r in caplog.records if " NEW: " in r.getMessage()]
 
     def test_the_same_role_name_in_two_accounts_is_not_one_provider(self, caplog, monkeypatch) -> None:
         """The identity is the full arn, because a role NAME is not unique.
@@ -467,7 +472,7 @@ class TestIcechunkCredentialVisibility:
                 first()
                 second()
 
-        assert not [r for r in caplog.records if "ROTATED" in r.message]
+        assert not [r for r in caplog.records if " NEW: " in r.getMessage()]
         assert len([r for r in caplog.records if "FIRST" in r.message]) == 2
         text = " ".join(r.getMessage() for r in caplog.records)
         # The account id is in the line, which is also what makes it correlatable against the
@@ -537,7 +542,7 @@ class TestIcechunkCredentialVisibility:
         self._reset()
         with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
             self._serve("task-role", "ASIAONE")  # FIRST
-            self._serve("task-role", "ASIATWO")  # ROTATED
+            self._serve("task-role", "ASIATWO")  # NEW
             self._serve("task-role", "ASIATWO")  # steady, DEBUG
         assert [r.levelname for r in caplog.records] == ["INFO", "INFO", "DEBUG"]
         for record in caplog.records:
@@ -566,14 +571,49 @@ class TestIcechunkCredentialVisibility:
             # asserts the straggler changed nothing rather than merely that it stayed quiet.
             self._serve("task-role", "ASIANEW", base + timedelta(minutes=11))
 
-        assert len([r for r in caplog.records if "ROTATED" in r.message]) == 1
+        assert len([r for r in caplog.records if " NEW: " in r.getMessage()]) == 1
         assert [r.levelname for r in caplog.records] == ["INFO", "INFO", "DEBUG", "DEBUG"]
-        assert "stale" in caplog.records[2].getMessage()
+        # Both late lines are ordinary steady-state re-serves: the boundary makes no claim
+        # about which key is "current", so there is nothing for a straggler to contradict.
+        assert "served" in caplog.records[2].getMessage()
         assert "served" in caplog.records[3].getMessage()
+
+    def test_a_straggler_at_process_start_cannot_invert_the_history(self, caplog) -> None:
+        """The case novelty alone does not suppress, and why no pairing is reported.
+
+        A spawned assembly worker begins with a credential it never asked this callback for
+        (``scatter_initial_credentials``), so its FIRST callbacks land exactly at an expiry
+        boundary — the one moment a refresh can interleave with them. One thread can freeze the
+        old credential, be descheduled while a faster thread announces the NEW one, and arrive
+        with a key that has no history to be suppressed against.
+
+        Reporting a from/to pair here produced ``NEW -> OLD`` and then left the superseded key
+        standing as "current", so every later serve of the real credential was mislabelled. With
+        no pairing the worst case is one extra INFO line naming a credential the process genuinely
+        did use, and the current credential is never misdescribed.
+        """
+        self._reset()
+        base = datetime(2026, 8, 28, 12, tzinfo=UTC)
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            # The faster thread, carrying the post-refresh credential, arrives first.
+            self._serve("task-role", "ASIAFRESH", base + timedelta(minutes=5))
+            # The straggler, carrying the pre-refresh credential and no history to match.
+            self._serve("task-role", "ASIAPRIOR", base)
+            # The real credential again: already announced, so steady — NOT "stale", and not a
+            # second transition. This is the assertion the pairing version failed.
+            self._serve("task-role", "ASIAFRESH", base + timedelta(minutes=6))
+
+        assert [r.levelname for r in caplog.records] == ["INFO", "INFO", "DEBUG"]
+        assert "FIRST: ASIAFRESH" in caplog.records[0].getMessage()
+        assert "NEW: ASIAPRIOR" in caplog.records[1].getMessage()
+        assert "served: ASIAFRESH" in caplog.records[2].getMessage()
+        # Nothing anywhere claims a transition, which is the whole point.
+        for record in caplog.records:
+            assert "->" not in record.getMessage()
 
     def test_every_event_carries_an_in_lock_sequence_number(self, caplog) -> None:
         """The records are emitted OUTSIDE the lock, so two threads can emit out of order and a
-        ROTATED can reach the stream before the FIRST it followed. The sequence number is
+        NEW can reach the stream before the FIRST it followed. The sequence number is
         stamped while the lock is held, so a reader can always put the stream back in order.
         """
         self._reset()
