@@ -40,27 +40,31 @@ refusing every request, arrival times recorded server-side:
 0.5, 1.01, 2.07, 4.92, 10.96, 24.82, 52.36, 105.94 s
 ```
 
-Total scales linearly in the base (confirmed at a ratio of 9.99 for a tenfold change). **The two
-shadowed retry settings must be read together, and doing so reverses the obvious conclusion:**
+Total scales linearly in the base (confirmed at a ratio of 9.99 for a tenfold change). **But the
+multiplier is RANDOM between 2.0 and 2.5, not a clean doubling** — GDAL draws it per retry
+(`port/cpl_http.cpp`). The measured ratios above are 2.02, 2.05, 2.38, 2.23, 2.26, 2.11, 2.02: one
+sample of a random process, which I first read as "roughly doubles" and used as though it were the
+rule. **A single ladder is therefore a lower bound, not a typical case.**
 
-| config | retries | base | backoff sleep before giving up |
+Two budgets, and they ADD rather than overlapping — sleep between attempts, and the attempts
+themselves. `GDAL_HTTP_TIMEOUT=120` is not shadowed, so a permanently hanging request costs up to
+120 s per attempt, and `n` retries means `n+1` attempts:
+
+| config | backoff sleep (×2.0 → ×2.5) | request time, worst | worst total |
 |---|---:|---:|---:|
-| **odc** (what the read path runs) | 10 | 0.5 s | **~14 min** |
-| **ours** (what the environment carries) | 5 | 5 s | **~3 min** |
+| **ours** — 5 retries, base 5 s | 2.6 → **5.4 min** | 12 min (6 × 120 s) | **~17 min** |
+| **odc** — 10 retries, base 0.5 s | 8.5 → **53 min** | 22 min (11 × 120 s) | **~75 min** |
+| 10 retries at base 5 s | 85 min → **8.8 h** | 22 min | **~9.2 h** |
 
-**odc is ~5x MORE patient than our own defaults.** Only the base is 10x smaller; the retry COUNT is
-twice as large, and the ladder's total is dominated by its last rungs. Forcing our values onto the
-read path would have REDUCED patience there — the opposite of what the outage wanted. That is the
-strongest argument for the no-code outcome, and I had it backwards until review.
+**odc's read path is still the more patient of the two** — roughly 3–4× ours depending where in the
+random range each lands — which is the point that matters, and the opposite of what I assumed before
+review. Only the base is 10× smaller; the retry COUNT is twice as large and the ladder's total is
+dominated by its last rungs. Forcing our values onto the read path would have REDUCED patience there.
 
-**Those figures are BACKOFF SLEEP ONLY.** `GDAL_HTTP_TIMEOUT=120` is not shadowed and still applies,
-so a request that hangs rather than failing fast adds up to 120 s per attempt: roughly **15 min** for
-five retries and **36 min** for ten, in the worst case. The real budget is the sleep plus the
-requests.
-
-For scale, ten retries at a base of **5 s** would be ~2.5 h of sleep alone. The S2 coverage gate then
-wraps the read in `source_read_retrying()` — `SOURCE_READ_ATTEMPTS = 8` is passed to
-`stop_after_attempt`, so **eight attempts in total, seven of them after the first** — while
+**And note the last row.** Raising our base to 5 s while leaving odc's count of 10 would give a
+worst case near **nine hours for one unreadable object**, not the 2.5 h an average-multiplier model
+suggests. The S2 coverage gate then wraps the read in `source_read_retrying()` — `SOURCE_READ_ATTEMPTS = 8`
+passed to `stop_after_attempt`, so eight attempts in total, seven after the first — while
 `max_leg_wall_clock_s` cannot interrupt a running leg.
 
 ## What shipped: nothing but this record
