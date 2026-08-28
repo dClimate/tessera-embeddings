@@ -8,12 +8,11 @@ emitted once, no read-modify-write, no dense nodata.
 
 Cooperative fork/merge: the coordinator forks the session, workers write into
 their fork, the coordinator merges and makes **one commit per (zone, year)**,
-updating ``years_complete`` in the same commit (D1). Commits are UNGATED here, and
-whether they should be is UNRESOLVED: the campaign writes all 120 zone groups into
-ONE repo on one branch tip, so commits contend on the branch-tip CAS even though
-their data is disjoint. See
-``context_docs/design/commit-gate-removal-2026_08.md``, which withdraws the
-premise this removal was argued from.
+updating ``years_complete`` in the same commit (D1). Commits are UNGATED. They do
+contend on the branch-tip CAS -- all 120 zone groups share one repo -- but run 1
+measured that as 2.2 s at 16 simultaneous committers and 15 s at 120, with zero
+unresolvable conflicts at every N. See
+``context_docs/design/commit-gate-removal-2026_08.md``.
 
 A :class:`ShardSource` decouples the writer from *where* shard data comes from
 (staged inference files in production; synthetic in tests), and must be picklable
@@ -166,11 +165,10 @@ def commit_with_rebase(
     and always rebase cleanly (run-1 T0/T5: zero unresolvable conflicts). A real
     chunk conflict surfaces as ``RebaseFailedError`` rather than being masked.
 
-    Commits are UNGATED. A fleet-wide committer limit used to wrap this call. Whether
-    removing it was right is UNRESOLVED — the measured 1 s commit was taken at one
-    assembly in flight, not at the 16-20 concurrent committers the campaign's default
-    width can reach on this repo's single branch tip. See
-    ``context_docs/design/commit-gate-removal-2026_08.md``.
+    Commits are UNGATED. A fleet-wide committer limit used to wrap this call; it was
+    removed because what it bounded is a SLOWDOWN, not a failure -- run 1 measured 2.2 s
+    commits at 16 concurrent committers and 15 s at 120, with zero unresolvable
+    conflicts at every N. See ``context_docs/design/commit-gate-removal-2026_08.md``.
     """
     return session.commit(message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries)
 

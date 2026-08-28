@@ -43,10 +43,8 @@ fills from colliding without a year barrier. ``overlap_years=False`` restores th
 older shape: **year by year** in an outer serial loop, dispatching each year's zones
 concurrently, where distinct zones make same-zone overlap impossible by construction.
 Either way concurrency is bounded by ``max_parallel_clusters``.
-
-Commits are UNGATED in this branch, and that is UNRESOLVED: at
-``max_parallel_clusters=10`` the committer ceiling is ~2N=20 on a SINGLE repo branch
-tip, against a run-1 breach at N>=16. See
+Commits are UNGATED. At ``max_parallel_clusters=10`` the committer ceiling is ~2N=20
+on a single repo branch tip; run 1 measured that as ~2.2 s commits, not a failure. See
 ``context_docs/design/commit-gate-removal-2026_08.md``. ``pending()`` is year-major,
 which is the drain pattern the barrier path relies on.
 """

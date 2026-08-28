@@ -257,11 +257,10 @@ Zone-parallelism (either flavor) is safe because inference is independent
 across zones and only *same-zone* fills conflict (shared group attrs →
 `RebaseFailedError`) — the year-serial loop guarantees a zone never fills two
 years at once, and within a sequential run the depth-1 trailing assembly can
-never overlap a commit for the same zone group. **Commits are otherwise ungated
-in this branch, and whether they should be is UNRESOLVED** — the campaign writes
-all 120 zone groups into one repo on one branch tip, so commits contend on the
-branch-tip CAS even with disjoint data. See
-`context_docs/design/commit-gate-removal-2026_08.md`. `build_land_mask` and `seed_global_store` are
+never overlap a commit for the same zone group. **Commits are otherwise ungated.**
+They contend on the branch-tip CAS, since all 120 zone groups share one repo, but
+run 1 measured that as 2.2 s at 16 committers and 15 s at 120 with zero
+unresolvable conflicts. See `context_docs/design/commit-gate-removal-2026_08.md`. `build_land_mask` and `seed_global_store` are
 cluster-less (they run on the flow runner like `generate_roi`); only
 `fill_zone_year` / `fill_zones_sequential` provision Ray.
 

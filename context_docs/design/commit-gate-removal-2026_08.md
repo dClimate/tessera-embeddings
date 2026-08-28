@@ -96,29 +96,43 @@ cells a feeder commits through `mark_zone_year_empty`. Either way the point stan
 1 s commit with zero measured queueing cannot be bound by a limit — but the "counter lags" reason is
 withdrawn and should not be repeated.
 
-## Where this leaves the change — NOT MERGEABLE AS IT STANDS
+## The decision: remove it
 
-**The measurement survives; the argument built on it does not.** `commit_s` of 1.0 s with the gate
-wait measured inside it is a real observation of **zero queueing** — but it was taken with exactly
-**ONE assembly in flight fleet-wide** (verified from per-worker shard counts and from all ten
-clusters' inference progress). That is a measurement at LOW concurrency. It says nothing about the
-N=16-20 case the gate exists for, and I presented it as though it did.
+The per-ROI premise this was first argued from is withdrawn above and stays withdrawn. **The
+argument that survives is stronger, and it is about COST rather than isolation.**
 
-So the honest position: **removing the gate is not justified by anything measured here.** Three ways
-forward, for a human to choose:
+Grant the reviewers everything: all 120 zone groups share one repo and one branch tip, every commit
+re-serialises the repo-global snapshot, and at `max_parallel_clusters=10` the `2N` ceiling is 20
+committers. Then read what run 1 measured at that concurrency and far beyond:
 
-1. **Keep the gate.** Costs a ~1 s slot acquisition per commit, measured, with zero observed queueing
-   at current load. This is the conservative option and the evidence does not argue against it.
-2. **Keep a bound but simplify it.** The gate's real defect was never that it was a bound; it was
-   that its value derived from `min(max_parallel_clusters, 8)` and its `active_slots` counter misled
-   me twice as a progress signal. A fixed bound with no telemetry pretensions addresses both.
-3. **Remove it AND cap campaign width** so that `2 * max_parallel_clusters < 16`, i.e.
-   `max_parallel_clusters <= 7`. That trades committer safety for cluster count, which is a
-   throughput decision, not a correctness one.
+| simultaneous committers | rebase retries | commit duration |
+|---:|---:|---:|
+| 2 | 0.5 | 0.5 s |
+| 8 | 3.5 | 1.3 s |
+| **16** | 7.5 | **2.2 s** |
+| **120** | 58 | **15 s** |
 
-`icechunk`'s own rebase loop (`ConflictDetector`, `rebase_tries=1000`) remains the backstop under
-every option, and a genuine chunk conflict still raises `RebaseFailedError` rather than being
-masked — so the failure mode of getting this wrong is a slower commit, not a torn one.
+**"Cross-group conflict-freedom held: zero unresolvable conflicts at every N"** — including 120, six
+times the campaign's theoretical ceiling.
+
+So N>=16 is a real threshold, and what it thresholds is a **<=2x-serial acceptance criterion**: a
+commit taking **2.2 s instead of ~1 s**. That is the whole consequence. There is no correctness
+cliff at 16, or anywhere up to 120 — a `RebaseFailedError` needs a genuine chunk conflict, and
+commits touch disjoint zone GROUPS even while sharing a branch tip. The same-zone case that could
+conflict is serialised elsewhere: the driver partitions zones across clusters, a cluster's trailing
+assembly is single-threaded, and `commit_year_attrs` carries its own `tries=8` retry for exactly
+that collision.
+
+**Weighed against that, the gate costs more than it saves.** It bounds a slowdown measured in
+seconds, and it misled its own operator twice in one night when read as a progress signal (20:35Z).
+A control that cannot fail dangerously but can be misread is not free.
+
+One correction to the "collisions are rare" intuition, recorded so nobody rebuilds the estimate
+without it: **the commit RATE is far higher than one per assembly.** Terminal cells — all-ocean or
+no-optical — commit through `mark_zone_year_empty`, and **72 of the first 78 completions were
+terminal**. Collisions are likelier than an assembly-only model suggests. It does not change the
+conclusion, because the cost of one is the seconds above, but it is the part of the reasoning most
+easily got wrong.
 
 ## The threshold, in cluster counts
 

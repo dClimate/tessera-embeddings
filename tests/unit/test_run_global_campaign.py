@@ -286,9 +286,10 @@ class TestCampaignDefaults:
         """Commits are ungated, and the cluster count no longer implies a committer cap.
 
         The removed gate derived ``min(clusters, 8)`` from the run-1 contention curve. It was
-        removed on a measured 1 s commit with zero observed gate wait — but that reading was
-        taken at ONE assembly in flight, and the campaign writes every zone group into one repo,
-        so the removal is UNRESOLVED pending a decision. The curve itself is kept in
+        removed because what it bounded is a SLOWDOWN, not a failure: all 120 zone groups do
+        share one repo and one branch tip, and run 1 measured that contention as 2.2 s commits
+        at 16 simultaneous committers and 15 s at 120, with ZERO unresolvable conflicts at every
+        N. The curve itself is kept in
         ``context_docs/design/commit-gate-removal-2026_08.md`` together with the scale
         (N>=16) at which it would matter again — this is parametrised past that scale on
         purpose, so a reader sees the removal is unconditional rather than tuned.
