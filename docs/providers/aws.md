@@ -77,7 +77,7 @@ baked (see `gotchas.md` for the AMI-bake pattern).
 
 | Key | Type | Purpose |
 |---|---|---|
-| `gpu-worker-ladder` | String | Per-instance-type GPU worker ceilings, e.g. `g6e.xlarge:100,g6e.2xlarge:150` |
+| `gpu-worker-ladder` | String | Per-instance-type GPU worker ceilings, e.g. `g6e.xlarge:101,g5.2xlarge:105` |
 
 **Absent is the default, and it means the cluster template's node types stand
 exactly as shipped.** Set it and `_resolve_ray_config` rewrites the `max_workers`
@@ -227,10 +227,12 @@ and neither works without the other:
    and never reads it — so a rung refusing with `InsufficientInstanceCapacity` stays
    top-scored and is re-requested indefinitely while an open fallback sits idle.
 
-With both in place the fleet prefers the L40S whenever AWS will sell one, moves to the
-A10G when it will not, and returns on its own once capacity comes back — Ray clears the
-unavailability record on the next successful launch of that type, and in any case after
-30 minutes. **The fleet never gets bigger**, only differently made: `num_actors` bounds
+With both in place the fleet prefers the L40S whenever AWS will sell one and moves to
+the A10G when it will not. Recovery applies to NEW demand, not to nodes already running:
+Ray clears the unavailability record on the next successful launch of that type (and in
+any case after 30 minutes), after which fresh bundles go back to the L40S — but nothing
+evicts a running A10G to make room for one. A fleet whose demand is already satisfied by
+fallback nodes stays on them until those nodes idle out and retire. **The fleet never gets bigger**, only differently made: `num_actors` bounds
 it exactly as before.
 
 Three things to know before you turn it on.

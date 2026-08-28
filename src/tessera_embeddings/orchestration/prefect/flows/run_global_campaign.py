@@ -89,6 +89,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_work_weight,
     zone_year_on_axis,
 )
+from tessera_embeddings.providers.aws.ray import GPU_FALLBACK_CARDS
 from tessera_embeddings.storage.campaign import (
     CampaignStatus,
     campaign_status,
@@ -964,6 +965,22 @@ async def run_global_campaign(
     # gave and which turned out to cover more cases than it named — see there.
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
+    # HERE, before any dispatch. `_apply_gpu_fallback` refuses an unknown card too, but
+    # it runs inside the child, AFTER that child has primed its look-ahead mosaics and
+    # entered `ray_cluster`. A typo would therefore spend real ingest work per cluster
+    # before anything said so, on a campaign that cannot succeed as configured.
+    if gpu_fallback_cards:
+        unknown = sorted(set(gpu_fallback_cards) - set(GPU_FALLBACK_CARDS))
+        if unknown:
+            raise ValueError(
+                f"gpu_fallback_cards names unknown card(s) {unknown}. Known: {sorted(GPU_FALLBACK_CARDS)}."
+            )
+        if len(set(gpu_fallback_cards)) > 1:
+            raise ValueError(
+                f"Only one GPU fallback card may be opened at a time, got "
+                f"{sorted(set(gpu_fallback_cards))} — both are 8 vCPU / 1 GPU and Ray "
+                "scores them equally, breaking the tie on node-type name."
+            )
     if fill_strategy not in ("cluster-per-zone", "chained-clusters"):
         raise ValueError(f"fill_strategy must be 'cluster-per-zone' or 'chained-clusters', got {fill_strategy!r}")
     # Each of the three staging levers CLAIMS the identity, so any pair of them is a

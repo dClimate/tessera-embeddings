@@ -252,14 +252,24 @@ class TestVcpuBudget:
         with pytest.raises(RuntimeError, match="Cannot price node type"):
             tray._apply_gpu_fallback(config, ["A10G"], 1000)
 
-    def test_a_budget_never_closes_a_rung_silently(self) -> None:
-        """Floors at 1. A budget too small for even one card should narrow the fleet, not
-        produce a cluster that looks configured and can launch nothing.
+    def test_a_budget_too_small_to_seat_a_node_is_refused(self) -> None:
+        """REPLACES a test that asserted a floor of 1, which was the defect: a budget of
+        5 would open one 8-vCPU node and overspend the caller's stated quota by 60%.
+
+        The caller stated a quota, not a preference. Refusing here is cheaper than
+        discovering it as an unexplained `InstanceLimitExceeded` during a capacity event.
         """
         config = yaml.safe_load(TEMPLATE.read_text())
-        tray._apply_gpu_fallback(config, ["A10G"], 1)
-        types = config["available_node_types"]
-        assert types[PRODUCTION]["max_workers"] == types[A10G]["max_workers"] == 1
+        with pytest.raises(ValueError, match="cannot afford a single"):
+            tray._apply_gpu_fallback(config, ["A10G"], 1)
+
+    def test_a_budget_that_seats_production_but_not_the_fallback_is_refused(self) -> None:
+        """4 vCPU seats one production GPU and zero fallback GPUs. Opening the fallback
+        anyway would be the same overspend by a narrower margin.
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        with pytest.raises(ValueError, match="cannot afford a single"):
+            tray._apply_gpu_fallback(config, ["A10G"], 4)
 
 
 class TestTheCampaignRestartConfiguration:
@@ -317,6 +327,48 @@ class TestTheCampaignRestartConfiguration:
         ceilings = self._ceilings()
         both_full = ceilings[PRODUCTION] * 4 + ceilings[A10G] * 8
         assert both_full * self.CLUSTERS > self.ACCOUNT_VCPU_QUOTA
+
+
+class TestCeilingsAreDerivedFromProductionOnly:
+    """Fallback rungs share the node-type prefix, which made them look like production."""
+
+    def test_a_ladder_opened_fallback_does_not_supply_the_production_ceiling(self) -> None:
+        """`g6e.xlarge:250,g5.2xlarge:50` opens both. The 50 was deliberate, and matching
+        the fallback to "the widest open rung" must not read the fallback's own ceiling.
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_worker_ladder(config, "g6e.xlarge:250,g5.2xlarge:50")
+        tray._apply_gpu_fallback(config, ["A10G"])
+        assert config["available_node_types"][A10G]["max_workers"] == 50, (
+            "an explicit ladder ceiling on the fallback must not be widened"
+        )
+
+    def test_an_all_fallback_ladder_has_nothing_to_fall_back_from(self) -> None:
+        """The guard read "any open rung with the prefix", which a fallback satisfies --
+        so a ladder opening ONLY the fallback passed a check whose whole point is that a
+        production rung exists to fail over from.
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_worker_ladder(config, "g5.2xlarge:50")
+        with pytest.raises(RuntimeError, match="no PRODUCTION GPU rung is open"):
+            tray._apply_gpu_fallback(config, ["A10G"])
+
+
+class TestOnlyOneCardAtATime:
+    """Ray cannot express a preference between two equally-scored node types."""
+
+    def test_two_cards_are_refused(self) -> None:
+        """Both fallbacks are 8 vCPU / 1 GPU with identical declared resources, so Ray
+        scores them equally and breaks the tie on node-type NAME, descending -- the L4
+        would win every request despite being measurably the slower card.
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        with pytest.raises(RuntimeError, match="Only one GPU fallback card"):
+            tray._apply_gpu_fallback(config, ["A10G", "L4"])
+
+    def test_the_same_card_twice_is_not_two_cards(self) -> None:
+        config = yaml.safe_load(TEMPLATE.read_text())
+        assert tray._apply_gpu_fallback(config, ["A10G", "A10G"]) == [A10G, A10G]
 
 
 class TestScorerInstallation:

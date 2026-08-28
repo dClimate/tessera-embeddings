@@ -423,10 +423,25 @@ def _vcpu_per_gpu(node_type: dict[str, Any]) -> int:
 
 
 def _vcpu_budget_ceiling(node_type: dict[str, Any], vcpu_budget: int) -> int:
-    """How many of this rung the vCPU budget affords. At least 1, so a budget can
-    narrow a fleet but never close it silently.
+    """How many of this rung the vCPU budget affords.
+
+    Raises rather than flooring at 1. A floor would open a rung the budget cannot pay
+    for -- a budget of 5 buying one 8-vCPU node overspends by 60% -- and the caller
+    stated a quota, not a preference. A budget too small to seat one node of an open
+    rung is a configuration error, and it is cheaper to say so here than to discover it
+    as an unexplained `InstanceLimitExceeded` during a capacity event.
     """
-    return max(1, vcpu_budget // _vcpu_per_gpu(node_type))
+    per_gpu = _vcpu_per_gpu(node_type)
+    affords = vcpu_budget // per_gpu
+    if affords < 1:
+        instance = node_type.get("node_config", {}).get("InstanceType")
+        msg = (
+            f"gpu_fallback_vcpu_budget={vcpu_budget} cannot afford a single {instance!r} "
+            f"at {per_gpu} vCPU per GPU. Raise the budget to at least {per_gpu}, or close "
+            "that rung."
+        )
+        raise ValueError(msg)
+    return affords
 
 
 def _apply_gpu_vcpu_budget(config: dict[str, Any], vcpu_budget: int) -> None:
@@ -505,6 +520,17 @@ def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str], vcpu_budge
     if not cards:
         return []
 
+    if len(set(cards)) > 1:
+        msg = (
+            f"Only one GPU fallback card may be opened at a time, got {sorted(set(cards))}. "
+            "Both supported cards are 8 vCPU / 1 GPU with identical declared resources, so "
+            "Ray scores them EQUALLY and breaks the tie on node-type name, descending -- "
+            "'gpu-workers-ondemand-l4-2xl' beats 'gpu-workers-ondemand-a10g-2xl' and the "
+            "slower card would win every request. Ray's scorer has no priority concept to "
+            "express the preference with, so the choice is made here, by naming one card."
+        )
+        raise RuntimeError(msg)
+
     unknown = [c for c in cards if c not in GPU_FALLBACK_CARDS]
     if unknown:
         msg = (
@@ -519,18 +545,25 @@ def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str], vcpu_budge
         for name, cfg in node_types.items()
         if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX)
     }
-    # The production ceiling every fallback is matched to. Taken from the widest OPEN
-    # on-demand GPU rung, so this composes with `gpu-worker-ladder` rather than
-    # overriding it -- a ladder that set the production rung to 250 gives fallbacks 250.
+    # The production ceiling every fallback is matched to, from the widest open
+    # PRODUCTION rung. Fallback rungs are excluded by instance type, not by ceiling:
+    # they share the node-type prefix, so a ladder that had already opened one would
+    # otherwise contribute its own ceiling here -- and, worse, an all-fallback ladder
+    # would satisfy the "something to fall back FROM" guard with nothing to fall back
+    # from at all.
+    fallback_types = set(GPU_FALLBACK_CARDS.values())
     open_ceilings = [
         cfg["max_workers"]
         for name, cfg in node_types.items()
-        if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX) and cfg.get("max_workers", 0) > 0
+        if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX)
+        and cfg["node_config"]["InstanceType"] not in fallback_types
+        and cfg.get("max_workers", 0) > 0
     ]
     if not open_ceilings:
         msg = (
-            "GPU fallback was requested but no on-demand GPU rung is open, so there is no "
-            "production ceiling to match and nothing to fall back FROM."
+            "GPU fallback was requested but no PRODUCTION GPU rung is open, so there is "
+            "no ceiling to match and nothing to fall back FROM. Open one with the "
+            f"{GPU_WORKER_LADDER_SSM_KEY} key, or drop the fallback request."
         )
         raise RuntimeError(msg)
     ceiling = max(open_ceilings)
@@ -545,9 +578,11 @@ def _apply_gpu_fallback(config: dict[str, Any], cards: Sequence[str], vcpu_budge
                 f"cluster template offers. Available: {sorted(by_instance_type)}."
             )
             raise RuntimeError(msg)
-        node_types[name]["max_workers"] = (
-            _vcpu_budget_ceiling(node_types[name], vcpu_budget) if vcpu_budget is not None else ceiling
-        )
+        want = _vcpu_budget_ceiling(node_types[name], vcpu_budget) if vcpu_budget is not None else ceiling
+        # A ladder that already opened this rung chose its ceiling on purpose; opening it
+        # again must not widen it. Same rule as the budget's, for the same reason.
+        current = node_types[name].get("max_workers", 0)
+        node_types[name]["max_workers"] = min(current, want) if current > 0 else want
         opened.append(name)
 
     widest = max(node_types[n]["max_workers"] for n in opened)
