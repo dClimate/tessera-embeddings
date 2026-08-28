@@ -609,6 +609,10 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
     timer = PhaseTimer()
     tiles = writes = nbytes = 0
     last_report = time.monotonic()
+    # Publish the DENOMINATOR before the first shard. The coordinator sums totals across workers,
+    # so until every worker has reported once its percentage is measured against a short total —
+    # and a worker that finishes inside one reporting interval would never report at all.
+    report_shard_progress(worker_index, 0, total)
     for sy, sx in payload["shards"]:
         if time.monotonic() - last_report >= progress_interval_s:
             _log.info("Assembly worker %d progress: %d/%d shards written (%s)", worker_index, tiles, total, group)
@@ -629,6 +633,10 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
                 arr[year : year + 1, y0 : y0 + h, x0 : x0 + w] = block
             writes += 1
             nbytes += block.nbytes
+    # And the final count, which no timed checkpoint reaches: the loop exits without one, so a
+    # finished worker's slot would sit at its last checkpoint and understate the total for as long
+    # as any slower worker kept the coordinator reporting.
+    report_shard_progress(worker_index, tiles, total)
     return fork, {"tiles": tiles, "writes": writes, "bytes": nbytes, **timer.stats()}
 
 

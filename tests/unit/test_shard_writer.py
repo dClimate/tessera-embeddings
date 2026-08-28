@@ -621,6 +621,40 @@ class TestAssemblyProgressReportsShards:
         assert "1/1 bands outstanding" in line
 
 
+class TestShardCountsArePublishedAtBothEnds:
+    """The timed checkpoint sits at the TOP of the shard loop, so on its own it publishes neither
+    the denominator before the first shard nor the final count after the last. Both matter: the
+    coordinator sums totals across workers, so a worker yet to report leaves the percentage measured
+    against a short total, and a finished worker's slot would sit at its last checkpoint and
+    understate progress while slower workers keep the reporting going. A partition that fits inside
+    one interval would otherwise never report at all.
+    """
+
+    def test_the_worker_reports_the_total_first_and_the_count_last(self, tmp_path, monkeypatch):
+        calls: list[tuple[int, int, int]] = []
+        monkeypatch.setattr(
+            shard_writer,
+            "report_shard_progress",
+            lambda w, done, total: calls.append((w, done, total)),
+        )
+        store, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        payload = {
+            "fork": session.fork(),
+            "group": "01N",
+            "year_index": 2,
+            "shard_px": _SHARD,
+            "source": _SlowLoadSource(),
+            "shards": [(0, 0), (1, 0)],
+            "worker_index": 3,
+            # Long enough that no timed checkpoint fires, so only the two ends can report.
+            "progress_interval_s": 3600.0,
+        }
+        _write_shards_worker(payload)
+        assert calls[0] == (3, 0, 2), "the denominator must be published before the first shard"
+        assert calls[-1] == (3, 2, 2), "the final count must be published after the last"
+
+
 class TestForkedWorkersGetLoggingConfigured:
     """A spawned process inherits no logging config, so an unconfigured worker's INFO records are
     discarded by the root WARNING default — which once made the assembly workers invisible to the
