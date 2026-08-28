@@ -391,11 +391,9 @@ class TestIcechunkCredentialVisibility:
         )
 
     def test_first_then_new_then_steady(self, caplog) -> None:
-        """The level ladder, and that every line carries the pid and an ordering stamp.
-
-        A process that fails before it ever changes credential must still name one at production
-        level; a change is the event a signature failure is lined up against; a routine re-serve
-        must not be, since icechunk asks per request once its cache lapses.
+        """The level ladder, plus the pid and ordering stamp on every line. A process that fails
+        before it ever changes credential must still name one at production level; a routine
+        re-serve must not be, since icechunk asks per request once its cache lapses.
         """
         self._reset()
         with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
@@ -434,14 +432,11 @@ class TestIcechunkCredentialVisibility:
 
     @pytest.mark.parametrize("straggler_was_announced", [True, False])
     def test_a_late_callback_is_neither_a_change_nor_new_state(self, caplog, straggler_was_announced) -> None:
-        """Acquisition happens before this boundary and outside its lock.
-
-        So a thread can freeze the old credential, be descheduled past a refresh, and arrive
-        after a faster thread recorded the new one — **carrying a LATER expiry**, since the
-        expiry is computed after the freeze. Both shapes are covered: a straggler whose key was
-        already announced, and one at process start with no history to be matched against, which
-        novelty alone cannot suppress. Neither may report a change or leave the superseded key
-        looking current.
+        """Acquisition happens before this boundary and outside its lock, so a thread can freeze
+        the old credential, be descheduled past a refresh, and arrive after a faster thread
+        recorded the new one — **carrying a LATER expiry**, since the expiry is computed after the
+        freeze. Both shapes: a straggler already announced, and one at process start with no
+        history, which novelty alone cannot suppress.
         """
         self._reset()
         base = datetime(2026, 8, 28, 12, tzinfo=UTC)
@@ -460,9 +455,9 @@ class TestIcechunkCredentialVisibility:
         assert len([r for r in caplog.records if r.levelname == "INFO"]) == 2
 
     def test_a_workers_first_line_says_it_is_probably_a_change(self, caplog, monkeypatch) -> None:
-        """A spawned worker inherits a scattered credential without asking, so its first call
-        lands only once that credential lapses — the line is a change wearing the word FIRST.
-        Anyone reading these logs cold would misread it, so it says so in its own text.
+        """Where a caller scatters, a worker's first call lands only once the inherited credential
+        lapses — a change wearing the word FIRST, which a reader would misread. Phrased as a
+        possibility, since multiprocessing ancestry does not prove the storage scattered.
         """
         self._reset()
         with caplog.at_level(logging.INFO, logger=creds_mod.__name__):

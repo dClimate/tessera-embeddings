@@ -569,10 +569,8 @@ def test_every_commit_is_timed_including_the_terminal_path(tmp_path, caplog):
 
 
 class TestAssemblyProgressReportsShards:
-    """The coordinator's line is the only progress a flow run can see, and it used to count
-    PAYLOADS — which read `0/16 outstanding` for the entire write, because a payload completes
-    only when its worker returns and all of them return at the end. Shard counts come from the
-    workers through shared memory instead.
+    """The only progress a flow run can see. It counted PAYLOADS, which read `0/16` for the
+    entire write since all workers return at the end; shard counts come through shared memory.
     """
 
     def test_the_worker_publishes_into_the_slots_it_was_initialised_with(self) -> None:
@@ -622,12 +620,10 @@ class TestAssemblyProgressReportsShards:
 
 
 class TestShardCountsArePublishedAtBothEnds:
-    """The timed checkpoint sits at the TOP of the shard loop, so on its own it publishes neither
-    the denominator before the first shard nor the final count after the last. Both matter: the
-    coordinator sums totals across workers, so a worker yet to report leaves the percentage measured
-    against a short total, and a finished worker's slot would sit at its last checkpoint and
-    understate progress while slower workers keep the reporting going. A partition that fits inside
-    one interval would otherwise never report at all.
+    """The timed checkpoint sits at the TOP of the loop, so alone it publishes neither the
+    denominator before the first shard nor the final count after the last. The coordinator sums
+    totals across workers, so a worker yet to report shortens the denominator, and a finished
+    one would sit at its last checkpoint understating progress.
     """
 
     def test_the_worker_reports_the_total_first_and_the_count_last(self, tmp_path, monkeypatch):
@@ -656,11 +652,8 @@ class TestShardCountsArePublishedAtBothEnds:
 
 
 class TestForkedWorkersGetLoggingConfigured:
-    """A spawned process inherits no logging config, so an unconfigured worker's INFO records are
-    discarded by the root WARNING default — which once made the assembly workers invisible to the
-    instrumentation added to diagnose them. Set on the POOL, so a worker added later cannot omit
-    it; that is what this pins. The pool is built before `run_forked`'s try block, so raising in
-    the constructor captures the kwargs without spawning anything.
+    """A spawned process inherits no logging config, so an unconfigured worker's records are
+    discarded. Set on the POOL so a worker added later cannot omit it, which is what this pins.
     """
 
     def test_the_pool_configures_logging_in_every_child(self, tmp_path, monkeypatch) -> None:

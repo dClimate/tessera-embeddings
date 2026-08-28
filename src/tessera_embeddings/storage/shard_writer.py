@@ -196,9 +196,8 @@ _PROGRESS_SLOTS: ctypes.Array[ctypes.c_long] | None = None
 
 
 def _init_fork_worker(slots: ctypes.Array[ctypes.c_long]) -> None:
-    """Runs once per spawned child, before any payload: configure logging (a spawned process
-    inherits none, so the root WARNING default would discard the worker's own records) and stash
-    the slots it publishes shard counts into.
+    """Runs once per spawned child: configure logging (a spawned process inherits none, so the
+    root WARNING default would discard its records) and stash the slots it reports counts into.
     """
     global _PROGRESS_SLOTS
     configure_logging()
@@ -206,12 +205,9 @@ def _init_fork_worker(slots: ctypes.Array[ctypes.c_long]) -> None:
 
 
 def report_shard_progress(worker_index: int, done: int, total: int) -> None:
-    """Publish a worker's shard counts where the COORDINATOR can read them.
-
-    A worker's own log line reaches its process's stream and never the orchestrator, so the flow
-    run could see how many payloads were outstanding but not how much of the write was done.
-    Unlocked on purpose: monotone telemetry counters, where a torn read costs one stale progress
-    line and a lock would be taken on every shard by every worker. No-op off the pool path.
+    """Publish a worker's shard counts where the COORDINATOR can read them: a worker's own log
+    line never reaches the orchestrator. Unlocked on purpose -- monotone counters where a torn
+    read costs one stale line, against a lock taken on every shard. No-op off the pool path.
     """
     if _PROGRESS_SLOTS is None:
         return
@@ -255,32 +251,21 @@ def _await_forks(
             if future.exception() is not None:
                 future.result()  # re-raises, with the worker's traceback attached
         if pending:
-            mins = (time.monotonic() - started) / 60.0
-            # SHARDS, not payloads. A payload counts as done only when its worker returns and
-            # they all return at the end, so the payload figure read 0/N for the whole write and
-            # said nothing. `slots` carries what the workers have actually written.
-            written = sum(slots[2 * i] for i in range(len(futures))) if slots is not None else 0
-            expected = sum(slots[2 * i + 1] for i in range(len(futures))) if slots is not None else 0
-            if expected:
-                logger.info(
-                    "Assembly progress: %d/%d shards written (%.0f%%), %d/%d %s outstanding after %.0f min",
-                    written,
-                    expected,
-                    100.0 * written / expected,
-                    len(pending),
-                    len(futures),
-                    unit,
-                    mins,
-                )
-            else:
-                # Before the first worker reports, and on any caller whose worker does not.
-                logger.info(
-                    "Assembly progress: %d/%d %s outstanding after %.0f min",
-                    len(pending),
-                    len(futures),
-                    unit,
-                    mins,
-                )
+            # SHARDS, not payloads: a payload completes only when its worker returns and they all
+            # return at the end, so the payload figure read 0/N for the whole write. `slots` is what
+            # the workers have actually written; empty until the first of them reports.
+            n = len(futures)
+            got = sum(slots[2 * i] for i in range(n)) if slots is not None else 0
+            want = sum(slots[2 * i + 1] for i in range(n)) if slots is not None else 0
+            shards = f"{got}/{want} shards written ({100.0 * got / want:.0f}%), " if want else ""
+            logger.info(
+                "Assembly progress: %s%d/%d %s outstanding after %.0f min",
+                shards,
+                len(pending),
+                n,
+                unit,
+                (time.monotonic() - started) / 60.0,
+            )
     return [future.result() for future in futures]
 
 
