@@ -244,6 +244,27 @@ either 2,500 L40S or 1,250 A10G. A fleet fully on fallback is half the card coun
 clears in seconds, and a quota refusal (`InstanceLimitExceeded`) only gets worse on a
 rung that spends more quota — so neither demotes.
 
+**The configuration the campaign runs.** As of 2026-08-28, with the L40S in short
+supply:
+
+```
+gpu_fallback_cards       = ["A10G"]
+gpu_fallback_vcpu_budget = 840
+gpu-worker-ladder (SSM)  = g6e.xlarge:101
+```
+
+That yields ceilings of **101 L40S and 105 A10G** per cluster. The L40S ceiling sits
+well above the ~39 AWS is currently supplying, which costs nothing unclaimed and
+converts straight into more actors per vCPU if supply recovers — an L40S actor is half
+the quota of an A10G one. The A10G ceiling is what actually decides the bill while the
+L40S trickles: `39x4 + 105x8 = 996` vCPU per cluster, **9,960 across ten, inside the
+10,000 account quota by design** rather than by AWS refusing the last launches.
+
+Both rungs full would be 1,244 vCPU per cluster and over quota. That is the accepted
+limitation — Ray's ceilings count nodes and cannot be jointly weighted — and AWS
+enforces the real line by refusing, which the scorer correctly declines to treat as a
+reason to fall back further. `TestTheCampaignRestartConfiguration` pins all of it.
+
 **The vCPU-matched sizes are deliberately not offered.** `g5.xlarge` and `g6.xlarge` are
 4 vCPU per GPU like the production rung, but carry 16 GiB of host RAM against a measured
 ~17.7 GB per-actor requirement — the exact shape that OOMed the loader on the earlier

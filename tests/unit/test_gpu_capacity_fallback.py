@@ -262,6 +262,63 @@ class TestVcpuBudget:
         assert types[PRODUCTION]["max_workers"] == types[A10G]["max_workers"] == 1
 
 
+class TestTheCampaignRestartConfiguration:
+    """The exact numbers the 2026-08-28 restart dispatches with, pinned.
+
+    Not a unit of behaviour -- a guard. These ceilings are the campaign's contract with
+    a 10,000 vCPU account quota, and every term that decides them lives somewhere this
+    test can see: the ladder value, the budget, and the two rungs' declared vCPU per GPU.
+    A template edit that changed any of them would otherwise re-shape the production
+    fleet with nothing failing.
+    """
+
+    LADDER = "g6e.xlarge:101"
+    VCPU_BUDGET = 840
+    CLUSTERS = 10
+    ACCOUNT_VCPU_QUOTA = 10_000
+    #: What AWS has actually been supplying per cluster while capacity is short. The
+    #: ceiling is a reservation limit, not a promise -- see the fleet arithmetic below.
+    OBSERVED_L40S_PER_CLUSTER = 39
+
+    def _ceilings(self) -> dict[str, int]:
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_worker_ladder(config, self.LADDER)
+        tray._apply_gpu_fallback(config, ["A10G"], self.VCPU_BUDGET)
+        return {n: c["max_workers"] for n, c in config["available_node_types"].items()}
+
+    def test_it_yields_101_l40s_and_105_a10g(self) -> None:
+        ceilings = self._ceilings()
+        assert ceilings[PRODUCTION] == 101
+        assert ceilings[A10G] == 105
+
+    def test_the_realistic_fleet_fits_the_account_quota(self) -> None:
+        """With the L40S trickling at ~39 per cluster, the A10G ceiling is what decides
+        the bill. 39x4 + 105x8 = 996 vCPU per cluster, 9,960 across ten -- inside 10,000
+        BY DESIGN rather than by AWS refusing the last few hundred launches.
+        """
+        ceilings = self._ceilings()
+        per_cluster = self.OBSERVED_L40S_PER_CLUSTER * 4 + ceilings[A10G] * 8
+        assert per_cluster * self.CLUSTERS <= self.ACCOUNT_VCPU_QUOTA
+        assert per_cluster * self.CLUSTERS == 9_960
+
+    def test_the_l40s_ceiling_leaves_room_to_grow(self) -> None:
+        """101 is deliberately well above the ~39 being supplied. The ceiling costs
+        nothing unclaimed, and an L40S actor is half the quota of an A10G one -- so any
+        recovery in supply converts straight into more actors per vCPU.
+        """
+        assert self._ceilings()[PRODUCTION] > self.OBSERVED_L40S_PER_CLUSTER
+
+    def test_a_fully_supplied_fleet_would_exceed_the_quota(self) -> None:
+        """Stated rather than guarded, because it is the accepted limitation: ceilings
+        count nodes and cannot be jointly weighted, so both rungs full is 1,244 vCPU per
+        cluster. AWS refuses with `InstanceLimitExceeded` at the account quota, and the
+        scorer deliberately does NOT treat that as a reason to fall back further.
+        """
+        ceilings = self._ceilings()
+        both_full = ceilings[PRODUCTION] * 4 + ceilings[A10G] * 8
+        assert both_full * self.CLUSTERS > self.ACCOUNT_VCPU_QUOTA
+
+
 class TestScorerInstallation:
     """The scorer only works if Ray can find it on the head node."""
 
