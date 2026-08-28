@@ -379,6 +379,16 @@ def _serve_icechunk_credential(
       campaign runs on the order of a hundred clients, so this is the one that would be a drip
       saying nothing on almost every day.
 
+    **"FIRST" means the first credential THIS PROCESS served, and on a scattered path that is
+    not the first credential the process USED.** Where the caller passes
+    ``scatter_initial_credentials=True`` (assembly's fork paths), icechunk caches a credential
+    in the parent and each spawned child begins with it *without* invoking this callback. The
+    child's first call therefore happens only after that credential lapses, and it is announced
+    as FIRST because this process has no prior key to compare against -- so a search for
+    ROTATED will not find that transition. It is not lost: the parent announced the earlier key,
+    and the pid on every line is what chains the two. Seeding the child is not possible from
+    here, since what icechunk cached lives on its Rust side and is never handed back.
+
     Logs the access-key id, which is an identifier rather than a secret and is what CloudTrail
     indexes on. **Never the secret key or the session token.**
     """
@@ -392,28 +402,27 @@ def _serve_icechunk_credential(
     with _LAST_ACCESS_KEY_LOCK:
         previous = _last_icechunk_access_key.get(source)
         _last_icechunk_access_key[source] = access_key
+    # PROCESS IDENTITY on every line, because the state this decides against is process-local
+    # while the log stream is not. An assembly's spawned workers and their parent write to one
+    # container stream, and `configure_logging()`'s formatter carries no process field, so
+    # without this a rotation observed in one worker reads as though it belonged to whichever
+    # process reported the adjacent failure -- the exact correlation this instrumentation is
+    # for. The pid is the discriminator because it is what the OS guarantees unique among live
+    # processes and what a crash dump or a `ps` line can be matched against.
+    where = f"[{source}] pid={os.getpid()}"
+    until = expires_after.isoformat(timespec="seconds")
     if previous is None:
-        _LOG.info(
-            "icechunk credential [%s] FIRST: %s, valid until %s",
-            source,
-            access_key,
-            expires_after.isoformat(timespec="seconds"),
-        )
+        _LOG.info("icechunk credential %s FIRST: %s, valid until %s", where, access_key, until)
     elif previous != access_key:
         _LOG.info(
-            "icechunk credential [%s] ROTATED: %s -> %s, valid until %s",
-            source,
+            "icechunk credential %s ROTATED: %s -> %s, valid until %s",
+            where,
             previous,
             access_key,
-            expires_after.isoformat(timespec="seconds"),
+            until,
         )
     else:
-        _LOG.debug(
-            "icechunk credential [%s] served: %s, valid until %s",
-            source,
-            access_key,
-            expires_after.isoformat(timespec="seconds"),
-        )
+        _LOG.debug("icechunk credential %s served: %s, valid until %s", where, access_key, until)
     return icechunk.S3StaticCredentials(
         access_key_id=access_key,
         secret_access_key=secret_key,

@@ -14,6 +14,7 @@ covered is the arithmetic and the branching, which is where the mistakes actuall
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -526,6 +527,24 @@ class TestIcechunkCredentialVisibility:
 
         assert len([r for r in caplog.records if "FIRST" in r.message]) == 1
         assert len(caplog.records) == 8
+
+    def test_every_credential_event_carries_the_process_id(self, caplog) -> None:
+        """The state this decides against is process-local; the log stream is not.
+
+        An assembly's spawned workers and their parent share one container stream, and the
+        formatter carries no process field, so without a pid a rotation seen in one worker
+        reads as though it belonged to whichever process reported the adjacent failure. All
+        three levels carry it, because the level that matters is whichever one is next to the
+        failure.
+        """
+        self._reset()
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            self._serve("task-role", "ASIAONE")  # FIRST
+            self._serve("task-role", "ASIATWO")  # ROTATED
+            self._serve("task-role", "ASIATWO")  # steady, DEBUG
+        assert [r.levelname for r in caplog.records] == ["INFO", "INFO", "DEBUG"]
+        for record in caplog.records:
+            assert f"pid={os.getpid()}" in record.getMessage(), record.getMessage()
 
     def test_it_never_logs_the_secret_or_the_token(self, caplog) -> None:
         """The access-key id is an identifier and is what CloudTrail indexes on. The secret key
