@@ -148,14 +148,20 @@ class FleetDemand:
         if self._publish is None:
             return
         want = self.machines(max(0, min(target, outstanding, requested)), self._num_gpus)
-        for attempt in range(self.ATTEMPTS if retry else 1):
+        attempts = self.ATTEMPTS if retry else 1
+        failure: Exception | None = None
+        for attempt in range(attempts):
             try:
                 self._publish(want)
                 return
-            except Exception:
-                if attempt + 1 < (self.ATTEMPTS if retry else 1):
+            except Exception as exc:
+                failure = exc
+                if attempt + 1 < attempts:
                     time.sleep(self.BACKOFF_S)
-        self._log.warning("Could not publish GPU fleet demand (want=%d)", want, exc_info=True)
+        # `exc_info=failure`, NOT `exc_info=True`: this runs OUTSIDE the except block, where
+        # there is no active exception, so `True` silently logs no traceback at all — a
+        # warning that names the symptom and drops its cause, which cost a whole dev cycle.
+        self._log.warning("Could not publish GPU fleet demand (want=%d)", want, exc_info=failure)
 
     def clear(self) -> None:
         """Drop the request. Machines it holds are exempt from idle termination, so a floor
