@@ -466,6 +466,39 @@ def fill_zones_sequential(
             max_retained_failures,
         )
 
+    def _announce_deadline(zone: str, year: int, exc: BaseException) -> None:
+        """Say loudly that an assembly was ABANDONED, if that is what ``exc`` is.
+
+        A no-op for anything else, so every site that catches a broad ``Exception`` around
+        an assembly can call it unconditionally rather than each growing its own clause.
+        There are two such sites — the trailing finalizer and the in-child retry — and a
+        deterministic stall reaches BOTH, so a check at only the first would announce the
+        first attempt and swallow the second into an ordinary error line.
+
+        Separate from ``_record_failure`` because this is the ONE assembly failure that
+        says nothing about the cell. Every other names something about the data or the
+        store; this one only says a phase stopped returning, and its cause is not yet
+        known. A DISTINCTIVE, GREPPABLE PREFIX for the same reason `FAILURE CAP EXCEEDED`
+        has one: there is no alerting transport in this repo and monitoring matches on the
+        text. CRITICAL rather than ERROR because a recorded failure is routine here and
+        this is not.
+
+        What lets the fill survive it is that the caller reached this line at all. The
+        wedged work sits on a thread of the writer's own, abandoned rather than joined, so
+        the single-slot finalizer every later cell queues behind is free the moment the
+        deadline passes.
+        """
+        if not isinstance(exc, AssemblyDeadlineError):
+            return
+        log.critical(
+            "ASSEMBLY DEADLINE EXCEEDED for %s-%d: %s. The cell keeps its mosaic, so it resumes "
+            "from its staged tiles; the thread that was doing the work is abandoned, not killed, "
+            "and this fill goes on to its other cells.",
+            zone,
+            year,
+            exc,
+        )
+
     def _record_failure(cell: SequentialCell, phase: str, exc: BaseException) -> None:
         with lock:
             failures.append({"zone": cell.zone, "year": cell.year, "phase": phase, "error": str(exc)})
@@ -507,35 +540,9 @@ def fill_zones_sequential(
         try:
             handoff = complete_zone_inference(tally.plan, results=tally.results)
             _record_outcome(assemble(handoff, prep))
-        except AssemblyDeadlineError as exc:
-            # The assembly stopped finishing and the writer stopped waiting for it. Handled
-            # exactly like any other assembly failure below — the cell is recorded, its mosaic
-            # is retained and it resumes from its staged tiles — but announced separately,
-            # because this is the ONE failure that says nothing about the cell. Every other
-            # one names something about the data or the store; this one only says a phase
-            # stopped returning, and its cause is not yet known.
-            #
-            # A DISTINCTIVE, GREPPABLE PREFIX, for the same reason `FAILURE CAP EXCEEDED` has
-            # one: there is no alerting transport in this repo and monitoring matches on the
-            # text. CRITICAL rather than ERROR because a recorded failure is routine here and
-            # this is not.
-            #
-            # What makes the fill survive it is that this thread got here at all. The wedged
-            # work is on a thread of the writer's own, abandoned rather than joined, so THIS
-            # thread — the single-slot finalizer every later cell queues behind — is free the
-            # moment the deadline passes and goes straight on to the next assembly.
-            failed_assembly = True
-            log.critical(
-                "ASSEMBLY DEADLINE EXCEEDED for %s-%d: %s. The cell is recorded as a failed "
-                "assembly and keeps its mosaic, so a retry resumes it from its staged tiles. "
-                "This fill continues assembling later cells.",
-                cell.zone,
-                cell.year,
-                exc,
-            )
-            _record_failure(cell, "assembly", exc)
         except Exception as exc:
             failed_assembly = True
+            _announce_deadline(cell.zone, cell.year, exc)
             _record_failure(cell, "assembly", exc)
         else:
             # OUTSIDE the assembly try, because by here the cell is committed, tagged
@@ -994,6 +1001,7 @@ def fill_zones_sequential(
                 # Leave the original failure record in place and log the retry's own
                 # error, so the summary still names the cell and the driver still
                 # sees it as pending.
+                _announce_deadline(zone_name, year, exc)
                 log.error("Cell %s-%d retry attempt %d failed: %s", zone_name, year, attempt, exc, exc_info=exc)
                 continue
             _clear_failure(cell)

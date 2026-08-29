@@ -409,6 +409,31 @@ def test_an_abandoned_assembly_is_announced_and_the_fill_keeps_going(caplog):
     assert assembled == ["02N", "03N"], "the fill stopped assembling after the abandoned cell"
 
 
+def test_an_abandoned_assembly_in_the_in_child_retry_is_announced_too(caplog):
+    """A deterministic stall reaches the retry as well, and that one must not be silent.
+
+    The retry runs under a broad `except Exception` that logs an ordinary error line, so
+    without the shared announcement the first attempt would alert and the second — the one
+    that proves the stall is deterministic — would be swallowed.
+    """
+    events: list[str] = []
+    inputs = RecordingInputs(events)
+
+    def assemble(handoff, prep):
+        raise AssemblyDeadlineError("merge had not returned 600s after the forks did")
+
+    with (
+        caplog.at_level(logging.CRITICAL, logger="test-sequential-fill"),
+        pytest.raises(RuntimeError, match="1/1 cell"),
+    ):
+        _run(_cells(1), inputs=inputs, assemble=assemble, infer_single=_recovering_single([]))
+
+    said = [r.getMessage() for r in caplog.records if "ASSEMBLY DEADLINE EXCEEDED" in r.getMessage()]
+    # One from the trailing finalizer, one from the retry that hit the same wall.
+    assert len(said) == 2, f"the retry's abandoned assembly was not announced: {said}"
+    assert all("01N-2025" in m for m in said)
+
+
 def test_session_crash_unwinds_feeder_without_deadlock():
     """A crashing session must not leave the feeder blocked on zone slots."""
 

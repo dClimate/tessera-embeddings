@@ -192,7 +192,10 @@ What that buys, and what it costs:
   up interpreter exit.
 - **In-child retry interaction:** `attempts_per_cell_in_cluster` defaults to 2, so a
   deterministically stalling cell leaks one thread per attempt — two, not an unbounded
-  number.
+  number. Both attempts announce. The retry runs under a broad `except Exception` that
+  logs an ordinary error line, so the announcement is a shared helper rather than a
+  clause at one site: otherwise the first attempt would alert and the second — the one
+  that proves the stall is deterministic — would be swallowed.
 
 The runner announces it at CRITICAL under `ASSEMBLY DEADLINE EXCEEDED`, a greppable
 prefix in the same style as `FAILURE CAP EXCEEDED`, because this repo has no alerting
