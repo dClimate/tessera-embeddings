@@ -11,6 +11,8 @@ how it was" is only possible if exactly one place tracks what "it was" is. That 
 
 from __future__ import annotations
 
+import faulthandler
+import logging
 import os
 import threading
 from collections.abc import Callable, Iterator
@@ -18,10 +20,22 @@ from contextlib import contextmanager, suppress
 
 import icechunk
 
-#: What icechunk's own Rust tracing is raised to while a commit runs. Both modules, because
-#: the two answer different halves of "where did it stop": ``session`` names the commit phase,
-#: ``asset_manager`` names the storage operation inside it.
-COMMIT_LOG_FILTER = "icechunk::session=debug,icechunk::asset_manager=debug"
+_log = logging.getLogger(__name__)
+
+#: What icechunk's own Rust tracing is raised to while a commit runs. EVERY icechunk module,
+#: not a chosen few: the point is to know where a stall stopped, and naming modules in advance
+#: assumes we already know which one that is. A commit normally takes about a second, so the
+#: volume is nil, and the one time it is not nil is the time we need it.
+COMMIT_LOG_FILTER = "icechunk=debug"
+
+#: How long a commit may run before the alarm starts. Every commit ever measured finished in
+#: 0.6-1.6 s, so five minutes is roughly two hundred times the worst observed and cannot fire
+#: on a healthy one.
+COMMIT_ALARM_S = 300.0
+
+#: Dump every thread's Python stack on the first alarm and then every tenth, so a stall that
+#: lasts hours keeps proving it is still stuck without writing 140 stacks every five minutes.
+STACK_DUMP_EVERY = 10
 
 #: THE ONE OWNER of icechunk's process-global log filter. It has a setter and no getter, so a
 #: filter installed by anyone else is invisible to everyone else — which makes "put it back
@@ -66,6 +80,56 @@ def set_base_logs_filter(directive: str | None) -> None:
         _base_log_filter = directive
 
 
+@contextmanager
+def _commit_alarm(what: str) -> Iterator[None]:
+    """Shout, repeatedly, for as long as a commit has not returned — and dump the stacks.
+
+    A stalled commit is silent by construction: our own last line is printed before the call
+    and the next only after it returns, so hours of nothing look exactly like a commit that
+    finished. On 2026-08-29 that silence is what made seven stalled assemblies take a day to
+    even localise. An alarm that repeats is the difference between "this stopped at 09:04"
+    and "we noticed at 16:00".
+
+    **The stack dump is the part that could not be got any other way.** `py-spy` needs
+    `CAP_SYS_PTRACE`, which Fargate does not grant, and `/proc/<pid>/syscall` and
+    `/proc/<pid>/stack` are gated the same way — all three were tried against a live stalled
+    task and all three refused. `faulthandler` runs INSIDE the process, so it needs no
+    permission at all, and it prints every thread's Python stack. That names the exact call
+    the assembly thread is parked in, and shows what the other threads are doing beside it.
+
+    Dumped on the first alarm and every tenth after, because a stall lasting hours should keep
+    proving it is still stuck without writing 140 stacks every five minutes.
+
+    Best-effort throughout, on its own daemon thread: an alarm that can end the work it is
+    watching, or that dies on one failed emission and lets the silence back in, is worse than
+    no alarm at all.
+    """
+    returned = threading.Event()
+
+    def _watch() -> None:
+        rings = 0
+        while not returned.wait(timeout=COMMIT_ALARM_S):
+            rings += 1
+            with suppress(Exception):
+                _log.critical(
+                    "ASSEMBLY COMMIT STALLED: %r has not returned after %.0f minutes. This fill "
+                    "publishes nothing further until it does. icechunk's own tracing is raised "
+                    "for this commit — its last line names where it stopped.",
+                    what,
+                    rings * COMMIT_ALARM_S / 60.0,
+                )
+            if rings == 1 or rings % STACK_DUMP_EVERY == 0:
+                with suppress(Exception):
+                    _log.critical("ASSEMBLY COMMIT STALLED: thread stacks follow (ring %d)", rings)
+                    faulthandler.dump_traceback()
+
+    threading.Thread(target=_watch, name="commit-alarm", daemon=True).start()
+    try:
+        yield
+    finally:
+        returned.set()
+
+
 def traced_commit(
     session: icechunk.Session,
     message: str,
@@ -91,7 +155,7 @@ def traced_commit(
     Returns:
         The new snapshot id.
     """
-    with commit_tracing():
+    with commit_tracing(), _commit_alarm(message):
         return session.commit(message, rebase_with=rebase_with, rebase_tries=rebase_tries)
 
 

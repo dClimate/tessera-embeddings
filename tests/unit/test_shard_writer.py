@@ -832,3 +832,65 @@ def test_every_assembly_commit_goes_through_the_traced_helper():
             ):
                 bare.append(f"{module.__name__}:{node.lineno}")
     assert not bare, f"commit(s) outside a tracing scope: {bare}; use traced_commit"
+
+
+class _SlowSession:
+    """Minimal stand-in: a commit that takes as long as it is told to."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+
+    def commit(self, message, **kwargs):
+        time.sleep(self.seconds)
+        return "snapshot-id"
+
+
+class TestTheStalledCommitAlarm:
+    """A stalled commit is silent by construction; this is what breaks the silence."""
+
+    def test_a_normal_commit_says_nothing(self, monkeypatch, caplog):
+        monkeypatch.setattr(icechunk_logging, "COMMIT_ALARM_S", 5.0)
+        with caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.icechunk_logging"):
+            assert icechunk_logging.traced_commit(_SlowSession(0.0), "quick") == "snapshot-id"
+        assert not [r for r in caplog.records if "STALLED" in r.getMessage()]
+
+    def test_a_stalled_commit_is_announced_repeatedly(self, monkeypatch, caplog):
+        """Once is not enough: one line followed by silence reads the same as recovery."""
+        monkeypatch.setattr(icechunk_logging, "COMMIT_ALARM_S", 0.05)
+        with caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.icechunk_logging"):
+            icechunk_logging.traced_commit(_SlowSession(0.4), "13N-2018 shard commit")
+        said = [r.getMessage() for r in caplog.records if "ASSEMBLY COMMIT STALLED" in r.getMessage()]
+        assert len(said) >= 2, f"a stalled commit must keep announcing itself: {said}"
+        assert "13N-2018 shard commit" in said[0], "the alarm must name which commit stopped"
+
+    def test_the_first_alarm_dumps_every_thread_stack(self, monkeypatch, caplog):
+        """The artefact that cannot be got from outside the process.
+
+        py-spy needs CAP_SYS_PTRACE, which Fargate does not grant, and /proc/<pid>/syscall
+        and /proc/<pid>/stack are gated the same way — all three refused against a live
+        stalled task. faulthandler runs inside the process and needs no permission at all.
+        """
+        monkeypatch.setattr(icechunk_logging, "COMMIT_ALARM_S", 0.05)
+        dumps = []
+        monkeypatch.setattr(icechunk_logging.faulthandler, "dump_traceback", lambda: dumps.append(1))
+        with caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.icechunk_logging"):
+            icechunk_logging.traced_commit(_SlowSession(0.2), "stuck")
+        assert dumps, "the first alarm must dump the stacks; there is no other way to get them"
+
+    def test_a_failing_emission_does_not_end_the_alarm(self, monkeypatch, caplog):
+        """One bad log line must not hand the silence back."""
+        monkeypatch.setattr(icechunk_logging, "COMMIT_ALARM_S", 0.05)
+        real = icechunk_logging._log.critical
+        state = {"failed": False}
+
+        def _boom_once(msg, *args, **kwargs):
+            if not state["failed"]:
+                state["failed"] = True
+                raise RuntimeError("log transport down")
+            return real(msg, *args, **kwargs)
+
+        monkeypatch.setattr(icechunk_logging._log, "critical", _boom_once)
+        with caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.icechunk_logging"):
+            icechunk_logging.traced_commit(_SlowSession(0.4), "stuck")
+        assert state["failed"], "the first emission was meant to fail"
+        assert [r for r in caplog.records if "STALLED" in r.getMessage()], "the alarm died on one failure"
