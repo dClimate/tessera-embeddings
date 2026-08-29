@@ -108,22 +108,34 @@ point of this change; the exact constants matter much less.
 ### The fork-write budget
 
 ```
-fork_phase_budget_s(n) = max(FORK_PHASE_FLOOR_S,
-                             60 * n / FORK_PHASE_SHARDS_PER_MINUTE * FORK_PHASE_SAFETY_FACTOR)
+fork_phase_budget_s(n, w) = max(FORK_PHASE_FLOOR_S,
+                                60 * n / (FORK_PHASE_SHARDS_PER_WORKER_MINUTE * w)
+                                       * FORK_PHASE_SAFETY_FACTOR)
 
-FORK_PHASE_SHARDS_PER_MINUTE = 20     # half the slowest measured rate (42.2)
-FORK_PHASE_SAFETY_FACTOR     = 3
-FORK_PHASE_FLOOR_S           = 3600
+FORK_PHASE_SHARDS_PER_WORKER_MINUTE = 1.25   # half the slowest measured rate, per worker
+FORK_PHASE_SAFETY_FACTOR            = 3
+FORK_PHASE_FLOOR_S                  = 3600
 ```
 
-Derived from the work, not the clock, because the phase's duration tracks its shard
-count. The divisor is **half the slowest rate measured** (42.2/min), so the safety factor
-is padding on top of an already-halved worst case rather than padding towards it.
+Derived from the work **and the parallelism**, not the clock, because the phase's duration
+is one divided by the other. The per-worker divisor is **half the slowest rate measured**
+(42.2/min across sixteen workers is 2.64 per worker, so 1.25 is a little under half), which
+puts the safety factor on top of an already-halved worst case rather than padding towards
+it.
 
-At the densest cell in the table, 9,132 shards, that is 9,132 / 20 x 60 x 3 = **82,188 s
-(22.8 h)**, against a worst observed 213 min (3.6 h) — **6.4x the slowest fill on record**,
-or 3.4x under the superseded reading of the table above. Below ~400 shards the floor binds,
-so a sparse zone-year still gets an hour.
+Every rate in the table above is an **aggregate over sixteen workers**, and that is why `w`
+is in the formula rather than folded into the constant. `n_workers` is a supported override
+and `write_year_shards` defaults it to 1. A budget derived from the shard count alone would
+hold a narrow fill to a sixteen-worker pace: at the densest cell in the table it goes under
+water below three workers (1.58x headroom at four, 0.79x at two, 0.40x at one), so a healthy
+fill would have been killed for the crime of running narrow. With `w` in the formula the
+headroom is 6.4x at any width.
+
+At the densest cell in the table, 9,132 shards on sixteen workers, that is
+9,132 / (1.25 x 16) x 60 x 3 = **82,188 s (22.8 h)**, against a worst observed 213 min
+(3.6 h) — **6.4x the slowest fill on record**, or 3.4x under the superseded reading of the
+table above. Below ~400 shards on sixteen workers the floor binds, so a sparse zone-year
+still gets an hour.
 
 The factor is deliberately generous, and the reason is what the table cannot show rather
 than what it does. Eleven cells at one campaign shape, on two days, span 1.27x. That is far

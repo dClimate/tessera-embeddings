@@ -695,19 +695,31 @@ class TestTheForkPhaseBudgetIsDerivedFromTheWork:
     """
 
     def test_it_scales_with_the_shard_count(self):
-        assert shard_writer.fork_phase_budget_s(18_000) == pytest.approx(2 * shard_writer.fork_phase_budget_s(9_000))
+        budget = shard_writer.fork_phase_budget_s
+        assert budget(18_000, 16) == pytest.approx(2 * budget(9_000, 16))
+
+    def test_it_scales_inversely_with_the_worker_count(self):
+        """The same work on a quarter of the workers takes four times as long.
+
+        The measured rates are aggregates over sixteen workers. A budget derived from the
+        shard count alone would hold a narrow fill to a sixteen-worker pace and kill it
+        while it was working perfectly well — the one thing this budget must never do.
+        """
+        budget = shard_writer.fork_phase_budget_s
+        assert budget(9_000, 4) == pytest.approx(4 * budget(9_000, 16))
 
     def test_a_sparse_year_still_gets_the_floor(self):
         # A zone-year with almost nothing to write must not be held to a budget of
         # seconds just because its work is small.
-        assert shard_writer.fork_phase_budget_s(1) == shard_writer.FORK_PHASE_FLOOR_S
+        assert shard_writer.fork_phase_budget_s(1, 1) == shard_writer.FORK_PHASE_FLOOR_S
 
     def test_it_clears_the_slowest_fill_on_record(self):
-        # The slowest fork phase yet measured wrote 9,030 shards in 213 minutes. The budget
-        # must clear that by the safety factor at least, or a cell slower than anything in
-        # a narrow sample gets killed while it is working perfectly well.
+        # The slowest fork phase yet measured wrote 9,030 shards in 213 minutes on sixteen
+        # workers. The budget must clear that by the safety factor at least, or a cell
+        # slower than anything in a narrow sample gets killed while it is working fine.
         slowest_on_record_s = 213 * 60
-        assert shard_writer.fork_phase_budget_s(9_030) >= shard_writer.FORK_PHASE_SAFETY_FACTOR * slowest_on_record_s
+        budget = shard_writer.fork_phase_budget_s(9_030, 16)
+        assert budget >= shard_writer.FORK_PHASE_SAFETY_FACTOR * slowest_on_record_s
 
 
 class TestTheForkPhaseIsAbandonedOnItsBudget:

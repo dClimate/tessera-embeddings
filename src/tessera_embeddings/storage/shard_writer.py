@@ -67,13 +67,18 @@ _log = logging.getLogger(__name__)
 #: quiet for short writes and close enough to bound how long a stall hides.
 PROGRESS_INTERVAL_S = 300.0
 
-#: Shards per minute the fork-write phase is credited with. Measured consistently, the
-#: phase turns out to be a steady rate — the observed cells span barely a quarter — so this
-#: is set at HALF the slowest one seen rather than at the slow end of a wide spread. The
-#: margin is against variation the measurements could not see (a denser cell, a busier
-#: campaign shape) rather than against a measured range. Rates and their derivation live in
+#: Shards per minute ONE fork worker is credited with. Measured consistently, the phase
+#: turns out to be a steady rate — the observed cells span barely a quarter — so this is set
+#: at HALF the slowest one seen rather than at the slow end of a wide spread. The margin is
+#: against variation the measurements could not see (a denser cell, a busier campaign shape)
+#: rather than against a measured range.
+#:
+#: PER WORKER, not per fill, because the phase's duration is its work divided by its
+#: parallelism. The observed rates are aggregates over SIXTEEN workers; a budget derived
+#: from the shard count alone would hold a fill running four workers to a sixteen-worker
+#: pace and kill it while it was working perfectly well. Rates and their derivation live in
 #: ``context_docs/design/assembly-deadlines-2026_08.md``.
-FORK_PHASE_SHARDS_PER_MINUTE = 20.0
+FORK_PHASE_SHARDS_PER_WORKER_MINUTE = 1.25
 
 #: Multiplier on the work-derived fork-phase budget. Deliberately large, and for what the
 #: measurements CANNOT show rather than what they do: a handful of cells at one campaign
@@ -119,17 +124,20 @@ class AssemblyDeadlineError(RuntimeError):
         self.abandoned = abandoned
 
 
-def fork_phase_budget_s(n_shards: int) -> float:
+def fork_phase_budget_s(n_shards: int, n_workers: int) -> float:
     """How long a fill's fork-write phase may run before it is abandoned.
 
-    Derived from the WORK rather than from a clock: this phase writes ``n_shards``
-    shards and its duration tracks that count, so one fixed cutoff would be too tight
-    for a dense zone-year and too loose for a sparse one at the same time. Scaled from a
-    rate set well under the slowest observed, padded by :data:`FORK_PHASE_SAFETY_FACTOR`,
-    and floored so a small fill still gets a generous allowance.
+    Derived from the WORK and the PARALLELISM rather than from a clock: this phase writes
+    ``n_shards`` shards across ``n_workers`` forks, and its duration tracks their ratio, so
+    one fixed cutoff would be too tight for a dense zone-year and too loose for a sparse one
+    at the same time. ``n_workers`` is load-bearing and not a refinement: the same shard
+    count on a quarter of the workers takes four times as long, and a budget blind to that
+    would kill a healthy narrow fill. Scaled from a per-worker rate set well under the
+    slowest observed, padded by :data:`FORK_PHASE_SAFETY_FACTOR`, and floored so a small
+    fill still gets a generous allowance.
     """
-    scaled = 60.0 * n_shards / FORK_PHASE_SHARDS_PER_MINUTE * FORK_PHASE_SAFETY_FACTOR
-    return max(FORK_PHASE_FLOOR_S, scaled)
+    per_minute = FORK_PHASE_SHARDS_PER_WORKER_MINUTE * max(1, n_workers)
+    return max(FORK_PHASE_FLOOR_S, 60.0 * n_shards / per_minute * FORK_PHASE_SAFETY_FACTOR)
 
 
 class _Deadline:
@@ -1049,7 +1057,10 @@ def write_year_shards(
         payloads,
         unit="tile partitions",
         log=log,
-        fork_budget_s=fork_phase_budget_s(len(shards)),
+        # The PAYLOAD count, not `n_workers`: `partition_round_robin` yields at most one
+        # payload per worker and fewer when there are fewer shards, and it is the payloads
+        # that actually run in parallel.
+        fork_budget_s=fork_phase_budget_s(len(shards), len(payloads)),
         post_fork=post_fork,
     )
 
