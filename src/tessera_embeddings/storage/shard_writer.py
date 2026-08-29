@@ -177,6 +177,16 @@ def _run_before_deadline[T](deadline: _Deadline | None, fn: Callable[[], T], wha
     """
     if deadline is None:
         return fn()
+    # REFUSE BEFORE STARTING when the shared budget is already gone. Launching here and
+    # abandoning a microsecond later would leave a writer running that nobody will ever
+    # observe — for the commits that is a background committer racing the cell's retry —
+    # bought for no chance at all of finishing in time.
+    remaining = deadline.remaining_s()
+    if remaining <= 0.0:
+        raise AssemblyDeadlineError(
+            f"{what} was not started: the {deadline.budget_s:.0f}s budget for the phase after the forks "
+            f"was already spent by an earlier step"
+        )
     box: dict[str, Any] = {}
     finished = threading.Event()
 
@@ -189,7 +199,7 @@ def _run_before_deadline[T](deadline: _Deadline | None, fn: Callable[[], T], wha
             finished.set()
 
     threading.Thread(target=_body, name=f"assembly-{what}", daemon=True).start()
-    if not finished.wait(timeout=deadline.remaining_s()):
+    if not finished.wait(timeout=remaining):
         raise AssemblyDeadlineError(
             f"{what} had not returned {deadline.budget_s:.0f}s after the forks did, and was abandoned "
             f"(the thread doing it is leaked, not killed)"
@@ -481,7 +491,23 @@ def run_forked(
     own commits, so the two functions share one ceiling rather than one each.
     """
     t0 = time.monotonic()
-    fork = session.fork()
+    fork_deadline = None
+    if fork_budget_s is not None:
+        fork_deadline = _Deadline(fork_budget_s)
+        fork_deadline.start()
+    # The fork clock starts BEFORE `session.fork()`, not after it: that is an icechunk call
+    # of the same family as the ones that stalled, and a caller whose fork never returns is
+    # wedged exactly as one whose commit never returns.
+    #
+    # What is deliberately NOT inside it is the pool construction and the submits below.
+    # Bounding those would put the executor itself on a thread the caller abandons, where
+    # its processes could no longer be reached to terminate — trading one leaked thread for
+    # a leaked pool of sixteen. THE COST OF LEAVING THEM: a stall in `ProcessPoolExecutor`
+    # startup still holds the caller's thread indefinitely. Nothing has been seen to stall
+    # there, and unlike the phases that have, it happens before the first progress line — so
+    # it would show as a fill that never starts assembling rather than one that never
+    # finishes, which is the easier of the two to spot.
+    fork = _run_before_deadline(fork_deadline, session.fork, "session fork")
     # Copies, not mutation: callers keep their payload dicts fork-free.
     payloads = [
         {**payload, "fork": fork, "worker_index": i, "progress_interval_s": progress_interval_s}
@@ -498,10 +524,6 @@ def run_forked(
         # is never merged, so nothing it produced can reach the store. What the process
         # path buys and this cannot is the KILL — an abandoned thread keeps running and
         # keeps writing fork objects. They are unreferenced either way.
-        fork_deadline = None
-        if fork_budget_s is not None:
-            fork_deadline = _Deadline(fork_budget_s)
-            fork_deadline.start()
         results = [_run_before_deadline(fork_deadline, lambda: worker_fn(payloads[0]), "fork-write phase")]
         if post_fork is not None:
             post_fork.start()
@@ -521,8 +543,16 @@ def run_forked(
         )
         try:
             futures = [ex.submit(worker_fn, payload) for payload in payloads]
+            # What is LEFT of the fork budget, not the whole of it: the fork and the pool
+            # startup above have already spent some, and a wait given the full budget would
+            # let the phase overrun by however long they took.
             results = _await_forks(
-                futures, progress_interval_s, unit=unit, log=log, slots=slots, budget_s=fork_budget_s
+                futures,
+                progress_interval_s,
+                unit=unit,
+                log=log,
+                slots=slots,
+                budget_s=None if fork_deadline is None else fork_deadline.remaining_s(),
             )
         except BaseException:
             # Cancel what has not started, then TERMINATE what has. `cancel_futures` only

@@ -230,6 +230,15 @@ one only says a phase stopped returning.
 - **`repo.writable_session("main")` and `source.live_shards()`**, at the top of
   `write_year_shards`, are before the fork phase and outside both budgets. The observed
   signature places the stall after the forks returned, so bounding them would be guessing.
+- **The process-pool construction and the `submit()` calls.** The fork budget starts before
+  `session.fork()` — an icechunk call of the same family as the ones that stalled — but the
+  pool that follows is not inside it. Bounding it would put the executor itself on a thread
+  the caller abandons, where its processes could no longer be reached to terminate, trading
+  one leaked thread for a leaked pool of sixteen. **Cost of leaving it:** a stall in
+  `ProcessPoolExecutor` startup still holds the caller's thread indefinitely. Nothing has
+  been seen to stall there, and unlike the phases that have, it would happen before the
+  first progress line — so it shows as a fill that never starts assembling rather than one
+  that never finishes, which is the easier of the two to spot.
 - **The single-ROI assembly path** (`inference/assembly.py`'s other `run_forked` caller)
   passes no budgets and is unchanged. The incident is on the global campaign path.
 - **The mosaic delete** (`inputs.cleanup`) that follows a landed assembly also runs on

@@ -769,6 +769,28 @@ class TestTheForkPhaseIsAbandonedOnItsBudget:
         finally:
             release.set()
 
+    def test_a_stuck_session_fork_is_bounded(self):
+        """The clock starts before `session.fork()`, not after it.
+
+        That is an icechunk call of the same family as the ones that stalled, and a caller
+        whose fork never returns is wedged exactly as one whose commit never returns.
+        """
+        release = threading.Event()
+        entered = threading.Event()
+
+        class _Session:
+            def fork(self):
+                entered.set()
+                release.wait(30)
+                return object()
+
+        try:
+            with pytest.raises(shard_writer.AssemblyDeadlineError, match="session fork"):
+                run_forked(_Session(), lambda p: p, [{"tag": "a"}], fork_budget_s=0.2)
+            assert entered.is_set(), "the fork never ran, so the test proved nothing"
+        finally:
+            release.set()
+
     def test_a_single_payload_fill_with_no_budget_is_untouched(self, tmp_path):
         # The default every other caller keeps: in-process, on the caller's thread.
         store, repo = _seed(tmp_path)
@@ -816,7 +838,9 @@ class TestTheForkPhaseIsAbandonedOnItsBudget:
         store, repo = _seed(tmp_path)
         session = repo.writable_session("main")
         with pytest.raises(shard_writer.AssemblyDeadlineError, match="fork-write phase"):
-            run_forked(session, lambda p: p, [{"tag": "a"}, {"tag": "b"}], progress_interval_s=0.01, fork_budget_s=0.0)
+            # Small but NON-zero: a zero budget is now refused before `session.fork()` runs,
+            # which would never reach the wait this test is about.
+            run_forked(session, lambda p: p, [{"tag": "a"}, {"tag": "b"}], progress_interval_s=0.01, fork_budget_s=0.3)
         assert running.terminated, "an abandoned fork phase must terminate its workers"
 
 
@@ -840,6 +864,17 @@ class TestThePhaseAfterTheForksIsBounded:
         seen: list[threading.Thread] = []
         shard_writer._run_before_deadline(None, lambda: seen.append(threading.current_thread()), "merge")
         assert seen == [threading.current_thread()]
+
+    def test_work_is_not_started_once_the_shared_budget_is_gone(self):
+        # The phases share one clock, so an earlier one can spend all of it. Launching the
+        # next anyway would leave a writer running that nobody will ever observe — for the
+        # commits, one racing the cell's retry — bought for no chance of finishing in time.
+        ran: list[bool] = []
+        spent = shard_writer._Deadline(0.0)
+        spent.start()
+        with pytest.raises(shard_writer.AssemblyDeadlineError, match="was not started"):
+            shard_writer._run_before_deadline(spent, lambda: ran.append(True), "year-attrs commit")
+        assert ran == [], "the work was launched despite having no budget left"
 
     def test_a_failure_inside_the_budget_reaches_the_caller(self):
         # A real commit failure must not be swallowed by the hand-off thread.
