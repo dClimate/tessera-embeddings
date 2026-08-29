@@ -67,6 +67,7 @@ context_docs/
     │  INFERENCE + STORE
     ├── inference_gpu_saturation_profile_2026_07.md
     ├── gpu-card-choice-2026_08.md                which GPU rungs the campaign may open, and why
+    ├── a10g_batch_size_2026_08.md                why the sub-batch scales with the card, and why not with depth
     ├── stage_decoupling_2026_08.md              why ingest/inference/assembly are ungated
     ├── icechunk-credential-stampede-2026_08.md   the 28 Aug storage-credential incident (written for a general reader)
     ├── assembly-worker-clamp-2026_08.md          why assembly ran 5 of its 16 forks

@@ -296,10 +296,17 @@ MIN_GPU_BATCH_SIZE: int = 512
 def batch_size_for_gpu(configured: int, total_gib: float | None) -> int:
     """Return the sub-batch size a card holding ``total_gib`` of memory can run.
 
-    Activations dominate the working set: the checkpoint is ~0.2 GiB against the ~21 GiB a
-    full batch reserves, so what fits scales with the card and the batch has to scale with
-    it. The A10G in ``g5.2xlarge`` reports 22.06 GiB against the L40S's 44.7, and at the
-    tuned batch it runs out of memory on a 2.5 GiB allocation with 1.2 GiB free.
+    A sub-batch's working set is activations, and activations are linear in
+    ``batch_size x (t_s2 + t_s1)`` — the batch, times the sequence lengths of the bucket it
+    was drawn from. Only the first factor is ours to pick, but the second is BOUNDED:
+    :func:`~tessera_embeddings.inference.sampling.compute_bin_keys` clips a pixel to
+    ``max(num_obs_checkpoints)`` observations on each of the two streams, so no bucket can
+    present more than twice that per pixel. Scaling the batch by the card's memory
+    therefore leaves the deepest bucket the sampler can build at the same fraction of every
+    card, which is why one ratio is enough and no sequence-length term is needed. That
+    bound is the load-bearing half of the argument and it appears nowhere in the arithmetic
+    below, so ``test_config_inference`` pins it against the depth the smallest rung was
+    measured to sustain.
 
     An actor that runs out of memory is killed and replaced, and its chunk is retried, so
     the cost is not lost data but a reloaded checkpoint on a fresh actor. Measurements

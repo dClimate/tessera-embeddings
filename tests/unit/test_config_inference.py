@@ -7,6 +7,7 @@ from dataclasses import fields
 import pytest
 
 from tessera_embeddings.config.inference import (
+    DEFAULT_NUM_OBS_CHECKPOINTS,
     MIN_GPU_BATCH_SIZE,
     TUNED_GPU_GIB,
     InferenceConfig,
@@ -220,6 +221,18 @@ class TestActorRequestPolicy:
 # batch_size_for_gpu — the card decides how much of a batch fits
 # ---------------------------------------------------------------------------
 
+#: The A10G in ``g5.2xlarge``, the smallest rung `fleet_mix.GPU_RUNGS` offers.
+A10G_TOTAL_GIB = 22.06
+
+#: Deepest sub-batch an A10G was measured to complete, in tokens: 7,168 pixels at 325
+#: tokens each, the last rung of the forward sweep in
+#: ``context_docs/design/gpu-card-choice-2026_08.md``. The rung above it refuses.
+A10G_MEASURED_TOKEN_CEILING = 7168 * 325
+
+#: Most tokens one pixel can carry: the sampler clips each of the two streams to the
+#: deepest checkpoint, so this is a property of the bucketing, not of any geography.
+DEEPEST_TOKENS_PER_PIXEL = 2 * max(DEFAULT_NUM_OBS_CHECKPOINTS)
+
 
 class TestBatchSizeForGpu:
     """The tuned batch is an L40S number; a smaller card has to be given a smaller one."""
@@ -247,15 +260,23 @@ class TestBatchSizeForGpu:
         """Below the floor the per-forward overhead dominates and the card is starved."""
         assert batch_size_for_gpu(7168, 0.5) == MIN_GPU_BATCH_SIZE
 
-    def test_the_a10g_batch_leaves_real_headroom(self) -> None:
-        """The observed failure was a 2.5 GiB allocation with 1.2 GiB free at 20.9 GiB in use.
+    def test_the_fitted_batch_holds_the_deepest_bucket_the_sampler_can_build(self) -> None:
+        """The batch must fit the DEEPEST sub-batch, not the one that happened to fail.
 
-        Activations dominate, so the scaled batch has to bring that 23.4 GiB requirement
-        under the card's 22.06 — this pins the margin rather than just the arithmetic.
+        A sub-batch's working set is linear in ``batch x (t_s2 + t_s1)``, and the sampler
+        clips both sequences to ``max(num_obs_checkpoints)`` — so the worst case is fixed
+        at construction rather than by which geography a fill draws. That bound is the
+        whole reason a plain memory ratio is safe, and nothing in ``batch_size_for_gpu``
+        states it. Pinned here so it turns red if the batch law loosens, if
+        ``TUNED_GPU_GIB`` rises, or if the checkpoint ladder grows past the depth the
+        smallest rung was measured to sustain.
         """
-        fitted = batch_size_for_gpu(7168, 22.06)
-        projected_gib = 23.4 * fitted / 7168
-        assert projected_gib < 22.06 * 0.75
+        fitted = batch_size_for_gpu(7168, A10G_TOTAL_GIB)
+        assert fitted * DEEPEST_TOKENS_PER_PIXEL <= A10G_MEASURED_TOKEN_CEILING
+
+    def test_the_unfitted_batch_does_not_hold_it(self) -> None:
+        """The bound above is only evidence if the batch it replaced fails the same test."""
+        assert 7168 * DEEPEST_TOKENS_PER_PIXEL > A10G_MEASURED_TOKEN_CEILING
 
     def test_a_configured_batch_below_the_floor_is_not_raised(self) -> None:
         """The floor bounds SCALING, not the caller: a small batch was asked for on purpose."""
