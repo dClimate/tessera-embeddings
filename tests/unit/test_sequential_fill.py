@@ -376,6 +376,37 @@ def test_assembly_failure_recorded_run_continues():
         _run(_cells(2), assemble=assemble)
 
 
+#: What the writer puts on an exception raised from a step it leaked a thread for, and what
+#: it puts on one whose worker processes it killed. Held here as the literal strings the
+#: announcement is asked to reproduce, so a test cannot pass by agreeing with a bug.
+_LEAKED = "the thread running it is leaked, not killed, so it is still running"
+_TERMINATED = "its worker processes are terminated, so nothing it wrote can reach the store"
+
+
+def test_the_announcement_reports_the_disposition_the_writer_gave_it(caplog):
+    """A fork-write overrun KILLS its workers; only a post-fork overrun leaks a thread.
+
+    The CRITICAL line is the greppable incident signal and the only lifecycle statement an
+    operator gets, so it must repeat what actually happened rather than assume one of the
+    two. Asserting a leaked thread for a terminated fork phase is the opposite diagnosis:
+    it sends someone hunting a live writer that does not exist.
+    """
+
+    def assemble(handoff, prep):
+        raise AssemblyDeadlineError("fork-write phase still had 3/16 outstanding", abandoned=_TERMINATED)
+
+    with (
+        caplog.at_level(logging.CRITICAL, logger="test-sequential-fill"),
+        pytest.raises(RuntimeError, match="1/1 cell"),
+    ):
+        _run(_cells(1), assemble=assemble)
+
+    said = [r.getMessage() for r in caplog.records if "ASSEMBLY DEADLINE EXCEEDED" in r.getMessage()]
+    assert said, "the abandoned assembly was not announced"
+    assert _TERMINATED in said[0]
+    assert "leaked" not in said[0], "a terminated fork phase was announced as a leaked thread"
+
+
 def test_an_abandoned_assembly_is_announced_and_the_fill_keeps_going(caplog):
     """An assembly that stopped finishing gets its own announcement, not a quiet record.
 
@@ -392,7 +423,7 @@ def test_an_abandoned_assembly_is_announced_and_the_fill_keeps_going(caplog):
 
     def assemble(handoff, prep):
         if handoff.zone == "01N":
-            raise AssemblyDeadlineError("shard commit had not returned 600s after the forks did")
+            raise AssemblyDeadlineError("merge had not returned 600s after the forks did", abandoned=_LEAKED)
         assembled.append(handoff.zone)
         return {"zone": handoff.zone}
 
@@ -405,7 +436,7 @@ def test_an_abandoned_assembly_is_announced_and_the_fill_keeps_going(caplog):
     said = [r.getMessage() for r in caplog.records if "ASSEMBLY DEADLINE EXCEEDED" in r.getMessage()]
     assert len(said) == 1, f"expected one announcement, got {said}"
     assert "01N-2025" in said[0]
-    assert "shard commit" in said[0], "the announcement must carry which phase stopped"
+    assert "merge" in said[0], "the announcement must carry which phase stopped"
     assert assembled == ["02N", "03N"], "the fill stopped assembling after the abandoned cell"
 
 
@@ -420,7 +451,7 @@ def test_an_abandoned_assembly_in_the_in_child_retry_is_announced_too(caplog):
     inputs = RecordingInputs(events)
 
     def assemble(handoff, prep):
-        raise AssemblyDeadlineError("merge had not returned 600s after the forks did")
+        raise AssemblyDeadlineError("merge had not returned 600s after the forks did", abandoned=_LEAKED)
 
     with (
         caplog.at_level(logging.CRITICAL, logger="test-sequential-fill"),

@@ -484,19 +484,32 @@ def fill_zones_sequential(
         this is not.
 
         What lets the fill survive it is that the caller reached this line at all. The
-        wedged work sits on a thread of the writer's own, abandoned rather than joined, so
-        the single-slot finalizer every later cell queues behind is free the moment the
-        deadline passes.
+        wedged work sits outside the finalizer — on a thread of the writer's own, or in
+        worker processes it has already killed — so the single-slot finalizer every later
+        cell queues behind is free the moment the deadline passes.
+
+        WHAT BECAME OF THE WORK COMES FROM THE EXCEPTION, never from this line's own
+        assumption. The paths dispose of it oppositely — a fork-write overrun terminates
+        its worker processes, while a post-fork overrun leaks a thread that is still
+        running — so asserting either one here would give operators the wrong lifecycle
+        diagnosis for the other, and this line is the greppable incident signal, the one
+        place that must not.
+
+        Everything announced here was safe to abandon: it wrote only into a fork, which
+        enters the repository only once a coordinator merges and commits it. The two
+        commits are never abandoned and so never arrive here — a stalled one announces
+        itself as ``ASSEMBLY COMMIT OVERDUE`` from the writer and keeps waiting, which is
+        the one case where the fill does NOT go on to its other cells.
         """
         if not isinstance(exc, AssemblyDeadlineError):
             return
         log.critical(
-            "ASSEMBLY DEADLINE EXCEEDED for %s-%d: %s. The cell keeps its mosaic, so it resumes "
-            "from its staged tiles; the thread that was doing the work is abandoned, not killed, "
-            "and this fill goes on to its other cells.",
+            "ASSEMBLY DEADLINE EXCEEDED for %s-%d: %s — %s. The cell keeps its mosaic, so it "
+            "resumes from its staged tiles, and this fill goes on to its other cells.",
             zone,
             year,
             exc,
+            exc.abandoned,
         )
 
     def _record_failure(cell: SequentialCell, phase: str, exc: BaseException) -> None:

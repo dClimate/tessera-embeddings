@@ -143,12 +143,12 @@ No thread is leaked on that path.
 
 **A single-payload fill is the exception.** `partition_round_robin` yields one payload
 for a sparse cell whatever `n_workers` says, and one payload runs in-process — there is
-no worker process to terminate. That case is bounded the same way the post-fork phase is,
-by abandoning a thread, because the alternative is a sparse cell blocking its fill's
-finalizer exactly as the stall this exists for does. It is the cheaper leak of the two:
-the abandoned worker writes into a fork that is never merged, so nothing it produced can
-reach the store. What it keeps that a killed process would not is CPU and object writes,
-against objects nothing references.
+no worker process to terminate. That case is bounded by abandoning a thread, because the
+alternative is a sparse cell blocking its fill's finalizer exactly as the stall this exists
+for does. Abandoning is safe here for the same reason killing the workers is: the worker
+writes into a fork that is never merged, so nothing it produced can reach the store. What it
+keeps that a killed process would not is CPU and object writes, against objects nothing
+references.
 
 ### The post-fork budget
 
@@ -165,65 +165,135 @@ is:
   simultaneous committers (`commit-gate-removal-2026_08.md`).
 
 So a contention storm cannot reach it, and the false-positive risk is close to nil. **This
-is the bound that can actually catch the stall.**
+is the bound that can actually catch the stall** — though what it *does* when it fires
+depends on the step, which is the next section.
 
 It spans two functions — `run_forked` does the teardown and the merge,
 `write_year_shards` the group read and both commits — so the two share **one** clock
-(`_PostForkDeadline`), started at the single moment the phase begins: the last fork's
+(`_Deadline`), started at the single moment the phase begins: the last fork's
 result in hand. Two independent ceilings would have let a fill sit for twenty minutes
 instead of ten.
 
-## How the fill survives it
+## What may be abandoned, and what may only be announced
 
-Python cannot interrupt a thread blocked inside a Rust or C call, and every call in the
-post-fork phase descends into icechunk's Rust extension. A bare timeout returns control
-to the caller but leaves the wedged thread holding whatever it holds — which, on the
-single-slot finalizer, would have fixed nothing.
+**A process can be killed; a thread cannot.** Killing a process releases its locks, its
+threads and its memory and guarantees that nothing further happens. Abandoning a thread
+promises only that the *caller* comes back — the abandoned work keeps running, and Python
+cannot stop it, because every call in this phase blocks inside icechunk's Rust extension
+where the interpreter has no reach.
 
-So the post-fork work runs on a **single-use daemon thread** and the caller waits on it
-with a deadline. On overrun the caller raises `AssemblyDeadlineError` and the worker
-thread is **deliberately leaked**.
+That is the whole reason the line is drawn where it is. **What may be abandoned is decided
+by what the abandoned work could still touch, not by how long it has run.**
 
-What that buys, and what it costs:
+| step | may be abandoned? | why |
+|---|---|---|
+| `session.fork()` | yes | creates a fork; a fork is not in the repository |
+| fork writes (pool) | yes — and **killed** | worker processes; the handler terminates them |
+| fork write (single payload) | yes | writes into a fork that is never merged |
+| pool teardown | yes | joins processes; touches no store state |
+| `session.merge(...)` | yes | stages the forks into a local session; publishes nothing |
+| years-complete read | yes | a read |
+| **shard commit** | **no** | mutates the published store |
+| **year-attrs commit** | **no** | mutates the published store |
 
-- **Buys:** the finalizer thread comes back. It is never the wedged thread, so it needs
-  no replacing and the fill goes straight on to the next cell's assembly. The cell is
+Icechunk's write model is what makes the first six safe rather than merely tolerable: a
+worker writes into a fork, and **a fork enters the repository only when a coordinator
+merges *and commits* it**. Dropping any of them orphans chunk objects in S3 with nothing
+pointing at them, and nothing else. Those objects are not recoverable after the fact — a
+chunk object is anonymous, and the mapping that says which array and position it belongs to
+exists only in the index built at commit time — so they are garbage for an orphan sweep and
+the cell is re-run from its staged tiles. **That loss is not caused by the deadline.** It is
+the same loss as cancelling the fill and the same loss as waiting forever; the difference is
+that this way the fill's other cells still publish.
+
+### How the fill survives an abandoned step
+
+The step runs on a **single-use daemon thread** and the caller waits on it with the
+deadline. On overrun the caller raises `AssemblyDeadlineError`, and the thread is
+deliberately leaked.
+
+- **What it buys:** the finalizer thread comes back. It is never the wedged thread, so it
+  needs no replacing and the fill goes straight on to the next cell's assembly. The cell is
   recorded through the existing failure path, `_record_failure(cell, "assembly", exc)`,
   which retains its mosaic — so a retry resumes from its staged tiles.
-- **Costs, in the order they are likely:** *a leaked thread still holds an icechunk
-  session.* On the evidence so far it never unblocks — the stalled assemblies were still
-  stalled hours later — so the expected outcome is that the thread's merged index dies
-  with the process at the end of the fill, leaving its chunk objects in S3 with nothing
-  pointing at them. Those objects are not recoverable after the fact: a chunk object is
-  anonymous, and the mapping that says which array and position it belongs to exists only
-  in the index built at commit time. They are garbage for an orphan sweep, and the cell is
-  re-run from its staged tiles.
-
-  That loss is not caused by the deadline. It is the same loss as cancelling the fill, and
-  the same loss as waiting forever — the difference is that this way the fill's other cells
-  still publish.
-
-  The less likely branch is worth stating too: if the thread ever *does* unblock it will
-  commit, possibly after a retry of the same cell already has. Both write the same year's
-  shards from the same staged tiles and `commit_year_attrs` inserts one year key
-  idempotently, so that costs a duplicate write and a second provenance entry rather than a
-  damaged year. Either way it is a live writer nobody is waiting on, which is the main
-  reason the budgets above are generous rather than tight.
+- **What it costs:** a thread holding an icechunk session and its merged forks. On the
+  evidence so far it never unblocks: the stalled assemblies were still stalled hours later.
 - **Affordable because:** the runner is 16 vCPU / 64 GiB and sits near 1.2 GB resident,
-  against tens of cells per fill. The threads are daemons, so a leaked one cannot hold
-  up interpreter exit.
-- **In-child retry interaction:** `attempts_per_cell_in_cluster` defaults to 2, so a
-  deterministically stalling cell leaks one thread per attempt — two, not an unbounded
-  number. Both attempts announce. The retry runs under a broad `except Exception` that
-  logs an ordinary error line, so the announcement is a shared helper rather than a
-  clause at one site: otherwise the first attempt would alert and the second — the one
-  that proves the stall is deterministic — would be swallowed.
+  against tens of cells per fill. The threads are daemons, so a leaked one cannot hold up
+  interpreter exit. `attempts_per_cell_in_cluster` defaults to 2, so a deterministically
+  stalling cell leaks one thread per attempt — two, not an unbounded number.
 
-The runner announces it at CRITICAL under `ASSEMBLY DEADLINE EXCEEDED`, a greppable
-prefix in the same style as `FAILURE CAP EXCEEDED`, because this repo has no alerting
-transport and monitoring matches on text. It is the one assembly failure that says
-nothing about the cell — every other names something about the data or the store; this
-one only says a phase stopped returning.
+The runner announces it at CRITICAL under `ASSEMBLY DEADLINE EXCEEDED`, a greppable prefix
+in the same style as `FAILURE CAP EXCEEDED`, because this repo has no alerting transport and
+monitoring matches on text. It is the one assembly failure that says nothing about the cell
+— every other names something about the data or the store; this one only says a phase
+stopped returning. **The line reports what became of the work from the exception, never from
+its own assumption**: a fork-write overrun terminated its worker processes, an abandoned
+step leaked a thread, and asserting either lifecycle for both would hand an operator the
+opposite diagnosis half the time. Both assembly sites — the trailing finalizer and the
+in-child retry — call one shared announcer, because a deterministic stall reaches both and
+the retry's broad `except Exception` would otherwise swallow the confirming second line.
+
+### Why a commit is announced instead
+
+An abandoned commit is a writer with the power to land minutes later, unobserved, after the
+caller has already failed the cell and moved on. The two commits are not equally bad, and
+neither is acceptable:
+
+- An abandoned **shard commit** that lands leaves the year written but not marked. That
+  state is benign and self-correcting — the work list reads the marks, so the cell looks
+  pending and a retry rewrites the same shards.
+- An abandoned **year-attrs commit** that lands is not self-correcting. It marks the cell
+  complete after `assemble_global` has unwound, so the registry part that follows a landed
+  assembly is never published; the next campaign then sees a complete-but-untagged cell,
+  takes `zone_fill`'s retag path, and returns without assembling or publishing. The result
+  is a cell advertised as complete that registry consumers cannot discover, and the part
+  cannot be rebuilt afterwards — its per-tile depth measurements come from inference, not
+  from the store.
+
+Reconciling that after the fact was considered and rejected: it means acting on a state
+nobody observed, and every version of it depends on assumptions about *where* the stall is,
+which is the one thing still unknown. So **the commits are not abandoned at all.** Their
+overrun is announced under a second greppable prefix, `ASSEMBLY COMMIT OVERDUE`, re-emitted
+every budget for as long as the commit is outstanding, and the wait continues.
+
+Two prefixes and not one, because they demand opposite responses: `ASSEMBLY DEADLINE
+EXCEEDED` means that fill has moved on and the cell will be retried, while `ASSEMBLY COMMIT
+OVERDUE` means that fill is stuck and will publish nothing further until a human acts.
+
+**This is stated as a limit, not as a fix.** A thread-based bound cannot stop a commit, so
+it does the only two things it honestly can: it converts a silent multi-hour hang into a
+repeating alarm within ten minutes, and it refuses to pretend the commit was stopped. Every
+step that *can* be abandoned safely still is, and three of the four places the stall could
+be sitting — the teardown, the merge, the years-complete read — are among them.
+
+### What would make a commit killable
+
+Run the assembly coordinator in a **child process** and kill it on expiry. Killing releases
+the locks, the threads and the memory, which is precisely the guarantee thread abandonment
+cannot give. Feasibility was checked rather than assumed:
+
+- `Repository` pickles (957 bytes) and `ForkSession` pickles.
+- A writable `Session` deliberately does **not** — icechunk raises *"You must opt-in to
+  pickle writable sessions in a distributed context using `Session.fork()`"*. So
+  merge-and-commit cannot be shipped out on their own: the whole of `write_year_shards`
+  would have to move, session creation included.
+- Two arguments do not cross a process boundary. `log` is a Prefect logger adapter, and
+  `telemetry` is an out-parameter dict; the child's stdout already reaches CloudWatch, and
+  telemetry can come back in the return value.
+- The cost is a nested pool — one coordinator child plus its sixteen workers — and a
+  handshake, because the parent has to be told when the fork phase ended to know which
+  budget it is enforcing.
+
+It was **not** done in this change, and the reasons are scope rather than doubt: it moves
+the process topology of every assembly in the campaign, it puts every assembly failure
+through a pickle round trip (icechunk's exceptions have not been shown to survive one, and
+this campaign's forensics live in those exceptions), it drops the coordinator's progress
+lines off the route to the Prefect API, it orphans sixteen grandchildren unless the kill
+goes to a process group, and it breaks the monkeypatch-based test seam that three test
+modules use to reach inside the write path — `spawn` re-imports the module and drops every
+patch. That is a change worth making deliberately, on its own, with its own rehearsal. It is
+not containment to ship during an incident.
 
 ## What is deliberately NOT covered
 
@@ -250,19 +320,26 @@ one only says a phase stopped returning.
 
 ## What would retire this
 
-A root cause. The strongest clue is in the campaign-side record and is not a timing one:
-counting the commits that landed between an assembly opening its session and trying to
-commit, **every one of the seven that faced four intervening commits stalled, and every one
-of the four that faced two or fewer committed in about a second — eleven out of eleven.**
-One case rules out simple simultaneity: 44N/2017 finished its long half 94 minutes after
-any other assembly was active, with nothing else committing, and still stalled. So the
-suspect is how stale a session had become, not contention at the instant of the commit.
-Reproduction at that shape has so far been negative — rebase depth adds about 30% to commit
-cost in a synthetic harness and never stalls — so something about the real environment is
-still missing.
+A root cause, and **fifteen hypotheses have now been eliminated without finding one.**
+Ruled out so far: rebase depth, changeset size (a million references committed in 0.99 s,
+and 25,600 chunks through the real sixteen-worker path), manifest preload, the credential
+callback, ordinary lock contention, session age (a fifteen-minute idle session committed in
+1.22 s), and the real `run_forked` with sixteen spawned workers, which did not stall in
+nineteen runs.
 
-If it turns out to be, say, a lost wakeup in the rebase or a retry loop with no ceiling,
+**A claim recorded in an earlier revision of this doc is withdrawn.** It read the eleven
+cells as showing that every assembly facing four intervening commits stalled and every one
+facing two or fewer committed in about a second, and concluded that *how stale a session had
+become* was the suspect. Session age has since been measured directly and does not stall, so
+that conclusion no longer stands; the counting still holds as an observation, but it is a
+correlation with no mechanism behind it. The campaign-side record,
+`yield-embeddings/context_docs/crash-recovery/assembly-stalls-before-commit-2026-08-29.md`,
+carries the full elimination list and a draft bug report for the icechunk maintainers.
+
+**Nothing in this change depends on the cause.** The budgets do not assume where the stall
+is, and the abandonment line is drawn by what each step can touch, which is true whatever
+the cause turns out to be. If the cause turns out to be, say, a lost wakeup in a retry loop,
 the fix belongs there and this becomes a cheap guard rather than the mechanism keeping fills
-alive. Until then, **the post-fork budget firing is a signal to go and look, not a routine
-outcome** — one `ASSEMBLY DEADLINE EXCEEDED` line means a fill hit the thing nobody has
-explained yet.
+alive. Until then, **either announcement is a signal to go and look, not a routine outcome**
+— one `ASSEMBLY DEADLINE EXCEEDED` or `ASSEMBLY COMMIT OVERDUE` line means a fill hit the
+thing nobody has explained yet.

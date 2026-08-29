@@ -697,14 +697,21 @@ common. The fork-write phase gets a budget derived from the shard count — the 
 what sets its length, so one fixed cutoff would be too tight for a dense zone-year and
 too loose for a sparse one at the same time. Everything after the forks return — pool
 teardown, merge, the `years_complete` read, both commits — gets a much tighter flat
-ceiling, because that work does not scale with the fill. Overrunning either raises
-`AssemblyDeadlineError` rather than waiting indefinitely; the fork phase is abandoned by
-terminating its workers, while the post-fork phase runs on a thread the caller stops
-waiting on and deliberately leaks, since a call blocked inside icechunk's Rust extension
-cannot be interrupted from Python. The trailing-assembly thread in
-`fill_zones_sequential` is therefore never the wedged one, and the fill goes on to the
-next cell. This is containment for a stall whose cause is not yet known — the budgets,
-what they cost, and what they deliberately leave uncovered are in
+ceiling, because that work does not scale with the fill.
+
+**What an overrun does depends on what the step can still touch, not on how long it ran.**
+A call blocked inside icechunk's Rust extension cannot be interrupted from Python, so a
+process can be killed and a thread cannot: abandoning a thread frees the caller and stops
+nothing. Every step up to and including the merge writes only into a fork, and a fork
+enters the repository only when a coordinator merges *and* commits it — so those steps are
+abandoned with `AssemblyDeadlineError` (the pooled fork writes by killing their workers,
+the rest by leaking a thread), the trailing-assembly thread in `fill_zones_sequential` is
+never the wedged one, and the fill goes on to the next cell. **The two commits are not
+abandoned**, because an abandoned commit could still land, unobserved, after the cell had
+been failed; their overrun is announced under `ASSEMBLY COMMIT OVERDUE`, repeated every
+budget, and the wait continues. This is containment for a stall whose cause is not yet
+known — the budgets, what they cost, what they deliberately leave uncovered, and the
+killable-process change that would let a commit be abandoned too, are in
 `context_docs/design/assembly-deadlines-2026_08.md`.
 
 #### Assembly telemetry: the `ASSEMBLY_SUMMARY` record

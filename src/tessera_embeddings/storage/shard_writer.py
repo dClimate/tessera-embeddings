@@ -94,7 +94,9 @@ FORK_PHASE_FLOOR_S = 3600.0
 #: many shards were written. Two orders of magnitude above anything it has been measured
 #: taking, and still an order of magnitude above the worst commit latency measured at
 #: full campaign width (``commit-gate-removal-2026_08.md``), so a contention storm cannot
-#: reach it. This is the bound that can actually catch a stall.
+#: reach it. This is the bound that can actually catch a stall — by abandoning the steps that
+#: cannot reach the store, and by ANNOUNCING the two commits, which are never abandoned
+#: (:func:`_run_under_deadline`).
 POST_FORK_BUDGET_S = 600.0
 
 
@@ -104,7 +106,17 @@ class AssemblyDeadlineError(RuntimeError):
     Not a diagnosis. It says a phase stopped finishing, names which one and what it was
     allowed, and leaves the cause open. Callers treat it as a failed assembly, which
     retains the cell's mosaic so a retry resumes from its staged tiles.
+
+    ``abandoned`` says what became of the work, and it VARIES BY PATH: a fork-write
+    overrun terminates its worker processes, so nothing is left running, while every other
+    overrun leaks a thread that is still going. An incident line that asserted one
+    lifecycle for both would hand operators the opposite diagnosis half the time, so the
+    disposition travels on the exception rather than being assumed by whoever reports it.
     """
+
+    def __init__(self, message: str, *, abandoned: str) -> None:
+        super().__init__(message)
+        self.abandoned = abandoned
 
 
 def fork_phase_budget_s(n_shards: int) -> float:
@@ -143,49 +155,74 @@ class _Deadline:
         self._at = time.monotonic() + self.budget_s
 
     def remaining_s(self) -> float:
-        """Seconds left before the phase is abandoned; never negative."""
+        """Seconds left before the phase overruns its budget; never negative."""
         if self._at is None:
             raise RuntimeError("post-fork deadline consulted before the forks returned")
         return max(0.0, self._at - time.monotonic())
 
 
-def _run_before_deadline[T](deadline: _Deadline | None, fn: Callable[[], T], what: str) -> T:
-    """Run ``fn``, and stop WAITING for it once ``deadline`` passes.
+def _run_under_deadline[T](
+    deadline: _Deadline | None,
+    fn: Callable[[], T],
+    what: str,
+    *,
+    abandonable: bool = True,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+) -> T:
+    """Run ``fn`` under ``deadline``; ``abandonable`` decides what an overrun does.
 
     ``None`` runs ``fn`` inline and waits forever, which is exactly what every caller
     that asks for no budget keeps.
 
-    Otherwise ``fn`` runs on a single-use daemon thread and this returns control at the
-    deadline whether or not it finished, raising :exc:`AssemblyDeadlineError`. The
-    thread is not cancelled, and cannot be: these calls descend into icechunk's Rust
-    extension, and Python cannot interrupt a thread blocked below the interpreter. So it
-    is LEAKED, deliberately, and that is the whole trade:
+    Otherwise ``fn`` runs on a single-use daemon thread, so this function is still able
+    to act when the deadline passes. The thread cannot be cancelled, and that is not a
+    limitation of this code: these calls descend into icechunk's Rust extension, and
+    Python cannot interrupt a thread blocked below the interpreter. A PROCESS can be
+    killed and a thread cannot, so abandoning a thread promises only that the CALLER
+    comes back — never that the work stops.
 
-    * What it buys — the caller's thread comes back. In the campaign runner that thread
-      is a single-slot executor shared by every later cell, so one wedged fill otherwise
-      stops its whole fill publishing for the rest of the run.
-    * What it costs — the leaked thread still holds its icechunk session, its merged
-      forks and their memory, and it is still a writer. If it ever unblocks it will
-      commit, possibly after a retry of the same cell has already committed. Both write
-      the same year's shards from the same staged tiles and ``years_complete`` inserts
-      one key idempotently, so the visible cost is a duplicate write and a second
-      provenance entry rather than a damaged year — but it is a live writer nobody is
-      waiting on, which is why the budgets above are generous rather than tight.
-    * Why it is affordable — the runner is 16 vCPU / 64 GiB and sits near a gigabyte
-      resident, against tens of cells per fill. The thread is a daemon, so a leaked one
-      cannot hold up interpreter exit.
+    **That is why what may be abandoned is drawn where it is, and it is drawn by what the
+    work can still touch, not by how long it has run.** A later reader must not have to
+    rediscover this: a leaked thread keeps running and, if the step it is inside commits,
+    keeps its power to mutate the published store minutes after everyone stopped watching.
+
+    * ``abandonable=True`` — for steps that CANNOT reach the store: the pool teardown, the
+      merge, the years-complete read, and a single-payload fork write. Icechunk's write
+      model is what makes this safe rather than merely tolerable — a worker writes into a
+      fork, and a fork enters the repository only when a coordinator merges *and commits*
+      it, so dropping one orphans chunk objects and nothing else. The caller raises
+      :exc:`AssemblyDeadlineError`, its thread comes back, and in the campaign runner that
+      thread is the single-slot finalizer every later cell queues behind — which is the
+      whole point: one wedged fill otherwise stops its fill publishing for the rest of the
+      run. The cost is a leaked thread holding a session and its merged forks, on a runner
+      with 16 vCPU / 64 GiB and tens of cells per fill; it is a daemon, so it cannot hold
+      up interpreter exit.
+    * ``abandonable=False`` — for the two COMMITS, and only them. An abandoned commit
+      would be a writer nobody is waiting on that can still land: a shard commit arriving
+      late leaves the year written but unmarked, and a year-attrs commit arriving late
+      marks the cell complete after its caller has unwound, so the registry part that
+      follows a landed assembly is never published and the retag path tags the cell
+      without assembling it. Rather than reconcile a state we cannot observe, the commits
+      are not abandoned at all: the overrun is ANNOUNCED, repeatedly, and the wait
+      continues. That is the honest limit of a thread-based bound — it converts a silent
+      multi-hour hang into a repeating alarm, and it does not pretend to have stopped the
+      commit. Making a commit genuinely abandonable needs a killable process, which is a
+      change of shape rather than of constant; see
+      ``context_docs/design/assembly-deadlines-2026_08.md``.
     """
     if deadline is None:
         return fn()
-    # REFUSE BEFORE STARTING when the shared budget is already gone. Launching here and
-    # abandoning a microsecond later would leave a writer running that nobody will ever
-    # observe — for the commits that is a background committer racing the cell's retry —
-    # bought for no chance at all of finishing in time.
     remaining = deadline.remaining_s()
-    if remaining <= 0.0:
+    # REFUSE BEFORE STARTING when the shared budget is already gone. Launching here and
+    # abandoning a microsecond later would leave a thread running that nobody will ever
+    # observe, bought for no chance at all of finishing in time. Only for a step that WOULD
+    # be abandoned: one that is going to be waited on regardless may as well run, and
+    # failing a cell whose commit would have taken 200 ms is the worse trade.
+    if abandonable and remaining <= 0.0:
         raise AssemblyDeadlineError(
             f"{what} was not started: the {deadline.budget_s:.0f}s budget for the phase after the forks "
-            f"was already spent by an earlier step"
+            f"was already spent by an earlier step",
+            abandoned="nothing was started, so nothing of this step is still running",
         )
     box: dict[str, Any] = {}
     finished = threading.Event()
@@ -199,10 +236,28 @@ def _run_before_deadline[T](deadline: _Deadline | None, fn: Callable[[], T], wha
             finished.set()
 
     threading.Thread(target=_body, name=f"assembly-{what}", daemon=True).start()
-    if not finished.wait(timeout=remaining):
+    if not abandonable:
+        # ANNOUNCE AND KEEP WAITING. Re-announced on every budget, not once: a lone line
+        # followed by hours of silence is indistinguishable from the stall having cleared,
+        # and this is the only signal an operator gets for a phase that logs nothing of its
+        # own. A DISTINCT, GREPPABLE PREFIX from the abandoned case because the two demand
+        # opposite responses — that fill has moved on, this one has not.
+        logger = log or _log
+        timeout = remaining
+        while not finished.wait(timeout=timeout):
+            logger.critical(
+                "ASSEMBLY COMMIT OVERDUE: %s has not returned %.0fs after the forks did. It is NOT "
+                "abandoned — a commit mutates the published store, and a thread cannot be killed, so "
+                "waiting is the only thing that cannot corrupt the cell. This fill assembles nothing "
+                "further until it returns.",
+                what,
+                deadline.budget_s,
+            )
+            timeout = deadline.budget_s
+    elif not finished.wait(timeout=remaining):
         raise AssemblyDeadlineError(
-            f"{what} had not returned {deadline.budget_s:.0f}s after the forks did, and was abandoned "
-            f"(the thread doing it is leaked, not killed)"
+            f"{what} had not returned {deadline.budget_s:.0f}s after the forks did, and was abandoned",
+            abandoned="the thread running it is leaked, not killed, so it is still running",
         )
     if "error" in box:
         raise box["error"]
@@ -410,7 +465,11 @@ def _await_forks(
         if pending and budget_s is not None and time.monotonic() - started >= budget_s:
             raise AssemblyDeadlineError(
                 f"fork-write phase still had {len(pending)}/{len(futures)} {unit} outstanding after "
-                f"{(time.monotonic() - started) / 60.0:.0f} min, past its {budget_s / 60.0:.0f} min budget"
+                f"{(time.monotonic() - started) / 60.0:.0f} min, past its {budget_s / 60.0:.0f} min budget",
+                # The caller's handler terminates every live worker before this reaches anyone,
+                # so on THIS path nothing is left running — the opposite of what an abandoned
+                # post-fork step leaves behind, and the reason the disposition is carried.
+                abandoned="its worker processes are terminated, so nothing it wrote can reach the store",
             )
         if pending:
             # SHARDS, not payloads: a payload completes only when its worker returns and they all
@@ -488,7 +547,9 @@ def run_forked(
     both would have to clear the hours, which is far too loose to notice the seconds
     going wrong. ``post_fork`` is STARTED here, at the one moment that phase begins —
     the last fork's result in hand — and the caller then holds the same object over its
-    own commits, so the two functions share one ceiling rather than one each.
+    own commits, so the two functions share one ceiling rather than one each. Everything
+    bounded in THIS function is abandonable, because none of it can reach the published
+    store; the caller's commits are not (:func:`_run_under_deadline`).
     """
     t0 = time.monotonic()
     fork_deadline = None
@@ -507,7 +568,7 @@ def run_forked(
     # there, and unlike the phases that have, it happens before the first progress line — so
     # it would show as a fill that never starts assembling rather than one that never
     # finishes, which is the easier of the two to spot.
-    fork = _run_before_deadline(fork_deadline, session.fork, "session fork")
+    fork = _run_under_deadline(fork_deadline, session.fork, "session fork")
     # Copies, not mutation: callers keep their payload dicts fork-free.
     payloads = [
         {**payload, "fork": fork, "worker_index": i, "progress_interval_s": progress_interval_s}
@@ -515,16 +576,18 @@ def run_forked(
     ]
     if len(payloads) == 1:
         # One payload runs in-process, so there is no worker process to terminate — the
-        # fork budget is enforced the way the post-fork phase is, by abandoning a thread.
-        # It has to be enforced SOMEHOW: a sparse cell partitions to a single payload
-        # whatever `n_workers` says, and an unbudgeted one would block the caller's
-        # finalizer exactly as the stall this exists for does.
+        # fork budget is enforced here by abandoning a thread. It has to be enforced
+        # SOMEHOW: a sparse cell partitions to a single payload whatever `n_workers` says,
+        # and an unbudgeted one would block the caller's finalizer exactly as the stall
+        # this exists for does.
         #
-        # Cheaper to abandon here than after the forks: the worker writes into a fork that
-        # is never merged, so nothing it produced can reach the store. What the process
-        # path buys and this cannot is the KILL — an abandoned thread keeps running and
-        # keeps writing fork objects. They are unreferenced either way.
-        results = [_run_before_deadline(fork_deadline, lambda: worker_fn(payloads[0]), "fork-write phase")]
+        # Abandoning is SAFE here for the same reason terminating the workers is: the
+        # worker writes into a fork, and a fork enters the repository only when a
+        # coordinator merges and commits it, so nothing this thread produced can reach the
+        # store. What the process path buys and this cannot is the KILL — an abandoned
+        # thread keeps running and keeps writing fork objects. They are unreferenced either
+        # way.
+        results = [_run_under_deadline(fork_deadline, lambda: worker_fn(payloads[0]), "fork-write phase")]
         if post_fork is not None:
             post_fork.start()
     else:
@@ -595,7 +658,7 @@ def run_forked(
         # `shutdown` sets `_processes = None` unconditionally.
         procs = list((getattr(ex, "_processes", None) or {}).values())
         try:
-            _run_before_deadline(post_fork, ex.shutdown, "pool teardown")
+            _run_under_deadline(post_fork, ex.shutdown, "pool teardown")
         except AssemblyDeadlineError:
             # Kill the workers, but do NOT reuse the handler above: its first act is another
             # `ex.shutdown(...)`, which takes the shutdown lock the abandoned thread is still
@@ -608,7 +671,7 @@ def run_forked(
                     proc.terminate()
             raise
     t_merge = time.monotonic()
-    _run_before_deadline(post_fork, lambda: session.merge(*(fork_result for fork_result, _ in results)), "merge")
+    _run_under_deadline(post_fork, lambda: session.merge(*(fork_result for fork_result, _ in results)), "merge")
     done = time.monotonic()
     return {
         "workers": [stats for _, stats in results],
@@ -942,10 +1005,16 @@ def write_year_shards(
 
     BOUNDED IN TWO PARTS. The fork-write phase gets a budget derived from the shard
     count (:func:`fork_phase_budget_s`); everything after the forks return gets the much
-    tighter :data:`POST_FORK_BUDGET_S`. Overrunning either raises
-    :exc:`AssemblyDeadlineError` instead of waiting indefinitely — containment for a
-    stall whose cause is not yet known, not a fix for it. What that costs, and what it
-    leaves uncovered, is in ``context_docs/design/assembly-deadlines-2026_08.md``.
+    tighter :data:`POST_FORK_BUDGET_S`. Containment for a stall whose cause is not yet
+    known, not a fix for it.
+
+    WHAT AN OVERRUN DOES DEPENDS ON WHAT THE STEP CAN TOUCH, not on how long it ran. Every
+    step that writes only into a fork is abandoned with :exc:`AssemblyDeadlineError`, which
+    frees the caller and can orphan objects but cannot alter the store. THE TWO COMMITS ARE
+    NOT ABANDONED: a thread cannot be killed, so an abandoned commit would keep the power
+    to land unobserved after the cell had already been failed. Their overrun is announced
+    and the wait continues. What that costs, and the killable-process change that would
+    lift it, are in ``context_docs/design/assembly-deadlines-2026_08.md``.
 
     Returns the ATTR commit's snapshot id — a tag must point at a state where the
     year is both written and marked.
@@ -983,12 +1052,23 @@ def write_year_shards(
     # Each of these names its own phase, so an abandoned fill says which call stopped
     # returning rather than only that one did — the cause is not yet known, and that
     # name is the first thing an operator has to go on.
-    year_label = _run_before_deadline(
+    year_label = _run_under_deadline(
         post_fork, lambda: _year_label(_group_node(session.store, group), year_index), "years-complete read"
     )
     t_commit = time.monotonic()
-    _run_before_deadline(
-        post_fork, lambda: commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}"), "shard commit"
+    # NEITHER COMMIT IS ABANDONED. Everything before them writes into a fork, which enters
+    # the repository only when it is merged AND committed — so dropping any of those steps
+    # can orphan objects and nothing more. A commit is the step where that stops being true,
+    # and a thread cannot be killed: abandoning one would leave a writer with the power to
+    # land minutes later, unobserved, after the caller has already failed the cell. So the
+    # overrun is announced instead (see `_run_under_deadline`), through the CALLER's logger
+    # — under Prefect the run logger, the only route to the orchestrator's own log.
+    _run_under_deadline(
+        post_fork,
+        lambda: commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}"),
+        "shard commit",
+        abandonable=False,
+        log=log,
     )
     if fault is not None:
         # The drill's death lands HERE, between the two commits, and nowhere else can
@@ -999,7 +1079,7 @@ def write_year_shards(
     # collision costs a sub-second retry instead of this whole assembly. Return that
     # snapshot rather than the shard one: a tag must point at a state where the year is
     # both written AND marked.
-    snapshot = _run_before_deadline(
+    snapshot = _run_under_deadline(
         post_fork,
         lambda: commit_year_attrs(
             repo,
@@ -1012,6 +1092,8 @@ def write_year_shards(
             empty=empty,
         ),
         "year-attrs commit",
+        abandonable=False,
+        log=log,
     )
     if telemetry is not None:
         telemetry.update(

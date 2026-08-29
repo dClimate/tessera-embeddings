@@ -734,6 +734,19 @@ class TestTheForkPhaseIsAbandonedOnItsBudget:
             _await_forks([outstanding], 10.0, budget_s=0.1)
         assert time.monotonic() - started < 5.0, "the wait ran its whole progress interval"
 
+    def test_a_terminated_fork_phase_does_not_report_a_leaked_thread(self):
+        """The incident line is rendered from this, so it must not describe the other path.
+
+        A fork-write overrun kills its worker processes and a post-fork overrun leaks a
+        thread. An announcement that asserted either lifecycle for both would hand operators
+        the opposite diagnosis half the time.
+        """
+        outstanding: Future = Future()  # never resolves
+        with pytest.raises(shard_writer.AssemblyDeadlineError) as caught:
+            _await_forks([outstanding], 0.01, budget_s=0.0)
+        assert "terminated" in caught.value.abandoned
+        assert "leak" not in caught.value.abandoned
+
     def test_a_fill_inside_its_budget_is_untouched(self):
         outstanding: Future = Future()
         threading.Timer(0.05, lambda: outstanding.set_result("done")).start()
@@ -862,19 +875,42 @@ class TestThePhaseAfterTheForksIsBounded:
     def test_no_deadline_runs_inline_on_the_callers_thread(self):
         # The default every caller that names no budget keeps: no thread, no hand-off.
         seen: list[threading.Thread] = []
-        shard_writer._run_before_deadline(None, lambda: seen.append(threading.current_thread()), "merge")
+        shard_writer._run_under_deadline(None, lambda: seen.append(threading.current_thread()), "merge")
         assert seen == [threading.current_thread()]
 
-    def test_work_is_not_started_once_the_shared_budget_is_gone(self):
-        # The phases share one clock, so an earlier one can spend all of it. Launching the
-        # next anyway would leave a writer running that nobody will ever observe — for the
-        # commits, one racing the cell's retry — bought for no chance of finishing in time.
+    def test_abandonable_work_is_not_started_once_the_shared_budget_is_gone(self):
+        # The phases share one clock, so an earlier one can spend all of it. Launching work
+        # that would be abandoned a microsecond later leaves a thread running that nobody
+        # will ever observe, bought for no chance of finishing in time.
         ran: list[bool] = []
         spent = shard_writer._Deadline(0.0)
         spent.start()
         with pytest.raises(shard_writer.AssemblyDeadlineError, match="was not started"):
-            shard_writer._run_before_deadline(spent, lambda: ran.append(True), "year-attrs commit")
+            shard_writer._run_under_deadline(spent, lambda: ran.append(True), "merge")
         assert ran == [], "the work was launched despite having no budget left"
+
+    def test_a_commit_with_no_budget_left_still_runs(self):
+        """A step that will be WAITED on either way must not be refused for lack of budget.
+
+        Refusing is only worth it when the alternative is an unobserved thread. A commit is
+        never abandoned, so refusing to start one would throw away a cell whose commit was
+        about to take 200 ms — because an earlier step happened to spend the budget.
+        """
+        ran: list[bool] = []
+        spent = shard_writer._Deadline(0.0)
+        spent.start()
+        shard_writer._run_under_deadline(spent, lambda: ran.append(True), "shard commit", abandonable=False)
+        assert ran == [True]
+
+    def test_an_abandoned_step_reports_a_leaked_thread(self):
+        # The counterpart of the fork path's terminated workers: here nothing is killed.
+        release = threading.Event()
+        try:
+            with pytest.raises(shard_writer.AssemblyDeadlineError) as caught:
+                shard_writer._run_under_deadline(self._started(0.1), lambda: release.wait(30), "merge")
+            assert "leaked" in caught.value.abandoned
+        finally:
+            release.set()
 
     def test_a_failure_inside_the_budget_reaches_the_caller(self):
         # A real commit failure must not be swallowed by the hand-off thread.
@@ -882,7 +918,7 @@ class TestThePhaseAfterTheForksIsBounded:
             raise RuntimeError("rebase refused")
 
         with pytest.raises(RuntimeError, match="rebase refused"):
-            shard_writer._run_before_deadline(self._started(30.0), _refused, "shard commit")
+            shard_writer._run_under_deadline(self._started(30.0), _refused, "merge")
 
     def test_the_caller_is_freed_while_the_work_is_still_running(self):
         """The property that matters, since the work itself cannot be cancelled.
@@ -903,41 +939,56 @@ class TestThePhaseAfterTheForksIsBounded:
 
         try:
             with pytest.raises(shard_writer.AssemblyDeadlineError, match="pool teardown"):
-                shard_writer._run_before_deadline(self._started(0.2), _wedged, "pool teardown")
+                shard_writer._run_under_deadline(self._started(0.2), _wedged, "pool teardown")
             assert entered.is_set(), "the work never started"
             assert not finished.is_set(), "the caller waited for work it was supposed to abandon"
         finally:
             release.set()
         assert finished.wait(10), "the abandoned work is leaked, not killed — it still runs"
 
-    def test_a_commit_that_never_returns_abandons_the_fill_and_frees_the_caller(self, tmp_path, monkeypatch):
-        """The whole containment, end to end, at the phase where fills have stopped.
+    def test_a_stuck_commit_is_announced_repeatedly_and_never_abandoned(self, tmp_path, monkeypatch, caplog):
+        """A commit is the one step that mutates the published store, so it is WAITED on.
 
-        Both halves are asserted: the fill fails with the phase named (an operator's only
-        starting point while the cause is unknown), and the caller comes back on the
-        budget rather than on the commit — which is what lets the fill assemble later
-        cells at all.
+        A thread cannot be killed. Abandoning a commit would leave a writer that can still
+        land, minutes later, after the caller has already failed the cell — and nobody would
+        be watching when it did. So the budget only decides when to start shouting: the line
+        repeats every budget, because one line followed by hours of silence cannot be told
+        apart from the stall having cleared.
         """
-        monkeypatch.setattr(shard_writer, "POST_FORK_BUDGET_S", 1.0)
+        monkeypatch.setattr(shard_writer, "POST_FORK_BUDGET_S", 0.2)
         release = threading.Event()
         entered = threading.Event()
+        real_commit = shard_writer.commit_with_rebase
 
-        def _never_returns(session, message, **kwargs):
+        def _wedged_commit(session, message, **kwargs):
             entered.set()
             release.wait(60)
-            return "unreachable"
+            return real_commit(session, message, **kwargs)
 
-        monkeypatch.setattr(shard_writer, "commit_with_rebase", _never_returns)
+        monkeypatch.setattr(shard_writer, "commit_with_rebase", _wedged_commit)
         store, repo = _seed(tmp_path)
-        started = time.monotonic()
-        try:
-            with pytest.raises(shard_writer.AssemblyDeadlineError, match="shard commit"):
-                write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), shard_px=_SHARD)
-            elapsed = time.monotonic() - started
-        finally:
-            release.set()
-        assert entered.is_set(), "the commit never ran, so the test proved nothing"
-        assert elapsed < 30, f"the caller waited {elapsed:.0f}s on a commit it was supposed to abandon"
+        done = threading.Event()
+
+        def _said():
+            return [r.getMessage() for r in caplog.records if "ASSEMBLY COMMIT OVERDUE" in r.getMessage()]
+
+        def _fill():
+            write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), shard_px=_SHARD)
+            done.set()
+
+        with caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.shard_writer"):
+            threading.Thread(target=_fill, daemon=True).start()
+            try:
+                assert entered.wait(30), "the commit never ran, so the test proved nothing"
+                until = time.monotonic() + 15
+                while len(_said()) < 2 and time.monotonic() < until:
+                    time.sleep(0.05)
+                assert len(_said()) >= 2, f"a stuck commit must keep announcing itself: {_said()}"
+                assert not done.is_set(), "the fill returned; a commit must never be abandoned"
+            finally:
+                release.set()
+            assert done.wait(30), "the fill did not finish once its commit returned"
+        assert "shard commit" in _said()[0], "the announcement must name which commit stopped"
 
     def test_a_stuck_teardown_still_kills_the_workers(self, tmp_path, monkeypatch):
         """Abandoning the teardown must not abandon the pool with it.
