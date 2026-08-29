@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import fields
 
 import pytest
 
 from tessera_embeddings.config.inference import (
     DEFAULT_NUM_OBS_CHECKPOINTS,
-    MIN_GPU_BATCH_SIZE,
+    TUNED_BATCH_SIZE,
     TUNED_GPU_GIB,
     InferenceConfig,
     _normalize_obs_checkpoints,
@@ -227,7 +228,7 @@ A10G_TOTAL_GIB = 22.06
 #: Deepest sub-batch an A10G was measured to complete, in tokens: 7,168 pixels at 325
 #: tokens each, the last rung of the forward sweep in
 #: ``context_docs/design/gpu-card-choice-2026_08.md``. The rung above it refuses.
-A10G_MEASURED_TOKEN_CEILING = 7168 * 325
+A10G_MEASURED_TOKEN_CEILING = TUNED_BATCH_SIZE * 325
 
 #: Most tokens one pixel can carry: the sampler clips each of the two streams to the
 #: deepest checkpoint, so this is a property of the bucketing, not of any geography.
@@ -250,22 +251,40 @@ class TestBatchSizeForGpu:
         ],
     )
     def test_scales_only_below_the_tuned_card(self, total_gib: float, expected: int) -> None:
-        assert batch_size_for_gpu(7168, total_gib) == expected
+        assert batch_size_for_gpu(TUNED_BATCH_SIZE, total_gib) == expected
 
     def test_unknown_memory_leaves_the_tuned_value_alone(self) -> None:
         """A CPU device reports nothing; scaling on a guess is worse than the tuned default."""
-        assert batch_size_for_gpu(7168, None) == 7168
+        assert batch_size_for_gpu(TUNED_BATCH_SIZE, None) == TUNED_BATCH_SIZE
 
-    def test_a_tiny_card_stops_at_the_floor(self) -> None:
-        """Below the floor the per-forward overhead dominates and the card is starved."""
-        assert batch_size_for_gpu(7168, 0.5) == MIN_GPU_BATCH_SIZE
+    def test_a_tiny_card_gets_what_fits_rather_than_a_round_number(self) -> None:
+        """No floor: a batch rounded UP to look reasonable is the failure being prevented."""
+        assert batch_size_for_gpu(7168, 0.5) == int(TUNED_BATCH_SIZE * 0.5 / TUNED_GPU_GIB)
+
+    def test_a_request_above_the_calibration_is_capped_not_scaled(self) -> None:
+        """The fit comes off the calibrated batch, so an over-ask cannot ride through it."""
+        assert batch_size_for_gpu(10_000, A10G_TOTAL_GIB) == batch_size_for_gpu(TUNED_BATCH_SIZE, A10G_TOTAL_GIB)
+
+    @pytest.mark.parametrize("gpu_fraction", [0.6, 0.4])
+    def test_the_share_is_what_ray_packs_not_what_was_reserved(self, gpu_fraction: float) -> None:
+        """Ray fits ``floor(1 / num_gpus)`` actors on a card, so 0.6 owns all of it and 0.4 half.
+
+        Reading the reservation as the share would cut a batch that fits, for no memory
+        gained: at 0.6 no second actor can be placed beside this one.
+        """
+        packed = math.floor(1 / gpu_fraction)
+        assert batch_size_for_gpu(TUNED_BATCH_SIZE, 44.7, gpu_fraction=gpu_fraction) == batch_size_for_gpu(
+            TUNED_BATCH_SIZE, 44.7 / packed
+        )
 
     @pytest.mark.parametrize(
         ("num_obs_checkpoints", "gpu_fraction"),
         [
             (DEFAULT_NUM_OBS_CHECKPOINTS, 1.0),  # production: one actor, the tuned ladder
             ((512,), 1.0),  # a ladder deeper than the one the batch was tuned against
+            ((4096,), 1.0),  # a ladder deep enough that the safe batch is a few hundred
             (DEFAULT_NUM_OBS_CHECKPOINTS, 0.5),  # a fractional reservation packs two per card
+            (DEFAULT_NUM_OBS_CHECKPOINTS, 0.1),  # ten actors to a card
             ((512,), 0.5),  # both at once, which must compound rather than pick one
         ],
     )
@@ -283,20 +302,20 @@ class TestBatchSizeForGpu:
         on the card must not move.
         """
         fitted = batch_size_for_gpu(
-            7168,
+            TUNED_BATCH_SIZE,
             A10G_TOTAL_GIB,
             num_obs_checkpoints=num_obs_checkpoints,
             gpu_fraction=gpu_fraction,
         )
         # What the CARD is asked for, not what one actor is: a fractional reservation puts
         # that many concurrent forwards on the same memory.
-        per_card = fitted * 2 * max(num_obs_checkpoints) * round(1 / gpu_fraction)
+        per_card = fitted * 2 * max(num_obs_checkpoints) * math.floor(1 / gpu_fraction)
         assert per_card <= A10G_MEASURED_TOKEN_CEILING
 
     def test_the_unfitted_batch_does_not_hold_it(self) -> None:
         """The bound above is only evidence if the batch it replaced fails the same test."""
-        assert 7168 * DEEPEST_TOKENS_PER_PIXEL > A10G_MEASURED_TOKEN_CEILING
+        assert TUNED_BATCH_SIZE * DEEPEST_TOKENS_PER_PIXEL > A10G_MEASURED_TOKEN_CEILING
 
-    def test_a_configured_batch_below_the_floor_is_not_raised(self) -> None:
-        """The floor bounds SCALING, not the caller: a small batch was asked for on purpose."""
-        assert batch_size_for_gpu(64, 22.06) == 64
+    def test_a_small_configured_batch_is_never_raised(self) -> None:
+        """The request is a ceiling: a small batch (a tiny test model) was asked for on purpose."""
+        assert batch_size_for_gpu(64, A10G_TOTAL_GIB) == 64
