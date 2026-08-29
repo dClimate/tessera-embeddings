@@ -36,6 +36,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import yaml
@@ -291,6 +292,28 @@ def plan_from_resolved_yaml(path: str | Path, vcpu_budget: int | None) -> GpuFle
         return plan_from_resolved_config(yaml.safe_load(handle), vcpu_budget)
 
 
+def _ensure_gcs_client_for_request_resources(ray: ModuleType) -> None:
+    """Make ``request_resources`` usable from a driver that connected to a live cluster.
+
+    It reads the GCS address off Ray's *global* internal-KV client, which is a module
+    global set during ``worker.connect()`` and cleared by any ``disconnect()``. A driver
+    that reconnects with ``ignore_reinit_error=True`` returns early and never re-seeds it,
+    so the call fails with ``AssertionError: GCS client is not available`` even though the
+    driver is connected and everything else works — which is exactly what happened on the
+    first end-to-end run, silently, because the whole fleet mix is best-effort.
+
+    Re-seeding is idempotent and cheap. The address comes from the public runtime context.
+    """
+    from ray.experimental.internal_kv import _initialize_internal_kv, internal_kv_get_gcs_client
+
+    if internal_kv_get_gcs_client() is not None:
+        return
+    # `ray._raylet` is a compiled extension, so mypy cannot see `GcsClient` on it.
+    from ray._raylet import GcsClient  # type: ignore[attr-defined]
+
+    _initialize_internal_kv(GcsClient(address=ray.get_runtime_context().gcs_address))
+
+
 def publisher(plan: GpuFleetMixPlan) -> Callable[[int], None]:
     """A callable that publishes the fleet mix for a wanted machine count.
 
@@ -308,6 +331,8 @@ def publisher(plan: GpuFleetMixPlan) -> Callable[[int], None]:
         nonlocal last, cached
         import ray
         from ray.autoscaler.sdk import request_resources
+
+        _ensure_gcs_client_for_request_resources(ray)
 
         # Clearing must not depend on reading the cluster. It runs in a teardown path,
         # often against a cluster that is going away, and a failed live query there would
