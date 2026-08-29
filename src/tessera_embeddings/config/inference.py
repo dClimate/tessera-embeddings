@@ -292,25 +292,44 @@ TUNED_GPU_GIB: float = 44.0
 #: would be starved rather than protected.
 MIN_GPU_BATCH_SIZE: int = 512
 
+#: Deepest sequence the default batch was validated against, in tokens per pixel: both
+#: streams at the deepest checkpoint of the ladder that was in force when it was measured.
+#: A literal rather than ``2 * max(DEFAULT_NUM_OBS_CHECKPOINTS)`` — it records what the
+#: measurement covered, so changing the default ladder must NOT silently move it.
+TUNED_TOKENS_PER_PIXEL: int = 512
 
-def batch_size_for_gpu(configured: int, total_gib: float | None) -> int:
-    """Return the sub-batch size a card holding ``total_gib`` of memory can run.
+
+def batch_size_for_gpu(
+    configured: int,
+    total_gib: float | None,
+    *,
+    num_obs_checkpoints: tuple[int, ...] = DEFAULT_NUM_OBS_CHECKPOINTS,
+    gpu_fraction: float = 1.0,
+) -> int:
+    """Return the sub-batch size this actor's share of a card can run.
 
     A sub-batch's working set is activations, and activations are linear in
     ``batch_size x (t_s2 + t_s1)`` — the batch, times the sequence lengths of the bucket it
-    was drawn from. Only the first factor is ours to pick, but the second is BOUNDED:
+    was drawn from. Only the batch is ours to pick, but the sequence is BOUNDED:
     :func:`~tessera_embeddings.inference.sampling.compute_bin_keys` clips a pixel to
-    ``max(num_obs_checkpoints)`` observations on each of the two streams, so no bucket can
-    present more than twice that per pixel. Scaling the batch by the card's memory
-    therefore leaves the deepest bucket the sampler can build at the same fraction of every
-    card, which is why one ratio is enough and no sequence-length term is needed. That
-    bound is the load-bearing half of the argument and it appears nowhere in the arithmetic
-    below, so ``test_config_inference`` pins it against the depth the smallest rung was
-    measured to sustain.
+    ``max(num_obs_checkpoints)`` observations on each of the two streams, so the deepest
+    bucket the sampler can build is twice that per pixel. Its depth is therefore known
+    before any tile is read, which is why the batch needs no PER-BUCKET term: one value,
+    fitted once, is safe for every bucket a run can present.
+
+    Three things move that fit, and all three are here rather than at the call site because
+    a caller that knew to supply one would not necessarily know to supply the others:
+
+    * **How much memory the card has.** The reason this function exists.
+    * **How deep the ladder goes.** A ladder past the tuned depth makes every sub-batch
+      proportionally larger, so the batch has to come down to meet it.
+    * **How much of the card this actor gets.** A fractional reservation PACKS actors onto
+      one card (see ``FleetDemand.machines``), and each one sizing to the whole card would
+      oversubscribe it by exactly the packing factor.
 
     An actor that runs out of memory is killed and replaced, and its chunk is retried, so
     the cost is not lost data but a reloaded checkpoint on a fresh actor. Measurements
-    behind the constant are in ``context_docs/design/a10g_batch_size_2026_08.md``.
+    behind the constants are in ``context_docs/design/a10g_batch_size_2026_08.md``.
 
     ``None`` — a CPU device, or one that reports no memory — leaves ``configured`` alone,
     because scaling on an unknown is a guess and the tuned value is the better default.
@@ -318,16 +337,25 @@ def batch_size_for_gpu(configured: int, total_gib: float | None) -> int:
     Args:
         configured: The batch size the caller asked for.
         total_gib: The device's total memory in GiB, or ``None`` if unknown.
+        num_obs_checkpoints: The sampler's checkpoint ladder, whose deepest entry bounds
+            each stream's sequence length.
+        gpu_fraction: This actor's reservation of the card, ``1.0`` for sole occupancy.
 
     Returns:
-        ``configured`` on a card at least as large as the tuned one, otherwise the value
-        scaled by the memory ratio, floored at :data:`MIN_GPU_BATCH_SIZE` and never above
-        ``configured`` — the floor bounds the SCALING, so a caller that deliberately asked
-        for a small batch (a tiny test model) still gets the batch it asked for.
+        ``configured`` wherever this actor's share is at least as large as the tuned
+        reference, otherwise the value scaled to fit, floored at
+        :data:`MIN_GPU_BATCH_SIZE` and never above ``configured`` — the floor bounds the
+        SCALING, so a caller that deliberately asked for a small batch (a tiny test model)
+        still gets the batch it asked for.
     """
-    if total_gib is None or total_gib >= TUNED_GPU_GIB:
+    if total_gib is None:
         return configured
-    return min(configured, max(MIN_GPU_BATCH_SIZE, int(configured * total_gib / TUNED_GPU_GIB)))
+    share_gib = total_gib * min(1.0, gpu_fraction)
+    deepest_tokens_per_pixel = 2 * max(num_obs_checkpoints)
+    scale = (share_gib / TUNED_GPU_GIB) * (TUNED_TOKENS_PER_PIXEL / deepest_tokens_per_pixel)
+    if scale >= 1.0:
+        return configured
+    return min(configured, max(MIN_GPU_BATCH_SIZE, int(configured * scale)))
 
 
 @final

@@ -36,6 +36,7 @@ from tessera_embeddings.config.inference import (
     S1_ORBIT_NONE,
     S2_BAND_ORDER,
     TUNED_GPU_GIB,
+    TUNED_TOKENS_PER_PIXEL,
     InferenceConfig,
     S1Orbit,
     batch_size_for_gpu,
@@ -738,16 +739,24 @@ class InferenceActor:
         # cannot fill or batches it cannot hold. Rewriting the config once, before anything
         # reads it, keeps a single value for the whole actor.
         gpu_gib = _gpu_total_gib(_torch, self.device)
-        fitted = batch_size_for_gpu(config.batch_size, gpu_gib)
+        fitted = batch_size_for_gpu(
+            config.batch_size,
+            gpu_gib,
+            num_obs_checkpoints=config.num_obs_checkpoints,
+            gpu_fraction=config.num_gpus,
+        )
         if fitted != config.batch_size:
             logger.info(
-                "Batch size %d -> %d on instance %s: this card holds %.1f GiB, less than the "
-                "%.0f GiB the default was tuned against.",
+                "Batch size %d -> %d on instance %s: %.1f GiB card at %.2f GPU reserved, "
+                "deepest bucket %d tokens/px; the default was tuned on %.0f GiB at %d.",
                 config.batch_size,
                 fitted,
                 self.instance_id,
                 gpu_gib,
+                config.num_gpus,
+                2 * max(config.num_obs_checkpoints),
                 TUNED_GPU_GIB,
+                TUNED_TOKENS_PER_PIXEL,
             )
             self.config = replace(config, batch_size=fitted)
 

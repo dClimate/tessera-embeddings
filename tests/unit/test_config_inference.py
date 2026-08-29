@@ -260,19 +260,38 @@ class TestBatchSizeForGpu:
         """Below the floor the per-forward overhead dominates and the card is starved."""
         assert batch_size_for_gpu(7168, 0.5) == MIN_GPU_BATCH_SIZE
 
-    def test_the_fitted_batch_holds_the_deepest_bucket_the_sampler_can_build(self) -> None:
+    @pytest.mark.parametrize(
+        ("num_obs_checkpoints", "gpu_fraction"),
+        [
+            (DEFAULT_NUM_OBS_CHECKPOINTS, 1.0),  # production: one actor, the tuned ladder
+            ((512,), 1.0),  # a ladder deeper than the one the batch was tuned against
+            (DEFAULT_NUM_OBS_CHECKPOINTS, 0.5),  # a fractional reservation packs two per card
+            ((512,), 0.5),  # both at once, which must compound rather than pick one
+        ],
+    )
+    def test_the_fitted_batch_holds_the_deepest_bucket_the_sampler_can_build(
+        self, num_obs_checkpoints: tuple[int, ...], gpu_fraction: float
+    ) -> None:
         """The batch must fit the DEEPEST sub-batch, not the one that happened to fail.
 
         A sub-batch's working set is linear in ``batch x (t_s2 + t_s1)``, and the sampler
         clips both sequences to ``max(num_obs_checkpoints)`` — so the worst case is fixed
-        at construction rather than by which geography a fill draws. That bound is the
-        whole reason a plain memory ratio is safe, and nothing in ``batch_size_for_gpu``
-        states it. Pinned here so it turns red if the batch law loosens, if
-        ``TUNED_GPU_GIB`` rises, or if the checkpoint ladder grows past the depth the
-        smallest rung was measured to sustain.
+        before a tile is read rather than by which geography a fill draws. That is what
+        makes a batch fitted once safe for every bucket, and it holds only if the fit sees
+        everything that moves it: the card, the ladder's depth, and how many actors share
+        the card. Each row here is a way to make the deepest sub-batch bigger; the demand
+        on the card must not move.
         """
-        fitted = batch_size_for_gpu(7168, A10G_TOTAL_GIB)
-        assert fitted * DEEPEST_TOKENS_PER_PIXEL <= A10G_MEASURED_TOKEN_CEILING
+        fitted = batch_size_for_gpu(
+            7168,
+            A10G_TOTAL_GIB,
+            num_obs_checkpoints=num_obs_checkpoints,
+            gpu_fraction=gpu_fraction,
+        )
+        # What the CARD is asked for, not what one actor is: a fractional reservation puts
+        # that many concurrent forwards on the same memory.
+        per_card = fitted * 2 * max(num_obs_checkpoints) * round(1 / gpu_fraction)
+        assert per_card <= A10G_MEASURED_TOKEN_CEILING
 
     def test_the_unfitted_batch_does_not_hold_it(self) -> None:
         """The bound above is only evidence if the batch it replaced fails the same test."""

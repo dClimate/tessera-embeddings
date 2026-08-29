@@ -81,13 +81,13 @@ function of latitude (Pearson r = +0.009 against latitude band, where optical gi
 geographically clustered. Those are the fills that died. Nothing about the tiles was
 anomalous; they were on the far side of a threshold the batch size never knew about.
 
-## Why a memory ratio is nonetheless the whole answer
+## Why the batch still needs no per-bucket term
 
 The obvious next move, having found that memory depends on sequence length, is to make the
-batch depend on sequence length too — a token budget per sub-batch instead of a pixel
-count. **That was considered and rejected, on two measurements.**
+batch depend on the sequence length in hand — a token budget recomputed per bucket instead
+of one pixel count. **That was considered and rejected, on two measurements.**
 
-**First: the worst case is already bounded, and the ratio clears it.** A pixel's sequence
+**First: the worst case is already bounded, and one fitted value clears it.** A pixel's sequence
 is not open-ended. `compute_bin_keys` clips each of the two streams to
 `max(num_obs_checkpoints)`, which is 256, so no bucket the sampler can build carries more
 than **512 tokens per pixel** — a property of the bucketing, fixed at construction and
@@ -126,6 +126,33 @@ batch law would add a second knob, a second calibration constant and a per-bucke
 the hot loop, in exchange for an unmeasured gain on a fallback rung the economics say we
 would rather not be using at all.
 
+### But the fit has to see everything that moves the cap
+
+"No per-bucket term" is not "memory is the only input". The 512-token cap is a
+*consequence* of two configured things, and a fit that ignored them would be safe only by
+coincidence. Automated review found both, and they compound rather than compete:
+
+* **A deeper ladder.** `num_obs_checkpoints` is a config field and
+  `_normalize_obs_checkpoints` accepts any positive depths. A caller passing `(512,)` doubles
+  every sub-batch's token count, and a memory-only ratio would still hand the A10G 3,593
+  pixels — a 3,679,232-token sub-batch, well over the measured ceiling.
+* **A packed card.** A fractional `num_gpus` deliberately puts several actors on one card
+  — `FleetDemand.machines` documents and computes exactly that — and each of them sizing to
+  the card's *total* memory oversubscribes it by the packing factor.
+
+`batch_size_for_gpu` therefore takes all three, and the resulting demand on a card is
+invariant:
+
+| ladder | reservation | fitted batch | tokens demanded of the card | of the measured ceiling |
+|---|---:|---:|---:|---:|
+| default (max 256) | whole card | 3,593 | 1,839,616 | 79% |
+| default (max 256) | 0.5 — two actors | 1,796 | 1,839,104 | 79% |
+| `(512,)` | whole card | 1,796 | 1,839,104 | 79% |
+| `(512,)` | 0.5 — two actors | 898 | 1,839,104 | 79% |
+
+Same card, same demand, four configurations. The L40S at the default ladder and a whole
+card still gets 7,168 unchanged, because its share already exceeds the tuned reference.
+
 So the mechanism is real, and it is why the fix is needed. It is not a reason for the fix
 to be more complicated, because the quantity it varies is capped and the capped value fits.
 
@@ -133,12 +160,12 @@ to be more complicated, because the quantity it varies is capped and the capped 
 
 Two things, both of which now fail a test rather than fail a fill:
 
-* **The 512-token cap.** Nothing in `batch_size_for_gpu` mentions `num_obs_checkpoints`, so
-  extending the checkpoint ladder past 256 would silently invalidate the argument above.
-  `test_the_fitted_batch_holds_the_deepest_bucket_the_sampler_can_build` pins
-  `fitted × 2 × max(checkpoints)` against the measured ceiling, and
-  `test_the_unfitted_batch_does_not_hold_it` proves the bound is not vacuous by showing the
-  old batch fails the same test.
+* **The token cap itself.** `test_the_fitted_batch_holds_the_deepest_bucket_the_sampler_
+  can_build` pins `fitted × 2 × max(checkpoints) × actors-per-card` against the measured
+  ceiling, over all four combinations of ladder depth and reservation in the table above,
+  and `test_the_unfitted_batch_does_not_hold_it` proves the bound is not vacuous by showing
+  the old batch fails the same test. Dropping either the depth term or the packing term
+  from the fit turns exactly the two affected rows red.
 * **Segment-backed allocation.** Every VRAM figure here is *allocated* bytes. Under the
   default caching allocator the reserved pool runs well above that and strands the
   difference — 20.58 GiB reserved for an 11.97 GiB working set, measured — which is why the
