@@ -81,6 +81,7 @@ from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
+from tessera_embeddings.storage.icechunk_logging import traced_commit
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.registry import part_uri, registry_rows, write_registry_part
@@ -2067,7 +2068,7 @@ class ZarrWriter:
         # between repo creation and the schema commit) — treat as fresh.
         if is_new or "time" not in root:
             self._create_schema(root, layout, variables, total_y, total_x, time_date, spatial)
-            session.commit(f"Run {run_id}: create schema ({layout.name})")
+            traced_commit(session, f"Run {run_id}: create schema ({layout.name})")
             time_index = 0
             _log.info("Created %s with layout %s", output_path, layout.name)
         else:
@@ -2198,7 +2199,7 @@ class ZarrWriter:
                     parts = ([f"add {missing}"] if missing else []) + (
                         [f"reset untouched {untouched}"] if untouched else []
                     )
-                    session.commit(f"Run {run_id}: overwrite {time_date} — {'; '.join(parts)}")
+                    traced_commit(session, f"Run {run_id}: overwrite {time_date} — {'; '.join(parts)}")
                 _log.warning(
                     "Time %s already exists at index %d in %s — overwriting in place "
                     "(live positions rewritten, skip-marked footprints reset to fill%s)",
@@ -2209,9 +2210,10 @@ class ZarrWriter:
                 )
             else:
                 time_index = _extend_time_axis(root, time_date)
-                session.commit(
+                traced_commit(
+                    session,
                     f"Run {run_id}: extend time axis to {time_date}"
-                    + (f" (adding variables {missing})" if missing else "")
+                    + (f" (adding variables {missing})" if missing else ""),
                 )
                 _log.info("Extended %s time axis to index %d (%s)", output_path, time_index, time_date)
 

@@ -53,6 +53,7 @@ import zarr
 from tessera_embeddings.config.environment import code_identity, configure_logging
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.store_layout import SHARD_PX
+from tessera_embeddings.storage.icechunk_logging import traced_commit
 from tessera_embeddings.storage.zarr_store import read_time_values
 from tessera_embeddings.storage.zone_grid import year_of
 
@@ -179,7 +180,7 @@ def commit_with_rebase(
     completions. One line per commit, so the volume is one per zone-year.
     """
     started = time.monotonic()
-    snapshot = session.commit(message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries)
+    snapshot = traced_commit(session, message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries)
     _log.info("COMMIT %.2fs: %s", time.monotonic() - started, message)
     return snapshot
 
