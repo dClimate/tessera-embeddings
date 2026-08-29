@@ -703,11 +703,11 @@ class TestTheForkPhaseBudgetIsDerivedFromTheWork:
         assert shard_writer.fork_phase_budget_s(1) == shard_writer.FORK_PHASE_FLOOR_S
 
     def test_it_clears_the_slowest_fill_on_record(self):
-        # The slowest fork phase yet measured wrote 9,132 shards in ~400 minutes, on a
-        # cluster that was inferring hard throughout. The budget must clear that by the
-        # safety factor, or the next contention event kills a healthy assembly.
-        slowest_on_record_s = 400 * 60
-        assert shard_writer.fork_phase_budget_s(9_132) >= shard_writer.FORK_PHASE_SAFETY_FACTOR * slowest_on_record_s
+        # The slowest fork phase yet measured wrote 9,030 shards in 213 minutes. The budget
+        # must clear that by the safety factor at least, or a cell slower than anything in
+        # a narrow sample gets killed while it is working perfectly well.
+        slowest_on_record_s = 213 * 60
+        assert shard_writer.fork_phase_budget_s(9_030) >= shard_writer.FORK_PHASE_SAFETY_FACTOR * slowest_on_record_s
 
 
 class TestTheForkPhaseIsAbandonedOnItsBudget:

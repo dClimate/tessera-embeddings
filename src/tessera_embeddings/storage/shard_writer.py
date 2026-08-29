@@ -67,21 +67,21 @@ _log = logging.getLogger(__name__)
 #: quiet for short writes and close enough to bound how long a stall hides.
 PROGRESS_INTERVAL_S = 300.0
 
-#: Shards per minute the fork-write phase is assumed to manage at its SLOWEST. The
-#: measured rate spans a little over 2x at a fixed shard count, so the spread is not the
-#: size of the write — it is how contended the shared cluster was and how much valid data
-#: the year held, which the measurements cannot separate and the budget need not. This is
-#: the slow end of that spread, rounded down. Rates and their derivation live in
+#: Shards per minute the fork-write phase is credited with. Measured consistently, the
+#: phase turns out to be a steady rate — the observed cells span barely a quarter — so this
+#: is set at HALF the slowest one seen rather than at the slow end of a wide spread. The
+#: margin is against variation the measurements could not see (a denser cell, a busier
+#: campaign shape) rather than against a measured range. Rates and their derivation live in
 #: ``context_docs/design/assembly-deadlines-2026_08.md``.
 FORK_PHASE_SHARDS_PER_MINUTE = 20.0
 
-#: Multiplier on the work-derived fork-phase budget. Deliberately large. What varies in
-#: this phase — cluster contention and per-tile density — is set by the campaign rather
-#: than fixed, so the budget has to clear a denser cell or a busier hour than any yet
-#: measured. At this factor an assembly must run more than
-#: three times slower than the slowest one ever measured before it is abandoned. That
-#: makes this a backstop against a permanently stuck fork phase, NOT a detector — the
-#: detector is :data:`POST_FORK_BUDGET_S`.
+#: Multiplier on the work-derived fork-phase budget. Deliberately large, and for what the
+#: measurements CANNOT show rather than what they do: a handful of cells at one campaign
+#: shape is far too narrow a base to predict a denser cell or a wider fleet. On top of the
+#: halved rate above it puts the budget several times past the slowest fill on record, which
+#: costs nothing when the work is healthy and buys the one property that matters — it will
+#: not kill a slow assembly. So this is a backstop against a permanently stuck fork phase,
+#: NOT a detector; the detector is :data:`POST_FORK_BUDGET_S`.
 FORK_PHASE_SAFETY_FACTOR = 3.0
 
 #: Floor under the fork-phase budget, so a sparse zone-year is never held to a budget of
@@ -112,9 +112,9 @@ def fork_phase_budget_s(n_shards: int) -> float:
 
     Derived from the WORK rather than from a clock: this phase writes ``n_shards``
     shards and its duration tracks that count, so one fixed cutoff would be too tight
-    for a dense zone-year and too loose for a sparse one at the same time. Scaled from
-    the slowest rate observed, padded by :data:`FORK_PHASE_SAFETY_FACTOR`, and floored so
-    a small fill still gets a generous allowance.
+    for a dense zone-year and too loose for a sparse one at the same time. Scaled from a
+    rate set well under the slowest observed, padded by :data:`FORK_PHASE_SAFETY_FACTOR`,
+    and floored so a small fill still gets a generous allowance.
     """
     scaled = 60.0 * n_shards / FORK_PHASE_SHARDS_PER_MINUTE * FORK_PHASE_SAFETY_FACTOR
     return max(FORK_PHASE_FLOOR_S, scaled)
