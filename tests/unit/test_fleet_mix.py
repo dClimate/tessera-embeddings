@@ -134,17 +134,36 @@ class TestTheBoundsAreLoadBearing:
         """A fallback machine costs more quota than a primary one, so reserving a slot in
         the demand is not enough — the quota has to be reserved too.
         """
-        asks = fleet_mix.fleet_asks(want_gpus=2, live_by_instance_type={}, ceilings=_ceilings(), vcpu_budget=8)
+        asks = fleet_mix.fleet_asks(want_gpus=6, live_by_instance_type={}, ceilings=_ceilings(), vcpu_budget=20)
         assert asks[A10G] == 1
 
-    def test_a_proven_primary_keeps_the_whole_small_demand(self) -> None:
-        """Once the primary has machines the scheduler is correcting, so the reservation
-        stops applying and the better card is not held back.
+    def test_a_live_primary_does_not_cancel_the_fallback_probe(self) -> None:
+        """The floor is keyed on the FALLBACK's live count, not the primary's. An earlier
+        version dropped it as soon as the primary had any machine, reasoning that the
+        scheduler would correct — but the scheduler recomputes this same function, so it
+        never did: eight wanted GPUs with four live L40S asked for zero A10G forever, even
+        with the primary refusing everything above four.
         """
         asks = fleet_mix.fleet_asks(
             want_gpus=8, live_by_instance_type={L40S: 4}, ceilings=_ceilings(), vcpu_budget=BUDGET
         )
-        assert asks == {L40S: 8, A10G: 0}
+        assert asks[A10G] >= 1
+
+    def test_a_tight_aggregate_ceiling_still_reserves_for_the_fallback(self) -> None:
+        asks = fleet_mix.fleet_asks(
+            want_gpus=50, live_by_instance_type={}, ceilings=_ceilings(), vcpu_budget=BUDGET, max_total=3
+        )
+        assert asks[A10G] >= 1
+        assert sum(asks.values()) <= 3
+
+    def test_a_draining_tail_does_not_buy_a_probe_it_cannot_use(self) -> None:
+        """The floor only applies while the machines we hold cannot already cover the
+        demand — otherwise a tail would buy a machine for work that does not exist.
+        """
+        asks = fleet_mix.fleet_asks(
+            want_gpus=12, live_by_instance_type={L40S: 35}, ceilings=_ceilings(), vcpu_budget=BUDGET
+        )
+        assert asks == {L40S: 12, A10G: 0}
 
     def test_without_a_budget_only_demand_and_ceilings_bind(self) -> None:
         asks = fleet_mix.fleet_asks(want_gpus=250, live_by_instance_type={}, ceilings=_ceilings())
@@ -306,7 +325,9 @@ class TestFleetDemand:
             (250, 0, 0),  # a CPU-only run must not ask for GPU machines at all
             (250, 0.5, 125),
             (5, 0.4, 3),  # fractional reservations PACK: two to a card, so three machines
-            (10, 2.0, 20),  # a multi-GPU actor needs more machines than there are actors
+            # Every rung is single-GPU and Ray cannot combine GPUs across nodes, so an
+            # actor reserving more than one cannot be placed on anything this could buy.
+            (10, 2.0, 0),
         ],
     )
     def test_actors_are_converted_to_machines(self, actors: int, num_gpus: float, machines: int) -> None:

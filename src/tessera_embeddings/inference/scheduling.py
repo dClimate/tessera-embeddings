@@ -129,10 +129,13 @@ class FleetDemand:
         decides the count: five actors at 0.4 fit two to a card and need three machines,
         not the two that scaling by the reservation reports.
         """
-        if num_gpus <= 0:
+        if num_gpus <= 0 or num_gpus > 1:
+            # Zero: a CPU-only run must not ask for GPU machines at all. Above one: every
+            # rung is single-GPU and Ray cannot combine GPUs across nodes, so no machine
+            # this request could buy is able to host the actor.
             return 0
-        per_machine = math.floor(1 / num_gpus) if num_gpus <= 1 else 0
-        return math.ceil(actors / per_machine) if per_machine >= 1 else math.ceil(actors * num_gpus)
+        per_machine = math.floor(1 / num_gpus)
+        return math.ceil(actors / per_machine) if per_machine >= 1 else actors
 
     def send(self, *, target: int, outstanding: int, requested: int, retry: bool = False) -> None:
         """Publish the fleet shape for this moment. Never raises into the caller.
@@ -155,10 +158,11 @@ class FleetDemand:
         self._log.warning("Could not publish GPU fleet demand (want=%d)", want, exc_info=True)
 
     def clear(self) -> None:
-        """Drop the request. Machines it holds are exempt from idle termination, so a
-        floor left standing pins an idle GPU fleet through the assembly that follows.
+        """Drop the request. Machines it holds are exempt from idle termination, so a floor
+        left standing pins an idle GPU fleet through the assembly that follows — and this
+        is the LAST publication, so nothing retries it afterwards.
         """
-        self.send(target=0, outstanding=0, requested=0)
+        self.send(target=0, outstanding=0, requested=0, retry=True)
 
 
 class ActorPool:
@@ -1128,15 +1132,22 @@ def _process_chunks_work_stealing(
     # has placed nothing and would refuse to grow.
     last_joined_gpus = 0.0
 
-    def _maybe_request_next_batch() -> None:
-        nonlocal last_batch_at, nodes_at_last_batch, last_batch_size, last_joined_gpus
+    def _publish_fleet_demand() -> None:
+        """State the fleet's shape for this round. Called AFTER any new batch is added,
+        so those actors are counted: publishing first left a freshly requested batch
+        creating ordinary primary-only demand for a whole round.
+        """
         if fleet is not None and total_actors_target is not None:
             fleet.send(
                 target=total_actors_target,
                 outstanding=pool.outstanding_work(len(chunk_queue)),
                 requested=len(pool.actors),
             )
+
+    def _maybe_request_next_batch() -> None:
+        nonlocal last_batch_at, nodes_at_last_batch, last_batch_size, last_joined_gpus
         if not batching_enabled:
+            _publish_fleet_demand()
             return
         assert actor_factory is not None and total_actors_target is not None  # narrowed by batching_enabled
         last_joined_gpus = _joined_gpu_count(last_joined_gpus, config.num_gpus)
@@ -1154,6 +1165,7 @@ def _process_chunks_work_stealing(
             headroom=config.actor_request_headroom,
         )
         if n == 0:
+            _publish_fleet_demand()
             return
         pool.add_actors(actor_factory(n))
         last_batch_at = time.monotonic()
@@ -1167,6 +1179,7 @@ def _process_chunks_work_stealing(
             placed_actor_slots,
             " — placement timed out, requesting anyway" if timed_out else "",
         )
+        _publish_fleet_demand()
 
     def _handle_failure(item: WorkItem, actor_idx: int, error: str) -> None:
         """Retry a failed chunk on a different worker and kill the failing actor.

@@ -144,43 +144,74 @@ def fleet_asks(
     if not open_rungs:
         return {}
 
+    live = {r.instance_type: live_by_instance_type.get(r.instance_type, 0) for r in open_rungs}
     # Charge what is already live FIRST. Lowering an ask cannot remove a busy machine, so
     # pricing the asks alone let the live fleet ratchet past the budget round on round.
     committed = sum(live_by_instance_type.get(r.instance_type, 0) * r.vcpu_per_node for r in GPU_RUNGS)
     headroom = None if vcpu_budget is None else max(0, vcpu_budget - committed)
     want, total_left = want_gpus, max_total
+    granted = dict.fromkeys(live, 0)
 
-    asks: dict[str, int] = {}
-    for index, rung in enumerate(open_rungs):
-        live = live_by_instance_type.get(rung.instance_type, 0)
-        # Hold back one machine, AND its quota, for each lower rung with nothing running.
-        # A demand at or below the probe would otherwise go entirely to the best rung —
-        # and if that is the rung refusing, the cold-start request carries no fallback and
-        # the actor wait times out exactly as before. One machine is enough: it places an
-        # actor, which starts the scheduler, which republishes a real mix. Dropped once
-        # this rung has machines, because then the scheduler is already correcting.
-        held = (
-            [r for r in open_rungs[index + 1 :] if live_by_instance_type.get(r.instance_type, 0) == 0]
-            if live == 0
-            else []
-        )
+    def take(rung: GpuRung, up_to: int) -> int:
+        """Grant ADDITIONAL machines toward a total of ``up_to``, spending every
+        constraint as it goes.
 
-        bounds = [ceilings[rung.instance_type] - live]
-        if index == 0:
-            bounds.append(probe)
+        Additional, not total: the budgets below are what REMAINS after earlier grants, so
+        comparing a total against them double-counts what this rung already holds and
+        leaves that much of the quota permanently unspent.
+        """
+        nonlocal want, headroom, total_left
+        t = rung.instance_type
+        more = min(up_to - granted[t], want // rung.gpus_per_node, ceilings[t] - live[t] - granted[t])
         if headroom is not None:
-            reserved = sum(r.vcpu_per_node for r in held)
-            bounds.append(max(0, headroom - reserved) // rung.vcpu_per_node)
-        # Capped by demand, which is what lets an ask fall BELOW the live count as a queue
-        # drains: surplus machines then lose their protection and idle out.
-        ask = max(0, min(live + max(0, min(bounds)), want // rung.gpus_per_node - len(held)))
+            more = min(more, headroom // rung.vcpu_per_node)
+        if total_left is not None:
+            more = min(more, total_left - sum(granted.values()) - sum(live.values()))
+        more = max(0, more)
+        granted[t] += more
+        want -= more * rung.gpus_per_node
+        if headroom is not None:
+            headroom -= more * rung.vcpu_per_node
+        return more
+
+    # PHASE 1 — a floor for every rung we have never obtained, taken before anything is
+    # distributed. A rung with nothing running is a rung whose availability is UNKNOWN, and
+    # the only way to find out is to keep asking; without this the best rung absorbs the
+    # whole demand, quota or aggregate ceiling and the fallback is never requested at all.
+    # It is keyed on the rung's OWN live count, not the primary's: an earlier version
+    # dropped the reservation once the primary had any machine, on the reasoning that the
+    # scheduler would correct it. The scheduler recomputes THIS function, so it never did.
+    #
+    # Only while the machines we hold cannot already cover the demand: at a draining tail
+    # a probe would buy a machine for work that does not exist.
+    floors = dict.fromkeys(live, 0)
+    if want_gpus > sum(live[r.instance_type] * r.gpus_per_node for r in open_rungs):
+        for rung in open_rungs:
+            if live[rung.instance_type] == 0:
+                floors[rung.instance_type] = take(rung, 1)
+
+    # PHASE 2 — distribute what is left, best value per vCPU first. The primary grows by a
+    # bounded probe rather than to its ceiling: a ceiling-sized ask reserves budget for
+    # machines AWS is refusing, and an ask of exactly what is live would never grow.
+    for index, rung in enumerate(open_rungs):
+        take(rung, probe if index == 0 else ceilings[rung.instance_type])
+
+    # An ask is a total. Capped by demand so it can fall BELOW the live count as a queue
+    # drains — surplus machines then lose their protection and idle out, rather than being
+    # held by a stale floor through the assembly that follows.
+    # The floor is EXEMPT from that cap. It is one machine on a pool whose availability is
+    # unknown, and capping it away is precisely how the fallback stopped being requested.
+    asks: dict[str, int] = {}
+    remaining = want_gpus
+    for rung in open_rungs:
+        t = rung.instance_type
+        allowed = max(remaining // rung.gpus_per_node, floors[t])
+        ask = max(0, min(live[t] + granted[t], allowed))
         if total_left is not None:
             ask = min(ask, total_left)
-            total_left = max(0, total_left - ask)
-        asks[rung.instance_type] = ask
-        want = max(0, want - ask * rung.gpus_per_node)
-        if headroom is not None:
-            headroom = max(0, headroom - max(0, ask - live) * rung.vcpu_per_node)
+            total_left -= ask
+        asks[t] = ask
+        remaining = max(0, remaining - ask * rung.gpus_per_node)
     return asks
 
 
@@ -277,6 +308,16 @@ def publisher(plan: GpuFleetMixPlan) -> Callable[[int], None]:
         nonlocal last, cached
         import ray
         from ray.autoscaler.sdk import request_resources
+
+        # Clearing must not depend on reading the cluster. It runs in a teardown path,
+        # often against a cluster that is going away, and a failed live query there would
+        # leave the previous floor standing over the assembly that follows.
+        if want_gpus <= 0:
+            if last != {}:
+                request_resources(bundles=[])
+                last = {}
+                _LOG.info("GPU fleet mix cleared")
+            return
 
         now = time.monotonic()
         if cached is None or now - cached[0] >= _LIVE_READING_TTL_S:
