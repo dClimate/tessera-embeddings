@@ -8,13 +8,17 @@ construction is covered in integration tests where Ray is available.
 
 from __future__ import annotations
 
+import ast
+import inspect
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
 import ray
+import torch
 
 from tessera_embeddings.inference import actors as actors_mod
-from tessera_embeddings.inference.actors import InferenceActor, download_checkpoint
+from tessera_embeddings.inference.actors import InferenceActor, _gpu_total_gib, download_checkpoint
 
 
 def test_actor_class_has_no_static_gpu_reservation() -> None:
@@ -182,3 +186,83 @@ def test_the_ram_peak_is_reset_at_each_chunk_not_once_per_actor() -> None:
     reset = src.index("self._resource_monitor.reset_peak_host_ram()")
     prologue = src.index('set_context("work", f"{chunk.label}:prologue")')
     assert reset < prologue, "the reset must precede the chunk's own context, not follow it"
+
+
+# ---------------------------------------------------------------------------
+# The batch size an actor runs is the one its own card can hold
+# ---------------------------------------------------------------------------
+
+
+class _FakeProps:
+    def __init__(self, total_memory: int) -> None:
+        self.total_memory = total_memory
+
+
+class _FakeCuda:
+    def __init__(self, total_memory: int) -> None:
+        self._props = _FakeProps(total_memory)
+
+    def get_device_properties(self, index: int) -> _FakeProps:
+        assert index == 0
+        return self._props
+
+
+class _FakeTorch:
+    def __init__(self, total_memory: int) -> None:
+        self.cuda = _FakeCuda(total_memory)
+
+
+def test_gpu_total_gib_reports_the_cards_size() -> None:
+    """The A10G in g5.2xlarge reports 22.06 GiB, which is what the batch policy keys on."""
+    torch_mod = _FakeTorch(int(22.06 * 1024**3))
+    got = _gpu_total_gib(torch_mod, torch.device("cuda"))
+    assert got is not None
+    assert got == pytest.approx(22.06, abs=0.01)
+
+
+def test_gpu_total_gib_is_none_without_a_card() -> None:
+    """A CPU run has nothing to measure, and the policy must leave the batch alone."""
+    assert _gpu_total_gib(_FakeTorch(0), torch.device("cpu")) is None
+
+
+def test_the_actor_reads_no_un_narrowed_config_after_fitting_the_batch() -> None:
+    """``__init__`` must not touch the raw ``config`` parameter once it has narrowed it.
+
+    ``batch_size`` is consumed in two different functions downstream — the sub-batch split
+    and the pinned host buffers — so the actor narrows it ONCE and stores the result on
+    ``self.config``. Any later read of the bare parameter puts the tuned value back into
+    circulation beside the fitted one, and the two disagree only on the card where it
+    matters. Structural, because the failure is silent: it costs a GPU, not a test.
+    """
+    tree = ast.parse(inspect.getsource(actors_mod))
+    init = next(
+        node
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef) and cls.name == "InferenceActor"
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    fit_line = next(
+        node.lineno
+        for node in ast.walk(init)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "replace"
+    )
+    late = [
+        node.lineno
+        for node in ast.walk(init)
+        if isinstance(node, ast.Name) and node.id == "config" and node.lineno > fit_line
+    ]
+    assert not late, f"__init__ reads the un-narrowed `config` at line(s) {late}; use self.config"
+
+
+def test_the_actor_ships_the_segment_backed_allocator() -> None:
+    """The fitted batch's headroom was measured with segment-backed allocation in force.
+
+    Without it the caching allocator reserves a large multiple of what it allocates and
+    strands the difference, so the card fills long before the working set does — which is
+    the regime the batch policy's margin is quoted against. Removing this variable would
+    re-open the failure that policy closes, and would do it silently, on the fallback rung
+    only. See ``context_docs/design/a10g_batch_size_2026_08.md``.
+    """
+    env_vars = InferenceActor._default_options["runtime_env"]["env_vars"]
+    assert env_vars["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"

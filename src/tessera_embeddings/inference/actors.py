@@ -19,7 +19,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,8 +35,11 @@ from tessera_embeddings.config.inference import (
     RADAR_THIN_MAX_OBS,
     S1_ORBIT_NONE,
     S2_BAND_ORDER,
+    TUNED_GPU_GIB,
+    TUNED_TOKENS_PER_PIXEL,
     InferenceConfig,
     S1Orbit,
+    batch_size_for_gpu,
 )
 from tessera_embeddings.config.store_layout import MONTH_COVERED_VARS, MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -503,6 +506,18 @@ def _select_device(torch_mod: types.ModuleType, instance_id: str) -> torch.devic
     return device
 
 
+def _gpu_total_gib(torch_mod: types.ModuleType, device: torch.device) -> float | None:
+    """This actor's card size in GiB, or ``None`` when there is no card to measure.
+
+    Args:
+        torch_mod: The torch module (passed to avoid top-level import).
+        device: The device this actor selected.
+    """
+    if device.type != "cuda":
+        return None
+    return float(torch_mod.cuda.get_device_properties(0).total_memory) / 1024**3
+
+
 def _log_vram_breakdown(model: MultimodalBTInferenceModel, torch_mod: types.ModuleType) -> None:
     """Log VRAM usage breakdown after model loading."""
     allocated = torch_mod.cuda.memory_allocated() / 1024**3
@@ -718,9 +733,36 @@ class InferenceActor:
         self.instance_id = _fetch_ec2_instance_id()
         self.device = _torch.device("cpu") if self.config.num_gpus == 0 else _select_device(_torch, self.instance_id)
 
+        # NARROWED HERE AND NOWHERE ELSE. `batch_size` is read by both the sub-batch split and
+        # the pinned host buffers, in different functions; scaling it at either site would
+        # leave the other on the tuned value, which is how a card ends up with buffers it
+        # cannot fill or batches it cannot hold. Rewriting the config once, before anything
+        # reads it, keeps a single value for the whole actor.
+        gpu_gib = _gpu_total_gib(_torch, self.device)
+        fitted = batch_size_for_gpu(
+            config.batch_size,
+            gpu_gib,
+            num_obs_checkpoints=config.num_obs_checkpoints,
+            gpu_fraction=config.num_gpus,
+        )
+        if fitted != config.batch_size:
+            logger.info(
+                "Batch size %d -> %d on instance %s: %.1f GiB card at %.2f GPU reserved, "
+                "deepest bucket %d tokens/px; the default was tuned on %.0f GiB at %d.",
+                config.batch_size,
+                fitted,
+                self.instance_id,
+                gpu_gib,
+                config.num_gpus,
+                2 * max(config.num_obs_checkpoints),
+                TUNED_GPU_GIB,
+                TUNED_TOKENS_PER_PIXEL,
+            )
+            self.config = replace(config, batch_size=fitted)
+
         local_ckpt = download_checkpoint(checkpoint_path) if _is_remote_uri(checkpoint_path) else checkpoint_path
         self.model: MultimodalBTInferenceModel = build_inference_model(
-            config,
+            self.config,
             self.device,
             checkpoint_path=local_ckpt,
         )
