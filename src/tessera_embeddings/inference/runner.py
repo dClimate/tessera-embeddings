@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import math
 import time
 from collections.abc import Callable
 from typing import Any
@@ -29,7 +28,7 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.lifecycle import wait_for_actors
 from tessera_embeddings.inference.progress import ProgressTracker
-from tessera_embeddings.inference.scheduling import WorkItem, _process_chunks_work_stealing
+from tessera_embeddings.inference.scheduling import FleetDemand, WorkItem, _process_chunks_work_stealing
 
 
 def _resumed_result(label: str, *, skipped: bool) -> dict:
@@ -47,29 +46,6 @@ def _resumed_result(label: str, *, skipped: bool) -> dict:
         "elapsed_sec": 0.0,
         "resumed": True,
     }
-
-
-_INITIAL_PUBLISH_ATTEMPTS = 3
-_INITIAL_PUBLISH_BACKOFF_S = 2.0
-
-
-def _gpu_demand(actors: int, num_gpus: float) -> int:
-    """Single-GPU machines an actor count implies, which is not the same number.
-
-    The fleet mix counts GPUs; the pool counts actors. They coincide only at the
-    production default of one GPU per actor. A CPU-only run reserves none, and must ask
-    for none rather than for GPU machines it will never place work on.
-
-    Fractional reservations PACK, and the packing is what decides the machine count:
-    five actors at 0.4 each fit two to a card, so they need three machines rather than
-    the two that `ceil(5 * 0.4)` reports.
-    """
-    if num_gpus <= 0:
-        return 0
-    per_machine = math.floor(1 / num_gpus) if num_gpus <= 1 else 0
-    if per_machine >= 1:
-        return math.ceil(actors / per_machine)
-    return math.ceil(actors * num_gpus)
 
 
 def run_inference(
@@ -209,36 +185,14 @@ def run_inference(
     # what the scheduler will go on to do.
     batch_size = config.actor_request_batch_size
     first_batch = config.initial_actor_request(num_actors)
-    # BEFORE the first batch, not with it. The scheduler republishes every round but does
-    # not start until `wait_for_actors` returns, and under a total primary drought no
-    # first-batch actor ever initializes — so that wait runs to its hours-long timeout and
-    # the run dies having never once asked for the fallback, which is precisely the
-    # starvation this exists to prevent.
-    #
-    # Sized by the smaller of the first batch and the work in hand. The batch, because
-    # `actor_request_batch_size` exists to stop launch demand running ahead of placement
-    # and asking for the whole target here would undo it; the work, because the scheduler
-    # cannot correct an over-ask until that first actor arrives. A chained session is the
-    # exception to the second — it starts with an empty list by design and its work
-    # arrives through `more_work`.
-    initial_actors = min(first_batch, num_actors if more_work is not None else min(num_actors, len(chunks)))
-    if on_fleet_demand is not None and initial_actors > 0:
-        # RETRIED, because nothing else will until the scheduler starts: one transient
-        # GCS failure would otherwise become the whole actor wait. Non-fatal at the end
-        # of it — a run whose primary rung has capacity does not need this at all.
-        for attempt in range(_INITIAL_PUBLISH_ATTEMPTS):
-            try:
-                on_fleet_demand(_gpu_demand(initial_actors, config.num_gpus))
-                break
-            except Exception:
-                if attempt + 1 == _INITIAL_PUBLISH_ATTEMPTS:
-                    log.warning(
-                        "Could not publish the initial GPU fleet demand after %d attempts",
-                        _INITIAL_PUBLISH_ATTEMPTS,
-                        exc_info=True,
-                    )
-                else:
-                    time.sleep(_INITIAL_PUBLISH_BACKOFF_S)
+    # BEFORE the first batch, because the scheduler republishes every round but does not
+    # start until `wait_for_actors` returns — and under a total primary drought no
+    # first-batch actor ever initializes, so that wait runs to its hours-long timeout and
+    # the run dies having never once asked for the fallback.
+    fleet = FleetDemand(on_fleet_demand, config.num_gpus, log)
+    outstanding = num_actors if more_work is not None else len(chunks)
+    fleet.send(target=num_actors, outstanding=outstanding, requested=first_batch, retry=True)
+
     actors: list[ray.actor.ActorHandle] = []
     progress_tracker: ray.actor.ActorHandle | None = None
     # The try opens BEFORE the first batch, because the fleet floor is already published
@@ -293,7 +247,7 @@ def run_inference(
             tracker=progress_tracker,
             still_initializing=still_initializing,
             on_actor_retire=on_actor_retire,
-            on_fleet_demand=on_fleet_demand,
+            fleet=fleet,
             get_credentials=get_credentials,
             s3_region=s3_region,
             actor_factory=actor_factory,
@@ -304,15 +258,7 @@ def run_inference(
             on_item_done=on_item_done,
         )
     finally:
-        # Drop the fleet request before anything else. Constraint-held machines are
-        # exempt from idle termination, so a floor left standing pins an idle GPU fleet
-        # through the hours of assembly that follow — and the loop's own final
-        # zero-demand round does not run when it exits by exception.
-        if on_fleet_demand is not None:
-            try:
-                on_fleet_demand(0)
-            except Exception:
-                log.warning("Could not clear the GPU fleet request", exc_info=True)
+        fleet.clear()
         log.info("Killing %d actors to release resource reservations", len(actors))
         for actor in actors:
             with contextlib.suppress(Exception):
