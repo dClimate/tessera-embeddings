@@ -40,9 +40,11 @@ from __future__ import annotations
 import ctypes
 import logging
 import multiprocessing
+import os
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
@@ -153,6 +155,52 @@ class ShardSource(Protocol):
         ...
 
 
+#: What icechunk's own Rust tracing is raised to while a commit runs. Both modules, because
+#: the two answer different halves of "where did it stop": ``session`` names the commit phase,
+#: ``asset_manager`` names the storage operation inside it.
+COMMIT_LOG_FILTER = "icechunk::session=debug,icechunk::asset_manager=debug"
+
+
+@contextmanager
+def _commit_tracing() -> Iterator[None]:
+    """Raise icechunk's internal tracing for the duration of one commit.
+
+    On 2026-08-29 seven of eleven assemblies reached this call and never returned — no
+    exception, no CPU, no outstanding request, for hours. The commit is the one step in the
+    pipeline whose insides we cannot see: everything before it reports progress, and it does
+    not. Nothing in our own logs can distinguish a commit that is waiting on the session lock
+    from one that is waiting inside a storage request, because our last line is printed BEFORE
+    the call and the next one only after it returns.
+
+    icechunk instruments itself with ``tracing`` and exposes the filter, so the lines exist —
+    they are simply switched off. Raised here, the last line before a stall names the function
+    it entered and never left, with file and line, which is what an incident needs and what a
+    bug report to the maintainers needs.
+
+    Scoped to the commit rather than set process-wide because the filter is GLOBAL and the
+    fork-write phase would otherwise log a line per chunk for hours. A commit normally takes
+    about a second, so the volume is nil and the value only appears when one does not.
+
+    Best-effort: a version without ``set_logs_filter``, or a failure to set it, must not cost
+    a commit. Restores the operator's ``ICECHUNK_LOG`` rather than clearing to the default, so
+    turning tracing on globally still works.
+    """
+    setter = getattr(icechunk, "set_logs_filter", None)
+    if setter is None:
+        yield
+        return
+    try:
+        setter(COMMIT_LOG_FILTER)
+    except Exception:  # diagnostics must never fail a commit
+        yield
+        return
+    try:
+        yield
+    finally:
+        with suppress(Exception):
+            setter(os.environ.get("ICECHUNK_LOG") or None)
+
+
 def commit_with_rebase(
     session: icechunk.Session,
     message: str,
@@ -179,7 +227,8 @@ def commit_with_rebase(
     completions. One line per commit, so the volume is one per zone-year.
     """
     started = time.monotonic()
-    snapshot = session.commit(message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries)
+    with _commit_tracing():
+        snapshot = session.commit(message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries)
     _log.info("COMMIT %.2fs: %s", time.monotonic() - started, message)
     return snapshot
 

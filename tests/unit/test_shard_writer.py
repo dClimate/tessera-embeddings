@@ -9,6 +9,7 @@ import threading
 import time
 from concurrent.futures import Future
 
+import icechunk
 import numpy as np
 import pytest
 import zarr
@@ -17,8 +18,10 @@ from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, DRILL
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import global_store, shard_writer, zarr_store
 from tessera_embeddings.storage.shard_writer import (
+    COMMIT_LOG_FILTER,
     PhaseTimer,
     _await_forks,
+    _commit_tracing,
     _write_shards_worker,
     commit_with_rebase,
     run_forked,
@@ -684,3 +687,68 @@ class TestForkedWorkersGetLoggingConfigured:
             assert shard_writer._PROGRESS_SLOTS is slots
         finally:
             shard_writer._PROGRESS_SLOTS = None
+
+
+class TestCommitTracing:
+    """icechunk's own tracing, raised only while a commit runs.
+
+    The commit is the one step whose insides we cannot see from our own logs: our last line is
+    printed before the call and the next only after it returns, so a commit that never returns
+    tells us nothing about where it stopped. These pin that the filter is actually raised
+    AROUND the call, and put back afterwards.
+    """
+
+    def test_the_filter_is_raised_and_restored(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(icechunk, "set_logs_filter", calls.append)
+        monkeypatch.delenv("ICECHUNK_LOG", raising=False)
+        with _commit_tracing():
+            assert calls == [COMMIT_LOG_FILTER]
+        assert calls == [COMMIT_LOG_FILTER, None]
+
+    def test_an_operator_s_global_setting_survives(self, monkeypatch):
+        """Restoring must not silence someone who turned tracing on for the whole process."""
+        calls = []
+        monkeypatch.setattr(icechunk, "set_logs_filter", calls.append)
+        monkeypatch.setenv("ICECHUNK_LOG", "icechunk=trace")
+        with _commit_tracing():
+            pass
+        assert calls == [COMMIT_LOG_FILTER, "icechunk=trace"]
+
+    def test_a_failure_to_set_the_filter_does_not_break_the_commit(self, monkeypatch):
+        """Diagnostics are never worth losing a commit over."""
+
+        def boom(_):
+            raise RuntimeError("no filter here")
+
+        monkeypatch.setattr(icechunk, "set_logs_filter", boom)
+        with _commit_tracing():
+            pass  # must simply run
+
+    def test_an_icechunk_without_the_hook_is_tolerated(self, monkeypatch):
+        monkeypatch.delattr(icechunk, "set_logs_filter", raising=False)
+        with _commit_tracing():
+            pass
+
+    def test_the_filter_is_active_while_the_commit_runs(self, tmp_path, monkeypatch):
+        """The load-bearing one: raised around the call, not merely somewhere nearby.
+
+        A commit that stalls only produces useful lines if the filter is already up when it
+        enters icechunk. Recording the filter state from inside the commit is the only way to
+        pin that; asserting on call order alone would still pass if the wrapper were moved.
+        """
+        _, repo = _seed(tmp_path, zones=(_ZONE,))
+        session = repo.writable_session("main")
+        zarr.open_group(session.store, mode="a")["01N"]["embeddings"][2, 0:_CHUNK, 0:_CHUNK, :] = 1
+        state = {"filter": None}
+        monkeypatch.setattr(icechunk, "set_logs_filter", lambda f: state.__setitem__("filter", f))
+        real_commit = type(session).commit
+        seen = {}
+
+        def spy(self, *args, **kwargs):
+            seen["during"] = state["filter"]
+            return real_commit(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(session), "commit", spy)
+        commit_with_rebase(session, "traced")
+        assert seen["during"] == COMMIT_LOG_FILTER
