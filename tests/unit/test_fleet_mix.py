@@ -179,8 +179,12 @@ class TestTheBudget:
 
 
 class TestMoreThanOneFallback:
-    """The registry is n-ary. Opening two fallbacks used to be refused because Ray
-    broke the score tie on node-type name; the mix is stated now, so it is allowed.
+    """The POLICY is n-ary even though `_apply_gpu_fallback` still opens one fallback.
+
+    Stating the mix removes Ray's node-name tie for the machines the request covers, but
+    the request is a floor and ordinary demand above it is still scored by Ray — so the
+    guard stays. These pin the allocation for the day it lifts, and are the reason the
+    registry carries a value-per-vCPU order rather than a hardcoded pair.
     """
 
     def test_the_better_ratio_takes_the_budget_first(self) -> None:
@@ -361,7 +365,10 @@ class TestTheDemandIsPublishedBeforeTheFleetIsWaitedOn:
     def test_a_drought_that_kills_the_actor_wait_has_still_asked_for_the_fallback(self) -> None:
         published: list[int] = []
         self._run(published, wait_raises=True, chained=True)
-        assert published == [8], "a chained session's work arrives later, so ask for the whole target"
+        assert published, "the drought must not reach the actor timeout unasked"
+        # The FIRST BATCH, not the 8-actor target: `actor_request_batch_size` exists to
+        # keep launch demand from running ahead of placement, and this must not undo it.
+        assert published[0] == _config().initial_actor_request(8) == 4
 
     def test_a_static_run_asks_only_for_the_work_it_holds(self) -> None:
         """The scheduler cannot correct an over-ask until the first actor arrives, so a
@@ -370,7 +377,16 @@ class TestTheDemandIsPublishedBeforeTheFleetIsWaitedOn:
         """
         published: list[int] = []
         self._run(published, wait_raises=True, chunks=[object(), object()])
-        assert published == [2]
+        assert published[0] == 2
+
+    def test_the_request_is_cleared_when_the_run_ends(self) -> None:
+        """Constraint-held machines are exempt from idle termination, so a floor left
+        standing pins an idle GPU fleet through the hours of assembly that follow — and
+        the loop's own final zero-demand round does not run on an exception path.
+        """
+        published: list[int] = []
+        self._run(published, wait_raises=True, chunks=[object(), object()])
+        assert published[-1] == 0
 
     def test_every_session_that_gets_a_terminator_also_gets_the_publisher(self) -> None:
         """Structural, because both reviewers missed the same call site independently.

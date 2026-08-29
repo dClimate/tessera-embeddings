@@ -196,7 +196,12 @@ def run_inference(
     # otherwise launch and bill 20 machines for one chunk of work. A chained session is
     # the exception and keeps the whole target — it starts with an empty list by design
     # and its work arrives through `more_work`.
-    initial_want = num_actors if more_work is not None else min(num_actors, len(chunks))
+    # Capped by the FIRST BATCH, not the whole target. `actor_request_batch_size` and
+    # `actor_request_headroom` exist to stop launch demand running ahead of placement
+    # during a drought, and publishing 250 here would request a budget-shaped fleet
+    # before one actor had been created — pacing undone by the thing meant to survive
+    # it. The scheduler raises this every round once work is actually moving.
+    initial_want = min(first_batch, num_actors if more_work is not None else min(num_actors, len(chunks)))
     if on_fleet_demand is not None and initial_want > 0:
         try:
             on_fleet_demand(initial_want)
@@ -267,6 +272,15 @@ def run_inference(
             on_item_done=on_item_done,
         )
     finally:
+        # Drop the fleet request before anything else. Constraint-held machines are
+        # exempt from idle termination, so a floor left standing pins an idle GPU fleet
+        # through the hours of assembly that follow — and the loop's own final
+        # zero-demand round does not run when it exits by exception.
+        if on_fleet_demand is not None:
+            try:
+                on_fleet_demand(0)
+            except Exception:
+                log.warning("Could not clear the GPU fleet request", exc_info=True)
         log.info("Killing %d actors to release resource reservations", len(actors))
         for actor in actors:
             with contextlib.suppress(Exception):

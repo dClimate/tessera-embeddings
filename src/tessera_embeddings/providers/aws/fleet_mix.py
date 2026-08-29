@@ -35,11 +35,12 @@ merely read:
   therefore holds idle hardware indefinitely, which is why the ask is recomputed
   from live counts on every pass and is allowed to fall.
 
-**Only the best open rung is probe-bounded.** A supply-constrained middle rung is still
-charged against the budget up to its ceiling, so with three rungs open a dry fallback can
-leave the third at zero. Stated rather than fixed: it cannot arise on the shipped
-configuration, which opens one fallback, and probe-bounding every rung would slow the
-cold-start fill of the fallback we actually run — in the drought this exists for.
+**One fallback at a time, enforced upstream.** Stating the mix removes Ray's node-name
+tie for the machines this request covers, but the request is a floor: ordinary actor
+demand above it is scored by Ray as before, and the supported fallbacks are identical to
+that scorer. `_apply_gpu_fallback` therefore still refuses to open two at once. The
+registry and this policy are n-ary and ready for the day that guard lifts; until then a
+third rung cannot be starved by a dry second one, because there is no third rung.
 
 **An ask is a floor, not a delivery.** Ray launches with ``MinCount=1``, so AWS
 fills what it can and reports success: one measured call asked for six machines

@@ -488,10 +488,10 @@ def _apply_gpu_fallback(
     What sends work to it is the standing per-rung request published by
     :mod:`~tessera_embeddings.providers.aws.fleet_mix`. Neither half works alone.
 
-    More than one fallback may be opened at once. That used to be refused, because
-    equally-scored rungs made Ray break the tie on node-type name — an alphabetical
-    choice of card. The mix is now stated rather than inferred, so the tie no longer
-    decides anything.
+    Still one fallback at a time. Stating the mix removes Ray's node-name tie for the
+    machines the request covers, but the request is a FLOOR — ordinary actor demand
+    above it is scored by Ray as before, and the supported fallbacks are byte-identical
+    to that scorer. The registry is n-ary and ready; this guard is what is not.
 
     Each fallback rung is opened to the SAME ceiling as the production rung, so either
     card can carry the whole fleet. That does not make the fleet bigger: the cluster's
@@ -522,6 +522,17 @@ def _apply_gpu_fallback(
         _apply_gpu_vcpu_budget(config, vcpu_budget)
     if not instance_types:
         return []
+
+    if len(set(instance_types)) > 1:
+        msg = (
+            f"Only one GPU fallback instance type may be opened at a time, got "
+            f"{sorted(set(instance_types))}. The fleet mix states how many of each rung to "
+            "hold, but `request_resources` sets a FLOOR: ordinary actor demand above it is "
+            "still scored by Ray, and the supported fallbacks declare identical resources — "
+            "so Ray would break that tie on node-type name, choosing a card alphabetically "
+            "rather than on throughput."
+        )
+        raise RuntimeError(msg)
 
     unknown = [t for t in instance_types if t not in GPU_FALLBACK_INSTANCE_TYPES]
     if unknown:
