@@ -16,12 +16,11 @@ import zarr
 
 from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, DRILL_EXIT_STATUS, FaultInjection
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
-from tessera_embeddings.storage import global_store, shard_writer, zarr_store
+from tessera_embeddings.storage import global_store, icechunk_logging, shard_writer, zarr_store
+from tessera_embeddings.storage.icechunk_logging import COMMIT_LOG_FILTER, commit_tracing
 from tessera_embeddings.storage.shard_writer import (
-    COMMIT_LOG_FILTER,
     PhaseTimer,
     _await_forks,
-    _commit_tracing,
     _write_shards_worker,
     commit_with_rebase,
     run_forked,
@@ -694,43 +693,77 @@ class TestCommitTracing:
 
     The commit is the one step whose insides we cannot see from our own logs: our last line is
     printed before the call and the next only after it returns, so a commit that never returns
-    tells us nothing about where it stopped. These pin that the filter is actually raised
-    AROUND the call, and put back afterwards.
+    tells us nothing about where it stopped.
     """
 
-    def test_the_filter_is_raised_and_restored(self, monkeypatch):
+    @pytest.fixture
+    def no_base(self, monkeypatch):
+        """No standing filter — the production condition. The suite itself sets one."""
+        monkeypatch.setattr(icechunk_logging, "_base_log_filter", None)
+        monkeypatch.setattr(icechunk_logging, "_tracing_depth", 0)
+
+    def test_the_filter_is_raised_and_restored(self, monkeypatch, no_base):
         calls = []
         monkeypatch.setattr(icechunk, "set_logs_filter", calls.append)
-        monkeypatch.delenv("ICECHUNK_LOG", raising=False)
-        with _commit_tracing():
+        with commit_tracing():
             assert calls == [COMMIT_LOG_FILTER]
         assert calls == [COMMIT_LOG_FILTER, None]
 
-    def test_an_operator_s_global_setting_survives(self, monkeypatch):
-        """Restoring must not silence someone who turned tracing on for the whole process."""
+    def test_overlapping_commits_restore_only_once_the_last_one_leaves(self, monkeypatch, no_base):
+        """Two commits really can overlap: ``plan()`` commits an all-ocean cell on the feeder
+        thread while the trailing thread commits an assembly. They share one global filter, so
+        the FIRST one out must not switch tracing off under the one still running — which is
+        precisely the commit whose trace we would need if it stalled.
+        """
         calls = []
         monkeypatch.setattr(icechunk, "set_logs_filter", calls.append)
-        monkeypatch.setenv("ICECHUNK_LOG", "icechunk=trace")
-        with _commit_tracing():
-            pass
-        assert calls == [COMMIT_LOG_FILTER, "icechunk=trace"]
+        with commit_tracing():
+            with commit_tracing():
+                assert calls == [COMMIT_LOG_FILTER]
+            assert calls == [COMMIT_LOG_FILTER], "inner exit must not restore"
+        assert calls == [COMMIT_LOG_FILTER, None]
 
-    def test_a_failure_to_set_the_filter_does_not_break_the_commit(self, monkeypatch):
+    def test_a_configured_filter_is_left_completely_alone(self, monkeypatch):
+        """Someone who configured a filter chose it deliberately, and it is not ours to edit.
+
+        Appending would be worse than replacing: ``EnvFilter`` resolves a target to its most
+        specific directive, so adding ``icechunk::session=debug`` beside an ``icechunk=trace``
+        would DOWNGRADE the module they asked to watch.
+        """
+        monkeypatch.setattr(icechunk_logging, "_base_log_filter", "icechunk=trace")
+        monkeypatch.setattr(icechunk_logging, "_tracing_depth", 0)
+        calls = []
+        monkeypatch.setattr(icechunk, "set_logs_filter", calls.append)
+        with commit_tracing():
+            pass
+        assert calls == []
+
+    def test_the_base_filter_is_applied_and_is_what_a_scope_returns_to(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(icechunk, "set_logs_filter", calls.append)
+        monkeypatch.setattr(icechunk_logging, "_tracing_depth", 0)
+        monkeypatch.setattr(icechunk_logging, "_base_log_filter", None)
+        icechunk_logging.set_base_logs_filter("icechunk::storage::object_store=error")
+        assert calls == ["icechunk::storage::object_store=error"]
+        assert icechunk_logging._base_log_filter == "icechunk::storage::object_store=error"
+
+    def test_a_failure_to_set_the_filter_does_not_break_the_commit(self, monkeypatch, no_base):
         """Diagnostics are never worth losing a commit over."""
 
         def boom(_):
             raise RuntimeError("no filter here")
 
         monkeypatch.setattr(icechunk, "set_logs_filter", boom)
-        with _commit_tracing():
-            pass  # must simply run
+        with commit_tracing():
+            pass
+        assert icechunk_logging._tracing_depth == 0, "a failed raise must not leak a reference"
 
-    def test_an_icechunk_without_the_hook_is_tolerated(self, monkeypatch):
+    def test_an_icechunk_without_the_hook_is_tolerated(self, monkeypatch, no_base):
         monkeypatch.delattr(icechunk, "set_logs_filter", raising=False)
-        with _commit_tracing():
+        with commit_tracing():
             pass
 
-    def test_the_filter_is_active_while_the_commit_runs(self, tmp_path, monkeypatch):
+    def test_the_filter_is_active_while_the_commit_runs(self, tmp_path, monkeypatch, no_base):
         """The load-bearing one: raised around the call, not merely somewhere nearby.
 
         A commit that stalls only produces useful lines if the filter is already up when it

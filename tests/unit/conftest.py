@@ -7,20 +7,30 @@ reference are intentionally omitted — tessera-embeddings has no cloudmask modu
 
 from __future__ import annotations
 
-import boto3
-import icechunk
-import numpy as np
-import pytest
-import xarray as xr
-from moto.server import ThreadedMotoServer
+import os
 
-# -----------------------------------------------------------------------------
-# Warning Suppression
-# -----------------------------------------------------------------------------
+# Suppress Icechunk's Rust-level warning about local filesystem concurrency: valid for
+# production, irrelevant here (moto S3 or single-threaded local).
+#
+# Set as the ENVIRONMENT variable, before icechunk is imported, rather than only by calling
+# `set_logs_filter` afterwards. The filter is process-global and write-only, so a directive
+# installed by a direct call is invisible to `storage.icechunk_logging`, which has to restore
+# it after a commit's tracing scope. Seeding both from one variable makes them agree by
+# construction. Importing that module here instead would pull in the package's config tree
+# and its logging setup, which breaks unrelated log-capture tests.
+_ICECHUNK_LOG = "icechunk::storage::object_store=error"
+os.environ.setdefault("ICECHUNK_LOG", _ICECHUNK_LOG)
 
-# Suppress Icechunk's Rust-level warning about local filesystem concurrency.
-# Valid for production but irrelevant for tests (moto S3 or single-threaded local).
-icechunk.set_logs_filter("icechunk::storage::object_store=error")
+import boto3  # noqa: E402
+import icechunk  # noqa: E402
+import numpy as np  # noqa: E402
+import pytest  # noqa: E402
+import xarray as xr  # noqa: E402
+from moto.server import ThreadedMotoServer  # noqa: E402
+
+# Belt and braces: if anything imported icechunk before this file was loaded, it has already
+# read the variable and missed it. Applying it directly costs nothing and the value is the same.
+icechunk.set_logs_filter(os.environ["ICECHUNK_LOG"])
 
 # -----------------------------------------------------------------------------
 # AWS Mock Fixtures
