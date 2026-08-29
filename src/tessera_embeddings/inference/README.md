@@ -708,8 +708,8 @@ abandoned with `AssemblyDeadlineError` (the pooled fork writes by killing their 
 the rest by leaking a thread), the trailing-assembly thread in `fill_zones_sequential` is
 never the wedged one, and the fill goes on to the next cell. **The two commits are not
 abandoned**, because an abandoned commit could still land, unobserved, after the cell had
-been failed; their overrun is announced under `ASSEMBLY COMMIT OVERDUE`, repeated every
-budget, and the wait continues. This is containment for a stall whose cause is not yet
+been failed; they run inline on the caller's own thread, and their overrun is announced by a
+watchdog under `ASSEMBLY COMMIT OVERDUE`, repeated every budget, while the wait continues. This is containment for a stall whose cause is not yet
 known — the budgets, what they cost, what they deliberately leave uncovered, and the
 killable-process change that would let a commit be abandoned too, are in
 `context_docs/design/assembly-deadlines-2026_08.md`.

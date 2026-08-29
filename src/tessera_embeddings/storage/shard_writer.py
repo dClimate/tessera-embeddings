@@ -211,26 +211,62 @@ def _run_under_deadline[T](
       marks the cell complete after its caller has unwound, so the registry part that
       follows a landed assembly is never published and the retag path tags the cell
       without assembling it. Rather than reconcile a state we cannot observe, the commits
-      are not abandoned at all: the overrun is ANNOUNCED, repeatedly, and the wait
-      continues. That is the honest limit of a thread-based bound — it converts a silent
-      multi-hour hang into a repeating alarm, and it does not pretend to have stopped the
-      commit. Making a commit genuinely abandonable needs a killable process, which is a
-      change of shape rather than of constant; see
-      ``context_docs/design/assembly-deadlines-2026_08.md``.
+      are not abandoned at all: they run INLINE on the caller's thread — so no exception in
+      any wait can unwind the caller out from under a committer — and only the alarm is a
+      thread, announcing repeatedly for as long as the commit is outstanding. That is the
+      honest limit of a thread-based bound: it converts a silent multi-hour hang into a
+      repeating alarm, and it does not pretend to have stopped the commit. Making a commit
+      genuinely abandonable needs a killable process, which is a change of shape rather than
+      of constant; see ``context_docs/design/assembly-deadlines-2026_08.md``.
     """
     if deadline is None:
         return fn()
     remaining = deadline.remaining_s()
-    # REFUSE BEFORE STARTING when the shared budget is already gone. Launching here and
-    # abandoning a microsecond later would leave a thread running that nobody will ever
-    # observe, bought for no chance at all of finishing in time. Only for a step that WOULD
-    # be abandoned: one that is going to be waited on regardless may as well run, and
-    # failing a cell whose commit would have taken 200 ms is the worse trade.
-    # ONE CLOCK SERVES BOTH PHASES, so neither message below may name one. They are quoted
+    if not abandonable:
+        # A COMMIT RUNS ON THE CALLER'S OWN THREAD — never on a hand-off thread the caller
+        # merely waits for. That is structural, not stylistic: any exception raised in the
+        # WAITING (a KeyboardInterrupt on a synchronous run, anything a log handler lets
+        # escape) would unwind the caller while the hand-off thread went on committing, which
+        # is exactly the unobserved writer this split exists to prevent. Run inline and "the
+        # caller stopped waiting" is not a state that exists.
+        #
+        # Only the ALARM is a thread. It announces every budget for as long as the commit is
+        # outstanding, because one line followed by hours of silence cannot be told apart from
+        # the stall having cleared, and this is the only signal an operator gets for a phase
+        # that logs nothing of its own. A DISTINCT, GREPPABLE PREFIX from the abandoned case
+        # because the two demand opposite responses — that fill has moved on, this one has not.
+        logger = log or _log
+        returned = threading.Event()
+
+        def _announce_overdue() -> None:
+            timeout = remaining
+            while not returned.wait(timeout=timeout):
+                logger.critical(
+                    "ASSEMBLY COMMIT OVERDUE: %s has not returned within its %.0fs budget. It is NOT "
+                    "abandoned — a commit mutates the published store, and a thread cannot be killed, "
+                    "so waiting is the only thing that cannot corrupt the cell. This fill assembles "
+                    "nothing further until it returns.",
+                    what,
+                    deadline.budget_s,
+                )
+                timeout = deadline.budget_s
+
+        threading.Thread(target=_announce_overdue, name=f"overdue-{what}", daemon=True).start()
+        try:
+            return fn()
+        finally:
+            returned.set()
+    # ONE CLOCK SERVES BOTH PHASES, so no message raised here may name one — they are quoted
     # verbatim into the greppable `ASSEMBLY DEADLINE EXCEEDED` line, and text placing a
     # fork-phase overrun "after the forks" puts the stall on the wrong side of the boundary
     # an operator is trying to find. `what` is what says which phase it was.
-    if abandonable and remaining <= 0.0:
+    #
+    # REFUSE BEFORE STARTING when the budget is already gone. Launching here and abandoning a
+    # microsecond later would leave a thread running that nobody will ever observe, bought
+    # for no chance at all of finishing in time. Only reached for a step that WOULD be
+    # abandoned: a commit returned above, since one that is going to be waited on regardless
+    # may as well run, and failing a cell whose commit would have taken 200 ms is worse.
+    if remaining <= 0.0:
         raise AssemblyDeadlineError(
             f"{what} was not started: its {deadline.budget_s:.0f}s budget was already spent by an "
             f"earlier step of the same phase",
@@ -248,25 +284,7 @@ def _run_under_deadline[T](
             finished.set()
 
     threading.Thread(target=_body, name=f"assembly-{what}", daemon=True).start()
-    if not abandonable:
-        # ANNOUNCE AND KEEP WAITING. Re-announced on every budget, not once: a lone line
-        # followed by hours of silence is indistinguishable from the stall having cleared,
-        # and this is the only signal an operator gets for a phase that logs nothing of its
-        # own. A DISTINCT, GREPPABLE PREFIX from the abandoned case because the two demand
-        # opposite responses — that fill has moved on, this one has not.
-        logger = log or _log
-        timeout = remaining
-        while not finished.wait(timeout=timeout):
-            logger.critical(
-                "ASSEMBLY COMMIT OVERDUE: %s has not returned within its %.0fs budget. It is NOT "
-                "abandoned — a commit mutates the published store, and a thread cannot be killed, so "
-                "waiting is the only thing that cannot corrupt the cell. This fill assembles nothing "
-                "further until it returns.",
-                what,
-                deadline.budget_s,
-            )
-            timeout = deadline.budget_s
-    elif not finished.wait(timeout=remaining):
+    if not finished.wait(timeout=remaining):
         raise AssemblyDeadlineError(
             f"{what} had not returned within its {deadline.budget_s:.0f}s budget, and was abandoned",
             abandoned="the thread running it is leaked, not killed, so it is still running",

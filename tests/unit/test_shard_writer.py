@@ -906,6 +906,24 @@ class TestThePhaseAfterTheForksIsBounded:
             shard_writer._run_under_deadline(spent, lambda: ran.append(True), "merge")
         assert ran == [], "the work was launched despite having no budget left"
 
+    def test_a_commit_runs_on_the_callers_own_thread(self):
+        """Never on a hand-off thread the caller merely waits for.
+
+        Structural, not stylistic. Any exception raised in that WAITING — a KeyboardInterrupt
+        on a synchronous run, anything a log handler lets escape — would unwind the caller
+        while the hand-off thread went on committing: exactly the unobserved writer that
+        never abandoning a commit exists to prevent. Run inline and "the caller stopped
+        waiting" is not a state that exists.
+        """
+        seen: list[threading.Thread] = []
+        shard_writer._run_under_deadline(
+            self._started(30.0),
+            lambda: seen.append(threading.current_thread()),
+            "shard commit",
+            abandonable=False,
+        )
+        assert seen == [threading.current_thread()]
+
     def test_a_commit_with_no_budget_left_still_runs(self):
         """A step that will be WAITED on either way must not be refused for lack of budget.
 

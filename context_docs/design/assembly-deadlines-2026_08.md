@@ -269,6 +269,14 @@ which is the one thing still unknown. So **the commits are not abandoned at all.
 overrun is announced under a second greppable prefix, `ASSEMBLY COMMIT OVERDUE`, re-emitted
 every budget for as long as the commit is outstanding, and the wait continues.
 
+**A commit runs inline on the caller's own thread; only the alarm is a thread.** That is
+structural rather than stylistic, and review found the version that got it wrong: if the
+commit ran on a hand-off thread the caller merely waited for, any exception raised in the
+*waiting* — a `KeyboardInterrupt` on a synchronous run, anything a log handler let escape —
+would unwind the caller while the hand-off thread went on committing, which is precisely the
+unobserved writer this split exists to prevent. Run inline, "the caller stopped waiting" is
+not a state that exists.
+
 Two prefixes and not one, because they demand opposite responses: `ASSEMBLY DEADLINE
 EXCEEDED` means that fill has moved on and the cell will be retried, while `ASSEMBLY COMMIT
 OVERDUE` means that fill is stuck and will publish nothing further until a human acts.
@@ -321,6 +329,14 @@ not containment to ship during an incident.
   been seen to stall there, and unlike the phases that have, it would happen before the
   first progress line — so it shows as a fill that never starts assembling rather than one
   that never finishes, which is the easier of the two to spot.
+- **The executor's manager thread, when a `shutdown` overruns with no worker left alive.**
+  Terminating the workers is the only lever Python offers, and it is already pulled; if
+  none is alive, an abandoned `ProcessPoolExecutor.shutdown` leaves its manager thread and
+  queues owned by a call nobody is waiting on. **Cost of leaving it:** descriptors, and a
+  `concurrent.futures` atexit hook that joins manager threads, so a run could still hang at
+  interpreter exit — bounded to two occurrences per deterministically stalling cell.
+  Nothing short of the killable-coordinator change below can fix it, and inventing a
+  cleanup would mean guessing at a mechanism that is still unknown.
 - **The single-ROI assembly path** (`inference/assembly.py`'s other `run_forked` caller)
   passes no budgets and is unchanged. The incident is on the global campaign path.
 - **The mosaic delete** (`inputs.cleanup`) that follows a landed assembly also runs on
