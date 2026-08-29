@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import multiprocessing
 import os
@@ -738,6 +739,24 @@ class TestCommitTracing:
             pass
         assert calls == []
 
+    def test_a_rejected_directive_is_not_recorded_as_the_base(self, monkeypatch):
+        """Record only what actually got installed.
+
+        Recording first and swallowing the error left every later `commit_tracing` believing
+        an operator filter was in force, so it skipped the commit diagnostics — on the
+        strength of a filter icechunk had refused — while the caller heard nothing.
+        """
+        monkeypatch.setattr(icechunk_logging, "_base_log_filter", "icechunk=warn")
+        monkeypatch.setattr(icechunk_logging, "_tracing_depth", 0)
+
+        def _reject(_directive):
+            raise ValueError("malformed directive")
+
+        monkeypatch.setattr(icechunk, "set_logs_filter", _reject)
+        with pytest.raises(ValueError, match="malformed"):
+            icechunk_logging.set_base_logs_filter("not a directive")
+        assert icechunk_logging._base_log_filter == "icechunk=warn", "the prior base was lost"
+
     def test_the_base_filter_is_applied_and_is_what_a_scope_returns_to(self, monkeypatch):
         calls = []
         monkeypatch.setattr(icechunk, "set_logs_filter", calls.append)
@@ -785,3 +804,31 @@ class TestCommitTracing:
         monkeypatch.setattr(type(session), "commit", spy)
         commit_with_rebase(session, "traced")
         assert seen["during"] == COMMIT_LOG_FILTER
+
+
+def test_every_assembly_commit_goes_through_the_traced_helper():
+    """No bare ``session.commit`` anywhere an assembly can reach.
+
+    The single-ROI path commits directly three times — schema, overwrite, time-axis
+    extension — and every one can stall exactly as the fill's commits can. A commit outside
+    a tracing scope produces the same silence that made the 2026-08-29 incident take a day
+    to localise, so the property worth pinning is not "these three are wrapped" but "none is
+    left bare", which also catches the fourth someone adds later.
+    """
+    import ast
+
+    from tessera_embeddings.inference import assembly as assembly_mod
+
+    bare = []
+    for module in (assembly_mod, shard_writer):
+        tree = ast.parse(inspect.getsource(module))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "commit"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"session", "fork"}
+            ):
+                bare.append(f"{module.__name__}:{node.lineno}")
+    assert not bare, f"commit(s) outside a tracing scope: {bare}; use traced_commit"

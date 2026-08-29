@@ -43,16 +43,56 @@ def set_base_logs_filter(directive: str | None) -> None:
     this module's back is one it cannot see, cannot preserve, and will overwrite the next time
     a commit finishes.
 
+    **Installed first, recorded only if that succeeded, and errors are NOT swallowed.** The
+    order matters: recording a directive icechunk then rejected would leave every later
+    :func:`commit_tracing` believing an operator filter was in force, so it would skip the
+    commit diagnostics — on the strength of a filter that was never installed, and without
+    the caller hearing that their configuration failed. Unlike :func:`commit_tracing`, which
+    must never cost a commit, this is a configuration call made at start-up: a malformed
+    directive is a caller's mistake and is worth hearing about.
+
     Args:
         directive: A tracing directive, or ``None`` for icechunk's default.
+
+    Raises:
+        Exception: Whatever icechunk raises for a directive it will not accept. The
+            previously recorded base is left untouched.
     """
     global _base_log_filter
     with _tracing_lock:
-        _base_log_filter = directive
         setter = getattr(icechunk, "set_logs_filter", None)
         if setter is not None:
-            with suppress(Exception):
-                setter(directive)
+            setter(directive)
+        _base_log_filter = directive
+
+
+def traced_commit(
+    session: icechunk.Session,
+    message: str,
+    *,
+    rebase_with: icechunk.ConflictSolver | None = None,
+    rebase_tries: int = 1_000,
+) -> str:
+    """Commit with icechunk's tracing raised — the ONE way an assembly reaches a commit.
+
+    A helper rather than a rule to remember, because the value only shows up on the one
+    occasion nobody is watching. Every commit in an assembly can stall the same way, and a
+    commit that stalls outside a tracing scope produces exactly the silence that made the
+    2026-08-29 incident take a day to localise. Routing them all through here means a commit
+    added later is instrumented by default rather than by whoever remembers.
+
+    Args:
+        session: The icechunk session to commit.
+        message: The commit message.
+        rebase_with: Conflict solver for the fill's two commits; ``None`` for the schema
+            and time-axis commits, which are the only writer on a fresh work branch.
+        rebase_tries: How many times to rebase and retry, when a solver is given.
+
+    Returns:
+        The new snapshot id.
+    """
+    with commit_tracing():
+        return session.commit(message, rebase_with=rebase_with, rebase_tries=rebase_tries)
 
 
 @contextmanager
