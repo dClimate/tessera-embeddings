@@ -189,11 +189,17 @@ def run_inference(
     # but it does not start until `wait_for_actors` returns — and under a total primary
     # drought no first-batch actor ever initializes, so that wait runs to its (hours
     # long) timeout and the run dies having never once asked for the fallback. Which is
-    # precisely the starvation this exists to prevent. Nothing is live yet and all the
-    # work is outstanding, so the whole target is the honest ask.
-    if on_fleet_demand is not None:
+    # precisely the starvation this exists to prevent.
+    #
+    # Bounded by the work in hand, because the scheduler cannot correct an over-ask
+    # until that first actor arrives: a 20-actor default against one live tile would
+    # otherwise launch and bill 20 machines for one chunk of work. A chained session is
+    # the exception and keeps the whole target — it starts with an empty list by design
+    # and its work arrives through `more_work`.
+    initial_want = num_actors if more_work is not None else min(num_actors, len(chunks))
+    if on_fleet_demand is not None and initial_want > 0:
         with contextlib.suppress(Exception):
-            on_fleet_demand(num_actors)
+            on_fleet_demand(initial_want)
     actors = actor_factory(first_batch)
     if batch_size > 0 and first_batch < num_actors:
         log.info(

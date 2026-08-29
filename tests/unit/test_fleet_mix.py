@@ -325,7 +325,8 @@ class TestTheDemandIsPublishedBeforeTheFleetIsWaitedOn:
     """
 
     @staticmethod
-    def _run(published: list[int], *, wait_raises: bool) -> None:
+    def _run(published: list[int], *, wait_raises: bool, chunks: list | None = None, chained: bool = False) -> None:
+        from types import SimpleNamespace
         from unittest.mock import patch
 
         from tessera_embeddings.inference import runner as runner_mod
@@ -338,26 +339,38 @@ class TestTheDemandIsPublishedBeforeTheFleetIsWaitedOn:
         with (
             patch.object(runner_mod, "InferenceActor") as actor,
             patch.object(runner_mod, "wait_for_actors", side_effect=_wait),
-            patch.object(runner_mod, "ZarrWriter"),
+            patch.object(runner_mod, "ZarrWriter") as writer,
         ):
+            # Nothing already staged, so the chunk list reaches the ask intact.
+            writer.return_value.scan_existing_staged_artifacts.return_value = SimpleNamespace(done=set(), skipped=set())
             actor.options.return_value.remote.return_value = object()
             with pytest.raises(RuntimeError):
                 runner_mod.run_inference(
                     8,
                     _config(),
-                    [],
+                    chunks or [],
                     "m",
                     "s",
                     "r",
                     0.0,
                     _log(),
                     on_fleet_demand=published.append,
+                    more_work=(lambda: None) if chained else None,
                 )
 
     def test_a_drought_that_kills_the_actor_wait_has_still_asked_for_the_fallback(self) -> None:
         published: list[int] = []
-        self._run(published, wait_raises=True)
-        assert published == [8], "the whole target: nothing is live and all work is outstanding"
+        self._run(published, wait_raises=True, chained=True)
+        assert published == [8], "a chained session's work arrives later, so ask for the whole target"
+
+    def test_a_static_run_asks_only_for_the_work_it_holds(self) -> None:
+        """The scheduler cannot correct an over-ask until the first actor arrives, so a
+        20-actor default against one live tile would launch and bill 20 machines for one
+        chunk. Bounded here rather than later.
+        """
+        published: list[int] = []
+        self._run(published, wait_raises=True, chunks=[object(), object()])
+        assert published == [2]
 
     def test_every_session_that_gets_a_terminator_also_gets_the_publisher(self) -> None:
         """Structural, because both reviewers missed the same call site independently.
