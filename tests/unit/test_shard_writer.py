@@ -684,3 +684,180 @@ class TestForkedWorkersGetLoggingConfigured:
             assert shard_writer._PROGRESS_SLOTS is slots
         finally:
             shard_writer._PROGRESS_SLOTS = None
+
+
+class TestTheForkPhaseBudgetIsDerivedFromTheWork:
+    """A fill's fork-write budget comes from how many shards it has, not from a clock.
+
+    The phase runs for hours and its length tracks the shard count, so one fixed cutoff
+    would be too tight for a dense zone-year and too loose for a sparse one at the same
+    time. Rates and derivation: ``context_docs/design/assembly-deadlines-2026_08.md``.
+    """
+
+    def test_it_scales_with_the_shard_count(self):
+        assert shard_writer.fork_phase_budget_s(18_000) == pytest.approx(2 * shard_writer.fork_phase_budget_s(9_000))
+
+    def test_a_sparse_year_still_gets_the_floor(self):
+        # A zone-year with almost nothing to write must not be held to a budget of
+        # seconds just because its work is small.
+        assert shard_writer.fork_phase_budget_s(1) == shard_writer.FORK_PHASE_FLOOR_S
+
+    def test_it_clears_the_slowest_fill_on_record(self):
+        # The slowest fork phase yet measured wrote 9,132 shards in ~400 minutes, on a
+        # cluster that was inferring hard throughout. The budget must clear that by the
+        # safety factor, or the next contention event kills a healthy assembly.
+        slowest_on_record_s = 400 * 60
+        assert shard_writer.fork_phase_budget_s(9_132) >= shard_writer.FORK_PHASE_SAFETY_FACTOR * slowest_on_record_s
+
+
+class TestTheForkPhaseIsAbandonedOnItsBudget:
+    """Outstanding forks past the budget stop being waited on.
+
+    Cheap to abandon, uniquely among the phases: the caller's handler terminates the
+    worker processes, and nothing a worker wrote is in the store until its fork is
+    merged — so the cost of the kill is unreferenced objects.
+    """
+
+    def test_outstanding_forks_past_the_budget_raise(self):
+        outstanding: Future = Future()  # never resolves
+        with pytest.raises(shard_writer.AssemblyDeadlineError, match="fork-write phase"):
+            _await_forks([outstanding], 0.01, budget_s=0.0)
+
+    def test_a_fill_inside_its_budget_is_untouched(self):
+        outstanding: Future = Future()
+        threading.Timer(0.05, lambda: outstanding.set_result("done")).start()
+        assert _await_forks([outstanding], 0.01, budget_s=30.0) == ["done"]
+
+    def test_no_budget_never_abandons(self):
+        # The default every other caller keeps: a fork phase with no budget waits.
+        outstanding: Future = Future()
+        threading.Timer(0.05, lambda: outstanding.set_result("done")).start()
+        assert _await_forks([outstanding], 0.01) == ["done"]
+
+    def test_the_deadline_terminates_the_workers_still_running(self, tmp_path, monkeypatch):
+        """Abandoning the wait must not orphan the pool.
+
+        A worker left running keeps writing fork objects nobody will merge, and Python's
+        executor atexit hook then blocks interpreter shutdown on it — the same reasoning
+        as the failed-fork path, reached by a different door.
+        """
+
+        class _Proc:
+            def __init__(self):
+                self.terminated = False
+
+            def is_alive(self):
+                return True
+
+            def terminate(self):
+                self.terminated = True
+
+        running = _Proc()
+
+        class _FakeExecutor:
+            def __init__(self, **kwargs):
+                self._processes = {"a": running}
+
+            def submit(self, fn, payload):
+                return Future()  # never resolves
+
+            def shutdown(self, **kwargs):
+                self._processes = None
+
+        monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", _FakeExecutor)
+        store, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        with pytest.raises(shard_writer.AssemblyDeadlineError, match="fork-write phase"):
+            run_forked(session, lambda p: p, [{"tag": "a"}, {"tag": "b"}], progress_interval_s=0.01, fork_budget_s=0.0)
+        assert running.terminated, "an abandoned fork phase must terminate its workers"
+
+
+class TestThePhaseAfterTheForksIsBounded:
+    """The tight bound, and the one that can catch a stall.
+
+    Everything after the forks return does a fixed amount of work — one pool teardown,
+    one merge, two commits — however many shards were written, and it has never been
+    measured taking more than a couple of seconds. So a ceiling here is worth hundreds
+    of times the observed maximum and still catches a phase that has stopped.
+    """
+
+    @staticmethod
+    def _started(budget_s):
+        deadline = shard_writer._PostForkDeadline(budget_s)
+        deadline.start()
+        return deadline
+
+    def test_no_deadline_runs_inline_on_the_callers_thread(self):
+        # The default every caller that names no budget keeps: no thread, no hand-off.
+        seen: list[threading.Thread] = []
+        shard_writer._run_before_deadline(None, lambda: seen.append(threading.current_thread()), "merge")
+        assert seen == [threading.current_thread()]
+
+    def test_a_failure_inside_the_budget_reaches_the_caller(self):
+        # A real commit failure must not be swallowed by the hand-off thread.
+        def _refused():
+            raise RuntimeError("rebase refused")
+
+        with pytest.raises(RuntimeError, match="rebase refused"):
+            shard_writer._run_before_deadline(self._started(30.0), _refused, "shard commit")
+
+    def test_the_caller_is_freed_while_the_work_is_still_running(self):
+        """The property that matters, since the work itself cannot be cancelled.
+
+        These calls block below the interpreter, in icechunk's Rust extension, so the
+        thread doing them is abandoned rather than stopped. What the budget buys is the
+        CALLER's thread — in the campaign runner that is the single-slot finalizer every
+        later cell queues behind.
+        """
+        release = threading.Event()
+        entered = threading.Event()
+        finished = threading.Event()
+
+        def _wedged():
+            entered.set()
+            release.wait(30)
+            finished.set()
+
+        try:
+            with pytest.raises(shard_writer.AssemblyDeadlineError, match="pool teardown"):
+                shard_writer._run_before_deadline(self._started(0.2), _wedged, "pool teardown")
+            assert entered.is_set(), "the work never started"
+            assert not finished.is_set(), "the caller waited for work it was supposed to abandon"
+        finally:
+            release.set()
+        assert finished.wait(10), "the abandoned work is leaked, not killed — it still runs"
+
+    def test_a_commit_that_never_returns_abandons_the_fill_and_frees_the_caller(self, tmp_path, monkeypatch):
+        """The whole containment, end to end, at the phase where fills have stopped.
+
+        Both halves are asserted: the fill fails with the phase named (an operator's only
+        starting point while the cause is unknown), and the caller comes back on the
+        budget rather than on the commit — which is what lets the fill assemble later
+        cells at all.
+        """
+        monkeypatch.setattr(shard_writer, "POST_FORK_BUDGET_S", 1.0)
+        release = threading.Event()
+        entered = threading.Event()
+
+        def _never_returns(session, message, **kwargs):
+            entered.set()
+            release.wait(60)
+            return "unreachable"
+
+        monkeypatch.setattr(shard_writer, "commit_with_rebase", _never_returns)
+        store, repo = _seed(tmp_path)
+        started = time.monotonic()
+        try:
+            with pytest.raises(shard_writer.AssemblyDeadlineError, match="shard commit"):
+                write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), shard_px=_SHARD)
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+        assert entered.is_set(), "the commit never ran, so the test proved nothing"
+        assert elapsed < 30, f"the caller waited {elapsed:.0f}s on a commit it was supposed to abandon"
+
+    def test_a_healthy_fill_is_not_touched_by_the_bound(self, tmp_path):
+        # The bound is live on every fill now, so pin that an ordinary one still lands.
+        store, repo = _seed(tmp_path)
+        write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), shard_px=_SHARD)
+        assert zarr_store.open_store_as_zarr_group(store, group="01N").attrs["years_complete"] == [2025]

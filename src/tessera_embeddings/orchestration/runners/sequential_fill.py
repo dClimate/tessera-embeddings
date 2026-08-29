@@ -61,6 +61,13 @@ the flow and README point here):
   is measured, and slower than it looks (see the design note above). Nothing here
   depends on the backlog staying short.
 
+  One thread is also a single point of stoppage, so the assembly itself is bounded
+  (:func:`~tessera_embeddings.storage.shard_writer.write_year_shards`): an assembly
+  that stops finishing raises rather than holding the thread, and the cell is recorded
+  as failed with its mosaic kept for a staged resume. That is containment for a stall
+  whose cause is not yet known — see
+  ``context_docs/design/assembly-deadlines-2026_08.md``.
+
 Idle-actor retirement needs no per-zone gating here: the scheduler suppresses
 it while the work source is unexhausted and resumes it for the true cluster
 tail (see ``scheduling._process_chunks_work_stealing``).
@@ -106,6 +113,7 @@ from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.scheduling import WorkItem, ZoneContext
 from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff, ZonePlan, complete_zone_inference
+from tessera_embeddings.storage.shard_writer import AssemblyDeadlineError
 
 if TYPE_CHECKING:
     from tessera_embeddings.config.inference import InferenceConfig
@@ -499,6 +507,33 @@ def fill_zones_sequential(
         try:
             handoff = complete_zone_inference(tally.plan, results=tally.results)
             _record_outcome(assemble(handoff, prep))
+        except AssemblyDeadlineError as exc:
+            # The assembly stopped finishing and the writer stopped waiting for it. Handled
+            # exactly like any other assembly failure below — the cell is recorded, its mosaic
+            # is retained and it resumes from its staged tiles — but announced separately,
+            # because this is the ONE failure that says nothing about the cell. Every other
+            # one names something about the data or the store; this one only says a phase
+            # stopped returning, and its cause is not yet known.
+            #
+            # A DISTINCTIVE, GREPPABLE PREFIX, for the same reason `FAILURE CAP EXCEEDED` has
+            # one: there is no alerting transport in this repo and monitoring matches on the
+            # text. CRITICAL rather than ERROR because a recorded failure is routine here and
+            # this is not.
+            #
+            # What makes the fill survive it is that this thread got here at all. The wedged
+            # work is on a thread of the writer's own, abandoned rather than joined, so THIS
+            # thread — the single-slot finalizer every later cell queues behind — is free the
+            # moment the deadline passes and goes straight on to the next assembly.
+            failed_assembly = True
+            log.critical(
+                "ASSEMBLY DEADLINE EXCEEDED for %s-%d: %s. The cell is recorded as a failed "
+                "assembly and keeps its mosaic, so a retry resumes it from its staged tiles. "
+                "This fill continues assembling later cells.",
+                cell.zone,
+                cell.year,
+                exc,
+            )
+            _record_failure(cell, "assembly", exc)
         except Exception as exc:
             failed_assembly = True
             _record_failure(cell, "assembly", exc)

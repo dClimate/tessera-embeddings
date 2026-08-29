@@ -33,6 +33,7 @@ from tessera_embeddings.orchestration.runners.sequential_fill import (
     fill_zones_sequential,
 )
 from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff, ZonePlan
+from tessera_embeddings.storage.shard_writer import AssemblyDeadlineError
 
 LOG = logging.getLogger("test-sequential-fill")
 
@@ -373,6 +374,39 @@ def test_assembly_failure_recorded_run_continues():
 
     with pytest.raises(RuntimeError, match="1/2 cell"):
         _run(_cells(2), assemble=assemble)
+
+
+def test_an_abandoned_assembly_is_announced_and_the_fill_keeps_going(caplog):
+    """An assembly that stopped finishing gets its own announcement, not a quiet record.
+
+    It is the one assembly failure that says nothing about the cell — every other names
+    something about the data or the store, this one only says a phase stopped returning —
+    and its cause is not yet known, so it is announced at CRITICAL under a greppable
+    prefix that monitoring can match, exactly as the retained-failure cap is.
+
+    The cell itself is handled like any other failure: recorded, mosaic kept, run raises
+    at the end. What must NOT happen is the fill stopping: the finalizer is one thread
+    shared by every later cell, so the later cells must still assemble.
+    """
+    assembled: list[str] = []
+
+    def assemble(handoff, prep):
+        if handoff.zone == "01N":
+            raise AssemblyDeadlineError("shard commit had not returned 600s after the forks did")
+        assembled.append(handoff.zone)
+        return {"zone": handoff.zone}
+
+    with (
+        caplog.at_level(logging.CRITICAL, logger="test-sequential-fill"),
+        pytest.raises(RuntimeError, match="1/3 cell"),
+    ):
+        _run(_cells(3), assemble=assemble)
+
+    said = [r.getMessage() for r in caplog.records if "ASSEMBLY DEADLINE EXCEEDED" in r.getMessage()]
+    assert len(said) == 1, f"expected one announcement, got {said}"
+    assert "01N-2025" in said[0]
+    assert "shard commit" in said[0], "the announcement must carry which phase stopped"
+    assert assembled == ["02N", "03N"], "the fill stopped assembling after the abandoned cell"
 
 
 def test_session_crash_unwinds_feeder_without_deadlock():

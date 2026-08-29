@@ -692,6 +692,21 @@ tiles embed their ocean pixels — the mask selects tiles, not pixels), with
 zone-fill runner (`orchestration/runners/zone_fill.py`) drives it: coverage mask →
 inference → `assemble_global` → `campaign.tag_zone_year`.
 
+The global fill is **bounded in two parts**, because its two phases have nothing in
+common. The fork-write phase gets a budget derived from the shard count — the work is
+what sets its length, so one fixed cutoff would be too tight for a dense zone-year and
+too loose for a sparse one at the same time. Everything after the forks return — pool
+teardown, merge, the `years_complete` read, both commits — gets a much tighter flat
+ceiling, because that work does not scale with the fill. Overrunning either raises
+`AssemblyDeadlineError` rather than waiting indefinitely; the fork phase is abandoned by
+terminating its workers, while the post-fork phase runs on a thread the caller stops
+waiting on and deliberately leaks, since a call blocked inside icechunk's Rust extension
+cannot be interrupted from Python. The trailing-assembly thread in
+`fill_zones_sequential` is therefore never the wedged one, and the fill goes on to the
+next cell. This is containment for a stall whose cause is not yet known — the budgets,
+what they cost, and what they deliberately leave uncovered are in
+`context_docs/design/assembly-deadlines-2026_08.md`.
+
 #### Assembly telemetry: the `ASSEMBLY_SUMMARY` record
 
 Both `assemble` and `assemble_global` emit **one machine-readable log line per assembly**

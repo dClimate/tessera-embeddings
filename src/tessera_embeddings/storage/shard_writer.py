@@ -40,6 +40,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import multiprocessing
+import threading
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
@@ -65,6 +66,135 @@ _log = logging.getLogger(__name__)
 #: log — and the operator's only recourse is to guess. Set far enough apart to stay
 #: quiet for short writes and close enough to bound how long a stall hides.
 PROGRESS_INTERVAL_S = 300.0
+
+#: Shards per minute the fork-write phase is assumed to manage at its SLOWEST. The
+#: measured rate spans a little over 2x at a fixed shard count, so the spread is not the
+#: size of the write — it is how contended the shared cluster was and how much valid data
+#: the year held, which the measurements cannot separate and the budget need not. This is
+#: the slow end of that spread, rounded down. Rates and their derivation live in
+#: ``context_docs/design/assembly-deadlines-2026_08.md``.
+FORK_PHASE_SHARDS_PER_MINUTE = 20.0
+
+#: Multiplier on the work-derived fork-phase budget. Deliberately large. What varies in
+#: this phase — cluster contention and per-tile density — is set by the campaign rather
+#: than fixed, so the budget has to clear a denser cell or a busier hour than any yet
+#: measured. At this factor an assembly must run more than
+#: three times slower than the slowest one ever measured before it is abandoned. That
+#: makes this a backstop against a permanently stuck fork phase, NOT a detector — the
+#: detector is :data:`POST_FORK_BUDGET_S`.
+FORK_PHASE_SAFETY_FACTOR = 3.0
+
+#: Floor under the fork-phase budget, so a sparse zone-year is never held to a budget of
+#: minutes just because it had little to write.
+FORK_PHASE_FLOOR_S = 3600.0
+
+#: Ceiling on everything AFTER the forks return — pool teardown, merge, the
+#: years-complete read, and both commits. Flat rather than work-derived because this
+#: phase's work does not scale with the fill: it is one merge and two commits however
+#: many shards were written. Two orders of magnitude above anything it has been measured
+#: taking, and still an order of magnitude above the worst commit latency measured at
+#: full campaign width (``commit-gate-removal-2026_08.md``), so a contention storm cannot
+#: reach it. This is the bound that can actually catch a stall.
+POST_FORK_BUDGET_S = 600.0
+
+
+class AssemblyDeadlineError(RuntimeError):
+    """A fill phase outlived its budget and was abandoned rather than waited on.
+
+    Not a diagnosis. It says a phase stopped finishing, names which one and what it was
+    allowed, and leaves the cause open. Callers treat it as a failed assembly, which
+    retains the cell's mosaic so a retry resumes from its staged tiles.
+    """
+
+
+def fork_phase_budget_s(n_shards: int) -> float:
+    """How long a fill's fork-write phase may run before it is abandoned.
+
+    Derived from the WORK rather than from a clock: this phase writes ``n_shards``
+    shards and its duration tracks that count, so one fixed cutoff would be too tight
+    for a dense zone-year and too loose for a sparse one at the same time. Scaled from
+    the slowest rate observed, padded by :data:`FORK_PHASE_SAFETY_FACTOR`, and floored so
+    a small fill still gets a generous allowance.
+    """
+    scaled = 60.0 * n_shards / FORK_PHASE_SHARDS_PER_MINUTE * FORK_PHASE_SAFETY_FACTOR
+    return max(FORK_PHASE_FLOOR_S, scaled)
+
+
+class _PostForkDeadline:
+    """The one clock every phase after the forks return must finish inside.
+
+    Shared rather than per-call because that phase spans two functions —
+    :func:`run_forked` tears the pool down and merges, :func:`write_year_shards` reads
+    the group and makes both commits — and two independent ceilings would let a fill sit
+    for twice the budget before anyone gave up. :meth:`start` is called at the single
+    moment the phase begins: when the last fork's result is in hand.
+    """
+
+    __slots__ = ("_at", "budget_s")
+
+    def __init__(self, budget_s: float) -> None:
+        self.budget_s = budget_s
+        self._at: float | None = None
+
+    def start(self) -> None:
+        """Begin the budget. Called once, when the forks have returned."""
+        self._at = time.monotonic() + self.budget_s
+
+    def remaining_s(self) -> float:
+        """Seconds left before the phase is abandoned; never negative."""
+        if self._at is None:
+            raise RuntimeError("post-fork deadline consulted before the forks returned")
+        return max(0.0, self._at - time.monotonic())
+
+
+def _run_before_deadline[T](deadline: _PostForkDeadline | None, fn: Callable[[], T], what: str) -> T:
+    """Run ``fn``, and stop WAITING for it once ``deadline`` passes.
+
+    ``None`` runs ``fn`` inline and waits forever, which is exactly what every caller
+    that asks for no budget keeps.
+
+    Otherwise ``fn`` runs on a single-use daemon thread and this returns control at the
+    deadline whether or not it finished, raising :exc:`AssemblyDeadlineError`. The
+    thread is not cancelled, and cannot be: these calls descend into icechunk's Rust
+    extension, and Python cannot interrupt a thread blocked below the interpreter. So it
+    is LEAKED, deliberately, and that is the whole trade:
+
+    * What it buys — the caller's thread comes back. In the campaign runner that thread
+      is a single-slot executor shared by every later cell, so one wedged fill otherwise
+      stops its whole fill publishing for the rest of the run.
+    * What it costs — the leaked thread still holds its icechunk session, its merged
+      forks and their memory, and it is still a writer. If it ever unblocks it will
+      commit, possibly after a retry of the same cell has already committed. Both write
+      the same year's shards from the same staged tiles and ``years_complete`` inserts
+      one key idempotently, so the visible cost is a duplicate write and a second
+      provenance entry rather than a damaged year — but it is a live writer nobody is
+      waiting on, which is why the budgets above are generous rather than tight.
+    * Why it is affordable — the runner is 16 vCPU / 64 GiB and sits near a gigabyte
+      resident, against tens of cells per fill. The thread is a daemon, so a leaked one
+      cannot hold up interpreter exit.
+    """
+    if deadline is None:
+        return fn()
+    box: dict[str, Any] = {}
+    finished = threading.Event()
+
+    def _body() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:
+            box["error"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=_body, name=f"assembly-{what}", daemon=True).start()
+    if not finished.wait(timeout=deadline.remaining_s()):
+        raise AssemblyDeadlineError(
+            f"{what} had not returned {deadline.budget_s:.0f}s after the forks did, and was abandoned "
+            f"(the thread doing it is leaked, not killed)"
+        )
+    if "error" in box:
+        raise box["error"]
+    return cast("T", box["value"])
 
 
 class PhaseTimer:
@@ -222,6 +352,7 @@ def _await_forks(
     unit: str = "partitions",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     slots: ctypes.Array[ctypes.c_long] | None = None,
+    budget_s: float | None = None,
 ) -> list[Any]:
     """Collect ``futures`` in submission order, logging what is still outstanding.
 
@@ -236,6 +367,13 @@ def _await_forks(
     one. ``log`` is where the lines go: the module logger reaches only the
     process's own log stream, so a caller inside a flow passes its run logger to
     make the wait visible to the orchestrator as well.
+
+    ``budget_s`` bounds the whole wait: past it, whatever is still outstanding is
+    abandoned with :exc:`AssemblyDeadlineError`. ``None`` waits forever, which is
+    what a caller that names no budget keeps. Giving up HERE rather than around the
+    call is what makes the fork phase cheap to abandon — the caller's handler already
+    terminates the worker processes, and nothing they wrote is in the store until a
+    fork is merged, so the only cost of the kill is unreferenced objects.
     """
     logger = log or _log
     started = time.monotonic()
@@ -250,6 +388,11 @@ def _await_forks(
         for future in done:
             if future.exception() is not None:
                 future.result()  # re-raises, with the worker's traceback attached
+        if pending and budget_s is not None and time.monotonic() - started > budget_s:
+            raise AssemblyDeadlineError(
+                f"fork-write phase still had {len(pending)}/{len(futures)} {unit} outstanding after "
+                f"{(time.monotonic() - started) / 60.0:.0f} min, past its {budget_s / 60.0:.0f} min budget"
+            )
         if pending:
             # SHARDS, not payloads: a payload completes only when its worker returns and they all
             # return at the end, so the payload figure read 0/N for the whole write. `slots` is what
@@ -284,6 +427,8 @@ def run_forked(
     progress_interval_s: float = PROGRESS_INTERVAL_S,
     unit: str = "partitions",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+    fork_budget_s: float | None = None,
+    post_fork: _PostForkDeadline | None = None,
 ) -> dict[str, Any]:
     """Fork ``session``, run ``worker_fn`` over ``payloads``, merge the forks back.
 
@@ -316,6 +461,15 @@ def run_forked(
       index IS its payload's index, matching how forks are merged).
     * ``wall_s`` — fork creation through merge completion.
     * ``merge_s`` — the merge alone.
+
+    ``fork_budget_s`` and ``post_fork`` bound the two halves separately, and both
+    default to unbounded. They are separate because the halves have nothing in common:
+    the fork writes scale with the payloads and take hours, while what follows them is
+    one pool teardown and one merge however large the write was. A single cutoff across
+    both would have to clear the hours, which is far too loose to notice the seconds
+    going wrong. ``post_fork`` is STARTED here, at the one moment that phase begins —
+    the last fork's result in hand — and the caller then holds the same object over its
+    own commits, so the two functions share one ceiling rather than one each.
     """
     t0 = time.monotonic()
     fork = session.fork()
@@ -326,6 +480,8 @@ def run_forked(
     ]
     if len(payloads) == 1:
         results = [worker_fn(payloads[0])]
+        if post_fork is not None:
+            post_fork.start()
     else:
         ctx = multiprocessing.get_context("spawn")
         # `initializer` runs once per spawned child before any payload. A spawned process
@@ -342,7 +498,9 @@ def run_forked(
         )
         try:
             futures = [ex.submit(worker_fn, payload) for payload in payloads]
-            results = _await_forks(futures, progress_interval_s, unit=unit, log=log, slots=slots)
+            results = _await_forks(
+                futures, progress_interval_s, unit=unit, log=log, slots=slots, budget_s=fork_budget_s
+            )
         except BaseException:
             # Cancel what has not started, then TERMINATE what has. `cancel_futures` only
             # reaches queued work, so without the second step a multi-hour shard writer keeps
@@ -375,9 +533,14 @@ def run_forked(
                 if proc.is_alive():
                     proc.terminate()
             raise
-        ex.shutdown()
+        # The post-fork clock starts HERE, with every fork's result in hand and before the
+        # teardown, because that is the boundary the observed stall sits behind: the workers
+        # had all finished and exited, and nothing after them ever completed.
+        if post_fork is not None:
+            post_fork.start()
+        _run_before_deadline(post_fork, ex.shutdown, "pool teardown")
     t_merge = time.monotonic()
-    session.merge(*(fork_result for fork_result, _ in results))
+    _run_before_deadline(post_fork, lambda: session.merge(*(fork_result for fork_result, _ in results)), "merge")
     done = time.monotonic()
     return {
         "workers": [stats for _, stats in results],
@@ -709,6 +872,13 @@ def write_year_shards(
     two commits of one function, so there is nothing outside the process to aim a kill
     at, and a state documented as benign but never observed is an assumption.
 
+    BOUNDED IN TWO PARTS. The fork-write phase gets a budget derived from the shard
+    count (:func:`fork_phase_budget_s`); everything after the forks return gets the much
+    tighter :data:`POST_FORK_BUDGET_S`. Overrunning either raises
+    :exc:`AssemblyDeadlineError` instead of waiting indefinitely — containment for a
+    stall whose cause is not yet known, not a fix for it. What that costs, and what it
+    leaves uncovered, is in ``context_docs/design/assembly-deadlines-2026_08.md``.
+
     Returns the ATTR commit's snapshot id — a tag must point at a state where the
     year is both written and marked.
     """
@@ -723,11 +893,35 @@ def write_year_shards(
     ]
     # The payloads are round-robin partitions of the source's tiles — name them
     # that way; "band writes" would describe the OTHER caller of run_forked.
-    fill = run_forked(session, _write_shards_worker, payloads, unit="tile partitions", log=log)
+    #
+    # TWO budgets, not one, because this fill has two phases of completely different
+    # shape and only the second is where fills have been seen to stop. The fork writes
+    # scale with the shard count and run for hours; everything after them is one merge
+    # and two commits, fixed work that has never taken more than a couple of seconds.
+    # A single cutoff would have to clear the hours and so could never notice the
+    # seconds. The rates, the derivation and what is deliberately left outside both
+    # budgets are in ``context_docs/design/assembly-deadlines-2026_08.md``.
+    post_fork = _PostForkDeadline(POST_FORK_BUDGET_S)
+    fill = run_forked(
+        session,
+        _write_shards_worker,
+        payloads,
+        unit="tile partitions",
+        log=log,
+        fork_budget_s=fork_phase_budget_s(len(shards)),
+        post_fork=post_fork,
+    )
 
-    year_label = _year_label(_group_node(session.store, group), year_index)
+    # Each of these names its own phase, so an abandoned fill says which call stopped
+    # returning rather than only that one did — the cause is not yet known, and that
+    # name is the first thing an operator has to go on.
+    year_label = _run_before_deadline(
+        post_fork, lambda: _year_label(_group_node(session.store, group), year_index), "years-complete read"
+    )
     t_commit = time.monotonic()
-    commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}")
+    _run_before_deadline(
+        post_fork, lambda: commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}"), "shard commit"
+    )
     if fault is not None:
         # The drill's death lands HERE, between the two commits, and nowhere else can
         # produce this state on purpose. Inert for any other fault or any other cell.
@@ -737,15 +931,19 @@ def write_year_shards(
     # collision costs a sub-second retry instead of this whole assembly. Return that
     # snapshot rather than the shard one: a tag must point at a state where the year is
     # both written AND marked.
-    snapshot = commit_year_attrs(
-        repo,
-        group,
-        year_label,
-        run_id=run_id,
-        radar_coverage=radar_coverage,
-        optical_skips=optical_skips,
-        input_coverage=input_coverage,
-        empty=empty,
+    snapshot = _run_before_deadline(
+        post_fork,
+        lambda: commit_year_attrs(
+            repo,
+            group,
+            year_label,
+            run_id=run_id,
+            radar_coverage=radar_coverage,
+            optical_skips=optical_skips,
+            input_coverage=input_coverage,
+            empty=empty,
+        ),
+        "year-attrs commit",
     )
     if telemetry is not None:
         telemetry.update(

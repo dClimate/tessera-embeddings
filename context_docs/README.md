@@ -70,6 +70,7 @@ context_docs/
     ├── stage_decoupling_2026_08.md              why ingest/inference/assembly are ungated
     ├── icechunk-credential-stampede-2026_08.md   the 28 Aug storage-credential incident (written for a general reader)
     ├── assembly-worker-clamp-2026_08.md          why assembly ran 5 of its 16 forks
+    ├── assembly-deadlines-2026_08.md             the 29 Aug assembly stall: two budgets, and what abandoning one costs
     ├── single-global-alignment.md                why single-ROI was aligned to the campaign
     ├── staging-identity-and-resume.md            what a run_id identifies, and what resumes
     ├── d3-sharding-plan.md                       settled ADR-008 D3; spec for scale_tests/t8
