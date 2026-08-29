@@ -42,6 +42,13 @@ that scorer. `_apply_gpu_fallback` therefore still refuses to open two at once. 
 registry and this policy are n-ary and ready for the day that guard lifts; until then a
 third rung cannot be starved by a dry second one, because there is no third rung.
 
+**The budget bounds what this REQUESTS, not everything Ray may launch.** Ordinary actor
+demand above the requested shape is still scheduled by Ray, so a fleet sized by
+``num_actors`` well past what the budget affords can exceed it — the pre-existing
+limitation `_apply_gpu_vcpu_budget` already documents, unchanged here. Closing it means
+capping actor submissions to the planned capacity, which shrinks the fleet and is a
+campaign-level decision rather than a property of this module.
+
 **An ask is a floor, not a delivery.** Ray launches with ``MinCount=1``, so AWS
 fills what it can and reports success: one measured call asked for six machines
 and got one, with a launch-failure count of zero throughout. Anything watching
@@ -144,6 +151,7 @@ def fleet_asks(
     live_by_instance_type: Mapping[str, int],
     ceilings: Mapping[str, int],
     vcpu_budget: int | None = None,
+    max_total: int | None = None,
     probe: int = DEFAULT_PROBE,
 ) -> dict[str, int]:
     """How many machines of each open rung to hold a standing request for.
@@ -165,6 +173,10 @@ def fleet_asks(
             than requested, because a refused launch spends no quota; reading it
             this way errs toward asking for more fallback, which is the right
             direction under a drought.
+        max_total: The cluster-wide ``max_workers``. Bounds the SUM, which the per-rung
+            ceilings do not: individually valid asks can exceed the aggregate, and Ray
+            discards an infeasible constraint whole rather than filling part of it — so
+            an uncapped sum does not merely overshoot, it provisions nothing at all.
         ceilings: ``max_workers`` per instance type, for the OPEN rungs only. Read
             from the resolved cluster config — an ask above a ceiling provisions
             nothing at all, so this bound is load-bearing.
@@ -201,6 +213,7 @@ def fleet_asks(
     committed = sum(live_by_instance_type.get(r.instance_type, 0) * r.vcpu_per_node for r in GPU_RUNGS)
     headroom = None if vcpu_budget is None else max(0, vcpu_budget - committed)
     remaining_want = want_gpus
+    remaining_total = max_total
 
     asks: dict[str, int] = {}
     for index, rung in enumerate(open_rungs):
@@ -219,6 +232,9 @@ def fleet_asks(
         # live count as a queue drains — surplus machines then lose their constraint
         # protection and idle out, instead of being held forever by a stale floor.
         ask = max(0, min(live + growth, remaining_want // rung.gpus_per_node))
+        if remaining_total is not None:
+            ask = min(ask, remaining_total)
+            remaining_total = max(0, remaining_total - ask)
         asks[rung.instance_type] = ask
         remaining_want = max(0, remaining_want - ask * rung.gpus_per_node)
         if headroom is not None:
@@ -248,6 +264,7 @@ class GpuFleetMixPlan:
 
     ceilings: dict[str, int]
     vcpu_budget: int | None
+    max_total: int | None = None
     probe: int = DEFAULT_PROBE
 
     @property
@@ -285,7 +302,12 @@ def plan_from_resolved_config(config: Mapping[str, Any], vcpu_budget: int | None
             )
         ceilings[instance_type] = ceiling
 
-    plan = GpuFleetMixPlan(ceilings=ceilings, vcpu_budget=vcpu_budget)
+    global_ceiling = config.get("max_workers")
+    plan = GpuFleetMixPlan(
+        ceilings=ceilings,
+        vcpu_budget=vcpu_budget,
+        max_total=int(global_ceiling) if isinstance(global_ceiling, int) and global_ceiling > 0 else None,
+    )
     return plan if plan.has_fallback else None
 
 
@@ -324,6 +346,7 @@ def publisher(plan: GpuFleetMixPlan) -> Callable[[int], None]:
             live_by_instance_type=live,
             ceilings=plan.ceilings,
             vcpu_budget=plan.vcpu_budget,
+            max_total=plan.max_total,
             probe=plan.probe,
         )
         if asks == last:

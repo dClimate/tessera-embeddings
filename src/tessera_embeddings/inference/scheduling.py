@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import time
 from collections import deque
 from collections.abc import Callable
@@ -1070,7 +1071,10 @@ def _process_chunks_work_stealing(
             # Published from here because this is the one place that already knows
             # both halves of the answer, once per round, at no extra cost.
             with contextlib.suppress(Exception):
-                on_fleet_demand(min(total_actors_target, pool.outstanding_work(len(chunk_queue))))
+                want_actors = min(total_actors_target, pool.outstanding_work(len(chunk_queue)))
+                # GPUs, not actors: they coincide only at one GPU per actor.
+                gpus = math.ceil(want_actors * config.num_gpus) if config.num_gpus > 0 else 0
+                on_fleet_demand(gpus)
         if not batching_enabled:
             return
         assert actor_factory is not None and total_actors_target is not None  # narrowed by batching_enabled

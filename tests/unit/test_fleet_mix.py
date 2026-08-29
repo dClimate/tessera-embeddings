@@ -444,3 +444,53 @@ class TestTheBudgetPricesTheLiveFleet:
                 want_gpus=250, live_by_instance_type=live, ceilings=_campaign_ceilings(), vcpu_budget=BUDGET
             )
             assert self._held_vcpu(asks, live) <= BUDGET, f"{live} -> {asks}"
+
+
+class TestActorsAreNotGpus:
+    """The pool counts actors; the fleet mix counts GPUs. They coincide only at one
+    GPU per actor, which is the production default and therefore easy to conflate.
+    """
+
+    def test_a_cpu_only_run_asks_for_no_gpu_machines(self) -> None:
+        from tessera_embeddings.inference.runner import _gpu_demand
+
+        assert _gpu_demand(actors=250, num_gpus=0) == 0
+
+    def test_a_fractional_reservation_scales_the_ask_down(self) -> None:
+        from tessera_embeddings.inference.runner import _gpu_demand
+
+        assert _gpu_demand(actors=250, num_gpus=0.5) == 125
+        assert _gpu_demand(actors=8, num_gpus=1.0) == 8
+
+
+class TestTheClusterWideCeiling:
+    """The per-rung ceilings do not bound their SUM, and Ray discards an infeasible
+    constraint whole — so an uncapped sum provisions nothing at all rather than
+    overshooting. Found in review of PR #159.
+    """
+
+    def test_the_combined_ask_fits_under_the_global_ceiling(self) -> None:
+        asks = fleet_mix.fleet_asks(
+            want_gpus=600,
+            live_by_instance_type={},
+            ceilings={L40S: 500, A10G: 500},
+            max_total=500,
+        )
+        assert sum(asks.values()) <= 500
+
+    def test_the_campaign_shape_is_unaffected_by_the_cap(self) -> None:
+        asks = fleet_mix.fleet_asks(
+            want_gpus=250,
+            live_by_instance_type={L40S: 35},
+            ceilings=_campaign_ceilings(),
+            vcpu_budget=BUDGET,
+            max_total=500,
+        )
+        assert asks == {L40S: 51, A10G: 79}
+
+    def test_the_plan_reads_the_ceiling_from_the_resolved_config(self) -> None:
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_worker_ladder(config, "g6e.xlarge:7,g5.2xlarge:9")
+        plan = fleet_mix.plan_from_resolved_config(config, None)
+        assert plan is not None
+        assert plan.max_total == config["max_workers"]

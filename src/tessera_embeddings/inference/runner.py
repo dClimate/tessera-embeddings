@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import time
 from collections.abc import Callable
 from typing import Any
@@ -46,6 +47,20 @@ def _resumed_result(label: str, *, skipped: bool) -> dict:
         "elapsed_sec": 0.0,
         "resumed": True,
     }
+
+
+_INITIAL_PUBLISH_ATTEMPTS = 3
+_INITIAL_PUBLISH_BACKOFF_S = 2.0
+
+
+def _gpu_demand(actors: int, num_gpus: float) -> int:
+    """GPUs an actor count implies, which is not the same number.
+
+    The fleet mix counts GPUs; the pool counts actors. They coincide only at the
+    production default of one GPU per actor. A CPU-only run reserves none, and must ask
+    for none rather than for GPU machines it will never place work on.
+    """
+    return math.ceil(actors * num_gpus) if num_gpus > 0 else 0
 
 
 def run_inference(
@@ -185,32 +200,36 @@ def run_inference(
     # what the scheduler will go on to do.
     batch_size = config.actor_request_batch_size
     first_batch = config.initial_actor_request(num_actors)
-    # BEFORE the first batch, not with it. The scheduler republishes this every round,
-    # but it does not start until `wait_for_actors` returns — and under a total primary
-    # drought no first-batch actor ever initializes, so that wait runs to its (hours
-    # long) timeout and the run dies having never once asked for the fallback. Which is
-    # precisely the starvation this exists to prevent.
+    # BEFORE the first batch, not with it. The scheduler republishes every round but does
+    # not start until `wait_for_actors` returns, and under a total primary drought no
+    # first-batch actor ever initializes — so that wait runs to its hours-long timeout and
+    # the run dies having never once asked for the fallback, which is precisely the
+    # starvation this exists to prevent.
     #
-    # Bounded by the work in hand, because the scheduler cannot correct an over-ask
-    # until that first actor arrives: a 20-actor default against one live tile would
-    # otherwise launch and bill 20 machines for one chunk of work. A chained session is
-    # the exception and keeps the whole target — it starts with an empty list by design
-    # and its work arrives through `more_work`.
-    # Capped by the FIRST BATCH, not the whole target. `actor_request_batch_size` and
-    # `actor_request_headroom` exist to stop launch demand running ahead of placement
-    # during a drought, and publishing 250 here would request a budget-shaped fleet
-    # before one actor had been created — pacing undone by the thing meant to survive
-    # it. The scheduler raises this every round once work is actually moving.
-    initial_want = min(first_batch, num_actors if more_work is not None else min(num_actors, len(chunks)))
-    if on_fleet_demand is not None and initial_want > 0:
-        try:
-            on_fleet_demand(initial_want)
-        except Exception:
-            # Non-fatal — a run whose primary rung has capacity does not need this at
-            # all. But LOUD, because nothing retries until the scheduler starts, and
-            # under the drought it exists for the scheduler never starts: this is the
-            # one publication whose failure costs the whole run.
-            log.warning("Could not publish the initial GPU fleet demand", exc_info=True)
+    # Sized by the smaller of the first batch and the work in hand. The batch, because
+    # `actor_request_batch_size` exists to stop launch demand running ahead of placement
+    # and asking for the whole target here would undo it; the work, because the scheduler
+    # cannot correct an over-ask until that first actor arrives. A chained session is the
+    # exception to the second — it starts with an empty list by design and its work
+    # arrives through `more_work`.
+    initial_actors = min(first_batch, num_actors if more_work is not None else min(num_actors, len(chunks)))
+    if on_fleet_demand is not None and initial_actors > 0:
+        # RETRIED, because nothing else will until the scheduler starts: one transient
+        # GCS failure would otherwise become the whole actor wait. Non-fatal at the end
+        # of it — a run whose primary rung has capacity does not need this at all.
+        for attempt in range(_INITIAL_PUBLISH_ATTEMPTS):
+            try:
+                on_fleet_demand(_gpu_demand(initial_actors, config.num_gpus))
+                break
+            except Exception:
+                if attempt + 1 == _INITIAL_PUBLISH_ATTEMPTS:
+                    log.warning(
+                        "Could not publish the initial GPU fleet demand after %d attempts",
+                        _INITIAL_PUBLISH_ATTEMPTS,
+                        exc_info=True,
+                    )
+                else:
+                    time.sleep(_INITIAL_PUBLISH_BACKOFF_S)
     actors = actor_factory(first_batch)
     if batch_size > 0 and first_batch < num_actors:
         log.info(
