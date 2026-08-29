@@ -438,3 +438,15 @@ class TestTheRunnerLifecycle:
         assert len(sites) >= 2, "expected the shared session and the per-cell retry"
         for site in sites:
             assert "on_fleet_demand" in {kw.arg for kw in site.keywords}, f"line {site.lineno}"
+
+    def test_a_ladder_that_opens_a_third_rung_is_trimmed_to_two(self) -> None:
+        """The SSM worker ladder can open a third rung without naming it in
+        `gpu_fallback_instance_types`, walking past both guards. Trimmed on the resolved
+        plan rather than refused — dropping the whole mix would be worse than running on
+        the best two.
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_worker_ladder(config, "g6e.xlarge:20,g5.2xlarge:20,g6.2xlarge:20")
+        plan = fleet_mix.plan_from_resolved_config(config, BUDGET)
+        assert plan is not None
+        assert set(plan.ceilings) == {L40S, A10G}, "the worst ratio is the one dropped"

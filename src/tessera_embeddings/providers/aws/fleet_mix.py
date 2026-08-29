@@ -278,6 +278,21 @@ def plan_from_resolved_config(config: Mapping[str, Any], vcpu_budget: int | None
 
     if len(ceilings) < 2:
         return None
+    # At most ONE fallback, enforced on the RESOLVED plan and not only on the campaign
+    # parameter. The `gpu-worker-ladder` SSM key can open a third rung without naming it
+    # in `gpu_fallback_instance_types`, which walks straight past both guards. Trimmed
+    # rather than refused: the request is a floor, and ordinary demand above it is still
+    # scored by Ray, which breaks the tie between identically-shaped fallbacks on
+    # node-type name — so a third rung would put a card choice back in Ray's hands, but
+    # dropping the whole mix over it would be worse than running on the best two.
+    ordered = [r.instance_type for r in GPU_RUNGS if r.instance_type in ceilings]
+    if len(ordered) > 2:
+        dropped = ordered[2:]
+        _LOG.warning(
+            "GPU rungs %s are open but only one fallback is supported; excluded from the fleet mix",
+            dropped,
+        )
+        ceilings = {t: c for t, c in ceilings.items() if t not in dropped}
     global_ceiling = config.get("max_workers")
     return GpuFleetMixPlan(
         ceilings=ceilings,
