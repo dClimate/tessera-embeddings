@@ -35,6 +35,12 @@ merely read:
   therefore holds idle hardware indefinitely, which is why the ask is recomputed
   from live counts on every pass and is allowed to fall.
 
+**Only the best open rung is probe-bounded.** A supply-constrained middle rung is still
+charged against the budget up to its ceiling, so with three rungs open a dry fallback can
+leave the third at zero. Stated rather than fixed: it cannot arise on the shipped
+configuration, which opens one fallback, and probe-bounding every rung would slow the
+cold-start fill of the fallback we actually run — in the drought this exists for.
+
 **An ask is a floor, not a delivery.** Ray launches with ``MinCount=1``, so AWS
 fills what it can and reports success: one measured call asked for six machines
 and got one, with a launch-failure count of zero throughout. Anything watching
@@ -182,26 +188,40 @@ def fleet_asks(
 
     # An ask is a TOTAL, not an increment: `request_resources` says "the cluster must
     # be able to fit these bundles", and Ray fits them on existing machines before
-    # launching any. So the budget is spent by the ASKS, and subtracting live machines
-    # here as well would charge them twice — at the campaign's numbers that cut the
-    # fallback ask from 79 to 62 and left 140 vCPU of the budget permanently unspent.
-    unmet = want_gpus
-    remaining = vcpu_budget
+    # launching any.
+    #
+    # So the budget is spent by what the fleet will HOLD, which is not the same as what
+    # we ask for. Lowering an ask does not remove a busy machine, and ordinary actor
+    # demand provisions nodes this request never sees. Pricing the asks alone let the
+    # live fleet ratchet past the budget: at 51 L40S and 79 A10G the next round would
+    # ask 67 L40S while all 79 A10G stayed up — 900 vCPU against a budget of 840, and
+    # repeatable. So charge what is already live FIRST, and allocate only the headroom
+    # that leaves.
+    committed = sum(live_by_instance_type.get(r.instance_type, 0) * r.vcpu_per_node for r in GPU_RUNGS)
+    headroom = None if vcpu_budget is None else max(0, vcpu_budget - committed)
+    remaining_want = want_gpus
 
     asks: dict[str, int] = {}
     for index, rung in enumerate(open_rungs):
         live = live_by_instance_type.get(rung.instance_type, 0)
-        # The best OPEN rung gets a bounded standing request above what it holds;
-        # every other rung may go to its ceiling.
-        room = live + probe if index == 0 else ceilings[rung.instance_type]
-        bounds = [unmet // rung.gpus_per_node, ceilings[rung.instance_type], room]
-        if remaining is not None:
-            bounds.append(remaining // rung.vcpu_per_node)
-        ask = max(0, min(bounds))
+        # How far this rung may GROW, before demand is considered.
+        growth_bounds = [ceilings[rung.instance_type] - live]
+        if index == 0:
+            # The best open rung grows by a bounded probe rather than to its ceiling: a
+            # ceiling-sized ask reserves budget for machines AWS is refusing, and an ask
+            # of exactly what is live would never grow at all.
+            growth_bounds.append(probe)
+        if headroom is not None:
+            growth_bounds.append(headroom // rung.vcpu_per_node)
+        growth = max(0, min(growth_bounds))
+        # Capped by the demand still unplaced, which is what lets an ask fall BELOW the
+        # live count as a queue drains — surplus machines then lose their constraint
+        # protection and idle out, instead of being held forever by a stale floor.
+        ask = max(0, min(live + growth, remaining_want // rung.gpus_per_node))
         asks[rung.instance_type] = ask
-        unmet = max(0, unmet - ask * rung.gpus_per_node)
-        if remaining is not None:
-            remaining = max(0, remaining - ask * rung.vcpu_per_node)
+        remaining_want = max(0, remaining_want - ask * rung.gpus_per_node)
+        if headroom is not None:
+            headroom = max(0, headroom - max(0, ask - live) * rung.vcpu_per_node)
     return asks
 
 

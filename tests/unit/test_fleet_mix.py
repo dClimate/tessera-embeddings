@@ -396,3 +396,35 @@ class TestTheDemandIsPublishedBeforeTheFleetIsWaitedOn:
         for site in sites:
             passed = {kw.arg for kw in site.keywords}
             assert "on_fleet_demand" in passed, f"line {site.lineno} drives a fleet without publishing its shape"
+
+
+class TestTheBudgetPricesTheLiveFleet:
+    """The budget must bound what the fleet HOLDS, not what we ask for.
+
+    Lowering an ask cannot remove a busy machine, so pricing the asks alone let the live
+    fleet ratchet past the budget: at 51 L40S and 79 A10G the next round asked 67 L40S
+    while all 79 A10G stayed up — 900 vCPU against 840, and repeatable across rounds
+    until it approached the full both-rungs-full mixture and starved peer clusters.
+    Found in review of PR #159.
+    """
+
+    @staticmethod
+    def _held_vcpu(asks: dict[str, int], live: dict[str, int]) -> int:
+        return sum(
+            max(asks.get(t, 0), live.get(t, 0)) * fleet_mix.RUNGS_BY_INSTANCE_TYPE[t].vcpu_per_node
+            for t in set(asks) | set(live)
+        )
+
+    def test_a_fleet_already_at_budget_is_not_grown_past_it(self) -> None:
+        live = {L40S: 51, A10G: 79}
+        asks = fleet_mix.fleet_asks(
+            want_gpus=250, live_by_instance_type=live, ceilings=_campaign_ceilings(), vcpu_budget=BUDGET
+        )
+        assert self._held_vcpu(asks, live) <= BUDGET
+
+    def test_the_live_fleet_stays_inside_the_budget_from_every_state(self) -> None:
+        for live in ({}, {L40S: 35}, {L40S: 51, A10G: 79}, {L40S: 101, A10G: 54}, {A10G: 105}):
+            asks = fleet_mix.fleet_asks(
+                want_gpus=250, live_by_instance_type=live, ceilings=_campaign_ceilings(), vcpu_budget=BUDGET
+            )
+            assert self._held_vcpu(asks, live) <= BUDGET, f"{live} -> {asks}"

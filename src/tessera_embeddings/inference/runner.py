@@ -198,8 +198,14 @@ def run_inference(
     # and its work arrives through `more_work`.
     initial_want = num_actors if more_work is not None else min(num_actors, len(chunks))
     if on_fleet_demand is not None and initial_want > 0:
-        with contextlib.suppress(Exception):
+        try:
             on_fleet_demand(initial_want)
+        except Exception:
+            # Non-fatal — a run whose primary rung has capacity does not need this at
+            # all. But LOUD, because nothing retries until the scheduler starts, and
+            # under the drought it exists for the scheduler never starts: this is the
+            # one publication whose failure costs the whole run.
+            log.warning("Could not publish the initial GPU fleet demand", exc_info=True)
     actors = actor_factory(first_batch)
     if batch_size > 0 and first_batch < num_actors:
         log.info(
