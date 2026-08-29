@@ -536,6 +536,12 @@ def run_forked(
         # The post-fork clock starts HERE, with every fork's result in hand and before the
         # teardown, because that is the boundary the observed stall sits behind: the workers
         # had all finished and exited, and nothing after them ever completed.
+        #
+        # OUTSIDE the try above, and it must stay outside. That handler's first act is
+        # `ex.shutdown(...)`, which takes the executor's own shutdown lock — so if a bounded
+        # teardown timed out INSIDE the try, the handler would block on the lock the
+        # abandoned thread still holds, wedging the very thread this exists to free. Every
+        # payload has already returned by here, so there is no queued work left to cancel.
         if post_fork is not None:
             post_fork.start()
         _run_before_deadline(post_fork, ex.shutdown, "pool teardown")
