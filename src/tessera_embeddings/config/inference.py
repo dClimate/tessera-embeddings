@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Literal, final
 
@@ -283,6 +284,88 @@ PREFETCH_DEPTH = 2
 # so sparse tiles load in one full-height strip and only dense ones split.
 INFERENCE_CHUNK_SIZE = 2048
 
+#: Total GPU memory the calibration below was measured on, in GiB. The L40S in
+#: ``g6e.xlarge`` reports 44.7 GiB of its nominal 48 GB, so a card at or above this runs the
+#: configured batch unchanged.
+TUNED_GPU_GIB: float = 44.0
+
+#: Sub-batch the calibration was measured AT, and the only batch known to fit
+#: :data:`TUNED_GPU_GIB` at :data:`TUNED_TOKENS_PER_PIXEL`. The fitted batch is derived from
+#: this, never from the caller's request, so a caller asking for more than was calibrated
+#: cannot carry its over-ask through the scaling. It is the default of
+#: :attr:`InferenceConfig.batch_size`.
+TUNED_BATCH_SIZE: int = 7168
+
+#: Deepest sequence the calibration covered, in tokens per pixel: both streams at the
+#: deepest checkpoint of the ladder that was in force when it was measured. A literal rather
+#: than ``2 * max(DEFAULT_NUM_OBS_CHECKPOINTS)`` — it records what the measurement covered,
+#: so changing the default ladder must NOT silently move it.
+TUNED_TOKENS_PER_PIXEL: int = 512
+
+
+def batch_size_for_gpu(
+    configured: int,
+    total_gib: float | None,
+    *,
+    num_obs_checkpoints: tuple[int, ...] = DEFAULT_NUM_OBS_CHECKPOINTS,
+    gpu_fraction: float = 1.0,
+) -> int:
+    """Return the sub-batch size this actor's share of a card can run.
+
+    A sub-batch's working set is activations, and activations are linear in
+    ``batch_size x (t_s2 + t_s1)`` — the batch, times the sequence lengths of the bucket it
+    was drawn from. Only the batch is ours to pick, but the sequence is BOUNDED:
+    :func:`~tessera_embeddings.inference.sampling.compute_bin_keys` clips a pixel to
+    ``max(num_obs_checkpoints)`` observations on each of the two streams, so the deepest
+    bucket the sampler can build is twice that per pixel. Its depth is therefore known
+    before any tile is read, which is why the batch needs no PER-BUCKET term: one value,
+    fitted once, is safe for every bucket a run can present.
+
+    Three things move that fit, and all three are here rather than at the call site because
+    a caller that knew to supply one would not necessarily know to supply the others:
+
+    * **How much memory the card has.** The reason this function exists.
+    * **How deep the ladder goes.** A ladder past the tuned depth makes every sub-batch
+      proportionally larger, so the batch has to come down to meet it.
+    * **How much of the card this actor gets.** A fractional reservation PACKS actors onto
+      one card (see ``FleetDemand.machines``), and each one sizing to the whole card would
+      oversubscribe it by exactly the packing factor.
+
+    An actor that runs out of memory is killed and replaced, and its chunk is retried, so
+    the cost is not lost data but a reloaded checkpoint on a fresh actor. Measurements
+    behind the constants are in ``context_docs/design/a10g_batch_size_2026_08.md``.
+
+    ``None`` — a CPU device, or one that reports no memory — leaves ``configured`` alone,
+    because scaling on an unknown is a guess and the tuned value is the better default.
+
+    There is NO floor. A configuration whose safe batch is small gets the small batch and
+    runs slowly; raising it to a round number would restore exactly the out-of-memory this
+    exists to prevent, on exactly the configurations nobody watches.
+
+    Args:
+        configured: The batch size the caller asked for. It is a CEILING, not the thing
+            scaled: the fit comes off :data:`TUNED_BATCH_SIZE`, so asking for more than was
+            calibrated raises nothing.
+        total_gib: The device's total memory in GiB, or ``None`` if unknown.
+        num_obs_checkpoints: The sampler's checkpoint ladder, whose deepest entry bounds
+            each stream's sequence length.
+        gpu_fraction: This actor's Ray GPU reservation, ``1.0`` for sole occupancy. The
+            share it actually gets is ``1 / floor(1 / gpu_fraction)``, because that is how
+            many actors Ray fits on the card (:meth:`FleetDemand.machines`) — at ``0.6``
+            one actor packs and owns the whole card, not 60% of it.
+
+    Returns:
+        The calibrated capacity of this actor's share of the card, capped at ``configured``
+        and never below 1.
+    """
+    if total_gib is None:
+        return configured
+    actors_per_card = math.floor(1.0 / gpu_fraction) if 0.0 < gpu_fraction < 1.0 else 1
+    share_gib = total_gib / actors_per_card
+    deepest_tokens_per_pixel = 2 * max(num_obs_checkpoints)
+    scale = (share_gib / TUNED_GPU_GIB) * (TUNED_TOKENS_PER_PIXEL / deepest_tokens_per_pixel)
+    return max(1, min(configured, int(TUNED_BATCH_SIZE * scale)))
+
 
 @final
 @dataclass
@@ -344,7 +427,7 @@ class InferenceConfig:
     num_obs_checkpoints: tuple[int, ...] = field(default_factory=lambda: DEFAULT_NUM_OBS_CHECKPOINTS)
 
     # Inference
-    batch_size: int = 7168
+    batch_size: int = TUNED_BATCH_SIZE
     num_workers: int = 4
     norm_source: Literal["mpc", "aws"] = "aws"
     s1_orbit: S1Orbit = "both"
