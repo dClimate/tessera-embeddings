@@ -7,8 +7,11 @@ from dataclasses import fields
 import pytest
 
 from tessera_embeddings.config.inference import (
+    MIN_GPU_BATCH_SIZE,
+    TUNED_GPU_GIB,
     InferenceConfig,
     _normalize_obs_checkpoints,
+    batch_size_for_gpu,
     checkpoint_filename,
 )
 from tessera_embeddings.config.time_windows import parse_time_window
@@ -211,3 +214,49 @@ class TestActorRequestPolicy:
         assert bounded.initial_actor_request(250) == 25
         # A target smaller than either still wins, so a tiny run does not over-ask.
         assert bounded.initial_actor_request(10) == 10
+
+
+# ---------------------------------------------------------------------------
+# batch_size_for_gpu — the card decides how much of a batch fits
+# ---------------------------------------------------------------------------
+
+
+class TestBatchSizeForGpu:
+    """The tuned batch is an L40S number; a smaller card has to be given a smaller one."""
+
+    @pytest.mark.parametrize(
+        ("total_gib", "expected"),
+        [
+            # The card it was tuned on, and anything larger, is left alone.
+            (44.7, 7168),  # L40S in g6e.xlarge
+            (TUNED_GPU_GIB, 7168),  # exactly the reference — still unscaled
+            (79.0, 7168),  # a bigger card is not given a bigger batch
+            # The A10G is the case this exists for: 22.06 GiB, and 7168 does not fit.
+            (22.06, 3593),  # g5.2xlarge — int(7168 * 22.06 / 44.0)
+            (24.0, 3909),
+        ],
+    )
+    def test_scales_only_below_the_tuned_card(self, total_gib: float, expected: int) -> None:
+        assert batch_size_for_gpu(7168, total_gib) == expected
+
+    def test_unknown_memory_leaves_the_tuned_value_alone(self) -> None:
+        """A CPU device reports nothing; scaling on a guess is worse than the tuned default."""
+        assert batch_size_for_gpu(7168, None) == 7168
+
+    def test_a_tiny_card_stops_at_the_floor(self) -> None:
+        """Below the floor the per-forward overhead dominates and the card is starved."""
+        assert batch_size_for_gpu(7168, 0.5) == MIN_GPU_BATCH_SIZE
+
+    def test_the_a10g_batch_leaves_real_headroom(self) -> None:
+        """The observed failure was a 2.5 GiB allocation with 1.2 GiB free at 20.9 GiB in use.
+
+        Activations dominate, so the scaled batch has to bring that 23.4 GiB requirement
+        under the card's 22.06 — this pins the margin rather than just the arithmetic.
+        """
+        fitted = batch_size_for_gpu(7168, 22.06)
+        projected_gib = 23.4 * fitted / 7168
+        assert projected_gib < 22.06 * 0.75
+
+    def test_a_configured_batch_below_the_floor_is_not_raised(self) -> None:
+        """The floor bounds SCALING, not the caller: a small batch was asked for on purpose."""
+        assert batch_size_for_gpu(64, 22.06) == 64

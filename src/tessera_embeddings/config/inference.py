@@ -283,6 +283,45 @@ PREFETCH_DEPTH = 2
 # so sparse tiles load in one full-height strip and only dense ones split.
 INFERENCE_CHUNK_SIZE = 2048
 
+#: Total GPU memory the default :attr:`InferenceConfig.batch_size` was tuned against, in GiB.
+#: The L40S in ``g6e.xlarge`` reports 44.7 GiB of its nominal 48 GB, so a card at or above
+#: this runs the configured batch unchanged.
+TUNED_GPU_GIB: float = 44.0
+
+#: Floor for a scaled batch. Below this the per-forward overhead dominates and a small card
+#: would be starved rather than protected.
+MIN_GPU_BATCH_SIZE: int = 512
+
+
+def batch_size_for_gpu(configured: int, total_gib: float | None) -> int:
+    """Return the sub-batch size a card holding ``total_gib`` of memory can run.
+
+    Activations dominate the working set: the checkpoint is ~0.2 GiB against the ~21 GiB a
+    full batch reserves, so what fits scales with the card and the batch has to scale with
+    it. The A10G in ``g5.2xlarge`` reports 22.06 GiB against the L40S's 44.7, and at the
+    tuned batch it runs out of memory on a 2.5 GiB allocation with 1.2 GiB free.
+
+    An actor that runs out of memory is killed and replaced, and its chunk is retried, so
+    the cost is not lost data but a reloaded checkpoint on a fresh actor. Measurements
+    behind the constant are in ``context_docs/design/a10g_batch_size_2026_08.md``.
+
+    ``None`` — a CPU device, or one that reports no memory — leaves ``configured`` alone,
+    because scaling on an unknown is a guess and the tuned value is the better default.
+
+    Args:
+        configured: The batch size the caller asked for.
+        total_gib: The device's total memory in GiB, or ``None`` if unknown.
+
+    Returns:
+        ``configured`` on a card at least as large as the tuned one, otherwise the value
+        scaled by the memory ratio, floored at :data:`MIN_GPU_BATCH_SIZE` and never above
+        ``configured`` — the floor bounds the SCALING, so a caller that deliberately asked
+        for a small batch (a tiny test model) still gets the batch it asked for.
+    """
+    if total_gib is None or total_gib >= TUNED_GPU_GIB:
+        return configured
+    return min(configured, max(MIN_GPU_BATCH_SIZE, int(configured * total_gib / TUNED_GPU_GIB)))
+
 
 @final
 @dataclass
