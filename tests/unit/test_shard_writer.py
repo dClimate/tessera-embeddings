@@ -848,6 +848,37 @@ class _SlowSession:
 class TestTheStalledCommitAlarm:
     """A stalled commit is silent by construction; this is what breaks the silence."""
 
+    def test_the_filter_keeps_a_baseline_for_every_other_target(self):
+        """`set_logs_filter` REPLACES the filter, it does not add to it.
+
+        A directive naming only icechunk would switch every other target down for the length
+        of the commit — including warnings and errors, and on a stall that is forever. The
+        bare level in front keeps everyone else where they were.
+        """
+        directives = COMMIT_LOG_FILTER.split(",")
+        assert any("=" not in d for d in directives), (
+            f"{COMMIT_LOG_FILTER!r} names only targets, so every other target loses its level"
+        )
+        assert directives[0] == "warn"
+
+    def test_a_commit_still_happens_when_no_thread_can_be_started(self, monkeypatch, caplog):
+        """The alarm is a diagnostic; it must never be the reason a commit does not happen.
+
+        `Thread.start` raises `RuntimeError` when the OS will not give out another thread, and
+        that fires before the commit — so an unguarded start would abort the commit for want
+        of an alarm about it.
+        """
+
+        class _NoThreads:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(icechunk_logging.threading, "Thread", _NoThreads)
+        assert icechunk_logging.traced_commit(_SlowSession(0.0), "unwatched") == "snapshot-id"
+
     def test_a_normal_commit_says_nothing(self, monkeypatch, caplog):
         monkeypatch.setattr(icechunk_logging, "COMMIT_ALARM_S", 5.0)
         with caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.icechunk_logging"):

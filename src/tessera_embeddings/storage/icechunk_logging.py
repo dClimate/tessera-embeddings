@@ -26,7 +26,12 @@ _log = logging.getLogger(__name__)
 #: not a chosen few: the point is to know where a stall stopped, and naming modules in advance
 #: assumes we already know which one that is. A commit normally takes about a second, so the
 #: volume is nil, and the one time it is not nil is the time we need it.
-COMMIT_LOG_FILTER = "icechunk=debug"
+#:
+#: THE BARE ``warn`` IS LOAD-BEARING. ``set_logs_filter`` replaces the whole filter rather
+#: than adding to it, so a directive naming only icechunk would switch every OTHER target
+#: down for the duration — including its warnings and errors, and for as long as the commit
+#: lasts, which on a stall is forever. Raising icechunk's detail must not cost anyone else's.
+COMMIT_LOG_FILTER = "warn,icechunk=debug"
 
 #: How long a commit may run before the alarm starts. Every commit ever measured finished in
 #: 0.6-1.6 s, so five minutes is roughly two hundred times the worst observed and cannot fire
@@ -123,7 +128,15 @@ def _commit_alarm(what: str) -> Iterator[None]:
                     _log.critical("ASSEMBLY COMMIT STALLED: thread stacks follow (ring %d)", rings)
                     faulthandler.dump_traceback()
 
-    threading.Thread(target=_watch, name="commit-alarm", daemon=True).start()
+    try:
+        threading.Thread(target=_watch, name="commit-alarm", daemon=True).start()
+    except Exception:  # a diagnostic must never be the reason a commit does not happen
+        # `Thread.start` raises `RuntimeError` when the OS will not give out another thread.
+        # Letting that escape would abort the commit for want of an alarm about it — the
+        # exact inversion this whole module exists to avoid. Commit unwatched instead.
+        _log.exception("Could not start the commit alarm; committing without it")
+        yield
+        return
     try:
         yield
     finally:
