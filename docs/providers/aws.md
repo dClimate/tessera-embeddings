@@ -242,9 +242,13 @@ dead code and has been deleted. v2's own capacity signal is unreachable twice ov
 is only the tiebreak *after* the utilisation score, which our rungs never tie on
 (`g6e.xlarge` at 4 vCPU packs a one-CPU one-GPU actor more tightly than any 8 vCPU
 fallback), and it is only populated on `ALLOCATION_TIMEOUT` while our refusals arrive as
-`ALLOCATION_FAILED`. The mix is therefore **stated rather than inferred**, which is also
-why more than one fallback may now be opened at once — the tie Ray used to break on
-node-type name no longer decides anything.
+`ALLOCATION_FAILED`. The mix is therefore **stated rather than inferred**.
+
+**Still one fallback at a time.** Stating the mix removes Ray's node-name tie for the
+machines the request covers, but the request is a floor — ordinary actor demand above it
+is scored by Ray as before, and the supported fallbacks are identical to that scorer.
+Both `run-global-campaign` and `_apply_gpu_fallback` refuse a second one; the registry
+and the allocation policy are n-ary and ready for the day that lifts.
 
 **How the ask is sized.** Rungs are ranked by throughput per vCPU, because the quota is
 counted in vCPU and the cards are not equally priced in it (0.250, 0.0575 and 0.040 of

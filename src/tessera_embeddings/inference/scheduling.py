@@ -1071,7 +1071,16 @@ def _process_chunks_work_stealing(
             # Published from here because this is the one place that already knows
             # both halves of the answer, once per round, at no extra cost.
             with contextlib.suppress(Exception):
-                want_actors = min(total_actors_target, pool.outstanding_work(len(chunk_queue)))
+                # Also bounded by the actors actually REQUESTED. `request_resources`
+                # bypasses normal upscaling limits and pins what it provisions, so
+                # publishing the whole outstanding queue would let the fleet jump to a
+                # budget-shaped floor the moment one actor became ready — undoing the
+                # batching policy a round after the cold start respected it.
+                want_actors = min(
+                    total_actors_target,
+                    pool.outstanding_work(len(chunk_queue)),
+                    len(pool.actors),
+                )
                 # GPUs, not actors: they coincide only at one GPU per actor.
                 gpus = math.ceil(want_actors * config.num_gpus) if config.num_gpus > 0 else 0
                 on_fleet_demand(gpus)

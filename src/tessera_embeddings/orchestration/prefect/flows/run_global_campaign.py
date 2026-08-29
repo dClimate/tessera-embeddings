@@ -987,6 +987,17 @@ async def run_global_campaign(
                 f"{sorted(GPU_FALLBACK_INSTANCE_TYPES)}. Sizes are restricted on HOST RAM - the "
                 "vCPU-matched `xlarge` of each family would OOM the loader before inference."
             )
+        if len(set(gpu_fallback_instance_types)) > 1:
+            # Refused HERE as well as in the provider, and the duplication is the point:
+            # the provider's guard fires inside `ray_cluster`, by which time a chained
+            # fill has already primed its look-ahead ingests. A configuration that cannot
+            # work should cost nothing to discover.
+            raise ValueError(
+                f"Only one GPU fallback instance type may be opened at a time, got "
+                f"{sorted(set(gpu_fallback_instance_types))} - the fleet mix is a floor, and "
+                "ordinary actor demand above it is still scored by Ray, which breaks the tie "
+                "between identically-shaped fallbacks on node-type name rather than throughput."
+            )
         if gpu_fallback_vcpu_budget is not None:
             if gpu_fallback_vcpu_budget <= 0:
                 raise ValueError(f"gpu_fallback_vcpu_budget must be > 0, got {gpu_fallback_vcpu_budget}")

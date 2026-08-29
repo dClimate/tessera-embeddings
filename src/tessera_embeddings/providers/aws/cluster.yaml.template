@@ -101,7 +101,8 @@ available_node_types:
     # Both ship at `max_workers: 0`, which makes a rung completely unreachable to the
     # autoscaler. Merging them therefore changes nothing about a campaign in flight.
     # They are opened by the `gpu_fallback_instance_types` campaign parameter — see
-    # `ray.py::_apply_gpu_fallback`. More than one may be opened at a time.
+    # `ray.py::_apply_gpu_fallback` — one at a time, refused at both the campaign
+    # parameter and the provider.
     #
     # WHY A FALLBACK IS NEEDED AT ALL. A single instance type is a single capacity
     # pool. Measured in us-west-2 on 2026-08-27, every `g6e` size refused with

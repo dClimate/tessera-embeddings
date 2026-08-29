@@ -494,3 +494,53 @@ class TestTheClusterWideCeiling:
         plan = fleet_mix.plan_from_resolved_config(config, None)
         assert plan is not None
         assert plan.max_total == config["max_workers"]
+
+
+class TestASmallColdStartStillReachesTheFallback:
+    """A demand at or below the probe must not go entirely to the rung that is refusing.
+
+    The cold-start publication is the only one that happens before `wait_for_actors`, so
+    if it contains no fallback bundles a total primary drought still runs to the actor
+    timeout — the exact failure this machinery exists to prevent, reintroduced through
+    the arithmetic. Found in review of PR #159.
+    """
+
+    def test_a_demand_at_the_probe_still_asks_for_a_fallback(self) -> None:
+        asks = fleet_mix.fleet_asks(
+            want_gpus=fleet_mix.DEFAULT_PROBE,
+            live_by_instance_type={},
+            ceilings=_campaign_ceilings(),
+            vcpu_budget=BUDGET,
+        )
+        assert asks[A10G] >= 1, "one machine is enough to place an actor and start the scheduler"
+
+    def test_a_proven_primary_keeps_the_whole_small_demand(self) -> None:
+        """Once the primary has machines the scheduler is running and correcting, so the
+        reservation stops applying and the better card is not held back.
+        """
+        asks = fleet_mix.fleet_asks(
+            want_gpus=8,
+            live_by_instance_type={L40S: 4},
+            ceilings=_campaign_ceilings(),
+            vcpu_budget=BUDGET,
+        )
+        assert asks == {L40S: 8, A10G: 0}
+
+
+class TestOneFallbackIsRefusedInBothPlaces:
+    """The provider guard fires inside `ray_cluster`, by which time a chained fill has
+    already primed its look-ahead ingests. A configuration that cannot work should cost
+    nothing to discover, so the campaign parameter refuses it too.
+    """
+
+    def test_the_provider_refuses_two(self) -> None:
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_worker_ladder(config, LADDER)
+        with pytest.raises(RuntimeError, match=r"[Oo]nly one GPU fallback"):
+            tray._apply_gpu_fallback(config, [A10G, L4], BUDGET)
+
+    def test_the_campaign_refuses_two_before_any_ingest(self) -> None:
+        from tessera_embeddings.orchestration.prefect.flows import run_global_campaign as rgc
+
+        source = pathlib.Path(rgc.__file__).read_text()
+        assert "Only one GPU fallback instance type" in source

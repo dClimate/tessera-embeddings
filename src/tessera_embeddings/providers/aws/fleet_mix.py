@@ -231,7 +231,19 @@ def fleet_asks(
         # Capped by the demand still unplaced, which is what lets an ask fall BELOW the
         # live count as a queue drains — surplus machines then lose their constraint
         # protection and idle out, instead of being held forever by a stale floor.
-        ask = max(0, min(live + growth, remaining_want // rung.gpus_per_node))
+        # Hold back one bundle for each lower rung that has nothing running yet. A
+        # demand at or below the probe would otherwise go entirely to the best rung —
+        # and if that rung is the one refusing, the cold-start publication contains no
+        # fallback at all and the actor wait times out exactly as before. One machine is
+        # enough: it places an actor, which starts the scheduler, which republishes a
+        # real mix. Skipped once this rung has live machines, because then the scheduler
+        # is already running and correcting.
+        reserve = (
+            sum(1 for r in open_rungs[index + 1 :] if live_by_instance_type.get(r.instance_type, 0) == 0)
+            if live == 0
+            else 0
+        )
+        ask = max(0, min(live + growth, remaining_want // rung.gpus_per_node - reserve))
         if remaining_total is not None:
             ask = min(ask, remaining_total)
             remaining_total = max(0, remaining_total - ask)
@@ -317,6 +329,17 @@ def plan_from_resolved_yaml(path: str | Path, vcpu_budget: int | None) -> GpuFle
         return plan_from_resolved_config(yaml.safe_load(handle), vcpu_budget)
 
 
+_LIVE_READING_TTL_S = 5.0
+"""How long a live node-count reading may be reused. Node counts move on EC2 timescales."""
+
+
+def _live_from(totals: Mapping[str, float], plan: GpuFleetMixPlan) -> dict[str, int]:
+    """Machines up per open rung, counted by the marker each rung declares."""
+    return {
+        rung.instance_type: int(totals.get(rung.marker, 0)) for rung in GPU_RUNGS if rung.instance_type in plan.ceilings
+    }
+
+
 def publisher(plan: GpuFleetMixPlan) -> Callable[[int], None]:
     """A callable that publishes the fleet mix for a given wanted-GPU count.
 
@@ -329,18 +352,26 @@ def publisher(plan: GpuFleetMixPlan) -> Callable[[int], None]:
     when the computed asks have not moved, so a settled fleet writes nothing.
     """
     last: dict[str, int] | None = None
+    cached: tuple[float, dict[str, int]] | None = None
 
     def publish(want_gpus: int) -> None:
-        nonlocal last
+        nonlocal last, cached
+        import time
+
         import ray
         from ray.autoscaler.sdk import request_resources
 
-        totals = ray.cluster_resources()
-        live = {
-            rung.instance_type: int(totals.get(rung.marker, 0))
-            for rung in GPU_RUNGS
-            if rung.instance_type in plan.ceilings
-        }
+        # The scheduler calls this once per iteration — including once per completed
+        # chunk — and a cluster-wide GCS query between completion and redispatch is a
+        # blocking cost on the hot path. Node counts move on EC2 timescales, so a few
+        # seconds of staleness is free.
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < _LIVE_READING_TTL_S:
+            live = cached[1]
+        else:
+            totals = ray.cluster_resources()
+            live = _live_from(totals, plan)
+            cached = (now, live)
         asks = fleet_asks(
             want_gpus=want_gpus,
             live_by_instance_type=live,
