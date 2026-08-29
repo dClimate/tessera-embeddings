@@ -13,7 +13,7 @@ tuned for a 44 GiB card. On 29 August 2026 the campaign began renting a second, 
 processes were killed by out-of-memory errors in ten hours, and 16 units of work were
 abandoned permanently. The fix is to compute the batch from the card's memory rather than
 using a fixed number. This document explains the mechanism, gives the measurements it rests
-on, and sets out the three alternatives that were considered and why each was rejected.
+on, and sets out the four alternatives that were considered and why each was rejected.
 
 ---
 
@@ -32,17 +32,18 @@ cloudy tropical pixel may have 57 usable optical passes in a year and a clear de
 206.
 
 **Token.** The network reads each observation the way a language model reads a word: as one
-**token** in a sequence. A pixel with 180 optical and 120 radar observations is a
-300-token sequence. **Tokens per pixel** is therefore just optical depth plus radar depth,
-and it is the unit that matters for memory.
+**token** in a sequence. A pixel with 184 optical and 120 radar observations goes through
+the network as a 304-token sequence. **Tokens per pixel** is therefore just optical depth
+plus radar depth, and it is the unit that matters for memory.
 
 **Bucket.** A graphics card wants rectangular work — every sequence in one call the same
 length. Pixels do not oblige, so the pipeline sorts them into **buckets** by depth. All the
 pixels in one bucket are processed at the same sequence length; different buckets have
 different lengths. The allowed lengths are a fixed list called the **checkpoint ladder**
-(`num_obs_checkpoints`), which by default runs 8, 16, 32, … up to **256**. A pixel is
-rounded up to the next rung, and — the load-bearing part — anything deeper than the top rung
-is **clipped** to it.
+(`num_obs_checkpoints`), which by default is every multiple of 8 from 8 up to **256**. A
+pixel is rounded up to the next rung, and — the load-bearing part — anything deeper than the
+top rung is **clipped** to it. That is why an optical depth of 206 is processed as 208, and
+why 300 would also be processed as 256.
 
 **Sub-batch, and `batch_size`.** A bucket can hold millions of pixels, far more than a card
 can hold at once, so it is processed in slices. One slice is a **sub-batch**, and
@@ -248,8 +249,8 @@ learning that memory depends on depth.
 **Why it was rejected — two measurements.**
 
 *It solves a problem that is already solved.* The clipping bound above means the worst case
-is known before a tile is read, and one fitted value clears it with 21–23% margin against
-measurement. A per-bucket rule would be adapting to a quantity that is already capped.
+is known before a tile is read, and one fitted value clears it with 21% margin against the
+measured ceiling. A per-bucket rule would be adapting to a quantity that is already capped.
 
 *Its only remaining benefit is throughput, and the throughput is not there.* What a
 per-bucket budget could still buy is the full 7,168 pixels back on shallow buckets, where
@@ -288,9 +289,9 @@ that the linear memory law makes true for cards that have never been benchmarked
 test can pin. A hardcoded pair of numbers can only be checked against the two cards it was
 written for.
 
-*It has nowhere to put the other two inputs.* Automated review found two further ways to
-exceed the cap (section 6). Both fit naturally into a ratio and not at all into a card-name
-lookup.
+*It has nowhere to put the other inputs.* Automated review found three further ways to
+exceed the cap (section 6). All three fit naturally into a ratio and not at all into a
+card-name lookup.
 
 ### Alternative C — use the smaller batch everywhere
 
@@ -323,9 +324,10 @@ The fallback is worth having; it just needed a batch size that fits it.
 ## 6. What the fit has to see, and why
 
 "The batch needs no per-bucket term" is not the same claim as "memory is the only input".
-The 512-token cap in section 4 is a *consequence* of two configured things, and a fit that
-ignored them would be safe only by coincidence. Automated review found both, plus a third
-route around the calculation, and they compound rather than compete.
+The 512-token cap in section 4 is a *consequence* of two configured things — how deep the
+ladder goes, and how many actors share the card — and a fit that ignored them would be safe
+only by coincidence. Automated review found both, plus a third route around the calculation
+entirely, and they compound rather than compete.
 
 **A deeper ladder.** `num_obs_checkpoints` is an ordinary config field and the pipeline
 accepts any positive depths. A caller passing `(512,)` doubles every sub-batch's token count.
@@ -381,10 +383,10 @@ correctly and slowly is the better failure.
 
 **One caveat, stated because the table above does not show it.** The invariant is on
 *activations*. Each actor also pays fixed per-process costs — its own CUDA context and its
-own copy of the weights — which the token accounting does not model. At the default of one
-actor per card that is 0.14 GiB and irrelevant. At ten actors per card it is ten times that,
-and the true demand is nearer 83% of the card than 79%. Heavy packing is not a production
-configuration, and this is one of the reasons.
+own copy of the weights — which the token accounting does not model. That is the fitted
+line's 0.14 GiB intercept, and at the default of one actor per card it is irrelevant. At ten
+actors per card it is paid ten times, and the true demand is nearer 83% of the card than
+79%. Heavy packing is not a production configuration, and this is one of the reasons.
 
 ---
 
