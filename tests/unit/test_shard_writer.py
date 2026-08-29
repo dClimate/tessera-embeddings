@@ -1077,3 +1077,56 @@ class TestThePhaseAfterTheForksIsBounded:
         store, repo = _seed(tmp_path)
         write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), shard_px=_SHARD)
         assert zarr_store.open_store_as_zarr_group(store, group="01N").attrs["years_complete"] == [2025]
+
+    def test_a_failing_emission_does_not_end_the_overdue_watchdog(self, tmp_path, monkeypatch, caplog):
+        """One failed log line must not silence the alarm for the rest of the stall.
+
+        The watchdog is the only signal an operator gets for a commit that never returns. If a
+        raising handler killed the thread, the stall would go quiet again — which is the exact
+        condition it exists to break — and the silence would be indistinguishable from the
+        commit having cleared.
+        """
+        monkeypatch.setattr(shard_writer, "POST_FORK_BUDGET_S", 0.2)
+        release = threading.Event()
+        entered = threading.Event()
+        real_commit = shard_writer.commit_with_rebase
+
+        def _wedged_commit(session, message, **kwargs):
+            entered.set()
+            release.wait(60)
+            return real_commit(session, message, **kwargs)
+
+        monkeypatch.setattr(shard_writer, "commit_with_rebase", _wedged_commit)
+
+        real_critical = shard_writer._log.critical
+        failures = {"n": 0}
+
+        def _boom_once(msg, *args, **kwargs):
+            if "ASSEMBLY COMMIT OVERDUE" in str(msg) and failures["n"] == 0:
+                failures["n"] += 1
+                raise RuntimeError("log transport down")
+            return real_critical(msg, *args, **kwargs)
+
+        monkeypatch.setattr(shard_writer._log, "critical", _boom_once)
+        _, repo = _seed(tmp_path)
+        done = threading.Event()
+
+        def _said():
+            return [r.getMessage() for r in caplog.records if "ASSEMBLY COMMIT OVERDUE" in r.getMessage()]
+
+        def _fill():
+            write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), shard_px=_SHARD)
+            done.set()
+
+        with caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.shard_writer"):
+            threading.Thread(target=_fill, daemon=True).start()
+            try:
+                assert entered.wait(30), "the commit never ran, so the test proved nothing"
+                until = time.monotonic() + 15
+                while not _said() and time.monotonic() < until:
+                    time.sleep(0.05)
+                assert failures["n"] == 1, "the first emission was meant to fail"
+                assert _said(), "the watchdog died on a failed emission and the stall went silent"
+            finally:
+                release.set()
+            assert done.wait(30), "the fill did not finish once its commit returned"

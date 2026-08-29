@@ -44,6 +44,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
@@ -241,14 +242,20 @@ def _run_under_deadline[T](
         def _announce_overdue() -> None:
             timeout = remaining
             while not returned.wait(timeout=timeout):
-                logger.critical(
-                    "ASSEMBLY COMMIT OVERDUE: %s has not returned within its %.0fs budget. It is NOT "
-                    "abandoned — a commit mutates the published store, and a thread cannot be killed, "
-                    "so waiting is the only thing that cannot corrupt the cell. This fill assembles "
-                    "nothing further until it returns.",
-                    what,
-                    deadline.budget_s,
-                )
+                # The announcement must not be able to end the announcer. One failed emission
+                # — the Prefect API handler is a network client — would otherwise kill this
+                # thread while the commit is still blocked, and the stall would go silent
+                # again, which is the exact condition this watchdog exists to break. If every
+                # emission fails there is nothing further to try, so it simply keeps trying.
+                with suppress(Exception):
+                    logger.critical(
+                        "ASSEMBLY COMMIT OVERDUE: %s has not returned within its %.0fs budget. It is NOT "
+                        "abandoned — a commit mutates the published store, and a thread cannot be killed, "
+                        "so waiting is the only thing that cannot corrupt the cell. This fill assembles "
+                        "nothing further until it returns.",
+                        what,
+                        deadline.budget_s,
+                    )
                 timeout = deadline.budget_s
 
         threading.Thread(target=_announce_overdue, name=f"overdue-{what}", daemon=True).start()

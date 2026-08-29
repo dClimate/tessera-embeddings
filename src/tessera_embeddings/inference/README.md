@@ -692,26 +692,47 @@ tiles embed their ocean pixels — the mask selects tiles, not pixels), with
 zone-fill runner (`orchestration/runners/zone_fill.py`) drives it: coverage mask →
 inference → `assemble_global` → `campaign.tag_zone_year`.
 
-The global fill is **bounded in two parts**, because its two phases have nothing in
-common. The fork-write phase gets a budget derived from the shard count — the work is
-what sets its length, so one fixed cutoff would be too tight for a dense zone-year and
-too loose for a sparse one at the same time. Everything after the forks return — pool
-teardown, merge, the `years_complete` read, both commits — gets a much tighter flat
-ceiling, because that work does not scale with the fill.
+#### Deadlines on the global fill
 
-**What an overrun does depends on what the step can still touch, not on how long it ran.**
-A call blocked inside icechunk's Rust extension cannot be interrupted from Python, so a
-process can be killed and a thread cannot: abandoning a thread frees the caller and stops
-nothing. Every step up to and including the merge writes only into a fork, and a fork
-enters the repository only when a coordinator merges *and* commits it — so those steps are
-abandoned with `AssemblyDeadlineError` (the pooled fork writes by killing their workers,
-the rest by leaking a thread), the trailing-assembly thread in `fill_zones_sequential` is
-never the wedged one, and the fill goes on to the next cell. **The two commits are not
-abandoned**, because an abandoned commit could still land, unobserved, after the cell had
-been failed; they run inline on the caller's own thread, and their overrun is announced by a
-watchdog under `ASSEMBLY COMMIT OVERDUE`, repeated every budget, while the wait continues. This is containment for a stall whose cause is not yet
-known — the budgets, what they cost, what they deliberately leave uncovered, and the
-killable-process change that would let a commit be abandoned too, are in
+Assembly has two halves that behave nothing alike, so each gets its own deadline.
+
+**The long half** is the write: sixteen worker processes spend a few hours copying the
+finished tiles into the store. How long it should take is set by how much there is to
+write, so its budget is calculated from the shard count rather than fixed — one cutoff
+that suited a dense zone-year would be far too generous for a sparse one.
+
+**The short half** is everything after those workers finish: shutting the pool down,
+combining their work, and two commits. That work is the same size whatever the fill,
+and in practice takes about a second, so it gets a small flat ceiling.
+
+##### What happens when a deadline passes
+
+The rule is not *how long has this run* but **what can this step still touch if we walk
+away from it**. That matters because a call stuck inside icechunk cannot be interrupted
+from Python: we can stop waiting on a thread, but we cannot stop the thread. Whatever it
+was doing, it goes on doing.
+
+Up to and including the merge, every step writes into a private draft, and a draft only
+becomes part of the store when it is merged *and* committed. Walk away from one and it
+simply never lands — some storage objects are left unreferenced and nothing else happens.
+Those steps are therefore abandoned when their deadline passes: the fill records the cell
+as failed, keeps its mosaics so a retry can resume from the tiles already written, and
+moves on to its next cell. (The pooled writers are killed outright; the later steps leak
+a thread, which is the price of not being able to interrupt one.)
+
+**The two commits are the exception, and they are never abandoned.** A commit is the
+moment work becomes part of the published store, so an abandoned one could still succeed
+later — after the fill had already given up on that cell and moved on — leaving a
+zone-year marked complete with none of the follow-up that a real completion performs.
+Rather than try to repair a state nobody watched, the commits run on the fill's own thread
+and it waits. A watchdog says so, loudly, under `ASSEMBLY COMMIT OVERDUE`, and repeats for
+as long as the wait lasts.
+
+That is an honest limit rather than a fix: **a stalled commit still stops that fill
+publishing**, and the deadline turns hours of silence into a repeating alarm rather than
+ending the stall. Ending it needs the commit to run somewhere killable — a process instead
+of a thread — which is a change of shape, not of numbers. The budgets, what they cost, what
+they deliberately leave uncovered, and that change are in
 `context_docs/design/assembly-deadlines-2026_08.md`.
 
 #### Assembly telemetry: the `ASSEMBLY_SUMMARY` record

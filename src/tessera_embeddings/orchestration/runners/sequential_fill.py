@@ -106,6 +106,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -503,14 +504,22 @@ def fill_zones_sequential(
         """
         if not isinstance(exc, AssemblyDeadlineError):
             return
-        log.critical(
-            "ASSEMBLY DEADLINE EXCEEDED for %s-%d: %s — %s. The cell keeps its mosaic, so it "
-            "resumes from its staged tiles, and this fill goes on to its other cells.",
-            zone,
-            year,
-            exc,
-            exc.abandoned,
-        )
+        # BEST-EFFORT, and here rather than at each call site: this is an announcement, and
+        # an announcement must never decide whether the caller's real work happens. Both
+        # sites that call it — the trailing finalizer and the in-child retry — sit in an
+        # `except` block whose remaining statements record the failure and free the cell,
+        # and the finalizer's future is discarded, so a raising handler would drop a cell
+        # out of the retry set and the closing summary with nothing said about it. The
+        # Prefect API handler is a network client; it can and does fail.
+        with suppress(Exception):
+            log.critical(
+                "ASSEMBLY DEADLINE EXCEEDED for %s-%d: %s — %s. The cell keeps its mosaic, so it "
+                "resumes from its staged tiles, and this fill goes on to its other cells.",
+                zone,
+                year,
+                exc,
+                exc.abandoned,
+            )
 
     def _record_failure(cell: SequentialCell, phase: str, exc: BaseException) -> None:
         with lock:
@@ -555,8 +564,13 @@ def fill_zones_sequential(
             _record_outcome(assemble(handoff, prep))
         except Exception as exc:
             failed_assembly = True
-            _announce_deadline(cell.zone, cell.year, exc)
+            # RECORD BEFORE ANNOUNCING, and never let the announcement decide whether the
+            # record happens. `_record_failure` is what puts the cell in `failures`, and the
+            # finalizer's future is discarded, so an exception raised while logging would
+            # take the cell out of the retry set and the closing summary with nothing said
+            # about it. The Prefect API handler is a network client; it can raise.
             _record_failure(cell, "assembly", exc)
+            _announce_deadline(cell.zone, cell.year, exc)
         else:
             # OUTSIDE the assembly try, because by here the cell is committed, tagged
             # and already recorded as a success. Deleting its mosaics is housekeeping

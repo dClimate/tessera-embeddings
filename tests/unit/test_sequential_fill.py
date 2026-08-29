@@ -1314,3 +1314,31 @@ def test_a_nonpositive_cap_is_refused_before_anything_expensive():
     for bad in (0, -1):
         with pytest.raises(ValueError, match="max_retained_failures must be >= 1"):
             _run(_cells(2), max_retained_failures=bad)
+
+
+def test_a_failing_log_handler_cannot_lose_an_abandoned_cell(monkeypatch):
+    """The announcement is a side effect; the RECORD is the state that must survive.
+
+    `_record_failure` is what puts a cell in `failures`, and the finalizer's future is
+    discarded, so an exception raised while announcing would take the cell out of the retry
+    set and the closing summary with nothing said about it at all. The Prefect API log
+    handler is a network client, so this is a transport failing, not a hypothetical.
+    """
+    real_critical = LOG.critical
+
+    def _boom(msg, *args, **kwargs):
+        # Only the announcement under test: a blanket failure would take down unrelated
+        # CRITICAL sites and prove nothing about this one.
+        if "ASSEMBLY DEADLINE EXCEEDED" in str(msg):
+            raise RuntimeError("log transport down")
+        return real_critical(msg, *args, **kwargs)
+
+    monkeypatch.setattr(LOG, "critical", _boom)
+
+    def assemble(handoff, prep):
+        raise AssemblyDeadlineError("merge had not returned 600s after the forks did", abandoned=_LEAKED)
+
+    # Still raises on the failed cell: the record survived the announcement failing twice
+    # (the trailing finalizer's and the retry's).
+    with pytest.raises(RuntimeError, match="1/1 cell"):
+        _run(_cells(1), assemble=assemble, infer_single=_recovering_single([]))
