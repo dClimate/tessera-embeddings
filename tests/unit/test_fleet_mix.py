@@ -462,6 +462,19 @@ class TestActorsAreNotGpus:
         assert _gpu_demand(actors=250, num_gpus=0.5) == 125
         assert _gpu_demand(actors=8, num_gpus=1.0) == 8
 
+    def test_a_fraction_that_does_not_divide_evenly_counts_the_packing(self) -> None:
+        """Five actors at 0.4 fit two to a card, so they need three machines — not the
+        two that scaling by the reservation reports.
+        """
+        from tessera_embeddings.inference.runner import _gpu_demand
+
+        assert _gpu_demand(actors=5, num_gpus=0.4) == 3
+
+    def test_a_multi_gpu_actor_needs_more_machines_than_actors(self) -> None:
+        from tessera_embeddings.inference.runner import _gpu_demand
+
+        assert _gpu_demand(actors=10, num_gpus=2.0) == 20
+
 
 class TestTheClusterWideCeiling:
     """The per-rung ceilings do not bound their SUM, and Ray discards an infeasible

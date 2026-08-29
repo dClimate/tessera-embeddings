@@ -54,13 +54,22 @@ _INITIAL_PUBLISH_BACKOFF_S = 2.0
 
 
 def _gpu_demand(actors: int, num_gpus: float) -> int:
-    """GPUs an actor count implies, which is not the same number.
+    """Single-GPU machines an actor count implies, which is not the same number.
 
     The fleet mix counts GPUs; the pool counts actors. They coincide only at the
     production default of one GPU per actor. A CPU-only run reserves none, and must ask
     for none rather than for GPU machines it will never place work on.
+
+    Fractional reservations PACK, and the packing is what decides the machine count:
+    five actors at 0.4 each fit two to a card, so they need three machines rather than
+    the two that `ceil(5 * 0.4)` reports.
     """
-    return math.ceil(actors * num_gpus) if num_gpus > 0 else 0
+    if num_gpus <= 0:
+        return 0
+    per_machine = math.floor(1 / num_gpus) if num_gpus <= 1 else 0
+    if per_machine >= 1:
+        return math.ceil(actors / per_machine)
+    return math.ceil(actors * num_gpus)
 
 
 def run_inference(
@@ -230,15 +239,19 @@ def run_inference(
                     )
                 else:
                     time.sleep(_INITIAL_PUBLISH_BACKOFF_S)
-    actors = actor_factory(first_batch)
-    if batch_size > 0 and first_batch < num_actors:
-        log.info(
-            "Actor batching enabled: requesting %d at a time (batch 1/%d actors now)",
-            batch_size,
-            num_actors,
-        )
+    actors: list[ray.actor.ActorHandle] = []
     progress_tracker: ray.actor.ActorHandle | None = None
+    # The try opens BEFORE the first batch, because the fleet floor is already published
+    # by this point: an actor-creation failure outside this scope would leave that floor
+    # standing, holding GPU nodes on a cluster where inference never started.
     try:
+        actors = actor_factory(first_batch)
+        if batch_size > 0 and first_batch < num_actors:
+            log.info(
+                "Actor batching enabled: requesting %d at a time (batch 1/%d actors now)",
+                batch_size,
+                num_actors,
+            )
         # Start as soon as a single actor is live. Cloud providers roll out
         # instances with huge timing variation, so blocking on a fraction of
         # the fleet just stalls the run; the work-stealing scheduler dispatches
