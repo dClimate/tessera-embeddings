@@ -92,6 +92,7 @@ available_node_types:
         resources:
             CPU: 4
             GPU: 1
+            tessera_rung:g6e.xlarge: 1
         min_workers: 0
         max_workers: 500
 
@@ -99,8 +100,9 @@ available_node_types:
     #
     # Both ship at `max_workers: 0`, which makes a rung completely unreachable to the
     # autoscaler. Merging them therefore changes nothing about a campaign in flight.
-    # They are opened by the `gpu_fallback_cards` campaign parameter, which also
-    # installs the capacity-aware scorer — see `ray.py::_apply_gpu_fallback`.
+    # They are opened by the `gpu_fallback_instance_types` campaign parameter — see
+    # `ray.py::_apply_gpu_fallback` — one at a time, refused at both the campaign
+    # parameter and the provider.
     #
     # WHY A FALLBACK IS NEEDED AT ALL. A single instance type is a single capacity
     # pool. Measured in us-west-2 on 2026-08-27, every `g6e` size refused with
@@ -109,11 +111,18 @@ available_node_types:
     # type list of its own: its node provider passes ONE `InstanceType` to
     # `create_instances`, and only the SUBNET list rotates on retry.
     #
-    # WHY OPENING A RUNG IS NOT ENOUGH. Ray's default node-type scorer cannot see
-    # capacity — `_resource_based_utilization_scorer` takes a `node_availability_summary`
-    # and never reads it — so a refusing rung stays top-scored and is re-requested
-    # indefinitely while an open fallback sits idle. The scorer we install reads that
-    # summary and demotes a capacity-refused type. Neither half works alone.
+    # WHY OPENING A RUNG IS NOT ENOUGH. Ray picks node types greedily and stops choosing
+    # one only when THAT type's `max_workers` is exhausted, so while demand stays under
+    # the production ceiling an open fallback is never asked for at all — measured on dev
+    # 2026-08-28 as 18 consecutive L40S attempts, all refused, and zero A10G attempts.
+    # `fleet_mix.py` states how many of each card to hold, which autoscaler v2 satisfies
+    # in the same pass as actor demand. Neither half works alone.
+    #
+    # EACH on-demand GPU rung declares `tessera_rung:<instance-type>: 1`. That marker is
+    # how a fleet-mix request addresses ONE rung. It is ours rather than Ray's autofilled
+    # `accelerator_type:<CARD>` because the card is not unique — the spot rung below is
+    # the same `g6e.xlarge`, so a card-named request could be satisfied by INTERRUPTIBLE
+    # capacity. The spot rung deliberately carries no marker.
     #
     # WHY THE `2xlarge` OF EACH FAMILY. Host RAM, not price. The vCPU-matched
     # `g5.xlarge` and `g6.xlarge` carry 16 GiB against a measured ~17.7 GB per-actor
@@ -158,6 +167,7 @@ available_node_types:
         resources:
             CPU: 8
             GPU: 1
+            tessera_rung:g5.2xlarge: 1
         min_workers: 0
         max_workers: 0
 
@@ -176,6 +186,7 @@ available_node_types:
         resources:
             CPU: 8
             GPU: 1
+            tessera_rung:g6.2xlarge: 1
         min_workers: 0
         max_workers: 0
 

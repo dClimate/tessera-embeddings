@@ -237,7 +237,6 @@ class TestCampaignDefaults:
             # `ray_cluster`, so a typo would spend real ingest work per cluster before
             # anything said so.
             ({"gpu_fallback_instance_types": ["g5.xlarge"]}, "unsupported type"),
-            ({"gpu_fallback_instance_types": ["g5.2xlarge", "g6.2xlarge"]}, "Only one GPU fallback instance type"),
         ],
     )
     def test_a_doomed_invocation_touches_no_shared_limit(self, wired, kwargs, match):

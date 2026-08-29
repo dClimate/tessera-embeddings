@@ -359,6 +359,7 @@ def fill_zone_year(
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
     on_actor_retire: Callable[[str], None] | None = None,
+    on_fleet_demand: Callable[[int], None] | None = None,
     fault: ArmedFault | None = None,
     input_coverage: dict | None = None,
 ) -> dict[str, Any]:
@@ -395,6 +396,9 @@ def fill_zone_year(
         get_credentials: Optional icechunk credential callback (actors + store).
         s3_region: Optional S3 region override for the global store.
         on_actor_retire: Optional callback when a misbehaving actor is retired
+        on_fleet_demand: Optional callback ``(want_gpus) -> None`` letting the AWS
+            provider publish a per-instance-type fleet request; see
+            ``providers.aws.fleet_mix``
             (the AWS provider injects an EC2 terminator).
         input_coverage: How much of the requested window the input mosaics actually held,
             measured by the fill's preflight and recorded on the year. The mosaics are
@@ -422,6 +426,7 @@ def fill_zone_year(
         get_credentials=get_credentials,
         s3_region=s3_region,
         on_actor_retire=on_actor_retire,
+        on_fleet_demand=on_fleet_demand,
     )
     return assemble_zone_year(
         handoff,
@@ -800,6 +805,7 @@ def infer_zone_year(
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
     on_actor_retire: Callable[[str], None] | None = None,
+    on_fleet_demand: Callable[[int], None] | None = None,
     retire_idle_actors: bool = True,
 ) -> ZoneFillHandoff:
     """Inference phase of a (zone, year) fill: plan → run_inference.
@@ -840,6 +846,7 @@ def infer_zone_year(
             num_actors=num_actors,
             log=log,
             on_actor_retire=on_actor_retire,
+            on_fleet_demand=on_fleet_demand,
             get_credentials=get_credentials,
             s3_region=s3_region,
             retire_idle_actors=retire_idle_actors,
@@ -856,6 +863,7 @@ def _infer_planned(
     num_actors: int,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     on_actor_retire: Callable[[str], None] | None,
+    on_fleet_demand: Callable[[int], None] | None,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
     s3_region: str | None,
     retire_idle_actors: bool,
@@ -871,6 +879,7 @@ def _infer_planned(
         plan.t0,
         log,
         on_actor_retire=on_actor_retire,
+        on_fleet_demand=on_fleet_demand,
         get_credentials=get_credentials,
         s3_region=s3_region,
         retire_idle_actors=retire_idle_actors,

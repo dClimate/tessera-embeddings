@@ -1284,6 +1284,7 @@ def fill_zones_sequential_flow(
             t0_flow,
             log,
             on_actor_retire=terminator,
+            on_fleet_demand=publish_fleet_mix,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
             retire_idle_actors=True,  # the scheduler holds off until the source is exhausted
@@ -1309,6 +1310,7 @@ def fill_zones_sequential_flow(
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
             on_actor_retire=terminator,
+            on_fleet_demand=publish_fleet_mix,
             retire_idle_actors=final,
         )
 
@@ -1424,6 +1426,12 @@ def fill_zones_sequential_flow(
             gpu_fallback_vcpu_budget=gpu_fallback_vcpu_budget,
         ) as resolved_yaml:
             activate(resolved_yaml)
+            from tessera_embeddings.providers.aws.fleet_mix import publisher_for_resolved_yaml
+
+            # Read AFTER `ray up`, because the ceilings come from the resolved config
+            # it was handed. `_session` closes over the name and is called below, so
+            # assigning here reaches every session this cluster runs.
+            publish_fleet_mix = publisher_for_resolved_yaml(resolved_yaml, gpu_fallback_vcpu_budget, log)
             seq = fill_zones_sequential(
                 cells=live,
                 prepare=_prepare,

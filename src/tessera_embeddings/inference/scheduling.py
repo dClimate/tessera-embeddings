@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import time
 from collections import deque
 from collections.abc import Callable
@@ -89,6 +90,85 @@ class WorkItem:
 def _as_item(work: WorkItem | ChunkSpec, ctx: ZoneContext) -> WorkItem:
     """Normalize a bare ChunkSpec (legacy callers/tests) into a WorkItem."""
     return work if isinstance(work, WorkItem) else WorkItem(chunk=work, ctx=ctx)
+
+
+class FleetDemand:
+    """The one place that decides WHAT to publish and survives publishing it.
+
+    Every review round on PR #159 that was not about the allocation arithmetic was about
+    this: which call site publishes, when, bounded by what, converted how, retried or
+    not, cleared or not. Two call sites each computing their own answer produced a defect
+    per forgotten term. There is one answer, and it lives here.
+
+    The bound is the same in both places once named properly — the actor target, the work
+    outstanding, and what has actually been REQUESTED, whichever is smallest. At the cold
+    start "requested" is the first batch; afterwards it is the live pool. Bounding by the
+    request is what keeps the fleet from outrunning the batching policy that exists to
+    pace it.
+    """
+
+    ATTEMPTS = 3
+    BACKOFF_S = 2.0
+
+    def __init__(
+        self,
+        publish: Callable[[int], None] | None,
+        num_gpus: float,
+        log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    ) -> None:
+        self._publish = publish
+        self._num_gpus = num_gpus
+        self._log = log
+
+    @staticmethod
+    def machines(actors: int, num_gpus: float) -> int:
+        """Single-GPU machines an actor count implies, which is not the same number.
+
+        They coincide only at the production default of one GPU per actor. A CPU-only run
+        reserves none and must ask for none. Fractional reservations PACK, and the packing
+        decides the count: five actors at 0.4 fit two to a card and need three machines,
+        not the two that scaling by the reservation reports.
+        """
+        if num_gpus <= 0 or num_gpus > 1:
+            # Zero: a CPU-only run must not ask for GPU machines at all. Above one: every
+            # rung is single-GPU and Ray cannot combine GPUs across nodes, so no machine
+            # this request could buy is able to host the actor.
+            return 0
+        per_machine = math.floor(1 / num_gpus)
+        return math.ceil(actors / per_machine) if per_machine >= 1 else actors
+
+    def send(self, *, target: int, outstanding: int, requested: int, retry: bool = False) -> None:
+        """Publish the fleet shape for this moment. Never raises into the caller.
+
+        ``retry`` is for the cold start only: nothing else republishes until the scheduler
+        loop starts, and under the drought this exists for that loop never starts — so one
+        transient failure there becomes the whole hours-long actor wait. Every later call
+        is followed by another a moment afterwards, which is retry enough.
+        """
+        if self._publish is None:
+            return
+        want = self.machines(max(0, min(target, outstanding, requested)), self._num_gpus)
+        attempts = self.ATTEMPTS if retry else 1
+        failure: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                self._publish(want)
+                return
+            except Exception as exc:
+                failure = exc
+                if attempt + 1 < attempts:
+                    time.sleep(self.BACKOFF_S)
+        # `exc_info=failure`, NOT `exc_info=True`: this runs OUTSIDE the except block, where
+        # there is no active exception, so `True` silently logs no traceback at all — a
+        # warning that names the symptom and drops its cause, which cost a whole dev cycle.
+        self._log.warning("Could not publish GPU fleet demand (want=%d)", want, exc_info=failure)
+
+    def clear(self) -> None:
+        """Drop the request. Machines it holds are exempt from idle termination, so a floor
+        left standing pins an idle GPU fleet through the assembly that follows — and this
+        is the LAST publication, so nothing retries it afterwards.
+        """
+        self.send(target=0, outstanding=0, requested=0, retry=True)
 
 
 class ActorPool:
@@ -906,6 +986,7 @@ def _process_chunks_work_stealing(
     max_chunk_retries: int = 2,
     still_initializing: set[int] | None = None,
     on_actor_retire: Callable[[str], None] | None = None,
+    fleet: FleetDemand | None = None,
     get_credentials: Callable[[], Any] | None = None,
     s3_region: str | None = None,
     actor_factory: Callable[[int], list[ray.actor.ActorHandle]] | None = None,
@@ -945,6 +1026,8 @@ def _process_chunks_work_stealing(
             will pick up work via ``dispatch_idle`` once they come online.
         on_actor_retire: Callback to be triggered when the actor is removed from the pool.
             Used to consistently and swiftly terminate EC2 instances and save compute costs
+        fleet: Optional :class:`FleetDemand`, published once per scheduling round so a
+            capacity-refused rung cannot starve the fleet. Runs on the scheduler thread.
         get_credentials: Optional icechunk S3 credential provider injected into
             every actor (seeded and replacement) so store opens refresh creds.
         s3_region: Optional S3 region injected into every actor (seeded and
@@ -1055,9 +1138,22 @@ def _process_chunks_work_stealing(
     # has placed nothing and would refuse to grow.
     last_joined_gpus = 0.0
 
+    def _publish_fleet_demand() -> None:
+        """State the fleet's shape for this round. Called AFTER any new batch is added,
+        so those actors are counted: publishing first left a freshly requested batch
+        creating ordinary primary-only demand for a whole round.
+        """
+        if fleet is not None and total_actors_target is not None:
+            fleet.send(
+                target=total_actors_target,
+                outstanding=pool.outstanding_work(len(chunk_queue)),
+                requested=len(pool.actors),
+            )
+
     def _maybe_request_next_batch() -> None:
         nonlocal last_batch_at, nodes_at_last_batch, last_batch_size, last_joined_gpus
         if not batching_enabled:
+            _publish_fleet_demand()
             return
         assert actor_factory is not None and total_actors_target is not None  # narrowed by batching_enabled
         last_joined_gpus = _joined_gpu_count(last_joined_gpus, config.num_gpus)
@@ -1075,6 +1171,7 @@ def _process_chunks_work_stealing(
             headroom=config.actor_request_headroom,
         )
         if n == 0:
+            _publish_fleet_demand()
             return
         pool.add_actors(actor_factory(n))
         last_batch_at = time.monotonic()
@@ -1088,6 +1185,7 @@ def _process_chunks_work_stealing(
             placed_actor_slots,
             " — placement timed out, requesting anyway" if timed_out else "",
         )
+        _publish_fleet_demand()
 
     def _handle_failure(item: WorkItem, actor_idx: int, error: str) -> None:
         """Retry a failed chunk on a different worker and kill the failing actor.
