@@ -723,6 +723,17 @@ class TestTheForkPhaseIsAbandonedOnItsBudget:
         with pytest.raises(shard_writer.AssemblyDeadlineError, match="fork-write phase"):
             _await_forks([outstanding], 0.01, budget_s=0.0)
 
+    def test_the_deadline_lands_when_it_falls_not_one_progress_interval_later(self):
+        # Production reports progress every 5 minutes, so a wait that always runs the full
+        # interval would overshoot the budget by up to that much — and if the last fork
+        # landed during the overshoot, nothing would be abandoned at all. Each wait is
+        # capped by what is left of the budget instead.
+        outstanding: Future = Future()  # never resolves
+        started = time.monotonic()
+        with pytest.raises(shard_writer.AssemblyDeadlineError, match="fork-write phase"):
+            _await_forks([outstanding], 10.0, budget_s=0.1)
+        assert time.monotonic() - started < 5.0, "the wait ran its whole progress interval"
+
     def test_a_fill_inside_its_budget_is_untouched(self):
         outstanding: Future = Future()
         threading.Timer(0.05, lambda: outstanding.set_result("done")).start()
@@ -733,6 +744,43 @@ class TestTheForkPhaseIsAbandonedOnItsBudget:
         outstanding: Future = Future()
         threading.Timer(0.05, lambda: outstanding.set_result("done")).start()
         assert _await_forks([outstanding], 0.01) == ["done"]
+
+    def test_a_single_payload_fill_is_bounded_too(self, tmp_path):
+        """The in-process path is where a SPARSE cell lands, and it must not be exempt.
+
+        `partition_round_robin` yields one payload for a one-shard fill whatever
+        `n_workers` says, and one payload runs on the caller's thread. Unbounded, such a
+        cell would block its fill's finalizer exactly as the stall this exists for does.
+        """
+        release = threading.Event()
+        entered = threading.Event()
+
+        def _wedged_worker(payload):
+            entered.set()
+            release.wait(30)
+            return payload["fork"], {}
+
+        store, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        try:
+            with pytest.raises(shard_writer.AssemblyDeadlineError, match="fork-write phase"):
+                run_forked(session, _wedged_worker, [{"tag": "only"}], fork_budget_s=0.2)
+            assert entered.is_set(), "the worker never ran, so the test proved nothing"
+        finally:
+            release.set()
+
+    def test_a_single_payload_fill_with_no_budget_is_untouched(self, tmp_path):
+        # The default every other caller keeps: in-process, on the caller's thread.
+        store, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        seen: list[threading.Thread] = []
+
+        def _worker(payload):
+            seen.append(threading.current_thread())
+            return payload["fork"], {}
+
+        run_forked(session, _worker, [{"tag": "only"}])
+        assert seen == [threading.current_thread()]
 
     def test_the_deadline_terminates_the_workers_still_running(self, tmp_path, monkeypatch):
         """Abandoning the wait must not orphan the pool.
@@ -783,7 +831,7 @@ class TestThePhaseAfterTheForksIsBounded:
 
     @staticmethod
     def _started(budget_s):
-        deadline = shard_writer._PostForkDeadline(budget_s)
+        deadline = shard_writer._Deadline(budget_s)
         deadline.start()
         return deadline
 
@@ -855,6 +903,53 @@ class TestThePhaseAfterTheForksIsBounded:
             release.set()
         assert entered.is_set(), "the commit never ran, so the test proved nothing"
         assert elapsed < 30, f"the caller waited {elapsed:.0f}s on a commit it was supposed to abandon"
+
+    def test_a_stuck_teardown_still_kills_the_workers(self, tmp_path, monkeypatch):
+        """Abandoning the teardown must not abandon the pool with it.
+
+        A leaked executor is worse than a leaked thread: `concurrent.futures` joins
+        executor manager threads at interpreter exit, so a run could still hang at the
+        end. A stuck `shutdown` is stuck in a JOIN, so ending the processes is the thing
+        most likely to release it — and it cannot be done by calling `shutdown` again,
+        which would block on the lock the abandoned thread is holding.
+        """
+        monkeypatch.setattr(shard_writer, "POST_FORK_BUDGET_S", 0.2)
+        release = threading.Event()
+
+        class _Proc:
+            def __init__(self):
+                self.terminated = False
+
+            def is_alive(self):
+                return True
+
+            def terminate(self):
+                self.terminated = True
+
+        running = _Proc()
+
+        class _FakeExecutor:
+            def __init__(self, **kwargs):
+                self._processes = {"a": running}
+
+            def submit(self, fn, payload):
+                future: Future = Future()
+                future.set_result((payload["fork"], {}))
+                return future
+
+            def shutdown(self, **kwargs):
+                release.wait(30)  # never returns inside the budget
+
+        monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", _FakeExecutor)
+        store, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        deadline = shard_writer._Deadline(shard_writer.POST_FORK_BUDGET_S)
+        try:
+            with pytest.raises(shard_writer.AssemblyDeadlineError, match="pool teardown"):
+                run_forked(session, lambda p: p, [{"tag": "a"}, {"tag": "b"}], post_fork=deadline)
+            assert running.terminated, "an abandoned teardown must still kill the pool"
+        finally:
+            release.set()
 
     def test_a_healthy_fill_is_not_touched_by_the_bound(self, tmp_path):
         # The bound is live on every fill now, so pin that an ordinary one still lands.

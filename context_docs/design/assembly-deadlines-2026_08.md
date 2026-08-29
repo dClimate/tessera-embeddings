@@ -126,11 +126,20 @@ This budget is a **backstop against a permanently stuck fork phase, not a detect
 is nearly a day long. Nothing is expected to hit it, and if something does, that is a
 finding in its own right.
 
-It is also the cheap one to enforce. It fires inside `_await_forks`, and `run_forked`'s
-existing `except BaseException` handler already terminates the worker processes. Nothing
-a worker wrote is in the store until its fork is merged, so the cost of the kill is
-unreferenced objects that garbage collection reclaims. **No thread is leaked on this
-path.**
+It is also the cheap one to enforce **when the fill uses a process pool**. It fires
+inside `_await_forks`, and `run_forked`'s existing `except BaseException` handler already
+terminates the worker processes. Nothing a worker wrote is in the store until its fork is
+merged, so the cost of the kill is unreferenced objects that garbage collection reclaims.
+No thread is leaked on that path.
+
+**A single-payload fill is the exception.** `partition_round_robin` yields one payload
+for a sparse cell whatever `n_workers` says, and one payload runs in-process — there is
+no worker process to terminate. That case is bounded the same way the post-fork phase is,
+by abandoning a thread, because the alternative is a sparse cell blocking its fill's
+finalizer exactly as the stall this exists for does. It is the cheaper leak of the two:
+the abandoned worker writes into a fork that is never merged, so nothing it produced can
+reach the store. What it keeps that a killed process would not is CPU and object writes,
+against objects nothing references.
 
 ### The post-fork budget
 

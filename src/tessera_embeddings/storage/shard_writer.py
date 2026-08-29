@@ -120,14 +120,16 @@ def fork_phase_budget_s(n_shards: int) -> float:
     return max(FORK_PHASE_FLOOR_S, scaled)
 
 
-class _PostForkDeadline:
-    """The one clock every phase after the forks return must finish inside.
+class _Deadline:
+    """A budget, and the instant it runs out once :meth:`start` marks the phase begun.
 
-    Shared rather than per-call because that phase spans two functions —
-    :func:`run_forked` tears the pool down and merges, :func:`write_year_shards` reads
-    the group and makes both commits — and two independent ceilings would let a fill sit
-    for twice the budget before anyone gave up. :meth:`start` is called at the single
-    moment the phase begins: when the last fork's result is in hand.
+    An object rather than a timeout argument because the post-fork phase spans two
+    functions — :func:`run_forked` tears the pool down and merges,
+    :func:`write_year_shards` reads the group and makes both commits — and two
+    independent ceilings would let a fill sit for twice the budget before anyone gave
+    up. Passing the clock itself is what makes them share one. Starting is separate from
+    construction for the same reason: the post-fork budget begins at a moment only
+    ``run_forked`` can see, with the last fork's result in hand.
     """
 
     __slots__ = ("_at", "budget_s")
@@ -147,7 +149,7 @@ class _PostForkDeadline:
         return max(0.0, self._at - time.monotonic())
 
 
-def _run_before_deadline[T](deadline: _PostForkDeadline | None, fn: Callable[[], T], what: str) -> T:
+def _run_before_deadline[T](deadline: _Deadline | None, fn: Callable[[], T], what: str) -> T:
     """Run ``fn``, and stop WAITING for it once ``deadline`` passes.
 
     ``None`` runs ``fn`` inline and waits forever, which is exactly what every caller
@@ -379,7 +381,14 @@ def _await_forks(
     started = time.monotonic()
     pending: set[Future] = set(futures)
     while pending:
-        done, pending = wait(pending, timeout=progress_interval_s, return_when=FIRST_COMPLETED)
+        # Each wait is capped by what is LEFT of the budget, so the deadline lands when it
+        # falls rather than up to one progress interval later. A phase that FINISHES inside
+        # that overshoot is still a success — the budget exists to stop waiting on work that
+        # will never finish, not to discard work that finished slightly late.
+        timeout = progress_interval_s
+        if budget_s is not None:
+            timeout = min(timeout, max(0.0, budget_s - (time.monotonic() - started)))
+        done, pending = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
         # SURFACE A FAILURE AS SOON AS IT LANDS. A fork dies on a deterministic fault — a
         # corrupt staged tile, a dtype the destination cannot hold — and every other fork
         # is going to hit the same wall or write shards that will be discarded anyway.
@@ -388,7 +397,7 @@ def _await_forks(
         for future in done:
             if future.exception() is not None:
                 future.result()  # re-raises, with the worker's traceback attached
-        if pending and budget_s is not None and time.monotonic() - started > budget_s:
+        if pending and budget_s is not None and time.monotonic() - started >= budget_s:
             raise AssemblyDeadlineError(
                 f"fork-write phase still had {len(pending)}/{len(futures)} {unit} outstanding after "
                 f"{(time.monotonic() - started) / 60.0:.0f} min, past its {budget_s / 60.0:.0f} min budget"
@@ -428,7 +437,7 @@ def run_forked(
     unit: str = "partitions",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     fork_budget_s: float | None = None,
-    post_fork: _PostForkDeadline | None = None,
+    post_fork: _Deadline | None = None,
 ) -> dict[str, Any]:
     """Fork ``session``, run ``worker_fn`` over ``payloads``, merge the forks back.
 
@@ -479,7 +488,21 @@ def run_forked(
         for i, payload in enumerate(payloads)
     ]
     if len(payloads) == 1:
-        results = [worker_fn(payloads[0])]
+        # One payload runs in-process, so there is no worker process to terminate — the
+        # fork budget is enforced the way the post-fork phase is, by abandoning a thread.
+        # It has to be enforced SOMEHOW: a sparse cell partitions to a single payload
+        # whatever `n_workers` says, and an unbudgeted one would block the caller's
+        # finalizer exactly as the stall this exists for does.
+        #
+        # Cheaper to abandon here than after the forks: the worker writes into a fork that
+        # is never merged, so nothing it produced can reach the store. What the process
+        # path buys and this cannot is the KILL — an abandoned thread keeps running and
+        # keeps writing fork objects. They are unreferenced either way.
+        fork_deadline = None
+        if fork_budget_s is not None:
+            fork_deadline = _Deadline(fork_budget_s)
+            fork_deadline.start()
+        results = [_run_before_deadline(fork_deadline, lambda: worker_fn(payloads[0]), "fork-write phase")]
         if post_fork is not None:
             post_fork.start()
     else:
@@ -536,15 +559,24 @@ def run_forked(
         # The post-fork clock starts HERE, with every fork's result in hand and before the
         # teardown, because that is the boundary the observed stall sits behind: the workers
         # had all finished and exited, and nothing after them ever completed.
-        #
-        # OUTSIDE the try above, and it must stay outside. That handler's first act is
-        # `ex.shutdown(...)`, which takes the executor's own shutdown lock — so if a bounded
-        # teardown timed out INSIDE the try, the handler would block on the lock the
-        # abandoned thread still holds, wedging the very thread this exists to free. Every
-        # payload has already returned by here, so there is no queued work left to cancel.
         if post_fork is not None:
             post_fork.start()
-        _run_before_deadline(post_fork, ex.shutdown, "pool teardown")
+        # Snapshot BEFORE the teardown, for the same reason the handler above does it:
+        # `shutdown` sets `_processes = None` unconditionally.
+        procs = list((getattr(ex, "_processes", None) or {}).values())
+        try:
+            _run_before_deadline(post_fork, ex.shutdown, "pool teardown")
+        except AssemblyDeadlineError:
+            # Kill the workers, but do NOT reuse the handler above: its first act is another
+            # `ex.shutdown(...)`, which takes the shutdown lock the abandoned thread is still
+            # holding — that would wedge this thread, the one the budget exists to free. The
+            # terminate is worth doing on its own. A stuck `shutdown` is stuck in a JOIN, so
+            # ending the processes is the thing most likely to release both it and the
+            # executor's manager thread, which `concurrent.futures` joins at interpreter exit.
+            for proc in procs:
+                if proc.is_alive():
+                    proc.terminate()
+            raise
     t_merge = time.monotonic()
     _run_before_deadline(post_fork, lambda: session.merge(*(fork_result for fork_result, _ in results)), "merge")
     done = time.monotonic()
@@ -907,7 +939,7 @@ def write_year_shards(
     # A single cutoff would have to clear the hours and so could never notice the
     # seconds. The rates, the derivation and what is deliberately left outside both
     # budgets are in ``context_docs/design/assembly-deadlines-2026_08.md``.
-    post_fork = _PostForkDeadline(POST_FORK_BUDGET_S)
+    post_fork = _Deadline(POST_FORK_BUDGET_S)
     fill = run_forked(
         session,
         _write_shards_worker,
