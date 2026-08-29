@@ -157,7 +157,7 @@ class _Deadline:
     def remaining_s(self) -> float:
         """Seconds left before the phase overruns its budget; never negative."""
         if self._at is None:
-            raise RuntimeError("post-fork deadline consulted before the forks returned")
+            raise RuntimeError("deadline consulted before its phase was marked begun")
         return max(0.0, self._at - time.monotonic())
 
 
@@ -218,10 +218,14 @@ def _run_under_deadline[T](
     # observe, bought for no chance at all of finishing in time. Only for a step that WOULD
     # be abandoned: one that is going to be waited on regardless may as well run, and
     # failing a cell whose commit would have taken 200 ms is the worse trade.
+    # ONE CLOCK SERVES BOTH PHASES, so neither message below may name one. They are quoted
+    # verbatim into the greppable `ASSEMBLY DEADLINE EXCEEDED` line, and text placing a
+    # fork-phase overrun "after the forks" puts the stall on the wrong side of the boundary
+    # an operator is trying to find. `what` is what says which phase it was.
     if abandonable and remaining <= 0.0:
         raise AssemblyDeadlineError(
-            f"{what} was not started: the {deadline.budget_s:.0f}s budget for the phase after the forks "
-            f"was already spent by an earlier step",
+            f"{what} was not started: its {deadline.budget_s:.0f}s budget was already spent by an "
+            f"earlier step of the same phase",
             abandoned="nothing was started, so nothing of this step is still running",
         )
     box: dict[str, Any] = {}
@@ -246,7 +250,7 @@ def _run_under_deadline[T](
         timeout = remaining
         while not finished.wait(timeout=timeout):
             logger.critical(
-                "ASSEMBLY COMMIT OVERDUE: %s has not returned %.0fs after the forks did. It is NOT "
+                "ASSEMBLY COMMIT OVERDUE: %s has not returned within its %.0fs budget. It is NOT "
                 "abandoned — a commit mutates the published store, and a thread cannot be killed, so "
                 "waiting is the only thing that cannot corrupt the cell. This fill assembles nothing "
                 "further until it returns.",
@@ -256,7 +260,7 @@ def _run_under_deadline[T](
             timeout = deadline.budget_s
     elif not finished.wait(timeout=remaining):
         raise AssemblyDeadlineError(
-            f"{what} had not returned {deadline.budget_s:.0f}s after the forks did, and was abandoned",
+            f"{what} had not returned within its {deadline.budget_s:.0f}s budget, and was abandoned",
             abandoned="the thread running it is leaked, not killed, so it is still running",
         )
     if "error" in box:

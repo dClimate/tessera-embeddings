@@ -798,9 +798,14 @@ class TestTheForkPhaseIsAbandonedOnItsBudget:
                 return object()
 
         try:
-            with pytest.raises(shard_writer.AssemblyDeadlineError, match="session fork"):
+            with pytest.raises(shard_writer.AssemblyDeadlineError, match="session fork") as caught:
                 run_forked(_Session(), lambda p: p, [{"tag": "a"}], fork_budget_s=0.2)
             assert entered.is_set(), "the fork never ran, so the test proved nothing"
+            # One clock serves both phases, and this text is quoted into the greppable
+            # incident line. A fork that never returned must not be reported as having
+            # stalled AFTER the forks — that is the wrong side of the boundary an operator
+            # is trying to find.
+            assert "after the forks" not in str(caught.value)
         finally:
             release.set()
 
