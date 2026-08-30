@@ -55,6 +55,15 @@ _DIFF_NODE_FIELDS = (
 CATCH_UP_STOP_TIMEOUT_S = 30.0
 
 
+class CatchUpAbortedTheWaitError(RuntimeError):
+    """A periodic catch-up failed, so waiting on the remaining forks is pointless.
+
+    Raised only to END THE WAIT. The real cause is the tick's own exception, which
+    :func:`ticking` re-raises when its block exits — this one is what stops an assembly
+    spending another three hours and sixteen workers on a fill that can no longer commit.
+    """
+
+
 class CatchUpDidNotStopError(RuntimeError):
     """The timer thread was still inside a catch-up after being asked to stop.
 
@@ -237,7 +246,12 @@ CATCH_UP_INTERVAL_S = 60.0
 
 
 @contextmanager
-def ticking(interval_s: float, tick: Callable[[], None] | None) -> Iterator[None]:
+def ticking(
+    interval_s: float,
+    tick: Callable[[], None] | None,
+    *,
+    abort: threading.Event | None = None,
+) -> Iterator[None]:
     """Run ``tick`` every ``interval_s`` for the duration of the block.
 
     ONE timer for the whole fork phase, whichever way the payloads run. Hooking the waiting
@@ -248,6 +262,12 @@ def ticking(interval_s: float, tick: Callable[[], None] | None) -> Iterator[None
     **The tick's exceptions are re-raised on the CALLER's thread.** A daemon thread's exception
     is discarded, and one of the things a tick can raise is :class:`CaughtUpPastAConflictError`
     — which must fail the fill rather than vanish.
+
+    ``abort`` is set the moment a tick fails, so a caller that is waiting on hours of work can
+    stop early instead of finishing a fill already known to be uncommittable. Without it the
+    failure only surfaces when this block exits, which for an assembly is up to three hours and
+    sixteen workers' worth of object-store writes later. A caller that cannot be interrupted —
+    one running its payload inline — simply does not pass one.
     """
     if tick is None:
         yield
@@ -261,6 +281,8 @@ def ticking(interval_s: float, tick: Callable[[], None] | None) -> Iterator[None
                 tick()
             except BaseException as exc:  # re-raised on the caller's thread; never swallowed
                 failure.append(exc)
+                if abort is not None:
+                    abort.set()
                 return
 
     ticker = threading.Thread(target=_loop, name="catch-up", daemon=True)

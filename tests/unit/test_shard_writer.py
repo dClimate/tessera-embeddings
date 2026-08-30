@@ -1342,6 +1342,26 @@ class TestRunForkedCatchUp:
         with pytest.raises(session_catch_up.CatchUpDidNotStopError, match="still running"):
             run_forked(session, quick_worker, [{"tag": "only"}], catch_up=never_returns)
 
+    def test_a_failed_catch_up_stops_the_wait_instead_of_finishing_the_fill(self):
+        """A fill already known to be uncommittable must not spend three more hours writing.
+
+        Driven against plain futures because the behaviour under test is the WAITING policy:
+        once something outside the forks has made the fill unsafe, there is no point waiting
+        on them. Returning normally would be worse than raising — the caller would merge
+        forks it must not.
+        """
+        outstanding: Future = Future()
+        abort = threading.Event()
+        threading.Timer(0.05, abort.set).start()
+        threading.Timer(5.0, lambda: outstanding.set_result("never reached")).start()
+        with pytest.raises(session_catch_up.CatchUpAbortedTheWaitError, match="no longer commit"):
+            _await_forks([outstanding], 0.01, abort=abort)
+
+    def test_the_wait_is_unaffected_when_nothing_aborted(self):
+        outstanding: Future = Future()
+        threading.Timer(0.05, lambda: outstanding.set_result("done")).start()
+        assert _await_forks([outstanding], 0.01, abort=threading.Event()) == ["done"]
+
     def test_a_timer_failure_reaches_the_caller(self, tmp_path, monkeypatch):
         """A daemon thread's exception is discarded, and one of these must fail the fill."""
         monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)

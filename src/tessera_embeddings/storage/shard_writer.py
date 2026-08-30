@@ -56,7 +56,12 @@ from tessera_embeddings.config.environment import code_identity, configure_loggi
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage.icechunk_logging import traced_commit
-from tessera_embeddings.storage.session_catch_up import CATCH_UP_INTERVAL_S, catch_up_best_effort, ticking
+from tessera_embeddings.storage.session_catch_up import (
+    CATCH_UP_INTERVAL_S,
+    CatchUpAbortedTheWaitError,
+    catch_up_best_effort,
+    ticking,
+)
 from tessera_embeddings.storage.zarr_store import read_time_values
 from tessera_embeddings.storage.zone_grid import year_of
 
@@ -226,6 +231,7 @@ def _await_forks(
     unit: str = "partitions",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     slots: ctypes.Array[ctypes.c_long] | None = None,
+    abort: threading.Event | None = None,
 ) -> list[Any]:
     """Collect ``futures`` in submission order, logging what is still outstanding.
 
@@ -233,6 +239,11 @@ def _await_forks(
     position is its band and :meth:`icechunk.Session.merge` is given them as the
     caller's payloads were ordered. Re-raises the first failure in that same order,
     matching what ``Executor.map`` would have done.
+
+    ``abort``, when set, ends the wait early. Unlike a housekeeping hook this IS a waiting
+    concern: it answers "is there any point still waiting?". The forks' own failures already
+    stop the wait; this covers the case where something outside them has made the fill
+    uncommittable, so the writes still running are known to be wasted.
 
     ``unit`` is the caller's name for one payload. What a payload holds is the
     caller's decision (northing bands for one, round-robin tile partitions for
@@ -246,6 +257,10 @@ def _await_forks(
     pending: set[Future] = set(futures)
     while pending:
         done, pending = wait(pending, timeout=progress_interval_s, return_when=FIRST_COMPLETED)
+        if abort is not None and abort.is_set():
+            # The caller will raise the real cause; this only stops the waiting. Returning
+            # instead would look like success, and the fill would merge forks it must not.
+            raise CatchUpAbortedTheWaitError("a periodic catch-up failed, so this fill can no longer commit safely")
         # SURFACE A FAILURE AS SOON AS IT LANDS. A fork dies on a deterministic fault — a
         # corrupt staged tile, a dtype the destination cannot hold — and every other fork
         # is going to hit the same wall or write shards that will be discarded anyway.
@@ -352,7 +367,8 @@ def run_forked(
             catch_ups[outcome] += 1
 
     # ONE timer around the whole fork phase, so BOTH paths get the periodic catch-up.
-    with ticking(CATCH_UP_INTERVAL_S, _tick if catch_up is not None else None):
+    abort = threading.Event()
+    with ticking(CATCH_UP_INTERVAL_S, _tick if catch_up is not None else None, abort=abort):
         if len(payloads) == 1:
             results = [worker_fn(payloads[0])]
         else:
@@ -371,7 +387,7 @@ def run_forked(
             )
             try:
                 futures = [ex.submit(worker_fn, payload) for payload in payloads]
-                results = _await_forks(futures, progress_interval_s, unit=unit, log=log, slots=slots)
+                results = _await_forks(futures, progress_interval_s, unit=unit, log=log, slots=slots, abort=abort)
             except BaseException:
                 # Cancel what has not started, then TERMINATE what has. `cancel_futures` only
                 # reaches queued work, so without the second step a multi-hour shard writer keeps
