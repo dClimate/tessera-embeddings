@@ -266,8 +266,13 @@ def ticking(
     ``abort`` is set the moment a tick fails, so a caller that is waiting on hours of work can
     stop early instead of finishing a fill already known to be uncommittable. Without it the
     failure only surfaces when this block exits, which for an assembly is up to three hours and
-    sixteen workers' worth of object-store writes later. A caller that cannot be interrupted —
-    one running its payload inline — simply does not pass one.
+    sixteen workers' worth of object-store writes later.
+
+    **Only a caller that can act on it will.** ``run_forked`` always passes one, but its
+    single-payload branch runs the worker inline and never looks at it — that branch is a
+    one-shard cell or ``n_workers=1``, a short write by construction, so the abort would arrive
+    at a fill about to end anyway. Interrupting it would need a second cancellation mechanism
+    for the synchronous branch, which is not worth carrying for that case.
     """
     if tick is None:
         yield
