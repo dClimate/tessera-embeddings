@@ -11,6 +11,25 @@ session has fallen behind the branch. The full incident record — traces, threa
 socket evidence and the eliminations — is in yield-embeddings,
 `context_docs/crash-recovery/assembly-stalls-before-commit-2026-08-29.md`.
 
+## A third confirmation, from production, unprompted
+
+At 05:04Z on 2026-08-30 — while this fix was being written, with seven assemblies still stalled
+from the 22:30 batch — a NEW cell published: 50N/2017. Its trace shows why:
+
+```
+05:04:43.496  INFO icechunk::session: Commit started, old_snapshot_id: GH5GAHTPF2TS1QFRGHZ0
+05:04:44.086  INFO icechunk::session: Commit done
+```
+
+`GH5GAHTPF2TS1QFRGHZ0` was the branch TIP — 32N/2018's completion mark from 01:39Z. So this
+session was **zero snapshots behind**: no "Branch tip has changed", no rebase, no `list_nodes`,
+no `fetch_snapshot`. Both its commits landed in 0.6 seconds total.
+
+Three independent confirmations now, none of them arranged: depth 0 and 2 publish in about a
+second, depth 4 stalls indefinitely. This one is the most valuable because nobody set it up —
+the campaign produced it on its own, on the same store, in the same hour that seven cells sat
+wedged.
+
 ## The trigger, in one line
 
 A fill opens its session, forks it, writes for about three hours, then commits. Every cell that
