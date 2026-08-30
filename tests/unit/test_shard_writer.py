@@ -18,7 +18,13 @@ import zarr
 from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, DRILL_EXIT_STATUS, FaultInjection
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.inference import assembly
-from tessera_embeddings.storage import global_store, icechunk_logging, shard_writer, zarr_store
+from tessera_embeddings.storage import (
+    global_store,
+    icechunk_logging,
+    session_catch_up,
+    shard_writer,
+    zarr_store,
+)
 from tessera_embeddings.storage.icechunk_logging import COMMIT_LOG_FILTER, commit_tracing
 from tessera_embeddings.storage.shard_writer import (
     PhaseTimer,
@@ -954,29 +960,29 @@ class TestDiffTouches:
     """Which changes count as "somebody else wrote our cell"."""
 
     def test_a_chunk_write_inside_the_group_is_seen(self):
-        assert shard_writer._diff_touches(_FakeDiff(chunks=["/01N/embeddings"]), "01N")
+        assert session_catch_up._diff_touches(_FakeDiff(chunks=["/01N/embeddings"]), "01N")
 
     def test_a_group_attribute_change_is_seen(self):
         # `mark <zone> year N complete` writes group attrs and no chunks at all, so a
         # chunks-only test would wave through the second of every cell's two commits.
-        assert shard_writer._diff_touches(_FakeDiff(groups=["/01N"]), "01N")
+        assert session_catch_up._diff_touches(_FakeDiff(groups=["/01N"]), "01N")
 
     def test_a_new_array_inside_the_group_is_seen(self):
-        assert shard_writer._diff_touches(_FakeDiff(arrays=["/01N/extra"]), "01N")
+        assert session_catch_up._diff_touches(_FakeDiff(arrays=["/01N/extra"]), "01N")
 
     def test_another_zone_is_not_our_business(self):
-        assert not shard_writer._diff_touches(_FakeDiff(chunks=["/01S/embeddings"]), "01N")
+        assert not session_catch_up._diff_touches(_FakeDiff(chunks=["/01S/embeddings"]), "01N")
 
     def test_an_empty_diff_touches_nothing(self):
-        assert not shard_writer._diff_touches(_FakeDiff(), "01N")
+        assert not session_catch_up._diff_touches(_FakeDiff(), "01N")
 
     def test_a_rename_of_our_own_array_is_seen(self):
         # A rename populates `moved_nodes` and NOTHING else — verified against a real repo —
         # so a guard reading the other seven fields waves it through.
-        assert shard_writer._diff_touches(_FakeDiff(moved=[("/01N/embeddings", "/01N/emb2")]), "01N")
+        assert session_catch_up._diff_touches(_FakeDiff(moved=[("/01N/embeddings", "/01N/emb2")]), "01N")
 
     def test_a_rename_into_our_group_is_seen(self):
-        assert shard_writer._diff_touches(_FakeDiff(moved=[("/01S/embeddings", "/01N/stolen")]), "01N")
+        assert session_catch_up._diff_touches(_FakeDiff(moved=[("/01S/embeddings", "/01N/stolen")]), "01N")
 
     def test_the_stub_carries_every_member_of_the_real_diff(self):
         """A stub missing a field cannot fail on that field, which is how one got missed.
@@ -991,7 +997,7 @@ class TestDiffTouches:
         # "/01N2/..." starts with "01N" as a STRING but is a different zone. Matching on a
         # bare prefix would block every catch-up behind an unrelated neighbour, which fails
         # in the safe direction but disables the fix — worth pinning either way.
-        assert not shard_writer._diff_touches(_FakeDiff(chunks=["/01N2/embeddings"]), "01N")
+        assert not session_catch_up._diff_touches(_FakeDiff(chunks=["/01N2/embeddings"]), "01N")
 
 
 class TestCatchUpToBranch:
@@ -1011,14 +1017,14 @@ class TestCatchUpToBranch:
     def test_nothing_to_do_when_already_at_the_tip(self, tmp_path):
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
-        assert shard_writer.catch_up_to_branch(repo, session, "01N") == "current"
+        assert session_catch_up.catch_up_to_branch(repo, session, "01N") == "current"
 
     def test_advances_past_a_commit_to_another_zone(self, tmp_path):
         _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
         session = repo.writable_session("main")
         base = session.snapshot_id
         tip = self._commit_to(repo, "01S", 7)
-        assert shard_writer.catch_up_to_branch(repo, session, "01N") == "advanced"
+        assert session_catch_up.catch_up_to_branch(repo, session, "01N") == "advanced"
         assert session.snapshot_id == tip != base
 
     def test_refuses_to_skip_a_commit_that_touched_our_own_zone(self, tmp_path):
@@ -1026,7 +1032,7 @@ class TestCatchUpToBranch:
         session = repo.writable_session("main")
         base = session.snapshot_id
         self._commit_to(repo, "01N", 7)
-        assert shard_writer.catch_up_to_branch(repo, session, "01N") == "blocked"
+        assert session_catch_up.catch_up_to_branch(repo, session, "01N") == "blocked"
         assert session.snapshot_id == base, "a blocked catch-up must leave the base alone"
 
     def test_a_blocked_catch_up_leaves_the_collision_for_the_commit_to_raise(self, tmp_path):
@@ -1046,7 +1052,7 @@ class TestCatchUpToBranch:
         # past a competing writer without noticing. Writing to the session first would make
         # `rebase` raise for a different reason and the test would pass without testing this.
         self._commit_to(repo, "01N", 7)  # a competing writer lands on OUR zone
-        assert shard_writer.catch_up_to_branch(repo, session, "01N") == "blocked"
+        assert session_catch_up.catch_up_to_branch(repo, session, "01N") == "blocked"
 
         # ...and only now does the write arrive, as the merge would deliver it.
         node = zarr.open_group(session.store, mode="a")
@@ -1061,7 +1067,7 @@ class TestCatchUpToBranch:
         session = repo.writable_session("main")
         for value in (1, 2, 3):
             tip = self._commit_to(repo, "01S", value)
-            assert shard_writer.catch_up_to_branch(repo, session, "01N") == "advanced"
+            assert session_catch_up.catch_up_to_branch(repo, session, "01N") == "advanced"
             assert session.snapshot_id == tip
 
 
@@ -1087,8 +1093,8 @@ class TestCatchUpRaceAndBestEffort:
             return real_rebase(self, solver)
 
         monkeypatch.setattr(type(session), "rebase", rebase_with_a_latecomer)
-        with pytest.raises(shard_writer.CaughtUpPastAConflictError, match="01N"):
-            shard_writer.catch_up_to_branch(repo, session, "01N")
+        with pytest.raises(session_catch_up.CaughtUpPastAConflictError, match="01N"):
+            session_catch_up.catch_up_to_branch(repo, session, "01N")
 
     def test_best_effort_turns_a_failure_into_a_tally_entry(self, tmp_path, monkeypatch):
         # A rename anywhere in the store makes `rebase` raise even on an empty session, and a
@@ -1096,9 +1102,9 @@ class TestCatchUpRaceAndBestEffort:
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
         monkeypatch.setattr(
-            shard_writer, "catch_up_to_branch", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("s3 hiccup"))
+            session_catch_up, "catch_up_to_branch", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("s3 hiccup"))
         )
-        assert shard_writer.catch_up_best_effort(repo, session, "01N") == "failed"
+        assert session_catch_up.catch_up_best_effort(repo, session, "01N") == "failed"
 
     def test_a_failure_after_the_base_moved_is_not_best_effort(self, tmp_path, monkeypatch):
         """The rule is whether the base moved, NOT which exception was raised.
@@ -1118,9 +1124,9 @@ class TestCatchUpRaceAndBestEffort:
             session.rebase(icechunk.ConflictDetector())  # the base really moves
             raise RuntimeError("storage failed during the post-rebase check")
 
-        monkeypatch.setattr(shard_writer, "catch_up_to_branch", advance_then_fail)
-        with pytest.raises(shard_writer.CaughtUpPastAConflictError, match="never checked"):
-            shard_writer.catch_up_best_effort(repo, session, "01N")
+        monkeypatch.setattr(session_catch_up, "catch_up_to_branch", advance_then_fail)
+        with pytest.raises(session_catch_up.CaughtUpPastAConflictError, match="never checked"):
+            session_catch_up.catch_up_best_effort(repo, session, "01N")
         assert session.snapshot_id != before, "the test did not actually move the base"
 
     def test_best_effort_still_lets_the_unsafe_one_through(self, tmp_path, monkeypatch):
@@ -1129,11 +1135,11 @@ class TestCatchUpRaceAndBestEffort:
         session = repo.writable_session("main")
 
         def unsafe(*a, **k):
-            raise shard_writer.CaughtUpPastAConflictError("advanced past a conflict")
+            raise session_catch_up.CaughtUpPastAConflictError("advanced past a conflict")
 
-        monkeypatch.setattr(shard_writer, "catch_up_to_branch", unsafe)
-        with pytest.raises(shard_writer.CaughtUpPastAConflictError):
-            shard_writer.catch_up_best_effort(repo, session, "01N")
+        monkeypatch.setattr(session_catch_up, "catch_up_to_branch", unsafe)
+        with pytest.raises(session_catch_up.CaughtUpPastAConflictError):
+            session_catch_up.catch_up_best_effort(repo, session, "01N")
 
 
 class TestTheCatchUpIsActuallyWiredIn:
@@ -1151,7 +1157,7 @@ class TestTheCatchUpIsActuallyWiredIn:
             calls.append((repo_arg, session_arg, group_arg))
             return "current"
 
-        monkeypatch.setattr(shard_writer, "catch_up_to_branch", recording)
+        monkeypatch.setattr(session_catch_up, "catch_up_to_branch", recording)
         write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
         assert calls, "write_year_shards never asked for a catch-up"
         seen_repo, seen_session, seen_group = calls[0]
@@ -1170,7 +1176,7 @@ class TestTheCatchUpIsActuallyWiredIn:
         session = repo.writable_session("main")
         TestCatchUpToBranch._commit_to(repo, "01N", 7)  # ours, and now not the newest
         TestCatchUpToBranch._commit_to(repo, "01S", 8)  # someone else's, newest
-        assert shard_writer.catch_up_to_branch(repo, session, "01N") == "blocked"
+        assert session_catch_up.catch_up_to_branch(repo, session, "01N") == "blocked"
 
     def test_every_enumerated_diff_field_exists_on_a_real_diff(self, tmp_path):
         """The enumeration IS the guard's coverage.
@@ -1188,8 +1194,8 @@ class TestTheCatchUpIsActuallyWiredIn:
         # not someone shortening the tuple, which is the likelier accident and the one that
         # narrows the guard in silence.
         handled_separately = {"updated_chunks", "moved_nodes"}
-        assert set(shard_writer._DIFF_NODE_FIELDS) | handled_separately == members, (
-            f"the guard covers {set(shard_writer._DIFF_NODE_FIELDS) | handled_separately} "
+        assert set(session_catch_up._DIFF_NODE_FIELDS) | handled_separately == members, (
+            f"the guard covers {set(session_catch_up._DIFF_NODE_FIELDS) | handled_separately} "
             f"but icechunk.Diff has {members}"
         )
 
@@ -1209,7 +1215,7 @@ class TestTheCatchUpIsActuallyWiredIn:
             "rebase",
             lambda self, solver: (seen.append(solver), real_rebase(self, solver))[1],
         )
-        shard_writer.catch_up_to_branch(repo, session, "01N")
+        session_catch_up.catch_up_to_branch(repo, session, "01N")
         assert isinstance(seen[0], icechunk.ConflictDetector), f"rebased with {type(seen[0])}"
 
 
@@ -1327,10 +1333,10 @@ class TestRunForkedCatchUp:
         def boom_once() -> str:
             calls.append(1)
             if len(calls) == 1:
-                raise shard_writer.CaughtUpPastAConflictError("crossed an unvetted commit")
+                raise session_catch_up.CaughtUpPastAConflictError("crossed an unvetted commit")
             return "current"
 
-        with pytest.raises(shard_writer.CaughtUpPastAConflictError, match="unvetted"):
+        with pytest.raises(session_catch_up.CaughtUpPastAConflictError, match="unvetted"):
             run_forked(session, slow_worker, [{"tag": "only"}], catch_up=boom_once)
 
     def test_a_failing_catch_up_is_not_swallowed(self, tmp_path):

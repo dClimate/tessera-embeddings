@@ -271,3 +271,24 @@ The control fleet reached depth 7 and still committed normally, as did every sin
 arm up to depth 16. The harness reproduces the *condition*, never the *failure*. Anyone reading
 this as "reproduced in miniature, therefore proven" would be overstating it — what is proven in
 miniature is that the fix removes the condition without breaking anything.
+
+
+## Where the code lives, and why it is its own module
+
+`storage/session_catch_up.py`. The feature was written inside `shard_writer.py` and taken out
+once the review rounds made its shape clear: a constant, an error type, a predicate, the
+operation, a safety wrapper and a timer — 220 lines with one invariant between them, sitting in
+a 1,035-line module about writing shards.
+
+**The invariant, stated once in that module's docstring:** a session's base may only move past
+commits that have been checked against the group being written, and it must never be left moved
+without that check having happened.
+
+Every review finding so far has been an attack on exactly that sentence — the diff/rebase race
+crosses commits without checking them; the type-keyed error handler left the base moved after a
+failed check; the missing `moved_nodes` field made a check incomplete. Putting them in one file
+under one stated invariant is what makes the next such finding land somewhere obvious.
+
+`shard_writer` keeps only the wiring: build the callback, wrap the fork phase in the timer, tick
+once more before the merge, and report the tally. `_await_forks` went back to being a waiting
+helper with no housekeeping hook at all.
