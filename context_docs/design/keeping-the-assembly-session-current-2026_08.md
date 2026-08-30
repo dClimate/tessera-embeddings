@@ -110,3 +110,34 @@ tick report `blocked`. That is safe — it is exactly today's behaviour — but 
 mechanism switches off for the rest of that fill. Advancing to the last snapshot before the
 offending commit would keep most of the benefit and is not possible today, because `rebase`
 accepts no target snapshot. That is a second reason to want the upstream fix.
+
+## A second review, of the tests rather than the code
+
+The tests were then reviewed the same way — by mutating the source thirty times and checking
+which tests noticed. Four of them noticed nothing, and the pattern is worth keeping.
+
+**The mechanism was not connected to anything a test looked at.** Deleting the `catch_up=`
+argument from the single production call site passed the entire suite. Every test of the
+catch-up exercised a function that, as far as the suite was concerned, need never be called.
+There is now a test that drives `write_year_shards` and asserts it asks for a catch-up with
+its own repository, session and group.
+
+**The ordering test could not detect the inversion it forbade.** It asserted
+`has_uncommitted_changes is False` at catch-up time — but that is `False` under BOTH orderings
+when the worker hands back an untouched fork, so moving the final tick after the merge left it
+green. It now records the order of the two calls directly.
+
+**No test had more than one commit in the gap.** Every catch-up test created exactly one
+intervening snapshot, so a guard inspecting only the newest commit looked correct. Production
+is explicitly multi-commit — the depths measured above are 4, 8 and 16 — so there is now a
+test where the offending commit is the older of two.
+
+**Four of the six enumerated `Diff` fields were unpinned**, and the conflict solver was not
+pinned at all: swapping `ConflictDetector` for `BasicConflictSolver` — which would resolve a
+collision silently, the exact failure being guarded against — passed everything. Both are now
+asserted, the field list by equality against a real `Diff` so that shortening it fails too.
+
+**The lesson worth carrying.** Every one of these tests passed, was readable, and named the
+right property in its docstring. What they lacked was an oracle that could move: an assertion
+whose value differs between the correct and the broken implementation. Mutating the source and
+watching which tests go red is cheap, and it is the only thing that establishes that.

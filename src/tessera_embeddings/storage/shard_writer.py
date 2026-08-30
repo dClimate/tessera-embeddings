@@ -217,6 +217,20 @@ def report_shard_progress(worker_index: int, done: int, total: int) -> None:
     _PROGRESS_SLOTS[2 * worker_index + 1] = total
 
 
+#: The members of :class:`icechunk.Diff` that name NODES. Module-level so a test can assert the
+#: list against a real diff — the enumeration is the guard's coverage, and an entry that
+#: silently stopped existing would narrow what is checked with nothing to notice it.
+#: ``updated_chunks`` and ``moved_nodes`` are shaped differently and are read separately.
+_DIFF_NODE_FIELDS = (
+    "new_groups",
+    "updated_groups",
+    "deleted_groups",
+    "new_arrays",
+    "updated_arrays",
+    "deleted_arrays",
+)
+
+
 class CaughtUpPastAConflictError(RuntimeError):
     """A catch-up advanced past a commit that had touched this group, so the eventual commit
     can no longer detect a collision with it.
@@ -248,7 +262,7 @@ def _diff_touches(diff: icechunk.Diff, group: str) -> bool:
     # wrong twice over: it hid the omission of `moved_nodes` below, and a future icechunk that
     # renamed a field would silently stop checking that whole class of change rather than
     # raising. Degrading in the unsafe direction is the one thing this must not do.
-    for attr in ("new_groups", "updated_groups", "deleted_groups", "new_arrays", "updated_arrays", "deleted_arrays"):
+    for attr in _DIFF_NODE_FIELDS:
         paths |= {str(node) for node in getattr(diff, attr)}
     paths |= {str(node) for node in diff.updated_chunks}
     # A rename populates `moved_nodes` and NOTHING else — no chunks, no arrays, no groups — so
