@@ -711,6 +711,23 @@ S3 request cap in force, and object/byte counts, so throughput rates derive from
 record alone. Field-by-field meaning lives on `assembly._assembly_summary_line`; keep the
 keys stable or update the parsers in the same change.
 
+A global fill also carries **`catch_ups`**, a tally of what
+`shard_writer.catch_up_to_branch` did while the forks were writing — `advanced` (the
+session moved up to the branch tip), `current` (it was already there), `blocked` (another
+writer had touched this zone, so the base was deliberately left behind for the commit's own
+rebase to compare against), and `failed` (the catch-up could not run; harmless, since the
+commit's own rebase is the correctness mechanism). It is reported because a healthy commit
+looks identical whether the session was kept current or simply got lucky, so the tally is the
+only evidence the mechanism ran.
+
+**A `blocked` tally counts ticks, not rival commits, and it latches.** The range it checks
+runs from the session's base to the tip, and the base stops moving once anything is blocking,
+so a *single* same-zone commit early in a fill makes every remaining tick report `blocked`
+too. Read a run of them as "one or more same-zone writers, from the first blocked tick
+onward", not as a count of collisions — and note that the fill is then back to today's
+behaviour and exposed to the stall that
+`context_docs/design/keeping-the-assembly-session-current-2026_08.md` describes.
+
 The **campaign land mask** is not a pixel ROI but a per-zone *coverage bitmap*
 (`tile_live_2048`) built from the partner's delivery registry by
 `ingest/land_mask.py` and the `build-land-mask-coverage` flow (ADR-010). v1.1 tiles are

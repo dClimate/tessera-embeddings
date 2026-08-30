@@ -17,7 +17,14 @@ import zarr
 
 from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, DRILL_EXIT_STATUS, FaultInjection
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
-from tessera_embeddings.storage import global_store, icechunk_logging, shard_writer, zarr_store
+from tessera_embeddings.inference import assembly
+from tessera_embeddings.storage import (
+    global_store,
+    icechunk_logging,
+    session_catch_up,
+    shard_writer,
+    zarr_store,
+)
 from tessera_embeddings.storage.icechunk_logging import COMMIT_LOG_FILTER, commit_tracing
 from tessera_embeddings.storage.shard_writer import (
     PhaseTimer,
@@ -925,3 +932,453 @@ class TestTheStalledCommitAlarm:
             icechunk_logging.traced_commit(_SlowSession(0.4), "stuck")
         assert state["failed"], "the first emission was meant to fail"
         assert [r for r in caplog.records if "STALLED" in r.getMessage()], "the alarm died on one failure"
+
+
+class _FakeDiff:
+    """A duck-typed :class:`icechunk.Diff` for the pure-function cases.
+
+    Used ONLY for :func:`_diff_touches`, which is a predicate over path strings and has no
+    icechunk behaviour to get wrong. Everything about `catch_up_to_branch` is exercised
+    against a real repository below, because a stub of the thing under test cannot falsify it.
+    """
+
+    def __init__(self, *, chunks=(), groups=(), arrays=(), moved=()):
+        self.updated_chunks = {p: [[0, 0, 0]] for p in chunks}
+        self.updated_groups = set(groups)
+        self.new_groups = set()
+        self.deleted_groups = set()
+        self.new_arrays = set(arrays)
+        self.updated_arrays = set()
+        self.deleted_arrays = set()
+        # EIGHT members, matching icechunk.Diff exactly. The stub used to have seven, which is
+        # precisely how `moved_nodes` went unchecked in the code as well — a stub that is a
+        # subset of the real type makes an incomplete guard look complete.
+        self.moved_nodes = list(moved)
+
+
+class TestDiffTouches:
+    """Which changes count as "somebody else wrote our cell"."""
+
+    def test_a_chunk_write_inside_the_group_is_seen(self):
+        assert session_catch_up._diff_touches(_FakeDiff(chunks=["/01N/embeddings"]), "01N")
+
+    def test_a_group_attribute_change_is_seen(self):
+        # `mark <zone> year N complete` writes group attrs and no chunks at all, so a
+        # chunks-only test would wave through the second of every cell's two commits.
+        assert session_catch_up._diff_touches(_FakeDiff(groups=["/01N"]), "01N")
+
+    def test_a_new_array_inside_the_group_is_seen(self):
+        assert session_catch_up._diff_touches(_FakeDiff(arrays=["/01N/extra"]), "01N")
+
+    def test_another_zone_is_not_our_business(self):
+        assert not session_catch_up._diff_touches(_FakeDiff(chunks=["/01S/embeddings"]), "01N")
+
+    def test_an_empty_diff_touches_nothing(self):
+        assert not session_catch_up._diff_touches(_FakeDiff(), "01N")
+
+    def test_a_rename_of_our_own_array_is_seen(self):
+        # A rename populates `moved_nodes` and NOTHING else — verified against a real repo —
+        # so a guard reading the other seven fields waves it through.
+        assert session_catch_up._diff_touches(_FakeDiff(moved=[("/01N/embeddings", "/01N/emb2")]), "01N")
+
+    def test_a_rename_into_our_group_is_seen(self):
+        assert session_catch_up._diff_touches(_FakeDiff(moved=[("/01S/embeddings", "/01N/stolen")]), "01N")
+
+    def test_the_stub_carries_every_member_of_the_real_diff(self):
+        """A stub missing a field cannot fail on that field, which is how one got missed.
+
+        Pins the stub to `icechunk.Diff` so adding a member upstream breaks this rather than
+        quietly shrinking what the guard is tested against.
+        """
+        real = {a for a in dir(icechunk.Diff) if not a.startswith("_") and a != "is_empty"}
+        assert real <= set(vars(_FakeDiff(chunks=["/x/y"]))), f"stub is missing {real - set(vars(_FakeDiff()))}"
+
+    def test_a_group_whose_name_merely_starts_with_ours_is_not_ours(self):
+        # "/01N2/..." starts with "01N" as a STRING but is a different zone. Matching on a
+        # bare prefix would block every catch-up behind an unrelated neighbour, which fails
+        # in the safe direction but disables the fix — worth pinning either way.
+        assert not session_catch_up._diff_touches(_FakeDiff(chunks=["/01N2/embeddings"]), "01N")
+
+
+class TestCatchUpToBranch:
+    """Keeping an idle coordinator session current — and refusing to when that would hide a conflict.
+
+    Against a real repository, because the whole question is what icechunk does with a session
+    whose base has moved while its forks were outstanding.
+    """
+
+    @staticmethod
+    def _commit_to(repo, group, value):
+        session = repo.writable_session("main")
+        node = zarr.open_group(session.store, mode="a")
+        node[group]["embeddings"][0, 0:_CHUNK, 0:_CHUNK, :] = value
+        return session.commit(f"fill {group}")
+
+    def test_nothing_to_do_when_already_at_the_tip(self, tmp_path):
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        assert session_catch_up.catch_up_to_branch(repo, session, "01N") == "current"
+
+    def test_advances_past_a_commit_to_another_zone(self, tmp_path):
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+        base = session.snapshot_id
+        tip = self._commit_to(repo, "01S", 7)
+        assert session_catch_up.catch_up_to_branch(repo, session, "01N") == "advanced"
+        assert session.snapshot_id == tip != base
+
+    def test_refuses_to_skip_a_commit_that_touched_our_own_zone(self, tmp_path):
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+        base = session.snapshot_id
+        self._commit_to(repo, "01N", 7)
+        assert session_catch_up.catch_up_to_branch(repo, session, "01N") == "blocked"
+        assert session.snapshot_id == base, "a blocked catch-up must leave the base alone"
+
+    def test_a_blocked_catch_up_leaves_the_collision_for_the_commit_to_raise(self, tmp_path):
+        """THE SAFETY PROPERTY, and the reason the guard exists.
+
+        Moving the base past a commit is also a decision to stop checking it for conflicts.
+        A catch-up without the guard sails past a competing writer and then overwrites it in
+        silence; with the guard the commit still sees it and refuses, which is what icechunk
+        does today and what must not regress.
+        """
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+
+        # ORDER MATTERS, and matching production is the whole point. During the fork phase
+        # the coordinator's session is EMPTY — the forks have not been merged — so the
+        # catch-up runs with nothing to compare, which is exactly why an unguarded one sails
+        # past a competing writer without noticing. Writing to the session first would make
+        # `rebase` raise for a different reason and the test would pass without testing this.
+        self._commit_to(repo, "01N", 7)  # a competing writer lands on OUR zone
+        assert session_catch_up.catch_up_to_branch(repo, session, "01N") == "blocked"
+
+        # ...and only now does the write arrive, as the merge would deliver it.
+        node = zarr.open_group(session.store, mode="a")
+        node["01N"]["embeddings"][0, 0:_CHUNK, 0:_CHUNK, :] = 3
+        with pytest.raises(icechunk.RebaseFailedError):
+            session.commit("fill 01N", rebase_with=icechunk.ConflictDetector())
+
+    def test_repeated_catch_ups_keep_the_gap_at_zero(self, tmp_path):
+        # The point of running it on a timer rather than once: after each unrelated commit
+        # the session is back at the tip, so no single catch-up ever walks far.
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+        for value in (1, 2, 3):
+            tip = self._commit_to(repo, "01S", value)
+            assert session_catch_up.catch_up_to_branch(repo, session, "01N") == "advanced"
+            assert session.snapshot_id == tip
+
+
+class TestCatchUpRaceAndBestEffort:
+    """The two things that decide whether this is safe to run unattended for hours."""
+
+    def test_advancing_past_an_unvetted_conflicting_commit_raises(self, tmp_path, monkeypatch):
+        """`rebase` takes no target snapshot, so it lands on whatever the tip is when it runs.
+
+        A commit that arrives between the diff check and the rebase is skipped without being
+        vetted. It cannot be undone — an empty session's rebase never raises whatever it walks
+        over — so the only correct outcome is to notice and fail loudly. Simulated by landing
+        the competing commit inside the rebase call itself, which is exactly the window.
+        """
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+        TestCatchUpToBranch._commit_to(repo, "01S", 1)  # vetted as clean
+
+        real_rebase = type(session).rebase
+
+        def rebase_with_a_latecomer(self, solver):
+            TestCatchUpToBranch._commit_to(repo, "01N", 9)  # slips into the window
+            return real_rebase(self, solver)
+
+        monkeypatch.setattr(type(session), "rebase", rebase_with_a_latecomer)
+        with pytest.raises(session_catch_up.CaughtUpPastAConflictError, match="01N"):
+            session_catch_up.catch_up_to_branch(repo, session, "01N")
+
+    def test_best_effort_turns_a_failure_into_a_tally_entry(self, tmp_path, monkeypatch):
+        # A rename anywhere in the store makes `rebase` raise even on an empty session, and a
+        # reset branch makes `diff` raise. Neither may cost a three-hour fill.
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        monkeypatch.setattr(
+            session_catch_up, "catch_up_to_branch", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("s3 hiccup"))
+        )
+        assert session_catch_up.catch_up_best_effort(repo, session, "01N") == "failed"
+
+    def test_a_failure_after_the_base_moved_is_not_best_effort(self, tmp_path, monkeypatch):
+        """The rule is whether the base moved, NOT which exception was raised.
+
+        `rebase` advances incrementally and can leave the session advanced when a later step
+        throws, and the post-rebase verification is itself a network call. A handler keyed on
+        exception type therefore swallows exactly the case that matters: commits crossed
+        without being vetted, then forks merged onto that base, putting a same-group collision
+        beyond the commit's conflict detection.
+        """
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+        TestCatchUpToBranch._commit_to(repo, "01S", 1)
+        before = session.snapshot_id
+
+        def advance_then_fail(*args, **kwargs):
+            session.rebase(icechunk.ConflictDetector())  # the base really moves
+            raise RuntimeError("storage failed during the post-rebase check")
+
+        monkeypatch.setattr(session_catch_up, "catch_up_to_branch", advance_then_fail)
+        with pytest.raises(session_catch_up.CaughtUpPastAConflictError, match="never checked"):
+            session_catch_up.catch_up_best_effort(repo, session, "01N")
+        assert session.snapshot_id != before, "the test did not actually move the base"
+
+    def test_best_effort_still_lets_the_unsafe_one_through(self, tmp_path, monkeypatch):
+        """The one exception that must NOT be swallowed, or the guard is decorative."""
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+
+        def unsafe(*a, **k):
+            raise session_catch_up.CaughtUpPastAConflictError("advanced past a conflict")
+
+        monkeypatch.setattr(session_catch_up, "catch_up_to_branch", unsafe)
+        with pytest.raises(session_catch_up.CaughtUpPastAConflictError):
+            session_catch_up.catch_up_best_effort(repo, session, "01N")
+
+
+class TestTheCatchUpIsActuallyWiredIn:
+    """Without this, every other test here describes a function nothing calls.
+
+    Deleting the `catch_up=` argument from the one production call site passed the entire
+    3,600-test suite. A mechanism can be perfectly tested and completely disconnected.
+    """
+
+    def test_write_year_shards_asks_for_a_catch_up_on_its_own_repo_session_and_group(self, tmp_path, monkeypatch):
+        # The timer is the ONLY caller now — there is no final synchronous catch-up — so the
+        # interval has to be short enough to fire inside this small fill.
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.005)
+        _, repo = _seed(tmp_path)
+        calls: list[tuple] = []
+
+        def recording(repo_arg, session_arg, group_arg, **kwargs):
+            calls.append((repo_arg, session_arg, group_arg))
+            return "current"
+
+        monkeypatch.setattr(session_catch_up, "catch_up_to_branch", recording)
+        write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
+        assert calls, "write_year_shards never asked for a catch-up"
+        seen_repo, seen_session, seen_group = calls[0]
+        assert seen_repo is repo
+        assert seen_group == "01N"
+        assert isinstance(seen_session, icechunk.Session)
+
+    def test_the_guard_is_asked_about_the_whole_gap_not_just_the_newest_commit(self, tmp_path):
+        """Production is explicitly multi-commit — depths of 4, 8 and 16 were measured.
+
+        Every other catch-up test creates exactly one intervening snapshot, so a guard that
+        inspected only the most recent commit would look correct. Here the offending commit is
+        the OLDER of two.
+        """
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+        TestCatchUpToBranch._commit_to(repo, "01N", 7)  # ours, and now not the newest
+        TestCatchUpToBranch._commit_to(repo, "01S", 8)  # someone else's, newest
+        assert session_catch_up.catch_up_to_branch(repo, session, "01N") == "blocked"
+
+    def test_every_enumerated_diff_field_exists_on_a_real_diff(self, tmp_path):
+        """The enumeration IS the guard's coverage.
+
+        Four of the six node fields have no stub test of their own, so dropping them from the
+        tuple changes nothing any test sees. Asserting against a real `icechunk.Diff` means an
+        upstream rename breaks this rather than silently narrowing what is checked.
+        """
+        _, repo = _seed(tmp_path)
+        base = repo.lookup_branch("main")
+        tip = TestCatchUpToBranch._commit_to(repo, "01N", 5)
+        real = repo.diff(from_snapshot_id=base, to_snapshot_id=tip)
+        members = {a for a in dir(real) if not a.startswith("_")} - {"is_empty"}
+        # EQUALITY, both directions. `hasattr` on each entry would catch an upstream rename but
+        # not someone shortening the tuple, which is the likelier accident and the one that
+        # narrows the guard in silence.
+        handled_separately = {"updated_chunks", "moved_nodes"}
+        assert set(session_catch_up._DIFF_NODE_FIELDS) | handled_separately == members, (
+            f"the guard covers {set(session_catch_up._DIFF_NODE_FIELDS) | handled_separately} "
+            f"but icechunk.Diff has {members}"
+        )
+
+    def test_the_rebase_detects_conflicts_rather_than_solving_them(self, tmp_path, monkeypatch):
+        """A solver would resolve a collision silently — the exact failure the guard prevents.
+
+        The guard is the first line; this argument is the second. Swapping `ConflictDetector`
+        for `BasicConflictSolver` passed every other test.
+        """
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+        TestCatchUpToBranch._commit_to(repo, "01S", 4)
+        seen: list[object] = []
+        real_rebase = type(session).rebase
+        monkeypatch.setattr(
+            type(session),
+            "rebase",
+            lambda self, solver: (seen.append(solver), real_rebase(self, solver))[1],
+        )
+        session_catch_up.catch_up_to_branch(repo, session, "01N")
+        assert isinstance(seen[0], icechunk.ConflictDetector), f"rebased with {type(seen[0])}"
+
+
+class TestRunForkedCatchUp:
+    """`run_forked` runs the catch-up on a timer for the whole fork phase — and only then.
+
+    There is deliberately no final synchronous catch-up: it would sit outside the timer, so
+    nothing would bound it, and a hang there would be silent where a hung COMMIT at least
+    raises the stall alarm. Every test here therefore uses a short interval and a worker slow
+    enough for the timer to fire, which is also the production shape.
+    """
+
+    @staticmethod
+    def _slow_worker(payload):
+        time.sleep(0.2)
+        return payload["fork"], {}
+
+    def test_the_tally_reaches_the_telemetry(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        result = run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=lambda: "current")
+        assert result["catch_ups"].get("current", 0) >= 1, "no catch-up was counted"
+
+    def test_the_tally_separates_the_outcomes(self, tmp_path, monkeypatch):
+        # The tally's stated job is to say "how often the guard refused". Counting every
+        # outcome under one key satisfies a single-outcome test while destroying that.
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        outcomes = iter(["blocked"] + ["current"] * 200)
+        result = run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=lambda: next(outcomes))
+        assert result["catch_ups"]["blocked"] == 1, f"outcomes were merged: {result['catch_ups']}"
+        assert result["catch_ups"]["current"] >= 1, f"only one outcome recorded: {result['catch_ups']}"
+
+    def test_the_tally_reaches_the_summary_record_not_just_the_dict(self):
+        """`assemble_global` selects fields by hand for `_assembly_summary_line`.
+
+        A field can therefore sit in the telemetry dict and never appear in the record an
+        operator reads — which is where this one was, while its own documentation called it
+        the only evidence the mechanism ran.
+        """
+        source = inspect.getsource(assembly.ZarrWriter.assemble_global)
+        assert "catch_ups=telemetry.get(" in source, "assemble_global does not forward catch_ups into ASSEMBLY_SUMMARY"
+
+    def test_no_tally_when_no_catch_up_was_asked_for(self, tmp_path):
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        assert "catch_ups" not in run_forked(session, lambda p: (p["fork"], {}), [{"tag": "only"}])
+
+    def test_every_catch_up_happens_before_the_merge(self, tmp_path, monkeypatch):
+        """Ordering is the safety argument: a catch-up must only ever see an EMPTY session.
+
+        Records the order DIRECTLY. An earlier version asserted `has_uncommitted_changes is
+        False` at catch-up time, which is constant across both orderings when the worker hands
+        back an untouched fork — so it passed with the catch-up moved after the merge, the
+        exact inversion it claims to forbid.
+        """
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        order: list[str] = []
+        real_merge = type(session).merge
+
+        def recording_merge(self, *forks):
+            order.append("merge")
+            return real_merge(self, *forks)
+
+        monkeypatch.setattr(type(session), "merge", recording_merge)
+        run_forked(
+            session,
+            self._slow_worker,
+            [{"tag": "only"}],
+            catch_up=lambda: (order.append("catch_up"), "current")[1],
+        )
+        assert order.count("catch_up") >= 2, f"no periodic catch-up fired: {order}"
+        assert order[-1] == "merge", f"a catch-up ran at or after the merge: {order}"
+        assert "merge" not in order[:-1], f"the merge is not last: {order}"
+
+    def test_the_timer_fires_repeatedly_during_the_fork_phase(self, tmp_path, monkeypatch):
+        """Driven through the SINGLE-payload path: the one a waiting-loop hook never reached."""
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        ticks: list[int] = []
+        run_forked(
+            session,
+            self._slow_worker,
+            [{"tag": "only"}],
+            catch_up=lambda: (ticks.append(1), "current")[1],
+        )
+        assert len(ticks) >= 3, f"the timer fired {len(ticks)} time(s); the periodic catch-up is dead"
+
+    def test_a_catch_up_that_will_not_stop_aborts_rather_than_merging(self, tmp_path, monkeypatch):
+        """`join(timeout=...)` returns whether or not the thread noticed the stop.
+
+        A HUNG catch-up is the failure this module exists to bound, so the stop path must not
+        assume it stopped. Carrying on would hand the session to `merge` while another thread
+        is still inside it.
+        """
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
+        monkeypatch.setattr(session_catch_up, "CATCH_UP_STOP_TIMEOUT_S", 0.2)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        wedged = threading.Event()
+
+        def never_returns() -> str:
+            wedged.set()
+            time.sleep(30)  # the daemon dies with the test; nothing waits on it
+            return "current"
+
+        def worker_until_wedged(payload):
+            wedged.wait(timeout=5)
+            return payload["fork"], {}
+
+        with pytest.raises(session_catch_up.CatchUpDidNotStopError, match="still running"):
+            run_forked(session, worker_until_wedged, [{"tag": "only"}], catch_up=never_returns)
+
+    def test_a_failed_catch_up_stops_the_wait_instead_of_finishing_the_fill(self):
+        """A fill already known to be uncommittable must not spend three more hours writing."""
+        outstanding: Future = Future()
+        abort = threading.Event()
+        threading.Timer(0.05, abort.set).start()
+        threading.Timer(5.0, lambda: outstanding.set_result("never reached")).start()
+        with pytest.raises(session_catch_up.CatchUpAbortedTheWaitError, match="no longer commit"):
+            _await_forks([outstanding], 0.01, abort=abort)
+
+    def test_the_wait_is_unaffected_when_nothing_aborted(self):
+        outstanding: Future = Future()
+        threading.Timer(0.05, lambda: outstanding.set_result("done")).start()
+        assert _await_forks([outstanding], 0.01, abort=threading.Event()) == ["done"]
+
+    def test_a_timer_failure_reaches_the_caller(self, tmp_path, monkeypatch):
+        """A daemon thread's exception is discarded, and one of these must fail the fill."""
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        # RAISES ONCE, from the TIMER. If it raised on every call a later tick would raise on
+        # the caller's thread anyway, and the test would pass with the re-raise deleted.
+        calls: list[int] = []
+
+        def boom_once() -> str:
+            calls.append(1)
+            if len(calls) == 1:
+                raise session_catch_up.CaughtUpPastAConflictError("crossed an unvetted commit")
+            return "current"
+
+        with pytest.raises(session_catch_up.CaughtUpPastAConflictError, match="unvetted"):
+            run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=boom_once)
+
+    def test_a_failing_catch_up_is_not_swallowed(self, tmp_path, monkeypatch):
+        # `run_forked` itself does not catch — best-effort is applied at the CALL SITE by
+        # `catch_up_best_effort`. Keeping this layer honest means a caller that wants the raw
+        # behaviour still gets it.
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+
+        def boom() -> str:
+            raise RuntimeError("catch-up exploded")
+
+        with pytest.raises(RuntimeError, match="catch-up exploded"):
+            run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=boom)
