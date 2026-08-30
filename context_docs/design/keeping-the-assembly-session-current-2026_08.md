@@ -292,3 +292,26 @@ under one stated invariant is what makes the next such finding land somewhere ob
 `shard_writer` keeps only the wiring: build the callback, wrap the fork phase in the timer, tick
 once more before the merge, and report the tally. `_await_forks` went back to being a waiting
 helper with no housekeeping hook at all.
+
+
+## What the fix does NOT close, stated with the arithmetic
+
+A coordinator's base is current as of its last tick, not as of its commit. Peers can publish in
+between, so assemblies finishing together can still stack: **if three commit inside one
+`CATCH_UP_INTERVAL_S`, the third arrives four snapshots behind** — the depth that fails.
+
+It takes three inside one interval, and that is further than the observed spacing. In the
+2026-08-29 incident the nine commits fell at 01:02, 01:39, 01:46, 01:58:24, 01:58:36, 02:00,
+02:07, 02:09 and 02:11 — never more than two inside any 60-second window. Replaying those
+timings against a 60 s interval puts every one of them at depth 0.
+
+**Why not close it completely.** The obvious move is one more catch-up immediately before the
+commit, and that is exactly the unbounded call removed above: it sits outside the timer, so a
+stall there hangs forever and silently. Serialising commits was measured earlier and does not
+address the cause, because the gap opens during the write rather than during the commit.
+
+**What would show it mattering, and the lever.** The `catch_ups` tally. Ticks reporting
+`advanced` late in a fill mean peers are landing inside the interval; the response is to
+shorten `CATCH_UP_INTERVAL_S`, which trades linearly against how much traffic the catch-up puts
+through the same path that stalls. It is deliberately left at 60 s until the tally says
+otherwise, rather than multiplied on a guess.

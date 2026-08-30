@@ -432,6 +432,15 @@ def run_forked(
     # the worst case observed. The commit's own rebase closes it, from a depth that has never
     # failed, with the stall alarm watching. Less code, no unbounded call, and any residual
     # hang lands back where it is instrumented.
+    #
+    # THE RESIDUAL THIS LEAVES, quantified rather than waved at. Peers can publish between a
+    # coordinator's last tick and its own commit, so several assemblies finishing together can
+    # still stack: if three commit inside one CATCH_UP_INTERVAL_S, the third arrives four
+    # snapshots behind — the depth that fails. It takes THREE commits inside one interval, and
+    # in the 2026-08-29 incident the nine assemblies' commits were spaced 12 s to 26 min apart,
+    # never more than two inside any 60 s window, which is a depth that has never failed. The
+    # `catch_ups` tally is what would show this changing: a run of `advanced` at commit time
+    # means peers are landing inside the interval, and the lever is to shorten it.
     t_merge = time.monotonic()
     session.merge(*(fork_result for fork_result, _ in results))
     done = time.monotonic()
