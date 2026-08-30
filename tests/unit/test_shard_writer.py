@@ -1315,6 +1315,33 @@ class TestRunForkedCatchUp:
         run_forked(session, slow_worker, [{"tag": "only"}], catch_up=lambda: (ticks.append(1), "current")[1])
         assert len(ticks) >= 3, f"the timer fired {len(ticks)} time(s); the periodic catch-up is dead"
 
+    def test_a_catch_up_that_will_not_stop_aborts_rather_than_merging(self, tmp_path, monkeypatch):
+        """`join(timeout=...)` returns whether or not the thread noticed the stop.
+
+        A HUNG catch-up is the failure this module exists to bound, so the stop path must not
+        assume it stopped. Carrying on would hand the session to `merge` while another thread
+        is still inside it — which either blocks on icechunk's session lock, turning one stuck
+        call into a stuck fill, or moves the base after the write was merged.
+        """
+        monkeypatch.setattr(session_catch_up, "CATCH_UP_INTERVAL_S", 0.05)
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
+        monkeypatch.setattr(session_catch_up, "CATCH_UP_STOP_TIMEOUT_S", 0.2)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        wedged = threading.Event()
+
+        def never_returns() -> str:
+            wedged.set()
+            time.sleep(30)  # the daemon dies with the test; nothing waits on it
+            return "current"
+
+        def quick_worker(payload):
+            wedged.wait(timeout=5)
+            return payload["fork"], {}
+
+        with pytest.raises(session_catch_up.CatchUpDidNotStopError, match="still running"):
+            run_forked(session, quick_worker, [{"tag": "only"}], catch_up=never_returns)
+
     def test_a_timer_failure_reaches_the_caller(self, tmp_path, monkeypatch):
         """A daemon thread's exception is discarded, and one of these must fail the fill."""
         monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)

@@ -49,6 +49,23 @@ _DIFF_NODE_FIELDS = (
 )
 
 
+#: How long the timer is given to notice it has been asked to stop. `stop.set()` wakes a
+#: healthy ticker immediately and a catch-up in flight takes about a second, so this only
+#: matters when a catch-up is HUNG — which is the failure this whole module exists to bound.
+CATCH_UP_STOP_TIMEOUT_S = 30.0
+
+
+class CatchUpDidNotStopError(RuntimeError):
+    """The timer thread was still inside a catch-up after being asked to stop.
+
+    Raised rather than carried on with, because the session is not ours any more. The caller's
+    next steps merge the forks into it and commit, and icechunk guards a session with a lock:
+    a merge against a session a hung rebase still holds either blocks on that lock — turning
+    one stuck call into a stuck fill — or, if the catch-up later returns, moves the base AFTER
+    the write was merged, which is the expensive replay this module is written to avoid.
+    """
+
+
 class CaughtUpPastAConflictError(RuntimeError):
     """A catch-up advanced past a commit that had touched this group, so the eventual commit
     can no longer detect a collision with it.
@@ -252,6 +269,15 @@ def ticking(interval_s: float, tick: Callable[[], None] | None) -> Iterator[None
         yield
     finally:
         stop.set()
-        ticker.join(timeout=interval_s)
+        ticker.join(timeout=CATCH_UP_STOP_TIMEOUT_S)
+        if ticker.is_alive():
+            # A HUNG CATCH-UP IS THE WHOLE POINT OF THIS MODULE, so the one thing the stop
+            # path must not do is assume the thread noticed. `join` with a timeout returns
+            # whether or not it did, and continuing would hand the session to the merge while
+            # another thread is still inside it.
+            raise CatchUpDidNotStopError(
+                f"a catch-up was still running {CATCH_UP_STOP_TIMEOUT_S:.0f}s after being asked "
+                f"to stop; the session cannot be merged or committed while it is in use"
+            )
         if failure:
             raise failure[0]
