@@ -925,3 +925,164 @@ class TestTheStalledCommitAlarm:
             icechunk_logging.traced_commit(_SlowSession(0.4), "stuck")
         assert state["failed"], "the first emission was meant to fail"
         assert [r for r in caplog.records if "STALLED" in r.getMessage()], "the alarm died on one failure"
+
+
+class _FakeDiff:
+    """A duck-typed :class:`icechunk.Diff` for the pure-function cases.
+
+    Used ONLY for :func:`_diff_touches`, which is a predicate over path strings and has no
+    icechunk behaviour to get wrong. Everything about `catch_up_to_branch` is exercised
+    against a real repository below, because a stub of the thing under test cannot falsify it.
+    """
+
+    def __init__(self, *, chunks=(), groups=(), arrays=()):
+        self.updated_chunks = {p: [[0, 0, 0]] for p in chunks}
+        self.updated_groups = set(groups)
+        self.new_groups = set()
+        self.deleted_groups = set()
+        self.new_arrays = set(arrays)
+        self.updated_arrays = set()
+        self.deleted_arrays = set()
+
+
+class TestDiffTouches:
+    """Which changes count as "somebody else wrote our cell"."""
+
+    def test_a_chunk_write_inside_the_group_is_seen(self):
+        assert shard_writer._diff_touches(_FakeDiff(chunks=["/01N/embeddings"]), "01N")
+
+    def test_a_group_attribute_change_is_seen(self):
+        # `mark <zone> year N complete` writes group attrs and no chunks at all, so a
+        # chunks-only test would wave through the second of every cell's two commits.
+        assert shard_writer._diff_touches(_FakeDiff(groups=["/01N"]), "01N")
+
+    def test_a_new_array_inside_the_group_is_seen(self):
+        assert shard_writer._diff_touches(_FakeDiff(arrays=["/01N/extra"]), "01N")
+
+    def test_another_zone_is_not_our_business(self):
+        assert not shard_writer._diff_touches(_FakeDiff(chunks=["/01S/embeddings"]), "01N")
+
+    def test_an_empty_diff_touches_nothing(self):
+        assert not shard_writer._diff_touches(_FakeDiff(), "01N")
+
+    def test_a_group_whose_name_merely_starts_with_ours_is_not_ours(self):
+        # "/01N2/..." starts with "01N" as a STRING but is a different zone. Matching on a
+        # bare prefix would block every catch-up behind an unrelated neighbour, which fails
+        # in the safe direction but disables the fix — worth pinning either way.
+        assert not shard_writer._diff_touches(_FakeDiff(chunks=["/01N2/embeddings"]), "01N")
+
+
+class TestCatchUpToBranch:
+    """Keeping an idle coordinator session current — and refusing to when that would hide a conflict.
+
+    Against a real repository, because the whole question is what icechunk does with a session
+    whose base has moved while its forks were outstanding.
+    """
+
+    @staticmethod
+    def _commit_to(repo, group, value):
+        session = repo.writable_session("main")
+        node = zarr.open_group(session.store, mode="a")
+        node[group]["embeddings"][0, 0:_CHUNK, 0:_CHUNK, :] = value
+        return session.commit(f"fill {group}")
+
+    def test_nothing_to_do_when_already_at_the_tip(self, tmp_path):
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        assert shard_writer.catch_up_to_branch(repo, session, "01N") == "current"
+
+    def test_advances_past_a_commit_to_another_zone(self, tmp_path):
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+        base = session.snapshot_id
+        tip = self._commit_to(repo, "01S", 7)
+        assert shard_writer.catch_up_to_branch(repo, session, "01N") == "advanced"
+        assert session.snapshot_id == tip != base
+
+    def test_refuses_to_skip_a_commit_that_touched_our_own_zone(self, tmp_path):
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+        base = session.snapshot_id
+        self._commit_to(repo, "01N", 7)
+        assert shard_writer.catch_up_to_branch(repo, session, "01N") == "blocked"
+        assert session.snapshot_id == base, "a blocked catch-up must leave the base alone"
+
+    def test_a_blocked_catch_up_leaves_the_collision_for_the_commit_to_raise(self, tmp_path):
+        """THE SAFETY PROPERTY, and the reason the guard exists.
+
+        Moving the base past a commit is also a decision to stop checking it for conflicts.
+        A catch-up without the guard sails past a competing writer and then overwrites it in
+        silence; with the guard the commit still sees it and refuses, which is what icechunk
+        does today and what must not regress.
+        """
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+
+        # ORDER MATTERS, and matching production is the whole point. During the fork phase
+        # the coordinator's session is EMPTY — the forks have not been merged — so the
+        # catch-up runs with nothing to compare, which is exactly why an unguarded one sails
+        # past a competing writer without noticing. Writing to the session first would make
+        # `rebase` raise for a different reason and the test would pass without testing this.
+        self._commit_to(repo, "01N", 7)  # a competing writer lands on OUR zone
+        assert shard_writer.catch_up_to_branch(repo, session, "01N") == "blocked"
+
+        # ...and only now does the write arrive, as the merge would deliver it.
+        node = zarr.open_group(session.store, mode="a")
+        node["01N"]["embeddings"][0, 0:_CHUNK, 0:_CHUNK, :] = 3
+        with pytest.raises(icechunk.RebaseFailedError):
+            session.commit("fill 01N", rebase_with=icechunk.ConflictDetector())
+
+    def test_repeated_catch_ups_keep_the_gap_at_zero(self, tmp_path):
+        # The point of running it on a timer rather than once: after each unrelated commit
+        # the session is back at the tip, so no single catch-up ever walks far.
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+        for value in (1, 2, 3):
+            tip = self._commit_to(repo, "01S", value)
+            assert shard_writer.catch_up_to_branch(repo, session, "01N") == "advanced"
+            assert session.snapshot_id == tip
+
+
+class TestRunForkedCatchUp:
+    """`run_forked` runs the catch-up on the timer AND once more before it merges."""
+
+    def test_the_tally_reaches_the_telemetry(self, tmp_path):
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        result = run_forked(session, lambda p: (p["fork"], {}), [{"tag": "only"}], catch_up=lambda: "current")
+        assert result["catch_ups"] == {"current": 1}, "the pre-merge catch-up must be counted"
+
+    def test_no_tally_when_no_catch_up_was_asked_for(self, tmp_path):
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        assert "catch_ups" not in run_forked(session, lambda p: (p["fork"], {}), [{"tag": "only"}])
+
+    def test_the_last_catch_up_happens_before_the_merge(self, tmp_path):
+        """Ordering is the whole safety argument for the final call.
+
+        Before the merge the session holds nothing, so catching up is a pointer move. After
+        it, the session holds the entire write and catching up would replay it against every
+        intervening snapshot — the expensive path this exists to avoid.
+        """
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        seen: list[bool] = []
+        run_forked(
+            session,
+            lambda p: (p["fork"], {}),
+            [{"tag": "only"}],
+            catch_up=lambda: (seen.append(session.has_uncommitted_changes), "current")[1],
+        )
+        assert seen == [False], "the catch-up ran against a session that already held the write"
+
+    def test_a_failing_catch_up_is_not_swallowed(self, tmp_path):
+        # Best-effort belongs at the CALL SITE, where the caller can decide; a helper that
+        # hides its own failures makes a fix that silently stopped working look healthy.
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+
+        def boom() -> str:
+            raise RuntimeError("catch-up exploded")
+
+        with pytest.raises(RuntimeError, match="catch-up exploded"):
+            run_forked(session, lambda p: (p["fork"], {}), [{"tag": "only"}], catch_up=boom)

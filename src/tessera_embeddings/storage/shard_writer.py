@@ -41,6 +41,7 @@ import ctypes
 import logging
 import multiprocessing
 import time
+from collections import Counter
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from datetime import UTC, datetime
@@ -216,6 +217,83 @@ def report_shard_progress(worker_index: int, done: int, total: int) -> None:
     _PROGRESS_SLOTS[2 * worker_index + 1] = total
 
 
+def _diff_touches(diff: icechunk.Diff, group: str) -> bool:
+    """Did anything in ``diff`` change inside ``group``?
+
+    The safety half of :func:`catch_up_to_branch`. A conflict is only ever detected against
+    commits made AFTER a session's base, so moving the base past a commit is also a decision
+    to stop looking at it. That is harmless for a commit that touched some other zone and
+    unacceptable for one that touched ours, which is the difference this asks about.
+
+    Deliberately GROUP-wide rather than chunk-exact. The campaign's concurrent writers are
+    other zones, so a group-level test blocks essentially nothing in practice, while a
+    chunk-exact test would have to model shard geometry to stay correct — precision bought
+    with a second thing to get wrong, in the direction that fails silently.
+    """
+    own = f"/{group.strip('/')}"
+    prefix = f"{own}/"
+    paths: set[str] = set()
+    for attr in ("new_groups", "updated_groups", "deleted_groups", "new_arrays", "updated_arrays", "deleted_arrays"):
+        paths |= {str(node) for node in (getattr(diff, attr, None) or set())}
+    paths |= {str(node) for node in (diff.updated_chunks or {})}
+    return any(path == own or path.startswith(prefix) for path in paths)
+
+
+def catch_up_to_branch(
+    repo: icechunk.Repository,
+    session: icechunk.Session,
+    group: str,
+    *,
+    branch: str = "main",
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+) -> str:
+    """Move an idle coordinator session up to the branch tip. Returns what it did.
+
+    **Why an assembly needs this at all.** A fill opens its session, forks it, and then writes
+    for hours before committing. Every cell that publishes in those hours puts another
+    snapshot between the session's base and the tip, and the commit has to walk all of them
+    inside ``rebase``. That walk is where assemblies stopped dead on 2026-08-29 —
+    ``asset_manager::fetch_snapshot`` reached from ``session::rebase`` never returned, seven
+    times out of seven, and only ever when the walk was more than one cell long. Catching up
+    while the writing is still going on keeps every walk short.
+
+    **Why repeatedly, and not once at the end.** A single catch-up just before the commit
+    would walk exactly the same distance the commit would have, through exactly the same
+    call. The value is not in moving the base, it is in never letting the gap grow.
+
+    **Why this is cheap and not a second commit.** During the fork phase the coordinator's
+    session holds no changes of its own — the forks have not been merged yet — so there is
+    nothing to replay. This moves a base pointer.
+
+    **Why it can refuse.** See :func:`_diff_touches`: skipping past a commit is also a
+    decision to stop checking it for conflicts. So a commit that touched our own group is
+    never skipped. The base stays where it is, the gap stops closing, and the commit's own
+    rebase then behaves exactly as it does today — including raising ``RebaseFailedError``
+    on a real collision, which is the behaviour a naive version of this quietly lost.
+
+    Returns:
+        ``"current"`` — already at the tip, nothing to do.
+        ``"advanced"`` — the base moved up to the tip.
+        ``"blocked"`` — another writer has touched this group, so the base was left alone.
+    """
+    _logger = log or _log
+    tip = repo.lookup_branch(branch)
+    base = session.snapshot_id
+    if tip == base:
+        return "current"
+    if _diff_touches(repo.diff(from_snapshot_id=base, to_snapshot_id=tip), group):
+        _logger.info(
+            "Not catching up %s: another writer has touched this group since %s, so the "
+            "commit must still compare against it.",
+            group,
+            base,
+        )
+        return "blocked"
+    session.rebase(icechunk.ConflictDetector())
+    _logger.info("Caught up %s from %s to branch tip %s while its forks write.", group, base, tip)
+    return "advanced"
+
+
 def _await_forks(
     futures: list[Future],
     progress_interval_s: float,
@@ -223,6 +301,7 @@ def _await_forks(
     unit: str = "partitions",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     slots: ctypes.Array[ctypes.c_long] | None = None,
+    on_tick: Callable[[], object] | None = None,
 ) -> list[Any]:
     """Collect ``futures`` in submission order, logging what is still outstanding.
 
@@ -230,6 +309,12 @@ def _await_forks(
     position is its band and :meth:`icechunk.Session.merge` is given them as the
     caller's payloads were ordered. Re-raises the first failure in that same order,
     matching what ``Executor.map`` would have done.
+
+    ``on_tick`` runs once per progress interval while forks are still outstanding. This loop
+    is the only thing in the process that wakes on a timer during the write, which makes it
+    the only place a periodic housekeeping job can live — but the job itself is the caller's
+    business, so it arrives as a callback rather than as knowledge this function has to hold.
+    Its exceptions are the caller's too: nothing here catches them.
 
     ``unit`` is the caller's name for one payload. What a payload holds is the
     caller's decision (northing bands for one, round-robin tile partitions for
@@ -274,6 +359,8 @@ def _await_forks(
                 unit,
                 (time.monotonic() - started) / 60.0,
             )
+            if on_tick is not None:
+                on_tick()
     return [future.result() for future in futures]
 
 
@@ -285,6 +372,7 @@ def run_forked(
     progress_interval_s: float = PROGRESS_INTERVAL_S,
     unit: str = "partitions",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+    catch_up: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
     """Fork ``session``, run ``worker_fn`` over ``payloads``, merge the forks back.
 
@@ -317,6 +405,18 @@ def run_forked(
       index IS its payload's index, matching how forks are merged).
     * ``wall_s`` — fork creation through merge completion.
     * ``merge_s`` — the merge alone.
+    * ``catch_ups`` — tally of :func:`catch_up_to_branch` outcomes, when ``catch_up`` was
+      given. Reported because the fix it implements is invisible in a healthy run: a commit
+      that does not stall looks the same whether the session was kept current or simply got
+      lucky. The tally is the only evidence that it ran.
+
+    ``catch_up`` is called once per progress interval while forks are outstanding, and once
+    more after the last one returns. **Both matter, and for different reasons.** The periodic
+    calls keep each catch-up short, which is the entire point — a single deep one would walk
+    the same distance, through the same call, that the commit would have. The final one closes
+    the gap that opened during the last interval, so the commit itself has as little to do as
+    possible. See :func:`catch_up_to_branch` for why an assembly needs this and when it
+    deliberately refuses.
     """
     t0 = time.monotonic()
     fork = session.fork()
@@ -325,6 +425,12 @@ def run_forked(
         {**payload, "fork": fork, "worker_index": i, "progress_interval_s": progress_interval_s}
         for i, payload in enumerate(payloads)
     ]
+    catch_ups: Counter[str] = Counter()
+
+    def _tick() -> None:
+        if catch_up is not None:
+            catch_ups[catch_up()] += 1
+
     if len(payloads) == 1:
         results = [worker_fn(payloads[0])]
     else:
@@ -343,7 +449,7 @@ def run_forked(
         )
         try:
             futures = [ex.submit(worker_fn, payload) for payload in payloads]
-            results = _await_forks(futures, progress_interval_s, unit=unit, log=log, slots=slots)
+            results = _await_forks(futures, progress_interval_s, unit=unit, log=log, slots=slots, on_tick=_tick)
         except BaseException:
             # Cancel what has not started, then TERMINATE what has. `cancel_futures` only
             # reaches queued work, so without the second step a multi-hour shard writer keeps
@@ -377,14 +483,22 @@ def run_forked(
                     proc.terminate()
             raise
         ex.shutdown()
+    # LAST CHANCE, and it must be before the merge. Once the forks are merged the session
+    # holds the whole write, and catching up then would replay it against every intervening
+    # snapshot — the expensive, stalling path this exists to avoid. Here the session is still
+    # empty, so it is the same cheap pointer move as every tick before it.
+    _tick()
     t_merge = time.monotonic()
     session.merge(*(fork_result for fork_result, _ in results))
     done = time.monotonic()
-    return {
+    telemetry: dict[str, Any] = {
         "workers": [stats for _, stats in results],
         "wall_s": round(done - t0, 3),
         "merge_s": round(done - t_merge, 3),
     }
+    if catch_up is not None:
+        telemetry["catch_ups"] = dict(catch_ups)
+    return telemetry
 
 
 def _group_node(store: Any, group: str) -> zarr.Group:  # noqa: ANN401 — icechunk store handle
@@ -691,8 +805,8 @@ def write_year_shards(
 
     ``telemetry`` is an out-parameter: pass a dict to receive the fill's timing
     facts — the per-worker stats and ``wall_s``/``merge_s`` from
-    :func:`run_forked`, plus ``commit_s`` and ``attrs_commit_s`` (each measured
-    around its commit). An out-parameter
+    :func:`run_forked`, its ``catch_ups`` tally, plus ``commit_s`` and
+    ``attrs_commit_s`` (each measured around its commit). An out-parameter
     rather than a changed return, so the snapshot id the callers and tags key on
     stays a plain string; the caller that wants a summary record owns emitting it.
 
@@ -724,7 +838,17 @@ def write_year_shards(
     ]
     # The payloads are round-robin partitions of the source's tiles — name them
     # that way; "band writes" would describe the OTHER caller of run_forked.
-    fill = run_forked(session, _write_shards_worker, payloads, unit="tile partitions", log=log)
+    fill = run_forked(
+        session,
+        _write_shards_worker,
+        payloads,
+        unit="tile partitions",
+        log=log,
+        # Keep the session current WHILE the workers write. Without this the commit below has
+        # to walk every snapshot published during the write, and that walk is where seven of
+        # nine assemblies stopped dead on 2026-08-29. See `catch_up_to_branch`.
+        catch_up=lambda: catch_up_to_branch(repo, session, group, log=log),
+    )
 
     year_label = _year_label(_group_node(session.store, group), year_index)
     t_commit = time.monotonic()
@@ -753,6 +877,10 @@ def write_year_shards(
             workers=fill["workers"],
             fill_wall_s=fill["wall_s"],
             merge_s=fill["merge_s"],
+            # Carried so ASSEMBLY_SUMMARY records whether the session was kept current, and
+            # how often the guard refused. A healthy commit looks identical either way, so
+            # without this the fix is unobservable in production.
+            catch_ups=fill.get("catch_ups", {}),
             commit_s=round(t_attrs - t_commit, 3),
             attrs_commit_s=round(time.monotonic() - t_attrs, 3),
         )

@@ -1,0 +1,79 @@
+# Keeping the assembly session current (2026-08-30)
+
+**The change.** While an assembly's forks are writing, the coordinator now brings its own
+session up to the branch tip on the same timer it already reports progress on — but only past
+commits that did not touch its own zone group. One new function, one new hook, one call site.
+
+**Why.** On 2026-08-29 seven of nine assemblies finished hours of writing and then never
+returned from their commit. The trace named the call: `icechunk::asset_manager::fetch_snapshot`,
+reached from `session::rebase` via `session::list_nodes`, and it is only reached when the
+session has fallen behind the branch. The full incident record — traces, thread stacks, the
+socket evidence and the eliminations — is in yield-embeddings,
+`context_docs/crash-recovery/assembly-stalls-before-commit-2026-08-29.md`.
+
+## The trigger, in one line
+
+A fill opens its session, forks it, writes for about three hours, then commits. Every cell that
+publishes during those hours puts another snapshot between the session's base and the tip, and
+the commit has to walk all of them. **Zero and two never failed; four failed seven times out of
+seven.** Each published cell writes two commits, so in a batch of N simultaneous assemblies the
+k-th to finish is `2(k-1)` behind: the first two publish, the third onward stalls. Nine started,
+two published, seven stalled.
+
+## What was tried, and what the experiment showed
+
+A harness reproducing the production shape — 120 root groups, one forked session pickled to
+eight spawned workers, a concurrent publisher landing two commits per cell, icechunk 2.1.1 on
+real S3 in the dev account — ran four arms. `depth` is snapshots to catch up on at commit.
+
+| arm | what it does | depth at commit | commit | conflict case | data |
+|---|---|---:|---:|---|---|
+| `control` | nothing else commits | 0 | 0.57 s | — | PASS |
+| `current` | today's code | 4 / 8 / 16 | 1.58 / 2.31 / 2.77 s | **raises** | PASS |
+| `b1` | rebase on a timer, unguarded | **0** | 0.66 s | **SILENTLY OVERWROTE** | PASS |
+| `b3` | merge into a fresh session | **0** | 0.59 s | **SILENTLY OVERWROTE** | PASS |
+| **`b1g`** | **rebase on a timer, guarded** | **0** | **0.56 s** | **raises** | **PASS** |
+
+**Both naive fixes work and both are unsafe.** With a genuine collision — a second writer
+touching the same group and year — today's code correctly refuses with `RebaseFailedError`.
+Under `b1` and `b3` the commit succeeded and overwrote the other writer without a word. The
+reason is structural: a conflict is only ever detected against commits made *after* the
+session's base, so moving the base past a commit is also a decision to stop checking it.
+
+**The guard is what makes it safe.** Before advancing, diff base→tip and refuse if anything
+inside our own group changed. Then the base stays put, the commit's own rebase runs exactly as
+it does today, and the collision raises. Measured: `b1g` at depth 16 reached the tip with seven
+catch-ups and committed in 0.56 s; `b1g` against a collision blocked five times, arrived at the
+commit one snapshot behind, and raised `RebaseFailedError` — identical to `current`.
+
+**Why on a timer rather than once at the end.** A single catch-up just before the commit would
+walk the same distance, through the same call, that the commit would have. The value is in
+never letting the gap grow, not in closing it once.
+
+**Why before the merge and not after.** Before the merge the session holds nothing — the forks
+are still outstanding — so catching up is a pointer move. After it the session holds the whole
+write, and catching up would replay it against every intervening snapshot: the expensive path
+this exists to avoid.
+
+## Was the oracle able to fail?
+
+Yes, and it was checked rather than assumed. `--drop-fork K` omits one worker's fork from the
+merge while still claiming its writes; the verifier reported exactly that worker's six chunks
+as missing, under both `b1` and `b3`. An earlier version of the harness could not have caught
+this — eight workers wrote the same four chunk positions with values that did not encode the
+worker, so an entire lost fork was invisible and every arm "passed". Workers now write disjoint
+chunks carrying their own index.
+
+## What this does not claim
+
+**The harness never reproduced the stall.** Ten standalone attempts before it and this one all
+committed normally at every depth, on a laptop against dev S3. So the efficacy argument is not
+"the fix made the stall stop"; it is "the stall has only ever been observed above a depth this
+fix holds at zero". The safety argument is the one the experiment settles directly.
+
+**`assemble` is deliberately untouched.** It writes a per-ROI store where it is the only
+writer, so its session never falls behind. `catch_up` defaults to `None` and that path is
+unchanged.
+
+**The upstream bug is still a bug.** This removes the precondition, not the fault. The report
+belongs upstream regardless.
