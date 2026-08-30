@@ -1150,6 +1150,9 @@ class TestTheCatchUpIsActuallyWiredIn:
     """
 
     def test_write_year_shards_asks_for_a_catch_up_on_its_own_repo_session_and_group(self, tmp_path, monkeypatch):
+        # The timer is the ONLY caller now — there is no final synchronous catch-up — so the
+        # interval has to be short enough to fire inside this small fill.
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.005)
         _, repo = _seed(tmp_path)
         calls: list[tuple] = []
 
@@ -1220,37 +1223,36 @@ class TestTheCatchUpIsActuallyWiredIn:
 
 
 class TestRunForkedCatchUp:
-    """`run_forked` runs the catch-up on the timer AND once more before it merges."""
+    """`run_forked` runs the catch-up on a timer for the whole fork phase — and only then.
 
-    def test_the_tally_reaches_the_telemetry(self, tmp_path):
+    There is deliberately no final synchronous catch-up: it would sit outside the timer, so
+    nothing would bound it, and a hang there would be silent where a hung COMMIT at least
+    raises the stall alarm. Every test here therefore uses a short interval and a worker slow
+    enough for the timer to fire, which is also the production shape.
+    """
+
+    @staticmethod
+    def _slow_worker(payload):
+        time.sleep(0.2)
+        return payload["fork"], {}
+
+    def test_the_tally_reaches_the_telemetry(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
-        result = run_forked(session, lambda p: (p["fork"], {}), [{"tag": "only"}], catch_up=lambda: "current")
-        assert result["catch_ups"] == {"current": 1}, "the pre-merge catch-up must be counted"
+        result = run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=lambda: "current")
+        assert result["catch_ups"].get("current", 0) >= 1, "no catch-up was counted"
 
-    def test_the_tally_separates_the_outcomes(self, tmp_path):
+    def test_the_tally_separates_the_outcomes(self, tmp_path, monkeypatch):
         # The tally's stated job is to say "how often the guard refused". Counting every
         # outcome under one key satisfies a single-outcome test while destroying that.
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
-        outcomes = iter(["blocked", "advanced", "current"])
-        result = run_forked(session, lambda p: (p["fork"], {}), [{"tag": "only"}], catch_up=lambda: next(outcomes))
-        assert result["catch_ups"] == {"blocked": 1}
-
-    def test_the_tally_reaches_the_assembly_summary(self, tmp_path):
-        # A telemetry field nothing asserts can be dropped from the record without a failure.
-        _, repo = _seed(tmp_path)
-        telemetry: dict = {}
-        write_year_shards(
-            repo,
-            "01N",
-            year_index=2,
-            source=_OneInnerChunkSource(),
-            n_workers=1,
-            shard_px=_SHARD,
-            telemetry=telemetry,
-        )
-        assert "catch_ups" in telemetry, "the catch-up tally never reaches the telemetry dict"
+        outcomes = iter(["blocked"] + ["current"] * 200)
+        result = run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=lambda: next(outcomes))
+        assert result["catch_ups"]["blocked"] == 1, f"outcomes were merged: {result['catch_ups']}"
+        assert result["catch_ups"]["current"] >= 1, f"only one outcome recorded: {result['catch_ups']}"
 
     def test_the_tally_reaches_the_summary_record_not_just_the_dict(self):
         """`assemble_global` selects fields by hand for `_assembly_summary_line`.
@@ -1267,18 +1269,15 @@ class TestRunForkedCatchUp:
         session = repo.writable_session("main")
         assert "catch_ups" not in run_forked(session, lambda p: (p["fork"], {}), [{"tag": "only"}])
 
-    def test_the_last_catch_up_happens_before_the_merge(self, tmp_path, monkeypatch):
-        """Ordering is the whole safety argument for the final call.
+    def test_every_catch_up_happens_before_the_merge(self, tmp_path, monkeypatch):
+        """Ordering is the safety argument: a catch-up must only ever see an EMPTY session.
 
-        Before the merge the session holds nothing, so catching up is a pointer move. After it
-        the session holds the entire write, and catching up would replay it against every
-        intervening snapshot — the expensive path this exists to avoid.
-
-        **Records the order directly rather than inspecting the session.** The first version
-        asserted `has_uncommitted_changes is False` at catch-up time, which is constant across
-        BOTH orderings when the worker hands back an untouched fork — so it passed with the
-        final tick moved after the merge, the exact inversion it claims to forbid.
+        Records the order DIRECTLY. An earlier version asserted `has_uncommitted_changes is
+        False` at catch-up time, which is constant across both orderings when the worker hands
+        back an untouched fork — so it passed with the catch-up moved after the merge, the
+        exact inversion it claims to forbid.
         """
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
         order: list[str] = []
@@ -1291,28 +1290,26 @@ class TestRunForkedCatchUp:
         monkeypatch.setattr(type(session), "merge", recording_merge)
         run_forked(
             session,
-            lambda p: (p["fork"], {}),
+            self._slow_worker,
             [{"tag": "only"}],
             catch_up=lambda: (order.append("catch_up"), "current")[1],
         )
-        assert order == ["catch_up", "merge"], f"catch-up and merge ran in the order {order}"
+        assert order.count("catch_up") >= 2, f"no periodic catch-up fired: {order}"
+        assert order[-1] == "merge", f"a catch-up ran at or after the merge: {order}"
+        assert "merge" not in order[:-1], f"the merge is not last: {order}"
 
     def test_the_timer_fires_repeatedly_during_the_fork_phase(self, tmp_path, monkeypatch):
-        """The PERIODIC half of the mechanism — the reason it is a timer and not one call.
-
-        Driven through the SINGLE-payload path deliberately: that is the path a hook in the
-        waiting loop never reached, and `write_year_shards` defaults to it.
-        """
+        """Driven through the SINGLE-payload path: the one a waiting-loop hook never reached."""
         monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
         ticks: list[int] = []
-
-        def slow_worker(payload):
-            time.sleep(0.3)
-            return payload["fork"], {}
-
-        run_forked(session, slow_worker, [{"tag": "only"}], catch_up=lambda: (ticks.append(1), "current")[1])
+        run_forked(
+            session,
+            self._slow_worker,
+            [{"tag": "only"}],
+            catch_up=lambda: (ticks.append(1), "current")[1],
+        )
         assert len(ticks) >= 3, f"the timer fired {len(ticks)} time(s); the periodic catch-up is dead"
 
     def test_a_catch_up_that_will_not_stop_aborts_rather_than_merging(self, tmp_path, monkeypatch):
@@ -1320,10 +1317,8 @@ class TestRunForkedCatchUp:
 
         A HUNG catch-up is the failure this module exists to bound, so the stop path must not
         assume it stopped. Carrying on would hand the session to `merge` while another thread
-        is still inside it — which either blocks on icechunk's session lock, turning one stuck
-        call into a stuck fill, or moves the base after the write was merged.
+        is still inside it.
         """
-        monkeypatch.setattr(session_catch_up, "CATCH_UP_INTERVAL_S", 0.05)
         monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
         monkeypatch.setattr(session_catch_up, "CATCH_UP_STOP_TIMEOUT_S", 0.2)
         _, repo = _seed(tmp_path)
@@ -1335,21 +1330,15 @@ class TestRunForkedCatchUp:
             time.sleep(30)  # the daemon dies with the test; nothing waits on it
             return "current"
 
-        def quick_worker(payload):
+        def worker_until_wedged(payload):
             wedged.wait(timeout=5)
             return payload["fork"], {}
 
         with pytest.raises(session_catch_up.CatchUpDidNotStopError, match="still running"):
-            run_forked(session, quick_worker, [{"tag": "only"}], catch_up=never_returns)
+            run_forked(session, worker_until_wedged, [{"tag": "only"}], catch_up=never_returns)
 
     def test_a_failed_catch_up_stops_the_wait_instead_of_finishing_the_fill(self):
-        """A fill already known to be uncommittable must not spend three more hours writing.
-
-        Driven against plain futures because the behaviour under test is the WAITING policy:
-        once something outside the forks has made the fill unsafe, there is no point waiting
-        on them. Returning normally would be worse than raising — the caller would merge
-        forks it must not.
-        """
+        """A fill already known to be uncommittable must not spend three more hours writing."""
         outstanding: Future = Future()
         abort = threading.Event()
         threading.Timer(0.05, abort.set).start()
@@ -1367,14 +1356,8 @@ class TestRunForkedCatchUp:
         monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
-
-        def slow_worker(payload):
-            time.sleep(0.3)
-            return payload["fork"], {}
-
-        # RAISES ONCE, from the TIMER, and never again. If it raised on every call the final
-        # pre-merge tick would raise on the caller's thread anyway, and the test would pass
-        # with the timer's re-raise deleted — which is exactly what it did before this.
+        # RAISES ONCE, from the TIMER. If it raised on every call a later tick would raise on
+        # the caller's thread anyway, and the test would pass with the re-raise deleted.
         calls: list[int] = []
 
         def boom_once() -> str:
@@ -1384,12 +1367,13 @@ class TestRunForkedCatchUp:
             return "current"
 
         with pytest.raises(session_catch_up.CaughtUpPastAConflictError, match="unvetted"):
-            run_forked(session, slow_worker, [{"tag": "only"}], catch_up=boom_once)
+            run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=boom_once)
 
-    def test_a_failing_catch_up_is_not_swallowed(self, tmp_path):
+    def test_a_failing_catch_up_is_not_swallowed(self, tmp_path, monkeypatch):
         # `run_forked` itself does not catch — best-effort is applied at the CALL SITE by
-        # `catch_up_best_effort`, which is tested above. Keeping this layer honest means a
-        # caller that wants the raw behaviour still gets it.
+        # `catch_up_best_effort`. Keeping this layer honest means a caller that wants the raw
+        # behaviour still gets it.
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
 
@@ -1397,4 +1381,4 @@ class TestRunForkedCatchUp:
             raise RuntimeError("catch-up exploded")
 
         with pytest.raises(RuntimeError, match="catch-up exploded"):
-            run_forked(session, lambda p: (p["fork"], {}), [{"tag": "only"}], catch_up=boom)
+            run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=boom)

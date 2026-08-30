@@ -341,13 +341,13 @@ def run_forked(
       that does not stall looks the same whether the session was kept current or simply got
       lucky. The tally is the only evidence that it ran.
 
-    ``catch_up`` is called once per progress interval while forks are outstanding, and once
-    more after the last one returns. **Both matter, and for different reasons.** The periodic
-    calls keep each catch-up short, which is the entire point — a single deep one would walk
-    the same distance, through the same call, that the commit would have. The final one closes
-    the gap that opened during the last interval, so the commit itself has as little to do as
-    possible. See :func:`catch_up_to_branch` for why an assembly needs this and when it
-    deliberately refuses.
+    ``catch_up`` is called on a timer for the whole fork phase and NOT again afterwards. The
+    periodic calls are the entire point: they keep each catch-up short, where a single deep one
+    would walk the same distance, through the same call, that the commit would have. A final
+    synchronous call was tried and removed — it sat outside the timer, so nothing bounded it,
+    and a hang there would be silent where a hung COMMIT at least raises the stall alarm. See
+    :func:`~tessera_embeddings.storage.session_catch_up.catch_up_to_branch` for why an assembly
+    needs this and when it deliberately refuses.
     """
     t0 = time.monotonic()
     fork = session.fork()
@@ -421,15 +421,17 @@ def run_forked(
                         proc.terminate()
                 raise
             ex.shutdown()
-    # LAST CHANCE, and it must be before the merge. A residual window remains after it — the
-    # merge and the group read still have to happen before `commit_with_rebase` — so a commit
-    # landing in those seconds is caught by the commit's own rebase rather than here. That is
-    # the pre-existing behaviour and is bounded by seconds rather than by the write phase's
-    # hours, which is the whole difference this change makes. Once the forks are merged the session
-    # holds the whole write, and catching up then would replay it against every intervening
-    # snapshot — the expensive, stalling path this exists to avoid. Here the session is still
-    # empty, so it is the same cheap pointer move as every tick before it.
-    _tick()
+    # NO FINAL CATCH-UP HERE, deliberately. An earlier revision ticked once more at this point
+    # to close the gap opened since the last timer tick. That call sits OUTSIDE `ticking`, so
+    # nothing bounded it: if it entered the stalling path it would hang forever at the one step
+    # this whole change exists to protect — and unlike a stalled COMMIT, which `traced_commit`
+    # alarms on, a stalled catch-up here would be silent.
+    #
+    # Dropping it costs almost nothing. The residual gap is whatever published since the last
+    # tick, so at most one CATCH_UP_INTERVAL_S of commits — about none in this campaign, two in
+    # the worst case observed. The commit's own rebase closes it, from a depth that has never
+    # failed, with the stall alarm watching. Less code, no unbounded call, and any residual
+    # hang lands back where it is instrumented.
     t_merge = time.monotonic()
     session.merge(*(fork_result for fork_result, _ in results))
     done = time.monotonic()
