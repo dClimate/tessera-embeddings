@@ -141,3 +141,22 @@ asserted, the field list by equality against a real `Diff` so that shortening it
 right property in its docstring. What they lacked was an oracle that could move: an assertion
 whose value differs between the correct and the broken implementation. Mutating the source and
 watching which tests go red is cheap, and it is the only thing that establishes that.
+
+## Final check: the shipped function, not the design
+
+Every arm above tested the harness's own restatement of the mechanism. The last run imports
+`catch_up_best_effort` from this branch and calls it, so what was measured is the code that
+will run in production, against a real repository on dev S3:
+
+| run | catch-ups | depth at commit | commit | outcome |
+|---|---|---:|---:|---|
+| 16 snapshots behind, no collision | 6 `advanced`, 6 `current` | **0** | 0.59 s | all 48 chunks correct, neighbours intact |
+| 2 behind, deliberate collision | 5 `blocked`, 1 `current` | 1 | 0.61 s | **`RebaseFailedError`** — refused, and the other writer's value survives untouched |
+
+Both are the intended behaviour: the gap closes to nothing when it is safe to close it, and
+the fill refuses rather than overwrite when it is not.
+
+**What was NOT run:** a full assembly on the dev CLUSTER, with sixteen spawned forks and a
+three-hour write. The mechanism is exercised at production shape but not at production scale
+or duration, and the first campaign fill is the first time it runs for hours. Watch the
+`catch_ups` tally on the first few `ASSEMBLY_SUMMARY` records.
