@@ -204,3 +204,70 @@ the fill refuses rather than overwrite when it is not.
 three-hour write. The mechanism is exercised at production shape but not at production scale
 or duration, and the first campaign fill is the first time it runs for hours. Watch the
 `catch_ups` tally on the first few `ASSEMBLY_SUMMARY` records.
+
+## Eight coordinators catching up at once — the configuration production actually runs
+
+Every arm above ran ONE coordinator catching up, with a scripted publisher supplying the
+cross-traffic. That left the real question untested, and it is the one that matters most for
+this fix: **the catch-up multiplies calls to the very path that stalls** — `rebase` ->
+`list_nodes` -> `fetch_snapshot` — from about one per assembly to one per tick per assembly.
+If the fault were sensitive to concurrent traffic on that path rather than to depth, the fix
+would make things worse.
+
+So: eight coordinators, all doing catch-ups, all writing forks, all publishing into one store,
+each other's commits the only cross-traffic. Staggered starts and different write lengths so
+they reach their commits at different moments. Node hierarchy matched to production — 120
+groups of eight arrays each.
+
+| | catch-ups | depth at commit | commit | data |
+|---|---|---:|---:|---|
+| z000 | 5 current | 0 | 1.40 s | PASS |
+| z001 | 5 current, 1 advanced | 0 | 1.59 s | PASS |
+| z002 | 5 current, 2 advanced | 0 | 1.44 s | PASS |
+| z003 | 6 current, 2 advanced | 0 | 1.77 s | PASS |
+| z004 | 6 current, 3 advanced | 0 | 1.43 s | PASS |
+| z005 | 7 current, 3 advanced | 0 | 1.42 s | PASS |
+| z006 | 8 current, 3 advanced | 0 | 1.48 s | PASS |
+| z007 | 5 current, 7 advanced | 0 | 1.38 s | PASS |
+
+**All eight published. All at depth 0. 384 chunks verified, none wrong, no cross-clobbering,
+and all sixteen commits on the branch.** About 65 catch-up calls went through the stalling path
+inside two minutes — a call DENSITY roughly sixteen times production's, since production
+spreads its ticks over three hours — and none of them hung.
+
+**And the same fleet WITHOUT the fix reaches the dangerous depths**, which is what makes the
+result mean something rather than describing a configuration that was never at risk:
+
+| arm | depths reached at commit |
+|---|---|
+| catch-ups off | 0, 2, **4, 4, 4, 6, 6, 7** — six of eight at or above the level that fails in production |
+| catch-ups on | 0, 0, 0, 0, 0, 0, 0, 0 |
+
+## Is any of this scale-dependent? Partly — and it matters which part
+
+**What is matched to production:** the node hierarchy that `list_nodes(/)` walks (120 groups x
+8 arrays), the number of concurrent coordinators, two commits per cell, real S3, icechunk
+2.1.1, and forks pickled across spawned processes.
+
+**What is NOT matched, measured rather than assumed:** the snapshot object — the thing the
+stalling call downloads — is **33 KB here against production's 159 KB**, because production's
+also carries manifest references accumulated across ~25 published cells. And the fork phase is
+seconds rather than three hours.
+
+**The safety conclusion carries across that gap; the efficacy conclusion never rested on the
+harness at all.**
+
+* *Safety* is semantic, not dimensional. Whether a fork created before a rebase still merges
+  correctly, whether the guard refuses on a collision, whether anything clobbers a neighbour —
+  these are path-and-coordinate addressing and set membership on path strings. None has a
+  branch on object size, so a bigger snapshot cannot change the answer.
+* *Efficacy* comes from PRODUCTION, at full scale, on the real store: depth 0 or 2 published in
+  about a second on five occasions; depth 4 stalled on eight, across eleven hours and two
+  separate batches ten hours apart. The harness's job was only to show the fix drives depth to
+  zero and corrupts nothing, and it shows both at fleet width.
+
+**One correction worth stating plainly: the error has NOT been regenerated at small scale.**
+The control fleet reached depth 7 and still committed normally, as did every single-coordinator
+arm up to depth 16. The harness reproduces the *condition*, never the *failure*. Anyone reading
+this as "reproduced in miniature, therefore proven" would be overstating it — what is proven in
+miniature is that the fix removes the condition without breaking anything.
