@@ -217,6 +217,17 @@ def report_shard_progress(worker_index: int, done: int, total: int) -> None:
     _PROGRESS_SLOTS[2 * worker_index + 1] = total
 
 
+class CaughtUpPastAConflictError(RuntimeError):
+    """A catch-up advanced past a commit that had touched this group, so the eventual commit
+    can no longer detect a collision with it.
+
+    Its own type because it is the ONE failure in :func:`catch_up_to_branch` that must not be
+    treated as best-effort. Every other failure there costs an optimisation; this one leaves
+    the session in a state where a genuine conflict would be overwritten in silence, and an
+    aborted fill is far cheaper than that.
+    """
+
+
 def _diff_touches(diff: icechunk.Diff, group: str) -> bool:
     """Did anything in ``diff`` change inside ``group``?
 
@@ -233,9 +244,18 @@ def _diff_touches(diff: icechunk.Diff, group: str) -> bool:
     own = f"/{group.strip('/')}"
     prefix = f"{own}/"
     paths: set[str] = set()
+    # EVERY member of Diff, by direct attribute access. `getattr(diff, name, default)` was
+    # wrong twice over: it hid the omission of `moved_nodes` below, and a future icechunk that
+    # renamed a field would silently stop checking that whole class of change rather than
+    # raising. Degrading in the unsafe direction is the one thing this must not do.
     for attr in ("new_groups", "updated_groups", "deleted_groups", "new_arrays", "updated_arrays", "deleted_arrays"):
-        paths |= {str(node) for node in (getattr(diff, attr, None) or set())}
-    paths |= {str(node) for node in (diff.updated_chunks or {})}
+        paths |= {str(node) for node in getattr(diff, attr)}
+    paths |= {str(node) for node in diff.updated_chunks}
+    # A rename populates `moved_nodes` and NOTHING else — no chunks, no arrays, no groups — so
+    # omitting it made a commit that renamed our own array read as untouched. Both ends count:
+    # moving a node out of our group changes it, and so does moving one in.
+    for source, destination in diff.moved_nodes:
+        paths |= {str(source), str(destination)}
     return any(path == own or path.startswith(prefix) for path in paths)
 
 
@@ -290,8 +310,60 @@ def catch_up_to_branch(
         )
         return "blocked"
     session.rebase(icechunk.ConflictDetector())
-    _logger.info("Caught up %s from %s to branch tip %s while its forks write.", group, base, tip)
+    landed = session.snapshot_id
+    if landed != tip and _diff_touches(repo.diff(from_snapshot_id=tip, to_snapshot_id=landed), group):
+        # THE RACE, CLOSED AS FAR AS IT CAN BE. `rebase` takes no target snapshot — it goes to
+        # whatever the tip is when it runs — so a commit landing between the check above and
+        # this call is skipped without ever being vetted. That cannot be undone, but it must
+        # not pass unnoticed: an empty session's rebase never raises whatever it walks over, so
+        # nothing downstream would report it and the commit would overwrite the other writer in
+        # silence. Verified against a real repository: this predicate fires on exactly that
+        # sequence.
+        raise CaughtUpPastAConflictError(
+            f"catch-up for {group} advanced from {base} to {landed}, past the vetted tip {tip}, "
+            f"and a commit in that gap touched {group}; this session can no longer detect a "
+            f"collision with it"
+        )
+    _logger.info("Caught up %s from %s to branch tip %s while its forks write.", group, base, landed)
     return "advanced"
+
+
+def catch_up_best_effort(
+    repo: icechunk.Repository,
+    session: icechunk.Session,
+    group: str,
+    *,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+) -> str:
+    """:func:`catch_up_to_branch`, but a failure costs the optimisation rather than the fill.
+
+    The catch-up is an optimisation; the commit's own rebase is the correctness mechanism and
+    is untouched. So a catch-up that cannot run must leave the fill exactly as it was before
+    any of this existed — which is not what letting it raise does. It runs on a timer for three
+    hours and then once more AFTER every worker has succeeded and its fork is in hand, so an
+    exception at that last call would discard a finished multi-hour write over a failed
+    housekeeping call. The triggers are real and not all transient: a node rename anywhere in
+    the store makes ``rebase`` raise even on an empty session, and a reset branch makes
+    ``diff`` raise.
+
+    :class:`CaughtUpPastAConflictError` is deliberately NOT caught. It does not report a failed
+    optimisation; it reports that the session can no longer detect a collision, and failing
+    the fill is the cheap outcome there.
+
+    Returns:
+        Whatever :func:`catch_up_to_branch` returned, or ``"failed"``.
+    """
+    try:
+        return catch_up_to_branch(repo, session, group, log=log)
+    except CaughtUpPastAConflictError:
+        raise
+    except Exception:
+        (log or _log).warning(
+            "Catch-up for %s failed; the commit's own rebase still applies, so this costs speed and not correctness.",
+            group,
+            exc_info=True,
+        )
+        return "failed"
 
 
 def _await_forks(
@@ -847,7 +919,7 @@ def write_year_shards(
         # Keep the session current WHILE the workers write. Without this the commit below has
         # to walk every snapshot published during the write, and that walk is where seven of
         # nine assemblies stopped dead on 2026-08-29. See `catch_up_to_branch`.
-        catch_up=lambda: catch_up_to_branch(repo, session, group, log=log),
+        catch_up=lambda: catch_up_best_effort(repo, session, group, log=log),
     )
 
     year_label = _year_label(_group_node(session.store, group), year_index)

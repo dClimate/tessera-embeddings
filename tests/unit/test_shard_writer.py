@@ -935,7 +935,7 @@ class _FakeDiff:
     against a real repository below, because a stub of the thing under test cannot falsify it.
     """
 
-    def __init__(self, *, chunks=(), groups=(), arrays=()):
+    def __init__(self, *, chunks=(), groups=(), arrays=(), moved=()):
         self.updated_chunks = {p: [[0, 0, 0]] for p in chunks}
         self.updated_groups = set(groups)
         self.new_groups = set()
@@ -943,6 +943,10 @@ class _FakeDiff:
         self.new_arrays = set(arrays)
         self.updated_arrays = set()
         self.deleted_arrays = set()
+        # EIGHT members, matching icechunk.Diff exactly. The stub used to have seven, which is
+        # precisely how `moved_nodes` went unchecked in the code as well — a stub that is a
+        # subset of the real type makes an incomplete guard look complete.
+        self.moved_nodes = list(moved)
 
 
 class TestDiffTouches:
@@ -964,6 +968,23 @@ class TestDiffTouches:
 
     def test_an_empty_diff_touches_nothing(self):
         assert not shard_writer._diff_touches(_FakeDiff(), "01N")
+
+    def test_a_rename_of_our_own_array_is_seen(self):
+        # A rename populates `moved_nodes` and NOTHING else — verified against a real repo —
+        # so a guard reading the other seven fields waves it through.
+        assert shard_writer._diff_touches(_FakeDiff(moved=[("/01N/embeddings", "/01N/emb2")]), "01N")
+
+    def test_a_rename_into_our_group_is_seen(self):
+        assert shard_writer._diff_touches(_FakeDiff(moved=[("/01S/embeddings", "/01N/stolen")]), "01N")
+
+    def test_the_stub_carries_every_member_of_the_real_diff(self):
+        """A stub missing a field cannot fail on that field, which is how one got missed.
+
+        Pins the stub to `icechunk.Diff` so adding a member upstream breaks this rather than
+        quietly shrinking what the guard is tested against.
+        """
+        real = {a for a in dir(icechunk.Diff) if not a.startswith("_") and a != "is_empty"}
+        assert real <= set(vars(_FakeDiff(chunks=["/x/y"]))), f"stub is missing {real - set(vars(_FakeDiff()))}"
 
     def test_a_group_whose_name_merely_starts_with_ours_is_not_ours(self):
         # "/01N2/..." starts with "01N" as a STRING but is a different zone. Matching on a
@@ -1043,6 +1064,54 @@ class TestCatchUpToBranch:
             assert session.snapshot_id == tip
 
 
+class TestCatchUpRaceAndBestEffort:
+    """The two things that decide whether this is safe to run unattended for hours."""
+
+    def test_advancing_past_an_unvetted_conflicting_commit_raises(self, tmp_path, monkeypatch):
+        """`rebase` takes no target snapshot, so it lands on whatever the tip is when it runs.
+
+        A commit that arrives between the diff check and the rebase is skipped without being
+        vetted. It cannot be undone — an empty session's rebase never raises whatever it walks
+        over — so the only correct outcome is to notice and fail loudly. Simulated by landing
+        the competing commit inside the rebase call itself, which is exactly the window.
+        """
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+        TestCatchUpToBranch._commit_to(repo, "01S", 1)  # vetted as clean
+
+        real_rebase = type(session).rebase
+
+        def rebase_with_a_latecomer(self, solver):
+            TestCatchUpToBranch._commit_to(repo, "01N", 9)  # slips into the window
+            return real_rebase(self, solver)
+
+        monkeypatch.setattr(type(session), "rebase", rebase_with_a_latecomer)
+        with pytest.raises(shard_writer.CaughtUpPastAConflictError, match="01N"):
+            shard_writer.catch_up_to_branch(repo, session, "01N")
+
+    def test_best_effort_turns_a_failure_into_a_tally_entry(self, tmp_path, monkeypatch):
+        # A rename anywhere in the store makes `rebase` raise even on an empty session, and a
+        # reset branch makes `diff` raise. Neither may cost a three-hour fill.
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        monkeypatch.setattr(
+            shard_writer, "catch_up_to_branch", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("s3 hiccup"))
+        )
+        assert shard_writer.catch_up_best_effort(repo, session, "01N") == "failed"
+
+    def test_best_effort_still_lets_the_unsafe_one_through(self, tmp_path, monkeypatch):
+        """The one exception that must NOT be swallowed, or the guard is decorative."""
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+
+        def unsafe(*a, **k):
+            raise shard_writer.CaughtUpPastAConflictError("advanced past a conflict")
+
+        monkeypatch.setattr(shard_writer, "catch_up_to_branch", unsafe)
+        with pytest.raises(shard_writer.CaughtUpPastAConflictError):
+            shard_writer.catch_up_best_effort(repo, session, "01N")
+
+
 class TestRunForkedCatchUp:
     """`run_forked` runs the catch-up on the timer AND once more before it merges."""
 
@@ -1075,9 +1144,35 @@ class TestRunForkedCatchUp:
         )
         assert seen == [False], "the catch-up ran against a session that already held the write"
 
+    def test_the_tick_fires_on_the_timer_while_forks_are_outstanding(self):
+        """The PERIODIC half of the mechanism, which every other test here misses.
+
+        `run_forked` runs a single payload in-process and never reaches `_await_forks`, so the
+        one-payload tests above exercise only the pre-merge call. Driven here against plain
+        futures for the same reason the progress tests are: the behaviour under test is the
+        waiting policy, and resolvable futures make it deterministic.
+        """
+        outstanding: Future = Future()
+        threading.Timer(0.15, lambda: outstanding.set_result("done")).start()
+        ticks: list[int] = []
+        assert _await_forks([outstanding], 0.01, on_tick=lambda: ticks.append(1)) == ["done"]
+        assert len(ticks) >= 2, f"the timer fired {len(ticks)} time(s); the periodic catch-up is dead"
+
+    def test_no_tick_when_nothing_is_outstanding(self):
+        ticks: list[int] = []
+        _await_forks([self._resolved(1)], 0.01, on_tick=lambda: ticks.append(1))
+        assert ticks == []
+
+    @staticmethod
+    def _resolved(value):
+        future: Future = Future()
+        future.set_result(value)
+        return future
+
     def test_a_failing_catch_up_is_not_swallowed(self, tmp_path):
-        # Best-effort belongs at the CALL SITE, where the caller can decide; a helper that
-        # hides its own failures makes a fix that silently stopped working look healthy.
+        # `run_forked` itself does not catch — best-effort is applied at the CALL SITE by
+        # `catch_up_best_effort`, which is tested above. Keeping this layer honest means a
+        # caller that wants the raw behaviour still gets it.
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
 

@@ -77,3 +77,36 @@ unchanged.
 
 **The upstream bug is still a bug.** This removes the precondition, not the fault. The report
 belongs upstream regardless.
+
+## Review findings folded in (2026-08-30)
+
+An adversarial review against a real repository found three things the first version got wrong.
+All are fixed; all are recorded because each is a way this class of change fails.
+
+**The guard could be bypassed, and the result was the silent overwrite it exists to prevent.**
+`Session.rebase` takes no target snapshot — it advances to whatever the tip is when it runs —
+so a commit landing between the diff check and the rebase is skipped without being vetted.
+Reproduced end to end. It cannot be undone, because an empty session's rebase never raises
+whatever it walks over. So the catch-up now re-checks the range it *actually* crossed and
+raises `CaughtUpPastAConflict`, turning a silent overwrite into a loud abort.
+
+**A failed catch-up destroyed the fill, including after the work had succeeded.** The first
+version let exceptions propagate, on the stated reasoning that best-effort belonged at the call
+site — but the call site did not implement it. The final catch-up runs *after* every worker has
+returned its fork, so an exception there discarded a finished multi-hour write. The triggers
+are real and not all transient: a node rename anywhere in the store makes `rebase` raise even
+on an empty session, and a reset branch makes `diff` raise. `catch_up_best_effort` now logs and
+tallies those as `failed`, while still letting `CaughtUpPastAConflict` through.
+
+**The guard read seven of `Diff`'s eight members.** A rename populates `moved_nodes` and
+nothing else, so a commit that renamed our own array read as untouched. Both ends of each move
+now count, and all eight members are read by direct attribute access — the previous
+`getattr(diff, name, None) or set()` would have let a future field rename silently disable a
+whole class of check.
+
+**One behaviour worth knowing rather than fixing.** A block latches: the checked range only
+grows once the base stops moving, so one same-zone commit early in a fill makes every later
+tick report `blocked`. That is safe — it is exactly today's behaviour — but it means the
+mechanism switches off for the rest of that fill. Advancing to the last snapshot before the
+offending commit would keep most of the benefit and is not possible today, because `rebase`
+accepts no target snapshot. That is a second reason to want the upstream fix.
