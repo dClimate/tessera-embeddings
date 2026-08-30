@@ -30,6 +30,31 @@ second, depth 4 stalls indefinitely. This one is the most valuable because nobod
 the campaign produced it on its own, on the same store, in the same hour that seven cells sat
 wedged.
 
+## And a fifth: a NEW stall, ten hours later, predicted in mechanism first
+
+At 11:20Z on 2026-08-30 a fresh cell stalled — 50N/2018, on a different fill, ten hours after
+the batch that produced the original seven. It matters because the discriminator below (three
+transaction logs rather than two, with the third's fetch overlapping the rebase loop) was
+derived from the earlier stalls and had not yet been tested against a new one. It reproduced
+every element:
+
+```
+11:20:27.140  Commit started, old_snapshot_id: NXDTHZQNYV577DK4BN0G   <- the tip at 05:35Z
+11:20:27.739  Branch tip has changed, rebase needed
+11:20:27.749  Downloading transaction log: KCS9T67R0SDDDWD2N8YG
+11:20:27.749  Downloading transaction log: AX6YD47KB374KDMWDZP0
+11:20:27.796  Rebasing snapshot KCS9T67R0SDDDWD2N8YG
+11:20:27.797  Downloading transaction log: JQB6ZB6FM6N76FQT6C8G      <- THE THIRD, mid-loop
+11:20:27.819  Rebasing snapshot AX6YD47KB374KDMWDZP0
+11:20:27.819  Downloading snapshot: KCS9T67R0SDDDWD2N8YG             <- and nothing after
+```
+
+Two cells had published since its session opened (32N/2019, 13N/2018), so **depth 4** — the
+level that failed seven for seven — and it failed the same way, at the same call.
+
+**The tally across eleven hours and eight cells is now without exception:** every commit at or
+near the tip published in about a second; every commit four snapshots behind stalled.
+
 ## The trigger, in one line
 
 A fill opens its session, forks it, writes for about three hours, then commits. Every cell that
