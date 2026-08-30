@@ -2682,6 +2682,11 @@ class ZarrWriter:
                 merge_s=telemetry.get("merge_s"),
                 commit_s=telemetry.get("commit_s"),
                 attrs_commit_s=telemetry.get("attrs_commit_s"),
+                # The catch-up tally. This record is the ONLY place it reaches an operator, and
+                # a healthy commit looks identical whether the session was kept current or
+                # merely got lucky — so omitting it here left the mechanism with no evidence it
+                # ran at all, which is what its own documentation claims this provides.
+                catch_ups=telemetry.get("catch_ups"),
                 total_s=round(time.monotonic() - t0, 3),
                 fused_compress_put=True,
                 workers=workers,

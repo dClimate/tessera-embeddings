@@ -40,10 +40,12 @@ from __future__ import annotations
 import ctypes
 import logging
 import multiprocessing
+import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
@@ -367,17 +369,76 @@ def catch_up_best_effort(
     Returns:
         Whatever :func:`catch_up_to_branch` returned, or ``"failed"``.
     """
+    before = session.snapshot_id
     try:
         return catch_up_to_branch(repo, session, group, log=log)
     except CaughtUpPastAConflictError:
         raise
-    except Exception:
+    except Exception as exc:
+        # THE TEST IS WHETHER THE BASE MOVED, not which exception was raised. `rebase` advances
+        # incrementally and can leave the session advanced when a later step throws, and the
+        # post-rebase verification is itself a network call — so a handler keyed on exception
+        # TYPE swallows exactly the case that matters. Base unmoved: nothing was skipped and
+        # this is a lost optimisation. Base moved: commits were crossed that never got vetted,
+        # and merging the forks onto that base would put a same-group collision beyond the
+        # commit's conflict detection.
+        if session.snapshot_id != before:
+            raise CaughtUpPastAConflictError(
+                f"catch-up for {group} failed after advancing {before} -> {session.snapshot_id}; "
+                f"the commits it crossed were never checked against this group"
+            ) from exc
         (log or _log).warning(
-            "Catch-up for %s failed; the commit's own rebase still applies, so this costs speed and not correctness.",
+            "Catch-up for %s failed with the base unmoved at %s; the commit's own rebase still "
+            "applies, so this costs speed and not correctness.",
             group,
+            before,
             exc_info=True,
         )
         return "failed"
+
+
+#: How often an idle coordinator catches up while its forks write. Its OWN cadence rather than
+#: the progress timer's five minutes: that coupled a housekeeping decision to a reporting one
+#: and let the gap grow for a full reporting period before anything looked at it.
+CATCH_UP_INTERVAL_S = 60.0
+
+
+@contextmanager
+def _ticking(interval_s: float, tick: Callable[[], None] | None) -> Iterator[None]:
+    """Run ``tick`` every ``interval_s`` for the duration of the block.
+
+    ONE timer for the whole fork phase, whichever way the payloads run. Hooking the waiting
+    loop instead would reach only the multi-process branch — a single payload runs inline and
+    never enters it, so that path would get one deep catch-up at the end, which is precisely
+    what this change exists to avoid.
+
+    **The tick's exceptions are re-raised on the CALLER's thread.** A daemon thread's exception
+    is discarded, and one of the things a tick can raise is :class:`CaughtUpPastAConflictError`
+    — which must fail the fill rather than vanish.
+    """
+    if tick is None:
+        yield
+        return
+    stop = threading.Event()
+    failure: list[BaseException] = []
+
+    def _loop() -> None:
+        while not stop.wait(interval_s):
+            try:
+                tick()
+            except BaseException as exc:  # re-raised on the caller's thread; never swallowed
+                failure.append(exc)
+                return
+
+    ticker = threading.Thread(target=_loop, name="catch-up", daemon=True)
+    ticker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        ticker.join(timeout=interval_s)
+        if failure:
+            raise failure[0]
 
 
 def _await_forks(
@@ -387,7 +448,6 @@ def _await_forks(
     unit: str = "partitions",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     slots: ctypes.Array[ctypes.c_long] | None = None,
-    on_tick: Callable[[], object] | None = None,
 ) -> list[Any]:
     """Collect ``futures`` in submission order, logging what is still outstanding.
 
@@ -395,12 +455,6 @@ def _await_forks(
     position is its band and :meth:`icechunk.Session.merge` is given them as the
     caller's payloads were ordered. Re-raises the first failure in that same order,
     matching what ``Executor.map`` would have done.
-
-    ``on_tick`` runs once per progress interval while forks are still outstanding. This loop
-    is the only thing in the process that wakes on a timer during the write, which makes it
-    the only place a periodic housekeeping job can live — but the job itself is the caller's
-    business, so it arrives as a callback rather than as knowledge this function has to hold.
-    Its exceptions are the caller's too: nothing here catches them.
 
     ``unit`` is the caller's name for one payload. What a payload holds is the
     caller's decision (northing bands for one, round-robin tile partitions for
@@ -445,8 +499,6 @@ def _await_forks(
                 unit,
                 (time.monotonic() - started) / 60.0,
             )
-            if on_tick is not None:
-                on_tick()
     return [future.result() for future in futures]
 
 
@@ -512,64 +564,74 @@ def run_forked(
         for i, payload in enumerate(payloads)
     ]
     catch_ups: Counter[str] = Counter()
+    tally_lock = threading.Lock()
 
     def _tick() -> None:
-        if catch_up is not None:
-            catch_ups[catch_up()] += 1
+        if catch_up is None:
+            return
+        outcome = catch_up()
+        with tally_lock:  # the timer thread and this one both reach it
+            catch_ups[outcome] += 1
 
-    if len(payloads) == 1:
-        results = [worker_fn(payloads[0])]
-    else:
-        ctx = multiprocessing.get_context("spawn")
-        # `initializer` runs once per spawned child before any payload. A spawned process
-        # inherits no logging config, so without it the root WARNING default discards every
-        # INFO record a worker produces. Set HERE rather than in each worker body so a worker
-        # added later cannot omit it. The single-payload path above needs nothing: it runs in
-        # the coordinator, which is already configured.
-        slots = ctx.Array("l", 2 * len(payloads), lock=False)
-        ex = ProcessPoolExecutor(
-            max_workers=len(payloads),
-            mp_context=ctx,
-            initializer=_init_fork_worker,
-            initargs=(slots,),
-        )
-        try:
-            futures = [ex.submit(worker_fn, payload) for payload in payloads]
-            results = _await_forks(futures, progress_interval_s, unit=unit, log=log, slots=slots, on_tick=_tick)
-        except BaseException:
-            # Cancel what has not started, then TERMINATE what has. `cancel_futures` only
-            # reaches queued work, so without the second step a multi-hour shard writer keeps
-            # running — and keeps writing fork objects — after the coordinator has already
-            # raised, and Python's own executor atexit hook then blocks interpreter shutdown
-            # on it. A `with` block would be worse still: it joins every worker here, which is
-            # the whole delay `_await_forks` exists to avoid.
-            #
-            # Killing them is safe because nothing they have written is IN the store. Workers
-            # write into a fork; a fork becomes part of the repository only when the
-            # coordinator merges it and commits, and neither happens on this path. Icechunk's
-            # own guidance says as much — dropping a ForkSession without merging is its
-            # documented way to orphan chunks deliberately. So the cost of a kill is
-            # unreferenced objects, which garbage collection reclaims, and the cost of NOT
-            # killing is CPU, S3 writes, and a retry racing the previous attempt in the same
-            # process.
-            #
-            # `_processes` is private: ProcessPoolExecutor exposes no terminate API. Guarded
-            # so a future Python that renames it degrades to the old wait-free shutdown
-            # rather than masking the original failure with an AttributeError.
-            # SNAPSHOT BEFORE SHUTDOWN. `ProcessPoolExecutor.shutdown` sets `_processes = None`
-            # unconditionally — it drops references to objects holding file descriptors — so
-            # reading it afterwards yields None and `.values()` raises AttributeError, masking
-            # the assembly failure this handler exists to propagate. Worse than the leak it was
-            # meant to fix, and a stub executor whose `shutdown` does not null the attribute
-            # cannot catch it.
-            procs = list((getattr(ex, "_processes", None) or {}).values())
-            ex.shutdown(wait=False, cancel_futures=True)
-            for proc in procs:
-                if proc.is_alive():
-                    proc.terminate()
-            raise
-        ex.shutdown()
-    # LAST CHANCE, and it must be before the merge. Once the forks are merged the session
+    # ONE timer around the whole fork phase, so BOTH paths get the periodic catch-up.
+    with _ticking(CATCH_UP_INTERVAL_S, _tick if catch_up is not None else None):
+        if len(payloads) == 1:
+            results = [worker_fn(payloads[0])]
+        else:
+            ctx = multiprocessing.get_context("spawn")
+            # `initializer` runs once per spawned child before any payload. A spawned process
+            # inherits no logging config, so without it the root WARNING default discards every
+            # INFO record a worker produces. Set HERE rather than in each worker body so a worker
+            # added later cannot omit it. The single-payload path above needs nothing: it runs in
+            # the coordinator, which is already configured.
+            slots = ctx.Array("l", 2 * len(payloads), lock=False)
+            ex = ProcessPoolExecutor(
+                max_workers=len(payloads),
+                mp_context=ctx,
+                initializer=_init_fork_worker,
+                initargs=(slots,),
+            )
+            try:
+                futures = [ex.submit(worker_fn, payload) for payload in payloads]
+                results = _await_forks(futures, progress_interval_s, unit=unit, log=log, slots=slots)
+            except BaseException:
+                # Cancel what has not started, then TERMINATE what has. `cancel_futures` only
+                # reaches queued work, so without the second step a multi-hour shard writer keeps
+                # running — and keeps writing fork objects — after the coordinator has already
+                # raised, and Python's own executor atexit hook then blocks interpreter shutdown
+                # on it. A `with` block would be worse still: it joins every worker here, which is
+                # the whole delay `_await_forks` exists to avoid.
+                #
+                # Killing them is safe because nothing they have written is IN the store. Workers
+                # write into a fork; a fork becomes part of the repository only when the
+                # coordinator merges it and commits, and neither happens on this path. Icechunk's
+                # own guidance says as much — dropping a ForkSession without merging is its
+                # documented way to orphan chunks deliberately. So the cost of a kill is
+                # unreferenced objects, which garbage collection reclaims, and the cost of NOT
+                # killing is CPU, S3 writes, and a retry racing the previous attempt in the same
+                # process.
+                #
+                # `_processes` is private: ProcessPoolExecutor exposes no terminate API. Guarded
+                # so a future Python that renames it degrades to the old wait-free shutdown
+                # rather than masking the original failure with an AttributeError.
+                # SNAPSHOT BEFORE SHUTDOWN. `ProcessPoolExecutor.shutdown` sets `_processes = None`
+                # unconditionally — it drops references to objects holding file descriptors — so
+                # reading it afterwards yields None and `.values()` raises AttributeError, masking
+                # the assembly failure this handler exists to propagate. Worse than the leak it was
+                # meant to fix, and a stub executor whose `shutdown` does not null the attribute
+                # cannot catch it.
+                procs = list((getattr(ex, "_processes", None) or {}).values())
+                ex.shutdown(wait=False, cancel_futures=True)
+                for proc in procs:
+                    if proc.is_alive():
+                        proc.terminate()
+                raise
+            ex.shutdown()
+    # LAST CHANCE, and it must be before the merge. A residual window remains after it — the
+    # merge and the group read still have to happen before `commit_with_rebase` — so a commit
+    # landing in those seconds is caught by the commit's own rebase rather than here. That is
+    # the pre-existing behaviour and is bounded by seconds rather than by the write phase's
+    # hours, which is the whole difference this change makes. Once the forks are merged the session
     # holds the whole write, and catching up then would replay it against every intervening
     # snapshot — the expensive, stalling path this exists to avoid. Here the session is still
     # empty, so it is the same cheap pointer move as every tick before it.

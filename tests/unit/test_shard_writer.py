@@ -17,6 +17,7 @@ import zarr
 
 from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, DRILL_EXIT_STATUS, FaultInjection
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
+from tessera_embeddings.inference import assembly
 from tessera_embeddings.storage import global_store, icechunk_logging, shard_writer, zarr_store
 from tessera_embeddings.storage.icechunk_logging import COMMIT_LOG_FILTER, commit_tracing
 from tessera_embeddings.storage.shard_writer import (
@@ -1099,6 +1100,29 @@ class TestCatchUpRaceAndBestEffort:
         )
         assert shard_writer.catch_up_best_effort(repo, session, "01N") == "failed"
 
+    def test_a_failure_after_the_base_moved_is_not_best_effort(self, tmp_path, monkeypatch):
+        """The rule is whether the base moved, NOT which exception was raised.
+
+        `rebase` advances incrementally and can leave the session advanced when a later step
+        throws, and the post-rebase verification is itself a network call. A handler keyed on
+        exception type therefore swallows exactly the case that matters: commits crossed
+        without being vetted, then forks merged onto that base, putting a same-group collision
+        beyond the commit's conflict detection.
+        """
+        _, repo = _seed(tmp_path, zones=(_ZONE, _ZONE_B))
+        session = repo.writable_session("main")
+        TestCatchUpToBranch._commit_to(repo, "01S", 1)
+        before = session.snapshot_id
+
+        def advance_then_fail(*args, **kwargs):
+            session.rebase(icechunk.ConflictDetector())  # the base really moves
+            raise RuntimeError("storage failed during the post-rebase check")
+
+        monkeypatch.setattr(shard_writer, "catch_up_to_branch", advance_then_fail)
+        with pytest.raises(shard_writer.CaughtUpPastAConflictError, match="never checked"):
+            shard_writer.catch_up_best_effort(repo, session, "01N")
+        assert session.snapshot_id != before, "the test did not actually move the base"
+
     def test_best_effort_still_lets_the_unsafe_one_through(self, tmp_path, monkeypatch):
         """The one exception that must NOT be swallowed, or the guard is decorative."""
         _, repo = _seed(tmp_path)
@@ -1220,7 +1244,17 @@ class TestRunForkedCatchUp:
             shard_px=_SHARD,
             telemetry=telemetry,
         )
-        assert "catch_ups" in telemetry, "the catch-up tally never reaches ASSEMBLY_SUMMARY"
+        assert "catch_ups" in telemetry, "the catch-up tally never reaches the telemetry dict"
+
+    def test_the_tally_reaches_the_summary_record_not_just_the_dict(self):
+        """`assemble_global` selects fields by hand for `_assembly_summary_line`.
+
+        A field can therefore sit in the telemetry dict and never appear in the record an
+        operator reads — which is where this one was, while its own documentation called it
+        the only evidence the mechanism ran.
+        """
+        source = inspect.getsource(assembly.ZarrWriter.assemble_global)
+        assert "catch_ups=telemetry.get(" in source, "assemble_global does not forward catch_ups into ASSEMBLY_SUMMARY"
 
     def test_no_tally_when_no_catch_up_was_asked_for(self, tmp_path):
         _, repo = _seed(tmp_path)
@@ -1257,30 +1291,47 @@ class TestRunForkedCatchUp:
         )
         assert order == ["catch_up", "merge"], f"catch-up and merge ran in the order {order}"
 
-    def test_the_tick_fires_on_the_timer_while_forks_are_outstanding(self):
-        """The PERIODIC half of the mechanism, which every other test here misses.
+    def test_the_timer_fires_repeatedly_during_the_fork_phase(self, tmp_path, monkeypatch):
+        """The PERIODIC half of the mechanism — the reason it is a timer and not one call.
 
-        `run_forked` runs a single payload in-process and never reaches `_await_forks`, so the
-        one-payload tests above exercise only the pre-merge call. Driven here against plain
-        futures for the same reason the progress tests are: the behaviour under test is the
-        waiting policy, and resolvable futures make it deterministic.
+        Driven through the SINGLE-payload path deliberately: that is the path a hook in the
+        waiting loop never reached, and `write_year_shards` defaults to it.
         """
-        outstanding: Future = Future()
-        threading.Timer(0.15, lambda: outstanding.set_result("done")).start()
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
         ticks: list[int] = []
-        assert _await_forks([outstanding], 0.01, on_tick=lambda: ticks.append(1)) == ["done"]
-        assert len(ticks) >= 2, f"the timer fired {len(ticks)} time(s); the periodic catch-up is dead"
 
-    def test_no_tick_when_nothing_is_outstanding(self):
-        ticks: list[int] = []
-        _await_forks([self._resolved(1)], 0.01, on_tick=lambda: ticks.append(1))
-        assert ticks == []
+        def slow_worker(payload):
+            time.sleep(0.3)
+            return payload["fork"], {}
 
-    @staticmethod
-    def _resolved(value):
-        future: Future = Future()
-        future.set_result(value)
-        return future
+        run_forked(session, slow_worker, [{"tag": "only"}], catch_up=lambda: (ticks.append(1), "current")[1])
+        assert len(ticks) >= 3, f"the timer fired {len(ticks)} time(s); the periodic catch-up is dead"
+
+    def test_a_timer_failure_reaches_the_caller(self, tmp_path, monkeypatch):
+        """A daemon thread's exception is discarded, and one of these must fail the fill."""
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+
+        def slow_worker(payload):
+            time.sleep(0.3)
+            return payload["fork"], {}
+
+        # RAISES ONCE, from the TIMER, and never again. If it raised on every call the final
+        # pre-merge tick would raise on the caller's thread anyway, and the test would pass
+        # with the timer's re-raise deleted — which is exactly what it did before this.
+        calls: list[int] = []
+
+        def boom_once() -> str:
+            calls.append(1)
+            if len(calls) == 1:
+                raise shard_writer.CaughtUpPastAConflictError("crossed an unvetted commit")
+            return "current"
+
+        with pytest.raises(shard_writer.CaughtUpPastAConflictError, match="unvetted"):
+            run_forked(session, slow_worker, [{"tag": "only"}], catch_up=boom_once)
 
     def test_a_failing_catch_up_is_not_swallowed(self, tmp_path):
         # `run_forked` itself does not catch — best-effort is applied at the CALL SITE by
