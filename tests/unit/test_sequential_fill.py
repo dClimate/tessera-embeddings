@@ -14,6 +14,8 @@ import logging
 import pathlib
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 
 import pytest
 
@@ -933,6 +935,137 @@ class _FlakyIngestInputs(RecordingInputs):
         with self._lock:
             self._live.discard(zone)
             self.events.append(f"discard:{zone}")
+
+
+def test_a_cell_recovering_on_retry_can_still_submit_its_cleanup():
+    """THE PR #167 REVIEW FINDING. Two reviewers caught this independently.
+
+    The housekeeping pool used to be drained at the assembly drain, which happens BEFORE the
+    in-child retry pass. That pass calls `assemble()` again, and this flow's assemble hands
+    staging cleanup to the pool — so a retried cell committed and tagged itself and THEN raised
+    `cannot schedule new futures after shutdown`. The retry loop catches that as a failure, so a
+    cell that had genuinely recovered was reported failed and its staging prefix leaked.
+
+    The oracle is both halves: the cell must be counted as SUCCEEDED, and the work it handed to
+    the pool must actually have run. Asserting only the count would pass while the cleanup was
+    silently dropped.
+    """
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="test-housekeeping")
+    cleaned: list[str] = []
+    seen: dict[str, int] = {}
+
+    def assemble(handoff, prep):
+        seen[handoff.zone] = seen.get(handoff.zone, 0) + 1
+        if handoff.zone == "01N" and seen[handoff.zone] == 1:
+            raise RuntimeError("first assembly attempt fails")
+        # What `assemble_zone_year(defer_cleanup=housekeeping.submit)` does with a real pool.
+        pool.submit(cleaned.append, handoff.zone)
+        return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
+
+    attempts: list[str] = []
+    try:
+        summary = _run(
+            _cells(2),
+            assemble=assemble,
+            housekeeping=pool,
+            infer_single=_recovering_single(attempts),
+        )
+    finally:
+        pool.shutdown(wait=True)
+
+    assert summary["failed"] == 0, f"a recovered cell was reported failed: {summary['failures']}"
+    assert summary["succeeded"] == 2
+    assert attempts == ["01N"], "the retry did not run, so this proves nothing"
+    # 01N appears ONCE: its first attempt raised before reaching the submit, so only the
+    # recovering attempt hands cleanup over. Expecting it twice was my own error, not the code's.
+    assert sorted(cleaned) == ["01N", "02N"], f"cleanup submitted by the retry never ran: {cleaned}"
+
+
+def test_a_session_failure_still_joins_a_runner_owned_cleanup_pool():
+    """Review finding on this PR: the one exit that reaches NEITHER later join.
+
+    A `session` failure re-raises out of the drain's `finally`, skipping the retry pass and both
+    shutdowns after it. When the runner owns the pool — no `housekeeping` passed, which is every
+    caller but the Prefect flow — it would return control with its executor and potentially
+    multi-terabyte deletes still running, contrary to the guarantee its docstring makes.
+
+    The oracle is the pool's own state, not a log line: `submit` after a successful shutdown
+    raises, so a pool that was joined refuses new work and one that was not accepts it.
+    """
+    captured: dict = {}
+    real = ThreadPoolExecutor
+
+    def capturing(*a, **kw):
+        pool = real(*a, **kw)
+        # The RUNNER names its own pool "mosaic-cleanup"; "cell-housekeeping" is the FLOW's.
+        if kw.get("thread_name_prefix") == "mosaic-cleanup":
+            captured["pool"] = pool
+        return pool
+
+    with (
+        mock.patch.object(mod, "ThreadPoolExecutor", capturing),
+        pytest.raises(RuntimeError, match="session blew up"),
+    ):
+        _run(
+            _cells(2),
+            session=_exploding_session("session blew up"),
+            inputs=RecordingInputs([]),
+        )
+
+    assert "pool" in captured, "the runner did not create its own housekeeping pool"
+    with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
+        captured["pool"].submit(lambda: None)
+
+
+def _exploding_session(message: str):
+    def session(more_work, on_item_done):
+        raise RuntimeError(message)
+
+    return session
+
+
+def test_a_base_exception_from_a_retry_still_joins_a_runner_owned_pool():
+    """Third review finding on this PR, and the one the earlier fixes kept missing.
+
+    The retry loop catches `except Exception`, so a BaseException from `infer_single`,
+    `assemble` or `inputs.wait` — cancellation, KeyboardInterrupt — unwinds past it. The session
+    had completed normally, so the `session_raised` join did not fire either, and the runner's
+    own pool was left running with multi-terabyte deletes outstanding.
+
+    Two hand-placed joins covered three of the four exits and missed this one. The region is now
+    under a `finally`, which covers them by construction rather than by enumeration — which is
+    the part that kept going wrong.
+    """
+    captured: dict = {}
+    real = ThreadPoolExecutor
+
+    def capturing(*a, **kw):
+        pool = real(*a, **kw)
+        if kw.get("thread_name_prefix") == "mosaic-cleanup":
+            captured["pool"] = pool
+        return pool
+
+    attempts: list[str] = []
+
+    def interrupted_single(cell, prep, final):
+        attempts.append(cell.zone)
+        raise KeyboardInterrupt("cancelled mid-retry")
+
+    with (
+        mock.patch.object(mod, "ThreadPoolExecutor", capturing),
+        pytest.raises(KeyboardInterrupt, match="cancelled mid-retry"),
+    ):
+        _run(
+            _cells(2),
+            session=_sync_session(fail={"01N"}),
+            inputs=RecordingInputs([]),
+            infer_single=interrupted_single,
+        )
+
+    assert attempts == ["01N"], "the retry never ran, so this proves nothing"
+    assert "pool" in captured, "the runner did not create its own housekeeping pool"
+    with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
+        captured["pool"].submit(lambda: None)
 
 
 def test_an_ingest_failure_is_re_ingested_on_retry():

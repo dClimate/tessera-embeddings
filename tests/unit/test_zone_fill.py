@@ -760,6 +760,107 @@ def test_phase_split_matches_composed_fill(tmp_path, monkeypatch):
     assert zone_fill.zone_year_complete(store, _ZONE, 2025)
 
 
+def test_staging_cleanup_is_handed_to_the_caller_rather_than_run_inline(tmp_path, monkeypatch):
+    """THE REGRESSION. The staging delete used to run on the trailing-assembly thread.
+
+    Measured in production on 2026-08-31 at roughly TWO HOURS per cell — 34N-2018 published at
+    02:27Z and the next step on that thread did not begin until 04:27Z — during which the
+    cluster's next assembly could not start even with its tiles fully staged. Seven of nine
+    clusters were idle 91-117 minutes for this reason.
+
+    The oracle is that `cleanup_staging` is NOT called while `assemble_zone_year` runs, and IS
+    reachable afterwards through what the caller was handed. Asserting only that a deferral
+    callable fired would pass even if the work never happened.
+    """
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0), (1, 1)])
+    log = logging.getLogger("t")
+    staged: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        ZarrWriter, "cleanup_staging", lambda self, run_id, log=None: deleted.append(run_id), raising=True
+    )
+    handoff = zone_fill.infer_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2025,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="runDefer",
+    )
+    handed: list = []
+    zone_fill.assemble_zone_year(
+        handoff,
+        store_path=store,
+        staging_base=str(tmp_path / "staging"),
+        log=log,
+        defer_cleanup=handed.append,
+    )
+    assert deleted == [], f"the staging delete ran inline despite a deferral: {deleted}"
+    assert len(handed) == 1, "nothing was handed to the caller, so the delete would never happen"
+    handed[0]()
+    assert deleted == ["runDefer"], "what was handed over does not delete this run's staging"
+
+
+def test_staging_cleanup_still_runs_inline_without_a_deferral(tmp_path, monkeypatch):
+    """The default is unchanged for every caller that has no pool."""
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0), (1, 1)])
+    log = logging.getLogger("t")
+    staged: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        ZarrWriter, "cleanup_staging", lambda self, run_id, log=None: deleted.append(run_id), raising=True
+    )
+    handoff = zone_fill.infer_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2025,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="runInline",
+    )
+    zone_fill.assemble_zone_year(handoff, store_path=store, staging_base=str(tmp_path / "staging"), log=log)
+    assert deleted == ["runInline"]
+
+
+def test_the_flow_actually_defers_both_deletes():
+    """The wiring, not the mechanism.
+
+    A deferral that works and a flow that never passes it is a fix that cannot fire, and every
+    test above would still pass. Source inspection because the alternative is a live multi-hour
+    assembly.
+    """
+    import inspect
+
+    from tessera_embeddings.orchestration.prefect.flows import fill_zones_sequential as flow
+
+    src = (
+        inspect.getsource(flow.fill_zones_sequential_flow)
+        if hasattr(flow, "fill_zones_sequential_flow")
+        else inspect.getsource(flow)
+    )
+    assert "defer_cleanup=housekeeping.submit" in src, (
+        "the flow does not hand the staging delete to a pool, so it still runs on the assembly thread"
+    )
+    assert "housekeeping=housekeeping" in src, (
+        "the runner is not given the pool, so nothing joins it and the flow can return with "
+        "multi-terabyte deletes outstanding"
+    )
+
+
 def _seed_global_with_rule(tmp_path, rule: int) -> str:
     """A store whose write-once root declares a depth rule, so the fill's gate accepts one."""
     store = str(tmp_path / "global.icechunk")
