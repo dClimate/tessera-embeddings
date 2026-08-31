@@ -1006,7 +1006,7 @@ Eight samples of the summed `Progress: N/M chunks done` across the ten clusters,
 | fleet throughput | **5,578 tiles/h** (5,614 tiles over 60.4 min) |
 | in tokens | **1.12 × 10⁹ combined tok/s** aggregate |
 | GPU instances booted | 1,163 (408 g6e.xlarge / L40S + 755 g5.2xlarge / A10G) |
-| workers actually inferring | **712** (`active` in the same progress line) |
+| actor slots placed and busy | **712** (see the note below on how this was established) |
 | **per ACTIVE worker** | **1.58 M combined tok/s — 74% of the 2.127 M basis** |
 | per booted instance | 0.97 M tok/s — 46% of the basis |
 
@@ -1014,6 +1014,18 @@ Eight samples of the summed `Progress: N/M chunks done` across the ten clusters,
 13 live tiles plus 36N-2021's 8,709 — an exact match, so the driver's progress counter and the
 coverage census are in the same unit and 725.6 M tok/tile converts between them
 (2048² px × 173 tok/px).
+
+**And 712 is actor slots, which took a second measurement to establish.** The figure comes from
+the progress line's `N active` field, and `scheduling.py:805` says in as many words that it
+counts *chunks in flight, not actor slots and not GPUs* — so reading it as workers is precisely
+the substitution the source warns against. Checked against the batching line, which reports
+slots directly (`Requested actor batch: +N (X/TARGET total, Y actor slots placed)`): on the five
+clusters that logged both inside the window, **slots placed equalled chunks in flight exactly** —
+54/54, 118/118, 108/108, 65/65, 97/97. An actor holds one chunk at a time and the queue is deep,
+so every placed slot is busy. The four clusters showing zero slots had simply gone quiet after
+requesting their full target, and their in-flight counts sum to the remaining 270 of the 712.
+The substitution is therefore sound *here*, on a saturated fleet, and should be re-checked rather
+than assumed on a fleet with idle actors.
 
 ### Two separate gaps, and only one of them is about the model
 
@@ -1024,9 +1036,14 @@ hypothesis with arithmetic behind it, not a measurement** — nothing here attri
 per card, and doing so needs per-actor accounting the driver does not currently emit. Worth
 building before the mix is used to argue anything.
 
-**2. Only 61% of booted GPU instances are inferring at any moment** — 712 of 1,163. That is the
-gap between the fleet that is billed and the fleet that works: instances still booting, loading
-the checkpoint, or idle between chunks. §5's fleet-sizing policy provisions at 85% of matched
+**2. Only 61% of booted GPU instances hold an actor slot** — 712 of 1,163, so **451 booted GPU
+machines are running nothing**. That is the gap between the fleet that is billed and the fleet
+that works. The drivers had requested 567 of a 1,250 target across the five clusters visible in
+the window, so the leading explanation is that the autoscaler is bringing machines up faster than
+the paced actor-request loop claims them — which is consistent with `actor_request_headroom = 25`
+asking for held-plus-25 rather than for the target, and with constraint-held machines being
+exempt from idle termination. Instances mid-join account for some of it and cannot account for
+all of it at this width. §5's fleet-sizing policy provisions at 85% of matched
 supply to keep idle burn structurally zero, and it succeeds at that on the INGEST side; this
 number says the GPU side has its own 39% overhead which the model does not represent at all.
 
