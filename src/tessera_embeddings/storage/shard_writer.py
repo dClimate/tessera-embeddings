@@ -59,7 +59,9 @@ from tessera_embeddings.storage.icechunk_logging import traced_commit
 from tessera_embeddings.storage.session_catch_up import (
     CATCH_UP_INTERVAL_S,
     CatchUpAbortedTheWaitError,
+    CatchUpDidNotStopError,
     catch_up_best_effort,
+    rehome_after_a_wedged_catch_up,
     ticking,
 )
 from tessera_embeddings.storage.zarr_store import read_time_values
@@ -304,7 +306,8 @@ def run_forked(
     unit: str = "partitions",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     catch_up: Callable[[], str] | None = None,
-) -> dict[str, Any]:
+    rehome: Callable[[], icechunk.Session] | None = None,
+) -> tuple[dict[str, Any], icechunk.Session]:
     """Fork ``session``, run ``worker_fn`` over ``payloads``, merge the forks back.
 
     The shared coordinator scaffolding for cooperative writes: each payload is
@@ -340,6 +343,14 @@ def run_forked(
       given. Reported because the fix it implements is invisible in a healthy run: a commit
       that does not stall looks the same whether the session was kept current or simply got
       lucky. The tally is the only evidence that it ran.
+    * ``rehomed`` — True when a wedged catch-up forced the forks onto a fresh session. Present
+      only on that path, so its absence is the normal case rather than a false negative.
+
+    ``rehome`` is the escape hatch for a catch-up that wedges: called only when the workers all
+    finished and the timer then refused to stop, it must return a fresh session to merge into.
+    Without it that case fails the fill, which is what it did before this existed. Returning the
+    session used is why this returns a PAIR — the caller commits it, and after a re-home that is
+    no longer the session it passed in.
 
     ``catch_up`` is called on a timer for the whole fork phase and NOT again afterwards. The
     periodic calls are the entire point: they keep each catch-up short, where a single deep one
@@ -368,59 +379,78 @@ def run_forked(
 
     # ONE timer around the whole fork phase, so BOTH paths get the periodic catch-up.
     abort = threading.Event()
-    with ticking(CATCH_UP_INTERVAL_S, _tick if catch_up is not None else None, abort=abort):
-        if len(payloads) == 1:
-            results = [worker_fn(payloads[0])]
-        else:
-            ctx = multiprocessing.get_context("spawn")
-            # `initializer` runs once per spawned child before any payload. A spawned process
-            # inherits no logging config, so without it the root WARNING default discards every
-            # INFO record a worker produces. Set HERE rather than in each worker body so a worker
-            # added later cannot omit it. The single-payload path above needs nothing: it runs in
-            # the coordinator, which is already configured.
-            slots = ctx.Array("l", 2 * len(payloads), lock=False)
-            ex = ProcessPoolExecutor(
-                max_workers=len(payloads),
-                mp_context=ctx,
-                initializer=_init_fork_worker,
-                initargs=(slots,),
-            )
-            try:
-                futures = [ex.submit(worker_fn, payload) for payload in payloads]
-                results = _await_forks(futures, progress_interval_s, unit=unit, log=log, slots=slots, abort=abort)
-            except BaseException:
-                # Cancel what has not started, then TERMINATE what has. `cancel_futures` only
-                # reaches queued work, so without the second step a multi-hour shard writer keeps
-                # running — and keeps writing fork objects — after the coordinator has already
-                # raised, and Python's own executor atexit hook then blocks interpreter shutdown
-                # on it. A `with` block would be worse still: it joins every worker here, which is
-                # the whole delay `_await_forks` exists to avoid.
-                #
-                # Killing them is safe because nothing they have written is IN the store. Workers
-                # write into a fork; a fork becomes part of the repository only when the
-                # coordinator merges it and commits, and neither happens on this path. Icechunk's
-                # own guidance says as much — dropping a ForkSession without merging is its
-                # documented way to orphan chunks deliberately. So the cost of a kill is
-                # unreferenced objects, which garbage collection reclaims, and the cost of NOT
-                # killing is CPU, S3 writes, and a retry racing the previous attempt in the same
-                # process.
-                #
-                # `_processes` is private: ProcessPoolExecutor exposes no terminate API. Guarded
-                # so a future Python that renames it degrades to the old wait-free shutdown
-                # rather than masking the original failure with an AttributeError.
-                # SNAPSHOT BEFORE SHUTDOWN. `ProcessPoolExecutor.shutdown` sets `_processes = None`
-                # unconditionally — it drops references to objects holding file descriptors — so
-                # reading it afterwards yields None and `.values()` raises AttributeError, masking
-                # the assembly failure this handler exists to propagate. Worse than the leak it was
-                # meant to fix, and a stub executor whose `shutdown` does not null the attribute
-                # cannot catch it.
-                procs = list((getattr(ex, "_processes", None) or {}).values())
-                ex.shutdown(wait=False, cancel_futures=True)
-                for proc in procs:
-                    if proc.is_alive():
-                        proc.terminate()
-                raise
-            ex.shutdown()
+    # WORKERS FINISHED, not "we reached the exit". `ticking` raises from its `finally`, which
+    # runs on the failure path too — and an exception raised there REPLACES the body's own. So
+    # a worker that died while the ticker happened to be wedged would arrive here looking
+    # exactly like a clean run whose catch-up hung, and re-homing it would commit a partial
+    # write. This flag is the only thing that tells the two apart.
+    workers_finished = False
+    rehomed = False
+    try:
+        with ticking(CATCH_UP_INTERVAL_S, _tick if catch_up is not None else None, abort=abort):
+            if len(payloads) == 1:
+                results = [worker_fn(payloads[0])]
+            else:
+                ctx = multiprocessing.get_context("spawn")
+                # `initializer` runs once per spawned child before any payload. A spawned process
+                # inherits no logging config, so without it the root WARNING default discards every
+                # INFO record a worker produces. Set HERE rather than in each worker body so a worker
+                # added later cannot omit it. The single-payload path above needs nothing: it runs in
+                # the coordinator, which is already configured.
+                slots = ctx.Array("l", 2 * len(payloads), lock=False)
+                ex = ProcessPoolExecutor(
+                    max_workers=len(payloads),
+                    mp_context=ctx,
+                    initializer=_init_fork_worker,
+                    initargs=(slots,),
+                )
+                try:
+                    futures = [ex.submit(worker_fn, payload) for payload in payloads]
+                    results = _await_forks(futures, progress_interval_s, unit=unit, log=log, slots=slots, abort=abort)
+                except BaseException:
+                    # Cancel what has not started, then TERMINATE what has. `cancel_futures` only
+                    # reaches queued work, so without the second step a multi-hour shard writer keeps
+                    # running — and keeps writing fork objects — after the coordinator has already
+                    # raised, and Python's own executor atexit hook then blocks interpreter shutdown
+                    # on it. A `with` block would be worse still: it joins every worker here, which is
+                    # the whole delay `_await_forks` exists to avoid.
+                    #
+                    # Killing them is safe because nothing they have written is IN the store. Workers
+                    # write into a fork; a fork becomes part of the repository only when the
+                    # coordinator merges it and commits, and neither happens on this path. Icechunk's
+                    # own guidance says as much — dropping a ForkSession without merging is its
+                    # documented way to orphan chunks deliberately. So the cost of a kill is
+                    # unreferenced objects, which garbage collection reclaims, and the cost of NOT
+                    # killing is CPU, S3 writes, and a retry racing the previous attempt in the same
+                    # process.
+                    #
+                    # `_processes` is private: ProcessPoolExecutor exposes no terminate API. Guarded
+                    # so a future Python that renames it degrades to the old wait-free shutdown
+                    # rather than masking the original failure with an AttributeError.
+                    # SNAPSHOT BEFORE SHUTDOWN. `ProcessPoolExecutor.shutdown` sets `_processes = None`
+                    # unconditionally — it drops references to objects holding file descriptors — so
+                    # reading it afterwards yields None and `.values()` raises AttributeError, masking
+                    # the assembly failure this handler exists to propagate. Worse than the leak it was
+                    # meant to fix, and a stub executor whose `shutdown` does not null the attribute
+                    # cannot catch it.
+                    procs = list((getattr(ex, "_processes", None) or {}).values())
+                    ex.shutdown(wait=False, cancel_futures=True)
+                    for proc in procs:
+                        if proc.is_alive():
+                            proc.terminate()
+                    raise
+                ex.shutdown()
+            workers_finished = True
+    except CatchUpDidNotStopError:
+        # THE WORKERS ARE DONE AND THE SESSION IS NOT SAFE. These are separable, and separating
+        # them is the whole point: the write survives, only the session is lost. Re-home the
+        # finished forks onto one no other thread holds. Without a `rehome` this is what it
+        # always was — a failed cell with hours of shard writes discarded.
+        if rehome is None or not workers_finished:
+            raise
+        session = rehome()
+        rehomed = True
+
     # NO FINAL CATCH-UP HERE, deliberately. An earlier revision ticked once more at this point
     # to close the gap opened since the last timer tick. That call sits OUTSIDE `ticking`, so
     # nothing bounded it: if it entered the stalling path it would hang forever at the one step
@@ -428,19 +458,22 @@ def run_forked(
     # alarms on, a stalled catch-up here would be silent.
     #
     # Dropping it costs almost nothing. The residual gap is whatever published since the last
-    # tick, so at most one CATCH_UP_INTERVAL_S of commits — about none in this campaign, two in
-    # the worst case observed. The commit's own rebase closes it, from a depth that has never
-    # failed, with the stall alarm watching. Less code, no unbounded call, and any residual
-    # hang lands back where it is instrumented.
+    # tick, so at most one CATCH_UP_INTERVAL_S of commits. The commit's own rebase closes it,
+    # from a depth that has never failed, with the stall alarm watching. Less code, no unbounded
+    # call, and any residual hang lands back where it is instrumented.
     #
-    # THE RESIDUAL THIS LEAVES, quantified rather than waved at. Peers can publish between a
-    # coordinator's last tick and its own commit, so several assemblies finishing together can
-    # still stack: if three commit inside one CATCH_UP_INTERVAL_S, the third arrives four
-    # snapshots behind — the depth that fails. It takes THREE commits inside one interval, and
-    # in the 2026-08-29 incident the nine assemblies' commits were spaced 12 s to 26 min apart,
-    # never more than two inside any 60 s window, which is a depth that has never failed. The
-    # `catch_ups` tally is what would show this changing: a run of `advanced` at commit time
-    # means peers are landing inside the interval, and the lever is to shorten it.
+    # THE RESIDUAL THIS LEAVES, corrected 2026-08-31 after it fired twice in production. The
+    # earlier text here said it took THREE commits inside one interval to reach the failing
+    # depth, and read its own data as reassurance. That was off by one: a cell publishes TWO
+    # snapshots, the fill and the mark, so TWO publications inside an interval already put a
+    # coordinator four snapshots behind. Measured that night: 36 catch-ups crossing one
+    # publication all succeeded, and both of the two that had to cross a pair wedged.
+    #
+    # Two things answer it here. CATCH_UP_INTERVAL_S is now 30 s rather than 60, halving the
+    # window a second publication has to land in, and `rehome` above makes the remaining case
+    # survivable instead of fatal. Neither is a guarantee: only a minimum spacing between
+    # publications, set above the tick interval, makes depth 4 unreachable, and that needs a
+    # fleet-wide lock which is deliberately not built here.
     t_merge = time.monotonic()
     session.merge(*(fork_result for fork_result, _ in results))
     done = time.monotonic()
@@ -451,7 +484,9 @@ def run_forked(
     }
     if catch_up is not None:
         telemetry["catch_ups"] = dict(catch_ups)
-    return telemetry
+    if rehomed:
+        telemetry["rehomed"] = True
+    return telemetry, session
 
 
 def _group_node(store: Any, group: str) -> zarr.Group:  # noqa: ANN401 — icechunk store handle
@@ -791,7 +826,13 @@ def write_year_shards(
     ]
     # The payloads are round-robin partitions of the source's tiles — name them
     # that way; "band writes" would describe the OTHER caller of run_forked.
-    fill = run_forked(
+    # CAPTURED HERE, before anything forks. If the catch-up wedges, this is the one base that
+    # can still be read: the session itself is held by a thread we cannot stop, and asking it
+    # for its `snapshot_id` would be reaching into exactly the object we have given up on. It
+    # is also the safe answer — the range base..tip is a superset of what was skipped, so
+    # checking it can only refuse more often than strictly necessary, never less.
+    base_before_forking = session.snapshot_id
+    fill, session = run_forked(
         session,
         _write_shards_worker,
         payloads,
@@ -801,6 +842,9 @@ def write_year_shards(
         # to walk every snapshot published during the write, and that walk is where seven of
         # nine assemblies stopped dead on 2026-08-29. See `catch_up_to_branch`.
         catch_up=lambda: catch_up_best_effort(repo, session, group, log=log),
+        # And if that catch-up wedges — twice on 2026-08-31 — hand the finished forks a
+        # session no one else is inside, rather than throwing the write away.
+        rehome=lambda: rehome_after_a_wedged_catch_up(repo, group, base=base_before_forking, log=log),
     )
 
     year_label = _year_label(_group_node(session.store, group), year_index)

@@ -242,7 +242,95 @@ def catch_up_best_effort(
 #: How often an idle coordinator catches up while its forks write. Its OWN cadence rather than
 #: the progress timer's five minutes: that coupled a housekeeping decision to a reporting one
 #: and let the gap grow for a full reporting period before anything looked at it.
-CATCH_UP_INTERVAL_S = 60.0
+#:
+#: THIRTY SECONDS, LOWERED FROM SIXTY, and the arithmetic that sets it is worth stating because
+#: getting it wrong once already cost two cells. A cell publishes **two** snapshots — the fill
+#: and the completion mark — so depth is counted in twos:
+#:
+#:     one publication inside the interval  -> depth 2   (2026-08-31: 36 attempts, 36 fine)
+#:     two publications inside the interval -> depth 4   (2026-08-31: 2 attempts, 2 wedged)
+#:
+#: The window in which a second publication is fatal IS this interval, so halving it halves the
+#: exposure. On 2026-08-31 the pair that wedged two coordinators landed eleven seconds apart,
+#: which no practical interval survives on its own — which is the point: this value buys odds,
+#: not a guarantee.
+#:
+#: **It becomes a guarantee only when paired with a minimum spacing between publications**, set
+#: strictly above this interval, so at most one publication can land between consecutive ticks.
+#: That spacing is a fleet-wide lock and is NOT implemented here; see
+#: ``context_docs/design/keeping-the-assembly-session-current-2026_08.md``. Until it exists,
+#: :func:`rehome_after_a_wedged_catch_up` is what makes the remaining case survivable rather
+#: than fatal.
+#:
+#: The cost of ticking twice as often is a branch-tip ref read per tick, which returns
+#: ``"current"`` without entering the call that wedges.
+CATCH_UP_INTERVAL_S = 30.0
+
+
+def rehome_after_a_wedged_catch_up(
+    repo: icechunk.Repository,
+    group: str,
+    *,
+    base: str,
+    branch: str = "main",
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+) -> icechunk.Session:
+    """Open a fresh session for finished forks whose own session is no longer safe to touch.
+
+    **Why a fresh session rather than a stopped thread.** A wedged catch-up cannot be stopped.
+    It is blocked inside a pyo3 call into Rust, where no Python mechanism reaches it — not a
+    timeout, not a signal, not ``PyThreadState_SetAsyncExc`` — and on 2026-08-31 the two that
+    wedged never returned at all. So the session it holds can never be declared free, and the
+    only move left is to stop sharing state with it.
+
+    **Why the finished work survives that.** :func:`~...shard_writer.run_forked` raises from the
+    timer's exit, which runs after its body, so every worker's fork is already in hand and
+    undamaged. And a fork is not bound to the session that produced it: the normal path already
+    merges forks made at one base into a session that has since rebased to the tip, which eight
+    published cells did on 2026-08-31 across one to seven rebases. Verified directly against
+    icechunk 2.1.1 on a real repository — a fork merged into a session opened later commits, its
+    data lands, and the commits it skipped keep both their chunks and their attrs.
+
+    **What this must check, and why it is not optional.** Abandoning the old session also
+    abandons the conflict detection its commit would have done over ``base..tip``. A fresh
+    session's own rebase only covers what lands after it opens, so this walks the skipped range
+    itself and refuses if anything in it touched ``group`` — the same rule, and the same reason,
+    as :func:`catch_up_to_branch`. The walk is a read-only diff, which stayed at 0.1-0.4 s
+    throughout every stall yet observed, so it is not on the path that wedges.
+
+    Args:
+        repo: The repository.
+        group: The group being written, whose collisions must still be detectable.
+        base: The abandoned session's base, captured BEFORE the fork phase — never read off
+            the poisoned session, which another thread is inside.
+        branch: Branch to open the fresh session on.
+        log: Where to say that this happened; it should never pass unremarked.
+
+    Returns:
+        A fresh writable session at the branch tip, safe to merge the finished forks into.
+
+    Raises:
+        CaughtUpPastAConflictError: A commit in the skipped range touched ``group``, so
+            re-homing would put a same-group collision beyond conflict detection. The cell
+            fails, which is the cheap outcome.
+    """
+    fresh = repo.writable_session(branch)
+    landed = fresh.snapshot_id
+    if base != landed and _diff_touches(repo.diff(from_snapshot_id=base, to_snapshot_id=landed), group):
+        raise CaughtUpPastAConflictError(
+            f"cannot re-home {group} onto a fresh session: a commit between the abandoned base "
+            f"{base} and the tip {landed} touched {group}, so the re-homed commit could not "
+            f"detect a collision with it"
+        )
+    (log or _log).warning(
+        "Re-homing %s onto a fresh session at %s: its catch-up wedged and cannot be stopped, so "
+        "the finished forks are merged onto a session no other thread holds. The abandoned "
+        "session was based at %s.",
+        group,
+        landed,
+        base,
+    )
+    return fresh
 
 
 @contextmanager
