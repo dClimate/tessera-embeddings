@@ -250,6 +250,12 @@ def fill_zones_sequential(
         [Callable[[], list[WorkItem] | None], Callable[[WorkItem, dict[str, Any]], None]], list[dict[str, Any]]
     ],
     assemble: Callable[[ZoneFillHandoff, PreparedCell], dict[str, Any]],
+    # The pool a landed cell's deletes run on. The CALLER may own it because the staging delete
+    # is issued from inside `assemble` (see `assemble_zone_year`'s `defer_cleanup`), which this
+    # runner cannot reach — but the runner is what drains, so it is what joins the pool. A caller
+    # that passes one must not submit to it after this returns. None means the runner makes its
+    # own, which covers the mosaic delete alone.
+    housekeeping: ThreadPoolExecutor | None = None,
     infer_single: Callable[[SequentialCell, PreparedCell, bool], ZoneFillHandoff],
     session_s1_orbit: str,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
@@ -289,6 +295,10 @@ def fill_zones_sequential(
             ``(more_work, on_item_done)``. Blocks until every streamed tile
             is final.
         assemble: The assembly phase, ``(handoff, prepared) → summary``.
+        housekeeping: Pool for a landed cell's staging and mosaic deletes. Optional; the
+            runner makes its own when omitted. A caller passes one when it issues deletes
+            this runner cannot see — the staging delete comes from inside ``assemble`` —
+            and must not submit to it after this function returns, which joins it.
         infer_single: Per-cell fallback ``(cell, prepared, is_final) →``
             handoff for orbit-mismatch cells, run AFTER the session ends
             (their actor config cannot join the shared stream).
@@ -392,7 +402,8 @@ def fill_zones_sequential(
     #: drain, where the backlog can be most of a cluster's cells and take hours.
     assembly_pending = 0
     finalizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trailing-assembly")
-    #: Mosaic deletes run HERE, not on the assembly thread. A cell's mosaic is multi-terabyte
+    #: A landed cell's deletes — its STAGING prefix and its MOSAIC prefix — run HERE, not on
+    #: the assembly thread. A cell's mosaic is multi-terabyte
     #: and its delete takes as long as it takes; while it sat inside `_finalize` it held the
     #: single assembly worker, so the next cell's assembly could not start even with its tiles
     #: fully staged. Measured on 2026-08-31: seven of nine clusters idle 91-117 minutes after
@@ -403,7 +414,7 @@ def fill_zones_sequential(
     #: pool would let a cluster that publishes in a burst aim every delete at the same bucket
     #: at once. Four is comfortably more than the ~one publication per three hours a cluster
     #: sustains, so the queue only builds during a drain, which is exactly when it should.
-    mosaic_cleaner = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mosaic-cleanup")
+    mosaic_cleaner = housekeeping or ThreadPoolExecutor(max_workers=4, thread_name_prefix="mosaic-cleanup")
 
     def _leak_mosaic(cell: SequentialCell) -> None:
         """A LANDED cell whose mosaic delete failed: free the slot, do NOT count it.

@@ -940,6 +940,11 @@ def assemble_zone_year(
     n_assembly_workers: int | None = None,
     s3_concurrency: int | None = None,
     cleanup_staging: bool = True,
+    # How to run the staging delete. None runs it INLINE, which is what every caller did until
+    # 2026-08-31 — and on the trailing-assembly thread that meant the next cell's assembly waited
+    # out a multi-terabyte delete measured at ~2 h per cell in production. A caller with a pool
+    # passes its `submit` here and gets its assembly thread back the moment the cell has landed.
+    defer_cleanup: Callable[[Callable[[], None]], object] | None = None,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
     fault: ArmedFault | None = None,
@@ -973,6 +978,17 @@ def assemble_zone_year(
                 writer.cleanup_staging(run_id, log)
             except Exception:
                 log.warning("Staging cleanup failed for run %s", run_id, exc_info=True)
+
+    def _run_cleanup() -> None:
+        """Hand the staging delete to the caller's pool, or run it here if it has none.
+
+        Called only where `_cleanup()` was called before — after the cell is marked and tagged
+        — so deferring changes when the bytes go, never whether the cell landed.
+        """
+        if defer_cleanup is None:
+            _cleanup()
+        else:
+            defer_cleanup(_cleanup)
 
     staged_labels = writer.verify_staged_completeness(run_id, live, log=log)
     if not staged_labels:
@@ -1041,7 +1057,7 @@ def assemble_zone_year(
             "skipped": sum(r["status"] == "skipped" for r in results),
             "elapsed_sec": time.monotonic() - t0,
         }
-        _cleanup()
+        _run_cleanup()
         log.info(
             "Zone %s year %d: all %d live tiles skipped — marked complete empty (%s)",
             zone,
@@ -1113,7 +1129,7 @@ def assemble_zone_year(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
     )
     tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
-    _cleanup()
+    _run_cleanup()
 
     return {
         **summary,

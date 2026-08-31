@@ -1314,6 +1314,13 @@ def fill_zones_sequential_flow(
             retire_idle_actors=final,
         )
 
+    #: Where a landed cell's deletes go. Owned here rather than by the runner because the
+    #: STAGING delete is issued from inside `assemble_zone_year`, which the runner cannot reach;
+    #: the runner is handed this same pool and is what joins it at the drain. Both deletes of a
+    #: cell are multi-terabyte and neither may hold the single assembly thread — that cost 91-117
+    #: minutes of idle assembly slot per cluster on 2026-08-31.
+    housekeeping = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cell-housekeeping")
+
     def _assemble(handoff: ZoneFillHandoff, prep: PreparedCell) -> dict[str, Any]:
         # The validation dispatch rides HERE, on the trailing assembly thread, immediately
         # after the cell's tag is created — not at the end of the flow. The runner calls
@@ -1345,6 +1352,9 @@ def fill_zones_sequential_flow(
                 log=log,
                 s3_concurrency=s3_concurrency,
                 cleanup_staging=cleanup_staging,
+                # OFF the assembly thread. Measured at ~2 h per cell inline, during which the
+                # next cell's assembly could not start even with its tiles fully staged.
+                defer_cleanup=housekeeping.submit,
                 n_assembly_workers=n_assembly_workers,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
@@ -1438,6 +1448,7 @@ def fill_zones_sequential_flow(
                 plan=_plan,
                 session=_session,
                 assemble=_assemble,
+                housekeeping=housekeeping,
                 infer_single=_infer_single,
                 session_s1_orbit=s1_orbit,
                 log=log,
