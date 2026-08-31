@@ -900,6 +900,15 @@ def fill_zones_sequential(
         # skipping the retry pass and both later joins. There are no retries to keep it open
         # for on that path, so join it now.
         if session_raised:
+            # Stop the ingest queue BEFORE the join. This join waits out a staging delete —
+            # ~2 h measured — and the exception cannot reach the caller's teardown until it
+            # returns, so every queued ingest would keep producing mosaics for that whole
+            # window. Best-effort and idempotent: the retry pass calls it too.
+            if inputs is not None:
+                try:
+                    inputs.cancel_unstarted()
+                except Exception:
+                    log.warning("Could not cancel queued ingests before the cleanup join", exc_info=True)
             mosaic_cleaner.shutdown(wait=True)
 
     # EVERY EXIT FROM HERE ON JOINS THE POOL, in a `finally` rather than at each exit.

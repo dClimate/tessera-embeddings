@@ -1467,9 +1467,13 @@ def fill_zones_sequential_flow(
         # per the note below), a feeder crash, and cancellation. The runner joins it too, after
         # its retry pass; `shutdown` is idempotent, and the guarantee that matters is that no
         # path can return while multi-terabyte deletes are still outstanding.
-        housekeeping.shutdown(wait=True)
+        # INGEST DOWN FIRST, then join the deletes. Joining first blocked this teardown for the
+        # length of a staging delete — measured at ~2 h — and ingest children kept running and
+        # writing mosaics for all of it, wasting the resources and able to race a manual retry.
+        # Nothing about the join needs ingest alive, so the cheap, urgent stop goes first.
         if inputs is not None:
             inputs.shutdown()
+        housekeeping.shutdown(wait=True)
         # The context manager has already torn the cluster down (or the hook
         # will, on cancellation) — clear the hook state even when the runner
         # raises (its partial-failure RuntimeError is a NORMAL exit path).
