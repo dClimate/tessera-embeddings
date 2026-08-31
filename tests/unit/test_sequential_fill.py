@@ -15,6 +15,7 @@ import pathlib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 
 import pytest
 
@@ -978,6 +979,49 @@ def test_a_cell_recovering_on_retry_can_still_submit_its_cleanup():
     # 01N appears ONCE: its first attempt raised before reaching the submit, so only the
     # recovering attempt hands cleanup over. Expecting it twice was my own error, not the code's.
     assert sorted(cleaned) == ["01N", "02N"], f"cleanup submitted by the retry never ran: {cleaned}"
+
+
+def test_a_session_failure_still_joins_a_runner_owned_cleanup_pool():
+    """Review finding on this PR: the one exit that reaches NEITHER later join.
+
+    A `session` failure re-raises out of the drain's `finally`, skipping the retry pass and both
+    shutdowns after it. When the runner owns the pool — no `housekeeping` passed, which is every
+    caller but the Prefect flow — it would return control with its executor and potentially
+    multi-terabyte deletes still running, contrary to the guarantee its docstring makes.
+
+    The oracle is the pool's own state, not a log line: `submit` after a successful shutdown
+    raises, so a pool that was joined refuses new work and one that was not accepts it.
+    """
+    captured: dict = {}
+    real = ThreadPoolExecutor
+
+    def capturing(*a, **kw):
+        pool = real(*a, **kw)
+        # The RUNNER names its own pool "mosaic-cleanup"; "cell-housekeeping" is the FLOW's.
+        if kw.get("thread_name_prefix") == "mosaic-cleanup":
+            captured["pool"] = pool
+        return pool
+
+    with (
+        mock.patch.object(mod, "ThreadPoolExecutor", capturing),
+        pytest.raises(RuntimeError, match="session blew up"),
+    ):
+        _run(
+            _cells(2),
+            session=_exploding_session("session blew up"),
+            inputs=RecordingInputs([]),
+        )
+
+    assert "pool" in captured, "the runner did not create its own housekeeping pool"
+    with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
+        captured["pool"].submit(lambda: None)
+
+
+def _exploding_session(message: str):
+    def session(more_work, on_item_done):
+        raise RuntimeError(message)
+
+    return session
 
 
 def test_an_ingest_failure_is_re_ingested_on_retry():

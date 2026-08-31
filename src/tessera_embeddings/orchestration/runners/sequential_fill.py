@@ -857,12 +857,18 @@ def fill_zones_sequential(
     )
     feeder = threading.Thread(target=_feed, name="zone-feeder", daemon=True)
     feeder.start()
+    #: Set when `session` raises, because that path re-raises out of the `finally` below and
+    #: therefore skips BOTH later joins — the feeder-error one and the post-retry one. Without
+    #: this the runner could return control with its own executor and multi-terabyte deletes
+    #: still running, which is exactly the guarantee its docstring makes.
+    session_raised = False
     try:
         session(_more_work, _on_item_done)
     except BaseException:
         # Unwind the feeder (it may be blocked on an ingest wait) before
         # propagating — a hung feeder thread would leak.
         stop.set()
+        session_raised = True
         raise
     finally:
         feeder.join(timeout=600)
@@ -889,6 +895,12 @@ def fill_zones_sequential(
         # retry loop catches as a failure. A cell that had actually recovered was reported
         # failed and its staging prefix leaked. It is joined after the retry pass instead, and
         # the caller's own `finally` joins it again on any path that never gets there.
+        #
+        # EXCEPT on the one path that reaches neither: a `session` failure re-raises from here,
+        # skipping the retry pass and both later joins. There are no retries to keep it open
+        # for on that path, so join it now.
+        if session_raised:
+            mosaic_cleaner.shutdown(wait=True)
 
     # A feeder crash (captured above) means the session drained only a partial
     # queue and would otherwise look complete — surface it. Committed cells stay
