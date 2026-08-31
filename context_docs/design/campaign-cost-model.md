@@ -1005,10 +1005,10 @@ Eight samples of the summed `Progress: N/M chunks done` across the ten clusters,
 |---|---|
 | fleet throughput | **5,578 tiles/h** (5,614 tiles over 60.4 min) |
 | in tokens | **1.12 × 10⁹ combined tok/s** aggregate |
-| GPU instances booted | 1,163 (408 g6e.xlarge / L40S + 755 g5.2xlarge / A10G) |
-| actor slots placed and busy | **712** (see the note below on how this was established) |
-| **per ACTIVE worker** | **1.58 M combined tok/s — 74% of the 2.127 M basis** |
-| per booted instance | 0.97 M tok/s — 46% of the basis |
+| GPU instances booted, live fleets only | **784** (see the orphan correction below) |
+| actor slots placed and busy | **766** — 98% of booted instances hold one |
+| **per ACTOR SLOT** | **1.64 M combined tok/s — 77% of the 2.127 M basis** |
+| per booted instance | 1.60 M tok/s — 75% of the basis |
 
 **A chunk is a tile.** `adamant-aardvark` reported 8,722 chunks for a stream holding 36N-2020's
 13 live tiles plus 36N-2021's 8,709 — an exact match, so the driver's progress counter and the
@@ -1036,14 +1036,26 @@ hypothesis with arithmetic behind it, not a measurement** — nothing here attri
 per card, and doing so needs per-actor accounting the driver does not currently emit. Worth
 building before the mix is used to argue anything.
 
-**2. Only 61% of booted GPU instances hold an actor slot** — 712 of 1,163, so **451 booted GPU
-machines are running nothing**. That is the gap between the fleet that is billed and the fleet
-that works. The drivers had requested 567 of a 1,250 target across the five clusters visible in
-the window, so the leading explanation is that the autoscaler is bringing machines up faster than
-the paced actor-request loop claims them — which is consistent with `actor_request_headroom = 25`
-asking for held-plus-25 rather than for the target, and with constraint-held machines being
-exempt from idle termination. Instances mid-join account for some of it and cannot account for
-all of it at this width. §5's fleet-sizing policy provisions at 85% of matched
+**2. WITHDRAWN — there was no utilisation gap.** This section first read 712 slots against 1,163
+booted instances, called 451 machines idle, and blamed the autoscaler outrunning the paced
+actor-request loop. **That was wrong, and the mechanism was invented before the number was
+split.** 379 of those 451 machines belonged to **three orphaned Ray fleets** left running by
+`great-toucan` fill runs cancelled at 07:51Z — `berserk-dinosaur`, `glossy-python` and
+`adorable-rooster` — plus two stray head nodes. They held no actor slot because their DRIVER was
+dead, which is a teardown failure, not a provisioning one. Torn down at 15:15Z: **$590/h and
+~$9,650 already burned.**
+
+Measured across the teardown, and this is the part that settles it: fleet throughput did **not**
+fall when 379 machines died — 5,583 tiles/h before, 6,230 after — so those machines were
+contributing exactly nothing. On the live fleet alone, **766 of 784 booted instances hold an
+actor slot, 98%.** There is no meaningful gap between billed and working GPUs once the orphans
+are removed, and the per-instance and per-slot rates converge (75% and 77%) rather than
+differing by 28 points.
+
+**The real finding is the teardown gap.** `sweep-orphan-fleets` runs every 15 minutes and had
+completed five times while those fleets sat there, because it inventories and stops **ECS
+tasks** — the orphans are EC2 instances it never enumerates. Three of ten fleets leaked on one
+cancellation. Tracked separately; it is an orchestration defect, not a cost-model input. §5's fleet-sizing policy provisions at 85% of matched
 supply to keep idle burn structurally zero, and it succeeds at that on the INGEST side; this
 number says the GPU side has its own 39% overhead which the model does not represent at all.
 
@@ -1086,9 +1098,9 @@ over-estimate rather than an under-estimate.
 
 | assumption | rate | remaining | finishes |
 |---|---|---|---|
-| **measured rate holds** | 5,578 tiles/h | **455 h = 19.0 d** | **~19-20 Sep 2026** |
-| fleet edges up 15% | 6,415 tiles/h | 396 h = 16.5 d | ~17 Sep |
-| fleet edges up 30% | 7,252 tiles/h | 350 h = 14.6 d | ~15 Sep |
+| **post-teardown rate holds** | 6,230 tiles/h | **408 h = 17.0 d** | **~17-18 Sep 2026** |
+| whole-window average | 5,683 tiles/h | 447 h = 18.6 d | ~19 Sep |
+| fleet edges up 15% on the post-teardown rate | 7,165 tiles/h | 354 h = 14.8 d | ~15 Sep |
 
 **And inference is probably not the binding constraint.** Assembly runs one cell at a time per
 cluster at ~3.5 h, and on the code now deployed a landed cell also holds that thread through
