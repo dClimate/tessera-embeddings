@@ -189,7 +189,7 @@ class TestForkTelemetry:
     def test_run_forked_returns_worker_stats_in_payload_order(self, tmp_path):
         store, repo = _seed(tmp_path)
         session = repo.writable_session("main")
-        result = run_forked(session, lambda p: (p["fork"], {"tag": p["tag"]}), [{"tag": "only"}])
+        result, _ = run_forked(session, lambda p: (p["fork"], {"tag": p["tag"]}), [{"tag": "only"}])
         assert result["workers"] == [{"tag": "only"}]
         assert result["wall_s"] >= result["merge_s"] >= 0
 
@@ -435,7 +435,7 @@ class TestWorkerProgressReporting:
         # interval and a caller-tuned period never takes effect.
         store, repo = _seed(tmp_path)
         session = repo.writable_session("main")
-        result = run_forked(
+        result, _ = run_forked(
             session,
             lambda p: (p["fork"], {"idx": p["worker_index"], "interval": p["progress_interval_s"]}),
             [{}],
@@ -1240,7 +1240,7 @@ class TestRunForkedCatchUp:
         monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
-        result = run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=lambda: "current")
+        result, _ = run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=lambda: "current")
         assert result["catch_ups"].get("current", 0) >= 1, "no catch-up was counted"
 
     def test_the_tally_separates_the_outcomes(self, tmp_path, monkeypatch):
@@ -1250,7 +1250,7 @@ class TestRunForkedCatchUp:
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
         outcomes = iter(["blocked"] + ["current"] * 200)
-        result = run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=lambda: next(outcomes))
+        result, _ = run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=lambda: next(outcomes))
         assert result["catch_ups"]["blocked"] == 1, f"outcomes were merged: {result['catch_ups']}"
         assert result["catch_ups"]["current"] >= 1, f"only one outcome recorded: {result['catch_ups']}"
 
@@ -1267,7 +1267,7 @@ class TestRunForkedCatchUp:
     def test_no_tally_when_no_catch_up_was_asked_for(self, tmp_path):
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
-        assert "catch_ups" not in run_forked(session, lambda p: (p["fork"], {}), [{"tag": "only"}])
+        assert "catch_ups" not in run_forked(session, lambda p: (p["fork"], {}), [{"tag": "only"}])[0]
 
     def test_every_catch_up_happens_before_the_merge(self, tmp_path, monkeypatch):
         """Ordering is the safety argument: a catch-up must only ever see an EMPTY session.
@@ -1368,6 +1368,147 @@ class TestRunForkedCatchUp:
 
         with pytest.raises(session_catch_up.CaughtUpPastAConflictError, match="unvetted"):
             run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=boom_once)
+
+    # --- recovering a wedged catch-up (2026-08-31) ---
+
+    @staticmethod
+    def _wedge(monkeypatch):
+        """A catch-up that never returns, plus a worker that waits until it is wedged.
+
+        Returns the `wedged` event so a worker can synchronise on it: the recovery only
+        applies when the workers FINISHED and the timer then refused to stop, so a test that
+        did not order those two would pass for the wrong reason.
+        """
+        monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
+        monkeypatch.setattr(session_catch_up, "CATCH_UP_STOP_TIMEOUT_S", 0.2)
+        wedged = threading.Event()
+
+        def never_returns() -> str:
+            wedged.set()
+            time.sleep(30)  # daemon; dies with the test
+            return "current"
+
+        return wedged, never_returns
+
+    def test_a_wedged_catch_up_rehomes_the_finished_forks(self, tmp_path, monkeypatch):
+        """The write survives; only the session is lost.
+
+        Asserts the DATA landed, not merely that nothing raised. A recovery that committed an
+        empty session would satisfy every weaker assertion here.
+        """
+        store, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        base = session.snapshot_id
+        wedged, never_returns = self._wedge(monkeypatch)
+
+        def worker(payload):
+            wedged.wait(timeout=5)
+            arr = zarr.open_group(payload["fork"].store, mode="a")[_ZONE.group_name]["embeddings"]
+            arr[0:2, 0:2] = 7
+            return payload["fork"], {}
+
+        telemetry, used = run_forked(
+            session,
+            worker,
+            [{"tag": "only"}],
+            catch_up=never_returns,
+            rehome=lambda: session_catch_up.rehome_after_a_wedged_catch_up(repo, _ZONE.group_name, base=base),
+        )
+        assert telemetry["rehomed"] is True
+        assert used is not session, "the poisoned session was handed back"
+        used.commit("re-homed fill")
+        read = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
+        assert int(np.asarray(read[_ZONE.group_name]["embeddings"][0:2, 0:2]).max()) == 7, "the write did not land"
+
+    def test_no_rehome_flag_on_a_healthy_fill(self, tmp_path):
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        telemetry, used = run_forked(session, lambda p: (p["fork"], {}), [{"tag": "only"}], catch_up=lambda: "current")
+        assert "rehomed" not in telemetry
+        assert used is session
+
+    def test_without_a_rehome_a_wedged_catch_up_still_fails_the_fill(self, tmp_path, monkeypatch):
+        """The behaviour before this existed, kept for any caller that does not opt in."""
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        wedged, never_returns = self._wedge(monkeypatch)
+
+        def worker(payload):
+            wedged.wait(timeout=5)
+            return payload["fork"], {}
+
+        with pytest.raises(session_catch_up.CatchUpDidNotStopError, match="still running"):
+            run_forked(session, worker, [{"tag": "only"}], catch_up=never_returns)
+
+    def test_a_dead_worker_is_never_rehomed(self, tmp_path, monkeypatch):
+        """THE DANGEROUS CASE. `ticking` raises from its `finally`, which runs on the failure
+        path too and REPLACES the body's exception. So a worker that died while the ticker
+        happened to be wedged arrives at the handler looking exactly like a clean run — and
+        re-homing it would commit a partial write and report success.
+        """
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        wedged, never_returns = self._wedge(monkeypatch)
+        rehomes: list[int] = []
+
+        def dying_worker(payload):
+            wedged.wait(timeout=5)
+            raise RuntimeError("worker died mid-write")
+
+        with pytest.raises(BaseException) as excinfo:
+            run_forked(
+                session,
+                dying_worker,
+                [{"tag": "only"}],
+                catch_up=never_returns,
+                rehome=lambda: rehomes.append(1) or repo.writable_session("main"),
+            )
+        assert rehomes == [], "a failed write was re-homed and would have been committed"
+        # The worker's death must still be reachable, whichever exception surfaces.
+        chain = []
+        exc: BaseException | None = excinfo.value
+        while exc is not None:
+            chain.append(str(exc))
+            exc = exc.__context__ or exc.__cause__
+        assert any("worker died mid-write" in c for c in chain), f"the real failure was lost: {chain}"
+
+    def test_rehoming_refuses_when_the_skipped_range_touched_the_group(self, tmp_path):
+        """Abandoning a session abandons its conflict detection, so the range must be walked."""
+        _, repo = _seed(tmp_path)
+        stale = repo.writable_session("main")
+        base = stale.snapshot_id
+        rival = repo.writable_session("main")
+        zarr.open_group(rival.store, mode="a")[_ZONE.group_name].attrs["someone_else"] = True
+        rival.commit(f"a rival writer touches {_ZONE.group_name}")
+
+        with pytest.raises(session_catch_up.CaughtUpPastAConflictError, match=f"touched {_ZONE.group_name}"):
+            session_catch_up.rehome_after_a_wedged_catch_up(repo, _ZONE.group_name, base=base)
+
+    def test_rehoming_allows_a_range_that_left_the_group_alone(self, tmp_path):
+        _, repo = _seed(tmp_path)
+        base = repo.writable_session("main").snapshot_id
+        rival = repo.writable_session("main")
+        zarr.open_group(rival.store, mode="a").attrs["unrelated"] = True
+        tip = rival.commit("a rival writer touches something else")
+
+        fresh = session_catch_up.rehome_after_a_wedged_catch_up(repo, _ZONE.group_name, base=base)
+        assert fresh.snapshot_id == tip, "the fresh session is not at the tip"
+
+    def test_write_year_shards_commits_the_rehomed_session(self):
+        """The wiring, not the mechanism.
+
+        A recovery that returns a fresh session and a caller that commits the poisoned one is
+        a fix that cannot work, and every test above would still pass. This reads the source
+        because the alternative is a live wedge inside a full assembly.
+        """
+        source = inspect.getsource(shard_writer.write_year_shards)
+        assert "fill, session = run_forked(" in source, (
+            "write_year_shards drops the session run_forked hands back, so a re-home would be ignored"
+        )
+        assert "rehome=" in source, "write_year_shards never offers a rehome"
+        assert source.index("base_before_forking = session.snapshot_id") < source.index("run_forked("), (
+            "the base must be captured BEFORE forking; reading it later reaches into the poisoned session"
+        )
 
     def test_a_failing_catch_up_is_not_swallowed(self, tmp_path, monkeypatch):
         # `run_forked` itself does not catch — best-effort is applied at the CALL SITE by
