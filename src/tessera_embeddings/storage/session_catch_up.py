@@ -243,28 +243,20 @@ def catch_up_best_effort(
 #: the progress timer's five minutes: that coupled a housekeeping decision to a reporting one
 #: and let the gap grow for a full reporting period before anything looked at it.
 #:
-#: THIRTY SECONDS, LOWERED FROM SIXTY, and the arithmetic that sets it is worth stating because
-#: getting it wrong once already cost two cells. A cell publishes **two** snapshots — the fill
-#: and the completion mark — so depth is counted in twos:
+#: FIVE SECONDS, and the two bounds that pick it. A cell publishes TWO snapshots — the fill and
+#: the completion mark — so depth is counted in twos, and two publications inside one interval is
+#: the depth that hangs (2026-08-31: depth 2 fine 42+ times, depth 4 wedged 10 for 10).
 #:
-#:     one publication inside the interval  -> depth 2   (2026-08-31: 36 attempts, 36 fine)
-#:     two publications inside the interval -> depth 4   (2026-08-31: 2 attempts, 2 wedged)
+#: Bounded BELOW by the gap within one publication, measured at 0-1 s: a shorter interval starts
+#: landing a tick between a cell's own fill and mark, which puts the hop at an odd depth nothing
+#: has tested. Bounded ABOVE by the closest independent pair observed, 11 s.
 #:
-#: The window in which a second publication is fatal IS this interval, so halving it halves the
-#: exposure. On 2026-08-31 the pair that wedged two coordinators landed eleven seconds apart,
-#: which no practical interval survives on its own — which is the point: this value buys odds,
-#: not a guarantee.
-#:
-#: **It becomes a guarantee only when paired with a minimum spacing between publications**, set
-#: strictly above this interval, so at most one publication can land between consecutive ticks.
-#: That spacing is a fleet-wide lock and is NOT implemented here; see
-#: ``context_docs/design/keeping-the-assembly-session-current-2026_08.md``. Until it exists,
-#: :func:`rehome_after_a_wedged_catch_up` is what makes the remaining case survivable rather
-#: than fatal.
-#:
-#: The cost of ticking twice as often is a branch-tip ref read per tick, which returns
-#: ``"current"`` without entering the call that wedges.
-CATCH_UP_INTERVAL_S = 30.0
+#: A shorter interval does mean MORE rebases — a close pair becomes two shallow hops instead of
+#: one deep one — and that is the trade, because the hazard tracks depth and not call count. The
+#: no-op tick is one branch-tip ref read that returns ``"current"`` before any diff or rebase, so
+#: the count of EXPENSIVE calls is set by how many cells publish, not by how often we look:
+#: measured 6 rebases against 437 no-op ticks over a 222-minute fork phase.
+CATCH_UP_INTERVAL_S = 5.0
 
 
 def rehome_after_a_wedged_catch_up(
