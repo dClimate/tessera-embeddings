@@ -1024,6 +1024,50 @@ def _exploding_session(message: str):
     return session
 
 
+def test_a_base_exception_from_a_retry_still_joins_a_runner_owned_pool():
+    """Third review finding on this PR, and the one the earlier fixes kept missing.
+
+    The retry loop catches `except Exception`, so a BaseException from `infer_single`,
+    `assemble` or `inputs.wait` — cancellation, KeyboardInterrupt — unwinds past it. The session
+    had completed normally, so the `session_raised` join did not fire either, and the runner's
+    own pool was left running with multi-terabyte deletes outstanding.
+
+    Two hand-placed joins covered three of the four exits and missed this one. The region is now
+    under a `finally`, which covers them by construction rather than by enumeration — which is
+    the part that kept going wrong.
+    """
+    captured: dict = {}
+    real = ThreadPoolExecutor
+
+    def capturing(*a, **kw):
+        pool = real(*a, **kw)
+        if kw.get("thread_name_prefix") == "mosaic-cleanup":
+            captured["pool"] = pool
+        return pool
+
+    attempts: list[str] = []
+
+    def interrupted_single(cell, prep, final):
+        attempts.append(cell.zone)
+        raise KeyboardInterrupt("cancelled mid-retry")
+
+    with (
+        mock.patch.object(mod, "ThreadPoolExecutor", capturing),
+        pytest.raises(KeyboardInterrupt, match="cancelled mid-retry"),
+    ):
+        _run(
+            _cells(2),
+            session=_sync_session(fail={"01N"}),
+            inputs=RecordingInputs([]),
+            infer_single=interrupted_single,
+        )
+
+    assert attempts == ["01N"], "the retry never ran, so this proves nothing"
+    assert "pool" in captured, "the runner did not create its own housekeeping pool"
+    with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
+        captured["pool"].submit(lambda: None)
+
+
 def test_an_ingest_failure_is_re_ingested_on_retry():
     """The attempt budget has to buy a NEW ingest, not a re-read of the dead one.
 

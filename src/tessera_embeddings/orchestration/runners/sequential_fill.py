@@ -902,145 +902,156 @@ def fill_zones_sequential(
         if session_raised:
             mosaic_cleaner.shutdown(wait=True)
 
-    # A feeder crash (captured above) means the session drained only a partial
-    # queue and would otherwise look complete — surface it. Committed cells stay
-    # tagged; the un-enqueued ones stay pending for the next campaign pass.
-    if feeder_error:
-        # This exit never reaches the retry pass, so the pool is joined here instead.
-        mosaic_cleaner.shutdown(wait=True)
-        raise RuntimeError(
-            "zone feeder crashed before enqueuing all cells — run is incomplete "
-            "(unattempted cells remain pending for the next campaign pass)"
-        ) from feeder_error[0]
+    # EVERY EXIT FROM HERE ON JOINS THE POOL, in a `finally` rather than at each exit.
+    # Three of the four exits were already covered by hand — the feeder-error raise, the
+    # normal return, the partial-failure raise — and the fourth was not: the retry loop
+    # catches `except Exception`, so a BaseException from `infer_single`, `assemble` or
+    # `inputs.wait` (cancellation, KeyboardInterrupt) unwound past all of them. The session
+    # had completed normally, so `session_raised` was False too, and a runner-owned pool was
+    # left running with multi-terabyte deletes outstanding.
+    #
+    # Enumerating exits and covering each one is what failed twice here; a `finally` covers
+    # them by construction, including any exit added later. It also sits BEFORE the summary
+    # is built, which is deliberate: every `_leak_mosaic` call must have landed before
+    # `cleanup_leaked` is counted.
+    try:
+        # A feeder crash (captured above) means the session drained only a partial
+        # queue and would otherwise look complete — surface it. Committed cells stay
+        # tagged; the un-enqueued ones stay pending for the next campaign pass.
+        if feeder_error:
+            raise RuntimeError(
+                "zone feeder crashed before enqueuing all cells — run is incomplete "
+                "(unattempted cells remain pending for the next campaign pass)"
+            ) from feeder_error[0]
 
-    # ---------------------------------------------------------------------
-    # In-child retry of the stream's failed cells.
-    #
-    # WHY HERE rather than leaving it to the campaign driver: the driver's retry
-    # unit is a whole dispatch, so a cell that fails early would otherwise wait
-    # for every cluster to finish its entire list before being re-attempted —
-    # hours to days. The cluster is still provisioned right now, the failed
-    # cell's mosaic was deliberately RETAINED for exactly this, and its staged
-    # tiles resume, so a retry here is usually minutes.
-    #
-    # HOW: reuse `infer_single` — the same per-cell path the orbit-mismatch
-    # fallback uses. It composes plan + run_inference, so it re-validates and
-    # returns `done` for a cell that turns out to be complete, and it does its
-    # own staged-resume internally. Nothing here re-implements the feeder.
-    #
-    # BEFORE the fallback pass, deliberately: the fallback marks its last cell
-    # `final`, which retires idle actors. Running retries first means they never
-    # need actors that a fallback cell has already released. Fallback failures
-    # are therefore NOT retried in-child — they are orbit-mismatch cells, rare,
-    # and the driver's next round covers them.
-    #
-    # SAME-ZONE SAFETY: a retry of (Z, y) cannot collide with this child's own
-    # (Z, y+1) — assemblies serialise on the single finalizer thread and that
-    # thread has been joined by now. Across children it cannot collide either,
-    # because the partition is zone-disjoint. The mosaic-cleanup pool is joined in
-    # the same place, so no retry can start while a delete for its zone is in
-    # flight; and only LANDED cells are ever submitted for deletion, while only
-    # FAILED cells are retried, so the two sets are disjoint anyway.
-    #
-    # EVERY failing path retains its cell's mosaic, so every failed cell is retryable here.
-    # `retained_failed` is that set; with no mosaic budget at all the inputs are upstream and
-    # permanent, so everything is eligible.
-    # Clear the ingest queue before retrying. Every pending cell's ingest was submitted up
-    # front, so the pool can still hold most of a cluster; a retry's fresh `start` would
-    # queue behind all of it and wait hours on a cluster that is billing now. The cancelled
-    # cells are unattempted either way and stay pending for the next campaign pass.
-    if inputs is not None and failures:
-        try:
-            inputs.cancel_unstarted()
-        except Exception:
-            log.warning("Could not cancel queued ingests before the retry pass", exc_info=True)
-
-    for attempt in range(2, attempts_per_cell_in_cluster + 1):
-        with lock:
-            # Cells the feeder never admitted are recorded as failures so the run
-            # REPORTS them, but they are not retry candidates: the feeder stopped
-            # because too many failures were holding mosaics off-budget, and admitting
-            # more work here is the one thing that cap exists to prevent. They stay
-            # pending for the driver's next pass, which is what their record says.
-            failed_keys = [(f["zone"], f["year"]) for f in failures if f["phase"] != "unattempted"]
-            eligible = set(retained_failed)
-            # Cells whose INPUTS failed need their production re-run; every other
-            # phase failed with a usable mosaic already on disk. See the discard
-            # below for why the distinction matters.
-            reingest = {(f["zone"], f["year"]) for f in failures if f["phase"] == "inputs/prepare"}
-        pending = failed_keys if inputs is None else [k for k in failed_keys if k in eligible]
-        if skipped := [k for k in failed_keys if k not in pending]:
-            log.warning(
-                "Not retrying %d cell(s) in-child — their mosaic slots were released, so a retry would "
-                "run against nothing (they stay pending for the driver's next pass): %s",
-                len(skipped),
-                ", ".join(f"{z}-{y}" for z, y in skipped),
-            )
-        if not pending:
-            break
-        by_key = {(c.zone, c.year): c for c in cells}
-        log.warning(
-            "In-child retry attempt %d/%d over %d failed cell(s): %s",
-            attempt,
-            attempts_per_cell_in_cluster,
-            len(pending),
-            ", ".join(f"{z}-{y}" for z, y in pending),
-        )
-        for zone_name, year in pending:
-            cell = by_key.get((zone_name, year))
-            if cell is None:  # pragma: no cover - a failure record always names a cell
-                continue
+        # ---------------------------------------------------------------------
+        # In-child retry of the stream's failed cells.
+        #
+        # WHY HERE rather than leaving it to the campaign driver: the driver's retry
+        # unit is a whole dispatch, so a cell that fails early would otherwise wait
+        # for every cluster to finish its entire list before being re-attempted —
+        # hours to days. The cluster is still provisioned right now, the failed
+        # cell's mosaic was deliberately RETAINED for exactly this, and its staged
+        # tiles resume, so a retry here is usually minutes.
+        #
+        # HOW: reuse `infer_single` — the same per-cell path the orbit-mismatch
+        # fallback uses. It composes plan + run_inference, so it re-validates and
+        # returns `done` for a cell that turns out to be complete, and it does its
+        # own staged-resume internally. Nothing here re-implements the feeder.
+        #
+        # BEFORE the fallback pass, deliberately: the fallback marks its last cell
+        # `final`, which retires idle actors. Running retries first means they never
+        # need actors that a fallback cell has already released. Fallback failures
+        # are therefore NOT retried in-child — they are orbit-mismatch cells, rare,
+        # and the driver's next round covers them.
+        #
+        # SAME-ZONE SAFETY: a retry of (Z, y) cannot collide with this child's own
+        # (Z, y+1) — assemblies serialise on the single finalizer thread and that
+        # thread has been joined by now. Across children it cannot collide either,
+        # because the partition is zone-disjoint. The mosaic-cleanup pool is joined in
+        # the same place, so no retry can start while a delete for its zone is in
+        # flight; and only LANDED cells are ever submitted for deletion, while only
+        # FAILED cells are retried, so the two sets are disjoint anyway.
+        #
+        # EVERY failing path retains its cell's mosaic, so every failed cell is retryable here.
+        # `retained_failed` is that set; with no mosaic budget at all the inputs are upstream and
+        # permanent, so everything is eligible.
+        # Clear the ingest queue before retrying. Every pending cell's ingest was submitted up
+        # front, so the pool can still hold most of a cluster; a retry's fresh `start` would
+        # queue behind all of it and wait hours on a cluster that is billing now. The cancelled
+        # cells are unattempted either way and stay pending for the next campaign pass.
+        if inputs is not None and failures:
             try:
-                # ONLY for a cell whose inputs failed: drop the dead production attempt
-                # and run a new one. `start` is idempotent, so the failed future stays
-                # cached and the retry would otherwise re-read the same failure without
-                # ever producing the mosaics — spending the attempt budget on nothing.
-                #
-                # Not for the other phases. A cell that failed in plan, inference or
-                # assembly RETAINED its mosaic precisely so the retry could use it, so
-                # re-ingesting would redo work that is already on disk and re-admit
-                # budget the retention was designed to keep out.
-                if inputs is not None and (zone_name, year) in reingest:
-                    inputs.discard(zone_name, year)
-                    inputs.start(zone_name, year)
-                    inputs.wait(zone_name, year, stop=stop)
-                prep = prepare(cell)
-                handoff = infer_single(cell, prep, False)
-                _record_outcome(assemble(handoff, prep))
-            except Exception as exc:
-                # Leave the original failure record in place and log the retry's own
-                # error, so the summary still names the cell and the driver still
-                # sees it as pending.
-                log.error("Cell %s-%d retry attempt %d failed: %s", zone_name, year, attempt, exc, exc_info=exc)
-                continue
-            _clear_failure(cell)
-            if inputs is not None:
-                try:
-                    inputs.cleanup(zone_name, year)
-                except Exception:
-                    # The cell LANDED — committed, tagged, recorded. Only its mosaic
-                    # prefix is still there. Letting this propagate would leave the whole
-                    # child reporting nothing for every other cell it filled, to punish a
-                    # failed delete; the orphan sweep (`sweep_orphan_mosaics`) is the
-                    # designed remedy for a leaked prefix, and it needs the prefix named.
-                    log.error(
-                        "Cell %s-%d recovered but its mosaic was not deleted — it stays until an "
-                        "orphan sweep reclaims it",
-                        zone_name,
-                        year,
-                        exc_info=True,
-                    )
-            with lock:
-                retained_failed.discard((zone_name, year))
-            log.info("Cell %s-%d recovered on in-child retry attempt %d", zone_name, year, attempt)
+                inputs.cancel_unstarted()
+            except Exception:
+                log.warning("Could not cancel queued ingests before the retry pass", exc_info=True)
 
-    # No post-stream fallback pass. There was one, for cells whose resolved orbit could not
-    # join the shared session; the orbit now travels on each cell's ZoneContext so every cell
-    # streams, and the pass had nothing left to receive. ``infer_single`` is still LIVE — the
-    # in-child retry above runs on it — so only the pass is gone, not the hook.
-    # AFTER the retries, which is the whole point: every path that submits cleanup has now run.
-    # Both remaining exits — the partial-failure raise and the normal return — follow this line.
-    mosaic_cleaner.shutdown(wait=True)
+        for attempt in range(2, attempts_per_cell_in_cluster + 1):
+            with lock:
+                # Cells the feeder never admitted are recorded as failures so the run
+                # REPORTS them, but they are not retry candidates: the feeder stopped
+                # because too many failures were holding mosaics off-budget, and admitting
+                # more work here is the one thing that cap exists to prevent. They stay
+                # pending for the driver's next pass, which is what their record says.
+                failed_keys = [(f["zone"], f["year"]) for f in failures if f["phase"] != "unattempted"]
+                eligible = set(retained_failed)
+                # Cells whose INPUTS failed need their production re-run; every other
+                # phase failed with a usable mosaic already on disk. See the discard
+                # below for why the distinction matters.
+                reingest = {(f["zone"], f["year"]) for f in failures if f["phase"] == "inputs/prepare"}
+            pending = failed_keys if inputs is None else [k for k in failed_keys if k in eligible]
+            if skipped := [k for k in failed_keys if k not in pending]:
+                log.warning(
+                    "Not retrying %d cell(s) in-child — their mosaic slots were released, so a retry would "
+                    "run against nothing (they stay pending for the driver's next pass): %s",
+                    len(skipped),
+                    ", ".join(f"{z}-{y}" for z, y in skipped),
+                )
+            if not pending:
+                break
+            by_key = {(c.zone, c.year): c for c in cells}
+            log.warning(
+                "In-child retry attempt %d/%d over %d failed cell(s): %s",
+                attempt,
+                attempts_per_cell_in_cluster,
+                len(pending),
+                ", ".join(f"{z}-{y}" for z, y in pending),
+            )
+            for zone_name, year in pending:
+                cell = by_key.get((zone_name, year))
+                if cell is None:  # pragma: no cover - a failure record always names a cell
+                    continue
+                try:
+                    # ONLY for a cell whose inputs failed: drop the dead production attempt
+                    # and run a new one. `start` is idempotent, so the failed future stays
+                    # cached and the retry would otherwise re-read the same failure without
+                    # ever producing the mosaics — spending the attempt budget on nothing.
+                    #
+                    # Not for the other phases. A cell that failed in plan, inference or
+                    # assembly RETAINED its mosaic precisely so the retry could use it, so
+                    # re-ingesting would redo work that is already on disk and re-admit
+                    # budget the retention was designed to keep out.
+                    if inputs is not None and (zone_name, year) in reingest:
+                        inputs.discard(zone_name, year)
+                        inputs.start(zone_name, year)
+                        inputs.wait(zone_name, year, stop=stop)
+                    prep = prepare(cell)
+                    handoff = infer_single(cell, prep, False)
+                    _record_outcome(assemble(handoff, prep))
+                except Exception as exc:
+                    # Leave the original failure record in place and log the retry's own
+                    # error, so the summary still names the cell and the driver still
+                    # sees it as pending.
+                    log.error("Cell %s-%d retry attempt %d failed: %s", zone_name, year, attempt, exc, exc_info=exc)
+                    continue
+                _clear_failure(cell)
+                if inputs is not None:
+                    try:
+                        inputs.cleanup(zone_name, year)
+                    except Exception:
+                        # The cell LANDED — committed, tagged, recorded. Only its mosaic
+                        # prefix is still there. Letting this propagate would leave the whole
+                        # child reporting nothing for every other cell it filled, to punish a
+                        # failed delete; the orphan sweep (`sweep_orphan_mosaics`) is the
+                        # designed remedy for a leaked prefix, and it needs the prefix named.
+                        log.error(
+                            "Cell %s-%d recovered but its mosaic was not deleted — it stays until an "
+                            "orphan sweep reclaims it",
+                            zone_name,
+                            year,
+                            exc_info=True,
+                        )
+                with lock:
+                    retained_failed.discard((zone_name, year))
+                log.info("Cell %s-%d recovered on in-child retry attempt %d", zone_name, year, attempt)
+
+        # No post-stream fallback pass. There was one, for cells whose resolved orbit could not
+        # join the shared session; the orbit now travels on each cell's ZoneContext so every cell
+        # streams, and the pass had nothing left to receive. ``infer_single`` is still LIVE — the
+        # in-child retry above runs on it — so only the pass is gone, not the hook.
+    finally:
+        mosaic_cleaner.shutdown(wait=True)
+
     elapsed = time.monotonic() - t0
     summary: dict[str, Any] = {
         "cells": len(cells),
