@@ -248,6 +248,95 @@ def test_ingest_lifecycle_and_cleanup_after_assembly():
         assert f"start:{z}" in events and f"wait:{z}" in events and f"cleanup:{z}" in events
 
 
+class BlockingCleanupInputs(RecordingInputs):
+    """A mosaic delete that does not return until the NEXT assembly has started.
+
+    Multi-terabyte deletes are slow; this makes "slow" deterministic. The wait has a timeout
+    so that when the delete is back on the assembly thread the test FAILS on the recorded
+    order rather than hanging forever.
+    """
+
+    def __init__(self, events: list[str], next_assembly_started: threading.Event) -> None:
+        super().__init__(events)
+        self._started = next_assembly_started
+
+    def cleanup(self, zone: str, year: int) -> None:
+        with self._lock:
+            self.events.append(f"cleanup-start:{zone}")
+        self._started.wait(timeout=10)
+        with self._lock:
+            self.events.append(f"cleanup-end:{zone}")
+
+
+def test_a_slow_mosaic_delete_does_not_hold_up_the_next_assembly():
+    """THE REGRESSION. The delete used to run on the single assembly thread.
+
+    Measured in production on 2026-08-31: seven of nine clusters sat with an idle assembly
+    slot for 91-117 minutes after publishing, while 22 fully-staged cells waited behind their
+    predecessors' multi-terabyte deletes. Every cell still landed, so nothing failed and no
+    alarm fired — the campaign was simply running at a fraction of its assembly throughput.
+
+    The oracle is the ORDER: 02N's assembly must fall between the start and the end of 01N's
+    delete. Asserting only that both happened passes either way.
+    """
+    events: list[str] = []
+    second_started = threading.Event()
+
+    def assemble(handoff, prep):
+        events.append(f"assemble:{handoff.zone}")
+        if handoff.zone == "02N":
+            second_started.set()
+        return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
+
+    _run(_cells(2), inputs=BlockingCleanupInputs(events, second_started), assemble=assemble)
+
+    assert "cleanup-end:01N" in events, "01N's mosaic was never deleted"
+    start = events.index("cleanup-start:01N")
+    end = events.index("cleanup-end:01N")
+    second = events.index("assemble:02N")
+    assert start < second < end, (
+        "02N's assembly did not overlap 01N's mosaic delete — the delete is back on the "
+        f"assembly thread. order: {events}"
+    )
+
+
+def test_a_failing_mosaic_delete_still_leaks_rather_than_fails_the_cell():
+    """A landed cell whose delete fails must not be counted against the failure cap.
+
+    The delete now runs on a different thread from the assembly, so this checks the
+    accounting survived the move rather than being left behind with it.
+    """
+    events: list[str] = []
+
+    class ExplodingCleanupInputs(RecordingInputs):
+        def cleanup(self, zone: str, year: int) -> None:
+            with self._lock:
+                self.events.append(f"cleanup-attempt:{zone}")
+            raise RuntimeError("delete permission denied")
+
+    summary = _run(_cells(2), inputs=ExplodingCleanupInputs(events), assemble=_assemble(events))
+    assert summary["succeeded"] == 2, f"a failed DELETE failed the cell: {summary}"
+    assert summary["failed"] == 0
+    assert [e for e in events if e.startswith("cleanup-attempt:")] == ["cleanup-attempt:01N", "cleanup-attempt:02N"]
+
+
+def test_a_failed_assembly_never_submits_a_delete():
+    """A failed assembly retains its mosaic for the resume; deleting it would strand the cell."""
+    events: list[str] = []
+    inputs = RecordingInputs(events)
+
+    def assemble(handoff, prep):
+        events.append(f"assemble:{handoff.zone}")
+        if handoff.zone == "01N":
+            raise RuntimeError("assembly blew up")
+        return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
+
+    with pytest.raises(RuntimeError, match="1/2 cell"):
+        _run(_cells(2), inputs=inputs, assemble=assemble)
+    assert "cleanup:01N" not in events, "a failed assembly's mosaic was deleted"
+    assert "cleanup:02N" in events
+
+
 def test_failed_zone_keeps_mosaic_and_others_land():
     events: list[str] = []
     inputs = RecordingInputs(events)

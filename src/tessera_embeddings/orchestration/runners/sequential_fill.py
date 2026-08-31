@@ -54,7 +54,9 @@ the flow and README point here):
   for every cluster to finish its list. See the block above the fallback pass.
 - **Trailing assembly**: a completed zone's shard assembly runs on a background
   thread while later zones' tiles keep the GPUs busy. Assemblies serialize on one
-  thread; a zone's mosaic is deleted only after its assembly lands. A zone counts
+  thread; a zone's mosaic delete is HANDED TO A SECOND POOL once its assembly
+  lands, so the next assembly starts immediately rather than waiting out a
+  multi-terabyte delete. A zone counts
   as complete only when every tile's result is FINAL — the scheduler fires the
   completion callback after any deferred staging write confirms, so assembly never
   races an in-flight upload. Do NOT assume it is a small fraction of inference: it
@@ -390,6 +392,18 @@ def fill_zones_sequential(
     #: drain, where the backlog can be most of a cluster's cells and take hours.
     assembly_pending = 0
     finalizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trailing-assembly")
+    #: Mosaic deletes run HERE, not on the assembly thread. A cell's mosaic is multi-terabyte
+    #: and its delete takes as long as it takes; while it sat inside `_finalize` it held the
+    #: single assembly worker, so the next cell's assembly could not start even with its tiles
+    #: fully staged. Measured on 2026-08-31: seven of nine clusters idle 91-117 minutes after
+    #: publishing, with 22 fully-staged cells waiting behind their predecessors' deletes.
+    #:
+    #: FOUR workers, not one and not unbounded. Deletes are I/O-bound and can overlap each
+    #: other freely, but they are also the campaign's heaviest S3 traffic, and an unbounded
+    #: pool would let a cluster that publishes in a burst aim every delete at the same bucket
+    #: at once. Four is comfortably more than the ~one publication per three hours a cluster
+    #: sustains, so the queue only builds during a drain, which is exactly when it should.
+    mosaic_cleaner = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mosaic-cleanup")
 
     def _leak_mosaic(cell: SequentialCell) -> None:
         """A LANDED cell whose mosaic delete failed: free the slot, do NOT count it.
@@ -494,46 +508,49 @@ def fill_zones_sequential(
         resumes its staged tiles.
         """
         cell, prep = tally.cell, tally.prep
-        cleaned = False
-        failed_assembly = False
         try:
             handoff = complete_zone_inference(tally.plan, results=tally.results)
             _record_outcome(assemble(handoff, prep))
         except Exception as exc:
-            failed_assembly = True
-            _record_failure(cell, "assembly", exc)
-        else:
-            # OUTSIDE the assembly try, because by here the cell is committed, tagged
-            # and already recorded as a success. Deleting its mosaics is housekeeping
-            # on work that has landed, so a transient S3 error or a missing delete
-            # permission must not append a second, contradictory `assembly` failure for
-            # the same cell — which is what sharing the block above did, and it also
-            # retained the mosaic against the failure cap and could stall the feeder.
-            # The mosaic is still retained on this path; it is simply not a failure.
-            if inputs is not None:
-                try:
-                    inputs.cleanup(cell.zone, cell.year)
-                    cleaned = True
-                except Exception:
-                    log.exception(
-                        "Mosaic cleanup failed for %s-%s AFTER the cell landed; the cell stands, "
-                        "its mosaics are retained and will need sweeping.",
-                        cell.zone,
-                        cell.year,
-                    )
-        finally:
             # FAILED assembly → retain the mosaic for resume and COUNT it, so a systematic
-            # failure cannot accumulate every cluster's mosaic unbounded. LANDED cell whose
-            # delete failed → leak, uncounted: the cell is correct and must not consume the
-            # cap that exists to stop the feeder.
-            if not cleaned:
-                if failed_assembly:
-                    _retain_failed_mosaic(cell)
-                else:
-                    _leak_mosaic(cell)
+            # failure cannot accumulate every cluster's mosaic unbounded. Pure bookkeeping,
+            # so it stays on this thread; there is nothing to delete.
+            _record_failure(cell, "assembly", exc)
+            _retain_failed_mosaic(cell)
+        else:
+            # HANDED OFF, not run here. By this point the cell is committed, tagged and
+            # recorded as a success, so deleting its mosaics is housekeeping on work that
+            # has already landed — and housekeeping must not own the one thread the next
+            # cell's assembly needs. See `mosaic_cleaner` for what that cost.
+            if inputs is None:
+                _leak_mosaic(cell)
+            else:
+                mosaic_cleaner.submit(_delete_mosaic, cell)
+        finally:
             with lock:
                 nonlocal assembly_pending
                 assembly_pending -= 1
+
+    def _delete_mosaic(cell: SequentialCell) -> None:
+        """Delete a landed cell's mosaics, on the cleanup pool rather than the assembly thread.
+
+        A transient S3 error or a missing delete permission must not append a second,
+        contradictory `assembly` failure for a cell that succeeded — which is what sharing
+        the assembly's try block did, and it also retained the mosaic against the failure cap
+        and could stall the feeder. A LANDED cell whose delete failed leaks, uncounted: the
+        cell is correct and must not consume the cap that exists to stop the feeder.
+        """
+        assert inputs is not None  # only submitted on the `inputs is not None` branch
+        try:
+            inputs.cleanup(cell.zone, cell.year)
+        except Exception:
+            log.exception(
+                "Mosaic cleanup failed for %s-%s AFTER the cell landed; the cell stands, "
+                "its mosaics are retained and will need sweeping.",
+                cell.zone,
+                cell.year,
+            )
+            _leak_mosaic(cell)
 
     def _account_failed_inference(tally: _ZoneTally) -> None:
         """Record and count a cell whose inference failed. Does NO I/O, by design.
@@ -854,6 +871,11 @@ def fill_zones_sequential(
                 n_pending,
             )
         finalizer.shutdown(wait=True)
+        # AFTER the assemblies, because `_finalize` submits into this one. Joined here rather
+        # than left running so the retry logic below cannot start a cell whose mosaic delete
+        # is still in flight, and so the flow does not return while multi-terabyte deletes
+        # are outstanding.
+        mosaic_cleaner.shutdown(wait=True)
 
     # A feeder crash (captured above) means the session drained only a partial
     # queue and would otherwise look complete — surface it. Committed cells stay
@@ -888,7 +910,10 @@ def fill_zones_sequential(
     # SAME-ZONE SAFETY: a retry of (Z, y) cannot collide with this child's own
     # (Z, y+1) — assemblies serialise on the single finalizer thread and that
     # thread has been joined by now. Across children it cannot collide either,
-    # because the partition is zone-disjoint.
+    # because the partition is zone-disjoint. The mosaic-cleanup pool is joined in
+    # the same place, so no retry can start while a delete for its zone is in
+    # flight; and only LANDED cells are ever submitted for deletion, while only
+    # FAILED cells are retried, so the two sets are disjoint anyway.
     #
     # EVERY failing path retains its cell's mosaic, so every failed cell is retryable here.
     # `retained_failed` is that set; with no mosaic budget at all the inputs are upstream and
