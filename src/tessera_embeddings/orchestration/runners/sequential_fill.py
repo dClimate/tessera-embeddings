@@ -882,16 +882,20 @@ def fill_zones_sequential(
                 n_pending,
             )
         finalizer.shutdown(wait=True)
-        # AFTER the assemblies, because `_finalize` submits into this one. Joined here rather
-        # than left running so the retry logic below cannot start a cell whose mosaic delete
-        # is still in flight, and so the flow does not return while multi-terabyte deletes
-        # are outstanding.
-        mosaic_cleaner.shutdown(wait=True)
+        # `mosaic_cleaner` is DELIBERATELY still alive here. Draining it at this point was a
+        # real defect: the in-child retry pass below calls `assemble()` again, and this flow's
+        # assemble submits staging cleanup into this pool — so the retry committed and tagged
+        # its cell and THEN raised `cannot schedule new futures after shutdown`, which the
+        # retry loop catches as a failure. A cell that had actually recovered was reported
+        # failed and its staging prefix leaked. It is joined after the retry pass instead, and
+        # the caller's own `finally` joins it again on any path that never gets there.
 
     # A feeder crash (captured above) means the session drained only a partial
     # queue and would otherwise look complete — surface it. Committed cells stay
     # tagged; the un-enqueued ones stay pending for the next campaign pass.
     if feeder_error:
+        # This exit never reaches the retry pass, so the pool is joined here instead.
+        mosaic_cleaner.shutdown(wait=True)
         raise RuntimeError(
             "zone feeder crashed before enqueuing all cells — run is incomplete "
             "(unattempted cells remain pending for the next campaign pass)"
@@ -1022,6 +1026,9 @@ def fill_zones_sequential(
     # join the shared session; the orbit now travels on each cell's ZoneContext so every cell
     # streams, and the pass had nothing left to receive. ``infer_single`` is still LIVE — the
     # in-child retry above runs on it — so only the pass is gone, not the hook.
+    # AFTER the retries, which is the whole point: every path that submits cleanup has now run.
+    # Both remaining exits — the partial-failure raise and the normal return — follow this line.
+    mosaic_cleaner.shutdown(wait=True)
     elapsed = time.monotonic() - t0
     summary: dict[str, Any] = {
         "cells": len(cells),

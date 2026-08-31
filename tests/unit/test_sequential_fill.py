@@ -14,6 +14,7 @@ import logging
 import pathlib
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -933,6 +934,50 @@ class _FlakyIngestInputs(RecordingInputs):
         with self._lock:
             self._live.discard(zone)
             self.events.append(f"discard:{zone}")
+
+
+def test_a_cell_recovering_on_retry_can_still_submit_its_cleanup():
+    """THE PR #167 REVIEW FINDING. Two reviewers caught this independently.
+
+    The housekeeping pool used to be drained at the assembly drain, which happens BEFORE the
+    in-child retry pass. That pass calls `assemble()` again, and this flow's assemble hands
+    staging cleanup to the pool — so a retried cell committed and tagged itself and THEN raised
+    `cannot schedule new futures after shutdown`. The retry loop catches that as a failure, so a
+    cell that had genuinely recovered was reported failed and its staging prefix leaked.
+
+    The oracle is both halves: the cell must be counted as SUCCEEDED, and the work it handed to
+    the pool must actually have run. Asserting only the count would pass while the cleanup was
+    silently dropped.
+    """
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="test-housekeeping")
+    cleaned: list[str] = []
+    seen: dict[str, int] = {}
+
+    def assemble(handoff, prep):
+        seen[handoff.zone] = seen.get(handoff.zone, 0) + 1
+        if handoff.zone == "01N" and seen[handoff.zone] == 1:
+            raise RuntimeError("first assembly attempt fails")
+        # What `assemble_zone_year(defer_cleanup=housekeeping.submit)` does with a real pool.
+        pool.submit(cleaned.append, handoff.zone)
+        return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
+
+    attempts: list[str] = []
+    try:
+        summary = _run(
+            _cells(2),
+            assemble=assemble,
+            housekeeping=pool,
+            infer_single=_recovering_single(attempts),
+        )
+    finally:
+        pool.shutdown(wait=True)
+
+    assert summary["failed"] == 0, f"a recovered cell was reported failed: {summary['failures']}"
+    assert summary["succeeded"] == 2
+    assert attempts == ["01N"], "the retry did not run, so this proves nothing"
+    # 01N appears ONCE: its first attempt raised before reaching the submit, so only the
+    # recovering attempt hands cleanup over. Expecting it twice was my own error, not the code's.
+    assert sorted(cleaned) == ["01N", "02N"], f"cleanup submitted by the retry never ran: {cleaned}"
 
 
 def test_an_ingest_failure_is_re_ingested_on_retry():

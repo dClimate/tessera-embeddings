@@ -1462,6 +1462,12 @@ def fill_zones_sequential_flow(
                 paused=(pause_signal(inference_pause_gate, log=log) if inference_pause_gate else None),
             )
     finally:
+        # Joined HERE because this `finally` is the only place that covers every way the runner
+        # can exit — the normal return, its partial-failure RuntimeError (a normal exit path,
+        # per the note below), a feeder crash, and cancellation. The runner joins it too, after
+        # its retry pass; `shutdown` is idempotent, and the guarantee that matters is that no
+        # path can return while multi-terabyte deletes are still outstanding.
+        housekeeping.shutdown(wait=True)
         if inputs is not None:
             inputs.shutdown()
         # The context manager has already torn the cluster down (or the hook
