@@ -986,3 +986,96 @@ uncertainty list that carries its own retired entries is one nobody reads to the
 - `scripts/census_s1_coverage.py` — the radar census behind §6. Re-run it to refresh the
   observation counts, or to check whether OPERA coverage has expanded again. Unauthenticated;
   a few minutes per year queried.
+
+---
+
+## 12. MEASURED LIVE, 2026-08-31 — the fleet achieves 74% of the per-worker basis, and only 61% of its GPUs are working
+
+**These are live figures from the running global campaign (`simple-peacock`, dispatched
+08:44Z) and they supersede the modelled rate wherever the two disagree.** Everything in §5-§6
+divides by a per-worker rate measured on one card in one place; this section measures the whole
+fleet doing the real campaign, and the difference matters to the schedule rather than to the
+sizing.
+
+### The measurement
+
+Eight samples of the summed `Progress: N/M chunks done` across the ten clusters, 13:56-14:56Z:
+
+| quantity | value |
+|---|---|
+| fleet throughput | **5,578 tiles/h** (5,614 tiles over 60.4 min) |
+| in tokens | **1.12 × 10⁹ combined tok/s** aggregate |
+| GPU instances booted | 1,163 (408 g6e.xlarge / L40S + 755 g5.2xlarge / A10G) |
+| workers actually inferring | **712** (`active` in the same progress line) |
+| **per ACTIVE worker** | **1.58 M combined tok/s — 74% of the 2.127 M basis** |
+| per booted instance | 0.97 M tok/s — 46% of the basis |
+
+**A chunk is a tile.** `adamant-aardvark` reported 8,722 chunks for a stream holding 36N-2020's
+13 live tiles plus 36N-2021's 8,709 — an exact match, so the driver's progress counter and the
+coverage census are in the same unit and 725.6 M tok/tile converts between them
+(2048² px × 173 tok/px).
+
+### Two separate gaps, and only one of them is about the model
+
+**1. The per-worker rate is 74%, not 100%, and the fleet MIX is the leading explanation.** 65%
+of the fleet is A10G (g5.2xlarge) rather than L40S (g6e.xlarge), and the 2.127 M basis was
+measured on one card type. A rough weighting reproduces the observed figure. **This is a
+hypothesis with arithmetic behind it, not a measurement** — nothing here attributes throughput
+per card, and doing so needs per-actor accounting the driver does not currently emit. Worth
+building before the mix is used to argue anything.
+
+**2. Only 61% of booted GPU instances are inferring at any moment** — 712 of 1,163. That is the
+gap between the fleet that is billed and the fleet that works: instances still booting, loading
+the checkpoint, or idle between chunks. §5's fleet-sizing policy provisions at 85% of matched
+supply to keep idle burn structurally zero, and it succeeds at that on the INGEST side; this
+number says the GPU side has its own 39% overhead which the model does not represent at all.
+
+### What it means for the schedule
+
+The doc's headline is `307,854 GPU-hours ÷ 2,500 actors = 123 h ≈ 5.1 days` for the whole
+campaign. That divides by the 2.127 M basis. At the measured per-active-worker rate the same
+2,500 workers take **~166 h ≈ 6.9 days**; at the measured per-booted-instance rate, **~267 h ≈
+11.1 days**. Which of those is right depends on whether a 2,500-actor fleet would carry the same
+61% working fraction, and nothing here settles that.
+
+**Do NOT re-price the campaign off this.** The A10G is materially cheaper per hour than the L40S,
+so a slower-but-cheaper card can cost the same or less per token, and §5's $1.861/GPU-hour is a
+single figure that cannot express a mix. Re-pricing needs the per-card rate AND the per-card
+price together; this section supplies neither. What it does supply is a duration.
+
+### Outstanding work as of 2026-08-31 15:00Z
+
+Sized against the census total rather than a sample, because the campaign admits cells
+**densest-first** — so the median of the zones already queued is biased upward, and using it
+produced a remainder larger than the entire campaign. The 39 zones nobody has queued yet are
+closed by subtraction instead: 360,953 tiles/year minus the 313,929 measured across 66 queued
+zones leaves **47,024 tiles/year**, about 1,045 per zone, which is consistent with the small
+zones being last.
+
+| | tile-years |
+|---|---|
+| campaign total | 3,248,577 |
+| inferred: fully staged, awaiting assembly | 275,661 |
+| inferred: resumed inside partially-staged cells | 78,406 |
+| inferred: in flight now | 25,940 |
+| inferred: published cells (40 of 45 sized) | 329,449 |
+| **outstanding** | **2,539,121** |
+| **outstanding, in tokens** | **1.842 × 10¹⁵ combined** |
+
+Five published cells sit in a zone with no measured count, so the remainder is a slight
+over-estimate rather than an under-estimate.
+
+**Projection at a fleet that holds or barely grows:**
+
+| assumption | rate | remaining | finishes |
+|---|---|---|---|
+| **measured rate holds** | 5,578 tiles/h | **455 h = 19.0 d** | **~19-20 Sep 2026** |
+| fleet edges up 15% | 6,415 tiles/h | 396 h = 16.5 d | ~17 Sep |
+| fleet edges up 30% | 7,252 tiles/h | 350 h = 14.6 d | ~15 Sep |
+
+**And inference is probably not the binding constraint.** Assembly runs one cell at a time per
+cluster at ~3.5 h, and on the code now deployed a landed cell also holds that thread through
+~4 h of serial deletes (staging ~2 h 15 m then mosaic ~1 h 55 m, measured on 50N-2018). At 971
+roster cells over 10 clusters that is ~30 days against inference's 19. PR #167 moves both deletes
+off the assembly thread, which brings the assembly side to ~14 days and makes inference the limit
+again — so it is worth roughly two weeks of campaign wall-clock, not just tidiness.
