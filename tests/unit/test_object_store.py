@@ -45,7 +45,13 @@ def _never_called():
     raise AssertionError("the fsspec fallback must not run for a verified-but-incomplete delete")
 
 
-def test_delete_prefix_s3_defaults_to_all_versions(monkeypatch):
+def test_delete_prefix_s3_does_not_pass_all_versions_by_default(monkeypatch):
+    """OFF by default, because on an unversioned bucket the flag is not a free precaution.
+
+    It raises the required permission to `s3:DeleteObjectVersion` and enumerates through
+    `ListObjectVersions` instead of `ListObjectsV2`. The campaign's buckets are unversioned,
+    so every production delete was paying both costs for nothing.
+    """
     seen: dict = {}
 
     def fake_s5(uri, log, *, all_versions):
@@ -54,7 +60,20 @@ def test_delete_prefix_s3_defaults_to_all_versions(monkeypatch):
     monkeypatch.setattr(object_store, "_s5cmd_rm", fake_s5)
     _cleared(monkeypatch)
     object_store.delete_prefix("s3://bucket/mosaics/33N/2025")
-    assert seen == {"uri": "s3://bucket/mosaics/33N/2025", "all_versions": True}
+    assert seen == {"uri": "s3://bucket/mosaics/33N/2025", "all_versions": False}
+
+
+def test_delete_prefix_forwards_all_versions_when_asked(monkeypatch):
+    """The flag still WORKS — it is opt-in, not removed. A versioned bucket needs it."""
+    seen: dict = {}
+
+    def fake_s5(uri, log, *, all_versions):
+        seen.update(all_versions=all_versions)
+
+    monkeypatch.setattr(object_store, "_s5cmd_rm", fake_s5)
+    _cleared(monkeypatch)
+    object_store.delete_prefix("s3://bucket/p", all_versions=True)
+    assert seen == {"all_versions": True}
 
 
 def test_delete_prefix_verifies_and_stops_after_one_clean_pass(monkeypatch):
@@ -127,15 +146,16 @@ def test_delete_prefix_strict_raises_when_delete_fails(monkeypatch):
 
     object_store.delete_prefix("s3://b/p")  # best-effort: swallows
 
-    # strict + all_versions (the default) is refused BEFORE the fallback runs: fsspec cannot
-    # remove non-current versions, so the promise cannot be kept whatever the fallback does.
+    # strict + all_versions is refused BEFORE the fallback runs: fsspec cannot remove
+    # non-current versions, so the promise cannot be kept whatever the fallback does. Now
+    # that all_versions defaults OFF this arm has to ask for it explicitly.
     with pytest.raises(object_store.DeleteUnverifiedError):
-        object_store.delete_prefix("s3://b/p", strict=True)
+        object_store.delete_prefix("s3://b/p", strict=True, all_versions=True)
 
-    # With all_versions=False the fallback CAN keep the promise, so it runs — and its own
-    # failure propagates under strict, which is what this test was written to pin.
+    # At the DEFAULT (all_versions=False) the fallback CAN keep the promise, so it runs — and
+    # its own failure propagates under strict, which is what this test was written to pin.
     with pytest.raises(OSError, match="access denied"):
-        object_store.delete_prefix("s3://b/p", strict=True, all_versions=False)
+        object_store.delete_prefix("s3://b/p", strict=True)
 
 
 def test_a_throttled_delete_is_retried_before_the_fallback(monkeypatch):

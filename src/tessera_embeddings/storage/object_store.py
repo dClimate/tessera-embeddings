@@ -1,12 +1,16 @@
 """Bulk object-store prefix deletion, shared by staging + mosaic cleanup.
 
-On a versioned S3 bucket a plain delete only writes delete markers, so old
-object versions accumulate and keep costing storage. :func:`delete_prefix`
-removes a prefix with ``s5cmd rm --all-versions`` (the production path — s5cmd
+:func:`delete_prefix` removes a prefix with ``s5cmd rm`` (the production path — s5cmd
 parallelizes far past fsspec's serial per-key DELETEs), falling back to fsspec's
-recursive ``rm`` if s5cmd is unavailable. The fallback is best-effort: fsspec
-cannot remove non-current versions, so a warning is logged when it is used on a
-versioned bucket.
+recursive ``rm`` if s5cmd is unavailable.
+
+``--all-versions`` is OPT-IN, not the default. On a versioned bucket a plain delete only
+writes delete markers, so old versions accumulate and keep costing storage — that is what
+the flag is for. But the campaign's buckets are UNVERSIONED, and there the flag is not a
+free precaution: it raises the required permission to ``s3:DeleteObjectVersion`` and
+enumerates through ``ListObjectVersions``. Callers on a versioned bucket pass it
+explicitly. The fsspec fallback cannot remove non-current versions at all, so a warning is
+logged when it is used with the flag on.
 
 **The delete is verified, not reported.** A tool's count of what it removed says
 nothing about what is left, and a prefix that keeps some of its objects is worse
@@ -166,21 +170,26 @@ def _s5cmd_rm_verified(uri: str, log: _Log, *, all_versions: bool) -> None:
     raise PrefixNotEmptyError(uri)
 
 
-def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = True, strict: bool = False) -> None:
+def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = False, strict: bool = False) -> None:
     """Delete every object under *uri* (a directory-like prefix).
 
-    S3 uses ``s5cmd`` (all versions by default) with an fsspec fallback; other
-    schemes use fsspec directly.
+    S3 uses ``s5cmd`` with an fsspec fallback; other schemes use fsspec directly.
 
     Args:
         uri: Prefix to remove (e.g. ``s3://bucket/mosaics/33N/2025``).
         log: Optional logger; falls back to the module logger.
-        all_versions: Pass ``--all-versions`` to s5cmd so a versioned bucket does
-            not accumulate non-current versions (the default; the reason this
-            helper exists). Note the asymmetry: s5cmd DELETES every version, but the
-            read-back in :func:`_survivors` only CONFIRMS current ones — see its
-            docstring for why that is safe on today's buckets and what to change first
-            if versioning is ever enabled.
+        all_versions: Pass ``--all-versions`` to s5cmd, so a VERSIONED bucket does not
+            accumulate non-current versions. **Defaults off, because on an UNVERSIONED
+            bucket the flag is not a harmless no-op**: it buys nothing, it raises the
+            required permission from ``s3:DeleteObject`` to ``s3:DeleteObjectVersion``,
+            and it makes s5cmd enumerate through ``ListObjectVersions`` rather than
+            ``ListObjectsV2`` — a heavier request pattern against a prefix holding
+            hundreds of thousands of objects.
+
+            Turn it ON for a bucket that actually has versioning enabled. Note the
+            asymmetry when you do: s5cmd DELETES every version, but the read-back in
+            :func:`_survivors` only CONFIRMS current ones — see its docstring for what
+            to change first.
         strict: When True, RAISE if the delete does not succeed — including when it ran
             and left objects behind, which is the case a returned success used to hide.
             Best-effort (default) is right for post-success cleanup (staging, tagged
