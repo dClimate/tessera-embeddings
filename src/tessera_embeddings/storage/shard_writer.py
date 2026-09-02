@@ -469,7 +469,7 @@ def run_forked(
     # coordinator four snapshots behind. Measured that night: 36 catch-ups crossing one
     # publication all succeeded, and both of the two that had to cross a pair wedged.
     #
-    # Two things answer it here. CATCH_UP_INTERVAL_S is now 30 s rather than 60, halving the
+    # Two things answer it here. CATCH_UP_INTERVAL_S is now 5 s rather than 60, shrinking the
     # window a second publication has to land in, and `rehome` above makes the remaining case
     # survivable instead of fatal. Neither is a guarantee: only a minimum spacing between
     # publications, set above the tick interval, makes depth 4 unreachable, and that needs a
