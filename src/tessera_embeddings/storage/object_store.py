@@ -189,7 +189,17 @@ def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = Fal
             Turn it ON for a bucket that actually has versioning enabled. Note the
             asymmetry when you do: s5cmd DELETES every version, but the read-back in
             :func:`_survivors` only CONFIRMS current ones — see its docstring for what
-            to change first.
+            to change first. So a verified all-versions delete is not something this
+            module can currently deliver in either default, and turning the flag on
+            buys deletion without confirmation rather than full support.
+
+            The campaign flows that call this — staging cleanup in
+            ``inference.assembly`` and the deletes in ``run_global_campaign`` — take the
+            default and expose no option, because every bucket they can address has
+            versioning off (measured; the CDK creates them that way, Icechunk carrying
+            its own history). A deployment whose buckets ARE versioned should call this
+            directly with ``all_versions=True`` and read ``_survivors`` first, rather
+            than expect the flows to cover it.
         strict: When True, RAISE if the delete does not succeed — including when it ran
             and left objects behind, which is the case a returned success used to hide.
             Best-effort (default) is right for post-success cleanup (staging, tagged
@@ -252,3 +262,21 @@ def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = Fal
         if strict:
             raise
         log.warning("Failed to delete prefix %s", uri, exc_info=True)
+        return
+
+    if not strict:
+        return
+    # READ THE FALLBACK BACK TOO. `strict` promises to raise when the delete "ran and left objects
+    # behind", and `fs.rm` returning without error is not that guarantee — it reports per call, not
+    # per prefix. The s5cmd path has always verified; this one did not, and it did not have to:
+    # `all_versions` defaulted ON, so `strict and all_versions` above failed closed before fsspec
+    # was ever tried. Turning that default off made this path reachable for a strict caller, which
+    # is the caller whose next move is to release a retention slot on the strength of the answer.
+    remaining = _survivors(uri, log)
+    if remaining is None:
+        raise DeleteUnverifiedError(
+            f"deleted {uri} with the fsspec fallback but could not list it to confirm — a prefix "
+            "that cannot be read is unknown, not clean"
+        )
+    if remaining:
+        raise PrefixNotEmptyError(f"{uri} still holds {len(remaining)} object(s) after the fsspec fallback delete")
