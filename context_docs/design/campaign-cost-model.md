@@ -1131,13 +1131,21 @@ timestamps is assembly publishing them. **They agree to within 3%**, which they 
 stage is waiting on the other. Two further readings say the same thing:
 
 - **The queue between them is small and steady.** 79,445 tile-years were computed but not yet
-  published — about **7.3 hours** of work at the measured rate. Six cells in that queue are fully
-  computed and waiting their turn to be assembled; the other twelve are still being computed.
-- **Four to six cells are being assembled at any moment**, out of ten clusters, which is the
-  equilibrium the trailing-assembly design predicts.
+  published — about **7.3 hours** of work at the measured rate. Re-measured two hours later it was
+  75,640 across 17 cells, still about seven hours. It holds rather than growing.
 
 A queue that stays near seven hours while both stages run at the same rate is a balanced pipeline,
 not a growing backlog.
+
+**A weaker indicator, withdrawn rather than left standing.** An earlier draft of this section also
+cited "four to six cells being assembled at any moment" as evidence of balance. **Do not use it.**
+Two hours later that count had fallen to one — while completed publications ACCELERATED to four in
+an hour against a campaign average of 1.5. So the count of cells reported as assembling does not
+track delivered output, and on one occasion pointed the opposite way. Five cells were fully computed
+and awaiting assembly at the moment the count read one, which nothing here reconciles.
+
+The balance argument never needed that figure. What carries it is the two rates agreeing and the
+queue holding, both of which are measurements of delivered work rather than of a reported state.
 
 ### Where the campaign stands
 
