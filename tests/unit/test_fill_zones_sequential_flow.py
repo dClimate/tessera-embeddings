@@ -400,13 +400,19 @@ class _RecordingInputs:
         self._order.append("inputs_shutdown")
 
 
-def test_the_ingest_window_starts_before_ray_up(wired, monkeypatch):
-    """The window is `1 + look_ahead` zones, all kicked off before the cluster."""
+def test_every_cell_ingests_before_ray_up(wired, monkeypatch):
+    """EVERY cell is kicked off before the cluster, not a `1 + look_ahead` window.
+
+    The window was the bug: a cell outside it had no ingest running, and could not get one
+    until the feeder admitted a cell, which waited on an assembly. `1 + look_ahead` remains
+    the ingest driver's CONCURRENCY — how many run at once — but no longer decides how many
+    are asked for.
+    """
     monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
     _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
     order = wired["order"]
-    assert [e for e in order if e.startswith("start:")] == ["start:01N", "start:02N"]
-    assert order.index("start:02N") < order.index("ray_up")
+    assert [e for e in order if e.startswith("start:")] == ["start:01N", "start:02N", "start:03N"]
+    assert order.index("start:03N") < order.index("ray_up"), "GPUs must not be asked for first"
 
 
 def test_gpus_wait_for_whichever_mosaic_lands_first(wired, monkeypatch):
@@ -420,10 +426,11 @@ def test_gpus_wait_for_whichever_mosaic_lands_first(wired, monkeypatch):
     monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
     _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
     order = wired["order"]
-    # Every started zone is offered, and no single zone is waited on by name.
-    assert "wait_first:01N,02N" in order
+    # Every started zone is offered — now the whole cell list, not a window — and no single
+    # zone is waited on by name.
+    assert "wait_first:01N,02N,03N" in order
     assert not [e for e in order if e.startswith("wait:")]
-    assert order.index("wait_first:01N,02N") < order.index("ray_up")
+    assert order.index("wait_first:01N,02N,03N") < order.index("ray_up")
 
 
 def test_cells_are_ordered_by_true_tile_count_not_the_clamped_fleet_request(wired, monkeypatch):
@@ -859,6 +866,38 @@ def test_poll_error_keeps_id_registered_for_shutdown(monkeypatch):
     assert ("fr-5", StateType.CANCELLING) in client.cancelled
 
 
+def test_a_nonpositive_failure_cap_is_rejected_before_any_side_effect(wired):
+    """Same block, same reason as `look_ahead`: `0 >= cap` is true before any cell has failed, so
+    a non-positive value stops the feeder immediately — but the runner that used to be the only
+    place checking it is not reached until every live ingest is primed and `ray_cluster` entered.
+    The cheap refusal would arrive after the expensive part.
+    """
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="max_retained_failures must be >= 1"):
+            _run(max_retained_failures=bad)
+        assert wired["ray_kwargs"] is None, "no cluster may be provisioned"
+        assert wired["seq_kwargs"] is None, "the runner must never be entered"
+
+
+def test_the_flow_default_matches_the_runner_default(wired):
+    """The flow ALWAYS forwards its own value, so its default is what production runs.
+
+    Left at 30 while the runner said 100, every campaign launch would have used 30 — the raised
+    cap would have existed only for direct callers, which is nobody in production. Found in review.
+    """
+    import inspect
+
+    from tessera_embeddings.orchestration.runners import sequential_fill as runner_mod
+
+    flow = getattr(mod.fill_zones_sequential_flow, "fn", mod.fill_zones_sequential_flow)
+    flow_default = inspect.signature(flow).parameters["max_retained_failures"].default
+    runner_default = inspect.signature(runner_mod.fill_zones_sequential).parameters["max_retained_failures"].default
+    assert flow_default == runner_default == 100, (
+        f"flow={flow_default} runner={runner_default} — a divergence here is invisible in "
+        "production because the flow always forwards its own value"
+    )
+
+
 def test_negative_look_ahead_rejected_before_any_side_effect(wired):
     """look_ahead < 0 is rejected before triage / priming / `ray up` — a
     deadlock that only manifested after the GPU cluster was provisioned.
@@ -910,6 +949,111 @@ def test_wait_first_skips_a_failed_cell_while_a_sibling_is_still_ingesting():
         adapter.shutdown()
 
 
+def test_cancel_unstarted_drops_queued_ingests_but_not_running_ones():
+    """A retry must not queue behind a cluster's worth of unattempted ingests.
+
+    Future.cancel() succeeds only for a task still queued, so this must drop the queued ones
+    and leave the RUNNING one alone — dropping work, never interrupting it.
+    """
+    adapter = _adapter(max_parallel=1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def _occupy(zone: str, year: int) -> None:
+        started.set()
+        release.wait(timeout=10.0)
+
+    adapter._run = _occupy  # the one worker is busy from here on
+    try:
+        for i in range(1, 6):
+            adapter.start(f"{i:02d}N", 2024)
+        assert started.wait(timeout=5.0), "the first ingest never started"
+
+        cancelled = adapter.cancel_unstarted()
+
+        assert cancelled == 4, f"the four queued ingests must be cancelled, got {cancelled}"
+        assert ("01N", 2024) in adapter._futures, "a RUNNING ingest must not be cancelled"
+        assert not adapter._futures[("01N", 2024)].cancelled()
+        # Forgotten, so a retry's `start` creates a fresh attempt rather than re-reading a
+        # cancelled future.
+        assert ("05N", 2024) not in adapter._futures
+    finally:
+        release.set()
+        adapter.shutdown()
+
+
+def test_wait_first_does_not_abort_while_a_first_wave_cell_can_still_land():
+    """The false abort a running failure COUNT introduces — worse than the bug it fixed.
+
+    The executor starts a queued cell as soon as a worker frees, so a fast failure (01N)
+    plus a later-wave one (03N) reach two while 02N, the other original worker, is still
+    running and about to succeed. A cumulative quorum aborts there and the caller cancels
+    02N. The quorum is the first wave {01N, 02N}, so it cannot be met while 02N is unsettled.
+    """
+    adapter = _adapter(max_parallel=2)
+    slow_but_good: Future = Future()
+    try:
+        adapter._futures = {
+            ("01N", 2024): _settled(RuntimeError("fast failure, first wave")),
+            ("02N", 2024): slow_but_good,
+            ("03N", 2024): _settled(RuntimeError("fast failure, second wave")),
+            ("04N", 2024): Future(),
+        }
+        landed: list = []
+
+        def _land() -> None:
+            # Let wait_first observe the two failures first, then settle the good one.
+            time.sleep(0.3)
+            slow_but_good.set_result(None)
+
+        threading.Thread(target=_land, daemon=True).start()
+        got = adapter.wait_first([(f"{i:02d}N", 2024) for i in range(1, 5)], timeout=5.0)
+        landed.append(got)
+        assert got == ("02N", 2024), f"the still-running first-wave cell must be allowed to land, got {got}"
+    finally:
+        adapter.shutdown()
+
+
+def test_the_priming_abort_quorum_is_the_first_wave():
+    """Abort when the opening pool has all failed — not the whole list, not a running count.
+
+    The list would hold a doomed cluster through wave after wave. A running count is the
+    subtler trap: the pool starts a queued cell as soon as a worker frees, so fast failures
+    accumulate across waves while a slow first-wave cell is still running and about to
+    succeed, and aborting there cancels it.
+    """
+    # (a) first wave all failed, four cells still ingesting -> raise (pre-change: None).
+    adapter = _adapter(max_parallel=2)
+    try:
+        adapter._futures = {
+            ("01N", 2024): _settled(RuntimeError("bad credentials")),
+            ("02N", 2024): _settled(RuntimeError("bad credentials")),
+            **{(f"{i:02d}N", 2024): Future() for i in range(3, 7)},
+        }
+        with pytest.raises(RuntimeError, match=r"ingest\(s\) failed with none landing") as caught:
+            adapter.wait_first([(f"{i:02d}N", 2024) for i in range(1, 7)], timeout=2.0)
+        assert "01N-2024" in str(caught.value) and "02N-2024" in str(caught.value)
+        assert "03N-2024" not in str(caught.value), "a cell that never settled is not a failure"
+    finally:
+        adapter.shutdown()
+
+    # (b) a second-wave failure must NOT complete the quorum while 02N can still land.
+    adapter = _adapter(max_parallel=2)
+    slow_but_good: Future = Future()
+    try:
+        adapter._futures = {
+            ("01N", 2024): _settled(RuntimeError("fast failure, first wave")),
+            ("02N", 2024): slow_but_good,
+            ("03N", 2024): _settled(RuntimeError("fast failure, second wave")),
+            ("04N", 2024): Future(),
+        }
+        threading.Timer(0.3, lambda: slow_but_good.set_result(None)).start()
+        got = adapter.wait_first([(f"{i:02d}N", 2024) for i in range(1, 5)], timeout=5.0)
+        assert got == ("02N", 2024), f"a still-running first-wave cell must be allowed to land, got {got}"
+    finally:
+        adapter.shutdown()
+
+
 def test_wait_first_raises_rather_than_booting_gpus_when_every_cell_failed():
     """No mosaic is coming, so the one thing that must not happen is `ray up`.
 
@@ -925,7 +1069,7 @@ def test_wait_first_raises_rather_than_booting_gpus_when_every_cell_failed():
             ("01N", 2024): _settled(RuntimeError("bad credentials")),
             ("02N", 2024): _settled(RuntimeError("bad credentials")),
         }
-        with pytest.raises(RuntimeError, match="every ingest in the opening window failed") as caught:
+        with pytest.raises(RuntimeError, match="ingest\\(s\\) failed with none landing") as caught:
             adapter.wait_first([("01N", 2024), ("02N", 2024)])
         assert "01N-2024" in str(caught.value) and "02N-2024" in str(caught.value)
         assert isinstance(caught.value.__cause__, RuntimeError)
@@ -955,7 +1099,7 @@ def test_the_all_failed_report_names_cells_that_failed_in_earlier_waits():
         }
         threading.Timer(0.05, lambda: late.set_exception(RuntimeError("bad credentials"))).start()
 
-        with pytest.raises(RuntimeError, match="every ingest in the opening window failed") as caught:
+        with pytest.raises(RuntimeError, match="ingest\\(s\\) failed with none landing") as caught:
             adapter.wait_first([("01N", 2024), ("02N", 2024)])
 
         message = str(caught.value)

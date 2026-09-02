@@ -13,6 +13,9 @@ covered is the arithmetic and the branching, which is where the mistakes actuall
 
 from __future__ import annotations
 
+import logging
+import os
+import re
 from datetime import UTC, datetime, timedelta
 
 import icechunk
@@ -20,6 +23,7 @@ import pytest
 from dateutil.tz import tzutc
 
 from tessera_embeddings.providers.aws import credentials as cred
+from tessera_embeddings.providers.aws import credentials as creds_mod
 
 _OURS = "s3://global-tessera-embeddings/global-tessera/global/tessera.icechunk"
 _THEIRS = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
@@ -359,3 +363,166 @@ class TestTheWiringReachesTheStore:
         src = inspect.getsource(ZarrWriter.publish_registry_part)
         assert "plain_zarr_storage_options(uri, get_credentials, s3_region)" in src
         assert "_fs_for(uri)" not in src, "a bare _fs_for falls back to the ambient chain"
+
+
+# ---------------------------------------------------------------------------
+# Making the credential icechunk uses observable.
+# ---------------------------------------------------------------------------
+
+
+class TestIcechunkCredentialVisibility:
+    """The boundary that records WHICH credential icechunk is using.
+
+    Rationale and the incident behind it:
+    ``context_docs/design/icechunk-credential-stampede-2026_08.md``.
+    """
+
+    @staticmethod
+    def _reset() -> None:
+        creds_mod._announced_access_keys.clear()
+
+    def _serve(self, source: str, key: str, expires_after: datetime | None = None) -> None:
+        creds_mod._serve_icechunk_credential(
+            source=source,
+            access_key=key,
+            secret_key="s",
+            session_token="t",
+            expires_after=expires_after or datetime(2026, 8, 28, 12, tzinfo=UTC),
+        )
+
+    def test_first_then_new_then_steady(self, caplog) -> None:
+        """The level ladder, plus the pid and ordering stamp on every line. A process that fails
+        before it ever changes credential must still name one at production level; a routine
+        re-serve must not be, since icechunk asks per request once its cache lapses.
+        """
+        self._reset()
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            self._serve("task-role", "ASIAONE")
+            self._serve("task-role", "ASIATWO")
+            self._serve("task-role", "ASIATWO")
+        assert [r.levelname for r in caplog.records] == ["INFO", "INFO", "DEBUG"]
+        msgs = [r.getMessage() for r in caplog.records]
+        assert "FIRST: ASIAONE" in msgs[0]
+        assert " NEW: ASIATWO" in msgs[1]
+        assert "served: ASIATWO" in msgs[2]
+        seqs = [int(re.search(r"seq=(\d+)", m).group(1)) for m in msgs]
+        assert seqs == sorted(seqs) and len(set(seqs)) == 3
+        assert all(f"pid={os.getpid()}" in m for m in msgs)
+        # No record claims a transition: see the boundary docstring on why order is undecidable.
+        assert not any("->" in m for m in msgs)
+
+    @pytest.mark.parametrize(
+        ("first_source", "second_source"),
+        [
+            # One fill uses BOTH providers; a single slot would read the alternation as rotation.
+            ("task-role", "assumed-role:arn:aws:iam::1:role/W"),
+            # A role NAME is not unique — the same name in two partner accounts is real, and
+            # merging them reports one provider's rotation as the other's.
+            ("assumed-role:arn:aws:iam::111111111111:role/W", "assumed-role:arn:aws:iam::222222222222:role/W"),
+        ],
+    )
+    def test_distinct_sources_do_not_read_as_one_provider(self, caplog, first_source, second_source) -> None:
+        self._reset()
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            for _ in range(3):
+                self._serve(first_source, "ASIAA")
+                self._serve(second_source, "ASIAB")
+        assert len([r for r in caplog.records if " NEW: " in r.getMessage()]) == 0
+        assert len([r for r in caplog.records if "FIRST" in r.getMessage()]) == 2
+
+    @pytest.mark.parametrize("straggler_was_announced", [True, False])
+    def test_a_late_callback_is_neither_a_change_nor_new_state(self, caplog, straggler_was_announced) -> None:
+        """Acquisition happens before this boundary and outside its lock, so a thread can freeze
+        the old credential, be descheduled past a refresh, and arrive after a faster thread
+        recorded the new one — **carrying a LATER expiry**, since the expiry is computed after the
+        freeze. Both shapes: a straggler already announced, and one at process start with no
+        history, which novelty alone cannot suppress.
+        """
+        self._reset()
+        base = datetime(2026, 8, 28, 12, tzinfo=UTC)
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            if straggler_was_announced:
+                self._serve("task-role", "ASIAPRIOR", base)
+            self._serve("task-role", "ASIAFRESH", base + timedelta(minutes=5))
+            self._serve("task-role", "ASIAPRIOR", base + timedelta(minutes=10))
+            # The real credential again: must be steady, which asserts the straggler changed
+            # nothing rather than merely that it stayed quiet.
+            self._serve("task-role", "ASIAFRESH", base + timedelta(minutes=11))
+        msgs = [r.getMessage() for r in caplog.records]
+        assert "served: ASIAFRESH" in msgs[-1]
+        assert not any("->" in m for m in msgs)
+        # One INFO per credential the process really used, and never more.
+        assert len([r for r in caplog.records if r.levelname == "INFO"]) == 2
+
+    def test_a_workers_first_line_says_it_is_probably_a_change(self, caplog, monkeypatch) -> None:
+        """Where a caller scatters, a worker's first call lands only once the inherited credential
+        lapses — a change wearing the word FIRST, which a reader would misread. Phrased as a
+        possibility, since multiprocessing ancestry does not prove the storage scattered.
+        """
+        self._reset()
+        with caplog.at_level(logging.INFO, logger=creds_mod.__name__):
+            self._serve("task-role", "ASIAPARENT")
+        assert "child process" not in caplog.records[0].getMessage()
+
+        caplog.clear()
+        self._reset()
+        monkeypatch.setattr(creds_mod.multiprocessing, "parent_process", lambda: object())
+        with caplog.at_level(logging.INFO, logger=creds_mod.__name__):
+            self._serve("task-role", "ASIACHILD")
+        msg = caplog.records[0].getMessage()
+        assert "FIRST in this child process" in msg and "not a start" in msg
+        # Phrased as a possibility: being a multiprocessing child (a Dask nanny worker is one)
+        # does not prove the storage scattered, so the line must not assert inheritance.
+        assert "if it inherited" in msg
+        assert "ASIACHILD" in msg
+
+    def test_the_bookkeeping_is_locked_and_the_log_is_not(self, monkeypatch) -> None:
+        """Icechunk calls this from its own threads, so an unguarded read-then-write lets two of
+        them both announce the same key. Asserted directly because a racing test can only fail
+        probabilistically. The second half matters as much: holding the lock across the log would
+        serialise every icechunk request behind a log write.
+        """
+        self._reset()
+        lock = creds_mod._ANNOUNCE_LOCK
+        held: list[bool] = []
+
+        class _Watched(dict):
+            def setdefault(self, key, default=None):  # type: ignore[override]
+                held.append(lock.locked())
+                return super().setdefault(key, default)
+
+        monkeypatch.setattr(creds_mod, "_announced_access_keys", _Watched())
+        logged_under_lock: list[bool] = []
+        monkeypatch.setattr(creds_mod._LOG, "log", lambda *a, **k: logged_under_lock.append(lock.locked()))
+        self._serve("task-role", "ASIALOCKED")
+        assert held == [True], "the novelty check must happen under the lock"
+        assert logged_under_lock == [False], "the log must not run inside the lock"
+
+    def test_it_never_logs_the_secret_or_the_token(self, caplog) -> None:
+        self._reset()
+        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+            creds_mod._serve_icechunk_credential(
+                source="task-role",
+                access_key="ASIAVISIBLE",
+                secret_key="SECRETVALUE",
+                session_token="TOKENVALUE",
+                expires_after=datetime(2026, 8, 28, 12, tzinfo=UTC),
+            )
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "ASIAVISIBLE" in text
+        assert "SECRETVALUE" not in text and "TOKENVALUE" not in text
+
+    def test_both_providers_are_instrumented(self) -> None:
+        """The published store is served by the ASSUMED-ROLE callback, so instrumenting only the
+        task-role one would leave the credential behind the real failures invisible.
+        """
+        import inspect
+
+        for name, src in (
+            ("task-role", inspect.getsource(creds_mod.iam_icechunk_credentials)),
+            ("assumed-role", inspect.getsource(creds_mod.AssumedRoleIcechunkCredentials.__call__)),
+        ):
+            assert "_serve_icechunk_credential(" in src, f"{name} bypasses the boundary"
+            assert "icechunk.S3StaticCredentials(" not in src, (
+                f"{name} builds its own credential, so it can drift from the boundary"
+            )

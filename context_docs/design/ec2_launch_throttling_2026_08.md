@@ -426,3 +426,48 @@ scheduler loop with placements arriving, and asserts the fleet ends at its confi
 target — at one actor per node, at two actors per node, and with batching disabled.
 Reverting the unit fix turns the two-actors-per-node case into **49 of 120**, which is
 the stall reproduced as a test rather than as an argument.
+
+
+---
+
+## Measured at fleet width, 2026-08-26 — pacing per call is not enough
+
+The first campaign to run with `launch_pacing=True` gave the measurement the original work could
+not: ten clusters live at once, read from CloudTrail rather than inferred from failures.
+
+**2,392 `RunInstances` calls in 7.8 minutes — 306/min.**
+
+| outcome | rate | share |
+|---|---|---|
+| `Client.RequestLimitExceeded` | 188/min | 61% |
+| `Server.InsufficientInstanceCapacity` | 97/min | 32% |
+| `Client.UnauthorizedOperation` (an operator cap) | 13/min | 4% |
+| `OK` | 8.6/min | 3% |
+
+**The bucket model is confirmed.** Everything not throttled totals **118/min**, against a
+documented refill of 2/sec = 120/min. The quota behaves exactly as modelled, and every call beyond
+that rate is refused.
+
+**Per-client adaptive backoff does not converge here, and the reason is structural.**
+`AWS_RETRY_MODE=adaptive` is congestion control, which converges only for a controller that can
+observe the whole pipe. Each cluster runs its own autoscaler with its own controller against ONE
+account-wide bucket. Each observed ~60% refusal and backed off; each settled at a rate that is
+reasonable alone. Their sum overshot by 2.5x. Per-cluster call counts were 216–269 — within noise
+of one another, which is what independent controllers converging separately looks like.
+
+`AUTOSCALER_MAX_LAUNCH_BATCH` and `BOTO_CREATE_MAX_RETRIES` change what a call carries and how many
+attempts it spends. Neither reduces calls per minute. `AUTOSCALER_UPDATE_INTERVAL_S` is the only
+setting that does, and it composes across clusters because it divides every participant's rate by
+the same factor. Hence its addition to `LAUNCH_PACING_AUTOSCALER_ENV` at 15 s against Ray's 5.
+
+**But throttling was NOT the binding constraint on fleet growth, and this is the more important
+finding.** Of the 118/min the bucket admitted, **82% failed on `InsufficientInstanceCapacity`**.
+Eliminating throttling entirely would leave four in five admitted calls still finding no
+`g6e.xlarge` in us-west-2. Backing off is worth doing for API hygiene — 188 refused calls a minute
+is pressure the whole account pays, including our own describe and ECS calls — but the lever on
+fleet SPEED is instance-type diversity or a capacity reservation, not request rate.
+
+**What the pacing did buy: the throttle stopped being fatal.** The night before, the identical
+refusal rate killed a fill outright at its HEAD launch — nothing retries a head, and losing it
+fails the whole leg. With pacing on, ten clusters absorbed the same rate and all survived. Judge
+this work by deaths, not by the refusal percentage.

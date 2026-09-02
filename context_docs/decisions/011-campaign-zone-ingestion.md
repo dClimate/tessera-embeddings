@@ -210,7 +210,7 @@ The single-ROI path is deliberately untouched by all of this.
   zones ingesting simultaneously across the whole campaign. Under
   `chained-clusters` the clusters are separate Prefect flow runs, so no in-process
   semaphore can see across them and the cap is a Prefect **global concurrency
-  limit** — the same mechanism as the D6 commit gate. Each zone's ingest holds one
+  limit** — the mechanism the D6 commit gate also used, before its removal. Each zone's ingest holds one
   slot for its duration; a cluster starts as many zones as fit and queues the rest.
   The campaign upserts the limit from the parameter at start (failing preflight if
   it cannot), so the two can never drift. Each cluster also takes an even share of

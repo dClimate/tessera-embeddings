@@ -28,7 +28,7 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.lifecycle import wait_for_actors
 from tessera_embeddings.inference.progress import ProgressTracker
-from tessera_embeddings.inference.scheduling import WorkItem, _process_chunks_work_stealing
+from tessera_embeddings.inference.scheduling import FleetDemand, WorkItem, _process_chunks_work_stealing
 
 
 def _resumed_result(label: str, *, skipped: bool) -> dict:
@@ -59,6 +59,7 @@ def run_inference(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     *,
     on_actor_retire: Callable[[str], None] | None = None,
+    on_fleet_demand: Callable[[int], None] | None = None,
     get_credentials: Callable[[], Any] | None = None,
     s3_region: str | None = None,
     retire_idle_actors: bool = True,
@@ -90,6 +91,9 @@ def run_inference(
             is documented in ``docs/public-api.md`` and dropping a parameter there is a breaking
             change — remove it on the next deliberate pass at that API.
         log: Logger.
+        on_fleet_demand: Optional callback ``(want_gpus) -> None`` letting the AWS
+            provider publish a per-instance-type fleet request each scheduling
+            round; see ``providers.aws.fleet_mix``.
         on_actor_retire: Optional callback ``(instance_id) -> None`` invoked
             when a misbehaving actor is removed from the pool. The AWS
             provider injects an EC2-terminator here so dead instances stop
@@ -181,15 +185,27 @@ def run_inference(
     # what the scheduler will go on to do.
     batch_size = config.actor_request_batch_size
     first_batch = config.initial_actor_request(num_actors)
-    actors = actor_factory(first_batch)
-    if batch_size > 0 and first_batch < num_actors:
-        log.info(
-            "Actor batching enabled: requesting %d at a time (batch 1/%d actors now)",
-            batch_size,
-            num_actors,
-        )
+    # BEFORE the first batch, because the scheduler republishes every round but does not
+    # start until `wait_for_actors` returns — and under a total primary drought no
+    # first-batch actor ever initializes, so that wait runs to its hours-long timeout and
+    # the run dies having never once asked for the fallback.
+    fleet = FleetDemand(on_fleet_demand, config.num_gpus, log)
+    outstanding = num_actors if more_work is not None else len(chunks)
+    fleet.send(target=num_actors, outstanding=outstanding, requested=first_batch, retry=True)
+
+    actors: list[ray.actor.ActorHandle] = []
     progress_tracker: ray.actor.ActorHandle | None = None
+    # The try opens BEFORE the first batch, because the fleet floor is already published
+    # by this point: an actor-creation failure outside this scope would leave that floor
+    # standing, holding GPU nodes on a cluster where inference never started.
     try:
+        actors = actor_factory(first_batch)
+        if batch_size > 0 and first_batch < num_actors:
+            log.info(
+                "Actor batching enabled: requesting %d at a time (batch 1/%d actors now)",
+                batch_size,
+                num_actors,
+            )
         # Start as soon as a single actor is live. Cloud providers roll out
         # instances with huge timing variation, so blocking on a fraction of
         # the fleet just stalls the run; the work-stealing scheduler dispatches
@@ -231,6 +247,7 @@ def run_inference(
             tracker=progress_tracker,
             still_initializing=still_initializing,
             on_actor_retire=on_actor_retire,
+            fleet=fleet,
             get_credentials=get_credentials,
             s3_region=s3_region,
             actor_factory=actor_factory,
@@ -241,6 +258,7 @@ def run_inference(
             on_item_done=on_item_done,
         )
     finally:
+        fleet.clear()
         log.info("Killing %d actors to release resource reservations", len(actors))
         for actor in actors:
             with contextlib.suppress(Exception):

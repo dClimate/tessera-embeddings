@@ -43,11 +43,10 @@ fills from colliding without a year barrier. ``overlap_years=False`` restores th
 older shape: **year by year** in an outer serial loop, dispatching each year's zones
 concurrently, where distinct zones make same-zone overlap impossible by construction.
 Either way concurrency is bounded by ``max_parallel_clusters``.
-
-The fleet-wide committer bound is a separate knob: ``commit_limit_name`` (a Prefect
-global concurrency limit) is passed to every fill so commits stay under the storm
-threshold while inference runs free. ``pending()`` is year-major, which is the drain
-pattern the barrier path relies on.
+Commits are UNGATED. At ``max_parallel_clusters=10`` the committer ceiling is ~2N=20
+on a single repo branch tip; run 1 measured that as ~2.2 s commits, not a failure. See
+``context_docs/design/commit-gate-removal-2026_08.md``. ``pending()`` is year-major,
+which is the drain pattern the barrier path relies on.
 """
 
 from __future__ import annotations
@@ -126,16 +125,6 @@ def _child_tag(flow_run_id: object) -> str | None:
 #: one. The child flows keep their OWN teardown hooks; this one stops the runs those
 #: hooks then clean up after.
 _cancel_children_on_cancellation = make_child_cancel_hook(_CHILD_TAG_PREFIX, "campaign child run")
-
-
-#: Ceiling on simultaneous zone-year committers, from ADR-008 D5/D6 run 1. Commit
-#: contention is on the branch-tip CAS — every commit re-serialises the repo-global
-#: snapshot — so rebase retries scale with the number of racing writers and the
-#: aggregate wasted work with its square. Measured: N=2 -> 0.5 retries / 0.5 s,
-#: N=8 -> 3.5 / 1.3 s, N=16 -> 7.5 / 2.2 s (which BREACHED the run's own
-#: <=2x-serial acceptance criterion), N=120 -> 58 / 15 s. The recorded firm
-#: constraint is 4-8; this is its upper end.
-MAX_SIMULTANEOUS_COMMITTERS = 8
 
 
 #: Terminal states after which a chained fill has PROVABLY stopped writing, and is
@@ -572,11 +561,12 @@ async def run_global_campaign(
     zones: list[str] | None = None,
     max_parallel_clusters: int = 10,
     launch_pacing: bool = False,
+    gpu_fallback_instance_types: list[str] | None = None,
+    gpu_fallback_vcpu_budget: int | None = None,
     actor_request_headroom: int | None = None,
     actor_request_batch_size: int | None = None,
     fill_strategy: str = "chained-clusters",
     chained_fill_deployment: str | None = None,
-    commit_limit_name: str = "tessera-global-commits",
     num_actors: int = 250,
     s1_orbit: str = "both",
     s3_region: str | None = None,
@@ -658,6 +648,31 @@ async def run_global_campaign(
             symptom but a wall clock nobody has a baseline for.
         launch_pacing: Pace every fill's EC2 launch requests against the account's
             shared RunInstances quota, which is a small burst capacity refilled at a
+        gpu_fallback_instance_types: EC2 instance types this campaign may fall back to when
+            the production rung has no capacity, e.g. ``["g5.2xlarge"]``. Named as instance
+            types rather than card names so this and the ``gpu-worker-ladder`` key speak one
+            vocabulary, and so the size -- a host-RAM safety decision -- is explicit.
+
+            ``None`` -- the default -- keeps the fleet on ``g6e.xlarge`` alone and behaves
+            exactly as before.
+
+            Naming a card does two things per fill: it opens that card's rung, and it
+            installs an autoscaler scorer that demotes a rung AWS has just refused for
+            want of capacity. Ray's stock scorer cannot see capacity at all, so without
+            the scorer an open rung is never reached; without the rung the scorer has
+            nothing to promote.
+
+            The fleet does not get bigger -- ``num_actors`` still bounds it -- only
+            differently made. Note the price: the fallback sizes are 8 vCPU per GPU
+            against ``g6e.xlarge``'s 4, so each fallback GPU spends twice the G-and-VT
+            quota, and they run at 0.46 (A10G) or 0.32 (L4) of an L40S.
+        gpu_fallback_vcpu_budget: Optional per-cluster vCPU budget for the GPU fleet.
+            The G-and-VT quota is counted in vCPU, and the fallback cards spend twice as
+            much of it per GPU, so a ceiling in cards means a different quota bill
+            depending on which card the fleet ends up on. Given a budget, each rung is
+            ceilinged at what the budget affords it -- 250 cards at 4 vCPU/GPU, 125 at 8.
+            It bounds each PURE fleet exactly; a mixture can still exceed it, because
+            Ray's ceilings count nodes and carry no weight.
             fixed rate and is not adjustable. This is where the setting belongs
             because contention is a property of the CAMPAIGN, not of a fill: one
             cluster growing alone contends with nothing, while ``n`` autoscalers
@@ -704,15 +719,6 @@ async def run_global_campaign(
             fill deployment (``fill_strategy="chained-clusters"`` only). ``None``
             (default) derives ``fill-zones-sequential/fill-zones-sequential``
             routed by ``branch``; an explicit value is used verbatim.
-        commit_limit_name: Prefect global concurrency limit bounding fleet-wide
-            simultaneous committers to the global store (ADR-008 D6); forwarded to
-            every fill, which holds one slot for the duration of each zone-year
-            commit. Its VALUE is derived, not a parameter: the campaign upserts it
-            to ``min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS)`` at
-            preflight — a cluster's trailing assembly is single-threaded, so more
-            slots than clusters could never be used, and the run-1 curve caps it at
-            8 however many clusters run. Set to ``""`` to disable the gate; the
-            fills then commit ungated, which the run-1 storm makes a bad idea.
         num_actors: GPU actor count, forwarded to each fill.
         s1_orbit: S1 orbit selection, forwarded to both ingest and fill.
         s3_region: Optional S3 region for the global store, forwarded to the driver's
@@ -962,6 +968,46 @@ async def run_global_campaign(
     # gave and which turned out to cover more cases than it named — see there.
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
+    # HERE, before any dispatch. `_apply_gpu_fallback` refuses the same values, but it runs
+    # inside the child, AFTER that child has upserted shared limits and primed its look-ahead
+    # mosaics. A deterministic configuration error would therefore spend real ingest work per
+    # cluster before anything said so, on a campaign that cannot succeed as configured.
+    if gpu_fallback_instance_types:
+        # Imported HERE, not at module scope. `providers.aws.ray` pulls boto3 and ray, which
+        # live in the `aws` and `inference` extras -- a module-level import would stop a
+        # `tessera_embeddings[prefect]` install from importing or registering this flow, and
+        # would defeat the deferred AWS imports this module already uses to stay
+        # dependency-neutral for inspection and local runs.
+        from tessera_embeddings.providers.aws.ray import GPU_FALLBACK_INSTANCE_TYPES
+
+        unknown = sorted(set(gpu_fallback_instance_types) - GPU_FALLBACK_INSTANCE_TYPES)
+        if unknown:
+            raise ValueError(
+                f"gpu_fallback_instance_types names unsupported type(s) {unknown}. Supported: "
+                f"{sorted(GPU_FALLBACK_INSTANCE_TYPES)}. Sizes are restricted on HOST RAM - the "
+                "vCPU-matched `xlarge` of each family would OOM the loader before inference."
+            )
+        if len(set(gpu_fallback_instance_types)) > 1:
+            # Refused HERE as well as in the provider, and the duplication is the point:
+            # the provider's guard fires inside `ray_cluster`, by which time a chained
+            # fill has already primed its look-ahead ingests. A configuration that cannot
+            # work should cost nothing to discover.
+            raise ValueError(
+                f"Only one GPU fallback instance type may be opened at a time, got "
+                f"{sorted(set(gpu_fallback_instance_types))} - the fleet mix is a floor, and "
+                "ordinary actor demand above it is still scored by Ray, which breaks the tie "
+                "between identically-shaped fallbacks on node-type name rather than throughput."
+            )
+        if gpu_fallback_vcpu_budget is not None:
+            if gpu_fallback_vcpu_budget <= 0:
+                raise ValueError(f"gpu_fallback_vcpu_budget must be > 0, got {gpu_fallback_vcpu_budget}")
+            # 8 vCPU is the cheapest supported fallback instance, so a budget below it cannot
+            # seat one node of the rung it is about to open.
+            if gpu_fallback_vcpu_budget < 8:
+                raise ValueError(
+                    f"gpu_fallback_vcpu_budget={gpu_fallback_vcpu_budget} cannot afford one "
+                    "fallback instance (8 vCPU). Raise it, or drop the fallback request."
+                )
     if fill_strategy not in ("cluster-per-zone", "chained-clusters"):
         raise ValueError(f"fill_strategy must be 'cluster-per-zone' or 'chained-clusters', got {fill_strategy!r}")
     # Each of the three staging levers CLAIMS the identity, so any pair of them is a
@@ -1085,18 +1131,6 @@ async def run_global_campaign(
             # is not a lever they can reach at 3 a.m. — and reset to running at every start that
             # has work, so a campaign can never inherit a pause somebody left behind.
             _upsert_limit(inference_pause_gate, 1, what="inference pause (1 = running)", log=log)
-        if commit_limit_name:
-            # DERIVED, not a parameter. A cluster's trailing assembly is a single
-            # thread, so N clusters can produce at most N assembly commits at once —
-            # a larger limit would be a number that never binds. And the run-1 curve
-            # says never exceed MAX_SIMULTANEOUS_COMMITTERS however many clusters run.
-            #
-            # A cluster's FEEDER can also commit (a terminal plan inside `plan()`),
-            # so the fleet's true ceiling is 2N and the gate can briefly queue those.
-            # That is the intent: the gate is a bound, not an operating point, and a
-            # queued commit costs seconds against zones that run for hours.
-            commit_limit = min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS)
-            _upsert_limit(commit_limit_name, commit_limit, what="commit", log=log)
 
     # Orphan-mosaic recovery: a per-cell cleanup that failed after tagging leaves
     # the mosaic behind, and that cell is no longer in `work`, so it is never
@@ -1114,11 +1148,10 @@ async def run_global_campaign(
         log.info("Orphan-mosaic sweep: reclaimed %d completed-cell mosaic prefix(es)", swept)
 
     log.info(
-        "Campaign: %d (zone, year) cell(s) need work across %d year(s); <=%d concurrent fills/year, commit limit %r",
+        "Campaign: %d (zone, year) cell(s) need work across %d year(s); <=%d concurrent fills/year",
         len(work),
         len({y for _, y in work}),
         max_parallel_clusters,
-        commit_limit_name,
     )
 
     optical_rule_cache: list[int | None] = []
@@ -1272,7 +1305,6 @@ async def run_global_campaign(
             "num_actors": num_actors,
             "s1_orbit": s1_orbit,
             "s3_region": s3_region,
-            "commit_limit_name": commit_limit_name,
             "allow_partial_window": allow_partial_window,
             "allow_s2_only": allow_s2_only,
             # Explicit, and it must stay explicit: `fill-zone-year` DEMANDS radar by
@@ -1295,6 +1327,8 @@ async def run_global_campaign(
             # limiter each autoscaler runs for itself — so what the campaign passes is
             # whether to run it at all.
             "launch_pacing": launch_pacing,
+            "gpu_fallback_instance_types": gpu_fallback_instance_types,
+            "gpu_fallback_vcpu_budget": gpu_fallback_vcpu_budget,
             # The other half of the same problem, one layer up: pacing makes a launch
             # request cheaper, this bounds how many of them a fill makes at all. Both are
             # OMITTED when unset so the fill's own default decides — keyed on None rather
@@ -1342,10 +1376,10 @@ async def run_global_campaign(
     # gone is the BACKPRESSURE, not the cleanup.
     #
     # This applies to `cluster-per-zone` only. In `chained-clusters` — the default —
-    # the per-cell chain below is bypassed and each child bounds its own mosaics at
-    # `look_ahead + 2` (sequential_fill._MosaicBudget). Across the cluster count those
-    # settings imply, that bound already exceeds the zones in a year, so it is not
-    # the binding constraint there either.
+    # the per-cell chain below is bypassed and the child does not bound its mosaics at
+    # all: peak storage is a cluster's mosaics by design, and the two semaphores that
+    # used to bound them throttled ingest and inference behind assembly
+    # (`context_docs/design/stage_decoupling_2026_08.md`).
 
     async def _process(zone: str, year: int) -> str:
         # Ingest (if enabled) → fill → drop the transient mosaic. ingest_sem/fill_sem
@@ -1564,7 +1598,6 @@ async def run_global_campaign(
                         "num_actors": num_actors,
                         "s1_orbit": s1_orbit,
                         "s3_region": s3_region,
-                        "commit_limit_name": commit_limit_name,
                         "allow_partial_window": allow_partial_window,
                         "allow_ingest_code_mismatch": allow_ingest_code_mismatch,
                         "allow_s2_only": allow_s2_only,
@@ -1598,6 +1631,8 @@ async def run_global_campaign(
                         # enforces its own share client-side rather than being handed a
                         # divided count.
                         "launch_pacing": launch_pacing,
+                        "gpu_fallback_instance_types": gpu_fallback_instance_types,
+                        "gpu_fallback_vcpu_budget": gpu_fallback_vcpu_budget,
                         # And as in _fill_params, the bound on how many launch requests
                         # a cluster makes, beside the pacing that makes each one cheaper.
                         # Omitted when unset so the child's own default stands.

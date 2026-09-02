@@ -195,19 +195,20 @@ class TestCampaignDefaults:
         assert actors < 275, "one cluster's assembly thread is the ceiling"
 
     def test_every_gate_is_published_to_the_server(self, wired):
-        """All three gates live in CHILD flow runs, so a gate only binds if it reaches the
+        """Both gates live in CHILD flow runs, so a gate only binds if it reaches the
         Prefect limit they name. Writing them from this flow is what stops the server's
         numbers drifting from the ones chosen here — and, for the pause gate, what makes
         pausing reachable without an operator creating anything first.
+
+        There were three. The commit gate is gone — nothing bounds committers any more, and
+        `test_no_committer_gate_is_published` pins that it stays gone.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
         assert dict(wired["limits"]) == {
             "tessera-global-ingests": 60,
-            "tessera-global-commits": 8,
             "tessera-global-inference": 1,
         }
         assert wired["arun"][0][1]["ingest_limit_name"] == "tessera-global-ingests"
-        assert wired["arun"][0][1]["commit_limit_name"] == "tessera-global-commits"
         assert wired["arun"][0][1]["inference_pause_gate"] == "tessera-global-inference"
 
     def test_the_pause_gate_is_published_as_running_not_as_a_cap(self, wired):
@@ -231,6 +232,11 @@ class TestCampaignDefaults:
         [
             ({"num_actors": 0}, "num_actors must be >= 1"),
             ({"fill_strategy": "cluster-per-zne"}, "fill_strategy must be"),
+            # A card name is checked HERE and not only inside the child. The child's own
+            # refusal arrives after it has primed its look-ahead mosaics and entered
+            # `ray_cluster`, so a typo would spend real ingest work per cluster before
+            # anything said so.
+            ({"gpu_fallback_instance_types": ["g5.xlarge"]}, "unsupported type"),
         ],
     )
     def test_a_doomed_invocation_touches_no_shared_limit(self, wired, kwargs, match):
@@ -273,36 +279,37 @@ class TestCampaignDefaults:
         assert wired["arun"] == [], "and must dispatch nothing"
 
     def test_no_ingest_cap_is_published_when_ingest_is_off(self, wired):
-        """Prebuilt mosaics mean no ingest to gate. Commits still happen, so that cap is
-        still published — and so is the inference pause, because inference is exactly what
-        this run still does and pausing it must stay available.
+        """Prebuilt mosaics mean no ingest to gate. The inference pause is still published,
+        because inference is exactly what this run still does and pausing it must stay
+        available.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False))
-        assert dict(wired["limits"]) == {"tessera-global-commits": 8, "tessera-global-inference": 1}
+        assert dict(wired["limits"]) == {"tessera-global-inference": 1}
 
-    @pytest.mark.parametrize(("clusters", "expected"), [(1, 1), (4, 4), (8, 8), (16, 8), (40, 8)])
-    def test_the_commit_cap_is_derived_from_the_cluster_count(self, wired, clusters, expected):
-        """``min(clusters, 8)``, and both halves earn their place.
+    @pytest.mark.parametrize("clusters", [1, 4, 8, 16, 40])
+    def test_no_committer_gate_is_published_at_any_cluster_count(self, wired, clusters):
+        """Commits are ungated, and the cluster count no longer implies a committer cap.
 
-        A cluster's trailing assembly is single-threaded, so N clusters can produce
-        at most N assembly commits at once — more slots than clusters is a number
-        that could never bind. And the run-1 curve caps it at 8 however many
-        clusters run: 16 simultaneous committers measured 7.5 rebase retries and a
-        2.2 s commit, which breached that experiment's own acceptance criterion.
+        The removed gate derived ``min(clusters, 8)`` from the run-1 contention curve. It was
+        removed because what it bounded is a SLOWDOWN, not a failure: all 120 zone groups do
+        share one repo and one branch tip, and run 1 measured that contention as 2.2 s commits
+        at 16 simultaneous committers and 15 s at 120, with ZERO unresolvable conflicts at every
+        N. The curve itself is kept in
+        ``context_docs/design/commit-gate-removal-2026_08.md`` together with the scale
+        (N>=16) at which it would matter again — this is parametrised past that scale on
+        purpose, so a reader sees the removal is unconditional rather than tuned.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=clusters))
-        assert dict(wired["limits"])["tessera-global-commits"] == expected
+        assert "tessera-global-commits" not in dict(wired["limits"])
 
-    def test_the_commit_cap_is_never_above_the_measured_ceiling(self):
-        """Pinned as a literal so raising it is a deliberate act against the ADR."""
-        assert mod.MAX_SIMULTANEOUS_COMMITTERS == 8
-
-    def test_an_empty_commit_limit_name_publishes_nothing(self, wired):
-        """The documented escape hatch for running ungated — it must not then write
-        a limit named ``""``.
+    def test_the_flow_takes_no_commit_limit_parameter(self):
+        """Structural: there is no knob left to re-enable a fleet-wide committer bound, so a
+        dispatch cannot reintroduce one without a code change.
         """
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", commit_limit_name=""))
-        assert dict(wired["limits"]) == {"tessera-global-ingests": 60, "tessera-global-inference": 1}
+        import inspect
+
+        flow = getattr(mod.run_global_campaign, "fn", mod.run_global_campaign)
+        assert "commit_limit_name" not in inspect.signature(flow).parameters
 
     def test_nothing_bounds_mosaics_in_flight(self, wired, monkeypatch):
         """A whole year's mosaics may coexist: no backpressure from fill onto ingest.

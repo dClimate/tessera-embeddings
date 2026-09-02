@@ -38,7 +38,8 @@ import stat
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Callable, Iterator
+from collections import defaultdict
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +119,23 @@ LAUNCH_PACING_AUTOSCALER_ENV = {
     # count leaves exactly one pass over the zones: capacity failover is preserved and
     # the surplus no-delay attempts are not made.
     "BOTO_CREATE_MAX_RETRIES": "1",
+    # Seconds between autoscaler passes; Ray's default is 5. This is the only setting that
+    # bounds how OFTEN a cluster asks, as opposed to how much it asks for per call — and the
+    # request quota is a rate over calls. The two settings above make each call carry more and
+    # waste fewer attempts; neither reduces the calls per minute, so at fleet width the
+    # autoscalers still overshoot the account's shared bucket together.
+    #
+    # Why a fixed slowdown rather than backoff: botocore's adaptive mode is congestion control,
+    # and it converges only for a client that can see the whole pipe. Every cluster runs its own
+    # autoscaler with its own controller against ONE account-wide bucket, so each settles at a
+    # rate that is reasonable alone and collectively is not. A longer loop is the one lever that
+    # composes, because it divides every participant's rate by the same factor.
+    #
+    # Sized against the bucket rather than picked: at the default the fleet's aggregate call rate
+    # runs a small multiple of what the bucket admits, and this divides it by three. It costs
+    # latency in the autoscaler's OTHER duties — noticing a dead node, acting on a resource
+    # demand — which is why it is not longer.
+    "AUTOSCALER_UPDATE_INTERVAL_S": "15",
 }
 """Tuning for the AUTOSCALER's launch loop, and for nothing else.
 
@@ -143,6 +161,57 @@ LAUNCH_PACING_ENV = {**LAUNCH_PACING_CLIENT_ENV, **LAUNCH_PACING_AUTOSCALER_ENV}
 Applied only when a caller asks for it (``launch_pacing=True``). Default-off
 because it changes how a live fleet grows.
 """
+
+GPU_WORKER_LADDER_SSM_KEY = "gpu-worker-ladder"
+"""OPTIONAL SSM key under ``ssm_prefix`` that releases the template's GPU rungs.
+
+Value is a comma-separated list of ``<instance-type>:<max_workers>`` pairs, e.g.::
+
+    g6e.xlarge:100,g6e.2xlarge:150
+
+**Absent means the template stands untouched**, which is today's behaviour
+byte-for-byte — that is the whole point of putting the switch here rather than on
+the flow. A flow parameter would change the deployment's schema, and a schema
+change forces every deployment to be re-registered, which drops hand-set
+parameters on a live campaign. An SSM key is read at ``ray up`` time by whatever
+code the runner already has, so a rung can be released mid-campaign with a
+`put-parameter` and no release, no re-registration and no AMI re-bake.
+
+Why ``max_workers`` and not a smarter switch: node-type choice in Ray 2.55.1
+has no feedback from capacity errors, so ``max_workers`` per node type is the
+only mechanism that moves the autoscaler. ``0`` makes a rung unreachable.
+"""
+
+GPU_WORKER_NODE_TYPE_PREFIX = "gpu-workers-ondemand"
+"""Prefix identifying the ON-DEMAND GPU worker node types the ladder governs.
+
+The ladder addresses node types by their EC2 instance type, but an instance type
+does not identify a node type on its own: the template ships ``g6e.xlarge`` twice,
+once on-demand and once spot. So the ladder's domain is fixed by NAME — every
+``available_node_types`` key with this prefix — and spot rungs are outside it and
+never touched. Keep this in lockstep with ``cluster.yaml.template``; a template
+rename that breaks the prefix makes the ladder silently govern nothing, which is
+why :func:`_apply_gpu_worker_ladder` refuses an empty domain rather than
+returning quietly.
+"""
+
+
+#: Instance types this campaign will accept as a capacity fallback. Named the way the
+#: `gpu-worker-ladder` key names them, because two vocabularies for one domain is how a
+#: template edit and an operator's value drift apart.
+#:
+#: One size per card, chosen on HOST RAM rather than price: the vCPU-matched `g5.xlarge`
+#: and `g6.xlarge` carry 16 GiB against a measured ~17.7 GB per-actor requirement, which
+#: is the exact shape that OOMed the loader on the earlier 16 GB g5-class workers. The
+#: `2xlarge` of each family gives 32 GiB, matching `g6e.xlarge`. Sizes outside this set
+#: are refused rather than trusted -- an operator naming `g5.xlarge` under capacity
+#: pressure would get a fleet that cannot run the work.
+#:
+#: The cost of the safe size is quota, and it is not small: the G-and-VT quota is counted
+#: in vCPU, and these are 8 vCPU per GPU against `g6e.xlarge`'s 4. A fallback GPU spends
+#: TWICE the quota of a production one -- 10,000 vCPU buys 2,500 L40S or 1,250 A10G.
+GPU_FALLBACK_INSTANCE_TYPES: frozenset[str] = frozenset({"g5.2xlarge", "g6.2xlarge"})
+
 
 _RAY_START = "ray start"
 """The token in a ``*_start_ray_commands`` entry that :func:`_pace_ray_start` prefixes.
@@ -182,6 +251,363 @@ def _pace_ray_start(commands: list[str], pacing: dict[str, str]) -> list[str]:
         msg = f"launch pacing requested but no start command invokes {_RAY_START!r}: {commands}"
         raise ValueError(msg)
     return paced
+
+
+def _parse_gpu_worker_ladder(raw: str) -> list[tuple[str, int]]:
+    """Parse a ``gpu-worker-ladder`` value into ordered ``(instance_type, max_workers)`` pairs.
+
+    Args:
+        raw: The SSM parameter value, e.g. ``"g6e.xlarge:100,g6e.2xlarge:150"``.
+            Whitespace around any token is tolerated; empty entries (a trailing
+            comma) are dropped.
+
+    Returns:
+        Pairs in the order written. Order is preserved because it is what a human
+        reads back, NOT because it decides anything — Ray scores node types from
+        their resources and ignores declaration order entirely (see
+        ``TestRayNodeTypePreference``).
+
+    Raises:
+        RuntimeError: On any entry that is not exactly ``name:non-negative-int``,
+            or on a repeated instance type. Both REFUSE rather than warn: this
+            value sizes a GPU fleet, and the failure mode of a lenient parser is
+            a rung silently left at ``0`` (a campaign that never grows) or a
+            typo'd count read as capacity. A refusal at ``ray up`` costs one
+            corrected parameter; a silent misparse costs a run.
+    """
+    pairs: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, sep, count = entry.partition(":")
+        name, count = name.strip(), count.strip()
+        # Match the LEXICAL form, not a prefix of it: `partition` on a missing
+        # separator yields an empty tail, and `int("")` would raise a ValueError
+        # that reads as a bug rather than as bad configuration.
+        if not sep or not name or not count.isdigit():
+            msg = (
+                f"Malformed {GPU_WORKER_LADDER_SSM_KEY} entry {entry!r}: expected "
+                "'<instance-type>:<max_workers>' with a non-negative integer count"
+            )
+            raise RuntimeError(msg)
+        if name in seen:
+            msg = f"Duplicate instance type {name!r} in {GPU_WORKER_LADDER_SSM_KEY}: {raw!r}"
+            raise RuntimeError(msg)
+        seen.add(name)
+        pairs.append((name, int(count)))
+    if not pairs:
+        msg = f"{GPU_WORKER_LADDER_SSM_KEY} is set but names no rung: {raw!r}"
+        raise RuntimeError(msg)
+    return pairs
+
+
+def _apply_gpu_worker_ladder(config: dict[str, Any], raw: str) -> None:
+    """Rewrite the on-demand GPU rungs' ``max_workers`` from a ladder value, in place.
+
+    The ladder is AUTHORITATIVE over its domain, not additive to it: every
+    on-demand GPU node type (see :data:`GPU_WORKER_NODE_TYPE_PREFIX`) the value
+    does not name is set to ``0``. An additive reading would make
+    ``g6e.2xlarge:150`` mean "add 150 of these to the 500 g6e.xlarge already
+    allowed", so releasing a rung would also raise the fleet ceiling — two
+    changes from one edit, and the second one unstated. Naming every rung you
+    want makes the whole fleet shape readable from the parameter.
+
+    Args:
+        config: A loaded cluster config. Mutated in place.
+        raw: The raw SSM value; see :func:`_parse_gpu_worker_ladder`.
+
+    Raises:
+        RuntimeError: If the config declares no on-demand GPU node type (a
+            template drift that would otherwise make the ladder a no-op), or if
+            the ladder names an instance type no such node type offers, or if two
+            of them offer the same instance type so the target is ambiguous.
+            Refusing beats warning here for the reason a warn-and-continue guard
+            always loses: the run proceeds, and what it proceeds with is the
+            fleet shape the operator was trying to change.
+    """
+    node_types = config["available_node_types"]
+    domain = {name: cfg for name, cfg in node_types.items() if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX)}
+    if not domain:
+        msg = (
+            f"{GPU_WORKER_LADDER_SSM_KEY} is set but the cluster template declares no node type "
+            f"named {GPU_WORKER_NODE_TYPE_PREFIX!r}* — the ladder would govern nothing. "
+            f"Node types present: {sorted(node_types)}"
+        )
+        raise RuntimeError(msg)
+
+    by_instance_type: dict[str, list[str]] = defaultdict(list)
+    for name, cfg in domain.items():
+        by_instance_type[cfg["node_config"]["InstanceType"]].append(name)
+
+    pairs = _parse_gpu_worker_ladder(raw)
+    unknown = [t for t, _ in pairs if t not in by_instance_type]
+    if unknown:
+        msg = (
+            f"{GPU_WORKER_LADDER_SSM_KEY} names instance type(s) {unknown} with no on-demand GPU "
+            f"node type in the cluster template. Available: {sorted(by_instance_type)}. Add the "
+            "rung to cluster.yaml.template (at max_workers: 0) and ship it before releasing it."
+        )
+        raise RuntimeError(msg)
+    ambiguous = {t: names for t, names in by_instance_type.items() if len(names) > 1}
+    if ambiguous:
+        msg = (
+            f"Cannot apply {GPU_WORKER_LADDER_SSM_KEY}: instance type(s) {ambiguous} are offered by "
+            "more than one on-demand GPU node type, so a ladder entry has no single target"
+        )
+        raise RuntimeError(msg)
+
+    # Close every rung first, then open the named ones. Two passes, so an
+    # unnamed rung is closed whatever order the ladder lists things in.
+    for cfg in domain.values():
+        cfg["max_workers"] = 0
+    for instance_type, max_workers in pairs:
+        node_types[by_instance_type[instance_type][0]]["max_workers"] = max_workers
+
+    # `max_workers` per node type is a ceiling under the CLUSTER-wide ceiling, not
+    # beside it: Ray takes the min. A ladder summing above the global value would
+    # be capped there silently, so raise the global to fit the ladder it was given.
+    #
+    # And size it for EVERY open worker type, not just the ladder's. The cluster
+    # ceiling is one budget shared by all of them, so a bundled spot rung — or any
+    # custom type a template adds — left open at N consumes N of it and leaves the
+    # ladder's own per-rung ceilings unreachable by exactly that much. The head node
+    # is not a worker and does not count.
+    ladder_total = sum(count for _, count in pairs)
+    head_node_type = config.get("head_node_type")
+    non_ladder_workers = sum(
+        int(cfg.get("max_workers", 0) or 0)
+        for name, cfg in node_types.items()
+        if name != head_node_type and name not in domain
+    )
+    needed = ladder_total + non_ladder_workers
+    if needed > config.get("max_workers", 0):
+        config["max_workers"] = needed
+    logging.getLogger(__name__).info(
+        "Applied %s: %s (cluster max_workers=%d)",
+        GPU_WORKER_LADDER_SSM_KEY,
+        ", ".join(f"{t}={n}" for t, n in pairs),
+        config["max_workers"],
+    )
+
+
+def _vcpu_per_node(node_type: dict[str, Any]) -> int:
+    """What one INSTANCE of this rung costs in vCPU, from its DECLARED resources.
+
+    Per instance, not per GPU, because ``max_workers`` counts instances. The two are the
+    same number only while every rung is single-GPU, which is true of everything shipped
+    today and is exactly the assumption that makes the difference invisible: a rung
+    declaring 96 CPU and 8 GPU priced per-GPU reads as 12, and a 960-vCPU budget would
+    then permit 80 instances -- 7,680 vCPU, eight times the budget.
+
+    Read from the config rather than the EC2 catalogue because the declaration is what
+    the autoscaler itself scales against, and because it needs no API call at resolve
+    time. `test_declared_resources_match_the_ec2_catalogue` is what keeps the two honest.
+    """
+    resources = node_type.get("resources") or {}
+    cpu, gpu = int(resources.get("CPU", 0)), int(resources.get("GPU", 0))
+    if cpu <= 0 or gpu <= 0:
+        msg = (
+            f"Cannot price node type {node_type.get('node_config', {}).get('InstanceType')!r} "
+            f"against a vCPU budget: it declares CPU={cpu}, GPU={gpu}. Every GPU rung must "
+            "declare both -- see the resources block in cluster.yaml.template."
+        )
+        raise RuntimeError(msg)
+    return cpu
+
+
+def _vcpu_budget_ceiling(node_type: dict[str, Any], vcpu_budget: int) -> int:
+    """How many of this rung the vCPU budget affords.
+
+    Raises rather than flooring at 1. A floor would open a rung the budget cannot pay
+    for -- a budget of 5 buying one 8-vCPU node overspends by 60% -- and the caller
+    stated a quota, not a preference. A budget too small to seat one node of an open
+    rung is a configuration error, and it is cheaper to say so here than to discover it
+    as an unexplained `InstanceLimitExceeded` during a capacity event.
+    """
+    per_node = _vcpu_per_node(node_type)
+    affords = vcpu_budget // per_node
+    if affords < 1:
+        instance = node_type.get("node_config", {}).get("InstanceType")
+        msg = (
+            f"gpu_fallback_vcpu_budget={vcpu_budget} cannot afford a single {instance!r} "
+            f"at {per_node} vCPU per instance. Raise the budget to at least {per_node}, or "
+            "close that rung."
+        )
+        raise ValueError(msg)
+    return affords
+
+
+def _apply_gpu_vcpu_budget(config: dict[str, Any], vcpu_budget: int) -> None:
+    """Re-ceiling every OPEN on-demand GPU rung to what ``vcpu_budget`` affords.
+
+    The G-and-VT service quota is counted in vCPU, not in cards, and rungs are not
+    equally priced: the fallback sizes are 8 vCPU per GPU against the production rung's
+    4. A ceiling expressed in NODES therefore means a different quota bill depending on
+    which card wins, and an all-fallback fleet at the production node count quietly
+    spends twice the quota.
+
+    So each rung gets the count the budget affords IT -- 250 instances at 4 vCPU each,
+    125 at 8. Priced PER INSTANCE, because that is what ``max_workers`` counts.
+    That is the honest statement of "as many of this card as the quota allows".
+
+    It NARROWS only, never widens: a ceiling already lower than the budget affords was
+    set deliberately and stands.
+
+    **It does not bound a MIXTURE, and cannot.** Ray's ceilings count nodes and carry no
+    weight (`resource_demand_scheduler` has no cost concept at all), so a fleet that is
+    part production and part fallback can exceed the budget -- bounded by the widest
+    per-rung ceiling, not equal to it. Making it exact would need a controller outside
+    Ray adjusting demand as the mix shifts. What this does remove is the worst case: a
+    fleet that has fallen over entirely can no longer run at the production node count.
+    """
+    if vcpu_budget <= 0:
+        msg = f"gpu_fallback_vcpu_budget must be > 0, got {vcpu_budget}"
+        raise ValueError(msg)
+    node_types = config["available_node_types"]
+    for name, cfg in node_types.items():
+        if not name.startswith(GPU_WORKER_NODE_TYPE_PREFIX) or cfg.get("max_workers", 0) <= 0:
+            continue
+        # NARROWS ONLY. A budget must never RAISE a ceiling someone set deliberately:
+        # capping the production rung at what it can actually be supplied is the lever
+        # that pushes surplus demand onto the fallback, and a budget that overrode it
+        # would quietly undo the operator's decision. The budget is a maximum, not a
+        # target.
+        cfg["max_workers"] = min(cfg["max_workers"], _vcpu_budget_ceiling(cfg, vcpu_budget))
+
+
+def _apply_gpu_fallback(
+    config: dict[str, Any], instance_types: Sequence[str], vcpu_budget: int | None = None
+) -> list[str]:
+    """Open a fallback rung per named instance type.
+
+    Opening a rung only makes it REACHABLE. It does not make the autoscaler use it:
+    while demand stays under the production rung's ceiling, Ray keeps choosing that
+    rung and an open fallback sits idle however long the primary has been refusing.
+    What sends work to it is the standing per-rung request published by
+    :mod:`~tessera_embeddings.providers.aws.fleet_mix`. Neither half works alone.
+
+    Still one fallback at a time. Stating the mix removes Ray's node-name tie for the
+    machines the request covers, but the request is a FLOOR — ordinary actor demand
+    above it is scored by Ray as before, and the supported fallbacks are byte-identical
+    to that scorer. The registry is n-ary and ready; this guard is what is not.
+
+    Each fallback rung is opened to the SAME ceiling as the production rung, so either
+    card can carry the whole fleet. That does not make the fleet bigger: the cluster's
+    global ``max_workers`` still caps the sum, and in practice the count is bound by
+    inference demand well below it. What this changes is what the fleet is MADE OF.
+
+    Args:
+        config: A loaded cluster config. Mutated in place.
+        instance_types: EC2 instance types from :data:`GPU_FALLBACK_INSTANCE_TYPES`
+            (e.g. ``["g5.2xlarge"]``). Empty opens no rung and installs no scorer.
+        vcpu_budget: Optional G-and-VT vCPU budget for this cluster's GPU fleet. When
+            given, every open GPU rung -- production included -- is ceilinged at what the
+            budget affords IT rather than at a flat node count, which is the only way a
+            heterogeneous fleet can be held to a quota counted in vCPU. See
+            :func:`_apply_gpu_vcpu_budget` for what it does and does not bound.
+
+    Returns:
+        The node type names opened, for logging by the caller.
+
+    Raises:
+        RuntimeError: If a card has no known instance type, or that type has no rung in
+            the template, or the template declares no production GPU rung to match. Each
+            would otherwise leave the fleet quietly unable to fail over -- which is only
+            discovered during the capacity event the feature exists for.
+    """
+    node_types = config["available_node_types"]
+    if vcpu_budget is not None:
+        _apply_gpu_vcpu_budget(config, vcpu_budget)
+    if not instance_types:
+        return []
+
+    if len(set(instance_types)) > 1:
+        msg = (
+            f"Only one GPU fallback instance type may be opened at a time, got "
+            f"{sorted(set(instance_types))}. The fleet mix states how many of each rung to "
+            "hold, but `request_resources` sets a FLOOR: ordinary actor demand above it is "
+            "still scored by Ray, and the supported fallbacks declare identical resources — "
+            "so Ray would break that tie on node-type name, choosing a card alphabetically "
+            "rather than on throughput."
+        )
+        raise RuntimeError(msg)
+
+    unknown = [t for t in instance_types if t not in GPU_FALLBACK_INSTANCE_TYPES]
+    if unknown:
+        msg = (
+            f"Unsupported GPU fallback instance type(s) {unknown}. Supported: "
+            f"{sorted(GPU_FALLBACK_INSTANCE_TYPES)}. Sizes are restricted on HOST RAM: the "
+            "vCPU-matched `xlarge` of each family carries 16 GiB against a measured ~17.7 GB "
+            "per-actor requirement and would OOM the loader before inference."
+        )
+        raise RuntimeError(msg)
+
+    # ALL names per instance type, not the last one. An instance type does not identify a
+    # node type -- a template may offer the same type twice under different launch config,
+    # which is why the ladder refuses the same ambiguity rather than picking one.
+    by_instance_type: dict[str, list[str]] = defaultdict(list)
+    for name, cfg in node_types.items():
+        if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX):
+            by_instance_type[cfg["node_config"]["InstanceType"]].append(name)
+    ambiguous = {t: n for t, n in by_instance_type.items() if t in instance_types and len(n) > 1}
+    if ambiguous:
+        msg = (
+            f"Cannot open a GPU fallback: instance type(s) {ambiguous} are offered by more "
+            "than one on-demand GPU node type, so the request has no single target."
+        )
+        raise RuntimeError(msg)
+
+    # The production ceiling every fallback is matched to, from the widest open PRODUCTION
+    # rung. Fallbacks are excluded by instance type, not by ceiling: they share the
+    # node-type prefix, so a ladder that had already opened one would otherwise contribute
+    # its own ceiling here -- and an all-fallback ladder would satisfy the "something to
+    # fall back FROM" guard with nothing to fall back from at all.
+    open_ceilings = [
+        cfg["max_workers"]
+        for name, cfg in node_types.items()
+        if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX)
+        and cfg["node_config"]["InstanceType"] not in GPU_FALLBACK_INSTANCE_TYPES
+        and cfg.get("max_workers", 0) > 0
+    ]
+    if not open_ceilings:
+        msg = (
+            "GPU fallback was requested but no PRODUCTION GPU rung is open, so there is no "
+            "ceiling to match and nothing to fall back FROM. Open one with the "
+            f"{GPU_WORKER_LADDER_SSM_KEY} key, or drop the fallback request."
+        )
+        raise RuntimeError(msg)
+    ceiling = max(open_ceilings)
+
+    # NEVER above the cluster-wide ceiling. A fallback changes what the fleet is made of,
+    # not how big it is, so a template that deliberately caps the aggregate at 100 must
+    # keep that cap -- raising the global to fit a fallback would grow the fleet by exactly
+    # the amount the operator said no to.
+    global_ceiling = config.get("max_workers")
+    if isinstance(global_ceiling, int) and global_ceiling > 0:
+        ceiling = min(ceiling, global_ceiling)
+
+    opened = []
+    for instance_type in instance_types:
+        name = by_instance_type[instance_type][0]
+        want = _vcpu_budget_ceiling(node_types[name], vcpu_budget) if vcpu_budget is not None else ceiling
+        if isinstance(global_ceiling, int) and global_ceiling > 0:
+            want = min(want, global_ceiling)
+        # A ladder that already opened this rung chose its ceiling on purpose; opening it
+        # again must not widen it. Same rule as the budget's, for the same reason.
+        current = node_types[name].get("max_workers", 0)
+        node_types[name]["max_workers"] = min(current, want) if current > 0 else want
+        opened.append(name)
+
+    widest = max(node_types[n]["max_workers"] for n in opened)
+    logging.getLogger(__name__).info(
+        "GPU fallback enabled for %s: opened %s at max_workers=%d",
+        ", ".join(instance_types),
+        ", ".join(opened),
+        widest,
+    )
+    return opened
 
 
 def resolve_ami_id(ami_ssm_name: str, region: str = "us-west-2") -> str:
@@ -338,6 +764,8 @@ def _resolve_ray_config(
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
     idle_timeout_minutes: int | None = None,
     launch_pacing: bool = False,
+    gpu_fallback_instance_types: Sequence[str] = (),
+    gpu_fallback_vcpu_budget: int | None = None,
 ) -> str:
     """Inject AWS resource IDs from SSM into a Ray cluster YAML template.
 
@@ -362,6 +790,10 @@ def _resolve_ray_config(
         ssm_prefix: Prefix under which Ray resource IDs are stored.
             Required keys: ``security-group-id``, ``instance-profile-arn``,
             ``private-subnet-ids``, ``key-pair-name``, ``key-pair-id``.
+            Optional key: ``gpu-worker-ladder`` (see
+            :data:`GPU_WORKER_LADDER_SSM_KEY`) — releases the template's wider
+            GPU rungs without a release or a deployment re-registration. Absent
+            leaves the template's node types untouched.
         cluster_name: Override the template's ``cluster_name``. Required
             for running multiple clusters concurrently.
         instance_tags: Extra EC2 tags to apply to every node, on top of
@@ -385,6 +817,16 @@ def _resolve_ray_config(
             a larger value. ``None`` keeps the template's value.
         launch_pacing: Assign :data:`LAUNCH_PACING_ENV` on the head's ``ray start``
             command, so the autoscaler it spawns paces its EC2 launch requests
+        gpu_fallback_instance_types: Card names (see :data:`GPU_FALLBACK_CARDS`) this run may fall
+            back to when the production rung has no capacity. Empty -- the default --
+            leaves the cluster exactly as it is today. Naming a card opens its rung AND
+            installs the capacity-aware autoscaler scorer; see :func:`_apply_gpu_fallback`
+            for why both are needed and neither is sufficient.
+        gpu_fallback_vcpu_budget: Optional G-and-VT vCPU budget for this cluster's GPU
+            fleet. Rungs are not equally priced -- the fallback sizes are 8 vCPU per GPU
+            against the production rung's 4 -- so a ceiling in NODES means a different
+            quota bill depending on which card wins. Given a budget, each rung is
+            ceilinged at what the budget affords IT.
             against the account's shared request quota. ``False`` leaves the
             template's commands untouched; pass ``True`` when several clusters
             will be growing at once. Worker start commands are never touched —
@@ -420,6 +862,16 @@ def _resolve_ray_config(
     if missing:
         msg = f"Missing required SSM parameters under {ssm_prefix!r}: {sorted(missing)}"
         raise RuntimeError(msg)
+
+    # OPTIONAL, and its absence is the default: no key means the template's rungs
+    # stand exactly as shipped. Applied before anything else touches the node
+    # types so a refusal costs no tempfiles.
+    if GPU_WORKER_LADDER_SSM_KEY in params:
+        _apply_gpu_worker_ladder(config, params[GPU_WORKER_LADDER_SSM_KEY])
+
+    # AFTER the ladder, so a ladder that narrows the production rung narrows the
+    # fallbacks with it. Empty is the default and changes nothing.
+    _apply_gpu_fallback(config, gpu_fallback_instance_types, gpu_fallback_vcpu_budget)
 
     sg_ids = [params["security-group-id"]]
     all_subnet_ids = [s.strip() for s in params["private-subnet-ids"].split(",")]
@@ -828,6 +1280,8 @@ def ray_cluster(
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
     idle_timeout_minutes: int | None = None,
     launch_pacing: bool = False,
+    gpu_fallback_instance_types: Sequence[str] = (),
+    gpu_fallback_vcpu_budget: int | None = None,
 ) -> Iterator[str | None]:
     """Provision an AWS-backed Ray cluster; tear it down on exit.
 
@@ -873,6 +1327,14 @@ def ray_cluster(
             :func:`_resolve_ray_config`.
         launch_pacing: Pace this cluster's EC2 launch requests against the
             account's shared RunInstances quota — see :data:`LAUNCH_PACING_ENV`.
+        gpu_fallback_instance_types: Card names this cluster may fall back to when the production
+            GPU rung has no capacity -- see :data:`GPU_FALLBACK_CARDS`. Empty (the
+            default) leaves behaviour exactly as it is today.
+        gpu_fallback_vcpu_budget: Optional G-and-VT vCPU budget for this cluster's GPU
+            fleet. Rungs are not equally priced -- the fallback sizes are 8 vCPU per GPU
+            against the production rung's 4 -- so a ceiling in NODES means a different
+            quota bill depending on which card wins. Given a budget, each rung is
+            ceilinged at what the budget affords IT.
             Default ``False`` keeps today's launch behaviour. Pass ``True`` when
             several clusters grow concurrently; one cluster alone contends with
             nothing and gains only a smaller call count. Ignored in the
@@ -929,6 +1391,8 @@ def ray_cluster(
                 cloudwatch_template=cloudwatch_template,
                 idle_timeout_minutes=idle_timeout_minutes,
                 launch_pacing=launch_pacing,
+                gpu_fallback_instance_types=gpu_fallback_instance_types,
+                gpu_fallback_vcpu_budget=gpu_fallback_vcpu_budget,
             )
             head_ip = _start_ray_cluster(resolved_yaml, log, launch_pacing=launch_pacing)
             head_address = f"ray://{head_ip}:10001"

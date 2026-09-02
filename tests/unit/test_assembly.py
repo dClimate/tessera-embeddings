@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import icechunk
 import numpy as np
 import pytest
 import xarray as xr
@@ -62,18 +63,45 @@ from tessera_embeddings.storage.zarr_store import (
 
 @pytest.mark.parametrize(
     ("s3_concurrency", "n_workers"),
-    [(100, 8), (5, 8), (3, 8), (1, 8), (None, 8), (50, 4), (100, 200)],
+    [(100, 8), (5, 8), (3, 8), (1, 8), (None, 8), (50, 4), (100, 200), (5, 16)],
 )
-def test_s3_budget_split_never_exceeds_target(s3_concurrency, n_workers):
-    """Workers times the per-fork cap must never exceed the budget (else K fills burst
-    past TARGET_AGGREGATE_S3_CONCURRENCY, the ~800-req SlowDown) — even when the
-    per-fill budget is below the requested worker count (the per-fork floor of 1).
+def test_s3_budget_split_keeps_every_requested_worker(s3_concurrency, n_workers):
+    """REPLACES ``test_s3_budget_split_never_exceeds_target``, which asserted
+    ``workers * cap <= budget`` and so pinned the clamp that cost the campaign
+    two thirds of its assembly width.
+
+    The per-fork cap floors at 1, so that product CANNOT be held below the budget
+    once the requested worker count exceeds it — the only way to satisfy it is to
+    drop forks, which is what used to happen on every assembly. The invariant is
+    now the weaker, honest one: the fleet ceiling holds where it can, and where it
+    cannot, the overshoot is exactly the requested worker count.
     """
     budget = s3_concurrency if s3_concurrency is not None else TARGET_AGGREGATE_S3_CONCURRENCY
     workers, cap = _s3_budget_split(s3_concurrency, n_workers)
     assert workers >= 1 and cap >= 1
-    assert workers <= n_workers  # never MORE forks than requested
-    assert workers * cap <= budget  # the fleet request ceiling holds
+    assert workers == n_workers, "the S3 budget must never shrink the fork pool"
+    assert workers * cap <= max(budget, n_workers)
+
+
+def test_the_campaigns_own_parameters_no_longer_shrink_the_pool():
+    """The exact arithmetic that bound in production: TARGET_AGGREGATE_S3_CONCURRENCY
+    (100) // (2 * n_clusters) at ten clusters is 5, against AssemblyConfig's 16 workers.
+
+    Pinned with the campaign's real numbers rather than a synthetic pair, because
+    the clamp was invisible precisely where it bound — the requested count stayed
+    16 everywhere it was configured, and only the emitted `workers_used` disagreed.
+    The measured cost is in `context_docs/design/assembly-worker-clamp-2026_08.md`.
+    """
+    assert _s3_budget_split(5, 16) == (16, 1)
+
+
+def test_a_budget_above_the_worker_count_still_divides():
+    """The half that was never broken: when the budget genuinely exceeds the pool,
+    each fork gets its share and the fleet ceiling holds exactly.
+    """
+    workers, cap = _s3_budget_split(100, 8)
+    assert (workers, cap) == (8, 12)
+    assert workers * cap <= 100
 
 
 def _dummy_scales(h: int, w: int) -> np.ndarray:
@@ -2074,6 +2102,49 @@ class TestAssembleGlobal:
             g.create_array(name, data=arr)
         _mark_staged_complete(path)  # assembly requires both completion signals
 
+    @pytest.mark.parametrize("credentialled", [True, False])
+    def test_the_forking_write_asks_icechunk_to_cache_the_credential(self, tmp_path, monkeypatch, credentialled):
+        """`write_year_shards` PICKLES this session to spawned children, and an icechunk
+        credential fetcher's `initial` cache can never be refilled (icechunk#2077), so a child
+        that deserialises without one calls back on every S3 request for the life of the fork.
+        Asserted at the call site because that is where the decision lives — the flag puts a
+        live secret in the pickle, so it is right for a forking writer and pointless elsewhere.
+        True regardless of whether a callback is passed (hence the parameterisation):
+        `_create_storage` substitutes a default provider when it is None, so a
+        `get_credentials is not None` guard would disable the scatter on exactly that path.
+        """
+        dim = 8
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        writer.write_chunk(
+            ChunkSpec(row=0, col=0, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE),
+            np.ones((self.TILE, self.TILE, dim), dtype=np.int8),
+            "runS",
+            scales=np.ones((self.TILE, self.TILE), dtype=np.float32),
+        )
+
+        requested: list[bool] = []
+        real_open = _assembly_mod.open_global_repo
+
+        def spy(path, **kwargs):
+            requested.append(kwargs["scatter_initial_credentials"])
+            return real_open(path, **kwargs)
+
+        monkeypatch.setattr(_assembly_mod, "open_global_repo", spy)
+
+        def credentials() -> icechunk.S3StaticCredentials:
+            return icechunk.S3StaticCredentials(access_key_id="k", secret_access_key="s")
+
+        writer.assemble_global(
+            store_path,
+            self.ZONE,
+            year=2025,
+            run_id="runS",
+            n_workers=1,
+            get_credentials=credentials if credentialled else None,
+        )
+        assert requested == [True]
+
     def test_fills_year_from_staged_tiles(self, tmp_path):
         """Staged tiles land as whole shards at the right year index; provenance attrs update."""
         dim = 8
@@ -2234,6 +2305,42 @@ class TestAssembleGlobal:
         assert rec["fused_compress_put"] is True
         for key in ("read_s", "write_s", "fill_wall_s", "merge_s", "commit_s", "attrs_commit_s", "total_s"):
             assert rec[key] >= 0
+
+    def test_a_budget_below_the_worker_count_no_longer_drops_forks(self, tmp_path, caplog):
+        """The campaign's real shape, through the real call path: a per-fill S3 budget
+        well BELOW the requested worker count.
+
+        This is the end-to-end companion to the ``_s3_budget_split`` unit tests. The
+        clamp used to run ``min(n_workers, budget)`` forks — 2 of 4 here, and 5 of 16
+        in production — and the only place it showed was this record's ``workers_used``.
+        The budget now sets the per-fork request cap alone.
+        """
+        dim = 8
+        ny = nx = 2 * self.TILE
+        store_path = self._seed_zone_repo(tmp_path, ny, nx, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        rng = np.random.default_rng(22)
+        labels = []
+        for row in (0, 1):
+            for col in (0, 1):
+                self._stage_tile(writer, row, col, dim, "runB", rng)
+                labels.append(f"chunk_{row}_{col}")
+        with caplog.at_level(logging.INFO, logger="tessera_embeddings.inference.assembly"):
+            writer.assemble_global(
+                store_path,
+                self.ZONE,
+                year=2025,
+                run_id="runB",
+                n_workers=4,
+                s3_concurrency=2,
+                staged_labels=labels,
+            )
+        (rec,) = _assembly_summary_records(caplog)
+        assert rec["workers_requested"] == 4
+        assert rec["workers_used"] == 4 == len(rec["workers"]), "the S3 budget must not drop forks"
+        # Floors at 1, so this fill's aggregate concurrency is its worker count. That
+        # is the ceiling this change gives up, deliberately — see _s3_budget_split.
+        assert rec["per_worker_s3_cap"] == 1
 
     def _year_record(self, store_path):
         """The landed year's provenance entry (2025 is index 1 on the seeded axis)."""

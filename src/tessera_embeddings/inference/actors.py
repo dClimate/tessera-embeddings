@@ -19,7 +19,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,8 +35,11 @@ from tessera_embeddings.config.inference import (
     RADAR_THIN_MAX_OBS,
     S1_ORBIT_NONE,
     S2_BAND_ORDER,
+    TUNED_GPU_GIB,
+    TUNED_TOKENS_PER_PIXEL,
     InferenceConfig,
     S1Orbit,
+    batch_size_for_gpu,
 )
 from tessera_embeddings.config.store_layout import MONTH_COVERED_VARS, MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -503,6 +506,18 @@ def _select_device(torch_mod: types.ModuleType, instance_id: str) -> torch.devic
     return device
 
 
+def _gpu_total_gib(torch_mod: types.ModuleType, device: torch.device) -> float | None:
+    """This actor's card size in GiB, or ``None`` when there is no card to measure.
+
+    Args:
+        torch_mod: The torch module (passed to avoid top-level import).
+        device: The device this actor selected.
+    """
+    if device.type != "cuda":
+        return None
+    return float(torch_mod.cuda.get_device_properties(0).total_memory) / 1024**3
+
+
 def _log_vram_breakdown(model: MultimodalBTInferenceModel, torch_mod: types.ModuleType) -> None:
     """Log VRAM usage breakdown after model loading."""
     allocated = torch_mod.cuda.memory_allocated() / 1024**3
@@ -622,12 +637,39 @@ def _coverage_record(
     }
 
 
+def _accelerator_index() -> str | None:
+    """This actor's own GPU index on its host, from Ray's assignment. ``None`` if unassigned.
+
+    Ray sets ``CUDA_VISIBLE_DEVICES`` per actor, so TORCH already sees only this
+    actor's device and calls it 0. ``nvidia-smi`` does NOT honour that variable —
+    it reports every GPU on the host — so anything shelling out to it needs the
+    real host-level index, and this is where it comes from. On a one-GPU host the
+    answer is always "0" and the distinction is invisible, which is why the bug it
+    exists to prevent survived until a 4-GPU host was tried.
+
+    Returns the FIRST assigned id as a string: an ``InferenceActor`` reserves
+    exactly one GPU (``num_gpus=1``), so a second id would mean the reservation
+    changed and a single-GPU reader would be wrong anyway.
+    """
+    try:
+        ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
+    except Exception:  # No Ray runtime (local runner, unit tests)
+        return None
+    return str(ids[0]) if ids else None
+
+
 @ray.remote(
     runtime_env={
         "env_vars": {
             "CUBLAS_WORKSPACE_CONFIG": ":16:8",
             "MALLOC_ARENA_MAX": "2",
             "MALLOC_TRIM_THRESHOLD_": "0",
+            # Segment-backed allocation, so the caching allocator GROWS a segment instead of
+            # reserving a fresh larger one and stranding the old. Read once when the allocator
+            # is built, which is why it rides on runtime_env with the rest. On the L40S it stops
+            # the reserved pool drifting to ~95% of the card to hold a <9 GB working set --
+            # measured 42.2 GB reserved for a chunk whose real need was 8.99 GB.
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         }
     }
 )
@@ -691,9 +733,36 @@ class InferenceActor:
         self.instance_id = _fetch_ec2_instance_id()
         self.device = _torch.device("cpu") if self.config.num_gpus == 0 else _select_device(_torch, self.instance_id)
 
+        # NARROWED HERE AND NOWHERE ELSE. `batch_size` is read by both the sub-batch split and
+        # the pinned host buffers, in different functions; scaling it at either site would
+        # leave the other on the tuned value, which is how a card ends up with buffers it
+        # cannot fill or batches it cannot hold. Rewriting the config once, before anything
+        # reads it, keeps a single value for the whole actor.
+        gpu_gib = _gpu_total_gib(_torch, self.device)
+        fitted = batch_size_for_gpu(
+            config.batch_size,
+            gpu_gib,
+            num_obs_checkpoints=config.num_obs_checkpoints,
+            gpu_fraction=config.num_gpus,
+        )
+        if fitted != config.batch_size:
+            logger.info(
+                "Batch size %d -> %d on instance %s: %.1f GiB card at %.2f GPU reserved, "
+                "deepest bucket %d tokens/px; the default was tuned on %.0f GiB at %d.",
+                config.batch_size,
+                fitted,
+                self.instance_id,
+                gpu_gib,
+                config.num_gpus,
+                2 * max(config.num_obs_checkpoints),
+                TUNED_GPU_GIB,
+                TUNED_TOKENS_PER_PIXEL,
+            )
+            self.config = replace(config, batch_size=fitted)
+
         local_ckpt = download_checkpoint(checkpoint_path) if _is_remote_uri(checkpoint_path) else checkpoint_path
         self.model: MultimodalBTInferenceModel = build_inference_model(
-            config,
+            self.config,
             self.device,
             checkpoint_path=local_ckpt,
         )
@@ -701,7 +770,12 @@ class InferenceActor:
         if self.device.type == "cuda":  # No-op on CPU
             _log_vram_breakdown(self.model, _torch)
 
-        self._resource_monitor = ResourceMonitor(interval_sec=30)
+        # This actor's GPU index ON THE HOST, which is not always 0: Ray packs one actor per
+        # GPU, so a 4-GPU host runs four actors holding indices 0-3. Without it the monitor
+        # queries every GPU, rejects the multi-row answer, and a packed actor emits neither
+        # GPU statistics nor attribution — the whole point of the index.
+        self.gpu_index = _accelerator_index()
+        self._resource_monitor = ResourceMonitor(interval_sec=30, gpu_index=self.gpu_index)
         self._resource_monitor.start()
         logger.info("InferenceActor ready on instance %s", self.instance_id)
 
@@ -1109,6 +1183,11 @@ class InferenceActor:
         from tessera_embeddings.inference.inference import run_inference
 
         t0 = time.monotonic()
+        # Per CHUNK, not per actor: host RAM scales with a chunk's optical depth, so a peak
+        # taken over the actor's life describes its deepest chunk and gets attached to every
+        # later one. Without this reset the RAMpeak on a chunk's lines can belong to an
+        # earlier chunk entirely.
+        self._resource_monitor.reset_peak_host_ram()
         self._resource_monitor.set_context("work", f"{chunk.label}:prologue")
 
         # Progress is tracked by the run-qualified uid, not the bare label: labels

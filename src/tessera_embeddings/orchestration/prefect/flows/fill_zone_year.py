@@ -8,13 +8,12 @@ context manager; the cancellation hook is shared via :mod:`._ray_lifecycle`).
 
 **Concurrency model (ADR-008 D6).** Inference is embarrassingly parallel across
 zones — nothing is shared and nothing commits — so many of these flow runs can
-do GPU work at once. Only the *commit* contends: the runner gates
-``assemble_global``'s commit on ``gate`` and leaves ``run_inference`` ungated.
-Pass ``commit_limit_name`` to make ``gate`` a **Prefect global concurrency
-limit**, so no more than that limit's slots' worth of fill runs commit
-simultaneously across the whole fleet (avoiding S3 rebase/commit storms) while
-inference stays unbounded. Same-zone serialization (whose attr commits genuinely
-conflict) is the campaign driver's job, not this flow's.
+do GPU work at once. Commits are UNGATED: they share a branch tip, but the cost of
+contending for it is seconds (2.2 s at 16 committers, 15 s at 120) with no
+unresolvable conflicts at any measured N. See
+``context_docs/design/commit-gate-removal-2026_08.md``.
+Same-zone serialization (whose attr commits genuinely conflict) is the campaign
+driver's job, not this flow's.
 """
 
 from __future__ import annotations
@@ -34,7 +33,6 @@ from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.conventions import expected_model_url
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
-from tessera_embeddings.orchestration.prefect._fleet_gate import FleetGate
 from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
     cell_validation_parameters,
     dispatch_cell_validation,
@@ -58,27 +56,7 @@ from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 if TYPE_CHECKING:
-    import logging
-
     import icechunk
-
-
-class _PrefectCommitGate(FleetGate):
-    """A ``CommitGate`` backed by a Prefect global concurrency limit.
-
-    Each ``with gate:`` acquires one slot of the named limit for the duration of
-    a commit and releases it after, so the campaign's committer count is bounded
-    fleet-wide (across separate flow runs / machines) without limiting inference.
-    A fresh :func:`concurrency` context is opened per entry so the gate is
-    reusable across the (few) commits a single fill performs.
-
-    Everything about how the gate behaves — failing closed on an absent limit,
-    queueing behind a full one, HOLDING on a limit lowered to zero, and the
-    per-thread context stack a chained fill needs — is :class:`FleetGate`.
-    """
-
-    def __init__(self, name: str, occupy: int = 1, log: logging.Logger | logging.LoggerAdapter | None = None) -> None:
-        super().__init__(name, occupy=occupy, log=log)
 
 
 def _optical_min_obs_from_store(
@@ -175,7 +153,6 @@ def fill_zone_year_flow(
     s1_orbit: str = "both",
     require_s1: bool = True,
     s3_region: str | None = None,
-    commit_limit_name: str | None = None,
     cleanup_staging: bool = True,
     n_assembly_workers: int | None = None,
     allow_partial_window: bool = False,
@@ -184,6 +161,8 @@ def fill_zone_year_flow(
     mosaic_base: str | None = None,
     s3_concurrency: int | None = None,
     launch_pacing: bool = False,
+    gpu_fallback_instance_types: list[str] | None = None,
+    gpu_fallback_vcpu_budget: int | None = None,
     actor_request_headroom: int | None = None,
     actor_request_batch_size: int | None = None,
     run_id: str | None = None,
@@ -227,9 +206,6 @@ def fill_zone_year_flow(
             The global campaign passes False for the same reason.
         s3_region: Optional S3 region for the global store + mosaics, threaded through
             the preflight reads and the zone-fill runner (default region if None).
-        commit_limit_name: Prefect global concurrency limit that bounds the
-            fleet's simultaneous committers (D6). ``None`` = ungated (a single
-            isolated run has no commit contention).
         cleanup_staging: Delete staged tiles after a successful fill. Pass False to keep them,
             which is what makes an assembly measurement repeatable against identical input.
         n_assembly_workers: Override the assembly process-pool size for THIS run; ``None`` uses
@@ -257,6 +233,13 @@ def fill_zone_year_flow(
             ``target // max_parallel_zones`` so K concurrent fills stay near target.
         launch_pacing: Pace this cluster's EC2 launch requests against the account's
             shared RunInstances quota. Same shape as ``s3_concurrency``: a budget that
+        gpu_fallback_instance_types: EC2 instance types this fill may fall back to when the
+            production rung has no capacity (e.g. ``["g5.2xlarge"]``). ``None`` keeps today's behaviour. Opens
+            the card's rung AND installs the capacity-aware autoscaler scorer -- see
+            ``providers.aws.ray._apply_gpu_fallback``.
+        gpu_fallback_vcpu_budget: Optional vCPU budget for this cluster's GPU fleet, used
+            to ceiling each rung at what the G-and-VT quota affords IT rather than at a
+            flat node count.
             concurrent fills share, except this one is a request RATE and the
             enforcement lives in the client rather than in a count we divide. Default
             ``False`` keeps today's launch behaviour; the campaign turns it on when it
@@ -463,8 +446,6 @@ def fill_zone_year_flow(
             s3_region=s3_region,
         )
 
-    gate = _PrefectCommitGate(commit_limit_name, log=log) if commit_limit_name else None
-
     fill_kwargs: dict[str, Any] = {
         "store_path": store_path,
         "zone": zone,
@@ -485,7 +466,6 @@ def fill_zone_year_flow(
         "num_actors": num_actors,
         "log": log,
         "run_id": run_id,
-        "gate": gate,
         "cleanup_staging": cleanup_staging,
         "n_assembly_workers": n_assembly_workers,
         "s3_concurrency": s3_concurrency,
@@ -556,8 +536,13 @@ def fill_zone_year_flow(
             code_suffix=code_suffix,
             cluster_name=cluster_name_for_flow_run(flow_run_ctx.id),
             launch_pacing=launch_pacing,
+            gpu_fallback_instance_types=gpu_fallback_instance_types or (),
+            gpu_fallback_vcpu_budget=gpu_fallback_vcpu_budget,
         ) as resolved_yaml:
             activate(resolved_yaml)
+            from tessera_embeddings.providers.aws.fleet_mix import publisher_for_resolved_yaml
+
+            fill_kwargs["on_fleet_demand"] = publisher_for_resolved_yaml(resolved_yaml, gpu_fallback_vcpu_budget, log)
             summary = fill_zone_year(**fill_kwargs)
     finally:
         # Clear the hook state only AFTER the context manager's teardown has

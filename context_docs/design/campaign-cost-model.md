@@ -1025,3 +1025,125 @@ uncertainty list that carries its own retired entries is one nobody reads to the
 - `scripts/census_s1_coverage.py` — the radar census behind §6. Re-run it to refresh the
   observation counts, or to check whether OPERA coverage has expanded again. Unauthenticated;
   a few minutes per year queried.
+
+---
+
+## 12. MEASURED LIVE, 2026-08-31 — the fleet achieves 74% of the per-worker basis, and only 61% of its GPUs are working
+
+**These are live figures from the running global campaign (`simple-peacock`, dispatched
+08:44Z) and they supersede the modelled rate wherever the two disagree.** Everything in §5-§6
+divides by a per-worker rate measured on one card in one place; this section measures the whole
+fleet doing the real campaign, and the difference matters to the schedule rather than to the
+sizing.
+
+### The measurement
+
+Eight samples of the summed `Progress: N/M chunks done` across the ten clusters, 13:56-14:56Z:
+
+| quantity | value |
+|---|---|
+| fleet throughput | **5,578 tiles/h** (5,614 tiles over 60.4 min) |
+| in tokens | **1.12 × 10⁹ combined tok/s** aggregate |
+| GPU instances booted, live fleets only | **784** (see the orphan correction below) |
+| actor slots placed and busy | **766** — 98% of booted instances hold one |
+| **per ACTOR SLOT** | **1.64 M combined tok/s — 77% of the 2.127 M basis** |
+| per booted instance | 1.60 M tok/s — 75% of the basis |
+
+**A chunk is a tile.** `adamant-aardvark` reported 8,722 chunks for a stream holding 36N-2020's
+13 live tiles plus 36N-2021's 8,709 — an exact match, so the driver's progress counter and the
+coverage census are in the same unit and 725.6 M tok/tile converts between them
+(2048² px × 173 tok/px).
+
+**And 712 is actor slots, which took a second measurement to establish.** The figure comes from
+the progress line's `N active` field, and `scheduling.py:805` says in as many words that it
+counts *chunks in flight, not actor slots and not GPUs* — so reading it as workers is precisely
+the substitution the source warns against. Checked against the batching line, which reports
+slots directly (`Requested actor batch: +N (X/TARGET total, Y actor slots placed)`): on the five
+clusters that logged both inside the window, **slots placed equalled chunks in flight exactly** —
+54/54, 118/118, 108/108, 65/65, 97/97. An actor holds one chunk at a time and the queue is deep,
+so every placed slot is busy. The four clusters showing zero slots had simply gone quiet after
+requesting their full target, and their in-flight counts sum to the remaining 270 of the 712.
+The substitution is therefore sound *here*, on a saturated fleet, and should be re-checked rather
+than assumed on a fleet with idle actors.
+
+### Two separate gaps, and only one of them is about the model
+
+**1. The per-worker rate is 74%, not 100%, and the fleet MIX is the leading explanation.** 65%
+of the fleet is A10G (g5.2xlarge) rather than L40S (g6e.xlarge), and the 2.127 M basis was
+measured on one card type. A rough weighting reproduces the observed figure. **This is a
+hypothesis with arithmetic behind it, not a measurement** — nothing here attributes throughput
+per card, and doing so needs per-actor accounting the driver does not currently emit. Worth
+building before the mix is used to argue anything.
+
+**2. WITHDRAWN — there was no utilisation gap.** This section first read 712 slots against 1,163
+booted instances, called 451 machines idle, and blamed the autoscaler outrunning the paced
+actor-request loop. **That was wrong, and the mechanism was invented before the number was
+split.** 379 of those 451 machines belonged to **three orphaned Ray fleets** left running by
+`great-toucan` fill runs cancelled at 07:51Z — `berserk-dinosaur`, `glossy-python` and
+`adorable-rooster` — plus two stray head nodes. They held no actor slot because their DRIVER was
+dead, which is a teardown failure, not a provisioning one. Torn down at 15:15Z: **$590/h and
+~$9,650 already burned.**
+
+Measured across the teardown, and this is the part that settles it: fleet throughput did **not**
+fall when 379 machines died — 5,583 tiles/h before, 6,230 after — so those machines were
+contributing exactly nothing. On the live fleet alone, **766 of 784 booted instances hold an
+actor slot, 98%.** There is no meaningful gap between billed and working GPUs once the orphans
+are removed, and the per-instance and per-slot rates converge (75% and 77%) rather than
+differing by 28 points.
+
+**The real finding is the teardown gap.** `sweep-orphan-fleets` runs every 15 minutes and had
+completed five times while those fleets sat there, because it inventories and stops **ECS
+tasks** — the orphans are EC2 instances it never enumerates. Three of ten fleets leaked on one
+cancellation. Tracked separately; it is an orchestration defect, not a cost-model input. §5's fleet-sizing policy provisions at 85% of matched
+supply to keep idle burn structurally zero, and it succeeds at that on the INGEST side; this
+number says the GPU side has its own 39% overhead which the model does not represent at all.
+
+### What it means for the schedule
+
+The doc's headline is `307,854 GPU-hours ÷ 2,500 actors = 123 h ≈ 5.1 days` for the whole
+campaign. That divides by the 2.127 M basis. At the measured per-active-worker rate the same
+2,500 workers take **~166 h ≈ 6.9 days**; at the measured per-booted-instance rate, **~267 h ≈
+11.1 days**. Which of those is right depends on whether a 2,500-actor fleet would carry the same
+61% working fraction, and nothing here settles that.
+
+**Do NOT re-price the campaign off this.** The A10G is materially cheaper per hour than the L40S,
+so a slower-but-cheaper card can cost the same or less per token, and §5's $1.861/GPU-hour is a
+single figure that cannot express a mix. Re-pricing needs the per-card rate AND the per-card
+price together; this section supplies neither. What it does supply is a duration.
+
+### Outstanding work as of 2026-08-31 15:00Z
+
+Sized against the census total rather than a sample, because the campaign admits cells
+**densest-first** — so the median of the zones already queued is biased upward, and using it
+produced a remainder larger than the entire campaign. The 39 zones nobody has queued yet are
+closed by subtraction instead: 360,953 tiles/year minus the 313,929 measured across 66 queued
+zones leaves **47,024 tiles/year**, about 1,045 per zone, which is consistent with the small
+zones being last.
+
+| | tile-years |
+|---|---|
+| campaign total | 3,248,577 |
+| inferred: fully staged, awaiting assembly | 275,661 |
+| inferred: resumed inside partially-staged cells | 78,406 |
+| inferred: in flight now | 25,940 |
+| inferred: published cells (40 of 45 sized) | 329,449 |
+| **outstanding** | **2,539,121** |
+| **outstanding, in tokens** | **1.842 × 10¹⁵ combined** |
+
+Five published cells sit in a zone with no measured count, so the remainder is a slight
+over-estimate rather than an under-estimate.
+
+**Projection at a fleet that holds or barely grows:**
+
+| assumption | rate | remaining | finishes |
+|---|---|---|---|
+| **post-teardown rate holds** | 6,230 tiles/h | **408 h = 17.0 d** | **~17-18 Sep 2026** |
+| whole-window average | 5,683 tiles/h | 447 h = 18.6 d | ~19 Sep |
+| fleet edges up 15% on the post-teardown rate | 7,165 tiles/h | 354 h = 14.8 d | ~15 Sep |
+
+**And inference is probably not the binding constraint.** Assembly runs one cell at a time per
+cluster at ~3.5 h, and on the code now deployed a landed cell also holds that thread through
+~4 h of serial deletes (staging ~2 h 15 m then mosaic ~1 h 55 m, measured on 50N-2018). At 971
+roster cells over 10 clusters that is ~30 days against inference's 19. PR #167 moves both deletes
+off the assembly thread, which brings the assembly side to ~14 days and makes inference the limit
+again — so it is worth roughly two weeks of campaign wall-clock, not just tidiness.

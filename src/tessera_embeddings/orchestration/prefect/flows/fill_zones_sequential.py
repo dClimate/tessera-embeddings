@@ -87,7 +87,6 @@ from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
 from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
     _assert_seeded_model_matches,
     _optical_min_obs_from_store,
-    _PrefectCommitGate,
 )
 from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import (
     _ingest_dispatch_params,
@@ -182,7 +181,10 @@ class _DeploymentCellInputs:
         # never runs when Prefect kills the flow process). Mirrors the Ray
         # terminate-instances-by-tag pattern.
         self._child_tag = child_tag
-        self._executor = ThreadPoolExecutor(max_workers=max(1, max_parallel), thread_name_prefix="cell-ingest")
+        # Kept, not just handed to the executor: it is also the failure quorum
+        # ``wait_first`` aborts on — see there for why that must not be the whole list.
+        self._max_parallel = max(1, max_parallel)
+        self._executor = ThreadPoolExecutor(max_workers=self._max_parallel, thread_name_prefix="cell-ingest")
         self._futures: dict[tuple[str, int], Future[None]] = {}
         self._lock = threading.Lock()
         self._inflight: dict[tuple[str, int], Any] = {}  # (zone, year) → flow-run id
@@ -200,7 +202,7 @@ class _DeploymentCellInputs:
 
         A Prefect GLOBAL concurrency limit rather than a local semaphore: the
         clusters are separate flow runs on separate machines, so nothing
-        in-process can see across them. Same mechanism as the commit gate.
+        in-process can see across them.
 
         **This is also the campaign's pause lever.** Lowering the limit to zero
         makes every stream HOLD here — the cell in flight finishes, no new cell is
@@ -333,14 +335,21 @@ class _DeploymentCellInputs:
         lands first is a real mosaic, and the failure still surfaces when the runner
         reaches that cell.
 
-        When EVERY cell has finished and every one FAILED this RAISES, rather than
-        blocking forever or nominating one of the failures. Reporting a failed cell as
-        landed would send the caller straight into ``ray up`` — five to ten minutes of
-        billed GPU bringup for a mosaic that does not exist, torn down again the moment
-        the feeder reaches the same failure. Raising costs nothing and loses nothing: the
-        underlying ingest error is chained as the cause, and the priming this call belongs
-        to runs inside the flow's shutdown guard, so the started children are still
-        cancelled on the way out.
+        Once every cell of the FIRST WAVE — the first ``max_parallel`` of ``cells``, which
+        are the ones the pool starts — has failed, this RAISES rather than blocking on the
+        rest or nominating one of the failures. Reporting a failed cell as landed would send
+        the caller straight into ``ray up`` — five to ten minutes of billed GPU bringup for a
+        mosaic that does not exist, torn down again the moment the feeder reaches the same
+        failure. Raising costs nothing and loses nothing: the underlying ingest error is
+        chained as the cause, and the priming this call belongs to runs inside the flow's
+        shutdown guard, so the started children are still cancelled on the way out.
+
+        The quorum is that named wave, NOT the whole list and NOT a running failure count.
+        The list would hold a systematic failure through wave after wave before surfacing it.
+        A running count is the subtler trap: the executor starts a queued cell as soon as a
+        worker frees, so fast failures accumulate across waves while a slow first-wave cell
+        is still running and about to succeed — aborting there cancels the very ingest that
+        was going to land.
 
         ``None`` therefore means one thing only: the wait timed out (or no cell of
         ``cells`` was ever started).
@@ -350,6 +359,16 @@ class _DeploymentCellInputs:
             return None
         deadline = None if timeout is None else time.monotonic() + timeout
         pending = set(futs)
+        # The abort signal is a fully-failed FIRST WAVE — not a fully-failed list (the caller
+        # offers every live cell, so that would run a doomed cluster through wave after wave),
+        # and not a running failure total. The total is the trap: the pool starts a queued cell
+        # as soon as a worker frees, so fast failures accumulate across waves while a slow
+        # first-wave cell is still running and about to succeed, and aborting cancels it.
+        # These cells are the ones the pool starts first, so "all failed" cannot be true while
+        # any might still succeed. Same quorum as when the caller passed a window.
+        ordered = [c for c in cells if c in self._futures]
+        first_wave = {self._futures[c] for c in ordered[: self._max_parallel]}
+        failed_first_wave: set[Future[None]] = set()
         while pending:
             budget = None if deadline is None else max(0.0, deadline - time.monotonic())
             done, pending = wait(pending, timeout=budget, return_when=FIRST_COMPLETED)
@@ -362,28 +381,28 @@ class _DeploymentCellInputs:
                     if fut.exception() is None:
                         return futs[fut]
                 except CancelledError:
-                    continue
-            if not pending:
-                # ALL of `futs`, not this iteration's `done`. The loop drains `pending` over
-                # several waits, so `done` holds only whatever settled last — and reporting
-                # that made a whole window's failure read as one cell, hiding both the real
-                # extent and, when the cells failed for one shared reason, the cause. Every
-                # future is settled by the time `pending` is empty, so `.exception()` still
-                # cannot block.
-                self._raise_window_all_failed(futs, set(futs))
+                    pass
+                if fut in first_wave:
+                    failed_first_wave.add(fut)
+            if failed_first_wave == first_wave:
+                # EVERY first-wave failure, not this iteration's `done`: the loop drains
+                # `pending` over several waits, so `done` holds only whatever settled last —
+                # and reporting that made a whole pool's failure read as one cell, hiding both
+                # the extent and, when they failed for one shared reason, the cause.
+                self._raise_window_all_failed(futs, failed_first_wave)
         return None
 
     @staticmethod
-    def _raise_window_all_failed(futs: dict[Future[None], tuple[str, int]], done: set[Future[None]]) -> None:
-        """Every cell offered to :meth:`wait_first` finished and every one failed.
+    def _raise_window_all_failed(futs: dict[Future[None], tuple[str, int]], failed: set[Future[None]]) -> None:
+        """A pool's worth of ingests failed with none succeeding — abort the priming wait.
 
-        ``done`` must be every settled future, not one wait's slice of them: the message
-        names the cells an operator will go and look at, and a short list points at the
-        wrong subsystem when a fleet-wide failure took the whole window down.
+        ``failed`` must be every failure seen so far, not one wait's slice of them: the
+        message names the cells an operator will go and look at, and a short list points at
+        the wrong subsystem when one shared fault took the whole pool down.
         """
-        cells = sorted(futs[f] for f in done)
+        cells = sorted(futs[f] for f in failed)
         cause: BaseException | None = None
-        for fut in done:
+        for fut in failed:
             try:
                 cause = fut.exception()
             except CancelledError as exc:
@@ -392,8 +411,8 @@ class _DeploymentCellInputs:
                 break
         listed = ", ".join(f"{z}-{y}" for z, y in cells)
         raise RuntimeError(
-            f"every ingest in the opening window failed ({listed}) — there is no mosaic to "
-            f"infer, so no GPU fleet is requested. The first failure is chained below."
+            f"{len(cells)} ingest(s) failed with none landing ({listed}) — there is no mosaic "
+            f"to infer, so no GPU fleet is requested. The first failure is chained below."
         ) from cause
 
     def cleanup(self, zone: str, year: int) -> None:
@@ -472,6 +491,26 @@ class _DeploymentCellInputs:
             f"{CANCELLATION_CONFIRM_S:.0f}s of being cancelled. Refusing to start a second one over the same "
             f"mosaic prefix — those commits do not rebase, so the loser's failure is terminal."
         )
+
+    def cancel_unstarted(self) -> int:
+        """Cancel queued ingests that have not begun, and forget them. Returns how many.
+
+        ``Future.cancel()`` succeeds only for a task still sitting in the pool's queue, so
+        a running or finished ingest is untouched — this drops work, never interrupts it.
+
+        Called before the in-child retry pass: every pending cell's ingest is submitted up
+        front, so a retry's fresh ``start`` would otherwise sit behind most of a cluster in
+        this FIFO queue and block for hours on a still-billing cluster. Those cells are
+        unattempted either way and stay pending for the next campaign pass.
+        """
+        cancelled = 0
+        for key, fut in list(self._futures.items()):
+            if fut.cancel():
+                self._futures.pop(key, None)
+                cancelled += 1
+        if cancelled:
+            self._log.info("Cancelled %d queued ingest(s) that had not started", cancelled)
+        return cancelled
 
     def shutdown(self) -> None:
         """Stop dispatching, cancel in-flight child ingest runs, and WAIT for them to stop.
@@ -600,7 +639,6 @@ def fill_zones_sequential_flow(
     s1_orbit: str = "both",
     require_s1: bool = False,
     s3_region: str | None = None,
-    commit_limit_name: str | None = None,
     cleanup_staging: bool = True,
     n_assembly_workers: int | None = None,
     allow_partial_window: bool = False,
@@ -609,6 +647,8 @@ def fill_zones_sequential_flow(
     allow_ingest_code_mismatch: bool = False,
     s3_concurrency: int | None = None,
     launch_pacing: bool = False,
+    gpu_fallback_instance_types: list[str] | None = None,
+    gpu_fallback_vcpu_budget: int | None = None,
     actor_request_headroom: int | None = None,
     actor_request_batch_size: int | None = None,
     idle_timeout_minutes: int = 10,
@@ -616,6 +656,7 @@ def fill_zones_sequential_flow(
     ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
     branch: str | None = None,
     look_ahead: int = 2,
+    max_retained_failures: int = 100,
     attempts_per_cell_in_cluster: int = 2,
     inference_pause_gate: str | None = None,
     ingest_limit_name: str | None = None,
@@ -669,8 +710,6 @@ def fill_zones_sequential_flow(
             radar-free in principle and a global run cannot refuse them. Set this only
             where every cell in the sweep is known to be imaged.
         s3_region: Optional S3 region for the global store + mosaics.
-        commit_limit_name: Prefect global concurrency limit bounding fleet-wide
-            simultaneous committers (D6). ``None`` = ungated.
         cleanup_staging: Delete each cell's staged tiles after it lands.
         n_assembly_workers: Override the assembly process-pool size for every cell in this
             run; ``None`` uses ``AssemblyConfig``'s sizing. Applies per cell, not per run —
@@ -692,6 +731,13 @@ def fill_zones_sequential_flow(
             for the live cell's concurrent staging writes.
         launch_pacing: Pace this cluster's EC2 launch requests against the
             account's shared RunInstances quota. Same shape as ``s3_concurrency``:
+        gpu_fallback_instance_types: EC2 instance types this fill may fall back to when the
+            production rung has no capacity (e.g. ``["g5.2xlarge"]``). ``None`` keeps today's behaviour. Opens
+            the card's rung AND installs the capacity-aware autoscaler scorer -- see
+            ``providers.aws.ray._apply_gpu_fallback``.
+        gpu_fallback_vcpu_budget: Optional vCPU budget for this cluster's GPU fleet, used
+            to ceiling each rung at what the G-and-VT quota affords IT rather than at a
+            flat node count.
             a budget concurrent clusters share, except this one is a request RATE
             and the enforcement lives in the client rather than in a count we
             divide. Default ``False`` keeps today's launch behaviour; the campaign
@@ -737,8 +783,16 @@ def fill_zones_sequential_flow(
             first; 2 means one retry on the still-provisioned fleet. Distinct from
             the campaign driver's `max_dispatch_rounds`, which counts whole-dispatch
             rounds — see `sequential_fill.fill_zones_sequential`.
-        look_ahead: Cells beyond the current one kept in ingest flight (bounds
-            concurrent ingest Dask clusters AND in-flight mosaics, ADR-011).
+        look_ahead: Sizes INGEST width only — the ingest driver runs ``1 + look_ahead``
+            cells at a time, which also sets the priming abort quorum. It no longer bounds
+            in-flight mosaics (peak storage is a cluster's mosaics by design, ADR-011), and
+            it does not set the retained-failure cap — see ``max_retained_failures``.
+        max_retained_failures: Failed cells holding mosaics off-budget before the feeder stops
+            admitting and the run logs ``FAILURE CAP EXCEEDED``. A ceiling against a SYSTEMATIC
+            fault, not a tripwire for a bad hour, so set it near the roster size: a value a bad
+            hour can reach turns an exogenous failure wave into a fleet-wide teardown. The run
+            alerts and finishes its in-flight work; it does not restart itself, because ending a
+            fill costs its GPU actors and that is a campaign-manager decision.
         cleanup_mosaics: Delete each campaign-ingested mosaic after its cell
             lands (transient input). Ignored for ``ingest=False`` mosaics.
         ingest_settings: Grouped ingest tuning knobs (worker bounds, S2
@@ -766,8 +820,8 @@ def fill_zones_sequential_flow(
     t0_flow = time.monotonic()
 
     # Validate BEFORE any side effect (triage reads, primed ingests, `ray up`):
-    # look_ahead < 0 sizes the mosaic budget / zone_slots semaphore at zero
-    # capacity, deadlocking the feeder — and it would only wedge AFTER priming
+    # look_ahead < 0 sizes the ingest driver's thread pool (1 + look_ahead) at zero
+    # width, so no cell would ever ingest — and it would only wedge AFTER priming
     # has launched ingests and the GPU cluster is up. Fail fast instead.
     if look_ahead < 0:
         raise ValueError(f"look_ahead must be >= 0, got {look_ahead}")
@@ -775,6 +829,15 @@ def fill_zones_sequential_flow(
         raise ValueError(
             f"attempts_per_cell_in_cluster must be >= 1, got {attempts_per_cell_in_cluster} "
             "(no cell would be attempted)"
+        )
+    # HERE and not only in the runner, for the reason the block exists: `0 >= cap` is true before
+    # any cell has failed, so a non-positive value stops the feeder immediately -- but the runner
+    # is not reached until every live ingest has been primed and `ray_cluster` entered, so the
+    # cheap refusal would arrive after the expensive part.
+    if max_retained_failures < 1:
+        raise ValueError(
+            f"max_retained_failures must be >= 1, got {max_retained_failures} "
+            "(the cap would trip before any cell failed)"
         )
     # Same rule, same reason: on a direct invocation nothing else rejects this until
     # run_inference validates `session_actors`, by which point triage has run, the
@@ -816,7 +879,6 @@ def fill_zones_sequential_flow(
     store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
     checkpoint_path = f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}"
-    gate = _PrefectCommitGate(commit_limit_name, log=log) if commit_limit_name else None
 
     @cache
     def _window_for(cell_year: int) -> TimeWindow:
@@ -950,7 +1012,6 @@ def fill_zones_sequential_flow(
                 num_actors=1,
                 log=log,
                 run_id=run_id,
-                gate=gate,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
             ),
@@ -1179,7 +1240,6 @@ def fill_zones_sequential_flow(
             config=prep.config,
             log=log,
             run_id=prep.run_id,
-            gate=gate,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
         )
@@ -1224,6 +1284,7 @@ def fill_zones_sequential_flow(
             t0_flow,
             log,
             on_actor_retire=terminator,
+            on_fleet_demand=publish_fleet_mix,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
             retire_idle_actors=True,  # the scheduler holds off until the source is exhausted
@@ -1246,10 +1307,10 @@ def fill_zones_sequential_flow(
             num_actors=cell.num_actors,
             log=log,
             run_id=prep.run_id,
-            gate=gate,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
             on_actor_retire=terminator,
+            on_fleet_demand=publish_fleet_mix,
             retire_idle_actors=final,
         )
 
@@ -1282,7 +1343,6 @@ def fill_zones_sequential_flow(
                 optical_min_obs=_store_optical_min_obs(),
                 input_coverage=prep.input_coverage,
                 log=log,
-                gate=gate,
                 s3_concurrency=s3_concurrency,
                 cleanup_staging=cleanup_staging,
                 n_assembly_workers=n_assembly_workers,
@@ -1317,14 +1377,20 @@ def fill_zones_sequential_flow(
     # server-side that a prompt retry of this flow would then race.
     try:
         if inputs is not None:
-            ingest_window = live[: 1 + look_ahead]
+            # EVERY live cell, not a look-ahead window. The driver's `max_parallel` is what
+            # bounds concurrency; starting only a window meant a new ingest could not begin
+            # until the feeder admitted a cell, which waited on an assembly — so a cluster
+            # configured for 6 concurrent ingests ran 1.
+            ingest_window = live
             for cell in ingest_window:
                 inputs.start(cell.zone, cell.year)
 
             log.info(
-                "Ingesting %d UTM zone(s); GPUs are requested as soon as the first mosaic lands (sizes %s tiles)",
+                "Ingesting %d cell(s), %d at a time; GPUs are requested as soon as the first "
+                "mosaic lands (densest first: %s tiles)",
                 len(ingest_window),
-                ", ".join(f"{c.n_tiles:,}" for c in ingest_window),
+                1 + look_ahead,
+                ", ".join(f"{c.n_tiles:,}" for c in ingest_window[:6]),
             )
             t0 = time.monotonic()
             first = inputs.wait_first([(c.zone, c.year) for c in ingest_window])
@@ -1356,8 +1422,16 @@ def fill_zones_sequential_flow(
             idle_timeout_minutes=idle_timeout_minutes,
             cluster_name=cluster_name_for_flow_run(flow_run_ctx.id),
             launch_pacing=launch_pacing,
+            gpu_fallback_instance_types=gpu_fallback_instance_types or (),
+            gpu_fallback_vcpu_budget=gpu_fallback_vcpu_budget,
         ) as resolved_yaml:
             activate(resolved_yaml)
+            from tessera_embeddings.providers.aws.fleet_mix import publisher_for_resolved_yaml
+
+            # Read AFTER `ray up`, because the ceilings come from the resolved config
+            # it was handed. `_session` closes over the name and is called below, so
+            # assigning here reaches every session this cluster runs.
+            publish_fleet_mix = publisher_for_resolved_yaml(resolved_yaml, gpu_fallback_vcpu_budget, log)
             seq = fill_zones_sequential(
                 cells=live,
                 prepare=_prepare,
@@ -1369,6 +1443,7 @@ def fill_zones_sequential_flow(
                 log=log,
                 inputs=inputs,
                 look_ahead=look_ahead,
+                max_retained_failures=max_retained_failures,
                 attempts_per_cell_in_cluster=attempts_per_cell_in_cluster,
                 fault=fault,
                 # Built here rather than in the runner: the runner is Prefect-free, so the

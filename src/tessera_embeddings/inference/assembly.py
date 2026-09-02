@@ -81,11 +81,11 @@ from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
+from tessera_embeddings.storage.icechunk_logging import traced_commit
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.registry import part_uri, registry_rows, write_registry_part
 from tessera_embeddings.storage.shard_writer import (
-    CommitGate,
     PhaseTimer,
     commit_with_rebase,
     run_forked,
@@ -235,9 +235,10 @@ icechunk writes chunk objects to a flat ``chunks/<random-id>`` keyspace, so the
 keys spread across S3 partitions well — but partition splitting is adaptive and a
 hard burst overruns the per-prefix rate before (and even after) S3 adapts, which
 is exactly the SlowDown observed at 800 concurrent PUTs. Because
-``per_worker_cap`` floors at 1, :func:`_s3_budget_split` also caps the worker
-count at the budget so the ``n_workers * per_worker_cap`` product can never
-exceed it (``AssemblyConfig`` caps workers far lower in the common case).
+``per_worker_cap`` floors at 1, a fill's aggregate is ``max(budget, n_workers)``
+rather than ``<= budget``: the floor and the ceiling cannot both hold, and the
+ceiling is the one that gives way. ``AssemblyConfig.max_workers`` bounds the
+overshoot -- see :func:`_s3_budget_split` for why that is the right way round.
 """
 
 
@@ -245,15 +246,30 @@ def _s3_budget_split(s3_concurrency: int | None, n_workers: int) -> tuple[int, i
     """``(effective_workers, per_worker_cap)`` honoring the fleet S3-PUT budget.
 
     Each fork worker opens its own repo capped at ``per_worker_cap``, so a fill
-    issues up to ``effective_workers * per_worker_cap`` concurrent requests. When
-    the budget is smaller than the requested worker count, flooring the cap at 1
-    would let ``n_workers`` alone exceed it (e.g. budget 5, 8 workers → 8 > 5), so
-    the worker count is capped at the budget too — fewer concurrent forks, but the
-    fleet target holds. ``s3_concurrency=None`` uses the full aggregate target (a
-    lone fill). Both returned values are ``>= 1``, and their product ``<= budget``.
+    issues up to ``effective_workers * per_worker_cap`` concurrent requests.
+    ``s3_concurrency=None`` uses the full aggregate target (a lone fill). Both
+    returned values are ``>= 1``.
+
+    **The worker count is NOT reduced to fit the budget**, and that is the whole
+    point of this function. A per-fill budget is the fleet target divided by the
+    cluster count, so on a wide campaign it lands well below the requested worker
+    count — and clamping to it silently costs most of the fork pool on every
+    assembly, which is the campaign's longest stage.
+
+    Because ``per_worker_cap`` floors at 1, a worker count above the budget makes
+    the aggregate ``max(budget, n_workers)``. The floor and the ceiling cannot
+    both hold; the ceiling gives way, because the costs are asymmetric.
+    Overshooting the target risks 503s, which retry, and the target sits far below
+    the concurrency at which SlowDown was actually observed. Holding the target by
+    dropping forks costs wall-clock unconditionally, on every cell, whether or not
+    the service was ever going to complain. The overshoot is bounded by
+    ``AssemblyConfig.max_workers`` times the fleet's cluster count.
+
+    The measured cost of the clamp, and the concurrency evidence:
+    ``context_docs/design/assembly-worker-clamp-2026_08.md``.
     """
     budget = s3_concurrency if s3_concurrency is not None else TARGET_AGGREGATE_S3_CONCURRENCY
-    workers = min(n_workers, max(1, budget))
+    workers = max(1, n_workers)
     return workers, max(1, budget // workers)
 
 
@@ -294,8 +310,8 @@ def _assembly_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogene
       from these without a store listing. ``tiles_staged``/``tiles_cleared``
       are the caller's intent (real data vs fill-over-skip footprints).
     * ``fill_wall_s``/``merge_s`` — the fork-to-merge span and the merge alone;
-      ``commit_s``/``attrs_commit_s`` — the data and attrs commits (gate wait
-      included); ``total_s`` — the whole assembly call.
+      ``commit_s``/``attrs_commit_s`` — the data and attrs commits;
+      ``total_s`` — the whole assembly call.
     """
     return "ASSEMBLY_SUMMARY: " + json.dumps(fields, sort_keys=True)
 
@@ -2018,7 +2034,7 @@ class ZarrWriter:
                 max_concurrent_requests=per_worker_cap,
                 get_credentials=get_credentials,
                 region=s3_region,
-                scatter_initial_credentials=get_credentials is not None,
+                scatter_initial_credentials=True,  # see assemble_global's call site
             )
             # Persist the split on create so a later COLD writer (one that opens
             # the store outside this manifest_split block) keeps splitting rather
@@ -2052,7 +2068,7 @@ class ZarrWriter:
         # between repo creation and the schema commit) — treat as fresh.
         if is_new or "time" not in root:
             self._create_schema(root, layout, variables, total_y, total_x, time_date, spatial)
-            session.commit(f"Run {run_id}: create schema ({layout.name})")
+            traced_commit(session, f"Run {run_id}: create schema ({layout.name})")
             time_index = 0
             _log.info("Created %s with layout %s", output_path, layout.name)
         else:
@@ -2183,7 +2199,7 @@ class ZarrWriter:
                     parts = ([f"add {missing}"] if missing else []) + (
                         [f"reset untouched {untouched}"] if untouched else []
                     )
-                    session.commit(f"Run {run_id}: overwrite {time_date} — {'; '.join(parts)}")
+                    traced_commit(session, f"Run {run_id}: overwrite {time_date} — {'; '.join(parts)}")
                 _log.warning(
                     "Time %s already exists at index %d in %s — overwriting in place "
                     "(live positions rewritten, skip-marked footprints reset to fill%s)",
@@ -2194,9 +2210,10 @@ class ZarrWriter:
                 )
             else:
                 time_index = _extend_time_axis(root, time_date)
-                session.commit(
+                traced_commit(
+                    session,
                     f"Run {run_id}: extend time axis to {time_date}"
-                    + (f" (adding variables {missing})" if missing else "")
+                    + (f" (adding variables {missing})" if missing else ""),
                 )
                 _log.info("Extended %s time axis to index %d (%s)", output_path, time_index, time_date)
 
@@ -2246,7 +2263,9 @@ class ZarrWriter:
             # These payloads genuinely are northing-band writes — name them so.
             # `_log` is the caller's logger (the flow's run logger under Prefect),
             # so the coordinator's progress lines reach the orchestrator too.
-            fill = run_forked(session, _fill_band_worker, payloads, unit="band writes", log=_log)
+            # No catch-up on this path, so no timer and nothing that can wedge; the
+            # session comes back unchanged.
+            fill, _ = run_forked(session, _fill_band_worker, payloads, unit="band writes", log=_log)
 
         # --- Phase 3: root attrs + one data commit ----------------------------
         node = zarr.open_group(session.store, mode="a")
@@ -2331,7 +2350,6 @@ class ZarrWriter:
         year: int,
         run_id: str,
         n_workers: int = 8,
-        gate: CommitGate | None = None,
         staged_labels: Iterable[str] | None = None,
         skipped_labels: Iterable[str] | None = None,
         s3_concurrency: int | None = None,
@@ -2353,9 +2371,8 @@ class ZarrWriter:
         The global write path (ADR-008 D3/D6): every staged tile is exactly one
         output shard, written whole and lean by
         :func:`~tessera_embeddings.storage.shard_writer.write_year_shards` —
-        fork/merge across ``n_workers`` processes, one commit per (zone, year)
-        behind ``gate``, ``years_complete`` and per-year run provenance updated
-        in the same commit. The zone group must already be seeded
+        fork/merge across ``n_workers`` processes, one commit per (zone, year),
+        ``years_complete`` and per-year run provenance updated in the same commit. The zone group must already be seeded
         (:func:`~tessera_embeddings.storage.global_store.seed_zone_groups`);
         nothing is ever created or resized here (D1). Emits one
         ``ASSEMBLY_SUMMARY`` record (:func:`_assembly_summary_line`) with the
@@ -2399,8 +2416,6 @@ class ZarrWriter:
                 in both takes the marker, which is written at the end of a wholly refused shard.
             n_workers: Worker process count; also divides
                 ``TARGET_AGGREGATE_S3_CONCURRENCY`` into the per-fork cap.
-            gate: Optional commit gate shared across the zone-year fills this
-                process drives (fleet-wide gating is the orchestrator's job).
             staged_labels: Pre-listed staged tile labels (e.g. the return of
                 :meth:`verify_staged_completeness`); ``None`` lists the prefix.
             radar_coverage: This YEAR's radar-coverage summary, from
@@ -2472,13 +2487,25 @@ class ZarrWriter:
         # fill's forks. TARGET_AGGREGATE_S3_CONCURRENCY // n_workers alone bounds one
         # fill to ~target, so K concurrent fills burst K times the target PUTs (the
         # 800-req SlowDown). The campaign passes `s3_concurrency = target //
-        # max_parallel_zones` so the fleet stays near target; None = full target.
+        # max_parallel_zones`; None = full target.
+        #
+        # The budget sets the per-fork REQUEST CAP only -- it does not reduce the fork
+        # count, which is why a wide campaign no longer runs its assemblies on a
+        # fraction of their workers. Since that cap floors at 1, the fleet may exceed
+        # the target by up to `max_workers * n_clusters`; see `_s3_budget_split`.
         n_workers, per_worker_cap = _s3_budget_split(s3_concurrency, n_workers)
         repo = open_global_repo(
             store_path,
             get_credentials=get_credentials,
             region=s3_region,
             max_concurrent_requests=per_worker_cap,
+            # `write_year_shards` PICKLES this session to spawned children; without it each
+            # deserialises with no credential and calls back per S3 request for the life of the
+            # fork (icechunk#2077). Opt-in per call site because the pickle carries a live
+            # secret -- safe across a local spawn pipe, not over a network transport. True
+            # unconditionally, since `_create_storage` substitutes a default provider when
+            # `get_credentials` is None and omits the option when there is no provider at all.
+            scatter_initial_credentials=True,
         )
 
         # One readonly probe of the zone group: year index, shard pitch, variables.
@@ -2605,7 +2632,6 @@ class ZarrWriter:
             year_index,
             source,
             n_workers=n_workers,
-            gate=gate,
             shard_px=shard_px,
             commit_msg=f"Run {run_id}: fill {zone} year {year}",
             run_id=run_id,
@@ -2658,6 +2684,11 @@ class ZarrWriter:
                 merge_s=telemetry.get("merge_s"),
                 commit_s=telemetry.get("commit_s"),
                 attrs_commit_s=telemetry.get("attrs_commit_s"),
+                # The catch-up tally. This record is the ONLY place it reaches an operator, and
+                # a healthy commit looks identical whether the session was kept current or
+                # merely got lucky — so omitting it here left the mechanism with no evidence it
+                # ran at all, which is what its own documentation claims this provides.
+                catch_ups=telemetry.get("catch_ups"),
                 total_s=round(time.monotonic() - t0, 3),
                 fused_compress_put=True,
                 workers=workers,
