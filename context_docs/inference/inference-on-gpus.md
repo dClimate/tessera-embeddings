@@ -278,7 +278,8 @@ There is no reading on which both are true.
 
 Three instruments, because no single one answers both halves of the question.
 
-1. **A forward-pass sweep on synthetic tensors** (`profiling/inference/forward_bench.py`), sequence
+1. **A forward-pass sweep on synthetic tensors** (`profiling/inference/forward_bench.py`, which
+   lives on the unmerged `dev/gpu-node-type-ladder` branch — it is not on `main`), sequence
    length 8 → 256 at the production `B = 7,168` and bf16. Same tensors, same shapes, same dtype on
    every card: no S3 weather, no host feed, no geography, no optical-depth spread. This is the clean
    card comparison, and it is the ONLY way to reach the model's own 256-timestep ceiling — the Iowa
@@ -586,18 +587,37 @@ under its 0.651 break-even; the L4's (0.342) is well under its 0.526. Not margin
 an idle fleet at infinite cost per token, and 1.42× beats that. Gated on two things: the allocator
 flag, which now ships; and only the A10G rung being open.
 
-**The failover is not manual.** Ray's DEFAULT scorer accepts a `node_availability_summary` and never
-reads it, so a capacity refusal never moves it off the top-scored rung. Ray lets you replace that
-scorer (`RAY_AUTOSCALER_UTILIZATION_SCORER`), and `providers.aws.autoscaler_scorer` now does,
-demoting a rung AWS last refused for want of capacity. Enabling it is
-`gpu_fallback_instance_types=["g5.2xlarge"]` on the campaign, which opens the rung and installs the
-scorer together.
+> **The failover mechanism this section described is DELETED, and the correction is the useful
+> part.** It said Ray lets you replace its utilisation scorer through
+> `RAY_AUTOSCALER_UTILIZATION_SCORER`, that `providers.aws.autoscaler_scorer` did so, and that
+> `gpu_fallback_instance_types=["g5.2xlarge"]` opened the rung and installed the scorer together.
+> **It never engaged.** Measured on dev 2026-08-28: **18 consecutive launch attempts, every one for
+> the L40S, every one refused for capacity, and not one attempt at the A10G** — which sat open at a
+> ceiling of 25 throughout. `ray up` has started autoscaler **v2** by default since Ray 2.50 and
+> every one of our clusters runs it, verified on a live head three ways; **v2 has no plugin point
+> for a scoring function**, so the scorer was never called. It was deleted rather than left looking
+> live (`cf38515`).
+>
+> **What replaced it does not argue with the ranking at all — it states the answer.**
+> `providers/aws/fleet_mix.py` publishes how many machines of each rung the fleet should hold,
+> through `request_resources`, which v2 satisfies in the same scheduling pass as ordinary actor
+> demand. **Both pools are therefore asked for at once, and the ranking stops deciding anything.**
+>
+> Two consequences for what this section concluded. **The ranking analysis above still holds**, and
+> is why the fix took this shape: v2 also picks greedily and stops only when a type's own
+> `max_workers` is exhausted, so `g6e.xlarge` at 4 vCPU still wins every unit of demand on an
+> accident of vCPU count — and v2's own capacity signal cannot break that, because it is a tiebreak
+> *after* the utilisation score, which these rungs never tie on, and it is populated on
+> `ALLOCATION_TIMEOUT` while our refusals arrive as `ALLOCATION_FAILED`. But **the operating rule
+> "open at most ONE candidate rung, and make it `g5.2xlarge`" is superseded.** The rung order is now
+> explicit in `GPU_RUNGS`, sorted by throughput per vCPU, which puts the A10G (0.46) ahead of the L4
+> (0.32) by construction. The name-sort tie-break that would have filled a wide fallback with L4s
+> cannot arise, because nothing is tying.
 
-**One case remains manual, and it is the common one.** A launch that returns FEWER instances than
-requested is a success — `MinCount: 1` — so a production rung that is trickling rather than refusing
-outright is never marked unavailable and the scorer never fires. Releasing demand to the fallback
-under a trickle still means capping the production rung, which is one SSM key. The automatic path
-covers a hard outage; the cap covers a slow one.
+**One case remains, and it is the common one.** A launch that returns FEWER instances than requested
+is a success — `MinCount: 1` — so a production rung that is trickling rather than refusing outright
+never reports a refusal at all. Releasing demand to the fallback under a trickle still means capping
+the production rung, which is one SSM key.
 
 **Spend on the whole investigation: about $14** — 40 capacity probes at ~$0.10, four bench sweeps at
 $0.35–0.62 each, and two cluster windows at ~$5–7 and ~$6. No run was allowed to complete; a full
@@ -1111,12 +1131,12 @@ gap exists. See [`../../tests/README.md`](../../tests/README.md).
 | the allocator flag | `inference/actors.py`, the `@ray.remote(runtime_env=...)` decorator |
 | the checkpoint ladder and its clipping | `inference/sampling.py`, `compute_bin_keys` |
 | deepest bucket first | `inference/dataset.py`, `iter_buckets(largest_first=True)` |
-| the strip plan and its RAM budget | `inference/inference.py`, `_strip_plan`, `_S2_STRIP_BYTE_BUDGET` |
+| the strip plan and its RAM budget | `inference/actors.py`, `_strip_plan`, `_S2_STRIP_BYTE_BUDGET`, `_XCHUNK_*` |
 | the pipelined forward loop | `inference/inference.py`, `_pipelined_gpu_loop` |
 | how many actors Ray packs on a card | `inference/scheduling.py`, `FleetDemand.machines` |
 | which instance rungs may be opened | `providers/aws/fleet_mix.py`, `GPU_RUNGS` |
-| the capacity-aware autoscaler scorer | `providers/aws/autoscaler_scorer.py` |
-| the synthetic forward sweep | `profiling/inference/forward_bench.py` |
+| how both GPU pools are asked for at once | `providers/aws/fleet_mix.py`, `fleet_asks` and `GPU_RUNGS` |
+| the synthetic forward sweep | `profiling/inference/forward_bench.py` — **on `dev/gpu-node-type-ladder` only; never merged to `main`** |
 
 `batch_size` is read in two different places downstream, both in `inference/inference.py` — the
 sub-batch split in `run_inference`, and the pinned host buffers allocated by `_pipelined_gpu_loop`.

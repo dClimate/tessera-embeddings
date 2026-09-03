@@ -7,10 +7,12 @@ ran, and the decisions they settled are recorded in
 with the run that confirmed it. The harness itself is code, under `scripts/scale_tests/`.
 
 > **What was cut, and where it went.** The pre-run specification — the shared harness contract, the
-> metrics schema, one subsection per test giving its method, pass/kill thresholds, runtime and cost
-> budget, and the decision matrix mapping evidence to decisions — described work that is now code and
-> conclusions that are now ADR-008. It is in git history if the reasoning behind a threshold is ever
-> wanted. The build-order handoff spec (`global-store-test-impl-spec.md`) was absorbed into this
+> metrics schema, one subsection per test giving its method and its pass/kill thresholds, and the
+> decision matrix mapping evidence to decisions — described work that is now code and conclusions
+> that are now ADR-008. It is in git history if the reasoning behind a threshold is ever wanted.
+> **The infrastructure spec and the cost basis were NOT cut**: an operator budgeting a real bench
+> run needs them, so they moved to `scripts/scale_tests/README.md` beside the estimate they price,
+> along with the teardown checklist. The build-order handoff spec (`global-store-test-impl-spec.md`) was absorbed into this
 > ledger on 2026-08-17 and deleted.
 
 Every signature below was verified against **icechunk 2.0.4 / zarr 3.2.1 on 2026-07-13**; the bench

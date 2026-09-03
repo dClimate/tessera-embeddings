@@ -884,7 +884,7 @@ Two other conditions would put committers back in contention regardless of N: mo
 owning the same zone, which would put two committers on one zone group; and a change making assembly
 commit per-shard or per-tile rather than once per zone-year.
 
-**The detector is the `COMMIT <secs>: <message>` line in `commit_with_rebase`.** Every commit goes
+**The detector is the `COMMIT <secs>: <message>` line in `commit_with_rebase`** (`storage/shard_writer.py`)**.** Every commit goes
 through that function — the assembly path and the terminal path both — so it is the only place that
 sees all of them. `commit_s` in `ASSEMBLY_SUMMARY` was the obvious candidate and is **not
 sufficient**: a terminal cell marks itself through `mark_zone_year_empty` and returns without ever
@@ -1058,11 +1058,13 @@ rather than lazy.
 | the fork-count clamp, and the budget it divides | `inference/assembly.py`, `_s3_budget_split`; `config/assembly.py`, `AssemblyConfig.max_workers` |
 | the session catch-up: constant, error type, predicate, operation, wrapper, timer | `storage/session_catch_up.py` |
 | re-homing after a wedged catch-up | `storage/session_catch_up.py`, `rehome_after_a_wedged_catch_up` |
-| the commit itself, and the `COMMIT <secs>` detector line | `storage/zarr_store.py`, `commit_with_rebase` |
+| the commit itself, and the `COMMIT <secs>` detector line | `storage/shard_writer.py`, `commit_with_rebase` |
 | the two assembly paths that copy a connection to workers | `inference/assembly.py`, `assemble` and `assemble_global` |
 | the single place every storage credential is built and logged | `providers/aws/credentials.py`, `_serve_icechunk_credential` |
 | the two credential sources (our account; the partner's) | same file: `iam_icechunk_credentials`, `AssumedRoleIcechunkCredentials` |
 | the scatter setting discussed in §4 | `scatter_initial_credentials`, threaded through `storage/zarr_store.py` |
 | the existing storage retry allowance | `storage/zarr_store.py`, `StorageRetriesSettings` |
 | the registry's path, and its required store argument | `config/paths.py`, `optical_registry()` |
-| the registry writer and its one record builder | `inference/assembly.py`, `_coverage_record` |
+| the one record builder, on both the refused and embedded paths | `inference/actors.py`, `_coverage_record` |
+| publishing a cell's part once its commit lands | `inference/assembly.py`, `publish_registry_part` |
+| the registry's declared schema, its rows and its part writer | `storage/registry.py`, `dataset_schema`, `registry_rows`, `write_registry_part` |

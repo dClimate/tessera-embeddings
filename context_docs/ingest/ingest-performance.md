@@ -2378,9 +2378,11 @@ why the ingest snaps its windows to the chunk grid (§13.3): chunk-disjoint wind
 arise rather than handling it, which is also what lets N windows share one session and one commit.
 
 The reconciliation the region-merge tier has to do — overlapping windows, shared boundary chunks — is
-exactly the work this path avoids by construction. `storage/region_merge.py` and the ROI fan-out
-foundations solve that tier directly above this one; code was taken from both and generalised, so the
-generalised version here is the shared one.
+exactly the work this path avoids by construction. **That tier — merging many grid-aligned feature
+stores into one master — is not in this package**; a `storage/region_merge.py` was planned for it and
+never landed here, and §14.3 is what became of the batch path it would have used. What survives is
+the design consequence: the merge tier has to reconcile overlapping windows and shared boundary
+chunks, and the ingest does not, because it snapped its windows to the chunk grid.
 
 ### 14.2 The multi-write-per-commit contract (verified 2026-07-24)
 

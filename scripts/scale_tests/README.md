@@ -119,8 +119,30 @@ also builds its own stores so any single `tN` is independently runnable.
    supersede with a new ADR — the decisions file is append-only for reversals).
 3. Archive the report alongside ADR-008.
 
+## Infrastructure a bench run needs
+
+Absorbed here from the scale-test plan, which is retired. This is what the cost
+estimate below is priced against, so the two belong together.
+
+| item | spec | why |
+|---|---|---|
+| EC2 | `r7i.4xlarge` (16 vCPU / 128 GB), us-west-2 | RAM headroom for the commit-RSS tests — T2 sweeps to ~10⁷ refs, about 4 GB, plus the fork processes — and it matches the store's default region |
+| Bucket | fresh, us-west-2, same account | throwaway; expect a `SlowDown` ramp on the first heavy writes |
+| IAM | `s3:*` on the test bucket only | |
+| Env | `uv` venv; **icechunk ≥ 2.1.1** (ADR-008 D9), zarr 3.2.1 pinned; package installed from the branch under test | |
+| Results | `s3://<bucket>/results/<run-id>/*.jsonl` plus a local mirror | survives instance death |
+
+**Teardown:** `teardown.py --run-id …` deletes the `stores/`, `repos/` and
+`results/` prefixes (mirror the results locally first) and verifies the bucket is
+empty by LIST. Then delete the bucket, terminate the instance, confirm no EBS
+orphans, and archive the collated `report.py` output alongside ADR-008.
+
 ## Cost
 
-~$200–350 for a full bench run (see test plan §2): EC2 ~$45–85, S3 storage
-~$12–25, PUTs ~$25–50, plus a rerun buffer. `teardown.py` returns the bucket to
-$0; verify with its object-count output.
+**~$200–350 for a full bench run**, against the shape above: EC2 at ~$1.06/h for
+40–80 h is **$45–85**; S3 storage of ~0.5–1 TB-month is **$12–25**; ~5–10 M PUTs
+are **$25–50**; GETs and LISTs are minor; the rest is a buffer for reruns.
+`teardown.py` returns the bucket to $0 — verify with its object-count output.
+
+Develop and smoke everything at `--scale tiny --backend local` first, which costs
+nothing.

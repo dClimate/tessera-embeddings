@@ -369,7 +369,8 @@ majority of land, which is token-poor. Reducing tokens pays proportionally to to
 where the cost is not.
 
 Stratified figures, the projection interval, and what remains unmeasured:
-[`../inference/inference-on-gpus.md`](../inference/inference-on-gpus.md) §5.
+[`../inference/inference-on-gpus.md`](../inference/inference-on-gpus.md) §6, "Measured on the
+campaign path".
 
 **What this means for the durations above: raise them, but for seasonality.** The fit is built on
 January-conditions dates and a zone-year is not twelve Januaries — on one zone at one width,
