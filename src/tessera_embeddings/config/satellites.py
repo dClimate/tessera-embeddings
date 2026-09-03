@@ -1,15 +1,10 @@
-"""Satellite-specific configuration: bands, baseline corrections, and mappings.
-
-This module defines per-satellite constants that are independent of any
-particular STAC provider or data store implementation.
-"""
+"""Per-satellite bands, baseline corrections and mappings, independent of provider or store."""
 
 # =============================================================================
 # Sentinel-2 L2A Configuration
 # =============================================================================
 
-# Band name mapping: native Sentinel-2 names -> STAC common names
-# STAC catalogs use common names; this mapping enables conversion
+# Native Sentinel-2 names -> STAC common names (STAC catalogs index by common name).
 S2_BAND_MAPPING = {
     "B02": "blue",
     "B03": "green",
@@ -31,12 +26,12 @@ S2_L1C_BANDS = list(S2_BAND_MAPPING.values())
 # Bands as stored in Zarr (native names)
 S2_STORED_BANDS = list(S2_BAND_MAPPING.keys())
 
-# Scene Classification Layer (SCL) — loaded as extra band for cloud masking
+# Scene Classification Layer — loaded as an extra band for cloud masking.
 S2_SCL_BAND = "scl"
 # SCL classes considered invalid (nodata, saturated, cloud shadow, cloud, snow/ice)
 S2_SCL_INVALID_CLASSES = frozenset({0, 1, 2, 3, 8, 9})
 
-# Baseline correction: After baseline 4.00, ESA added +1000 offset to values
+# ESA added a +1000 offset to reflectances from processing baseline 4.00 onward.
 S2_BASELINE_THRESHOLD = 400
 S2_BASELINE_OFFSET = -1000
 

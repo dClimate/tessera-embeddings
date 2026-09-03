@@ -4,17 +4,16 @@
 that have been checked against the group being written, and it must never be left moved
 without that check having happened.
 
-**Why any of it.** A fill opens a session, forks it, writes for hours, then commits. Every
-cell that publishes in those hours puts another snapshot between the session's base and the
-branch tip, and the commit has to walk all of them inside ``rebase``. That walk is where
-seven of nine assemblies stopped dead on 2026-08-29 —
-``asset_manager::fetch_snapshot`` reached from ``session::rebase`` never returned, and only
-ever when the walk was more than one cell long. Catching up while the writing is still going
-on keeps every walk short.
+**Why any of it.** A fill opens a session, forks it, writes for hours, then commits. Every cell
+that publishes in those hours puts another snapshot between the session's base and the branch
+tip, and the commit has to walk all of them inside ``rebase``. That walk is where seven of nine
+assemblies stopped dead on 2026-08-29: ``asset_manager::fetch_snapshot`` reached from
+``session::rebase`` never returned, and only ever when the walk was more than one cell long.
+Catching up while the writing is still going on keeps every walk short.
 
 **Why it is dangerous to do naively, which is most of the code here.** A conflict is only ever
-detected against commits made AFTER a session's base, so moving the base past a commit is also
-a decision to stop checking it. Measured on dev with a real collision: an unguarded catch-up
+detected against commits made AFTER a session's base, so moving the base past a commit is also a
+decision to stop checking it. Measured on dev with a real collision: an unguarded catch-up
 committed over a competing writer in silence, where stock icechunk correctly raises. Hence
 :func:`_diff_touches` before moving, a re-check of what the move actually crossed, and
 :func:`catch_up_best_effort`, which treats a failure as best-effort ONLY when the base did not
@@ -58,20 +57,20 @@ CATCH_UP_STOP_TIMEOUT_S = 30.0
 class CatchUpAbortedTheWaitError(RuntimeError):
     """A periodic catch-up failed, so waiting on the remaining forks is pointless.
 
-    Raised only to END THE WAIT. The real cause is the tick's own exception, which
-    :func:`ticking` re-raises when its block exits — this one is what stops an assembly
-    spending another three hours and sixteen workers on a fill that can no longer commit.
+    Raised only to END THE WAIT; the real cause is the tick's own exception, which
+    :func:`ticking` re-raises when its block exits. This one stops an assembly spending another
+    three hours and sixteen workers on a fill that can no longer commit.
     """
 
 
 class CatchUpDidNotStopError(RuntimeError):
     """The timer thread was still inside a catch-up after being asked to stop.
 
-    Raised rather than carried on with, because the session is not ours any more. The caller's
-    next steps merge the forks into it and commit, and icechunk guards a session with a lock:
-    a merge against a session a hung rebase still holds either blocks on that lock — turning
-    one stuck call into a stuck fill — or, if the catch-up later returns, moves the base AFTER
-    the write was merged, which is the expensive replay this module is written to avoid.
+    Raised rather than carried on with, because the session is not ours any more. The caller next
+    merges the forks in and commits, and icechunk guards a session with a lock: a merge against a
+    session a hung rebase still holds either blocks on that lock — one stuck call becomes a stuck
+    fill — or, if the catch-up later returns, moves the base AFTER the write was merged, which is
+    the expensive replay this module exists to avoid.
     """
 
 
@@ -80,32 +79,29 @@ class CaughtUpPastAConflictError(RuntimeError):
     can no longer detect a collision with it.
 
     Its own type because it is the ONE failure in :func:`catch_up_to_branch` that must not be
-    treated as best-effort. Every other failure there costs an optimisation; this one leaves
-    the session in a state where a genuine conflict would be overwritten in silence, and an
-    aborted fill is far cheaper than that.
+    treated as best-effort: every other failure there costs an optimisation, while this leaves the
+    session in a state where a genuine conflict would be overwritten in silence.
     """
 
 
 def _diff_touches(diff: icechunk.Diff, group: str) -> bool:
     """Did anything in ``diff`` change inside ``group``?
 
-    The safety half of :func:`catch_up_to_branch`. A conflict is only ever detected against
-    commits made AFTER a session's base, so moving the base past a commit is also a decision
-    to stop looking at it. That is harmless for a commit that touched some other zone and
-    unacceptable for one that touched ours, which is the difference this asks about.
+    The safety half of :func:`catch_up_to_branch`. Moving a session's base past a commit is also
+    a decision to stop looking at it: harmless for a commit that touched some other zone,
+    unacceptable for one that touched ours.
 
-    Deliberately GROUP-wide rather than chunk-exact. The campaign's concurrent writers are
-    other zones, so a group-level test blocks essentially nothing in practice, while a
-    chunk-exact test would have to model shard geometry to stay correct — precision bought
-    with a second thing to get wrong, in the direction that fails silently.
+    Deliberately GROUP-wide rather than chunk-exact. The campaign's concurrent writers are other
+    zones, so a group-level test blocks essentially nothing in practice, while a chunk-exact test
+    would have to model shard geometry to stay correct — precision bought with a second thing to
+    get wrong, in the direction that fails silently.
     """
     own = f"/{group.strip('/')}"
     prefix = f"{own}/"
     paths: set[str] = set()
-    # EVERY member of Diff, by direct attribute access. `getattr(diff, name, default)` was
-    # wrong twice over: it hid the omission of `moved_nodes` below, and a future icechunk that
-    # renamed a field would silently stop checking that whole class of change rather than
-    # raising. Degrading in the unsafe direction is the one thing this must not do.
+    # EVERY member of Diff, by DIRECT attribute access: `getattr(diff, name, default)` hid the
+    # omission of `moved_nodes` below, and a future icechunk that renamed a field would silently
+    # stop checking that whole class of change rather than raising.
     for attr in _DIFF_NODE_FIELDS:
         paths |= {str(node) for node in getattr(diff, attr)}
     paths |= {str(node) for node in diff.updated_chunks}
@@ -127,27 +123,20 @@ def catch_up_to_branch(
 ) -> str:
     """Move an idle coordinator session up to the branch tip. Returns what it did.
 
-    **Why an assembly needs this at all.** A fill opens its session, forks it, and then writes
-    for hours before committing. Every cell that publishes in those hours puts another
-    snapshot between the session's base and the tip, and the commit has to walk all of them
-    inside ``rebase``. That walk is where assemblies stopped dead on 2026-08-29 —
-    ``asset_manager::fetch_snapshot`` reached from ``session::rebase`` never returned, seven
-    times out of seven, and only ever when the walk was more than one cell long. Catching up
-    while the writing is still going on keeps every walk short.
+    Why an assembly needs it, and the 2026-08-29 hang that motivates it, are in the module
+    docstring.
 
-    **Why repeatedly, and not once at the end.** A single catch-up just before the commit
-    would walk exactly the same distance the commit would have, through exactly the same
-    call. The value is not in moving the base, it is in never letting the gap grow.
+    **Why repeatedly, and not once at the end.** A single catch-up just before the commit would
+    walk exactly the same distance the commit would have, through exactly the same call. The value
+    is not in moving the base, it is in never letting the gap grow.
 
-    **Why this is cheap and not a second commit.** During the fork phase the coordinator's
-    session holds no changes of its own — the forks have not been merged yet — so there is
-    nothing to replay. This moves a base pointer.
+    **Why this is cheap and not a second commit.** During the fork phase the coordinator's session
+    holds no changes of its own — the forks have not been merged yet — so there is nothing to
+    replay. This moves a base pointer.
 
-    **Why it can refuse.** See :func:`_diff_touches`: skipping past a commit is also a
-    decision to stop checking it for conflicts. So a commit that touched our own group is
-    never skipped. The base stays where it is, the gap stops closing, and the commit's own
-    rebase then behaves exactly as it does today — including raising ``RebaseFailedError``
-    on a real collision, which is the behaviour a naive version of this quietly lost.
+    **Why it can refuse.** See :func:`_diff_touches`: a commit that touched our own group is never
+    skipped. The base stays where it is, the gap stops closing, and the commit's own rebase then
+    behaves as it always has, including raising ``RebaseFailedError`` on a real collision.
 
     Returns:
         ``"current"`` — already at the tip, nothing to do.
@@ -171,12 +160,10 @@ def catch_up_to_branch(
     landed = session.snapshot_id
     if landed != tip and _diff_touches(repo.diff(from_snapshot_id=tip, to_snapshot_id=landed), group):
         # THE RACE, CLOSED AS FAR AS IT CAN BE. `rebase` takes no target snapshot — it goes to
-        # whatever the tip is when it runs — so a commit landing between the check above and
-        # this call is skipped without ever being vetted. That cannot be undone, but it must
-        # not pass unnoticed: an empty session's rebase never raises whatever it walks over, so
-        # nothing downstream would report it and the commit would overwrite the other writer in
-        # silence. Verified against a real repository: this predicate fires on exactly that
-        # sequence.
+        # whatever the tip is when it runs — so a commit landing between the check above and this
+        # call is skipped without ever being vetted. That cannot be undone, but it must not pass
+        # unnoticed: an empty session's rebase never raises whatever it walks over, so the commit
+        # would overwrite the other writer in silence. Verified against a real repository.
         raise CaughtUpPastAConflictError(
             f"catch-up for {group} advanced from {base} to {landed}, past the vetted tip {tip}, "
             f"and a commit in that gap touched {group}; this session can no longer detect a "
@@ -195,18 +182,15 @@ def catch_up_best_effort(
 ) -> str:
     """:func:`catch_up_to_branch`, but a failure costs the optimisation rather than the fill.
 
-    The catch-up is an optimisation; the commit's own rebase is the correctness mechanism and
-    is untouched. So a catch-up that cannot run must leave the fill exactly as it was before
-    any of this existed — which is not what letting it raise does. It runs on a timer for three
-    hours and then once more AFTER every worker has succeeded and its fork is in hand, so an
-    exception at that last call would discard a finished multi-hour write over a failed
-    housekeeping call. The triggers are real and not all transient: a node rename anywhere in
-    the store makes ``rebase`` raise even on an empty session, and a reset branch makes
-    ``diff`` raise.
+    The catch-up is an optimisation; the commit's own rebase is the correctness mechanism and is
+    untouched. It runs on a timer for three hours and then once more AFTER every worker has
+    succeeded and its fork is in hand, so an exception at that last call would discard a finished
+    multi-hour write over a failed housekeeping call. The triggers are real and not all transient:
+    a node rename anywhere in the store makes ``rebase`` raise even on an empty session, and a
+    reset branch makes ``diff`` raise.
 
-    :class:`CaughtUpPastAConflictError` is deliberately NOT caught. It does not report a failed
-    optimisation; it reports that the session can no longer detect a collision, and failing
-    the fill is the cheap outcome there.
+    :class:`CaughtUpPastAConflictError` is deliberately NOT caught: it reports that the session can
+    no longer detect a collision, not a failed optimisation.
 
     Returns:
         Whatever :func:`catch_up_to_branch` returned, or ``"failed"``.
@@ -219,11 +203,10 @@ def catch_up_best_effort(
     except Exception as exc:
         # THE TEST IS WHETHER THE BASE MOVED, not which exception was raised. `rebase` advances
         # incrementally and can leave the session advanced when a later step throws, and the
-        # post-rebase verification is itself a network call — so a handler keyed on exception
-        # TYPE swallows exactly the case that matters. Base unmoved: nothing was skipped and
-        # this is a lost optimisation. Base moved: commits were crossed that never got vetted,
-        # and merging the forks onto that base would put a same-group collision beyond the
-        # commit's conflict detection.
+        # post-rebase verification is itself a network call, so a handler keyed on exception TYPE
+        # swallows exactly the case that matters. Base unmoved: a lost optimisation. Base moved:
+        # unvetted commits were crossed, and merging the forks onto that base would put a
+        # same-group collision beyond the commit's conflict detection.
         if session.snapshot_id != before:
             raise CaughtUpPastAConflictError(
                 f"catch-up for {group} failed after advancing {before} -> {session.snapshot_id}; "
@@ -239,23 +222,22 @@ def catch_up_best_effort(
         return "failed"
 
 
-#: How often an idle coordinator catches up while its forks write. Its OWN cadence rather than
-#: the progress timer's five minutes: that coupled a housekeeping decision to a reporting one
+#: How often an idle coordinator catches up while its forks write. Its OWN cadence, not the
+#: progress timer's five minutes, which would couple a housekeeping decision to a reporting one
 #: and let the gap grow for a full reporting period before anything looked at it.
 #:
-#: FIVE SECONDS, and the two bounds that pick it. A cell publishes TWO snapshots — the fill and
-#: the completion mark — so depth is counted in twos, and two publications inside one interval is
-#: the depth that hangs (2026-08-31: depth 2 fine 42+ times, depth 4 wedged 10 for 10).
+#: FIVE SECONDS, set by two bounds. A cell publishes TWO snapshots — the fill and the completion
+#: mark — so depth counts in twos, and two publications inside one interval is the depth that
+#: hangs (2026-08-31: depth 2 fine 42+ times, depth 4 wedged 10 for 10). Bounded BELOW by the
+#: 0-1 s gap within one publication: shorter starts landing a tick between a cell's own fill and
+#: mark, an odd depth nothing has tested. Bounded ABOVE by the closest independent pair observed,
+#: 11 s.
 #:
-#: Bounded BELOW by the gap within one publication, measured at 0-1 s: a shorter interval starts
-#: landing a tick between a cell's own fill and mark, which puts the hop at an odd depth nothing
-#: has tested. Bounded ABOVE by the closest independent pair observed, 11 s.
-#:
-#: A shorter interval does mean MORE rebases — a close pair becomes two shallow hops instead of
-#: one deep one — and that is the trade, because the hazard tracks depth and not call count. The
-#: no-op tick is one branch-tip ref read that returns ``"current"`` before any diff or rebase, so
-#: the count of EXPENSIVE calls is set by how many cells publish, not by how often we look:
-#: measured 6 rebases against 437 no-op ticks over a 222-minute fork phase.
+#: Shorter also means MORE rebases (a close pair becomes two shallow hops rather than one deep
+#: one), which is the trade, because the hazard tracks depth and not call count. A no-op tick is
+#: one branch-tip ref read returning ``"current"`` before any diff or rebase, so the count of
+#: EXPENSIVE calls tracks how many cells publish, not how often we look: measured 6 rebases
+#: against 437 no-op ticks over a 222-minute fork phase.
 CATCH_UP_INTERVAL_S = 5.0
 
 
@@ -269,26 +251,26 @@ def rehome_after_a_wedged_catch_up(
 ) -> icechunk.Session:
     """Open a fresh session for finished forks whose own session is no longer safe to touch.
 
-    **Why a fresh session rather than a stopped thread.** A wedged catch-up cannot be stopped.
-    It is blocked inside a pyo3 call into Rust, where no Python mechanism reaches it — not a
-    timeout, not a signal, not ``PyThreadState_SetAsyncExc`` — and on 2026-08-31 the two that
-    wedged never returned at all. So the session it holds can never be declared free, and the
-    only move left is to stop sharing state with it.
+    **Why a fresh session rather than a stopped thread.** A wedged catch-up cannot be stopped: it
+    is blocked inside a pyo3 call into Rust where no Python mechanism reaches it — not a timeout,
+    not a signal, not ``PyThreadState_SetAsyncExc`` — and on 2026-08-31 the two that wedged never
+    returned. The session it holds can never be declared free, so the only move left is to stop
+    sharing state with it.
 
     **Why the finished work survives that.** :func:`~...shard_writer.run_forked` raises from the
     timer's exit, which runs after its body, so every worker's fork is already in hand and
     undamaged. And a fork is not bound to the session that produced it: the normal path already
     merges forks made at one base into a session that has since rebased to the tip, which eight
-    published cells did on 2026-08-31 across one to seven rebases. Verified directly against
-    icechunk 2.1.1 on a real repository — a fork merged into a session opened later commits, its
-    data lands, and the commits it skipped keep both their chunks and their attrs.
+    published cells did on 2026-08-31 across one to seven rebases. Verified against icechunk 2.1.1
+    on a real repository — a fork merged into a session opened later commits, its data lands, and
+    the commits it skipped keep both their chunks and their attrs.
 
-    **What this must check, and why it is not optional.** Abandoning the old session also
-    abandons the conflict detection its commit would have done over ``base..tip``. A fresh
-    session's own rebase only covers what lands after it opens, so this walks the skipped range
-    itself and refuses if anything in it touched ``group`` — the same rule, and the same reason,
-    as :func:`catch_up_to_branch`. The walk is a read-only diff, which stayed at 0.1-0.4 s
-    throughout every stall yet observed, so it is not on the path that wedges.
+    **What this must check, and why it is not optional.** Abandoning the old session also abandons
+    the conflict detection its commit would have done over ``base..tip``. A fresh session's own
+    rebase only covers what lands after it opens, so this walks the skipped range itself and
+    refuses if anything in it touched ``group`` — the same rule, and reason, as
+    :func:`catch_up_to_branch`. The walk is a read-only diff, which stayed at 0.1-0.4 s throughout
+    every stall yet observed, so it is not on the path that wedges.
 
     Args:
         repo: The repository.
@@ -334,25 +316,25 @@ def ticking(
 ) -> Iterator[None]:
     """Run ``tick`` every ``interval_s`` for the duration of the block.
 
-    ONE timer for the whole fork phase, whichever way the payloads run. Hooking the waiting
-    loop instead would reach only the multi-process branch — a single payload runs inline and
-    never enters it, so that path would get one deep catch-up at the end, which is precisely
-    what this change exists to avoid.
+    ONE timer for the whole fork phase, whichever way the payloads run. Hooking the waiting loop
+    instead would reach only the multi-process branch — a single payload runs inline and never
+    enters it, so that path would get exactly the one deep catch-up at the end this exists to
+    avoid.
 
-    **The tick's exceptions are re-raised on the CALLER's thread.** A daemon thread's exception
-    is discarded, and one of the things a tick can raise is :class:`CaughtUpPastAConflictError`
-    — which must fail the fill rather than vanish.
+    **The tick's exceptions are re-raised on the CALLER's thread.** A daemon thread's exception is
+    discarded, and a tick can raise :class:`CaughtUpPastAConflictError`, which must fail the fill
+    rather than vanish.
 
-    ``abort`` is set the moment a tick fails, so a caller that is waiting on hours of work can
-    stop early instead of finishing a fill already known to be uncommittable. Without it the
-    failure only surfaces when this block exits, which for an assembly is up to three hours and
-    sixteen workers' worth of object-store writes later.
+    ``abort`` is set the moment a tick fails, so a caller waiting on hours of work can stop early
+    instead of finishing a fill already known to be uncommittable. Without it the failure surfaces
+    only when this block exits — for an assembly, up to three hours and sixteen workers' worth of
+    object-store writes later.
 
     **Only a caller that can act on it will.** ``run_forked`` always passes one, but its
-    single-payload branch runs the worker inline and never looks at it — that branch is a
-    one-shard cell or ``n_workers=1``, a short write by construction, so the abort would arrive
-    at a fill about to end anyway. Interrupting it would need a second cancellation mechanism
-    for the synchronous branch, which is not worth carrying for that case.
+    single-payload branch runs the worker inline and never looks at it. That branch is a one-shard
+    cell or ``n_workers=1``, a short write by construction, so the abort would arrive at a fill
+    about to end anyway; interrupting it would need a second cancellation mechanism that is not
+    worth carrying for that case.
     """
     if tick is None:
         yield
@@ -378,10 +360,9 @@ def ticking(
         stop.set()
         ticker.join(timeout=CATCH_UP_STOP_TIMEOUT_S)
         if ticker.is_alive():
-            # A HUNG CATCH-UP IS THE WHOLE POINT OF THIS MODULE, so the one thing the stop
-            # path must not do is assume the thread noticed. `join` with a timeout returns
-            # whether or not it did, and continuing would hand the session to the merge while
-            # another thread is still inside it.
+            # A HUNG CATCH-UP IS THE WHOLE POINT OF THIS MODULE, so the stop path must not assume
+            # the thread noticed: `join` with a timeout returns either way, and continuing would
+            # hand the session to the merge while another thread is still inside it.
             raise CatchUpDidNotStopError(
                 f"a catch-up was still running {CATCH_UP_STOP_TIMEOUT_S:.0f}s after being asked "
                 f"to stop; the session cannot be merged or committed while it is in use"

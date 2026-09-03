@@ -1,8 +1,7 @@
-"""Ray actor lifecycle helpers.
+"""Ray actor lifecycle helpers for ``inference.runner.run_inference``.
 
-Pure-domain support code for ``inference.runner.run_inference``. Lives in
-the domain layer (no Prefect, no AWS-specific code) so it can be reused by
-the plain runner, by tests, and by Prefect tasks alike.
+Pure domain layer — no Prefect, no AWS-specific code — so the plain runner, tests and Prefect
+tasks can all reuse it.
 """
 
 from __future__ import annotations
@@ -13,35 +12,20 @@ from typing import Any
 
 import ray
 
-#: How long to wait for a fleet's FIRST actor before giving the fill up.
+#: How long to wait for a fleet's FIRST actor before giving the fill up (6 h).
 #:
-#: Long, because of what this bound actually gates. The wait ends the moment ``min_required``
-#: actors are ready and lets the rest join while work proceeds, so in a healthy account it is
-#: never reached — a fleet that is filling normally leaves after the first actor answers. It binds
-#: only when the account cannot supply a SINGLE GPU instance, which is a property of the region's
-#: spare capacity rather than of anything the fill did wrong.
-#:
-#: That makes the two outcomes badly asymmetric. Waiting costs an idle head node and no GPU at
-#: all. Giving up fails the fill, and a chained fill owns a whole roster of zones — so it takes
-#: the ingest it would have dispatched with it, and the work waits for the driver's next
-#: re-dispatch round rather than for capacity. Erring long is much cheaper than erring short.
-#:
-#: **But not unbounded, and that is the reason there is a number here at all.** A misconfigured
-#: launch — a stale image, a revoked permission, an exhausted subnet — presents exactly as a
-#: drought does: zero actors arriving. This bound is the only thing that distinguishes the two, so
-#: removing it converts a failure that says what went wrong into a run that waits forever looking
-#: patient. It would also stop the driver's dispatch round from ever closing, since a round closes
-#: only when every fill returns, which is the very recovery a starved fill needs.
-#:
-#: So: long enough to outlast any real drought, short enough that nothing legitimate reaches it.
-#: Placing one instance does not take hours when the capacity exists.
+#: The wait ends as soon as ``min_required`` actors answer, so a healthy fill never reaches it; it
+#: binds only when the region cannot supply a single GPU instance. The outcomes are asymmetric —
+#: waiting costs an idle head node, while giving up fails a chained fill that owns a whole roster
+#: of zones and takes its ingest with it — so err long. Bounded rather than infinite because a
+#: misconfigured launch (stale image, revoked permission, exhausted subnet) looks exactly like a
+#: capacity drought, and this number is the only thing that turns "waits forever looking patient"
+#: back into a failure that says what went wrong. A driver dispatch round closes only when every
+#: fill returns, so an unbounded wait would also block the re-dispatch a starved fill needs.
+#: Sizing history: context_docs/design/immediate-refill-of-a-settled-fill.md.
 ACTOR_INIT_TIMEOUT_SEC = 21600
-"""Maximum wall-clock seconds to wait for actor ``__init__`` to complete.
-
-Sized for the worst case: instance launch + container pull + checkpoint
-download + model load to GPU. Tune via ``run_inference``'s parameter rather
-than monkey-patching this module-level default.
-"""
+"""Maximum wall-clock seconds to wait for actor ``__init__``: instance launch, container pull,
+checkpoint download and model load to GPU. Override via ``run_inference``, not by patching this."""
 
 
 def wait_for_actors(
@@ -55,18 +39,11 @@ def wait_for_actors(
 ) -> tuple[list[ray.actor.ActorHandle], list[str], set[int]]:
     """Wait for enough actors to initialize, then return all actors with readiness info.
 
-    Waits up to ``init_timeout_sec`` for at least ``min_required`` of the
-    requested actors to be ready. Once that threshold is met, returns
-    immediately so work can start. Actors that aren't ready yet are still
-    included in the returned lists — the work-stealing scheduler treats
-    them as initializing and will dispatch work to them once they come
-    online.
-
-    Callers typically pass ``min_required=1`` so the run starts as soon as
-    the first actor is live: cloud providers roll out instances with large
-    timing variation, and waiting for a fraction of the fleet just stalls
-    the run. The 30s poll window below still scoops up any fast-arriving
-    actors before returning.
+    Returns as soon as ``min_required`` of the requested actors are ready, or raises at
+    ``init_timeout_sec``. Not-yet-ready actors stay in the returned lists; the work-stealing
+    scheduler dispatches to them once they come online. Callers typically pass
+    ``min_required=1`` — instance launch times vary widely, so waiting for a fraction of the
+    fleet just stalls the run, and the 30 s poll window still scoops up fast arrivals.
 
     Args:
         actors: List of actor handles (just created, not yet confirmed ready).
@@ -94,12 +71,8 @@ def wait_for_actors(
     ready_indices: set[int] = set()
     pending: list[Any] = list(ping_refs)
 
-    # Poll with 30s sub-timeouts so progress logs land while waiting. Once
-    # min_required actors have responded we break out and let the
-    # scheduler start; the still-pending actors stay in the list with
-    # their indices in ``still_initializing``. Ray queues calls to those
-    # actors behind their __init__, so once they finish loading the model
-    # they begin processing whatever the scheduler has already dispatched.
+    # 30 s sub-timeouts so progress logs land while waiting. Ray queues calls to a still-pending
+    # actor behind its __init__, so it picks up whatever the scheduler already dispatched.
     deadline = time.monotonic() + init_timeout_sec
     while pending and time.monotonic() < deadline:
         remaining_sec = max(0, deadline - time.monotonic())
@@ -136,9 +109,8 @@ def wait_for_actors(
         )
         raise RuntimeError(msg)
 
-    # Resolve instance IDs for ready actors now (they're confirmed live, so
-    # this is fast). Still-initializing actors get placeholders; their real
-    # IDs are resolved lazily by the scheduler once the actor responds.
+    # Ready actors are confirmed live, so resolving their instance IDs is fast; the rest get
+    # placeholders and the scheduler resolves them lazily once the actor responds.
     actor_instance_ids: list[str] = ["pending-init"] * len(actors)
     if ready_indices:
         sorted_ready = sorted(ready_indices)
