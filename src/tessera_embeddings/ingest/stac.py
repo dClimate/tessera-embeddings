@@ -1537,9 +1537,11 @@ def query_stac_items(
 
     # `solar_day_sort_key` owns the order and the reasoning; `load_kwargs` below sets
     # `preserve_original_order=True` so it is that order the loader fuses in. Pinned end to end by
-    # `tests/unit/test_solar_day_fusion.py`, which loads two real scenes of one solar day through
-    # this path and asserts which one survives. Keyed on the SOLAR day, matching
-    # `normalize_to_solar_day` above and the loader's own grouping.
+    # `tests/unit/ingest/test_solar_day_fusion.py`, which loads two real scenes of one solar day
+    # through this path and asserts which one survives. Keyed on the SOLAR day, matching
+    # `normalize_to_solar_day` above and the loader's own grouping — keying on the UTC date
+    # instead splits a group the loader treats as one, in the zones where the solar offset
+    # crosses midnight.
     # TODO: this sort runs only for a collection WITH an SCL band, which today means
     # `sentinel-2-l2a` alone. Every other collection keeps the assembly order, and that order
     # follows the window tree rather than a single catalogue walk — parent prefix first, then

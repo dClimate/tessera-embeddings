@@ -23,7 +23,7 @@ EPSG registry (via ``pyproj``), then snapped outward to the 2048-px shard pitch
 (:data:`SHARD_PX` x :data:`PIXEL_M` = 20 480 m). Because every 6° band has the
 same geometry in its own CRS, all northern zones share one extent template and
 all southern zones another — but :func:`derive_extent` and the pinning test
-(``tests/unit/test_zone_grid.py``) re-derive per zone from pyproj so an
+(``tests/unit/storage/test_zone_grid.py``) re-derive per zone from pyproj so an
 EPSG-database change can't silently move the grid.
 """
 

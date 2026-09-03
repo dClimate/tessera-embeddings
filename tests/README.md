@@ -21,6 +21,46 @@ Two workflows exist but are deliberately dormant, each with the reason and the r
 steps in a comment at the top of the file: `nightly.yml` (Roadmap 1) and
 `downstream-smoke.yml` (waiting on a stable release of the private downstream consumer).
 
+## Where a new unit test goes
+
+`unit/` is grouped into **subject directories mirroring `src/tessera_embeddings/`**, so an edit
+to one subsystem can be verified without running the other 3,700 tests:
+
+```bash
+uv run pytest tests/unit/ingest        # ~36 files, a few seconds
+```
+
+```
+unit/
+├── config/  ingest/  inference/  storage/  providers/  profiling/
+├── assembly/                 what a published zone-year records about itself
+└── orchestration/
+    ├── flows/                Prefect flows
+    └── runners/              the plain / sequential / zone-fill runners underneath them
+```
+
+**Place a file by its primary subject** — what its docstring and test names say it tests, not
+which module it imports most. A test importing eight modules still has one subject.
+
+Two departures from a strict `src/` mirror, both deliberate. **`assembly/`** spans
+`inference/assembly.py` and `storage/shard_writer.py`, because the publication pipeline is one
+theme and mirroring would split it. **`orchestration/flows/` vs `runners/`** keeps a flow's test
+away from its runner's — `test_fill_zone_year_flow.py` and `test_zone_fill.py` are different
+subjects with confusingly similar names.
+
+**Eleven things stay at `unit/` root** and nothing else should join them: `conftest.py`; the three
+shared helpers `zone_density.py`, `mosaic_stores.py` and `coverage_repo.py`, which other tests
+import by absolute path and which therefore must not move; and six tests with no single subject —
+`test_imports`, `test_public_api`, `test_context_docs_index`, `test_architecture_rules`,
+`test_prefect_layer`, `test_properties`.
+
+**Do not locate files by counting directories up from `__file__`.** Import `REPO_ROOT`, `SRC_ROOT`
+or `FIXTURES` from `tests/_paths.py`, which anchors on the directory holding `pyproject.toml` and
+so works at any depth. Counting levels is what made this regrouping risky: three tests that scan
+the source tree fail *silently* when the count is wrong, passing while asserting nothing.
+
+Background in `context_docs/decisions/015-regrouping-the-unit-tests.md`.
+
 ## Optional dependencies
 
 Ray and torch are the `inference` extra, not part of the base install, because
@@ -74,7 +114,7 @@ uv run pytest -m parity
 
 # The pipelined CUDA path — NOT covered by CI, run this by hand on a machine
 # with a GPU. See Roadmap 2 for when.
-uv run pytest tests/unit/test_inference_loop.py -k pipelined -v
+uv run pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
 ```
 
 `-m "slow or parity"` is documented in older notes as the full local end-to-end. It does not
@@ -107,7 +147,7 @@ placeholder was still a placeholder. **Its schedule is suspended as of 2026-08-2
 **No GPU CI runner is available to this project, and one will not be provisioned. This gap is
 accepted, as of 2026-08-25.**
 
-`tests/unit/test_inference_loop.py::TestRunInference::test_pipelined_matches_serial` is the
+`tests/unit/inference/test_inference_loop.py::TestRunInference::test_pipelined_matches_serial` is the
 only coverage of the pinned-buffer / CUDA-event / two-deep-drain / backbone-stream-ordering
 path. It is gated on `torch.cuda.is_available()`, so it skips on every CI runner — it is the
 `1 skipped` you see in each unit run. That skip is the standing signal that this gap exists,

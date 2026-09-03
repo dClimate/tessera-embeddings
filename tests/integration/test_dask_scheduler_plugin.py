@@ -6,7 +6,7 @@ between those two is the registration path — ``register_plugin`` and the ``Per
 the plugin starts on the scheduler's own event loop — and it is not observable from a stub.
 
 Lives here rather than beside the unit tests because it stands up a ``LocalCluster``. It was
-in ``tests/unit/test_provider_aws_dask.py`` carrying ``@pytest.mark.integration``, where the
+in ``tests/unit/providers/test_provider_aws_dask.py`` carrying ``@pytest.mark.integration``, where the
 root ``addopts`` deselected it and no workflow ran ``tests/unit`` with the marker enabled —
 so it had never executed in CI. Moved 2026-08-25, unchanged apart from this docstring; see
 ``context_docs/design/test-suite-streamlining-plan.md`` §2.5.

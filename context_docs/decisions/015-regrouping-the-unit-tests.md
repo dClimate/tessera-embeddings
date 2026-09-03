@@ -1,6 +1,85 @@
 # 015 — Regrouping `tests/unit/` into subject directories
 
-**Status:** Accepted, not yet executed (2026-08-17)
+**Status:** Executed (2026-09-03). Accepted 2026-08-17.
+
+## What executing it corrected in this record
+
+Two statements below were true when written and had stopped being true by the time the move
+happened. Both are left in place rather than edited, because the reasoning around them is still
+the reasoning that was followed; read them with these corrections attached.
+
+**"Import paths inside tests are unaffected — tests import from `tessera_embeddings`, not from
+each other" (Consequences) is false.** Six test files import three shared helper modules —
+`zone_density.py`, `mosaic_stores.py`, `coverage_repo.py` — by absolute package path, and
+`test_source_coverage.py` imported one relatively. Anyone following the consequence as written
+would have moved those helpers and broken six importers. **Resolution:** the three helpers stay at
+`tests/unit/` alongside `conftest.py`, for the same reason `conftest.py` does; the one relative
+import was made absolute in its own commit beforehand.
+
+**"No content edits in a move commit" (recipe step 1) could not be followed literally.** Ten files
+located the source tree, the repo root or the fixtures directory by counting levels up from their
+own file, so descending a directory silently changed what they resolved to. Three of those fail
+*silently* rather than loudly when the anchor is wrong — an `rglob` over a nonexistent root asserts
+nothing and passes, and a `parametrize` fed from one is reported as skipped rather than failed.
+**Resolution:** `tests/_paths.py` anchors on the directory holding `pyproject.toml` instead of on a
+level count, landed in its own commit *before* any move, which let every move commit stay the pure
+rename the recipe asks for. The recipe's intent held; only its literal reading failed.
+
+Neither belongs in `corrections-register.md`: that file is scoped to published figures that were
+withdrawn, and these are stale design claims.
+
+## What was actually built
+
+**This tree is the layout, not the "Proposed grouping" block below it** — that one is kept as the
+historical proposal and differs in three ways.
+
+```
+tests/unit/
+├── conftest.py                                      fixtures for every subdirectory
+├── zone_density.py  mosaic_stores.py  coverage_repo.py
+│                                                    shared helpers, imported by absolute path
+├── test_imports.py  test_public_api.py  test_context_docs_index.py
+├── test_architecture_rules.py  test_prefect_layer.py  test_properties.py
+│                                                    no single subject
+├── config/                  10 files
+├── ingest/                  36 files
+├── inference/               18 files
+├── assembly/                 7 files
+├── storage/                 13 files
+├── orchestration/
+│   ├── flows/               14 files
+│   └── runners/              4 files
+├── providers/                5 files
+└── profiling/                5 files
+```
+
+112 of 123 files moved; the eleven listed at the root stay there. The three helpers must not move —
+six tests import them as `tests.unit.<name>`, which is the correction at the top of this record.
+
+**Placement rule: primary subject** — what the file's docstring and test names say it tests, not
+which module it imports most often. A test importing eight modules still has one subject.
+
+Three differences from the proposal:
+
+1. **Nine directories, not seven.** `profiling/` was added because it exists in `src/` and the
+   proposal omitted it. `orchestration/` was split into `flows/` and `runners/`, mirroring
+   `src/orchestration/prefect/flows/` and `src/orchestration/runners/`, which also separates
+   `test_fill_zone_year_flow.py` from `test_zone_fill.py` — different subjects whose names sat
+   adjacent and read as near-duplicates.
+2. **Two of the proposal's hints were overridden by the placement rule.** It lists `campaign` and
+   `scheduling` under `orchestration/`; their source modules are `storage/campaign.py` and
+   `inference/scheduling.py`, so their tests went to `storage/` and `inference/`. The prose hints
+   in that block are indicative only — the rule above decides.
+3. **`assembly/` was kept as its own subject**, as proposed, rather than folded into `inference/`.
+   It deliberately crosses the `inference`/`storage` boundary: `inference/assembly.py`,
+   `storage/shard_writer.py` and the four provenance-record tests are one theme — what a published
+   zone-year records about itself — and a strict mirror of `src/` would split it in two.
+
+Executed in PR #171, thirteen commits: four content changes and nine pure renames, each reporting
+zero insertions and zero deletions. Verified by three gates rather than by a green suite, because
+three of the tests involved fail silently when their path anchor is wrong — identical pass/skip
+counts (3712/1), an identical covered-source-line set (11,674, none lost) and an identical
+`filename::testname` set (3,713, none gained or lost).
 
 ## Context
 
@@ -32,7 +111,9 @@ The downstream repository already uses this layout — `tests/unit/coarsen/`,
 `roi_grid/`, `monitoring/`, `scripts/`, `embedding_validation/` — and it works. Copy it
 rather than invent one.
 
-Proposed grouping, following `src/tessera_embeddings/`:
+Proposed grouping, following `src/tessera_embeddings/` — **superseded; see "What was actually
+built" above for the layout that exists.** Nine directories were built rather than these seven,
+and two of the hints below (`campaign`, `scheduling`) name directories their tests did not go to:
 
 ```
 tests/unit/

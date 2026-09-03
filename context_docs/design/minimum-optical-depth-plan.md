@@ -189,7 +189,7 @@ below.
 > separate signal from "nothing was refused". Only FULLY refused shards need a record; for a shard
 > that was written, the per-pixel `s2_obs_count` arrays in the store are already the evidence.
 >
-> Design and red-team detail is in `inference/assembly.py` and `tests/unit/test_skip_registry.py`,
+> Design and red-team detail is in `inference/assembly.py` and `tests/unit/assembly/test_skip_registry.py`,
 > which are now the record. What belongs here is why it exists.
 
 > **OPTICAL DEPTH IS THE ONLY REFUSAL RULE — and radar was silently refusing land too
@@ -231,7 +231,7 @@ below.
 > **Three defects in the RECORD, all fixed by the per-shard registry (2026-08-18).** A fully refused
 > shard discarded its counters; "no records" and "every read failed" were the same empty dict; and
 > nothing checked that the reasons partition the refused set. All three are closed and pinned — see
-> the registry paragraph above and `tests/unit/test_skip_registry.py`.
+> the registry paragraph above and `tests/unit/assembly/test_skip_registry.py`.
 >
 > **The month array shipped wrong once, and how it failed is worth more than the fix.** The first
 > cell published twelve all-empty planes while every array beside them was correct. The cause was
@@ -447,7 +447,7 @@ where it cannot drift from what runs:
 | the store's rule is the only rule a fill may apply | `orchestration/runners/zone_fill.py` asserts it; the Prefect adapter substitutes it |
 | refusal recorded per shard, with a reason | `inference/actors.py` writes the marker, `inference/assembly.py` reads it at assembly |
 | the registry beside the store | `config/paths.py` (`optical_registry()`), a sibling of the Icechunk prefix rather than inside it |
-| the tests | `tests/unit/test_skip_registry.py`, `test_dataset_v11.py`, `test_assembly.py` |
+| the tests | `tests/unit/assembly/test_skip_registry.py`, `test_dataset_v11.py`, `test_assembly.py` |
 
 Kept from those sections, because the code states the mechanism and not the reason:
 

@@ -78,7 +78,7 @@ coordinate arrays at creation. Fill 2025 first, then backfill older years as
 end-appends.
 
 Why: unwritten chunks cost zero storage and zero manifest refs (verified in
-`tests/unit/test_empty_store.py`: `nchunks_initialized == 0`), so
+`tests/unit/storage/test_empty_store.py`: `nchunks_initialized == 0`), so
 pre-allocation is free. Physical prepends are possible since icechunk 2.0
 (`shift_array` / `reindex_array`, metadata-only chunk remapping) but the
 feature is ~3 months old, `reindex_array` has a documented stale-data gotcha

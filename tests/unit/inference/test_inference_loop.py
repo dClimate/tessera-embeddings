@@ -301,7 +301,7 @@ class TestPipelinedGpuLoop:
     chunk-staging path, and once before a campaign starts::
 
         uv sync --all-extras --frozen
-        uv run pytest tests/unit/test_inference_loop.py -k pipelined -v
+        uv run pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
 
     See ``tests/README.md`` → Roadmap 2.
     """

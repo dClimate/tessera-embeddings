@@ -19,7 +19,6 @@ alternative is a run that writes nothing and still reports success.
 from __future__ import annotations
 
 import ast
-from pathlib import Path
 
 import pytest
 
@@ -31,8 +30,9 @@ from tessera_embeddings.inference.data_loading import (
     _active_orbits,
     resolve_s1_orbit,
 )
+from tests._paths import SRC_ROOT
 
-_SRC = Path(__file__).resolve().parents[2] / "src" / "tessera_embeddings"
+_SRC = SRC_ROOT
 
 
 def test_none_activates_no_orbit() -> None:

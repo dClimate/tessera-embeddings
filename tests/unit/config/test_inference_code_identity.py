@@ -21,8 +21,9 @@ from tessera_embeddings.config.inference import (
     _STAGED_OUTPUT_SOURCES,
     inference_code_identity,
 )
+from tests._paths import SRC_ROOT
 
-_ROOT = Path(__file__).resolve().parents[2] / "src" / "tessera_embeddings"
+_ROOT = SRC_ROOT
 
 
 def _covered() -> set[str]:

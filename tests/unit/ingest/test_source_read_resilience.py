@@ -17,7 +17,6 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from pathlib import Path
 
 import pytest
 
@@ -28,6 +27,7 @@ from tessera_embeddings.ingest.roi_processing import (
     read_failure_context,
     source_read_retrying,
 )
+from tests._paths import SRC_ROOT
 
 #: The wording GDAL really used, copied from CloudWatch during the 2026-08-24 outage. Composed
 #: text is what let this whole area pass while recording nothing in production.
@@ -45,7 +45,7 @@ def _gdal_logs(message: str) -> None:
 
 #: Read as text rather than imported: these two tests assert on the SHAPE of log calls, which
 #: is not observable from the module object once the interpreter has compiled it.
-_SRC = Path(__file__).resolve().parents[2] / "src" / "tessera_embeddings"
+_SRC = SRC_ROOT
 
 
 class _Item:

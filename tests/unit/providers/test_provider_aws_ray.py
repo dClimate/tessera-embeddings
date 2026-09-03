@@ -42,6 +42,7 @@ from tessera_embeddings.providers.aws.ray import (
     resolve_ami_id,
     resolve_code_artifact_identity,
 )
+from tests._paths import FIXTURES
 
 _LOG = logging.getLogger("test")
 
@@ -746,7 +747,7 @@ def test_pacing_off_leaves_the_bootstrap_environment_alone() -> None:
 #: OMITTING GpuInfo on the CPU-only types — Ray does ``.get("GpuInfo", {}).get(...)``,
 #: which raises on a key materialised as null. A `--query` projection that wrote it
 #: as null made an otherwise-faithful fixture crash the code it was meant to feed.
-EC2_TYPES_FIXTURE = Path(__file__).parents[1] / "fixtures" / "ec2_describe_instance_types_gpu.json"
+EC2_TYPES_FIXTURE = FIXTURES / "ec2_describe_instance_types_gpu.json"
 
 #: The resource bundle one ``InferenceActor`` requests: one GPU, and the CPU Ray
 #: assigns an actor by default (nothing sets ``num_cpus``). Every score below is

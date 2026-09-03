@@ -18,7 +18,7 @@ zones and a long tail of islands.
 
 To SEE a split rather than assert on it::
 
-    TE_CLUSTERS=12 uv run pytest tests/unit/test_cluster_balance.py -k report -s
+    TE_CLUSTERS=12 uv run pytest tests/unit/orchestration/flows/test_cluster_balance.py -k report -s
 
 ``TE_CLUSTERS`` accepts a comma-separated list (``4,8,16``) and defaults to the
 campaign's own ``max_parallel_clusters``.

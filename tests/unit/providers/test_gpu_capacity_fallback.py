@@ -20,9 +20,10 @@ import yaml
 from ray.autoscaler._private.aws import node_provider as np_mod
 
 from tessera_embeddings.providers.aws import ray as tray
+from tests._paths import FIXTURES
 
 TEMPLATE = Path(tray.__file__).parent / "cluster.yaml.template"
-EC2_TYPES = Path(__file__).parents[1] / "fixtures" / "ec2_describe_instance_types_gpu.json"
+EC2_TYPES = FIXTURES / "ec2_describe_instance_types_gpu.json"
 
 #: What one InferenceActor asks Ray for. Every score below is relative to this.
 ACTOR_BUNDLE = {"CPU": 1, "GPU": 1}
