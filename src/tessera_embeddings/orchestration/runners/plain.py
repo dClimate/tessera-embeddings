@@ -1,16 +1,12 @@
 """Orchestrator-free pipeline runner.
 
-Runs ROI generation → S2 + S1 ingestion → inference → assembly
-end-to-end using local Dask for ingest, local Ray for inference, and
-worker processes for assembly. Proves layer separation is real —
-every step calls the same domain function the Prefect flows do.
+Runs ROI generation → S2 + S1 ingestion → inference → assembly end-to-end using local Dask for
+ingest, local Ray for inference, and worker processes for assembly. Proves layer separation is
+real — every step calls the same domain function the Prefect flows do.
 
-Device is controlled by the ``device`` key in the YAML config
-(``"auto"`` | ``"cpu"`` | ``"cuda"``; default ``"auto"`` uses
-a GPU when one is available).
-
-``--skip-inference`` short-circuits after ingestion for fast contributor
-iteration on the ingest path.
+Device comes from the ``device`` key in the YAML config (``"auto"`` | ``"cpu"`` | ``"cuda"``;
+``"auto"`` uses a GPU when one is available). ``--skip-inference`` short-circuits after ingestion
+for fast contributor iteration on the ingest path.
 """
 
 from __future__ import annotations
@@ -55,9 +51,8 @@ from tessera_embeddings.storage.manifest import EmbeddingManifest
 def _resolve_num_gpus(device: str) -> int:
     """Map the config ``device`` field to a Ray num_gpus count.
 
-    ``"auto"`` probes :func:`torch.cuda.is_available` at runtime so the
-    same config works on a CPU-only laptop and a single-GPU dev box.
-    Falls back to 0 if torch is not installed.
+    ``"auto"`` probes :func:`torch.cuda.is_available` at runtime so the same config works on a
+    CPU-only laptop and a single-GPU dev box. Falls back to 0 if torch is not installed.
 
     Raises:
         ValueError: if ``device`` is not one of ``"cpu"``, ``"cuda"``, ``"auto"``.
@@ -100,9 +95,8 @@ def _run_ingest(
 ) -> None:
     """Run S2 + S1 ingestion sequentially against a local Dask cluster.
 
-    The two stages share one cluster but run sequentially because the
-    plain runner is single-process; the cost of separate clusters
-    outweighs any concurrency win on a laptop.
+    The two stages share one cluster but run sequentially because the plain runner is
+    single-process; the cost of separate clusters outweighs any concurrency win on a laptop.
     """
     mosaic_base = paths.store_for(roi_name, "reflectance").rsplit("/", 1)[0]
 
@@ -123,10 +117,9 @@ def _run_ingest(
 
         for orbit in _active_orbits(s1_orbit):
             log.info("Ingesting S1 SAR (orbit=%s, use_s3_direct=%s)", orbit, s1_use_s3_direct)
-            # When S3 direct is on, the domain function expects callables that fetch
-            # ASF STS credentials and broadcast them to the cluster. The Prefect
-            # flow wires these the same way; without them GDAL hits /vsis3/ with no
-            # AWS env vars and ASF rejects the request.
+            # When S3 direct is on, the domain function expects callables that fetch ASF STS
+            # credentials and broadcast them to the cluster (the Prefect flow wires these the same
+            # way); without them GDAL hits /vsis3/ with no AWS env vars and ASF rejects it.
             s1_result = ingest_s1_roi_sar(
                 roi_zarr_path=roi_path,
                 start_date=start_date,
@@ -161,9 +154,9 @@ def _run_inference_and_assemble(
     output_bucket = paths.outputs
 
     time_window = parse_time_window(time_window_end)
-    # A full checkpoint URL/path (e.g. a HuggingFace `resolve/main` link) wins;
-    # otherwise derive `{checkpoint_dir or {inputs}/models}/{canonical filename}`.
-    # Remote URIs (s3://, https://, …) are downloaded and cached by the actor.
+    # A full checkpoint URL/path (e.g. a HuggingFace `resolve/main` link) wins; otherwise derive
+    # `{checkpoint_dir or {inputs}/models}/{canonical filename}`. Remote URIs (s3://, https://, …)
+    # are downloaded and cached by the actor.
     if checkpoint_url:
         checkpoint_path = checkpoint_url
     else:
@@ -173,21 +166,18 @@ def _run_inference_and_assemble(
     mosaic_base = paths.store_for(roi_name, "reflectance").rsplit("/", 1)[0]
     staging_base = f"{output_bucket.rstrip('/')}/staging"
 
-    # Probe for available SAR stores before dispatching inference; if s1_orbit="both"
-    # is requested but only one orbit was ingested, fall back gracefully.
+    # Probe for available SAR stores before dispatching inference; if s1_orbit="both" is requested
+    # but only one orbit was ingested, fall back gracefully.
     #
-    # Radar is DEMANDED here, matching the single-cell flows: this runner exists to fill
-    # one named ROI on one machine, so no radar at all is far more likely to be a broken
-    # ingest than genuinely radar-free terrain, and the operator should be told.
-    #
-    # THERE IS NO ESCAPE HATCH, deliberately, and ``s1_orbit: none`` in the YAML is not
-    # one: it is refused here even though ``_run_ingest`` accepts it and writes
-    # reflectance alone. Honouring it would let a run that demanded radar publish
-    # optical-only embeddings and report success, which is the outcome ``require_s1``
-    # exists to prevent — pinned by ``test_asking_for_no_radar_while_demanding_radar_is
-    # _refused``. Radar-free land is filled through the campaign flows, which pass the
-    # resolved orbit back in with radar allowed. (An earlier version of this comment
-    # said a caller "passes s1_orbit explicitly"; that was never true of this runner.)
+    # Radar is DEMANDED here, matching the single-cell flows: this runner fills one named ROI on
+    # one machine, so no radar at all is far more likely to be a broken ingest than genuinely
+    # radar-free terrain, and the operator should be told. THERE IS NO ESCAPE HATCH, deliberately,
+    # and ``s1_orbit: none`` in the YAML is not one — it is refused here even though
+    # ``_run_ingest`` accepts it and writes reflectance alone, because honouring it would let a run
+    # that demanded radar publish optical-only embeddings and report success, the outcome
+    # ``require_s1`` exists to prevent (pinned by
+    # ``test_asking_for_no_radar_while_demanding_radar_is_refused``). Radar-free land is filled
+    # through the campaign flows, which pass the resolved orbit back in with radar allowed.
     effective_orbit = resolve_s1_orbit(mosaic_base, s1_orbit, allow_none=False)
     config = build_inference_config(
         s1_orbit=effective_orbit,
@@ -298,13 +288,11 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
             device: auto            # "auto" | "cpu" | "cuda"
             storage_options: null
 
-        skip_inference: When True, stop after ingestion. Useful for
-            iterating on the ingest path without paying CPU inference
-            cost.
+        skip_inference: When True, stop after ingestion. Useful for iterating on the ingest path
+            without paying CPU inference cost.
 
     Returns:
-        Final assembly summary dict when inference + assembly run,
-        else ``None``.
+        Final assembly summary dict when inference + assembly run, else ``None``.
     """
     cfg = yaml.safe_load(config_path.read_text())
     log = logging.getLogger("tessera_embeddings.plain")
@@ -348,9 +336,9 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         n_workers=cfg.get("n_workers", 2),
         log=log,
         storage_options=cfg.get("storage_options"),
-        # The default in the domain layer is True (S3 direct from us-west-2).
-        # On a laptop outside us-west-2, default to CloudFront-signed HTTPS so
-        # the quickstart works without ASF S3 STS credentials.
+        # The domain-layer default is True (S3 direct from us-west-2). On a laptop outside
+        # us-west-2, default to CloudFront-signed HTTPS so the quickstart works without ASF
+        # S3 STS credentials.
         s1_use_s3_direct=cfg.get("s1_use_s3_direct", False),
     )
 

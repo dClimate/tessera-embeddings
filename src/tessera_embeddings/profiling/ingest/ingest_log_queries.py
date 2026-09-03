@@ -1,41 +1,36 @@
 """Run-scoped CloudWatch Logs Insights queries over an ingest run.
 
-The ``watch_scheduler`` tool answers "is the *scheduler* saturated?". This tool
-answers the other half — "is the bottleneck the scheduler, or something
-external?" — by grepping across the thousands of Dask worker streams at once.
-Each named query is parameterized only by the run's time window + log group
-(nothing hard-coded per run) and returns JSON rows, so the same pack works for
+The ``watch_scheduler`` tool answers "is the *scheduler* saturated?". This one answers the other
+half — "is the bottleneck the scheduler, or something external?" — by grepping across the
+thousands of Dask worker streams at once. Each named query is parameterized only by the run's time
+window + log group (nothing hard-coded per run) and returns JSON rows, so the same pack works for
 any ingest on any account.
 
 The patterns key off real log markers in the ingest path:
 
-- **HTTP catalog retries** — ``tessera_embeddings.ingest._http`` logs every
-  retry as ``<service> retry: <method> <url> — HTTP <status>`` (service is
-  ``CMR`` or ``STAC``); ``status_forcelist`` is (429, 500, 502, 503, 504), so
-  429 throttling and 503s from the catalog both surface here, attributable to
-  CMR vs earth-search/element84 by service and host.
-- **Store-write retries** — both ``ingest/s1_roi.py`` and ``ingest/s2_roi.py``
-  wrap ``write_dataset`` in tenacity with ``before_sleep_log``
-  (``Retrying ... as it raised ...``), so this measures icechunk/GDAL write
-  pressure across both sensors.
-- **S3 SlowDown** — 503s from the object store, keyed on the error code and
-  excluding catalog retry lines (which also carry ``HTTP 503``).
-- **Worker lifecycle** — distributed/nanny exit/kill/restart/removal counts by
-  category, to separate "workers dying" from "scheduler falling behind".
+- **HTTP catalog retries** — ``tessera_embeddings.ingest._http`` logs every retry as
+  ``<service> retry: <method> <url> — HTTP <status>`` (service is ``CMR`` or ``STAC``);
+  ``status_forcelist`` is (429, 500, 502, 503, 504), so 429 throttling and catalog 503s both
+  surface here, attributable to CMR vs earth-search/element84 by service and host.
+- **Store-write retries** — both ``ingest/s1_roi.py`` and ``ingest/s2_roi.py`` wrap
+  ``write_dataset`` in tenacity with ``before_sleep_log`` (``Retrying ... as it raised ...``), so
+  this measures icechunk/GDAL write pressure across both sensors.
+- **S3 SlowDown** — 503s from the object store, keyed on the error code and excluding catalog
+  retry lines (which also carry ``HTTP 503``).
+- **Worker lifecycle** — distributed/nanny exit/kill/restart/removal counts by category, to
+  separate "workers dying" from "scheduler falling behind".
 
-Counting note: **these counts are sound; do not "correct" them.** Flow-runner
-containers duplicated every log line for a period (two stdout handlers — fixed in
-``config/environment.py``), which invites the inference that line counts here are
-inflated 2x. Measured 2026-07-25, they are not: these queries count lines in the
-Dask **worker** streams, and ``watch_scheduler`` parses the **scheduler** stream —
-both launched by dask-cloudprovider with ``distributed``'s own logging, verified
-single-delivery. Only ``…-flow-runner/…`` streams were affected, and nothing here
-reads those. Halving these figures would corrupt valid measurements.
+Counting note: **these counts are sound; do not "correct" them.** Flow-runner containers
+duplicated every log line for a period (two stdout handlers, fixed in ``config/environment.py``),
+which invites the inference that line counts here are inflated 2x. Measured 2026-07-25, they are
+not: these queries count lines in the Dask **worker** streams while ``watch_scheduler`` parses the
+**scheduler** stream, both launched by dask-cloudprovider with ``distributed``'s own logging and
+verified single-delivery. Only ``…-flow-runner/…`` streams were affected, and nothing here reads
+those. Halving these figures would corrupt valid measurements.
 
-Known gap: **ASF granule downloads are not separately instrumented.** Nothing in
-the download path emits a stable retry marker today, so external download
-throttling is not directly observable here — it would show up indirectly as
-worker errors or stalled batches. Adding a marker to the download path is a
+Known gap: **ASF granule downloads are not separately instrumented.** Nothing in the download path
+emits a stable retry marker today, so external download throttling is not directly observable here
+— it shows up indirectly as worker errors or stalled batches. Adding a marker there is a
 follow-up, not something this query pack can infer.
 
 Usage::
@@ -45,10 +40,10 @@ Usage::
     te-ingest-log-queries ... --query http_retries_by_service
     te-ingest-log-queries --list    # names + descriptions
 
-Only needs CloudWatch Logs read access, resolved from the ambient AWS credential
-chain unless ``--profile`` names one. The log group is shared across ingest runs
-— scope the window tightly to the run of interest. A query that cannot be
-answered records ``rows: null`` and never aborts the others.
+Only needs CloudWatch Logs read access, resolved from the ambient AWS credential chain unless
+``--profile`` names one. The log group is shared across ingest runs — scope the window tightly to
+the run of interest. A query that cannot be answered records ``rows: null`` and never aborts the
+others.
 """
 
 from __future__ import annotations
@@ -61,8 +56,8 @@ import boto3
 from tessera_embeddings.profiling._cloudwatch import insights_query, iso, parse_ts
 from tessera_embeddings.profiling.ingest import DEFAULT_INGEST_LOG_GROUP
 
-# name -> (description, Insights query string). The run window + log group are
-# passed to start_query separately, so the query strings carry no per-run state.
+# name -> (description, Insights query string). The run window + log group are passed to
+# start_query separately, so the query strings carry no per-run state.
 QUERIES: dict[str, tuple[str, str]] = {
     "date_stage_timings": (
         "Per-date stage decomposition (build / gate / write) from the ingest's "
@@ -153,12 +148,11 @@ QUERIES: dict[str, tuple[str, str]] = {
         "Worker lifecycle counts by CATEGORY — separates 'workers dying' "
         "(exit/kill/restart/removal) from a scheduler that is merely behind. "
         "Returns one row of fixed columns.",
-        # Counted with per-category boolean flags summed into fixed columns rather
-        # than `parse ... | stats by event`: the lifecycle markers embed variable
-        # text (a PID in "Worker process 1234 exited", an address in "Nanny at
-        # 'tcp://...' restarting"), so capturing the match would group by that
-        # text and yield one bucket per worker — turning a restart storm into
-        # thousands of rows of 1 instead of a single visible count.
+        # Per-category boolean flags summed into fixed columns rather than
+        # `parse ... | stats by event`: the lifecycle markers embed variable text (a PID in
+        # "Worker process 1234 exited", an address in "Nanny at 'tcp://...' restarting"), so
+        # capturing the match would group by that text and yield one bucket per worker — turning
+        # a restart storm into thousands of rows of 1 instead of a single visible count.
         r"fields"
         r" (@message like /Worker process .* exited/) as f_proc_exited,"
         r" (@message like /Killed worker/) as f_killed,"
@@ -201,11 +195,10 @@ def run_queries(
 ) -> dict:
     """Run the named queries and return a JSON-able dict keyed by query name.
 
-    A query that fails hard (rejected/denied/timed out) records ``rows: null``; a
-    query that simply matched nothing records ``rows: []`` — the caller can tell
-    "couldn't ask" from "asked, nothing there". One failing query never aborts the
-    rest: the whole point is to collect whatever IS available for the dossier, so
-    every query is attempted and reported independently (see ``_insights``).
+    A query that fails hard (rejected/denied/timed out) records ``rows: null``; one that simply
+    matched nothing records ``rows: []`` — the caller can tell "couldn't ask" from "asked, nothing
+    there". One failing query never aborts the rest: the point is to collect whatever IS available
+    for the dossier, so every query is attempted and reported independently (see ``_insights``).
     ``truncated`` flags a result that hit the Insights row cap.
     """
     logs = session.client("logs")

@@ -1,21 +1,19 @@
 """Cancel a flow's child deployment runs when the parent is cancelled or crashes.
 
-A flow that dispatches work with ``run_deployment``/``arun_deployment`` gets an
-independently scheduled child run. Killing the parent does not touch it: the child
-keeps going, keeps writing, and keeps its Dask or Ray fleet billing. Prefect's
-subflow link does not help here either — several of these dispatches happen from
-worker threads, so there is no parent-run relationship to walk.
+A flow that dispatches work with ``run_deployment``/``arun_deployment`` gets an independently
+scheduled child run. Killing the parent does not touch it: the child keeps going, keeps writing,
+and keeps its Dask or Ray fleet billing. Prefect's subflow link does not help either — several of
+these dispatches happen from worker threads, so there is no parent-run relationship to walk.
 
-The mechanism is a deterministic TAG derived from the parent's flow-run id alone.
-Prefect runs terminal hooks in a FRESH import of the module after killing the flow
-process, so nothing in memory survives to tell the hook what it started; a tag it
-can re-derive from its ``flow_run`` argument is the only thing that does. The
-parent stamps the tag on every child it dispatches, and the hook asks the server
-for live runs carrying it.
+The mechanism is a deterministic TAG derived from the parent's flow-run id alone. Prefect runs
+terminal hooks in a FRESH import of the module after killing the flow process, so nothing in
+memory survives to tell the hook what it started; a tag it can re-derive from its ``flow_run``
+argument is the only thing that does. The parent stamps the tag on every child it dispatches, and
+the hook asks the server for live runs carrying it.
 
-Register the hook as BOTH ``on_cancellation`` and ``on_crashed`` — a crashed
-parent orphans children exactly like a cancelled one — and keep it idempotent:
-cancelling a parent and a child together delivers the transition twice.
+Register the hook as BOTH ``on_cancellation`` and ``on_crashed`` — a crashed parent orphans
+children exactly like a cancelled one — and keep it idempotent: cancelling a parent and a child
+together delivers the transition twice.
 """
 
 from __future__ import annotations
@@ -27,28 +25,28 @@ from typing import Any
 from prefect.client.orchestration import get_client
 from prefect.states import Cancelling
 
-#: Runs fetched per page when sweeping children by tag. Prefect's server-side default
-#: is 200; asking explicitly is what makes "a short page means the last page" true.
+#: Runs fetched per page when sweeping children by tag. Prefect's server-side default is 200;
+#: asking explicitly is what makes "a short page means the last page" true.
 _PAGE = 200
 
-#: How long a cancelled run is given to reach a terminal state before a caller stops
-#: waiting on it. Generous: Prefect's cancellation is asynchronous — the server marks the
-#: run Cancelling and a worker acts on it — and a mid-write child finishes its commit
-#: first. Waiting is cheap next to the alternative, which is two writers on one prefix.
+#: How long a cancelled run is given to reach a terminal state before a caller stops waiting on it.
+#: Generous: Prefect's cancellation is asynchronous — the server marks the run Cancelling and a
+#: worker acts on it — and a mid-write child finishes its commit first. Waiting is cheap next to
+#: the alternative, which is two writers on one prefix.
 #:
-#: Lives here rather than beside either caller because two layers spend it, one per level
-#: of the run tree: a parent waits this long for its own children before it goes terminal,
-#: and anything re-dispatching over that parent's work must allow the SAME budget again
-#: for the level below, whose cancellation nothing waited for. One constant, so the two
-#: cannot drift into disagreeing about how long an asynchronous cancellation takes.
+#: Lives here rather than beside either caller because two layers spend it, one per level of the
+#: run tree: a parent waits this long for its own children before it goes terminal, and anything
+#: re-dispatching over that parent's work must allow the SAME budget again for the level below,
+#: whose cancellation nothing waited for. One constant, so the two cannot disagree about how long
+#: an asynchronous cancellation takes.
 CANCELLATION_CONFIRM_S = 300.0
 
 
 def child_run_tag(prefix: str, flow_run_id: object) -> str | None:
     """The tag a parent stamps on its children, or ``None`` outside a flow run.
 
-    ``None`` means there is no id to derive from (a direct ``.fn`` call in tests),
-    in which case children simply go untagged and the hook has nothing to sweep.
+    ``None`` means there is no id to derive from (a direct ``.fn`` call in tests), in which case
+    children simply go untagged and the hook has nothing to sweep.
     """
     return f"{prefix}:{flow_run_id}" if flow_run_id else None
 
@@ -56,17 +54,16 @@ def child_run_tag(prefix: str, flow_run_id: object) -> str | None:
 def make_child_cancel_hook(prefix: str, what: str) -> Callable[..., None]:
     """A cancellation/crash hook that cancels live children tagged with ``prefix``.
 
-    ``what`` names the children in log messages ("child ingest run", "campaign
-    child run") — the operator reading a cancelled run's logs needs to know which
-    fleet was swept.
+    ``what`` names the children in log messages ("child ingest run", "campaign child run") — the
+    operator reading a cancelled run's logs needs to know which fleet was swept.
 
-    Returned as ``Callable[..., None]`` rather than a concrete three-argument type:
-    Prefect's ``FlowStateHook`` is declared with ``*args, **kwargs``, and a precise
-    signature here fails to match it at the registration site.
+    Returned as ``Callable[..., None]`` rather than a concrete three-argument type: Prefect's
+    ``FlowStateHook`` is declared with ``*args, **kwargs``, and a precise signature here fails to
+    match it at the registration site.
 
-    Every failure here is logged and swallowed. This runs while the flow is already
-    terminating, and a hook that raises would mask the flow's own terminal state;
-    the log line names the tag so the sweep can be finished by hand.
+    Every failure here is logged and swallowed. This runs while the flow is already terminating,
+    and a hook that raises would mask the flow's own terminal state; the log line names the tag so
+    the sweep can be finished by hand.
     """
 
     def _hook(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
@@ -79,16 +76,14 @@ def make_child_cancel_hook(prefix: str, what: str) -> Callable[..., None]:
             from prefect.client.schemas.filters import FlowRunFilter, FlowRunFilterTags
 
             with get_client(sync_client=True) as client:
-                # PAGE. `limit=None` takes the server default (200), and a campaign
-                # dispatches one child per (zone, year) — thousands over its life, all
-                # carrying this tag long after they finish. A live child outside the
-                # first page would never be cancelled, and its Ray fleet would keep
-                # billing and keep writing the mosaic a retry is about to rebuild.
-                # Filtering to live states server-side would be the cheaper query, but
-                # the state filter is what decides which runs a page contains, and
-                # getting the terminal-state set wrong here fails silently in exactly
-                # the same way — so page over everything and judge finality locally,
-                # where `is_final()` is the authority.
+                # PAGE. `limit=None` takes the server default (200), and a campaign dispatches one
+                # child per (zone, year) — thousands over its life, all carrying this tag long
+                # after they finish. A live child outside the first page would never be cancelled,
+                # and its Ray fleet would keep billing and keep writing the mosaic a retry is
+                # about to rebuild. Filtering to live states server-side would be cheaper, but the
+                # state filter decides which runs a page contains, so getting the terminal-state
+                # set wrong fails silently in exactly the same way — page over everything and
+                # judge finality locally, where `is_final()` is the authority.
                 live: list[Any] = []
                 offset = 0
                 while True:

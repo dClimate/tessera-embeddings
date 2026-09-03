@@ -1,19 +1,14 @@
 """AWS-backed Dask cluster provisioning (Fargate or hybrid EC2 scheduler).
 
-The :func:`ecs_cluster` context manager constructs a Dask
-:class:`FargateCluster` (or :class:`ECSCluster` with an EC2 scheduler)
-from environment variables that are expected to be injected by the
-orchestrator's job template (the Prefect work pool template, in our
-reference deployment). No Prefect imports — the orchestration layer
-binds this to Prefect via a thin task shell in
-``orchestration/prefect/``.
+The :func:`ecs_cluster` context manager constructs a Dask :class:`FargateCluster` (or
+:class:`ECSCluster` with an EC2 scheduler) from environment variables injected by the
+orchestrator's job template. No Prefect imports — the orchestration layer binds this to
+Prefect via a thin task shell in ``orchestration/prefect/``.
 
 # Environment-variable contract
 
-The provider reads the following env vars at construction time. The
-expected source is the orchestrator's job template (``env`` block on
-the work-pool definition); a deployment is responsible for setting
-them. They are not hardcoded in source.
+Read at construction time, from the orchestrator's job template (``env`` block on the
+work-pool definition). A deployment must set them; they are not hardcoded in source.
 
 | Variable | Purpose |
 |---|---|
@@ -29,12 +24,10 @@ them. They are not hardcoded in source.
 | ``EC2_SCHEDULER_SUBNET`` | Optional subnet override when ``ec2_scheduler=True`` |
 | ``AWS_RETRY_MODE`` / ``AWS_MAX_ATTEMPTS`` | Botocore retry policy for provisioning (defaulted, not required) |
 
-The last row differs from the rest: :func:`apply_provisioning_retry_defaults`
-supplies it, so a deployment need not, and a value already in the environment
-wins over the default.
+The last row differs: :func:`apply_provisioning_retry_defaults` supplies it, so a deployment
+need not, and a value already in the environment wins over the default.
 
-This contract is documented for the open-source release in
-``providers/aws/gotchas.md``.
+The contract is also documented in ``providers/aws/gotchas.md``.
 """
 
 from __future__ import annotations
@@ -70,56 +63,39 @@ from tenacity import (
 )
 from tornado.ioloop import PeriodicCallback
 
-# Default Fargate task sizes for ingest workloads. Callers can override
-# per-call via ``ecs_cluster``'s ``worker_cpu`` / ``worker_mem`` arguments.
+# Default Fargate task sizes for ingest workloads; ``ecs_cluster``'s ``worker_cpu`` /
+# ``worker_mem`` override per call.
 #
-# Memory is sized for the ONE worker that runs the ingest task, not for the average
-# one. That worker holds the STAC query's retained items — the month being processed
-# plus the month prefetched behind it (``ingest.stac.stream_stac_months``) — on top of
-# its share of the per-date graph. Every worker gets the same size, so this is paid
-# across the whole fleet to accommodate one of them.
+# Memory is sized for the ONE worker running the ingest task, not the average one: it holds
+# the STAC query's retained items — the month being processed plus the month prefetched
+# behind it (``ingest.stac.stream_stac_months``) — on top of its share of the per-date graph.
+# Every worker gets the same size, so the whole fleet pays to accommodate one of them.
 #
-# RAISING THIS IS A WEAK LEVER against the UNMANAGED baseline: a worker settles at
-# roughly 72% of whatever limit it is given — caches and allocator arenas expand into
-# whatever space exists — while Dask pauses at 80%, so the steady-state margin is ~8%
-# of the limit at ANY size. What protects the worker is keeping its PEAK close to that
-# steady ceiling, i.e. not retaining more per date than necessary.
+# THE RULE: leave that driver worker's peak a comfortable multiple below Dask's PAUSE
+# threshold — not below the container limit, and not below the spill threshold (spilling the
+# retained items costs nothing; the spilled bytes are exactly the prefetched month nobody
+# reads until the boundary). Spilling is NOT the protection: with unmanaged memory Dask has
+# nothing it may evict, and a paused worker never resumes, so work waiting on data it holds
+# can never complete and the run DEADLOCKS with the rest of the fleet idle. That observed
+# failure is what this size prevents, which is why the margin is a multiple rather than a few
+# hundred MiB — undersizing costs a whole run, not a retry.
 #
-# The size is set by ONE rule: leave the driver worker's peak a comfortable multiple
-# below the PAUSE threshold. Not below the container limit, and not below the spill
-# threshold — spilling the retained items was measured to cost nothing, because the
-# spilled bytes are precisely the prefetched month nobody reads until the boundary.
+# Raising the limit is a WEAK lever: a worker settles at ~72% of whatever it is given (caches
+# and allocator arenas expand into the space) while Dask pauses at 80%, leaving ~8% margin at
+# ANY size. Demand scales with a date's window count — the overlapped write holds every
+# window of a date concurrently — and that count varies by year, so the size follows the
+# asymptote of a long run over the densest dates. Measured peaks and the margin chosen
+# against them: context_docs/design/ingest_optimization_campaign_2026_07.md.
 #
-# Spilling is NOT the protection: Dask has nothing it is allowed to evict when the
-# memory is unmanaged. And a paused worker does not recover — work waiting on data it
-# holds can never complete, so the run DEADLOCKS with the rest of the fleet idle. That
-# is the observed failure this size exists to prevent, and it is why the margin is
-# stated as a multiple rather than a few hundred MiB: undersizing costs a whole run,
-# not a retry.
+# vCPU stays at 4: the Fargate quota counts vCPU, so doubling CPU would halve the workers a
+# cell can run. Valid pairings for 4 vCPU are 8192-30720 MiB in 1024 steps.
 #
-# A larger limit is a WEAK lever against that, per the 72% rule above — most of the
-# extra space becomes cache rather than margin. Pruning the retained items is what
-# actually moved the demand, but not far enough to make a smaller limit safe. The size
-# follows the asymptote of a LONG run over the DENSEST dates: the overlapped write holds
-# every window of a date concurrently, so demand scales with a date's window count, and
-# that count varies by year. Memory costs nothing in quota terms but it is not free in
-# dollars, and every worker in a cell pays it to accommodate one of them.
-#
-# See context_docs/design/ingest_optimization_campaign_2026_07.md for the measured
-# peaks and the margin this size was chosen against — deliberately not inlined here,
-# because a calibration goes stale while the rule above does not.
-#
-# The vCPU stays at 4 deliberately: the Fargate quota is counted in vCPU, so doubling
-# the CPU would halve the workers a cell can run. Valid pairings for 4 vCPU are
-# 8192-30720 MiB in 1024 steps.
-#
-# WHERE THESE ACTUALLY LAND depends on ``scheduler/worker_task_definition_arn``. Unset,
-# they size the definition this provider registers. SET — the campaign's configuration —
-# they reach only Dask's ``--memory-limit``, because dask_cloudprovider sends container
-# overrides alone and no task-level cpu/memory: the CONTAINER's size is whatever the
-# pinned definition registered. Raising this without raising that definition moves the
-# pause threshold ABOVE the container's hard limit, replacing a pause with an OOM kill.
-# The two must change together.
+# WHERE THESE LAND depends on ``scheduler/worker_task_definition_arn``. Unset, they size the
+# definition this provider registers. SET — the campaign's configuration — they reach only
+# Dask's ``--memory-limit``, because dask_cloudprovider sends container overrides alone and
+# no task-level cpu/memory, so the CONTAINER's size is whatever the pinned definition
+# registered. Raising this without raising that definition moves the pause threshold ABOVE
+# the container's hard limit, replacing a pause with an OOM kill. The two change together.
 DEFAULT_INGEST_WORKER_CPU = 4096
 DEFAULT_INGEST_WORKER_MEM = 24576
 
@@ -133,30 +109,28 @@ DEFAULT_CLOUDWATCH_LOG_GROUP = "/ecs/tessera/dask"
 #: Task-stream buffer for DIAGNOSTIC runs only.
 #:
 #: Dask's task stream is a bounded deque
-#: (``distributed.scheduler.dashboard.tasks.task-stream-length``, default 100,000). A
-#: performance report built from a capped stream holds only the run's TAIL, and dividing it
-#: by the run's date count understates packed task work — which put this campaign's packing
-#: ceiling at 1.60x when the true figure is ~2.8x. It survived review because the report's
-#: TOTAL rectangle count looks unremarkable once inter-worker transfers pad it.
+#: (``distributed.scheduler.dashboard.tasks.task-stream-length``, default 100,000). A report
+#: built from a capped stream holds only the run's TAIL, so dividing it by the run's date
+#: count understates packed task work — that put this campaign's packing ceiling at 1.60x
+#: against a true ~2.8x, and survived review because the report's TOTAL rectangle count looks
+#: unremarkable once inter-worker transfers pad it.
 #:
-#: At ~25k tasks per date, 100,000 covers about 4 dates; 3,000,000 covers a ~120-date run.
-#: Applied only when a performance report is requested: it is scheduler memory, and campaign
-#: runs neither need it nor should pay for it.
+#: At ~25k tasks per date, 100,000 covers ~4 dates and 3,000,000 covers a ~120-date run.
+#: Applied only when a report is requested: it is scheduler memory, which campaign runs
+#: neither need nor should pay for.
 DIAGNOSTIC_TASK_STREAM_LENGTH = 3_000_000
 
-# How often the scheduler logs its own resource usage. The default scheduler
-# logs are event-driven (worker register/connect) and say nothing about the
-# scheduler process's own load, so a slow event loop only shows up as the
-# after-the-fact "unresponsive for Ns" warning. A steady heartbeat makes the
-# run-up to that visible.
+# Scheduler self-profiling interval. The default scheduler logs are event-driven (worker
+# register/connect) and say nothing about the scheduler process's own load, so a slow event
+# loop surfaces only as the after-the-fact "unresponsive for Ns" warning. A steady heartbeat
+# makes the run-up visible.
 DEFAULT_SCHEDULER_PROFILE_INTERVAL_S = 30.0
 
-# Under-duress stack sampling. When the scheduler process crosses either
-# threshold, a short-lived background thread snapshots ``sys._current_frames()``
-# a few times and logs a collapsed tally of the busiest code locations — the
-# py-spy substitute for Fargate, where process-attach (SYS_PTRACE) isn't
-# granted. It attributes a stall to graph construction vs comms vs work-stealing
-# vs GC. Runs OFF the event loop, so it never adds to the lag it measures.
+# Under-duress stack sampling. Crossing either threshold spawns a short-lived background
+# thread that snapshots ``sys._current_frames()`` a few times and logs a collapsed tally of
+# the busiest code locations — the py-spy substitute for Fargate, which does not grant
+# process-attach (SYS_PTRACE). It attributes a stall to graph construction vs comms vs
+# work-stealing vs GC, and runs OFF the event loop so it never adds to the lag it measures.
 DEFAULT_STACK_TRIGGER_CPU_PCT = 90.0
 DEFAULT_STACK_TRIGGER_LAG_S = 3.0
 DEFAULT_STACK_SAMPLES = 5
@@ -166,49 +140,40 @@ DEFAULT_STACK_SAMPLE_GAP_S = 0.2
 class SchedulerResourceLogger(SchedulerPlugin):
     """Log the scheduler *process's own* health on a fixed interval.
 
-    The cluster dashboard surfaces aggregate worker load, but stress on the
-    scheduler itself — the single event-loop process that builds every graph
-    and routes every task — is otherwise invisible until it stalls and emits
-    the built-in ``Event loop was unresponsive for Ns`` warning, or the ECS
-    task is OOM-killed with no warning at all. This plugin runs a
-    :class:`~tornado.ioloop.PeriodicCallback` on the scheduler's event loop and
-    logs the signals that precede those failures to the ``dask-scheduler``
-    stream, so the run-up is traceable rather than only the aftermath.
+    The dashboard surfaces aggregate worker load, but stress on the scheduler itself — the
+    single event-loop process that builds every graph and routes every task — stays invisible
+    until it stalls and emits ``Event loop was unresponsive for Ns``, or the ECS task is
+    OOM-killed with no warning at all. This plugin runs a
+    :class:`~tornado.ioloop.PeriodicCallback` on the scheduler's event loop and logs the
+    signals that precede those failures to the ``dask-scheduler`` stream.
 
     Each line reports:
 
-    - ``cpu`` — scheduler process CPU %, averaged over the interval (can exceed
-      100% across threads). Sustained ~100% on the GIL-bound loop is the
-      precursor to event-loop stalls.
-    - ``rss`` / ``mem`` — process resident memory, absolute and as a percent of
-      the container memory limit. The OOM predictor; the whole reason the
-      scheduler task is sized at all.
-    - ``lag`` — event-loop lag: how late this callback fired versus its
-      schedule. The direct, leading measure of the "unresponsive" warning.
-    - ``fds`` / ``threads`` — open file descriptors and thread count, to catch
-      connection/fd leaks and thread blow-ups.
-    - ``workers`` / ``tasks`` — cluster size and total tracked tasks, with a
-      breakdown of tasks in flight (``processing``) and stuck waiting
-      (``no-worker``) — a rising backlog signals the scheduler falling behind.
-    - ``wmem`` / ``wmanaged`` / ``wspill`` / ``wmax`` — FLEET memory, summed
-      across workers from the per-worker state the scheduler already tracks, plus
-      the hottest single worker (a sum alone cannot distinguish an even fleet from
-      one worker holding the graph). Deliberately not scheduler health: worker
-      memory is a second failure mode, independent of every signal above, and a
-      run can die of it with the scheduler entirely nominal. ``wspill`` is the
-      leading indicator — spill means the graph no longer fits the fleet, and it
-      precedes worker kills rather than following them. A fleet that fits is the
-      precondition for the scheduler metrics to mean anything at all.
+    - ``cpu`` — scheduler process CPU %, averaged over the interval (can exceed 100% across
+      threads). Sustained ~100% on the GIL-bound loop precedes event-loop stalls.
+    - ``rss`` / ``mem`` — process resident memory, absolute and as a percent of the container
+      limit. The OOM predictor, and the whole reason the scheduler task is sized at all.
+    - ``lag`` — how late this callback fired versus its schedule: the direct, leading measure
+      of the "unresponsive" warning.
+    - ``fds`` / ``threads`` — to catch connection/fd leaks and thread blow-ups.
+    - ``workers`` / ``tasks`` — cluster size and tracked tasks, split into in-flight
+      (``processing``) and stuck (``no-worker``); a rising backlog means the scheduler is
+      falling behind.
+    - ``wmem`` / ``wmanaged`` / ``wspill`` / ``wmax`` — FLEET memory, summed from per-worker
+      state the scheduler already tracks, plus the hottest single worker (a sum alone cannot
+      tell an even fleet from one worker holding the graph). Deliberately not scheduler
+      health: worker memory is an independent second failure mode, and a run can die of it
+      with the scheduler entirely nominal. ``wspill`` leads — spill means the graph no longer
+      fits the fleet, and precedes worker kills rather than following them. A fleet that fits
+      is the precondition for the scheduler metrics to mean anything.
 
-    When ``cpu`` or ``lag`` crosses the stack-sampling thresholds, a one-shot
-    background thread additionally logs a ``scheduler stack sample`` line: a
-    collapsed tally of the busiest code locations across the process's threads,
-    to attribute the stall (graph build vs comms vs stealing vs GC). It is
-    single-flight and runs off the event loop, so it never worsens the lag it
-    measures; pass ``stack_sampling=False`` to disable it entirely.
+    When ``cpu`` or ``lag`` crosses the stack-sampling thresholds, a one-shot background
+    thread also logs a ``scheduler stack sample``: a collapsed tally of the busiest code
+    locations, to attribute the stall. Single-flight and off the event loop, so it never
+    worsens the lag it measures; ``stack_sampling=False`` disables it.
 
-    Instantiated on the client but pickled to and run inside the scheduler
-    process, so ``psutil.Process()`` measures the scheduler, not the client.
+    Instantiated on the client but pickled to and run inside the scheduler process, so
+    ``psutil.Process()`` measures the scheduler, not the client.
     """
 
     name = "scheduler-resource-logger"
@@ -235,35 +200,31 @@ class SchedulerResourceLogger(SchedulerPlugin):
         self._stack_trigger_lag_s = stack_trigger_lag_s
         self._stack_samples = stack_samples
         self._stack_sample_gap_s = stack_sample_gap_s
-        # Created in start(), NOT here: this object is pickled to the remote
-        # scheduler by Client.register_plugin, and a threading.Event owns a
-        # _thread.lock that neither pickle nor cloudpickle can serialize. Building
-        # it in __init__ makes registration raise — which ecs_cluster swallows as
-        # best-effort, silently leaving the run with no heartbeat at all.
+        # Created in start(), NOT here: Client.register_plugin pickles this object to the
+        # remote scheduler, and a threading.Event owns a _thread.lock that neither pickle nor
+        # cloudpickle can serialize. Building it in __init__ makes registration raise — which
+        # ecs_cluster swallows as best-effort, silently leaving the run with no heartbeat.
         self._sampler_active: threading.Event | None = None
-        # Likewise recorded in start(): the id of the thread the scheduler's event
-        # loop runs on, which is the thread `lag` measures and the one the stack
-        # sampler reports separately (see _sample_stacks_worker).
+        # Likewise recorded in start(): the scheduler's event-loop thread id — the thread
+        # `lag` measures and the one the stack sampler reports separately.
         self._loop_tid: int | None = None
 
     async def start(self, scheduler: Scheduler) -> None:
         """Bind to the scheduler and start the periodic probe (called in-process).
 
-        Async to match :class:`SchedulerPlugin`'s declared signature; the body
-        is non-blocking (no ``await``) — it just wires up the PeriodicCallback.
+        Async to match :class:`SchedulerPlugin`'s signature; the body is non-blocking.
         """
         self._scheduler = scheduler
         # Safe here: start() runs in the scheduler process, after unpickling.
         self._sampler_active = threading.Event()
-        # This coroutine is awaited ON the scheduler's event loop, so the current
-        # thread IS the loop thread. Recording it beats inferring it later.
+        # Awaited ON the scheduler's event loop, so the current thread IS the loop thread.
         self._loop_tid = threading.get_ident()
         self._proc = psutil.Process()
-        # Prime cpu_percent so the first real reading is an interval delta
-        # rather than the meaningless 0.0 the first call always returns.
+        # Prime cpu_percent so the first real reading is an interval delta rather than the
+        # meaningless 0.0 the first call always returns.
         self._proc.cpu_percent(None)
-        # Container memory ceiling (cgroup limit on Fargate). psutil reads the
-        # cgroup-aware total inside a container; fall back to None if unknown.
+        # Container memory ceiling (cgroup limit on Fargate); psutil reads the cgroup-aware
+        # total inside a container. None when unknown.
         try:
             self._mem_limit_bytes = psutil.virtual_memory().total
         except psutil.Error:
@@ -284,13 +245,12 @@ class SchedulerResourceLogger(SchedulerPlugin):
     def _worker_memory(sched: Scheduler) -> tuple[float, float, float, float]:
         """Fleet memory as ``(process, managed, spilled, hottest_process)`` GiB.
 
-        Read from :class:`distributed.scheduler.MemoryState` on each worker, which
-        the scheduler maintains anyway — no worker-side agent, no extra comms.
+        Read from :class:`distributed.scheduler.MemoryState` on each worker, which the
+        scheduler maintains anyway — no worker-side agent, no extra comms.
 
-        Isolated in its own guard rather than sharing ``_log_usage``'s: a change
-        in ``WorkerState`` internals must cost the four fleet numbers, not the
-        whole heartbeat. Returns NaNs (rendered ``nan``, which the profiler parses
-        as unknown) when the scheduler ref is absent or the fleet is empty.
+        Guarded separately from ``_log_usage``: a change in ``WorkerState`` internals must
+        cost the four fleet numbers, not the whole heartbeat. Returns NaNs (rendered ``nan``,
+        which the profiler parses as unknown) when the scheduler ref is absent.
         """
         try:
             mems = [w.memory for w in sched.workers.values()]
@@ -314,9 +274,9 @@ class SchedulerResourceLogger(SchedulerPlugin):
             return
         log = logging.getLogger("distributed.scheduler")
         try:
-            # Event-loop lag: how far past the scheduled fire time we actually
-            # ran. Large values mean the loop was blocked (GIL-bound work, big
-            # graph) — the same condition behind the "unresponsive" warnings.
+            # Event-loop lag: how far past the scheduled fire time this ran. Large values
+            # mean the loop was blocked (GIL-bound work, big graph) — the same condition
+            # behind the "unresponsive" warnings.
             now = sched.loop.time() if sched is not None else None
             lag_s = 0.0
             if now is not None and self._expected_next_s is not None:
@@ -382,26 +342,22 @@ class SchedulerResourceLogger(SchedulerPlugin):
     def _sample_stacks_worker(self, cpu_pct: float, lag_s: float) -> None:
         """Snapshot thread stacks a few times and log a collapsed leaf-frame tally.
 
-        Reports the **event-loop thread separately** from the rest, because a
-        single global tally is misleading: idle threads park on one unchanging
-        wait frame and so accumulate a high count, while the genuinely busy loop
-        spreads its samples across many frames and can fall off the end of the
-        list — the exact opposite of what we need to attribute a stall. The loop
-        thread is the one that matters here (it is what ``lag`` measures), so its
-        frames are tallied and reported on their own.
+        Reports the **event-loop thread separately** from the rest: in a single global tally
+        idle threads park on one unchanging wait frame and accumulate a high count, while the
+        genuinely busy loop spreads its samples across many frames and can fall off the end
+        of the list — the opposite of what attributing a stall needs. The loop thread is what
+        ``lag`` measures, so its frames get their own tally.
 
-        This sampler's own thread is excluded — it is guaranteed to be running
-        (it is doing the sampling) and would otherwise take a slot in every
-        report.
+        This sampler's own thread is excluded; it is guaranteed to be running and would
+        otherwise take a slot in every report.
         """
         log = logging.getLogger("distributed.scheduler")
         try:
             me = threading.current_thread().ident
-            # Recorded by start() from the loop thread itself. Falling back to
-            # MainThread covers a probe driven without start() (tests) and matches
-            # where dask-cloudprovider's `dask-scheduler` entrypoint runs the loop;
-            # attributing the stall to the wrong thread would only mislabel which
-            # of the two tallies below is which, never crash.
+            # Recorded by start() from the loop thread itself. The MainThread fallback covers
+            # a probe driven without start() (tests) and matches where dask-cloudprovider's
+            # `dask-scheduler` entrypoint runs the loop; guessing wrong only mislabels which
+            # of the two tallies is which, never crashes.
             loop_tid = self._loop_tid if self._loop_tid is not None else threading.main_thread().ident
             names = {t.ident: t.name for t in threading.enumerate()}
             loop_counts: collections.Counter[str] = collections.Counter()
@@ -440,37 +396,31 @@ class SchedulerResourceLogger(SchedulerPlugin):
 def maybe_performance_report(
     scheduler_address: str,
     uri: str | None,
-    # Both call sites are Prefect flows, whose get_run_logger() returns a
-    # LoggerAdapter, not a Logger. Only .warning/.info are used, which both have.
+    # Both call sites are Prefect flows, whose get_run_logger() returns a LoggerAdapter, not
+    # a Logger. Only .warning/.info are used, which both have.
     log: logging.Logger | logging.LoggerAdapter[Any],
 ) -> Iterator[None]:
     """Optionally capture a Dask ``performance_report`` for the wrapped compute.
 
-    No-op when ``uri`` is falsy (the default), so normal runs pay nothing. When
-    set, it opens a short-lived client on ``scheduler_address`` — needed because
-    ``performance_report`` talks to the scheduler through the *current* client,
-    and the Prefect task runner owns a separate one — captures the
-    task-stream/profile/bandwidth HTML to a temp file, then uploads it to ``uri``
-    (any fsspec target). Intended for probe rungs, not the campaign (large graphs
-    make report assembly heavy).
+    No-op when ``uri`` is falsy (the default). When set, it opens a short-lived client on
+    ``scheduler_address`` — needed because ``performance_report`` talks to the scheduler
+    through the *current* client and the Prefect task runner owns a separate one — captures
+    the task-stream/profile/bandwidth HTML to a temp file, then uploads it to ``uri`` (any
+    fsspec target). For probe rungs, not the campaign: large graphs make assembly heavy.
 
-    **The diagnostics are fully isolated from the wrapped body**, because this is
-    an optional probe-only artifact that must never affect the ingest it observes.
-    Three failure paths are each contained:
+    **The diagnostics are fully isolated from the wrapped body** — an optional probe artifact
+    must never affect the ingest it observes. Three failure paths are contained:
 
     1. *Setup* (client connect, report start) — logged, then the body runs with no
-       diagnostics at all, rather than an unreachable scheduler dashboard
-       preventing the ingest from running.
-    2. *Rendering* (``performance_report.__exit__``, which builds the HTML and is
-       the expensive part) — logged. Left unguarded it would fail an ingest that
-       had already completed, and on a FAILING ingest it would propagate in place
-       of the body's exception, hiding the real error behind a diagnostics one.
-    3. *Upload* — logged. fsspec backends raise anything (botocore ClientError for
-       a denied PUT or missing bucket, credential errors), none of which subclass
-       OSError.
+       diagnostics, rather than an unreachable dashboard preventing the ingest.
+    2. *Rendering* (``performance_report.__exit__``, the expensive HTML build) — logged.
+       Unguarded it would fail an already-completed ingest, and on a FAILING one it would
+       propagate in place of the body's exception, hiding the real error.
+    3. *Upload* — logged. fsspec backends raise anything (botocore ClientError for a denied
+       PUT or missing bucket, credential errors), none of which subclass OSError.
 
-    The report is shipped whether or not the body succeeded: a failed at-scale
-    run is exactly when its task stream is most worth reading.
+    The report ships whether or not the body succeeded: a failed at-scale run is exactly when
+    its task stream is most worth reading.
     """
     if not uri:
         yield
@@ -492,8 +442,8 @@ def maybe_performance_report(
         try:
             yield
         finally:
-            # Nothing below may raise: that is what keeps a diagnostics artifact
-            # from failing a completed ingest or masking a failing one.
+            # Nothing below may raise: that keeps a diagnostics artifact from failing a
+            # completed ingest or masking a failing one.
             rendered = False
             try:
                 diagnostics.close()  # renders the HTML
@@ -509,40 +459,30 @@ def maybe_performance_report(
                     log.warning("failed to upload Dask performance report to %s: %s", uri, e)
 
 
-# Substrings of transient cluster-start failures worth retrying. All are ECS
-# races/limits that clear on their own, not configuration errors:
-#   * "not enough values to unpack" — dask-cloudprovider's Task._update_task
-#     (ecs.py) calls run_task then immediately describe_tasks on the returned
-#     ARN; when the ECS control plane hasn't caught up, describe_tasks returns
-#     no task and the ``[self.task] = ...`` unpack raises, wrapped by _start()
-#     as RuntimeError("Cluster failed to start: not enough values to unpack").
-#   * "RESOURCE:ENI" — ECS RunTask rejects placement before creating a task
-#     when the subnet's ENI/IP capacity is exhausted. dask-cloudprovider's
-#     Task.start (ecs.py) raises ``RuntimeError(response)`` with the whole
-#     run_task response when ``tasks`` is empty, and AWS reports that placement
-#     failure reason as ``RESOURCE:ENI`` in that response.
-#   * "Scheduler failed to start" — the scheduler Fargate task didn't reach
-#     RUNNING in time, typically ENI/IP exhaustion when many clusters launch in
-#     a burst (e.g. a fan-out ingest) and their interfaces haven't drained yet.
-#     NOTE: dask-cloudprovider raises this same generic string for *any* task
-#     that fails to reach RUNNING, including permanent misconfigurations (bad
-#     image/command). It is not distinguishable from the transient ENI case by
-#     message alone, so we treat it as retryable; the cost of a wrong guess is
-#     bounded (a permanent failure burns ~3 backed-off retries before surfacing
-#     the original error via reraise=True).
-# distributed's spec._start() calls _close() before re-raising, so a failed
-# scheduler task is torn down before the exception surfaces — a fresh
-# constructor on retry starts clean, with no orphaned task/ENI to leak.
-#   * Throttle codes — control-plane rate limits hit while the constructor
-#     provisions. Creating a cluster calls ECS (``ListAccountSettings``,
-#     ``RunTask``) and then polls EC2 (``DescribeNetworkInterfaces``) for the
-#     scheduler's address, so a fan-out that starts many clusters at once
-#     exhausts per-account request buckets that no quota request can raise.
-#     dask-cloudprovider retries only some of these internally, and botocore's
-#     own attempt budget is spent before the code surfaces here, wrapped by
-#     _start() as ``RuntimeError("Cluster failed to start: ...")``. Matching the
-#     CODE rather than the prose covers every service in the provisioning path,
-#     which use different codes for the same condition.
+# Substrings of transient cluster-start failures worth retrying. All are ECS races/limits
+# that clear on their own, not configuration errors:
+#   * "not enough values to unpack" — dask-cloudprovider's Task._update_task (ecs.py) calls
+#     run_task then immediately describe_tasks on the returned ARN; before the ECS control
+#     plane catches up describe_tasks returns no task and the ``[self.task] = ...`` unpack
+#     raises, wrapped by _start() as RuntimeError("Cluster failed to start: ...").
+#   * "RESOURCE:ENI" — ECS RunTask rejects placement outright when the subnet's ENI/IP
+#     capacity is exhausted; Task.start raises ``RuntimeError(response)`` with the whole
+#     run_task response, in which AWS reports that placement failure reason.
+#   * "Scheduler failed to start" — the scheduler task didn't reach RUNNING in time, usually
+#     ENI/IP exhaustion when many clusters launch in a burst and interfaces haven't drained.
+#     dask-cloudprovider raises this same generic string for ANY task that fails to reach
+#     RUNNING, permanent misconfigurations (bad image/command) included, and the two are
+#     indistinguishable by message — so it is treated as retryable and a wrong guess costs a
+#     bounded ~3 backed-off retries before reraise=True surfaces the original error.
+#   * Throttle codes — control-plane rate limits hit during provisioning. Creating a cluster
+#     calls ECS (``ListAccountSettings``, ``RunTask``) then polls EC2
+#     (``DescribeNetworkInterfaces``) for the scheduler's address, so a fan-out starting many
+#     clusters at once exhausts per-account request buckets that no quota request can raise.
+#     dask-cloudprovider retries only some internally and botocore's attempt budget is spent
+#     before the code surfaces here. Match the CODE, not the prose: the services in the
+#     provisioning path use different codes for the same condition.
+# distributed's spec._start() calls _close() before re-raising, so a failed scheduler task is
+# torn down before the exception surfaces — a fresh constructor on retry leaks no task/ENI.
 _RETRYABLE_THROTTLE_CODES = (
     "RequestLimitExceeded",
     "Throttling",
@@ -558,20 +498,20 @@ _RETRYABLE_CLUSTER_START_ERRORS = (
 )
 
 
-#: Botocore retry defaults for the provisioning process. ``adaptive`` adds
-#: client-side rate limiting, which is what a burst of simultaneous cluster
-#: starts needs: every client in the process backs off against the same
-#: observed throttling instead of each discovering the limit alone.
+#: Botocore retry defaults for the provisioning process. ``adaptive`` adds client-side rate
+#: limiting, which is what a burst of simultaneous cluster starts needs: every client in the
+#: process backs off against the same observed throttling instead of each finding the limit
+#: alone.
 _PROVISIONING_RETRY_ENV = {"AWS_RETRY_MODE": "adaptive", "AWS_MAX_ATTEMPTS": "10"}
 
 
 def apply_provisioning_retry_defaults(env: dict[str, str] | None = None) -> None:
     """Raise this process's botocore retry budget for control-plane calls.
 
-    Set via the environment because the provisioning clients are constructed
-    inside dask-cloudprovider, which accepts no botocore config: an env default
-    is the only way to reach them. ``setdefault``, so a task definition or an
-    operator that has already chosen a policy keeps it.
+    Set via the environment because the provisioning clients are constructed inside
+    dask-cloudprovider, which accepts no botocore config — an env default is the only way to
+    reach them. ``setdefault``, so a task definition or operator that already chose a policy
+    keeps it.
     """
     for name, value in (env or _PROVISIONING_RETRY_ENV).items():
         os.environ.setdefault(name, value)
@@ -580,10 +520,9 @@ def apply_provisioning_retry_defaults(env: dict[str, str] | None = None) -> None
 def _is_retryable_cluster_start_error(exc: BaseException) -> bool:
     """True if ``exc`` is a transient cluster-start failure worth retrying.
 
-    Matches the RuntimeErrors dask-cloudprovider / distributed raise for the
-    ECS races in ``_RETRYABLE_CLUSTER_START_ERRORS``. Anything else (bad subnet,
-    IAM denial, image pull failure) is a real misconfiguration and must fail
-    fast rather than burn retries.
+    Matches the RuntimeErrors dask-cloudprovider / distributed raise for the ECS races in
+    ``_RETRYABLE_CLUSTER_START_ERRORS``. Anything else (bad subnet, IAM denial, image pull
+    failure) is a real misconfiguration and must fail fast rather than burn retries.
     """
     return isinstance(exc, RuntimeError) and any(s in str(exc) for s in _RETRYABLE_CLUSTER_START_ERRORS)
 
@@ -592,9 +531,8 @@ def _is_retryable_cluster_start_error(exc: BaseException) -> bool:
 class FargateConfig:
     """Resolved Fargate cluster configuration.
 
-    All values are sourced from environment variables (see module
-    docstring). Construct via :func:`get_fargate_config` rather than
-    instantiating directly.
+    All values come from environment variables (see the module docstring). Construct via
+    :func:`get_fargate_config` rather than instantiating directly.
     """
 
     cluster_arn: str
@@ -610,10 +548,8 @@ class FargateConfig:
     worker_mem: int
     cloudwatch_logs_group: str
     environment: dict[str, str] = field(default_factory=dict)
-    #: STABLE Dask task-definition ARNs. When both are set the provider reuses them and
-    #: registers NOTHING; when either is unset it falls back to registering a fresh pair
-    #: per cluster (the historical behaviour), so this is safe to ship before the
-    #: infrastructure that supplies them exists.
+    #: STABLE Dask task-definition ARNs. With both set the provider reuses them and registers
+    #: NOTHING; with either unset it registers a fresh pair per cluster.
     scheduler_task_definition_arn: str = ""
     worker_task_definition_arn: str = ""
 
@@ -627,15 +563,14 @@ class FargateConfig:
             "security_groups": self.security_groups,
             "execution_role_arn": self.execution_role_arn,
             "task_role_arn": self.task_role_arn,
-            # Definitions do NOT have to be created dynamically to get the scheduler
-            # address into worker commands, which is the reason usually given for it.
-            # The library does not work that way: the scheduler address, worker
-            # name, --nthreads and --memory-limit all travel as per-run CONTAINER
-            # OVERRIDES (`Task._overrides["command"]`, sent on every run_task), so the
-            # command baked into a registered definition is never used. Pinning stable
-            # definitions therefore loses nothing — and it takes RegisterTaskDefinition
-            # calls to zero, which is what tripped the account-wide rate limit at 37
-            # concurrent cells (ThrottlingException: Rate exceeded).
+            # Definitions need NOT be created dynamically to get the scheduler address into
+            # worker commands, the reason usually given for it. The scheduler address, worker
+            # name, --nthreads and --memory-limit all travel as per-run CONTAINER OVERRIDES
+            # (`Task._overrides["command"]`, sent on every run_task), so the command baked
+            # into a registered definition is never used. Pinning stable definitions
+            # therefore loses nothing and takes RegisterTaskDefinition calls to zero — which
+            # is what tripped the account-wide rate limit at 37 concurrent cells
+            # (ThrottlingException: Rate exceeded).
             "scheduler_cpu": self.scheduler_cpu,
             "scheduler_mem": self.scheduler_mem,
             "worker_cpu": self.worker_cpu,
@@ -653,30 +588,27 @@ class FargateConfig:
                 # Use unsigned requests for public S3 buckets (e.g. sentinel-s2-l1c)
                 "AWS_NO_SIGN_REQUEST": "YES",
                 # Task logs from Dask containers ship to the orchestrator API — Prefect's
-                # default, kept deliberately. Disabling it is tempting because Prefect tasks
-                # execute on the workers, making every worker an API client and so the
-                # largest client population by count. It was measured and rejected: the
-                # orchestrator's load is dominated by concurrent FLOW RUN count (heartbeats
-                # and state transitions), so removing task logging costs the per-task view
-                # in the UI and buys little. If this ever does need reducing, prefer
-                # PREFECT_LOGGING_TO_API_BATCH_INTERVAL (default 2 s) over disabling it: a
+                # default, kept deliberately. Disabling it looks attractive because Prefect
+                # tasks execute on the workers, making every worker an API client, but it was
+                # measured and rejected: orchestrator load is dominated by concurrent FLOW
+                # RUN count (heartbeats and state transitions), so dropping task logging
+                # costs the per-task UI view and buys little. To reduce it, prefer
+                # PREFECT_LOGGING_TO_API_BATCH_INTERVAL (default 2 s) over disabling — a
                 # longer interval keeps every line and sends proportionally fewer requests.
             },
-            # Keep True. dask-cloudprovider's startup sweep for stale resources
-            # from prior runs iterates all IAM roles, which fails on AWS SSO
-            # reserved roles — flipping to False breaks cluster construction
-            # every time, not just after a crash. It also only targets debris
-            # from runs that died without closing; it does NOT speed reclamation
-            # of ENIs from clusters that closed normally (the source of
-            # post-burst start failures — see _RETRYABLE_CLUSTER_START_ERRORS).
-            # CDK manages our cleanup, so we skip the sweep here.
+            # Keep True. dask-cloudprovider's startup sweep for stale resources iterates all
+            # IAM roles, which fails on AWS SSO reserved roles — False breaks cluster
+            # construction every time, not just after a crash. It also only targets debris
+            # from runs that died without closing; it does NOT speed reclamation of ENIs from
+            # clusters that closed normally, the source of post-burst start failures (see
+            # _RETRYABLE_CLUSTER_START_ERRORS). CDK manages our cleanup.
             "skip_cleanup": True,
         }
         if self.environment:
             kwargs["environment"].update(self.environment)
-        # BOTH or NEITHER. The library takes one ARN per role and registers whichever it
-        # was not given, so pinning only one would still leave a registration per cluster
-        # — the exact thing this removes. Unset means the historical dynamic path.
+        # BOTH or NEITHER. The library takes one ARN per role and registers whichever it was
+        # not given, so pinning only one still leaves a registration per cluster — the exact
+        # thing this removes.
         if self.scheduler_task_definition_arn and self.worker_task_definition_arn:
             kwargs["scheduler_task_definition_arn"] = self.scheduler_task_definition_arn
             kwargs["worker_task_definition_arn"] = self.worker_task_definition_arn
@@ -741,28 +673,26 @@ def log_dashboard_ssm_command(
 ) -> None:
     """Log a copy-pasteable SSM port-forward command for the Dask dashboard.
 
-    The SSM target must point at the *scheduler* Fargate task (where the
-    dashboard runs). ``--region`` is filled in from the task ARN — the cluster's
-    actual region, so a caller whose default region differs doesn't get an
-    "instance not found" from SSM. ``--profile`` stays a placeholder: it is a
-    property of the caller's credentials, not of the cluster.
+    The SSM target must point at the *scheduler* Fargate task, where the dashboard runs.
+    ``--region`` comes from the task ARN — the cluster's actual region, so a caller whose
+    default region differs doesn't get "instance not found" from SSM. ``--profile`` stays a
+    placeholder: it belongs to the caller's credentials, not the cluster.
 
-    Uses ``AWS-StartPortForwardingSession``, which targets a port on the
-    scheduler container itself. The ``...ToRemoteHost`` variant addresses hosts
-    reachable *from* the container, and current SSM agents reject loopback
-    destinations for it ("Forwarding to IP address localhost is forbidden").
+    Uses ``AWS-StartPortForwardingSession``, which targets a port on the scheduler container
+    itself; the ``...ToRemoteHost`` variant addresses hosts reachable *from* the container,
+    and current SSM agents reject loopback destinations for it ("Forwarding to IP address
+    localhost is forbidden").
 
-    Best-effort: if the scheduler task metadata isn't shaped as expected
-    (e.g. an EC2 scheduler), logs a warning and returns without raising.
+    Best-effort: unexpected scheduler task metadata (an EC2 scheduler, say) logs a warning
+    and returns without raising.
     """
     try:
         scheduler = cluster.scheduler
         cluster_name, task_id = scheduler.task_arn.rsplit("/", 2)[1:]
         # arn:aws:ecs:<region>:<account>:task/<cluster>/<task-id>
         region = scheduler.task_arn.split(":")[3]
-        # The scheduler task has multiple containers (dask-scheduler plus
-        # injected sidecars like the SSM/ECS-Exec guard); ordering isn't
-        # stable, so look up by name.
+        # The scheduler task has several containers (dask-scheduler plus injected sidecars
+        # like the SSM/ECS-Exec guard) in unstable order, so look up by name.
         scheduler_container = next(c for c in scheduler.task["containers"] if c["name"] == "dask-scheduler")
         runtime_id = scheduler_container["runtimeId"]
         ssm_target = f"ecs:{cluster_name}_{task_id}_{runtime_id}"
@@ -803,9 +733,8 @@ def ecs_cluster(
 ) -> Iterator[ECSCluster]:
     """Provision a Dask cluster backed by AWS Fargate (or hybrid EC2 scheduler).
 
-    Reads the environment-variable contract documented in this module's
-    docstring. The cluster adapts between ``min_workers`` and
-    ``max_workers``.
+    Reads the environment-variable contract in this module's docstring. The cluster adapts
+    between ``min_workers`` and ``max_workers``.
 
     Args:
         log: Logger.
@@ -816,38 +745,31 @@ def ecs_cluster(
         scheduler_cpu: Override scheduler CPU units.
         scheduler_mem: Override scheduler memory in MiB.
         worker_nthreads: Threads per worker process.
-        worker_nprocs: Worker processes per Fargate task. Set
-            ``worker_nprocs > 1`` with ``worker_nthreads=1`` for
-            GIL-bound workloads (e.g. TensorFlow) to use all vCPUs via
-            multiprocessing.
-        extra_worker_env: Additional env vars to set on every worker.
-            Merged after the defaults.
-        extra_scheduler_env: Env vars set on the flow-runner process
-            *before* :func:`get_fargate_config` is called. Use to
-            override worker resource defaults that
-            :class:`FargateConfig` reads from env vars.
-        ec2_scheduler: Run the Dask scheduler on EC2 instead of
-            Fargate. Provides better single-threaded CPU performance
-            for large-graph planning. Workers still run on Fargate.
-            Requires ``EC2_SCHEDULER_CAPACITY_PROVIDER`` env var.
+        worker_nprocs: Worker processes per Fargate task. Set ``> 1`` with
+            ``worker_nthreads=1`` for GIL-bound workloads to use all vCPUs.
+        extra_worker_env: Env vars set on every worker, merged after the defaults.
+        extra_scheduler_env: Env vars set on the flow-runner process *before*
+            :func:`get_fargate_config` runs, to override the worker resource defaults
+            :class:`FargateConfig` reads from the environment.
+        ec2_scheduler: Run the Dask scheduler on EC2 instead of Fargate, for better
+            single-threaded CPU on large-graph planning. Workers stay on Fargate. Requires
+            ``EC2_SCHEDULER_CAPACITY_PROVIDER``.
         diagnostic_task_stream: Raise the scheduler's task-stream buffer to
             :data:`DIAGNOSTIC_TASK_STREAM_LENGTH` so a performance report covers the whole
-            run rather than only its last few dates. Pass this whenever a report is being
-            captured; leave it off for campaign runs, where the buffer is scheduler memory
-            spent on data nobody reads.
+            run rather than its last few dates. Pass it whenever a report is captured; leave
+            it off for campaign runs, where the buffer is scheduler memory nobody reads.
         image: Override Docker image URI for scheduler and workers.
-        resource_tags: Extra tags applied to every AWS resource the cluster
-            creates (scheduler + worker ECS tasks included). The flows tag with
-            their flow-run id so an emergency teardown can find this run's
-            tasks from nothing but the flow_run (see
-            :func:`stop_ecs_tasks_by_tag`).
+        resource_tags: Extra tags applied to every AWS resource the cluster creates,
+            scheduler and worker ECS tasks included. The flows tag with their flow-run id so
+            an emergency teardown can find this run's tasks from nothing but the flow run
+            (see :func:`stop_ecs_tasks_by_tag`).
 
     Yields:
         The :class:`ECSCluster`/``FargateCluster``.
     """
-    # Tightened timeouts compared to dask defaults so worker death is detected
-    # quickly enough to drive autoscaling reliably. Heartbeat at 10s gives the
-    # scheduler near-immediate awareness of worker exits.
+    # Tighter than dask's defaults so worker death is detected quickly enough to drive
+    # autoscaling reliably; a 10 s heartbeat gives the scheduler near-immediate awareness of
+    # worker exits.
     dask.config.set(
         {
             "distributed.scheduler.worker-ttl": "180s",
@@ -881,8 +803,8 @@ def ecs_cluster(
         cluster_kwargs["scheduler_task_kwargs"]["capacityProviderStrategy"] = [
             {"capacityProvider": capacity_provider, "weight": 1, "base": 1}
         ]
-        # Pin all tasks (scheduler + workers) to the ASG's subnet so everything
-        # is co-located in the same AZ — avoids cross-AZ data transfer costs.
+        # Pin all tasks to the ASG's subnet so scheduler and workers share an AZ, avoiding
+        # cross-AZ data transfer costs.
         scheduler_subnet = os.environ.get("EC2_SCHEDULER_SUBNET", "")
         if scheduler_subnet:
             cluster_kwargs["subnets"] = [scheduler_subnet]
@@ -911,14 +833,12 @@ def ecs_cluster(
 
     safe_kwargs = {k: v for k, v in cluster_kwargs.items() if k != "environment"}
 
-    # Retry the cluster constructor on transient ECS start failures (the
-    # describe_tasks read-after-write race and scheduler-start/ENI exhaustion —
-    # see ``_RETRYABLE_CLUSTER_START_ERRORS``). dask-cloudprovider itself only
-    # retries ThrottlingException, so we wrap the whole constructor. Randomized
-    # exponential backoff (up to 120s) gives a drained ENI/IP pool time to
-    # recover after a burst of cluster launches; the jitter desynchronizes the
-    # many flows that exhausted ENIs together so they don't wake and re-collide
-    # on RunTask in lockstep, which a deterministic schedule would preserve.
+    # Retry the constructor on transient ECS start failures (see
+    # ``_RETRYABLE_CLUSTER_START_ERRORS``); dask-cloudprovider itself retries only
+    # ThrottlingException, so the whole constructor is wrapped. Randomized exponential
+    # backoff up to 120 s lets a drained ENI/IP pool recover after a burst of launches, and
+    # the jitter desynchronizes the flows that exhausted ENIs together so they don't wake and
+    # re-collide on RunTask in lockstep, as a deterministic schedule would.
     retrying = Retrying(
         retry=retry_if_exception(_is_retryable_cluster_start_error),
         stop=stop_after_attempt(4),
@@ -931,10 +851,9 @@ def ecs_cluster(
         ),
     )
 
-    # HLG culling and graph construction run on the client before any tasks are
-    # submitted; the scheduler sees no activity during that window and shuts
-    # itself down at its 300s default idle timeout. Raise it so the scheduler
-    # stays alive through the client-side prep phase.
+    # HLG culling and graph construction run on the client before any tasks are submitted;
+    # the scheduler sees no activity meanwhile and would shut down at its 300 s default idle
+    # timeout. Raised so it survives the client-side prep phase.
     cluster_kwargs["scheduler_timeout"] = "600s"
 
     # Before the constructor, so the clients dask-cloudprovider builds inherit it.
@@ -954,11 +873,10 @@ def ecs_cluster(
     cluster.adapt(minimum=min_workers, maximum=max_workers)
     log.info("Adaptive scaling configured: min=%d, max=%d", min_workers, max_workers)
 
-    # Register the scheduler health heartbeat. A short-lived Client is the only
-    # way to push a SchedulerPlugin onto a remote scheduler; the plugin persists
-    # on the scheduler after this Client closes, independent of the task-runner
-    # Client the flow opens next. Best-effort: a registration failure must not
-    # take down the run, since this is diagnostics only.
+    # Register the scheduler health heartbeat. A short-lived Client is the only way to push a
+    # SchedulerPlugin onto a remote scheduler; the plugin persists after this Client closes,
+    # independent of the task-runner Client the flow opens next. Best-effort — diagnostics
+    # must not take down the run.
     try:
         with Client(cluster, timeout="60s") as client:
             client.register_plugin(SchedulerResourceLogger(), name=SchedulerResourceLogger.name)
@@ -976,9 +894,8 @@ def ecs_cluster(
 def _region_from_arn(arn: str) -> str | None:
     """The region encoded in an AWS ARN, or ``None`` if it does not look like one.
 
-    ``arn:aws:ecs:<region>:<account>:cluster/<name>`` — field 3. Returning ``None``
-    rather than guessing lets boto3 fall back to its own resolution, which is the
-    right behaviour for a malformed or non-standard ARN.
+    ``arn:aws:ecs:<region>:<account>:cluster/<name>`` — field 3. ``None`` rather than a guess
+    lets boto3 fall back to its own resolution for a malformed or non-standard ARN.
     """
     parts = arn.split(":")
     return parts[3] if len(parts) > 4 and parts[3] else None
@@ -988,28 +905,25 @@ def ecs_inventory_client(region: str | None = None) -> Any:  # noqa: ANN401 — 
     """A boto3 ECS client configured to survive a cluster-wide task enumeration.
 
     **Use this for any code that paginates ``list_tasks``/``describe_tasks``**, in either
-    repo. Walking a wide cluster is ~2 calls per 100 tasks, and both land in ECS's
-    *cluster service resource read* bucket, which refills at **one request per second**
-    with a burst of ten — the tightest bucket ECS has. At 36 concurrent cells (~1,200
-    tasks) one walk is ~24 calls, and boto3's default of four legacy retries gives up
-    partway with ``ThrottlingException: Rate exceeded``.
+    repo. Walking a wide cluster costs ~2 calls per 100 tasks, and both land in ECS's
+    *cluster service resource read* bucket, which refills at **one request per second** with
+    a burst of ten — the tightest bucket ECS has. At 36 concurrent cells (~1,200 tasks) one
+    walk is ~24 calls, and boto3's default of four legacy retries gives up partway with
+    ``ThrottlingException: Rate exceeded``.
 
-    ``adaptive`` mode pairs with a generous attempt budget. Adaptive adds client-side
-    rate limiting that learns the throttle and paces requests into it rather than
-    retrying into an empty bucket; the attempt budget then decides how long it is willing
-    to wait. Both are needed: pacing alone still gives up while the bucket is starved,
-    and attempts alone hammer it.
+    ``adaptive`` mode plus a generous attempt budget, and both are needed: adaptive paces
+    requests into the learned throttle rather than retrying into an empty bucket, but pacing
+    alone still gives up while the bucket is starved, and attempts alone hammer it.
 
-    **The bucket is shared, and this client is not its main consumer** — a fleet's own
-    task polling is. So contention is not something a caller can reduce by making fewer
-    calls; it can only wait for a gap. That is why the budget is set for a wait of
-    minutes rather than seconds.
+    **The bucket is shared and this client is not its main consumer** — a fleet's own task
+    polling is — so a caller cannot reduce contention by making fewer calls; it can only wait
+    for a gap. Hence a budget sized for minutes, not seconds.
 
-    The orphan-fleet sweep is the caller that matters: it enumerates in order to stop
-    fleets a dead run left behind, so it runs precisely when the cluster is widest and a
-    leak is most expensive. Nothing waits on a sweep, so finishing slowly always beats
-    failing. A quota raise is the real remedy and is tracked in yield-embeddings
-    ``docs/aws-quota-requests.md``, but this client must not depend on being granted one.
+    The caller that matters is the orphan-fleet sweep: it enumerates to stop fleets a dead
+    run left behind, so it runs precisely when the cluster is widest and a leak is most
+    expensive. Nothing waits on a sweep, so finishing slowly beats failing. A quota raise is
+    the real remedy (yield-embeddings ``docs/aws-quota-requests.md``), but this client must
+    not depend on being granted one.
     """
     import boto3
     from botocore.config import Config
@@ -1030,27 +944,25 @@ def stop_ecs_tasks_by_tag(
 ) -> int:
     """Stop every running ECS task in the ingest cluster carrying ``tag_key=tag_value``.
 
-    The emergency teardown for a Dask ingest cluster whose owning flow was
-    cancelled or crashed: ``ecs_cluster`` tears down in a ``finally``, which a
-    hard cancel skips (the process is killed first), leaving scheduler + workers
-    running in ECS. The flows tag every cluster resource with their flow-run id
-    (``resource_tags``), so this can find the leak from nothing but that id — the
-    same tag-based pattern as ``ray.terminate_ray_instances_by_tag``. Idempotent:
-    already-stopped tasks simply no longer match.
+    The emergency teardown for a Dask ingest cluster whose owning flow was cancelled or
+    crashed: ``ecs_cluster`` tears down in a ``finally``, which a hard cancel skips (the
+    process is killed first), leaving scheduler and workers running in ECS. The flows tag
+    every cluster resource with their flow-run id (``resource_tags``), so this finds the leak
+    from nothing but that id — the same pattern as ``ray.terminate_ray_instances_by_tag``.
+    Idempotent: already-stopped tasks no longer match.
 
-    ``cluster_arn`` defaults to the module's env contract (``ECS_CLUSTER_ARN``).
-    Returns the number of tasks stopped; 0 with a warning when the env var is
-    absent (nothing to sweep against) rather than raising — the hook must never
-    mask the flow's own terminal state.
+    ``cluster_arn`` defaults to the module's env contract (``ECS_CLUSTER_ARN``). Returns the
+    number of tasks stopped; 0 with a warning when the env var is absent, rather than
+    raising — the hook must never mask the flow's own terminal state.
     """
     arn = cluster_arn or os.environ.get("ECS_CLUSTER_ARN", "")
     if not arn:
         log.warning("ECS_CLUSTER_ARN unset — cannot sweep tasks for %s=%s", tag_key, tag_value)
         return 0
-    # Built in the CLUSTER's region, not the ambient one. A cluster ARN carries its
-    # region, and passing one to a default-region client does not redirect the call —
-    # so a cross-region sweep would fail to list anything and leave the fleet running
-    # and billing, at exactly the moment this hook exists to prevent that.
+    # Built in the CLUSTER's region, not the ambient one. A cluster ARN carries its region,
+    # and passing one to a default-region client does not redirect the call, so a
+    # cross-region sweep would list nothing and leave the fleet running and billing — at
+    # exactly the moment this hook exists to prevent that.
     ecs = ecs_inventory_client(_region_from_arn(arn))
     task_arns: list[str] = []
     paginator = ecs.get_paginator("list_tasks")

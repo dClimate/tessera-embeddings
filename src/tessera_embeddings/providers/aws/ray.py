@@ -1,31 +1,21 @@
 """AWS-backed Ray cluster provisioning.
 
-The :func:`ray_cluster` context manager handles SSM config resolution,
-SSH key materialisation, ``ray up`` / ``ray down`` subprocess calls,
-CloudWatch agent configuration, and (optionally) code-tarball sync to
-S3. No ML logic, no Prefect tasks — orchestration code imports this as a
-plain context manager.
+The :func:`ray_cluster` context manager handles SSM config resolution, SSH key
+materialisation, ``ray up`` / ``ray down`` subprocess calls, CloudWatch agent
+configuration, and optionally code-tarball sync to S3. No ML logic, no Prefect tasks —
+orchestration code imports this as a plain context manager.
 
-Adapted from the reference repo's ``infra/ray/cluster.py``. Notable
-differences for the open-source release:
+Nothing here is account-bound: security groups, AMIs, IAM roles, subnets, key pairs and EC2
+tags are read from SSM under a configurable prefix, bucket names and the CloudWatch log
+group are caller-supplied, and source-tarball sync is opt-in (``sync_source_path``; the
+default assumes a pre-baked AMI).
 
-* Account-bound IDs (security groups, AMIs, IAM roles, subnets, key
-  pairs, EC2 tags) are read from SSM under a configurable prefix —
-  there are no hardcoded ``/yield/ray/`` paths.
-* The dev/prod bucket toggle from the reference repo is removed; bucket
-  names are caller-supplied.
-* Source-code tarball sync is opt-in (``sync_source_path``); the default
-  assumes a pre-baked AMI and skips the sync step entirely.
-* CloudWatch log-group name is a parameter, not a hardcoded
-  ``/ec2/yield/ray``.
-
-# NOTE — cancellation hook dependency:
-# :func:`terminate_ray_instances_by_tag` and :func:`cleanup_ray_tempfiles` are
-# intended to be wired into the orchestrator's on-cancellation/on-crashed
-# hooks. Those hooks are the real last line of defence: the autoscaler idle
-# timeout only drains workers above a node type's ``min_workers`` floor and
-# NEVER terminates the head node, so an untorn-down cluster runs until
-# someone terminates it by tag. See gotchas.md ("Teardown").
+# NOTE — cancellation hook dependency: :func:`terminate_ray_instances_by_tag` and
+# :func:`cleanup_ray_tempfiles` are meant to be wired into the orchestrator's
+# on-cancellation/on-crashed hooks, which are the real last line of defence. The autoscaler
+# idle timeout only drains workers above a node type's ``min_workers`` floor and NEVER
+# terminates the head node, so an untorn-down cluster runs until someone terminates it by
+# tag. See gotchas.md ("Teardown").
 """
 
 from __future__ import annotations
@@ -56,9 +46,8 @@ DEFAULT_CLOUDWATCH_TEMPLATE = Path(__file__).parent / "cloudwatch-agent.json.tpl
 DEFAULT_SSM_PREFIX = "/tessera/ray/"
 """Default SSM Parameter Store prefix for Ray cluster resource IDs.
 
-Production deployments override this — there is no global default that
-makes sense across organisations. Configure the prefix to match wherever
-you've stored the EC2 resource IDs your Ray nodes need.
+No global default makes sense across organisations, so deployments override this to
+wherever they publish the EC2 resource IDs their Ray nodes need.
 """
 
 DEFAULT_CLOUDWATCH_LOG_GROUP = "/ec2/tessera/ray"
@@ -67,99 +56,77 @@ DEFAULT_CLOUDWATCH_LOG_GROUP = "/ec2/tessera/ray"
 RAY_DOWN_TIMEOUT_S = 300
 """Upper bound (seconds) on a cancellation-time ``ray down``.
 
-``ray down`` SSHes into the head to tear the cluster down; if the head is
-unreachable or the CLI wedges it can block forever. A cancellation hook that
-hangs here never reaches the tag-based EC2 termination fallback, leaving GPU
-workers running and billed — so the call is bounded and a timeout falls through
-to tag termination. Generous enough for a normal teardown (~1-2 min)."""
+``ray down`` SSHes into the head; an unreachable head or a wedged CLI blocks forever, and
+a hook that hangs here never reaches the tag-based EC2 termination fallback, leaving GPU
+workers billing. A timeout therefore falls through to tag termination. Generous for a
+normal teardown (~1-2 min)."""
 
 PROJECT_TAG_VALUE = "tessera-embeddings"
 """Value of the ``Project`` EC2 tag stamped on every Ray node.
 
 The deployment's runner IAM role conditions ``ec2:TerminateInstances`` on
-``aws:ResourceTag/Project`` equal to this value, so that ``ray down`` (which
-terminates nodes using the driver's credentials) and the
-:func:`terminate_ray_instances_by_tag` fallback are both authorised. Without
-this tag every teardown terminate is IAM-denied and the instances leak. Keep
-this in lockstep with the deployment's IAM condition (yield CDK:
-``ray_inference.py`` ``RayEc2Terminate``)."""
+``aws:ResourceTag/Project`` equal to this value, authorising both ``ray down`` (which
+terminates with the driver's credentials) and the :func:`terminate_ray_instances_by_tag`
+fallback. Without the tag every teardown terminate is IAM-denied and the instances leak.
+Keep in lockstep with the deployment's IAM condition (yield CDK: ``ray_inference.py``
+``RayEc2Terminate``)."""
 
 _REQUIRED_SSM_KEYS = frozenset(
     {"security-group-id", "instance-profile-arn", "private-subnet-ids", "key-pair-name", "key-pair-id"}
 )
 
 LAUNCH_PACING_CLIENT_ENV = {
-    # Client-side rate limiting on whatever EC2 client the process builds. Ray sets only
-    # `max_attempts` on its launch client's botocore Config and never `mode`, so the mode
-    # is still resolved from the environment — this is the one place we can reach inside
-    # Ray's launch path without owning its retry loop. Adaptive mode paces sends through a
-    # token bucket that narrows when EC2 answers with a throttle and widens again on
-    # success. The INVARIANT that makes it safe to hand a fleet's growth to: botocore
-    # floors that bucket's fill rate, so a paced client never stops asking.
-    #
-    # Safe for ANY launching process because it only spaces attempts out — it never
-    # removes one. That is what separates it from the autoscaler settings below.
+    # Ray sets only `max_attempts` on its launch client's botocore Config, never `mode`, so
+    # the mode still resolves from the environment — the one way into Ray's launch path
+    # without owning its retry loop. Adaptive mode paces sends through a token bucket that
+    # narrows on a throttle and widens on success; botocore floors that bucket's fill rate,
+    # so a paced client never stops asking. Safe for ANY launching process because it only
+    # spaces attempts out, never removes one — unlike the autoscaler settings below.
     "AWS_RETRY_MODE": "adaptive",
 }
 """Pacing that is safe wherever instances are launched, including one-shot launches."""
 
 LAUNCH_PACING_AUTOSCALER_ENV = {
-    # Instances per RunInstances call. The request quota is a rate over CALLS, not
-    # over instances, so asking for more per call buys fleet at a fixed price in
-    # quota. MinCount stays 1, so a call the region can only partly fill returns what
-    # it can rather than failing — a larger batch does not trade capacity for volume.
-    # It also narrows the burst: Ray sizes its launcher-thread pool as
-    # ceil(max_concurrent_launches / max_launch_batch), so a bigger batch is fewer
-    # threads calling at once.
+    # Instances per RunInstances call. The request quota is a rate over CALLS, not over
+    # instances, so a bigger batch buys fleet at a fixed price in quota. MinCount stays 1, so
+    # a partly-fillable call returns what it can rather than failing. It also narrows the
+    # burst: Ray's launcher-thread pool is ceil(max_concurrent_launches / max_launch_batch).
     "AUTOSCALER_MAX_LAUNCH_BATCH": "25",
-    # Ray retries a failed launch in a loop with no delay between attempts, rotating
-    # to the next subnet each time, for max(this, subnet count) attempts. A rotation
-    # is spent whatever the error was, so a throttled attempt consumes an availability
-    # zone that a capacity-short attempt still needs. Setting this below the subnet
-    # count leaves exactly one pass over the zones: capacity failover is preserved and
-    # the surplus no-delay attempts are not made.
+    # Ray retries a failed launch with NO delay, rotating to the next subnet each time, for
+    # max(this, subnet count) attempts. A rotation is spent whatever the error was, so a
+    # throttled attempt burns an AZ a capacity-short attempt still needs. Below the subnet
+    # count leaves exactly one pass over the zones: capacity failover kept, surplus no-delay
+    # attempts not made.
     "BOTO_CREATE_MAX_RETRIES": "1",
-    # Seconds between autoscaler passes; Ray's default is 5. This is the only setting that
-    # bounds how OFTEN a cluster asks, as opposed to how much it asks for per call — and the
-    # request quota is a rate over calls. The two settings above make each call carry more and
-    # waste fewer attempts; neither reduces the calls per minute, so at fleet width the
-    # autoscalers still overshoot the account's shared bucket together.
-    #
-    # Why a fixed slowdown rather than backoff: botocore's adaptive mode is congestion control,
-    # and it converges only for a client that can see the whole pipe. Every cluster runs its own
-    # autoscaler with its own controller against ONE account-wide bucket, so each settles at a
-    # rate that is reasonable alone and collectively is not. A longer loop is the one lever that
-    # composes, because it divides every participant's rate by the same factor.
-    #
-    # Sized against the bucket rather than picked: at the default the fleet's aggregate call rate
-    # runs a small multiple of what the bucket admits, and this divides it by three. It costs
-    # latency in the autoscaler's OTHER duties — noticing a dead node, acting on a resource
-    # demand — which is why it is not longer.
+    # Seconds between autoscaler passes (Ray's default is 5) — the only setting that bounds
+    # how OFTEN a cluster asks, which is what the quota meters. Adaptive backoff cannot do
+    # this job: it is congestion control that converges only for a client seeing the whole
+    # pipe, and each cluster's autoscaler sees only itself against ONE account-wide bucket.
+    # A longer loop is the one lever that composes, dividing every participant's rate by the
+    # same factor; 15 divides the fleet's aggregate rate by three. Not longer because it also
+    # delays the autoscaler's other duties (noticing a dead node, acting on resource demand).
     "AUTOSCALER_UPDATE_INTERVAL_S": "15",
 }
 """Tuning for the AUTOSCALER's launch loop, and for nothing else.
 
-Separate from :data:`LAUNCH_PACING_CLIENT_ENV` because these two settings change
-how many attempts a launch gets, not merely how they are spaced. That is safe for
-a worker request, which the autoscaler will make again on its next cycle, and
-unsafe for a launch that happens once. Give this to a process that runs the
-autoscaler; give the client pacing to anything else that launches.
+Separate from :data:`LAUNCH_PACING_CLIENT_ENV` because these settings change how many
+attempts a launch GETS, not merely how they are spaced — safe for a worker request the
+autoscaler will repeat next cycle, unsafe for a launch that happens once. Give this only
+to a process that runs the autoscaler.
 
-The account's RunInstances quota is a token bucket — a small burst capacity,
-refilled at a fixed rate — and it is not adjustable. Concurrent clusters share
-one bucket, so several autoscalers requesting at the same moment drain it and
-everything behind them is refused; those refusals are retried and drain it
-again. None of that loop is ours: the call is made by Ray's AWS node provider
-and the retry around it is Ray's. What we can set is the environment the
-autoscaler process runs in, and every name here is one Ray or botocore reads
-from the environment.
+The account's RunInstances quota is a non-adjustable token bucket (small burst capacity,
+fixed refill) shared by every concurrent cluster, so autoscalers requesting together drain
+it and the refusals are retried into it again. None of that loop is ours — Ray's AWS node
+provider makes the call and owns the retry — so the only lever is the environment the
+autoscaler runs in, and every name here is one Ray or botocore reads from it.
+Measurements and the quota values: context_docs/design/ec2_launch_throttling_2026_08.md.
 """
 
 LAUNCH_PACING_ENV = {**LAUNCH_PACING_CLIENT_ENV, **LAUNCH_PACING_AUTOSCALER_ENV}
 """Everything the head node wants: it both launches and hosts the autoscaler.
 
-Applied only when a caller asks for it (``launch_pacing=True``). Default-off
-because it changes how a live fleet grows.
+Applied only on ``launch_pacing=True``; default-off because it changes how a live fleet
+grows.
 """
 
 GPU_WORKER_LADDER_SSM_KEY = "gpu-worker-ladder"
@@ -169,57 +136,50 @@ Value is a comma-separated list of ``<instance-type>:<max_workers>`` pairs, e.g.
 
     g6e.xlarge:100,g6e.2xlarge:150
 
-**Absent means the template stands untouched**, which is today's behaviour
-byte-for-byte — that is the whole point of putting the switch here rather than on
-the flow. A flow parameter would change the deployment's schema, and a schema
-change forces every deployment to be re-registered, which drops hand-set
-parameters on a live campaign. An SSM key is read at ``ray up`` time by whatever
-code the runner already has, so a rung can be released mid-campaign with a
-`put-parameter` and no release, no re-registration and no AMI re-bake.
+**Absent means the template stands untouched.** The switch lives in SSM rather than on
+the flow because a flow parameter changes the deployment's schema, and a schema change
+forces a re-registration that drops hand-set parameters on a live campaign. An SSM key is
+read at ``ray up`` time, so a rung is released mid-campaign with a `put-parameter` — no
+release, no re-registration, no AMI re-bake.
 
-Why ``max_workers`` and not a smarter switch: node-type choice in Ray 2.55.1
-has no feedback from capacity errors, so ``max_workers`` per node type is the
-only mechanism that moves the autoscaler. ``0`` makes a rung unreachable.
+``max_workers`` and not a smarter switch because node-type choice in Ray 2.55.1 takes no
+feedback from capacity errors, so per-node-type ``max_workers`` is the only mechanism that
+moves the autoscaler. ``0`` makes a rung unreachable.
 """
 
 GPU_WORKER_NODE_TYPE_PREFIX = "gpu-workers-ondemand"
 """Prefix identifying the ON-DEMAND GPU worker node types the ladder governs.
 
-The ladder addresses node types by their EC2 instance type, but an instance type
-does not identify a node type on its own: the template ships ``g6e.xlarge`` twice,
-once on-demand and once spot. So the ladder's domain is fixed by NAME — every
-``available_node_types`` key with this prefix — and spot rungs are outside it and
-never touched. Keep this in lockstep with ``cluster.yaml.template``; a template
-rename that breaks the prefix makes the ladder silently govern nothing, which is
-why :func:`_apply_gpu_worker_ladder` refuses an empty domain rather than
-returning quietly.
+An instance type does not identify a node type — the template ships ``g6e.xlarge`` twice,
+once on-demand and once spot — so the ladder's domain is fixed by NAME (every
+``available_node_types`` key with this prefix) and spot rungs are never touched. Keep in
+lockstep with ``cluster.yaml.template``: a rename that breaks the prefix would make the
+ladder govern nothing, which is why :func:`_apply_gpu_worker_ladder` refuses an empty
+domain rather than returning quietly.
 """
 
 
-#: Instance types this campaign will accept as a capacity fallback. Named the way the
-#: `gpu-worker-ladder` key names them, because two vocabularies for one domain is how a
-#: template edit and an operator's value drift apart.
+#: Instance types this campaign will accept as a capacity fallback, named the way the
+#: `gpu-worker-ladder` key names them (two vocabularies for one domain is how a template
+#: edit and an operator's value drift apart).
 #:
-#: One size per card, chosen on HOST RAM rather than price: the vCPU-matched `g5.xlarge`
-#: and `g6.xlarge` carry 16 GiB against a measured ~17.7 GB per-actor requirement, which
-#: is the exact shape that OOMed the loader on the earlier 16 GB g5-class workers. The
-#: `2xlarge` of each family gives 32 GiB, matching `g6e.xlarge`. Sizes outside this set
-#: are refused rather than trusted -- an operator naming `g5.xlarge` under capacity
-#: pressure would get a fleet that cannot run the work.
+#: One size per card, chosen on HOST RAM: the vCPU-matched `g5.xlarge`/`g6.xlarge` carry
+#: 16 GiB against a measured ~17.7 GB per-actor requirement -- the exact shape that OOMed
+#: the loader on 16 GB g5-class workers -- while each family's `2xlarge` gives 32 GiB,
+#: matching `g6e.xlarge`. Sizes outside this set are refused, not trusted.
 #:
-#: The cost of the safe size is quota, and it is not small: the G-and-VT quota is counted
-#: in vCPU, and these are 8 vCPU per GPU against `g6e.xlarge`'s 4. A fallback GPU spends
-#: TWICE the quota of a production one -- 10,000 vCPU buys 2,500 L40S or 1,250 A10G.
+#: The safe size costs quota: G-and-VT is counted in vCPU and these are 8 per GPU against
+#: `g6e.xlarge`'s 4, so 10,000 vCPU buys 2,500 L40S or 1,250 A10G. Card evidence:
+#: context_docs/design/gpu-card-choice-2026_08.md.
 GPU_FALLBACK_INSTANCE_TYPES: frozenset[str] = frozenset({"g5.2xlarge", "g6.2xlarge"})
 
 
 _RAY_START = "ray start"
 """The token in a ``*_start_ray_commands`` entry that :func:`_pace_ray_start` prefixes.
 
-Ray runs each entry as its own shell command over SSH, so an ``export`` on its own
-line reaches nothing. Assignments have to ride on the command that starts Ray — and
-the autoscaler is a child of that process, which is what carries the pacing to the
-code that actually launches nodes.
+Ray runs each entry as its own shell command over SSH, so an ``export`` on its own line
+reaches nothing: the assignments have to ride on the command that starts Ray, whose child
+is the autoscaler that actually launches nodes.
 """
 
 
@@ -234,9 +194,9 @@ def _pace_ray_start(commands: list[str], pacing: dict[str, str]) -> list[str]:
         A new list, with the assignments prefixed to the ``ray start`` invocation.
 
     Raises:
-        ValueError: If no entry starts Ray. A pacing request that lands nowhere is
-            worse than one refused: the cluster comes up looking configured and
-            launches at the unpaced rate, so this refuses rather than warns.
+        ValueError: If no entry starts Ray. A pacing request that lands nowhere is worse
+            than one refused — the cluster comes up looking configured and launches at the
+            unpaced rate.
     """
     assignments = " ".join(f"{name}={value}" for name, value in pacing.items())
     paced = []
@@ -262,18 +222,16 @@ def _parse_gpu_worker_ladder(raw: str) -> list[tuple[str, int]]:
             comma) are dropped.
 
     Returns:
-        Pairs in the order written. Order is preserved because it is what a human
-        reads back, NOT because it decides anything — Ray scores node types from
-        their resources and ignores declaration order entirely (see
-        ``TestRayNodeTypePreference``).
+        Pairs in the order written. Order is preserved for the human reading it back, NOT
+        because it decides anything — Ray scores node types from their resources and
+        ignores declaration order (see ``TestRayNodeTypePreference``).
 
     Raises:
-        RuntimeError: On any entry that is not exactly ``name:non-negative-int``,
-            or on a repeated instance type. Both REFUSE rather than warn: this
-            value sizes a GPU fleet, and the failure mode of a lenient parser is
-            a rung silently left at ``0`` (a campaign that never grows) or a
-            typo'd count read as capacity. A refusal at ``ray up`` costs one
-            corrected parameter; a silent misparse costs a run.
+        RuntimeError: On any entry that is not exactly ``name:non-negative-int``, or on a
+            repeated instance type. This value sizes a GPU fleet, and a lenient parser
+            fails as a rung silently left at ``0`` (a campaign that never grows) or a
+            typo'd count read as capacity. A refusal at ``ray up`` costs one corrected
+            parameter; a silent misparse costs a run.
     """
     pairs: list[tuple[str, int]] = []
     seen: set[str] = set()
@@ -283,9 +241,8 @@ def _parse_gpu_worker_ladder(raw: str) -> list[tuple[str, int]]:
             continue
         name, sep, count = entry.partition(":")
         name, count = name.strip(), count.strip()
-        # Match the LEXICAL form, not a prefix of it: `partition` on a missing
-        # separator yields an empty tail, and `int("")` would raise a ValueError
-        # that reads as a bug rather than as bad configuration.
+        # Match the LEXICAL form: `partition` on a missing separator yields an empty tail,
+        # and `int("")` raises a ValueError that reads as a bug, not as bad configuration.
         if not sep or not name or not count.isdigit():
             msg = (
                 f"Malformed {GPU_WORKER_LADDER_SSM_KEY} entry {entry!r}: expected "
@@ -306,26 +263,23 @@ def _parse_gpu_worker_ladder(raw: str) -> list[tuple[str, int]]:
 def _apply_gpu_worker_ladder(config: dict[str, Any], raw: str) -> None:
     """Rewrite the on-demand GPU rungs' ``max_workers`` from a ladder value, in place.
 
-    The ladder is AUTHORITATIVE over its domain, not additive to it: every
-    on-demand GPU node type (see :data:`GPU_WORKER_NODE_TYPE_PREFIX`) the value
-    does not name is set to ``0``. An additive reading would make
-    ``g6e.2xlarge:150`` mean "add 150 of these to the 500 g6e.xlarge already
-    allowed", so releasing a rung would also raise the fleet ceiling — two
-    changes from one edit, and the second one unstated. Naming every rung you
-    want makes the whole fleet shape readable from the parameter.
+    The ladder is AUTHORITATIVE over its domain, not additive: every on-demand GPU node
+    type (see :data:`GPU_WORKER_NODE_TYPE_PREFIX`) the value does not name is set to ``0``.
+    Read additively, ``g6e.2xlarge:150`` would mean "add 150 to the 500 g6e.xlarge already
+    allowed", so releasing a rung would also raise the fleet ceiling — two changes from one
+    edit, the second unstated. Naming every rung makes the whole fleet shape readable from
+    the parameter.
 
     Args:
         config: A loaded cluster config. Mutated in place.
         raw: The raw SSM value; see :func:`_parse_gpu_worker_ladder`.
 
     Raises:
-        RuntimeError: If the config declares no on-demand GPU node type (a
-            template drift that would otherwise make the ladder a no-op), or if
-            the ladder names an instance type no such node type offers, or if two
-            of them offer the same instance type so the target is ambiguous.
-            Refusing beats warning here for the reason a warn-and-continue guard
-            always loses: the run proceeds, and what it proceeds with is the
-            fleet shape the operator was trying to change.
+        RuntimeError: If the config declares no on-demand GPU node type (template drift
+            that would make the ladder a no-op), if the ladder names an instance type no
+            such node type offers, or if two of them offer the same instance type so the
+            target is ambiguous. A warn-and-continue would proceed with exactly the fleet
+            shape the operator was trying to change.
     """
     node_types = config["available_node_types"]
     domain = {name: cfg for name, cfg in node_types.items() if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX)}
@@ -365,15 +319,11 @@ def _apply_gpu_worker_ladder(config: dict[str, Any], raw: str) -> None:
     for instance_type, max_workers in pairs:
         node_types[by_instance_type[instance_type][0]]["max_workers"] = max_workers
 
-    # `max_workers` per node type is a ceiling under the CLUSTER-wide ceiling, not
-    # beside it: Ray takes the min. A ladder summing above the global value would
-    # be capped there silently, so raise the global to fit the ladder it was given.
-    #
-    # And size it for EVERY open worker type, not just the ladder's. The cluster
-    # ceiling is one budget shared by all of them, so a bundled spot rung — or any
-    # custom type a template adds — left open at N consumes N of it and leaves the
-    # ladder's own per-rung ceilings unreachable by exactly that much. The head node
-    # is not a worker and does not count.
+    # Per-node-type `max_workers` sits UNDER the cluster-wide ceiling, not beside it: Ray
+    # takes the min, so a ladder summing above the global value would be capped silently.
+    # Raise the global to fit — sized for EVERY open worker type, since the cluster ceiling
+    # is one budget shared by all of them and a bundled spot rung (or any custom type a
+    # template adds) left open at N eats N of it. The head node is not a worker.
     ladder_total = sum(count for _, count in pairs)
     head_node_type = config.get("head_node_type")
     non_ladder_workers = sum(
@@ -395,15 +345,15 @@ def _apply_gpu_worker_ladder(config: dict[str, Any], raw: str) -> None:
 def _vcpu_per_node(node_type: dict[str, Any]) -> int:
     """What one INSTANCE of this rung costs in vCPU, from its DECLARED resources.
 
-    Per instance, not per GPU, because ``max_workers`` counts instances. The two are the
-    same number only while every rung is single-GPU, which is true of everything shipped
-    today and is exactly the assumption that makes the difference invisible: a rung
-    declaring 96 CPU and 8 GPU priced per-GPU reads as 12, and a 960-vCPU budget would
-    then permit 80 instances -- 7,680 vCPU, eight times the budget.
+    Per instance, not per GPU, because ``max_workers`` counts instances. The two coincide
+    only while every rung is single-GPU (true of everything shipped today, which is what
+    makes the difference invisible): a rung declaring 96 CPU and 8 GPU priced per-GPU reads
+    as 12, and a 960-vCPU budget would then permit 80 instances -- 7,680 vCPU, eight times
+    the budget.
 
-    Read from the config rather than the EC2 catalogue because the declaration is what
-    the autoscaler itself scales against, and because it needs no API call at resolve
-    time. `test_declared_resources_match_the_ec2_catalogue` is what keeps the two honest.
+    From the config rather than the EC2 catalogue: the declaration is what the autoscaler
+    itself scales against, and it needs no API call at resolve time.
+    `test_declared_resources_match_the_ec2_catalogue` keeps the two honest.
     """
     resources = node_type.get("resources") or {}
     cpu, gpu = int(resources.get("CPU", 0)), int(resources.get("GPU", 0))
@@ -420,11 +370,10 @@ def _vcpu_per_node(node_type: dict[str, Any]) -> int:
 def _vcpu_budget_ceiling(node_type: dict[str, Any], vcpu_budget: int) -> int:
     """How many of this rung the vCPU budget affords.
 
-    Raises rather than flooring at 1. A floor would open a rung the budget cannot pay
-    for -- a budget of 5 buying one 8-vCPU node overspends by 60% -- and the caller
-    stated a quota, not a preference. A budget too small to seat one node of an open
-    rung is a configuration error, and it is cheaper to say so here than to discover it
-    as an unexplained `InstanceLimitExceeded` during a capacity event.
+    Raises rather than flooring at 1: a floor opens a rung the budget cannot pay for (a
+    budget of 5 buying one 8-vCPU node overspends by 60%), and the caller stated a quota,
+    not a preference. Cheaper to refuse here than to meet it as an unexplained
+    `InstanceLimitExceeded` during a capacity event.
     """
     per_node = _vcpu_per_node(node_type)
     affords = vcpu_budget // per_node
@@ -442,25 +391,21 @@ def _vcpu_budget_ceiling(node_type: dict[str, Any], vcpu_budget: int) -> int:
 def _apply_gpu_vcpu_budget(config: dict[str, Any], vcpu_budget: int) -> None:
     """Re-ceiling every OPEN on-demand GPU rung to what ``vcpu_budget`` affords.
 
-    The G-and-VT service quota is counted in vCPU, not in cards, and rungs are not
-    equally priced: the fallback sizes are 8 vCPU per GPU against the production rung's
-    4. A ceiling expressed in NODES therefore means a different quota bill depending on
-    which card wins, and an all-fallback fleet at the production node count quietly
-    spends twice the quota.
+    The G-and-VT quota is counted in vCPU, not cards, and rungs are not equally priced --
+    the fallback sizes are 8 vCPU per GPU against the production rung's 4 -- so a ceiling
+    in NODES means a different quota bill depending on which card wins, and an
+    all-fallback fleet at the production node count quietly spends twice the quota.
 
-    So each rung gets the count the budget affords IT -- 250 instances at 4 vCPU each,
-    125 at 8. Priced PER INSTANCE, because that is what ``max_workers`` counts.
-    That is the honest statement of "as many of this card as the quota allows".
-
-    It NARROWS only, never widens: a ceiling already lower than the budget affords was
-    set deliberately and stands.
+    So each rung gets the count the budget affords IT (250 instances at 4 vCPU, 125 at 8),
+    priced PER INSTANCE because that is what ``max_workers`` counts. It NARROWS only: a
+    ceiling already below what the budget affords was set deliberately and stands.
 
     **It does not bound a MIXTURE, and cannot.** Ray's ceilings count nodes and carry no
-    weight (`resource_demand_scheduler` has no cost concept at all), so a fleet that is
-    part production and part fallback can exceed the budget -- bounded by the widest
-    per-rung ceiling, not equal to it. Making it exact would need a controller outside
-    Ray adjusting demand as the mix shifts. What this does remove is the worst case: a
-    fleet that has fallen over entirely can no longer run at the production node count.
+    weight (`resource_demand_scheduler` has no cost concept), so a part-production,
+    part-fallback fleet can exceed the budget -- bounded by the widest per-rung ceiling,
+    not equal to it. Exactness would need a controller outside Ray adjusting demand as the
+    mix shifts. What this removes is the worst case: a fleet that has fallen over entirely
+    can no longer run at the production node count.
     """
     if vcpu_budget <= 0:
         msg = f"gpu_fallback_vcpu_budget must be > 0, got {vcpu_budget}"
@@ -469,10 +414,9 @@ def _apply_gpu_vcpu_budget(config: dict[str, Any], vcpu_budget: int) -> None:
     for name, cfg in node_types.items():
         if not name.startswith(GPU_WORKER_NODE_TYPE_PREFIX) or cfg.get("max_workers", 0) <= 0:
             continue
-        # NARROWS ONLY. A budget must never RAISE a ceiling someone set deliberately:
-        # capping the production rung at what it can actually be supplied is the lever
-        # that pushes surplus demand onto the fallback, and a budget that overrode it
-        # would quietly undo the operator's decision. The budget is a maximum, not a
+        # NARROWS ONLY. Capping the production rung at what it can actually be supplied is
+        # the lever that pushes surplus demand onto the fallback; a budget that raised that
+        # ceiling back would quietly undo the operator's decision. It is a maximum, not a
         # target.
         cfg["max_workers"] = min(cfg["max_workers"], _vcpu_budget_ceiling(cfg, vcpu_budget))
 
@@ -482,21 +426,20 @@ def _apply_gpu_fallback(
 ) -> list[str]:
     """Open a fallback rung per named instance type.
 
-    Opening a rung only makes it REACHABLE. It does not make the autoscaler use it:
-    while demand stays under the production rung's ceiling, Ray keeps choosing that
-    rung and an open fallback sits idle however long the primary has been refusing.
-    What sends work to it is the standing per-rung request published by
-    :mod:`~tessera_embeddings.providers.aws.fleet_mix`. Neither half works alone.
+    Opening a rung only makes it REACHABLE, not used: while demand stays under the
+    production rung's ceiling Ray keeps choosing that rung, however long the primary has
+    been refusing. What sends work to a fallback is the standing per-rung request published
+    by :mod:`~tessera_embeddings.providers.aws.fleet_mix`. Neither half works alone.
 
-    Still one fallback at a time. Stating the mix removes Ray's node-name tie for the
-    machines the request covers, but the request is a FLOOR — ordinary actor demand
-    above it is scored by Ray as before, and the supported fallbacks are byte-identical
-    to that scorer. The registry is n-ary and ready; this guard is what is not.
+    ONE fallback at a time. Stating the mix removes Ray's node-name tie for the machines
+    the request covers, but the request is a FLOOR — ordinary actor demand above it is
+    scored by Ray as before, and the supported fallbacks are byte-identical to that scorer.
+    The registry is n-ary and ready; this guard is what is not.
 
-    Each fallback rung is opened to the SAME ceiling as the production rung, so either
-    card can carry the whole fleet. That does not make the fleet bigger: the cluster's
-    global ``max_workers`` still caps the sum, and in practice the count is bound by
-    inference demand well below it. What this changes is what the fleet is MADE OF.
+    Each fallback rung is opened to the SAME ceiling as the production rung, so either card
+    can carry the whole fleet. The fleet does not get bigger — the cluster's global
+    ``max_workers`` still caps the sum, and inference demand binds well below it — only
+    differently MADE OF.
 
     Args:
         config: A loaded cluster config. Mutated in place.
@@ -504,7 +447,7 @@ def _apply_gpu_fallback(
             (e.g. ``["g5.2xlarge"]``). Empty opens no rung and installs no scorer.
         vcpu_budget: Optional G-and-VT vCPU budget for this cluster's GPU fleet. When
             given, every open GPU rung -- production included -- is ceilinged at what the
-            budget affords IT rather than at a flat node count, which is the only way a
+            budget affords IT rather than at a flat node count, the only way a
             heterogeneous fleet can be held to a quota counted in vCPU. See
             :func:`_apply_gpu_vcpu_budget` for what it does and does not bound.
 
@@ -514,8 +457,8 @@ def _apply_gpu_fallback(
     Raises:
         RuntimeError: If a card has no known instance type, or that type has no rung in
             the template, or the template declares no production GPU rung to match. Each
-            would otherwise leave the fleet quietly unable to fail over -- which is only
-            discovered during the capacity event the feature exists for.
+            would leave the fleet quietly unable to fail over -- discovered only during the
+            capacity event the feature exists for.
     """
     node_types = config["available_node_types"]
     if vcpu_budget is not None:
@@ -544,9 +487,9 @@ def _apply_gpu_fallback(
         )
         raise RuntimeError(msg)
 
-    # ALL names per instance type, not the last one. An instance type does not identify a
-    # node type -- a template may offer the same type twice under different launch config,
-    # which is why the ladder refuses the same ambiguity rather than picking one.
+    # ALL names per instance type, not the last one: a template may offer the same type
+    # twice under different launch config, which is why the ladder refuses this ambiguity
+    # rather than picking one.
     by_instance_type: dict[str, list[str]] = defaultdict(list)
     for name, cfg in node_types.items():
         if name.startswith(GPU_WORKER_NODE_TYPE_PREFIX):
@@ -559,11 +502,11 @@ def _apply_gpu_fallback(
         )
         raise RuntimeError(msg)
 
-    # The production ceiling every fallback is matched to, from the widest open PRODUCTION
-    # rung. Fallbacks are excluded by instance type, not by ceiling: they share the
-    # node-type prefix, so a ladder that had already opened one would otherwise contribute
-    # its own ceiling here -- and an all-fallback ladder would satisfy the "something to
-    # fall back FROM" guard with nothing to fall back from at all.
+    # The ceiling every fallback is matched to, from the widest open PRODUCTION rung.
+    # Fallbacks are excluded by instance type, not by ceiling: they share the node-type
+    # prefix, so a ladder that had already opened one would contribute its own ceiling here
+    # -- and an all-fallback ladder would satisfy the "something to fall back FROM" guard
+    # with nothing to fall back from at all.
     open_ceilings = [
         cfg["max_workers"]
         for name, cfg in node_types.items()
@@ -580,10 +523,9 @@ def _apply_gpu_fallback(
         raise RuntimeError(msg)
     ceiling = max(open_ceilings)
 
-    # NEVER above the cluster-wide ceiling. A fallback changes what the fleet is made of,
-    # not how big it is, so a template that deliberately caps the aggregate at 100 must
-    # keep that cap -- raising the global to fit a fallback would grow the fleet by exactly
-    # the amount the operator said no to.
+    # NEVER above the cluster-wide ceiling: a fallback changes what the fleet is made of,
+    # not how big it is, so raising the global to fit one would grow the fleet by exactly
+    # the amount a deliberate aggregate cap said no to.
     global_ceiling = config.get("max_workers")
     if isinstance(global_ceiling, int) and global_ceiling > 0:
         ceiling = min(ceiling, global_ceiling)
@@ -595,7 +537,7 @@ def _apply_gpu_fallback(
         if isinstance(global_ceiling, int) and global_ceiling > 0:
             want = min(want, global_ceiling)
         # A ladder that already opened this rung chose its ceiling on purpose; opening it
-        # again must not widen it. Same rule as the budget's, for the same reason.
+        # again must not widen it. Same rule as the budget's.
         current = node_types[name].get("max_workers", 0)
         node_types[name]["max_workers"] = min(current, want) if current > 0 else want
         opened.append(name)
@@ -613,10 +555,10 @@ def _apply_gpu_fallback(
 def resolve_ami_id(ami_ssm_name: str, region: str = "us-west-2") -> str:
     """Resolve the worker AMI ID the ``ami_ssm_name`` SSM parameter currently points at.
 
-    The campaign resolves this ONCE up front and pins it into every fill's
-    provisioning (``ray_cluster(ami_id=...)``), so a re-bake that repoints the SSM
-    parameter mid-campaign can't make a fill boot a different image than the one its
-    staging fingerprint recorded — see :func:`resolve_code_artifact_identity`.
+    The campaign resolves this ONCE up front and pins it into every fill's provisioning
+    (``ray_cluster(ami_id=...)``), so a mid-campaign re-bake that repoints the SSM parameter
+    can't make a fill boot a different image than its staging fingerprint recorded — see
+    :func:`resolve_code_artifact_identity`.
     """
     return boto3.client("ssm", region_name=region).get_parameter(Name=ami_ssm_name)["Parameter"]["Value"]
 
@@ -635,23 +577,22 @@ def resolve_code_artifact_identity(
     from (the AMI behind ``ami_ssm_name`` and ``s3://{code_bucket}/code/src{suffix}.tar.gz``).
 
     The global campaign folds this into each cell's staging ``run_id`` because
-    ``code_suffix`` alone is NOT immutable: it is empty for a baked production AMI and
-    only a filename/branch stem for a tarball, so re-baking the AMI under the same SSM
-    name, or overwriting the tarball, leaves it unchanged. A retry would then resume
-    tiles staged by the OLD code while remaining tiles run the NEW code, permanently
-    publishing a mixed-version year. Resolving the real AMI ID and tarball ETag makes
-    any code change flip the fingerprint, so a fresh staging prefix is used.
+    ``code_suffix`` alone is NOT immutable: it is empty for a baked production AMI and only
+    a filename/branch stem for a tarball, so re-baking the AMI under the same SSM name, or
+    overwriting the tarball, leaves it unchanged. A retry would then resume tiles staged by
+    the OLD code while the rest ran the NEW code, permanently publishing a mixed-version
+    year. The real AMI ID and tarball ETag make any code change flip the fingerprint onto a
+    fresh staging prefix.
 
     KNOWN RESIDUAL WINDOW (dev-overlay path only). The ETag is read here, once, while
-    workers later download the mutable key ``code/src{code_suffix}.tar.gz``. Overwrite
-    that object mid-campaign and workers boot code the fingerprint does not describe.
-    Re-reading the ETag just before launch would narrow the window, not close it — the
-    overwrite can land between that HEAD and the worker's GET — so this is left as a
-    constraint rather than a partial mitigation: DO NOT overwrite a tarball a campaign
-    is running against. Production is unaffected (a baked AMI passes ``code_bucket=None``
-    and has no tarball term at all). To close it properly, upload content-addressed keys
-    (``code/src-<sha>.tar.gz``) so the object is immutable by construction, rather than
-    threading an S3 versionId through provisioning. Same reasoning as the model
+    workers later download the mutable key ``code/src{code_suffix}.tar.gz``: overwrite that
+    object mid-campaign and workers boot code the fingerprint does not describe. Re-reading
+    the ETag just before launch would narrow the window, not close it (the overwrite can
+    land between that HEAD and the worker's GET), so the constraint stands instead: DO NOT
+    overwrite a tarball a campaign is running against. Production is unaffected — a baked
+    AMI passes ``code_bucket=None`` and has no tarball term. Closing it properly means
+    content-addressed keys (``code/src-<sha>.tar.gz``), immutable by construction, rather
+    than threading an S3 versionId through provisioning. Same reasoning as the model
     checkpoint's filename-not-bytes identity in ``_staging_run_id``.
 
     Args:
@@ -676,16 +617,16 @@ def source_tarball_identity(code_bucket: str | None, code_suffix: str, region: s
     """``tarball=<etag>`` for the source archive workers overlay, or ``""`` when there is none.
 
     Split out of :func:`resolve_code_artifact_identity` so the staging fingerprint can carry
-    the TARBALL term without the AMI one. Those two have opposite properties for staging
-    reuse: re-baking an AMI does not change what a staged tile contains, so folding it in
-    abandoned every staged tile for nothing — which is why the staging identity was narrowed
-    on 2026-07-30 — while replacing the tarball changes exactly what a worker executes.
+    the TARBALL term WITHOUT the AMI one. The two have opposite properties for staging
+    reuse, and that asymmetry is the standing rule: re-baking an AMI does not change what a
+    staged tile contains, so folding the AMI into the staging identity abandons every staged
+    tile for nothing, while replacing the tarball changes exactly what a worker executes.
 
-    **Empty for a baked-AMI deploy** (``code_bucket=None``), which is production. So a
-    fingerprint that includes this is unchanged there and gains the term only on the
-    dev-overlay path, where it is the whole exposure.
+    **Empty for a baked-AMI deploy** (``code_bucket=None``), which is production — so a
+    fingerprint including this is unchanged there and gains the term only on the dev-overlay
+    path, where it is the whole exposure.
 
-    The residual window in :func:`resolve_code_artifact_identity` applies here unchanged: the
+    The residual window in :func:`resolve_code_artifact_identity` applies unchanged: the
     ETag is read once while workers later GET the mutable key, so do not overwrite a tarball
     a campaign is running against.
     """
@@ -700,12 +641,11 @@ def cluster_name_for_flow_run(flow_run_id: object, cluster_yaml: Path = DEFAULT_
     """Deterministic Ray cluster name for a flow run, or ``None`` if no id is known.
 
     The name must be recomputable from nothing but the flow-run id: Prefect runs
-    cancellation/crash hooks in a freshly imported module after the flow's child
-    process is killed, so a hook can re-derive the cluster tag (and terminate the
-    fleet) even with the flow's module globals unset. Both the ``tessera_embeddings``
-    and ``fill-zone-year`` flows pass this as ``ray_cluster(cluster_name=...)`` so the
-    provisioned name and the hook's re-derived name always match. The base comes from
-    the shipped cluster template so it stays in sync with what ``ray up`` uses.
+    cancellation/crash hooks in a freshly imported module after killing the flow's child
+    process, so a hook re-derives the cluster tag (and terminates the fleet) with the flow's
+    module globals unset. Both the ``tessera_embeddings`` and ``fill-zone-year`` flows pass
+    this as ``ray_cluster(cluster_name=...)`` so provisioned and re-derived names match. The
+    base comes from the shipped cluster template, keeping it in sync with ``ray up``.
     """
     if not flow_run_id:
         return None
@@ -720,11 +660,10 @@ def _build_cloudwatch_setup_command(
 ) -> str:
     """Build a shell command that configures the CloudWatch agent on a Ray node.
 
-    Reads the human-readable JSON template, compacts it to a single line,
-    substitutes the EC2 instance ID at boot, and writes the resulting
-    config in place. Heredocs in YAML setup_commands break when Ray
-    sends them over SSH (indented terminators are never matched), so we
-    inline the whole config as a single shell command.
+    Reads the human-readable JSON template, compacts it to a single line, substitutes the
+    EC2 instance ID at boot, and writes the config in place. Heredocs in YAML
+    setup_commands break when Ray sends them over SSH (indented terminators are never
+    matched), so the whole config is inlined as one shell command.
 
     Args:
         cloudwatch_template: Path to the JSON template. Defaults to the
@@ -784,53 +723,48 @@ def _resolve_ray_config(
         ami_ssm_name: SSM parameter name holding the worker AMI ID. Used only
             when ``ami_id`` is not given.
         ami_id: A pre-resolved worker AMI ID that PINS the image, bypassing the
-            ``ami_ssm_name`` lookup. The campaign resolves the AMI once and threads
-            it here so a mid-campaign re-bake can't repoint the SSM parameter and
-            boot a different image than a fill's staging fingerprint recorded.
-        ssm_prefix: Prefix under which Ray resource IDs are stored.
-            Required keys: ``security-group-id``, ``instance-profile-arn``,
-            ``private-subnet-ids``, ``key-pair-name``, ``key-pair-id``.
-            Optional key: ``gpu-worker-ladder`` (see
-            :data:`GPU_WORKER_LADDER_SSM_KEY`) — releases the template's wider
-            GPU rungs without a release or a deployment re-registration. Absent
-            leaves the template's node types untouched.
-        cluster_name: Override the template's ``cluster_name``. Required
-            for running multiple clusters concurrently.
-        instance_tags: Extra EC2 tags to apply to every node, on top of
-            the always-present ``Project`` tag (see :data:`PROJECT_TAG_VALUE`)
-            and Ray's own ``ray-cluster-name`` tag. List of
-            ``{"Key": str, "Value": str}`` dicts; a ``Project`` key here
-            overrides the default. ``None`` means only the defaults.
-        code_bucket: S3 bucket name (without ``s3://``) substituted for
-            ``{CODE_BUCKET}`` in setup_commands. ``None`` leaves the
-            placeholder; pair with ``sync_source_path=None`` to disable
-            tarball sync entirely.
-        code_suffix: Substituted for ``{CODE_SUFFIX}``. Empty string for
-            production tarballs; ``"-mybranch"`` for dev branches.
+            ``ami_ssm_name`` lookup. The campaign resolves the AMI once and threads it here
+            so a mid-campaign re-bake can't repoint the SSM parameter and boot a different
+            image than a fill's staging fingerprint recorded.
+        ssm_prefix: Prefix under which Ray resource IDs are stored. Required keys:
+            ``security-group-id``, ``instance-profile-arn``, ``private-subnet-ids``,
+            ``key-pair-name``, ``key-pair-id``. Optional: ``gpu-worker-ladder`` (see
+            :data:`GPU_WORKER_LADDER_SSM_KEY`), which releases the template's wider GPU
+            rungs without a release or a deployment re-registration; absent leaves the
+            template's node types untouched.
+        cluster_name: Override the template's ``cluster_name``. Required for running
+            multiple clusters concurrently.
+        instance_tags: Extra EC2 tags for every node, on top of the always-present
+            ``Project`` tag (see :data:`PROJECT_TAG_VALUE`) and Ray's own
+            ``ray-cluster-name``. List of ``{"Key": str, "Value": str}``; a ``Project`` key
+            here overrides the default. ``None`` means only the defaults.
+        code_bucket: S3 bucket name (without ``s3://``) substituted for ``{CODE_BUCKET}``
+            in setup_commands. ``None`` drops the fetch command; pair with
+            ``sync_source_path=None`` to disable tarball sync entirely.
+        code_suffix: Substituted for ``{CODE_SUFFIX}``. Empty for production tarballs;
+            ``"-mybranch"`` for dev branches.
         cloudwatch_log_group: CloudWatch log group for Ray agent logs.
         cloudwatch_template: Path to the CloudWatch agent JSON template.
-        idle_timeout_minutes: Override the template's autoscaler idle-down
-            delay. The template default (2 min) suits single-ROI runs, where
-            any idle worker is surplus; a multi-zone sequential fill holds one
-            cluster across zones and must survive the inter-zone gap
-            (staged-completeness verify + next zone's dispatch), so it passes
-            a larger value. ``None`` keeps the template's value.
-        launch_pacing: Assign :data:`LAUNCH_PACING_ENV` on the head's ``ray start``
-            command, so the autoscaler it spawns paces its EC2 launch requests
-        gpu_fallback_instance_types: Card names (see :data:`GPU_FALLBACK_CARDS`) this run may fall
-            back to when the production rung has no capacity. Empty -- the default --
-            leaves the cluster exactly as it is today. Naming a card opens its rung AND
-            installs the capacity-aware autoscaler scorer; see :func:`_apply_gpu_fallback`
-            for why both are needed and neither is sufficient.
+        idle_timeout_minutes: Override the template's autoscaler idle-down delay. The
+            template default (2 min) suits single-ROI runs, where any idle worker is
+            surplus; a multi-zone sequential fill holds one cluster across zones and must
+            survive the inter-zone gap (staged-completeness verify plus the next zone's
+            dispatch), so it passes a larger value. ``None`` keeps the template's value.
+        launch_pacing: Assign :data:`LAUNCH_PACING_ENV` on the head's ``ray start`` command,
+            so the autoscaler it spawns paces its EC2 launch requests against the account's
+            shared request quota. ``False`` leaves the template's commands untouched; pass
+            ``True`` when several clusters will be growing at once. Worker start commands
+            are never touched — only the head runs an autoscaler.
+        gpu_fallback_instance_types: Instance types (see
+            :data:`GPU_FALLBACK_INSTANCE_TYPES`) this run may fall back to when the
+            production rung has no capacity. Empty -- the default -- leaves the cluster as
+            it is. Naming one opens its rung AND installs the capacity-aware autoscaler
+            scorer; :func:`_apply_gpu_fallback` says why neither alone is sufficient.
         gpu_fallback_vcpu_budget: Optional G-and-VT vCPU budget for this cluster's GPU
             fleet. Rungs are not equally priced -- the fallback sizes are 8 vCPU per GPU
-            against the production rung's 4 -- so a ceiling in NODES means a different
-            quota bill depending on which card wins. Given a budget, each rung is
-            ceilinged at what the budget affords IT.
-            against the account's shared request quota. ``False`` leaves the
-            template's commands untouched; pass ``True`` when several clusters
-            will be growing at once. Worker start commands are never touched —
-            only the head runs an autoscaler.
+            against the production rung's 4 -- so a ceiling in NODES means a different quota
+            bill depending on which card wins. Given a budget, each rung is ceilinged at
+            what the budget affords IT.
 
     Returns:
         Path to the resolved YAML tempfile.
@@ -863,9 +797,8 @@ def _resolve_ray_config(
         msg = f"Missing required SSM parameters under {ssm_prefix!r}: {sorted(missing)}"
         raise RuntimeError(msg)
 
-    # OPTIONAL, and its absence is the default: no key means the template's rungs
-    # stand exactly as shipped. Applied before anything else touches the node
-    # types so a refusal costs no tempfiles.
+    # OPTIONAL: no key means the template's rungs stand as shipped. Applied before anything
+    # else touches the node types so a refusal costs no tempfiles.
     if GPU_WORKER_LADDER_SSM_KEY in params:
         _apply_gpu_worker_ladder(config, params[GPU_WORKER_LADDER_SSM_KEY])
 
@@ -886,19 +819,16 @@ def _resolve_ray_config(
     merged_tags.extend(instance_tags or [])
     tag_specs: list[dict[str, Any]] = [{"ResourceType": "instance", "Tags": merged_tags}]
 
-    # Every node type gets ALL private subnets, in SSM-param order. Ray's AWS
-    # node provider launches in the FIRST listed subnet and rotates to the
-    # next on a launch ClientError (e.g. InsufficientInstanceCapacity),
-    # trying every subnet before giving up — so the fleet lands mostly in one
-    # AZ with automatic capacity spillover to the others (a 2026-07-17 run
-    # stalled at 2 workers when its pinned AZ ran out of g6e capacity).
-    # Cross-AZ exposure is negligible by construction: inference's bulk data
-    # plane is actor↔S3 only (free in-region via the subnets' S3 gateway
-    # endpoints — verify routes when subnets change, see gotchas.md) and
-    # head↔worker traffic is KB/s control RPCs. INVARIANT that keeps this
-    # cheap: Ray actors must never exchange bulk data node-to-node — all bulk
-    # I/O goes to S3. (The Dask provider keeps its single-AZ pin; Dask
-    # genuinely shuffles between workers.)
+    # Every node type gets ALL private subnets, in SSM-param order. Ray's AWS node provider
+    # launches in the FIRST listed subnet and rotates to the next on a launch ClientError
+    # (e.g. InsufficientInstanceCapacity), trying every subnet before giving up — so the
+    # fleet lands mostly in one AZ with automatic capacity spillover (a 2026-07-17 run
+    # stalled at 2 workers when its pinned AZ ran out of g6e capacity). Cross-AZ cost is
+    # negligible by construction: the bulk data plane is actor↔S3 only (free in-region via
+    # the subnets' S3 gateway endpoints — verify routes when subnets change, see
+    # gotchas.md) and head↔worker traffic is KB/s control RPCs. INVARIANT: Ray actors must
+    # never exchange bulk data node-to-node. (The Dask provider keeps its single-AZ pin;
+    # Dask genuinely shuffles between workers.)
     ec2 = boto3.client("ec2", region_name=region)
     subnet_resp = ec2.describe_subnets(SubnetIds=all_subnet_ids)
     if not subnet_resp.get("Subnets"):
@@ -910,11 +840,9 @@ def _resolve_ray_config(
     azs = list(dict.fromkeys(az_by_subnet[sid] for sid in all_subnet_ids))
     config["provider"]["availability_zone"] = ",".join(azs)
 
-    # Prefer a caller-PINNED AMI ID (the campaign resolves it once and threads it
-    # through every fill) over re-reading the SSM pointer here: re-reading would let
-    # a mid-campaign re-bake boot a different image than the fill's staging
-    # fingerprint recorded. Fall back to the SSM lookup when unpinned (direct/dev
-    # invocations), where the pointer is authoritative.
+    # Prefer a caller-PINNED AMI ID over re-reading the SSM pointer: re-reading would let a
+    # mid-campaign re-bake boot a different image than the fill's staging fingerprint
+    # recorded. Unpinned (direct/dev invocations) the pointer is authoritative.
     resolved_ami_id = ami_id if ami_id is not None else ssm.get_parameter(Name=ami_ssm_name)["Parameter"]["Value"]
 
     for node_type_cfg in config["available_node_types"].values():
@@ -943,36 +871,28 @@ def _resolve_ray_config(
 
     config["auth"]["ssh_private_key"] = ssh_key_path
 
-    # Inject the CloudWatch agent setup command (replaces any heredoc-style
-    # cloudwatch entry in the template, which would break over SSH).
-    #
-    # Append it to the *_start_ray_commands, NOT setup_commands: setup_commands
-    # run before `ray start`, so the agent would resolve its file paths while
-    # /tmp/ray/session_latest is empty or stale, then `ray start` repoints the
-    # session_latest symlink out from under it and no logs ship. Starting the
-    # agent after `ray start` guarantees the session and its log files already
-    # exist when fetch-config discovers them. Strip any pre-existing cloudwatch
-    # entries from every command list so we don't double-start.
+    # Inject the CloudWatch agent setup command, replacing any heredoc-style cloudwatch
+    # entry in the template (which would break over SSH). It goes on the
+    # *_start_ray_commands, NOT setup_commands: those run before `ray start`, so the agent
+    # would resolve its paths while /tmp/ray/session_latest is empty or stale and then
+    # `ray start` repoints the symlink out from under it and no logs ship. Pre-existing
+    # cloudwatch entries are stripped from every list so nothing double-starts.
     cw_cmd = _build_cloudwatch_setup_command(cloudwatch_template, cloudwatch_log_group)
     for key in ("setup_commands", "head_start_ray_commands", "worker_start_ray_commands"):
         config[key] = [cmd for cmd in config.get(key, []) if "cloudwatch" not in str(cmd).lower()]
     config["head_start_ray_commands"].append(cw_cmd)
     config["worker_start_ray_commands"].append(cw_cmd)
 
-    # Pace this cluster's EC2 launch requests. Head only: the autoscaler that issues
-    # RunInstances is a child of the head's `ray start`, and a worker has none to
-    # inherit the setting. Applied after the CloudWatch append so the entry that
+    # Head only: the autoscaler that issues RunInstances is a child of the head's
+    # `ray start`, and a worker has none. After the CloudWatch append, so the entry that
     # starts Ray is the one that gets the assignments.
     if launch_pacing:
         config["head_start_ray_commands"] = _pace_ray_start(config["head_start_ray_commands"], LAUNCH_PACING_ENV)
 
     # Substitute {CODE_BUCKET} and {CODE_SUFFIX} in setup_commands. With no bucket the
-    # command is DROPPED, not left alone: an unsubstituted `aws s3 cp
-    # s3://{CODE_BUCKET}/...` is a valid command line over a bucket name that cannot
-    # exist, so `ray up` runs it on every node and every node fails setup. `None` is the
-    # documented default and means the AMI already carries the code, so there is nothing
-    # to fetch — dropping the line is what that default has to mean for the cluster to
-    # boot at all.
+    # command is DROPPED, not left alone: an unsubstituted `aws s3 cp s3://{CODE_BUCKET}/…`
+    # is a valid command line over an impossible bucket name, so `ray up` runs it on every
+    # node and every node fails setup. `None` means the AMI already carries the code.
     if code_bucket is not None:
         config["setup_commands"] = [
             cmd.replace("{CODE_BUCKET}", code_bucket).replace("{CODE_SUFFIX}", code_suffix)
@@ -1015,9 +935,9 @@ def _sync_code_to_s3(
 ) -> None:
     """Tar a source directory and upload it to S3.
 
-    Workers pull this tarball on startup instead of using Ray
-    ``file_mounts``, which depends on SSH-based rsync and bottlenecks at
-    100-500+ workers. The S3 download is parallel across all workers.
+    Workers pull this tarball on startup instead of using Ray ``file_mounts``, which
+    depends on SSH-based rsync and bottlenecks at 100-500+ workers. The S3 download is
+    parallel across all workers.
 
     Args:
         src_dir: Directory to package.
@@ -1044,22 +964,17 @@ def _start_ray_cluster(
 ) -> str:
     """Launch a Ray cluster via ``ray up`` on a resolved YAML; return the head IP.
 
-    Config resolution happens in the caller (:func:`ray_cluster`) so the
-    resolved path is already bound when a failed launch unwinds to the
-    teardown block — ``ray down`` must target the real (uuid-suffixed)
-    cluster, not the unresolved template.
+    Config resolution happens in the caller (:func:`ray_cluster`) so the resolved path is
+    already bound when a failed launch unwinds to the teardown block — ``ray down`` must
+    target the real (uuid-suffixed) cluster, not the unresolved template.
 
-    ``launch_pacing`` paces the head node's OWN launch. ``ray up`` runs the node
-    provider in this process, not on the head, so the head's RunInstances call
-    draws on the same account quota from here — and several clusters starting
-    together is exactly when that matters.
-
-    It gets :data:`LAUNCH_PACING_CLIENT_ENV` only, NOT the autoscaler tuning. This
-    launch happens once: nothing retries a head that failed to start, and losing it
-    fails the whole fill. Spacing its attempts out is a help; taking attempts away
-    from it is a fleet-ending risk taken in exchange for nothing, since the batch
-    size is meaningless for a single instance. The autoscaler's own settings travel
-    separately, in the resolved YAML (see :func:`_resolve_ray_config`).
+    ``launch_pacing`` paces the head node's OWN launch: ``ray up`` runs the node provider in
+    this process, not on the head, so the head's RunInstances call draws on the same account
+    quota from here. It gets :data:`LAUNCH_PACING_CLIENT_ENV` only, NOT the autoscaler
+    tuning — this launch happens once, nothing retries a head that failed to start, and
+    losing it fails the whole fill, so taking attempts away buys nothing (batch size is
+    meaningless for a single instance). The autoscaler's settings travel separately, in the
+    resolved YAML (see :func:`_resolve_ray_config`).
     """
     log.info("Starting Ray cluster from %s", resolved_yaml)
     ray_up = subprocess.run(
@@ -1100,28 +1015,23 @@ def _log_ray_dashboard_ssm_command(
 ) -> None:
     """Log a copy-pasteable SSM command to port-forward the Ray dashboard.
 
-    Finds the head node by its ``ray-cluster-name`` + ``ray-node-type=head``
-    tags and emits an ``aws ssm start-session`` block that forwards the
-    dashboard (port 8265) to ``localhost``. The head listens on 8265 with
-    ``--dashboard-host=0.0.0.0`` and the EC2 role carries
-    ``AmazonSSMManagedInstanceCore``, so the port-forward works against the
-    instance ID.
+    Finds the head by its ``ray-cluster-name`` + ``ray-node-type=head`` tags and emits an
+    ``aws ssm start-session`` block forwarding the dashboard (port 8265) to ``localhost``.
+    The head listens on 8265 with ``--dashboard-host=0.0.0.0`` and the EC2 role carries
+    ``AmazonSSMManagedInstanceCore``, so the forward works against the instance ID.
 
-    Uses ``AWS-StartPortForwardingSession``, which targets a port on the
-    managed instance itself. The ``...ToRemoteHost`` variant addresses hosts
-    reachable *from* the instance, and the SSM agent rejects loopback
-    destinations for it.
-
-    ``--region`` is filled in from the region the head node was looked up in,
-    so an operator whose default region differs doesn't get a "target not
-    connected" from SSM. No ``--profile`` is printed — credentials come from
-    the operator's environment (``AWS_PROFILE`` or their default).
+    Uses ``AWS-StartPortForwardingSession``, which targets a port on the managed instance
+    itself; the ``...ToRemoteHost`` variant addresses hosts reachable *from* the instance
+    and the SSM agent rejects loopback destinations for it. ``--region`` is filled in from
+    the lookup region, so an operator whose default differs doesn't get a "target not
+    connected". No ``--profile`` is printed — credentials come from the operator's
+    environment.
 
     Best-effort: warns and returns on any failure, never raises.
 
     Args:
-        cluster_name: Resolved, unique ``ray-cluster-name`` tag value (with
-            the uuid8 suffix) that Ray actually tagged instances with.
+        cluster_name: Resolved, unique ``ray-cluster-name`` tag value (with the uuid8
+            suffix) that Ray actually tagged instances with.
         log: Logger.
         region: AWS region.
     """
@@ -1159,11 +1069,10 @@ def make_instance_terminator(
 ) -> Callable[[str], None]:
     """Create a callback that terminates a single EC2 instance by ID.
 
-    Wired into the inference scheduler's ``on_actor_retire`` hook so that
-    GPU nodes are terminated immediately after retiring idle actors,
-    rather than waiting for the Ray autoscaler's idle timeout (which is
-    unreliable after ``ray.kill()`` because it relies on the node
-    self-reporting empty).
+    Wired into the inference scheduler's ``on_actor_retire`` hook so GPU nodes are
+    terminated immediately after retiring idle actors, rather than waiting for the Ray
+    autoscaler's idle timeout — unreliable after ``ray.kill()``, which relies on the node
+    self-reporting empty.
 
     Args:
         region: AWS region.
@@ -1191,17 +1100,16 @@ def terminate_ray_instances_by_tag(
 ) -> None:
     """Terminate all running/pending EC2 instances belonging to a Ray cluster.
 
-    Fallback used when the resolved cluster YAML is unavailable (e.g. the
-    flow was cancelled before ``ray up`` wrote it). Finds instances by
-    the ``ray-cluster-name`` tag that Ray sets on every node it launches.
+    Fallback for when the resolved cluster YAML is unavailable (e.g. the flow was cancelled
+    before ``ray up`` wrote it). Finds instances by the ``ray-cluster-name`` tag Ray sets on
+    every node it launches.
 
     Args:
         cluster_name: Value (or prefix) of the ``ray-cluster-name`` EC2 tag.
         region: AWS region.
         log: Optional logger; silently swallows errors if ``None``.
-        prefix_match: If True, match clusters whose ``ray-cluster-name``
-            *starts with* ``cluster_name``. Use with caution — this will
-            terminate instances from ALL matching clusters.
+        prefix_match: If True, match clusters whose ``ray-cluster-name`` *starts with*
+            ``cluster_name`` — this terminates instances from ALL matching clusters.
     """
     _log = log or logging.getLogger(__name__)
     try:
@@ -1229,15 +1137,12 @@ def _stop_ray_cluster(
 ) -> bool:
     """Tear down the Ray cluster via ``ray down``. Best-effort — does not raise.
 
-    Returns True if ``ray down`` exited 0, False otherwise (caller may then fall
-    back to tag-based termination so a head that ``ray down`` couldn't reach
-    doesn't leak).
+    Returns True if ``ray down`` exited 0, False otherwise, so the caller can fall back to
+    tag-based termination and a head ``ray down`` couldn't reach doesn't leak.
 
-    BOUNDED by ``RAY_DOWN_TIMEOUT_S``, for the reason that constant documents: this
-    SSHes into the head, and an unreachable head makes it hang indefinitely. Unbounded,
-    the fallback in the sentence above is unreachable exactly when it is needed — the
-    call never returns, so nothing terminates the fleet by tag and the GPUs bill on. A
-    timeout is therefore reported as a failed ``ray down``, not raised.
+    BOUNDED by ``RAY_DOWN_TIMEOUT_S``: this SSHes into the head, and unbounded it would hang
+    on an unreachable one, making that fallback unreachable exactly when it is needed while
+    the GPUs bill on. A timeout is therefore reported as a failed ``ray down``, not raised.
     """
     log.info("Tearing down Ray cluster")
     try:
@@ -1287,64 +1192,57 @@ def ray_cluster(
 
     Two modes:
 
-    * ``ray_address`` set — connect to an existing cluster at that
-      address. No ``ray up``/``ray down`` is performed; the caller owns
-      the lifecycle.
-    * Default — call ``ray up`` against the resolved cluster YAML, then
-      ``ray.init`` against the head node, and tear the cluster down on
-      exit.
+    * ``ray_address`` set — connect to an existing cluster at that address. No ``ray up`` /
+      ``ray down``; the caller owns the lifecycle.
+    * Default — ``ray up`` against the resolved cluster YAML, ``ray.init`` against the head
+      node, and tear the cluster down on exit.
 
     Args:
         log: Logger.
-        ami_ssm_name: SSM parameter name holding the worker AMI ID.
-            Required even when ``ray_address`` is given (kept as a
-            consistent signature; ignored in that path). Used only when
-            ``ami_id`` is not given.
+        ami_ssm_name: SSM parameter name holding the worker AMI ID. Required even when
+            ``ray_address`` is given (consistent signature; ignored in that path). Used
+            only when ``ami_id`` is not given.
         ami_id: Pre-resolved AMI ID that PINS the worker image (bypasses the
-            ``ami_ssm_name`` lookup). The campaign threads the AMI it resolved
-            once into every fill so a mid-campaign re-bake can't boot a
-            different image than the fill's staging fingerprint recorded.
+            ``ami_ssm_name`` lookup). The campaign threads the AMI it resolved once into
+            every fill so a mid-campaign re-bake can't boot a different image than the
+            fill's staging fingerprint recorded.
         ray_address: Connect to an existing cluster instead of launching one.
-        cluster_yaml: Path to the cluster YAML template. Defaults to the
-            template shipped at :data:`DEFAULT_CLUSTER_TEMPLATE`.
-        cluster_name: Override the YAML's ``cluster_name``. When ``None``,
-            an auto-generated name is used so concurrent clusters get
-            distinct EC2 tags.
+        cluster_yaml: Path to the cluster YAML template. Defaults to
+            :data:`DEFAULT_CLUSTER_TEMPLATE`.
+        cluster_name: Override the YAML's ``cluster_name``. ``None`` auto-generates one so
+            concurrent clusters get distinct EC2 tags.
         region: AWS region (must match the SSM region).
         ssm_prefix: SSM Parameter Store prefix for Ray resource IDs.
         instance_tags: EC2 tags applied to every node.
-        sync_source_path: When provided, tar this directory and upload it
-            to ``s3://{code_bucket}/code/src{code_suffix}.tar.gz`` before
-            ``ray up``. Use for dev iteration; production deployments
-            should bake source into the AMI and leave this ``None``.
-        code_bucket: S3 bucket for the source tarball. Required when
-            ``sync_source_path`` is set.
+        sync_source_path: When provided, tar this directory and upload it to
+            ``s3://{code_bucket}/code/src{code_suffix}.tar.gz`` before ``ray up``. Dev
+            iteration only; production bakes source into the AMI and leaves this ``None``.
+        code_bucket: S3 bucket for the source tarball. Required when ``sync_source_path``
+            is set.
         code_suffix: Filename suffix for the tarball.
         cloudwatch_log_group: CloudWatch log group for Ray agent logs.
         cloudwatch_template: CloudWatch agent JSON template path.
-        idle_timeout_minutes: Optional override of the template's autoscaler
-            idle-down delay; ``None`` keeps the template's value. Rationale at
+        idle_timeout_minutes: Optional override of the template's autoscaler idle-down
+            delay; ``None`` keeps the template's value. Rationale at
             :func:`_resolve_ray_config`.
-        launch_pacing: Pace this cluster's EC2 launch requests against the
-            account's shared RunInstances quota — see :data:`LAUNCH_PACING_ENV`.
-        gpu_fallback_instance_types: Card names this cluster may fall back to when the production
-            GPU rung has no capacity -- see :data:`GPU_FALLBACK_CARDS`. Empty (the
-            default) leaves behaviour exactly as it is today.
+        launch_pacing: Pace this cluster's EC2 launch requests against the account's shared
+            RunInstances quota — see :data:`LAUNCH_PACING_ENV`. Default ``False``; pass
+            ``True`` when several clusters grow concurrently, since one cluster alone
+            contends with nothing and gains only a smaller call count. Ignored in the
+            ``ray_address`` path, which provisions nothing.
+        gpu_fallback_instance_types: Instance types this cluster may fall back to when the
+            production GPU rung has no capacity -- see
+            :data:`GPU_FALLBACK_INSTANCE_TYPES`. Empty (the default) changes nothing.
         gpu_fallback_vcpu_budget: Optional G-and-VT vCPU budget for this cluster's GPU
             fleet. Rungs are not equally priced -- the fallback sizes are 8 vCPU per GPU
-            against the production rung's 4 -- so a ceiling in NODES means a different
-            quota bill depending on which card wins. Given a budget, each rung is
-            ceilinged at what the budget affords IT.
-            Default ``False`` keeps today's launch behaviour. Pass ``True`` when
-            several clusters grow concurrently; one cluster alone contends with
-            nothing and gains only a smaller call count. Ignored in the
-            ``ray_address`` path, which provisions nothing.
+            against the production rung's 4 -- so a ceiling in NODES means a different quota
+            bill depending on which card wins. Given a budget, each rung is ceilinged at
+            what the budget affords IT.
 
     Yields:
-        Path to the resolved cluster YAML tempfile when this context
-        manages the cluster lifecycle, or ``None`` when ``ray_address``
-        was supplied. The yielded path is intended for an
-        on-cancellation hook to call :func:`cleanup_ray_tempfiles`.
+        Path to the resolved cluster YAML tempfile when this context manages the cluster
+        lifecycle, or ``None`` when ``ray_address`` was supplied. The yielded path is for an
+        on-cancellation hook to pass to :func:`cleanup_ray_tempfiles`.
     """
     resolved_yaml: str | None = None
     manages_cluster = False
@@ -1369,13 +1267,11 @@ def ray_cluster(
                 log.info("Syncing %s → s3://%s/%s", sync_source_path, code_bucket, s3_key)
                 _sync_code_to_s3(sync_source_path, code_bucket, s3_key)
 
-            # Resolve BEFORE launching so `resolved_yaml` is bound when a
-            # failed `ray up` unwinds to the finally-block: a partial launch
-            # can leave a provisioned head behind, and `ray down` against the
-            # unresolved template (whose cluster_name lacks the uuid suffix)
-            # matches nothing — that exact path leaked a head on 2026-07-16.
-            # _resolve_ray_config lists every private subnet on every node
-            # type (multi-AZ with launch-time capacity failover).
+            # Resolve BEFORE launching so `resolved_yaml` is bound when a failed `ray up`
+            # unwinds to the finally-block: a partial launch can leave a provisioned head
+            # behind, and `ray down` against the unresolved template (whose cluster_name
+            # lacks the uuid suffix) matches nothing — that exact path leaked a head on
+            # 2026-07-16.
             log.info("Resolving Ray cluster config from SSM (cluster_name=%s)", cluster_name)
             resolved_yaml = _resolve_ray_config(
                 cluster_yaml,
@@ -1406,18 +1302,15 @@ def ray_cluster(
         ray.shutdown()
         if manages_cluster:
             if resolved_yaml is None:
-                # Config resolution failed before launch, so no resolved YAML
-                # exists. `ray down` on the UNRESOLVED template would target its
-                # base cluster_name (no flow-specific uuid suffix) and could tear
-                # down an unrelated `tessera-inference` cluster — skip it and
-                # terminate anything tagged with our exact cluster_name instead.
+                # Resolution failed before launch. `ray down` on the UNRESOLVED template
+                # would target its base cluster_name (no flow-specific uuid suffix) and
+                # could tear down an unrelated `tessera-inference` cluster — terminate by
+                # our exact cluster_name tag instead.
                 if cluster_name:
                     terminate_ray_instances_by_tag(cluster_name=cluster_name, region=region, log=log)
             elif not _stop_ray_cluster(resolved_yaml, log) and cluster_name:
-                # When `ray down` can't tear the cluster down (unreachable head,
-                # stale YAML), fall back to exact-tag termination so a normally-
-                # completed run can't leave the fleet billing. The
-                # cancellation/crash hook only covers cancelled/crashed flows,
-                # not this path.
+                # `ray down` couldn't tear the cluster down (unreachable head, stale YAML):
+                # fall back to exact-tag termination so a normally-completed run can't leave
+                # the fleet billing. The cancellation/crash hook does not cover this path.
                 terminate_ray_instances_by_tag(cluster_name=cluster_name, region=region, log=log)
             cleanup_ray_tempfiles(resolved_yaml)

@@ -1,19 +1,16 @@
 """Shared Dask/ECS teardown hook for cluster-owning ingest flows.
 
-The Dask analogue of :mod:`._ray_lifecycle`, for the leak found on the first
-real campaign cell: ``ecs_cluster`` tears down in a ``finally``, which a hard
-cancel skips (Prefect kills the flow process first), leaving the scheduler and
-workers running in ECS. (NOT the provider's ``skip_cleanup`` flag — that only
-disables dask-cloudprovider's startup sweep for debris from PRIOR runs, and
-turning it off breaks cluster construction under AWS SSO.)
+The Dask analogue of :mod:`._ray_lifecycle`, for the leak found on the first real campaign cell:
+``ecs_cluster`` tears down in a ``finally``, which a hard cancel skips (Prefect kills the flow
+process first), leaving the scheduler and workers running in ECS. (NOT the provider's
+``skip_cleanup`` flag — that only disables dask-cloudprovider's startup sweep for debris from
+PRIOR runs, and turning it off breaks cluster construction under AWS SSO.)
 
-Simpler than the Ray hook because it is tag-based end to end: the flows tag
-every cluster resource with their flow-run id at provisioning
-(``resource_tags``), and the hook re-derives that tag from nothing but the
-``flow_run`` argument — no module state to survive Prefect's fresh-import hook
-process. Register :func:`dask_cleanup_on_cancellation` as BOTH
-``on_cancellation`` and ``on_crashed``: a crashed run leaks exactly like a
-cancelled one.
+Simpler than the Ray hook because it is tag-based end to end: the flows tag every cluster resource
+with their flow-run id at provisioning (``resource_tags``), and the hook re-derives that tag from
+nothing but the ``flow_run`` argument — no module state to survive Prefect's fresh-import hook
+process. Register :func:`dask_cleanup_on_cancellation` as BOTH ``on_cancellation`` and
+``on_crashed``: a crashed run leaks exactly like a cancelled one.
 """
 
 from __future__ import annotations
@@ -46,24 +43,20 @@ def dask_cleanup_on_cancellation(flow: object, flow_run: object, state: object) 
 def _stop_ecs_tasks_by_tag(tag_key: str, tag_value: str, *, log: logging.Logger) -> None:
     """Lazy-import wrapper over the AWS provider's ECS sweep.
 
-    Deferred, NOT imported at module scope: both ingest flows import this module
-    unconditionally, and ``providers.aws.dask`` pulls in ``dask-cloudprovider`` and
-    ``psutil`` from the ``aws`` extra. A module-scope import therefore makes a
-    supported ``tessera_embeddings[prefect]`` install unable to so much as IMPORT the
-    ingest flows — including to run them with ``use_local=True`` or a non-AWS
-    provider, which need no AWS packages at all. Deferring it keeps the flows
-    importable everywhere and costs an import only on the AWS teardown path, where a
-    cluster is being swept anyway. Same pattern as ``run_global_campaign``'s
-    ``_resolve_code_identity``.
+    Deferred, NOT imported at module scope: both ingest flows import this module unconditionally,
+    and ``providers.aws.dask`` pulls in ``dask-cloudprovider`` and ``psutil`` from the ``aws``
+    extra, so a module-scope import would make a supported ``tessera_embeddings[prefect]`` install
+    unable to so much as IMPORT the ingest flows — including to run them with ``use_local=True`` or
+    a non-AWS provider, which need no AWS packages at all. Deferring costs an import only on the
+    AWS teardown path, where a cluster is being swept anyway. Same pattern as
+    ``run_global_campaign``'s ``_resolve_code_identity``.
 
-    An ``ImportError`` here is NOT a failure. Deferring the import fixed the flows
-    being unimportable, but a ``use_local=True`` run on a ``[prefect]``-only install
-    still reaches this hook on cancellation, where the import that never mattered —
-    there is no ECS cluster to sweep — would raise and fail the terminal hook. The
-    absence of the AWS provider is itself the proof there is nothing to tear down, so
-    it is logged and swallowed. Every OTHER exception propagates: on a real AWS run a
-    failed sweep means leaked ECS tasks that keep billing, which is precisely what
-    this hook exists to prevent and must never be hidden.
+    An ``ImportError`` here is NOT a failure: a ``use_local=True`` run on a ``[prefect]``-only
+    install still reaches this hook on cancellation, where the import that never mattered — there
+    is no ECS cluster to sweep — would otherwise raise and fail the terminal hook. The absence of
+    the AWS provider is itself the proof there is nothing to tear down, so it is logged and
+    swallowed. Every OTHER exception propagates: on a real AWS run a failed sweep means leaked ECS
+    tasks that keep billing, which is precisely what this hook exists to prevent.
     """
     try:
         from tessera_embeddings.providers.aws.dask import stop_ecs_tasks_by_tag

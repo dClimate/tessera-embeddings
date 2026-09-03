@@ -1,15 +1,12 @@
 """Storage path configuration.
 
-Replaces the hardcoded ``s3://cl-tessera-*`` bucket names from the reference
-repo. Paths are supplied by caller configuration, not derived from a
-``dev/prod`` boolean toggle.
+Paths come from caller configuration — never a hardcoded bucket name, never a ``dev/prod``
+boolean toggle. The ``BucketPaths`` model is what all domain code sees; Prefect flows and
+the plain runner populate it differently (env vars, YAML config, Prefect Block) but domain
+function signatures are identical.
 
-The ``BucketPaths`` model is what all domain code sees. Prefect flows and the
-plain runner populate it differently (env vars, YAML config, Prefect Block)
-but domain function signatures are identical.
-
-URIs may use any fsspec-supported protocol: ``s3://``, ``gs://``,
-``file://``, ``/absolute/local/path``, etc.
+URIs may use any fsspec-supported protocol: ``s3://``, ``gs://``, ``file://``,
+``/absolute/local/path``, etc.
 """
 
 from __future__ import annotations
@@ -33,8 +30,8 @@ _DEFAULT_GLOBAL_STORE_NAME = "tessera"
 class BucketPaths(BaseModel):
     """Base storage URIs for each pipeline stage.
 
-    All fields accept any fsspec-supported URI. Domain functions receive a
-    ``BucketPaths`` instance and construct store URIs via :meth:`store_for`.
+    All fields accept any fsspec-supported URI. Domain functions receive a ``BucketPaths``
+    instance and construct store URIs via :meth:`store_for`.
     """
 
     inputs: str = Field(..., description="Base URI for ROI masks and intermediate ingest stores.")
@@ -78,35 +75,35 @@ class BucketPaths(BaseModel):
     def zone_roi_store(self, zone: str) -> str:
         """Return the URI of the campaign ingest ROI mask for one UTM zone.
 
-        Zone masks are ordinary ``roi``-kind stores under the reserved
-        ``zone_{zone}`` name, so a zone mask and a conventionally-named ROI can
-        never collide. Every producer and consumer of a zone mask addresses it
-        through here: a mask written to a path the ingest does not read would
-        look like success and then be silently rebuilt per cell.
+        Zone masks are ordinary ``roi``-kind stores under the reserved ``zone_{zone}`` name,
+        so a zone mask and a conventionally-named ROI can never collide. Every producer and
+        consumer addresses one through here: a mask written to a path the ingest does not
+        read looks like success and is then silently rebuilt per cell.
         """
         return self.store_for(f"zone_{zone}", "roi")
 
     def global_store(self, name: str = _DEFAULT_GLOBAL_STORE_NAME) -> str:
         """Return the URI of the single global-embeddings Icechunk repo.
 
-        The global campaign writes all 120 UTM-zone groups into one repo
-        (ADR-008 D5), addressed by zone group name — unlike :meth:`store_for`,
-        which is one ``.zarr`` per (roi, kind).
+        The global campaign writes all 120 UTM-zone groups into one repo (ADR-008 D5),
+        addressed by zone group name — unlike :meth:`store_for`, one ``.zarr`` per
+        (roi, kind).
 
-        **``global_store_uri`` overrides the derivation entirely**, because a published location
-        need not be shaped like one this method could build: a different bucket, no ``global/``
-        segment, a name chosen by whoever owns the bucket. Every producer and consumer
-        of the campaign store asks this one method, which is what makes a single field enough — and
-        what makes it impossible for one tool to write the override while another reads the derived
-        path.
+        **``global_store_uri`` overrides the derivation entirely**, because a published
+        location need not be shaped like one this method could build: a different bucket, no
+        ``global/`` segment, a name chosen by whoever owns the bucket. Every producer and
+        consumer of the campaign store asks this one method, which is what makes a single
+        field enough and makes it impossible for one tool to write the override while
+        another reads the derived path.
 
         Args:
             name: Repo basename, used only when deriving.
 
         Raises:
-            ValueError: If an override is set AND a caller asks for a non-default ``name``. The
-                override IS the store, so the name has nowhere to go — and a silently ignored
-                argument is how a caller ends up certain it addressed a store that does not exist.
+            ValueError: If an override is set AND a caller asks for a non-default ``name``.
+                The override IS the store, so the name has nowhere to go, and a silently
+                ignored argument leaves a caller certain it addressed a store that does not
+                exist.
         """
         if self.global_store_uri:
             if name != _DEFAULT_GLOBAL_STORE_NAME:
@@ -121,51 +118,47 @@ class BucketPaths(BaseModel):
     def optical_registry(self, store_uri: str) -> str:
         """Return the URI of the per-shard registry that sits BESIDE ``store_uri``.
 
-        A Parquet dataset indexing what the store contains per shard and year — what was embedded,
-        what was refused and how close the refusals were to the line — so a consumer can answer
-        "is my area covered, and how well" with one read instead of opening a petabyte.
+        A Parquet dataset indexing what the store contains per shard and year — what was
+        embedded, what was refused and how close the refusals were to the line — so a
+        consumer can answer "is my area covered, and how well" with one read instead of
+        opening a petabyte.
 
-        **Takes the store URI, and the argument is required.** This used to call
-        :meth:`global_store` with no arguments, which meant it derived from the DEFAULT repo
-        basename whatever store the run was actually writing. A campaign against
-        ``store_name="tessera-radar"`` therefore published its registry beside
-        ``tessera.icechunk``: every tool still worked, the part was valid, and it described a
-        zone-year that store does not contain. Worse than an overwrite, because two stores' parts
-        then merge into one dataset under the same partition keys and nothing in the dataset can
-        tell them apart. Observed on 2026-08-19 against ``tessera-radar``.
+        **Takes the store URI, and the argument is required.** Anything derived instead (the
+        default repo basename, or ``outputs``) can name a store the run is not writing, and
+        the failure is silent: every tool works, the Parquet part is valid, and it describes
+        a zone-year that store does not contain. Worse than an overwrite, because two
+        stores' parts then merge into one dataset under the same partition keys with nothing
+        able to tell them apart. Deriving from ``outputs`` fails the same way in the other
+        direction — production publishes through :attr:`global_store_uri` to a bucket that
+        is not ours, so the registry would sit in our bucket and the store in the public
+        one. One input, and it IS the store. Incident and schema:
+        context_docs/design/optical-registry-2026-08-19.md.
 
-        Passing the resolved store URI is what makes disagreement impossible: there is one input
-        and it IS the store. The same reasoning rules out deriving from ``outputs`` — production
-        publishes to a bucket that is not ours through :attr:`global_store_uri`, so a registry
-        built from ``outputs`` would sit in our bucket while the store sat in the public one.
-
-        A SIBLING of the store rather than a path inside it, because Icechunk owns every key under
-        its own prefix: its garbage collection enumerates that prefix and reconciles it against its
-        own manifests, so a Parquet file living there is at best unrecognised and at worst
-        collected.
+        A SIBLING of the store rather than a path inside it, because Icechunk owns every key
+        under its own prefix: garbage collection enumerates that prefix and reconciles it
+        against its own manifests, so a Parquet file there is at best unrecognised and at
+        worst collected.
         """
-        # TRAILING SEPARATORS FIRST. An override ending in "/" leaves `name` empty, and the sibling
-        # then comes out as `.../dclimate.icechunk/.registry` — INSIDE the Icechunk-owned prefix,
-        # which is the one place a Parquet file must never live: garbage collection enumerates that
-        # prefix, reconciles it against its own manifests, and can collect what it does not
-        # recognise. A configured URI is human-entered, so the trailing slash is a matter of time.
+        # TRAILING SEPARATORS FIRST. An override ending in "/" leaves `name` empty and the
+        # sibling comes out as `.../dclimate.icechunk/.registry` — INSIDE the Icechunk-owned
+        # prefix, the one place a Parquet file must never live (see above). A configured URI
+        # is human-entered, so the trailing slash is a matter of time.
         store = store_uri.rstrip("/")
         base, sep, name = store.rpartition("/")
         stem = name[: -len(".icechunk")] if name.endswith(".icechunk") else name
-        # A store URI with no separator at all — a bare relative path like
-        # ``tessera.icechunk``, which local runs and tests use — leaves ``base`` empty, and
-        # f"{base}/{stem}" then names ``/tessera.registry`` at the FILESYSTEM ROOT rather
-        # than a sibling. That fails on permissions if you are lucky and writes somewhere
-        # unrelated to the configured store if you are not.
+        # A store URI with no separator — a bare relative path like ``tessera.icechunk``,
+        # which local runs and tests use — leaves ``base`` empty, and f"{base}/{stem}" would
+        # name ``/tessera.registry`` at the FILESYSTEM ROOT: a permissions failure if you are
+        # lucky, a write unrelated to the configured store if you are not.
         return f"{base}{sep}{stem}.registry"
 
     def land_mask_store(self, name: str = "global") -> str:
         """Return the URI of the campaign land-mask coverage Icechunk repo.
 
-        One repo of 120 UTM-zone groups (ADR-010), each holding registry-derived
-        coverage bitmaps (``tile_live_2048`` / ``chunk_live_256``) addressed by
-        zone group name — mirroring :meth:`global_store` so the zone-fill runner
-        reads it with the same ``open_store_as_zarr_group(path, group=zone)``
-        helper. Lives under ``inputs`` (it is a campaign input, like ROI masks).
+        One repo of 120 UTM-zone groups (ADR-010), each holding registry-derived coverage
+        bitmaps (``tile_live_2048`` / ``chunk_live_256``) addressed by zone group name —
+        mirroring :meth:`global_store` so the zone-fill runner reads it with the same
+        ``open_store_as_zarr_group(path, group=zone)`` helper. Lives under ``inputs``, being
+        a campaign input like the ROI masks.
         """
         return posixpath.join(self.inputs, "masks", f"{name}.icechunk")

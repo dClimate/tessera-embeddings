@@ -1,17 +1,11 @@
 """Reusable architecture-rule checker.
 
-The ``tessera_embeddings`` OSS contract is enforced by a small set of
-"hard rules" — e.g. *no* ``import prefect`` outside
-``orchestration/prefect/``. This module makes those rules executable
-against any source tree.
-
-Use cases:
-
-* The OSS repo's CI runs the bundled rules against
-  ``src/tessera_embeddings/`` (``tests/architecture/test_layer_rules.py``).
-* Downstream consumers (closed-source repos, community-adapter PRs)
-  point the same checker at *their* source tree, optionally with a
-  TOML allowlist that adds extra paths where a rule is permitted.
+The ``tessera_embeddings`` OSS contract is enforced by a small set of "hard rules" — e.g.
+*no* ``import prefect`` outside ``orchestration/prefect/``. This module makes those rules
+executable against any source tree: the OSS repo's CI runs the bundled rules against
+``src/tessera_embeddings/`` (``tests/architecture/test_layer_rules.py``), and downstream
+consumers (closed-source repos, community-adapter PRs) point the same checker at *their*
+tree, optionally with a TOML allowlist adding paths where a rule is permitted.
 
 Public API:
 
