@@ -9,7 +9,7 @@ Lives here rather than beside the unit tests because it stands up a ``LocalClust
 in ``tests/unit/providers/test_provider_aws_dask.py`` carrying ``@pytest.mark.integration``, where the
 root ``addopts`` deselected it and no workflow ran ``tests/unit`` with the marker enabled —
 so it had never executed in CI. Moved 2026-08-25, unchanged apart from this docstring; see
-``context_docs/test-suite-streamlining.md`` §2.5.
+``context_docs/test-suite-streamlining.md``, Phase 2 item 2.5.
 """
 
 from __future__ import annotations

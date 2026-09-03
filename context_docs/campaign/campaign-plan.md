@@ -80,6 +80,29 @@ once is `cells in flight × ~5.6 TB` rather than the whole 5.6 PB (5.6 PB over 1
 zone-years). Run sequentially, that full volume is held at once and storage alone becomes about
 **$128,000 a month** instead of ~$3,000.
 
+> **The three stages are also UNGATED with respect to each other, and that was a measured
+> correction** (PR #149, 2026-08-26). The campaign asked for 60 concurrent ingests and **ran 7**,
+> with the configuration correct all along: the fleet-wide Prefect gate never engaged, because two
+> *in-process* semaphores bound first and **both released their slot only after a cell's ASSEMBLY
+> landed.** `_MosaicBudget` admitted ingest starts, so ingest throughput was set by assembly
+> throughput; `zone_slots` admitted cells to the inference stream, so inference stalled once
+> `look_ahead + 2` cells were awaiting assembly.
+>
+> Both were sized as a storage budget on the assumption that assembly is cheap — a docstring said
+> 10–15% of inference wall time. **Measured on this campaign's first three assemblies it is ~1,380
+> tiles/hour** (1,369 / 1,354 / 1,424, within 5% across three cells), which on a dense cell is a
+> plausible per-cell critical path. **A gate released by assembly gates the slowest stage.** The
+> storage rationale had lapsed independently: the flow ingests a whole cluster before requesting
+> GPUs, so peak storage is a cluster's mosaics by design (ADR-011).
+>
+> So GPUs now wait for nothing but their own input: ingest runs `1 + look_ahead` per cluster,
+> inference admits without bound and waits on its chosen cell's mosaic, and assembly runs one
+> trailing thread per cluster that may lag arbitrarily far behind. **What stays bounded is FAILURE,
+> not throughput** — a failed cell keeps its mosaic for staged resume, and the feeder stops
+> admitting once `max_retained_failures` are outstanding. The price is an assembly backlog, which
+> is the cheap direction to fail. Assembly's own margin against the next cell's inference is in
+> [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §1.
+
 **Every year is dispatched in one batch** (`overlap_years=true`), **so there is no year barrier.**
 A cluster works a multi-year zone list, which makes the makespan `total work ÷ cells` rather than
 `max(longest zone, work ÷ cells)` *per year*. That is what lets cell count and GPU quota buy wall

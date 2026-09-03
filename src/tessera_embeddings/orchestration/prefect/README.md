@@ -243,9 +243,18 @@ Two subtleties worth knowing:
 
 How this plays out on the real world — 112 live UTM zones, 360,953 land tiles —
 and what happens if you move off 8 clusters is measured in
-[`context_docs/campaign/campaign-cost-model.md`](../../../../context_docs/campaign/campaign-cost-model.md).
-Short version: 8 splits the year to within 0.0%, 16 costs 0.6% and roughly halves
-wall clock, and past ~20 the largest zones start to dominate.
+[`context_docs/campaign/campaign-cost-model.md`](../../../../context_docs/campaign/campaign-cost-model.md)
+§5b.
+
+**Read the short version below as the SUPERSEDED area-only diagnostic**: 8 splits
+the year to within 0.0%, 16 costs 0.6%, and past ~20 the largest zones start to
+dominate. Those figures balance on raw live-tile count, which is balancing on
+AREA. The shipped partition weights each zone's tiles by its latitude band's
+observation count — proportional to GPU-hours — and by the years it still carries,
+and on that basis the campaign's **10** clusters spread by **0.009%** where the
+tile-count split would give **21.8%**. Do not quote the row above for a cluster
+count; run `scripts/cluster_work_spread.py --mask … --clusters …`, which reads the
+current mask through the campaign's own partitioner.
 
 > **Size the fleets to match.** These caps count *clusters* and *zones*, not
 > machines. Eight inference clusters at the default `num_actors` plus forty

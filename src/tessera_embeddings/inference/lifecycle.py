@@ -22,7 +22,13 @@ import ray
 #: capacity drought, and this number is the only thing that turns "waits forever looking patient"
 #: back into a failure that says what went wrong. A driver dispatch round closes only when every
 #: fill returns, so an unbounded wait would also block the re-dispatch a starved fill needs.
-#: Sizing history: context_docs/campaign/campaign-plan.md (§3, `immediate_refill`).
+#: Sizing history: 600 s -> 1800 s (PR #140) -> 21600 s (PR #142), after a fill carrying 81 cells
+#: across 9 zones aborted at 600 s because the GPU instance type was exhausted in every AZ of the
+#: region. What the longer wait COSTS is measured in
+#: context_docs/inference/gpu-fleet-launch-throttling.md: a pending actor is unsatisfied demand the
+#: autoscaler keeps re-placing against a five-token bucket, so this deadline sits through ~72
+#: placement intervals instead of 6. NOT to be confused with `max_leg_wall_clock_s`, which is also
+#: six hours and bounds an INGEST leg's retries — a different stage, a different quantity.
 ACTOR_INIT_TIMEOUT_SEC = 21600
 """Maximum wall-clock seconds to wait for actor ``__init__``: instance launch, container pull,
 checkpoint download and model load to GPU. Override via ``run_inference``, not by patching this."""

@@ -109,7 +109,7 @@ class RunConfig:
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
-    """Register the CLI flags every ``tN`` script accepts (impl-spec §2.1)."""
+    """Register the CLI flags every ``tN`` script accepts — the shared harness contract."""
     parser.add_argument("--run-id", required=True, help="Groups all artifacts of one run.")
     parser.add_argument("--backend", choices=[_LOCAL, _S3], default=_LOCAL)
     parser.add_argument("--scale", choices=[_TINY, _BENCH], default=_TINY)

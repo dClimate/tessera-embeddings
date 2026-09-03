@@ -98,8 +98,13 @@ by the GPU or by everything around it. Absolute figures depend on the instance
 type, the ROI's valid-pixel density and the batch size, so read them from your
 own run rather than from a number written here.
 
-Measurements from the campaign this harness was built for — baselines, the
-per-phase progression, and what each change bought — are in
-`context_docs/inference/inference-on-gpus.md` and its run
-ledger. They are recorded there rather than here so this file stays a
-description of the tools, which does not go stale when the next run lands.
+Measurements from the campaign this harness was built for — the phase-0 baseline,
+what each change bought, and the levers that were measured and abandoned — are in
+`context_docs/inference/inference-on-gpus.md` §2 and §3. They are recorded there
+rather than here so this file stays a description of the tools, which does not go
+stale when the next run lands.
+
+The hand-maintained per-run ledger that used to map staging run ids to the code
+that produced them is **gone**, and deliberately: `_staging_run_id` fingerprints
+inputs, config and inference-source identity, so the mapping is computed rather
+than typed. Its raw per-run figures are in git history.
