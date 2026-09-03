@@ -1061,7 +1061,9 @@ evidence yet that the inference line is sound.
 **RAM budget is load-bearing.** Do NOT raise `_S2_STRIP_BYTE_BUDGET` or reintroduce whole-chunk
 cross-chunk prefetch without re-deriving the arithmetic at the constant. The pair ceiling (2× budget)
 plus the ~2 GiB prefetch stash is what keeps peak host RAM under 60%. The prefetch MUST skip
-pair-budget plans (`_XCHUNK_UNSAFE_STRATEGIES`) — their last strip is not a RAM trough.
+pair-budget plans — their last strip is not a RAM trough. (The guard is no longer a named list of
+unsafe strategies: **every** strategy now respects the same resident-pair ceiling in `_strip_plan`,
+and the `_XCHUNK_*` constants in `inference/actors.py` are the prefetch's own caps.)
 
 **The strip-plan estimator is strategy-only.** `_EST_*` constants pick which safe strategy is
 fastest; they are NEVER a RAM bound. Every branch is RAM-safe regardless of estimate accuracy.

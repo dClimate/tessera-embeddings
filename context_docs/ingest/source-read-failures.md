@@ -406,9 +406,17 @@ When it fires, the loop breaks exactly as a terminal failure does — `errors` s
 cell raises — and the ERROR line names the elapsed time, the configured budget, and the fact
 that the cell returns to the campaign work list and will RESUME from committed dates.
 
-### The default (36 h = 129,600 s), derived from measured leg durations
+### The default was 36 h; the campaign ships 6 h, and the two are not reconciled
 
-Two facts pin it, both from `ingest-performance.md`:
+**`IngestSettings.max_leg_wall_clock_s` is `6 * 3600` in the code today**, and
+[`../campaign/campaign-plan.md`](../campaign/campaign-plan.md) §3 states 6 h with the note that "six
+hours still clears three legs of the slowest dense zone". **The derivation below says the S2 leg
+alone is ~17.8 h on the densest zone-year**, which those two statements cannot both be right about.
+The derivation is kept because it is the reasoning that produced a number, and because whichever way
+the disagreement resolves it names the quantity that has to be re-checked: the longest legitimate
+single leg at the default width. **Re-derive before quoting either figure.**
+
+Two facts pinned the original 36 h, both from `ingest-performance.md`:
 
 1. **It must comfortably exceed the longest legitimate single leg at the default width.**
    The densest measured zone-year (35N, 2,415 live chunks) ran **175.6 s/date at ~60
@@ -424,8 +432,9 @@ Two facts pin it, both from `ingest-performance.md`:
    best achievable is "within about a working day of outliving the legitimate band":
    36 h ≈ the ~24 h band edge plus ~12 h.
 
-Re-derive the number if per-date cost or the default fleet width changes; both live in the
-ingest optimisation record.
+Re-derive the number if per-date cost or the default fleet width changes; both live in
+[`ingest-performance.md`](ingest-performance.md), and note that its per-date figures are
+January-conditions (§11.4), which pushes the legitimate band edge out rather than in.
 
 ### What a legitimately slow-but-recovering source loses
 
@@ -1846,9 +1855,15 @@ the arithmetic.
 **A third instance, resolved for the radar read itself:** Cause 5 above. The prescription is the
 same and was followed literally — `is_provider_refusal` classifies at the point the read fails,
 the verdict is carried into the store's own record as `scope`, and the layer holding the budget
-acts on the count rather than on the message. What is new is the direction of the verdict: the
-error the ceiling raises is left OUT of `_NON_RETRYABLE_LEG_MARKERS` on purpose, because a
-refusal clears and the retry is what recovers the dates.
+acts on the count rather than on the message.
+
+> **Corrected in place: the ceiling's error is IN `_NON_RETRYABLE_LEG_MARKERS`, not out of it.**
+> This paragraph said `TooManyGivenUpDatesError` was left out on purpose, "because a refusal clears
+> and the retry is what recovers the dates". It is listed, and the code's own comment gives the
+> opposite and correct reasoning: **a provider refusal is not a reason to give up a date**, so every
+> date the ceiling counts is one whose bytes will not read. A re-dispatch re-reads the same objects,
+> spends the per-read retry ladder on each, and holds a fleet to reach the identical answer. The
+> classification advice above is unaffected — only the disposition of this one marker was wrong.
 
 ### Some failures say enough to be judged, and those skip the retries
 
