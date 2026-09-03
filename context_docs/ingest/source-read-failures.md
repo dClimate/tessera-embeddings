@@ -406,35 +406,51 @@ When it fires, the loop breaks exactly as a terminal failure does — `errors` s
 cell raises — and the ERROR line names the elapsed time, the configured budget, and the fact
 that the cell returns to the campaign work list and will RESUME from committed dates.
 
-### The default was 36 h; the campaign ships 6 h, and the two are not reconciled
+### The default is 6 h — and the 36 h it replaced rested on a misreading of what this bounds
 
-**`IngestSettings.max_leg_wall_clock_s` is `6 * 3600` in the code today**, and
-[`../campaign/campaign-plan.md`](../campaign/campaign-plan.md) §3 states 6 h with the note that "six
-hours still clears three legs of the slowest dense zone". **The derivation below says the S2 leg
-alone is ~17.8 h on the densest zone-year**, which those two statements cannot both be right about.
-The derivation is kept because it is the reasoning that produced a number, and because whichever way
-the disagreement resolves it names the quantity that has to be re-checked: the longest legitimate
-single leg at the default width. **Re-derive before quoting either figure.**
+**`IngestSettings.max_leg_wall_clock_s` is `6 * 3600`.** An earlier version of this section derived
+36 h and is **withdrawn**. The arithmetic in it was fine; its first premise was wrong, and the wrong
+premise is the part worth keeping, because it is the natural thing to assume about any deadline.
 
-Two facts pinned the original 36 h, both from `ingest-performance.md`:
+**The withdrawn premise: "it must comfortably exceed the longest legitimate single leg."** From that,
+the densest measured zone-year (35N, 2,415 live chunks) at **175.6 s/date on ~60 workers** across
+**365 dates** gives an optical leg of ~17.8 h, a legitimate band edge of roughly a day once ±35%
+per-zone residuals and in-leg catalogue patience are allowed for, and therefore a bound of 36 h.
 
-1. **It must comfortably exceed the longest legitimate single leg at the default width.**
-   The densest measured zone-year (35N, 2,415 live chunks) ran **175.6 s/date at ~60
-   workers** (the five-region k=1 column, §3.16), and a zone-year is **365 dates** — so the
-   S2 leg alone is **~17.8 h**. Per-zone residuals on that fit run **±35%**, and a legitimate
-   leg can additionally carry in-leg catalogue patience (364 s ladders that eventually
-   succeed), so the legitimate band edge is **roughly a day**. This fact is load-bearing for
-   the multi-leg case: if S2 succeeds slowly while an S1 orbit fails transiently, the elapsed
-   at the re-dispatch decision is S2's whole runtime — a deadline inside the legitimate band
-   would refuse that S1 orbit its *first* retry on every dense cell.
-2. **A stuck cell must release its campaign slot promptly.** No bound can release it in less
-   time than the longest legitimate leg without cutting legs that are merely slow, so the
-   best achievable is "within about a working day of outliving the legitimate band":
-   36 h ≈ the ~24 h band edge plus ~12 h.
+**Three things make that premise false, and each alone is enough.**
 
-Re-derive the number if per-date cost or the default fleet width changes; both live in
-[`ingest-performance.md`](ingest-performance.md), and note that its per-date figures are
-January-conditions (§11.4), which pushes the legitimate band edge out rather than in.
+**The deadline is checked only when deciding to START another attempt.** A running leg is never
+judged against it, so **a slow-but-succeeding leg cannot trip it however long it takes**. What the
+bound actually limits is *patience* — wall clock a leg spends not getting anywhere — and the loop's
+true worst case is the deadline plus one final attempt. The longest legitimate leg is simply not the
+quantity it has to exceed.
+
+**Firing costs latency, not work.** Icechunk commits each date's time slot atomically with its
+pixels, so a leg that gives up returns the cell to the campaign work list and the next dispatch
+**resumes from the dates already committed** (`ingest-performance.md` §4.15). A shorter bound does
+not discard a long slow leg's output; it releases the campaign slot sooner and picks the work up
+where it stopped.
+
+**A leg that is being productive earns more time anyway.** `leg_progress_extension_s` (1 h) grants
+extra wall clock each time the deadline would otherwise refuse the next attempt — but only if the
+store has GAINED DATES since the last grant, so a leg that commits nothing never leaves the 6 h.
+That is precisely the case the 36 h premise was worried about, handled by a mechanism that
+distinguishes a leg making progress from one that is stuck, which a single flat deadline cannot. The
+ceiling is `max_leg_wall_clock_s + (max_leg_attempts − 1) × 3600` = **8 h**.
+
+Two smaller errors in the same arithmetic, noted because they compound rather than cancel: it used
+**365 dates where a zone-year keeps ~250** after the coverage gate, and it used a January per-date
+figure, which §11.4 of the ingest record shows understates a full seasonally-weighted year. Those
+move the number in opposite directions and neither matters once the premise is gone.
+
+**What survives, and it is the half that still pins the number: a stuck cell must release its
+campaign slot promptly.** 6 h clears three legs of a slow dense cell plus their expansive backoff,
+while still releasing a pathological cell's slot inside a working day.
+
+**Re-derive against measured leg durations if the retry stack changes** — in particular if the
+progress extension is ever turned off (`leg_progress_extension_s = 0` restores the plain deadline
+exactly), because then the flat bound is the only thing standing between a productive-but-slow leg
+and a refusal, and the withdrawn premise becomes relevant again.
 
 ### What a legitimately slow-but-recovering source loses
 
