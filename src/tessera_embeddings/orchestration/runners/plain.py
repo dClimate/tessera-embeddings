@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import time
 from collections.abc import Iterator
@@ -85,13 +86,25 @@ def _dask_client(n_workers: int) -> Iterator[Client]:
         yield client
 
 
-def _staging_run_id(*, roi_name: str, config: InferenceConfig) -> str:
+def _staging_run_id(*, roi_name: str, config: InferenceConfig, upstream: dict[str, Any]) -> str:
     """A staging identity that repeats for the same run, so an interrupted run resumes.
 
-    Derived from what the OUTPUT depends on — the ROI, the time window, the resolved orbit and
-    the checkpoint — so re-running the same config finds the tiles the last attempt staged and
-    infers only what is missing. Changing any of those starts a fresh prefix on its own, which
-    is the behaviour wanted: a different window is a different product.
+    Derived from everything the OUTPUT depends on, so re-running the same config finds the tiles
+    the last attempt staged and infers only what is missing, while any change that would alter a
+    pixel starts a fresh prefix instead of blending old tiles with new ones. ``run_inference``
+    resumes purely on this id, so a term missing here is a silently mixed store.
+
+    The terms, and what each one catches:
+
+    * **ROI name, time window, orbit, checkpoint** — the obvious four. A different window is a
+      different product.
+    * **allow_s2_only** — decides whether S2-valid pixels with no S1 observation are embedded at
+      all. Toggling it between a crash and the retry would keep radar-gated tiles beside
+      optical-only ones under one identity.
+    * **the upstream manifests** — the ingest stores' own fingerprints, which move when the
+      mosaics do. This is what catches a re-rasterised ROI, a re-ingest at a different
+      ``min_valid_coverage``, and a changed ingest code identity, none of which are visible in
+      the inference config.
 
     Deliberately NOT the campaign's staging fingerprint. That one mixes in
     :func:`inference_code_identity` and the code tarball's ETag so a mid-campaign code change
@@ -105,15 +118,33 @@ def _staging_run_id(*, roi_name: str, config: InferenceConfig) -> str:
     Staging is removed after a successful assemble, so in practice a prefix only survives a run
     that failed — which is exactly the run worth resuming.
     """
+    # sort_keys so a manifest dict that arrives in a different order is still the same identity
     terms = "|".join(
         [
             roi_name,
             config.time_window.window_end_label,
             str(config.s1_orbit),
             config.checkpoint_path,
+            f"s2_only={config.allow_s2_only}",
+            json.dumps(upstream, sort_keys=True, default=str),
         ]
     )
     return hashlib.sha256(terms.encode()).hexdigest()[:12]
+
+
+def _checked_coverage(value: float) -> float:
+    """Bound the coverage threshold the way :class:`IngestSettings` does.
+
+    The flow path validates through a pydantic model with ``gt=0, le=100``; the plain runner
+    hands a bare float to the domain function, whose test is ``coverage >= min_valid_coverage``
+    and does not range-check. Unbounded, 0 admits a date with no valid pixels at all and 101
+    rejects every date — both silently, as a config that looks like it worked.
+    """
+    coverage = float(value)
+    if not 0.0 < coverage <= 100.0:
+        msg = f"min_valid_coverage must be in (0, 100]; got {coverage!r}"
+        raise ValueError(msg)
+    return coverage
 
 
 def _run_ingest(
@@ -231,7 +262,11 @@ def _run_inference_and_assemble(
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_path)
     log.info("ROI filter: %d/%d chunks intersect the ROI", len(live_chunks), len(chunks))
 
-    run_id = _staging_run_id(roi_name=roi_name, config=config)
+    # Read before the identity rather than just before the manifest: these carry the ingest
+    # fingerprints the staging id needs, and reading them first also fails a missing-mosaic run
+    # here instead of after inference has been paid for.
+    upstream_manifests = read_upstream_manifests(mosaic_base, config.s1_orbit)
+    run_id = _staging_run_id(roi_name=roi_name, config=config, upstream=upstream_manifests)
     run_staging = f"{staging_base.rstrip('/')}/{run_id}"
     log.info("Staging prefix for this run: %s (delete it to force a clean re-inference)", run_staging)
     t0 = time.monotonic()
@@ -268,7 +303,6 @@ def _run_inference_and_assemble(
     output_path = f"{output_bucket.rstrip('/')}/embeddings/{roi_name}.zarr"
     writer = ZarrWriter(staging_base)
     model_version = checkpoint_to_version(config.checkpoint_path)
-    upstream_manifests = read_upstream_manifests(mosaic_base, config.s1_orbit)
     manifest = EmbeddingManifest.from_upstream_stores(
         model_checkpoint=model_version,
         num_obs_checkpoints=config.num_obs_checkpoints,
@@ -297,7 +331,10 @@ def _run_inference_and_assemble(
     # and they are pure cost from here -- on the quickstart the staged prefix is LARGER than the
     # product it produced. Best-effort: a cleanup failure must not fail a finished pipeline.
     try:
-        delete_prefix(run_staging, log=log)
+        # strict: delete_prefix otherwise swallows an unverified delete and a
+        # non-empty prefix, and we would log success over staging that is still there
+        # -- which the deterministic run_id above would then resume onto.
+        delete_prefix(run_staging, log=log, strict=True)
         log.info("Removed staging prefix %s", run_staging)
     except Exception:
         log.warning("Could not remove staging prefix %s; it is safe to delete by hand", run_staging, exc_info=True)
@@ -399,7 +436,7 @@ def run_plain(
         # us-west-2, default to CloudFront-signed HTTPS so the quickstart works without ASF
         # S3 STS credentials.
         s1_use_s3_direct=cfg.get("s1_use_s3_direct", False),
-        min_valid_coverage=(
+        min_valid_coverage=_checked_coverage(
             min_valid_coverage
             if min_valid_coverage is not None
             else cfg.get("min_valid_coverage", DEFAULT_MIN_VALID_COVERAGE)

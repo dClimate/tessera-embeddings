@@ -42,6 +42,15 @@ def _config(tmp_path: Path, **overrides) -> Path:
     return p
 
 
+def _run_id(roi_name: str = "roi", *, upstream: dict | None = None, **config_over) -> str:
+    """`_staging_run_id` with the boilerplate folded away."""
+    return plain._staging_run_id(
+        roi_name=roi_name,
+        config=_inference_config(**config_over),
+        upstream={"reflectance": {"ingest_code_identity": "ing-1"}} if upstream is None else upstream,
+    )
+
+
 def _inference_config(**over) -> MagicMock:
     """A stand-in ``InferenceConfig`` with a REAL time window.
 
@@ -52,6 +61,7 @@ def _inference_config(**over) -> MagicMock:
         time_window=parse_time_window("August 2024"),
         s1_orbit="ascending",
         checkpoint_path="/models/ckpt.pt",
+        allow_s2_only=False,
         chunk_size=2048,
     )
     base.update(over)
@@ -83,6 +93,16 @@ class TestTheCoverageThresholdReachesIngest:
             plain.run_plain(_config(tmp_path, **over), skip_inference=True, min_valid_coverage=flag)
         assert run_ingest.call_args.kwargs["min_valid_coverage"] == expected
 
+    @pytest.mark.parametrize("bad", [0.0, -1.0, 100.1, 1000.0], ids=["zero", "negative", "just-over", "way-over"])
+    def test_an_out_of_range_threshold_is_refused(self, tmp_path, bad):
+        """The flow path validates through pydantic (gt=0, le=100); this path did not.
+
+        The domain test is `coverage >= min_valid_coverage`, so 0 admits a date with no valid
+        pixels and 101 rejects every date -- both silently, as a config that looks like it worked.
+        """
+        with pytest.raises(ValueError, match=r"min_valid_coverage must be in \(0, 100\]"):
+            plain.run_plain(_config(tmp_path), skip_inference=True, min_valid_coverage=bad)
+
     @pytest.mark.parametrize(
         ("argv_extra", "expected"),
         [
@@ -104,24 +124,33 @@ class TestTheStagingIdentityRepeats:
 
     def test_the_same_run_gets_the_same_prefix(self):
         """This is what makes an interrupted run resume instead of re-inferring."""
-        first = plain._staging_run_id(roi_name="roi", config=_inference_config())
-        second = plain._staging_run_id(roi_name="roi", config=_inference_config())
-        assert first == second
+        assert _run_id() == _run_id()
 
     @pytest.mark.parametrize(
-        ("roi_name", "config_over"),
+        ("kwargs", "why"),
         [
-            ("roi", {"time_window": parse_time_window("July 2024")}),
-            ("roi", {"s1_orbit": "descending"}),
-            ("roi", {"checkpoint_path": "/models/other.pt"}),
-            ("other_roi", {}),
+            ({"time_window": parse_time_window("July 2024")}, "a different window is a different product"),
+            ({"s1_orbit": "descending"}, "a different orbit reads different mosaics"),
+            ({"checkpoint_path": "/models/other.pt"}, "a different model is a different embedding"),
+            ({"roi_name": "other_roi"}, "a different ROI is a different footprint"),
+            ({"allow_s2_only": True}, "decides whether radar-free pixels are embedded at all"),
+            (
+                {"upstream": {"reflectance": {"ingest_code_identity": "ing-2"}}},
+                "the mosaics moved: a re-rasterised ROI, a re-ingest at another threshold",
+            ),
         ],
-        ids=["window", "orbit", "checkpoint", "roi"],
+        ids=["window", "orbit", "checkpoint", "roi", "allow_s2_only", "upstream"],
     )
-    def test_a_different_product_gets_a_different_prefix(self, roi_name, config_over):
-        """Every term changes the OUTPUT, so sharing tiles across one would publish a blend."""
-        base = plain._staging_run_id(roi_name="roi", config=_inference_config())
-        assert plain._staging_run_id(roi_name=roi_name, config=_inference_config(**config_over)) != base
+    def test_a_different_product_gets_a_different_prefix(self, kwargs, why):
+        """`run_inference` resumes purely on this id, so a missing term is a silently mixed store."""
+        roi_name = kwargs.pop("roi_name", "roi")
+        assert _run_id(roi_name, **kwargs) != _run_id(), why
+
+    def test_manifest_key_order_does_not_change_the_identity(self):
+        """The upstream digest must be a fact about content, not about dict construction order."""
+        one = _run_id(upstream={"reflectance": {"a": 1, "b": 2}, "sar_ascending": {"c": 3}})
+        two = _run_id(upstream={"sar_ascending": {"c": 3}, "reflectance": {"b": 2, "a": 1}})
+        assert one == two
 
     def test_the_identity_is_not_the_campaign_fingerprint(self):
         """It must NOT depend on code identity — the safeguard we deliberately omit.
@@ -133,7 +162,7 @@ class TestTheStagingIdentityRepeats:
         every single-ROI run start from scratch.
         """
         with patch("tessera_embeddings.config.inference.inference_code_identity") as identity:
-            plain._staging_run_id(roi_name="roi", config=_inference_config())
+            _run_id()
         identity.assert_not_called()
 
 
@@ -152,7 +181,7 @@ class TestStagingLifecycle:
             patch(f"{_MOD}.ray_cluster"),
             patch(f"{_MOD}.run_inference", return_value=inference_results),
             patch(f"{_MOD}.checkpoint_to_version", return_value="v1.1"),
-            patch(f"{_MOD}.read_upstream_manifests", return_value=[]),
+            patch(f"{_MOD}.read_upstream_manifests", return_value={"reflectance": {"x": 1}}),
             patch(f"{_MOD}.EmbeddingManifest"),
             patch(f"{_MOD}.ZarrWriter"),
             patch(f"{_MOD}.delete_prefix", side_effect=delete_raises) as delete,
@@ -179,6 +208,10 @@ class TestStagingLifecycle:
             self._call(tmp_path)
         delete.assert_called_once()
         assert "/staging/" in delete.call_args.args[0]
+        # Without strict, delete_prefix swallows an unverified delete and a non-empty prefix and
+        # returns, so the outer except never fires and we log success over surviving staging --
+        # which the deterministic run_id would then resume onto.
+        assert delete.call_args.kwargs["strict"] is True
 
     def test_a_failed_run_keeps_its_staging_prefix(self, tmp_path):
         """The retention that makes the resume possible: a failed run's tiles must survive."""
