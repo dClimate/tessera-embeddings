@@ -67,9 +67,9 @@ class MosaicChunkInferenceDataset:
         optical_min_obs: int | None = None,
     ) -> None:
         if optical_min_obs is not None and optical_min_obs <= 0:
-            # Zero refuses nothing while reading as a configured rule, making a caller that meant
-            # "no minimum" indistinguishable from one whose config silently resolved to 0 — the
-            # second being a campaign publishing under no rule while believing it has one.
+            # Zero refuses nothing while reading as a configured rule, making a caller that meant "no minimum"
+            # indistinguishable from one whose config silently resolved to 0 — the second being a campaign publishing
+            # under no rule while believing it has one.
             raise ValueError(
                 f"optical_min_obs={optical_min_obs} refuses nothing — pass None for no minimum, "
                 "or a positive number of observations."
@@ -102,15 +102,14 @@ class MosaicChunkInferenceDataset:
         s1_asc = chunk_data.s1_asc_bands
         s1_desc = chunk_data.s1_desc_bands
 
-        # The pre-pruning s2_obs_count when available, so pixels are not under-bucketed merely
-        # because the loader dropped empty S2 timesteps.
+        # The pre-pruning s2_obs_count when available, so pixels are not under-bucketed merely because the loader
+        # dropped empty S2 timesteps.
         if chunk_data.s2_obs_count is not None:
             s2_valid_count = chunk_data.s2_obs_count.astype(np.int32)
         else:
             s2_valid_count = s2_masks.sum(axis=0).astype(np.int32)
 
-        # Any-nonzero S2 check: excludes pixels with zero reflectance everywhere (sensor gap,
-        # out-of-swath).
+        # Any-nonzero S2 check: excludes pixels with zero reflectance everywhere (sensor gap, out-of-swath).
         s2_nonzero = np.zeros((self.H, self.W), dtype=bool)
         for t in range(s2_bands.shape[0]):
             s2_nonzero |= np.any(s2_bands[t] != 0, axis=-1)
@@ -125,16 +124,15 @@ class MosaicChunkInferenceDataset:
             s1_desc_valid = np.any(s1_desc != 0, axis=-1).sum(axis=0).astype(np.int32)
         s1_total_valid = s1_asc_valid + s1_desc_valid
 
-        # A pixel needs real S2 to embed at all; the S1 term is the optional part. By default a
-        # pixel with zero S1 observations is skipped; with allow_s2_only it is kept and flows
-        # through as the upstream v1.1 missing-S1 convention (all-zeros normalized S1 slice,
-        # smallest bucket via compute_bin_keys' clip). Per-pixel provenance stays exact either
-        # way — s1_asc/desc_obs_count are written as 0 for these pixels.
+        # A pixel needs real S2 to embed at all; the S1 term is the optional part. By default a pixel with zero S1
+        # observations is skipped; with allow_s2_only it is kept and flows through as the upstream v1.1 missing-S1
+        # convention (all-zeros normalized S1 slice, smallest bucket via compute_bin_keys' clip). Per-pixel provenance
+        # stays exact either way — s1_asc/desc_obs_count are written as 0 for these pixels.
         #
-        # THREE refusal reasons, kept apart rather than folded into one boolean: no optical input
-        # at all, too little of it, or no radar. Downstream records count them separately — one is
-        # a property of the imagery, one this campaign's quality rule, one a coverage fact — and a
-        # caller cannot recover the distinction from a single mask.
+        # THREE refusal reasons, kept apart rather than folded into one boolean: no optical input at all, too little
+        # of it, or no radar. Downstream records count them separately — one is a property of the imagery, one this
+        # campaign's quality rule, one a coverage fact — and a caller cannot recover the distinction from a single
+        # mask.
         has_optical = s2_nonzero & (s2_valid_count > 0)
         deep_enough = (
             np.ones_like(has_optical) if self.optical_min_obs is None else s2_valid_count >= self.optical_min_obs
@@ -144,9 +142,9 @@ class MosaicChunkInferenceDataset:
         valid_mask = has_optical & deep_enough
         if not self.allow_s2_only:
             valid_mask &= has_radar
-        # For the per-chunk record: eligible-but-refused, by reason. "Thin" counts only pixels
-        # that HAD optical and lost on depth, so the two optical reasons partition rather than
-        # overlap and their sum is the optical refusal total.
+        # For the per-chunk record: eligible-but-refused, by reason. "Thin" counts only pixels that HAD optical and
+        # lost on depth, so the two optical reasons partition rather than overlap and their sum is the optical refusal
+        # total.
         self.refused_no_optical = int((~has_optical).sum())
         self.refused_thin = int((has_optical & ~deep_enough).sum())
         self.refused_no_radar = 0 if self.allow_s2_only else int((has_optical & deep_enough & ~has_radar).sum())
@@ -176,8 +174,8 @@ class MosaicChunkInferenceDataset:
         pixel_s1_counts = s1_total_valid[rows, cols]
         keys = compute_bin_keys(pixel_s2_counts, pixel_s1_counts, self.num_obs_checkpoints)
 
-        # Group pixel indices by (s2, s1) bucket, packing structured (int32, int32) into one
-        # int64 for a stable argsort.
+        # Group pixel indices by (s2, s1) bucket, packing structured (int32, int32) into one int64 for a stable
+        # argsort.
         flat_keys = keys.view(np.int64)
         sort_order = np.argsort(flat_keys, kind="stable")
         sorted_keys = flat_keys[sort_order]

@@ -79,8 +79,9 @@ TIME_ENCODING = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic
 #: retried. Pass to ``tenacity``'s ``retry_if_not_exception_type`` wherever a store write
 #: is retried.
 #:
-#: Retrying either is worse than failing. The ingest path commits without rebasing precisely
-#: so a second writer's commit fails against a moved branch tip rather than merging silently,
+#: Retrying either is worse than failing. The ingest path commits with no ``rebase_with``
+#: precisely so a second writer's commit fails against a moved branch tip rather than merging
+#: silently,
 #: and a retry re-opens the session from the NEW tip — turning that refusal back into a
 #: success and letting two writers interleave dates on one axis, the exact outcome the
 #: no-rebase choice prevents. When the two collide on the SAME date the retry instead fails as
@@ -1736,23 +1737,23 @@ def write_days_windows(
             baselines={},  # merged per date below, exactly like the append path
             manifest=manifest,
             # Seed through a repo opened with THIS call's credentials/region. Letting
-            # create_empty_store open its own would use the default storage config,
-            # so the probe above and every write below would honour a callback or a
-            # non-default region while the one-time seed silently did not — failing
-            # the first cropped date of any such deployment.
+            # create_empty_store open its own would use the default storage config, so the
+            # probe above and every write below would honour a callback or a non-default
+            # region while the one-time seed silently did not, failing the first cropped date
+            # of any such deployment.
             #
-            # open_or_create, NOT create: the probe above fires for a MISSING repo and
-            # for an existing-but-ROOTLESS one alike (GroupNotFoundError subclasses
-            # FileNotFoundError). Creating unconditionally would hit Icechunk's
-            # clean-prefix rule on the rootless case and raise CorruptedStoreError on
-            # every retry — wedging exactly the crash window this recovery exists for.
+            # open_or_create, NOT create: the probe above fires alike for a MISSING repo and
+            # an existing-but-ROOTLESS one (GroupNotFoundError subclasses FileNotFoundError).
+            # Creating unconditionally would hit Icechunk's clean-prefix rule on the rootless
+            # case and raise CorruptedStoreError on every retry — wedging exactly the crash
+            # window this recovery exists for.
             repo=open_or_create_repo(store_path, get_credentials=get_credentials, region=s3_region)[0],
         )
 
     total_windows = sum(len(w) for _, w in days)
     if len(days) == 1:
-        # The single-date message format is a stable interface: commit-cadence
-        # tooling and log queries parse `date <iso>:` out of snapshot messages.
+        # A stable interface: commit-cadence tooling and log queries parse `date <iso>:` out
+        # of snapshot messages.
         message = f"date {date_str}: {total_windows} live window(s)"
     else:
         message = f"dates {date_str}..{str(whens[-1])[:10]} ({len(days)} dates): {total_windows} live window(s)"
@@ -1764,10 +1765,10 @@ def write_days_windows(
         s3_region=s3_region,
     ) as batch:
         mixed = manifest.validate_against(extract_manifest(dict(batch.group.attrs)), store_path) if manifest else []
-        # Slots are appended for every date up front — the session sees its own
-        # uncommitted resizes, so each date's windows write into its own index. The
-        # appends and the windows land in the ONE commit together, preserving the
-        # no-date-before-its-pixels invariant at batch granularity.
+        # Slots are appended for every date up front — the session sees its own uncommitted
+        # resizes, so each date's windows write into its own index. Appends and windows land
+        # in the ONE commit together, preserving the no-date-before-its-pixels invariant at
+        # batch granularity.
         writes: list[tuple[xr.Dataset, list[tuple[int, int, int, int]], int, list[str]]] = []
         for (one_ds, one_windows), when in zip(days, whens, strict=True):
             t = batch.append_time_slot(when)
@@ -1793,20 +1794,17 @@ def write_days_windows(
                     batch.session,
                     mode="r+",
                     region=_window_region(window, t),
-                    # align_chunks stays ON, and the reason is memory rather than graph
-                    # size. Dropping it does shrink the graph a little and ran ~4% faster,
-                    # but it makes each write task carry a whole load block instead of one
-                    # store chunk, which pushed workers over their spill threshold: peak
-                    # spill 3.19 GiB across ~30% of scheduler samples, against zero with it
-                    # on. Spill is a hidden cost that scales badly here, so the ~4% is not
-                    # worth it. Untested middle path if it is ever wanted: halve the
-                    # threads per worker to restore the headroom.
+                    # ON for memory, not graph size. Dropping it shrinks the graph a little
+                    # and ran ~4% faster, but each write task then carries a whole load block
+                    # instead of one store chunk, which pushed workers over their spill
+                    # threshold: peak spill 3.19 GiB across ~30% of scheduler samples, against
+                    # zero with it on. Spill scales badly here, so the ~4% is not worth it.
                     align_chunks=True,
                     split_every=_MERGE_SPLIT_EVERY,
                 )
-                # Each window is a blocking compute, so these lines ARE the write
-                # pipeline's decomposition: their sum against the date's write phase says
-                # whether windows serialise, and their spread says what overlap can buy.
+                # Each window is a blocking compute, so these lines ARE the write pipeline's
+                # decomposition: their sum against the date's write phase says whether
+                # windows serialise, and their spread says what overlap can buy.
                 logger.info(
                     "Window %d/%d rows=%d..%d: %.1fs",
                     i,
@@ -1818,10 +1816,7 @@ def write_days_windows(
 
 
 def compute_doy(timestamps: np.ndarray) -> np.ndarray:
-    """Compute day-of-year from datetime64 timestamps.
-
-    Returns (N,) array of int32 DOY values (1-366).
-    """
+    """Compute day-of-year from datetime64 timestamps: an (N,) int32 array of 1-366."""
     years = timestamps.astype("datetime64[Y]")
     return ((timestamps.astype("datetime64[D]") - years).astype(int) + 1).astype(np.int32)
 
@@ -1846,20 +1841,19 @@ def write_dataset(
         tile_id: Tile identifier for store metadata.
         baselines: Dict mapping date strings to baseline integers.
         chunks: Chunk sizes dict with ``time``, ``northing``, and ``easting`` keys.
-        manifest: Typed manifest for append-safety validation.
-            Written on create, validated on append.
-        crs: CRS authority code (e.g. ``"EPSG:32615"``). Stored in root
-            attrs so downstream consumers can determine the projection.
+        manifest: Typed manifest for append-safety validation, written on create and
+            validated on append.
+        crs: CRS authority code (e.g. ``"EPSG:32615"``), stored in root attrs so downstream
+            consumers can determine the projection.
         get_credentials: Optional credential callback for Icechunk's S3 client.
-        s3_region: Optional S3 region override. Threaded through EVERY open below,
-            not just the first: a store outside the default region must be read,
-            created and appended the same way, or the ingest fails partway.
+        s3_region: Optional S3 region override. Threaded through EVERY open below, not just
+            the first: a store outside the default region must be read, created and appended
+            the same way, or the ingest fails partway.
     """
     existing_dates = get_existing_dates(store_path, get_credentials=get_credentials, s3_region=s3_region)
 
-    # Normalize time to nanosecond resolution to match TIME_ENCODING.
-    # Newer pandas/xarray versions may produce datetime64[us]; coerce
-    # so the zarr encoding round-trips correctly.
+    # Normalize time to nanoseconds to match TIME_ENCODING: newer pandas/xarray may produce
+    # datetime64[us], which would not round-trip through the zarr encoding.
     if data.time.dtype != np.dtype("datetime64[ns]"):
         data = data.assign_coords(time=data.time.values.astype("datetime64[ns]"))
 

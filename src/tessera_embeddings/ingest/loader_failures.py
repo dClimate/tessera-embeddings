@@ -89,13 +89,13 @@ import dask.distributed
 import rasterio._base
 from dask.distributed import WorkerPlugin
 
-# Private because rasterio publishes no other name for either, and imported rather than restated
-# so the wording this module forwards in cannot drift from rasterio's own handler: `code_map`
-# names the CPL error class, `level_map` maps GDAL's error class onto a logging level.
+# Private because rasterio publishes no other name for either, and imported rather than restated so the wording this
+# module forwards in cannot drift from rasterio's own handler: `code_map` names the CPL error class, `level_map` maps
+# GDAL's error class onto a logging level.
 from rasterio._env import code_map, level_map
 
-# Private for the same reason: `rasterio.errors` holds the wrappers, and every GDAL/CPL error
-# that becomes a wrapper's cause lives here.
+# Private for the same reason: `rasterio.errors` holds the wrappers, and every GDAL/CPL error that becomes a wrapper's
+# cause lives here.
 from rasterio._err import CPLE_BaseError
 
 from tessera_embeddings.ingest.duplicates import (
@@ -109,47 +109,44 @@ from tessera_embeddings.ingest.solar_days import solar_day_of
 
 logger = logging.getLogger(__name__)
 
-#: Logger whose records name the aborted object. A handler here also sees records from its
-#: children (``odc.loader._rio`` is the one that emits), so this survives odc moving the
-#: message between its own modules.
+#: Logger whose records name the aborted object. A handler here also sees records from its children
+#: (``odc.loader._rio`` is the one that emits), so this survives odc moving the message between its own modules.
 _ODC_LOGGER = "odc"
 
-#: The loader's own wording for "I gave up on this object". Kept as a cheap substring test
-#: plus a capture, so the common case (no match) costs one ``in``.
+#: The loader's own wording for "I gave up on this object". Kept as a cheap substring test plus a capture, so the
+#: common case (no match) costs one ``in``.
 _ABORT_MARKER = "failure while reading"
 _ABORT_RE = re.compile(r"failure while reading:\s*(\S+)")
 
-#: How many aborted hrefs one process retains. A failing date aborts once per affected load task,
-#: so the same href repeats; a few hundred is far more than attribution needs and bounds the
-#: memory a pathological run can hold.
+#: How many aborted hrefs one process retains. A failing date aborts once per affected load task, so the same href
+#: repeats; a few hundred is far more than attribution needs and bounds the memory a pathological run can hold.
 _CAPACITY = 256
 
-#: Logger GDAL's OWN messages reach. rasterio installs a CPL error handler that forwards GDAL's
-#: errors and warnings here, the only place a refusal GDAL declined to raise is stated. It does
-#: NOT reach every thread — rasterio installs that handler with ``CPLPushErrorHandler``, which
-#: GDAL keeps per THREAD, so a message emitted on a thread that never entered a ``rasterio.Env``
-#: reaches no logger at all. Hence :func:`hear_gdal_from_every_thread`.
+#: Logger GDAL's OWN messages reach. rasterio installs a CPL error handler that forwards GDAL's errors and warnings
+#: here, the only place a refusal GDAL declined to raise is stated. It does NOT reach every thread — rasterio installs
+#: that handler with ``CPLPushErrorHandler``, which GDAL keeps per THREAD, so a message emitted on a thread that never
+#: entered a ``rasterio.Env`` reaches no logger at all. Hence :func:`hear_gdal_from_every_thread`.
 _GDAL_LOGGER = "rasterio._env"
 
-#: How many distinct refusal lines one process retains. Far smaller than the href capacity
-#: because these repeat almost exactly — an outage says the same sentence about every object —
-#: and because every one of them can end up quoted on an exception.
+#: How many distinct refusal lines one process retains. Far smaller than the href capacity because these repeat almost
+#: exactly — an outage says the same sentence about every object — and because every one of them can end up quoted on
+#: an exception.
 _REFUSAL_CAPACITY = 16
 
-#: The verdicts a line has to reach ON ITS OWN to be worth keeping. Both are ordered above every
-#: statement about the bytes, which bounds what this capture can do to a verdict: it can move one
-#: into these two and nowhere else, and neither gives a date up.
+#: The verdicts a line has to reach ON ITS OWN to be worth keeping. Both are ordered above every statement about the
+#: bytes, which bounds what this capture can do to a verdict: it can move one into these two and nowhere else, and
+#: neither gives a date up.
 _KEEPABLE = (ReadFailure.PROVIDER_REFUSED, ReadFailure.OUR_CREDENTIAL)
 
 #: Bounded because they are written from the loader's threads and read from the caller's.
 _aborted: deque[str] = deque(maxlen=_CAPACITY)
-#: Each entry is ``(recorded_at, message)``. The time is this WORKER's ``monotonic`` clock, only
-#: ever compared inside the process that wrote it, so no clock is compared across machines.
+#: Each entry is ``(recorded_at, message)``. The time is this WORKER's ``monotonic`` clock, only ever compared inside
+#: the process that wrote it, so no clock is compared across machines.
 _refused: deque[tuple[float, str]] = deque(maxlen=_REFUSAL_CAPACITY)
 _lock = threading.Lock()
-#: Serialises the install in :func:`hear_gdal_from_every_thread`. Separate from ``_lock`` because
-#: the handlers that take that one run INSIDE the forwarder, so a lock held across the install
-#: must not be one a forwarded message can ask for.
+#: Serialises the install in :func:`hear_gdal_from_every_thread`. Separate from ``_lock`` because the handlers that
+#: take that one run INSIDE the forwarder, so a lock held across the install must not be one a forwarded message can
+#: ask for.
 _install_lock = threading.Lock()
 
 _handlers: list[logging.Handler] = []
@@ -221,23 +218,23 @@ class _LoggedRefusalHandler(logging.Handler):
             _refused.append((time.monotonic(), message))
 
 
-#: GDAL error classes worth forwarding. ``CE_Warning`` and ``CE_Failure`` are the two a refusal is
-#: ever stated at. ``CE_Debug`` is left alone because forwarding it would put GDAL's whole debug
-#: stream on a logger, and ``CE_Fatal`` because the handler already installed answers it by
-#: aborting the process — a response this must not take over or pre-empt.
+#: GDAL error classes worth forwarding. ``CE_Warning`` and ``CE_Failure`` are the two a refusal is ever stated at.
+#: ``CE_Debug`` is left alone because forwarding it would put GDAL's whole debug stream on a logger, and ``CE_Fatal``
+#: because the handler already installed answers it by aborting the process — a response this must not take over or
+#: pre-empt.
 _CE_WARNING = 2
 _CE_FAILURE = 3
 
 #: A CPL error handler: ``void (*)(CPLErr, CPLErrorNum, const char *)``.
 _CPL_ERROR_HANDLER = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_int, ctypes.c_char_p)
 
-#: Every forwarder ever installed, held at module scope for as long as GDAL may call it — GDAL
-#: keeps the function POINTER, so nothing else keeps the callback object alive. Doubles as the
-#: idempotence flag, since a second install would chain the forwarder to itself.
+#: Every forwarder ever installed, held at module scope for as long as GDAL may call it — GDAL keeps the function
+#: POINTER, so nothing else keeps the callback object alive. Doubles as the idempotence flag, since a second install
+#: would chain the forwarder to itself.
 #:
-#: **Append-only, rather than one slot.** Overwrite a slot while GDAL and a chained handler still
-#: hold the old address and the next GDAL error calls into freed memory, recursing through the
-#: chain rather than failing cleanly. Appending makes that structurally impossible.
+#: **Append-only, rather than one slot.** Overwrite a slot while GDAL and a chained handler still hold the old address
+#: and the next GDAL error calls into freed memory, recursing through the chain rather than failing cleanly. Appending
+#: makes that structurally impossible.
 _forwarders: list[Any] = []
 
 
@@ -277,8 +274,8 @@ def hear_gdal_from_every_thread() -> None:
         if _forwarders:
             return
         gdal_log = logging.getLogger(_GDAL_LOGGER)
-        # Reassigned below to whatever was installed; read by `forward` through the closure, so
-        # the chain is live from the moment it exists and merely empty for the instant before.
+        # Reassigned below to whatever was installed; read by `forward` through the closure, so the chain is live from
+        # the moment it exists and merely empty for the instant before.
         already: Any = None
 
         def forward(err_class: int, err_no: int, message: bytes) -> None:
@@ -296,10 +293,10 @@ def hear_gdal_from_every_thread() -> None:
                 return
 
         try:
-            # Through the rasterio extension that LINKS GDAL rather than by library filename:
-            # rasterio's wheels ship GDAL version-stamped inside a private directory whose name
-            # differs by platform and release, while `dlsym` on a loaded extension searches what
-            # that extension was linked against — the one path Python already knows.
+            # Through the rasterio extension that LINKS GDAL rather than by library filename: rasterio's wheels ship
+            # GDAL version-stamped inside a private directory whose name differs by platform and release, while
+            # `dlsym` on a loaded extension searches what that extension was linked against — the one path Python
+            # already knows.
             gdal = ctypes.CDLL(rasterio._base.__file__)
             gdal.CPLSetErrorHandler.restype = _CPL_ERROR_HANDLER
             gdal.CPLSetErrorHandler.argtypes = [_CPL_ERROR_HANDLER]
@@ -316,9 +313,9 @@ def hear_gdal_from_every_thread() -> None:
             )
             return
 
-        # Put GDAL's own handler back while the interpreter is still there to be called into. A
-        # callback GDAL invokes from one of its threads has to take the GIL, and taking it after
-        # finalisation has begun is fatal to the process rather than to the read.
+        # Put GDAL's own handler back while the interpreter is still there to be called into. A callback GDAL invokes
+        # from one of its threads has to take the GIL, and taking it after finalisation has begun is fatal to the
+        # process rather than to the read.
         atexit.register(gdal.CPLSetErrorHandler, already)
 
 
@@ -374,11 +371,10 @@ def clear_local_refusals() -> None:
         _refused.clear()
 
 
-#: How long a recorded refusal is kept. It has to outlast the longest single read — the read
-#: ladder is :data:`~tessera_embeddings.ingest.roi_processing.SOURCE_READ_ATTEMPTS` attempts and
-#: the radar write may then wait out :data:`~tessera_embeddings.storage.zarr_store.WAIT_OUT_BACKOFF_S`
-#: on top — while staying far shorter than a leg, so a buffer cannot accumulate a whole day. The
-#: buffer's ``maxlen`` bounds it a second way, by count.
+#: How long a recorded refusal is kept. It has to outlast the longest single read — the read ladder is
+#: :data:`~tessera_embeddings.ingest.roi_processing.SOURCE_READ_ATTEMPTS` attempts and the radar write may then wait
+#: out :data:`~tessera_embeddings.storage.zarr_store.WAIT_OUT_BACKOFF_S` on top — while staying far shorter than a
+#: leg, so a buffer cannot accumulate a whole day. The buffer's ``maxlen`` bounds it a second way, by count.
 _REFUSAL_RETENTION_S = 3600.0
 
 
@@ -404,19 +400,18 @@ def read_local_refusals() -> list[tuple[float, str]]:
     """
     now = time.monotonic()
     with _lock:
-        # Eviction is the only thing that removes a line, and it happens on the way past rather
-        # than on a timer: nothing in flight can be evicted, because the horizon is longer than
-        # any read that could still be judging it.
+        # Eviction is the only thing that removes a line, and it happens on the way past rather than on a timer:
+        # nothing in flight can be evicted, because the horizon is longer than any read that could still be judging
+        # it.
         while _refused and now - _refused[0][0] > _REFUSAL_RETENTION_S:
             _refused.popleft()
         return [(now - at, message) for at, message in _refused]
 
 
-#: Exception classes whose cause cannot be serialised out of the worker that raised it, and the
-#: one line to extend when another turns up. One entry suffices because every read-only ``args``
-#: in the read stack belongs to a ``CPLE_BaseError`` subclass — a census rather than a guess,
-#: recorded in the design doc. Patching the base covers the subclasses, so a GDAL release adding
-#: error classes needs no change here.
+#: Exception classes whose cause cannot be serialised out of the worker that raised it, and the one line to extend
+#: when another turns up. One entry suffices because every read-only ``args`` in the read stack belongs to a
+#: ``CPLE_BaseError`` subclass — a census rather than a guess, recorded in the design doc. Patching the base covers
+#: the subclasses, so a GDAL release adding error classes needs no change here.
 _CAUSES_THAT_DO_NOT_TRAVEL: tuple[type[BaseException], ...] = (CPLE_BaseError,)
 
 
@@ -482,14 +477,12 @@ class AbortedReadCapture(WorkerPlugin):
         keep_causes_picklable()
 
 
-#: Tries before refusing the leg — enough that a briefly unreachable scheduler costs seconds
-#: rather than a cell.
+#: Tries before refusing the leg — enough that a briefly unreachable scheduler costs seconds rather than a cell.
 _REGISTRATION_ATTEMPTS = 3
 
-#: Seconds to wait after a failed attempt, doubling. Without a wait the three attempts complete
-#: in the same instant, which is one attempt with extra steps: the case they exist for is a
-#: RESTARTING scheduler, which cannot recover inside a microsecond. Bounded low because this is
-#: paid at leg dispatch, before any fleet exists to sit idle.
+#: Seconds to wait after a failed attempt, doubling. Without a wait the three attempts complete in the same instant,
+#: which is one attempt with extra steps: the case they exist for is a RESTARTING scheduler, which cannot recover
+#: inside a microsecond. Bounded low because this is paid at leg dispatch, before any fleet exists to sit idle.
 _REGISTRATION_BACKOFF_S = 2.0
 
 
@@ -556,10 +549,10 @@ def _collect[T](client: dask.distributed.Client | None, read: Callable[[], list[
     if client is None:
         return found
     try:
-        # ``"return"`` and not ``"ignore"``: both refuse to raise, which is the requirement, but
-        # ``"ignore"`` REMOVES the failed worker from the result dict, so a worker that died
-        # holding the only refusal line is indistinguishable from one that had nothing to give.
-        # ``"return"`` puts the exception in its place, which is what lets the count below exist.
+        # ``"return"`` and not ``"ignore"``: both refuse to raise, which is the requirement, but ``"ignore"`` REMOVES
+        # the failed worker from the result dict, so a worker that died holding the only refusal line is
+        # indistinguishable from one that had nothing to give. ``"return"`` puts the exception in its place, which is
+        # what lets the count below exist.
         per_worker = client.run(read, on_error="return")
     except Exception:
         logger.warning("Could not collect %s from workers", what, exc_info=True)
@@ -571,10 +564,9 @@ def _collect[T](client: dask.distributed.Client | None, read: Callable[[], list[
         else:
             silent += 1
     if silent:
-        # NAMED, because the buffer lives on the worker that read and a worker that dies or is
-        # retired between the failure and this call takes its evidence with it. A short answer
-        # returned in silence would let a refusal be judged as bad bytes with nothing recording
-        # that the evidence was merely unreachable.
+        # NAMED, because the buffer lives on the worker that read and a worker that dies or is retired between the
+        # failure and this call takes its evidence with it. A short answer returned in silence would let a refusal be
+        # judged as bad bytes with nothing recording that the evidence was merely unreachable.
         logger.warning(
             "Collected %s from %d of %d worker(s): %d did not answer, so any evidence they held is not in this verdict",
             what,
@@ -611,13 +603,12 @@ def collect_logged_refusals(client: dask.distributed.Client | None, since: float
     return [message for age, message in aged if age <= cutoff]
 
 
-#: How the attached evidence introduces itself in a log and on an exception. A reader has to be
-#: able to tell a line the reader COPIED from a line the reader was given.
+#: How the attached evidence introduces itself in a log and on an exception. A reader has to be able to tell a line
+#: the reader COPIED from a line the reader was given.
 _REFUSAL_NOTE = "The source reader logged, but did not raise:"
 
-#: Distinct lines one note quotes. An outage repeats one sentence per object, so the first few
-#: distinct ones carry the whole finding and the rest are volume on a store attribute and in a
-#: traceback.
+#: Distinct lines one note quotes. An outage repeats one sentence per object, so the first few distinct ones carry the
+#: whole finding and the rest are volume on a store attribute and in a traceback.
 _LINES_PER_NOTE = 4
 
 
@@ -692,9 +683,8 @@ def refusal_wait_out(client: dask.distributed.Client | None) -> Callable[[BaseEx
     def _refused(exc: BaseException) -> bool:
         evidence = carry_logged_refusal(exc, client, since=since)
         verdict = is_provider_refusal(exc)
-        # Says what was decided and what from. Without it the only observable is the attempt
-        # count, which is the same for "no refusal was logged" and "a refusal was logged and not
-        # read" — and those want opposite repairs.
+        # Says what was decided and what from. Without it the only observable is the attempt count, which is the same
+        # for "no refusal was logged" and "a refusal was logged and not read" — and those want opposite repairs.
         logger.warning(
             "REFUSAL WAIT-OUT verdict=%s evidence=%d: %s",
             "wait" if verdict else "no-wait",
@@ -708,9 +698,9 @@ def refusal_wait_out(client: dask.distributed.Client | None) -> Callable[[BaseEx
     return _refused
 
 
-#: How many objects a label names before it summarises the rest. One failing date aborts once
-#: per affected load task, so the same handful of objects repeats; a longer label means many
-#: distinct objects failing at once, which the count conveys better than the names do.
+#: How many objects a label names before it summarises the rest. One failing date aborts once per affected load task,
+#: so the same handful of objects repeats; a longer label means many distinct objects failing at once, which the count
+#: conveys better than the names do.
 _OBJECT_LABEL_CAP = 8
 
 

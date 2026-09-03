@@ -21,9 +21,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# State-dict prefixes emitted by v1.1 training that are not part of the inference graph:
-# ``projector`` is the BarlowTwins head, the segmented matryoshka projector serves the
-# variable-width training objective.
+# State-dict prefixes emitted by v1.1 training that are not part of the inference graph: ``projector`` is the
+# BarlowTwins head, the segmented matryoshka projector serves the variable-width training objective.
 _TRAINING_ONLY_PREFIXES: tuple[str, ...] = ("projector.", "segmented_matryoshka_projector.")
 
 

@@ -40,9 +40,8 @@ _EDL_TOKEN_URL = f"https://{_AUTH_HOST}/api/users/token"
 _S3_CREDENTIALS_URL = "https://cumulus.asf.alaska.edu/s3credentials"
 _OPERA_S3_BUCKET = "asf-cumulus-prod-opera-products"
 
-# Hosts trusted to receive EDL credentials across redirects. The datapool → URS → cumulus →
-# CloudFront chain stays within these three; any redirect to a host outside the set must drop
-# the Authorization header.
+# Hosts trusted to receive EDL credentials across redirects. The datapool → URS → cumulus → CloudFront chain stays
+# within these three; any redirect to a host outside the set must drop the Authorization header.
 _TRUSTED_AUTH_SUFFIXES = (
     "urs.earthdata.nasa.gov",
     "asf.alaska.edu",
@@ -146,8 +145,8 @@ def get_edl_session() -> _EDLSession:
     token = os.environ.get("EARTHDATA_TOKEN")
 
     if token:
-        # LOCAL-ONLY FALLBACK: bearer at SESSION level so _EDLSession's rebuild_auth can
-        # re-inject it on each hop of the chain (datapool → URS → cumulus → CloudFront).
+        # LOCAL-ONLY FALLBACK: bearer at SESSION level so _EDLSession's rebuild_auth can re-inject it on each hop of
+        # the chain (datapool → URS → cumulus → CloudFront).
         session = _EDLSession()
         session.headers["Authorization"] = f"Bearer {token}"
         return session
@@ -229,8 +228,8 @@ def _get_edl_token(session: _EDLSession) -> str:
         raise RuntimeError("EDL authentication failed — check username/password")
     list_resp.raise_for_status()
 
-    # log_body=False on all three EDL calls: the body that fails to parse is a truncated
-    # credential document, and its leading bytes are the credential.
+    # log_body=False on all three EDL calls: the body that fails to parse is a truncated credential document, and its
+    # leading bytes are the credential.
     tokens = json_or_raise(list_resp, log_body=False)
     if tokens:
         return tokens[0]["access_token"]
@@ -275,8 +274,7 @@ def get_s3_credentials(
     # Step 1: Get EDL bearer token (reuse existing if available)
     token = _get_edl_token(session)
 
-    # Step 2: Exchange bearer token for S3 credentials
-    # Clear basic auth so it doesn't clobber the Bearer header
+    # Step 2: Exchange bearer token for S3 credentials Clear basic auth so it doesn't clobber the Bearer header
     session.auth = None
     s3_resp = session.get(
         _S3_CREDENTIALS_URL,
@@ -386,9 +384,9 @@ def _patch_odc_thread_session_for_env_drift() -> None:
     _OdcThreadSession.session = session_with_env_check  # type: ignore[method-assign]
 
 
-# Installed at module import, before any thread can call ThreadSession.session() and cache a
-# session without the drift check. Runs on the orchestrator and on workers alike, since this
-# module is imported when the pickled plugin is unpickled.
+# Installed at module import, before any thread can call ThreadSession.session() and cache a session without the drift
+# check. Runs on the orchestrator and on workers alike, since this module is imported when the pickled plugin is
+# unpickled.
 _patch_odc_thread_session_for_env_drift()
 
 
@@ -412,10 +410,10 @@ class _S3CredentialPlugin(WorkerPlugin):
 
     def setup(self, worker: object) -> None:  # noqa: ARG002
         os.environ.update(self.env)
-        # Reset the main-thread AWSSession cache; task pool threads refresh themselves via the
-        # module-level env-drift patch on their next session() call. Together they ensure
-        # rasterio.env.Env (used by odc.loader on every /vsis3/ open) signs with the new key,
-        # which makes gdal.SetConfigOption and gdal.VSICurlClearCache redundant here.
+        # Reset the main-thread AWSSession cache; task pool threads refresh themselves via the module-level env-drift
+        # patch on their next session() call. Together they ensure rasterio.env.Env (used by odc.loader on every
+        # /vsis3/ open) signs with the new key, which makes gdal.SetConfigOption and gdal.VSICurlClearCache redundant
+        # here.
         _odc_thread_session.reset()
 
 
@@ -447,9 +445,9 @@ def set_s3_credentials(creds: dict[str, str]) -> None:
     except ValueError as e:
         raise RuntimeError("No Dask client found — S3 credentials cannot be broadcast to workers") from e
 
-    # On the orchestrator too. odc.loader's rio_env() wraps rasterio.env.Env around
-    # _local.session() on every /vsis3/ open, and rasterio.env.Env passes the AWSSession's frozen
-    # credentials into GDAL on entry, so updating os.environ suffices to sign with the new key.
+    # On the orchestrator too. odc.loader's rio_env() wraps rasterio.env.Env around _local.session() on every /vsis3/
+    # open, and rasterio.env.Env passes the AWSSession's frozen credentials into GDAL on entry, so updating os.environ
+    # suffices to sign with the new key.
     env = _build_aws_env(creds)
     os.environ.update(env)
     _odc_thread_session.reset()

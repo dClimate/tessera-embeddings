@@ -36,9 +36,9 @@ from zarr.codecs.numcodecs import PCodec as _PCodecZarr3
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM
 
-# PCodec is intentionally a Zarr v3 *serializer* (array->bytes), not a bytes->bytes compressor;
-# silence the "not in the Zarr v3 spec" warning it emits on construction. This module is the
-# codec's canonical home (inference.assembly and the scale-test harness import it from here).
+# PCodec is intentionally a Zarr v3 *serializer* (array->bytes), not a bytes->bytes compressor; silence the "not in
+# the Zarr v3 spec" warning it emits on construction. This module is the codec's canonical home (inference.assembly
+# and the scale-test harness import it from here).
 warnings.filterwarnings("ignore", message="Numcodecs codecs are not in the Zarr version 3")
 
 DIMS_4D: tuple[str, str, str, str] = ("time", "northing", "easting", "band")
@@ -46,53 +46,49 @@ DIMS_3D: tuple[str, str, str] = ("time", "northing", "easting")
 #: Trailing axis of :data:`MONTH_COVERED_VARS` — twelve calendar months, not bands.
 DIMS_4D_MONTH: tuple[str, str, str, str] = ("time", "northing", "easting", "month")
 
-#: The three observation sources a pixel can be seen by, as the prefix their per-sensor arrays are
-#: named from. ONE list, because every per-sensor array is a pair — a count and a month mask —
-#: derived from a single validity mask per sensor. Spelling the sensors once and deriving both
-#: name lists means a fourth source, or a renamed one, cannot arrive in only half the arrays.
+#: The three observation sources a pixel can be seen by, as the prefix their per-sensor arrays are named from. ONE
+#: list, because every per-sensor array is a pair — a count and a month mask — derived from a single validity mask per
+#: sensor. Spelling the sensors once and deriving both name lists means a fourth source, or a renamed one, cannot
+#: arrive in only half the arrays.
 SENSORS: tuple[str, ...] = ("s2", "s1_asc", "s1_desc")
 
-#: obs-count variables carried through inference (canonical definition;
-#: inference.assembly re-exports it).
+#: obs-count variables carried through inference (canonical definition; inference.assembly re-exports it).
 OBS_COUNT_VARS: tuple[str, ...] = tuple(f"{sensor}_obs_count" for sensor in SENSORS)
 
-#: Months in the coverage axis, and the coordinate values written for it (1 = January), so a reader
-#: can say ``cov.sel(month=7)`` and mean July rather than having to know the axis is 0-based.
+#: Months in the coverage axis, and the coordinate values written for it (1 = January), so a reader can say
+#: ``cov.sel(month=7)`` and mean July rather than having to know the axis is 0-based.
 MONTHS_IN_YEAR = 12
 MONTH_COORD = tuple(range(1, MONTHS_IN_YEAR + 1))
 
 #: Per-pixel record of WHICH months a pixel was seen in, as twelve booleans, PER SENSOR.
 #:
-#: The ``*_obs_count`` arrays say how many usable observations a pixel had; these say how they
-#: were distributed. Only the second distinguishes a pixel seen twenty times in July from one seen
-#: twelve times, once a month — for a year-long embedding, a partial season versus a whole one.
+#: The ``*_obs_count`` arrays say how many usable observations a pixel had; these say how they were distributed. Only
+#: the second distinguishes a pixel seen twenty times in July from one seen twelve times, once a month — for a
+#: year-long embedding, a partial season versus a whole one.
 #:
-#: **Per sensor, because the sensors fail differently and a merged mask would hide it.** Optical
-#: gaps are weather and seasonal: a cloudy monsoon removes the same months every year. Radar gaps
-#: are orbital, and the S1B failure left whole regions with one orbit direction for years, so an
-#: ascending and a descending gap over the same pixel mean different things about what the
-#: embedding saw. Or-ing the three would report a pixel as covered in a month it was seen only by
-#: the sensor a given reader cannot use.
+#: **Per sensor, because the sensors fail differently and a merged mask would hide it.** Optical gaps are weather and
+#: seasonal: a cloudy monsoon removes the same months every year. Radar gaps are orbital, and the S1B failure left
+#: whole regions with one orbit direction for years, so an ascending and a descending gap over the same pixel mean
+#: different things about what the embedding saw. Or-ing the three would report a pixel as covered in a month it was
+#: seen only by the sensor a given reader cannot use.
 #:
-#: **They gate nothing.** ``config.inference.OPTICAL_MIN_OBS`` remains the only rule deciding
-#: whether a pixel is embedded. These let a reader apply their own view of sufficiency without
-#: re-deriving it from imagery we do not publish — the mosaics behind them are deleted after a
-#: fill, so it is captured here or nowhere.
+#: **They gate nothing.** ``config.inference.OPTICAL_MIN_OBS`` remains the only rule deciding whether a pixel is
+#: embedded. These let a reader apply their own view of sufficiency without re-deriving it from imagery we do not
+#: publish — the mosaics behind them are deleted after a fill, so it is captured here or nowhere.
 #:
-#: Presence, not counts, and each mask partitions ITS OWN count: a month is covered when at least
-#: one timestep that month passed the same validity test the paired ``*_obs_count`` totals — SCL
-#: classes for optical, a non-zero backscatter sample for radar. Both come from one validity mask
-#: per sensor (``data_loading.coverage_from_validity``), so "how many" and "which months" cannot
-#: disagree. ``False`` also reads for an unwritten pixel, exactly as a count of 0.
+#: Presence, not counts, and each mask partitions ITS OWN count: a month is covered when at least one timestep that
+#: month passed the same validity test the paired ``*_obs_count`` totals — SCL classes for optical, a non-zero
+#: backscatter sample for radar. Both come from one validity mask per sensor
+#: (``data_loading.coverage_from_validity``), so "how many" and "which months" cannot disagree. ``False`` also reads
+#: for an unwritten pixel, exactly as a count of 0.
 #:
-#: Stored as ``int8`` carrying the attribute ``dtype="bool"``, xarray's own representation of a
-#: boolean array, so a reader gets booleans back while the on-disk type is the one the staging
-#: writer can produce (``Dataset.to_zarr`` stores bool as int8 whatever the encoding says, and
-#: assembly reads staged tiles with raw zarr).
+#: Stored as ``int8`` carrying the attribute ``dtype="bool"``, xarray's own representation of a boolean array, so a
+#: reader gets booleans back while the on-disk type is the one the staging writer can produce (``Dataset.to_zarr``
+#: stores bool as int8 whatever the encoding says, and assembly reads staged tiles with raw zarr).
 MONTH_COVERED_VARS: tuple[str, ...] = tuple(f"{sensor}_month_covered" for sensor in SENSORS)
 
-#: The month mask paired with each obs-count array, so a caller holding one can name the other
-#: without slicing a name apart.
+#: The month mask paired with each obs-count array, so a caller holding one can name the other without slicing a name
+#: apart.
 MONTH_COVERED_FOR_OBS: dict[str, str] = dict(zip(OBS_COUNT_VARS, MONTH_COVERED_VARS, strict=True))
 
 # codec keys
@@ -119,8 +115,8 @@ def clamp_chunks_and_shards(
     single implementation of this geometry math: both :meth:`ArrayLayout.create_kwargs` and the
     empty-store seeder call it.
     """
-    # max(..., 1): a zero-extent axis is legal (a mosaic seeded with an EMPTY time axis, appended
-    # per date), but a zero chunk edge is not — keep the nominal chunk so the axis grows into it.
+    # max(..., 1): a zero-extent axis is legal (a mosaic seeded with an EMPTY time axis, appended per date), but a
+    # zero chunk edge is not — keep the nominal chunk so the axis grows into it.
     clamped = tuple(max(min(c, s), 1) for c, s in zip(chunks, shape, strict=True))
     if shards is None:
         return clamped, None
@@ -201,10 +197,10 @@ def _obs(chunks: tuple[int, ...], shards: tuple[int, ...] | None, codec: str) ->
     return dict.fromkeys(OBS_COUNT_VARS, layout)
 
 
-#: The 2048-px shard pitch — also the inference read-tile size, so one tile is exactly one shard
-#: (ADR-008 D3; ``config.inference.INFERENCE_CHUNK_SIZE`` is pinned to this by a test, since
-#: importing it here would be circular) — and the 256-px inner-chunk size. The single numeric
-#: source both presets are built from, so the constants and the presets cannot drift.
+#: The 2048-px shard pitch — also the inference read-tile size, so one tile is exactly one shard (ADR-008 D3;
+#: ``config.inference.INFERENCE_CHUNK_SIZE`` is pinned to this by a test, since importing it here would be circular) —
+#: and the 256-px inner-chunk size. The single numeric source both presets are built from, so the constants and the
+#: presets cannot drift.
 SHARD_PX: int = 2048
 INNER_PX: int = 256
 
@@ -212,9 +208,8 @@ _INNER_4D = (1, INNER_PX, INNER_PX, EMBEDDING_DIM)
 _SHARD_4D = (1, SHARD_PX, SHARD_PX, EMBEDDING_DIM)
 _INNER_3D = (1, INNER_PX, INNER_PX)
 _SHARD_3D = (1, SHARD_PX, SHARD_PX)
-# The month axis is never split, for the same reason the band axis is not: a reader gets a
-# pixel's whole year from one object, so "was this pixel covered every month of the growing
-# season" is one read rather than twelve.
+# The month axis is never split, for the same reason the band axis is not: a reader gets a pixel's whole year from one
+# object, so "was this pixel covered every month of the growing season" is one read rather than twelve.
 _INNER_4D_MONTH = (1, INNER_PX, INNER_PX, MONTHS_IN_YEAR)
 _SHARD_4D_MONTH = (1, SHARD_PX, SHARD_PX, MONTHS_IN_YEAR)
 
@@ -238,19 +233,17 @@ def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
         "embeddings": ArrayLayout(DIMS_4D, _INNER_4D, "int8", 0, _ZSTD, shards=_SHARD_4D),
         "scales": ArrayLayout(DIMS_3D, _INNER_3D, "float32", float("nan"), _PCODEC, shards=_SHARD_3D),
         **_obs(_INNER_3D, _SHARD_3D, _ZSTD),
-        # Twelve labelled planes rather than a packed integer, and zstd rather than PCodec.
-        # Measured on real coverage: the planes cost 1.14x a packed 12-bit mask once compressed
-        # (0.24 bits a pixel against 0.21), because month coverage is spatially smooth and a plane
-        # compresses ~400x while packed bits look like noise to the compressor. The 6x uncompressed
-        # never reaches disk, and a plane per month needs no helper library to read.
+        # Twelve labelled planes rather than a packed integer, and zstd rather than PCodec. Measured on real coverage:
+        # the planes cost 1.14x a packed 12-bit mask once compressed (0.24 bits a pixel against 0.21), because month
+        # coverage is spatially smooth and a plane compresses ~400x while packed bits look like noise to the
+        # compressor. The 6x uncompressed never reaches disk, and a plane per month needs no helper library to read.
         #
-        # int8 + attrs dtype="bool" is xarray's OWN representation of a boolean array, forced here
-        # by the write path: staged tiles are written with `Dataset.to_zarr`, which stores bool as
-        # int8 whatever the encoding asks, while assembly reads those tiles with RAW zarr and sees
-        # int8 — so a bool destination refused every staged month tile on the dtype guard.
-        # Matching the destination to what the writer can express keeps the guard intact, and the
-        # attribute is what makes an xarray reader see booleans rather than 0/1, so
-        # `cov.sel(month=7)` is still a boolean mask. Size is unchanged: numpy bool is 1 byte.
+        # int8 + attrs dtype="bool" is xarray's OWN representation of a boolean array, forced here by the write path:
+        # staged tiles are written with `Dataset.to_zarr`, which stores bool as int8 whatever the encoding asks, while
+        # assembly reads those tiles with RAW zarr and sees int8 — so a bool destination refused every staged month
+        # tile on the dtype guard. Matching the destination to what the writer can express keeps the guard intact, and
+        # the attribute is what makes an xarray reader see booleans rather than 0/1, so `cov.sel(month=7)` is still a
+        # boolean mask. Size is unchanged: numpy bool is 1 byte.
         **{
             var: ArrayLayout(
                 DIMS_4D_MONTH,
@@ -269,24 +262,21 @@ def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
     return arrays
 
 
-#: Single-ROI output. Its own name because callers pass a preset explicitly and
-#: the name lands in the store's creating commit message.
+#: Single-ROI output. Its own name because callers pass a preset explicitly and the name lands in the store's creating
+#: commit message.
 SINGLE = StoreLayout(name="single", arrays=_sharded_arrays(include_std=True))
 
 #: The arrays every staged tile must carry and every destination must hold.
 REQUIRED_VARS: tuple[str, str] = ("embeddings", "scales")
 
-#: The per-pixel arrays BESIDES :data:`REQUIRED_VARS` that inference stages and assembly copies
-#: into the destination.
+#: The per-pixel arrays BESIDES :data:`REQUIRED_VARS` that inference stages and assembly copies into the destination.
 #:
-#: DERIVED from the layout, so a new array is carried by construction. Enumerated by hand at the
-#: write path's four decision points instead, adding an array to :func:`_sharded_arrays` is
-#: silently insufficient: the array is created and seeded, tiles stage real values into it, and
-#: the destination copy drops it — publishing fill over a whole zone-year. Assembly still filters
-#: on presence in BOTH the staged tile and the destination, so a store that predates an array, or
-#: a run that stages nothing for one, is unaffected. Built from :data:`SINGLE` because it is the
-#: superset (it alone has ``embedding_std``); the global path's filter drops what its zones do
-#: not hold.
+#: DERIVED from the layout, so a new array is carried by construction. Enumerated by hand at the write path's four
+#: decision points instead, adding an array to :func:`_sharded_arrays` is silently insufficient: the array is created
+#: and seeded, tiles stage real values into it, and the destination copy drops it — publishing fill over a whole
+#: zone-year. Assembly still filters on presence in BOTH the staged tile and the destination, so a store that predates
+#: an array, or a run that stages nothing for one, is unaffected. Built from :data:`SINGLE` because it is the superset
+#: (it alone has ``embedding_std``); the global path's filter drops what its zones do not hold.
 CARRIED_VARS: tuple[str, ...] = tuple(v for v in SINGLE.arrays if v not in REQUIRED_VARS)
 
 
@@ -304,6 +294,5 @@ def trailing_extent(var: str, embedding_dim: int) -> int | None:
     return MONTHS_IN_YEAR if dims[3] == "month" else (embedding_dim or None)
 
 
-#: The global campaign (ADR-008 D3). No ``embedding_std``, ever — see
-#: :func:`_sharded_arrays`.
+#: The global campaign (ADR-008 D3). No ``embedding_std``, ever — see :func:`_sharded_arrays`.
 GLOBAL = StoreLayout(name="global", arrays=_sharded_arrays(include_std=False))
