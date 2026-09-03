@@ -1,20 +1,14 @@
 """Forwarding optional parameters to a child run without overriding its own defaults.
 
-A flow that dispatches to another deployment has two different things to say about a
-parameter, and the difference is load-bearing: *the caller chose this value* and *the
-caller chose nothing, so whatever the child registered stands*. Prefect has one channel
-for both — a key is either in the parameters dict or it is not — so "chose nothing" has
-to be expressed by leaving the key out.
+Prefect has one channel for two different statements — *the caller chose this value* and
+*the caller chose nothing, so the child's registered default stands* — so "chose nothing"
+must be expressed by leaving the key out of the parameters dict.
 
-The rule that gives this module its reason to exist: **an omitted parameter is not the
-same as one passed as its falsy value.** Written by hand the guard reads
-``if value else {}``, which is right only while no legitimate value is falsy. It stops
-being right the moment a parameter's domain includes ``0`` — and one here does:
-``actor_request_batch_size`` documents ``0`` as the all-at-once mode. Applied at six
-call sites across three flows, that guard silently dropped the mode at every one of
-them, and each site looked correct in isolation.
-
-So the rule lives here instead, tested once, keyed on ``None`` alone.
+**An omitted parameter is not the same as one passed as its falsy value.** The hand-written
+guard ``if value else {}`` is right only while no legitimate value is falsy, and
+``actor_request_batch_size`` documents ``0`` as the all-at-once mode: that guard silently
+dropped the mode at all six call sites across three flows, each of which looked correct in
+isolation. So the rule lives here, tested once, keyed on ``None`` alone.
 """
 
 from __future__ import annotations

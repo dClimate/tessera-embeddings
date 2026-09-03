@@ -1,20 +1,15 @@
 """Master orchestration flow: ROI generation → S1/S2 ingestion → Tessera embeddings.
 
-Chains the three pipeline stages and dispatches each to its registered
-Prefect deployment via ``arun_deployment``. The two ingestion stages
-run concurrently. Cancelling this flow in the Prefect UI propagates
-cancellation to all running child deployments.
+Chains the three pipeline stages and dispatches each to its registered Prefect
+deployment via ``arun_deployment``. The two ingestion stages run concurrently.
+Cancelling this flow in the Prefect UI propagates to all running child deployments.
 
-Differences from the reference repo:
-
-* The coarsening stage is **not included** — the coarsen flow is out
-  of OSS scope (plan §17). Downstream consumers can chain a coarsen
-  step themselves.
-* The deployment names are caller-supplied via :class:`PipelineDeployments`
-  rather than module-level constants pinned to a private deployment
-  layout.
-* The ``BucketPaths`` parameter replaces ``resolve_buckets(dev)``; CRS
-  suffix logic is preserved via :func:`tessera_embeddings.orchestration.prefect.flows.generate_roi._crs_suffix`.
+Deliberately unlike the reference repo: there is no coarsening stage (out of OSS
+scope, plan §17 — chain one downstream); deployment names are caller-supplied via
+:class:`PipelineDeployments` rather than module constants pinned to a private
+deployment layout; and ``BucketPaths`` replaces ``resolve_buckets(dev)``, with CRS
+suffix logic preserved via
+:func:`tessera_embeddings.orchestration.prefect.flows.generate_roi._crs_suffix`.
 """
 
 from __future__ import annotations
@@ -37,8 +32,7 @@ from tessera_embeddings.orchestration.prefect.flows.generate_roi import _crs_suf
 class PipelineDeployments(BaseModel):
     """Deployment refs (``flow_name/deployment_name``) for the master pipeline.
 
-    The reference repo hardcodes deployment names as module constants;
-    making them caller-configurable lets the same pipeline flow drive
+    Caller-configurable rather than module constants, so one pipeline flow drives
     multiple environments (prod, dev, staging) without code changes.
     """
 
@@ -97,48 +91,39 @@ async def tessera_full_pipeline(
 
     Args:
         paths: Deployment-supplied storage URIs (see :class:`BucketPaths`).
-        time_window_end: End month of the 12-month window as
-            ``"Month Year"`` (e.g. ``"June 2025"``).
+        time_window_end: End month of the 12-month window as ``"Month Year"``
+            (e.g. ``"June 2025"``).
         deployments: Deployment refs to dispatch to.
-        roi_name: GeoJSON-mode ROI name. Mutually exclusive with
-            ``tile_names``.
-        tile_names: Comma-separated MGRS tile IDs. Mutually exclusive
-            with ``roi_name``.
+        roi_name: GeoJSON-mode ROI name. Mutually exclusive with ``tile_names``.
+        tile_names: Comma-separated MGRS tile IDs. Mutually exclusive with ``roi_name``.
         roi_override_name: Human-readable nickname in tile mode.
         resolution: ROI rasterisation pixel size (metres).
         force_crs: Optional CRS override for ROI generation.
-        ingest_min_workers: Override for ingest Dask min_workers (None
-            = auto-size from chunk count).
+        ingest_min_workers: Override for ingest Dask min_workers (None auto-sizes from
+            the chunk count).
         ingest_max_workers: Override for ingest Dask max_workers.
         num_actors: Override for Ray GPU actor count.
-        s1_orbit: SAR orbit direction — ``"ascending"``, ``"descending"``,
-            or ``"both"``. ``"both"`` ingests both orbits concurrently.
-        allow_s2_only: Forwarded to the embeddings stage: embed S2-valid pixels
-            that have ZERO S1 observations (sub-zone SAR coverage gaps) via the
-            upstream v1.1 missing-S1 convention instead of skipping them.
-            Default False (historical behaviour); quality is unvalidated for
+        s1_orbit: SAR orbit direction — ``"ascending"``, ``"descending"`` or ``"both"``;
+            ``"both"`` ingests both orbits concurrently.
+        allow_s2_only: Forwarded to the embeddings stage: embed S2-valid pixels with ZERO
+            S1 observations (sub-zone SAR coverage gaps) via the upstream v1.1 missing-S1
+            convention instead of skipping them. Default False; quality is unvalidated for
             this S1-trained checkpoint — see the optional-S1 ADR.
-        skip_coverage_check: Skip the time-window coverage validation
-            on the embeddings stage.
+        skip_coverage_check: Skip the embeddings stage's time-window coverage validation.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
-        ssm_prefix: SSM Parameter Store prefix under which the Ray
-            cluster resource IDs are published by the deployment's infra.
-            Forwarded to the embeddings stage; deployments that publish
-            under a different prefix must override the OSS ``/tessera/ray/``.
-        cloudwatch_log_group: CloudWatch log group the Ray workers write
-            agent logs to. Forwarded to the embeddings stage; must match
-            the group the deployment's infra creates and grants access to.
-        code_bucket: S3 bucket (no ``s3://`` prefix) workers pull the
-            source tarball from. Setting it only points workers at an
-            existing tarball (expected to be uploaded by CI — the general
-            production path); it does not upload one. Forwarded to the
-            embeddings stage; leave ``None`` for AMI-baked source.
-        code_suffix: Source tarball filename suffix. Forwarded to the
-            embeddings stage.
-        sync_source_path: Dev-iteration only. Local source dir to tar and
-            upload before ``ray up`` (requires ``code_bucket``), so
-            workers run your working-tree code without a CI round-trip.
-            Forwarded into the embeddings stage's ``dev_params``.
+        ssm_prefix: SSM Parameter Store prefix the deployment's infra publishes Ray
+            cluster resource IDs under. Deployments publishing elsewhere must override
+            the OSS ``/tessera/ray/``.
+        cloudwatch_log_group: CloudWatch log group the Ray workers write agent logs to;
+            must match the group the deployment's infra creates and grants access to.
+        code_bucket: S3 bucket (no ``s3://`` prefix) workers pull the source tarball
+            from. It only POINTS workers at an existing tarball (CI uploads it — the
+            general production path); it does not upload one. ``None`` uses AMI-baked
+            source.
+        code_suffix: Source tarball filename suffix.
+        sync_source_path: Dev-iteration only. Local source dir to tar and upload before
+            ``ray up`` (requires ``code_bucket``), so workers run your working-tree code
+            without a CI round-trip. Forwarded into the embeddings stage's ``dev_params``.
 
     Returns:
         Dict with the run IDs of every child flow.
@@ -181,13 +166,12 @@ async def tessera_full_pipeline(
     )
     _check_completed(roi_run, "generate_roi")
 
-    # The CRS suffix is part of the ROI's canonical identity, not just the
-    # ROI-zarr filename: it must thread through the mosaic dir and the
-    # downstream embeddings roi_name too, or `store_for(roi_name, "roi")` in
-    # the embeddings flow rebuilds an unsuffixed path that doesn't exist (and
-    # CRS variants would collide on the mosaic/embeddings paths). generate_roi
-    # stays the sole place that *derives* the suffix; everything after it uses
-    # this suffixed id uniformly. force_crs=None → roi_id == canonical_name.
+    # The CRS suffix is part of the ROI's canonical identity, not just the ROI-zarr
+    # filename: it must thread through the mosaic dir and the downstream embeddings
+    # roi_name too, or `store_for(roi_name, "roi")` in the embeddings flow rebuilds an
+    # unsuffixed path that doesn't exist — and CRS variants would collide on the
+    # mosaic/embeddings paths. generate_roi is the sole place that *derives* the suffix;
+    # everything after uses this suffixed id. force_crs=None → roi_id == canonical_name.
     roi_id = f"{canonical_name}{_crs_suffix(force_crs)}"
     roi_zarr_path = f"{inputs_bucket.rstrip('/')}/rois/zarrs/{roi_id}.zarr"
     store_path = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_id}"
