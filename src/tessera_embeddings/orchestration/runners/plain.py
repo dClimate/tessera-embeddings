@@ -331,10 +331,19 @@ def _run_inference_and_assemble(
     # and they are pure cost from here -- on the quickstart the staged prefix is LARGER than the
     # product it produced. Best-effort: a cleanup failure must not fail a finished pipeline.
     try:
-        # strict: delete_prefix otherwise swallows an unverified delete and a
-        # non-empty prefix, and we would log success over staging that is still there
-        # -- which the deterministic run_id above would then resume onto.
-        delete_prefix(run_staging, log=log, strict=True)
+        # strict, so an unverified delete or a surviving prefix reaches the `except` below
+        # instead of being swallowed and logged as success -- staging the deterministic run_id
+        # would then resume onto.
+        #
+        # all_versions=False because this is OUR OWN transient output, written minutes ago and
+        # deleted here. The default exists for the campaign's versioned mosaic archive, where
+        # non-current versions accumulate and a storage-budget slot is released on the strength
+        # of the delete. Keeping it on would also make s5cmd a hard requirement of the
+        # orchestrator-free runner: on s3 the fsspec fallback cannot honour `all_versions`, so
+        # `strict` turns a missing s5cmd binary into a leaked prefix. Opting out lets the
+        # fallback do the job, which is what `delete_prefix` documents for callers that only
+        # need current objects.
+        delete_prefix(run_staging, log=log, all_versions=False, strict=True)
         log.info("Removed staging prefix %s", run_staging)
     except Exception:
         log.warning("Could not remove staging prefix %s; it is safe to delete by hand", run_staging, exc_info=True)

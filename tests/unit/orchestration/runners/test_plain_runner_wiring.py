@@ -212,6 +212,9 @@ class TestStagingLifecycle:
         # returns, so the outer except never fires and we log success over surviving staging --
         # which the deterministic run_id would then resume onto.
         assert delete.call_args.kwargs["strict"] is True
+        # all_versions would make s5cmd a hard requirement of the orchestrator-free path: on s3
+        # the fsspec fallback cannot honour it, so strict turns a missing binary into a leak.
+        assert delete.call_args.kwargs["all_versions"] is False
 
     def test_a_failed_run_keeps_its_staging_prefix(self, tmp_path):
         """The retention that makes the resume possible: a failed run's tiles must survive."""
