@@ -26,6 +26,14 @@ rather than buried.
 | Ray cluster ramp | ~$1,200 — 10 boots, one per cluster. A year-serial campaign would pay one per cluster-year instead, ~$11,000 (§4) |
 | **Campaign total** | **$594,000 – $846,000**, plan on **$700,000** — the sum of the lines above. The ingest line is under review upward (§4); the inference line is measured on one token unit and one completed cell (§6b, §6c) |
 
+**MEASURED 2026-09-02 — the campaign is running, is a third done, and §12 supersedes every
+DURATION in this table.** Live throughput is 10,900 tile-years an hour on a fleet of 1,238 graphics
+cards, which puts completion around **11 September 2026** with about **$372,000** of compute left to
+pay for. The money holds up: the measured whole-campaign card cost of **$538,000** falls inside the
+$472,000–$713,000 range above and slightly under the $573,000 plan. The timing does not — the table
+assumes 2,500 cards at the full single-card rate, and the real fleet is half that size running at
+83% of it. **Read §12 before quoting any duration or GPU-hour figure from here.**
+
 **The campaign is a GO and is inside budget; this document's job is now accuracy, not the
 decision.** Every revision since 2026-08-07 has moved the inference line by single-digit
 percentages, and none of them approaches the margin the decision was taken with. Read the
@@ -424,6 +432,22 @@ same rate either way. What the ingest configuration decides is whether the fleet
 
 ### Size the fleet UNDER what ingest can feed
 
+> **MEASURED 2026-08-26: per-chunk cost varies ~2.2x BY ZONE, so a single per-zone-year figure
+> cannot size a fleet.** Marginal GPU-hours per 2048-px chunk, taken on legs with ZERO resumed
+> tiles so nothing is flattered by staged work resolving free: **37N 0.094, 32N-2018 0.199,
+> 34N 0.204**, against a reference of 0.104 implied by this section. That is 0.204/0.094 = **2.17x**.
+>
+> **An earlier draft of this note said ~7x, and that was self-contradictory.** The 7x came from
+> including a 0.029 reading which the very next sentence rejects as a partial-resumption artefact —
+> resumed tiles cost nothing and drag a leg's average down. Using a figure to size the spread while
+> declaring it invalid overstates sustainable variation and weakens the fleet-sizing conclusion it
+> was meant to support. **The uncontaminated spread is 2.2x.** Campaign-wide marginal cost over a
+> 6.4 h window was 0.072, which carries the same flattery at fleet scale and is likewise not a
+> sustainable rate.
+>
+> The spread is observation depth and it straddles the reference rather than sitting on it, so the
+> matched-fleet arithmetic below is right in form and needs a per-zone cost to be right in value.
+
 A zone-year costs **289.2 GPU-hours** at the planning basis. The *matched* fleet — the size
 at which the fleet exactly consumes what ingest produces — is `supply × 289.2`. Running at
 the matched size is the wrong target for two reasons: it leaves no absorber when supply dips,
@@ -758,13 +782,36 @@ question is whether assembly finishes before the next cell's inference does:
 | dense cell (8,714 tiles) | 3.28 h | 3.61 h | **1.10×** |
 | average cell (3,222 tiles) | 1.21 h | 1.33 h | **1.10×** |
 
-**1.10× at the campaign's 250 actors per cluster**, and scale-invariant because both terms are
+> **SUPERSEDED 2026-08-26 by a second measured assembly, and the margin needs re-deriving.**
+> 48N-2017 assembled in **5.78 h** (`fill_wall_s` 20,815 s, 7,912 staged tiles, 6.42 TB), against
+> the 3.28 h above for a comparable cell. Two corrections follow.
+>
+> **Size assembly on LIVE tiles, not staged ones.** That cell wrote 8,803 shards, not 7,912: the
+> 891 tiles resolved as skips are still written, as fill, over the whole live footprint. An
+> estimate built on the staged count is short by however many were skipped — 10% here.
+>
+> **The 1.10× margin cannot be read off the table below any more.** Both of its terms moved and
+> not by the same factor. Measured on the same cell: assembly 5.78 h against inference of 9.3 h at
+> ~245 actors, so the margin was ~1.6× — wider than documented, but arrived at from two numbers
+> that are each ~1.7-2.6× the modelled ones. Re-derive it from a matched pair before quoting it.
+>
+> **The commit really is negligible, confirmed twice.** 0.77 s for the shard commit and 0.475 s for
+> the attrs commit, out of 20,815 s. Assembly IS the shard write.
+
+> **WITHDRAWN 2026-08-26, not merely annotated.** Everything in the paragraph below rests on the
+> 1.10x margin, and both of that ratio's terms have been re-measured at 1.7-2.6x their modelled
+> values. So the **275-actor crossover is unsupported**, and so is the ten-clusters-rather-than-eight
+> conclusion drawn from it. Do not size a fleet from this paragraph until the margin is re-derived
+> from a matched pair of measurements. It is kept here for provenance, struck through, because a
+> note saying "re-derive this" above prose that still reads as current guidance is not a withdrawal.
+
+~~**1.10× at the campaign's 250 actors per cluster**, and scale-invariant because both terms are
 linear in tiles. (At 228 it was 1.21×; the two cross at **275**, which is what caps actors per
-cluster and therefore why the fleet is 10 clusters rather than 8.) Assembly stays off the critical path, but by 21% rather than comfortably, and a
-cluster runs ~126 cells in sequence so a persistent deficit compounds rather than averaging out.
-That is what makes the **39% of CPU left idle** worth keeping: not spare performance to harvest,
-but the margin's only buffer. **F8 now tests a thin ratio rather than confirming a comfortable
-one.**
+cluster and therefore why the fleet is 10 clusters rather than 8.) Assembly stays off the critical
+path, but by 21% rather than comfortably, and a cluster runs ~126 cells in sequence so a persistent
+deficit compounds rather than averaging out. That is what makes the **39% of CPU left idle** worth
+keeping: not spare performance to harvest, but the margin's only buffer. **F8 now tests a thin ratio
+rather than confirming a comfortable one.**~~
 
 ### Throughput is not purely token-bound, and the floor bites where tokens are fewest
 
@@ -986,3 +1033,197 @@ uncertainty list that carries its own retired entries is one nobody reads to the
 - `scripts/census_s1_coverage.py` — the radar census behind §6. Re-run it to refresh the
   observation counts, or to check whether OPERA coverage has expanded again. Unauthenticated;
   a few minutes per year queried.
+
+---
+
+
+## 12. MEASURED LIVE — the campaign delivers about 10,900 tile-years an hour, and finishes around 11 September 2026
+
+**This section replaces the modelled rate wherever the two disagree, and it supersedes its own
+first version in place.** Everything in §5–§6 divides by a rate measured on one graphics card in
+one place. This measures the whole fleet doing the real campaign.
+
+Read this section before quoting a duration or a cost from anywhere above it.
+
+### The one unit everything here counts in
+
+A **tile-year** is one 2048 × 2048-pixel square of ground, for one calendar year, in one UTM zone.
+It is the unit the inference engine actually schedules, the unit the store commits, and the unit
+the progress logs count — so it is the only unit used below. One tile-year is **725.6 million
+tokens** (2048² pixels × 173 tokens per pixel, optical and radar combined).
+
+The whole campaign is **3,248,577 tile-years**, and that figure is now derived rather than
+asserted: the land mask records a live-tile count for each zone as its own stored attribute, and
+summing those across the 112 zones that contain any land gives 360,953 tile-years per calendar
+year, which over nine years reproduces 3,248,577 exactly.
+
+### The rate, measured three independent ways
+
+Taken 2026-09-02 17:40Z, with the fleet steady at 1,238 graphics cards for several hours.
+
+| how it was measured | tile-years per hour |
+|---|---|
+| counting the engine's own per-tile completion messages over one hour | **10,875** |
+| counting what the store committed over the last 6 hours | **10,693** |
+| counting what the store committed over the last 12 hours | **11,004** |
+
+**Call it 10,900 an hour.** Three methods within 3% of each other is the strongest statement this
+document has ever been able to make about throughput, and they are genuinely independent: the first
+reads the compute logs, the other two read commit timestamps in the published store.
+
+**The log count had to be halved, and the other two methods are what confirm it.** The engine
+publishes every completion message **twice** — once with delimiters and once without — which the
+health checker deliberately does not correct for, because it only asks whether the count is zero.
+Taken at face value the log says 21,750 an hour. That would require the store to commit 2.7 cells
+an hour; it commits 1.50. So the doubling is real and the corrected figure is the right one. Anyone
+re-running that check for a *rate* rather than a *presence* must halve it.
+
+### One rate here is higher, and it is the wrong one to plan with
+
+Measured from the relaunch on 2026-08-31 19:00Z, the delivered rate is **13,728 an hour** — 26%
+above the figure above. That difference is not improvement and must not be used for a projection.
+
+A relaunch inherits work that was already computed and staged before it started, and those tiles
+resolve almost instantly when their cell is next picked up. So the hours right after a relaunch
+deliver tiles that earlier hours paid for. The trailing 6- and 12-hour windows sit past that
+inheritance and agree with the log count; the since-relaunch window still contains it. **This is
+the same flattery §5 warns about for per-zone cost, appearing again at fleet scale.**
+
+### The fleet, and what it costs per hour
+
+| | count | list price each | per hour |
+|---|---|---|---|
+| g5.2xlarge (A10G card) | 773 | $1.212 | $936.88 |
+| g6e.xlarge (L40S card) | 465 | $1.861 | $865.37 |
+| cluster head nodes (m5.2xlarge) | 10 | $0.384 | $3.84 |
+| ingest containers (964 vCPU) | — | $0.04048/vCPU-h | $56.16 |
+| **total** | | | **$1,862** |
+
+Prices are on-demand list rates from the AWS Pricing API for us-west-2. This is an estimate, not a
+reconciliation against a bill.
+
+**Just under two thirds of the fleet — 62% — is the cheaper, slower card.** That matters for every sentence below
+about per-card performance, and it is why the single blended price of $1.861 per graphics-card hour
+used in §5 cannot describe this fleet.
+
+### Per card: 83% of the modelled basis
+
+10,900 tile-years an hour is **2.19 billion tokens per second** combined across the fleet. Divided
+by all 1,238 cards that are switched on, that is **1.77 million tokens per second per card**,
+against the **2.127 million** basis §6 measured on a single L40S.
+
+**83% of basis.** The division is deliberately by every card that is *billed*, not by the ones
+observed to be busy, so the figure already absorbs any idleness and needs no separate adjustment
+for it. The first version of this section reported 74%–77% against a smaller fleet.
+
+**The mix is the leading explanation and remains a hypothesis.** 62% of the fleet is the A10G
+rather than the L40S the basis was measured on, and a rough weighting reproduces something
+close to 83%. Nothing here attributes throughput per card type, and doing so needs per-card
+accounting the engine does not currently emit. Do not use the mix to argue anything until it does.
+
+### Inference and assembly are in balance, and this is the evidence
+
+The first version of this section warned that assembly, not inference, might set the schedule.
+It does not, and the delivered curve is what settles it.
+
+The rate measured from compute logs is inference finishing tiles. The rate measured from commit
+timestamps is assembly publishing them. **They agree to within 3%**, which they cannot do if either
+stage is waiting on the other. Two further readings say the same thing:
+
+- **The queue between them is small and steady.** 79,445 tile-years were computed but not yet
+  published — about **7.3 hours** of work at the measured rate. Re-measured two hours later it was
+  75,640 across 17 cells, still about seven hours. It holds rather than growing.
+
+A queue that stays near seven hours while both stages run at the same rate is a balanced pipeline,
+not a growing backlog.
+
+**A weaker indicator, withdrawn rather than left standing.** An earlier draft of this section also
+cited "four to six cells being assembled at any moment" as evidence of balance. **Do not use it.**
+Two hours later that count had fallen to one — while completed publications ACCELERATED to four in
+an hour against a campaign average of 1.5. So the count of cells reported as assembling does not
+track delivered output, and on one occasion pointed the opposite way. Five cells were fully computed
+and awaiting assembly at the moment the count read one, which nothing here reconciles.
+
+The balance argument never needed that figure. What carries it is the two rates agreeing and the
+queue holding, both of which are measurements of delivered work rather than of a reported state.
+
+### Where the campaign stands
+
+| | tile-years | share |
+|---|---|---|
+| whole campaign | 3,248,577 | 100% |
+| published and committed | **1,073,579** | **33.05%** |
+| computed, awaiting publication | 79,445 | 2.4% |
+| remaining | **2,174,998** | 66.9% |
+
+That is 132 zone-years published with real data, spanning 21 UTM zones. A further 72 zone-years are
+committed as empty — ocean, or otherwise carrying no land — and are excluded from every figure
+above, because counting them would inflate the cell count while contributing no tiles. They are
+genuine completions of the roster, just not of any work.
+
+### When it finishes, and what it costs to get there
+
+Remaining work is 2,174,998 tile-years, which is 1.58 × 10¹⁵ tokens.
+
+| assumption | rate per hour | hours left | finishes | cost at $1,862/h |
+|---|---|---|---|---|
+| **measured rate holds** | **10,900** | **200** | **~11 Sep 2026** | **~$372,000** |
+| slowest trailing window | 10,693 | 203 | ~11 Sep | ~$379,000 |
+| fastest trailing window | 11,004 | 198 | ~10–11 Sep | ~$368,000 |
+| since-relaunch rate (inherits staged work — not a forecast) | 13,728 | 158 | ~9 Sep | ~$295,000 |
+
+**Plan on 11 September and roughly $372,000 of remaining compute.** The whole campaign at this rate
+and this fleet would be about 298 hours and **$555,000** all-in, of which **$538,000 is the graphics
+cards alone**.
+
+**That lands inside the modelled range, which is the most useful thing this section says about
+cost.** §1 budgets $472,000–$713,000 for inference and plans on $573,000; the measured
+whole-campaign card cost of $538,000 sits inside that range and slightly under the plan. The model
+got the money right while getting the duration wrong — it assumed 2,500 cards at full basis rate,
+where the real fleet is half the size at 83% of basis, so the same work costs about what was
+budgeted but takes longer.
+
+Compare against §8's scenarios — noting that a real campaign also paid for the restarts, the orphaned fleets
+recorded two subsections below, and the ingest that ran ahead of inference.
+
+Working cost per unit, for anyone sizing a different campaign: **$0.171 per tile-year**, or **$0.24
+per billion tokens**.
+
+### What the first version of this section got wrong, and what the mistake cost
+
+Kept because it is campaign history and a real line of spend, and because the paragraph above
+about per-card performance would otherwise be quoting a correction with nothing to point at.
+
+The first version, written 2026-08-31, reported that **only 61% of the fleet's cards were working**
+— 712 busy against 1,163 switched on — and blamed the machine-provisioning loop for outrunning the
+software that places work on them. **Both halves were wrong, and the explanation was invented
+before the number was taken apart.**
+
+379 of the 451 supposedly-idle machines belonged to **three abandoned compute clusters**, left
+running by cell-fill runs that had been cancelled hours earlier. They held no work because the
+process that would have given them work was dead — a shutdown failure, not a provisioning one.
+They ran at **$590 an hour and had burned about $9,650** before being shut down manually.
+
+**What settles it: fleet throughput did not fall when those 379 machines were switched off** —
+5,583 tile-years an hour before, 6,230 after. They were contributing nothing. On the live fleet
+alone, 766 of 784 cards held work: 98%. There was never a meaningful gap between billed and
+working cards.
+
+The real finding was the shutdown gap. The sweeper meant to catch abandoned clusters had run
+five times while those three sat there, because it inventories **container tasks** and these were
+**virtual machines**, which it never looks at. Three of ten clusters leaked on a single
+cancellation. That is an orchestration defect rather than a cost-model input, and it is fixed
+separately; it is recorded here because the campaign paid for it.
+
+### What this section does not settle
+
+- **It cannot re-price the campaign per card.** A cheaper card that is also slower can cost the same
+  or less per token. Re-pricing needs the per-card rate and the per-card price together, and this
+  section supplies the price but not the rate.
+- **It does not extrapolate to a larger fleet.** Everything here is measured at 1,238 cards. Whether
+  2,500 cards would hold 83% of basis is untested, and §5's headline of 5.1 days assumes 2,500 cards
+  at 100% of basis, which nothing has ever observed.
+- **Ingest is deliberately throttled and is not a constraint here.** The ingest gate is held at 5
+  concurrent cells and the containers use 964 of 25,000 available vCPU, under 4%. The queue of
+  already-built input is large enough that inference has not waited on it. §4's scenarios describe
+  an ingest running at full width, which this campaign is not.
