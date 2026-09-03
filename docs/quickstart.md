@@ -1,11 +1,11 @@
 # Quickstart
 
 A laptop demo that exercises the full pipeline against a small,
-real-world AOI: ~1 km² over Story County, Iowa (the densest
-corn-producing county in the United States, picked because both
-Sentinel-2 and OPERA RTC-S1 give dense coverage there).
+real-world AOI: ~1 km² over Denver, Colorado, picked because it sits
+under both ascending and descending OPERA RTC-S1 tracks, so the
+quickstart exercises `s1_orbit: both`.
 
-Read time: 5 minutes. Run time: ~5 min for ingest only, ~15 min for
+Read time: 5 minutes. Run time: ~2.5 min for ingest only, ~3.5 min for
 full end-to-end CPU inference.
 
 ## Prerequisites
@@ -115,7 +115,7 @@ What happens:
 
 Output: `${paths.inputs}/quickstart_denver_co/{reflectance.zarr, sar_ascending.zarr}`.
 
-## Full pipeline (30+ minutes on CPU, much faster on GPU)
+## Full pipeline (~3.5 minutes on CPU)
 
 Same command without `--skip-inference`:
 
@@ -129,8 +129,8 @@ Now the runner adds two steps:
 
 ```
 6. Local Ray cluster (GPU if available, else CPU)
-7. Inference: 1 chunk of ROI           (~15-30 min CPU, ~1-2 min GPU)
-8. Assemble (local worker processes)   (~2 min)
+7. Inference: 1 chunk of ROI           (~1 min CPU)
+8. Assemble (local worker processes)   (<1 s, one worker)
 ```
 
 The `device` field in `config.yaml` controls this:
@@ -142,17 +142,23 @@ The `device` field in `config.yaml` controls this:
 | `cuda` | always GPU — fails if no CUDA device is visible |
 
 Output:
-`${paths.outputs}/embeddings/quickstart_story_county_ia.zarr` — a
+`${paths.outputs}/embeddings/quickstart_denver_co.zarr` — a
 128-dim per-pixel Tessera embedding store at 10 m resolution.
 
-## Why the CPU run is slow on purpose
+## Why the CPU run exists
 
-CPU torch is slow. **It is the credibility test, not the path you'd
-use in production.** If the same domain functions that power the
-production GPU pipeline also work — without modification — on a CPU
-laptop (`device: cpu`), then the inference layer has no GPU-specific
-coupling. That's the strongest decoupling proof we can run without
-deploying to multiple cloud targets.
+**It is the credibility test, not the path you'd use in production.** If
+the same domain functions that power the production GPU pipeline also
+work — without modification — on a CPU laptop (`device: cpu`), then the
+inference layer has no GPU-specific coupling. That's the strongest
+decoupling proof we can run without deploying to multiple cloud targets.
+
+It used to be slow enough that this page apologised for it. It is not any
+more: one chunk takes about a minute on CPU, because the optimisations
+built for the global campaign — vectorised temporal resampling, the
+two-deep GPU pipeline, the larger batch — are in the shared inference
+code and apply here too. Scaling to a large AOI still wants a GPU; the
+quickstart does not.
 
 If you have a GPU locally, set `device: auto` (the default) or `device: cuda`
 in `config.yaml` and the plain runner will use it.
@@ -164,7 +170,7 @@ For real workloads, run the Prefect flow against
 ## Adapting to a different AOI
 
 The bundled `examples/quickstart/roi.geojson` is a ~1 km² box over
-Story County, IA (roughly 84×101 pixels at 10 m resolution, one inference chunk). To use your own AOI:
+Denver, CO — one inference chunk at 10 m resolution. To use your own AOI:
 
 1. Edit `examples/quickstart/roi.geojson` (any single-feature
    GeoJSON polygon works).

@@ -62,6 +62,7 @@ context_docs/
     ├── solar_day_fusion_order_2026_08.md         which scene wins a contested pixel, and why it was inverted
     ├── ingest-live-tile-cropping.md              + appendix A, the multi-write-per-commit test
     ├── ingest-graph-and-stac-budget.md
+    ├── single-path-audit-2026-09.md          the SINGLE-ROI path after the campaign: what it inherited, what it did not
     ├── region-writes.md
     │
     │  INFERENCE + STORE

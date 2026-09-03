@@ -12,9 +12,10 @@ for fast contributor iteration on the ingest path.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import time
-import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,7 +25,11 @@ import yaml
 from dask.distributed import Client
 
 from tessera_embeddings.config.assembly import AssemblyConfig
-from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
+from tessera_embeddings.config.inference import (
+    INFERENCE_CHUNK_SIZE,
+    InferenceConfig,
+    checkpoint_filename,
+)
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
@@ -46,6 +51,7 @@ from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
 from tessera_embeddings.providers.local.dask import local_cluster
 from tessera_embeddings.providers.local.ray import ray_cluster
 from tessera_embeddings.storage.manifest import EmbeddingManifest
+from tessera_embeddings.storage.object_store import delete_prefix
 
 
 def _resolve_num_gpus(device: str) -> int:
@@ -80,6 +86,88 @@ def _dask_client(n_workers: int) -> Iterator[Client]:
         yield client
 
 
+#: Upstream-manifest fields that describe what a mosaic CONTAINS, and so belong in the staging
+#: identity. Deliberately excludes ``ingest_code_identity``: that is the campaign's mid-flight
+#: safeguard, and including it would re-infer every single-ROI run whenever the ingest source
+#: moved, which is redoing work by default rather than by intent.
+_MOSAIC_CONTENT_KEYS: frozenset[str] = frozenset({"roi_manifest_hash", "coverage_sha256", "min_valid_coverage"})
+
+
+def _staging_run_id(*, roi_name: str, config: InferenceConfig, upstream: dict[str, Any]) -> str:
+    """A staging identity that repeats for the same run, so an interrupted run resumes.
+
+    Derived from everything the OUTPUT depends on, so re-running the same config finds the tiles
+    the last attempt staged and infers only what is missing, while any change that would alter a
+    pixel starts a fresh prefix instead of blending old tiles with new ones. ``run_inference``
+    resumes purely on this id, so a term missing here is a silently mixed store.
+
+    The terms, and what each one catches:
+
+    * **ROI name, time window, orbit, checkpoint** — the obvious four. A different window is a
+      different product.
+    * **allow_s2_only** — decides whether S2-valid pixels with no S1 observation are embedded at
+      all. Toggling it between a crash and the retry would keep radar-gated tiles beside
+      optical-only ones under one identity.
+    * **the mosaics' CONTENT terms** — :data:`_MOSAIC_CONTENT_KEYS` out of each upstream ingest
+      manifest, which catch a re-rasterised ROI and a re-ingest at a different admission
+      threshold. Named explicitly rather than digesting the whole manifest, and the omission is
+      the point: the manifest also carries ``ingest_code_identity``, so hashing it wholesale
+      would re-infer every ROI whenever the INGEST source moved — a comment edit included. That
+      is the campaign's safeguard reappearing by the side door, and it would make redoing work
+      the normal case rather than a deliberate one. An explicit list also means a new manifest
+      field cannot silently start forcing re-inference.
+
+      What that gives up: a mosaic re-ingested under changed selection logic, at the same ROI
+      and threshold, is not distinguished. Rare, deliberate, and already fenced at the layer
+      that owns it — ``IngestManifest.REQUIRED_TO_APPEND`` refuses to append to a store whose
+      recorded ``ingest_code_identity`` differs, unless the operator opts in.
+
+    Deliberately NOT the campaign's staging fingerprint. That one mixes in
+    :func:`inference_code_identity` and the code tarball's ETag so a mid-campaign code change
+    can never blend two versions into one write-once zone-year — a safeguard that earns its
+    cost across 120 zones and months of wall time, and does not here. A single-ROI run is one
+    operator, one machine, minutes long, and re-inferring everything because a comment moved
+    is the wrong default for it. The consequence is explicit: **edit inference code between a
+    crash and its retry and the retry reuses tiles the old code staged.** Delete the staging
+    directory (logged at every run) to force a clean pass.
+
+    Staging is removed after a successful assemble, so in practice a prefix only survives a run
+    that failed — which is exactly the run worth resuming.
+    """
+    # Only the content keys, and sorted, so the digest is a fact about what the mosaics HOLD
+    # rather than about dict ordering or about which code wrote them.
+    content = {
+        store: {k: v for k, v in (manifest or {}).items() if k in _MOSAIC_CONTENT_KEYS}
+        for store, manifest in upstream.items()
+    }
+    terms = "|".join(
+        [
+            roi_name,
+            config.time_window.window_end_label,
+            str(config.s1_orbit),
+            config.checkpoint_path,
+            f"s2_only={config.allow_s2_only}",
+            json.dumps(content, sort_keys=True, default=str),
+        ]
+    )
+    return hashlib.sha256(terms.encode()).hexdigest()[:12]
+
+
+def _checked_coverage(value: float) -> float:
+    """Bound the coverage threshold the way :class:`IngestSettings` does.
+
+    The flow path validates through a pydantic model with ``gt=0, le=100``; the plain runner
+    hands a bare float to the domain function, whose test is ``coverage >= min_valid_coverage``
+    and does not range-check. Unbounded, 0 admits a date with no valid pixels at all and 101
+    rejects every date — both silently, as a config that looks like it worked.
+    """
+    coverage = float(value)
+    if not 0.0 < coverage <= 100.0:
+        msg = f"min_valid_coverage must be in (0, 100]; got {coverage!r}"
+        raise ValueError(msg)
+    return coverage
+
+
 def _run_ingest(
     *,
     roi_path: str,
@@ -92,6 +180,7 @@ def _run_ingest(
     log: logging.Logger,
     storage_options: dict | None,
     s1_use_s3_direct: bool,
+    min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
 ) -> None:
     """Run S2 + S1 ingestion sequentially against a local Dask cluster.
 
@@ -110,6 +199,7 @@ def _run_ingest(
             end_date=end_date,
             store_path=mosaic_base,
             client=client,
+            min_valid_coverage=min_valid_coverage,
             log=log,
             storage_options=storage_options,
         )
@@ -193,7 +283,13 @@ def _run_inference_and_assemble(
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_path)
     log.info("ROI filter: %d/%d chunks intersect the ROI", len(live_chunks), len(chunks))
 
-    run_id = uuid.uuid4().hex[:12]
+    # Read before the identity rather than just before the manifest: these carry the ingest
+    # fingerprints the staging id needs, and reading them first also fails a missing-mosaic run
+    # here instead of after inference has been paid for.
+    upstream_manifests = read_upstream_manifests(mosaic_base, config.s1_orbit)
+    run_id = _staging_run_id(roi_name=roi_name, config=config, upstream=upstream_manifests)
+    run_staging = f"{staging_base.rstrip('/')}/{run_id}"
+    log.info("Staging prefix for this run: %s (delete it to force a clean re-inference)", run_staging)
     t0 = time.monotonic()
 
     if num_gpus == 0:
@@ -228,7 +324,6 @@ def _run_inference_and_assemble(
     output_path = f"{output_bucket.rstrip('/')}/embeddings/{roi_name}.zarr"
     writer = ZarrWriter(staging_base)
     model_version = checkpoint_to_version(config.checkpoint_path)
-    upstream_manifests = read_upstream_manifests(mosaic_base, config.s1_orbit)
     manifest = EmbeddingManifest.from_upstream_stores(
         model_checkpoint=model_version,
         num_obs_checkpoints=config.num_obs_checkpoints,
@@ -252,6 +347,28 @@ def _run_inference_and_assemble(
         n_workers=n_assembly_workers,
     )
 
+    # Only after assemble RETURNS. A failed run keeps its staged tiles so the next attempt
+    # resumes onto them (see `_staging_run_id`); a successful one has them in the output store
+    # and they are pure cost from here -- on the quickstart the staged prefix is LARGER than the
+    # product it produced. Best-effort: a cleanup failure must not fail a finished pipeline.
+    try:
+        # strict, so an unverified delete or a surviving prefix reaches the `except` below
+        # instead of being swallowed and logged as success -- staging the deterministic run_id
+        # would then resume onto.
+        #
+        # all_versions=False because this is OUR OWN transient output, written minutes ago and
+        # deleted here. The default exists for the campaign's versioned mosaic archive, where
+        # non-current versions accumulate and a storage-budget slot is released on the strength
+        # of the delete. Keeping it on would also make s5cmd a hard requirement of the
+        # orchestrator-free runner: on s3 the fsspec fallback cannot honour `all_versions`, so
+        # `strict` turns a missing s5cmd binary into a leaked prefix. Opting out lets the
+        # fallback do the job, which is what `delete_prefix` documents for callers that only
+        # need current objects.
+        delete_prefix(run_staging, log=log, all_versions=False, strict=True)
+        log.info("Removed staging prefix %s", run_staging)
+    except Exception:
+        log.warning("Could not remove staging prefix %s; it is safe to delete by hand", run_staging, exc_info=True)
+
     return {
         "run_id": run_id,
         "roi_name": roi_name,
@@ -261,7 +378,9 @@ def _run_inference_and_assemble(
     }
 
 
-def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, Any] | None:
+def run_plain(
+    config_path: Path, *, skip_inference: bool = False, min_valid_coverage: float | None = None
+) -> dict[str, Any] | None:
     """Run the full pipeline from a YAML config.
 
     Args:
@@ -281,6 +400,11 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
               start: "2024-07-01"
               end: "2025-07-01"
             s1_orbit: ascending    # or "descending" or "both"
+            s1_use_s3_direct: false # read OPERA granules over ASF's S3 (needs STS creds and
+                                    # us-west-2); false uses CloudFront-signed HTTPS, which is
+                                    # what a laptop outside us-west-2 wants
+            min_valid_coverage: 20.0 # minimum SCL valid-pixel % to keep an S2 date; the CLI's
+                                    # --min-valid-coverage overrides it
             allow_s2_only: false   # embed S2-valid pixels with zero S1 observations
             n_workers: 2
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
@@ -290,6 +414,8 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
 
         skip_inference: When True, stop after ingestion. Useful for iterating on the ingest path
             without paying CPU inference cost.
+        min_valid_coverage: Overrides the config's ``min_valid_coverage`` (itself defaulting to
+            :data:`DEFAULT_MIN_VALID_COVERAGE`). This is the CLI's ``--min-valid-coverage``.
 
     Returns:
         Final assembly summary dict when inference + assembly run, else ``None``.
@@ -305,10 +431,10 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
     roi_path = paths.store_for(roi_name, "roi")
 
     if not skip_inference:
-        log.warning(
-            "Plain runner will execute the full pipeline end-to-end with CPU inference. "
-            "Expect ~30+ minutes on a developer laptop. Pass --skip-inference for an "
-            "ingest-only sanity check."
+        log.info(
+            "Plain runner will execute the full pipeline end-to-end. On the bundled quickstart "
+            "ROI that is about 3.5 minutes on a CPU laptop, most of it ingest. Pass "
+            "--skip-inference for an ingest-only sanity check."
         )
 
     # Stage 1: rasterize the ROI (no cluster needed)
@@ -340,6 +466,11 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         # us-west-2, default to CloudFront-signed HTTPS so the quickstart works without ASF
         # S3 STS credentials.
         s1_use_s3_direct=cfg.get("s1_use_s3_direct", False),
+        min_valid_coverage=_checked_coverage(
+            min_valid_coverage
+            if min_valid_coverage is not None
+            else cfg.get("min_valid_coverage", DEFAULT_MIN_VALID_COVERAGE)
+        ),
     )
 
     # ``--skip-inference`` ends here, with ingest output verified.
@@ -377,11 +508,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--min-valid-coverage",
         type=float,
-        default=DEFAULT_MIN_VALID_COVERAGE,
-        help="Minimum SCL valid-pixel coverage to keep a date (default: %(default)s)",
+        default=None,
+        help=(
+            "Minimum SCL valid-pixel coverage to keep an S2 date. Overrides the config key of "
+            f"the same name; both default to {DEFAULT_MIN_VALID_COVERAGE}."
+        ),
     )
     args = parser.parse_args(argv)
-    run_plain(args.config_path, skip_inference=args.skip_inference)
+    run_plain(
+        args.config_path,
+        skip_inference=args.skip_inference,
+        min_valid_coverage=args.min_valid_coverage,
+    )
 
 
 if __name__ == "__main__":
