@@ -427,7 +427,15 @@ class _DeploymentCellInputs:
         """
         if (zone, year) not in self._futures or not self._cleanup_mosaics:
             return
-        delete_prefix(f"{self._inputs_bucket.rstrip('/')}/mosaics/{zone}/{year}", log=self._log, strict=True)
+        delete_prefix(
+            f"{self._inputs_bucket.rstrip('/')}/mosaics/{zone}/{year}",
+            log=self._log,
+            strict=True,
+            # Versioning is OFF on the campaign buckets, which is what makes the strict
+            # read-back trustworthy: on a versioned bucket this combination would report a
+            # clean prefix from delete markers alone and release the retention slot.
+            all_versions=False,
+        )
 
     def discard(self, zone: str, year: int) -> None:
         """Forget the cell's ingest future, cancelling any child still registered for it.

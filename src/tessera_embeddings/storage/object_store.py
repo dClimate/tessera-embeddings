@@ -170,7 +170,7 @@ def _s5cmd_rm_verified(uri: str, log: _Log, *, all_versions: bool) -> None:
     raise PrefixNotEmptyError(uri)
 
 
-def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = False, strict: bool = False) -> None:
+def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = True, strict: bool = False) -> None:
     """Delete every object under *uri* (a directory-like prefix).
 
     S3 uses ``s5cmd`` with an fsspec fallback; other schemes use fsspec directly.
@@ -178,28 +178,29 @@ def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = Fal
     Args:
         uri: Prefix to remove (e.g. ``s3://bucket/mosaics/33N/2025``).
         log: Optional logger; falls back to the module logger.
-        all_versions: Pass ``--all-versions`` to s5cmd, so a VERSIONED bucket does not
-            accumulate non-current versions. **Defaults off, because on an UNVERSIONED
-            bucket the flag is not a harmless no-op**: it buys nothing, it raises the
-            required permission from ``s3:DeleteObject`` to ``s3:DeleteObjectVersion``,
-            and it makes s5cmd enumerate through ``ListObjectVersions`` rather than
-            ``ListObjectsV2`` — a heavier request pattern against a prefix holding
-            hundreds of thousands of objects.
+        all_versions: Pass ``--all-versions`` to s5cmd. **Defaults ON, and the default is
+            the safe one rather than the cheap one**, because getting it wrong on a
+            VERSIONED bucket is not a cost mistake but a FALSE SUCCESS:
 
-            Turn it ON for a bucket that actually has versioning enabled. Note the
-            asymmetry when you do: s5cmd DELETES every version, but the read-back in
-            :func:`_survivors` only CONFIRMS current ones — see its docstring for what
-            to change first. So a verified all-versions delete is not something this
-            module can currently deliver in either default, and turning the flag on
-            buys deletion without confirmation rather than full support.
+            * the delete removes current keys and leaves delete markers;
+            * :func:`_survivors` reads back with ``fs.find``, which lists CURRENT keys
+              only, so it sees an empty prefix;
+            * an empty read-back is "verified clean", so even ``strict=True`` returns
+              success — and a caller that releases a storage-budget slot on the strength
+              of that answer does so while every non-current version is still stored and
+              still billed.
 
-            The campaign flows that call this — staging cleanup in
-            ``inference.assembly`` and the deletes in ``run_global_campaign`` — take the
-            default and expose no option, because every bucket they can address has
-            versioning off (measured; the CDK creates them that way, Icechunk carrying
-            its own history). A deployment whose buckets ARE versioned should call this
-            directly with ``all_versions=True`` and read ``_survivors`` first, rather
-            than expect the flows to cover it.
+            Passing ``False`` is therefore an assertion by the caller that the bucket has
+            versioning OFF. It is worth making on a bucket you know: the flag buys nothing
+            there, it raises the required permission from ``s3:DeleteObject`` to
+            ``s3:DeleteObjectVersion``, and it makes s5cmd enumerate through
+            ``ListObjectVersions`` rather than ``ListObjectsV2`` — a heavier request
+            pattern against a prefix holding hundreds of thousands of objects.
+
+            Note the standing asymmetry even with the flag ON: s5cmd deletes every
+            version, but the read-back still confirms only current ones. A *verified*
+            all-versions delete needs :func:`_survivors` moved to a version-aware listing
+            first, which is the prerequisite for offering this as a flow-level option.
         strict: When True, RAISE if the delete does not succeed — including when it ran
             and left objects behind, which is the case a returned success used to hide.
             Best-effort (default) is right for post-success cleanup (staging, tagged

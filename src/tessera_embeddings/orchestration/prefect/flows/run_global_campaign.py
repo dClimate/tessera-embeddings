@@ -1143,7 +1143,15 @@ async def run_global_campaign(
         for y in set(campaign_years):
             for z in sweep_zones:
                 if (z, y) not in work_set and status.has(z, y) and zone_year_tag(z, y) in existing_tags:
-                    delete_prefix(f"{paths.inputs.rstrip('/')}/mosaics/{z}/{y}", log=log)
+                    delete_prefix(
+                        f"{paths.inputs.rstrip('/')}/mosaics/{z}/{y}",
+                        log=log,
+                        # Campaign buckets have versioning OFF (measured; the CDK creates them
+                        # that way, Icechunk carrying its own history), so all-versions buys
+                        # nothing here and costs a heavier request pattern and a wider
+                        # permission. Asserted at the call site rather than assumed by default.
+                        all_versions=False,
+                    )
                     swept += 1
         log.info("Orphan-mosaic sweep: reclaimed %d completed-cell mosaic prefix(es)", swept)
 
