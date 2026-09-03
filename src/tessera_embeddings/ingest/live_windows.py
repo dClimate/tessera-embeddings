@@ -2,7 +2,7 @@
 
 Ingest cost scales with the extent it computes, not the land it keeps, so the
 mosaic loads are restricted to windows that actually intersect the ROI
-(``context_docs/design/ingest-live-tile-cropping.md``). This module is the pure
+(``context_docs/ingest/ingest-performance.md``). This module is the pure
 geometry half, in two stages: coarsen the boolean ROI mask (a bare zarr array on
 the fixed grid — the artifact both ``rasterize_roi_zarr`` and ``export_zone_roi``
 write) to the ingest chunk grid and emit one window per live chunk-row
@@ -63,7 +63,7 @@ DEFAULT_TASKS_PER_CHUNK = 200
 #: What one window write costs when each window is its own SEQUENTIAL blocking region
 #: write, expressed as the chunk area that costs the same. Extra computed area is
 #: parallel and cheap; a serial window boundary is not. Calibration in
-#: ``context_docs/design/ingest-live-tile-cropping.md``. Still the right value for the
+#: ``context_docs/ingest/ingest-performance.md``. Still the right value for the
 #: sequential write path — S1 is on it (``overlap_window_writes`` defaults False there).
 WINDOW_COST_IN_CHUNKS = 200
 
@@ -276,7 +276,7 @@ def merge_bands(
     Grouping only unions adjacent chunk-row ranges, so windows stay chunk-aligned and mutually
     chunk-disjoint — the property that lets one session write a whole date and commit once.
 
-    Calibration, campaign-wide effect and cap sweep: ``context_docs/design/ingest-live-tile-cropping.md``.
+    Calibration, campaign-wide effect and cap sweep: ``context_docs/ingest/ingest-performance.md``.
     """
     n = len(windows)
     if n == 0:

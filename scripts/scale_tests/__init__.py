@@ -2,7 +2,7 @@
 
 Standalone benchmarks (NOT pytest) that answer the PENDING decisions in
 ``context_docs/decisions/008-global-store-architecture.md``. See
-``context_docs/design/global-store-test-plan.md`` — what each test measures, and §8
+``context_docs/storage/icechunk-api-ledger.md`` — what each test measures, and §8
 for the verified icechunk/zarr signatures — plus ``README.md`` here for how to run.
 
 Run from the ``scripts/`` directory so ``scale_tests`` is importable by the

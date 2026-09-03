@@ -262,7 +262,7 @@ def test_the_actor_ships_the_segment_backed_allocator() -> None:
     strands the difference, so the card fills long before the working set does — which is
     the regime the batch policy's margin is quoted against. Removing this variable would
     re-open the failure that policy closes, and would do it silently, on the fallback rung
-    only. See ``context_docs/design/a10g_batch_size_2026_08.md``.
+    only. See ``context_docs/inference/inference-on-gpus.md``.
     """
     env_vars = InferenceActor._default_options["runtime_env"]["env_vars"]
     assert env_vars["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"

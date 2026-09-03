@@ -28,7 +28,7 @@ loop, valid-pixel-aware striping, and a RAM-bounded cross-chunk starter prefetch
 phase-by-phase below, then synthesized into a decision tree with relative impact in
 [**How Our Performance Optimizations Fit Together**](#how-our-performance-optimizations-fit-together); full profiling and
 gotchas are in
-[`context_docs/design/inference_gpu_saturation_profile_2026_07.md`](../../../context_docs/design/inference_gpu_saturation_profile_2026_07.md).
+[`context_docs/inference/inference-on-gpus.md`](../../../context_docs/inference/inference-on-gpus.md).
 
 ---
 
@@ -726,7 +726,7 @@ so a *single* same-zone commit early in a fill makes every remaining tick report
 too. Read a run of them as "one or more same-zone writers, from the first blocked tick
 onward", not as a count of collisions — and note that the fill is then back to today's
 behaviour and exposed to the stall that
-`context_docs/design/keeping-the-assembly-session-current-2026_08.md` describes.
+`context_docs/storage/writing-to-the-global-store.md` describes.
 
 The **campaign land mask** is not a pixel ROI but a per-zone *coverage bitmap*
 (`tile_live_2048`) built from the partner's delivery registry by

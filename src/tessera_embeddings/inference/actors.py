@@ -108,7 +108,7 @@ def _chunk_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogeneous
 # The non-hideable strategy (_strip_plan regime 3) may size a strip to the PAIR budget, but only
 # with prefetch OFF, so at most ONE such set is resident — the pair ceiling bounds peak either way.
 # Do NOT raise this, or reintroduce whole-chunk cross-chunk prefetch, without re-deriving the
-# arithmetic above: context_docs/design/inference_gpu_saturation_profile_2026_07.md.
+# arithmetic above: context_docs/inference/inference-on-gpus.md.
 _S2_STRIP_BYTE_BUDGET = int(5.75 * 1024**3)
 
 # Per-(timestep, pixel) byte cost of resident S2 bands: 10 bands x uint16.
@@ -604,7 +604,7 @@ def _accelerator_index() -> str | None:
             # Segment-backed allocation, so the caching allocator GROWS a segment instead of reserving a fresh larger
             # one and stranding the old. On the L40S it stops the reserved pool drifting to ~95% of the card to hold a
             # <9 GB working set — measured 42.2 GB reserved for a chunk whose real need was 8.99 GB. It is also what
-            # opens the deeper t_s2 rungs on 22.4 GiB cards; see context_docs/design/gpu-card-choice-2026_08.md.
+            # opens the deeper t_s2 rungs on 22.4 GiB cards; see context_docs/inference/inference-on-gpus.md.
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         }
     }
@@ -1513,7 +1513,7 @@ class InferenceActor:
                     # zone: `label` is chunk_<row>_<col>, grid-local, so every cell restarts at chunk_0_0 and labels
                     # collide across zones and across concurrent fills sharing a log group. Attributing by time window
                     # instead produced two confidently wrong findings — see
-                    # context_docs/design/campaign_inference_profile_2026_08.md.
+                    # context_docs/inference/inference-on-gpus.md.
                     run=run_id,
                     # "success" = inference finished and outputs are staged for upload. write_confirmed=False flags
                     # that the deferred S3 write is NOT yet durably confirmed (that happens a chunk later via

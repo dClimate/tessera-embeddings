@@ -785,7 +785,7 @@ autoscaler against the account's launch quota, so the surplus is paid in throttl
 waits out. A constant rather than a function of the target because that quota is a property of
 the ACCOUNT: a fleet of 250 and a fleet of 20 draw on the same bucket, and sizing the allowance
 to the ask is what let the larger one drown the smaller. Sizing evidence:
-``context_docs/design/ec2_launch_throttling_2026_08.md``.
+``context_docs/inference/gpu-fleet-launch-throttling.md``.
 """
 
 
@@ -840,7 +840,7 @@ def _batch_actors_to_request(
     which is what lets a run begin, and ``outstanding`` remains a second ceiling — the smaller
     of the two wins, so a short tail stays safe from over-provisioning.
 
-    Full derivation: ``context_docs/design/ec2_launch_throttling_2026_08.md``.
+    Full derivation: ``context_docs/inference/gpu-fleet-launch-throttling.md``.
 
     Args:
         requested: Actors requested so far (``len(pool.actors)``).

@@ -1,5 +1,9 @@
 # Streamlining the test suite
 
+**Where the unit suite's time went, what was safe to cut, and the coverage-equivalence gate that made
+it safe.** All phases landed; §5 is the measured outcome. This is the one record here about the
+repository's own engineering rather than the data pipeline.
+
 **Status:** plan, not yet executed. Drawn up 2026-08-25 against `main` @ `76aeda9`, which is
 the tip including PRs #133–#140 — the GDAL-forwarder, ranged-reader-status, radar-refusal and
 GPU-hours work that landed that day. Every measurement below was taken on that commit.

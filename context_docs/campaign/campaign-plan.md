@@ -144,7 +144,8 @@ lands. Each row carries its WGS84 bounding box, whether the tile holds embedding
 land the depth rule removed and for which reason, how deep the pixels that fell short actually got,
 the depth rule they were judged against, whether radar reached the tile at all, and the build that
 produced the judgement. Verified against two live cells. The schema, the decisions behind it, and the
-five defects the first live runs exposed are in `optical-registry-2026-08-19.md`; the reader-facing
+five defects the first live runs exposed are in
+[`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §6; the reader-facing
 notes — WGS84, the antimeridian convention, and stating the schema on a whole-dataset read — are in
 the access request itself.
 
@@ -298,8 +299,9 @@ The remaining gates are **Prefect global concurrency limits**, because clusters 
 runs on separate machines and only a server-side gate can bound them together.
 
 **There used to be a third, `tessera-global-commits`, and it is gone** — see
-`commit-gate-removal-2026_08.md`. Nothing bounds committers now, and no pre-launch provisioning
-step is needed for one.
+[`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §5, which
+carries the measurement, the committer-count threshold that would reopen it, and the detector that
+would say so. Nothing bounds committers now, and no pre-launch provisioning step is needed for one.
 
 | gate | who creates it | if it is absent |
 |---|---|---|
@@ -412,11 +414,12 @@ read as a missing verdict.
 **A corrected cell needs a fresh tag name** — icechunk tags are write-once forever, so a refill can
 never re-pin the canonical name (`scripts/reopen_zone_year.py`).
 
-The whole design, its costs and its limits: `final-data-validation-plan.md`. A closing sweep over every
+The whole design, its costs and its limits:
+[`campaign-validation-and-monitoring.md`](campaign-validation-and-monitoring.md). A closing sweep over every
 published cell runs once at the end, for final peace of mind rather than as a gate — it renders a
 *second, differently sampled* set of windows so the inspectable total doubles. How the verdicts and
 the figures reach a person, and which findings justify stopping the campaign rather than shelving the
-zone: `campaign-monitoring-plan.md`.
+zone: [`campaign-validation-and-monitoring.md`](campaign-validation-and-monitoring.md).
 
 ---
 
@@ -462,7 +465,8 @@ answer — cost-model §4.
    Read the applied value in the account before relying on either; the request history lags
    amendments to an open case.
 2. *(Removed.)* The commit gate used to be provisioned here. Commits are ungated now
-   (`commit-gate-removal-2026_08.md`), and the ingest gate was never a pre-launch item: the
+   ([`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §5),
+   and the ingest gate was never a pre-launch item: the
    campaign upserts it from `max_parallel_ingest` at start (§3).
 3. **Coverage/land mask built** for all 120 zones, and its `registry_sha256` frozen. A
    mask rebuild mid-campaign invalidates every completed zone-year's fingerprint.
@@ -849,7 +853,7 @@ commits rather than a deadlock, and there is no manual release procedure.
 > Prefect worker service.
 >
 > The mechanism, the three guard properties that have each had a hole in them, and the full set of
-> resume levers: [`staging-identity-and-resume.md`](staging-identity-and-resume.md).
+> resume levers: [`../storage/staging-identity-and-resume.md`](../storage/staging-identity-and-resume.md).
 
 ---
 
@@ -862,7 +866,7 @@ So the reliable half is a poll: **`campaign-watch`, a flow on a five-minute cron
 `campaign_health.py`, remembers what it has already said, and posts what is new to
 `#alerts-global-tessera`. It grades nothing while the campaign is not running, publishes a record of
 every round to `monitoring/` in the outputs bucket, and mutates nothing. Full design and posting
-rules: [`campaign-monitoring-plan.md`](campaign-monitoring-plan.md).
+rules: [`campaign-validation-and-monitoring.md`](campaign-validation-and-monitoring.md).
 
 **The round runs inside the account it is grading**, which is what makes it trustworthy and is also
 why it needed permissions nothing in-account had ever asked for: CloudWatch Logs Insights, CloudWatch
@@ -987,11 +991,12 @@ pointer, never a derivation.
 | document | authoritative for | explicitly NOT for |
 |---|---|---|
 | this file | what runs, with what settings, in what order, and what to do when it breaks | any figure's derivation |
-| [`campaign-cost-model.md`](campaign-cost-model.md) | every cost, rate, fleet size and GPU-hour figure, and the per-pixel source-coverage census | operational order |
-| [`campaign-cluster-sizing.md`](campaign-cluster-sizing.md) | how work balances across N clusters, and that commits do not constrain the count | throughput, GPU-hours or cost — its px/s figures predate the switch to tokens |
-| [`campaign_inference_profile_2026_08.md`](campaign_inference_profile_2026_08.md) | measured per-cell inference behaviour: observation depth, throughput, cost per chunk, and the radar effect on all three | anything from a run still in flight, which it now refuses to carry |
-| [`radar_source_coverage_2026_08.md`](radar_source_coverage_2026_08.md) | which zones publish **no** usable radar at all, and the polarisation reason Greenland and Arctic Canada are optical-only | how much LAND has radar — that is a per-pixel question and belongs to the cost model |
-| [`inference-perf-run-ledger.md`](inference-perf-run-ledger.md) | the raw per-run measurements each figure came from | conclusions |
+| [`campaign-cost-model.md`](campaign-cost-model.md) | every cost, rate, fleet size and GPU-hour figure; the per-pixel source-coverage census; and (§5b) how work balances across N clusters | operational order |
+| [`../inference/inference-on-gpus.md`](../inference/inference-on-gpus.md) | everything the GPU does: the saturation work, which cards may be rented, how the batch is sized to one, and the measured per-cell campaign behaviour behind the cost basis | anything from a run still in flight, which it now refuses to carry |
+| [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md) | every ingest measurement — what each change bought, what failed, the graph and catalogue budgets, and the fleet-scale throughput work | any figure quoted without its season, since the duration basis is January-conditions |
+| [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) | how a finished cell is written: the fork pool, the session catch-up, the credential incident, why commits are ungated, and the published registry | the store's user-facing layout, which is §2 here |
+| [`radar-coverage-by-zone.md`](radar-coverage-by-zone.md) | which zones publish **no** usable radar at all, and the polarisation reason Greenland and Arctic Canada are optical-only | how much LAND has radar — that is a per-pixel question and belongs to the cost model |
+| [`campaign-validation-and-monitoring.md`](campaign-validation-and-monitoring.md) | how each cell is checked, what blocks, and how a finding reaches a person | whether a given cell passed, which is its verdict on file |
 
 **Those documents carry their own withdrawn claims beside the corrected ones, on purpose** — a
 reviewer who sees only the final number learns nothing about how it went wrong, and
@@ -1007,18 +1012,15 @@ that keeps repeating: eight mechanisms cover every one, and most recur across do
 do not cite each other. **Read it before publishing a figure or reusing one.**
 
 - [`campaign-cost-model.md`](campaign-cost-model.md) — costs, GPU fleet sizing, the idle-burn
-  arithmetic, and the observation-count model behind the throughput basis.
-- [`campaign-cluster-sizing.md`](campaign-cluster-sizing.md) — the coverage census, how zones
-  divide across N clusters, and why commit concurrency is a non-issue.
-- [`ingest_optimization_campaign_2026_07.md`](ingest_optimization_campaign_2026_07.md) — every
-  ingest measurement: what each change bought and what failed.
+  arithmetic, the observation-count model behind the throughput basis, and the cluster split.
+- [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md) — every ingest
+  measurement: what each change bought and what failed.
 - [`../decisions/011-campaign-zone-ingestion.md`](../decisions/011-campaign-zone-ingestion.md)
   — why the campaign triggers ingestion per zone.
 - [`../decisions/008-global-store-architecture.md`](../decisions/008-global-store-architecture.md)
   — the store layout, write model, and commit behaviour.
 - [`../decisions/013-optional-s1-s2-only-pixels.md`](../decisions/013-optional-s1-s2-only-pixels.md)
   — what the `allow_s2_only` flag does, the neutral-input convention, and the scientific
-  validation it left open. **The flag is on for this campaign** (§3); that validation is the
-  **P2** rung's job.
-- `tests/unit/orchestration/flows/test_cluster_balance.py` — the runnable diagnostic behind §4; rerun it rather
-  than trusting the figures if the mask is rebuilt.
+  validation it left open. **The flag is on for this campaign** (§3).
+- `tests/unit/orchestration/flows/test_cluster_balance.py` — the runnable diagnostic behind §4;
+  rerun it rather than trusting the figures if the mask is rebuilt.

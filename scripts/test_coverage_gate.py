@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 r"""Compare two coverage runs and fail if any source line lost its last covering test.
 
-The gate behind ``context_docs/design/test-suite-streamlining-plan.md``. Restructuring a test
+The gate behind ``context_docs/test-suite-streamlining.md``. Restructuring a test
 suite is safe exactly insofar as it changes no source line's coverage; the percentage cannot
 show that, because a file can gain covered lines and lose others while the ratio holds.
 This compares the SETS.

@@ -119,7 +119,7 @@ fixed refill) shared by every concurrent cluster, so autoscalers requesting toge
 it and the refusals are retried into it again. None of that loop is ours — Ray's AWS node
 provider makes the call and owns the retry — so the only lever is the environment the
 autoscaler runs in, and every name here is one Ray or botocore reads from it.
-Measurements and the quota values: context_docs/design/ec2_launch_throttling_2026_08.md.
+Measurements and the quota values: context_docs/inference/gpu-fleet-launch-throttling.md.
 """
 
 LAUNCH_PACING_ENV = {**LAUNCH_PACING_CLIENT_ENV, **LAUNCH_PACING_AUTOSCALER_ENV}
@@ -170,7 +170,7 @@ domain rather than returning quietly.
 #:
 #: The safe size costs quota: G-and-VT is counted in vCPU and these are 8 per GPU against
 #: `g6e.xlarge`'s 4, so 10,000 vCPU buys 2,500 L40S or 1,250 A10G. Card evidence:
-#: context_docs/design/gpu-card-choice-2026_08.md.
+#: context_docs/inference/inference-on-gpus.md.
 GPU_FALLBACK_INSTANCE_TYPES: frozenset[str] = frozenset({"g5.2xlarge", "g6.2xlarge"})
 
 

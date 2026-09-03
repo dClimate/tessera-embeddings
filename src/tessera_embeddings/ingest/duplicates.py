@@ -704,7 +704,7 @@ def alternates_for(
 #: `True` here means "give up this date", and it is the DEFAULT for anything the transient lists
 #: do not recognise, so every gap in those lists becomes a silent data-loss verdict. That is how a
 #: 429, and separately a DNS failure, a refused connection and a TLS error, each came to be
-#: recorded as permanently bad imagery (``context_docs/design/ingest_read_failure_causes_2026_08.md``).
+#: recorded as permanently bad imagery (``context_docs/ingest/source-read-failures.md``).
 #:
 #: So the generic wrappers are deliberately absent: `Chunk and warp failed`, `Read failed. See
 #: previous exception` and `IReadBlock failed` are what GDAL raises when a block read fails FOR ANY

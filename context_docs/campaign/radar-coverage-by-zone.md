@@ -1,40 +1,35 @@
-# Radar source coverage across the campaign — measured 2026-08-06
+# Which zones have no usable radar, and why
 
-> ## ⚠ READ THIS FIRST — this survey answers a NARROWER question than its headline claimed
+**What OPERA RTC-S1 publishes over the 112 land zones, measured 2026-08-06.** This survey answers a
+narrower question than its first headline claimed, and the narrowing is the point of reading it.
+
+> ## ⚠ READ THIS FIRST — what this instrument can and cannot see
 >
-> **Withdrawn: "both orbits cover 95.8–98.6% of campaign land in every year."** That figure is
-> **per ZONE**, not per pixel: a zone counts as dual-orbit if each orbit has granules *anywhere*
-> over its live tiles. The 2022–2024 radar loss is **sub-zonal** — interior Australia and much of
-> Siberia, inside zones whose coastal tiles keep their radar — so this instrument cannot see it and
-> reported those zones as fully covered.
+> **Withdrawn: "both orbits cover 95.8–98.6% of campaign land in every year."** That figure is **per
+> ZONE**, not per pixel: a zone counts as dual-orbit if each orbit has granules *anywhere* over its
+> live tiles. The 2022–2024 radar loss is **sub-zonal** — interior Australia and much of Siberia,
+> inside zones whose coastal tiles keep their radar — so this instrument cannot see it and reported
+> those zones as fully covered.
 >
 > **The authoritative measurement already existed** and is area-weighted per pixel, in
-> `campaign-cost-model.md` §"The 2022–2024 radar gap":
->
-> | era | covered land (area-weighted) | dual-orbit fraction |
-> |---|---|---|
-> | 2017–2021, S1A + S1B | 100% (baseline) | 0.57 |
-> | **2022–2024, S1A alone** | **81%** | **0.51** |
-> | 2025, S1A + S1C | 96% | 0.57 |
->
-> **The cause was already known too: Sentinel-1B failed in December 2021**, and Sentinel-1C
-> restored coverage during 2025. My "looks like a production backlog" is withdrawn — it is a
-> satellite failure. Across the nine years **6.8% of pixel-years are optical-only**, and
-> `allow_s2_only` is ON precisely so those pixels produce data.
+> [`campaign-cost-model.md`](campaign-cost-model.md) §"The 2022–2024 radar gap": 100% of land covered
+> in 2017–2021, **81% in 2022–2024** with S1A alone, 96% in 2025. **The cause was already known too:
+> Sentinel-1B failed in December 2021**, and Sentinel-1C restored coverage during 2025. My "looks
+> like a production backlog" is withdrawn — it is a satellite failure. Across the nine years **6.8%
+> of pixel-years are optical-only**, and `allow_s2_only` is ON precisely so those pixels produce
+> data.
 >
 > **What this survey IS still good for**, and why it is kept:
-> - **A zone-level ZERO is decisive.** A zone with no granules over any live tile genuinely has
->   none, so the `radar_free_no_radar` and `radar_free_wrong_polarisation` verdicts stand.
+> - **A zone-level ZERO is decisive.** A zone with no granules over any live tile genuinely has none,
+>   so the `radar_free_no_radar` and `radar_free_wrong_polarisation` verdicts stand.
 > - **The polarisation finding is new and is not in the census**: zones 23N and 24N publish tens of
 >   thousands of HH/HV granules and effectively no VV+VH, so they are radar-free because the ingest
 >   declines cross-pol, not because radar is absent.
 > - The per-orbit, per-year granule counts are sound as counts.
 >
 > **What it must never be used for again: any statement of the form "N% of campaign land has both
-> orbits."** Use the per-pixel census. This is the same error as
-> `a-granule-count-is-not-coverage`, committed at a coarser granularity — a count over a zone is
-> not coverage of that zone's land.
-
+> orbits."** Use the per-pixel census. This is the same error as *a granule count is not coverage*,
+> committed at a coarser granularity — a count over a zone is not coverage of that zone's land.
 
 What OPERA RTC-S1 actually publishes over the 112 land zones, how much of the product is
 optical-only as a result, and why the largest part of that is a polarisation decision rather
@@ -201,8 +196,9 @@ Two claims not to make about it, both of which I would have made without checkin
 usable radar is one. For 2025 that is 93×3 + 6×2 + 13×1 = 304 fleets against 336 if every cell
 needed both — about 9% fewer. Real, but not a planning lever.
 
-**Product quality is where it lands instead.** Roughly 1.2% of the 2025 land will ship
-optical-only embeddings, and it is not scattered: it is Greenland, Arctic Canada, and a set of
+**Product quality is where it lands instead.** Roughly 1.2% of the 2025 land is optical-only *for
+this survey's zone-level reason* — the per-pixel figure across all nine years is 6.8% (cost model §6)
+— and it ships as optical-only embeddings, and it is not scattered: it is Greenland, Arctic Canada, and a set of
 small ocean zones. The per-year radar coverage now recorded on each zone group
 (`radar_coverage` in the run provenance) makes that legible per cell without consulting this
 table, which is the right place for it.

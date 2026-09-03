@@ -12,7 +12,7 @@ updating ``years_complete`` in the same commit (D1). Commits are UNGATED. They d
 contend on the branch-tip CAS -- all 120 zone groups share one repo -- but that
 was measured at 2.2 s for 16 simultaneous committers and 15 s for 120, with zero
 unresolvable conflicts at every N. See
-``context_docs/design/commit-gate-removal-2026_08.md``.
+``context_docs/storage/writing-to-the-global-store.md``.
 
 A :class:`ShardSource` decouples the writer from *where* shard data comes from
 (staged inference files in production; synthetic in tests), and must be picklable
@@ -178,7 +178,7 @@ def commit_with_rebase(
 
     Commits are UNGATED: concurrency here buys a SLOWDOWN, not a failure -- 2.2 s
     commits at 16 concurrent committers, 15 s at 120, zero unresolvable conflicts at
-    every N. See ``context_docs/design/commit-gate-removal-2026_08.md``.
+    every N. See ``context_docs/storage/writing-to-the-global-store.md``.
 
     **Timed here, and here is the only place that sees every commit.** That decision's
     reopen criterion is commit LATENCY, and the obvious detector -- ``commit_s`` in
@@ -459,7 +459,7 @@ def run_forked(
     # makes the remaining case survivable instead of fatal. Neither is a guarantee — only a
     # minimum spacing between publications, set above the tick interval, makes depth 4
     # unreachable, and that needs a fleet-wide lock deliberately not built here. See
-    # ``context_docs/design/keeping-the-assembly-session-current-2026_08.md``.
+    # ``context_docs/storage/writing-to-the-global-store.md``.
     t_merge = time.monotonic()
     session.merge(*(fork_result for fork_result, _ in results))
     done = time.monotonic()

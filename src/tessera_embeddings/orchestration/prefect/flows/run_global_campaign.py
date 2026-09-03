@@ -35,7 +35,7 @@ single trailing assembly thread — which keeps same-zone fills apart without a 
 concurrently, where distinct zones make same-zone overlap impossible by construction. Either
 way ``max_parallel_clusters`` bounds concurrency. Commits are UNGATED: at 10 clusters the
 committer ceiling is ~2N=20 on a single branch tip, measured at ~2.2 s commits
-(``context_docs/design/commit-gate-removal-2026_08.md``). ``pending()`` is year-major, the
+(``context_docs/storage/writing-to-the-global-store.md``). ``pending()`` is year-major, the
 drain pattern the barrier path relies on.
 """
 
@@ -300,7 +300,7 @@ def _staging_run_id(
     ``code_identity`` is the inference SOURCE hash only, not the whole build — the AMI is
     still resolved and pinned into every fill's provisioning, it just no longer decides
     staging reuse. Mechanism and failure modes:
-    ``context_docs/design/staging-identity-and-resume.md``.
+    ``context_docs/storage/staging-identity-and-resume.md``.
     """
     key = (
         year,
@@ -575,7 +575,7 @@ async def run_global_campaign(
             ``IngestSettings.max_workers`` down to match, or the aggregate fleet exceeds the
             account's EC2 quota. This, ``max_parallel_ingest``, ``num_actors`` and
             ``overlap_years`` are ONE decision and move together
-            (``context_docs/design/campaign-plan.md`` §3). A wrong width does not fail: the
+            (``context_docs/campaign/campaign-plan.md`` §3). A wrong width does not fail: the
             run completes and publishes real data at a fraction of the intended rate, with
             no symptom but a wall clock nobody has a baseline for.
         launch_pacing: Pace every fill's EC2 launch requests against the account's shared
@@ -668,7 +668,7 @@ async def run_global_campaign(
             tiles are written to and read back from. None of them touches the published store
             or relaxes a gate on it: a cell's completion mark, its write-once tag and its
             manifest checks are unaffected. Full mechanism:
-            ``context_docs/design/staging-identity-and-resume.md``.
+            ``context_docs/storage/staging-identity-and-resume.md``.
 
             **This flag cannot reach staging created without it.** It substitutes a constant
             into the run-id hash, so it yields a *different* prefix from the one an unflagged
@@ -768,7 +768,7 @@ async def run_global_campaign(
 
             Not part of the staging fingerprint: it changes WHEN work is dispatched, not what
             is computed. Design record:
-            ``context_docs/design/immediate-refill-of-a-settled-fill.md``.
+            ``context_docs/campaign/campaign-plan.md`` (§3, ``immediate_refill``).
         ingest_limit_name: Prefect global concurrency limit backing ``max_parallel_ingest``
             under ``"chained-clusters"``. The campaign upserts it to that value at start, so
             the parameter is the single place the number is written and cannot drift from
@@ -1079,7 +1079,7 @@ async def run_global_campaign(
         changed code replaced.
 
         The three are mutually exclusive, refused at preflight rather than ordered here. See
-        ``context_docs/design/staging-identity-and-resume.md``.
+        ``context_docs/storage/staging-identity-and-resume.md``.
         """
         identity = _derive_staging_code_identity()
         # ANNOUNCED, never cached, and the difference is load-bearing. The tarball's ETag is
@@ -1254,7 +1254,7 @@ async def run_global_campaign(
     # `cluster-per-zone` only. Under `chained-clusters` (the default) the per-cell chain below
     # is bypassed and the child bounds its mosaics not at all — peak storage is a cluster's
     # mosaics by design, and the two semaphores that used to bound them throttled ingest and
-    # inference behind assembly (`context_docs/design/stage_decoupling_2026_08.md`).
+    # inference behind assembly (`context_docs/campaign/campaign-plan.md` §1).
 
     async def _process(zone: str, year: int) -> str:
         # Ingest (if enabled) → fill → drop the transient mosaic. ingest_sem/fill_sem cap the

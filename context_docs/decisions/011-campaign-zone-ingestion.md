@@ -225,7 +225,7 @@ The single-ROI path is deliberately untouched by all of this.
   not run dry.
 
   Measured against the real coverage bitmaps in
-  [`design/campaign-cluster-sizing.md`](../design/campaign-cluster-sizing.md):
+  [`../campaign/campaign-cost-model.md`](../campaign/campaign-cost-model.md):
   at 8 clusters every one opens on a zone of 8,593+ tiles (~20% of its own
   workload) and totals land within 0.0% of each other. That doc is the basis for
   choosing the cluster count.

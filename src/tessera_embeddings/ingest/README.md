@@ -308,7 +308,7 @@ the window newest-first, the worklist returns window by window in date order. Th
 because `query_stac_items` re-sorts with `solar_day_sort_key`, making the final sequence a function
 of the items rather than of the order the walk produced (see *Cloud cover* below for what that sort
 decides). Verified against an unsplit walk at several part counts; see
-[the ingest campaign record](../../../context_docs/design/ingest_optimization_campaign_2026_07.md),
+[the ingest campaign record](../../../context_docs/ingest/ingest-performance.md),
 which also records the measurements and the two optimisations that are closed (a larger page,
 and server-side field selection).
 
@@ -391,7 +391,7 @@ deadline plus one final attempt. And failing the cell this way is not surrender:
 returns to the campaign's work list, and a later dispatch RESUMES from the dates already
 committed (Icechunk commits a date's time slot atomically with its pixels), so the bound
 costs latency, never work. The default's derivation against measured leg durations is in
-`context_docs/design/ingest_read_failure_causes_2026_08.md` (cause 3).
+`context_docs/ingest/source-read-failures.md` (cause 3).
 
 **Two things stop that bound refusing an attempt a leg had the budget for.**
 
@@ -1110,7 +1110,7 @@ landing every zone in 2–5 windows. Sparse ROIs group *harder* in relative term
 point: a large fraction of a tiny area is still a tiny area.
 
 Calibration of the price, the campaign-wide table, and the cap sweep are in
-`context_docs/design/ingest-live-tile-cropping.md`.
+`context_docs/ingest/ingest-performance.md`.
 
 - **Windows** come from `live_windows.py`, from the boolean ROI mask that both
   `rasterize_roi_zarr` and `export_zone_roi` write. The mask is coarsened to the ingest chunk
@@ -1669,7 +1669,7 @@ sits at the top of the range where that was *measured* to hold, not at an estima
 widening it means measuring an ROI in between. Being denominated in covered window area also couples
 it to the merge exchange rate above: a finer merge covers less area, so ROIs drift below the
 threshold and more of them batch. Recalibrate against runs, never an offline sweep at a different
-merge cost. Figures in `context_docs/design/ingest_optimization_campaign_2026_07.md` §3.16.
+merge cost. Figures in `context_docs/ingest/ingest-performance.md` §3.16.
 
 When it is on, k consecutive PASSING dates compute as ONE graph: their work packs the fleet
 together, one date's straggling reads backfill with another's writes, and the drain tail and commit

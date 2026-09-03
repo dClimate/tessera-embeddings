@@ -34,7 +34,7 @@ def configure_gdal_environment() -> None:
     # environment. There is currently NO knob that changes those three on the imagery path.
     #
     # Measurements, the ladder, and why closing that gap was rejected:
-    # `context_docs/design/gdal-read-config-2026_08.md`.
+    # `context_docs/ingest/source-read-failures.md`.
     os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "5")  # Default: 0 (no retries)
     os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "5")  # Default: 30 seconds
     os.environ.setdefault("GDAL_HTTP_TIMEOUT", "120")  # Connection timeout in seconds

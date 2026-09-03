@@ -1,17 +1,21 @@
 # context_docs/
 
-Design records and decision rationale for `tessera_embeddings`.
-This isn't reference documentation — that lives in `docs/`. This is
-the **rationale** behind the choices. Read it if you're trying to
-understand why the code looks the way it does, or if you're
-proposing a change that conflicts with one of these decisions.
+**The rationale behind the code, not documentation of it.** Reference documentation lives in
+`docs/`. Read this if you are trying to understand *why* the code looks the way it does, or if you
+are proposing a change that conflicts with one of these decisions.
+
+Two kinds of thing live here. **Decision records** are one page each and answer "why is X the way it
+is?". **Stage records** are long-form and answer "what did we measure, what did it cost, what did we
+try that failed?" — one per pipeline stage, so a question about ingest has exactly one place to go.
 
 ## Layout
 
 ```
 context_docs/
-├── corrections-register.md   EVERY withdrawn figure, grouped by how it went wrong
-├── decisions/        Architecture Decision Records (1 page each)
+├── corrections-register.md        EVERY withdrawn figure, grouped by how it went wrong
+├── test-suite-streamlining.md     this repo's own test suite: where its time went, what was cut
+│
+├── decisions/                     Architecture Decision Records — 1 page each, append-only
 │   ├── 001-thin-prefect-wrapping.md
 │   ├── 002-shape-c-task-shells.md
 │   ├── 003-tenacity-retries-not-prefect-native.md
@@ -34,89 +38,87 @@ context_docs/
 │   ├── 020-boa-offset-applies-to-every-valid-dn.md
 │   ├── 021-correct-the-boa-offset-per-image.md
 │   └── 022-resolve-the-roi-mask-credential-at-read-time.md
-└── design/           Long-form framing docs, grouped by what they answer
-    │
-    │  THE CAMPAIGN — start here
-    ├── campaign-plan.md                          <- START HERE; §10 is the authority map
-    ├── campaign-cost-model.md                    every cost, rate, fleet size, GPU-hour
-    ├── campaign-cluster-sizing.md                how work balances across N clusters
-    ├── campaign_inference_profile_2026_08.md     measured per-cell inference behaviour
-    ├── ec2_launch_throttling_2026_08.md          why fleets throttle themselves on RunInstances, and the two bounds
-    ├── radar_source_coverage_2026_08.md          which zones publish no usable radar
-    ├── optical_depth_census_2026_08.md           how much of the product is optically thin, and where
-    ├── minimum-optical-depth-plan.md             BUILT at 15; the evidence behind ADR-018
-    ├── window_legibility_vs_depth_2026_08.md     the elbow at 25 — which the line at 15 knowingly crosses
-    ├── optical_retention_per_pixel_2026_08.md    what each candidate line costs, counted per pixel
-    ├── inference-perf-run-ledger.md              raw per-run measurements
-    ├── campaign-monitoring-plan.md               what is watched while it runs, and how
-    ├── immediate-refill-of-a-settled-fill.md      how a dead fill's roster is recovered without waiting for the round
-    ├── commit-gate-removal-2026_08.md            why the fleet-wide committer limit is gone, and when to put it back
-    ├── final-data-validation-plan.md             the closing gate over every published cell
-    ├── optical-registry-2026-08-19.md            the published per-tile index: schema, and what the first live run corrected
-    │
-    │  INGEST
-    ├── ingest_optimization_campaign_2026_07.md   every ingest measurement
-    ├── ingest_concurrency_investigation_2026_08.md
-    ├── gdal-read-config-2026_08.md               odc shadows three GDAL options on the imagery read path; no knob overrides them
-    ├── ingest_read_failure_causes_2026_08.md     five source-read failure causes, and the retry budget they share
-    ├── solar_day_fusion_order_2026_08.md         which scene wins a contested pixel, and why it was inverted
-    ├── ingest-live-tile-cropping.md              + appendix A, the multi-write-per-commit test
-    ├── ingest-graph-and-stac-budget.md
-    ├── single-path-audit-2026-09.md          the SINGLE-ROI path after the campaign: what it inherited, what it did not
-    ├── region-writes.md
-    │
-    │  INFERENCE + STORE
-    ├── inference_gpu_saturation_profile_2026_07.md
-    ├── gpu-card-choice-2026_08.md                which GPU rungs the campaign may open, and why
-    ├── a10g_batch_size_2026_08.md                why the inference batch is sized to the card (written for a general reader)
-    ├── stage_decoupling_2026_08.md              why ingest/inference/assembly are ungated
-    ├── icechunk-credential-stampede-2026_08.md   the 28 Aug storage-credential incident (written for a general reader)
-    ├── assembly-worker-clamp-2026_08.md          why assembly ran 5 of its 16 forks
-    ├── keeping-the-assembly-session-current-2026_08.md  why an assembly catches up while its forks write
-    ├── single-global-alignment.md                why single-ROI was aligned to the campaign
-    ├── staging-identity-and-resume.md            what a run_id identifies, and what resumes
-    ├── d3-sharding-plan.md                       settled ADR-008 D3; spec for scale_tests/t8
-    ├── global-store-test-plan.md                 the T0-T8 scale tests; §8 is the icechunk API ledger
-    ├── test-suite-streamlining-plan.md           where the unit suite's time goes, and what is safe to cut
-    │
-    │  MODEL
-    └── v2_data_source_alignment_2026_07.md       AWS-vs-MPC input for Tessera v2
+│
+├── campaign/                      THE GLOBAL CAMPAIGN — start here
+│   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
+│   │                                              what order, and what to do when it breaks.
+│   │                                              §11 is the authority map over everything else
+│   ├── campaign-cost-model.md                  every cost, rate, fleet size and GPU-hour, plus
+│   │                                              how work balances across N clusters (§5b)
+│   ├── campaign-validation-and-monitoring.md   how each published cell is checked, and how a
+│   │                                              finding reaches a person
+│   └── radar-coverage-by-zone.md               which zones publish no usable radar, and why
+│                                                  three quarters of that is a polarisation choice
+│
+├── ingest/                        BUILDING THE MOSAICS
+│   ├── ingest-performance.md                   what ingest costs, what made it faster, and what
+│   │                                              limits it now — the graph budget, the catalogue
+│   │                                              budget, live-tile cropping, region writes
+│   ├── source-read-failures.md                 twelve ways a source read fails, the guard each
+│   │                                              earned, and the retry budget they share
+│   └── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
+│                                                  answer was inverted for the life of the code
+│
+├── inference/                     RUNNING THE ENCODER
+│   ├── inference-on-gpus.md                    throughput, which cards may be rented, why the
+│   │                                              batch is sized to the card, and what the
+│   │                                              campaign path itself measured
+│   ├── minimum-optical-depth.md                the one data-quality rule: refuse a pixel below
+│   │                                              15 observations. Four measurement campaigns
+│   └── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once
+│                                                  throttle each other, and the two bounds
+│
+└── storage/                       WRITING AND KEEPING THE RESULT
+    ├── writing-to-the-global-store.md          assembly's fork pool, the session catch-up, the
+    │                                              credential incident, why commits are ungated,
+    │                                              and the registry published beside the store
+    ├── staging-identity-and-resume.md          what a run id identifies, and what resumes
+    └── icechunk-api-ledger.md                  signatures and gotchas the scale tests earned
 ```
 
 ## How to read these
 
-**The corrections register** is the index over everything this programme has published and
-then withdrawn — **83 marked retractions across the 14 documents that carried them, audited
-2026-08-11** — grouped by the eight mechanisms that produced them rather than by which file
-they sit in. It does not replace the withdrawals
-themselves, which stay beside the claims they correct; it exists because the same mistake
-has recurred across documents that never cite each other, and no single document can see
-that. Read it before publishing a figure or quoting one.
+**Decision records** have a fixed shape — Context, Decision, Rejected alternatives, Consequences —
+so you can scan to the part you need. They are **append-only**: supersede one with a new record
+rather than editing it in place.
 
+**Stage records** are grouped by the pipeline stage they belong to, which is also how the code is
+grouped. Each one is the single place for its subject: what was measured, what each change bought,
+what was tried and abandoned, and what is still open. They carry their own withdrawn claims beside
+the corrected ones, on purpose — a reader who sees only the final number learns nothing about how it
+went wrong.
 
+**The corrections register** is the index over everything this programme has published and then
+withdrawn, grouped by the eight mechanisms that produced them rather than by which file they sit in.
+It does not replace the withdrawals themselves, which stay beside the claims they correct; it exists
+because the same mistake has recurred across documents that never cite each other, and no single
+document can see that. **Read it before publishing a figure or quoting one.**
 
-**Decision records** answer "why is X the way it is?" They have a
-fixed shape — Context, Decision, Rejected alternatives, Consequences
-— so you can scan to the part you need. Append-only: supersede with
-a new record rather than editing in place.
+**For the global campaign specifically**, [`campaign/campaign-plan.md`](campaign/campaign-plan.md)
+is the entry point: what will run, with what settings, at what cost, and what is still open. It
+links onward to the sizing, cost and ingest evidence rather than restating it, and its §11 states
+which document is authoritative for what.
 
-**Design docs** are the longer-form framing material that informed
-the decisions. Read these if a single ADR doesn't satisfy your
-question and you need the broader thinking.
+## Conventions
 
-**For the global campaign specifically**, `design/campaign-plan.md` is
-the entry point: what will run, with what settings, at what cost, and
-what is still open. It links onward to the sizing, cost and ingest
-evidence rather than restating it.
+**One subject, one file.** If a finding belongs to ingest, it goes in the ingest record — not in a
+new document that the ingest record then has to cite. The corpus reached 29 topical files once, and
+the cost was not the reading: it was that a superseded number could sit uncorrected in a neighbouring
+file for weeks. Add a section, not a file.
+
+**Name a file for its subject, not for when it was written.** Dates belong inside the document, on
+the measurement they qualify.
+
+**Every file here is named in the layout block above**, and
+`tests/unit/test_context_docs_index.py` fails if that stops being true in either direction — a file
+nobody listed, or a row whose file is gone. Update the block in the same commit that adds or removes
+a file.
 
 ## When to add a new ADR
 
 - A change PR conflicts with an existing ADR.
-- A change adds a new architectural constraint future contributors
-  need to know about.
-- Multiple PRs have hit the same surprise; the ADR makes the
-  reasoning durable.
+- A change adds a new architectural constraint future contributors need to know about.
+- Multiple PRs have hit the same surprise; the ADR makes the reasoning durable.
 
-We don't write ADRs for trivial choices (variable names, file
-layout) — only for decisions that shape multiple components or
-constrain future work.
+We don't write ADRs for trivial choices (variable names, file layout) — only for decisions that
+shape multiple components or constrain future work.

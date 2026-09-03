@@ -1,4 +1,8 @@
-# EC2 launch throttling: where it comes from and what we changed
+# Launching the GPU fleet: where EC2 throttling comes from, and what we changed
+
+**Several inference clusters asking AWS for GPU instances at once throttle each other**, against a
+fixed account-wide request bucket that cannot be raised. This is where that comes from, what we
+measured, and what shipped.
 
 **Status:** measured and implemented, default-off, 2026-08-25.
 **Code:** `inference/scheduling.py::ACTOR_REQUEST_HEADROOM`,
@@ -67,7 +71,7 @@ callback, no hook, and no configuration that reaches inside it. Two findings fel
 reading it that matter beyond this change:
 
 * **A throttled attempt spends a subnet rotation.** The loop rotates on any error, so
-  refusals consume the multi-AZ capacity failover that `gotchas.md` documents. A fleet
+  refusals consume the multi-AZ capacity failover that `docs/providers/aws.md` documents. A fleet
   can exhaust its subnet list on throttling without ever having asked the later zones
   for capacity — which makes throttling and the capacity shortage compound rather than
   merely coexist.

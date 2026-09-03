@@ -14,7 +14,8 @@ a prefix only when they would produce the same tiles.
 reads and writes. A cell's completion mark, its write-once zone-year tag and its manifest checks are
 untouched by every lever below.
 
-Operational summary in `campaign-plan.md` §3 (the settings) and §8 (failure handling); this file
+Operational summary in [`../campaign/campaign-plan.md`](../campaign/campaign-plan.md) §3
+(the settings) and §8 (failure handling); this file
 holds the mechanism and the failure modes it is shaped by.
 
 ---

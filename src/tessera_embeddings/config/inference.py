@@ -65,7 +65,7 @@ def inference_code_identity() -> str:
     :func:`~tessera_embeddings.config.code_identity.source_identity` for the closure and for
     what a source hash cannot see. A build identity would be correct but far too wide, so a
     hotfix would abandon every staged tile; rationale in
-    ``context_docs/design/staging-identity-and-resume.md``.
+    ``context_docs/storage/staging-identity-and-resume.md``.
 
     The residual dependency-drift case is bounded twice: the AMI is resolved once and PINNED
     into every fill of a campaign, so one run cannot straddle two images, and a model change
@@ -207,7 +207,7 @@ S1Orbit = Literal["ascending", "descending", "both", "none"]
 #: reproducibility: it keeps **94% of pixels rather than 79%**, at the knowingly accepted cost
 #: that two independent embeddings of the same ground agree less well. The trade, including
 #: what 15 admits that 20 would not, is in
-#: ``context_docs/design/minimum-optical-depth-plan.md`` (ADR-018).
+#: ``context_docs/inference/minimum-optical-depth.md`` (ADR-018).
 OPTICAL_MIN_OBS = 15
 
 #: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
@@ -295,7 +295,7 @@ def batch_size_for_gpu(
 
     An actor that runs out of memory is killed and replaced and its chunk retried, so the
     cost is a reloaded checkpoint rather than lost data. Measurements behind the constants:
-    ``context_docs/design/a10g_batch_size_2026_08.md``.
+    ``context_docs/inference/inference-on-gpus.md``.
 
     There is NO floor: a configuration whose safe batch is small gets the small batch and
     runs slowly, because raising it to a round number would restore exactly the

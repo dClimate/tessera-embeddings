@@ -54,7 +54,7 @@ INGEST_CHUNKS = {"time": 1, "northing": INGEST_CHUNK_SIZE, "easting": INGEST_CHU
 # a date's parallel width at blocks x bands, starving any fleet wider than that, and that width
 # cost is paid on every compact ROI while the graph-size saving only binds on the densest zones
 # at wide fleets. Do not reintroduce a load/store split without re-reading
-# context_docs/design/ingest_optimization_campaign_2026_07.md §3.5 and its 2026-07-27 correction.
+# context_docs/ingest/ingest-performance.md §3.5 and its 2026-07-27 correction.
 
 # Manifest sharding for the campaign mosaics. Without it every commit rewrites the whole array
 # manifest, so bytes rewritten grow with the number of dates already written — the shape that
@@ -64,7 +64,7 @@ INGEST_CHUNKS = {"time": 1, "northing": INGEST_CHUNK_SIZE, "easting": INGEST_CHU
 # window — essentially the whole live area — so spatial shards cannot localise a commit; all they
 # add is object count. A 4x4 split on a 6-degree zone rewrites ~4,000 tiny manifest objects per
 # commit instead of ~14, and those PUT latencies cost far more than the bytes saved (measured: a
-# 30-50% regression, context_docs/design/ingest_optimization_campaign_2026_07.md). A time split
+# 30-50% regression, context_docs/ingest/ingest-performance.md). A time split
 # rewrites only the dates sharing its shard rather than every date so far.
 #
 # Size trades write cost against read cost: smaller shards rewrite less per commit but a reader
@@ -85,7 +85,7 @@ DEFAULT_MIN_VALID_COVERAGE = 0.1
 # crowds out the preparation overlapping it. A THRESHOLD, not an interpolated curve, set at the
 # upper edge of the range where batching was measured to win rather than at the estimated
 # crossover: widening it means measuring an ROI in between, not extrapolating. Measurements and
-# per-size ratios: context_docs/design/ingest_optimization_campaign_2026_07.md.
+# per-size ratios: context_docs/ingest/ingest-performance.md.
 #
 # Denominated in the COVERED chunk area of a run's live windows — the area the write graph
 # actually touches, already known once windows are merged, so deriving it costs no extra I/O.
@@ -135,7 +135,7 @@ class IngestSettings(BaseModel):
     # GDAL/HTTP caches. Adaptivity buys nothing to offset that, because these fleets are busy for
     # essentially the whole run — there is no idle stretch for a lower floor to reclaim. Set a
     # floor below the derived width only for a fleet that genuinely idles. Measurements:
-    # context_docs/design/ingest_optimization_campaign_2026_07.md.
+    # context_docs/ingest/ingest-performance.md.
     min_workers: int | None = Field(default=None, ge=1)
     max_workers: int = Field(default=60, ge=1)
     # Each S1 orbit's fleet width as a FRACTION of the S2 fleet's, because S1's work is a fixed
@@ -173,7 +173,7 @@ class IngestSettings(BaseModel):
     # Icechunk having committed each date's time slot atomically with its pixels. 6 h clears three
     # legs of a slow dense cell plus expansive backoff while still releasing a pathological cell's
     # campaign slot promptly. Calibrate against measured leg durations in
-    # context_docs/design/ingest_read_failure_causes_2026_08.md.
+    # context_docs/ingest/source-read-failures.md.
     max_leg_wall_clock_s: int = Field(default=6 * 3600, ge=1)
     # Base delay, in seconds, before re-dispatching a failed leg. Doubles per attempt, capped at
     # four times this value. The legs retry INDEPENDENTLY, so nothing else spaces a retry.
@@ -237,7 +237,7 @@ class IngestSettings(BaseModel):
     # `leg_stagger_window_s / n` apart. Sized for the campaign's ordinary width — widen it if the
     # fleet grows. It addresses the opening peak ONLY, not a leg that starts a new catalogue
     # window mid-run, and is paid as latency on every first dispatch, not only on a cold start:
-    # context_docs/design/ingest_read_failure_causes_2026_08.md.
+    # context_docs/ingest/source-read-failures.md.
     leg_stagger_window_s: int = Field(default=600, ge=0)
     # Optional base URI (an fsspec target, e.g. s3://.../perf/) for capturing a Dask
     # ``distributed.performance_report`` per child ingest. None = off, so normal runs pay nothing;

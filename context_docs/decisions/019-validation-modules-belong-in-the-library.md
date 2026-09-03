@@ -87,4 +87,4 @@ for its own store; it is not a per-validation-run argument.
 
 - [ADR 018](018-refuse-pixels-below-minimum-optical-depth.md) — the rule these two statements
   contradict
-- [`design/minimum-optical-depth-plan.md`](../design/minimum-optical-depth-plan.md)
+- [`../inference/minimum-optical-depth.md`](../inference/minimum-optical-depth.md)

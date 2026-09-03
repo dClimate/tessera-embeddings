@@ -3,7 +3,7 @@
 Standalone benchmarks (NOT pytest) that settle the PENDING decisions in
 [`context_docs/decisions/008-global-store-architecture.md`](../../context_docs/decisions/008-global-store-architecture.md).
 They implement the program in
-[`context_docs/design/global-store-test-plan.md`](../../context_docs/design/global-store-test-plan.md),
+[`context_docs/storage/icechunk-api-ledger.md`](../../context_docs/storage/icechunk-api-ledger.md),
 whose §8 carries the verified icechunk/zarr API ledger these scripts were built against.
 
 These scripts write real data to real object stores and cost real money at
@@ -31,7 +31,7 @@ scale_tests/
 ├── t6_gc_bench.py    GC / expiry / rollback                → ADR D7
 ├── t7_ramp.py        fresh-bucket PUT ramp (S3 only)       → campaign warm-up
 ├── t8_sharding.py    shard vs unshard: write-align, bytes, → ADR D3 (see
-│                     scattered reads, object count            design/d3-sharding-plan.md)
+│                     scattered reads, object count            ADR-008 D3)
 ├── report.py         collate metrics → decision matrix markdown
 └── teardown.py       delete a run's stores; verify $0 residue
 ```
@@ -63,7 +63,7 @@ uv run python -m scale_tests.t5_contention --run-id run1 --backend s3 --scale be
 uv run python -m scale_tests.t6_gc_bench   --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
 uv run python -m scale_tests.t7_ramp       --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
 
-# D3 settlement (separate run; see design/d3-sharding-plan.md)
+# D3 settlement (separate run; see ADR-008 D3)
 uv run python -m scale_tests.t8_sharding   --run-id d3   --backend s3 --scale bench --bucket <bucket>/global-embeddings/
 
 # collate + tear down

@@ -22,7 +22,7 @@ import ray
 #: capacity drought, and this number is the only thing that turns "waits forever looking patient"
 #: back into a failure that says what went wrong. A driver dispatch round closes only when every
 #: fill returns, so an unbounded wait would also block the re-dispatch a starved fill needs.
-#: Sizing history: context_docs/design/immediate-refill-of-a-settled-fill.md.
+#: Sizing history: context_docs/campaign/campaign-plan.md (§3, `immediate_refill`).
 ACTOR_INIT_TIMEOUT_SEC = 21600
 """Maximum wall-clock seconds to wait for actor ``__init__``: instance launch, container pull,
 checkpoint download and model load to GPU. Override via ``run_inference``, not by patching this."""

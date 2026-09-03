@@ -2,7 +2,7 @@
 
 **Status:** **Accepted — scoping concluded (2026-07-14).** All decisions
 D1–D9 are FIRM, each backed by S3-bench evidence from runs `run1`, `d3`, and
-`d3v2` (test program in `context_docs/design/global-store-test-plan.md`). One
+`d3v2` (test program in `context_docs/storage/icechunk-api-ledger.md`). One
 operational measurement is explicitly *deferred, not blocking* — GC duration at
 10⁸-object scale (D7) — to be taken against a large repo before/while the
 campaign runs. The next work is **implementation** of the group-aware, sharded,
@@ -306,7 +306,7 @@ held: zero unresolvable conflicts at every N.
 >
 > Reopen criterion is now **N ≥ 120**, detected by the `COMMIT <secs>` line in
 > `commit_with_rebase`, which is the only site every commit passes through. See
-> [`design/commit-gate-removal-2026_08.md`](../design/commit-gate-removal-2026_08.md).
+> [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md).
 
 **Enforced in code from 2026-07-28 until 2026-08-27.** The cap was a Prefect global
 concurrency limit (`commit_limit_name`) held around each commit, and `run_global_campaign`
@@ -315,7 +315,7 @@ upserted its VALUE at preflight to
 limit's *name* was threaded through and the number lived on the server, where it
 could silently drift from this constraint. Duty-cycle measurements showing how
 much headroom this leaves are in
-[`design/campaign-cluster-sizing.md`](../design/campaign-cluster-sizing.md).
+[`../campaign/campaign-cost-model.md`](../campaign/campaign-cost-model.md).
 
 ### D7 — Snapshot hygiene: tags + expiry policy (FIRM policy; cadence PENDING T6)
 

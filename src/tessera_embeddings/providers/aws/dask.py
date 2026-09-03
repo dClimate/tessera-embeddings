@@ -85,7 +85,7 @@ from tornado.ioloop import PeriodicCallback
 # ANY size. Demand scales with a date's window count — the overlapped write holds every
 # window of a date concurrently — and that count varies by year, so the size follows the
 # asymptote of a long run over the densest dates. Measured peaks and the margin chosen
-# against them: context_docs/design/ingest_optimization_campaign_2026_07.md.
+# against them: context_docs/ingest/ingest-performance.md.
 #
 # vCPU stays at 4: the Fargate quota counts vCPU, so doubling CPU would halve the workers a
 # cell can run. Valid pairings for 4 vCPU are 8192-30720 MiB in 1024 steps.

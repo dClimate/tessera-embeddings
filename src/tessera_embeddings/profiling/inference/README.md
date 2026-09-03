@@ -100,6 +100,6 @@ own run rather than from a number written here.
 
 Measurements from the campaign this harness was built for — baselines, the
 per-phase progression, and what each change bought — are in
-`context_docs/design/inference_gpu_saturation_profile_2026_07.md` and its run
+`context_docs/inference/inference-on-gpus.md` and its run
 ledger. They are recorded there rather than here so this file stays a
 description of the tools, which does not go stale when the next run lands.
