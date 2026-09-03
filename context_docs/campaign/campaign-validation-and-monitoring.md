@@ -96,9 +96,14 @@ prose**, and counts the expected-and-upstream ones once rather than listing them
 
 Two prefixes in the outputs bucket, one per zone, written by both passes: **`windows/<zone>/`** for
 the figures and **`verdicts/<zone>/`** for the machine-readable verdict. Filenames carry zone and
-year, so a zone's whole history shares one browsable folder in each. The split is what keeps the
-sweep cheap: it rolls up stored verdicts rather than re-reading the product, and it can list a
-directory of verdicts without paging past every PNG.
+year, so a zone's whole history shares one browsable folder in each.
+
+**What the split makes cheap is the ROLL-UP, not the sweep** — and the distinction matters, because
+reading it the other way would suggest the closing sweep is a summary rather than a second
+independent read. It is not: §1.2's sweep re-runs the whole check against the product, per cell,
+with a different sample. What the split buys is that *aggregating* ~1,000 verdicts, and monitoring's
+per-round read of published cells against the verdicts beside them, can list a directory of small
+JSON documents without paging past every PNG.
 
 ## 2. What blocks, and what does not
 

@@ -132,10 +132,24 @@ estimate below is priced against, so the two belong together.
 | Env | `uv` venv; **icechunk ≥ 2.1.1** (ADR-008 D9), zarr 3.2.1 pinned; package installed from the branch under test | |
 | Results | `s3://<bucket>/results/<run-id>/*.jsonl` plus a local mirror | survives instance death |
 
-**Teardown:** `teardown.py --run-id …` deletes the `stores/`, `repos/` and
-`results/` prefixes (mirror the results locally first) and verifies the bucket is
-empty by LIST. Then delete the bucket, terminate the instance, confirm no EBS
-orphans, and archive the collated `report.py` output alongside ADR-008.
+**Teardown**, in the order that works:
+
+```bash
+# 1. Stores only. Results are KEPT by default — they are the run's product.
+uv run python -m scale_tests.teardown --run-id <id> --backend s3 --bucket <bucket>
+
+# 2. Archive the collated report.py output alongside ADR-008, and mirror the
+#    results locally, BEFORE step 3 removes them from the bucket.
+
+# 3. Results too, once they are safe elsewhere.
+uv run python -m scale_tests.teardown --run-id <id> --backend s3 --bucket <bucket> \
+    --purge-results
+```
+
+**`teardown.py` verifies the STORE ROOT is empty, not the bucket.** Without
+`--purge-results` the results prefix survives, and a `DeleteBucket` on a non-empty
+bucket fails — so run step 3 before deleting the bucket, then confirm the bucket is
+empty yourself. Finally terminate the instance and confirm no EBS orphans.
 
 ## Cost
 
