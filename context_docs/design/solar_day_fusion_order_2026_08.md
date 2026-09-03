@@ -93,7 +93,7 @@ direction.
 
 ## What now pins it
 
-`tests/unit/test_solar_day_fusion.py` refuses to mock the loader: two real GeoTIFFs, two real STAC
+`tests/unit/ingest/test_solar_day_fusion.py` refuses to mock the loader: two real GeoTIFFs, two real STAC
 items on one solar day, through the production path, asserting the pixels that come out.
 
 It asserts first-wins **in both directions**, which pins the mechanism rather than today's outcome —

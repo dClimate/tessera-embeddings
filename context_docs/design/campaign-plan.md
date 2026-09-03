@@ -1020,5 +1020,5 @@ do not cite each other. **Read it before publishing a figure or reusing one.**
   — what the `allow_s2_only` flag does, the neutral-input convention, and the scientific
   validation it left open. **The flag is on for this campaign** (§3); that validation is the
   **P2** rung's job.
-- `tests/unit/test_cluster_balance.py` — the runnable diagnostic behind §4; rerun it rather
+- `tests/unit/orchestration/flows/test_cluster_balance.py` — the runnable diagnostic behind §4; rerun it rather
   than trusting the figures if the mask is rebuilt.

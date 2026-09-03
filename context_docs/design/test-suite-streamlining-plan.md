@@ -160,7 +160,7 @@ is not junk — it is a carefully written contract (tiny inputs, tiny model, com
 to a CPU reference, ≤ 2 CI minutes per run). It is an unimplemented design, not dead code,
 so **do not just delete it.**
 
-Meanwhile `tests/unit/test_inference_loop.py::TestRunInference::test_pipelined_matches_serial`
+Meanwhile `tests/unit/inference/test_inference_loop.py::TestRunInference::test_pipelined_matches_serial`
 is gated by `@pytest.mark.skipif(not torch.cuda.is_available())` rather than
 `@pytest.mark.gpu`, and its own docstring says it is "the only coverage of the pinned-buffer /
 CUDA-event / two-deep-drain / backbone-stream-ordering path". No CI runner has a GPU, so it
@@ -185,7 +185,7 @@ that is a documentation and ergonomics job, not a coverage one:
   can actually do on any CUDA machine:
   ```bash
   uv sync --all-extras --frozen
-  uv run pytest tests/unit/test_inference_loop.py -k pipelined -v
+  uv run pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
   ```
 - **Name when to run it**: after any change to the pipelined loop, the actor pool, or the
   chunk-staging path, and once before a campaign starts. Manual verification with no trigger
@@ -229,7 +229,7 @@ contradict the top-level one.
 and `tests/parity`. So these two, which live in `tests/unit/`, are executed by nothing:
 
 - `tests/unit/test_provider_local_ray.py::test_local_ray_cluster_enters_and_exits` (`slow`)
-- `tests/unit/test_provider_aws_dask.py:585` (`integration`)
+- `tests/unit/providers/test_provider_aws_dask.py:585` (`integration`)
 
 They are not protecting anything today. Decide per test: move it to the tier whose job would
 run it, or delete it. Do not leave it where it is — a test that never runs reads as coverage

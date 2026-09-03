@@ -1,6 +1,49 @@
 # 015 — Regrouping `tests/unit/` into subject directories
 
-**Status:** Accepted, not yet executed (2026-08-17)
+**Status:** Executed (2026-09-03). Accepted 2026-08-17.
+
+## What executing it corrected in this record
+
+Two statements below were true when written and had stopped being true by the time the move
+happened. Both are left in place rather than edited, because the reasoning around them is still
+the reasoning that was followed; read them with these corrections attached.
+
+**"Import paths inside tests are unaffected — tests import from `tessera_embeddings`, not from
+each other" (Consequences) is false.** Six test files import three shared helper modules —
+`zone_density.py`, `mosaic_stores.py`, `coverage_repo.py` — by absolute package path, and
+`test_source_coverage.py` imported one relatively. Anyone following the consequence as written
+would have moved those helpers and broken six importers. **Resolution:** the three helpers stay at
+`tests/unit/` alongside `conftest.py`, for the same reason `conftest.py` does; the one relative
+import was made absolute in its own commit beforehand.
+
+**"No content edits in a move commit" (recipe step 1) could not be followed literally.** Ten files
+located the source tree, the repo root or the fixtures directory by counting levels up from their
+own file, so descending a directory silently changed what they resolved to. Three of those fail
+*silently* rather than loudly when the anchor is wrong — an `rglob` over a nonexistent root asserts
+nothing and passes, and a `parametrize` fed from one is reported as skipped rather than failed.
+**Resolution:** `tests/_paths.py` anchors on the directory holding `pyproject.toml` instead of on a
+level count, landed in its own commit *before* any move, which let every move commit stay the pure
+rename the recipe asks for. The recipe's intent held; only its literal reading failed.
+
+Neither belongs in `corrections-register.md`: that file is scoped to published figures that were
+withdrawn, and these are stale design claims.
+
+## What was actually built
+
+Nine directories rather than the seven proposed. `profiling/` was added because it exists in
+`src/` and the proposal simply omitted it, and `orchestration/` was split into `flows/` and
+`runners/` to mirror `src/orchestration/prefect/flows/` and `src/orchestration/runners/` — which
+also resolves a standing confusion, since `test_fill_zone_year_flow.py` tests a flow while
+`test_zone_fill.py` tests the runner beneath it and the two names sat adjacent.
+
+112 of 123 files moved. Eleven stay at `tests/unit/`: `conftest.py`, the three shared helpers, and
+six tests with no single subject (`test_imports`, `test_public_api`, `test_context_docs_index`,
+`test_architecture_rules`, `test_prefect_layer`, `test_properties`).
+
+`assembly/` was kept as its own subject, as proposed, rather than folded into `inference/`. It
+deliberately crosses the `inference`/`storage` boundary: `inference/assembly.py`,
+`storage/shard_writer.py` and the four provenance-record tests are one theme — what a published
+zone-year records about itself — and a strict mirror of `src/` would split it in two.
 
 ## Context
 

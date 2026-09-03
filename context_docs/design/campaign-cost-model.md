@@ -648,7 +648,7 @@ not machine speed, and a per-chunk or per-pixel cost basis would have read it as
 throughput discrepancy between two halves of one zone in one year.
 
 **Two things the partial sample had wrong**, both now corrected in
-`tests/unit/test_gpu_starvation.py`:
+`tests/unit/inference/test_gpu_starvation.py`:
 
 * Its span was recorded as 30–32°. The completed cell spans **0.1–32.1°** — the run swept
   north to south, so the opening chunks were its northern extreme. A whole-cell median over a

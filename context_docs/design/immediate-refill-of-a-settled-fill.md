@@ -3,7 +3,7 @@
 **Date:** 2026-08-25
 **Status:** implemented, behind `immediate_refill` (default off)
 **Scope:** `src/tessera_embeddings/orchestration/prefect/flows/run_global_campaign.py`,
-`tests/unit/test_run_global_campaign.py`
+`tests/unit/orchestration/flows/test_run_global_campaign.py`
 
 `_live_claims.py` and its tests are named throughout as the census this design REJECTED — see
 "A live-run census was built, and then deleted". Neither file exists; do not go looking.
