@@ -86,6 +86,13 @@ def _dask_client(n_workers: int) -> Iterator[Client]:
         yield client
 
 
+#: Upstream-manifest fields that describe what a mosaic CONTAINS, and so belong in the staging
+#: identity. Deliberately excludes ``ingest_code_identity``: that is the campaign's mid-flight
+#: safeguard, and including it would re-infer every single-ROI run whenever the ingest source
+#: moved, which is redoing work by default rather than by intent.
+_MOSAIC_CONTENT_KEYS: frozenset[str] = frozenset({"roi_manifest_hash", "coverage_sha256", "min_valid_coverage"})
+
+
 def _staging_run_id(*, roi_name: str, config: InferenceConfig, upstream: dict[str, Any]) -> str:
     """A staging identity that repeats for the same run, so an interrupted run resumes.
 
@@ -101,10 +108,19 @@ def _staging_run_id(*, roi_name: str, config: InferenceConfig, upstream: dict[st
     * **allow_s2_only** — decides whether S2-valid pixels with no S1 observation are embedded at
       all. Toggling it between a crash and the retry would keep radar-gated tiles beside
       optical-only ones under one identity.
-    * **the upstream manifests** — the ingest stores' own fingerprints, which move when the
-      mosaics do. This is what catches a re-rasterised ROI, a re-ingest at a different
-      ``min_valid_coverage``, and a changed ingest code identity, none of which are visible in
-      the inference config.
+    * **the mosaics' CONTENT terms** — :data:`_MOSAIC_CONTENT_KEYS` out of each upstream ingest
+      manifest, which catch a re-rasterised ROI and a re-ingest at a different admission
+      threshold. Named explicitly rather than digesting the whole manifest, and the omission is
+      the point: the manifest also carries ``ingest_code_identity``, so hashing it wholesale
+      would re-infer every ROI whenever the INGEST source moved — a comment edit included. That
+      is the campaign's safeguard reappearing by the side door, and it would make redoing work
+      the normal case rather than a deliberate one. An explicit list also means a new manifest
+      field cannot silently start forcing re-inference.
+
+      What that gives up: a mosaic re-ingested under changed selection logic, at the same ROI
+      and threshold, is not distinguished. Rare, deliberate, and already fenced at the layer
+      that owns it — ``IngestManifest.REQUIRED_TO_APPEND`` refuses to append to a store whose
+      recorded ``ingest_code_identity`` differs, unless the operator opts in.
 
     Deliberately NOT the campaign's staging fingerprint. That one mixes in
     :func:`inference_code_identity` and the code tarball's ETag so a mid-campaign code change
@@ -118,7 +134,12 @@ def _staging_run_id(*, roi_name: str, config: InferenceConfig, upstream: dict[st
     Staging is removed after a successful assemble, so in practice a prefix only survives a run
     that failed — which is exactly the run worth resuming.
     """
-    # sort_keys so a manifest dict that arrives in a different order is still the same identity
+    # Only the content keys, and sorted, so the digest is a fact about what the mosaics HOLD
+    # rather than about dict ordering or about which code wrote them.
+    content = {
+        store: {k: v for k, v in (manifest or {}).items() if k in _MOSAIC_CONTENT_KEYS}
+        for store, manifest in upstream.items()
+    }
     terms = "|".join(
         [
             roi_name,
@@ -126,7 +147,7 @@ def _staging_run_id(*, roi_name: str, config: InferenceConfig, upstream: dict[st
             str(config.s1_orbit),
             config.checkpoint_path,
             f"s2_only={config.allow_s2_only}",
-            json.dumps(upstream, sort_keys=True, default=str),
+            json.dumps(content, sort_keys=True, default=str),
         ]
     )
     return hashlib.sha256(terms.encode()).hexdigest()[:12]

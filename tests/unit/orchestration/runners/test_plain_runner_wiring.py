@@ -47,7 +47,7 @@ def _run_id(roi_name: str = "roi", *, upstream: dict | None = None, **config_ove
     return plain._staging_run_id(
         roi_name=roi_name,
         config=_inference_config(**config_over),
-        upstream={"reflectance": {"ingest_code_identity": "ing-1"}} if upstream is None else upstream,
+        upstream={"reflectance": {"roi_manifest_hash": "roi-1"}} if upstream is None else upstream,
     )
 
 
@@ -135,11 +135,15 @@ class TestTheStagingIdentityRepeats:
             ({"roi_name": "other_roi"}, "a different ROI is a different footprint"),
             ({"allow_s2_only": True}, "decides whether radar-free pixels are embedded at all"),
             (
-                {"upstream": {"reflectance": {"ingest_code_identity": "ing-2"}}},
-                "the mosaics moved: a re-rasterised ROI, a re-ingest at another threshold",
+                {"upstream": {"reflectance": {"roi_manifest_hash": "roi-2"}}},
+                "a re-rasterised ROI is a different footprint",
+            ),
+            (
+                {"upstream": {"reflectance": {"min_valid_coverage": 50.0}}},
+                "a re-ingest at another threshold admitted different dates",
             ),
         ],
-        ids=["window", "orbit", "checkpoint", "roi", "allow_s2_only", "upstream"],
+        ids=["window", "orbit", "checkpoint", "roi", "allow_s2_only", "roi_hash", "coverage"],
     )
     def test_a_different_product_gets_a_different_prefix(self, kwargs, why):
         """`run_inference` resumes purely on this id, so a missing term is a silently mixed store."""
@@ -151,6 +155,20 @@ class TestTheStagingIdentityRepeats:
         one = _run_id(upstream={"reflectance": {"a": 1, "b": 2}, "sar_ascending": {"c": 3}})
         two = _run_id(upstream={"sar_ascending": {"c": 3}, "reflectance": {"b": 2, "a": 1}})
         assert one == two
+
+    def test_ingest_code_identity_is_excluded_from_the_digest(self):
+        """An INGEST source change must not re-infer every ROI.
+
+        The upstream manifests carry `ingest_code_identity`, so digesting them wholesale would
+        reintroduce the campaign's safeguard by the side door: a comment edit in the ingest path
+        moves that value, which would move this identity, which would re-infer the whole ROI.
+        Redoing work has to be deliberate, not the normal case.
+        """
+        base = _run_id(upstream={"reflectance": {"roi_manifest_hash": "roi-1"}})
+        moved_code = _run_id(
+            upstream={"reflectance": {"roi_manifest_hash": "roi-1", "ingest_code_identity": "ingcode-DIFFERENT"}}
+        )
+        assert moved_code == base
 
     def test_the_identity_is_not_the_campaign_fingerprint(self):
         """It must NOT depend on code identity — the safeguard we deliberately omit.
