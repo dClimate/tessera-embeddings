@@ -30,20 +30,56 @@ withdrawn, and these are stale design claims.
 
 ## What was actually built
 
-Nine directories rather than the seven proposed. `profiling/` was added because it exists in
-`src/` and the proposal simply omitted it, and `orchestration/` was split into `flows/` and
-`runners/` to mirror `src/orchestration/prefect/flows/` and `src/orchestration/runners/` — which
-also resolves a standing confusion, since `test_fill_zone_year_flow.py` tests a flow while
-`test_zone_fill.py` tests the runner beneath it and the two names sat adjacent.
+**This tree is the layout, not the "Proposed grouping" block below it** — that one is kept as the
+historical proposal and differs in three ways.
 
-112 of 123 files moved. Eleven stay at `tests/unit/`: `conftest.py`, the three shared helpers, and
-six tests with no single subject (`test_imports`, `test_public_api`, `test_context_docs_index`,
-`test_architecture_rules`, `test_prefect_layer`, `test_properties`).
+```
+tests/unit/
+├── conftest.py                                      fixtures for every subdirectory
+├── zone_density.py  mosaic_stores.py  coverage_repo.py
+│                                                    shared helpers, imported by absolute path
+├── test_imports.py  test_public_api.py  test_context_docs_index.py
+├── test_architecture_rules.py  test_prefect_layer.py  test_properties.py
+│                                                    no single subject
+├── config/                  10 files
+├── ingest/                  36 files
+├── inference/               18 files
+├── assembly/                 7 files
+├── storage/                 13 files
+├── orchestration/
+│   ├── flows/               14 files
+│   └── runners/              4 files
+├── providers/                5 files
+└── profiling/                5 files
+```
 
-`assembly/` was kept as its own subject, as proposed, rather than folded into `inference/`. It
-deliberately crosses the `inference`/`storage` boundary: `inference/assembly.py`,
-`storage/shard_writer.py` and the four provenance-record tests are one theme — what a published
-zone-year records about itself — and a strict mirror of `src/` would split it in two.
+112 of 123 files moved; the eleven listed at the root stay there. The three helpers must not move —
+six tests import them as `tests.unit.<name>`, which is the correction at the top of this record.
+
+**Placement rule: primary subject** — what the file's docstring and test names say it tests, not
+which module it imports most often. A test importing eight modules still has one subject.
+
+Three differences from the proposal:
+
+1. **Nine directories, not seven.** `profiling/` was added because it exists in `src/` and the
+   proposal omitted it. `orchestration/` was split into `flows/` and `runners/`, mirroring
+   `src/orchestration/prefect/flows/` and `src/orchestration/runners/`, which also separates
+   `test_fill_zone_year_flow.py` from `test_zone_fill.py` — different subjects whose names sat
+   adjacent and read as near-duplicates.
+2. **Two of the proposal's hints were overridden by the placement rule.** It lists `campaign` and
+   `scheduling` under `orchestration/`; their source modules are `storage/campaign.py` and
+   `inference/scheduling.py`, so their tests went to `storage/` and `inference/`. The prose hints
+   in that block are indicative only — the rule above decides.
+3. **`assembly/` was kept as its own subject**, as proposed, rather than folded into `inference/`.
+   It deliberately crosses the `inference`/`storage` boundary: `inference/assembly.py`,
+   `storage/shard_writer.py` and the four provenance-record tests are one theme — what a published
+   zone-year records about itself — and a strict mirror of `src/` would split it in two.
+
+Executed in PR #171, thirteen commits: four content changes and nine pure renames, each reporting
+zero insertions and zero deletions. Verified by three gates rather than by a green suite, because
+three of the tests involved fail silently when their path anchor is wrong — identical pass/skip
+counts (3712/1), an identical covered-source-line set (11,674, none lost) and an identical
+`filename::testname` set (3,713, none gained or lost).
 
 ## Context
 
@@ -75,7 +111,9 @@ The downstream repository already uses this layout — `tests/unit/coarsen/`,
 `roi_grid/`, `monitoring/`, `scripts/`, `embedding_validation/` — and it works. Copy it
 rather than invent one.
 
-Proposed grouping, following `src/tessera_embeddings/`:
+Proposed grouping, following `src/tessera_embeddings/` — **superseded; see "What was actually
+built" above for the layout that exists.** Nine directories were built rather than these seven,
+and two of the hints below (`campaign`, `scheduling`) name directories their tests did not go to:
 
 ```
 tests/unit/
