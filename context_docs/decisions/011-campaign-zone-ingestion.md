@@ -130,14 +130,25 @@ upstream. `canonicalize_zone` is the single parser.
 
 **Staging `run_id`** (fill, per cell): the campaign derives each cell's staging
 `run_id` as `{zone}-{year}-{hash}` over the acceptance config (threshold / orbit /
-window / checkpoint), the **immutable code artifact** the fill will run, and the
-per-`(zone, year)` mosaic identity (post-ingest `ingest_marker`). A retry with
+window / checkpoint / S2-only / minimum optical depth), the code the fill will run, and
+the per-`(zone, year)` mosaic identity (post-ingest `ingest_marker`). A retry with
 identical inputs resumes the same staging prefix; any change starts a fresh one, so
-tiles staged by old inputs are never resumed under new ones. The code artifact is the
-**resolved AMI ID plus (when a source tarball overlays it) that object's ETag**, not
-the mutable `code_suffix` label — re-baking the AMI under the same SSM name or
-overwriting `code/src{suffix}.tar.gz` would otherwise leave the fingerprint unchanged
-and let a retry publish a permanently-tagged mixed-code year. An **all-ocean cell**
+tiles staged by old inputs are never resumed under new ones.
+
+> **Amended 2026-09-03 — the code component is no longer the AMI.** This record said the
+> code artifact is the *"resolved AMI ID plus (when a source tarball overlays it) that
+> object's ETag"*. **The AMI half is withdrawn.** The staging identity is now
+> `inference_code_identity()` — a source hash over the inference import closure — plus the
+> source tarball's ETag where a `code_bucket` is set. A build identity was correct but far
+> too wide: it moves on every re-bake and every hotfix anywhere in the repo, so it abandoned
+> perfectly reusable work. **Read literally, the old sentence tells an operator that
+> re-baking an image discards every staged tile in the campaign, and it does not.** The AMI
+> is still resolved and pinned into every fill's provisioning, so one campaign cannot
+> straddle two images; it simply no longer decides staging reuse. The tarball term stands,
+> and for the reason given: overwriting `code/src{suffix}.tar.gz` changes what workers
+> execute without changing anything the flow runner can see. Mechanism, the three levers
+> that reach an existing prefix, and the failure modes:
+> [`../storage/staging-identity-and-resume.md`](../storage/staging-identity-and-resume.md). An **all-ocean cell**
 (no live tiles) produces no mosaic and the fill marks it empty with no staging, so it
 takes a stable `-empty` `run_id` and skips both mosaic fingerprinting (which would
 raise) and cleanup. The campaign's `s3_region` is threaded through ingest's Icechunk

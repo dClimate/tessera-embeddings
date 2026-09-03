@@ -54,7 +54,10 @@ S1_BASELINE_OFFSET = 0
 S1_OPERA_BANDS = ["0_VV", "0_VH"]
 
 # Amplitude-to-dB conversion constants
-# Formula: (20 * log10(amplitude) + S1_DB_SHIFT) * S1_DB_SCALE, clipped to int16
+# Formula: (20 * log10(amplitude) + S1_DB_SHIFT) * S1_DB_SCALE, clipped to [0, S1_DB_CLIP_MAX]
+# and stored as UINT16, with 0 reserved as the nodata marker. The clip ceiling is int16's
+# maximum, which is where an earlier comment's "clipped to int16" came from — but the stored
+# dtype is unsigned and the floor is 0, not -32768. See `ingest.transforms.amplitude_to_db`.
 # Ported from tessera_preprocessing/s1_fast_processor.py:758-797
 S1_DB_SHIFT = 50
 S1_DB_SCALE = 200

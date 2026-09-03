@@ -11,8 +11,8 @@ a tiebreak these rungs never reach and populated only on a launch *timeout*, not
 So this does not argue with the ranking. It states how many machines of each rung the
 fleet should hold, through ``request_resources``, which v2 satisfies in the same
 scheduling pass as ordinary actor demand. Three properties of that pass are load-bearing,
-all measured on a live cluster rather than read (evidence in
-``temp/simultaneous-gpu-fill-plan.md``):
+all measured on a live cluster rather than read from Ray's documentation, and each pinned by
+a test in ``tests/unit/providers/test_fleet_mix.py``:
 
 * an ask above a rung's ceiling provisions **nothing** — a partially infeasible
   constraint is discarded whole, so every bound here is required, not defensive;
@@ -92,7 +92,7 @@ The order is a computation, not a preference: the quota is counted in vCPU and t
 are not equally priced in it, so filling the best ratio first is the fractional-knapsack
 greedy. Sizes are restricted on host RAM — the vCPU-matched ``xlarge`` of each family
 carries 16 GiB against a measured ~17.7 GB per actor. Adding a card is a row here plus a
-rung in the template. Throughput measured; see ``gpu-card-choice-2026_08.md``.
+rung in the template. Throughput measured; see ``context_docs/inference/inference-on-gpus.md`` §4.
 """
 
 RUNGS_BY_INSTANCE_TYPE: dict[str, GpuRung] = {r.instance_type: r for r in GPU_RUNGS}
