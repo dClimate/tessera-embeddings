@@ -32,10 +32,10 @@ from tessera_embeddings.inference.scheduling import FleetDemand, WorkItem, _proc
 def _resumed_result(label: str, *, skipped: bool) -> dict:
     """One restored outcome for a tile a previous attempt already staged.
 
-    ``status`` mirrors what the actor reported at the time — ``skipped`` for a tile it
-    found nothing to write in, ``success`` otherwise — so a resume and a fresh run agree
-    on what happened. The counters are absent rather than zero: this run did not measure
-    them, and a zero would read as a measurement of none.
+    ``status`` mirrors what the actor reported at the time — ``skipped`` for a tile it found
+    nothing to write in, ``success`` otherwise — so a resume and a fresh run agree on what
+    happened. The counters are zeroed because this run measured nothing; a consumer must not
+    read that zero as a measurement of none.
     """
     return {
         "chunk": label,
