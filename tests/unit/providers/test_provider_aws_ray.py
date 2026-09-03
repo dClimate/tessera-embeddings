@@ -1308,7 +1308,7 @@ class TestL4Rungs:
         0.32x an L40S against the A10G's 0.46x, and costs +65% per unit of work against
         the A10G's +42%. Nothing in the design chose that; a letter in a name did.
 
-        So `gpu-card-choice-2026_08.md` records the rule as: open the A10G rung alone.
+        So `context_docs/inference/inference-on-gpus.md` §4 records the rule as: open the A10G rung alone.
         This test exists so that rule is not merely written down — if a future rename
         flipped the tie the other way, or Ray started reading a resource that separates
         the cards, the reason for the rule would be gone and this would say so.

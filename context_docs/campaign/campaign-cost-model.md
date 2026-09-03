@@ -533,17 +533,25 @@ Within a cluster, zones are ordered by tile count rather than by work. That is c
 inconsistency: ordering and actor clamping are properties of area, while the split is a property of
 work.
 
-**Re-derive it, do not quote it.** `scripts/cluster_work_spread.py` reads the current mask and runs
-the campaign's own partitioner — the shipped `_partition_by_live_tiles` and the shipped densest-first
-sort — so it reports what a campaign would actually do rather than a model of it. Rerun it if the
-mask is ever rebuilt:
+**Re-derive it, do not quote it — and the two ways of re-deriving it are not interchangeable.**
 
 ```bash
+# Against the LIVE mask. This is the one to run after a mask rebuild: it reads each zone's
+# live-tile bitmap and runs the campaign's own partitioner over what it finds.
+uv run python scripts/cluster_work_spread.py --mask s3://<inputs-bucket>/masks/global.icechunk \
+    --clusters 8 10 16
+
+# Offline, against the SNAPSHOT. Fast and deterministic, and correct only while the snapshot is.
 TE_CLUSTERS=8,16,24 uv run pytest tests/unit/orchestration/flows/test_cluster_balance.py -k report -s
 ```
 
-Tile counts are snapshotted in `tests/unit/zone_density.py`, which also carries the recipe for
-refreshing them after a mask rebuild.
+Both drive the shipped `_partition_by_live_tiles` and the shipped densest-first sort, so both report
+what a campaign would actually do rather than a model of it. **What differs is where the tile counts
+come from.** The script reads them from the mask, one GET per zone, and takes a few minutes. The
+test reads them from `tests/unit/zone_density.py`, a snapshot taken 2026-07-24 — deliberately, so
+the diagnostic runs offline — so **after a mask rebuild the test reproduces the old answer with no
+sign that it has.** `zone_density.py`'s own docstring carries the recipe for refreshing it; refresh
+it, or use the script.
 
 **Provenance of the coverage figures.** `s3://global-tessera-inputs-dev/masks/global.icechunk`,
 built 2026-07-24 from `s3://tessera-embeddings/v1.1/global_0.1_degree_tiff_all/`, registry sha256
