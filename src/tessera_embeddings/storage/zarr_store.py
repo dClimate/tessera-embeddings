@@ -81,9 +81,8 @@ TIME_ENCODING = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic
 #:
 #: Retrying either is worse than failing. The ingest path commits with no ``rebase_with``
 #: precisely so a second writer's commit fails against a moved branch tip rather than merging
-#: silently,
-#: and a retry re-opens the session from the NEW tip — turning that refusal back into a
-#: success and letting two writers interleave dates on one axis, the exact outcome the
+#: silently, and a retry re-opens the session from the NEW tip — turning that refusal back
+#: into a success and letting two writers interleave dates on one axis, the exact outcome the
 #: no-rebase choice prevents. When the two collide on the SAME date the retry instead fails as
 #: a duplicate, so the visible error names a date rather than the collision.
 #:
@@ -714,16 +713,13 @@ def open_or_create_repo(
     Args:
         store_path: Local path or S3 URI.
         max_concurrent_requests: Optional cap on concurrent S3 requests per repo.
-        get_credentials: Optional credential callback for Icechunk's S3 client.
-            See :func:`_create_storage` for details.
+        get_credentials: Optional credential callback (see :func:`_create_storage`).
         region: Optional S3 region override.
-        scatter_initial_credentials: When True with a distributed writer,
-            cache the initial credentials so pickled storage copies don't
-            re-invoke the callback on each worker. See :func:`_create_storage`.
+        scatter_initial_credentials: With a distributed writer, cache the initial credentials
+            so pickled storage copies do not re-invoke the callback on each worker.
 
     Returns:
-        Tuple of ``(repository, is_new)``. ``is_new`` is True if the repo was
-        just created.
+        ``(repository, is_new)``, where ``is_new`` is True if the repo was just created.
 
     Creates ONLY on proven absence — see :func:`is_missing_repo`. Every other failure of the
     open leg is re-raised unchanged, because routing one into the create leg is actively
