@@ -1,9 +1,8 @@
 """Model construction and checkpoint loading for Tessera v1.1.
 
-Builds the v1.1 inference model (two TransformerEncoder backbones + MLP
-dim_reducer), loads the v1.1 encoder checkpoint, strips training-only keys
-(projector and segmented-matryoshka-projector), fuses CustomGRU to nn.GRU for
-cuDNN performance, then freezes and moves to the target device.
+Builds the inference model (two TransformerEncoder backbones + MLP dim_reducer), loads the v1.1
+encoder checkpoint, strips training-only keys (projector and segmented-matryoshka-projector),
+fuses CustomGRU to nn.GRU for cuDNN performance, then freezes and moves to the target device.
 """
 
 from __future__ import annotations
@@ -22,30 +21,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# State-dict prefixes emitted by v1.1 training that are not part of the
-# inference graph. ``projector`` is the BarlowTwins head; the segmented
-# matryoshka projector is used for the variable-width training objective.
+# State-dict prefixes emitted by v1.1 training that are not part of the inference graph:
+# ``projector`` is the BarlowTwins head, the segmented matryoshka projector serves the
+# variable-width training objective.
 _TRAINING_ONLY_PREFIXES: tuple[str, ...] = ("projector.", "segmented_matryoshka_projector.")
 
 
 def _fuse_custom_gru(module: torch.nn.Module) -> None:
     """Replace CustomGRU with nn.GRU by fusing per-gate weights.
 
-    Walks the module tree, finds TemporalAwarePooling instances with CustomGRU,
-    and swaps in nn.GRU with fused weight matrices. This recovers cuDNN
-    performance (~1 kernel launch vs ~480).
+    Walks the module tree, finds TemporalAwarePooling instances holding a CustomGRU, and swaps in
+    nn.GRU with fused weight matrices — recovering cuDNN performance (~1 kernel launch vs ~480).
 
     The tessera CustomGRUCell differs from nn.GRU in two ways:
 
-    1. **Update gate convention is inverted.** Tessera: h' = (1-z)*h + z*n (z selects
-       the new candidate). nn.GRU: h' = (1-z)*n + z*h (z keeps old state). Since
-       1 - sigmoid(x) = sigmoid(-x), we negate all z gate weights and biases.
+    1. **Update gate convention is inverted.** Tessera: h' = (1-z)*h + z*n (z selects the new
+       candidate). nn.GRU: h' = (1-z)*n + z*h (z keeps old state). Since 1 - sigmoid(x) =
+       sigmoid(-x), all z gate weights and biases are negated.
 
-    2. **Reset gate placement differs.** Tessera: W_hh @ (r * h) — reset applied
-       before matmul. nn.GRU: r * (W_hh @ h + b_hh) — reset applied after matmul.
-       This is NOT equivalent for dense weight matrices, but is a small approximation
-       in practice because the reset gate is close to 1 for most dimensions after
-       training. b_h is placed in bias_ih (input-side) since tessera adds it outside
+    2. **Reset gate placement differs.** Tessera applies reset BEFORE the matmul, W_hh @ (r * h);
+       nn.GRU applies it after, r * (W_hh @ h + b_hh). NOT equivalent for dense weight matrices,
+       but a small approximation in practice because the reset gate is close to 1 for most
+       dimensions after training. b_h goes in bias_ih (input-side) since tessera adds it outside
        the reset gate product.
     """
     for _name, child in module.named_modules():
@@ -76,9 +73,9 @@ def _fuse_custom_gru(module: torch.nn.Module) -> None:
 def _build_inference_model(config: InferenceConfig, device: torch.device) -> MultimodalBTInferenceModel:
     """Construct the v1.1 inference model (pre-checkpoint-load) on *device*.
 
-    The two backbones share architecture hyperparameters. Both consume
-    ``band_num + 1`` input features (the ``+1`` is DOY appended by the sampler).
-    S2 is 10 bands; the merged S1 stream (asc + desc concatenated) is 2 bands.
+    The two backbones share architecture hyperparameters and both consume ``band_num + 1`` input
+    features, the ``+1`` being DOY appended by the sampler. S2 is 10 bands; the merged S1 stream
+    (asc + desc concatenated) is 2.
     """
     max_seq_len = max(config.num_obs_checkpoints)
 
@@ -163,10 +160,10 @@ def build_inference_model(
 ) -> MultimodalBTInferenceModel:
     """Build the v1.1 inference model from config and checkpoint.
 
-    Constructs the model on CPU, loads the checkpoint with ``strict=False``
-    (projector/matryoshka keys are already filtered in ``load_checkpoint``),
-    fuses CustomGRU to nn.GRU, freezes, zeros TransformerEncoderLayer
-    dropouts for the fused-attention fast path, and moves to *device* in eval mode.
+    Constructs on CPU, loads the checkpoint with ``strict=False`` (projector/matryoshka keys are
+    already filtered in ``load_checkpoint``), fuses CustomGRU to nn.GRU, freezes, zeros
+    TransformerEncoderLayer dropouts for the fused-attention fast path, and moves to *device* in
+    eval mode.
 
     Args:
         config: Inference configuration.

@@ -35,13 +35,11 @@ def _get_gpu_stats(gpu_index: str | None = None) -> dict[str, str] | None:
             GPU — correct only on a one-GPU host.
 
     **Why the index has to be passed in.** ``nvidia-smi`` does not honour
-    ``CUDA_VISIBLE_DEVICES``; it reports every GPU on the host regardless of what
-    the calling process can see. Without ``-i`` this returned one CSV ROW PER GPU,
-    and the old parse split the whole multi-line output on commas — so on a 4-GPU
-    host the six names above were filled from the first row's six fields plus the
-    newline-joined boundary, i.e. every actor reported GPU 0 with fields sliding
-    out of alignment. On a one-GPU host there is one row and the bug is invisible,
-    which is why it survived: the code was never wrong anywhere it had run.
+    ``CUDA_VISIBLE_DEVICES``; it reports every GPU on the host regardless of what the calling
+    process can see. Without ``-i`` it emits one CSV ROW PER GPU, so on a packed host a parse that
+    splits the whole output on commas fills the six names above from the first row plus the
+    newline-joined boundary — every actor reporting GPU 0 with fields out of alignment. A one-GPU
+    host has one row and the defect is invisible there.
 
     Returns:
         One GPU's stats, or ``None`` if nvidia-smi is absent, times out, exits
@@ -63,11 +61,10 @@ def _get_gpu_stats(gpu_index: str | None = None) -> dict[str, str] | None:
         return None
     if result.returncode != 0:
         return None
-    # Split on LINES first and require exactly one. Several lines means the -i
-    # filter did not apply (an unset index, or a future nvidia-smi that ignores
-    # it), and the honest answer to "which GPU is this?" is then no answer —
-    # returning the first row's numbers under this actor's name is how the
-    # original defect misreported a whole packed host.
+    # Split on LINES first and require exactly one. Several means the -i filter did not apply (an
+    # unset index, or a future nvidia-smi that ignores it), and the honest answer to "which GPU is
+    # this?" is then no answer — returning the first row's numbers under this actor's name is what
+    # misreported a whole packed host.
     lines = [ln for ln in result.stdout.strip().splitlines() if ln.strip()]
     if len(lines) != 1:
         logger.warning(
@@ -130,24 +127,20 @@ def _query_gpu(gpu_index: str | None, fields: tuple[str, ...]) -> list[str] | No
 def _get_gpu_extra_stats(gpu_index: str | None = None) -> dict[str, str]:
     """Clock, PCIe link and throttle state for ONE GPU. ``{}`` for anything unavailable.
 
-    Split from :func:`_get_gpu_stats` into its own subprocess call deliberately.
-    nvidia-smi rejects an ENTIRE query when one field name is unknown, so folding
-    these into the six-field query would mean a driver that does not know one of
-    them silently costs us utilisation, VRAM, temperature AND power — the metrics
-    the fleet has always had. A separate call degrades to ``{}`` instead.
+    A separate subprocess call from :func:`_get_gpu_stats` deliberately: nvidia-smi rejects an
+    ENTIRE query when one field name is unknown, so folding these in would let an unfamiliar driver
+    cost us utilisation, VRAM, temperature AND power. A separate call degrades to ``{}`` instead.
 
-    These exist to answer "is the card being held back by something other than the
-    work?" on a GPU we have never run before:
+    These answer "is the card held back by something other than the work?" on a GPU we have never
+    run before:
 
-    * ``sm_clock`` against the card's boost clock, with ``throttle``'s bitmask,
-      distinguishes a card that is thermally or power limited from one that is
-      simply given small kernels. A non-zero bitmask with only bit 0
-      (``GpuIdle``) set is normal; ``SwPowerCap`` (0x4) and ``HwSlowdown``
-      (0x8) / ``HwThermalSlowdown`` (0x40) are not.
-    * ``pcie_gen`` / ``pcie_width`` are the negotiated link, not traffic. A card
-      that came up at Gen1 x8 would explain a feed problem that looks like a
-      slow GPU. PCIe THROUGHPUT is not measured here (it needs
-      ``nvidia-smi dmon`` or DCGM) and is not claimed.
+    * ``sm_clock`` against the card's boost clock, with ``throttle``'s bitmask, distinguishes a
+      thermally or power limited card from one simply given small kernels. A non-zero bitmask with
+      only bit 0 (``GpuIdle``) set is normal; ``SwPowerCap`` (0x4) and ``HwSlowdown`` (0x8) /
+      ``HwThermalSlowdown`` (0x40) are not.
+    * ``pcie_gen`` / ``pcie_width`` are the negotiated link, NOT traffic — a card that came up at
+      Gen1 x8 would explain a feed problem that looks like a slow GPU. PCIe throughput needs
+      ``nvidia-smi dmon`` or DCGM and is not claimed here.
     """
     global _throttle_field
     stats: dict[str, str] = {}
@@ -175,7 +168,7 @@ def _get_cpu_mem_stats() -> dict[str, str]:
     """Get CPU and memory stats from /proc (Linux only)."""
     stats: dict[str, str] = {}
 
-    # CPU usage from /proc/stat (snapshot — shows cumulative, but useful for trends)
+    # Load average from /proc/loadavg (1/5/15-minute figures, not instantaneous CPU)
     try:
         with Path("/proc/loadavg").open() as f:
             parts = f.read().strip().split()
@@ -195,12 +188,11 @@ def _get_cpu_mem_stats() -> dict[str, str]:
 def read_host_ram_gib() -> tuple[float, float] | None:
     """``(used, total)`` host RAM in GiB from /proc/meminfo, or ``None`` off Linux.
 
-    Used is ``MemTotal - MemAvailable``, which is the figure the per-actor budget
-    at :data:`~tessera_embeddings.inference.actors._S2_STRIP_BYTE_BUDGET` is sized
-    against. Whole-HOST, not per-process: on a host where several actors share the
-    box this is their sum plus the system's, which is the right denominator for a
-    "did we fit in this instance size" question and the wrong one for "how much did
-    THIS actor use".
+    Used is ``MemTotal - MemAvailable``, the figure the per-actor budget at
+    :data:`~tessera_embeddings.inference.actors._S2_STRIP_BYTE_BUDGET` is sized against.
+    Whole-HOST, not per-process: where several actors share a box this is their sum plus the
+    system's — the right denominator for "did we fit in this instance size", the wrong one for
+    "how much did THIS actor use".
     """
     try:
         with Path("/proc/meminfo").open() as f:
@@ -221,35 +213,31 @@ class ResourceMonitor:
     Args:
         interval_sec: Seconds between log lines. Default 30.
         gpu_index: This process's own host-level GPU index, for ``nvidia-smi -i``
-            (see :func:`_get_gpu_stats`). ``None`` — the default, and correct on a
-            one-GPU host — leaves the query unfiltered. On a host where several
-            actors share the box, passing it is what keeps each actor's GPU line
-            about its own GPU; it is also stamped on the RESOURCES line, so a
-            reader can tell four actors' samples apart instead of seeing four
-            identical ones.
+            (see :func:`_get_gpu_stats`). ``None`` — the default, correct on a one-GPU
+            host — leaves the query unfiltered. Where several actors share a box, passing
+            it is what keeps each actor's GPU line about its own GPU; it is also stamped
+            on the RESOURCES line so a reader can tell their samples apart.
     """
 
     def __init__(self, interval_sec: float = 30, gpu_index: str | None = None, sample_sec: float = 2.0) -> None:
         self._interval = interval_sec
         self._sample_sec = min(sample_sec, interval_sec)
         self._gpu_index = gpu_index
-        # Host-RAM high-water mark since the last reset. Sampled at
-        # `sample_sec`, NOT at `interval_sec`: the per-actor RAM budget is sized
-        # to leave ~0.9 GB under a 60% ceiling for spikes shorter than the
-        # 30-second emit cadence, so the emitted instantaneous figure is
-        # systematically below the peak it is supposed to police. A 2-second
-        # sampler is still not an upper bound — a sub-second spike escapes it too
-        # — but it is the difference between "34% average" and a usable peak.
+        # Host-RAM high-water mark since the last reset. Sampled at `sample_sec`, NOT at
+        # `interval_sec`: the per-actor RAM budget leaves ~0.9 GB under a 60% ceiling for spikes
+        # shorter than the 30-second emit cadence, so the emitted instantaneous figure sits
+        # systematically below the peak it is meant to police. A 2-second sampler is still no upper
+        # bound (a sub-second spike escapes it) but it is the difference between "34% average" and
+        # a usable peak.
         self._peak_ram_gb = 0.0
         self._ram_total_gb = 0.0
         self._ram_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        # Named context slots appended to every RESOURCES line so post-hoc RAM
-        # analysis can attribute a sample to what the process was doing. Slots
-        # (not one string) because two threads legitimately report at once: the
-        # actor's main thread ("work" — chunk/phase) and its background writer
-        # ("write" — a staging upload overlapping the next chunk's prologue).
+        # Named context slots appended to every RESOURCES line so post-hoc RAM analysis can
+        # attribute a sample to what the process was doing. Slots rather than one string because
+        # two threads legitimately report at once: the actor's main thread ("work" — chunk/phase)
+        # and its background writer ("write" — a staging upload overlapping the next prologue).
         self._contexts: dict[str, str] = {}
         self._ctx_lock = threading.Lock()
 
@@ -301,10 +289,9 @@ class ResourceMonitor:
         with self._ram_lock:
             self._peak_ram_gb = 0.0
             # Cleared TOO, because `peak_host_ram_gib` reports "not sampled" as a zero TOTAL.
-            # Leaving the total set makes a just-reset monitor return `(0.0, total)`, which
-            # `_host_fields` publishes as a measured-looking `host_ram_peak_gib: 0.0` — so a
-            # chunk that finished inside one 2 s sampling interval, or was skipped outright,
-            # wrote a false zero into the per-chunk RAM record instead of nothing at all.
+            # Left set, a just-reset monitor returns `(0.0, total)`, which `_host_fields` publishes
+            # as a measured-looking `host_ram_peak_gib: 0.0` — a chunk that finished inside one 2 s
+            # sampling interval writes a false zero into the per-chunk RAM record.
             self._ram_total_gb = 0.0
 
     def _sample_ram(self) -> None:

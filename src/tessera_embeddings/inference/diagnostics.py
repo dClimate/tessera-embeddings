@@ -1,10 +1,9 @@
 """Post-mortem diagnostics for failed Ray inference workers.
 
-Parses ResourceMonitor log lines into structured snapshots and formats a
-memory-ramp table. Log retrieval is pluggable: pass a ``fetch_events``
-callable to ``build_worker_failure_diagnostic``; the AWS provider supplies
-a CloudWatch-backed implementation, and the default is a no-op that returns
-an empty list (stdlib logging already captured the live output).
+Parses ResourceMonitor log lines into structured snapshots and formats a memory-ramp table. Log
+retrieval is pluggable: pass a ``fetch_events`` callable to ``build_worker_failure_diagnostic``.
+The AWS provider supplies a CloudWatch-backed implementation; the default is a no-op returning an
+empty list, since stdlib logging already captured the live output.
 """
 
 from __future__ import annotations
@@ -102,8 +101,8 @@ def _parse_resource_snapshots(events: list[dict]) -> list[ResourceSnapshot]:
 def _select_key_snapshots(snapshots: list[ResourceSnapshot]) -> list[ResourceSnapshot]:
     """Select snapshots that show meaningful RAM changes.
 
-    Keeps first, last, phase transitions, and any snapshot where RAM%
-    changed by >= 3 points from the previous kept snapshot.
+    Keeps first, last, phase transitions, and any snapshot whose RAM% moved by >= 3 points from
+    the previous kept snapshot.
     """
     if len(snapshots) <= 6:
         return snapshots
@@ -147,10 +146,9 @@ def build_worker_failure_diagnostic(
         instance_id: Identifier for the failed worker (e.g. EC2 instance ID).
         chunk_label: Label of the chunk that failed.
         error_msg: Error message from the failure.
-        fetch_events: Optional callable ``(instance_id) -> list[dict]`` where
-            each dict has at least a ``"message"`` key. The AWS provider passes
-            a CloudWatch-backed implementation; ``None`` means no remote log
-            fetch (live stdout logs are the fallback).
+        fetch_events: Optional callable ``(instance_id) -> list[dict]``, each dict carrying at
+            least a ``"message"`` key. The AWS provider passes a CloudWatch-backed
+            implementation; ``None`` means no remote log fetch, with live stdout as the fallback.
 
     Returns:
         Formatted diagnostic string, or ``None`` if no log data is available.
@@ -196,8 +194,8 @@ def log_worker_failure_diagnostic(
         error_msg: Error message from the failure.
         log: Logger to write the diagnostic to.
         fetch_events: Optional event-fetch callable (see
-            :func:`build_worker_failure_diagnostic`). When ``None``, logs a
-            brief "no diagnostics available" message instead.
+            :func:`build_worker_failure_diagnostic`). ``None`` logs a brief "no diagnostics
+            available" message instead.
     """
     try:
         diagnostic = build_worker_failure_diagnostic(instance_id, chunk_label, error_msg, fetch_events=fetch_events)

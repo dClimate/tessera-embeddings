@@ -1,35 +1,29 @@
 """Deliberate fault injection, for failure drills a human cannot perform by hand.
 
-Some failure modes cannot be reproduced from outside the run. One occupies a window
-between two commits that is too narrow to aim a kill at; another needs a condition
-that every healthy mechanism in the system removes the moment it appears. A drill
-that cannot reach the failure it names produces a false pass, which is worse than
-leaving the question open — so those faults are injected from inside the run
-instead, under an explicit request.
+Some failure modes cannot be reproduced from outside the run: one occupies a window
+between two commits too narrow to aim a kill at; another needs a condition that every
+healthy mechanism removes the moment it appears. A drill that cannot reach the failure it
+names produces a false pass, which is worse than leaving the question open — so those
+faults are injected from inside the run, under an explicit request.
 
-**The invariant this module exists to hold: nothing here can run unless a human
-asked for it in the dispatch that started the run.** One injection point sits on
-the commit path of the store that is the campaign's only output, so the guarantee
-has to be structural rather than careful:
+**The invariant this module holds: nothing here can run unless a human asked for it in the
+dispatch that started the run.** One injection point sits on the commit path of the store
+that is the campaign's only output, so the guarantee has to be structural, not careful:
 
-* A request arrives ONLY as an explicit flow parameter (:class:`FaultInjection`),
-  whose default is nothing at all. No environment variable, and no default that a
-  task definition, an image, or a stored deployment schema could carry silently
-  into an ordinary run.
-* An injection point accepts only an :class:`ArmedFault`, and the only code that
-  produces one is :meth:`FaultInjection.arm`. A request therefore cannot reach a
-  firing site without passing the checks that method makes.
-* :meth:`FaultInjection.arm` refuses every deployment except those named in
-  :data:`DRILL_DEPLOYMENTS`. That is an ALLOWLIST rather than a denylist of
-  production, which matters for the case a denylist gets wrong: a run whose
-  deployment identity cannot be resolved at all is refused for exactly the reason
-  production is refused, because an unresolvable identity is what a
+* A request arrives ONLY as an explicit flow parameter (:class:`FaultInjection`), whose
+  default is nothing at all. No environment variable, and no default a task definition, an
+  image, or a stored deployment schema could carry silently into an ordinary run.
+* An injection point accepts only an :class:`ArmedFault`, and the only producer of one is
+  :meth:`FaultInjection.arm`, so a request cannot reach a firing site unchecked.
+* :meth:`FaultInjection.arm` refuses every deployment except those in
+  :data:`DRILL_DEPLOYMENTS`. An ALLOWLIST rather than a denylist of production, for the
+  case a denylist gets wrong: a run whose deployment identity cannot be resolved at all is
+  refused for exactly the reason production is, because an unresolvable identity is what a
   mis-registered production run looks like.
-* :meth:`FaultInjection.arm` also refuses a fault the calling flow does not host,
-  so an armed drill can never quietly do nothing and be recorded as a pass.
-* Arming announces itself, and so does every firing, at error level and under one
-  fixed prefix. Whoever reads these logs next must not mistake a drill's
-  artifacts for an incident.
+* It also refuses a fault the calling flow does not host, so an armed drill can never
+  quietly do nothing and be recorded as a pass.
+* Arming and every firing announce themselves at error level under one fixed prefix, so
+  whoever reads these logs next does not mistake a drill's artifacts for an incident.
 
 Deployment identity is READ, never asked for: :func:`deployment_stem` takes it off the
 Ray control-plane SSM prefix, which a registration injects and a caller has no reason to
@@ -38,17 +32,15 @@ set.
 RESIDUAL, ACCEPTED (repo owner, 2026-08-11 — do not "harden" this). That prefix is a flow
 PARAMETER, so a dispatch can state it: naming a drill control plane while pointing storage
 at production would pass this check. Reviewers raise it as a privilege-escalation finding
-and it is not one here. Arming ALSO requires an explicit ``fault`` argument, so the path
-is two deliberate acts by someone already authorised to dispatch the flow — the gate
-exists to stop an accident, not an operator who is trying. The owner's ruling: drills are
-not production, and this is not a threat model worth a second identity.
-
-Closing it anyway would need a deployment fact this module does not have (the registered
-Prefect deployment name, or an allowlist of drill storage) and would drag either the
-Prefect runtime or an AWS identity call into ``config`` — the latter forbidden outright by
-``no-botocore-outside-aws-provider``. An environment variable was tried and rejected for a
-separate reason: one can be left behind in a task definition and inherited by an ordinary
-run, which ``test_nothing_about_a_fault_is_read_from_the_environment`` pins.
+and it is not one here — arming ALSO requires an explicit ``fault`` argument, so the path
+is two deliberate acts by someone already authorised to dispatch the flow, and the gate
+exists to stop an accident, not an operator who is trying. Closing it would need a
+deployment fact this module does not have (the registered Prefect deployment name, or an
+allowlist of drill storage) and would drag either the Prefect runtime or an AWS identity
+call into ``config`` — the latter forbidden by ``no-botocore-outside-aws-provider``. An
+environment variable was tried and rejected separately: one can be left behind in a task
+definition and inherited by an ordinary run, which
+``test_nothing_about_a_fault_is_read_from_the_environment`` pins.
 """
 
 from __future__ import annotations
@@ -70,12 +62,11 @@ _log = logging.getLogger(__name__)
 DIE_BETWEEN_COMMITS = "die_between_commits"
 WITHHOLD_WORK = "withhold_work"
 
-#: The deployments a fault may be armed on — an allowlist, and the whole of it.
-#: A deployment is named here because losing a store or a fleet on it costs a drill,
-#: not a campaign. Every other identity is refused, INCLUDING one that cannot be
-#: resolved: "no identity" and "production" must earn the same answer, because a
-#: registration that failed to inject its control-plane parameters is indistinguishable
-#: from a run on an account this module has never heard of.
+#: The deployments a fault may be armed on — an allowlist, and the whole of it. A deployment
+#: is named here because losing a store or a fleet on it costs a drill, not a campaign. Every
+#: other identity is refused, INCLUDING one that cannot be resolved: a registration that
+#: failed to inject its control-plane parameters is indistinguishable from a run on an
+#: account this module has never heard of, so the two must earn the same answer.
 DRILL_DEPLOYMENTS: frozenset[str] = frozenset({"global-tessera-dev"})
 
 
@@ -89,10 +80,10 @@ FAULT_LOG_PREFIX = "FAULT INJECTION"
 #: rather than looking like an out-of-memory kill or an ordinary failure.
 DRILL_EXIT_STATUS = 93
 
-#: Ceiling on ``withhold_work``'s hold. The fault holds a provisioned GPU fleet
-#: deliberately idle, so its duration IS the drill's cost, and an unbounded hold on a
-#: fleet nothing will reclaim is the failure the drill exists to study rather than a
-#: way to study it. A request above this ceiling is rejected at validation.
+#: Ceiling on ``withhold_work``'s hold, rejected at validation. The fault holds a
+#: provisioned GPU fleet deliberately idle, so its duration IS the drill's cost — and an
+#: unbounded hold on a fleet nothing will reclaim is the failure the drill exists to study
+#: rather than a way to study it.
 MAX_HOLD_MINUTES = 45.0
 
 #: The canonical UTM common name, i.e. exactly what ``zone_grid.canonicalize_zone``
@@ -108,22 +99,20 @@ _HOLD_REPORT_S = 120.0
 class FaultInjectionRefusedError(RuntimeError):
     """A fault was requested where it may not be injected.
 
-    Raised by :meth:`FaultInjection.arm`, and never caught inside this package: a
-    refused request must end the run rather than downgrade to a warning, because a
-    drill that continued unarmed would report whatever the run did as the drill's
-    result.
+    Raised by :meth:`FaultInjection.arm` and never caught inside this package: a refused
+    request must end the run rather than downgrade to a warning, because a drill that
+    continued unarmed would report whatever the run did as the drill's result.
     """
 
 
 def deployment_stem(ssm_prefix: str | None) -> str | None:
     """The deployment's own name, read off an injected control-plane parameter.
 
-    A run cannot be trusted to state which account it is on, so identity is derived
-    from something a registration supplies and an operator has no reason to pass: the
-    Ray control-plane SSM prefix, which is namespaced by the deployment's resource
-    stem. Returns ``None`` when the value does not have that shape at all — including
-    the flow parameter's own placeholder default, which is what an un-injected run
-    carries and must not be credited as an identity.
+    A run cannot be trusted to state which account it is on, so identity comes from
+    something a registration supplies and an operator has no reason to pass: the Ray
+    control-plane SSM prefix, namespaced by the deployment's resource stem. Returns ``None``
+    when the value does not have that shape — including the flow parameter's own placeholder
+    default, which an un-injected run carries and must not be credited as an identity.
     """
     parts = [part for part in (ssm_prefix or "").split("/") if part]
     if len(parts) != 2 or parts[1] != "ray":
@@ -135,14 +124,13 @@ def deployment_stem(ssm_prefix: str | None) -> str | None:
 class FaultInjection(BaseModel):
     """A request to inject ONE deliberate fault into the run that receives it.
 
-    A flow parameter, so it is visible in the dispatch that created the run and in
-    that run's stored parameters forever after — the record of why a drill's run
-    behaved unlike a real one. Extra fields are rejected rather than ignored, so a
-    misspelled key fails the dispatch instead of silently arming something else.
-
-    Each fault requires the arguments it uses and forbids the others, so a request can
-    never be half-specified: a ``die_between_commits`` without a cell would have no
-    single cell to fire on, and a ``withhold_work`` without a hold would have no end.
+    A flow parameter, so it is visible in the dispatch that created the run and in that
+    run's stored parameters forever after — the record of why a drill's run behaved unlike a
+    real one. Extra fields are rejected rather than ignored, so a misspelled key fails the
+    dispatch instead of silently arming something else. Each fault requires the arguments it
+    uses and forbids the others, so a request can never be half-specified: a
+    ``die_between_commits`` without a cell has no single cell to fire on, and a
+    ``withhold_work`` without a hold has no end.
 
     Holding a request is not permission to use it — see :meth:`arm`.
     """
@@ -165,24 +153,20 @@ class FaultInjection(BaseModel):
         if self.fault == DIE_BETWEEN_COMMITS:
             if self.zone is None or self.year is None:
                 raise ValueError(f"{DIE_BETWEEN_COMMITS} needs the zone and year it may fire on")
-            # CANONICAL FORM ONLY. The firing site compares the request's zone to the
-            # writer's, and the fill canonicalizes before it gets there — so ``"33n"``
-            # arms, announces itself, and then silently never matches ``"33N"``. A drill
-            # that does nothing and is written up as a pass is the one outcome this module
-            # exists to prevent, and it is worse here than anywhere else: the drill's whole
-            # purpose is to prove the recovery path runs.
+            # CANONICAL FORM ONLY, refused rather than normalised. The firing site compares
+            # the request's zone to the writer's, and the fill canonicalizes before it gets
+            # there, so ``"33n"`` arms, announces itself, and then silently never matches
+            # ``"33N"`` — a drill that does nothing and is written up as a pass, which this
+            # module exists to prevent and which is worst here, where the drill's whole
+            # purpose is to prove the recovery path runs. Refused at dispatch because that
+            # is the last point a human reads the error; normalising would hide a request
+            # that does not say what its author meant.
             #
-            # REFUSED rather than normalised, and refused HERE rather than at the firing
-            # site. Normalising would hide a request that does not say what its author
-            # meant, and refusing at dispatch is the only point where a human is still
-            # reading the error.
-            # The FULL canonical form, not merely uppercase: ``"7N"``, ``"99N"`` and
-            # ``"33N "`` are all uppercase and all fail to equal the writer's ``"07N"``,
-            # so an uppercase-only check leaves exactly the silent-pass it was added to
-            # close. Matched against a literal pattern rather than
-            # ``zone_grid.canonicalize_zone`` because ``storage`` imports ``config`` and
-            # the reverse would cycle; the pattern IS that function's output format
-            # (zero-padded 01-60 plus hemisphere), and a unit test pins the two together.
+            # The FULL form, not merely uppercase: ``"7N"``, ``"99N"`` and ``"33N "`` are all
+            # uppercase and none equals the writer's ``"07N"``. A literal pattern rather than
+            # ``zone_grid.canonicalize_zone`` because ``storage`` imports ``config`` and the
+            # reverse would cycle; the pattern IS that function's output format (zero-padded
+            # 01-60 plus hemisphere), and a unit test pins the two together.
             if _CANONICAL_ZONE.fullmatch(self.zone) is None:
                 raise ValueError(
                     f"zone must be the canonical UTM common name (e.g. '33N', '07S'); got {self.zone!r}. "
@@ -209,20 +193,19 @@ class FaultInjection(BaseModel):
     ) -> ArmedFault:
         """Clear this request for the current run, or refuse it — the only gate there is.
 
-        The only producer of an :class:`ArmedFault`, which is the only thing an
-        injection point accepts. Every check a fault must pass therefore lives here,
-        and cannot be skipped by a caller that already holds a request.
+        The only producer of an :class:`ArmedFault`, which is the only thing an injection
+        point accepts, so every check a fault must pass lives here and cannot be skipped by
+        a caller that already holds a request.
 
-        ``ssm_prefix`` is the run's own injected control-plane parameter, resolved
-        here rather than by the caller so a flow cannot hand in an identity of its own
-        choosing. ``supports`` is the set of faults the calling flow actually hosts:
-        a fault it does not host is refused, because the alternative is an armed drill
-        that does nothing and is written up as a pass.
+        ``ssm_prefix`` is the run's own injected control-plane parameter, resolved here
+        rather than by the caller so a flow cannot hand in an identity of its own choosing.
+        ``supports`` is the set of faults the calling flow actually hosts; one it does not
+        host is refused, because the alternative is an armed drill that does nothing and is
+        written up as a pass.
 
-        Announces the arming at error level under :data:`FAULT_LOG_PREFIX`. That line
-        is the durable one — a fault that ends the process may lose its own firing
-        line to an unflushed handler, so the record that this run is a drill is
-        established before anything fires.
+        Announces the arming at error level under :data:`FAULT_LOG_PREFIX`. That line is the
+        durable one — a fault that ends the process may lose its own firing line to an
+        unflushed handler, so the record that this run is a drill is established first.
 
         Raises:
             FaultInjectionRefusedError: On any deployment outside
@@ -258,13 +241,13 @@ class FaultInjection(BaseModel):
 class ArmedFault:
     """A fault THIS run is cleared to inject — the only type an injection point takes.
 
-    Constructed solely by :meth:`FaultInjection.arm`, which is what makes the checks
-    in that method unskippable: a site that holds one of these is holding proof they
-    ran. An architecture test pins the sole construction, because the guarantee is the
-    point of the type and a second constructor call would silently retire it.
+    Constructed solely by :meth:`FaultInjection.arm`, which is what makes that method's
+    checks unskippable: a site holding one of these is holding proof they ran. An
+    architecture test pins the sole construction, because a second constructor call would
+    silently retire the guarantee that is the point of the type.
 
-    Firing is asked for at every site and granted only by the fault that names it, so
-    a run armed for one fault is inert at the other's site.
+    Firing is asked for at every site and granted only by the fault that names it, so a run
+    armed for one fault is inert at the other's site.
     """
 
     def __init__(self, request: FaultInjection, deployment: str) -> None:
@@ -289,16 +272,15 @@ class ArmedFault:
     ) -> None:
         """End this process now, if armed for this fault and aimed at this cell.
 
-        Called from between a zone-year's two commits — the shards, then the attrs
-        that mark the year complete. Returns immediately for any other fault, and for
-        the same fault aimed at a different cell, so a run filling several cells loses
-        only the one the request named.
+        Called between a zone-year's two commits — the shards, then the attrs that mark the
+        year complete. Returns immediately for any other fault, and for the same fault aimed
+        at a different cell, so a run filling several cells loses only the one named.
 
-        The death is a hard exit rather than an exception: an exception at this point
-        unwinds cleanly, runs the caller's handlers and is reported as a failure, none
-        of which a real death does. Handlers are flushed first so the announcement
-        survives the exit; a run logger that batches to an orchestrator may still lose
-        it, which is why :meth:`FaultInjection.arm` states the drill up front.
+        A hard exit rather than an exception: an exception here unwinds cleanly, runs the
+        caller's handlers and is reported as a failure, none of which a real death does.
+        Handlers are flushed first so the announcement survives the exit; a run logger that
+        batches to an orchestrator may still lose it, which is why
+        :meth:`FaultInjection.arm` states the drill up front.
         """
         if self._request.fault != DIE_BETWEEN_COMMITS:
             return
@@ -324,30 +306,27 @@ class ArmedFault:
         """What a scheduler should see in place of its work source, while armed to starve it.
 
         Wraps the source at the point supply enters the scheduler, and takes it as a
-        CALLABLE rather than as its result. That is the load-bearing detail: a source
-        that hands work over by removing it from a queue has already given it away by
-        the time a value could be inspected, so a wrapper that inspected and then
-        discarded would DESTROY the prepared work rather than delay it. Not calling the
-        supplier is the only way to withhold without consuming, and it makes that
-        property structural instead of a rule a later edit could break.
+        CALLABLE rather than as its result. That is the load-bearing detail: a source that
+        hands work over by removing it from a queue has already given it away by the time a
+        value could be inspected, so a wrapper that inspected and then discarded would
+        DESTROY the prepared work rather than delay it. Not calling the supplier is the only
+        way to withhold without consuming, and it makes that structural instead of a rule a
+        later edit could break. For any other fault the source is called and its result
+        returned unchanged.
 
-        For any other fault the source is called and its result returned, unchanged.
+        While the hold runs this returns the empty list — the source's own "nothing ready
+        yet" — so the session stays alive, keeps its actors and holds no work: a fleet
+        provisioned, billing, and completing nothing, which is the condition the drill needs.
 
-        While the hold runs this returns the empty list, which is the source's own
-        "nothing ready yet" — so the session stays alive, keeps its actors, and holds no
-        work. That is the condition the drill needs: a fleet provisioned, billing, and
-        completing nothing.
+        The hold begins only AFTER a first hand-over has been let through. A fleet that never
+        received work has not starved, it has never started — the shape every detector
+        correctly exempts as a ramp — so withholding from the outset would buy an idle fleet
+        and prove nothing. Exhaustion before that first hand-over is announced rather than
+        withheld, so a drill that could not fire is never mistaken for one that did.
 
-        The hold begins only AFTER a first hand-over has been let through. A fleet that
-        never received work has not starved, it has never started — the shape every
-        detector correctly exempts as a ramp — so withholding from the outset would buy
-        an idle fleet and prove nothing. Exhaustion before that first hand-over is
-        announced rather than withheld, so a drill that could not fire is never mistaken
-        for one that did.
-
-        Releasing is unconditional once the hold elapses: the real source is consulted
-        again and the session finishes normally. Nothing here fails a run, which is what
-        separates withholding supply from breaking the thing that supplies it.
+        Releasing is unconditional once the hold elapses: the real source is consulted again
+        and the session finishes normally. Nothing here fails a run, which is what separates
+        withholding supply from breaking the thing that supplies it.
         """
         if self._request.fault != WITHHOLD_WORK:
             return supply()

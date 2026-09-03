@@ -2,20 +2,17 @@
 
 Reading
 -------
-``read_roi_metadata`` and ``read_roi_mask`` load an existing Zarr ROI store
-(local or S3) and extract spatial metadata needed for STAC queries and
-odc.stac.load: WGS84 bounding box, native CRS, and grid dimensions.
+``read_roi_metadata`` and ``read_roi_mask`` load an existing Zarr ROI store (local or S3) and
+extract the spatial metadata STAC queries and odc.stac.load need: WGS84 bounding box, native CRS,
+grid dimensions.
 
 Generation
 ----------
-``rasterize_roi_zarr`` converts GeoJSON polygons (or pre-loaded Shapely
-geometries) into a chunked boolean Zarr mask on a UTM grid.  Rasterization
-is performed per spatial chunk so the full output is never held in memory.
-
-Helper functions handle CRS detection, UTM zone selection, reprojection,
-and grid computation.  ``load_s2_tile_geometry`` fetches Sentinel-2 MGRS
-tile footprints from a GeoJSON index on S3 as a shortcut for tile-aligned
-ROIs.
+``rasterize_roi_zarr`` converts GeoJSON polygons (or pre-loaded Shapely geometries) into a chunked
+boolean Zarr mask on a UTM grid, rasterizing per spatial chunk so the full output is never held in
+memory. Helper functions handle CRS detection, UTM zone selection, reprojection and grid
+computation; ``load_s2_tile_geometry`` fetches Sentinel-2 MGRS tile footprints from a GeoJSON
+index on S3 as a shortcut for tile-aligned ROIs.
 """
 
 from __future__ import annotations
@@ -93,11 +90,9 @@ def read_roi_metadata(roi_path: str, *, storage_options: StorageOptions = None) 
 
     Args:
         roi_path: Path to the Zarr ROI store (local or s3://).
-        storage_options: fsspec options for the open, or a callable resolving them.
-            The per-date mask reads take these already; this open happens BEFORE any
-            of them, so without it a callback-only or non-default-region deployment
-            fails at the very first ROI read — on the leg whose mask reads were wired
-            to succeed.
+        storage_options: fsspec options for the open, or a callable resolving them. The per-date
+            mask reads take these already; this open happens BEFORE any of them, so without it a
+            callback-only or non-default-region deployment fails at the very first ROI read.
 
     Returns:
         ROIMetadata with WGS84 bbox, native CRS string, and grid dimensions.
@@ -130,14 +125,11 @@ StorageOptions = dict | Callable[[], "dict | None"] | None
 def resolve_storage_options(storage_options: StorageOptions) -> dict | None:
     """Resolve ``storage_options``, calling it if it is a provider.
 
-    **Accepting a callable is what keeps these credentials fresh, and it belongs here
-    rather than at each call site.** A dict is a snapshot: resolved once, it is still
-    the value being used however much later the read happens, and an IAM credential
-    outlives neither a long leg nor its own TTL. A provider is re-invoked at each read,
-    which is where the credential is actually consumed.
-
-    Resolving inside the reader rather than at the call sites means a new call site
-    cannot silently reintroduce the frozen behaviour by forgetting to re-resolve.
+    **Accepting a callable is what keeps these credentials fresh.** A dict is a snapshot: resolved
+    once, it is still the value in use however much later the read happens, and an IAM credential
+    outlives neither a long leg nor its own TTL. A provider is re-invoked at each read, where the
+    credential is actually consumed. Resolving inside the reader rather than at each call site
+    means a new call site cannot silently reintroduce the frozen behaviour.
     """
     return storage_options() if callable(storage_options) else storage_options
 
@@ -152,12 +144,11 @@ def read_roi_mask(
     Args:
         roi_path: Path to the Zarr ROI store (local or s3:// or any fsspec URI).
         chunks: Dict with ``"northing"`` and ``"easting"`` chunk sizes.
-        storage_options: fsspec storage options, or a callable returning them.
-            Prefer the callable for S3: it is re-invoked per block read, so the
-            credential cannot be older than that read. When ``None``, fsspec infers
-            credentials from the environment — which on the radar path holds the
-            SOURCE's short-lived token rather than our own role, so ``None`` is only
-            safe locally.
+        storage_options: fsspec storage options, or a callable returning them. Prefer the
+            callable for S3: it is re-invoked per block read, so the credential cannot be older
+            than that read. ``None`` lets fsspec infer credentials from the environment — which
+            on the radar path holds the SOURCE's short-lived token rather than our own role, so
+            ``None`` is only safe locally.
 
     Returns:
         Chunked dask boolean array aligned to the target grid (True = inside ROI).
@@ -191,13 +182,12 @@ def read_roi_mask(
 def load_geometries_from_geojson(input_path: str) -> tuple[list, CRS]:
     """Load geometries and detect CRS from a GeoJSON file (local or S3).
 
-    Handles FeatureCollection, Feature, and raw geometry types.
-    If the GeoJSON contains a ``crs`` property (e.g. from gdal_polygonize),
-    that CRS is returned; otherwise WGS84 is assumed.
+    Handles FeatureCollection, Feature and raw geometry types. A ``crs`` property (e.g. from
+    gdal_polygonize) is honoured; otherwise WGS84 is assumed.
 
     Args:
-        input_path: Path to the GeoJSON file. Any fsspec-compatible URI
-            (``s3://``, ``gs://``, ``file://``, absolute local path).
+        input_path: Path to the GeoJSON file. Any fsspec-compatible URI (``s3://``, ``gs://``,
+            ``file://``, absolute local path).
 
     Returns:
         Tuple of (list of Shapely geometries, detected CRS).
@@ -231,15 +221,14 @@ def load_geometries_from_geojson(input_path: str) -> tuple[list, CRS]:
 def load_s2_tile_geometry(tile_names: str, roi_bucket: str) -> list:
     """Load Sentinel-2 tile polygon(s) from the S3 tile index.
 
-    Accepts a single MGRS tile identifier or a comma-separated list of
-    identifiers.  The GeoJSON index is fetched once regardless of how many
-    tiles are requested.
+    Accepts one MGRS tile identifier or a comma-separated list; the GeoJSON index is fetched once
+    however many are requested.
 
     Args:
-        tile_names: One or more MGRS tile identifiers, comma-separated
-            (e.g. ``"14TPK"`` or ``"14TPK,14TQK,15TPK"``).
-        roi_bucket: Base URI for ROI storage (e.g. ``s3://my-bucket/rois``
-            or ``/local/path/rois``). Any fsspec-compatible URI is accepted.
+        tile_names: One or more MGRS tile identifiers, comma-separated (e.g. ``"14TPK"`` or
+            ``"14TPK,14TQK,15TPK"``).
+        roi_bucket: Base URI for ROI storage (e.g. ``s3://my-bucket/rois`` or
+            ``/local/path/rois``). Any fsspec-compatible URI is accepted.
 
     Returns:
         List of Shapely geometries for the requested tiles.
@@ -412,9 +401,9 @@ def rasterize_roi_zarr(
 ) -> str:
     """Rasterize GeoJSON polygons into a chunked boolean Zarr ROI mask.
 
-    Rasterizes per spatial chunk so the full output is never held in memory.
-    Each chunk calls ``rasterio.features.rasterize`` with a chunk-local
-    transform - only geometries that intersect the chunk contribute pixels.
+    Rasterizes per spatial chunk so the full output is never held in memory: each chunk calls
+    ``rasterio.features.rasterize`` with a chunk-local transform, and only geometries intersecting
+    the chunk contribute pixels.
 
     Zarr attrs stored:
         crs: CRS string (e.g. ``"EPSG:32615"``)
@@ -426,12 +415,11 @@ def rasterize_roi_zarr(
     Args:
         output_path: Path to output Zarr store (local directory or ``s3://`` URI).
         resolution: Output pixel size in meters.
-        chunk_size: Spatial chunk size in pixels (default
-            ``INGEST_CHUNK_SIZE``, matching the ingestion pipeline's
-            ``load_chunks`` so the ROI mask read during ingest is a clean
-            merge rather than a cross-chunk shuffle).
-        force_crs: Optional EPSG string (e.g. ``"EPSG:32633"``) to override
-            automatic UTM zone selection.
+        chunk_size: Spatial chunk size in pixels. Defaults to ``INGEST_CHUNK_SIZE``, matching the
+            ingestion pipeline's ``load_chunks`` so the ROI mask read during ingest is a clean
+            merge rather than a cross-chunk shuffle.
+        force_crs: Optional EPSG string (e.g. ``"EPSG:32633"``) overriding automatic UTM zone
+            selection.
         input_path: Path to input GeoJSON file (local or ``s3://``).
         geometries: Pre-loaded list of Shapely geometries (alternative to input_path).
 
@@ -454,10 +442,9 @@ def rasterize_roi_zarr(
     if not geometries:
         raise ValueError("No geometries found")
 
-    # Compute the WGS84 bounding box from the original geometry *before*
-    # reprojection.  This ensures the STAC query extent is projection-
-    # invariant — reprojecting to different target CRSes and back-projecting
-    # the axis-aligned grid bounds can inflate the bbox significantly.
+    # WGS84 bbox from the ORIGINAL geometry, before reprojection, so the STAC query extent is
+    # projection-invariant: reprojecting to different target CRSes and back-projecting the
+    # axis-aligned grid bounds can inflate the bbox significantly.
     wgs84_crs = CRS.from_epsg(4326)
     wgs84_geoms = reproject_geometries(geometries, input_crs, wgs84_crs) if input_crs != wgs84_crs else geometries
     bbox_wgs84 = unary_union(wgs84_geoms).bounds  # (minx, miny, maxx, maxy)
@@ -468,13 +455,12 @@ def rasterize_roi_zarr(
     reprojected = reproject_geometries(geometries, input_crs, target_crs)
     grid = compute_grid(reprojected, resolution, target_crs)
 
-    # Pre-build (geometry, burn_value) pairs once — reused in every chunk's
-    # rasterize call. Only geometries intersecting a chunk's extent actually
-    # contribute pixels; rasterio handles the spatial filtering internally.
+    # Pre-built once and reused in every chunk's rasterize call. Only geometries intersecting a
+    # chunk's extent contribute pixels; rasterio does the spatial filtering internally.
     geom_pairs = [(mapping(g), 1) for g in reprojected]
 
-    # Create the output Zarr array with spatial chunking matching the
-    # ingestion pipeline so downstream da.from_zarr reads are zero-copy.
+    # Spatial chunking matches the ingestion pipeline so downstream da.from_zarr reads are
+    # zero-copy.
     z = zarr.open(
         output_path,
         mode="w",
@@ -483,15 +469,15 @@ def rasterize_roi_zarr(
         dtype="bool",
     )
     assert isinstance(z, zarr.Array)
-    # Store spatial metadata so read_roi_metadata() can reconstruct the
-    # GeoBox and WGS84 bbox without the original GeoJSON.
+    # Spatial metadata, so read_roi_metadata() can reconstruct the GeoBox and WGS84 bbox without
+    # the original GeoJSON.
     z.attrs["crs"] = str(grid.target_crs)
     z.attrs["transform"] = list(grid.transform)[:6]
     z.attrs["resolution"] = grid.resolution
     z.attrs["bbox_wgs84"] = list(bbox_wgs84)
 
-    # Rasterize one spatial chunk at a time to bound memory usage.
-    # Each iteration shifts the base affine to the chunk's top-left corner.
+    # One spatial chunk at a time to bound memory; each iteration shifts the base affine to the
+    # chunk's top-left corner.
     valid_pixels = 0
     total_chunks = 0
     for y0 in range(0, grid.height, chunk_size):
@@ -511,8 +497,8 @@ def rasterize_roi_zarr(
             valid_pixels += int(chunk.sum())
             total_chunks += 1
 
-    # Write manifest only after rasterization completes successfully,
-    # so interrupted runs don't leave a partial store that looks valid.
+    # Written only after rasterization succeeds, so an interrupted run leaves no partial store
+    # that looks valid.
     manifest = RoiManifest(resolution=grid.resolution, chunk_size=chunk_size, crs=str(grid.target_crs))
     z.attrs["_manifest"] = manifest.to_dict()
     logger.info("Wrote _manifest to %s", output_path)

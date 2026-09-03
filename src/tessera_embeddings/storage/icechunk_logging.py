@@ -1,9 +1,9 @@
 """Ownership of icechunk's process-global log filter.
 
-Its own module, and deliberately a light one: it imports nothing from this package, so a
-caller that only wants to register a filter — the test suite's conftest, for one — does not
-drag in the writer, its logging configuration, or anything else. Putting it in
-``shard_writer`` did exactly that and broke ten unrelated log-capture tests.
+Deliberately a light module: it imports nothing from this package, so a caller that only wants to
+register a filter — the test suite's conftest, for one — does not drag in the writer or its logging
+configuration. Living in ``shard_writer`` did exactly that and broke ten unrelated log-capture
+tests.
 
 The filter is global and write-only — icechunk offers a setter and no getter — so "put it back
 how it was" is only possible if exactly one place tracks what "it was" is. That place is here.
@@ -22,15 +22,12 @@ import icechunk
 
 _log = logging.getLogger(__name__)
 
-#: What icechunk's own Rust tracing is raised to while a commit runs. EVERY icechunk module,
-#: not a chosen few: the point is to know where a stall stopped, and naming modules in advance
-#: assumes we already know which one that is. A commit normally takes about a second, so the
-#: volume is nil, and the one time it is not nil is the time we need it.
+#: What icechunk's own Rust tracing is raised to while a commit runs. EVERY icechunk module, not a
+#: chosen few: naming modules in advance assumes we already know which one a stall stops in.
 #:
-#: THE BARE ``warn`` IS LOAD-BEARING. ``set_logs_filter`` replaces the whole filter rather
-#: than adding to it, so a directive naming only icechunk would switch every OTHER target
-#: down for the duration — including its warnings and errors, and for as long as the commit
-#: lasts, which on a stall is forever. Raising icechunk's detail must not cost anyone else's.
+#: THE BARE ``warn`` IS LOAD-BEARING. ``set_logs_filter`` replaces the whole filter rather than
+#: adding to it, so a directive naming only icechunk would switch every OTHER target down for the
+#: duration — warnings and errors included, and on a stall that duration is forever.
 COMMIT_LOG_FILTER = "warn,icechunk=debug"
 
 #: How long a commit may run before the alarm starts. Every commit ever measured finished in
@@ -42,10 +39,9 @@ COMMIT_ALARM_S = 300.0
 #: lasts hours keeps proving it is still stuck without writing 140 stacks every five minutes.
 STACK_DUMP_EVERY = 10
 
-#: THE ONE OWNER of icechunk's process-global log filter. It has a setter and no getter, so a
-#: filter installed by anyone else is invisible to everyone else — which makes "put it back
-#: how it was" impossible unless exactly one place tracks what "it was" is. Seeded from the
-#: environment because that is icechunk's own entry point, read once at its import.
+#: THE ONE OWNER of icechunk's process-global log filter (setter, no getter — a filter installed
+#: behind this module's back is invisible and unrestorable). Seeded from the environment because
+#: that is icechunk's own entry point, read once at its import.
 _base_log_filter: str | None = os.environ.get("ICECHUNK_LOG") or None
 #: Overlapping commits share the one global filter, so the LAST one out restores it, not the
 #: first. `plan()` commits an all-ocean cell on the feeder thread while the trailing thread
@@ -57,18 +53,15 @@ _tracing_lock = threading.Lock()
 def set_base_logs_filter(directive: str | None) -> None:
     """Install a standing icechunk log filter, and record it as the one to return to.
 
-    Call this instead of :func:`icechunk.set_logs_filter`. Going direct is not wrong so much
-    as unrecoverable: the filter is process-global and write-only, so a directive set behind
-    this module's back is one it cannot see, cannot preserve, and will overwrite the next time
-    a commit finishes.
+    Call this instead of :func:`icechunk.set_logs_filter`: the filter is process-global and
+    write-only, so a directive set behind this module's back is one it cannot see, cannot
+    preserve, and will overwrite the next time a commit finishes.
 
-    **Installed first, recorded only if that succeeded, and errors are NOT swallowed.** The
-    order matters: recording a directive icechunk then rejected would leave every later
-    :func:`commit_tracing` believing an operator filter was in force, so it would skip the
-    commit diagnostics — on the strength of a filter that was never installed, and without
-    the caller hearing that their configuration failed. Unlike :func:`commit_tracing`, which
-    must never cost a commit, this is a configuration call made at start-up: a malformed
-    directive is a caller's mistake and is worth hearing about.
+    **Installed first, recorded only if that succeeded, and errors are NOT swallowed.** Recording
+    a directive icechunk then rejected would leave every later :func:`commit_tracing` believing an
+    operator filter was in force and skipping the commit diagnostics, on the strength of a filter
+    that was never installed. This is a start-up configuration call, not a commit path: a malformed
+    directive is worth raising.
 
     Args:
         directive: A tracing directive, or ``None`` for icechunk's default.
@@ -89,25 +82,18 @@ def set_base_logs_filter(directive: str | None) -> None:
 def _commit_alarm(what: str) -> Iterator[None]:
     """Shout, repeatedly, for as long as a commit has not returned — and dump the stacks.
 
-    A stalled commit is silent by construction: our own last line is printed before the call
-    and the next only after it returns, so hours of nothing look exactly like a commit that
-    finished. On 2026-08-29 that silence is what made seven stalled assemblies take a day to
-    even localise. An alarm that repeats is the difference between "this stopped at 09:04"
-    and "we noticed at 16:00".
+    A stalled commit is silent by construction: our last line is printed before the call and the
+    next only after it returns, so hours of nothing look exactly like a commit that finished. On
+    2026-08-29 that silence made seven stalled assemblies take a day to even localise.
 
-    **The stack dump is the part that could not be got any other way.** `py-spy` needs
-    `CAP_SYS_PTRACE`, which Fargate does not grant, and `/proc/<pid>/syscall` and
-    `/proc/<pid>/stack` are gated the same way — all three were tried against a live stalled
-    task and all three refused. `faulthandler` runs INSIDE the process, so it needs no
-    permission at all, and it prints every thread's Python stack. That names the exact call
-    the assembly thread is parked in, and shows what the other threads are doing beside it.
+    **The stack dump could not be got any other way.** `py-spy` needs `CAP_SYS_PTRACE`, which
+    Fargate does not grant, and `/proc/<pid>/syscall` and `/proc/<pid>/stack` are gated the same
+    way — all three were tried against a live stalled task and refused. `faulthandler` runs INSIDE
+    the process, needs no permission, and prints every thread's Python stack, naming the exact call
+    the assembly thread is parked in.
 
-    Dumped on the first alarm and every tenth after, because a stall lasting hours should keep
-    proving it is still stuck without writing 140 stacks every five minutes.
-
-    Best-effort throughout, on its own daemon thread: an alarm that can end the work it is
-    watching, or that dies on one failed emission and lets the silence back in, is worse than
-    no alarm at all.
+    Best-effort throughout, on its own daemon thread: an alarm that can end the work it watches, or
+    that dies on one failed emission, is worse than no alarm.
     """
     returned = threading.Event()
 
@@ -152,11 +138,10 @@ def traced_commit(
 ) -> str:
     """Commit with icechunk's tracing raised — the ONE way an assembly reaches a commit.
 
-    A helper rather than a rule to remember, because the value only shows up on the one
-    occasion nobody is watching. Every commit in an assembly can stall the same way, and a
-    commit that stalls outside a tracing scope produces exactly the silence that made the
-    2026-08-29 incident take a day to localise. Routing them all through here means a commit
-    added later is instrumented by default rather than by whoever remembers.
+    A helper rather than a rule to remember: every commit in an assembly can stall the same way,
+    and one that stalls outside a tracing scope produces exactly the silence that made the
+    2026-08-29 incident take a day to localise. Routing them all through here instruments a
+    commit added later by default.
 
     Args:
         session: The icechunk session to commit.
@@ -176,31 +161,23 @@ def traced_commit(
 def commit_tracing() -> Iterator[None]:
     """Raise icechunk's internal tracing for the duration of one commit.
 
-    On 2026-08-29 seven of eleven assemblies reached this call and never returned — no
-    exception, no CPU, no outstanding request, for hours. The commit is the one step in the
-    pipeline whose insides we cannot see: everything before it reports progress, and it does
-    not. Nothing in our own logs can distinguish a commit waiting on the session lock from one
-    waiting inside a storage request, because our last line is printed BEFORE the call and the
-    next only after it returns.
-
-    icechunk instruments itself with ``tracing`` and exposes the filter, so the lines exist —
-    they are simply switched off. Raised here, the last line before a stall names the function
-    it entered and never left, with file and line.
+    On 2026-08-29 seven of eleven assemblies reached this call and never returned — no exception,
+    no CPU, no outstanding request, for hours. The commit is the one pipeline step whose insides we
+    cannot see, and nothing in our own logs distinguishes a commit waiting on the session lock from
+    one waiting inside a storage request. icechunk instruments itself with ``tracing`` and exposes
+    the filter, so those lines exist and are merely switched off; raised here, the last line before
+    a stall names the function it entered and never left, with file and line.
 
     Scoped to the commit rather than set process-wide because the filter is GLOBAL and the
-    fork-write phase would otherwise log a line per chunk for hours. A commit normally takes
-    about a second, so the volume is nil and the value only appears when one does not.
+    fork-write phase would otherwise log a line per chunk for hours.
 
-    **A configured filter wins outright.** If anything has set one, this does nothing at all:
-    it does not replace it, and it does not append to it. Appending would be worse than it
-    sounds — ``EnvFilter`` resolves a target to its MOST SPECIFIC directive, so adding
-    ``icechunk::session=debug`` beside an operator's ``icechunk=trace`` would quietly DOWNGRADE
-    the very module they asked to see, during the very operation they are investigating. An
-    operator who wants both can name both in ``ICECHUNK_LOG``.
+    **A configured filter wins outright** — this neither replaces nor appends to it. Appending is
+    the trap: ``EnvFilter`` resolves a target to its MOST SPECIFIC directive, so adding
+    ``icechunk::session=debug`` beside an operator's ``icechunk=trace`` would quietly DOWNGRADE the
+    module they asked to see. An operator who wants both names both in ``ICECHUNK_LOG``.
 
-    Reference-counted, because overlapping commits share the one global filter and the last
-    one out must restore it. Best-effort: a version without the hook, or a failed set, must
-    never cost a commit.
+    Reference-counted, because overlapping commits share the one global filter and the last one out
+    must restore it. Best-effort: a missing hook or a failed set must never cost a commit.
     """
     global _tracing_depth
     setter = getattr(icechunk, "set_logs_filter", None)

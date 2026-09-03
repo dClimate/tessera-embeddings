@@ -1,12 +1,11 @@
 """Core inference loop for Tessera v1.1 embeddings.
 
-Iterates buckets (pixels sharing a ``(s2_target, s1_target)`` key), then
-sub-batches each bucket by ``config.batch_size``. Each sub-batch goes through
-a single forward pass; the 192-D output is sliced to the canonical 128-D
-downstream representation and written into a flat per-pixel output array.
+Iterates buckets (pixels sharing a ``(s2_target, s1_target)`` key), then sub-batches each bucket
+by ``config.batch_size``. Each sub-batch takes one forward pass; the 192-D output is sliced to the
+canonical 128-D downstream representation and written into a flat per-pixel output array.
 
-Sampling is deterministic under v1.1 (no random repeats), so ``compute_std``
-from v1.0 is now a no-op and the ``embeddings_std`` field is always ``None``.
+v1.1 sampling is deterministic (no random repeats), so ``compute_std`` is a no-op and
+``embeddings_std`` is always ``None``.
 """
 
 from __future__ import annotations
@@ -42,9 +41,9 @@ PROFILE_BATCH_IDX = 10
 """Batch index for the one-time deep profile (per-layer timing + dtype checks)."""
 
 _SERIAL_LOOP_ENV = "TESSERA_SERIAL_GPU_LOOP"
-"""Set to any non-empty value to force the synchronous per-batch GPU loop
-(pageable transfers, host sync per sub-batch) instead of the pipelined one.
-Escape hatch for debugging the async pipeline in production."""
+"""Any non-empty value forces the synchronous per-batch GPU loop (pageable transfers, host sync
+per sub-batch) instead of the pipelined one — an escape hatch for debugging the async pipeline in
+production."""
 
 
 @dataclass
@@ -95,21 +94,18 @@ class InferenceResult:
 def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> torch.dtype | None:
     """Configure model and GPU for inference.
 
-    On CUDA: converts to BF16 (preferred) and enables cuDNN benchmark mode.
-    Falls back to FP16 on GPUs that don't support BF16 (e.g. T4, compute
-    capability < 8.0). BF16 is strongly preferred — it has the same exponent
-    range as FP32 and avoids overflow on large intermediate activations. The
-    FP16 fallback is functional but carries a risk of inf/NaN from saturation
-    at 65504; treat it as a best-effort path, not a validated production config.
+    On CUDA, converts to BF16 and falls back to FP16 only where BF16 is unsupported (T4, compute
+    capability < 8.0). BF16 is strongly preferred: same exponent range as FP32, so no overflow on
+    large intermediate activations. The FP16 fallback works but risks inf/NaN from saturation at
+    65504 — a best-effort path, not a validated production config.
 
-    The dtype conversion is idempotent: actors reuse one persistent model
-    across every strip and chunk, so once converted the model already carries
-    the target dtype and we skip the (non-trivial) re-cast. This hoists the
-    one-time conversion cost to the first strip instead of paying it per strip.
+    The dtype conversion is idempotent. Actors reuse one persistent model across every strip and
+    chunk, so the non-trivial re-cast is skipped once converted, paying the conversion on the
+    first strip rather than every strip.
 
     Returns:
-        The reduced-precision dtype to use for inputs (bfloat16 or float16), or None
-        on CPU (inputs stay float32).
+        The reduced-precision dtype for inputs (bfloat16 or float16), or None on CPU (inputs stay
+        float32).
     """
     log_cuda_diagnostics(device)
 
@@ -128,11 +124,10 @@ def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> tor
         model.half()
         logger.warning("BF16 not supported on this GPU; falling back to FP16")
 
-    # benchmark=False: with variable bucket shapes (per-bucket seq lengths +
-    # partial final sub-batches) the autotuner re-searches constantly for little
-    # gain, and inflates the host-side cuDNN footprint by trial-loading multiple
-    # algorithms and holding the largest workspace it tried. Disabling it lowers
-    # the first-batch host-RAM plateau. See inference RAM investigation.
+    # benchmark=False: with variable bucket shapes (per-bucket seq lengths + partial final
+    # sub-batches) the autotuner re-searches constantly for little gain, and inflates the
+    # host-side cuDNN footprint by trial-loading multiple algorithms and holding the largest
+    # workspace it tried. Disabling it lowers the first-batch host-RAM plateau.
     torch.backends.cudnn.benchmark = False
     logger.debug("cuDNN benchmark mode disabled (variable input shapes)")
     log_autocast_dtype_probe(device, dtype=dtype)
@@ -164,23 +159,21 @@ def _transfer_and_forward(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
     """Transfer → forward → slice → quantize on-device → copy int8 to host.
 
-    Must be called inside a ``torch.no_grad()`` context, on the thread that owns
-    the GPU. Returns ``(q_host, scales_host, global_idxs, transfer_secs,
-    forward_secs)`` where ``q_host`` is the ``(B, save_dim)`` int8 array and
-    ``scales_host`` the ``(B,)`` float32 scales, both already on the host and
-    ready for :func:`_write_quantized_rows`.
+    Must be called inside a ``torch.no_grad()`` context, on the thread that owns the GPU. Returns
+    ``(q_host, scales_host, global_idxs, transfer_secs, forward_secs)``, where ``q_host`` is the
+    ``(B, save_dim)`` int8 array and ``scales_host`` the ``(B,)`` float32 scales, both already on
+    the host and ready for :func:`_write_quantized_rows`.
 
-    Quantization runs on-device (:func:`quantize_rows_torch`) in the forward's
-    compute stream, so its seq-length-independent cost folds into GPU work rather
-    than gating a separate CPU stage — the case that hurt low-observation chunks,
-    whose forwards are tiny. It also shrinks the D2H copy ~4x (int8 + scales vs.
-    float32 embeddings).
+    Quantization runs on-device (:func:`quantize_rows_torch`) in the forward's compute stream, so
+    its seq-length-independent cost folds into GPU work rather than gating a separate CPU stage —
+    the case that hurt low-observation chunks, whose forwards are tiny. It also shrinks the D2H
+    copy ~4x (int8 + scales versus float32 embeddings).
 
-    On CUDA the transfer, forward, and quantize run on the default stream with no
-    intervening ``synchronize`` — the trailing ``.cpu()`` is the sync point, so
-    ordering is preserved. Per-phase times are coarse wall clock (for rough
-    logging, not precise attribution); ``profile`` adds one ``synchronize`` so
-    the one-shot profile batch reports an accurate forward time.
+    On CUDA the transfer, forward and quantize run on the default stream with no intervening
+    ``synchronize``; the trailing ``.cpu()`` is the sync point, so ordering is preserved.
+    Per-phase times are coarse wall clock, for rough logging rather than precise attribution;
+    ``profile`` adds one ``synchronize`` so the one-shot profile batch times its forward
+    accurately.
     """
     tb1 = time.monotonic()
 
@@ -224,15 +217,13 @@ def _transfer_and_forward(
                 s1_seq_len=bucket_key[1],
             )
 
-    # Slice 192-D rep to canonical save_dim, quantize on-device, then pull the
-    # compact int8 + scales to host in one D2H. The .cpu() blocks until the
-    # forward+quantize complete, which is what bounds the GPU work for this batch.
+    # Slice the 192-D rep to save_dim, quantize on-device, then pull the compact int8 + scales to
+    # host in one D2H. The .cpu() blocks until forward+quantize complete, bounding this batch.
     q, scales = quantize_rows_torch(z[:, :save_dim])
     q_host = q.cpu().numpy()
     scales_host = scales.cpu().numpy()
-    # Finiteness is validated on the host-side scales (equivalent to checking
-    # the embeddings — see raise_on_nonfinite_scales) so the GPU pipeline never
-    # pays a device-wide sync for the check.
+    # Finiteness is validated on the HOST-side scales (equivalent to checking the embeddings —
+    # see raise_on_nonfinite_scales) so the GPU pipeline never pays a device-wide sync for it.
     raise_on_nonfinite_scales(scales_host)
     return q_host, scales_host, global_idxs, tb2 - tb1, tb3 - tb2
 
@@ -246,9 +237,9 @@ def _write_quantized_rows(
 ) -> None:
     """Scatter already-quantized rows into the flat output buffers in place.
 
-    A cheap memcpy — the arithmetic now happens on-device in
-    :func:`_transfer_and_forward`. Each call writes only its own bucket's
-    ``global_idxs`` (disjoint across sub-batches), so writes never contend.
+    A cheap memcpy: the arithmetic happens on-device in :func:`_transfer_and_forward`. Each call
+    writes only its own bucket's ``global_idxs``, disjoint across sub-batches, so writes never
+    contend.
     """
     flat_q[global_idxs] = q_host
     flat_scales[global_idxs] = scales_host
@@ -272,15 +263,13 @@ class _LoopProgress:
     tokens: int = 0
     flops: int = 0
     sub_batch_idx: int = 0
-    # Worst single-batch CPU prep this call — averages hide the spikes that
-    # actually starve the GPU (feed-fix telemetry; see actors' reserve_cpus).
+    # Worst single-batch CPU prep this call: averages hide the spikes that actually starve the
+    # GPU (see actors' reserve_cpus).
     get_batch_max: float = 0.0
-    # Per-bucket (pixels, sub-batches) — the workload-side input to any
-    # token-budget batching decision: the expected gain is bucket occupancy
-    # weighted by the per-shape speedup curve, and occupancy varies by region,
-    # so it is logged on every run rather than assumed from one measurement.
-    # Counts only — per-bucket forward times are NOT recorded because the
-    # pipelined loop's timings are enqueue-side and would mislead.
+    # Per-bucket (pixels, sub-batches) — the workload-side input to any token-budget batching
+    # decision, since the expected gain is bucket occupancy weighted by the per-shape speedup
+    # curve and occupancy varies by region. Counts only: per-bucket forward times are NOT
+    # recorded, because the pipelined loop's timings are enqueue-side and would mislead.
     bucket_px: dict[tuple[int, int], tuple[int, int]] = field(default_factory=dict)
 
     def record(self, bucket_key: tuple[int, int], n_px: int, timings: _BatchTimings) -> None:
@@ -380,8 +369,8 @@ def _run_sync_batch(
 ) -> None:
     """One synchronous transfer → forward → scatter batch, with timing record.
 
-    Shared by ``_serial_loop`` and the pipelined loop's profile batch so the
-    postprocess-timing arithmetic lives once.
+    Shared by ``_serial_loop`` and the pipelined loop's profile batch so the postprocess-timing
+    arithmetic lives once.
     """
     tb0 = time.monotonic()
     q_host, scales_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
@@ -403,10 +392,9 @@ def _run_sync_batch(
 class _PinnedSlot:
     """Reusable pinned staging buffers for one in-flight sub-batch.
 
-    Inputs are staged as flat float32 buffers sized to the chunk's largest
-    (batch, seq-len) so any sub-batch shape carves a contiguous view — a
-    contiguous pinned view is what makes ``.to(device, non_blocking=True)`` a
-    single async DMA instead of a hidden staging copy.
+    Inputs are staged as flat float32 buffers sized to the chunk's largest (batch, seq-len) so any
+    sub-batch shape carves a CONTIGUOUS view — which is what makes ``.to(device,
+    non_blocking=True)`` a single async DMA instead of a hidden staging copy.
     """
 
     def __init__(self, batch_size: int, t_s2_max: int, t_s1_max: int, save_dim: int) -> None:
@@ -421,9 +409,9 @@ class _PinnedSlot:
 class _InFlight:
     """Bookkeeping for a sub-batch whose GPU work is enqueued but not drained.
 
-    Holds the device-side ``q``/``scales`` refs until the D2H completes so the
-    caching allocator cannot hand their blocks to a later batch while the
-    async copy still reads them (belt-and-braces; the copy is stream-ordered).
+    Holds the device-side ``q``/``scales`` refs until the D2H completes, so the caching allocator
+    cannot hand their blocks to a later batch while the async copy still reads them
+    (belt-and-braces; the copy is stream-ordered).
     """
 
     slot: _PinnedSlot
@@ -450,17 +438,15 @@ def _pipelined_gpu_loop(
 ) -> None:
     """Two-deep asynchronous GPU loop: batch i+1 is enqueued while i executes.
 
-    Everything runs on the current CUDA stream in the same op order as the
-    serial loop (bit-identical results); the difference is purely *when* the
-    host waits. Inputs are staged in pinned buffers (async H2D), outputs copy
-    back asynchronously with a CUDA event per batch, and the host only blocks
-    on the event of the batch one behind — so the GPU always has the next
-    sub-batch's work queued and never idles on Python bookkeeping, H2D, or the
-    scatter-back. Per-phase TIMING numbers here are *enqueue-side* costs
-    (postprocess = drain wait); wall-clock px/s and tok/s are unaffected.
+    Everything runs on the current CUDA stream in the same op order as the serial loop, so results
+    are bit-identical; only *when* the host waits differs. Inputs are staged in pinned buffers
+    (async H2D), outputs copy back asynchronously with a CUDA event per batch, and the host blocks
+    only on the event of the batch one behind — so the GPU always has the next sub-batch queued
+    and never idles on Python bookkeeping, H2D, or the scatter-back. Per-phase TIMING numbers here
+    are *enqueue-side* costs (postprocess = drain wait); wall-clock px/s and tok/s are unaffected.
 
-    The one-shot deep profile still runs through the synchronous path: the
-    pipeline is drained first, so its per-layer timings stay accurate.
+    The one-shot deep profile still runs through the synchronous path, with the pipeline drained
+    first, so its per-layer timings stay accurate.
     """
     if not sub_batches:
         return
@@ -585,19 +571,18 @@ def run_inference(
     bucket_sizes = dataset.bucket_sizes()
     total_sub_batches = sum((n + batch_size - 1) // batch_size for n in bucket_sizes.values())
 
-    # Save the canonical 128-D slice of the model's 192-D representation.
-    # If the model is configured smaller (e.g. tiny test model), save the full width.
+    # The canonical 128-D slice of the model's 192-D representation, or the full width when the
+    # model is configured smaller (a tiny test model).
     save_dim = min(EMBEDDING_DIM, config.representation_dim)
 
     h, w = dataset.H, dataset.W
-    # Quantize per bucket into skinny int8 + scale buffers instead of accumulating
-    # the whole chunk in float32 (4x smaller resident accumulator). Pixels whose
-    # embeddings can't be generated — failed validity, or outside the ROI but
-    # inside the bbox (zeroed during ingest, so they fail the nonzero check and
-    # never enter a bucket) — keep their initial values: embeddings 0 in every
-    # band, scale NaN. Only pixels run through the model overwrite their slot via
-    # flat_scales[global_idxs] = s. This matches the NaN-scale / 0-embedding fill
-    # assembly applies to skipped and non-intersecting chunks.
+    # Quantized per bucket into skinny int8 + scale buffers rather than accumulating the whole
+    # chunk in float32 (4x smaller resident accumulator). Pixels whose embeddings cannot be
+    # generated — failed validity, or outside the ROI but inside the bbox (zeroed during ingest,
+    # so they fail the nonzero check and never enter a bucket) — keep their initial values:
+    # embeddings 0 in every band, scale NaN. Only pixels run through the model overwrite their
+    # slot. This matches the NaN-scale / 0-embedding fill assembly applies to skipped and
+    # non-intersecting chunks.
     flat_q = np.zeros((h * w, save_dim), dtype=np.int8)
     flat_scales = np.full(h * w, np.nan, dtype=np.float32)
 
@@ -610,15 +595,13 @@ def run_inference(
     )
     reduced_precision_dtype = _prepare_gpu(model, device)
 
-    # px/s conflates sequence length across chunks (a sparse chunk's pixel is
-    # ~10x cheaper than a dense one's), so _LoopProgress also tracks tokens
-    # (= pixels x (T_s2 + T_s1)) and transformer FLOPs for density-neutral
-    # throughput reporting.
+    # px/s conflates sequence length across chunks (a sparse chunk's pixel is ~10x cheaper than a
+    # dense one's), so _LoopProgress also tracks tokens (= pixels x (T_s2 + T_s1)) and transformer
+    # FLOPs for density-neutral throughput reporting.
     d_model = config.latent_dim * 4
     t0 = time.monotonic()
 
-    # Flatten (bucket_key, start, end) triples so the prefetch thread can
-    # pipeline CPU batch prep across bucket boundaries.
+    # Flattened so the prefetch thread can pipeline CPU batch prep across bucket boundaries.
     sub_batches: list[tuple[tuple[int, int], int, int]] = []
     for bucket_key, pixel_indices in dataset.iter_buckets(largest_first=True):
         n_in_bucket = int(pixel_indices.size)
@@ -640,10 +623,9 @@ def run_inference(
         on_batch=on_batch,
     )
 
-    # Two prep workers keep PREFETCH_DEPTH batches staged: depth 1 starved the
-    # GPU whenever a forward ran shorter than one CPU prep (partial sub-batches,
-    # short sequences). Quantization is not a CPU stage — it runs on-device —
-    # so the scatter-back is a cheap memcpy either way.
+    # PREFETCH_DEPTH prep workers keep that many batches staged: depth 1 starved the GPU whenever
+    # a forward ran shorter than one CPU prep (partial sub-batches, short sequences). Quantization
+    # is not a CPU stage — it runs on-device — so the scatter-back is a cheap memcpy either way.
     use_pipelined = device.type == "cuda" and not os.environ.get(_SERIAL_LOOP_ENV)
     with torch.no_grad(), ThreadPoolExecutor(max_workers=PREFETCH_DEPTH, thread_name_prefix="prefetch") as pool:
         prefetched: deque[Future[tuple[dict[str, np.ndarray], float]]] = deque()

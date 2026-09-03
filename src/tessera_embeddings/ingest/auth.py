@@ -1,17 +1,15 @@
 """NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data.
 
-Provides two access modes for OPERA RTC-S1 data on ASF:
+Two access modes for OPERA RTC-S1 data on ASF:
 
-1. **S3 direct access** (preferred): Fetches temporary STS credentials from
-   ASF's cumulus endpoint, enabling in-region S3 reads from us-west-2.
-   One HTTP call per task (~0.5s) replaces hundreds of redirect chains.
+1. **S3 direct access** (preferred): temporary STS credentials from ASF's cumulus endpoint enable
+   in-region S3 reads from us-west-2. One HTTP call per task (~0.5 s) replaces hundreds of
+   redirect chains.
+2. **CloudFront signed URLs** (legacy): pre-resolves asset URLs through a 5-hop OAuth redirect
+   chain. Kept for backwards compatibility.
 
-2. **CloudFront signed URLs** (legacy): Pre-resolves asset URLs through a
-   5-hop OAuth redirect chain. Kept for backwards compatibility.
-
-Prerequisites:
-  - EDL account with EARTHDATA_USERNAME + EARTHDATA_PASSWORD env vars
-  - ASF Cumulus app approved at urs.earthdata.nasa.gov (Authorized Apps)
+Prerequisites: an EDL account exported as EARTHDATA_USERNAME + EARTHDATA_PASSWORD, and the ASF
+Cumulus app approved under Authorized Apps at urs.earthdata.nasa.gov.
 """
 
 from __future__ import annotations
@@ -42,10 +40,9 @@ _EDL_TOKEN_URL = f"https://{_AUTH_HOST}/api/users/token"
 _S3_CREDENTIALS_URL = "https://cumulus.asf.alaska.edu/s3credentials"
 _OPERA_S3_BUCKET = "asf-cumulus-prod-opera-products"
 
-# Hosts that are trusted to receive EDL credentials across redirects. The
-# datapool → URS → cumulus → CloudFront chain stays within asf.alaska.edu,
-# earthdatacloud.nasa.gov, and urs.earthdata.nasa.gov; any redirect to a
-# host outside this set must drop the Authorization header.
+# Hosts trusted to receive EDL credentials across redirects. The datapool → URS → cumulus →
+# CloudFront chain stays within these three; any redirect to a host outside the set must drop
+# the Authorization header.
 _TRUSTED_AUTH_SUFFIXES = (
     "urs.earthdata.nasa.gov",
     "asf.alaska.edu",
@@ -64,13 +61,10 @@ _BAND_SUFFIX_RE = re.compile(r"_(VV|VH|mask)\.tif$")
 class _EDLSession(requests.Session):
     """Session that preserves auth headers across NASA's cross-domain redirects.
 
-    Python ``requests`` strips the Authorization header when following a
-    redirect to a different domain.  ASF's download chain redirects from
-    datapool.asf.alaska.edu → urs.earthdata.nasa.gov → CloudFront, so the
-    credentials are lost and URS returns 401.
-
-    This subclass overrides ``rebuild_auth`` to keep the header whenever the
-    redirect target is (or came from) ``urs.earthdata.nasa.gov``, following
+    ``requests`` strips the Authorization header on a redirect to a different domain, and ASF's
+    download chain redirects datapool.asf.alaska.edu -> urs.earthdata.nasa.gov -> CloudFront, so
+    the credentials are lost and URS returns 401. ``rebuild_auth`` is overridden to keep the
+    header whenever the redirect target is (or came from) ``urs.earthdata.nasa.gov``, following
     NASA's documented pattern.
     """
 
@@ -88,28 +82,23 @@ class _EDLSession(requests.Session):
     def rebuild_auth(self, prepared_request: requests.PreparedRequest, response: requests.Response) -> None:
         """Re-inject auth on cross-domain redirects within the EDL/ASF chain.
 
-        ``requests`` strips Authorization on every cross-domain redirect, and
-        by the time a redirect reaches URS the header is already gone from an
-        earlier hop (datapool → cumulus stripped it).  We must actively
-        re-apply credentials, not just skip the strip — a plain ``return``
-        would preserve "already missing".
+        ``requests`` strips Authorization on every cross-domain redirect, and by the time a
+        redirect reaches URS the header is already gone from an earlier hop (datapool -> cumulus
+        stripped it). Credentials must be actively RE-APPLIED, not merely spared the strip — a
+        plain ``return`` would preserve "already missing".
 
-        The two auth modes are scoped differently because they carry very
-        different blast radii:
+        The two auth modes are scoped differently because their blast radii differ:
 
-        * **Basic auth** via ``self.auth`` is the user's permanent EDL
-          password.  It is only re-injected on redirects to URS
-          (``urs.earthdata.nasa.gov``), the OAuth handshake target.  Other
-          ASF / Earthdata Cloud hosts in the chain don't need it — URS issues
-          a token / sets cookies and redirects onward — and sending the
-          password to non-URS hosts would leak the user's credentials.
+        * **Basic auth** via ``self.auth`` is the user's permanent EDL password, re-injected only
+          on redirects to URS (``urs.earthdata.nasa.gov``), the OAuth handshake target. Other ASF
+          / Earthdata Cloud hosts do not need it — URS issues a token, sets cookies and redirects
+          onward — and sending the password to a non-URS host would leak the user's credentials.
 
-        * **Bearer token** via ``self.headers['Authorization']`` (the local
-          SAML fallback) is scoped and time-limited.  Session headers get
-          merged into the prepared request before ``rebuild_auth`` runs, so
-          requests' default behaviour strips it on every cross-domain hop —
-          we must restore it across the whole trusted chain (datapool → URS
-          → cumulus → CloudFront) for the bearer path to work at all.
+        * **Bearer token** via ``self.headers['Authorization']`` (the local SAML fallback) is
+          scoped and time-limited. Session headers merge into the prepared request BEFORE
+          ``rebuild_auth`` runs, so requests strips it on every cross-domain hop; it has to be
+          restored across the whole trusted chain (datapool -> URS -> cumulus -> CloudFront) for
+          the bearer path to work at all.
         """
         redirect_host = (urlparse(prepared_request.url or "").hostname or "").lower()
 
@@ -133,28 +122,18 @@ class _EDLSession(requests.Session):
 def get_edl_session() -> _EDLSession:
     """Create an authenticated requests session for ASF datapool.
 
-    Returns a session that preserves auth headers across NASA's
-    cross-domain OAuth redirect chain (ASF → URS → CloudFront).
+    The session preserves auth headers across NASA's cross-domain OAuth redirect chain
+    (ASF -> URS -> CloudFront). Two modes:
 
-    Authentication modes:
-
-    * **Basic auth** via ``EARTHDATA_USERNAME`` + ``EARTHDATA_PASSWORD``
-      is the production path. Production deployments set only these
-      two env vars and the contract our deployed pipelines rely on is
-      basic auth.
-    * **Bearer token** via ``EARTHDATA_TOKEN`` is a LOCAL DEVELOPMENT
-      FALLBACK ONLY. NASA EDL accounts that authenticate through
-      SAML / Launchpad cannot complete a basic-auth handshake against
-      datapool — the redirect chain returns 401 even when the user has
-      approved the ASF Data Access app. A user-generated bearer token
-      (from urs.earthdata.nasa.gov/profile) survives the redirect
-      chain when set as a session-level header.
-
-      Production deployments MUST NOT set ``EARTHDATA_TOKEN``: tokens
-      have a finite TTL and are not suitable for unattended workloads.
-      Bearer takes precedence when both are set, on the assumption
-      that a developer who has explicitly exported a token does so to
-      override basic auth that doesn't work for their account.
+    * **Basic auth** via ``EARTHDATA_USERNAME`` + ``EARTHDATA_PASSWORD`` is the production path,
+      and the contract deployed pipelines rely on.
+    * **Bearer token** via ``EARTHDATA_TOKEN`` is a LOCAL DEVELOPMENT FALLBACK ONLY. NASA EDL
+      accounts that authenticate through SAML / Launchpad cannot complete a basic-auth handshake
+      against datapool — the redirect chain returns 401 even when the user has approved the ASF
+      Data Access app. A user-generated token (urs.earthdata.nasa.gov/profile) survives the chain
+      when set as a SESSION-LEVEL header. Production MUST NOT set it: tokens have a finite TTL
+      and are unsuitable for unattended workloads. Bearer wins when both are set, since a
+      developer who exported a token did so to override basic auth their account cannot use.
 
     Returns:
         Authenticated session with redirect-safe auth handling
@@ -167,9 +146,8 @@ def get_edl_session() -> _EDLSession:
     token = os.environ.get("EARTHDATA_TOKEN")
 
     if token:
-        # LOCAL-ONLY FALLBACK: set bearer at session level so _EDLSession's
-        # rebuild_auth can re-inject it on each hop of the cross-domain
-        # redirect chain (datapool → URS → cumulus → CloudFront).
+        # LOCAL-ONLY FALLBACK: bearer at SESSION level so _EDLSession's rebuild_auth can
+        # re-inject it on each hop of the chain (datapool → URS → cumulus → CloudFront).
         session = _EDLSession()
         session.headers["Authorization"] = f"Bearer {token}"
         return session
@@ -230,8 +208,8 @@ def resolve_item_assets(
 def _get_edl_token(session: _EDLSession) -> str:
     """Get an EDL bearer token, reusing an existing one if available.
 
-    EDL accounts have a maximum token limit. This function first checks
-    for existing tokens (GET) before creating a new one (POST).
+    EDL accounts have a maximum token limit, so existing tokens are listed (GET) before a new one
+    is created (POST).
 
     Args:
         session: Authenticated _EDLSession (with .auth set)
@@ -319,10 +297,9 @@ def get_s3_credentials(
 def _datapool_url_to_s3(url: str) -> str:
     """Convert an ASF OPERA HTTPS URL to an S3 URI.
 
-    CMR-STAC returns two URL patterns depending on satellite vintage.
-    Older S1A products use datapool (flat filename); newer S1C products
-    use earthdatacloud (nested path matching S3 layout). Both map to the
-    same S3 bucket but require different transformations:
+    CMR-STAC returns two URL patterns depending on satellite vintage: older S1A products use
+    datapool (flat filename), newer S1C products use earthdatacloud (nested path matching the S3
+    layout). Both map to the same bucket but need different transformations:
 
     1. **datapool** (flat) — strip band suffix to derive granule dir::
 
@@ -372,23 +349,19 @@ def _build_aws_env(creds: dict[str, str]) -> dict[str, str]:
 def _patch_odc_thread_session_for_env_drift() -> None:
     """Make odc.loader's per-thread AWSSession cache self-invalidate on env drift.
 
-    odc.loader's ThreadSession caches a boto3 AWSSession in threading.local on
-    first use — subsequent os.environ updates are ignored for that thread's
-    lifetime. Since Dask task pool threads are long-lived, an initial STS token
-    (1hr TTL) gets pinned across refreshes and expires mid-read.
+    odc.loader's ThreadSession caches a boto3 AWSSession in threading.local on first use, and
+    ignores later os.environ updates for that thread's lifetime. Dask task pool threads are
+    long-lived, so an initial STS token (1 hr TTL) gets pinned across refreshes and expires
+    mid-read. Resetting _local from the plugin setup() clears only the worker's main thread;
+    patching session() pushes the check into every thread — on each call, if the cached session's
+    access key differs from AWS_ACCESS_KEY_ID in env, drop it and rebuild from current env.
 
-    Resetting _local from the plugin setup() only clears the worker's main
-    thread, not the task pool threads. Patching session() itself pushes the
-    check into every thread: on each call, if the cached session's access key
-    differs from AWS_ACCESS_KEY_ID in env, drop it and rebuild from current env.
+    Dropping it must NOT go through ``ThreadSession.reset()``: that also calls
+    ``rasterio.env.delenv()``, and ``session()`` is called from inside ``rio_env()``, nested in
+    the environment odc wraps around a whole Dask chunk task. Tearing that down loses the task's
+    GDAL options — the HTTP retry ladder among them — for every read after the refresh.
 
-    Dropping it must not go through ``ThreadSession.reset()``: that also calls
-    ``rasterio.env.delenv()``, and ``session()`` is called from inside
-    ``rio_env()`` — nested in the environment odc wraps around a whole Dask
-    chunk task. Tearing that down loses the task's GDAL options (the HTTP retry
-    ladder among them) for every read after the refresh.
-
-    Idempotent — safe to call multiple times.
+    Idempotent.
     """
     if getattr(_OdcThreadSession.session, "_env_drift_patched", False):
         return
@@ -413,24 +386,23 @@ def _patch_odc_thread_session_for_env_drift() -> None:
     _OdcThreadSession.session = session_with_env_check  # type: ignore[method-assign]
 
 
-# Install at module import time, before any thread has a chance to call
-# ThreadSession.session() and cache a session without the drift check.
-# Runs on both the orchestrator and on workers (this module is imported
-# when the pickled plugin is unpickled).
+# Installed at module import, before any thread can call ThreadSession.session() and cache a
+# session without the drift check. Runs on the orchestrator and on workers alike, since this
+# module is imported when the pickled plugin is unpickled.
 _patch_odc_thread_session_for_env_drift()
 
 
 class _S3CredentialPlugin(WorkerPlugin):
     """Dask WorkerPlugin that sets ASF S3 credentials on every worker.
 
-    Unlike ``client.run``, a plugin's ``setup`` is called on workers
-    that join *after* registration — critical for adaptive scaling.
+    Unlike ``client.run``, a plugin's ``setup`` runs on workers that join *after* registration —
+    critical under adaptive scaling.
 
-    What it distributes is a SNAPSHOT: the credential is frozen at construction and
-    stored on the scheduler, so a worker joining N minutes after the last broadcast
-    starts life with the remaining (TTL - N), and past the TTL starts with none. That
-    makes the broadcast CADENCE, not just the credential's own margin, a correctness
-    condition — the caller must re-broadcast on a timer for late joiners to be usable.
+    What it distributes is a SNAPSHOT: the credential is frozen at construction and stored on the
+    scheduler, so a worker joining N minutes after the last broadcast starts with the remaining
+    (TTL - N), and past the TTL with none. The broadcast CADENCE, not just the credential's own
+    margin, is therefore a correctness condition — the caller must re-broadcast on a timer for
+    late joiners to be usable.
     """
 
     name = "s3-creds"
@@ -440,31 +412,24 @@ class _S3CredentialPlugin(WorkerPlugin):
 
     def setup(self, worker: object) -> None:  # noqa: ARG002
         os.environ.update(self.env)
-        # Reset the main-thread AWSSession cache. Task pool threads handle
-        # their own refresh via the module-level env-drift patch, which detects
-        # the env mismatch on the next session() call and rebuilds. Together
-        # they ensure rasterio.env.Env (used by odc.loader on every /vsis3/
-        # open) signs with the new key — making gdal.SetConfigOption and
-        # gdal.VSICurlClearCache redundant for credential refresh.
+        # Reset the main-thread AWSSession cache; task pool threads refresh themselves via the
+        # module-level env-drift patch on their next session() call. Together they ensure
+        # rasterio.env.Env (used by odc.loader on every /vsis3/ open) signs with the new key,
+        # which makes gdal.SetConfigOption and gdal.VSICurlClearCache redundant here.
         _odc_thread_session.reset()
 
 
 def set_s3_credentials(creds: dict[str, str]) -> None:
     """Inject ASF STS credentials for GDAL/rasterio S3 reads.
 
-    Sets AWS env vars on the orchestrator and (if a Dask cluster is
-    active) registers a ``WorkerPlugin`` that sets env vars on all
-    current and future workers.  Rasterio resolves credentials through
-    boto3, which reads env vars.
+    Sets AWS env vars on the orchestrator and, if a Dask cluster is active, registers a
+    ``WorkerPlugin`` that sets them on all current and future workers. Rasterio resolves
+    credentials through boto3, which reads env vars.
 
-    Credentials are never restored — this is intentional:
-
-    - Avoids a thread-safety race where one thread's cleanup
-      removes credentials that another thread still needs.
-    - Safe because all non-GDAL S3 callers (icechunk writes,
-      store cleanup) explicitly strip the ``env`` provider from
-      botocore's credential chain, so they always resolve IAM
-      credentials regardless of what env vars are set.
+    Credentials are never restored, deliberately: cleanup on one thread would race with another
+    thread still using them, and every non-GDAL S3 caller (icechunk writes, store cleanup) strips
+    the ``env`` provider from botocore's credential chain, so those always resolve IAM
+    credentials whatever the env vars say.
 
     Args:
         creds: Dict from get_s3_credentials() with accessKeyId,
@@ -482,10 +447,9 @@ def set_s3_credentials(creds: dict[str, str]) -> None:
     except ValueError as e:
         raise RuntimeError("No Dask client found — S3 credentials cannot be broadcast to workers") from e
 
-    # Set on orchestrator too. odc.loader's rio_env() wraps rasterio.env.Env
-    # around _local.session() on every /vsis3/ open, and rasterio.env.Env
-    # passes the AWSSession's frozen credentials into GDAL on entry — so
-    # updating os.environ is sufficient for GDAL to sign with the new key.
+    # On the orchestrator too. odc.loader's rio_env() wraps rasterio.env.Env around
+    # _local.session() on every /vsis3/ open, and rasterio.env.Env passes the AWSSession's frozen
+    # credentials into GDAL on entry, so updating os.environ suffices to sign with the new key.
     env = _build_aws_env(creds)
     os.environ.update(env)
     _odc_thread_session.reset()

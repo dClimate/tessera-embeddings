@@ -23,16 +23,15 @@ def configure_gdal_environment() -> None:
 
     # Retry settings for transient network failures (DNS, connection, timeout).
     #
-    # RETRY_DELAY is the BASE of an exponential ladder, not a fixed wait: GDAL roughly doubles
-    # it after each failure and does not cap it. So these two multiply into a WALL-CLOCK BUDGET
-    # per unreadable object, and the coverage gate then wraps that read in more attempts of its
-    # own. Read them as a pair, and read the measured ladder before changing either.
+    # RETRY_DELAY is the BASE of an exponential ladder, not a fixed wait: GDAL roughly doubles it
+    # after each failure and does not cap it, so these two multiply into a WALL-CLOCK BUDGET per
+    # unreadable object, which the coverage gate then wraps in more attempts of its own. Read them
+    # as a pair.
     #
-    # THREE of the options in this function never reach the odc read path -- MAX_RETRY,
-    # RETRY_DELAY and DISABLE_READDIR_ON_OPEN -- because odc applies its own values as an
-    # explicit rasterio Env, which beats the process environment. The rest do reach it, through
-    # GDAL's fallback to the environment. There is currently NO knob that changes those three
-    # on the imagery path.
+    # THREE options here never reach the odc read path -- MAX_RETRY, RETRY_DELAY and
+    # DISABLE_READDIR_ON_OPEN -- because odc applies its own values as an explicit rasterio Env,
+    # which beats the process environment; the rest reach it through GDAL's fallback to the
+    # environment. There is currently NO knob that changes those three on the imagery path.
     #
     # Measurements, the ladder, and why closing that gap was rejected:
     # `context_docs/design/gdal-read-config-2026_08.md`.
@@ -77,37 +76,32 @@ def configure_gdal_environment() -> None:
 def configure_logging() -> None:
     """Make the package's module loggers emit, wherever the process got its handlers.
 
-    Idempotent, and safe to call in any process. Two callers need it: process
-    entry points (via :func:`configure_gdal_environment`), and spawned worker
-    processes — a ``spawn`` child inherits NO logging configuration, so its
-    module loggers fall through to the root WARNING default with no handler and
-    every INFO record is silently dropped. A worker that reports progress must
-    call this first or its reports never exist.
+    Idempotent and safe to call in any process. Two callers need it: process entry points (via
+    :func:`configure_gdal_environment`), and spawned worker processes — a ``spawn`` child inherits
+    NO logging configuration, so its module loggers fall through to the root WARNING default with
+    no handler and every INFO record is silently dropped. A worker that reports progress must call
+    this first or its reports never exist.
     """
-    # Set the LEVEL on the `tessera_embeddings` package logger so all module-level
-    # loggers (getLogger(__name__) in stac.py, zarr_store.py, etc.) are not dropped.
-    # The package logger name must match the module loggers' parent — they are
-    # getLogger(__name__), i.e. "tessera_embeddings.*" — or the level never applies
-    # and the loggers fall through to the root WARNING default.
-    # Reads SRC_LOG_LEVEL env var; defaults to INFO.
+    # LEVEL on the `tessera_embeddings` package logger, so module-level loggers
+    # (getLogger(__name__) in stac.py, zarr_store.py, ...) are not dropped. The package logger
+    # name must match those loggers' parent — "tessera_embeddings.*" — or the level never applies
+    # and they fall through to the root WARNING default. Reads SRC_LOG_LEVEL, defaulting to INFO.
     level = os.environ.get("SRC_LOG_LEVEL", "INFO").upper()
     pkg_logger = logging.getLogger("tessera_embeddings")
     pkg_logger.setLevel(getattr(logging, level, logging.INFO))
 
-    # Attach a stderr handler ONLY when nothing upstream will emit these records.
-    # Under Prefect, `setup_logging()` puts a PrefectConsoleHandler on the ROOT
-    # logger, and our records reach it by propagation — so adding a handler here
-    # too emitted EVERY line twice to CloudWatch, in two formats (ours renders
-    # `2026-07-25 00:33:35,395 | ...`, Prefect's `00:33:35.395 | ...`). That is a
-    # straight 2x on log ingest at campaign scale, and it silently inflates any
-    # analysis that counts log lines. Root-handler presence is the right test
-    # rather than a Prefect import check: it equally covers a caller who ran
-    # logging.basicConfig() themselves. In a spawned worker neither logger has
-    # handlers, so the worker gets this handler and its records reach the
-    # container's log stream through the inherited stderr.
+    # Attach a stderr handler ONLY when nothing upstream will emit these records. Under Prefect,
+    # `setup_logging()` puts a PrefectConsoleHandler on the ROOT logger and our records reach it
+    # by propagation, so adding one here too emits EVERY line twice to CloudWatch in two formats
+    # (ours `2026-07-25 00:33:35,395 | ...`, Prefect's `00:33:35.395 | ...`) — a straight 2x on
+    # log ingest at campaign scale, which silently inflates any analysis that counts log lines.
+    # Root-handler presence is the right test rather than a Prefect import check: it equally
+    # covers a caller who ran logging.basicConfig() themselves. In a spawned worker neither logger
+    # has handlers, so the worker gets this one and its records reach the container's log stream
+    # through the inherited stderr.
     #
-    # This does NOT affect the Prefect UI. UI logs come from the APILogHandler on
-    # `prefect.flow_runs` (what get_run_logger() returns) — never from this logger.
+    # This does NOT affect the Prefect UI: UI logs come from the APILogHandler on
+    # `prefect.flow_runs` (what get_run_logger() returns), never from this logger.
     if not pkg_logger.handlers and not logging.getLogger().handlers:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s - %(message)s"))
@@ -117,25 +111,22 @@ def configure_logging() -> None:
 def code_identity() -> dict | None:
     """Which build of this package is running, read from its own install metadata.
 
-    Recorded on a published cell so "what code produced this?" is a read rather than an
-    inference. It was inferred once, and only worked by luck: a fill was found to have run an
-    image predating a provenance field, and the only evidence was that the field it should
-    have written was absent. That proxy exists exactly once, for exactly that field.
+    Recorded on a published cell so "what code produced this?" is a read rather than an inference.
+    Inferring it worked once only by luck: a fill was found to have run an image predating a
+    provenance field, and the only evidence was that the field it should have written was absent.
 
-    Needs no build argument and no environment variable, because a git install already
-    records its commit: ``direct_url.json`` carries the resolved ``commit_id`` alongside the
-    revision that was asked for. The distinction matters — a branch name says which line of
-    development, the commit says which build — and both go in.
+    Needs no build argument and no environment variable, because a git install already records its
+    commit: ``direct_url.json`` carries the resolved ``commit_id`` alongside the revision that was
+    asked for. Both go in — a branch name says which line of development, the commit which build.
 
-    **RECORD ONLY. Nothing compares this, and nothing may.** A mid-campaign change is a
-    normal event, so a value that differs between cells is information for whoever is
-    diagnosing something and inert the rest of the time. Turning it into a gate would let a
-    routine edit refuse a dispatch, which is a decision an operator makes, not a property the
-    architecture should assert.
+    **RECORD ONLY. Nothing compares this, and nothing may.** A mid-campaign change is a normal
+    event, so a value differing between cells is information for whoever is diagnosing something
+    and inert the rest of the time. Turning it into a gate would let a routine edit refuse a
+    dispatch, which is an operator's decision, not a property the architecture should assert.
 
-    Returns ``None`` rather than raising, for the same reason: this is a nice-to-have on a
-    record, and no fill should ever fail because its own metadata was unreadable. A wheel
-    install (no VCS info) legitimately has no commit and returns the version alone.
+    Returns ``None`` rather than raising, for the same reason: no fill should fail because its own
+    metadata was unreadable. A wheel install (no VCS info) legitimately has no commit and returns
+    the version alone.
     """
     try:
         import importlib.metadata as md
@@ -152,9 +143,9 @@ def code_identity() -> dict | None:
                 identity["commit"] = str(vcs["commit_id"])
             if vcs.get("requested_revision"):
                 identity["revision"] = str(vcs["requested_revision"])
-            # An editable install has no commit and is worth SAYING so, not omitting: it means
-            # the cell was filled from a working copy rather than a pinned build, which is the
-            # single most useful thing to know about a result nobody can reproduce.
+            # An editable install has no commit and is worth SAYING so rather than omitting: the
+            # cell was filled from a working copy rather than a pinned build, which is the single
+            # most useful thing to know about a result nobody can reproduce.
             if (record.get("dir_info") or {}).get("editable"):
                 identity["editable"] = True
         return identity

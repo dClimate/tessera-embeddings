@@ -3,13 +3,11 @@
 Reads spatial chunks from three stores (reflectance, sar_ascending, sar_descending),
 stacks bands in the correct order, derives masks from SCL, and extracts DOY values.
 
-Under Tessera v1.1 the model uses every valid observation per pixel (bucketed
-resampling at the dataset layer), so all S2 timesteps with any valid pixel in
-the chunk are loaded. Timesteps with zero coverage across the chunk are pruned
-to avoid paying to load data the sampler can't use anyway.
+Under Tessera v1.1 the model uses every valid observation per pixel (bucketed resampling at
+the dataset layer), so all S2 timesteps with any valid pixel in the chunk are loaded.
+Timesteps with zero coverage across the chunk are pruned — the sampler could never draw them.
 
-SAR data is ~10x smaller than S2 (2 bands, fewer timesteps); both orbits are
-loaded eagerly.
+SAR is ~10x smaller than S2 (2 bands, fewer timesteps); both orbits are loaded eagerly.
 """
 
 from __future__ import annotations
@@ -41,25 +39,21 @@ from tessera_embeddings.storage.zarr_store import (
 logger = logging.getLogger(__name__)
 
 
-# Worker cap for the concurrent S2 band read (see ``_load_s2_bands``). The 10
-# bands are independent zarr arrays, so their reads fan out across a thread
-# pool. Unlike the latency-bound ROI probe (``chunk_spec._ROI_PROBE_WORKERS``,
-# oversubscribed x4), this read is decompression-bound: with time chunked at 1,
-# each band's ``oindex`` already issues its per-timestep S3 GETs concurrently,
-# so the serial cost we remove is the 10 decompression waves, not GET latency.
-# Decompression runs in Rust with the GIL released, so it scales to cores — but
-# only to cores, so we cap at the allocated CPU count (never above the band
-# count) to keep decompression cores busy without oversubscribing. Uses
-# ``sched_getaffinity`` where available (Linux inference actors) so a
-# cgroup/affinity-pinned worker sees its real allocation, not the host's.
+# Worker cap for the concurrent S2 band read (see ``_load_s2_bands``). Unlike the latency-bound
+# ROI probe (``chunk_spec._ROI_PROBE_WORKERS``, oversubscribed x4), this read is
+# DECOMPRESSION-bound: with time chunked at 1, each band's ``oindex`` already issues its
+# per-timestep S3 GETs concurrently, so what fanning out removes is the 10 serial decompression
+# waves, not GET latency. Decompression runs in Rust with the GIL released, so it scales to cores
+# and only to cores — hence the cap at the allocated CPU count, never above the band count.
+# ``sched_getaffinity`` where available (Linux actors) so a cgroup-pinned worker sees its real
+# allocation, not the host's.
 def _band_read_workers(reserve_cpus: int = 0) -> int:
     """Decompression pool size for the concurrent S2 band read.
 
-    ``reserve_cpus`` leaves that many cores free for concurrent CPU work.
-    Callers loading in the background while the GPU runs (the intra-chunk
-    strip prefetch) reserve cores for the batch-prep workers that feed the
-    GPU — on the 4-vCPU g6e.xlarge, four decompression threads competing with
-    batch prep produced ~500 ms get_batch spikes that starved the GPU.
+    ``reserve_cpus`` leaves that many cores free for concurrent CPU work. Callers loading in
+    the background while the GPU runs (the intra-chunk strip prefetch) reserve cores for the
+    batch-prep workers that feed it — on the 4-vCPU g6e.xlarge, four decompression threads
+    competing with batch prep produced ~500 ms get_batch spikes that starved the GPU.
     Foreground loads (the serial chunk prologue, GPU idle) reserve nothing.
     """
     try:
@@ -73,28 +67,23 @@ def _band_read_workers(reserve_cpus: int = 0) -> int:
     return max(1, min(len(S2_BAND_ORDER), allocated - reserve_cpus))
 
 
-# A function that maps a store path to an open zarr group. The default is
-# ``open_store_as_zarr_group`` (a fresh repo open per call). The strip loop
-# passes a memoizing opener (see ``make_store_opener``) so every strip of a
-# chunk reuses one repo handle rather than re-paying the repo-open and
-# manifest-load cost on each strip.
+# Maps a store path to an open zarr group. Default ``open_store_as_zarr_group`` (a fresh repo open
+# per call); the strip loop passes a memoizing opener (``make_store_opener``) so every strip of a
+# chunk reuses one repo handle instead of re-paying the repo-open and manifest load.
 StoreOpener = Callable[[str], zarr.Group]
 
 
 def make_store_opener(region: str | None = None) -> StoreOpener:
     """Return a store opener that opens each distinct path once and reuses it.
 
-    Intended to live for the duration of one chunk's strip loop: each strip of
-    a split chunk would otherwise reopen the same three stores, re-paying the
-    icechunk repo-open and manifest load every time. (It does not amortise chunk
-    *data* re-reads: a dense strip's working set far exceeds icechunk's chunk
-    cache, so cross-strip reuse does not hit — see
-    ``zarr_store._default_repo_config``.)
+    Intended to live for one chunk's strip loop: each strip of a split chunk would otherwise
+    reopen the same three stores. It does NOT amortise chunk *data* re-reads — a dense strip's
+    working set far exceeds icechunk's chunk cache, so cross-strip reuse does not hit (see
+    ``zarr_store._default_repo_config``).
 
-    ``region`` is the S3 region for the mosaic repos (credentials are injected
-    separately, via the actor's :func:`credentials_provider` context); a
-    non-default-region fill must thread it so the actor's reads open the store in
-    the same region the preflight/assembly paths use.
+    ``region`` is the S3 region for the mosaic repos (credentials are injected separately, via
+    the actor's :func:`credentials_provider` context); a non-default-region fill must thread it
+    so the actor's reads open the store in the same region as the preflight/assembly paths.
     """
     cache: dict[str, zarr.Group] = {}
 
@@ -112,20 +101,17 @@ def make_store_opener(region: str | None = None) -> StoreOpener:
 class S2MaskBundle:
     """Full-chunk S2 SCL validity, loaded once and shared across northing strips.
 
-    The strip loop reads SCL for the whole chunk a single time, then slices this
-    bundle per strip instead of re-decompressing SCL on every strip. SCL chunks
-    on disk are ``(time=1, 4000, 4000)``, so any sub-region read decompresses the
-    whole chunk anyway; loading once and slicing turns the per-strip SCL re-reads
-    into pure in-memory views. The mask is also what sizes the strip height (see
-    ``actors._strip_height_for_density``): its ``T_kept`` is the true post-pruning
-    timestep count for *this* chunk, so sparse chunks get tall strips (often the
-    whole chunk) and only genuinely dense chunks split.
+    The strip loop reads SCL for the whole chunk once, then slices this bundle per strip. SCL
+    chunks on disk are ``(time=1, 4000, 4000)``, so any sub-region read decompresses the whole
+    chunk anyway; loading once turns per-strip SCL re-reads into in-memory views. The mask also
+    sizes the strip height (``actors._strip_height_for_density``): its ``T_kept`` is the true
+    post-pruning timestep count for *this* chunk, so sparse chunks get tall strips and only
+    genuinely dense chunks split.
 
-    Timesteps are pruned at the *chunk* level — any timestep with no valid pixel
-    anywhere in the chunk is dropped, since the per-pixel resampler can never draw
-    it. A strip may therefore carry a timestep that is empty within its own rows;
-    that wastes a little band memory for that strip but keeps pruning a single
-    whole-chunk decision rather than a per-strip one.
+    Timesteps are pruned at the *chunk* level — any timestep with no valid pixel anywhere in the
+    chunk is dropped, since the per-pixel resampler can never draw it. A strip may therefore
+    carry a timestep empty within its own rows, wasting a little band memory but keeping pruning
+    one whole-chunk decision.
 
     Attributes:
         mask: Binary SCL validity, shape (T_kept, chunk_height, W), bool.
@@ -180,10 +166,9 @@ class ChunkData:
     s2_obs_count: np.ndarray | None = None  # (H, W), uint16
     s1_asc_obs_count: np.ndarray | None = None  # (H, W), uint16
     s1_desc_obs_count: np.ndarray | None = None  # (H, W), uint16
-    # Full-chunk-width SAR obs counts, populated ONLY for x-cropped loads
-    # (x_sub): the saved obs-count layers must keep full-extent fidelity, but
-    # the cropped grid above can't carry it. SAR is read full-width regardless
-    # (it is ~10x smaller than S2); these hold the pre-crop counts.
+    # Full-chunk-width SAR obs counts, populated ONLY for x-cropped loads (x_sub): the saved
+    # obs-count layers must keep full-extent fidelity, which the cropped grid above cannot carry.
+    # SAR is read full-width regardless (~10x smaller than S2); these hold the pre-crop counts.
     s1_asc_obs_count_full: np.ndarray | None = None  # (H, full W), uint16
     s1_desc_obs_count_full: np.ndarray | None = None  # (H, full W), uint16
     # Which months each pixel was seen in per orbit, (MONTHS_IN_YEAR, H, W) bool, paired with the
@@ -243,12 +228,11 @@ def _load_s2_bands(
     result = np.empty((t, h, w, len(S2_BAND_ORDER)), dtype=ref.dtype)
 
     # The 10 bands are independent zarr arrays and each thread writes a distinct
-    # ``result[..., i]`` column, so the reads have no shared mutable state and
-    # run concurrently. Reading one band per iteration is serial across 10
-    # decompression waves; fanning them out collapses those to one wave bounded
-    # by the allocated cores (see ``_band_read_workers``). Concurrent reads on
-    # one readonly icechunk session store (an immutable snapshot view) are safe
-    # — only concurrent *commits* are not; verified against a real store.
+    # ``result[..., i]`` column, so the reads share no mutable state. Fanning them out collapses
+    # 10 serial decompression waves into one bounded by the allocated cores
+    # (``_band_read_workers``). Concurrent reads on one readonly icechunk session store (an
+    # immutable snapshot view) are safe — only concurrent *commits* are not; verified on a real
+    # store.
     def _read_band(i: int, band: str) -> None:
         result[:, :, :, i] = root[band].oindex[time_indices, y_slice, x_slice]
 
@@ -324,40 +308,33 @@ def resolve_s1_orbit(
 ) -> str:
     """Downgrade ``s1_orbit="both"`` to a single orbit when only one store exists.
 
-    ``"both"`` is a request, not a guarantee — if upstream ingestion only wrote
-    one SAR store, the inference pipeline transparently falls back to
-    single-orbit rather than failing. Probing once at flow entry keeps every
-    downstream callsite aligned on the same effective orbit value.
+    ``"both"`` is a request, not a guarantee: if upstream ingestion wrote only one SAR store,
+    inference falls back to single-orbit rather than failing. Probing once at flow entry keeps
+    every downstream callsite on the same effective orbit. ``"ascending"`` / ``"descending"``
+    are returned unchanged without probing; a missing store then is an error downstream.
 
-    ``"ascending"`` / ``"descending"`` are returned unchanged without probing;
-    a missing store at that point is an error surfaced downstream.
+    ``allow_none`` defaults to **True**, because parts of the globe are radar-free in principle
+    and a global product cannot refuse them: over ice Sentinel-1 flies Extra Wide swath with
+    HH/HV, which the dual-pol query correctly discards, so a zone can be permanently radar-free
+    while its catalogue holds a hundred thousand granules. Requiring a SAR store there fails the
+    cell forever, on every retry.
 
-    ``allow_none`` defaults to **True**, because parts of the globe are radar-free in
-    principle and a global product cannot refuse them: over ice Sentinel-1 flies Extra Wide
-    swath with HH/HV, which the dual-pol query correctly discards, so a zone can be
-    permanently radar-free while its catalogue holds a hundred thousand granules. Requiring a
-    SAR store there fails the cell forever, on every retry.
+    Pass ``allow_none=False`` where radar is a *demand* — a single run over terrain known to be
+    imaged, where an absent store means something upstream broke and embedding without radar
+    would hide it. Callers reach this through the flows' ``require_s1`` parameter.
 
-    Pass ``allow_none=False`` where radar is a *demand* rather than a request — a single run
-    over terrain that is known to be imaged, where an absent store means something upstream
-    broke and silently embedding without radar would hide it. Callers reach this through the
-    flows' ``require_s1`` parameter.
-
-    The SAR stores are opened with the SAME credential callback / region that
-    the runner uses for the rest of the fill (``get_credentials`` / ``s3_region``);
-    without them the probe would fall back to the default Icechunk credential
-    chain and fail at orbit resolution in any deployment that needs the callback.
+    The SAR stores are opened with the SAME credential callback / region the runner uses for the
+    rest of the fill; without them the probe falls back to the default Icechunk credential chain
+    and fails at orbit resolution wherever the callback is needed.
     """
     if s1_orbit != "both":
         _active_orbits(s1_orbit)  # validates
         if s1_orbit == S1_ORBIT_NONE and not allow_none:
-            # `none` is meant as a RESOLVED value — what "both" becomes over radar-free
-            # terrain — but it is a plain string on a public flow parameter, so a caller
-            # can pass it in. Returning it here skipped the check below entirely, and
-            # `InferenceConfig` then forces `allow_s2_only` for it, so a run that demanded
-            # radar published optical-only embeddings instead of failing. Asking for no
-            # radar while demanding radar is a contradiction, and the only safe reading of
-            # a contradiction is to refuse it.
+            # `none` is meant as a RESOLVED value — what "both" becomes over radar-free terrain —
+            # but it is a plain string on a public flow parameter, so a caller can pass it in.
+            # Returned unchecked it skips the checks below, and `InferenceConfig` then forces
+            # `allow_s2_only`, so a run that DEMANDED radar publishes optical-only embeddings
+            # instead of failing. The contradiction is refused rather than read either way.
             raise InsufficientCoverageError(
                 f"s1_orbit={S1_ORBIT_NONE!r} was requested for {mosaic_base} while radar was demanded "
                 "(require_s1). Those cannot both hold: drop require_s1 to embed this cell optical-only, "
@@ -373,10 +350,10 @@ def resolve_s1_orbit(
             present.append(orbit)
         except zarr.errors.GroupNotFoundError:
             # PRESENT but rootless (created, then crashed before the schema commit).
-            # GroupNotFoundError subclasses FileNotFoundError, so without this clause a
-            # damaged orbit reads as an absent one — and with s1_orbit="both" and the
-            # sibling healthy, the campaign would quietly resolve to a single orbit and
-            # permanently publish half the radar it was asked for. Fail closed.
+            # GroupNotFoundError subclasses FileNotFoundError, so without this clause a damaged
+            # orbit reads as an absent one — and with `both` and a healthy sibling the campaign
+            # quietly resolves to a single orbit, permanently publishing half the radar it was
+            # asked for. Fail closed.
             raise
         except FileNotFoundError:
             logger.info("SAR %s store not present at %s — will be excluded", orbit, path)
@@ -398,10 +375,9 @@ def resolve_s1_orbit(
             )
             raise InsufficientCoverageError(msg)
         # A consumer reading a finished mosaic cannot distinguish a radar-free ROI from a lost
-        # orbit, so this warning is the only record that it happened. It must name the mosaic
-        # and say where to confirm, because the confirmation lives in a different run's log:
-        # the INGEST queried both orbits and its per-orbit item count is the authority —
-        # `items_seen=0` means the source offers nothing here, which is terrain, not a gap.
+        # orbit, so this warning is the only record it happened — and the confirmation lives in a
+        # different run's log: the INGEST queried both orbits and its per-orbit item count is the
+        # authority (`items_seen=0` means the source offers nothing here, which is terrain).
         logger.warning(
             "s1_orbit='both' and NO SAR store exists under %s — resolving to %r. "
             "Legitimate where the ROI has no dual-pol VV+VH coverage; check the ingest's "
@@ -420,9 +396,8 @@ def _months_within_assessed(months: list[tuple[int, int]], assessed: object) -> 
     """Of ``months``, those lying ENTIRELY inside an ``assessed_window`` attribute.
 
     Returns an empty set for any unusable attribute — absent, malformed, unparseable — so a
-    damaged record makes the gate STRICTER rather than more permissive. That asymmetry is the
-    safety argument: over-excusing a month publishes a mosaic with a hole in it, while
-    under-excusing one costs a re-ingest.
+    damaged record makes the gate STRICTER. Over-excusing a month publishes a mosaic with a hole
+    in it; under-excusing one costs a re-ingest.
     """
     if not isinstance(assessed, (list, tuple)) or len(assessed) != 2:
         return set()
@@ -457,14 +432,12 @@ def check_time_window_coverage(
     store (no in-window data at all) but skips the month-span check, the escape
     hatch for a legitimately partial window (e.g. an arctic-only edge zone).
 
-    **Returns what it measured, so a fill can record it, and the RELAXED path is the whole
-    reason that is worth doing.** A cell filled under ``skip_coverage_check`` is published
-    from an input the strict rule would have refused, and afterwards nothing can tell:
-    mosaics are deleted once a cell lands, so the evidence outlives neither the run nor the
-    question. The returned summary is per store label — months present of those required,
-    and the first/last in-window date — plus ``relaxed``, which records which rule was in
-    force. :func:`~tessera_embeddings.storage.shard_writer.run_provenance` is where it
-    lands on the year.
+    **Returns what it measured, so a fill can record it, and the RELAXED path is why that is
+    worth doing.** A cell filled under ``skip_coverage_check`` is published from an input the
+    strict rule would have refused, and mosaics are deleted once a cell lands, so afterwards
+    nothing can tell. The summary is per store label — months present of those required, the
+    first/last in-window date — plus ``relaxed``, recording which rule was in force.
+    :func:`~tessera_embeddings.storage.shard_writer.run_provenance` lands it on the year.
 
     Raises:
         InsufficientCoverageError: If any required store does not span the window.
@@ -504,16 +477,13 @@ def check_time_window_coverage(
             "last": str(in_window.max())[:10] if len(in_window) else None,
         }
 
-        # At least one timestamp INSIDE the window, whichever mode this is. A store with
-        # only out-of-window dates is non-empty but useless: the loaders filter to the
-        # window and raise on an empty index, so without this the preflight passes, a GPU
-        # fleet is provisioned, and the run fails at the first read.
-        #
-        # Applies to the STRICT mode too, which is not redundant with its every-month
-        # rule. An assessed window can explain every absent month away (see below), and
-        # that path can empty the missing list entirely — so a store the ingest examined
-        # and wrote nothing into would otherwise sail through the one gate that exists to
-        # fail before provisioning.
+        # At least one timestamp INSIDE the window, whichever mode this is. A store holding only
+        # out-of-window dates is non-empty but useless: the loaders filter to the window and raise
+        # on an empty index, so without this the preflight passes, a GPU fleet is provisioned, and
+        # the run fails at the first read. Not redundant with STRICT mode's every-month rule
+        # either — an assessed window can explain every absent month away (see below) and empty
+        # the missing list entirely, so a store the ingest examined and wrote nothing into would
+        # sail through the one gate that exists to fail before provisioning.
         if not (present_months & required_months):
             msg = (
                 f"{label} store at {path} has no timestamps within the window "
@@ -521,47 +491,41 @@ def check_time_window_coverage(
             )
             raise InsufficientCoverageError(msg)
 
-        # Require EVERY month of the window to be present, not just that the
-        # min/max span it: a mosaic with only January + December (or out-of-window
-        # dates bracketing the year) would otherwise pass despite missing every
-        # intervening month, and the write-once tag would make that partial year
+        # Require EVERY month of the window, not just that the min/max span it: a mosaic with only
+        # January + December (or out-of-window dates bracketing the year) would otherwise pass
+        # despite missing every intervening month, and the write-once tag makes that partial year
         # permanent. Month granularity matches the campaign's calendar-year window.
         missing = sorted(required_months - present_months)
 
-        # Split the absence into EXPLAINED and UNEXPLAINED for the record, before any
-        # decision to raise or to skip, and for BOTH paths. A month the ingest examined and
-        # found empty is a legitimately absent month — common for radar, where a zone's orbit
-        # may reach its land on no date of a month — and a count of present months alone
-        # cannot tell it from a hole. Anything reading this field to raise an alarm must key
-        # on the UNEXPLAINED count, never on the month total, or it fires on healthy cells.
+        # Split the absence into EXPLAINED and UNEXPLAINED for the record, before any decision to
+        # raise or skip, and for BOTH paths. A month the ingest examined and found empty is
+        # legitimately absent — common for radar, where a zone's orbit may reach its land on no
+        # date of a month — and a count of present months cannot tell it from a hole. Anything
+        # alarming on this must key on the UNEXPLAINED count, or it fires on healthy cells.
         _assessed = root.attrs.get(ASSESSED_WINDOW_ATTR)
         # A month wholly inside the assessed window is EXPLAINED: the ingest looked, and WHY a day
-        # is absent is not a distinction this gate can act on. An unreadable day and a cloudy one
-        # are the same absence downstream, and the published coverage masks say which months a
-        # pixel actually has.
+        # is absent is not a distinction this gate can act on — an unreadable day and a cloudy one
+        # are the same absence downstream, and the published `*_month_covered` masks record the
+        # month as uncovered per pixel either way.
         #
-        # Below the store's newest date the day is also closed for good, since the time axis only
-        # grows. A TRAILING month is not closed — a resume starts at the newest date plus one and
-        # would re-offer it — and it is excused anyway. Two loss paths can leave one, and neither
-        # is worth blocking a cell for:
+        # The time axis only grows, so a month below the store's newest date is closed for good. A
+        # TRAILING month is not (a resume starts at the newest date plus one and would re-offer
+        # it), and is excused anyway: two loss paths can leave one, neither worth blocking a cell
+        # for.
         #
         # * A date given up because `is_unreadable_source` says the bytes are permanently bad. That
         #   verdict RECOMPUTES, so re-offering recovers nothing the provider has not republished.
         # * A date refused as `producer-conflict`, where no single BOA-offset decision fits the
-        #   day. That one is OURS to fix — classify the bucket in `ingest/asset_locations.py` — and
-        #   a re-run after the fix would recover it. But for a whole month to be absent, EVERY date
-        #   in it must have been refused, which is a catalogue-wide event rather than a per-date
-        #   accident, and it announces itself: the leg ends with a DATA LOSS SUMMARY naming the
-        #   remedy. Blocking one cell's inference is not what surfaces that, and the fix is a code
-        #   change and a re-ingest either way.
-        #
-        # In both cases the published `*_month_covered` mask records the month as uncovered, per
-        # pixel, so the absence is legible in the product rather than silent.
+        #   day. That one is OURS to fix — classify the bucket in `ingest/asset_locations.py` — but
+        #   a whole absent month means EVERY date in it was refused, a catalogue-wide event that
+        #   announces itself: the leg ends with a DATA LOSS SUMMARY naming the remedy. The fix is a
+        #   code change and a re-ingest either way, which blocking one cell's inference does not
+        #   surface.
         _explained = _months_within_assessed(missing, _assessed) if missing else set()
         # The ingest's own account of what it looked at and did not keep, carried onto the year
-        # because it is recorded on the MOSAIC and the mosaic is deleted once a cell lands. Empty
-        # dates are the cloud-and-footprint answer — dates the window examined that yielded
-        # nothing — which turns "why is this year thin?" from an unanswerable question into a read.
+        # because it lives on the MOSAIC and the mosaic is deleted once a cell lands. Empty dates
+        # are the cloud-and-footprint answer — dates examined that yielded nothing — which turns
+        # "why is this year thin?" into a read.
         summary["stores"][label].update(
             assessed_window=list(_assessed) if isinstance(_assessed, (list, tuple)) else None,
             assessed_empty_dates=int(root.attrs.get("assessed_empty_dates") or 0),
@@ -573,20 +537,16 @@ def check_time_window_coverage(
         if skip_coverage_check:
             continue
 
-        # A month can be absent because the ingest EXAMINED it and found nothing reachable,
-        # which is a finding, or because the ingest never covered it, which is a gap. Only
-        # the second is an error, and `assessed_window` is what tells them apart: the ingest
-        # records the range it processed in full, so a month wholly inside that range was
-        # looked at. A satellite pass covers a swath rather than a whole UTM zone, and some
-        # zones have an orbit that reaches their land on no date of the year at all.
-        #
-        # Requires the month to be COVERED ENTIRELY. A partially-assessed month could hide
-        # unexamined days, so it stays an error — strict here costs nothing on the campaign's
-        # calendar-year windows, where months are always wholly inside.
+        # A month absent because the ingest EXAMINED it and found nothing reachable is a finding;
+        # absent because the ingest never covered it is a gap, and only the second is an error.
+        # `assessed_window` tells them apart: the ingest records the range it processed in full, so
+        # a month wholly inside that range was looked at. (A satellite pass covers a swath, not a
+        # whole UTM zone, and some zones have an orbit reaching their land on no date of the year.)
+        # COVERED ENTIRELY is required — a partially-assessed month could hide unexamined days —
+        # which costs nothing on the campaign's calendar-year windows.
         if missing:
-            # Reuses the split computed above rather than re-deriving it: two copies of this
-            # decision could disagree, and the record and the gate must never differ about
-            # which months were examined.
+            # Reuses the split computed above rather than re-deriving it: the record and the gate
+            # must never differ about which months were examined.
             assessed, examined = _assessed, _explained
             if examined:
                 logger.info(
@@ -640,7 +600,7 @@ def _empty_sar_arrays(height: int, width: int) -> tuple[np.ndarray, np.ndarray, 
 
     Length zero rather than absent, so a skipped orbit flows through the same derivation as a
     present one: :func:`coverage_from_validity` over an empty mask yields a zero count and an
-    all-False month mask, which is what a pixel that orbit never saw should read.
+    all-False month mask — what a pixel that orbit never saw should read.
     """
     return (
         np.empty((0, height, width, 2), dtype=np.uint16),
@@ -680,14 +640,12 @@ def load_s2_mask_bundle(
 ) -> S2MaskBundle:
     """Load and prune the full-chunk S2 SCL mask once for reuse across strips.
 
-    Reads SCL for the entire chunk extent (all easting, all northing), computes
-    the per-pixel obs count from the un-pruned mask, then drops timesteps with no
-    valid pixel anywhere in the chunk. The result is shared by every strip's
-    band load (sliced, not re-read) and is what sizes the strip height.
+    Reads SCL for the entire chunk extent, computes the per-pixel obs count from the UN-PRUNED
+    mask, then drops timesteps with no valid pixel anywhere in the chunk. The result is shared
+    by every strip's band load (sliced, not re-read) and sizes the strip height.
 
-    SCL is 1 byte/pixel — far cheaper than the 20 bytes/pixel of reflectance — so
-    loading the whole chunk's mask up front is a small fixed cost that removes the
-    per-strip SCL re-decompression entirely. See :class:`S2MaskBundle`.
+    SCL is 1 byte/pixel against reflectance's 20, so loading the whole chunk's mask up front is
+    a small fixed cost that removes per-strip SCL re-decompression. See :class:`S2MaskBundle`.
     """
     if store_opener is None:
         store_opener = open_store_as_zarr_group
@@ -699,14 +657,12 @@ def load_s2_mask_bundle(
     mask_full = _load_scl_mask(root, window_indices, y_slice, x_slice)
     t_full = mask_full.shape[0]
     # Both from the full (PRE-PRUNE) mask, so pixels aren't under-counted, and both from the SAME
-    # mask, so "how many" and "which months" cannot disagree about what counted. Pruning only drops
-    # timesteps with no valid pixel anywhere in the chunk, which contribute to neither.
+    # mask, so "how many" and "which months" cannot disagree about what counted.
     obs_count, month_covered = coverage_from_validity(mask_full, months_full)
     logger.info("Loaded full-chunk SCL for %d S2 timesteps", t_full)
 
-    # Prune timesteps with no valid pixel anywhere in the chunk — the v1.1
-    # per-pixel resampler only draws from valid indices, so fully-empty
-    # timesteps would never be read by any strip.
+    # Prune timesteps with no valid pixel anywhere in the chunk — the v1.1 per-pixel resampler
+    # only draws from valid indices, so no strip would ever read them.
     nonempty_t = mask_full.any(axis=(1, 2))
     kept = np.where(nonempty_t)[0]
     if len(kept) < t_full:
@@ -738,10 +694,9 @@ def _load_s2(
     reads the full chunk.
 
     ``mask_bundle`` is an optional precomputed full-chunk SCL bundle (see
-    :func:`load_s2_mask_bundle`). When supplied, the SCL is sliced from it rather
-    than re-read — chunk-level timestep pruning has already happened, so the band
-    load reads exactly the bundle's kept timesteps. When ``None`` (the unstriped
-    default path), SCL is loaded and pruned inline as before.
+    :func:`load_s2_mask_bundle`). When supplied the SCL is sliced from it rather than re-read —
+    chunk-level pruning has already happened, so the band load reads exactly the bundle's kept
+    timesteps. ``None`` (the unstriped path) loads and prunes SCL inline.
 
     Returns:
         Tuple of (s2_bands, s2_masks, s2_doys, s2_obs_count):
@@ -768,17 +723,16 @@ def _load_s2(
         abs_kept = mask_bundle.abs_indices
         y_slice = _resolve_y_slice(chunk, y_sub)
 
-        # obs_count > 0 ⟺ the pruned mask has a valid entry (pruning drops only
-        # all-False planes), and the (H, W) scan avoids walking the strided
-        # (T_kept, H, W) mask view (~100 ms/chunk on dense multi-strip chunks).
+        # obs_count > 0 ⟺ the pruned mask has a valid entry (pruning drops only all-False
+        # planes), and the (H, W) scan avoids walking the strided (T_kept, H, W) mask view
+        # (~100 ms/chunk on dense multi-strip chunks).
         if not s2_obs_count.any():
-            # No valid S2 pixel anywhere in this strip: bucketing would select
-            # zero pixels, so the (expensive, 20 B/px) band read is pure waste.
-            # Return a T=0 band stack — the dataset sees no candidates and the
-            # strip short-circuits — while obs counts keep full fidelity from
-            # the bundle. Common on sparse/edge chunks whose valid sliver lies
-            # in other strips; the timestep prune can't help them because it is
-            # chunk-global (one sliver anywhere keeps the timestep).
+            # No valid S2 pixel anywhere in this strip: bucketing would select none, so the
+            # 20 B/px band read is pure waste. Return a T=0 band stack — the dataset sees no
+            # candidates and the strip short-circuits — while obs counts keep full fidelity
+            # from the bundle. Common on sparse/edge chunks whose valid sliver lies in other
+            # strips; the chunk-global timestep prune cannot help them (one sliver anywhere
+            # keeps the timestep).
             h = y_slice.stop - y_slice.start
             w = x_slice.stop - x_slice.start
             logger.info("Strip rows %s have no valid S2 pixels — skipping band read", rows)
@@ -801,9 +755,8 @@ def _load_s2(
     s2_obs_count = s2_masks_full.sum(axis=0).astype(np.uint16)
     logger.info("Loaded SCL for %d S2 timesteps", t_full)
 
-    # Prune timesteps with no valid pixels anywhere in the chunk — the v1.1
-    # per-pixel resampler only draws from valid indices, so fully-empty
-    # timesteps would never be read.
+    # Prune timesteps with no valid pixel anywhere in the chunk — the v1.1 per-pixel resampler
+    # only draws from valid indices, so they would never be read.
     nonempty_t = s2_masks_full.any(axis=(1, 2))
     kept = np.where(nonempty_t)[0]
     n_kept = len(kept)
@@ -820,22 +773,19 @@ def _load_s2(
     s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice, reserve_cpus=reserve_cpus)
     logger.info("Loaded S2 bands shape %s", s2_bands.shape)
 
-    # Keep the mask bool (1 byte/elem) rather than widening to int32 — it stays
-    # resident in ChunkData for the whole chunk, and the only consumers
-    # (np.nonzero in resampling, .sum for obs_count) handle bool directly.
+    # Mask stays bool (1 byte/elem) rather than widening to int32: it is resident in ChunkData for
+    # the whole chunk, and both consumers (np.nonzero in resampling, .sum for obs_count) take bool.
     return s2_bands, s2_masks, s2_doys, s2_obs_count
 
 
 def coverage_from_validity(valid: np.ndarray, months: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """``(obs_count, month_covered)`` from one per-timestep validity mask.
 
-    **The pair is derived together so it cannot disagree, for every sensor rather than one.** A
-    count and a month mask answer different questions about the same evidence — how many usable
-    observations a pixel had, and how they were spread — and the only way they can contradict each
-    other is by being computed from two different notions of "usable". The optical path already
-    took this care and said so in a comment; radar computed the count alone and dropped the dates
-    on the floor. Taking a validity mask and returning both makes the property structural: whatever
-    a caller counts as valid is what both outputs describe, because there is only one input.
+    **The pair is derived together so it cannot disagree, for every sensor.** A count and a month
+    mask answer different questions about the same evidence — how many usable observations a pixel
+    had, and how they were spread — and the only way they can contradict each other is by resting
+    on two different notions of "usable". Taking one validity mask and returning both makes that
+    structural: whatever a caller counts as valid is what both outputs describe.
 
     Args:
         valid: ``(T, H, W)`` boolean-ish mask, True where timestep ``t`` is usable at that pixel.
@@ -853,19 +803,17 @@ def coverage_from_validity(valid: np.ndarray, months: np.ndarray) -> tuple[np.nd
     obs_count = valid.sum(axis=0, dtype=np.uint16)
     month_covered = np.zeros((MONTHS_IN_YEAR, *obs_count.shape), dtype=bool)
 
-    # Accumulated per TIMESTEP rather than gathered per month. Selecting `valid[months == m]` copies
-    # that month's timesteps into a fresh array before reducing it, so a pass over twelve months
-    # copies the whole mask — tens of MB per chunk per sensor, and now three sensors rather than
-    # one. OR-ing each timestep into its month's plane touches the same bytes with no temporary at
-    # all, and each iteration is still one vectorised operation over the full grid.
+    # Accumulated per TIMESTEP rather than gathered per month: `valid[months == m]` copies that
+    # month's timesteps into a fresh array before reducing, so a pass over twelve months copies the
+    # whole mask — tens of MB per chunk, times three sensors. OR-ing each timestep into its month's
+    # plane touches the same bytes with no temporary, still one vectorised op per iteration.
     if valid.shape[0]:
         index = np.asarray(months, dtype=np.intp) - 1
         if index.min() < 0 or index.max() >= MONTHS_IN_YEAR:
-            # Guarded because the failure would otherwise be SILENT and wrong rather than loud:
-            # a month of 0 indexes -1, which is December, so a mislabelled timestep would quietly
-            # mark the wrong end of the year. The previous formulation dropped out-of-range months
-            # instead, which is a different silent answer. `_filter_times_from_zarr` derives these
-            # modulo 12, so neither should ever happen; this says so rather than assuming it.
+            # Guarded because the failure would otherwise be SILENT: a month of 0 indexes -1, which
+            # is December, so a mislabelled timestep would mark the wrong end of the year.
+            # `_filter_times_from_zarr` derives these modulo 12, so it should never happen; this
+            # says so rather than assuming it.
             raise ValueError(f"month labels out of range 1..{MONTHS_IN_YEAR}: {np.unique(months)}")
         for timestep, month_index in enumerate(index):
             month_covered[month_index] |= valid[timestep]
@@ -882,12 +830,9 @@ def _load_sar_orbit(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load SAR bands, DOYs and calendar months for a single orbit direction.
 
-    ``y_sub`` is an optional chunk-relative northing slice (full easting width);
-    ``None`` reads the full chunk.
-
-    The months were always read here — ``_filter_times_from_zarr`` returns them alongside the DOYs
-    — and were discarded at this line, which is why radar could report how many observations a
-    pixel had but not when. Returning them costs a slice of an array already in hand.
+    ``y_sub`` is an optional chunk-relative northing slice (full easting width); ``None`` reads
+    the full chunk. The months come free from ``_filter_times_from_zarr`` alongside the DOYs, and
+    returning them is what lets radar say WHEN a pixel was observed and not only how often.
 
     Returns:
         Tuple of (bands, doys, months) with shapes (T, H, W, 2) uint16, (T,) int32 and (T,) int16.
@@ -907,8 +852,7 @@ def load_chunk(
     mosaic_base: str,
     time_window: TimeWindow,
     # Includes "none": `_active_orbits` returns an empty tuple for it, and the S2-only path
-    # (ADR-013) reaches here with exactly that. The narrower annotation was wrong rather than
-    # protective — it described three of the four values this already handles.
+    # (ADR-013) reaches here with exactly that.
     s1_orbit: Literal["ascending", "descending", "both", "none"] = "both",
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
@@ -924,37 +868,30 @@ def load_chunk(
         time_window: 12-month time window for temporal filtering.
         s1_orbit: Which S1 orbit direction(s) to load — ``"ascending"``,
             ``"descending"``, or ``"both"``.
-        store_opener: Maps a store path to an open zarr group. Defaults to a
-            fresh repo open per call; the strip loop passes one shared opener
-            (see ``make_store_opener``) for all strips of a chunk so each strip
-            reuses one repo handle instead of re-paying the repo open per strip.
-        y_sub: Optional chunk-relative northing slice bounding the resident
-            input working set. When given, only that horizontal strip of the
-            chunk is read (full easting width) and the returned ``ChunkData``
-            describes a self-contained strip — its ``height`` reflects the
-            strip, ``width`` stays full, and pruning / obs counts are computed
-            on the strip's own pixels (so a strip may keep a different T_kept
-            than its neighbour). ``None`` reads the whole chunk, reproducing
-            the unstriped behaviour byte-for-byte.
+        store_opener: Maps a store path to an open zarr group. Defaults to a fresh repo open
+            per call; the strip loop passes one shared opener (``make_store_opener``) so all
+            strips of a chunk reuse one repo handle.
+        y_sub: Optional chunk-relative northing slice bounding the resident input working
+            set. Only that horizontal strip is read (full easting width) and the returned
+            ``ChunkData`` is a self-contained strip — ``height`` is the strip's, ``width``
+            stays full, and pruning / obs counts are computed on the strip's own pixels (so a
+            strip may keep a different T_kept than its neighbour). ``None`` reads the whole
+            chunk, reproducing the unstriped behaviour byte-for-byte.
         mask_bundle: Optional precomputed full-chunk S2 SCL bundle (see
-            :func:`load_s2_mask_bundle`). When supplied, S2 SCL is sliced from
-            it per strip instead of re-read, and timestep pruning uses the
-            chunk-level decision baked into the bundle. The strip loop loads the
-            bundle once and passes it to every strip; ``None`` loads SCL inline.
-        reserve_cpus: Cores to leave free during the S2 band decompression —
-            background loads running alongside GPU inference reserve cores for
-            the batch-prep workers (see :func:`_band_read_workers`); foreground
-            loads use the default 0.
-        x_sub: Optional chunk-relative EASTING window (the S2 valid-pixel
-            bounding box on sparse/edge chunks). S2 bands — the 20 B/px cost —
-            are read only for these columns and the returned grid is cropped
-            to them (``width`` shrinks, mirroring how ``y_sub`` crops rows).
-            SAR is still READ full-width so the saved obs-count layers keep
-            full-extent fidelity: the pre-crop counts are returned in
-            ``s1_*_obs_count_full`` while the grid-shaped ``s1_*_obs_count``
-            are cropped like everything else. Pixels outside the box have zero
-            valid S2 observations, so they could never be inferred — cropping
-            them changes which bytes are read, not any output.
+            :func:`load_s2_mask_bundle`). When supplied, S2 SCL is sliced from it per strip
+            instead of re-read and timestep pruning uses the bundle's chunk-level decision.
+            ``None`` loads SCL inline.
+        reserve_cpus: Cores to leave free during the S2 band decompression — background loads
+            running alongside GPU inference reserve cores for the batch-prep workers (see
+            :func:`_band_read_workers`); foreground loads use the default 0.
+        x_sub: Optional chunk-relative EASTING window (the S2 valid-pixel bounding box on
+            sparse/edge chunks). S2 bands — the 20 B/px cost — are read only for these columns
+            and the returned grid is cropped to them, mirroring how ``y_sub`` crops rows. SAR
+            is still READ full-width so the saved obs-count layers keep full-extent fidelity:
+            pre-crop counts come back in ``s1_*_obs_count_full`` while the grid-shaped
+            ``s1_*_obs_count`` are cropped like everything else. Pixels outside the box have
+            zero valid S2 observations and could never be inferred, so cropping them changes
+            which bytes are read, not any output.
 
     Returns:
         ChunkData with all S2 timesteps that have any valid pixel in the
@@ -1001,9 +938,9 @@ def load_chunk(
         else _empty_sar_arrays(height, chunk.width)
     )
 
-    # A non-zero sample in either polarisation is the radar validity test, and it is the SAME
-    # expression the count was already built from — passing it to `coverage_from_validity` is what
-    # makes the count and the month mask two views of one decision rather than two decisions.
+    # A non-zero sample in either polarisation is the radar validity test; passing that one
+    # expression to `coverage_from_validity` makes the count and the month mask two views of one
+    # decision rather than two decisions.
     s1_asc_obs_count, s1_asc_month_covered = coverage_from_validity(np.any(s1_asc_bands != 0, axis=-1), s1_asc_months)
     s1_desc_obs_count, s1_desc_month_covered = coverage_from_validity(
         np.any(s1_desc_bands != 0, axis=-1), s1_desc_months
@@ -1014,11 +951,10 @@ def load_chunk(
     s1_asc_month_covered_full: np.ndarray | None = None
     s1_desc_month_covered_full: np.ndarray | None = None
     if x_sub is not None:
-        # SAR was read full-width (see the x_sub docstring): keep the full-width
-        # counts for the saved obs layers, then crop the grid-shaped arrays to
-        # match the S2 grid. ascontiguousarray drops the full-width parents.
-        # The month masks travel with their counts — same full-extent fidelity, same crop, one axis
-        # further right because month leads their shape.
+        # SAR was read full-width (see the x_sub docstring): keep the full-width counts for the
+        # saved obs layers, then crop the grid-shaped arrays to the S2 grid (ascontiguousarray
+        # drops the full-width parents). The month masks travel with their counts — same crop, one
+        # axis further right because month leads their shape.
         s1_asc_obs_count_full = s1_asc_obs_count
         s1_desc_obs_count_full = s1_desc_obs_count
         s1_asc_month_covered_full = s1_asc_month_covered

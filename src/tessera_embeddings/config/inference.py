@@ -41,58 +41,43 @@ def checkpoint_filename(norm_source: str = "aws") -> str:
 # Staged-output code identity
 # ---------------------------------------------------------------------------
 
-#: SEED for the source whose behaviour determines what a staged tile CONTAINS.
+#: SEED for the source whose behaviour determines what a staged tile CONTAINS. The
+#: fingerprint covers this plus everything it imports, transitively (see
+#: :mod:`tessera_embeddings.config.code_identity`). A change anywhere in that closure means
+#: already-staged tiles came from different logic and must not be mixed with new ones; code
+#: outside it — orchestration, providers, tooling, and the ingest and storage modules
+#: inference never reaches — does not invalidate staging.
 #:
-#: The fingerprint covers this plus everything it imports, transitively (see
-#: :mod:`tessera_embeddings.config.code_identity`) — a hand-maintained list cannot keep
-#: up with the imports, and it fails in the silent direction when it falls behind.
-#:
-#: A change anywhere in that closure means already-staged tiles were produced by
-#: different logic and must not be mixed with new ones. Code outside it — orchestration,
-#: provider and tooling code, and the ingest and storage modules inference never reaches
-#: — does not invalidate staging, which is the point of narrowing away from the old
-#: whole-build identity.
-#:
-#: The whole ``inference`` package seeds it rather than a hand-picked module list, and
-#: the closure then pulls in what those modules import (about a third of the package).
-#: Both OVER-include: ``assembly.py`` reads staged tiles rather than producing them, and
-#: ``storage.zarr_store`` arrives for ``compute_doy`` but brings its own dependencies
-#: with it. Deliberate, because the two errors are not symmetric — over-including costs
-#: a spurious re-inference, and ``force_staging_reuse`` exists to wave one through, while
+#: The whole ``inference`` package seeds it rather than a hand-picked module list, and both
+#: the seed and the closure OVER-include: ``assembly.py`` reads staged tiles rather than
+#: producing them, and ``storage.zarr_store`` arrives for ``compute_doy`` bringing its own
+#: dependencies. Deliberate, because the errors are not symmetric — over-including costs a
+#: spurious re-inference that ``force_staging_reuse`` can wave through, while
 #: under-including silently assembles tiles from two code versions into one write-once
-#: zone-year and has no escape hatch at all. Err toward the expensive failure, never the
-#: silent one.
+#: zone-year and has no escape hatch at all.
 _STAGED_OUTPUT_SOURCES: tuple[str, ...] = ("inference", "config/inference.py")
 
 
 def inference_code_identity() -> str:
     """Fingerprint of the code that determines staged tile CONTENT, not of the whole build.
 
-    Replaces the AMI-ID-plus-tarball-ETag identity that used to feed the campaign's staging
-    ``run_id``. That identity was correct but far too wide: re-baking the worker AMI, or a
-    hotfix anywhere in the repo, changed it and so abandoned every staged tile and re-ran
-    inference for no semantic reason. At campaign scale that is the difference between a
-    hotfix costing minutes and costing a re-run.
+    Hashes :data:`_STAGED_OUTPUT_SOURCES` **and everything it imports**, transitively — see
+    :func:`~tessera_embeddings.config.code_identity.source_identity` for the closure and for
+    what a source hash cannot see. A build identity would be correct but far too wide, so a
+    hotfix would abandon every staged tile; rationale in
+    ``context_docs/design/staging-identity-and-resume.md``.
 
-    Hashes :data:`_STAGED_OUTPUT_SOURCES` **and everything it imports**, transitively —
-    see :func:`~tessera_embeddings.config.code_identity.source_identity` for the closure
-    and for what a source hash cannot see.
-
-    The residual dependency-drift case is bounded twice here: the AMI is resolved once
-    and PINNED into every fill of a campaign, so one run cannot straddle two images, and
-    a model change ships under a new checkpoint filename, which is in the fingerprint
-    separately. A deliberate library upgrade mid-campaign wants the force-new escape
-    hatch rather than a silent reuse.
+    The residual dependency-drift case is bounded twice: the AMI is resolved once and PINNED
+    into every fill of a campaign, so one run cannot straddle two images, and a model change
+    ships under a new checkpoint filename, which is in the fingerprint separately. A
+    deliberate library upgrade mid-campaign wants the force-new escape hatch rather than a
+    silent reuse.
     """
     return source_identity(_STAGED_OUTPUT_SOURCES, "infcode")
 
 
 def _normalize_obs_checkpoints(checkpoints: tuple[int, ...]) -> tuple[int, ...]:
-    """Coerce and validate a num_obs_checkpoints value.
-
-    Deduplicates, sorts, and filters out non-positive values. Safe to call on
-    values arriving as lists from YAML deserialization.
-    """
+    """Deduplicate, sort and drop non-positive values; safe on lists from YAML."""
     result = tuple(sorted({int(v) for v in checkpoints if int(v) > 0}))
     if not result:
         raise ValueError("num_obs_checkpoints must contain at least one positive integer")
@@ -185,61 +170,44 @@ SCL_VALID_CLASSES = frozenset({4, 5, 6, 7, 10, 11})
 
 #: A pixel with fewer than this many radar observations in the year is "radar-thin".
 #:
-#: Reported per year alongside the radar-free count so a downstream user can tell a pixel
-#: the radar barely saw from one it saw normally — a distinction the embedding itself does
-#: not expose, since both produce an embedding. The exact per-pixel counts are in the store;
-#: this only sets where the summary draws its line, and it is deliberately generous:
-#: twelve is roughly one observation a month, below which a year's radar signal is thin
-#: however it is sampled.
+#: Reported per year alongside the radar-free count so a downstream user can tell a pixel the
+#: radar barely saw from one it saw normally — a distinction the embedding itself does not
+#: expose, since both produce an embedding. The exact per-pixel counts are in the store; this
+#: only sets where the summary draws its line, and it is deliberately generous: twelve is
+#: roughly one observation a month, below which a year's radar signal is thin however sampled.
 RADAR_THIN_MAX_OBS = 12
+
+#: The four orbit selections, as one name rather than a Literal repeated at every boundary.
+#: ``"none"`` is a real member: the S2-only path (ADR-013) carries it end to end, and a
+#: signature that omits it forces a cast at each hop instead of saying what the value is.
+S1Orbit = Literal["ascending", "descending", "both", "none"]
 
 #: Minimum valid Sentinel-2 observations for a pixel to be EMBEDDED AT ALL, in the calendar
 #: year being filled. A pixel below it is written as fill, exactly as an out-of-ROI pixel is.
 #:
-#: **Not the counterpart of :data:`RADAR_THIN_MAX_OBS`, and the asymmetry is deliberate.** The
-#: radar line labels; this one refuses. They are also not comparable as numbers: radar sees
-#: through cloud, so its count is set by orbit geometry and one observation a month is a
-#: thin-but-usable year, while optical loses most of its passes to cloud and what survives
-#: masking is a small fraction of the overpasses.
+#: **Not the counterpart of :data:`RADAR_THIN_MAX_OBS`.** That line LABELS; this one REFUSES,
+#: irreversibly — a refused pixel has no embedding, so recovering one re-runs its whole shard.
+#: Nor are the numbers comparable: radar sees through cloud, so one observation a month is a
+#: thin-but-usable year, while optical loses most passes to cloud. (Documents and commits
+#: predating 2026-08-13 use the old name ``OPTICAL_THIN_MAX_OBS``, when it was a label.)
 #:
-#: **This is a refusal, not a label, and the difference is that it is not reversible.** Under
-#: its old name (``OPTICAL_THIN_MAX_OBS``, 40 until 2026-08-12, then 15) nothing was refused for
-#: being under it and the per-pixel counts in ``s2_obs_count`` told the whole story either way —
-#: so raising or lowering it changed what summaries said and never what was published. That is no
-#: longer true: a refused pixel has no embedding, so recovering one is a re-run of its whole
-#: shard. **A reader of commits or documents from before 2026-08-13 will find the opposite claim
-#: under the old name.**
+#: Two things bound how freely the value moves. It is stamped into the global store's root
+#: attrs as part of their write-once identity, so **a store cannot be re-stamped** — changing
+#: the line means a new store, not a migration, and a store seeded at another value keeps it.
+#: And the seeder takes it explicitly rather than defaulting to this constant, so nothing can
+#: stamp a store by inheriting whatever happens to be here.
 #:
-#: Two things bound how freely this value moves:
+#: ``s2_thin_px`` per chunk and ``s2_thin_below_obs`` in run provenance count EMBEDDED pixels
+#: below this value — a preview of what a refusal removes while nothing refuses, and once the
+#: gate is enforced an invariant: **the count must be zero; a non-zero one means it leaked.**
+#: Each cell's provenance records the line its own numbers were produced under, so cells
+#: filled before and after a change stay comparable.
 #:
-#: * it is stamped into the global store's root attrs and is part of their write-once identity,
-#:   so **a store cannot be re-stamped with a different value** — changing the line means a new
-#:   store, not a migration;
-#: * the seeder takes it explicitly and does not default to this constant, so nothing can stamp
-#:   a store by inheriting whatever happens to be here.
-#:
-#: **What the thin counters mean now that this is the only line.** ``s2_thin_px`` per chunk and
-#: ``s2_thin_below_obs`` in run provenance count EMBEDDED pixels below this value. While nothing
-#: refuses, that is a preview of what a refusal would remove. Once the gate is enforced it is an
-#: invariant: **the count must be zero, and a non-zero one means the gate leaked.** Each cell's
-#: provenance records the line its own numbers were produced under, so cells filled before and
-#: after a change are comparable rather than silently restated.
-#:
-#: **15 is a DECISION (Robert and colleague, 2026-08-17), not a placeholder** — it replaces the 25
-#: that stood here from 2026-08-13 purely so the machinery could be built. Coverage was chosen over
-#: reproducibility: the line keeps **94% of pixels rather than 79%**, and the cost, accepted
-#: knowingly, is that two independent embeddings of the same ground agree less well. The trade is
-#: recorded in full, including what 15 admits that 20 would not, in
-#: ``context_docs/design/minimum-optical-depth-plan.md``.
-#:
-#: **A store already seeded at another value keeps it.** The root attr decides, and it is write-once,
-#: so this constant changes what a NEW store is seeded with and what the thin counters report —
-#: never what an existing store enforces.
-#: The four orbit selections, as one name rather than a Literal repeated at every boundary.
-#: ``"none"`` is a real member: the S2-only path (ADR-013) carries it end to end, and a signature
-#: that omits it forces a cast at each hop instead of saying what the value is.
-S1Orbit = Literal["ascending", "descending", "both", "none"]
-
+#: **15 is a DECISION (Robert and colleague, 2026-08-17), not a placeholder.** Coverage over
+#: reproducibility: it keeps **94% of pixels rather than 79%**, at the knowingly accepted cost
+#: that two independent embeddings of the same ground agree less well. The trade, including
+#: what 15 admits that 20 would not, is in
+#: ``context_docs/design/minimum-optical-depth-plan.md`` (ADR-018).
 OPTICAL_MIN_OBS = 15
 
 #: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
@@ -248,10 +216,10 @@ OPTICAL_MIN_OBS = 15
 #: to once probing shows neither orbit wrote a store. Some land has no dual-pol VV+VH radar in
 #: principle — over ice Sentinel-1 runs Extra Wide swath with HH/HV, which the OPERA query
 #: correctly discards — so a zone can be permanently radar-free while the catalogue holds a
-#: hundred thousand granules for it. Requiring a SAR store there fails the cell forever.
+#: hundred thousand granules for it, and requiring a SAR store there fails the cell forever.
 #:
-#: Defined HERE, in the layer the config lives in, because ``InferenceConfig`` has to validate
-#: it and the loader that resolves it already depends on this module.
+#: Defined here because ``InferenceConfig`` has to validate it and the loader that resolves it
+#: already depends on this module.
 S1_ORBIT_NONE = "none"
 
 # Embedding output dimension — v1.1 produces 192-D reps; we save the first 128.
@@ -265,23 +233,22 @@ REPRESENTATION_DIM = 192
 # transformer. Multiples of 8 from 8 to 256 match tessera v1.1 defaults.
 DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 
-# CPU batch-prep pipeline depth for the inference loop (also the number of prep
-# workers). Depth 1 starved the GPU whenever a forward ran shorter than one prep;
-# depth 2 keeps a batch ready across consecutive short forwards. Lives here
-# (torch-free) because actors.py sizes its background-load CPU reservation to
-# match — one reserved core per prep worker — and cannot import inference.py at
-# module scope (the Fargate flow runner has no torch).
+# CPU batch-prep pipeline depth for the inference loop, and the number of prep workers.
+# Depth 1 starved the GPU whenever a forward ran shorter than one prep; depth 2 keeps a batch
+# ready across consecutive short forwards. Lives in this torch-free module because actors.py
+# sizes its background-load CPU reservation to match (one reserved core per prep worker) and
+# cannot import inference.py at module scope — the Fargate flow runner has no torch.
 PREFETCH_DEPTH = 2
 
-# Spatial read-tile size for inference, on both paths: one tile is exactly one
-# 2048-px output shard (ADR-008 D3), so assembly writes whole shards instead of
-# read-modify-writing a partial output chunk at each tile edge. A literal rather
-# than an import of ``store_layout.SHARD_PX`` — that module imports EMBEDDING_DIM
-# from this one — and ``test_store_layout`` pins the two together.
+# Spatial read-tile size for inference, on both paths: one tile is exactly one 2048-px output
+# shard (ADR-008 D3), so assembly writes whole shards instead of read-modify-writing a partial
+# output chunk at each tile edge. A literal rather than an import of ``store_layout.SHARD_PX``
+# — that module imports EMBEDDING_DIM from this one — and ``test_store_layout`` pins the two
+# together.
 #
-# A tile's peak host RAM is not T x H x W: the resident input working set is
-# bounded by density-sized northing strips (actors._strip_height_for_density),
-# so sparse tiles load in one full-height strip and only dense ones split.
+# A tile's peak host RAM is not T x H x W: the resident input working set is bounded by
+# density-sized northing strips (actors._strip_height_for_density), so sparse tiles load in
+# one full-height strip and only dense ones split.
 INFERENCE_CHUNK_SIZE = 2048
 
 #: Total GPU memory the calibration below was measured on, in GiB. The L40S in
@@ -289,11 +256,10 @@ INFERENCE_CHUNK_SIZE = 2048
 #: configured batch unchanged.
 TUNED_GPU_GIB: float = 44.0
 
-#: Sub-batch the calibration was measured AT, and the only batch known to fit
-#: :data:`TUNED_GPU_GIB` at :data:`TUNED_TOKENS_PER_PIXEL`. The fitted batch is derived from
-#: this, never from the caller's request, so a caller asking for more than was calibrated
-#: cannot carry its over-ask through the scaling. It is the default of
-#: :attr:`InferenceConfig.batch_size`.
+#: Sub-batch the calibration was measured AT, the only batch known to fit
+#: :data:`TUNED_GPU_GIB` at :data:`TUNED_TOKENS_PER_PIXEL`, and the default of
+#: :attr:`InferenceConfig.batch_size`. The fitted batch derives from this and never from the
+#: caller's request, so an over-ask cannot carry through the scaling.
 TUNED_BATCH_SIZE: int = 7168
 
 #: Deepest sequence the calibration covered, in tokens per pixel: both streams at the
@@ -312,47 +278,42 @@ def batch_size_for_gpu(
 ) -> int:
     """Return the sub-batch size this actor's share of a card can run.
 
-    A sub-batch's working set is activations, and activations are linear in
-    ``batch_size x (t_s2 + t_s1)`` — the batch, times the sequence lengths of the bucket it
-    was drawn from. Only the batch is ours to pick, but the sequence is BOUNDED:
+    A sub-batch's working set is activations, linear in ``batch_size x (t_s2 + t_s1)``. Only
+    the batch is ours to pick, but the sequence is BOUNDED:
     :func:`~tessera_embeddings.inference.sampling.compute_bin_keys` clips a pixel to
-    ``max(num_obs_checkpoints)`` observations on each of the two streams, so the deepest
-    bucket the sampler can build is twice that per pixel. Its depth is therefore known
-    before any tile is read, which is why the batch needs no PER-BUCKET term: one value,
-    fitted once, is safe for every bucket a run can present.
+    ``max(num_obs_checkpoints)`` observations on each stream, so the deepest bucket the
+    sampler can build is twice that per pixel — known before any tile is read, which is why
+    the batch needs no PER-BUCKET term: one value, fitted once, is safe for every bucket.
 
-    Three things move that fit, and all three are here rather than at the call site because
-    a caller that knew to supply one would not necessarily know to supply the others:
+    Three things move that fit, all handled here rather than at the call site because a
+    caller that knew to supply one would not necessarily supply the others: how much memory
+    the card has (the reason this exists); how deep the ladder goes, since a ladder past the
+    tuned depth makes every sub-batch proportionally larger; and how much of the card this
+    actor gets, since a fractional reservation PACKS actors onto one card
+    (``FleetDemand.machines``) and each sizing to the whole card would oversubscribe it by
+    exactly the packing factor.
 
-    * **How much memory the card has.** The reason this function exists.
-    * **How deep the ladder goes.** A ladder past the tuned depth makes every sub-batch
-      proportionally larger, so the batch has to come down to meet it.
-    * **How much of the card this actor gets.** A fractional reservation PACKS actors onto
-      one card (see ``FleetDemand.machines``), and each one sizing to the whole card would
-      oversubscribe it by exactly the packing factor.
+    An actor that runs out of memory is killed and replaced and its chunk retried, so the
+    cost is a reloaded checkpoint rather than lost data. Measurements behind the constants:
+    ``context_docs/design/a10g_batch_size_2026_08.md``.
 
-    An actor that runs out of memory is killed and replaced, and its chunk is retried, so
-    the cost is not lost data but a reloaded checkpoint on a fresh actor. Measurements
-    behind the constants are in ``context_docs/design/a10g_batch_size_2026_08.md``.
-
-    ``None`` — a CPU device, or one that reports no memory — leaves ``configured`` alone,
-    because scaling on an unknown is a guess and the tuned value is the better default.
-
-    There is NO floor. A configuration whose safe batch is small gets the small batch and
-    runs slowly; raising it to a round number would restore exactly the out-of-memory this
-    exists to prevent, on exactly the configurations nobody watches.
+    There is NO floor: a configuration whose safe batch is small gets the small batch and
+    runs slowly, because raising it to a round number would restore exactly the
+    out-of-memory this exists to prevent, on the configurations nobody watches.
 
     Args:
-        configured: The batch size the caller asked for. It is a CEILING, not the thing
-            scaled: the fit comes off :data:`TUNED_BATCH_SIZE`, so asking for more than was
+        configured: The batch size the caller asked for. A CEILING, not the thing scaled —
+            the fit comes off :data:`TUNED_BATCH_SIZE`, so asking for more than was
             calibrated raises nothing.
-        total_gib: The device's total memory in GiB, or ``None`` if unknown.
-        num_obs_checkpoints: The sampler's checkpoint ladder, whose deepest entry bounds
-            each stream's sequence length.
-        gpu_fraction: This actor's Ray GPU reservation, ``1.0`` for sole occupancy. The
-            share it actually gets is ``1 / floor(1 / gpu_fraction)``, because that is how
-            many actors Ray fits on the card (:meth:`FleetDemand.machines`) — at ``0.6``
-            one actor packs and owns the whole card, not 60% of it.
+        total_gib: The device's total memory in GiB, or ``None`` if unknown (a CPU device, or
+            one reporting no memory), which leaves ``configured`` alone: scaling on an
+            unknown is a guess and the tuned value is the better default.
+        num_obs_checkpoints: The sampler's checkpoint ladder, whose deepest entry bounds each
+            stream's sequence length.
+        gpu_fraction: This actor's Ray GPU reservation, ``1.0`` for sole occupancy. The share
+            it actually gets is ``1 / floor(1 / gpu_fraction)``, because that is how many
+            actors Ray fits on the card (:meth:`FleetDemand.machines`) — at ``0.6`` one actor
+            packs and owns the whole card, not 60% of it.
 
     Returns:
         The calibrated capacity of this actor's share of the card, capped at ``configured``
@@ -401,16 +362,15 @@ class InferenceConfig:
             ray_address: Ray cluster address (None for local mode).
             use_spot: Whether to use spot instances.
             max_gpu_workers: Maximum number of GPU workers.
-            actor_request_batch_size: Request actors this many at a time (0 =
-                all at once). Paces the EC2 demand the autoscaler forwards to
-                AWS, which fulfils a large simultaneous ask slowly. Inference
-                still starts on the first ready actor.
+            actor_request_batch_size: Request actors this many at a time (0 = all at
+                once). Paces the EC2 demand the autoscaler forwards to AWS, which
+                fulfils a large simultaneous ask slowly. Inference still starts on the
+                first ready actor.
             actor_batch_placement_timeout_sec: Max seconds to wait for a batch's
                 instances to join the cluster before requesting the next batch
                 regardless (capacity-shortfall escape hatch).
-            actor_request_headroom: Hold the request to the fleet's placed GPU
-                nodes plus this many, replacing the batch-and-timeout policy above.
-                None keeps today's behaviour.
+            actor_request_headroom: Hold the request to the fleet's placed GPU nodes plus
+                this many, replacing the batch-and-timeout policy above. None keeps it.
     """
 
     # Time window (required — no default)
@@ -433,19 +393,18 @@ class InferenceConfig:
     s1_orbit: S1Orbit = "both"
     """Which S1 orbit direction(s) to read.
 
-    ``"none"`` is a RESOLVED value, not a request: it is what ``"both"`` becomes once probing
-    finds that neither orbit wrote a store. Parts of the globe are radar-free in principle —
-    over ice Sentinel-1 flies Extra Wide swath with HH/HV, which the dual-pol query correctly
-    discards — so this is a permanent property of the terrain rather than an ingest failure,
-    and a global product cannot refuse it. It requires ``allow_s2_only``: with no radar at all
-    every pixel has zero S1 observations, so the default gate would skip every one of them.
+    ``"none"`` is a RESOLVED value, not a request: what ``"both"`` becomes once probing finds
+    that neither orbit wrote a store. Parts of the globe are radar-free in principle — over
+    ice Sentinel-1 flies Extra Wide swath with HH/HV, which the dual-pol query correctly
+    discards — so it is a permanent property of the terrain, not an ingest failure, and a
+    global product cannot refuse it. It requires ``allow_s2_only``: with no radar at all every
+    pixel has zero S1 observations, so the default gate would skip every one of them.
     """
     # Deterministic sampling under v1.1 — no repeat variance; forced False in __post_init__.
     compute_std: bool = False
 
-    # Ray actor resource reservation. num_gpus=1 is production default (one GPU per
-    # actor — L40S on g6e.xlarge workers);
-    # set to 0 for CPU-only runs (local smoke tests, plain runner on a non-GPU host).
+    # Ray actor resource reservation. 1 is the production default (one GPU per actor — L40S
+    # on g6e.xlarge); 0 for CPU-only runs (local smoke tests, a runner on a non-GPU host).
     num_gpus: float = 1.0
 
     # I/O. Callers must supply absolute URIs; no environment-derived defaults.
@@ -459,62 +418,58 @@ class InferenceConfig:
     use_spot: bool = False
     max_gpu_workers: int = 500
 
-    # Actor request batching. AWS fulfils a large simultaneous EC2 ask slowly,
-    # so we can request actors in batches and let the autoscaler see demand for
-    # only one batch at a time. 0 disables batching (request all actors up
-    # front — the historical behaviour). When enabled, inference still starts on
-    # the first ready actor; subsequent batches are requested by the
-    # work-stealing loop once the prior batch's instances have joined the
-    # cluster (placement), so a slow model load never gates the next AWS ask.
+    # Actor request batching. AWS fulfils a large simultaneous EC2 ask slowly, so actors are
+    # requested in batches and the autoscaler sees demand for one batch at a time; 0 disables
+    # batching and requests them all up front. Inference still starts on the first ready
+    # actor, and the work-stealing loop requests the next batch once the prior batch's
+    # instances have joined the cluster (placement), so a slow model load never gates the
+    # next AWS ask.
     actor_request_batch_size: int = 50
-    # Max seconds to wait for a batch's instances to be placed before requesting
-    # the next batch anyway. Escape hatch so a capacity shortfall (e.g. AWS only
-    # provisions 48/50) can't gate every remaining batch forever.
+    # Max seconds to wait for a batch's instances to be placed before requesting the next
+    # batch anyway — an escape hatch so a capacity shortfall (AWS provisions 48 of 50) cannot
+    # gate every remaining batch forever.
     actor_batch_placement_timeout_sec: float = 300.0
 
-    # Appended last on purpose: InferenceConfig is public API (docs/public-api.md)
-    # and this is a positional dataclass, so a new field in the middle would
-    # silently rebind later positional args in downstream construction. Keep new
-    # fields at the tail.
+    # Fields below are appended last on purpose: InferenceConfig is public API
+    # (docs/public-api.md) and this is a positional dataclass, so a new field in the middle
+    # would silently rebind later positional args in downstream construction.
     #
-    # Embed S2-valid pixels that have ZERO S1 observations (sub-zone SAR coverage
-    # gaps — swath edges/holes; worst at high latitudes). Such a pixel gets the
-    # upstream v1.1 missing-S1 convention: an all-zeros (normalized-space) S1 slice
-    # at the smallest bucket — exactly ucam-eo/tessera's `_sample_s1_merged` zero
-    # return — so this restores upstream parity rather than inventing an input.
-    # Default False: pixels without S1 are skipped (this pipeline's historical
-    # gate). Per-pixel provenance is free either way: an embedded pixel with
-    # s1_asc_obs_count + s1_desc_obs_count == 0 is an S2-only embedding. NOTE:
-    # S2-only embedding QUALITY is unvalidated for this S1-trained checkpoint —
-    # see the optional-S1 ADR before enabling in production.
+    # Embed S2-valid pixels that have ZERO S1 observations (sub-zone SAR coverage gaps —
+    # swath edges and holes, worst at high latitudes). Such a pixel gets the upstream v1.1
+    # missing-S1 convention: an all-zeros (normalized-space) S1 slice at the smallest bucket,
+    # exactly ucam-eo/tessera's `_sample_s1_merged` zero return, so this restores upstream
+    # parity rather than inventing an input. Default False skips pixels without S1. Per-pixel
+    # provenance is free either way: an embedded pixel with s1_asc_obs_count +
+    # s1_desc_obs_count == 0 is an S2-only embedding. NOTE: S2-only embedding QUALITY is
+    # unvalidated for this S1-trained checkpoint — see the optional-S1 ADR before enabling in
+    # production.
     allow_s2_only: bool = False
 
-    # Minimum valid optical observations for a pixel to be embedded at all, or None for "embed
-    # everything with any optical input" — the historical behaviour, and what every non-campaign
-    # caller wants. See OPTICAL_MIN_OBS for what a refusal costs. None rather than 0 because the
-    # two are different statements and only one of them is recoverable from a config dump: a
-    # campaign whose value silently resolved to 0 would publish under no rule while believing it
-    # had one, which is the shape of two failures already in this repo's register.
+    # Minimum valid optical observations for a pixel to be embedded at all; None means "embed
+    # everything with any optical input", which is what every non-campaign caller wants. See
+    # OPTICAL_MIN_OBS for what a refusal costs. None rather than 0 because only one of the two
+    # is recoverable from a config dump: a campaign whose value silently resolved to 0 would
+    # publish under no rule while believing it had one, the shape of two failures already in
+    # this repo's corrections register.
     optical_min_obs: int | None = None
 
-    # How far the actor request may run ahead of the actor slots the fleet actually
-    # holds. Set, it replaces the batch-and-timeout policy outright: the run asks for
-    # what it has plus this, so a region that cannot place instances stops the fleet
-    # growing rather than letting the request run away from it (see
-    # `_batch_actors_to_request`, and ACTOR_REQUEST_HEADROOM for the value to pass).
-    # None keeps the historical policy, so a release cannot change how a fleet already
-    # in flight grows; a caller that wants the bound asks for it, and names the
-    # distance in the same breath. `__post_init__` decides what each combination of
-    # this and `actor_request_batch_size` MEANS — read that before adding a third knob.
+    # How far the actor request may run ahead of the actor slots the fleet actually holds. Set,
+    # it replaces the batch-and-timeout policy outright: the run asks for what it has plus
+    # this, so a region that cannot place instances stops the fleet growing rather than letting
+    # the request run away from it (see `_batch_actors_to_request`, and ACTOR_REQUEST_HEADROOM
+    # for the value to pass). None keeps batch-and-timeout, so a release cannot change how a
+    # fleet already in flight grows; a caller wanting the bound asks for it and names the
+    # distance in the same breath. `__post_init__` decides what each combination of this and
+    # `actor_request_batch_size` MEANS — read that before adding a third knob.
     actor_request_headroom: int | None = None
 
     def initial_actor_request(self, num_actors: int) -> int:
         """How many actors to create before the scheduling loop takes over.
 
-        The cold start of whichever request policy is in force, in ONE place. Deriving it
-        here and gating it again in the scheduler lets the two disagree: the clamp below
-        applies on a path where the loop that undoes it may not run, and a fleet then
-        opens at the reduced width and stays there. Both callers read this instead.
+        The cold start of whichever request policy is in force, in ONE place, read by both
+        callers. Deriving it here and gating it again in the scheduler lets the two disagree:
+        the clamp below applies on a path where the loop that undoes it may not run, and the
+        fleet then opens at the reduced width and stays there.
 
         Args:
             num_actors: The run's actor target.
@@ -534,13 +489,11 @@ class InferenceConfig:
 
     def __post_init__(self) -> None:
         """Validate and normalise config fields."""
-        # The actor-request policy, defined once as a total function over both knobs.
-        # `actor_request_batch_size` carried a sentinel (0 = all at once) before
-        # `actor_request_headroom` arrived with another (None = off), and the
-        # combinations were never reconciled — which is how a contradictory pair came to
-        # be accepted and then silently half-honoured. Each refusal below is a
-        # combination that cannot be given a coherent meaning, so it is refused here
-        # rather than resolved for the caller at run time.
+        # The actor-request policy, defined once as a total function over both knobs — each
+        # carries its own sentinel (`actor_request_batch_size` 0 = all at once,
+        # `actor_request_headroom` None = off) and some pairings contradict. Each refusal
+        # below is a combination with no coherent meaning, refused here rather than resolved
+        # for the caller at run time and then silently half-honoured.
         if self.actor_request_headroom is not None:
             if self.actor_request_headroom < 1:
                 raise ValueError(
@@ -578,16 +531,15 @@ class InferenceConfig:
             )
         if self.s1_orbit == S1_ORBIT_NONE and not self.allow_s2_only:
             # FORCED, not refused, and not left alone. Refusing would defeat the decision that
-            # radar-free land is acceptable — a global product cannot reject terrain that has no
-            # dual-pol radar in principle. Leaving the flag alone would be worse than either:
-            # with no radar every pixel has zero S1 observations, the default gate skips every
-            # one, and the fill would COMPLETE having written nothing while tagging the year
-            # done. An empty result that reads as success is the one outcome no later run
-            # revisits.
+            # radar-free land is acceptable — a global product cannot reject terrain with no
+            # dual-pol radar in principle. Leaving the flag alone is worse than either: with no
+            # radar every pixel has zero S1 observations, the default gate skips every one, and
+            # the fill COMPLETES having written nothing while tagging the year done — an empty
+            # result that reads as success, which no later run revisits.
             #
             # Safe to derive rather than demand from the caller because it is a function of
             # s1_orbit alone, so a resume computes the same value from the same inputs and the
-            # staged-chunk consistency check in the embeddings flow still holds.
+            # embeddings flow's staged-chunk consistency check still holds.
             self.allow_s2_only = True
             logger.warning(
                 "s1_orbit=%r: forcing allow_s2_only=True. This ROI has no radar at all, so "

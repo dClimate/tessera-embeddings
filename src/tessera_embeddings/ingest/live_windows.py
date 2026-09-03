@@ -9,25 +9,22 @@ write) to the ingest chunk grid and emit one window per live chunk-row
 (:func:`row_band_windows`), then group vertically adjacent bands into fewer, taller
 windows (:func:`merge_bands`).
 
-The second stage exists because the two costs a window strategy trades are nothing
-alike. Chunk area is computed in PARALLEL across the fleet, so more of it widens
-the graph — which is what the fleet wants. A window BOUNDARY is a serial, blocking
-region write the whole fleet waits through. Minimising area alone therefore buys
-the cheap thing and pays for the expensive one; grouping does the reverse.
+The second stage exists because the two costs a window strategy trades are nothing alike.
+Chunk area is computed in PARALLEL across the fleet; a window BOUNDARY is a serial, blocking
+region write the whole fleet waits through. Minimising area alone buys the cheap thing and
+pays for the expensive one; grouping does the reverse.
 
-This module is general-purpose: it serves a SINGLE run (any sparse ROI — scattered
-fields, a coastline, any footprint much smaller than its bounding box) and a GLOBAL
-campaign zone identically, because both produce the same mask artifact.
+General-purpose: a SINGLE run over any sparse ROI (scattered fields, a coastline) and a GLOBAL
+campaign zone are served identically, because both produce the same mask artifact.
 
-Windows are snapped to the chunk grid by construction, which makes them
-chunk-disjoint — the property that lets one session write every window of a date
-and commit once, with no shared-chunk reconciliation. Grouping preserves it, since
-it only unions adjacent chunk-row ranges.
+Windows are snapped to the chunk grid by construction, hence chunk-disjoint — the property
+that lets one session write every window of a date and commit once, with no shared-chunk
+reconciliation. Grouping preserves it, since it only unions adjacent chunk-row ranges.
 
-The grid itself is normally read from the mask's chunk KEYS rather than its pixels:
-an all-ocean chunk is never written, so the set of stored chunks IS the set of live
-cells, and one listing replaces a read per chunk position. The pixel scan remains as
-the fallback for any store whose layout is not positively recognised.
+The grid itself is normally read from the mask's chunk KEYS rather than its pixels: an
+all-ocean chunk is never written, so the set of stored chunks IS the set of live cells, and one
+listing replaces a read per chunk position. The pixel scan remains the fallback for any store
+whose layout is not positively recognised.
 """
 
 from __future__ import annotations
@@ -52,11 +49,10 @@ logger = logging.getLogger(__name__)
 #: matches, while a key of different rank (``c/1/2/3``) deliberately does not.
 _CHUNK_KEY_RE = re.compile(r"(?:^|/)c/(\d+)/(\d+)$")
 
-#: Cap on the graph a single region write may build, in TASKS — the unit that
-#: actually saturates, because the scheduler dispatches tasks and its event loop is
-#: single-threaded. Denominated in tasks rather than chunk area because the tasks a
-#: chunk costs depends on band count and block geometry, so a chunk-denominated cap
-#: silently changes meaning whenever either moves. See :func:`merge_bands`.
+#: Cap on the graph a single region write may build, in TASKS — the unit that saturates, because
+#: the scheduler dispatches tasks on a single-threaded event loop. Not chunk area: the tasks a
+#: chunk costs depend on band count and block geometry, so a chunk-denominated cap would change
+#: meaning whenever either moves. See :func:`merge_bands`.
 MAX_TASKS_PER_WINDOW = 24_000
 
 #: Graph tasks one window chunk is assumed to cost, for turning the task cap into a
@@ -71,18 +67,16 @@ DEFAULT_TASKS_PER_CHUNK = 200
 #: sequential write path — S1 is on it (``overlap_window_writes`` defaults False there).
 WINDOW_COST_IN_CHUNKS = 200
 
-#: The same exchange rate once a date's windows share ONE dask graph
-#: (``overlap_window_writes``), which is what makes a window boundary cheap rather than
-#: a serial stall. A window then costs a client-side subgraph, one leaf in the merge
-#: reduction and one changeset — order 15 chunks against the 200 a serial write cost.
+#: The same exchange rate once a date's windows share ONE dask graph (``overlap_window_writes``),
+#: which makes a window boundary cheap rather than a serial stall: a window then costs a
+#: client-side subgraph, one leaf in the merge reduction and one changeset — order 15 chunks
+#: against the 200 a serial write costs.
 #:
-#: Lower is not free: paying less per window makes the DP merge less, so it stops
-#: dragging ocean into ragged-edge merges (the dead area this recovers) but issues more
-#: windows. Measured over all 112 zone masks, 200 -> 20 cuts covered area 6.0% for 14.4%
-#: more windows, and total submitted tasks FALL 6% because area dominates. The knee is
-#: 10-20: 200->50 buys 74 chunks per added window, 50->20 buys 28, 20->10 buys 13.5.
-#: Numbers and the per-zone spread in
-#: ``yield-embeddings/context_docs/measurements/`` (2026-07-27 sweep).
+#: Lower is not free: paying less per window makes the DP merge less, so it stops dragging ocean
+#: into ragged-edge merges but issues more windows. Measured over all 112 zone masks, 200 -> 20
+#: cuts covered area 6.0% for 14.4% more windows, and total submitted tasks FALL 6% because area
+#: dominates. The knee is 10-20: 200->50 buys 74 chunks per added window, 50->20 buys 28, 20->10
+#: buys 13.5. Per-zone spread in ``yield-embeddings/context_docs/measurements/`` (2026-07-27).
 WINDOW_COST_IN_CHUNKS_OVERLAPPED = 20
 
 
@@ -103,10 +97,10 @@ class LiveWindow:
 def _open_mask(mask_path: str, storage_options: StorageOptions = None) -> zarr.Array:
     """Open + validate the ROI mask array (the shape both mask writers produce).
 
-    ``storage_options`` mirrors :func:`ingest.roi.read_roi_mask` in both senses: a
-    deployment whose mask needs non-default fsspec/S3 settings must pass them here too,
-    or window derivation fails where the ingest's own mask read succeeds — and a callable
-    is resolved here, at the read, so a credential cannot be older than this call.
+    ``storage_options`` mirrors :func:`ingest.roi.read_roi_mask` in both senses: a deployment
+    whose mask needs non-default fsspec/S3 settings must pass them here too, or window derivation
+    fails where the ingest's own mask read succeeds; and a callable is resolved at the read, so a
+    credential cannot be older than this call.
     """
     z = zarr.open(mask_path, mode="r", storage_options=resolve_storage_options(storage_options))
     if not isinstance(z, zarr.Array) or z.ndim != 2 or z.dtype != np.bool_:
@@ -124,23 +118,20 @@ def live_chunk_grid_from_keys(
     """The live-chunk grid read from the mask's stored chunk KEYS, not its pixels.
 
     An all-ocean chunk is never written — the campaign writer skips it explicitly
-    (``export_zone_roi``), and the single-ROI writer gets the same result because an
-    all-False boolean chunk equals the fill value and zarr does not write all-fill
-    chunks. So a chunk object exists exactly where the ROI has pixels, and one
-    listing yields what :func:`live_chunk_grid` otherwise derives with a read per
-    chunk position (a UTM zone has ~3,700 of them, ~2 minutes in-region).
+    (``export_zone_roi``), and the single-ROI writer gets the same result because an all-False
+    boolean chunk equals the fill value and zarr does not store all-fill chunks. So a chunk
+    object exists exactly where the ROI has pixels, and one listing yields what
+    :func:`live_chunk_grid` otherwise derives with a read per chunk position (a UTM zone has
+    ~3,700 of them, ~2 minutes in-region).
 
-    Errs only toward MORE work. A chunk that was written but holds no live pixel
-    would be reported live, widening one window; the worst case is the full-extent
-    behaviour we already had. It cannot under-report, because a chunk containing a
-    live pixel must exist as an object — which is the property that makes this safe
-    to prefer over reading.
+    Errs only toward MORE work: a written-but-empty chunk reads as live and widens one window,
+    worst case the full-extent behaviour. It cannot UNDER-report, because a chunk containing a
+    live pixel must exist as an object — the property that makes this safe to prefer.
 
-    Returns ``None`` — meaning "fall back to the block scan" — for any store whose
-    layout this does not positively recognise: sharded, non-default chunk key
-    encoding, chunking that does not match ``chunk_px``, an index outside the
-    grid, or a listing that fails. Never guesses, because a grid derived from a
-    misread layout would crop to the wrong windows and silently drop land.
+    Returns ``None`` — "fall back to the block scan" — for any store whose layout this does not
+    positively recognise: sharded, non-default chunk key encoding, chunking that does not match
+    ``chunk_px``, an index outside the grid, or a failed listing. Never guesses: a grid derived
+    from a misread layout would crop to the wrong windows and silently drop land.
     """
     if mask.chunks != (chunk_px, chunk_px):
         # Keys would not map 1:1 onto the grid being built.
@@ -150,12 +141,11 @@ def live_chunk_grid_from_keys(
         # A shard object holds many chunks, so its key is not a chunk index.
         logger.debug("mask is sharded; using the block scan")
         return None
-    # POSITIVELY recognise the key layout _CHUNK_KEY_RE assumes: zarr v3 with the
-    # default "c/<row>/<col>" encoding. Without this the regex simply matches
-    # nothing on a v2 mask (keys like "0.0") or a custom separator, and "no chunk
-    # keys found" is indistinguishable from "no live pixels" — so cropped ingest
-    # would derive zero windows and write an EMPTY mosaic while reporting success.
-    # A caller-supplied single-ROI mask is the realistic v2 source.
+    # POSITIVELY recognise the key layout _CHUNK_KEY_RE assumes: zarr v3 with the default
+    # "c/<row>/<col>" encoding. Without this the regex matches nothing on a v2 mask (keys like
+    # "0.0") or a custom separator, and "no chunk keys found" is indistinguishable from "no live
+    # pixels" — cropped ingest would derive zero windows and write an EMPTY mosaic while reporting
+    # success. A caller-supplied single-ROI mask is the realistic v2 source.
     encoding = getattr(mask.metadata, "chunk_key_encoding", None)
     if type(encoding).__name__ != "DefaultChunkKeyEncoding" or getattr(encoding, "separator", None) != "/":
         logger.debug("mask chunk-key encoding %r is not the v3 default; using the block scan", encoding)
@@ -199,13 +189,11 @@ def live_chunk_grid(
 ) -> np.ndarray:
     """Coarsen the ROI mask onto the ingest chunk grid: True where any pixel is live.
 
-    Reads one chunk-sized block at a time (~16 MB at the 4096 default), reducing
-    each straight into its ``live`` cell — never a whole row band (a full-width
-    band of a wide zone is hundreds of MB, and an arbitrary single-ROI width is
-    unbounded) and never the whole mask (tens of GB decompressed). The block
-    reads hit the same underlying zarr chunk objects a wider read would — zarr
-    fetches per chunk either way — so this bounds memory without extra I/O.
-    Plain zarr, no dask: a metadata-scale scan must not cost a task graph.
+    Reads one chunk-sized block at a time (~16 MB at the 4096 default), reducing each straight
+    into its ``live`` cell — never a whole row band (hundreds of MB on a wide zone, unbounded on
+    an arbitrary single ROI) and never the whole mask (tens of GB decompressed). Zarr fetches
+    per chunk either way, so this bounds memory without extra I/O. Plain zarr, no dask: a
+    metadata-scale scan must not cost a task graph.
     """
     z = _open_mask(mask_path, storage_options)
     height, width = z.shape
@@ -268,51 +256,42 @@ def merge_bands(
 ) -> list[LiveWindow]:
     """Group vertically-adjacent row bands to minimise total ingest cost.
 
-    One window per chunk-row computes the least *area*, but area is not what a
-    windowed ingest is billed for. Each window is a separate BLOCKING region write,
-    so a date costs about ``n_windows x F + chunk_area x V`` — and the two are
-    wildly different in scale, because area is computed in parallel across the
-    fleet while a window boundary is a serial stall the whole fleet waits through.
-    ``window_cost_in_chunks`` is that exchange rate: the chunk area worth as much
-    as one saved write. It is large, so grouping is usually worth it, and a
-    strategy that minimises area alone leaves most of the win unclaimed.
+    One window per chunk-row computes the least *area*, but a date costs about
+    ``n_windows x F + chunk_area x V`` and the two terms differ wildly in scale: area is computed
+    in parallel across the fleet while a window boundary is a serial stall it all waits through.
+    ``window_cost_in_chunks`` is that exchange rate — the chunk area worth one saved write — and
+    it is large, so a strategy minimising area alone leaves most of the win unclaimed.
 
-    This therefore minimises ``n_windows x window_cost_in_chunks + total_area``
-    EXACTLY, by dynamic programming over groupings of CONSECUTIVE bands — O(n^2)
-    in a zone's live chunk-rows, a few hundred at most. Optimising the true
-    objective matters more than it sounds: a heuristic bound on wasted area cannot
-    express "extra area is nearly free", so it under-merges precisely on the sparse
-    ROIs where the absolute waste is trivial.
+    This minimises ``n_windows x window_cost_in_chunks + total_area`` EXACTLY, by dynamic
+    programming over groupings of CONSECUTIVE bands: O(n^2) in a zone's live chunk-rows, a few
+    hundred at most. A heuristic bound on wasted area cannot express "extra area is nearly free",
+    so it under-merges precisely on the sparse ROIs where the absolute waste is trivial.
 
-    ``max_tasks_per_window`` bounds one window's GRAPH, converted to a chunk area
-    through ``tasks_per_chunk``. Tasks are the right unit: the scheduler dispatches
-    tasks on a single-threaded event loop, and past its throughput extra area stops
-    being cheap — which is how an unbounded objective over-merges into a saturated
-    scheduler and gets slower. A single row band over the cap is still emitted:
-    being one chunk-row, it cannot be split.
+    ``max_tasks_per_window`` bounds one window's GRAPH, converted to a chunk area through
+    ``tasks_per_chunk``. Tasks are the right unit: the scheduler dispatches them on a
+    single-threaded event loop, and past its throughput extra area stops being cheap — which is
+    how an unbounded objective over-merges into a saturated scheduler and gets slower. A single
+    row band over the cap is still emitted; being one chunk-row, it cannot be split.
 
-    Grouping only unions adjacent chunk-row ranges, so windows stay chunk-aligned
-    and mutually chunk-disjoint — the property that lets one session write a whole
-    date and commit once.
+    Grouping only unions adjacent chunk-row ranges, so windows stay chunk-aligned and mutually
+    chunk-disjoint — the property that lets one session write a whole date and commit once.
 
-    Calibration, the campaign-wide effect, and the cap sweep are in
-    ``context_docs/design/ingest-live-tile-cropping.md``.
+    Calibration, campaign-wide effect and cap sweep: ``context_docs/design/ingest-live-tile-cropping.md``.
     """
     n = len(windows)
     if n == 0:
         return []
     max_chunks = max(1, max_tasks_per_window // max(1, tasks_per_chunk))
 
-    # best[i] = min cost of covering the first i bands; cut[i] = where its last
-    # group starts. Costs are in CHUNK-EQUIVALENTS, so no seconds are needed —
-    # only the ratio between a window and a chunk, which is what we measured.
+    # best[i] = min cost of covering the first i bands; cut[i] = where its last group starts.
+    # Costs are in CHUNK-EQUIVALENTS, so no seconds are needed — only the measured ratio between
+    # a window and a chunk.
     best = [0] + [math.inf] * n
     cut = [0] * (n + 1)
     for i in range(1, n + 1):
-        # Walk j DOWNWARD so the group grows: windows[j:i] is one band at j=i-1 and
-        # the whole prefix at j=0. Once it exceeds the cap every smaller j is worse,
-        # so we can stop — but a lone band over the cap is still emitted, since a
-        # single chunk-row cannot be split.
+        # Walk j DOWNWARD so the group grows: windows[j:i] is one band at j=i-1 and the whole
+        # prefix at j=0. Once it exceeds the cap every smaller j is worse, so stop — but a lone
+        # band over the cap is still emitted, since a single chunk-row cannot be split.
         for j in range(i - 1, -1, -1):
             group = _union(windows[j:i])
             area = _chunk_area(group, chunk_px)
@@ -335,11 +314,11 @@ def merge_bands(
 def coarsen_live_grid(live: np.ndarray, factor: int) -> np.ndarray:
     """Coarsen a live-chunk grid by ``factor``: a coarse cell is live if any fine one is.
 
-    Lets windows be derived on a COARSER grid than the mask is chunked at, which is
-    what keeps them aligned to the ingest's load blocks when those are a multiple of
-    the store's chunks. Deriving on the fine grid and snapping outward afterwards
-    would be wrong: two windows on adjacent fine rows can snap into the same coarse
-    block and stop being chunk-disjoint, which the single-session write requires.
+    Lets windows be derived on a COARSER grid than the mask is chunked at, keeping them aligned
+    to the ingest's load blocks when those are a multiple of the store's chunks. Deriving on the
+    fine grid and snapping outward afterwards would be wrong: two windows on adjacent fine rows
+    can snap into the same coarse block and stop being chunk-disjoint, which the single-session
+    write requires.
     """
     if factor == 1:
         return live
@@ -354,12 +333,10 @@ def coarsen_live_grid(live: np.ndarray, factor: int) -> np.ndarray:
 
 #: Window cells added around every reprojected footprint, on all four sides.
 #:
-#: The footprint comes from reprojecting each item's lon/lat bounding box and taking
-#: the result's bounds, which for a curved reprojection can fall marginally inside
-#: the true image. Under-covering would silently drop data, so the footprint is
-#: padded until that is impossible: one window cell is tens of kilometres, orders of
-#: magnitude more than the curvature error of a scene-sized box. The cost is a little
-#: extra computed area, which is the cheap direction.
+#: The footprint reprojects each item's lon/lat bounding box and takes the result's bounds, which
+#: for a curved reprojection can fall marginally INSIDE the true image — and under-covering
+#: silently drops data. One window cell is tens of kilometres, orders of magnitude more than the
+#: curvature error of a scene-sized box, so the cost is a little extra computed area.
 FOOTPRINT_PAD_CELLS = 1
 
 
@@ -385,22 +362,19 @@ def footprint_grid(
 ) -> np.ndarray | None:
     """Cells a set of lon/lat bounding boxes could put data in, or ``None`` if unsure.
 
-    ``bboxes`` are ``(west, south, east, north)`` in EPSG:4326 — the form STAC
-    publishes — and ``geobox`` is the grid the ingest writes on. Only geometry
-    matters here, so callers pass bounding boxes rather than catalog items and this
-    module stays free of catalog types.
+    ``bboxes`` are ``(west, south, east, north)`` in EPSG:4326 — the form STAC publishes — and
+    ``geobox`` is the grid the ingest writes on. Callers pass bounding boxes rather than catalog
+    items so this module stays free of catalog types.
 
-    **Returning ``None`` means "assume everything"**, and every uncertain path takes
-    it: an unusable bounding box, a geobox that cannot be read, a projection that
-    fails. The caller then behaves exactly as it did before this function existed.
-    That asymmetry is the whole safety argument — a footprint that is too LARGE only
-    costs computed area that was going to be discarded anyway, while one that is too
-    SMALL silently drops imagery from a mosaic and nothing downstream would notice.
-    Every rounding here goes outward for the same reason, and
+    **Returning ``None`` means "assume everything"**, and every uncertain path takes it: an
+    unusable bounding box, an unreadable geobox, a failed projection. That asymmetry is the whole
+    safety argument — a footprint that is too LARGE only costs computed area that was going to be
+    discarded, while one that is too SMALL silently drops imagery from a mosaic and nothing
+    downstream would notice. Every rounding here goes outward for the same reason, and
     :data:`FOOTPRINT_PAD_CELLS` widens the result again on top.
 
-    An empty result (no cell set) is meaningful and distinct from ``None``: those
-    items fall entirely outside this grid.
+    An empty result (no cell set) is meaningful and distinct from ``None``: those items fall
+    entirely outside this grid.
     """
     try:
         from odc.geo.geom import box
@@ -435,11 +409,10 @@ def footprint_grid(
             except Exception:  # a projection failure means "assume everything"
                 logger.debug("footprint: could not project %r; computing the full extent", bbox, exc_info=True)
                 return None
-            # A projection can return NaN/inf without raising, and math.floor/ceil on
-            # those throws OUTSIDE the guard above — turning this function's documented
-            # conservative fallback into an aborted date, or an aborted ingest. Checked
-            # here so a non-finite corner takes the same "assume everything" path as a
-            # projection that failed outright.
+            # A projection can return NaN/inf without raising, and math.floor/ceil on those throws
+            # OUTSIDE the guard above — turning the documented conservative fallback into an
+            # aborted date. Checked here so a non-finite corner takes the same "assume everything"
+            # path as a projection that failed outright.
             if not all(math.isfinite(v) for v in (r0, r1, c0, c1)):
                 logger.debug("footprint: non-finite projection of %r; computing the full extent", bbox)
                 return None
@@ -464,27 +437,21 @@ def windows_for_date(
 ) -> list[LiveWindow]:
     """A run's live windows, narrowed to what ONE date's imagery can actually fill.
 
-    A run's windows describe where the ROI has land, and they are identical on every
-    date. A single date is not: an optical satellite images a fraction of a wide ROI
-    per pass, so most of those windows hold nothing for a given date. Tasks built over
-    them still run, find no data, and write nothing — the mosaic is the same either
-    way, because an all-fill chunk is never stored.
-
-    So this removes work whose result is already discarded, which is why it cannot
-    change what a mosaic contains. What it changes is cost, in both terms that matter:
-    the graph shrinks with the area, and windows the date misses entirely disappear,
-    taking their serial region writes with them.
+    A run's windows describe where the ROI has land and are identical on every date. A single
+    date is not: an optical satellite images a fraction of a wide ROI per pass, so most windows
+    hold nothing for it. Tasks built over them run, find no data and write nothing — an all-fill
+    chunk is never stored — so this removes work whose result is already discarded and CANNOT
+    change what a mosaic contains. It changes cost in both terms: the graph shrinks with the
+    area, and windows the date misses entirely disappear with their serial region writes.
 
     Returns the input unchanged when the footprint cannot be determined
-    (:func:`footprint_grid`), so the conservative behaviour is the fallback rather
-    than something a caller opts into. An EMPTY result means this date reaches no
-    live cell at all and there is nothing to write.
+    (:func:`footprint_grid`), so conservative behaviour is the fallback rather than an opt-in. An
+    EMPTY result means this date reaches no live cell at all.
 
     ``window_cost_in_chunks`` must be the value the RUN's windows were built with
-    (:func:`live_windows_for_mask`): the re-merge below is the same exchange rate
-    decision made again on a smaller grid, and leaving it at the sequential default
-    would buy dead area to save window boundaries that the overlapped write path has
-    already made cheap — undoing the calibration for every narrowed date.
+    (:func:`live_windows_for_mask`): the re-merge below is the same exchange-rate decision made
+    again on a smaller grid, and the sequential default would buy dead area to save window
+    boundaries the overlapped write path has already made cheap.
     """
     if not windows:
         return windows
@@ -511,30 +478,28 @@ def live_windows_for_mask(
 ) -> list[LiveWindow]:
     """The one-call form: mask store → live windows to write.
 
-    Derives the live-chunk grid from the mask's chunk keys when the store's layout
-    is recognised (:func:`live_chunk_grid_from_keys` — one listing) and falls back
-    to reading every chunk position (:func:`live_chunk_grid`) when it is not. Both
-    routes return the same grid; the difference is one listing against thousands of
-    sequential reads. Row bands are then merged into taller bands
-    (:func:`merge_bands`), because the per-window write cost is what dominates.
+    Derives the live-chunk grid from the mask's chunk keys when the store's layout is recognised
+    (:func:`live_chunk_grid_from_keys` — one listing) and falls back to reading every chunk
+    position (:func:`live_chunk_grid`) when it is not. Both routes return the same grid. Row
+    bands are then merged into taller ones (:func:`merge_bands`), the per-window write cost
+    dominating.
 
-    ``window_px`` snaps the windows to a COARSER grid than the mask's own chunking —
-    set it to the ingest's load-block size so every window lands on whole load
-    blocks. It must be a multiple of ``chunk_px``; ``None`` means the mask's grid.
-    The mask itself stays at ``chunk_px``, so the fast key-listing path is unaffected.
+    ``window_px`` snaps the windows to a COARSER grid than the mask's own chunking — set it to
+    the ingest's load-block size so every window lands on whole load blocks. It must be a
+    multiple of ``chunk_px``; ``None`` means the mask's grid. The mask itself stays at
+    ``chunk_px``, so the fast key-listing path is unaffected.
 
-    ``window_cost_in_chunks`` is what one window is assumed to cost, in chunk area, and
-    the caller owns it because it depends on how that caller WRITES: pass
-    :data:`WINDOW_COST_IN_CHUNKS_OVERLAPPED` when the windows of a date share one dask
-    graph, and leave the default when each window is its own blocking write. Getting
-    this backwards is a real regression rather than a mis-tuning — a sequential writer
-    on the overlapped rate pays extra serial boundaries for area it does not care about.
+    ``window_cost_in_chunks`` is what one window is assumed to cost, in chunk area, and the
+    caller owns it because it depends on how that caller WRITES: pass
+    :data:`WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows share one dask graph, and
+    leave the default when each window is its own blocking write. Backwards is a regression, not
+    a mis-tuning — a sequential writer on the overlapped rate pays extra serial boundaries for
+    area it does not care about.
 
-    ``prefer_keys=False`` forces the read path and ``merge=False`` the unmerged row
-    bands, which is how each is held against the other in tests.
-    ``storage_options`` mirrors :func:`ingest.roi.read_roi_mask`, so a deployment
-    whose mask needs non-default fsspec/S3 settings derives windows where its
-    ingest already reads the mask.
+    ``prefer_keys=False`` forces the read path and ``merge=False`` the unmerged row bands, which
+    is how each is held against the other in tests. ``storage_options`` mirrors
+    :func:`ingest.roi.read_roi_mask`, so a deployment whose mask needs non-default fsspec/S3
+    settings derives windows where its ingest already reads the mask.
     """
     window_px = window_px or chunk_px
     if window_px % chunk_px:
