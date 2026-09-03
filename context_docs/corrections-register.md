@@ -226,9 +226,10 @@ also a small share of the text they sit in: across the documents that carry them
 for. Extracting them would shorten nothing meaningfully and would retire no document, while
 moving each correction one lookup away from the number it corrects.
 
-`campaign/campaign-plan.md` §10 states the underlying rule: *"each was wrong in a way worth not
-repeating, and a reviewer who only sees the corrected number learns nothing about how it
-went wrong."* The decision records follow the same principle by being append-only — a
-superseded record stays and a new one supersedes it.
+[`campaign/campaign-plan.md`](campaign/campaign-plan.md) §11 states the underlying rule: the
+stage records *"carry their own withdrawn claims beside the corrected ones, on purpose — a
+reviewer who sees only the final number learns nothing about how it went wrong"*. The decision
+records follow the same principle by being append-only — a superseded record stays and a new one
+supersedes it.
 
 This register is the index over that material, not a replacement for it.

@@ -114,7 +114,7 @@ directory of verdicts without paging past every PNG.
 | high optical-thin share | **RECORD and PUBLISH** — a property of the input, not a fault |
 | absent land tiles explained by the skip record | **RECORD** — expected |
 | **observation-count seams** | **IGNORE** — §3 |
-| a window the AI review calls suspicious | **FLAG for a human, never block** — §8 |
+| a window the AI review calls suspicious | **FLAG for a human, never block** — §11 |
 
 A **constant dimension** is one of the 128 numbers with zero variance across the sample: a dead
 output channel, invisible in any picture because three components make the image. What makes it
@@ -160,7 +160,7 @@ is a fault. **The checks cannot tell those apart from pixels alone**, which is w
 provenance — `radar_coverage`, `optical_skips`, `assessed_window` — is reconciled against the pixel
 findings rather than the pixels being graded on their own.
 
-The AI reviewer (§8) exists for the residue: whether the published imagery *looks like ground* is
+The AI reviewer (§11) exists for the residue: whether the published imagery *looks like ground* is
 not a question any deterministic check can ask, and a thin cell that looks like ground is fine while
 a dense one that does not is a fault.
 

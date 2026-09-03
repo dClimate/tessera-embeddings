@@ -1,16 +1,24 @@
 # Streamlining the test suite
 
 **Where the unit suite's time went, what was safe to cut, and the coverage-equivalence gate that made
-it safe.** All phases landed; §5 is the measured outcome. This is the one record here about the
-repository's own engineering rather than the data pipeline.
+it safe.** This is the one record here about the repository's own engineering rather than the data
+pipeline.
 
-**Status:** plan, not yet executed. Drawn up 2026-08-25 against `main` @ `76aeda9`, which is
-the tip including PRs #133–#140 — the GDAL-forwarder, ranged-reader-status, radar-refusal and
-GPU-hours work that landed that day. Every measurement below was taken on that commit.
+**Status: EXECUTED**, and §5 is the measured outcome — 84.3 s to 24.5 s with the same 10,817
+source lines covered. **One phase is a partial**, and it says so where it sits: Phase 3 landed
+only in part and its estimate was wrong, for the reason in its own heading. §7 is a list of
+things the review turned up that were deliberately NOT part of this work and still need a
+decision.
 
-The suite has grown across many PRs and nobody has looked at it as a whole. This plan says
-what to change, what to leave alone, and — most importantly — what has to hold true before
-any change lands.
+**The phase sections below are kept in their proposal voice on purpose.** They say what to
+change, what to leave alone, and what had to hold true before any change landed — and the last
+of those is the part worth keeping, because it is the argument the coverage-equivalence gate
+(§6) exists to enforce and it applies to the next such exercise as much as to this one. Read
+§5 first if you want to know what actually happened.
+
+Drawn up 2026-08-25 against `main` @ `76aeda9`, the tip including PRs #133–#140 — the
+GDAL-forwarder, ranged-reader-status, radar-refusal and GPU-hours work that landed that day.
+Every measurement below was taken on that commit.
 
 Every measurement below was taken on this machine (10 cores, `-n auto`) against `main`. The
 two headline fixes were prototyped and measured, not estimated; where a number is an
@@ -43,7 +51,7 @@ says, and the drift is the source of most of §2's findings:
 | `unit/` | every PR | `unit.yml` (3.12 + 3.13) — correct. Note `downstream-smoke.yml` also runs this suite but is deliberately disabled to manual-only, pending a stable release of the private downstream consumer |
 | `architecture/` | every PR | `architecture.yml` — correct |
 | `integration/` | path-filtered PRs **+ nightly** | `integration.yml` on path-filtered PRs only. **Never nightly.** |
-| `parity/` | flow-touching PRs + nightly | correct — but see §2.3 for what nightly actually selects |
+| `parity/` | flow-touching PRs + nightly | correct — but see Phase 2 item 2.3 for what nightly actually selects |
 | `slow/` | nightly + on-demand | **directory is empty.** Its documented occupant is an `xfail` stub in `parity/` |
 | `gpu/` | inference-touching PRs only | **directory is empty, marker has zero uses, no workflow runs `-m gpu`** |
 
@@ -223,7 +231,7 @@ downstream consumer.
 
 The table now describes what is wired, and a **Roadmap** section at the end of
 `tests/README.md` carries the four undone things — the empty `slow/` tier and the suspended
-nightly, the accepted GPU gap, the two orphaned tests from §2.5, and the 30-second bound
+nightly, the accepted GPU gap, the two orphaned tests from Phase 2 item 2.5, and the 30-second bound
 broken by §3 item 1.1 — so they can be scooped up rather than rediscovered. Status banners
 were added to `tests/slow/README.md` and `tests/gpu/README.md` so the tier docs no longer
 contradict the top-level one.
@@ -390,7 +398,7 @@ failure. They are cheap and they catch circular imports. Leave them.
 | src lines covered | 10,817 | **10,817 — none lost**, by the §6 gate |
 | daily CI runners doing nothing | 1 | 0 |
 | tests no CI job ran | 2 | 0 |
-| GPU inference path | uncovered, unstated | uncovered, **stated and runnable by hand** (§2.2) |
+| GPU inference path | uncovered, unstated | uncovered, **stated and runnable by hand** (Phase 2 item 2.2) |
 
 ### 5.1 Every test movement, named
 
@@ -435,7 +443,7 @@ it pins are genuinely numerous and the naming is deliberately long. The 3.4× sp
 two closed CI gaps are the real wins. If a larger LOC cut is wanted, it has to come from
 §4 — and §4 is the part I would not do.
 
-**One gap is accepted rather than closed.** Per §2.2 the pipelined CUDA path stays outside
+**One gap is accepted rather than closed.** Per Phase 2 item 2.2 the pipelined CUDA path stays outside
 CI, because no GPU runner is available. Nothing in this plan changes that; what changes is
 that it stops being silent. The honest reading of the "after" column is *84 % of the codebase
 verified automatically, one hot path verified by hand on a documented trigger* — which is a

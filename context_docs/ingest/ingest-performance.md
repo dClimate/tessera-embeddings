@@ -591,18 +591,20 @@ tried. Sweep before generalising, or scope the setting to where it was measured.
 ### 4.1-4.8 What was tried and rejected — the table, so none of it is retried
 
 Eight approaches measured and turned down. Each had its working; what a future reader needs is the
-verdict and the reason, because the cost of losing these is someone re-running them.
+verdict and the reason, because the cost of losing these is someone re-running them. **The rows keep
+their numbers** — they had one section each before this was condensed, and §4.4, §4.6, §4.7 and §4.8
+are cited by number elsewhere in this document.
 
 | approach | verdict | why |
 |---|---|---|
-| **coarsen the STORE chunk to 8192** | rejected | the GPU side vetoes it: inference reads whole chunks, so a coarser store chunk multiplies read volume for every consumer. Measured, not argued |
-| **cost-model window grouping** | rejected | over-merged into the scheduler; the optimiser traded real area for a boundary cost that had already stopped existing (§3.17) |
-| **spatial manifest sharding** | rejected | a **30–50% regression** — the axis matters more than the size, and time is the right axis |
-| **double load blocks again, 8192 → 16384** | not worth it | measured **1.35×**, against a prediction of 2–3×, at 537 MB per band-block |
-| **several rejected without testing** | defensible | each contradicted a measured constraint already in hand; the section records which, so "untested" is not read as "unconsidered" |
-| **remove the realignment** | reverted | projected 3.85× and ~5% materialised, because the census modelled the write layer instead of measuring it — and the memory claim came from the first twelve heartbeats of a run that later spilled |
-| **narrow window geometry further** | rejected | three variants, all worse. The best any rectangle strategy achieves is 0.50× current area; the shipped one already achieves 0.75× |
-| **worker memory back to 16 GiB** | ADOPTED, then WITHDRAWN (§8) | rejected while the driver held unpruned catalogue items, and it looked affordable once §3.13's pruning landed — but the peak it was sized against came from dates carrying half the windows of a 2019 optical date, and those denser dates paused workers at this size. Now **24576 MiB** |
+| **4.1** coarsen the STORE chunk to 8192 | rejected | the GPU side vetoes it: inference reads whole chunks, so a coarser store chunk multiplies read volume for every consumer. Measured, not argued |
+| **4.2** cost-model window grouping | rejected | over-merged into the scheduler; the optimiser traded real area for a boundary cost that had already stopped existing (§3.17) |
+| **4.3** spatial manifest sharding | rejected | a **30–50% regression** — the axis matters more than the size, and time is the right axis |
+| **4.4** double load blocks again, 8192 → 16384 | not worth it | measured **1.35×**, against a prediction of 2–3×, at 537 MB per band-block |
+| **4.5** several rejected without testing | defensible | each contradicted a measured constraint already in hand; the section records which, so "untested" is not read as "unconsidered" |
+| **4.6** remove the realignment | reverted | projected 3.85× and ~5% materialised, because the census modelled the write layer instead of measuring it — and the memory claim came from the first twelve heartbeats of a run that later spilled |
+| **4.7** narrow window geometry further | rejected | three variants, all worse. The best any rectangle strategy achieves is 0.50× current area; the shipped one already achieves 0.75× |
+| **4.8** worker memory back to 16 GiB | ADOPTED, then WITHDRAWN (§8) | rejected while the driver held unpruned catalogue items, and it looked affordable once §3.13's pruning landed — but the peak it was sized against came from dates carrying half the windows of a 2019 optical date, and those denser dates paused workers at this size. Now **24576 MiB** |
 
 **The transferable one is the realignment revert**: a projection built by modelling a layer rather
 than measuring it, and a memory figure taken from the opening minutes of a run that later spilled.
