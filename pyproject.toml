@@ -53,7 +53,7 @@ dependencies = [
     # class, and `rasterio._base.__file__` as the extension to `dlsym` GDAL out of. The wording
     # is load-bearing rather than cosmetic — the classifier corroborates that a line came from
     # the source READER by its `CPLE_` prefix, so a renamed map entry silences the sensor rather
-    # than breaking it. `tests/unit/test_loader_failure_attribution.py` drives a real `CPLError`
+    # than breaking it. `tests/unit/ingest/test_loader_failure_attribution.py` drives a real `CPLError`
     # through the real map and asserts the whole line, so drift fails CI; the bound is what keeps
     # a fresh resolution from walking into it unasked. See
     # context_docs/design/ingest_read_failure_causes_2026_08.md.

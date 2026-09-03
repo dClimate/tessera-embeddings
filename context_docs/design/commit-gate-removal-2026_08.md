@@ -196,7 +196,7 @@ of the workload is terminal.
 
 **`FleetGate` itself stays.** The ingest gate is the campaign's pause lever and uses the same class;
 only the commit gate's subclass and wiring are gone. The two thread-safety tests written against
-`_PrefectCommitGate` moved to `tests/unit/test_fleet_gate.py` and now target `FleetGate` directly,
+`_PrefectCommitGate` moved to `tests/unit/orchestration/flows/test_fleet_gate.py` and now target `FleetGate` directly,
 because the per-thread context stack they exercise is still load-bearing for ingest.
 
 ## Cost of being wrong

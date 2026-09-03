@@ -21,7 +21,9 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[2]
+from tests._paths import REPO_ROOT
+
+REPO = REPO_ROOT
 CONTEXT_DOCS = REPO / "context_docs"
 INDEX = CONTEXT_DOCS / "README.md"
 

@@ -13,7 +13,7 @@ tail of islands.
 Reproduce any of it:
 
 ```bash
-TE_CLUSTERS=8,16,24 uv run pytest tests/unit/test_cluster_balance.py -k report -s
+TE_CLUSTERS=8,16,24 uv run pytest tests/unit/orchestration/flows/test_cluster_balance.py -k report -s
 ```
 
 The diagnostic drives the shipped `_partition_by_live_tiles` and the shipped

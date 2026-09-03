@@ -640,7 +640,7 @@ Two facts, and both matter:
    from the excused set, so a given-up date disqualifies its month from being excused, what remains
    in `missing` raises `InsufficientCoverageError`, and the comment above that code says why:
    "Excusing it would let a write-once year publish a whole-month data-loss hole labelled a
-   legitimate absence." `tests/unit/test_time_window.py::test_a_month_lost_to_unreadable_imagery_is_not_excused`
+   legitimate absence." `tests/unit/config/test_time_window.py::test_a_month_lost_to_unreadable_imagery_is_not_excused`
    had pinned that all along.
 
 So the two cases land differently:

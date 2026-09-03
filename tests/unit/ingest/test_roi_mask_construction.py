@@ -37,8 +37,9 @@ import zarr
 import zarr.storage
 
 from tessera_embeddings.ingest.roi import read_roi_mask
+from tests._paths import SRC_ROOT
 
-_SRC = Path(__file__).resolve().parents[2] / "src" / "tessera_embeddings"
+_SRC = SRC_ROOT
 
 #: Deliberately awkward: neither dimension is a multiple of the chunk size, and the two axes
 #: have different remainders. Ragged edge blocks are where a hand-rolled ``block_info`` slice

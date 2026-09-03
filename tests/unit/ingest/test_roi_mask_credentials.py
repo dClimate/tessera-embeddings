@@ -20,15 +20,15 @@ write's compute. ``test_roi_mask_credential_expiry.py`` covers the read itself.
 from __future__ import annotations
 
 import ast
-from pathlib import Path
 
 import numpy as np
 import pytest
 import zarr
 
 from tessera_embeddings.ingest.roi import read_roi_mask, resolve_storage_options
+from tests._paths import SRC_ROOT
 
-_SRC = Path(__file__).resolve().parents[2] / "src" / "tessera_embeddings"
+_SRC = SRC_ROOT
 
 
 def test_a_dict_is_passed_through_unchanged() -> None:

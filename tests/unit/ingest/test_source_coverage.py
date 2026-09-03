@@ -20,8 +20,7 @@ from tessera_embeddings.ingest.land_mask import _live_tile_bbox_wgs84, live_tile
 from tessera_embeddings.ingest.source_coverage import BLOCK_TILES, SourceFinding, preflight_optical_source
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.zone_grid import PIXEL_M
-
-from .coverage_repo import make_coverage
+from tests.unit.coverage_repo import make_coverage
 
 WINDOW = parse_time_window("December 2021")
 
