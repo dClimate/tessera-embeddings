@@ -2717,7 +2717,12 @@ class ZarrWriter:
         _log.info("Cleaning up staging: %s", target)
         # Shared prefix delete: s5cmd --all-versions (so a versioned bucket doesn't
         # keep the staged tiles as non-current versions), fsspec fallback.
-        delete_prefix(target, log=_log)
+        delete_prefix(
+            target,
+            log=_log,
+            # Staging lives in a campaign bucket with versioning OFF (CDK).
+            all_versions=False,
+        )
 
 
 #: A refusal reason a skip record may carry, in the order a reader should weigh them: the first is a
