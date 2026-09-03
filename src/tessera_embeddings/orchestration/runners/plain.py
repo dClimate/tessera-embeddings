@@ -12,9 +12,9 @@ for fast contributor iteration on the ingest path.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import time
-import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,7 +24,11 @@ import yaml
 from dask.distributed import Client
 
 from tessera_embeddings.config.assembly import AssemblyConfig
-from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
+from tessera_embeddings.config.inference import (
+    INFERENCE_CHUNK_SIZE,
+    InferenceConfig,
+    checkpoint_filename,
+)
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
@@ -46,6 +50,7 @@ from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
 from tessera_embeddings.providers.local.dask import local_cluster
 from tessera_embeddings.providers.local.ray import ray_cluster
 from tessera_embeddings.storage.manifest import EmbeddingManifest
+from tessera_embeddings.storage.object_store import delete_prefix
 
 
 def _resolve_num_gpus(device: str) -> int:
@@ -80,6 +85,37 @@ def _dask_client(n_workers: int) -> Iterator[Client]:
         yield client
 
 
+def _staging_run_id(*, roi_name: str, config: InferenceConfig) -> str:
+    """A staging identity that repeats for the same run, so an interrupted run resumes.
+
+    Derived from what the OUTPUT depends on — the ROI, the time window, the resolved orbit and
+    the checkpoint — so re-running the same config finds the tiles the last attempt staged and
+    infers only what is missing. Changing any of those starts a fresh prefix on its own, which
+    is the behaviour wanted: a different window is a different product.
+
+    Deliberately NOT the campaign's staging fingerprint. That one mixes in
+    :func:`inference_code_identity` and the code tarball's ETag so a mid-campaign code change
+    can never blend two versions into one write-once zone-year — a safeguard that earns its
+    cost across 120 zones and months of wall time, and does not here. A single-ROI run is one
+    operator, one machine, minutes long, and re-inferring everything because a comment moved
+    is the wrong default for it. The consequence is explicit: **edit inference code between a
+    crash and its retry and the retry reuses tiles the old code staged.** Delete the staging
+    directory (logged at every run) to force a clean pass.
+
+    Staging is removed after a successful assemble, so in practice a prefix only survives a run
+    that failed — which is exactly the run worth resuming.
+    """
+    terms = "|".join(
+        [
+            roi_name,
+            config.time_window.window_end_label,
+            str(config.s1_orbit),
+            config.checkpoint_path,
+        ]
+    )
+    return hashlib.sha256(terms.encode()).hexdigest()[:12]
+
+
 def _run_ingest(
     *,
     roi_path: str,
@@ -92,6 +128,7 @@ def _run_ingest(
     log: logging.Logger,
     storage_options: dict | None,
     s1_use_s3_direct: bool,
+    min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
 ) -> None:
     """Run S2 + S1 ingestion sequentially against a local Dask cluster.
 
@@ -110,6 +147,7 @@ def _run_ingest(
             end_date=end_date,
             store_path=mosaic_base,
             client=client,
+            min_valid_coverage=min_valid_coverage,
             log=log,
             storage_options=storage_options,
         )
@@ -193,7 +231,9 @@ def _run_inference_and_assemble(
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_path)
     log.info("ROI filter: %d/%d chunks intersect the ROI", len(live_chunks), len(chunks))
 
-    run_id = uuid.uuid4().hex[:12]
+    run_id = _staging_run_id(roi_name=roi_name, config=config)
+    run_staging = f"{staging_base.rstrip('/')}/{run_id}"
+    log.info("Staging prefix for this run: %s (delete it to force a clean re-inference)", run_staging)
     t0 = time.monotonic()
 
     if num_gpus == 0:
@@ -252,6 +292,16 @@ def _run_inference_and_assemble(
         n_workers=n_assembly_workers,
     )
 
+    # Only after assemble RETURNS. A failed run keeps its staged tiles so the next attempt
+    # resumes onto them (see `_staging_run_id`); a successful one has them in the output store
+    # and they are pure cost from here -- on the quickstart the staged prefix is LARGER than the
+    # product it produced. Best-effort: a cleanup failure must not fail a finished pipeline.
+    try:
+        delete_prefix(run_staging, log=log)
+        log.info("Removed staging prefix %s", run_staging)
+    except Exception:
+        log.warning("Could not remove staging prefix %s; it is safe to delete by hand", run_staging, exc_info=True)
+
     return {
         "run_id": run_id,
         "roi_name": roi_name,
@@ -261,7 +311,9 @@ def _run_inference_and_assemble(
     }
 
 
-def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, Any] | None:
+def run_plain(
+    config_path: Path, *, skip_inference: bool = False, min_valid_coverage: float | None = None
+) -> dict[str, Any] | None:
     """Run the full pipeline from a YAML config.
 
     Args:
@@ -281,6 +333,11 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
               start: "2024-07-01"
               end: "2025-07-01"
             s1_orbit: ascending    # or "descending" or "both"
+            s1_use_s3_direct: false # read OPERA granules over ASF's S3 (needs STS creds and
+                                    # us-west-2); false uses CloudFront-signed HTTPS, which is
+                                    # what a laptop outside us-west-2 wants
+            min_valid_coverage: 20.0 # minimum SCL valid-pixel % to keep an S2 date; the CLI's
+                                    # --min-valid-coverage overrides it
             allow_s2_only: false   # embed S2-valid pixels with zero S1 observations
             n_workers: 2
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
@@ -290,6 +347,8 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
 
         skip_inference: When True, stop after ingestion. Useful for iterating on the ingest path
             without paying CPU inference cost.
+        min_valid_coverage: Overrides the config's ``min_valid_coverage`` (itself defaulting to
+            :data:`DEFAULT_MIN_VALID_COVERAGE`). This is the CLI's ``--min-valid-coverage``.
 
     Returns:
         Final assembly summary dict when inference + assembly run, else ``None``.
@@ -305,10 +364,10 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
     roi_path = paths.store_for(roi_name, "roi")
 
     if not skip_inference:
-        log.warning(
-            "Plain runner will execute the full pipeline end-to-end with CPU inference. "
-            "Expect ~30+ minutes on a developer laptop. Pass --skip-inference for an "
-            "ingest-only sanity check."
+        log.info(
+            "Plain runner will execute the full pipeline end-to-end. On the bundled quickstart "
+            "ROI that is about 3.5 minutes on a CPU laptop, most of it ingest. Pass "
+            "--skip-inference for an ingest-only sanity check."
         )
 
     # Stage 1: rasterize the ROI (no cluster needed)
@@ -340,6 +399,11 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         # us-west-2, default to CloudFront-signed HTTPS so the quickstart works without ASF
         # S3 STS credentials.
         s1_use_s3_direct=cfg.get("s1_use_s3_direct", False),
+        min_valid_coverage=(
+            min_valid_coverage
+            if min_valid_coverage is not None
+            else cfg.get("min_valid_coverage", DEFAULT_MIN_VALID_COVERAGE)
+        ),
     )
 
     # ``--skip-inference`` ends here, with ingest output verified.
@@ -377,11 +441,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--min-valid-coverage",
         type=float,
-        default=DEFAULT_MIN_VALID_COVERAGE,
-        help="Minimum SCL valid-pixel coverage to keep a date (default: %(default)s)",
+        default=None,
+        help=(
+            "Minimum SCL valid-pixel coverage to keep an S2 date. Overrides the config key of "
+            f"the same name; both default to {DEFAULT_MIN_VALID_COVERAGE}."
+        ),
     )
     args = parser.parse_args(argv)
-    run_plain(args.config_path, skip_inference=args.skip_inference)
+    run_plain(
+        args.config_path,
+        skip_inference=args.skip_inference,
+        min_valid_coverage=args.min_valid_coverage,
+    )
 
 
 if __name__ == "__main__":

@@ -107,9 +107,9 @@ git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
 uv sync --all-extras   # resolves uv.lock; all extras + dev tools
 
-# End-to-end pipeline on the bundled Story-County, IA quickstart ROI.
-# Ingest → cloud mask → CPU inference → assemble. Expect ~30+ minutes;
-# a warning banner confirms CPU inference is slow before kicking off.
+# End-to-end pipeline on the bundled Denver, CO quickstart ROI.
+# Ingest → cloud mask → CPU inference → assemble. ~3-4 minutes on a laptop,
+# most of it ingest; CPU inference of the single chunk takes about a minute.
 python -m tessera_embeddings.orchestration.runners.plain examples/quickstart/config.yaml
 
 # Skip inference for fast ingest-only sanity checks (~5 min).
@@ -505,8 +505,8 @@ is an orchestrator-free sequencer that calls the same domain
 functions as the Prefect flows, without Prefect. By default it runs
 the full end-to-end pipeline (ingest → cloud mask → inference →
 assembly) on a laptop with torch on CPU via Ray's local mode. Slow on
-real workloads, practical on the Story-County quickstart ROI we ship
-for exactly this purpose.
+real workloads, practical on the Denver quickstart ROI we ship for
+exactly this purpose.
 
 A `--skip-inference` flag runs only ingest for fast sanity checks;
 assembly is skipped because it has nothing to assemble without
