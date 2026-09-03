@@ -547,29 +547,20 @@ def fill_zones_sequential(
     def _take_next(pending: list[SequentialCell]) -> SequentialCell:
         """Pop the first PENDING cell whose mosaic has LANDED, else the head.
 
-        Cells are ordered densest-first and the densest zone is also the slowest to ingest, so
-        strict order makes the fleet wait on the very last mosaic of its opening window while
-        smaller ones sit finished. Measured on the real coverage counts: a cluster's window
-        spans ~4 h to ~10 h of ingest, so strict order idles the GPUs ~6 h at the start of
-        every year.
+        The readiest-first rationale is in the module docstring; measured on the real coverage
+        counts, a cluster's opening window spans ~4 h to ~10 h of ingest, so strict density
+        order idles the GPUs ~6 h at the start of every year.
 
-        Every pending cell is a candidate, because ``_start_ingests`` has STARTED an ingest
-        for all of them; to be TAKEN, a cell's ingest must also have COMPLETED (``ready``).
-        Scanning the whole list rather than a window is free — ``ready`` is a
-        ``Future.done()`` check and does no I/O.
+        Every pending cell is a candidate, because ``_start_ingests`` has STARTED an ingest for
+        all of them; to be TAKEN, a cell's ingest must also have COMPLETED (``ready``), which
+        is a ``Future.done()`` check and does no I/O.
 
         A partial mosaic is never handed to inference under any branch: when nothing has
         landed this returns the head and the caller BLOCKS on it, so an ingest-starved cluster
-        behaves as it would in strict order.
-
-        ``ready`` is also true for a cell whose ingest FAILED (the future is done either way).
-        That is deliberate: the caller's ``wait`` re-raises, the cell is recorded as failed,
-        and the cluster continues with its others. Blocking forever on a mosaic that will
-        never arrive is the worse outcome.
-
-        The DENSITY ORDER ITSELF IS UNCHANGED — it still sizes the session (the fleet is
-        provisioned for the largest cell up front) and still puts the island tail last. What
-        changes is that it is no longer a barrier.
+        behaves as it would in strict order. ``ready`` is also true for a cell whose ingest
+        FAILED (the future is done either way), deliberately: the caller's ``wait`` re-raises,
+        the cell is recorded as failed, and the cluster continues with its others. Blocking
+        forever on a mosaic that will never arrive is the worse outcome.
         """
         if inputs is not None:
             for idx, cell in enumerate(pending):
@@ -601,12 +592,12 @@ def fill_zones_sequential(
                         n_failed,
                         len(pending),
                     )
-                    # Recorded as failures, not just logged. The cells that triggered the cap
+                    # Recorded as failures, not just logged: the cells that triggered the cap
                     # can RECOVER in the in-child retry pass, and if every one does `failures`
-                    # empties and this run reports clean — while these cells were never
-                    # started. The driver re-reads the store either way, so this is not the
-                    # only protection, but a child that under-reports its own outcome is not
-                    # worth shipping.
+                    # empties and this run reports clean while these cells were never started.
+                    # The driver re-reads the store either way, so this is not the only
+                    # protection, but a child that under-reports its outcome is not worth
+                    # shipping.
                     with lock:
                         failures.extend(
                             {
