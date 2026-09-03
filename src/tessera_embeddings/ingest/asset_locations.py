@@ -39,22 +39,20 @@ PREFERRED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-cogs", "e84-earth
 UNHARMONISED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-s2-l2a"})
 
 #: Buckets whose Sentinel-2 surface reflectance already has the post-baseline-04.00 offset
-#: subtracted. Membership is a determination about the PRODUCER, taken from the pixels and NOT
-#: from the catalogue's own account of itself.
-#:
-#: That distinction is the whole reason this is a bucket list rather than an item-level read.
-#: ``earthsearch:boa_offset_applied`` is absent on exactly the items whose producer is in
-#: question, ``raster:bands`` carries an offset that contradicts the data (sertit/eoreader#120),
-#: and Element 84's own documentation describes legacy COGs whose offset state varies. An
-#: item-level signal would therefore be read from fields that are missing or wrong precisely
-#: where a decision is needed. Every Element 84 COG measured against its ESA original is
+#: subtracted. Membership is a determination about the PRODUCER, taken from the pixels and NOT from
+#: the catalogue's own account of itself — which is why this is a bucket list rather than an
+#: item-level read. ``earthsearch:boa_offset_applied`` is absent on exactly the items whose
+#: producer is in question, ``raster:bands`` carries an offset that contradicts the data
+#: (sertit/eoreader#120), and Element 84's own documentation describes legacy COGs whose offset
+#: state varies, so an item-level signal would be read from fields that are missing or wrong
+#: precisely where a decision is needed. Every Element 84 COG measured against its ESA original is
 #: harmonised, so that is what this encodes — see
 #: ``context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md`` for the measurement, the
 #: metadata that cannot substitute for it, and the residual risk this accepts.
 #:
 #: An unrecognised bucket is neither harmonised nor known-raw, so it is UNKNOWN and the caller
-#: refuses the date: over-correcting harmonised data and under-correcting raw data are
-#: both wrong and both silent, so neither is safe to default to.
+#: refuses the date: over-correcting harmonised data and under-correcting raw data are both wrong
+#: and both silent, so neither is safe to default to.
 HARMONISED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-cogs", "e84-earth-search-sentinel-data"})
 
 #: Everything an S2 ingest actually reads: the configured bands plus the scene classification
@@ -67,9 +65,9 @@ READ_ASSET_KEYS: tuple[str, ...] = (*S2_L2A_BANDS, "scl")
 #: The subset the BOA offset is applied to. Used for HARMONISATION, and deliberately EXCLUDES
 #: ``scl``: the scene classification layer is categorical and never baseline-corrected —
 #: subtracting 1000 from a class label is meaningless — so which producer served it cannot make
-#: the reflectance correction ambiguous. Including it classified an item whose reflectance is
-#: uniformly harmonised as MIXED on the strength of a layer that is never touched, which costs that
-#: copy its ranking position against duplicates that are no better.
+#: the reflectance correction ambiguous. Including it classifies an item whose reflectance is
+#: uniformly harmonised as MIXED on the strength of a layer that is never touched, costing that
+#: copy its ranking against duplicates that are no better.
 REFLECTANCE_ASSET_KEYS: tuple[str, ...] = tuple(S2_L2A_BANDS)
 
 
@@ -84,11 +82,10 @@ def asset_href(asset: Any) -> str | None:  # noqa: ANN401 — pystac Asset or a 
 def asset_bucket(href: str) -> str | None:
     """The S3 bucket an href addresses, or ``None`` if it does not address one.
 
-    Parsed rather than substring-matched, because a substring test answers yes to things that
-    are not the bucket: ``s3://sentinel-cogs-backup/...`` and
-    ``https://elsewhere.example/sentinel-cogs/...`` both contain a known bucket's name while
-    being somewhere else entirely. Returning ``None`` for anything unrecognised is what keeps
-    every unlisted-is-the-cautious-answer rule in this module honest.
+    Parsed rather than substring-matched: a substring test says yes to things that are not the
+    bucket — ``s3://sentinel-cogs-backup/...`` and ``https://elsewhere.example/sentinel-cogs/...``
+    both contain a known bucket's name while being somewhere else entirely. Returning ``None`` for
+    anything unrecognised keeps every unlisted-is-the-cautious-answer rule in this module honest.
 
     Handles the three forms the catalogues emit: ``s3://bucket/key``, virtual-hosted
     ``https://bucket.s3.<region>.amazonaws.com/key``, and path-style
@@ -142,12 +139,11 @@ class AssetSources:
     def all_in(self, buckets: frozenset[str]) -> bool:
         """Whether the complete requested set is served from ``buckets``.
 
-        False for an incomplete set: a claim about every asset cannot be made from a subset. And
-        false for an EMPTY one, which `all()` would otherwise satisfy vacuously — nothing resolved
-        is "we did not look", not "everything is here". A caller asking about no keys at all was
-        being told yes: the duplicate audit reports locality over the requested read set, and where
-        that set is deliberately empty (a provider whose assets cannot be looked up by name) every
-        winner was reported as in-region while sitting in another cloud entirely.
+        False for an incomplete set — a claim about every asset cannot be made from a subset — and
+        false for an EMPTY one, which `all()` would satisfy vacuously: nothing resolved means "we
+        did not look", not "everything is here". A caller asking about no keys at all was told
+        yes, and the duplicate audit then reported every winner as in-region for a provider whose
+        assets cannot be looked up by name while they sat in another cloud entirely.
         """
         return bool(self.buckets) and self.complete and all(bucket in buckets for bucket in self.buckets.values())
 
@@ -202,17 +198,16 @@ class Harmonisation(enum.Enum):
     """Which producer served an ITEM's reflectance, and so whether the offset is still present.
 
     Four states and not a boolean, because two of them need a response neither answer gives.
-    ``MIXED`` is an item whose own reflectance bands span a harmonised and a raw producer, so no
-    single answer fits the item: exempting it leaves its raw bands 1000 high, correcting it drops
-    1000 from its harmonised ones. ``UNKNOWN`` is the same difficulty with less evidence — a bucket
-    nobody has classified. A boolean forces one of those silently.
+    ``MIXED`` is an item whose reflectance bands span a harmonised and a raw producer, so no single
+    answer fits: exempting it leaves its raw bands 1000 high, correcting it drops 1000 from its
+    harmonised ones. ``UNKNOWN`` is the same difficulty with less evidence — a bucket nobody has
+    classified. A boolean forces one of those silently.
 
     **An item-level answer is a ranking input, not a correction input.** The offset is decided per
     ASSET, from that asset's own bucket
     (:func:`~tessera_embeddings.ingest.boa_offset.source_decision`), so an item straddling two
-    producers is corrected band by band rather than needing one answer. What these four states buy
-    is duplicate selection's ability to prefer a copy whose producer is settled over one whose is
-    not.
+    producers is corrected band by band. What these four states buy is duplicate selection's
+    ability to prefer a copy whose producer is settled over one whose is not.
     """
 
     HARMONISED = "harmonised"
@@ -238,31 +233,27 @@ def item_harmonisation(
 ) -> Harmonisation:
     """Which producer served the REFLECTANCE bands — the only ones the offset touches.
 
-    Judged over the reflectance bands alone, for two separate reasons. A real Element 84 item
-    carries the original JP2s as extra assets beside its COG bands, so judging *every* asset
-    reports ``MIXED`` for an item that is wholly harmonised where it matters. And ``scl`` is
-    excluded even though it IS read: it is categorical and never corrected, so its producer
-    cannot make the reflectance decision ambiguous.
+    Judged over the reflectance bands alone, for two reasons. A real Element 84 item carries the
+    original JP2s as extra assets beside its COG bands, so judging *every* asset reports ``MIXED``
+    for an item that is wholly harmonised where it matters. And ``scl`` is excluded even though it
+    IS read: it is categorical and never corrected, so its producer cannot make the reflectance
+    decision ambiguous.
 
     **Absence of evidence buys neither a correction nor an exemption.** Both mistakes are silent
     and neither is safe to default to: a doubled correction takes 1000 off pixels that already had
-    it removed, a skipped one leaves plausible pixels 1000 too high. So an item served from a
-    bucket nobody has listed is ``UNKNOWN`` rather than guessed at — see the next paragraph for the
-    two ways that state arises.
-
-    An item is ``UNKNOWN`` rather than ``RAW`` or ``MIXED`` whenever a bucket serving it has not
-    been classified: it does not expose every reflectance band under the configured names, or some
-    band comes from a bucket in neither list. Nothing here can resolve the alias table mapping a
-    band name to an asset key, so a band absent under the requested name may still be served under
-    a native one — and either way, calling the item raw would subtract the offset from pixels that
-    may already be harmonised.
+    it removed, a skipped one leaves plausible pixels 1000 too high. So an item is ``UNKNOWN``
+    rather than ``RAW`` or ``MIXED`` whenever a bucket serving it has not been classified — it does
+    not expose every reflectance band under the configured names, or some band comes from a bucket
+    in neither list. Nothing here can resolve the alias table mapping a band name to an asset key,
+    so a band absent under the requested name may still be served under a native one; either way,
+    calling the item raw would subtract the offset from pixels that may already be harmonised.
 
     **Nothing here refuses anything.** The one production caller is duplicate selection, which
     ranks an ``UNKNOWN`` copy last and withholds it from the fallback ladder — a copy nobody can
     classify refuses at load time rather than failing to read, and the ladder recovers from a read
-    failure and not from a refusal. The refusal itself is raised per asset by
-    :func:`~tessera_embeddings.ingest.boa_offset.source_decision`, and its message names
-    classifying the bucket as the fix.
+    failure but not from a refusal. The refusal itself is raised per asset by
+    :func:`~tessera_embeddings.ingest.boa_offset.source_decision`, whose message names classifying
+    the bucket as the fix.
     """
     sources = read_asset_sources(item, keys)
     if not sources.complete:
@@ -270,16 +261,15 @@ def item_harmonisation(
     if sources.all_in(buckets):
         return Harmonisation.HARMONISED
     # RAW only when EVERY band comes from a producer explicitly identified as unharmonised. One raw
-    # band beside bands from an unlisted bucket is not a raw item — correcting it would subtract the
-    # offset from bands that may already have had it removed. An unlisted bucket is UNKNOWN:
-    # were a harmonised mirror to move behind a new bucket or CDN, calling it raw would subtract the
-    # offset from pixels that already had it removed. The caller refuses on UNKNOWN.
+    # band beside bands from an unlisted bucket is not a raw item: were a harmonised mirror to move
+    # behind a new bucket or CDN, calling it raw would subtract the offset from pixels that already
+    # had it removed. An unlisted bucket is UNKNOWN, and the caller refuses on UNKNOWN.
     if sources.all_in(UNHARMONISED_ASSET_BUCKETS):
         return Harmonisation.RAW
     # MIXED needs BOTH known classes present, because MIXED is the state no date-wide decision
     # fits. Harmonised bands beside bands from a bucket nobody has classified is UNKNOWN instead:
     # nothing there is known to be raw, so the actionable fix is to classify the bucket, which is
-    # what the caller's UNKNOWN message says. Reporting MIXED sent the operator to split the date
+    # what the caller's UNKNOWN message says. Reporting MIXED sends the operator to split the date
     # by producer for an ambiguity that may not exist.
     if sources.any_in(buckets) and sources.any_in(UNHARMONISED_ASSET_BUCKETS):
         return Harmonisation.MIXED

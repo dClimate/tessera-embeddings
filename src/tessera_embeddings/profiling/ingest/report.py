@@ -1,16 +1,14 @@
 """Assemble a per-run ingest dossier from the profiling JSON outputs.
 
-The dossier is the deliverable of every at-scale ingest rung: it merges the
-scheduler profile (``watch_scheduler.py --report``), the external-service
-aggregates (``ingest_log_queries.py``), and — when captured — the deep-profile
-``performance_report`` artifact link, into one markdown skeleton. This tool
-does the mechanical merge and leaves a clearly-marked **Interpretation** section
-for the operator (Claude) to fill in with the bottleneck verdict and the
-recommended next rung.
+The dossier is the deliverable of every at-scale ingest rung: it merges the scheduler
+profile (``watch_scheduler.py --report``), the external-service aggregates
+(``ingest_log_queries.py``) and — when captured — the deep-profile
+``performance_report`` artifact link into one markdown skeleton, leaving a
+clearly-marked **Interpretation** section for the operator to fill in with the
+bottleneck verdict and the recommended next rung.
 
-It is pure: it reads JSON files already produced by the other tools and touches
-no AWS, so it is deterministic and unit-testable, and the raw JSON stays the
-system of record behind the prose.
+Pure: it reads JSON the other tools already produced and touches no AWS, so it is
+deterministic and unit-testable, and the raw JSON stays the system of record.
 
 Usage::
 
@@ -33,10 +31,9 @@ from pathlib import Path
 def _load_json(path: str | None) -> dict | None:
     """Read one profiling JSON file, or None when the flag wasn't given.
 
-    Raises :class:`ValueError` for an unreadable or malformed file so ``main`` can
-    turn it into a one-line message: an operator assembling a dossier has usually
-    just mistyped a path or piped a tool's stderr over its stdout, and a traceback
-    is a poor way to say so.
+    Raises :class:`ValueError` for an unreadable or malformed file so ``main`` can turn it
+    into a one-line message: the operator has usually mistyped a path or piped a tool's
+    stderr over its stdout, and a traceback is a poor way to say so.
     """
     if not path:
         return None
@@ -67,20 +64,19 @@ def _md_table(rows: list[dict], limit: int = 25) -> str:
     return head + sep + body
 
 
-#: Marker appended to any section built from a capped (partial) result set. The
-#: producing tools flag truncation in their JSON (``truncated``); the dossier is
-#: what an operator actually reads, so it must carry the flag through rather than
-#: present a capped series as a full run — the peaks and onsets below a cap are
-#: lower bounds, and a saturation onset may be missing entirely.
+#: Marker appended to any section built from a capped (partial) result set. The producing
+#: tools flag truncation in their JSON (``truncated``); the dossier is what an operator
+#: reads, so it must carry the flag through rather than present a capped series as a full
+#: run — peaks and onsets below a cap are lower bounds, and an onset may be missing entirely.
 _PARTIAL = "**PARTIAL — hit the Insights row cap; figures below are lower bounds.**"
 
 
 def _gib(value: float | None) -> str:
     """Render a fleet-memory peak, distinguishing "not measured" from zero.
 
-    Mirrors ``watch_scheduler``'s formatter rather than importing it: that module
-    imports boto3 at module scope, and this assembler is deliberately pure over
-    the JSON — no cloud SDK, so it runs anywhere the files do.
+    Mirrors ``watch_scheduler``'s formatter rather than importing it: that module imports
+    boto3 at module scope, and this assembler is pure over the JSON — no cloud SDK, so it
+    runs anywhere the files do.
     """
     return "not recorded" if value is None else f"{value:.2f} GiB"
 
@@ -88,9 +84,9 @@ def _gib(value: float | None) -> str:
 def _truncation_banner(sched: dict | None, logs: dict | None) -> list[str]:
     """A top-of-dossier warning naming every capped input, or [] when all complete.
 
-    Repeated at the top because the per-section markers are easy to skim past,
-    and a reader who misses the cap draws conclusions ("peaked at 98% CPU, never
-    tripped backlog-growth") from a series that simply stopped early.
+    Repeated at the top because the per-section markers are easy to skim past, and a reader
+    who misses the cap draws conclusions ("peaked at 98% CPU, never tripped backlog-growth")
+    from a series that simply stopped early.
     """
     capped: list[str] = []
     if sched is not None and sched.get("truncated"):

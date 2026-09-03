@@ -1,40 +1,34 @@
 """Watch and profile the Dask *scheduler* during an ingest run.
 
-The ingest scheduler is a single event-loop process that builds every task graph
-and routes every task, which makes it the named saturation risk at UTM scale: one
-GIL-bound loop fanning work across many hundreds of workers is a real single point
-of failure, and it has bottlenecked from ~250 workers on. Watching it is the
-primary job here. :class:`SchedulerResourceLogger`
-(``tessera_embeddings.providers.aws.dask``) ships a 30 s ``scheduler health:``
-heartbeat to the ``dask-scheduler`` CloudWatch stream, which additionally carries
-FLEET memory (``wmem``/``wmanaged``/``wspill``/``wmax``).
+The ingest scheduler is one GIL-bound event-loop process building every task graph and
+routing every task, which makes it the named saturation risk at UTM scale — it has
+bottlenecked from ~250 workers on. :class:`SchedulerResourceLogger`
+(``tessera_embeddings.providers.aws.dask``) ships a 30 s ``scheduler health:`` heartbeat to
+the ``dask-scheduler`` CloudWatch stream, which also carries FLEET memory
+(``wmem``/``wmanaged``/``wspill``/``wmax``).
 
-The two metric sets answer different questions and neither substitutes for the
-other. Scheduler metrics answer "is the scheduler keeping up?" — what a
-high-worker-count rung exists to probe. Fleet metrics answer "does the graph fit
-the cluster at all?", and must be clean FIRST: a run that dies of worker memory
-never reaches a scheduler limit, so its scheduler numbers describe a doomed run
-rather than an envelope. Hence the ``worker-spill`` alert.
+The two metric sets answer different questions. Scheduler metrics answer "is the scheduler
+keeping up?" — what a high-worker-count rung exists to probe. Fleet metrics answer "does the
+graph fit the cluster at all?", and must be clean FIRST: a run that dies of worker memory
+never reaches a scheduler limit, so its scheduler numbers describe a doomed run rather than
+an envelope. Hence the ``worker-spill`` alert.
 
-This tool turns that heartbeat into something a machine can act on:
+Two modes:
 
-1. ``--live`` — tail the scheduler stream in near real time, parse each health
-   line into a rolling window, derive rates (task-count change, backlog slope,
-   worker churn), evaluate saturation thresholds, and emit one machine-readable
-   JSON snapshot per line to **stdout** (with ALERT objects when a threshold
-   trips). A compact human line goes to **stderr**, so stdout stays a clean
-   JSON stream an agent can consume live.
-2. ``--report --since --until`` — post-hoc full-run profile from CloudWatch: the
-   complete metric time series, per-metric peaks, saturation-onset timestamps,
-   a simple cpu/backlog co-occurrence summary, and derived worker join/exit
-   events — emitted as one JSON object to stdout (consumed by ``report.py``),
-   with ``--markdown`` adding a paste-ready section to stderr.
+1. ``--live`` — tail the scheduler stream in near real time, parse each health line into a
+   rolling window, derive rates (task-count change, backlog slope, worker churn), evaluate
+   saturation thresholds, and emit one JSON snapshot per line to **stdout** (carrying ALERT
+   entries when a threshold trips). A compact human line goes to **stderr**, keeping stdout
+   a clean JSON stream an agent can consume live.
+2. ``--report --since --until`` — post-hoc full-run profile from CloudWatch: the complete
+   metric time series, per-metric peaks, saturation-onset timestamps, a cpu/backlog
+   co-occurrence count, and derived worker join/exit events, as one JSON object on stdout
+   (consumed by ``report.py``); ``--markdown`` adds a paste-ready section on stderr.
 
-Both modes only need CloudWatch Logs read access, resolved from the ambient AWS
-credential chain (``AWS_PROFILE``, instance role, …) unless ``--profile`` names
-one. Scope ``--report`` tightly: the log group is shared across ingest runs, so
-an overlapping run's scheduler stream lands in the same group (disambiguate with
-``--stream-prefix``).
+Both modes need only CloudWatch Logs read access, from the ambient AWS credential chain
+unless ``--profile`` names one. Scope ``--report`` tightly: the log group is shared across
+ingest runs, so an overlapping run's scheduler stream lands in it too — disambiguate with
+``--stream-prefix``.
 
 Usage::
 
@@ -61,30 +55,26 @@ import boto3
 from tessera_embeddings.profiling._cloudwatch import insights_query, iso, parse_ts
 from tessera_embeddings.profiling.ingest import DEFAULT_INGEST_LOG_GROUP
 
-# dask-cloudprovider names streams ``<prefix>/<container>/<task-id>``;
-# ``ecs_cluster`` sets prefix "dask" and the scheduler container is
-# "dask-scheduler" (see providers/aws/dask.py), so scheduler health lines land
-# under "dask/dask-scheduler/...".
+# dask-cloudprovider names streams ``<prefix>/<container>/<task-id>``; ``ecs_cluster`` sets
+# prefix "dask" and the scheduler container is "dask-scheduler" (providers/aws/dask.py).
 DEFAULT_SCHEDULER_STREAM_PREFIX = "dask/dask-scheduler"
 
-# The substring CloudWatch filters on server-side, and the marker the parser
-# keys off — kept identical to the logger's format string.
+# CloudWatch's server-side filter substring and the parser's marker — kept identical to the
+# logger's format string.
 HEALTH_MARKER = "scheduler health:"
 
-# How often --live polls CloudWatch. The heartbeat itself is every 30 s, so a
-# 20 s poll keeps latency under one heartbeat without hammering the API.
+# --live poll interval. The heartbeat is every 30 s, so 20 s keeps latency under one
+# heartbeat without hammering the API.
 DEFAULT_POLL_INTERVAL_S = 20.0
 
-# How much already-emitted heartbeat --live replays before tailing. One
-# heartbeat is 30 s, so the default gives ~10 samples of context — enough for
-# the sustained-CPU and backlog-growth rules to have a window to judge from
-# the first snapshot, instead of staying blind for their first few intervals.
+# Already-emitted heartbeat --live replays before tailing. At 30 s per heartbeat this gives
+# ~10 samples, so the sustained-CPU and backlog-growth rules have a window to judge from the
+# first snapshot rather than staying blind for their first few intervals.
 DEFAULT_LOOKBACK_S = 300
 
-# How far back --live rewinds its cursor each poll, so a heartbeat that CloudWatch
-# surfaces out of order (common when the prefix spans several scheduler streams)
-# is still picked up instead of being skipped forever. eventId dedupe makes the
-# replay free; two minutes covers ingestion lag at a 30 s heartbeat.
+# How far --live rewinds its cursor each poll, so a heartbeat CloudWatch surfaces out of
+# order (common when the prefix spans several scheduler streams) is picked up instead of
+# skipped forever. eventId dedupe makes the replay free; two minutes covers ingestion lag.
 REPLAY_OVERLAP_MS = 120_000
 
 
@@ -92,28 +82,26 @@ REPLAY_OVERLAP_MS = 120_000
 class Thresholds:
     """Saturation rules evaluated against the rolling window.
 
-    Defaults encode the operating envelope we care about; ``--cpu-threshold``
-    etc. override them (the smoke test forces them low to prove alerts fire).
+    Defaults encode the operating envelope; ``--cpu-threshold`` etc. override them (the
+    smoke test forces them low to prove alerts fire).
     """
 
-    # Sustained scheduler CPU: the GIL-bound loop pinned near 100% precedes
-    # event-loop stalls. Trip when >= cpu_pct for cpu_intervals consecutive
-    # samples.
+    # Sustained scheduler CPU: the GIL-bound loop pinned near 100% precedes event-loop
+    # stalls. Trips at >= cpu_pct for cpu_intervals consecutive samples.
     cpu_pct: float = 90.0
     cpu_intervals: int = 3
     # Process RSS as a percent of the container limit: the OOM predictor.
     mem_pct: float = 80.0
-    # Backlog (no-worker / unrunnable) rising for backlog_intervals consecutive
-    # samples: the scheduler is falling behind assigning work.
+    # Backlog (no-worker / unrunnable) rising this many consecutive samples: the scheduler
+    # is falling behind assigning work.
     backlog_intervals: int = 3
     # Event-loop lag (seconds) in a single sample: the direct stall signal.
     lag_s: float = 5.0
     # Worker-count change between two samples that counts as a churn spike.
     churn_delta: int = 25
-    # Fleet bytes spilled to disk, summed across workers, in a single sample.
-    # Spill means the graph no longer fits the fleet. A healthy ingest spills
-    # nothing, so the default sits just above zero rather than at a fraction of
-    # some limit.
+    # Fleet GiB spilled to disk in a single sample, summed across workers. Spill means the
+    # graph no longer fits the fleet; a healthy ingest spills nothing, so the default sits
+    # just above zero rather than at a fraction of some limit.
     spill_gib: float = 1.0
 
 
@@ -121,12 +109,11 @@ class Thresholds:
 #   scheduler health: cpu=100% rss=1.50GiB mem=18% lag=5.0s fds=42 threads=9 \
 #   workers=2 tasks=42 processing=8 no-worker=7 \
 #   wmem=40.00GiB wmanaged=32.00GiB wspill=6.50GiB wmax=14.00GiB
-# mem may be "nan" when the container limit is unknown; counts may be -1 when
-# the scheduler ref is briefly unavailable. Parse defensively.
-#
-# The fleet-memory tail is OPTIONAL on purpose: `--report` is routinely pointed at
-# windows profiled before it existed, and requiring it would return zero samples
-# for those runs instead of the scheduler-only series they legitimately contain.
+# mem may be "nan" when the container limit is unknown; counts may be -1 when the scheduler
+# ref is briefly unavailable. Parse defensively. The fleet-memory tail is OPTIONAL on
+# purpose: `--report` is routinely pointed at windows profiled before it existed, and
+# requiring it would return zero samples instead of the scheduler-only series those runs do
+# legitimately contain.
 _NUM = r"-?\d+(?:\.\d+)?"
 _HEALTH_RE = re.compile(
     rf"scheduler health: cpu=(?P<cpu>{_NUM})% rss=(?P<rss>{_NUM})GiB "
@@ -137,29 +124,25 @@ _HEALTH_RE = re.compile(
     rf" wspill=(?P<wspill>nan|{_NUM})GiB wmax=(?P<wmax>nan|{_NUM})GiB)?"
 )
 
-#: Parsed keys carrying the fleet-memory tail. Absent on pre-change log lines and
-#: ``nan`` when the scheduler could not read worker state, both of which become
-#: None — the same JSON-safe treatment ``mem`` gets.
+#: Parsed keys carrying the fleet-memory tail. Absent on older log lines, and ``nan`` when
+#: the scheduler could not read worker state; both become None, as ``mem`` does.
 WORKER_MEM_KEYS = ("worker_mem_gib", "worker_managed_gib", "worker_spill_gib", "worker_max_gib")
 
 
 def parse_health_line(message: str) -> dict | None:
     """Parse a ``scheduler health:`` log message into a metrics dict, or None.
 
-    Returns None for any line that isn't a well-formed health line, so callers
-    can feed raw CloudWatch messages in and drop non-matches silently.
+    Returns None for any line that isn't a well-formed health line, so callers can feed raw
+    CloudWatch messages in and drop non-matches silently.
 
-    ``mem`` is ``None`` when the scheduler could not read its container limit (it
-    logs ``mem=nan%``). Deliberately None rather than ``float("nan")``: these
-    dicts go through ``json.dumps``, which renders NaN as the bare token ``NaN``
-    — not valid JSON — so a strict consumer of the advertised JSON/JSONL output
-    would break in exactly the unknown-memory case. ``None`` serializes to null.
+    ``mem`` is ``None``, not ``float("nan")``, when the scheduler could not read its
+    container limit (logged as ``mem=nan%``): these dicts go through ``json.dumps``, which
+    renders NaN as the bare token ``NaN`` — not valid JSON — breaking a strict consumer of
+    the advertised JSON/JSONL output in exactly the unknown-memory case.
 
-    The four :data:`WORKER_MEM_KEYS` are always present and get the same
-    treatment, reading None both on a pre-fleet-memory log line and on ``nan``.
-    Every downstream consumer therefore sees one shape regardless of when the run
-    was profiled, and "unknown" stays distinguishable from a measured zero — which
-    matters, because zero spill is the healthy result rather than missing data.
+    The four :data:`WORKER_MEM_KEYS` are always present and treated the same way, so every
+    consumer sees one shape regardless of when the run was profiled and "unknown" stays
+    distinguishable from a measured zero — zero spill is the healthy result, not missing data.
     """
     m = _HEALTH_RE.search(message)
     if not m:
@@ -274,24 +257,20 @@ def watch_live(
 ) -> int:
     """Tail scheduler health lines and emit JSON snapshots until interrupted.
 
-    Uses ``filter_log_events`` (not Insights) for low-latency incremental
-    tailing. stdout = one JSON object per health line; stderr = a human line and
-    ALERT banners.
+    Uses ``filter_log_events``, not Insights, for low-latency incremental tailing. stdout =
+    one JSON object per health line; stderr = a human line and ALERT banners.
 
-    The cursor is advanced to ``newest seen - REPLAY_OVERLAP_MS`` rather than
-    past the newest event: when the prefix spans several scheduler streams,
-    CloudWatch can make a line from one stream visible only after a
-    later-timestamped line from another has already been consumed, and a cursor
-    parked past the newest timestamp would skip that heartbeat forever (a missed
-    sample can mean a missed alert). Re-fetching a small overlap each poll is
-    harmless because ``seen`` dedupes on eventId.
+    The cursor advances to ``newest seen - REPLAY_OVERLAP_MS`` rather than past the newest
+    event: when the prefix spans several scheduler streams, CloudWatch can make a line from
+    one visible only after a later-timestamped line from another was consumed, and a cursor
+    parked past the newest timestamp would skip that heartbeat forever — a missed sample can
+    mean a missed alert. The small re-fetch is harmless; ``seen`` dedupes on eventId.
     """
     logs = session.client("logs")
     start_ms = int((time.time() - lookback_s) * 1000)
     seen: set[str] = set()
-    # Bounded to what the longest sustained rule looks back over, +1 for the
-    # rising-backlog comparison and +1 of slack. The deque length IS the window
-    # every rule sees, so no caller-side slicing is needed.
+    # Bounded to the longest sustained rule's look-back, +1 for the rising-backlog
+    # comparison and +1 of slack. The deque length IS the window every rule sees.
     window: deque[dict] = deque(maxlen=max(thresholds.cpu_intervals, thresholds.backlog_intervals) + 2)
     prev: dict | None = None
     prev_epoch: int | None = None
@@ -341,10 +320,9 @@ def _series_from_rows(rows: list[dict]) -> list[dict]:
         sample = parse_health_line(r.get("@message", ""))
         if sample is None:
             continue
-        # Insights renders @timestamp as "YYYY-MM-DD HH:MM:SS.mmm" (space-separated,
-        # no zone); parse_ts reads that and treats the naive value as UTC, which is
-        # what CloudWatch means. Skip a row whose timestamp doesn't parse rather
-        # than lose the whole series to one malformed value.
+        # Insights renders @timestamp as "YYYY-MM-DD HH:MM:SS.mmm" with no zone; parse_ts
+        # treats the naive value as UTC, which is what CloudWatch means. Skip an unparseable
+        # row rather than lose the whole series to one malformed value.
         try:
             epoch = parse_ts(r.get("@timestamp", ""))
         except ValueError:
@@ -371,15 +349,15 @@ def profile_run(series: list[dict], thresholds: Thresholds) -> dict:
         "no_worker": max(s["no_worker"] for s in series),
         "workers": max(s["workers"] for s in series),
         "tasks": max(s["tasks"] for s in series),
-        # None (JSON null) for a run profiled before the heartbeat carried fleet
-        # memory — distinct from 0.0, which is a measured, healthy no-spill run.
+        # None (JSON null) when the heartbeat carried no fleet memory — distinct from 0.0,
+        # a measured, healthy no-spill run.
         "worker_mem_gib": max(_known("worker_mem_gib"), default=None),
         "worker_spill_gib": max(_known("worker_spill_gib"), default=None),
         "worker_max_gib": max(_known("worker_max_gib"), default=None),
     }
 
-    # Onsets: first timestamp each sustained/single rule trips, replaying the
-    # same evaluator the live path uses so live and post-hoc agree.
+    # Onsets: first timestamp each rule trips, replaying the evaluator the live path uses so
+    # live and post-hoc agree.
     onsets: dict[str, str | None] = dict.fromkeys(
         ("cpu-sustained", "mem-high", "backlog-growth", "loop-lag", "worker-spill")
     )
@@ -445,9 +423,8 @@ def _markdown(profile: dict, log_group: str, *, truncated: bool = False) -> str:
         f"- Fleet peaks: memory **{_gib(pk['worker_mem_gib'])}**, spilled "
         f"**{_gib(pk['worker_spill_gib'])}**, hottest worker **{_gib(pk['worker_max_gib'])}**"
         # `== 0`, not falsiness: worker_spill_gib is None when worker state could not be
-        # read, and None is falsy — so an UNKNOWN measurement would be reported as the
-        # positive finding "the graph fit the fleet", which is exactly what an experiment
-        # sizing decision would act on.
+        # read, and None is falsy — an UNKNOWN measurement would then be reported as the
+        # positive finding "the graph fit the fleet", which sizing decisions act on.
         + ("  _(no spill — the graph fit the fleet)_" if pk["worker_spill_gib"] == 0 else ""),
         f"- cpu-high ∧ backlog-rising intervals: **{p['cpu_backlog_cooccurrence']}**",
         "- Saturation onsets: " + (", ".join(f"{k} @ {v}" for k, v in p["onsets"].items() if v) or "_none tripped_"),
@@ -467,11 +444,10 @@ def report_run(
 ) -> int:
     """Post-hoc profile: pull health lines via Insights, emit JSON (+ optional md)."""
     logs = session.client("logs")
-    # Match on the FULL stream prefix, so --stream-prefix can actually separate
-    # overlapping ingests in the shared log group as documented (truncating to the
-    # last path component would merge two runs' series into one bogus profile).
-    # Insights `like "..."` is a literal substring match — no regex escaping of
-    # the slashes, and no chance of a prefix character being read as a metachar.
+    # Match on the FULL stream prefix so --stream-prefix really separates overlapping
+    # ingests in the shared log group; truncating to the last path component would merge two
+    # runs' series into one bogus profile. Insights `like "..."` is a literal substring
+    # match — no regex escaping of the slashes, no prefix character read as a metachar.
     query = (
         "fields @timestamp, @message "
         f'| filter @logStream like "{stream_prefix}" '
@@ -487,9 +463,9 @@ def report_run(
         "log_group": log_group,
         "stream_prefix": stream_prefix,
         "window": {"start": iso(start_epoch), "end": iso(end_epoch)},
-        # True when the row cap was hit: the series is PARTIAL, so the peaks and
-        # onsets below are lower bounds, not the full run (insights_query also
-        # warns on stderr). Never present a capped series as a full-run profile.
+        # True when the row cap was hit: the series is PARTIAL and the peaks and onsets are
+        # lower bounds (insights_query also warns on stderr). Never present a capped series
+        # as a full-run profile.
         "truncated": truncated,
         "profile": profile,
         "series": series,

@@ -1,14 +1,12 @@
 """Domain-pure inference runner.
 
-Orchestrates a Ray-based embedding-inference run end-to-end without any
-Prefect or cloud-provider coupling: create actors, wait for readiness,
-dispatch chunks via the work-stealing scheduler, tear down actors. The
-caller is responsible for connecting to Ray (``ray.init`` or attaching to
-an existing cluster) and supplying the ``InferenceConfig``.
+Orchestrates a Ray-based embedding-inference run end-to-end without any Prefect or
+cloud-provider coupling: create actors, wait for readiness, dispatch chunks via the
+work-stealing scheduler, tear down actors. The caller connects to Ray (``ray.init`` or an
+existing cluster) and supplies the ``InferenceConfig``.
 
-Output is written to staging via :class:`ZarrWriter`; final assembly is a
-separate step (:meth:`ZarrWriter.assemble`). This separation keeps GPU
-actors free of icechunk write contention.
+Output goes to staging via :class:`ZarrWriter`; final assembly is a separate step
+(:meth:`ZarrWriter.assemble`), which keeps GPU actors free of icechunk write contention.
 """
 
 from __future__ import annotations
@@ -34,10 +32,10 @@ from tessera_embeddings.inference.scheduling import FleetDemand, WorkItem, _proc
 def _resumed_result(label: str, *, skipped: bool) -> dict:
     """One restored outcome for a tile a previous attempt already staged.
 
-    ``status`` mirrors what the actor reported at the time — ``skipped`` for a tile it
-    found nothing to write in, ``success`` otherwise — so a resume and a fresh run agree
-    on what happened. The counters are absent rather than zero: this run did not measure
-    them, and a zero would read as a measurement of none.
+    ``status`` mirrors what the actor reported at the time — ``skipped`` for a tile it found
+    nothing to write in, ``success`` otherwise — so a resume and a fresh run agree on what
+    happened. The counters are zeroed because this run measured nothing; a consumer must not
+    read that zero as a measurement of none.
     """
     return {
         "chunk": label,
@@ -68,59 +66,51 @@ def run_inference(
 ) -> list[dict]:
     """Create Ray actors, run work-stealing inference, return per-chunk results.
 
-    Pure-domain function — no Prefect, no cloud SDKs. Caller must have
-    already connected to Ray (e.g. via ``ray.init`` or an attached
-    cluster) and ensured a placement group exists if one is required.
+    Pure-domain function — no Prefect, no cloud SDKs. The caller must already be connected
+    to Ray and have a placement group if one is required.
 
     Args:
-        num_actors: Number of GPU/CPU inference actors to create. Must be
-            at least 1.
-        config: Inference configuration. ``config.num_gpus`` controls the
-            per-actor resource reservation passed to ``.options()``.
+        num_actors: Number of GPU/CPU inference actors to create. Must be at least 1.
+        config: Inference configuration. ``config.num_gpus`` is the per-actor resource
+            reservation passed to ``.options()``.
         chunks: Spatial chunks to process.
         mosaic_base: Base path for input mosaic stores (any fsspec URI).
         staging_base: Base path for staged output stores.
-        run_id: Unique run identifier; used for resume detection and
-            staging-path namespacing.
-        t0: **Accepted and ignored.** It used to feed the scheduler's progress line, reported as
-            "N min elapsed" — but for a chained session the run's start is the top of the whole
-            stream, so that figure counted the ingest look-ahead, ``ray up``, EC2 bringup and model
-            load, and read as though inference had been running that long. It also disagreed with
-            the GPU-hours on its own line, which measures actor time. The progress line now starts
-            its clock when the dispatch loop does. Kept in the signature because ``run_inference``
-            is documented in ``docs/public-api.md`` and dropping a parameter there is a breaking
-            change — remove it on the next deliberate pass at that API.
+        run_id: Unique run identifier, for resume detection and staging-path namespacing.
+        t0: **Accepted and ignored.** For a chained session the run's start is the top of
+            the whole stream, so this counted the ingest look-ahead, ``ray up``, EC2 bringup
+            and model load, and read as though inference had been running that long; it also
+            disagreed with the GPU-hours on its own line, which measures actor time. The
+            progress line now starts its clock when the dispatch loop does. Kept in the
+            signature only because ``run_inference`` is documented in ``docs/public-api.md``
+            — remove it on the next deliberate pass at that API.
         log: Logger.
-        on_fleet_demand: Optional callback ``(want_gpus) -> None`` letting the AWS
-            provider publish a per-instance-type fleet request each scheduling
-            round; see ``providers.aws.fleet_mix``.
-        on_actor_retire: Optional callback ``(instance_id) -> None`` invoked
-            when a misbehaving actor is removed from the pool. The AWS
-            provider injects an EC2-terminator here so dead instances stop
-            billing immediately; the local provider passes ``None``.
-        get_credentials: Optional icechunk S3 credential provider injected into
-            every actor so store opens refresh credentials. The AWS provider
-            passes ``iam_icechunk_credentials``; the local provider passes
-            ``None`` (icechunk's default chain). See :class:`InferenceActor`.
-        s3_region: Optional S3 region for the mosaic repos, injected into every
-            actor so its reads open the store in the same region the caller's
-            preflight/assembly opens use. ``None`` uses icechunk's default region.
-        retire_idle_actors: Kill actors idle past the grace period at the run
-            tail (default); see ``scheduling._process_chunks_work_stealing``
-            for when a caller passes False.
-        more_work: Optional chained-session work source (see the scheduler's
-            docstring). With a source, ``chunks`` is typically empty and every
-            item carries its own :class:`~tessera_embeddings.inference.scheduling.ZoneContext`; the
-            single-zone resume scan is skipped (the source's feeder does its
-            own per-zone scan before enqueueing).
-        on_item_done: Optional per-item final-outcome callback (chained
-            sessions use it for per-zone completion accounting). Runs on the
-            scheduler thread — must not block.
+        on_fleet_demand: Optional callback ``(want_gpus) -> None`` letting the AWS provider
+            publish a per-instance-type fleet request each scheduling round; see
+            ``providers.aws.fleet_mix``.
+        on_actor_retire: Optional callback ``(instance_id) -> None`` invoked when a
+            misbehaving actor leaves the pool. The AWS provider injects an EC2-terminator
+            here so dead instances stop billing immediately; the local provider passes None.
+        get_credentials: Optional icechunk S3 credential provider injected into every actor
+            so store opens refresh credentials. The AWS provider passes
+            ``iam_icechunk_credentials``; the local provider passes ``None`` (icechunk's
+            default chain). See :class:`InferenceActor`.
+        s3_region: Optional S3 region for the mosaic repos, injected into every actor so its
+            reads open the store in the same region the caller's preflight/assembly opens
+            use. ``None`` uses icechunk's default region.
+        retire_idle_actors: Kill actors idle past the grace period at the run tail (default);
+            see ``scheduling._process_chunks_work_stealing`` for when a caller passes False.
+        more_work: Optional chained-session work source (see the scheduler's docstring). With
+            a source, ``chunks`` is typically empty and every item carries its own
+            :class:`~tessera_embeddings.inference.scheduling.ZoneContext`; the single-zone
+            resume scan is skipped, since the source's feeder scans per zone before
+            enqueueing.
+        on_item_done: Optional per-item final-outcome callback (chained sessions use it for
+            per-zone completion accounting). Runs on the scheduler thread — must not block.
 
     Returns:
-        Per-chunk result dicts (status, valid pixel count, timing, etc.),
-        with ``"resumed": True`` on entries that were already staged from
-        a prior run.
+        Per-chunk result dicts (status, valid pixel count, timing, etc.), with
+        ``"resumed": True`` on entries already staged by a prior run.
 
     Raises:
         ValueError: If ``num_actors < 1``.
@@ -138,12 +128,12 @@ def run_inference(
     resumed_skips: set[str] = set()
     if chunks:
         writer = ZarrWriter(staging_base)
-        # The ARTIFACT form, not the label-set form: both kinds mean "do not re-infer",
-        # but a staged zarr produced pixels and a skip marker recorded that the tile had
-        # none. Restoring both as successes makes a resumed zone's tally disagree with the
-        # same zone's tally on a fresh run, and the year's radar-coverage provenance is
-        # derived from those statuses — `summarise_radar_coverage` returns None when tiles
-        # report no counters, so miscounted skips can suppress the whole summary.
+        # The ARTIFACT form, not the label-set form: both mean "do not re-infer", but a
+        # staged zarr produced pixels while a skip marker recorded that the tile had none.
+        # Restoring both as successes makes a resumed zone's tally disagree with a fresh
+        # run's, and the year's radar-coverage provenance derives from those statuses —
+        # `summarise_radar_coverage` returns None when tiles report no counters, so
+        # miscounted skips can suppress the whole summary.
         staged = writer.scan_existing_staged_artifacts(
             run_id,
             chunks,
@@ -178,11 +168,10 @@ def run_inference(
         """Request ``n`` new inference actors (one .remote() each)."""
         return [actor_cls.remote(config, config.checkpoint_path, get_credentials, s3_region) for _ in range(n)]
 
-    # Request the first batch up front; the work-stealing scheduler requests
-    # the rest as slots are placed (see scheduling._maybe_request_next_batch).
-    # The size is the config's to decide — both the batching sentinel and the
-    # headroom's cold start live in one method there, so this cannot drift from
-    # what the scheduler will go on to do.
+    # Request the first batch up front; the work-stealing scheduler requests the rest as
+    # slots are placed (scheduling._maybe_request_next_batch). The size is the config's to
+    # decide — the batching sentinel and the headroom's cold start live in one method there,
+    # so this cannot drift from what the scheduler goes on to do.
     batch_size = config.actor_request_batch_size
     first_batch = config.initial_actor_request(num_actors)
     # BEFORE the first batch, because the scheduler republishes every round but does not
@@ -206,10 +195,9 @@ def run_inference(
                 batch_size,
                 num_actors,
             )
-        # Start as soon as a single actor is live. Cloud providers roll out
-        # instances with huge timing variation, so blocking on a fraction of
-        # the fleet just stalls the run; the work-stealing scheduler dispatches
-        # to the rest as they come online (see wait_for_actors / scheduling.py).
+        # Start as soon as a single actor is live: cloud providers roll instances out with
+        # huge timing variation, so blocking on a fraction of the fleet just stalls the run.
+        # The work-stealing scheduler dispatches to the rest as they come online.
         min_required = 1
         log.info("Waiting for actors to initialize (need at least %d / %d)...", min_required, num_actors)
         actors, actor_instance_ids, still_initializing = wait_for_actors(
@@ -222,10 +210,9 @@ def run_inference(
         else:
             log.info("Processing %d chunks across %d actors (work-stealing)", len(chunks), len(actors))
 
-        # Pin the ProgressTracker to a node with no GPUs (typically the head
-        # node in a Ray cluster). Tracker is lightweight; keeping it off
-        # GPU workers prevents it from competing with actors for memory and
-        # avoids losing progress state when a worker dies.
+        # Pin the lightweight ProgressTracker to a GPU-less node (typically the head): off
+        # the GPU workers it neither competes with actors for memory nor loses progress
+        # state when a worker dies.
         head_nodes = [n for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0) == 0]  # type: ignore[attr-defined]
         if head_nodes:
             head_strategy = NodeAffinitySchedulingStrategy(node_id=head_nodes[0]["NodeID"], soft=True)

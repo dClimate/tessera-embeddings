@@ -1,12 +1,11 @@
 """Ray actor for distributed GPU inference.
 
-Each actor loads the model once, then processes multiple spatial chunks sequentially.
-This amortizes model loading and GPU warm-up across chunks.
+Each actor loads the model once, then processes multiple spatial chunks sequentially,
+amortizing model loading and GPU warm-up across chunks.
 
-NOTE: torch and modules that import torch (models.builder, dataset, inference) are
-deferred to __init__ / method bodies so the module can be imported on the Fargate
-flow runner (which has ray but not torch). Ray serializes the actor class reference;
-torch is only needed on GPU workers at runtime.
+torch and the modules that import it (models.builder, dataset, inference) are deferred to
+``__init__`` / method bodies so this module imports on the Fargate flow runner, which has ray
+but not torch. Ray serializes only the actor class reference; torch is needed on GPU workers.
 """
 
 from __future__ import annotations
@@ -66,18 +65,16 @@ if TYPE_CHECKING:
 class _ChunkPrologue:
     """Everything ``_process_chunk`` needs before its first forward pass.
 
-    Built serially (GPU idle) by :meth:`InferenceActor._load_chunk_prologue`,
-    or ahead of time by the bounded cross-chunk prefetch (see the ``_XCHUNK_*``
-    constants) — in which case ``first_strip`` may still be None (mask-only
-    rung) and the consumer loads it serially.
+    Built serially (GPU idle) by :meth:`InferenceActor._load_chunk_prologue`, or ahead of time
+    by the bounded cross-chunk prefetch (the ``_XCHUNK_*`` constants) — in which case
+    ``first_strip`` may still be None (mask-only rung) and the consumer loads it serially.
     """
 
     store_opener: StoreOpener
     mask_bundle: S2MaskBundle
     plan: _StripPlan
-    # Chunk-relative easting window of the S2 valid-pixel bounding box, or None
-    # for full width. Sparse/edge chunks read (and infer) only these columns;
-    # outputs are placed at this offset in the whole-chunk buffers.
+    # Chunk-relative easting window of the S2 valid-pixel bounding box, or None for full width. Sparse/edge chunks
+    # read (and infer) only these columns; outputs are placed at this offset in the whole-chunk buffers.
     x_sub: slice | None
     # (ChunkData, dataset) for plan.strips[0]; None until loaded.
     first_strip: tuple[ChunkData, MosaicChunkInferenceDataset] | None
@@ -91,127 +88,101 @@ logger = logging.getLogger(__name__)
 def _chunk_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogeneous JSON payload
     """One machine-readable per-chunk line for the profiling tools.
 
-    ``te-observe-cluster --report`` parses these in
-    preference to prose log lines (whose wording drifts across branches and
-    silently breaks regex parsers). Keep the keys stable — or update that
-    parser in the same change.
+    ``te-observe-cluster --report`` parses these rather than prose log lines, whose wording
+    drifts across branches and silently breaks regex parsers. Keep the keys stable, or update
+    that parser in the same change.
     """
     return "CHUNK_SUMMARY: " + json.dumps(fields, sort_keys=True)
 
 
-# Host-RAM budget (bytes) for one resident S2 band set (a strip's bands + its
-# full-chunk SCL mask). The intra-chunk 1-deep strip prefetch keeps TWO such
-# sets resident at once (dense/prefetch path), so the steady-state S2 ceiling
-# is the pair: 5.75 GiB/set => ~11.5 GiB. Sized for UTM-zone-scale runs, where
-# chunk-density variance produces RAM spikes; the operating target is peak host
-# RAM at the 60% ceiling of the 30.9 GB usable on a g6e.xlarge:
-#   pair ~11.5 GiB (~12.35 GB) + SAR ~1.5 (unmodelled; spikes on dense-S1
-#   chunks) + whole-chunk int8 output buffers ~0.6 + model/torch/misc baseline
-#   ~3.3 => ~17.7 GB ~ 57% — ~0.9 GB under the 60% line for sub-30s spikes the
-#   RESOURCES poll misses. Validated on the 2026-07-17 run at 4.75 GiB: 34% avg
-#   / 51% peak; the bump to 5.75 lets the whole T<=71 full-width band run as a
-#   SINGLE strip (dropping a wasted ~13s fixed read/chunk) while dense T=114
-#   still splits. The non-hideable strip strategy (see _strip_plan) may size a
-#   strip up to the PAIR budget, but only with prefetch OFF, so at most ONE such
-#   set is resident — peak stays bounded by the same pair ceiling either way.
-#   The cross-chunk starter prefetch adds <= _XCHUNK_PREFETCH_CAP_BYTES
-#   (~2 GiB) of stash during the current chunk's LAST strip; measured on the
-#   phase-5 run a60550ae it lifted peak ~6 pts (striping 45-47% -> ~52%, the
-#   stash partly co-resident with the peak), still comfortably under the 60% line.
-# History: 7.0 GiB/set held ~68-75% peak once cross-chunk prologue prefetch was
-# removed (and ~92-95% with it — the chunk_5_9 OOM). Cross-chunk interleaving
-# is deliberately gone (see _load_chunk_prologue); do not raise this budget
-# without re-deriving the arithmetic above against the RAM target.
+# Host-RAM budget (bytes) for one resident S2 band set (a strip's bands + its full-chunk SCL
+# mask). The intra-chunk 1-deep strip prefetch keeps TWO such sets resident, so the steady-state
+# S2 ceiling is the PAIR: 5.75 GiB/set => ~11.5 GiB. The operating target is peak host RAM under
+# 60% of the 30.9 GB usable on a g6e.xlarge:
+#   pair ~11.5 GiB (~12.35 GB) + SAR ~1.5 (unmodelled; spikes on dense-S1 chunks) + whole-chunk
+#   int8 output buffers ~0.6 + model/torch/misc baseline ~3.3 => ~17.7 GB ~ 57%, leaving ~0.9 GB
+#   for sub-30s spikes the RESOURCES poll misses. Measured at 4.75 GiB/set: 34% avg / 51% peak;
+#   5.75 lets the whole T<=71 full-width band run as a SINGLE strip (saving a ~13 s fixed read
+#   per chunk) while dense T=114 still splits. The cross-chunk starter prefetch adds at most
+#   _XCHUNK_PREFETCH_CAP_BYTES (~2 GiB) during the last strip: measured +~6 pts (45-47% -> ~52%).
+# The non-hideable strategy (_strip_plan regime 3) may size a strip to the PAIR budget, but only
+# with prefetch OFF, so at most ONE such set is resident — the pair ceiling bounds peak either way.
+# Do NOT raise this, or reintroduce whole-chunk cross-chunk prefetch, without re-deriving the
+# arithmetic above: context_docs/design/inference_gpu_saturation_profile_2026_07.md.
 _S2_STRIP_BYTE_BUDGET = int(5.75 * 1024**3)
 
 # Per-(timestep, pixel) byte cost of resident S2 bands: 10 bands x uint16.
 _S2_BYTES_PER_OBS_PX = len(S2_BAND_ORDER) * 2
 
-# The foreground S2 band read fans out one decompression thread per core (capped
-# at the 10-band count) — 4 on the 4-vCPU g6e.xlarge. Each concurrent thread
-# holds a transient single-band (T, strip_h, W) uint16 array ON TOP of the
-# resident stacked result, so a read's momentary peak is (10 + readers) bands'
-# worth, not 10. The dense path reads strips in the BACKGROUND (2 reserved-core
-# readers) and its measured peak already includes that transient; only the
-# pair-budget FOREGROUND read (few-valid-px, prefetch off, a single set sized to
-# the full pair budget) must charge it so its momentary peak stays within the
-# pair ceiling. See _strip_plan regime 3.
+# The foreground S2 band read fans out one decompression thread per core (capped at the 10-band count) — 4 on the
+# 4-vCPU g6e.xlarge. Each thread holds a transient single-band (T, strip_h, W) uint16 array ON TOP of the resident
+# stacked result, so a read's momentary peak is (10 + readers) bands' worth, not 10. The dense path reads in the
+# BACKGROUND and its measured peak already includes that transient; only the pair-budget FOREGROUND read (_strip_plan
+# regime 3) must charge it so its momentary peak stays inside the pair ceiling.
 _S2_FOREGROUND_DECODE_READERS = min(len(S2_BAND_ORDER), 4)
 
-# Cores left free for the inference loop's batch-prep workers while a
-# BACKGROUND strip load decompresses bands: one per prep worker, BY DEFINITION
-# tied to the prep pool size so a PREFETCH_DEPTH change can't silently
-# re-introduce the ~500 ms get_batch starvation this reservation prevents on
-# the 4-vCPU g6e.xlarge. Foreground (prologue) loads reserve nothing — the GPU
-# is idle and wants the fastest load.
+# Cores left free for the inference loop's batch-prep workers while a BACKGROUND strip load decompresses bands: one
+# per prep worker, tied BY DEFINITION to the prep pool size so a PREFETCH_DEPTH change cannot silently re-introduce
+# the ~500 ms get_batch starvation this prevents on the 4-vCPU g6e.xlarge. Foreground (prologue) loads reserve nothing
+# — the GPU is idle and wants the fastest load.
 _BACKGROUND_LOAD_RESERVED_CPUS = PREFETCH_DEPTH
 
-# Hard ceiling on any in-actor wait for a background I/O future — a strip /
-# starter prefetch load, or the prior chunk's deferred staging write. These are
-# seconds of S3/zarr I/O in the normal case (a full strip is ~6.5 s at measured
-# BW); a wait this long means the underlying client is wedged with no socket
-# timeout. Bounding the wait lets process_chunk fail out (or fall back to a
-# serial load) so Ray surfaces the error and the scheduler kills+replaces the
-# actor and requeues — recovery the tail flush_writes() timeout provides for an
-# IDLE actor but which a wedge INSIDE process_chunk never reaches (Ray
-# serialises actor calls; a 1-2 actor run never hits the >=3-stall abort).
-# Matches the scheduler's flush_writes() RPC timeout for consistency.
+# Hard ceiling on any in-actor wait for a background I/O future — a strip / starter prefetch load, or the prior
+# chunk's deferred staging write. Normal case is seconds of S3/zarr I/O (a full strip is ~6.5 s at measured BW), so a
+# wait this long means the client is wedged with no socket timeout. Bounding it lets process_chunk fail out (or fall
+# back to a serial load) so Ray surfaces the error and the scheduler kills + replaces the actor and requeues —
+# recovery that flush_writes() provides for an IDLE actor but that a wedge INSIDE process_chunk never reaches (Ray
+# serialises actor calls; a 1-2 actor run never hits the >=3-stall abort). Matches the scheduler's flush_writes() RPC
+# timeout.
 _BACKGROUND_IO_TIMEOUT_S = 600.0
 
-# Apply the S2 easting-bbox crop only when it removes at least this fraction
-# of the chunk's width. Near-full boxes (interior chunks) skip the crop
-# entirely, keeping the mainline path byte-for-byte identical to the uncropped
-# code and avoiding pointless SAR column-copies for a few saved columns.
+# Apply the S2 easting-bbox crop only when it removes at least this fraction of the chunk's width. Near-full boxes
+# (interior chunks) skip it, keeping the mainline path byte-for-byte identical to the uncropped code rather than
+# paying SAR column-copies for a few saved columns.
 _X_CROP_MIN_SAVING = 0.10
 
-# Floor on derived strip height. Below this a strip reads so few northing rows
-# that per-strip fixed overhead (zarr open, SCL slice, dataset bucketing)
-# dominates and read amplification climbs without meaningfully lowering peak RAM.
-# A pathologically dense chunk bottoms out here — deliberately breaching the byte
-# budget (logged) — rather than degenerating into hundreds of tiny reads.
+# Floor on derived strip height. Below this, per-strip fixed overhead (zarr open, SCL slice, dataset bucketing)
+# dominates and read amplification climbs without meaningfully lowering peak RAM. A pathologically dense chunk bottoms
+# out here — deliberately breaching the byte budget, and logged — rather than degenerating into hundreds of tiny
+# reads.
 _MIN_STRIP_H = 256
 
-# Strategy-only estimator constants, calibrated from the 2026-07-17 run logs
-# (chunk_0_9's two strips: 4.85 GB in 19.4s and 0.19 GB in 14.5s => BW ~950 MB/s,
-# fixed ~14s/read from re-decompressing the shared 4000^2 storage chunks + zarr
-# open + bucketing; inference px/s ~constant at ~16K, GPU-bound). These pick a
-# strip STRATEGY only — never a correctness value and never a RAM bound. A wrong
-# estimate's worst case is the previous always-prefetch behavior, because both
-# strategies respect the same resident-pair ceiling (see _strip_plan).
+# Strategy-only estimator constants, calibrated from real run logs (a two-strip chunk: 4.85 GB in 19.4 s and 0.19 GB
+# in 14.5 s => BW ~950 MB/s, fixed ~14 s/read from re-decompressing the shared 4000^2 storage chunks + zarr open +
+# bucketing; inference ~16K px/s, GPU-bound). These pick a strip STRATEGY only — never a correctness value and never a
+# RAM bound. A wrong estimate's worst case is the old always-prefetch behaviour, since every strategy respects the
+# same resident-pair ceiling (see _strip_plan).
 _EST_PX_PER_SEC = 16_000.0
 _EST_READ_BYTES_PER_SEC = 900e6
 _EST_FIXED_READ_S = 13.0
-# P2 starter strip: a deliberately small first strip so the GPU starts inferring
-# after only the ~fixed read cost instead of a full budget-sized load, with the
-# remainder hiding behind it. Bounded upside (~bytes-of-one-budget / BW ~= 7s);
-# applied only when inference comfortably hides the extra read it introduces.
+# Starter strip: a deliberately small first strip so the GPU starts inferring after only the fixed read cost instead
+# of a full budget-sized load, with the remainder hiding behind it. Bounded upside (~one budget / BW ~= 7 s); applied
+# only when inference comfortably hides the extra read.
 _STARTER_STRIP_H = 256
 
 # ---------------------------------------------------------------------------
 # Bounded cross-chunk starter prefetch ("interleaving lite")
 # ---------------------------------------------------------------------------
-# The scheduler reserves each actor's next chunk and passes it as
-# ``prefetch_hint``; during the CURRENT chunk's last strip (its final load is
-# complete by then — the RAM trough, temporally separated from the mid-chunk
-# two-strip peak), the actor prefetches a hard-capped payload for the next
-# chunk: its SCL mask bundle and, when the cap and a net-gain check allow, its
-# 256-row starter strip. This is NOT the removed full interleaving: that
-# co-resided an entire next working set (5-7+ GiB, density-dependent — the
-# 92-95% RAM OOM); this co-resides <= ~2 GiB by construction, and every
-# failure (cap exceeded, label mismatch after a steal, credential-window
-# expiry, load error) degrades to today's serial prologue — slower, never
-# bigger. Escape hatch: set TESSERA_DISABLE_XCHUNK_PREFETCH=1.
+# The scheduler reserves each actor's next chunk and passes it as ``prefetch_hint``; during the
+# CURRENT chunk's last strip (its final load is complete by then — the RAM trough, temporally
+# separated from the mid-chunk two-strip peak), the actor prefetches a hard-capped payload for
+# the next chunk: its SCL mask bundle and, when the cap and a net-gain check allow, its 256-row
+# starter strip. This is NOT the removed full interleaving, which co-resided an entire next
+# working set (5-7+ GiB) and OOM-killed a worker at 92-95% RAM; this co-resides <= ~2 GiB by
+# construction, and every failure (cap exceeded, label mismatch after a steal, credential-window
+# expiry, load error) degrades to the serial prologue — slower, never bigger. Escape hatch:
+# TESSERA_DISABLE_XCHUNK_PREFETCH=1.
 _XCHUNK_DISABLE_ENV = "TESSERA_DISABLE_XCHUNK_PREFETCH"
 # Resident cap for a stashed payload (mask bundle + starter ChunkData/dataset).
 _XCHUNK_PREFETCH_CAP_BYTES = int(2.0 * 1024**3)
-# The full-SCL read transiently holds t_all x H x W bytes before pruning;
-# skip prefetching entirely for chunks where even that transient is outsized.
+# The full-SCL read transiently holds t_all x H x W bytes before pruning; skip prefetching entirely for chunks where
+# even that transient is outsized.
 _XCHUNK_MASK_TRANSIENT_CAP_BYTES = int(1.5 * 1024**3)
-# Upper-bound estimate of pre-prune S2 timesteps in a 12-month window (~5-day
-# revisit x tile overlap); used only for the transient precheck above.
+# Upper-bound estimate of pre-prune S2 timesteps in a 12-month window (~5-day revisit x tile overlap); used only for
+# the transient precheck above.
 _XCHUNK_T_ALL_EST = 230
-# Flat allowance for the starter strip's full-width SAR stack (read full-width
-# for obs-layer fidelity; see load_chunk's x_sub docs).
+# Flat allowance for the starter strip's full-width SAR stack (read full-width for obs-layer fidelity; see
+# load_chunk's x_sub docs).
 _XCHUNK_SAR_STARTER_EST_BYTES = int(0.4 * 1024**3)
 
 
@@ -225,28 +196,25 @@ def _strip_height_for_density(
 ) -> int:
     """Largest northing strip height (rows) whose resident S2 working set fits ``budget``.
 
-    Every resident set is charged ``bands(strip_h) + a full SCL mask`` — the
-    RAM model and its arithmetic live at :data:`_S2_STRIP_BYTE_BUDGET`.
-    ``width`` sizes the (possibly easting-cropped) band read; ``mask_width``
-    sizes the mask, which stays full-chunk-width even when bands are cropped
-    (defaults to ``width`` for the uncropped case). ``decode_readers`` (>0)
-    additionally charges the concurrent per-band decode transient (see
-    :data:`_S2_FOREGROUND_DECODE_READERS`), so the strip's momentary read peak —
-    not just its resident set — fits ``budget``; the default 0 leaves sizing
-    unchanged for the background-read dense path (already measured-safe). A chunk
-    dense enough to drive the height below ``_MIN_STRIP_H`` bottoms out there and
-    breaches the budget (logged) rather than degenerating into tiny reads.
+    Every resident set is charged ``bands(strip_h) + a full SCL mask``; the RAM model lives at
+    :data:`_S2_STRIP_BYTE_BUDGET`. ``width`` sizes the (possibly easting-cropped) band read;
+    ``mask_width`` sizes the mask, which stays full-chunk-width even when bands are cropped
+    (defaults to ``width``). ``decode_readers`` (>0) additionally charges the concurrent per-band
+    decode transient (:data:`_S2_FOREGROUND_DECODE_READERS`), so the strip's momentary read peak
+    — not just its resident set — fits ``budget``; the default 0 leaves the background-read dense
+    path (already measured-safe) unchanged. A chunk dense enough to drive the height below
+    ``_MIN_STRIP_H`` bottoms out there and breaches the budget, logged.
     """
     t = max(1, t_kept)
     mask_bytes = t * height * (mask_width if mask_width is not None else width)
     band_budget = budget - mask_bytes
-    # Resident stacked result (_S2_BYTES_PER_OBS_PX) plus decode_readers transient
-    # single-band arrays (2 B/px each) held concurrently during the read.
+    # Resident stacked result (_S2_BYTES_PER_OBS_PX) plus decode_readers transient single-band arrays (2 B/px each)
+    # held concurrently during the read.
     per_row = t * width * (_S2_BYTES_PER_OBS_PX + 2 * decode_readers)
     budget_h = max(0, band_budget) // per_row
     if budget_h < _MIN_STRIP_H:
-        # Worst-case resident pair: two floor-height band sets, each charged a
-        # full mask (conservative; the intra-chunk pair actually shares one).
+        # Worst-case resident pair: two floor-height band sets, each charged a full mask (conservative; the
+        # intra-chunk pair actually shares one).
         pair_gib = 2 * (_MIN_STRIP_H * per_row + mask_bytes) / 1024**3
         logger.warning(
             "S2 density (T_kept=%d, W=%d, H=%d) drives strip_h=%d below floor "
@@ -280,21 +248,18 @@ def _strip_slices(height: int, strip_h: int, start: int = 0) -> list[slice]:
 class _StripPlan:
     """How to tile a chunk into northing strips, and whether to prefetch them.
 
-    ``prefetch`` gates the intra-chunk 1-deep load pipeline: True only when
-    inference is estimated long enough to hide a background strip load;
-    otherwise loads run serially (never two strips co-resident) and strips may
-    use the PAIR budget. The two booleans carry the plan's load-bearing
-    properties; ``strategy`` is a log label and ``strip_h`` the logged body
-    height — neither drives behavior.
+    ``prefetch`` gates the intra-chunk 1-deep load pipeline: True only when inference is
+    estimated long enough to hide a background strip load; otherwise loads run serially (never
+    two strips co-resident) and strips may use the PAIR budget. ``strategy`` is a log label and
+    ``strip_h`` the logged body height — neither drives behaviour.
     """
 
     strips: list[slice]
     prefetch: bool
     strategy: str
     strip_h: int
-    # True when a strip was sized to the PAIR budget (~2x): the last strip then
-    # holds a near-2x set, NOT a RAM trough, so the cross-chunk prefetch must
-    # be skipped for this chunk.
+    # True when a strip was sized to the PAIR budget (~2x): the last strip then holds a near-2x set, NOT a RAM trough,
+    # so the cross-chunk prefetch must be skipped for this chunk.
     pair_budget: bool = False
     # True when strips[0] is already the small starter strip.
     starter_first: bool = False
@@ -303,16 +268,13 @@ class _StripPlan:
 def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width: int | None = None) -> _StripPlan:
     """Choose a strip tiling + prefetch strategy for a chunk.
 
-    Bytes scale with ``t_kept x height x width``; inference time scales with
-    valid pixels — they diverge, so the plan picks per chunk: fits-one-budget →
-    single strip; split + hideable (dense) → balanced strips + prefetch, with a
-    small starter strip when inference absorbs the extra fixed read; split +
-    not hideable (wide but few valid px) → prefetch OFF at the PAIR budget
-    (only one set ever resident). RAM safety does NOT depend on the estimates —
-    every branch respects the pair ceiling (arithmetic at
-    :data:`_S2_STRIP_BYTE_BUDGET`); a mis-estimate only costs speed.
-    ``mask_width`` is the full-chunk mask width when bands are easting-cropped
-    (defaults to ``width`` for the uncropped case).
+    Bytes scale with ``t_kept x height x width``; inference time scales with valid pixels — they
+    diverge, so the plan is per chunk: fits-one-budget -> single strip; split + hideable (dense)
+    -> balanced strips + prefetch, with a small starter strip when inference absorbs the extra
+    fixed read; split + not hideable (wide but few valid px) -> prefetch OFF at the PAIR budget
+    (only one set ever resident). RAM safety does NOT depend on the estimates: every branch
+    respects the pair ceiling (arithmetic at :data:`_S2_STRIP_BYTE_BUDGET`), so a mis-estimate
+    costs only speed. ``mask_width`` is the full-chunk mask width when bands are easting-cropped.
     """
     budget = _S2_STRIP_BYTE_BUDGET
     mw = mask_width if mask_width is not None else width
@@ -324,9 +286,8 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width:
     if per_set_1x <= budget:
         return _StripPlan([slice(0, height)], prefetch=False, strategy="single", strip_h=height)
 
-    # Split needed. Will inference hide the loads? Compare estimated total
-    # inference time against estimated total load time (fixed per-read cost x
-    # number of 1x-budget strips, plus bytes / bandwidth).
+    # Split needed. Will inference hide the loads? Compare estimated total inference time against estimated total load
+    # time (fixed per-read cost x number of 1x-budget strips, plus bytes / bandwidth).
     n_dense = (per_set_1x + budget - 1) // budget
     t_infer = valid_px / _EST_PX_PER_SEC
     t_load = n_dense * _EST_FIXED_READ_S + bytes_total / _EST_READ_BYTES_PER_SEC
@@ -335,8 +296,8 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width:
         # Regime 2: hideable (dense). Balanced strips at one budget, prefetch on.
         strip_h = _strip_height_for_density(t_kept, width, height, budget, mask_width=mw)
         strips = _strip_slices(height, strip_h)
-        # P2 starter strip: only when there is a real body to hide behind and
-        # inference comfortably absorbs the one extra fixed read it introduces.
+        # P2 starter strip: only when there is a real body to hide behind and inference comfortably absorbs the one
+        # extra fixed read it introduces.
         starter = len(strips) >= 2 and strip_h > _STARTER_STRIP_H and t_infer >= t_load + _EST_FIXED_READ_S
         if starter:
             strips = [slice(0, _STARTER_STRIP_H), *_strip_slices(height, strip_h, start=_STARTER_STRIP_H)]
@@ -348,11 +309,10 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width:
             starter_first=starter,
         )
 
-    # Regime 3: not hideable. Prefetch off => only one set resident, read in the
-    # FOREGROUND (GPU idle), so the momentary peak is that set's bands + its
-    # concurrent decode transient + mask. We size so THAT fits the pair budget —
-    # the same ceiling the dense resident pair sits at (measured-safe) — rather
-    # than sizing the resident set alone to the pair and overshooting mid-read.
+    # Regime 3: not hideable. Prefetch off => only one set resident, read in the FOREGROUND (GPU idle), so the
+    # momentary peak is that set's bands + its concurrent decode transient + mask. Size so THAT fits the pair budget —
+    # the same measured-safe ceiling the dense resident pair sits at — rather than sizing the resident set alone to
+    # the pair and overshooting mid-read.
     pair = 2 * budget
     readers = _S2_FOREGROUND_DECODE_READERS
     decode_transient = bytes_total * 2 * readers // _S2_BYTES_PER_OBS_PX
@@ -369,26 +329,22 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width:
 def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice | None, int, _StripPlan]:
     """Crop bbox, valid-pixel count, and strip plan derived from the SCL mask.
 
-    Shared by the serial prologue and the cross-chunk starter prefetch so both
-    paths make identical decisions from the same inputs — a prefetched chunk
-    must tile and crop exactly as it would have serially.
+    Shared by the serial prologue and the cross-chunk starter prefetch so both make identical
+    decisions from the same inputs — a prefetched chunk must tile and crop exactly as it would
+    have serially.
     """
     t_kept = int(mask_bundle.mask.shape[0])
-    # (H, W): pixels with >=1 valid S2 observation. Drives both the easting
-    # crop bbox and the strip-plan's inference-time estimate below. Equivalent
-    # to mask.any(axis=0) — obs_count sums the pre-prune mask and pruning drops
-    # only all-False timestep planes — but reads (H, W) instead of scanning the
-    # full (T_kept, H, W) mask (up to ~1 GB) once per chunk.
+    # (H, W): pixels with >=1 valid S2 observation. Drives the easting crop bbox and the strip plan's inference-time
+    # estimate. Equivalent to mask.any(axis=0) — obs_count sums the pre-prune mask and pruning drops only all-False
+    # timestep planes — but reads (H, W) instead of scanning the full (T_kept, H, W) mask (up to ~1 GB) once per
+    # chunk.
     valid_any = mask_bundle.obs_count > 0
 
-    # S2 valid-pixel bounding box in easting. On sparse/edge chunks (a
-    # coastline sliver, a UTM-zone boundary) the valid columns can be a
-    # small fraction of the width — the S2 band read (20 B/px) shrinks to
-    # the box. Columns outside it have zero valid S2 observations, so they
-    # could never be inferred; the saved obs layers keep full-extent
-    # fidelity via the bundle (S2) and full-width SAR reads (see
-    # load_chunk's x_sub docs). Near-full boxes skip the crop so interior
-    # chunks stay on the byte-identical uncropped path.
+    # S2 valid-pixel bounding box in easting. On sparse/edge chunks (a coastline sliver, a UTM zone boundary) the
+    # valid columns can be a small fraction of the width, and the S2 band read (20 B/px) shrinks to the box. Columns
+    # outside it have zero valid S2 observations and could never be inferred; the saved obs layers keep full extent
+    # via the bundle (S2) and full-width SAR reads (see load_chunk's x_sub docs). Near-full boxes skip the crop so
+    # interior chunks stay on the byte-identical uncropped path.
     x_sub: slice | None = None
     valid_cols = np.flatnonzero(valid_any.any(axis=0))
     if valid_cols.size:
@@ -405,8 +361,8 @@ def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice
 
     effective_width = chunk.width if x_sub is None else (x_sub.stop - x_sub.start)
     valid_px = int(valid_any[:, x_sub].sum()) if x_sub is not None else int(valid_any.sum())
-    # Bands read at effective_width (possibly cropped); the SCL mask stays
-    # full chunk width, so charge it at chunk.width in the budget.
+    # Bands read at effective_width (possibly cropped); the SCL mask stays full chunk width, so charge it at
+    # chunk.width in the budget.
     plan = _strip_plan(t_kept, chunk.height, effective_width, valid_px, mask_width=chunk.width)
     return x_sub, valid_px, plan
 
@@ -414,15 +370,13 @@ def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice
 def _xchunk_rung(chunk: ChunkSpec, t_kept: int, x_sub: slice | None, valid_px: int, plan: _StripPlan) -> str:
     """Choose the prefetch rung for a hinted next chunk: "starter" or "mask-only".
 
-    The starter rung requires ``plan.strips[0]`` to be the SMALL 256-row
-    starter: either the plan already starts small (``starter_first`` — no
-    extra read), or it's a one-budget single strip convertible to
-    starter+body — which PAYS one extra fixed read, so it's worth it only
-    when the starter's own inference can hide a meaningful slice of the body
-    read (net-gain check). Everything else gets the mask: budget-sized first
-    strips are over the cap by construction, and pair-budget plans have too
-    few valid pixels to hide the extra read. Finally the byte cap: the
-    resident mask + starter estimate must fit ``_XCHUNK_PREFETCH_CAP_BYTES``.
+    The starter rung requires ``plan.strips[0]`` to be the SMALL 256-row starter: either the plan
+    already starts small (``starter_first``, no extra read), or it is a one-budget single strip
+    convertible to starter+body — which PAYS one extra fixed read, so it is worth it only when
+    the starter's own inference hides a meaningful slice of the body read (the net-gain check).
+    Everything else gets the mask: budget-sized first strips are over the cap by construction,
+    and pair-budget plans have too few valid pixels to hide the extra read. Finally the byte cap:
+    the resident mask + starter estimate must fit ``_XCHUNK_PREFETCH_CAP_BYTES``.
     """
     if plan.starter_first:
         candidate = True
@@ -476,9 +430,8 @@ def _configure_actor_logging() -> None:
     )
     for noisy in ("zarr", "zarr.group", "icechunk", "botocore", "s3transfer", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    # Derive from this module's package so the names survive renames — these
-    # were once hardcoded to a stale "src.inference.*" prefix, which silently
-    # disabled every DEBUG diagnostic (TIMING, EFFECTIVE TFLOPS, autocast probe).
+    # Derived from this module's package so the names survive renames: a hardcoded, stale "src.inference.*" prefix
+    # once silently disabled every DEBUG diagnostic (TIMING, EFFECTIVE TFLOPS, autocast probe).
     pkg = __name__.rsplit(".", 1)[0]  # tessera_embeddings.inference
     for name in (
         f"{pkg}.inference",
@@ -536,26 +489,6 @@ def _log_vram_breakdown(model: MultimodalBTInferenceModel, torch_mod: types.Modu
     )
 
 
-# Host-RAM env vars, all set via runtime_env (not the decorator process) so Ray
-# exports them into the worker environment BEFORE this module imports torch /
-# instantiates the C allocator — each is read once at init and ignored if set
-# later. On the decorator so they cover every creation site: the initial pool,
-# the ActorPool replacement path (scheduling.py), and the local CPU runner.
-#
-# CUBLAS_WORKSPACE_CONFIG caps the cuBLAS host-side workspace. The model runs
-# two CUDA streams (one per backbone), so the default workspace is reserved
-# twice and inflates the per-chunk host-RAM plateau. Pinning it small claws that
-# back. cuBLAS reads the var only when the first CUDA handle is created.
-#
-# MALLOC_ARENA_MAX=2 / MALLOC_TRIM_THRESHOLD_=0 attack glibc heap retention. The
-# per-sub-batch prefetch thread churns numpy/torch CPU buffers every ~250ms;
-# across multiple glibc arenas the freed regions are held on per-arena free
-# lists at the high-water mark instead of returned to the OS, which an smaps
-# rollup shows as dirty-anon RSS (much of it THP-backed). Capping arenas to 2
-# (main + prefetch) and forcing trim-on-free returns that churn to the OS.
-# These are A/B probes: if peak RSS drops, the plateau was retained churn, not
-# live working set; if it barely moves, the working set is genuinely resident
-# and chunking is the only remaining lever.
 def _coverage_record(
     chunk: ChunkSpec,
     *,
@@ -567,26 +500,23 @@ def _coverage_record(
 ) -> dict[str, Any]:
     """One shard's refusal reasons and observation depth, in the shape the registry consumes.
 
-    Built here rather than at each of the two call sites because BOTH need it and they must not
-    disagree: a wholly-refused shard writes it into its skip marker, and a shard that embedded
-    something returns it with its result. Two copies of these expressions is how the two rows in one
-    registry stop being comparable — and comparing them is the point, since a shard 60% refused for
-    thin optical is a better revisit candidate than many that were refused outright.
+    Built here rather than at each of the two call sites — a wholly-refused shard writes it into
+    its skip marker, a shard that embedded something returns it with its result — because two
+    copies of these expressions is how two rows in one registry stop being comparable. Comparing
+    them is the point: a shard 60% refused for thin optical is a better revisit candidate than
+    many that were refused outright.
 
-    Every count is over the footprint the reasons were COUNTED over (``eligible_px``), not over the
-    embedded pixels: an infill planner is asking about the land, and a denominator that shrinks with
-    the answer cannot support the comparison. ``chunk_px`` is the published footprint beside it, so a
-    reader can also see how much of the shard was never evaluated at all.
+    Every count is over the footprint the reasons were COUNTED over (``eligible_px``), not over
+    the embedded pixels: an infill planner asks about the land, and a denominator that shrinks
+    with the answer cannot support the comparison. ``chunk_px`` sits beside it so a reader can
+    see how much of the shard was never evaluated at all.
 
-    ``x_sub`` IS THE COLUMN RANGE THE REASONS WERE COUNTED OVER, and every buffer here is sliced by
-    it — which is why this takes the slice rather than its width. The obs buffers are allocated and
-    filled at FULL chunk width on both the cropped and uncropped paths, deliberately, so the arrays
-    published into the store keep full-extent fidelity. Summing them whole would describe a footprint
-    the refusal counts do not cover: observations in columns outside the evaluated range would inflate
-    every statistic here and can push a count above its own ``eligible_px`` denominator, telling a
-    consumer more imagery could repair a shard when the imagery it is counting was never in question.
-    Carrying both footprints was the alternative and is rejected here: the unevaluated columns were
-    never refused, so no consumer ranks by them, and ``chunk_px`` already says how much was skipped.
+    ``x_sub`` IS THAT COLUMN RANGE, which is why this takes the slice rather than its width, and
+    every buffer here is sliced by it. The obs buffers are deliberately allocated and filled at
+    FULL chunk width on both paths so the published arrays keep full-extent fidelity; summing
+    them whole would describe a footprint the refusal counts do not cover, inflating every
+    statistic and potentially pushing a count above its own ``eligible_px`` denominator — telling
+    a consumer more imagery could repair a shard when that imagery was never in question.
     """
     cols = x_sub if x_sub is not None else slice(None)
     eff_w = int(chunk.width) if x_sub is None else int(x_sub.stop - x_sub.start)
@@ -596,41 +526,38 @@ def _coverage_record(
         "refused": dict(refused),
         "eligible_px": int(chunk.height) * int(eff_w),
         "chunk_px": int(chunk.height) * int(chunk.width),
-        # The grid this record was produced on. An assembly-only resume of an all-skipped run has no
-        # staged tile to read a chunk size off, and falling back to the CURRENT default
-        # re-enumerates the labels — after which valid old markers read as unexpected.
+        # The grid this record was produced on. An assembly-only resume of an all-skipped run has no staged tile to
+        # read a chunk size off, and falling back to the CURRENT default re-enumerates the labels — after which valid
+        # old markers read as unexpected.
         "chunk_side_px": int(chunk.width),
-        # None when no strip ran far enough to say — reported as unknown rather than guessed from the
-        # config, whose value the per-cell orbit downgrade can override.
+        # None when no strip ran far enough to say — unknown rather than guessed from the config, whose value the
+        # per-cell orbit downgrade can override.
         "radar_rule_enforced": radar_rule_enforced,
         "s2_obs": {
             "px_with_any": int(any_obs.sum()),
             "max": int(s2_obs.max()),
             "mean_where_any": round(float(s2_obs[any_obs].mean()), 2) if any_obs.any() else 0.0,
-            # MEDIAN, beside the mean, because a cleanup planner's question is "would another scene
-            # or two cross the line for most of this tile" and a mean is pulled by a bright patch of
-            # deep pixels next to a dark majority. Over pixels that saw ANYTHING, not over the land:
-            # including the never-imaged ones drags it to zero and then it describes neither
-            # population.
+            # MEDIAN beside the mean: a cleanup planner asks "would another scene or two cross the line for most of
+            # this tile", and a mean is pulled by a bright patch of deep pixels next to a dark majority. Over pixels
+            # that saw ANYTHING, not over the land — including never-imaged ones drags it to zero and it then
+            # describes neither population.
             "median_where_any": (round(float(np.median(s2_obs[any_obs])), 1) if any_obs.any() else 0.0),
-            # AND THE DEPTH OF THE PIXELS THAT FELL SHORT, which is the one an infill planner
-            # ranks by. `median_where_any` is over the whole evaluated footprint, so on a
-            # PARTLY refused shard it is dominated by the pixels that passed: 09S/2021 published
-            # tiles with a median of 50 against a line of 15 while still refusing several
-            # thousand pixels each. Ranking by it put a handful of marginal pixels in deep
-            # imagery above a shard that is uniformly thin. Over pixels strictly below the line
-            # and above zero — the thin population by the rule's own definition. None when the
-            # shard has none, which is different from a shard whose thin pixels sit at zero.
+            # AND THE DEPTH OF THE PIXELS THAT FELL SHORT, which is what an infill planner ranks by.
+            # `median_where_any` covers the whole evaluated footprint, so on a PARTLY refused shard it is dominated by
+            # the pixels that passed: 09S/2021 published tiles with a median of 50 against a line of 15 while still
+            # refusing several thousand pixels each, so ranking by it put marginal pixels in deep imagery above
+            # uniformly thin shards. Taken over pixels strictly below the line and above zero — the thin population by
+            # the rule's own definition. None when the shard has none, which is different from a shard whose thin
+            # pixels sit at zero.
             "median_where_thin": (
                 round(float(np.median(s2_obs[thin])), 1)
                 if (thin := (any_obs & (s2_obs < optical_min_obs))).any()
                 else None
             ),
         },
-        # RADAR PRESENCE, because a tile that is thin AND radar-free is a different cleanup
-        # candidate from one that is merely thin — more optical will not fix the first. Either orbit
-        # counts: which one it was is per-pixel in the coverage arrays, so the summary only has to
-        # answer presence.
+        # RADAR PRESENCE: a tile that is thin AND radar-free is a different cleanup candidate from one that is merely
+        # thin, since more optical will not fix the first. Either orbit counts — which one it was is per-pixel in the
+        # coverage arrays.
         "px_with_any_radar": int(
             ((obs_buffers["s1_asc_obs_count"][:, cols] > 0) | (obs_buffers["s1_desc_obs_count"][:, cols] > 0)).sum()
         ),
@@ -640,16 +567,15 @@ def _coverage_record(
 def _accelerator_index() -> str | None:
     """This actor's own GPU index on its host, from Ray's assignment. ``None`` if unassigned.
 
-    Ray sets ``CUDA_VISIBLE_DEVICES`` per actor, so TORCH already sees only this
-    actor's device and calls it 0. ``nvidia-smi`` does NOT honour that variable —
-    it reports every GPU on the host — so anything shelling out to it needs the
-    real host-level index, and this is where it comes from. On a one-GPU host the
-    answer is always "0" and the distinction is invisible, which is why the bug it
-    exists to prevent survived until a 4-GPU host was tried.
+    Ray sets ``CUDA_VISIBLE_DEVICES`` per actor, so TORCH already sees only this actor's device
+    and calls it 0. ``nvidia-smi`` does NOT honour that variable — it reports every GPU on the
+    host — so anything shelling out to it needs the real host-level index. On a one-GPU host the
+    answer is always "0", which is why the bug this prevents survived until a 4-GPU host was
+    tried.
 
-    Returns the FIRST assigned id as a string: an ``InferenceActor`` reserves
-    exactly one GPU (``num_gpus=1``), so a second id would mean the reservation
-    changed and a single-GPU reader would be wrong anyway.
+    Returns the FIRST assigned id as a string: an ``InferenceActor`` reserves exactly one GPU
+    (``num_gpus=1``), so a second id would mean the reservation changed and a single-GPU reader
+    would be wrong anyway.
     """
     try:
         ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
@@ -658,17 +584,27 @@ def _accelerator_index() -> str | None:
     return str(ids[0]) if ids else None
 
 
+# Memory env vars, all on runtime_env rather than the decorator process, so Ray exports them into the worker
+# environment BEFORE this module imports torch / instantiates the C allocator — each is read once at init and ignored
+# if set later. On the decorator so they cover every creation site: the initial pool, the ActorPool replacement path
+# (scheduling.py), and the local CPU runner.
 @ray.remote(
     runtime_env={
         "env_vars": {
+            # Caps the cuBLAS host-side workspace. The model runs two CUDA streams (one per backbone), so the default
+            # workspace is reserved twice and inflates the per-chunk host-RAM plateau. cuBLAS reads this only when the
+            # first CUDA handle is created.
             "CUBLAS_WORKSPACE_CONFIG": ":16:8",
+            # glibc heap retention: the per-sub-batch prefetch thread churns numpy/torch CPU buffers every ~250 ms,
+            # and across multiple arenas the freed regions sit on per-arena free lists at the high-water mark instead
+            # of returning to the OS (visible as dirty-anon RSS in an smaps rollup). Two arenas (main + prefetch) with
+            # trim-on-free returns that churn.
             "MALLOC_ARENA_MAX": "2",
             "MALLOC_TRIM_THRESHOLD_": "0",
-            # Segment-backed allocation, so the caching allocator GROWS a segment instead of
-            # reserving a fresh larger one and stranding the old. Read once when the allocator
-            # is built, which is why it rides on runtime_env with the rest. On the L40S it stops
-            # the reserved pool drifting to ~95% of the card to hold a <9 GB working set --
-            # measured 42.2 GB reserved for a chunk whose real need was 8.99 GB.
+            # Segment-backed allocation, so the caching allocator GROWS a segment instead of reserving a fresh larger
+            # one and stranding the old. On the L40S it stops the reserved pool drifting to ~95% of the card to hold a
+            # <9 GB working set — measured 42.2 GB reserved for a chunk whose real need was 8.99 GB. It is also what
+            # opens the deeper t_s2 rungs on 22.4 GiB cards; see context_docs/design/gpu-card-choice-2026_08.md.
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         }
     }
@@ -676,13 +612,12 @@ def _accelerator_index() -> str | None:
 class InferenceActor:
     """Ray actor that runs embedding inference on a single GPU or CPU.
 
-    Loads the model checkpoint once at initialization, then processes
-    chunks on demand via :meth:`process_chunk`.
+    Loads the model checkpoint once at initialization, then processes chunks on demand via
+    :meth:`process_chunk`.
 
-    Resource reservations (``num_gpus``, ``num_cpus``, ...) are NOT set on
-    the decorator. Callers pass them via ``InferenceActor.options(...)``
-    at ``.remote()`` call time so the same class supports GPU and CPU
-    deployments without duplication. Typical patterns::
+    Resource reservations (``num_gpus``, ``num_cpus``, ...) are NOT set on the decorator; callers
+    pass them via ``InferenceActor.options(...)`` at ``.remote()`` time so one class serves both
+    GPU and CPU deployments::
 
         # GPU worker (production / CUDA host)
         InferenceActor.options(num_gpus=1).remote(config, ckpt)
@@ -690,13 +625,11 @@ class InferenceActor:
         # CPU-only worker (local runner, smoke tests)
         InferenceActor.options(num_gpus=0).remote(config, ckpt)
 
-    The optional ``get_credentials`` callback is the icechunk S3 credential
-    provider used for every store open in :meth:`process_chunk`. It is injected
-    by the cloud-aware caller (the AWS provider passes
-    ``iam_icechunk_credentials``) so this domain actor stays free of any
-    cloud-SDK import. When ``None``, icechunk falls back to its default AWS
-    credential chain — fine for local/moto runs, but on long-lived cloud
-    workers that chain can fail to refresh the instance-profile token; see
+    The optional ``get_credentials`` callback is the icechunk S3 credential provider used for
+    every store open in :meth:`process_chunk`. The cloud-aware caller injects it (the AWS provider
+    passes ``iam_icechunk_credentials``) so this domain actor stays free of any cloud-SDK import.
+    ``None`` falls back to icechunk's default AWS credential chain — fine for local/moto runs, but
+    on long-lived cloud workers that chain can fail to refresh the instance-profile token; see
     ``providers.aws.credentials.iam_icechunk_credentials``.
     """
 
@@ -733,11 +666,9 @@ class InferenceActor:
         self.instance_id = _fetch_ec2_instance_id()
         self.device = _torch.device("cpu") if self.config.num_gpus == 0 else _select_device(_torch, self.instance_id)
 
-        # NARROWED HERE AND NOWHERE ELSE. `batch_size` is read by both the sub-batch split and
-        # the pinned host buffers, in different functions; scaling it at either site would
-        # leave the other on the tuned value, which is how a card ends up with buffers it
-        # cannot fill or batches it cannot hold. Rewriting the config once, before anything
-        # reads it, keeps a single value for the whole actor.
+        # NARROWED HERE AND NOWHERE ELSE. `batch_size` is read by both the sub-batch split and the pinned host
+        # buffers, in different functions; scaling it at either site leaves the other on the tuned value, which is how
+        # a card ends up with buffers it cannot fill or batches it cannot hold. One rewrite, before anything reads it.
         gpu_gib = _gpu_total_gib(_torch, self.device)
         fitted = batch_size_for_gpu(
             config.batch_size,
@@ -770,10 +701,9 @@ class InferenceActor:
         if self.device.type == "cuda":  # No-op on CPU
             _log_vram_breakdown(self.model, _torch)
 
-        # This actor's GPU index ON THE HOST, which is not always 0: Ray packs one actor per
-        # GPU, so a 4-GPU host runs four actors holding indices 0-3. Without it the monitor
-        # queries every GPU, rejects the multi-row answer, and a packed actor emits neither
-        # GPU statistics nor attribution — the whole point of the index.
+        # This actor's GPU index ON THE HOST, which is not always 0: Ray packs one actor per GPU, so a 4-GPU host runs
+        # four actors holding indices 0-3. Without it the monitor queries every GPU, rejects the multi-row answer, and
+        # a packed actor emits no GPU statistics.
         self.gpu_index = _accelerator_index()
         self._resource_monitor = ResourceMonitor(interval_sec=30, gpu_index=self.gpu_index)
         self._resource_monitor.start()
@@ -803,20 +733,17 @@ class InferenceActor:
     ) -> tuple[ChunkData, MosaicChunkInferenceDataset]:
         """Load one strip's bands and build its bucketed dataset.
 
-        The single loader shared by the serial prologue, the cross-chunk
-        prefetch, and the strip loop — the load/dataset kwargs must stay
-        identical across all three for bit-identity.
+        The single loader shared by the serial prologue, the cross-chunk prefetch, and the strip
+        loop — the load/dataset kwargs must stay identical across all three for bit-identity.
         """
         from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 
-        # Both derived from the ONE threaded orbit, never re-resolved per path: the three
-        # callers must pass identical load/dataset kwargs for bit-identity, and a value each
-        # of them computed for itself is exactly how they would drift apart.
+        # Derived from the ONE threaded orbit, never re-resolved per path: a value each caller computed for itself is
+        # exactly how the three would drift out of bit-identity.
         #
-        # A radar-free cell has zero S1 observations at every pixel, so the default gate would
-        # skip all of them and the cell would write nothing while reporting success. The gate
-        # is therefore opened BY the orbit rather than asked of the caller — the same rule
-        # InferenceConfig applies, applied here per cell because the orbit is now per cell.
+        # A radar-free cell has zero S1 observations at every pixel, so the default gate would skip all of them and
+        # the cell would write nothing while reporting success. The gate is therefore opened BY the orbit rather than
+        # asked of the caller — the rule InferenceConfig applies, applied per cell because the orbit is now per cell.
         allow_s2_only = self.config.allow_s2_only or s1_orbit == S1_ORBIT_NONE
         data = load_chunk(
             chunk,
@@ -843,24 +770,20 @@ class InferenceActor:
     ) -> _ChunkPrologue:
         """Load everything _process_chunk needs before its first forward pass.
 
-        Runs inline (serially, GPU idle) at the top of every chunk, UNLESS the
-        bounded cross-chunk prefetch staged some of it during the previous
-        chunk's tail (see the ``_XCHUNK_*`` constants): a label-matching stash
-        supplies the mask bundle + read plan and possibly the first strip;
-        whatever is missing loads serially here.
+        Runs inline (serially, GPU idle) at the top of every chunk, UNLESS the bounded cross-chunk
+        prefetch staged some of it during the previous chunk's tail (the ``_XCHUNK_*`` constants):
+        a label-matching stash supplies the mask bundle + read plan and possibly the first strip,
+        and whatever is missing loads serially here.
         """
         prologue = self._take_prefetched(chunk.label)
         if prologue is not None:
             logger.info("xchunk prefetch: hit (%s) for %s", prologue.rung, chunk.label)
-            # The stash's opener was created on the prefetch thread; if that
-            # thread's store opens outlived the PRIOR chunk's credential scope
-            # (the icechunk provider is a process-wide global, not thread-local)
-            # its repo handles are bound to the default AWS chain, which can
-            # fail to refresh on long-lived workers. The prefetched mask/strip
-            # are already-materialised numpy and safe to keep — but rebuild the
-            # LIVE opener inside THIS call's credential scope so the body-strip
-            # reads never inherit stale credentials (worst case: one repo
-            # re-open, matching the serial path's per-chunk opener).
+            # The stash's opener was created on the prefetch thread; if that thread's store opens outlived the PRIOR
+            # chunk's credential scope (the icechunk provider is a process-wide global, not thread-local) its repo
+            # handles are bound to the default AWS chain, which can fail to refresh on long-lived workers. The
+            # prefetched mask/strip are already-materialised numpy and safe to keep, but the LIVE opener is rebuilt
+            # inside THIS call's credential scope so body-strip reads never inherit stale credentials. Worst case: one
+            # repo re-open, matching the serial path.
             prologue.store_opener = make_store_opener(region=self._s3_region)
         else:
             store_opener, mask_bundle, x_sub, _valid_px, plan = self._open_and_plan(chunk, mosaic_base, time_window)
@@ -881,8 +804,8 @@ class InferenceActor:
     # ------------------------------------------------------------------
     # Bounded cross-chunk starter prefetch
     # ------------------------------------------------------------------
-    # Stash keyed by chunk label; lazily initialised so test harnesses that
-    # build bare actors via object.__new__ keep working without __init__.
+    # Stash keyed by chunk label; lazily initialised so test harnesses building bare actors via
+    # object.__new__ keep working without __init__.
 
     def _prefetch_state(self) -> tuple[ThreadPoolExecutor, dict[str, Future[_ChunkPrologue]]]:
         pool = getattr(self, "_xchunk_prefetch_pool", None)
@@ -897,10 +820,9 @@ class InferenceActor:
     ) -> _ChunkPrologue:
         """Load the capped prefetch payload for ``chunk`` (prefetch thread).
 
-        Store opens normally land inside the calling process_chunk's scoped
-        credential provider; a prefetch that outlives its originating call may
-        open through icechunk's default chain instead — if that fails, the
-        consumer falls back to an inline (in-scope) reload, so a
+        Store opens normally land inside the calling process_chunk's scoped credential provider;
+        a prefetch that outlives its originating call may open through icechunk's default chain
+        instead. If that fails the consumer falls back to an inline, in-scope reload, so a
         credential-window miss degrades to the unprefetched behaviour.
         """
         store_opener, mask_bundle, x_sub, valid_px, plan = self._open_and_plan(chunk, mosaic_base, time_window)
@@ -909,10 +831,9 @@ class InferenceActor:
         first_strip = None
         if rung == "starter":
             if not plan.starter_first:
-                # One-budget single-strip plan: convert to starter+body (both
-                # <= one budget) so the prefetched piece is small; the body
-                # loads behind the starter's inference via the normal strip
-                # pipeline. The rung's net-gain check priced the extra read.
+                # One-budget single-strip plan: convert to starter+body (both <= one budget) so the prefetched piece
+                # is small; the body loads behind the starter's inference via the normal strip pipeline. The rung's
+                # net-gain check priced the extra read.
                 plan = _StripPlan(
                     strips=[slice(0, _STARTER_STRIP_H), slice(_STARTER_STRIP_H, chunk.height)],
                     prefetch=True,
@@ -938,16 +859,14 @@ class InferenceActor:
     ) -> None:
         """Kick off the next chunk's capped prefetch on the prefetch thread.
 
-        Called from the strip loop at the top of the CURRENT chunk's last
-        strip — its load is complete by then and no body loads remain, so the
-        stash's bytes land on the RAM trough, temporally separated from the
-        mid-chunk two-strip peak.
+        Called from the strip loop at the top of the CURRENT chunk's last strip — its load is
+        complete by then and no body loads remain, so the stash's bytes land on the RAM trough,
+        temporally separated from the mid-chunk two-strip peak.
         """
         if os.environ.get(_XCHUNK_DISABLE_ENV):
             logger.info("xchunk prefetch: disabled by env — skipping %s", chunk.label)
             return
-        # Transient precheck: the full-SCL read briefly holds t_all x H x W
-        # bytes before pruning; skip outsized chunks outright.
+        # Transient precheck: the full-SCL read briefly holds t_all x H x W bytes before pruning.
         if _XCHUNK_T_ALL_EST * chunk.height * chunk.width > _XCHUNK_MASK_TRANSIENT_CAP_BYTES:
             logger.info("xchunk prefetch: skipped (cap) — %s mask transient too large", chunk.label)
             return
@@ -960,21 +879,18 @@ class InferenceActor:
     def _take_prefetched(self, label: str) -> _ChunkPrologue | None:
         """Consume the stash for ``label``; evict stale entries.
 
-        Blocks on an in-flight matching prefetch (partial overlap still wins).
-        Returns None — the serial prologue — when there is no matching stash or
-        the prefetch ERRORED (worker free, degrade gracefully). RAISES if a
-        prefetch TIMED OUT: the prefetch pool is a single persistent worker, so
-        a wedged task never frees and would poison every later prefetch with a
-        600 s wait — failing the chunk gets the actor (and its pool) replaced.
+        Blocks on an in-flight matching prefetch (partial overlap still wins). Returns None — the
+        serial prologue — when there is no matching stash or the prefetch ERRORED (worker free,
+        degrade gracefully). RAISES if a prefetch TIMED OUT: the prefetch pool is a single
+        persistent worker, so a wedged task never frees and would poison every later prefetch
+        with a 600 s wait; failing the chunk gets the actor and its pool replaced.
         """
         _, stash = self._prefetch_state()
         for stale in [k for k in stash if k != label]:
-            # A steal/requeue changed our next chunk. The stale prefetch's load
-            # may still be running on the prefetch thread; DRAIN it (wait, then
-            # drop the result) so its capped stash frees before we load the
-            # reassigned chunk — otherwise the stale set and the new load would
-            # briefly co-reside. Rare (only on reassignment); a failed stale
-            # prefetch drains to a no-op.
+            # A steal/requeue changed our next chunk. The stale prefetch's load may still be running; DRAIN it (wait,
+            # then drop the result) so its capped stash frees before the reassigned chunk loads — otherwise the stale
+            # set and the new load briefly co-reside. Rare (reassignment only); a failed stale prefetch drains to a
+            # no-op.
             logger.info("xchunk prefetch: draining stale stash for %s", stale)
             try:
                 stash.pop(stale).result(timeout=_BACKGROUND_IO_TIMEOUT_S)
@@ -990,22 +906,20 @@ class InferenceActor:
         except TimeoutError as exc:
             raise RuntimeError(f"xchunk prefetch pool wedged loading {label}") from exc
         except Exception as exc:
-            # The load errored (worker is free) — fall back to the in-scope
-            # serial prologue; slower, never wedged.
+            # The load errored (worker is free) — fall back to the in-scope serial prologue.
             logger.warning("xchunk prefetch for %s failed (%s); loading inline", label, exc)
             return None
 
     # ------------------------------------------------------------------
     # Deferred staging writes
     # ------------------------------------------------------------------
-    # A chunk's staging upload (~seconds of pure I/O) runs on a single-slot
-    # writer thread so it overlaps the NEXT chunk's serial prologue load
-    # instead of adding GPU-idle time. Durability protocol: the deferring
-    # result carries ``write_deferred=True`` and is NOT counted complete by
-    # the scheduler until the write's outcome arrives — piggybacked as
-    # ``prior_write`` on this actor's next result, or via ``flush_writes()``
-    # when the actor idles. RAM cost: one chunk's output buffers (~0.6 GB)
-    # held until the upload lands. Lazily initialised for bare-actor tests.
+    # A chunk's staging upload (~seconds of pure I/O) runs on a single-slot writer thread so it
+    # overlaps the NEXT chunk's serial prologue load instead of adding GPU-idle time. Durability
+    # protocol: the deferring result carries ``write_deferred=True`` and is NOT counted complete
+    # by the scheduler until the write's outcome arrives — piggybacked as ``prior_write`` on this
+    # actor's next result, or via ``flush_writes()`` when the actor idles. RAM cost: one chunk's
+    # output buffers (~0.6 GB) held until the upload lands. Lazily initialised for bare-actor
+    # tests.
 
     def _writer_pool_handle(self) -> ThreadPoolExecutor:
         pool = getattr(self, "_writer_pool", None)
@@ -1018,9 +932,9 @@ class InferenceActor:
     def _collect_prior_write(self) -> dict[str, Any] | None:
         """Resolve the outstanding deferred write, if any.
 
-        Blocks until the upload finishes — by construction it started at least
-        one chunk ago, so it is almost always already done. Returns
-        ``{"label", "ok", "error"}`` or ``None`` when nothing was pending.
+        Blocks until the upload finishes — by construction it started at least one chunk ago, so
+        it is almost always done. Returns ``{"label", "ok", "error"}``, or ``None`` if nothing
+        was pending.
         """
         self._writer_pool_handle()
         pending = self._pending_write
@@ -1030,17 +944,14 @@ class InferenceActor:
         self._pending_write = None
         wait_start = time.monotonic()
         try:
-            # Bounded: an unbounded wait on a wedged upload would hang
-            # process_chunk, so the scheduler never reaches its flush_writes()
-            # recovery. On timeout (or any error) return ok=False so the
-            # scheduler requeues the deferred chunk on a healthy actor.
+            # Bounded: an unbounded wait on a wedged upload hangs process_chunk, so the scheduler never reaches its
+            # flush_writes() recovery. On timeout (or any error) return ok=False so the scheduler requeues the
+            # deferred chunk on a healthy actor.
             future.result(timeout=_BACKGROUND_IO_TIMEOUT_S)
         except TimeoutError:
-            # A bare TimeoutError stringifies to "" — give the scheduler's
-            # requeue log a legible reason. timed_out=True flags that the
-            # upload is still WEDGED in the single-slot writer pool (not merely
-            # failed): the actor must be replaced, not reused, or later writes
-            # queue behind it and time out too.
+            # A bare TimeoutError stringifies to "" — give the scheduler's requeue log a legible reason.
+            # timed_out=True flags that the upload is still WEDGED in the single-slot writer pool rather than merely
+            # failed: the actor must be replaced, not reused, or later writes queue behind it and time out too.
             err = f"staging upload did not complete within {_BACKGROUND_IO_TIMEOUT_S:.0f}s"
             logger.warning("Deferred staging write for %s FAILED: %s", label, err)
             return {"label": label, "ok": False, "error": err, "timed_out": True}
@@ -1049,9 +960,8 @@ class InferenceActor:
             return {"label": label, "ok": False, "error": str(exc)}
         blocked = time.monotonic() - wait_start
         if blocked > 0.5:
-            # The upload did NOT fully hide under the next chunk's prologue —
-            # the collection had to wait. Persistent blocking here means S3
-            # write throughput, not GPU work, is pacing the actor.
+            # The upload did NOT fully hide under the next chunk's prologue. Persistent blocking here means S3 write
+            # throughput, not GPU work, is pacing the actor.
             logger.info(
                 "Deferred write for %s blocked collection for %.1fs (upload slower than prologue)", label, blocked
             )
@@ -1060,15 +970,13 @@ class InferenceActor:
     def _collect_prior_write_checked(self) -> dict[str, Any] | None:
         """`_collect_prior_write`, but RAISE if the prior upload timed out.
 
-        A timeout means the single-slot writer pool is wedged on a hung upload;
-        deferring this chunk's write behind it would just queue another doomed
-        task. Raising fails the whole chunk so the scheduler kills + replaces
-        this actor (reaping the wedged writer thread) and requeues both this
-        chunk and the orphaned prior write via the standard failure path. A
-        normal write error (`ok=False` without `timed_out`) leaves the healthy
-        actor in rotation and just requeues the one chunk. Used on the hot
-        path; `flush_writes` (idle path) keeps the non-raising variant so the
-        scheduler's flush handler can replace the slot itself.
+        A timeout means the single-slot writer pool is wedged on a hung upload, so deferring this
+        chunk's write behind it would queue another doomed task. Raising fails the whole chunk,
+        which gets the scheduler to kill + replace this actor (reaping the wedged writer thread)
+        and requeue both this chunk and the orphaned prior write via the standard failure path. A
+        normal write error (`ok=False` without `timed_out`) leaves the healthy actor in rotation
+        and requeues just the one chunk. Hot path only; `flush_writes` (idle path) keeps the
+        non-raising variant so the scheduler's flush handler can replace the slot itself.
         """
         outcome = self._collect_prior_write()
         if outcome is not None and outcome.get("timed_out"):
@@ -1083,11 +991,7 @@ class InferenceActor:
         return self._collect_prior_write()
 
     def ping(self) -> bool:
-        """No-op health check used to wait for actor initialization.
-
-        Called after actor creation to block until __init__ completes
-        (model loaded, GPU ready). Returns True when ready.
-        """
+        """No-op health check: blocks until ``__init__`` completes (model loaded, GPU ready)."""
         return True
 
     def get_instance_id(self) -> str:
@@ -1107,16 +1011,15 @@ class InferenceActor:
     ) -> dict[str, Any]:
         """Process a single spatial chunk: load data, run inference, write output.
 
-        When a ``get_credentials`` provider was injected at construction, reads
-        and the staging write run inside a scoped :func:`credentials_provider`
-        so every icechunk S3 open resolves through it. The AWS provider passes
-        ``iam_icechunk_credentials``, a botocore-backed callback carrying an
-        ``expires_after`` so icechunk periodically re-invokes it and botocore
-        refreshes the instance-profile token. Without an injected provider,
-        icechunk falls back to the Rust AWS SDK's default chain, which resolves
-        the instance-profile credential once and — on a long-lived actor — can
-        fail to refresh it, failing this chunk and every subsequent one in the
-        process with "no providers in chain provided credentials".
+        When a ``get_credentials`` provider was injected at construction, reads and the staging
+        write run inside a scoped :func:`credentials_provider` so every icechunk S3 open resolves
+        through it. The AWS provider passes ``iam_icechunk_credentials``, a botocore-backed
+        callback carrying an ``expires_after`` so icechunk periodically re-invokes it and
+        botocore refreshes the instance-profile token. Without an injected provider, icechunk
+        falls back to the Rust AWS SDK's default chain, which resolves the instance-profile
+        credential once and — on a long-lived actor — can fail to refresh it, failing this chunk
+        and every subsequent one in the process with "no providers in chain provided
+        credentials".
 
         Args:
             chunk: Spatial chunk specification.
@@ -1125,22 +1028,20 @@ class InferenceActor:
             staging_base: Base path for staging output.
             run_id: Unique run identifier.
             tracker: Optional ProgressTracker actor handle for batch-level progress.
-            prefetch_hint: The chunk the scheduler has reserved as this actor's
-                next assignment; its capped starter payload is prefetched
-                during this chunk's last strip (see ``_XCHUNK_*`` constants).
-            s1_orbit: This CELL's resolved orbit, overriding the actor's own config, for
-                the same reason as ``time_window``: a chained session's cells may resolve
-                different orbits because parts of the globe are radar-free in principle, and
-                an actor built for ``"both"`` would otherwise be unable to serve one. ``None``
-                uses the actor's own config. A ``"none"`` cell also opens the S2-only pixel
-                gate, since every one of its pixels has zero S1 observations.
-            time_window: This CELL's inference window, overriding the actor's own
-                config. Required for a chained session whose cells span campaign
-                years: an actor is built once with one config, so reading the
-                window from it would make every cell of a different year read the
-                wrong months — and the session's only mismatch check is on
-                ``s1_orbit``, so nothing would catch it. ``None`` uses the actor's
-                config, which is what the single-ROI path does.
+            prefetch_hint: The chunk the scheduler has reserved as this actor's next assignment;
+                its capped starter payload is prefetched during this chunk's last strip (see the
+                ``_XCHUNK_*`` constants).
+            s1_orbit: This CELL's resolved orbit, overriding the actor's own config: a chained
+                session's cells may resolve different orbits because parts of the globe are
+                radar-free in principle, and an actor built for ``"both"`` could not otherwise
+                serve one. ``None`` uses the actor's config. A ``"none"`` cell also opens the
+                S2-only pixel gate, since every one of its pixels has zero S1 observations.
+            time_window: This CELL's inference window, overriding the actor's own config.
+                Required for a chained session whose cells span campaign years: an actor is built
+                once with one config, so reading the window from it would make every cell of a
+                different year read the wrong months — and the session's only mismatch check is
+                on ``s1_orbit``, so nothing would catch it. ``None`` uses the actor's config,
+                which is what the single-ROI path does.
 
         Returns:
             Result dict with chunk label, status, pixel count, and timing.
@@ -1168,31 +1069,26 @@ class InferenceActor:
     ) -> dict[str, Any]:
         """Run the load → inference → write pipeline for one chunk.
 
-        Always invoked through :meth:`process_chunk`, which establishes the
-        scoped icechunk credential provider this body's S3 opens depend on.
+        Always invoked through :meth:`process_chunk`, which establishes the scoped icechunk
+        credential provider this body's S3 opens depend on.
         """
-        # Resolve the cell's window ONCE, here, and pass the resolved value down. The
-        # three loader call sites (serial prologue, cross-chunk prefetch, strip loop)
-        # must receive identical kwargs for bit-identity, so the fallback must not be
-        # re-evaluated at each of them — one resolution, one value, no chance of drift.
+        # Resolved ONCE and passed down. The three loader call sites (serial prologue, cross-chunk prefetch, strip
+        # loop) must receive identical kwargs for bit-identity, so neither fallback may be re-evaluated at each of
+        # them.
         window = time_window if time_window is not None else self.config.time_window
-        # Same rule, same reason: a chained session's cells may resolve DIFFERENT orbits,
-        # because parts of the globe are radar-free in principle. Resolved once here so the
-        # three loader call sites cannot disagree about which orbit a chunk was read under.
+        # A chained session's cells may resolve DIFFERENT orbits, because parts of the globe are radar-free in
+        # principle.
         orbit = s1_orbit if s1_orbit is not None else self.config.s1_orbit
         from tessera_embeddings.inference.inference import run_inference
 
         t0 = time.monotonic()
-        # Per CHUNK, not per actor: host RAM scales with a chunk's optical depth, so a peak
-        # taken over the actor's life describes its deepest chunk and gets attached to every
-        # later one. Without this reset the RAMpeak on a chunk's lines can belong to an
-        # earlier chunk entirely.
+        # Per CHUNK, not per actor: host RAM scales with a chunk's optical depth, so a peak taken over the actor's
+        # life describes its deepest chunk and would be attached to every later one.
         self._resource_monitor.reset_peak_host_ram()
         self._resource_monitor.set_context("work", f"{chunk.label}:prologue")
 
-        # Progress is tracked by the run-qualified uid, not the bare label: labels
-        # repeat across zones, and a shared multi-zone session (chained fill) can
-        # have two zones' same-labelled chunks in flight at once (see chunk_uid).
+        # Tracked by the run-qualified uid, not the bare label: labels repeat across zones, and a shared multi-zone
+        # session (chained fill) can have two zones' same-labelled chunks in flight at once (see chunk_uid).
         uid = chunk_uid(run_id, chunk.label)
 
         # Report loading phase so stall detection has visibility before batch 50
@@ -1200,37 +1096,31 @@ class InferenceActor:
             tracker.report.remote(uid, 0, 0, "loading")  # type: ignore[union-attr]
 
         try:
-            # The prologue — repo handles, full-chunk SCL mask (which sizes the
-            # density-based strips), and the first strip's bands + dataset —
-            # loads serially here (GPU idle) unless the bounded cross-chunk
-            # prefetch staged part of it during the PREVIOUS chunk's tail; see
-            # _load_chunk_prologue and the _XCHUNK_* constants.
+            # The prologue — repo handles, full-chunk SCL mask (which sizes the density-based strips), and the first
+            # strip's bands + dataset — loads serially here (GPU idle) unless the bounded cross-chunk prefetch staged
+            # part of it during the PREVIOUS chunk's tail; see _load_chunk_prologue and the _XCHUNK_* constants.
             prologue = self._load_chunk_prologue(chunk, mosaic_base, window, orbit)
             store_opener = prologue.store_opener
             mask_bundle = prologue.mask_bundle
             plan = prologue.plan
             strips = plan.strips
             x_sub = prologue.x_sub
-            # Column window the cropped grids map to in the whole-chunk output
-            # buffers (full width when uncropped).
+            # Column window the cropped grids map to in the whole-chunk output buffers (full width when uncropped).
             cols = x_sub if x_sub is not None else slice(0, chunk.width)
-            # (chunk_data, dataset) for strips[0]; handed to iteration 0 of the
-            # strip loop below, then dropped so at most two strips stay resident.
+            # (chunk_data, dataset) for strips[0]; handed to iteration 0 of the strip loop below, then dropped so at
+            # most two strips stay resident.
             first_strip: tuple[ChunkData, MosaicChunkInferenceDataset] | None = prologue.first_strip
-            # Captured for the CHUNK_SUMMARY line — mask_bundle and prologue are
-            # both deleted before the completion site.
+            # Captured for the CHUNK_SUMMARY line — mask_bundle and prologue are both deleted before the completion
+            # site.
             t_kept = int(mask_bundle.mask.shape[0])
-            # Radar sequence lengths, also for the CHUNK_SUMMARY line, and NOT redundant with
-            # ``t_kept``: that counts OPTICAL timesteps only, since it comes from the S2 SCL
-            # mask. So the token identity built on it (``t_kept x valid_px``) cannot see the two
-            # further sequences a radar-bearing chunk's forward pass encodes — and those are no
-            # rounding error. Measured pairs at equal optical depth put a chunk carrying one
-            # orbit at about 1.3x, and both orbits at about 2.0x, the per-chunk inference time of
-            # a radar-free one. Without these fields that gap is visible only by comparing whole
-            # runs; with them it is a within-run regression over every chunk.
+            # Radar sequence lengths, also for the CHUNK_SUMMARY line, and NOT redundant with ``t_kept``: that counts
+            # OPTICAL timesteps only, so the token identity built on it (``t_kept x valid_px``) cannot see the two
+            # further sequences a radar-bearing chunk's forward pass encodes. Measured at equal optical depth, one
+            # orbit costs ~1.3x and both orbits ~2.0x the per-chunk inference time of a radar-free chunk. Without
+            # these fields that gap shows only by comparing whole runs.
             #
-            # Zero is a real answer here rather than a missing one: for a radar-free cell it is
-            # every chunk, which is exactly what makes the comparison possible.
+            # Zero is a real answer, not a missing one: for a radar-free cell it is every chunk, which is what makes
+            # the comparison possible.
             t_s1_asc = 0
             t_s1_desc = 0
             rung = prologue.rung or "serial"
@@ -1246,22 +1136,19 @@ class InferenceActor:
             )
             del prologue
 
-            # Whole-chunk output buffers, allocated once and held for the chunk.
-            # We sub-tile INPUTS only; the output and write path are untouched.
-            # save_dim mirrors run_inference: the canonical 128-D slice, or the
-            # full representation width for smaller (test) models.
+            # Whole-chunk output buffers, allocated once and held for the chunk: only INPUTS are sub-tiled. save_dim
+            # mirrors run_inference — the canonical 128-D slice, or the full representation width for smaller (test)
+            # models.
             save_dim = min(EMBEDDING_DIM, self.config.representation_dim)
             embeddings = np.zeros((chunk.height, chunk.width, save_dim), dtype=np.int8)
             scales = np.full((chunk.height, chunk.width), np.nan, dtype=np.float32)
 
             writer = ZarrWriter(staging_base, embedding_dim=save_dim)
 
-            # mask_bundle is passed as an explicit submit() arg rather than
-            # captured, so the loop can `del` the only strong reference once the
-            # last strip has loaded (a closure capture can't be deleted).
-            # BACKGROUND loads (prefetch on) reserve cores for the batch-prep
-            # workers feeding the GPU; SERIAL loads (prefetch off, prologue)
-            # reserve nothing — the GPU is idle and wants every core.
+            # mask_bundle is an explicit submit() arg rather than a capture, so the loop can `del` the only strong
+            # reference once the last strip has loaded (a closure capture cannot be deleted). BACKGROUND loads
+            # (prefetch on) reserve cores for the batch-prep workers feeding the GPU; SERIAL loads reserve nothing —
+            # the GPU is idle.
             def _load_strip(
                 y_sub: slice, bundle: S2MaskBundle, reserve_cpus: int
             ) -> tuple[ChunkData, MosaicChunkInferenceDataset]:
@@ -1283,79 +1170,63 @@ class InferenceActor:
                 else None
             )
 
-            # accumulate obs counts per strip into whole-chunk buffers so the
-            # single write_chunk carries the full-chunk obs maps.
+            # Obs counts accumulate per strip into whole-chunk buffers so the single write_chunk carries the
+            # full-chunk obs maps.
             obs_buffers: dict[str, np.ndarray] = {
                 var: np.zeros((chunk.height, chunk.width), dtype=np.uint16) for var in OBS_COUNT_VARS
             }
-            # Which months each pixel was seen in, PER SENSOR, accumulated per strip like the obs
-            # counts and keyed the same way. Gates nothing — published so a reader can apply their
-            # own view of sufficiency without the imagery, which is deleted after the fill. Month
-            # axis first so a strip assigns as `[:, strip, :]`, matching how the mask bundle is
-            # sliced. Keyed off the layout rather than named here, so the buffers and the arrays on
-            # disk cannot come to disagree about which sensors exist.
+            # Which months each pixel was seen in, PER SENSOR, accumulated per strip and keyed the same way. Gates
+            # nothing — published so a reader can apply their own view of sufficiency without the imagery, which is
+            # deleted after the fill. Month axis first so a strip assigns as `[:, strip, :]`, matching how the mask
+            # bundle is sliced. Keyed off the layout rather than named here, so the buffers and the arrays on disk
+            # cannot come to disagree about which sensors exist.
             month_buffers: dict[str, np.ndarray] = {
                 var: np.zeros((MONTHS_IN_YEAR, chunk.height, chunk.width), dtype=bool) for var in MONTH_COVERED_VARS
             }
 
             total_valid = 0
-            # Refusals accumulate across STRIPS: one dataset is built per strip, so its counters
-            # describe a slice rather than the shard. Summed here because the per-shard record's
-            # invariant is that the parts reach the shard's eligible total, and a per-strip count
-            # would fail it by construction.
+            # Refusals accumulate across STRIPS: one dataset is built per strip, so its counters describe a slice
+            # rather than the shard, and the per-shard record's invariant is that the parts reach the shard's eligible
+            # total.
             refused = {"thin": 0, "no_optical": 0, "no_radar": 0}
-            # WAS THE RADAR RULE IN FORCE? Recorded because otherwise `no_radar: 0` means two
-            # different things and the record cannot say which: no tile was refused for missing
-            # radar, or that rule was switched off. `allow_s2_only` defaults to FALSE in the
-            # library — refusing radar-free land is the default behaviour — and the global campaign
-            # registers True to embed it, so under campaign settings the count is zero by
-            # construction. A reader who took that for a measurement would conclude the campaign
-            # found radar everywhere. None until a strip has run, since the effective value includes
-            # the per-cell orbit downgrade and only the dataset knows it.
+            # WAS THE RADAR RULE IN FORCE? Without it `no_radar: 0` means two different things: no tile was refused
+            # for missing radar, or that rule was switched off. `allow_s2_only` defaults to FALSE in the library —
+            # refusing radar-free land is the default — while the global campaign registers True to embed it, so under
+            # campaign settings the count is zero by construction and a reader who took it for a measurement would
+            # conclude the campaign found radar everywhere. None until a strip has run, since the effective value
+            # includes the per-cell orbit downgrade and only the dataset knows it.
             radar_rule_enforced: bool | None = None
             infer_s = 0.0  # summed wall-clock of the per-strip inference calls
-            # Strip pipeline. When prefetch is on (dense/hideable), strip i+1
-            # loads (and buckets) on the background thread while strip i runs
-            # inference, so at most two S2 sets are co-resident. When it is off
-            # (sparse/non-hideable), each strip is loaded serially in the loop
-            # body — the prior set is dropped first, so only ONE is ever resident
-            # and a strip may safely use the larger pair budget. Strip 0 arrived
-            # already loaded with the prologue in both modes.
-            # Managed explicitly (NOT `with`): a timed-out strip load raises
-            # below, and `ThreadPoolExecutor.__exit__` would call
-            # shutdown(wait=True), re-joining the SAME hung worker and swallowing
-            # the escape. The finally shuts down non-blocking (wait=False,
-            # cancel_futures) so the raise reaches the scheduler; the wedged
-            # worker leaks but dies with the actor the scheduler then replaces.
-            # On the normal path nothing is outstanding at loop exit, so this is
-            # an immediate no-op.
+            # Strip pipeline. With prefetch on (dense/hideable), strip i+1 loads and buckets on the background thread
+            # while strip i runs inference, so at most two S2 sets are co-resident. With it off (sparse/non-hideable),
+            # each strip loads serially in the loop body with the prior set dropped first, so only ONE is ever
+            # resident and a strip may safely use the larger pair budget. Strip 0 arrives loaded with the prologue in
+            # both modes. Managed explicitly, NOT with `with`: a timed-out strip load raises below, and
+            # `ThreadPoolExecutor.__exit__` calls shutdown(wait=True), which re-joins the SAME hung worker and
+            # swallows the escape. The finally shuts down non-blocking so the raise reaches the scheduler; the wedged
+            # worker leaks but dies with the actor the scheduler then replaces. On the normal path nothing is
+            # outstanding at loop exit.
             pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strip-prefetch")
             try:
                 next_future: Future[tuple[ChunkData, MosaicChunkInferenceDataset]] | None = None
 
-                # Bound to None so the first iteration's `del` has a target; each
-                # iteration rebinds both before use.
+                # Bound to None so the first iteration's `del` has a target; each iteration rebinds both before use.
                 chunk_data: ChunkData | None = None
                 dataset: MosaicChunkInferenceDataset | None = None
                 for i, strip in enumerate(strips):
-                    # Split the strip window into :load then :infer (below) so a
-                    # RESOURCES spike is attributable to the band decode vs the
-                    # forward — the band-decode transient and the inference peak
-                    # are different RAM events worth telling apart.
+                    # Split the strip window into :load then :infer (below) so a RESOURCES spike is attributable to
+                    # the band decode versus the forward — two different RAM events worth telling apart.
                     self._resource_monitor.set_context("work", f"{chunk.label}:s{i + 1}/{len(strips)}:load")
-                    # The previous strip reported "inference"; flip back to
-                    # "loading" before blocking on this strip's read so a slow
-                    # multi-strip load isn't misclassified as an inference stall
-                    # by _poll_tracker. (Strip 0's "loading" was reported above.)
+                    # The previous strip reported "inference"; flip back to "loading" before blocking on this strip's
+                    # read so _poll_tracker does not misclassify a slow multi-strip load as an inference stall. (Strip
+                    # 0's was reported above.)
                     if tracker and i > 0:
                         tracker.report.remote(uid, 0, 0, "loading")  # type: ignore[union-attr]
 
-                    # Release the previous strip's input arrays BEFORE blocking
-                    # on this strip's load and submitting the next prefetch. The
-                    # dataset retains chunk_data.s2_bands (dataset.py), so without
-                    # this drop the prior strip's dataset, the current strip, and
-                    # the prefetched next strip could all be resident at once —
-                    # three strips, though the strip budget is sized for two.
+                    # Release the previous strip's input arrays BEFORE blocking on this strip's load and submitting
+                    # the next prefetch. The dataset retains chunk_data.s2_bands (dataset.py), so without this drop
+                    # the prior strip's dataset, the current strip and the prefetched next strip could all be resident
+                    # at once — three strips, on a budget sized for two.
                     del chunk_data, dataset
 
                     if i == 0:
@@ -1364,10 +1235,9 @@ class InferenceActor:
                         first_strip = None
                     elif plan.prefetch:
                         assert next_future is not None
-                        # Bounded: a wedged background strip read would hang the
-                        # actor inside process_chunk with no scheduler recourse.
-                        # On timeout raise (with strip context) so the chunk
-                        # fails out and the scheduler replaces the actor + requeues.
+                        # Bounded: a wedged background strip read would hang the actor inside process_chunk with no
+                        # scheduler recourse. Raising on timeout (with strip context) fails the chunk out so the actor
+                        # is replaced and the chunk requeued.
                         try:
                             chunk_data, dataset = next_future.result(timeout=_BACKGROUND_IO_TIMEOUT_S)
                         except TimeoutError as exc:
@@ -1379,8 +1249,8 @@ class InferenceActor:
                         # Serial: GPU idle, take all cores, one set resident.
                         chunk_data, dataset = _load_strip(strip, mask_bundle, 0)
 
-                    # With prefetch on, kick off the next strip's BACKGROUND load
-                    # (reserving prep cores) before inferring this one.
+                    # With prefetch on, kick off the next strip's BACKGROUND load (reserving prep cores) before
+                    # inferring this one.
                     if plan.prefetch:
                         next_future = (
                             pool.submit(_load_strip, strips[i + 1], mask_bundle, _BACKGROUND_LOAD_RESERVED_CPUS)
@@ -1388,28 +1258,24 @@ class InferenceActor:
                             else None
                         )
 
-                    # Last strip: its load is complete (bound above) and no body
-                    # loads remain. For <=1x-budget plans this is the RAM trough,
-                    # so prefetch the NEXT chunk's capped starter behind this
-                    # strip's inference. Pair-budget plans hold a near-2x set
-                    # here — no room for the stash — so they take a serial
-                    # prologue instead.
+                    # Last strip: its load is complete (bound above) and no body loads remain. For <=1x-budget plans
+                    # this is the RAM trough, so prefetch the NEXT chunk's capped starter behind this strip's
+                    # inference. Pair-budget plans hold a near-2x set here — no room for the stash — so they take a
+                    # serial prologue.
                     if i + 1 == len(strips) and prefetch_hint is not None and not plan.pair_budget:
                         self._start_chunk_prefetch(prefetch_hint, mosaic_base, window, orbit)
 
-                    # The chunk's radar sequence lengths. Read here because every strip of a
-                    # chunk sees the same ones — SAR is read full-width regardless of the crop —
-                    # so any strip's value is the chunk's, and the last assignment wins. A
-                    # skipped orbit gets an EMPTY array rather than None (see
-                    # ``load_chunk``'s full-width placeholders), so a length is always defined.
+                    # The chunk's radar sequence lengths. Every strip sees the same ones — SAR is read full-width
+                    # regardless of the crop — so any strip's value is the chunk's and the last assignment wins. A
+                    # skipped orbit gets an EMPTY array rather than None (``load_chunk``'s full-width placeholders),
+                    # so a length is always defined.
                     t_s1_asc = len(chunk_data.s1_asc_doys)
                     t_s1_desc = len(chunk_data.s1_desc_doys)
 
-                    # SAR month masks: the strip's own when the grid is uncropped, the full-width
-                    # side channel when it is — exactly the choice the SAR obs counts make, and for
-                    # the same reason (the saved provenance layers keep full-extent fidelity even
-                    # where the inferred grid is narrower). Either way the array is
-                    # (month, strip rows, full width), so both assign through the same slice below.
+                    # SAR month masks: the strip's own when the grid is uncropped, the full-width side channel when it
+                    # is — the same choice the SAR obs counts make, so the saved provenance layers keep full extent
+                    # even where the inferred grid is narrower. Either way the array is (month, strip rows, full
+                    # width), so both assign through the same slice below.
                     sar_months = (
                         (chunk_data.s1_asc_month_covered, chunk_data.s1_desc_month_covered)
                         if x_sub is None
@@ -1421,14 +1287,13 @@ class InferenceActor:
                             if arr is not None:
                                 obs_buffers[var][strip] = arr
                         if mask_bundle is not None:
-                            # Sliced, not assigned whole: the bundle is a WHOLE-CHUNK array loaded
-                            # once and shared by every strip, unlike the strip-shaped SAR arrays.
+                            # Sliced, not assigned whole: the bundle is a WHOLE-CHUNK array loaded once and shared by
+                            # every strip, unlike the strip-shaped SAR arrays.
                             month_buffers["s2_month_covered"][:, strip, :] = mask_bundle.month_covered[:, strip, :]
                     else:
-                        # Cropped grid: the saved obs layers keep full-extent
-                        # fidelity — S2 counts come from the (full-width) mask
-                        # bundle, SAR counts from the full-width side channel
-                        # (SAR is read full-width regardless; see load_chunk).
+                        # Cropped grid: the saved obs layers keep full extent — S2 counts from the (full-width) mask
+                        # bundle, SAR counts from the full-width side channel (SAR is read full-width regardless; see
+                        # load_chunk).
                         obs_buffers["s2_obs_count"][strip] = mask_bundle.obs_count[strip, :]
                         month_buffers["s2_month_covered"][:, strip, :] = mask_bundle.month_covered[:, strip, :]
                         for var, full in (
@@ -1443,14 +1308,11 @@ class InferenceActor:
                             month_buffers[var][:, strip, :] = arr
 
                     if len(dataset) == 0:
-                        # Empty strip: leave its output rows at the initialised
-                        # zero embeddings / NaN scale, mirroring run_inference's
-                        # handling of fully-invalid chunks and the NaN convention
-                        # for "no embedding here" (see #39). The strip still
-                        # contributes its (zero) obs counts, already written above.
-                        # Its refusals still count: an empty strip is the case the record most
-                        # needs to explain, and skipping the tally here would make a fully refused
-                        # shard report zero refusals.
+                        # Empty strip: leave its output rows at the initialised zero embeddings / NaN scale, mirroring
+                        # run_inference's handling of fully-invalid chunks and the NaN convention for "no embedding
+                        # here" (see #39). The strip still contributes its (zero) obs counts, written above. Its
+                        # refusals still count too: an empty strip is the case the record most needs to explain, and
+                        # skipping the tally here would make a fully refused shard report zero refusals.
                         refused["thin"] += dataset.refused_thin
                         refused["no_optical"] += dataset.refused_no_optical
                         refused["no_radar"] += dataset.refused_no_radar
@@ -1462,9 +1324,8 @@ class InferenceActor:
                     t_inf = time.monotonic()
                     result = run_inference(self.model, dataset, self.config, self.device, on_batch=on_batch)
                     infer_s += time.monotonic() - t_inf
-                    # Cropped grids land at their column offset; outside the
-                    # box the buffers keep their initial zero/NaN fill — the
-                    # exact values those never-valid pixels get today.
+                    # Cropped grids land at their column offset; outside the box the buffers keep their initial
+                    # zero/NaN fill — the values those never-valid pixels get.
                     embeddings[strip, cols] = result.embeddings
                     scales[strip, cols] = result.scales
                     total_valid += len(dataset)
@@ -1475,36 +1336,27 @@ class InferenceActor:
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
 
-            # All strips done: the last strip's inputs and the full-chunk SCL
-            # mask are no longer needed (obs counts and embeddings already live
-            # in the whole-chunk output buffers). Free them before the S3 write
-            # so peak RAM doesn't carry a dead strip + mask through the write.
+            # All strips done: the last strip's inputs and the full-chunk SCL mask are no longer needed (obs counts
+            # and embeddings already live in the whole-chunk output buffers). Freed before the S3 write so peak RAM
+            # does not carry a dead strip + mask through it.
             del chunk_data, dataset, mask_bundle
 
             if total_valid == 0:
-                # Every strip was empty. ROI pre-filter means chunks get here
-                # only if they intersect the ROI, so this fires only when every
-                # pixel in a live chunk fails the SCL/S1 validity thresholds.
-                # Assembly will fill the chunk's footprint with zeros/NaN from
-                # the Dask graph — no placeholder zarr needed. We still drop a
-                # zero-byte skip marker so verify_staged_completeness can
-                # distinguish a legitimate skip from a silently-failed chunk
-                # (Ray worker crash, etc.).
-                # THE REASON, RECORDED. These three counts are summed over the chunk's strips just
-                # above and used to be discarded here, which made a thin-depth refusal
-                # indistinguishable from land that was never imaged — and left 43 of 40S's 58 live
-                # shards attributed to "optical skips" when every one was refused for having no
-                # radar. The cell is write-once and its mosaic is deleted when it lands, so a reason
-                # not written here is not recoverable.
+                # Every strip was empty. The ROI pre-filter means a chunk reaches here only if it intersects the ROI,
+                # so this fires only when every pixel in a live chunk fails the SCL/S1 validity thresholds. Assembly
+                # fills the footprint with zeros/NaN from the Dask graph, so no placeholder zarr is needed — but a
+                # zero-byte skip marker still goes down so verify_staged_completeness can tell a legitimate skip from
+                # a silently-failed chunk (Ray worker crash, etc.).
                 #
-                # The observation summary rides along because the counts alone cannot say HOW thin:
-                # obs counts are accumulated per strip regardless of validity, so they are populated
-                # even on a chunk where nothing passed.
-                # THE FOOTPRINT THE REASONS ACTUALLY COVER, which is not the whole chunk when the
-                # read plan cropped it, and the depth behind them. The crop is passed as the slice
-                # itself so the record can restrict its own buffers to it. Shared with the success
-                # path so a refused shard and a partly-refused one are described in the same terms —
-                # see `_coverage_record`.
+                # THE REASON, RECORDED. Discarding these three counts made a thin-depth refusal indistinguishable from
+                # land that was never imaged, and left 43 of 40S's 58 live shards attributed to "optical skips" when
+                # every one was refused for having no radar. The cell is write-once and its mosaic is deleted when it
+                # lands, so a reason not written here is not recoverable. The observation summary rides along because
+                # the counts alone cannot say HOW thin: obs counts accumulate per strip regardless of validity, so
+                # they are populated even where nothing passed. The crop is passed as the slice itself so the record
+                # can restrict its own buffers to the footprint the reasons actually cover. Shared with the success
+                # path so a refused and a partly-refused shard are described in the same terms — see
+                # `_coverage_record`.
                 skip_record = {"label": chunk.label} | _coverage_record(
                     chunk,
                     refused=refused,
@@ -1518,12 +1370,11 @@ class InferenceActor:
                     chunk.label,
                     ", ".join(f"{k}={v}" for k, v in sorted(refused.items()) if v),
                 )
-                # COVERAGE FIRST, MARKER LAST, and the order is the atomicity: the marker's presence
-                # is what vouches for the coverage tile being complete, so a crash between them
-                # leaves a tile nothing points at rather than a marker promising data that is not
-                # there. Best-effort — losing the coverage degrades provenance, while losing the
-                # MARKER turns a benign skip into a failed chunk and wedges the cell on every retry
-                # under the stable run id. Same rule as the record inside the marker.
+                # COVERAGE FIRST, MARKER LAST — the order IS the atomicity: the marker's presence vouches for the
+                # coverage tile being complete, so a crash between them leaves a tile nothing points at rather than a
+                # marker promising data that is not there. Best-effort: losing the coverage degrades provenance, while
+                # losing the MARKER turns a benign skip into a failed chunk and wedges the cell on every retry under
+                # the stable run id.
                 try:
                     writer.write_coverage_only(chunk, run_id, obs_buffers, month_buffers)
                 except Exception:
@@ -1532,26 +1383,20 @@ class InferenceActor:
                         "fill. The refusal reasons in the marker are unaffected.",
                         chunk.label,
                     )
-                    # AND REMOVE WHAT IT LEFT, which is the half of this that matters. A failure
-                    # AFTER `to_zarr` created the array metadata but BEFORE `staged_complete` was set
-                    # leaves a tile that reads back as fill and that `_open_staged_tile` refuses —
-                    # while the marker written just below makes every resume skip this chunk, so
-                    # nothing ever repairs it. Under the stable, input-fingerprinted run id that
-                    # refusal then repeats on every retry and wedges the cell until someone deletes
-                    # the prefix by hand. Swallowing the write and keeping its debris would have
-                    # turned a degraded provenance entry into a permanently failing cell.
-                    # Guarded at the CALL as well, even though `discard_coverage` is written not to
-                    # raise. Nothing on this path may stop the marker below being written: the marker
-                    # is what tells a legitimate skip from a crashed worker, and an exception here —
-                    # an older writer without the method, anything — would turn a benign skip into a
-                    # failed chunk and wedge the cell on every retry. Exactly the failure this whole
-                    # cleanup exists to prevent, so it must not reintroduce it one line up.
+                    # AND REMOVE WHAT IT LEFT, which is the half that matters. A failure AFTER `to_zarr` created the
+                    # array metadata but BEFORE `staged_complete` was set leaves a tile that reads back as fill and
+                    # that `_open_staged_tile` refuses — while the marker written just below makes every resume skip
+                    # this chunk, so nothing ever repairs it. Under the stable, input-fingerprinted run id that
+                    # refusal repeats on every retry and wedges the cell until someone deletes the prefix by hand.
+                    # Guarded at the CALL as well, even though `discard_coverage` is written not to raise: nothing on
+                    # this path may stop the marker below being written, and an exception here (an older writer
+                    # without the method, anything) would turn a benign skip into a failed chunk — the very failure
+                    # this cleanup exists to prevent.
                     with contextlib.suppress(Exception):
                         writer.discard_coverage(chunk, run_id)
                 writer.write_skip_marker(chunk, run_id, skip_record)  # small marker: keep synchronous
-                # Collect the prior deferred write BEFORE snapshotting elapsed —
-                # the wait is actor-occupancy this chunk owns, same as the
-                # success path below (else the phase table under-reports it).
+                # Collect the prior deferred write BEFORE snapshotting elapsed: the wait is actor-occupancy this chunk
+                # owns, as on the success path below, and leaving it out under-reports the phase table.
                 prior_write = self._collect_prior_write_checked()
                 elapsed = time.monotonic() - t0
                 logger.info(
@@ -1582,52 +1427,42 @@ class InferenceActor:
                     "prior_write": prior_write,
                 }
 
-            # Resolve the PREVIOUS chunk's deferred write first (it queued a
-            # full chunk ago on the single-slot writer — normally long done),
-            # so its outcome rides this result back to the scheduler.
+            # Resolve the PREVIOUS chunk's deferred write first (queued a full chunk ago on the single-slot writer, so
+            # normally long done) so its outcome rides this result back to the scheduler.
             prior_write = self._collect_prior_write_checked()
 
-            # Defer the whole-chunk staging write to the writer thread: it
-            # overlaps the next chunk's serial prologue load instead of adding
-            # GPU-idle time. This chunk is only counted complete once the
-            # write's outcome is confirmed (see class comment above).
+            # Defer the whole-chunk staging write to the writer thread: it overlaps the next chunk's serial prologue
+            # load instead of adding GPU-idle time. This chunk is only counted complete once the write's outcome is
+            # confirmed (see the section comment).
             self._writer_pool_handle()
 
-            # Radar coverage for this chunk, from buffers already in memory — no extra read.
-            # `scales` is NaN-filled and written only where a pixel was embedded, so it IS
-            # the embedded mask; counting over the whole chunk instead would score every
-            # out-of-ROI pixel as radar-free and swamp the answer.
-            #
-            # Summed only over embedded pixels, so the intermediate is as small as the ROI
-            # rather than the chunk. Radar-free needs no sum at all — both counts zero.
+            # Radar coverage for this chunk, from buffers already in memory — no extra read. `scales` is NaN-filled
+            # and written only where a pixel was embedded, so it IS the embedded mask; counting over the whole chunk
+            # would score every out-of-ROI pixel as radar-free and swamp the answer. Summing only over embedded pixels
+            # also keeps the intermediate ROI-sized rather than chunk-sized.
             embedded = ~np.isnan(scales)
             asc, desc = obs_buffers["s1_asc_obs_count"], obs_buffers["s1_desc_obs_count"]
             s1_free_px = int((embedded & (asc == 0) & (desc == 0)).sum())
             obs_at_embedded = asc[embedded].astype(np.uint32) + desc[embedded].astype(np.uint32)
             s1_thin_px = int(((obs_at_embedded > 0) & (obs_at_embedded < RADAR_THIN_MAX_OBS)).sum())
-            # Optical depth, from the same mask and the same principle. Previously only the
-            # EXTREME was visible: a tile where nothing survived the validity filter is recorded
-            # as a skip, so every depth above zero published as ordinary data even though a year
-            # seen a handful of times and one seen weekly are not the same embedding. No
-            # optical-free count is needed — that case IS the skip, and a skipped chunk never
-            # reaches here.
+            # Optical depth, from the same mask and the same principle. Without it only the EXTREME is visible: a tile
+            # where nothing survived the validity filter is recorded as a skip, so every depth above zero publishes as
+            # ordinary data even though a year seen a handful of times and one seen weekly are not the same embedding.
+            # No optical-free count is needed — that case IS the skip, and a skipped chunk never reaches here.
             s2_at_embedded = obs_buffers["s2_obs_count"][embedded]
-            # The rule this RUN applied, not the module default. The dataset gates on
-            # `config.optical_min_obs`, which comes from the store root, so counting against
-            # the constant would report a thin share measured by a line the fill never used —
-            # and it would read as a non-zero count on a store whose rule already refuses
-            # every pixel it names.
+            # The rule this RUN applied, not the module default. The dataset gates on `config.optical_min_obs`, which
+            # comes from the store root, so counting against the constant would report a thin share measured by a line
+            # the fill never used — and would read as a non-zero count on a store whose rule already refuses every
+            # pixel it names.
             thin_below = self.config.optical_min_obs or OPTICAL_MIN_OBS
             s2_thin_px = int((s2_at_embedded < thin_below).sum())
             del embedded, obs_at_embedded, s2_at_embedded
 
-            # THE SAME RECORD A WHOLLY-REFUSED SHARD WRITES, for a shard that embedded something.
-            # `refused` is accumulated over this shard's strips on BOTH paths, so a shard where the
-            # depth gate removed part of the land has always known how much — and used to discard it,
-            # because only the all-refused branch wrote a record. The registry then described such a
-            # shard as embedded with no refusals recorded, which reads as "covered" for ground that
-            # is partly holes. Those holes are exactly what a revisit campaign would fill, so this is
-            # the larger half of the infill work list, not a refinement of it.
+            # THE SAME RECORD A WHOLLY-REFUSED SHARD WRITES, for a shard that embedded something. `refused`
+            # accumulates over this shard's strips on BOTH paths, so a shard where the depth gate removed part of the
+            # land knows how much. Without this the registry described such a shard as embedded with no refusals
+            # recorded, reading as "covered" for ground that is partly holes — and those holes are the larger half of
+            # the infill work list, not a refinement of it.
             coverage = _coverage_record(
                 chunk,
                 refused=refused,
@@ -1638,9 +1473,8 @@ class InferenceActor:
             )
 
             def _timed_write() -> str:
-                # "write" is a separate context slot: the upload overlaps the
-                # NEXT chunk's prologue on the main thread, so both phases must
-                # be attributable on the same RESOURCES line.
+                # "write" is a separate context slot: the upload overlaps the NEXT chunk's prologue on the main
+                # thread, so both phases must be attributable on the same RESOURCES line.
                 self._resource_monitor.set_context("write", chunk.label)
                 try:
                     t_w = time.monotonic()
@@ -1653,9 +1487,8 @@ class InferenceActor:
                         obs_counts=obs_buffers,
                         month_covered=month_buffers,
                     )
-                    # One line per chunk: how long the backgrounded upload took
-                    # (the phase table's write_s is ~0 by design — this is the
-                    # off-critical-path cost, for post-run upload health checks).
+                    # One line per chunk: how long the backgrounded upload took. The phase table's write_s is ~0 by
+                    # design, so this is the off-critical-path cost, for post-run upload health checks.
                     logger.info(
                         "Staging write for %s completed in %.1fs (backgrounded)", chunk.label, time.monotonic() - t_w
                     )
@@ -1676,36 +1509,31 @@ class InferenceActor:
                 "%s",
                 _chunk_summary_line(
                     label=chunk.label,
-                    # The per-CELL run id (e.g. "49S-2021-f1fa65fc"). Without it this line
-                    # cannot be attributed to a zone at all: `label` is chunk_<row>_<col>,
-                    # grid-local, so every cell restarts at chunk_0_0 and labels collide both
-                    # across zones and across concurrent fills sharing a log group. Attributing
-                    # by time window instead produced two confidently wrong findings on
-                    # 2026-08-05, including a write-failure rework tax whose mechanism had not
-                    # fired at all. Additive, and observe_cluster reads keys via .get(), so no
-                    # consumer breaks.
+                    # The per-CELL run id (e.g. "49S-2021-f1fa65fc"). Without it this line cannot be attributed to a
+                    # zone: `label` is chunk_<row>_<col>, grid-local, so every cell restarts at chunk_0_0 and labels
+                    # collide across zones and across concurrent fills sharing a log group. Attributing by time window
+                    # instead produced two confidently wrong findings — see
+                    # context_docs/design/campaign_inference_profile_2026_08.md.
                     run=run_id,
-                    # "success" = inference finished and outputs are staged for
-                    # upload. write_confirmed=False flags that the deferred S3
-                    # write is NOT yet durably confirmed (that happens a chunk
-                    # later via prior-write chain-confirmation) — so a phase
-                    # tool should treat a later duplicate label as the retry of
-                    # a failed write, keeping the last, not double-count it.
+                    # "success" = inference finished and outputs are staged for upload. write_confirmed=False flags
+                    # that the deferred S3 write is NOT yet durably confirmed (that happens a chunk later via
+                    # prior-write chain-confirmation), so a phase tool should treat a later duplicate label as the
+                    # retry of a failed write and keep the last, not double-count it.
                     status="success",
                     write_confirmed=False,
                     valid_px=total_valid,
                     total_s=round(elapsed, 1),
                     prologue_s=round(prologue_s, 1),
                     infer_s=round(infer_s, 1),
-                    # write is deferred to the background writer, so the honest
-                    # critical-path overhead is everything that isn't inference.
+                    # The write is deferred to the background writer, so the honest critical-path overhead is
+                    # everything that is not inference.
                     overhead_s=round(elapsed - infer_s, 1),
                     strips=len(strips),
                     strip_h=plan.strip_h,
                     strategy=plan.strategy,
                     t_kept=t_kept,
-                    # Optical depth alone does not say how much the forward pass did — see the
-                    # capture site. Additive keys, and every consumer reads by name.
+                    # Optical depth alone does not say how much the forward pass did — see the capture site. Additive
+                    # keys, and every consumer reads by name.
                     t_s1_asc=t_s1_asc,
                     t_s1_desc=t_s1_desc,
                     rung=rung,
@@ -1717,17 +1545,17 @@ class InferenceActor:
                 "chunk": chunk.label,
                 "status": "success",
                 "valid_pixels": total_valid,
-                # Per-chunk radar coverage, aggregated per YEAR at assembly. Reported from
-                # here because this is the only place the observation maps and the embedded
-                # mask are both in memory; recomputing it later would mean reading the grid.
+                # Per-chunk radar coverage, aggregated per YEAR at assembly. Reported here because this is the only
+                # place the observation maps and the embedded mask are both in memory; recomputing it later would mean
+                # reading the grid.
                 "s1_free_pixels": s1_free_px,
                 "s1_thin_pixels": s1_thin_px,
                 "s2_thin_pixels": s2_thin_px,
-                # The line the count was measured against, carried so the year record
-                # states the rule this fill applied rather than the module default.
+                # The line the count was measured against, so the year record states the rule this fill applied rather
+                # than the module default.
                 "s2_thin_below_obs": thin_below,
-                # Per-shard refusal reasons and optical depth, for the published registry. Keyed
-                # under one name so assembly can merge it by label without knowing its contents.
+                # Per-shard refusal reasons and optical depth, for the published registry. Keyed under one name so
+                # assembly can merge it by label without knowing its contents.
                 "coverage": coverage,
                 "elapsed_sec": elapsed,
                 "instance_id": self.instance_id,
@@ -1738,8 +1566,8 @@ class InferenceActor:
         except Exception as e:
             elapsed = time.monotonic() - t0
             logger.exception("Chunk %s failed after %.1fs on instance %s", chunk.label, elapsed, self.instance_id)
-            # Minimal summary (prologue may not have completed, so per-plan
-            # fields can be unbound here); parsers key on status.
+            # Minimal summary: the prologue may not have completed, so per-plan fields can be unbound here. Parsers
+            # key on status.
             logger.info(
                 "%s",
                 _chunk_summary_line(
@@ -1758,13 +1586,13 @@ class InferenceActor:
                 "instance_id": self.instance_id,
             }
         finally:
-            # Between chunks the main thread is idle (any live "write" slot is
-            # owned by the background writer and cleared there).
+            # Between chunks the main thread is idle; any live "write" slot is owned by the background writer and
+            # cleared there.
             self._resource_monitor.set_context("work", "idle")
 
 
-# Schemes that mean "fetch this from somewhere else first". A local filesystem
-# path (or an explicit file:// URI) is loaded in place by torch.
+# Schemes that mean "fetch this from somewhere else first". A local filesystem path (or an explicit file:// URI) is
+# loaded in place by torch.
 _REMOTE_CKPT_SCHEMES = ("s3://", "http://", "https://", "gs://", "az://", "abfs://")
 
 
@@ -1776,10 +1604,9 @@ def _is_remote_uri(path: str) -> bool:
 def _default_checkpoint_cache() -> str:
     """Pick a download cache dir that exists on the running host.
 
-    On AWS DLAMI GPU boxes the NVMe instance store (~1.5 GB/s) is the right
-    target — the root EBS volume (~42 MB/s) is too slow and torch.load with
-    mmap hangs on it. Off that path (laptops, CI, non-AWS GPUs) the NVMe mount
-    doesn't exist, so fall back to a temp dir under the system tmp.
+    On AWS DLAMI GPU boxes the NVMe instance store (~1.5 GB/s) is the right target: the root EBS
+    volume (~42 MB/s) is too slow and torch.load with mmap hangs on it. Off that path (laptops,
+    CI, non-AWS GPUs) the NVMe mount does not exist, so fall back to the system temp dir.
     """
     nvme = Path("/opt/dlami/nvme")
     if nvme.is_dir():
@@ -1790,25 +1617,24 @@ def _default_checkpoint_cache() -> str:
 def download_checkpoint(remote_path: str, local_dir: str | None = None) -> str:
     """Download a model checkpoint from a remote URI to local storage.
 
-    Handles any fsspec-supported remote scheme — ``s3://``, ``https://``
-    (e.g. a HuggingFace ``resolve/main`` URL), ``gs://``, etc. The file is
-    staged locally because torch.load wants a real path and reads it twice.
+    Handles any fsspec-supported remote scheme — ``s3://``, ``https://`` (e.g. a HuggingFace
+    ``resolve/main`` URL), ``gs://``. The file is staged locally because torch.load wants a real
+    path and reads it twice.
 
     Args:
         remote_path: Remote URI (e.g. ``"s3://bucket/path/model.pt"`` or
             ``"https://huggingface.co/.../tessera_v1_1_aws_encoder.pt"``).
-        local_dir: Local directory for downloads. Defaults to the NVMe
-            instance store on AWS DLAMI hosts, else a system temp dir.
+        local_dir: Local directory for downloads. Defaults to the NVMe instance store on AWS
+            DLAMI hosts, else a system temp dir.
 
     Returns:
         Local file path.
 
-    Concurrency: many actors on the same host may call this with the same
-    ``remote_path`` and shared cache dir at once (cold cache, 100s of actors).
-    The download writes to a unique temp file and is published to the final
-    path with an atomic rename, so a concurrent reader never observes a
-    partially-written checkpoint and concurrent writers can't corrupt each
-    other's output — the last rename wins, and every byte is identical.
+    Concurrency: many actors on one host may call this with the same ``remote_path`` and shared
+    cache dir at once (cold cache, hundreds of actors). The download writes to a unique temp file
+    and is published with an atomic rename, so a concurrent reader never sees a partially-written
+    checkpoint and concurrent writers cannot corrupt each other — the last rename wins and every
+    byte is identical.
     """
     filename = remote_path.rsplit("/", 1)[-1]
 
@@ -1824,9 +1650,8 @@ def download_checkpoint(remote_path: str, local_dir: str | None = None) -> str:
     # Checkpoints are ~200 MB, so reading the whole file into memory is fine.
     with fsspec.open(remote_path, "rb") as remote:
         data = remote.read()
-    # Stage into a unique temp file in the same dir (so the rename stays on one
-    # filesystem and is atomic), then atomically publish — concurrent actors
-    # publishing the same checkpoint can't observe a half-written file.
+    # Staged into a unique temp file in the SAME dir, so the rename stays on one filesystem and is atomic: concurrent
+    # actors publishing the same checkpoint cannot see a half-written file.
     with tempfile.NamedTemporaryFile(dir=local, prefix=f"{filename}.", suffix=".part", delete=False) as tmp:
         tmp.write(data)
         tmp_path = Path(tmp.name)

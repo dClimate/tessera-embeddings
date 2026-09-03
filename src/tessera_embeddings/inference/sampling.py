@@ -1,16 +1,13 @@
 """Deterministic bucketed resampling for Tessera v1.1 inference.
 
-v1.1 replaces v1.0's random weighted sampling + repeat averaging with a
-deterministic "use every valid observation" scheme: a pixel with ``k`` valid
-observations is mapped to the next bucket size ``t`` in ``num_obs_checkpoints``
-and resampled to exactly ``t`` rows. Downsizes pick the median element of each
-even chunk; upsizes keep every original index and fill with evenly-spaced
-duplicates.
+A deterministic "use every valid observation" scheme: a pixel with ``k`` valid observations is
+mapped to the next bucket size ``t`` in ``num_obs_checkpoints`` and resampled to exactly ``t``
+rows. Downsizes pick the median element of each even chunk; upsizes keep every original index and
+fill with evenly-spaced duplicates.
 
-Pixels sharing a ``(s2_bin, s1_bin)`` bucket are batched together so the
-transformer sees rectangular sequences. Per-modality S1 normalisation is
-applied BEFORE concatenating ascending and descending orbits into the merged
-S1 stream.
+Pixels sharing a ``(s2_bin, s1_bin)`` bucket are batched together so the transformer sees
+rectangular sequences. Per-modality S1 normalisation is applied BEFORE concatenating ascending
+and descending orbits into the merged S1 stream.
 """
 
 from __future__ import annotations
@@ -43,23 +40,22 @@ def build_resample_indices(valid_len: int, target_size: int) -> np.ndarray:
     return np.concatenate([np.arange(valid_len, dtype=np.int64), extras], axis=0)
 
 
-# build_resample_indices depends only on (valid_len, target), both small ints
-# (valid_len <= T of the chunk, target one of ~32 checkpoints), so the index
-# vectors are memoised. Callers must treat the returned arrays as READ-ONLY —
-# they are shared across every pixel with the same (valid_len, target).
+# build_resample_indices depends only on (valid_len, target), both small ints (valid_len <= T of the chunk, target one
+# of ~32 checkpoints), so the index vectors are memoised. Callers must treat the returned arrays as READ-ONLY: they
+# are shared across every pixel with the same pair.
 _resample_indices_cached = functools.lru_cache(maxsize=None)(build_resample_indices)
 
 
 def _local_resample_matrix(counts: np.ndarray, target: int) -> np.ndarray:
     """Stack per-pixel local resample indices into a ``(B, target)`` matrix.
 
-    ``counts[i]`` is pixel *i*'s valid-observation count; row *i* of the result
-    is ``build_resample_indices(counts[i], target)``. Rows with ``counts == 0``
-    are left as zeros — callers must exclude them from any gather.
+    ``counts[i]`` is pixel *i*'s valid-observation count; row *i* of the result is
+    ``build_resample_indices(counts[i], target)``. Rows with ``counts == 0`` are left as zeros —
+    callers must exclude them from any gather.
 
-    The Python-level work is one cache lookup per *unique* count (a handful per
-    bucket) instead of per pixel, which is what makes the bucket resamplers
-    vectorised rather than 2 x batch_size Python iterations per sub-batch.
+    The Python-level work is one cache lookup per *unique* count (a handful per bucket) rather
+    than per pixel, which is what makes the bucket resamplers vectorised instead of
+    2 x batch_size Python iterations per sub-batch.
     """
     local = np.zeros((len(counts), target), dtype=np.int64)
     for count in np.unique(counts):
@@ -139,12 +135,10 @@ def resample_s2_bucket(
     if t == 0 or target == 0:
         return out
 
-    # Vectorised across pixels: np.nonzero on the (B, T) mask yields each
-    # row's valid time indices contiguously in row-major order; _row_starts
-    # locates each row's slice, and the memoised local-index matrix maps every
-    # pixel straight to its absolute gather indices. Bit-identical to the
-    # per-pixel loop it replaced (same indices, same per-element arithmetic) —
-    # see the golden reference test in test_sampling_v11.py.
+    # Vectorised across pixels: np.nonzero on the (B, T) mask yields each row's valid time indices contiguously in
+    # row-major order, _row_starts locates each row's slice, and the memoised local-index matrix maps every pixel
+    # straight to its absolute gather indices. Bit-identical to a per-pixel loop (same indices, same per-element
+    # arithmetic) — golden reference test in test_sampling_v11.py.
     counts = s2_masks.sum(axis=1).astype(np.int64)
     rows = np.nonzero(counts > 0)[0]
     if rows.size == 0:
@@ -173,9 +167,9 @@ def resample_s1_bucket(
 ) -> np.ndarray:
     """Resample a batch of pixels' merged S1 observations to a uniform length.
 
-    Ascending and descending are each normalised with their OWN mean/std before
-    concatenation — this matches v1.1 training preprocessing. A timestep is
-    valid iff any band is non-zero (zero-padded SAR timesteps are skipped).
+    Ascending and descending are each normalised with their OWN mean/std before concatenation,
+    matching v1.1 training preprocessing. A timestep is valid iff any band is non-zero, so
+    zero-padded SAR timesteps are skipped.
 
     Args:
         s1_asc_bands: ``(B, T_asc, 2)`` uint16.
@@ -196,13 +190,11 @@ def resample_s1_bucket(
     if target == 0 or b == 0:
         return out
 
-    # Vectorised over pixels. Each pixel's merged stream is its valid ascending
-    # rows followed by its valid descending rows; a merged local index below
-    # ``ca`` (the pixel's asc count) resolves into the ascending arrays and the
-    # rest into descending, so the two sides are gathered separately and
-    # combined with np.where. Per-element arithmetic matches the per-pixel loop
-    # this replaced (normalise-then-gather == gather-then-normalise
-    # elementwise) — see the golden reference test in test_sampling_v11.py.
+    # Vectorised over pixels. Each pixel's merged stream is its valid ascending rows followed by its valid descending
+    # rows; a merged local index below ``ca`` (the pixel's asc count) resolves into the ascending arrays and the rest
+    # into descending, so the two sides are gathered separately and combined with np.where. Per-element arithmetic
+    # matches a per-pixel loop (normalise-then-gather == gather-then-normalise elementwise) — golden reference test in
+    # test_sampling_v11.py.
     valid_a = np.any(s1_asc_bands != 0, axis=-1) if s1_asc_bands.shape[1] > 0 else np.zeros((b, 0), dtype=bool)
     valid_d = np.any(s1_desc_bands != 0, axis=-1) if s1_desc_bands.shape[1] > 0 else np.zeros((b, 0), dtype=bool)
     ca = valid_a.sum(axis=1).astype(np.int64)
@@ -216,8 +208,8 @@ def resample_s1_bucket(
     ca_v = ca[rows, None]
     from_asc = local < ca_v
 
-    # Masked-out lanes get a guarded index of 0 BEFORE the gather so every
-    # index is in-bounds; their gathered values are discarded by np.where.
+    # Masked-out lanes get a guarded index of 0 BEFORE the gather so every index is in-bounds; their gathered values
+    # are discarded by np.where.
     def _gather_side(
         valid: np.ndarray,
         bands: np.ndarray,

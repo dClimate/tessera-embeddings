@@ -1,10 +1,9 @@
 """CloudWatch-backed log fetcher for the inference diagnostics shim.
 
 The pure-domain ``inference.diagnostics`` module accepts a callable
-``fetch_events(instance_id) -> list[dict]`` that returns CloudWatch-style
-event dicts (each with a ``"message"`` key). This module provides the
-AWS implementation: a factory that returns such a callable, bound to a
-specific log group, region, and stream suffix.
+``fetch_events(instance_id) -> list[dict]`` returning CloudWatch-style event dicts (each
+with a ``"message"`` key). This is the AWS implementation: a factory returning such a
+callable, bound to a log group, region and stream suffix.
 
 Pair with :func:`tessera_embeddings.inference.diagnostics.log_worker_failure_diagnostic`::
 
@@ -38,21 +37,18 @@ def make_cloudwatch_fetcher(
     """Return a CloudWatch-backed ``fetch_events`` callable.
 
     Args:
-        log_group: CloudWatch log group name. Should match the
-            ``cloudwatch_log_group`` passed to :func:`ray_cluster`.
+        log_group: CloudWatch log group name. Should match the ``cloudwatch_log_group``
+            passed to :func:`ray_cluster`.
         region: AWS region.
-        stream_suffix: Suffix on the per-instance log stream name. Ray's
-            CloudWatch agent template (see
-            ``providers/aws/cloudwatch-agent.json.tpl``) writes streams
-            named ``{instance_id}/{stream_suffix}`` for each log type
-            (``"actors"``, ``"raylet"``, ``"workers"``, ``"other"``).
+        stream_suffix: Suffix on the per-instance log stream name. Ray's CloudWatch agent
+            template (``providers/aws/cloudwatch-agent.json.tpl``) writes streams named
+            ``{instance_id}/{stream_suffix}`` per log type (``"actors"``, ``"raylet"``,
+            ``"workers"``, ``"other"``).
         limit: Maximum events fetched per call.
-        filter_pattern: Optional CloudWatch filter pattern applied at the
-            API level.
+        filter_pattern: Optional CloudWatch filter pattern applied at the API level.
 
     Returns:
-        A callable ``(instance_id) -> list[dict]`` suitable for the
-        ``fetch_events`` parameter on
+        A callable ``(instance_id) -> list[dict]`` for the ``fetch_events`` parameter on
         :func:`tessera_embeddings.inference.diagnostics.build_worker_failure_diagnostic`.
     """
     client = boto3.client("logs", region_name=region)

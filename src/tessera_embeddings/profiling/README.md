@@ -13,19 +13,11 @@ group).
 
 ## Which one do I want?
 
-- **"Is the ingest scheduler falling behind at N workers?"** → `ingest/` —
-  `te-watch-scheduler` (live scheduler heartbeat → JSON + alerts),
-  `te-ingest-log-queries` (429/503/retry/worker-exit aggregates across every
-  worker stream), `te-ingest-report` (assemble the per-run dossier).
-- **"Where does a date's time go, and what did a mode change buy?"** → also
-  `te-ingest-log-queries` — `date_stage_timings` (per-date build/gate/write from
-  the `Stage timings` lines), `batch_timings` (its `batch_dates > 1`
-  counterpart: one shared write per batch, divide by `n_dates`), and
-  `pipeline_stalls` (how much preparation `pipeline_dates` hid; emitted in both
-  modes so the A/B is one query).
-- **"Are the GPUs busy? are workers OOMing?"** → `inference/` —
-  `te-observe-cluster` (live GPU/RAM pollers + post-hoc CloudWatch rollups),
-  plus the `te-compare-*` output-equivalence gates.
+| Question | Reach for |
+| --- | --- |
+| Is the ingest scheduler falling behind at N workers? | `te-watch-scheduler` (live heartbeat → JSON + alerts), `te-ingest-log-queries` (429/503/retry/worker-exit aggregates), `te-ingest-report` (per-run dossier) |
+| Where does a date's time go, and what did a mode change buy? | `te-ingest-log-queries` — `date_stage_timings`, `batch_timings` (its `batch_dates > 1` counterpart: one shared write per batch, divide by `n_dates`), `pipeline_stalls` (emitted in both modes, so the A/B is one query) |
+| Are the GPUs busy? Are workers OOMing? | `te-observe-cluster` (live GPU/RAM pollers + CloudWatch rollups), plus the `te-compare-*` equivalence gates |
 
 ## Invocation
 
@@ -61,37 +53,26 @@ role) is enough, and `--profile` / `--region` override per call. Only
 `--log-group` carries a deployment-shaped default — `/ecs/tessera/dask` for
 ingest, the yield Ray group for inference — so pass it on other deployments.
 
-## AWS-specific by necessity — and a template for other clouds
+## Why two harnesses, and why AWS-coupled
 
-These tools are deliberately AWS-coupled: they read CloudWatch Logs (Insights
-and stream tails), ECS task metadata, EC2 tags, and reach workers over SSM.
-There is no vendor-neutral way to ask those questions, so the harnesses live
-under the AWS provider's umbrella rather than pretending to be portable.
+They are separate because the interesting object differs. Inference profiling
+watches **workers** — GPU and host RAM — discovered by Ray tags and sampled over
+SSM. Ingest profiling watches a **single event-loop process**, whose stress
+shows up as 30-second heartbeat lines and slow backlog growth across thousands
+of worker streams. That is a poor fit for human watching, which is why `ingest/`
+emits machine-readable JSON snapshots and threshold alerts meant to be consumed
+by an agent. Sibling directories keep each one's discovery model, log
+conventions and output formats coherent.
 
-That said, **the structure is meant to be a template, not a dead end.** What
-carries over to any cloud is the shape: a periodic in-process health heartbeat
-on the scheduler; a log-derived time series parsed into machine-readable
-snapshots with threshold alerts; a query pack that separates "our scheduler is
-saturated" from "an external service is throttling us"; and a per-run dossier
-that an operator (or an agent) interprets. Swapping CloudWatch for Cloud
-Logging, Log Analytics, or Loki is a matter of replacing the log-read and
-query layers — the parsers, threshold rules, and dossier assembly are
-provider-agnostic already.
+They are AWS-coupled because there is no vendor-neutral way to read CloudWatch
+Logs, ECS task metadata, EC2 tags, or reach a worker over SSM.
 
-**PRs that generalize these are very welcome** — whether that means factoring
-the log backend behind a small interface or contributing a sibling harness for
-another provider. See `docs/providers/adding-your-own.md` for how the rest of
-the codebase handles the same split.
-
-## Why they are separate
-
-Inference profiling is mature and GPU/RAM-centric: the workers are the
-interesting thing, and the tooling discovers them by Ray tags and samples them
-over SSM. Ingest profiling is scheduler-centric: the interesting thing is a
-single event-loop process whose stress shows up as 30-second heartbeat lines
-and gradual backlog growth across thousands of worker log streams — a bad fit
-for human watching, which is why `ingest/` leans on machine-readable JSON
-snapshots, threshold alerts, and Logs-Insights aggregates meant to be consumed
-and summarized by an agent. Keeping the two harnesses in sibling directories
-(rather than one grab-bag) keeps each one's discovery model, log conventions,
-and output formats coherent.
+**The structure is a template, not a dead end**, and PRs generalizing it are
+welcome. What carries over to any cloud is the shape: an in-process health
+heartbeat, a log-derived time series parsed into snapshots with threshold
+alerts, a query pack separating "our scheduler is saturated" from "an external
+service is throttling us", and a per-run dossier a human or agent interprets.
+The parsers, threshold rules and dossier assembly are already
+provider-agnostic — only the log-read and query layers are CloudWatch-shaped.
+See `docs/providers/adding-your-own.md` for how the rest of the codebase handles
+the same split.

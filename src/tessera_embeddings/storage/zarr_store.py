@@ -1,48 +1,34 @@
 """Zarr store management utilities for reflectance and cloudmask data.
 
-This module provides functions for creating, reading, and writing Zarr stores
-that hold preprocessed Sentinel-2 reflectance data and cloud masks.
+Creating, reading and writing the Icechunk-backed Zarr stores that hold preprocessed
+Sentinel-2 reflectance and cloud masks. Five write paths, all committing atomically:
 
-Uses Icechunk for transactional writes with atomic commit semantics.
-
-Five write paths, all committing atomically:
-
-- **create** (:func:`write_dataset` on a fresh store) — ``to_icechunk`` mode
-  ``"w"`` writes the whole array.
+- **create** (:func:`write_dataset` on a fresh store) — ``to_icechunk`` mode ``"w"``
+  writes the whole array.
 - **append** (:func:`write_dataset` on an existing store) — mode ``"a"`` with
   ``append_dim="time"`` extends the time axis.
-- **region overwrite** (:func:`write_region`) — mode ``"r+"`` rewrites an
-  existing temporal/spatial slice in place. The region need not be
-  chunk-aligned: :func:`_pad_region_to_chunks` widens unaligned edges to chunk
-  boundaries and backfills the untouched cells from the store
-  (read-modify-write), because ``align_chunks=True`` only remaps the producer's
-  dask blocks and ``mode="r+"`` rejects partial-chunk writes. Use
-  :func:`resolve_region` to turn coordinate ranges into the integer slices
-  ``write_region`` expects.
+- **region overwrite** (:func:`write_region`) — mode ``"r+"`` rewrites an existing
+  temporal/spatial slice in place. The region need not be chunk-aligned:
+  :func:`_pad_region_to_chunks` widens unaligned edges to chunk boundaries and backfills
+  the untouched cells from the store (read-modify-write), because ``align_chunks=True``
+  only remaps the producer's dask blocks and ``mode="r+"`` rejects partial-chunk writes.
+  Use :func:`resolve_region` to turn coordinate ranges into the integer slices it wants.
 - **windowed per-date batch** (:func:`write_day_windows`, on
-  :func:`batched_region_writes`) — the cropped-ingest counterpart of
-  ``write_dataset``: seed an all-fill store with an EMPTY time axis once, then
-  per date append the time slot atomically WITH that date's chunk-disjoint
-  live-window region writes, all under ONE commit. Same bookkeeping contract
-  as create/append (attr set, baselines/doy merge, per-write manifest
-  validation); write volume scales with live area instead of extent.
-  ``parallel_windows`` submits the date's windows as a SINGLE dask compute
-  rather than one blocking compute per window, so their critical paths overlap
-  across the fleet instead of summing — the same store either way, and the
-  windows' chunk-disjointness is what makes the merged changesets
-  conflict-free.
-- **shard-assemble** (embeddings only; lives in
-  :mod:`tessera_embeddings.inference.assembly` +
-  :mod:`tessera_embeddings.storage.shard_writer`) — staged inference tiles
-  written straight into the output arrays as raw-zarr fork/merge region
-  writes: granularity-aligned northing bands for standalone stores, whole
-  2048-px shards of a pre-allocated global-store zone group for the campaign
-  (one commit per zone-year, ADR-008).
-
-The batch variant of the region-overwrite path (a Dask-graph write of many
-regions at once — one graph spanning every region, built on the flow runner)
-was removed as unused; the windowed per-date batch is NOT its return, since it
-builds no graph at all.
+  :func:`batched_region_writes`) — the cropped-ingest counterpart of ``write_dataset``:
+  seed an all-fill store with an EMPTY time axis once, then per date append the time slot
+  atomically WITH that date's chunk-disjoint live-window region writes, all under ONE
+  commit. Same bookkeeping contract as create/append (attr set, baselines/doy merge,
+  per-write manifest validation); write volume scales with live area instead of extent.
+  ``parallel_windows`` submits the date's windows as a SINGLE dask compute rather than one
+  blocking compute per window, so their critical paths overlap across the fleet instead of
+  summing — the same store either way, and the windows' chunk-disjointness is what makes
+  the merged changesets conflict-free.
+- **shard-assemble** (embeddings only; in :mod:`tessera_embeddings.inference.assembly` +
+  :mod:`tessera_embeddings.storage.shard_writer`) — staged inference tiles written
+  straight into the output arrays as raw-zarr fork/merge region writes:
+  granularity-aligned northing bands for standalone stores, whole 2048-px shards of a
+  pre-allocated global-store zone group for the campaign (one commit per zone-year,
+  ADR-008).
 """
 
 import itertools
@@ -93,17 +79,16 @@ TIME_ENCODING = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic
 #: retried. Pass to ``tenacity``'s ``retry_if_not_exception_type`` wherever a store write
 #: is retried.
 #:
-#: Retrying either one is worse than failing. The ingest path commits WITHOUT
-#: ``rebase_with`` precisely so a second writer's commit fails against a moved branch tip
-#: rather than merging silently, and a retry re-opens the session from the NEW tip — which
-#: turns that refusal back into a success and lets two writers interleave dates on one
-#: axis, the exact outcome the no-rebase choice exists to prevent. When the two writers
-#: collide on the SAME date the retry instead fails as a duplicate, so the visible error
-#: names a date rather than the collision, which is a long way from the cause.
+#: Retrying either is worse than failing. The ingest path commits with no ``rebase_with``
+#: precisely so a second writer's commit fails against a moved branch tip rather than merging
+#: silently, and a retry re-opens the session from the NEW tip — turning that refusal back
+#: into a success and letting two writers interleave dates on one axis, the exact outcome the
+#: no-rebase choice prevents. When the two collide on the SAME date the retry instead fails as
+#: a duplicate, so the visible error names a date rather than the collision.
 #:
-#: Everything else a store write can raise — throttling, expired credentials, a transient
-#: GDAL read — is worth retrying, and a failed attempt commits nothing, so the retry
-#: starts from clean committed state.
+#: Everything else a store write can raise — throttling, expired credentials, a transient GDAL
+#: read — is worth retrying, and a failed attempt commits nothing, so the retry starts from
+#: clean committed state.
 CONCURRENT_WRITER_ERRORS: tuple[type[BaseException], ...] = (icechunk.ConflictError, DuplicateDateError)
 
 #: Failures that must NEVER trigger `cleanup_on_failure`'s delete, because each one means
@@ -115,29 +100,25 @@ NEVER_CLEAN_UP: tuple[type[BaseException], ...] = (
     *CONCURRENT_WRITER_ERRORS,
 )
 
-#: Attempts per store write. Three has been enough for the transient failures this path
-#: actually sees (throttling, a credential rolling over mid-write, a flaky COG read).
-#:
-#: It is NOT enough for a source provider that stops serving reads for minutes at a time, and
-#: that is a different kind of failure rather than a bigger one: waiting is the only thing that
-#: resolves it, and three attempts of exponential backoff do not wait long enough to matter. A
-#: caller that can identify such a failure passes ``wait_out`` to :func:`store_write_retrying`
-#: and gets :data:`WAIT_OUT_BACKOFF_S` of patience for that failure alone.
+#: Attempts per store write. Three is enough for the transient failures this path sees
+#: (throttling, a credential rolling over mid-write, a flaky COG read), and NOT enough for a
+#: source provider that stops serving reads for minutes at a time — a different kind of
+#: failure, not a bigger one, since only waiting resolves it and three exponential backoffs do
+#: not wait long enough to matter. A caller that can identify such a failure passes
+#: ``wait_out`` to :func:`store_write_retrying` for :data:`WAIT_OUT_BACKOFF_S` of patience on
+#: that failure alone.
 STORE_WRITE_ATTEMPTS = 3
 
-#: The total backoff ONE store write may spend on a failure its caller has said to wait out.
-#:
-#: The single lever for that tolerance: no other constant, ladder or attempt count needs
-#: touching to change it, and the ladder's cap below is what turns it into an attempt count.
-#: Budgeted as accumulated BACKOFF rather than as wall clock so the bound is a property of the
-#: policy alone — the work each attempt does is the caller's, and unmeasurable from here.
+#: The total backoff ONE store write may spend on a failure its caller has said to wait out —
+#: the single lever for that tolerance, with the ladder's cap below turning it into an attempt
+#: count. Budgeted as accumulated BACKOFF rather than wall clock so the bound is a property of
+#: the policy alone; the work each attempt does is the caller's and unmeasurable from here.
 #:
 #: **Minutes, not tens of minutes, and the ceiling is a COST not a guess.** A write waits with
-#: its leg's whole Dask fleet held idle behind it, so this is the expensive place to be patient.
-#: The cheap place is between leg attempts, where the fleet has been released — so this budget
-#: covers the ordinary wobble and a source that stays down is escalated to the leg, which waits
-#: far longer for almost nothing. Raising this trades fleet-hours for events the cheap wait
-#: already covers.
+#: its leg's whole Dask fleet held idle behind it, so this is the expensive place to be
+#: patient. The cheap place is between leg attempts, where the fleet has been released — so
+#: this budget covers the ordinary wobble and a source that stays down escalates to the leg.
+#: Raising it trades fleet-hours for events the cheap wait already covers.
 WAIT_OUT_BACKOFF_S = 300.0
 
 #: Ceiling on ONE sleep in the ladder. Reached only by a write that is waiting something out:
@@ -157,29 +138,27 @@ def store_write_retrying(
     :data:`CONCURRENT_WRITER_ERRORS` member. :data:`STORE_WRITE_ATTEMPTS` attempts by default.
 
     Shared rather than built per site — S1's per-date write, S2's per-date write and S2's
-    per-batch write all use it — because the exclusion is the part that is easy to omit,
-    and one policy in one place cannot half-apply.
+    per-batch write all use it — because the exclusion is the easy part to omit, and one
+    policy in one place cannot half-apply. Retrying is safe precisely because a failed write
+    commits NOTHING: every write site goes through a single-session commit, so an abandoned
+    attempt is invisible to readers and the next starts from the last committed state.
 
-    Retrying is safe precisely because a failed write commits NOTHING — every write site
-    goes through a single-session commit, so an abandoned attempt is invisible to readers
-    and the next attempt starts from the last committed state.
+    The jitter is unconditional: at fleet width thousands of writes fail in the same second
+    when a shared source falters, and an undithered ladder re-issues them all in the same
+    second too.
 
     Args:
         log: Logger for the before-sleep line.
-        wait_out: Predicate over the failure that decides whether this write may keep going
-            past the attempt limit, up to :data:`WAIT_OUT_BACKOFF_S` of accumulated backoff.
-            A predicate, not a flag, because the classification belongs to the ingest layer
-            that owns the source's vocabulary; storage only owns the budget. Default
-            ``None`` keeps the attempt limit for every failure, which is what a caller whose
-            answer to a source refusing reads is to read a DIFFERENT copy of the object
-            wants: a long wait per copy would multiply with that ladder.
+        wait_out: Predicate over the failure deciding whether this write may keep going past
+            the attempt limit, up to :data:`WAIT_OUT_BACKOFF_S` of accumulated backoff. A
+            predicate, not a flag, because the classification belongs to the ingest layer
+            that owns the source's vocabulary; storage owns only the budget. Default ``None``
+            keeps the attempt limit for every failure — what a caller wants when its answer
+            to a source refusing reads is to read a DIFFERENT copy of the object, since a
+            long wait per copy would multiply with that ladder.
 
     Returns:
         A ``Retrying`` to iterate around the write.
-
-    The jitter is unconditional. At fleet width thousands of writes fail in the same second
-    when a shared source falters, and an undithered ladder re-issues all of them in the same
-    second too.
     """
 
     def _stop(state: RetryCallState) -> bool:
@@ -202,9 +181,8 @@ def store_write_retrying(
 def read_time_values(node: zarr.Group) -> np.ndarray:
     """Decode a group's ``time`` coordinate to ``datetime64[ns]`` values.
 
-    Raw-zarr counterpart to xarray's CF decoding for the one convention every
-    engine-written store uses (:data:`TIME_ENCODING`); anything else is a loud
-    error rather than a silent misread.
+    Raw-zarr counterpart to xarray's CF decoding for the one convention every engine-written
+    store uses (:data:`TIME_ENCODING`); anything else is a loud error, not a silent misread.
     """
     time_arr = node["time"]
     units = str(time_arr.attrs.get("units", ""))
@@ -233,12 +211,12 @@ def _fsspec_credentials(
 ) -> dict[str, Any]:
     """Storage options for fsspec, drawn from the SAME credential source icechunk uses.
 
-    fsspec resolves the ``AWS_*`` environment variables, and on the S1 ingest path those
-    have been overwritten with OPERA-scoped STS tokens for downloading NASA granules. So a
-    bare ``fsspec.filesystem("s3")`` there authenticates as OPERA against OUR bucket and is
-    refused — which is how a store cleanup came to fail with ``Forbidden`` while every
-    icechunk write beside it succeeded. Explicit credentials, or the registered provider,
-    are the only reliable source in that process. See ``_default_credentials_provider``.
+    fsspec resolves the ``AWS_*`` environment variables, and on the S1 ingest path those have
+    been overwritten with OPERA-scoped STS tokens for downloading NASA granules — so a bare
+    ``fsspec.filesystem("s3")`` there authenticates as OPERA against OUR bucket and is
+    refused. That is how a store cleanup came to fail with ``Forbidden`` while every icechunk
+    write beside it succeeded. Explicit credentials, or the registered provider, are the only
+    reliable source in that process. See ``_default_credentials_provider``.
     """
     provider = get_credentials or _default_credentials_provider
     if provider is None:
@@ -260,13 +238,13 @@ def _delete_store(
 ) -> bool:
     """Delete a store at the given path. Returns True if deleted, False if not found.
 
-    Takes credentials for the reason :func:`_fsspec_credentials` gives: without them this
-    is the one S3 operation in the module authenticating from the environment, and on the
-    S1 path the environment is pointed somewhere else entirely.
+    Takes credentials for the reason :func:`_fsspec_credentials` gives: without them this is
+    the one S3 operation in the module authenticating from the environment, and on the S1
+    path the environment points somewhere else entirely.
 
-    Still returns rather than raises — it runs while another exception is propagating and
-    must not mask it — but a failure is logged at ERROR with its consequence, because a
-    silent failed cleanup is what turns an interrupted write into a wedged prefix.
+    Returns rather than raises — it runs while another exception is propagating and must not
+    mask it — but logs a failure at ERROR with its consequence, because a silent failed
+    cleanup is what turns an interrupted write into a wedged prefix.
     """
     protocol = fsspec.utils.get_protocol(store_path)
     try:
@@ -290,17 +268,16 @@ def _delete_store(
 def cleanup_on_failure[**P, T](func: Callable[P, T]) -> Callable[P, T]:
     """Decorator that deletes the store at store_path (first arg) if the function fails.
 
-    Use on store creation functions to prevent leaving corrupted/partial stores.
+    Use on store creation functions so a failure leaves no corrupt or partial store.
 
     Forwards the wrapped call's ``get_credentials`` / ``s3_region`` to the delete, so the
-    cleanup authenticates the same way the write it is cleaning up after did. It used to
-    delete with ambient credentials, which on the S1 path meant OPERA's — see
-    :func:`_fsspec_credentials`.
+    cleanup authenticates the same way the write it is cleaning up after did — with ambient
+    credentials it would authenticate as OPERA on the S1 path (see
+    :func:`_fsspec_credentials`).
 
-    Best-effort by design, and no longer the only line of defence: an interrupted create
-    leaves a repo that the next attempt ADOPTS rather than re-creates (see
-    :func:`_write_new`), so a failed cleanup costs a wasted prefix rather than a wedged one.
-
+    Best-effort, and not the only line of defence: an interrupted create leaves a repo the
+    next attempt ADOPTS rather than re-creates (:func:`_write_new`), so a failed cleanup
+    costs a wasted prefix rather than a wedged one.
     """
 
     @wraps(func)
@@ -311,18 +288,16 @@ def cleanup_on_failure[**P, T](func: Callable[P, T]) -> Callable[P, T]:
         try:
             return func(*args, **kwargs)
         except NEVER_CLEAN_UP:
-            # NOT ours to delete. Every other failure here leaves a half-written store
-            # worth removing; these fired because the store holds data somebody else
-            # committed, and cleaning up would destroy exactly what they wrote.
+            # NOT ours to delete. Every other failure leaves a half-written store worth
+            # removing; these fired because the store holds data somebody else committed.
             #
-            # StoreHoldsCommittedDataError is the check-time half: the store already held
-            # data when we looked. The concurrent-writer errors are the RACE half, and the
-            # gap between them is what made this dangerous — two first-date writers can
-            # both pass the empty-store probe, and the loser then fails at
-            # ``session.commit()`` with ConflictError, which is not the guard's error. It
-            # would have fallen through to the delete below and taken the WINNER's
-            # committed data with it. A conflict is positive evidence that the prefix is
-            # not ours, so it is the one class of failure that must never clean up.
+            # StoreHoldsCommittedDataError is the check-time half — the store already held
+            # data when we looked. The concurrent-writer errors are the RACE half: two
+            # first-date writers can both pass the empty-store probe, and the loser then
+            # fails at ``session.commit()`` with ConflictError, which is not the guard's
+            # error, so it would fall through to the delete below and take the WINNER's
+            # committed data with it. A conflict is positive evidence that the prefix is not
+            # ours, so it is the one class of failure that must never clean up.
             raise
         except Exception:
             logger.warning(f"Store creation failed, cleaning up {store_path}")
@@ -348,22 +323,18 @@ def _parse_s3_url(url: str) -> tuple[str, str]:
     return parts[0], parts[1] if len(parts) > 1 else ""
 
 
-# NOTE: Hardcoding a default region is normally an anti-pattern in this
-# package — paths and credentials are caller-supplied so the code works for
-# any deployment. We make a deliberate exception here: the Sentinel-1 OPERA
-# RTC archive lives in us-west-2 and authentication to it only succeeds
-# from in-region clients (cross-region requests are rejected, not just
-# charged for). Any pipeline running this code against OPERA must therefore
-# be in us-west-2, so defaulting the region here keeps that path zero-config
-# while still letting callers override via the ``region`` argument.
+# A hardcoded default region is normally an anti-pattern here — paths and credentials are
+# caller-supplied so the code works for any deployment — but the Sentinel-1 OPERA RTC archive
+# lives in us-west-2 and authenticates only from in-region clients (cross-region requests are
+# rejected, not merely charged for). Any pipeline running against OPERA must therefore be in
+# us-west-2, so this keeps that path zero-config; callers override via ``region``.
 _DEFAULT_S3_REGION = "us-west-2"
 
 
-# Process-wide fallback credential provider for icechunk S3 storage. When set,
-# _create_storage uses it for any S3 open that didn't receive an explicit
-# get_credentials. The S1 ingest path registers an IAM-resolving callback here
-# (via the AWS provider) so icechunk writes keep using IAM-role creds even
-# after set_s3_credentials overwrites the AWS_* env vars with OPERA-scoped STS
+# Process-wide fallback credential provider for icechunk S3 storage. When set, _create_storage
+# uses it for any S3 open with no explicit get_credentials. The S1 ingest path registers an
+# IAM-resolving callback here (via the AWS provider) so icechunk writes keep using IAM-role
+# creds even after set_s3_credentials overwrites the AWS_* env vars with OPERA-scoped STS
 # tokens. Stays None in the open-source layer, keeping it cloud-agnostic.
 _default_credentials_provider: "Callable[[], icechunk.S3StaticCredentials] | None" = None
 
@@ -377,16 +348,14 @@ def plain_zarr_storage_options(
 
     An ROI mask is a plain zarr, not an Icechunk store, so it is opened through fsspec and
     does not travel on the credential callback its callers thread everywhere else. Left to
-    the ambient chain, those opens fail outright in a callback-only deployment — and they
-    are the reads that decide which chunks exist and where the grid is, so they happen
-    before anything that was wired correctly.
+    the ambient chain those opens fail outright in a callback-only deployment — and they are
+    the reads that decide which chunks exist and where the grid is, so they happen before
+    anything that was wired correctly.
 
-    Lives here rather than beside either caller because BOTH the ingest's ROI export and
-    the inference assembly need it, and neither package should import the other for five
-    lines.
-
-    Resolved at CALL time, not stored: an IAM credential expires in hours, and the point
-    of a callback is that each consumer asks when it needs one.
+    Lives here rather than beside either caller because BOTH the ingest's ROI export and the
+    inference assembly need it, and neither package should import the other for five lines.
+    Resolved at CALL time, not stored: an IAM credential expires in hours, and the point of a
+    callback is that each consumer asks when it needs one.
     """
     if fsspec.utils.get_protocol(path) != "s3":
         return None
@@ -409,13 +378,11 @@ def credentials_provider(
 ) -> "Iterator[None]":
     """Temporarily register a fallback credential provider for icechunk S3 opens.
 
-    Used by :func:`_create_storage` whenever an S3 open inside the ``with``
-    block has no explicit ``get_credentials``. Scoped to the block so a
-    reused process (e.g. a Dask worker) is not left pinned to ``provider``
-    for later, unrelated icechunk opens. The previous provider is restored
-    even if the body raises. See the module-level
-    ``_default_credentials_provider`` note for why the S1 ingest path needs
-    this.
+    Used by :func:`_create_storage` whenever an S3 open inside the ``with`` block has no
+    explicit ``get_credentials``. Scoped to the block, and restored even if the body raises,
+    so a reused process (e.g. a Dask worker) is not left pinned to ``provider`` for later,
+    unrelated icechunk opens. See the module-level ``_default_credentials_provider`` note for
+    why the S1 ingest path needs this.
     """
     global _default_credentials_provider
     previous = _default_credentials_provider
@@ -436,37 +403,29 @@ def _create_storage(
 
     Args:
         store_path: Local path or S3 URI.
-        get_credentials: Optional credential callback for Icechunk's S3
-            client. The callable returns a fresh
-            :class:`icechunk.S3StaticCredentials` on each invocation; setting
-            ``expires_after`` on the returned object tells Icechunk when to
-            call back for refresh. When ``None`` on an S3 path, Icechunk
-            falls back to the default AWS credential chain (env, instance
-            profile, etc.), which is suitable for local testing with moto.
-            The AWS provider in the closed-source repo supplies a
-            botocore-backed callback that adapts boto's
+        get_credentials: Optional credential callback for Icechunk's S3 client, returning a
+            fresh :class:`icechunk.S3StaticCredentials` per invocation; ``expires_after`` on
+            the returned object tells Icechunk when to call back for a refresh. ``None`` on
+            an S3 path falls back to the default AWS credential chain (env, instance profile,
+            etc.), which suits local testing with moto. The AWS provider in the closed-source
+            repo supplies a botocore-backed callback adapting boto's
             ``RefreshableCredentials`` into ``S3StaticCredentials``.
-        region: Optional S3 region. Defaults to ``us-west-2`` because the
-            Sentinel-1 OPERA RTC archive only authenticates in-region.
-            Override for stores outside us-west-2.
-        scatter_initial_credentials: When True, Icechunk eagerly calls
-            ``get_credentials`` once and caches the result so that pickled
-            copies of the storage (e.g. shipped to Ray actors or Dask workers
-            during ``to_icechunk``) don't all stampede the credential
-            provider on deserialisation. Set True for distributed assembly.
+        region: Optional S3 region. Defaults to ``us-west-2`` because the Sentinel-1 OPERA
+            RTC archive only authenticates in-region. Override for stores outside it.
+        scatter_initial_credentials: When True, Icechunk eagerly calls ``get_credentials``
+            once and caches the result, so pickled copies of the storage (shipped to Ray
+            actors or Dask workers during ``to_icechunk``) do not all stampede the provider
+            on deserialisation. True for distributed assembly.
     """
     if store_path.startswith("s3://"):
         bucket, prefix = _parse_s3_url(store_path)
         if _s3_config_override:
             return _s3_config_override.make_storage(prefix_override=prefix)
-        # Fall back to a globally-registered credential provider when the
-        # caller didn't pass one explicitly. This is how the S1 ingest path
-        # keeps icechunk on IAM-role creds: set_s3_credentials overwrites the
-        # AWS_* env vars with OPERA-scoped STS tokens for GDAL reads, and
-        # icechunk's default AWS chain would otherwise pick those up and get
-        # AccessDenied writing our own store. The S1 ingest task registers an
-        # IAM-resolving callback via credentials_provider(). See
-        # tessera_embeddings.providers.aws.credentials.
+        # Fall back to the globally-registered provider when the caller passed none. This is
+        # how the S1 ingest path keeps icechunk on IAM-role creds: set_s3_credentials
+        # overwrites the AWS_* env vars with OPERA-scoped STS tokens for GDAL reads, and
+        # icechunk's default AWS chain would otherwise pick those up and get AccessDenied
+        # writing our own store. See tessera_embeddings.providers.aws.credentials.
         if get_credentials is None:
             get_credentials = _default_credentials_provider
         s3_kwargs: dict = {
@@ -486,70 +445,58 @@ def _create_storage(
 
 
 # Process-wide opt-in for manifest splitting. None = off (icechunk's default
-# single-manifest-per-array layout); a ``{dim_name: shard_size}`` dict = split
-# each named dimension's manifest into shards of that many chunks. A store's
-# manifest is the index mapping every chunk to its storage location; by default
-# it is ONE object per array, so every commit rewrites the whole manifest —
-# O(total store size), independent of how few chunks the commit changed. At
-# continental scale (hundreds of dates x thousands of spatial chunks x many
-# bands) that single manifest is huge and dominates commit time. Splitting
-# bounds a commit's rewrite to the shards it touches.
+# single-manifest-per-array layout); a ``{dim_name: shard_size}`` dict splits each named
+# dimension's manifest into shards of that many chunks. A store's manifest is the index
+# mapping every chunk to its storage location, and by default it is ONE object per array, so
+# every commit rewrites the whole thing — O(total store size), independent of how few chunks
+# the commit changed. At continental scale that dominates commit time; splitting bounds a
+# commit's rewrite to the shards it touches.
 #
-# WHICH AXIS TO SPLIT DEPENDS ENTIRELY ON WHAT ONE COMMIT TOUCHES. Two workloads
-# in this repo want opposite answers, so read this before choosing sizes.
+# WHICH AXIS TO SPLIT DEPENDS ENTIRELY ON WHAT ONE COMMIT TOUCHES — split the axis along
+# which a single commit is NARROW, and check that against the caller's write shape rather
+# than inheriting the default. Two workloads here want opposite answers:
 #
-# (a) Region-write MERGE workload — split SPATIALLY (the default below). Its
-#     manifest entry count is n_dates x northing_chunks x easting_chunks with tens
-#     of chunks per spatial axis against often <256 dates, so it is spatially
-#     dominated, and each write_region commits one compact, scattered ~3x3-chunk
-#     block. A 2D split localizes the rewrite to the few tiles that block overlaps.
-#     A time split is a no-op here at <=256 dates (one shard == the whole array).
+# (a) Region-write MERGE workload — split SPATIALLY (the default below). Manifest entries are
+#     n_dates x northing_chunks x easting_chunks, tens of chunks per spatial axis against
+#     often <256 dates, so it is spatially dominated, and each write_region commits one
+#     compact scattered ~3x3-chunk block that a 2D split localises. A time split is a no-op
+#     here at <=256 dates (one shard == the whole array).
 #
-# (b) Campaign zone INGEST — split by TIME ONLY (config.ingest.INGEST_MANIFEST_SPLIT).
-#     One commit is one DATE, and a date writes every live window, i.e. essentially
-#     the zone's whole live area. So a spatial split cannot localise anything —
-#     every commit touches nearly every spatial shard — and all it adds is object
-#     count: measured on a 6-degree zone, a 4x4 split rewrote ~5,097 manifest
-#     objects per commit instead of ~14, and those PUT latencies made ingest 30-50%
-#     SLOWER than no split at all. A time split is what localises a per-date commit,
-#     and at a size well under the date count it is emphatically not a no-op.
+# (b) Campaign zone INGEST — split by TIME ONLY (config.ingest.INGEST_MANIFEST_SPLIT). One
+#     commit is one DATE and a date writes essentially the zone's whole live area, so a
+#     spatial split localises nothing and only adds object count: on a 6-degree zone a 4x4
+#     split rewrote ~5,097 manifest objects per commit instead of ~14, and those PUT
+#     latencies made ingest 30-50% SLOWER than no split at all.
 #
-# The rule behind both: split the axis along which a single commit is NARROW. Check
-# that against the caller's write shape rather than inheriting the default.
-#
-# This is OFF by default and opt-in via ``manifest_split`` because (a) it's only
-# a win on large, frequently-region-written stores, and (b) the split config
-# must be applied consistently across a store's create and all later opens — a
-# process-wide override (like ``credentials_provider``) guarantees that without
-# threading a parameter through every public entry point.
+# OFF by default and opt-in via ``manifest_split`` because it only wins on large,
+# frequently-region-written stores, and because the split config must be applied consistently
+# across a store's create and all later opens — a process-wide override (like
+# ``credentials_provider``) guarantees that without threading a parameter through every
+# public entry point.
 _manifest_split_sizes: dict[str, int] | None = None
 
-# Default for the region-write merge workload (case (a) above) — NOT for campaign
-# ingest, which wants time-only. A 2D spatial split at 4 chunks per axis.
-# With INGEST_CHUNK_SIZE=4096 that's ~16k px/shard — a touch larger than a
-# typical ~3x3-chunk region write, so most commits hit only 1-4 tiles, while
-# shard objects stay in the low hundreds on a ~50x50-chunk store. Region writes
-# are spatially scattered, so a per-write commit rewrites only its tiles rather
-# than a full-height stripe (which a 1D split would force).
+# Default for the region-write merge workload, case (a) above — NOT for campaign ingest,
+# which wants time-only. With INGEST_CHUNK_SIZE=4096 a 4x4 spatial split is ~16k px/shard, a
+# touch larger than a typical ~3x3-chunk region write, so most commits hit only 1-4 tiles
+# while shard objects stay in the low hundreds on a ~50x50-chunk store. Region writes are
+# spatially scattered, so a per-write commit rewrites its tiles rather than the full-height
+# stripe a 1D split would force.
 DEFAULT_MANIFEST_SPLIT_SIZES = {"northing": 4, "easting": 4}
 
-# Per-attempt request timeouts (ms) pushed onto every repo's icechunk storage
-# config (see _default_repo_config) and inherited by every session and fork. These
-# cap a SINGLE object-store attempt so a hung socket fails the attempt instead of
-# blocking forever; the retry settings below then re-issue it with backoff.
-# ``read_timeout_ms`` is the one that bites the diagnosed production hang (a worker
-# stuck in ``sk_wait_data`` mid-response). The failure mode is request-level, not
-# merge-specific — every open (writes, reads, distributed assembly) is exposed — so
-# these are package-wide defaults.
+# Per-attempt request timeouts (ms) pushed onto every repo's icechunk storage config (see
+# _default_repo_config) and inherited by every session and fork, capping a SINGLE object-store
+# attempt so a hung socket fails it instead of blocking forever; the retry settings below then
+# re-issue with backoff. ``read_timeout_ms`` is the one that bites the diagnosed production
+# hang, a worker stuck in ``sk_wait_data`` mid-response. Package-wide defaults because the
+# failure is request-level, not merge-specific: every open is exposed.
 _DEFAULT_CONNECT_TIMEOUT_MS = 30_000
 _DEFAULT_READ_TIMEOUT_MS = 120_000
 _DEFAULT_OPERATION_ATTEMPT_TIMEOUT_MS = 180_000
 
-# Storage retry policy applied alongside the timeouts. Icechunk's default is a
-# single try with no backoff, so a timed-out attempt would propagate as an error
-# rather than being retried; bump tries + exponential backoff so a transient drop
-# is absorbed in-process. SlowDown (503) is already retriable in the AWS SDK; this
-# extends that to the timed-out/dropped-connection case.
+# Storage retry policy applied alongside the timeouts. Icechunk defaults to a single try with
+# no backoff, so a timed-out attempt would propagate as an error rather than being retried;
+# more tries plus exponential backoff absorbs a transient drop in-process. SlowDown (503) is
+# already retriable in the AWS SDK; this extends that to timed-out/dropped connections.
 _DEFAULT_STORAGE_MAX_TRIES = 10
 _DEFAULT_STORAGE_INITIAL_BACKOFF_MS = 200
 _DEFAULT_STORAGE_MAX_BACKOFF_MS = 30_000
@@ -560,20 +507,19 @@ def manifest_split(split_sizes: "dict[str, int] | None" = DEFAULT_MANIFEST_SPLIT
     """Enable manifest splitting for repos opened in this block.
 
     Every ``open_repo`` / ``_create_repo`` inside the ``with`` block applies a
-    :class:`icechunk.ManifestSplittingConfig` built from ``split_sizes`` — a
-    ``{dimension_name: shard_size_in_chunks}`` mapping — so commits rewrite only
-    the touched shards rather than the whole array manifest. The default splits
-    the two spatial axes (4 chunks each); pass e.g. ``{"northing": 4, "easting":
-    4, "time": 256}`` to also shard time, or ``None`` to explicitly disable
-    within a block.
+    :class:`icechunk.ManifestSplittingConfig` built from ``split_sizes``, a
+    ``{dimension_name: shard_size_in_chunks}`` mapping, so commits rewrite only the touched
+    shards rather than the whole array manifest. The default splits the two spatial axes at 4
+    chunks each; pass e.g. ``{"northing": 4, "easting": 4, "time": 256}`` to shard time too,
+    or ``None`` to disable within a block.
 
-    Scoped like :func:`credentials_provider`: the previous setting is restored on
-    exit even if the body raises, so a reused process (e.g. a Dask worker) is not
-    left globally pinned. The split config must match across a store's create and
-    every later open — wrap the whole merge in one block to keep them consistent.
+    Scoped like :func:`credentials_provider` — the previous setting is restored on exit even
+    if the body raises, so a reused process (e.g. a Dask worker) is not left globally pinned.
+    The split config must match across a store's create and every later open, so wrap the
+    whole merge in one block.
 
-    What splitting buys, pictorially (spatial 2D split shown; ``time@1`` is the
-    same idea along the time axis — see :func:`global_store_config`)::
+    What splitting buys, pictorially (spatial 2D split shown; ``time@1`` is the same idea
+    along the time axis — see :func:`global_store_config`)::
 
         unsplit: 1 manifest/array          split 4x4: 1 manifest/16-chunk tile
         ┌─────────────────────┐            ┌────┬────┬────┬────┐
@@ -595,9 +541,8 @@ def manifest_split(split_sizes: "dict[str, int] | None" = DEFAULT_MANIFEST_SPLIT
 def _manifest_splitting_config(split_sizes: dict[str, int]) -> icechunk.ManifestSplittingConfig:
     """Split every array's manifest along each named dimension into ``shard_size`` chunks.
 
-    Applies to all arrays (``AnyArray``), keyed on dimension *name* so each split
-    tracks its axis regardless of position. Multiple entries (e.g. northing +
-    easting) tile the manifest into a multi-dimensional grid of shards.
+    Applies to all arrays (``AnyArray``), keyed on dimension *name* so a split tracks its
+    axis regardless of position. Multiple entries tile the manifest into a grid of shards.
     """
     return icechunk.ManifestSplittingConfig.from_dict(
         {
@@ -614,35 +559,31 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     Chunk cache is left at icechunk's (small) default — see
     context_docs/decisions/007-icechunk-chunk-cache-disabled.md.
 
-    **Manifest splitting** is applied only when opted in via
-    :func:`manifest_split` (off by default). When active it bounds a commit's
-    manifest rewrite to the shards it touched, the dominant region-write cost on
-    large continental stores.
+    **Manifest splitting** is applied only when opted in via :func:`manifest_split` (off by
+    default). When active it bounds a commit's manifest rewrite to the shards it touched, the
+    dominant region-write cost on large continental stores.
 
-    When ``max_concurrent_requests`` is provided, caps per-repo HTTP
-    concurrency. Assembly at cornbelt scale fans out thousands of concurrent
-    PUTs to one zarr prefix, blowing past S3's ~3.5K/s per-prefix limit and
-    triggering 503 SlowDown. Icechunk's default is 256 concurrent HTTP
-    requests per repo; callers that fan out across many workers should set
-    this lower (e.g. 64) so aggregate request rate stays under S3's ceiling.
+    ``max_concurrent_requests`` caps per-repo HTTP concurrency (icechunk's default is 256).
+    Assembly at cornbelt scale fans out thousands of concurrent PUTs to one zarr prefix,
+    blowing past S3's ~3.5K/s per-prefix limit and triggering 503 SlowDown, so callers
+    fanning out across many workers should set it lower (e.g. 64).
 
-    **Storage timeouts + retries** are always applied. Icechunk defaults to
-    unbounded per-attempt timeouts and a single try, so a wedged socket
-    (diagnosed in production: a worker stuck in ``sk_wait_data`` mid-response)
-    blocks forever. We set finite connect/read/operation-attempt timeouts so a
-    single attempt fails instead of hanging, and a backed-off retry budget so a
-    transient drop is absorbed in-process. Tradeoff: a *retriable* failure
-    (sustained 5xx, repeated timeouts) now takes minutes to surface across the
-    ``max_tries`` budget instead of failing fast; non-retriable errors (403 etc.)
-    still fail immediately.
+    **Storage timeouts + retries** are always applied, because icechunk defaults to unbounded
+    per-attempt timeouts and a single try, so a wedged socket (diagnosed in production: a
+    worker stuck in ``sk_wait_data`` mid-response) blocks forever. Finite
+    connect/read/operation-attempt timeouts make a single attempt fail instead of hanging,
+    and a backed-off retry budget absorbs a transient drop in-process. Tradeoff: a *retriable*
+    failure (sustained 5xx, repeated timeouts) now takes minutes to surface across the
+    ``max_tries`` budget instead of failing fast; non-retriable errors (403 etc.) still fail
+    immediately.
     """
     config = icechunk.RepositoryConfig.default()
     if _manifest_split_sizes:
         config.manifest = icechunk.ManifestConfig(splitting=_manifest_splitting_config(_manifest_split_sizes))
     if max_concurrent_requests is not None:
         config.max_concurrent_requests = max_concurrent_requests
-    # Mutate the existing StorageSettings in place (RepositoryConfig.default() may
-    # leave storage=None) so any fields icechunk seeded survive.
+    # Mutate the existing StorageSettings in place (RepositoryConfig.default() may leave
+    # storage=None) so any fields icechunk seeded survive.
     storage = config.storage or icechunk.StorageSettings()
     storage.timeouts = icechunk.StorageTimeoutSettings(
         connect_timeout_ms=_DEFAULT_CONNECT_TIMEOUT_MS,
@@ -658,11 +599,11 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     return config
 
 
-# Preload scan cap for the global store: 120 groups x 10 nodes each (6 data
-# arrays + 4 coords under GLOBAL) = 1200 nodes, so the icechunk default of 50
-# (issue #1464) never reaches later groups' coord arrays. 2400 leaves 2x
-# headroom so schema growth can't silently push trailing zones' coord manifests
-# out of preload; refs cap is generous because coord manifests are tiny.
+# Preload scan cap for the global store: 120 groups x 10 nodes each (6 data arrays + 4 coords
+# under GLOBAL) = 1200 nodes, so the icechunk default of 50 (issue #1464) never reaches later
+# groups' coord arrays. 2400 leaves 2x headroom so schema growth cannot silently push trailing
+# zones' coord manifests out of preload; the refs cap is generous because coord manifests are
+# tiny.
 _GLOBAL_PRELOAD_MAX_ARRAYS = 2400
 _GLOBAL_PRELOAD_MAX_REFS = 1_000_000
 
@@ -670,11 +611,10 @@ _GLOBAL_PRELOAD_MAX_REFS = 1_000_000
 def global_store_config(max_concurrent_requests: int | None = None) -> icechunk.RepositoryConfig:
     """RepositoryConfig for the 120-group global store (ADR-008 D4/D5).
 
-    Layers on :func:`_default_repo_config` (timeouts + retries): manifest split
-    **time@1** (one manifest per year per array, so a year fill rewrites only
-    that year's manifests), and preload tuning so coordinate manifests across all
-    120 groups are preloaded. Persist with ``repo.save_config()`` on create so
-    re-opens (and forked workers) inherit it.
+    Layers on :func:`_default_repo_config` (timeouts + retries): manifest split **time@1**,
+    one manifest per year per array so a year fill rewrites only that year's, plus preload
+    tuning so coordinate manifests across all 120 groups are preloaded. Persist with
+    ``repo.save_config()`` on create so re-opens and forked workers inherit it.
     """
     config = _default_repo_config(max_concurrent_requests)
     config.manifest = icechunk.ManifestConfig(
@@ -690,14 +630,13 @@ def global_store_config(max_concurrent_requests: int | None = None) -> icechunk.
 def is_missing_repo(exc: icechunk.IcechunkError) -> bool:
     """Whether an ``IcechunkError`` means the repo is genuinely ABSENT.
 
-    Icechunk reports a missing repository as "the repository doesn't exist". Every
-    other ``IcechunkError`` — auth, throttling, timeout, real corruption — must be
-    told apart from absence, because the two call for opposite responses: absence
-    means create, and anything else means surface the error. Conflating them sends a
-    transient failure down the create path, where it resurfaces as a dirty-prefix
-    ``CorruptedStoreError`` that names the wrong problem.
+    Icechunk reports a missing repository as "the repository doesn't exist". Every other
+    ``IcechunkError`` — auth, throttling, timeout, real corruption — must be told apart from
+    absence, because absence means create and anything else means surface the error.
+    Conflating them sends a transient failure down the create path, where it resurfaces as a
+    dirty-prefix ``CorruptedStoreError`` naming the wrong problem.
 
-    Lives here, not in the inference layer that first needed it: it is a fact about
+    Lives here rather than in the inference layer that first needed it: it is a fact about
     Icechunk repositories, and the storage layer cannot import upward to reach it.
     """
     msg = str(exc).lower()
@@ -713,11 +652,10 @@ def open_repo(
 ) -> icechunk.Repository:
     """Open an EXISTING Icechunk repository; raise if it is not there.
 
-    The counterpart to :func:`open_or_create_repo`, and the right call whenever the
-    store is known to exist — writing a marker onto a store just written, say. Prefer it
-    on that path even now that ``open_or_create_repo`` discriminates absence correctly:
-    saying "this must already be there" makes a missing store an error rather than a
-    silent creation, which is the stronger statement wherever it is true.
+    The counterpart to :func:`open_or_create_repo`, and the right call whenever the store is
+    known to exist — writing a marker onto a store just written, say. Saying "this must
+    already be there" makes a missing store an error rather than a silent creation, the
+    stronger statement wherever it is true.
     """
     return icechunk.Repository.open(
         _create_storage(
@@ -750,11 +688,10 @@ def _create_repo(
         )
     except icechunk.IcechunkError as e:
         if "repositories can only be created in clean prefixes" in str(e):
-            # Say what the state IS, and do not instruct a delete. Reaching here means the
-            # prefix holds objects but no readable repository — a writer interrupted between
-            # creating the repo and committing its schema. The prefix may still hold chunks
-            # somebody wants, so deleting is a judgement the operator makes, not an
-            # instruction we hand them.
+            # Say what the state IS; do not instruct a delete. Reaching here means the prefix
+            # holds objects but no readable repository — a writer interrupted between
+            # creating the repo and committing its schema — and it may still hold chunks
+            # somebody wants, so deleting is the operator's judgement to make.
             raise CorruptedStoreError(
                 f"Store {store_path} holds objects but no readable repository — a writer was "
                 f"interrupted between creating it and committing its schema. If nothing has "
@@ -776,26 +713,22 @@ def open_or_create_repo(
     Args:
         store_path: Local path or S3 URI.
         max_concurrent_requests: Optional cap on concurrent S3 requests per repo.
-        get_credentials: Optional credential callback for Icechunk's S3 client.
-            See :func:`_create_storage` for details.
+        get_credentials: Optional credential callback (see :func:`_create_storage`).
         region: Optional S3 region override.
-        scatter_initial_credentials: When True with a distributed writer,
-            cache the initial credentials so pickled storage copies don't
-            re-invoke the callback on each worker. See :func:`_create_storage`.
+        scatter_initial_credentials: With a distributed writer, cache the initial credentials
+            so pickled storage copies do not re-invoke the callback on each worker.
 
     Returns:
-        Tuple of ``(repository, is_new)``. ``is_new`` is True if the repo was
-        just created.
+        ``(repository, is_new)``, where ``is_new`` is True if the repo was just created.
 
-    Creates ONLY on proven absence — see :func:`is_missing_repo`. Every other failure of
-    the open leg is re-raised unchanged, because routing one into the create leg is
-    actively harmful rather than merely imprecise: the create then trips Icechunk's
-    clean-prefix rule and surfaces as a ``CorruptedStoreError`` naming a store that is
-    perfectly healthy, whose advice is to delete it, and which is DETERMINISTIC from then
-    on. That last part is what does the damage. Callers wrap these writes in a retry that
-    retries every exception, so a transient open failure is already survivable — but once
-    the repo exists, every retry's create fails identically, and the retry cannot escape.
-    A momentary blip becomes a hard failure reported as corruption, with the real error
+    Creates ONLY on proven absence — see :func:`is_missing_repo`. Every other failure of the
+    open leg is re-raised unchanged, because routing one into the create leg is actively
+    harmful: the create trips Icechunk's clean-prefix rule and surfaces as a
+    ``CorruptedStoreError`` naming a perfectly healthy store and advising its deletion, and
+    it is DETERMINISTIC from then on. That last part does the damage. Callers wrap these
+    writes in a retry-everything loop, so a transient open failure is survivable — but once
+    the repo exists every retry's create fails identically and the retry cannot escape, so a
+    momentary blip becomes a hard failure reported as corruption with the real error
     destroyed.
     """
     try:
@@ -835,25 +768,24 @@ def rollback_commits(
 ) -> str:
     """Roll a branch's HEAD back by ``n`` commits and return the new HEAD id.
 
-    Icechunk has no destructive "undo": a rollback is a non-fast-forward
-    ``reset_branch`` that re-points the branch at an older snapshot. The ``n``
-    snapshots being dropped are not deleted — they remain reachable by id until
-    expiry/garbage collection, so the rollback is itself reversible (reset back
-    to the old HEAD id).
+    Icechunk has no destructive "undo": a rollback is a non-fast-forward ``reset_branch``
+    re-pointing the branch at an older snapshot. The ``n`` dropped snapshots are not deleted
+    — they stay reachable by id until expiry/garbage collection — so the rollback is itself
+    reversible by resetting back to the old HEAD id.
 
     Args:
         store_path: Local path or S3 URI of the store.
-        n: Number of commits to drop from the tip. Must be >= 1 and leave at
-            least one snapshot (you cannot roll back past the root/init commit).
+        n: Number of commits to drop from the tip. Must be >= 1 and leave at least one
+            snapshot (you cannot roll back past the root/init commit).
         branch: Branch to reset. Defaults to ``"main"``.
         get_credentials: Optional credential callback (see :func:`_create_storage`).
         region: Optional S3 region override.
-        dry_run: When True, resolve and return the target snapshot id without
-            moving the branch. Useful for eyeballing the target before committing.
+        dry_run: When True, resolve and return the target snapshot id without moving the
+            branch — useful for eyeballing the target first.
 
     Returns:
-        The id of the snapshot the branch now points at (or *would* point at,
-        when ``dry_run`` is True).
+        The id of the snapshot the branch now points at, or *would* point at under
+        ``dry_run``.
 
     Raises:
         ValueError: If ``n < 1`` or ``n`` would drop the entire history.
@@ -863,8 +795,8 @@ def rollback_commits(
 
     repo = open_repo(store_path, get_credentials=get_credentials, region=region)
 
-    # ancestry is newest-first: history[0] is the current HEAD, history[n] is
-    # the snapshot n commits back. The final entry is the repo's root commit.
+    # ancestry is newest-first: history[0] is the current HEAD, history[n] the snapshot n
+    # commits back, and the final entry the repo's root commit.
     history = list(repo.ancestry(branch=branch))
     current = history[0]
     if n >= len(history):
@@ -893,9 +825,9 @@ def rollback_commits(
 # =============================================================================
 
 
-# Sentinel: caller did not pass ``chunks``, so let ``xr.open_zarr`` apply its own
-# default (one dask block per on-disk chunk). Distinct from ``chunks=None``, which
-# is a real, meaningful value (open zarr-lazy with no dask graph).
+# Sentinel: caller did not pass ``chunks``, so let ``xr.open_zarr`` apply its own default (one
+# dask block per on-disk chunk). Distinct from ``chunks=None``, itself a meaningful value
+# (open zarr-lazy with no dask graph).
 class _ChunksUnset:
     pass
 
@@ -916,18 +848,17 @@ def _open_readonly(
 ) -> xr.Dataset:
     """Open store for reading. Returns xarray Dataset.
 
-    ``chunks`` is forwarded to :func:`xarray.open_zarr` only when set; the default
-    builds one dask task per on-disk chunk — fine for tile-scale stores, but on a
-    CONUS-scale embeddings store the band axis alone is 32 chunks and the graph is
-    ``n_time x n_y x n_x x 32`` tasks, large enough that even a lazy ``isel``/``sel``
-    OOMs while manipulating the graph. Pass ``chunks=None`` to open zarr-lazy with
-    no dask graph: slicing is then pure metadata and chunks are read only when
-    ``.values`` is pulled — the right choice for interactive or selective reads of
-    large stores.
+    ``chunks`` is forwarded to :func:`xarray.open_zarr` only when set; the default builds one
+    dask task per on-disk chunk, fine for tile-scale stores but on a CONUS-scale embeddings
+    store the band axis alone is 32 chunks and the graph is ``n_time x n_y x n_x x 32``
+    tasks, large enough that even a lazy ``isel``/``sel`` OOMs while manipulating the graph.
+    Pass ``chunks=None`` to open zarr-lazy with no dask graph: slicing is then pure metadata
+    and chunks are read only when ``.values`` is pulled — right for interactive or selective
+    reads of large stores.
 
-    ``group`` selects a Zarr group within the store (the global store's per-zone
-    layout). ``None`` reads the root. Readers should target a single group; never
-    open the whole 120-group repo as a datatree (~200x slower — ADR-008 D5).
+    ``group`` selects a Zarr group within the store (the global store's per-zone layout);
+    ``None`` reads the root. Readers should target a single group and never open the whole
+    120-group repo as a datatree (~200x slower — ADR-008 D5).
     """
     repo = open_repo(store_path, get_credentials=get_credentials, region=region)
     session = repo.readonly_session(branch="main")
@@ -939,21 +870,20 @@ def _open_readonly(
 def _assert_no_committed_dates(repo: "icechunk.Repository", store_path: str) -> None:
     """Refuse to adopt a repo that already holds committed dates.
 
-    The last thing standing between a failed date probe and a destroyed mosaic. The
-    create path adopts an existing repo and writes ``mode="w"``, which is right for the
-    empty shell an interrupted first write leaves behind and catastrophic for a store
-    with data in it. Which one it is comes from :func:`get_existing_dates`, a network
-    read; this asks the repo directly, from the session about to be overwritten.
+    The last thing standing between a failed date probe and a destroyed mosaic. The create
+    path adopts an existing repo and writes ``mode="w"``, right for the empty shell an
+    interrupted first write leaves behind and catastrophic for a store with data in it. Which
+    one it is comes from :func:`get_existing_dates`, a network read; this asks the repo
+    directly, from the session about to be overwritten.
 
-    Reads the time axis, not the manifest or attrs: dates are what the caller claimed
-    were absent, so dates are what gets checked. A repo with no root group at all is
-    the canonical thing this path adopts — an interrupted first write commits the
-    repo's initialization snapshot and nothing else — so that reads as zero dates
-    rather than as an error.
+    Reads the time axis, not the manifest or attrs: dates are what the caller claimed were
+    absent, so dates are what gets checked. A repo with no root group at all is the canonical
+    thing this path adopts — an interrupted first write commits the repo's initialization
+    snapshot and nothing else — so that reads as zero dates rather than an error.
 
     Raises:
-        StoreHoldsCommittedDataError: If the repo holds one or more committed dates.
-            A dedicated type because ``cleanup_on_failure`` must NOT delete this store.
+        StoreHoldsCommittedDataError: If the repo holds one or more committed dates. A
+            dedicated type because ``cleanup_on_failure`` must NOT delete this store.
     """
     try:
         root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
@@ -983,26 +913,24 @@ def _write_new(
 
     ``open_or_create_repo``, not ``_create_repo``: an interrupted first write leaves a repo
     holding only its initialization snapshot, and creating unconditionally then trips
-    Icechunk's clean-prefix rule and raises ``CorruptedStoreError`` on EVERY retry. That
-    made a momentary failure permanent — the caller's retry could not escape, because the
-    error it now hit was deterministic and of its own making. Adopting instead means an
-    interruption costs the work in flight and nothing more.
+    Icechunk's clean-prefix rule and raises ``CorruptedStoreError`` on EVERY retry, making a
+    momentary failure permanent — the retry cannot escape an error that is deterministic and
+    of its own making. Adopting instead means an interruption costs the work in flight and
+    nothing more.
 
     Reached only when the store holds no dates (see :func:`write_dataset`), so writing
-    ``mode="w"`` over whatever the interrupted attempt staged is correct: there is no
-    committed data to lose. The complementary half is that a store WITH dates takes the
-    append path and is never handed here.
-
-    That premise is RE-CHECKED here rather than trusted, because it is the difference
-    between adopting an empty shell and destroying a finished mosaic, and the caller
-    establishes it with a probe that has to read the network to answer.
+    ``mode="w"`` over whatever the interrupted attempt staged loses no committed data; a
+    store WITH dates takes the append path and is never handed here. That premise is
+    RE-CHECKED rather than trusted, because it is the difference between adopting an empty
+    shell and destroying a finished mosaic, and the caller establishes it with a probe that
+    has to read the network to answer.
     """
     repo, is_new = open_or_create_repo(store_path, get_credentials=get_credentials, region=s3_region)
     if not is_new:
         # The probe reads the network, so it can fail without answering. An unanswered probe
         # must not reach `cleanup_on_failure`'s generic handler, which would delete the whole
-        # prefix — possibly another writer's committed store — on the strength of not knowing.
-        # Deletion requires POSITIVE evidence the prefix is ours.
+        # prefix — possibly another writer's committed store — on the strength of not
+        # knowing. Deletion requires POSITIVE evidence the prefix is ours.
         try:
             _assert_no_committed_dates(repo, store_path)
         except StoreHoldsCommittedDataError:
@@ -1028,11 +956,10 @@ def _commit_preserving_attrs(
 ) -> None:
     """Run a ``to_icechunk`` write, then commit with root attrs preserved.
 
-    ``to_icechunk`` overwrites root attrs with the (typically empty)
-    ``data.attrs`` — destroying crs, ``_manifest``, etc. We snapshot them
-    before the write and restore (plus any ``update_attrs``) after, then commit.
-    Shared by the append and region-write paths; ``write_kwargs`` carries the
-    mode-specific arguments (``mode``, ``append_dim``/``region``, etc.).
+    ``to_icechunk`` overwrites root attrs with the (typically empty) ``data.attrs``,
+    destroying crs, ``_manifest`` and the rest, so they are snapshotted before the write and
+    restored (plus any ``update_attrs``) after. Shared by the append and region-write paths;
+    ``write_kwargs`` carries the mode-specific arguments.
     """
     root = zarr.open_group(session.store, mode="r")
     preserved_attrs = dict(root.attrs)
@@ -1087,22 +1014,18 @@ def _write_region(
     repo = open_repo(store_path, get_credentials=get_credentials, region=region_name)
     session = repo.writable_session("main")
 
-    # Committed view for padding unaligned regions. Read from a *readonly*
-    # session (not ``session.store``): the lazy pad shell's graph is handed to
-    # ``to_icechunk``, which under a distributed client pickles it to the
-    # workers. A writable session refuses to pickle; a readonly one pickles
-    # freely. Pin it to the writable session's base snapshot rather than
-    # re-resolving ``branch="main"`` so the shell is read from exactly the
-    # snapshot we commit on top of — a concurrent commit between the two opens
-    # can't make the shell come from a different snapshot than the write base.
-    # The write target still uses the writable session, which ``to_icechunk``
-    # forks internally.
+    # Committed view for padding unaligned regions, read from a *readonly* session rather
+    # than ``session.store``: the lazy pad shell's graph is handed to ``to_icechunk``, which
+    # under a distributed client pickles it to the workers, and a writable session refuses to
+    # pickle. Pinned to the writable session's base snapshot rather than re-resolving
+    # ``branch="main"``, so a concurrent commit between the two opens cannot make the shell
+    # come from a different snapshot than the write base. The write target still uses the
+    # writable session, which ``to_icechunk`` forks internally.
     read_session = repo.readonly_session(snapshot_id=session.snapshot_id)
     existing = xr.open_zarr(read_session.store, consolidated=False)
-    # Raw zarr group on the SAME readonly session, for the zarr-direct padding
-    # shell (one read task per overlapping chunk, no whole-store layer). Must be
-    # this session — same pinned snapshot as ``existing`` and pickle-safe to
-    # workers — not a fresh branch="main" group.
+    # Raw zarr group on the SAME readonly session, for the zarr-direct padding shell (one
+    # read task per overlapping chunk, no whole-store layer). Must be this session — same
+    # pinned snapshot as ``existing``, and pickle-safe to workers.
     group = zarr.open_group(read_session.store, mode="r")
     try:
         padded, widened = _pad_region_to_chunks(existing, data, region, group)
@@ -1135,11 +1058,11 @@ def open_store(
 ) -> xr.Dataset:
     """Open an Icechunk store for reading as an xarray Dataset.
 
-    Pass ``chunks=None`` for large (e.g. CONUS-scale) stores to skip the dask
-    task graph and slice lazily on metadata alone — see :func:`_open_readonly`.
-    ``group`` selects one Zarr group (the global store's per-zone layout).
-    ``get_credentials``/``region`` thread a credential callback / region to the
-    repo open, for callback-only or non-default-region deployments.
+    Pass ``chunks=None`` for large (e.g. CONUS-scale) stores to skip the dask task graph and
+    slice lazily on metadata alone — see :func:`_open_readonly`. ``group`` selects one Zarr
+    group (the global store's per-zone layout). ``get_credentials``/``region`` thread a
+    credential callback and region to the repo open, for callback-only or
+    non-default-region deployments.
     """
     return _open_readonly(store_path, get_credentials=get_credentials, region=region, chunks=chunks, group=group)
 
@@ -1154,20 +1077,18 @@ def open_store_as_zarr_group(
 ) -> zarr.Group:
     """Open an Icechunk store for reading as a raw zarr Group.
 
-    Bypasses xarray/dask entirely. Use when you need to read large arrays into
-    numpy without the dask task-graph overhead — e.g., loading a chunk of
-    reflectance bands for inference, where each ``.values`` call on the xarray
-    path would build and execute a fresh dask graph per variable and hold
-    scheduler state until the dataset handle dies.
+    Bypasses xarray/dask entirely — use it to read large arrays into numpy without the dask
+    task-graph overhead, e.g. loading a chunk of reflectance bands for inference, where each
+    ``.values`` call on the xarray path would build and execute a fresh dask graph per
+    variable and hold scheduler state until the dataset handle dies.
 
-    ``max_concurrent_requests`` caps per-repo HTTP concurrency (icechunk default
-    256). Pass it when many processes read one S3 prefix concurrently — e.g. the
-    region merge's worker forks all reading one feature store — so the aggregate
-    GET rate stays under S3's per-prefix ceiling. ``group`` selects one Zarr
-    group (the global store's per-zone layout); ``None`` returns the root group.
-    ``get_credentials``/``region`` are forwarded to the opener so a store outside
-    the default S3 region — or one reachable only via an explicit credential
-    callback — can be read with the same options used for the writer.
+    ``max_concurrent_requests`` caps per-repo HTTP concurrency (icechunk default 256); pass
+    it when many processes read one S3 prefix at once — the region merge's worker forks all
+    reading one feature store — so the aggregate GET rate stays under S3's per-prefix
+    ceiling. ``group`` selects one Zarr group (the global store's per-zone layout); ``None``
+    returns the root. ``get_credentials``/``region`` are forwarded so a store outside the
+    default S3 region, or reachable only via an explicit credential callback, can be read
+    with the same options as the writer used.
     """
     return open_store_group_and_tip(
         store_path,
@@ -1189,21 +1110,16 @@ def open_store_group_and_tip(
 ) -> tuple[zarr.Group, str]:
     """Open a store for reading and also return ``branch``'s tip snapshot ID.
 
-    Same as :func:`open_store_as_zarr_group`, plus the commit the returned group
-    is a view of. The snapshot ID is the store's canonical CONTENT identity —
-    it moves on every commit and cannot be left stale the way a bookkeeping
-    attribute can — so callers deciding "is this the same data I saw last
-    time?" should key on it rather than on attrs a writer is trusted to update.
-    Both come from ONE repo open, so asking for the tip costs no extra round
-    trip over opening the group alone.
+    Same as :func:`open_store_as_zarr_group`, plus the commit the returned group is a view
+    of. The snapshot ID is the store's canonical CONTENT identity — it moves on every commit
+    and cannot be left stale the way a bookkeeping attribute can — so callers deciding "is
+    this the same data I saw last time?" should key on it rather than on attrs a writer is
+    trusted to update. Both come from ONE repo open, so the tip costs no extra round trip.
 
-    The session is opened AT ``tip``, not at ``branch`` — the two must describe
-    the same bytes or the pair is worse than useless. Resolving the tip and then
-    opening the branch separately lets a commit land between them, returning
-    content from the NEW snapshot labelled with the OLD id; a caller using the
-    pair to decide "same inputs as last time?" would then read fresh data under
-    a stale identity, which is precisely the confusion the snapshot is here to
-    prevent.
+    The session is opened AT ``tip``, not at ``branch``: resolving the tip and then opening
+    the branch separately lets a commit land between them, returning content from the NEW
+    snapshot labelled with the OLD id — fresh data under a stale identity, precisely the
+    confusion the snapshot is here to prevent.
     """
     repo = open_repo(
         store_path, max_concurrent_requests=max_concurrent_requests, get_credentials=get_credentials, region=region
@@ -1223,10 +1139,9 @@ ASSESSED_WINDOW_ATTR = "assessed_window"
 
 """Root attribute naming the date range an ingest examined in full.
 
-The distinction it exists to draw: a month absent from a mosaic's time axis means either
-"the ingest looked and there was nothing reachable" or "the ingest never got there", and
-without this those are indistinguishable. The coverage gate must fail on the second and
-must not fail on the first.
+A month absent from a mosaic's time axis means either "the ingest looked and there was
+nothing reachable" or "the ingest never got there", and without this they are
+indistinguishable. The coverage gate must fail on the second and not on the first.
 
 Written by the ingest paths themselves rather than by the completion marker, because the
 gate runs BEFORE the marker on a first ingest, and again later from the fill.
@@ -1244,24 +1159,24 @@ def record_assessed_window(
 ) -> None:
     """Record on ``store_path`` that ``start_date..end_date`` was examined in full.
 
-    Absence of a month INSIDE this range is then a finding — the imagery for it either did
-    not exist or reached no live window — rather than a gap. Absence outside it remains a
-    gap, so widening a window later cannot be excused by an older, narrower assessment.
+    A month absent INSIDE this range is then a finding — the imagery either did not exist or
+    reached no live window — rather than a gap. Absence outside it remains a gap, so widening
+    a window later cannot be excused by an older, narrower assessment.
 
-    ``empty_dates`` is recorded for observability only; the gate does not read it. It says
-    how many dates were examined and skipped as reaching no live window, which is the
-    difference between "sparse region" and "something is wrong with the footprints".
+    ``empty_dates`` is observability only, unread by the gate: how many dates were examined
+    and skipped as reaching no live window, which distinguishes "sparse region" from
+    "something is wrong with the footprints".
 
-    **It does not record which dates were lost, and that is deliberate.** A store's time axis only
-    grows, so once a later date commits, every day at or below it is closed to that store for
-    good — whatever the imagery for it turns out to be. A run therefore never revisits such a day,
-    and a record of it unlocks no action. What survives a fill is the embeddings store, and it
-    already publishes per-pixel observation counts and a per-month coverage mask per sensor; the
-    mosaic this attribute sits on is deleted once a cell lands. See ``ingest/README.md``.
+    **It does not record WHICH dates were lost, deliberately.** A store's time axis only
+    grows, so once a later date commits every day at or below it is closed to that store for
+    good; a run never revisits such a day and a record of it unlocks no action. What survives
+    a fill is the embeddings store, which already publishes per-pixel observation counts and
+    a per-month coverage mask per sensor, and the mosaic this attribute sits on is deleted
+    once a cell lands. See ``ingest/README.md``.
 
-    OPENS, never creates: this runs only against a store that was just written. Failing
-    here must not be fatal — the assessment is an optimisation of the gate's judgement, and
-    a store without it simply falls back to the stricter every-month-present rule.
+    OPENS, never creates: it runs only against a store just written. Failing here must not be
+    fatal — the assessment only optimises the gate's judgement, and a store without it falls
+    back to the stricter every-month-present rule.
     """
     try:
         repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
@@ -1269,12 +1184,12 @@ def record_assessed_window(
         root = zarr.open_group(session.store, mode="a")
         root.attrs[ASSESSED_WINDOW_ATTR] = [start_date, end_date]
         root.attrs["assessed_empty_dates"] = int(empty_dates)
-        # ``allow_empty`` because re-recording the SAME window writes no bytes, and icechunk
+        # ``allow_empty`` because re-recording the SAME window writes no bytes and icechunk
         # refuses a commit with no changes ("cannot commit, no changes made to the session").
         # That refusal surfaced as a WARNING on healthy stores — every resumed leg that had
-        # already recorded its window logged one — which is the worse failure: a warning that
-        # fires routinely teaches the reader to skip the whole line, including the times it
-        # means something. The record is idempotent, so committing it again is harmless.
+        # already recorded its window logged one — and a warning that fires routinely teaches
+        # the reader to skip the line, including when it means something. The record is
+        # idempotent, so committing it again is harmless.
         session.commit(
             f"assessed window {start_date}..{end_date} ({empty_dates} empty date(s))",
             allow_empty=True,
@@ -1293,15 +1208,15 @@ def get_existing_dates(
 ) -> set[str]:
     """Get dates already present in a store. Returns an empty set only if it has none.
 
-    **Fails closed.** An empty return means "this store holds no dates", and callers
-    act on that: :func:`write_dataset` routes an empty result to the CREATE path, which
-    adopts an existing repo and writes ``mode="w"``. So an empty set produced by a
-    transient read failure is not a missed optimisation, it is a request to overwrite
-    committed data. Only genuine absence answers empty; everything else — auth,
-    throttling, timeout, corrupt metadata, a decode failure — propagates.
+    **Fails closed.** An empty return means "this store holds no dates", and callers act on
+    that: :func:`write_dataset` routes it to the CREATE path, which adopts an existing repo
+    and writes ``mode="w"``. An empty set produced by a transient read failure is therefore
+    not a missed optimisation but a request to overwrite committed data, so only genuine
+    absence answers empty; everything else — auth, throttling, timeout, corrupt metadata, a
+    decode failure — propagates.
 
-    Absence covers both a missing repo and a repo with no root group (an interrupted
-    first write), which is the state ``_write_new`` exists to adopt.
+    Absence covers both a missing repo and a repo with no root group (an interrupted first
+    write), the state ``_write_new`` exists to adopt.
     """
     t0 = time.monotonic()
     logger.debug(f"Opening store: {store_path}")
@@ -1333,34 +1248,27 @@ def resolve_region(
 ) -> dict[str, slice]:
     """Map coordinate-value ranges to half-open integer slices for an existing store.
 
-    Each argument is a fully-inclusive ``(low, high)`` coordinate range or
-    ``None`` (= the full axis, omitted from the result). Both ends are matched
-    (``coord >= low & coord <= high``); the returned slices are half-open
-    ``[start, stop)`` in the usual Python sense. ``(low, high)`` may be given in
-    either order — they're sorted before matching — so a descending axis can be
-    addressed low-to-high or high-to-low. ``time`` accepts anything
-    ``np.datetime64`` understands. Spatial bounds are matched against the
-    store's ``northing``/``easting`` coordinate values regardless of axis
-    direction (northing typically descends).
+    Each argument is a fully-inclusive ``(low, high)`` coordinate range or ``None`` (= the
+    full axis, omitted from the result). Both ends are matched (``coord >= low & coord <=
+    high``) and the returned slices are half-open ``[start, stop)``. The bounds may be given
+    in either order — they are sorted before matching — so a descending axis (northing
+    typically) can be addressed either way. ``time`` accepts anything ``np.datetime64``
+    understands. ``get_credentials``/``s3_region`` are forwarded to the store opener so a
+    store outside the default S3 region resolves with the same options later passed to
+    :func:`write_region`.
 
-    ``get_credentials``/``s3_region`` are forwarded to the store opener so a
-    store outside the default S3 region can be resolved with the same options
-    later passed to :func:`write_region`.
+    Returns a dict of integer slices for :func:`write_region`, containing only dims with a
+    non-``None`` range; an empty dict means "the whole array", which the caller should treat
+    as a plain overwrite rather than a region.
 
-    Returns a dict of integer slices suitable for :func:`write_region`. Only
-    dims with a non-``None`` range are included; an empty dict means "the whole
-    array" (which the caller should treat as a plain overwrite, not a region).
-
-    Enforces the overwrite-in-place contract: the requested range must select at
-    least one existing coordinate. A range that matches nothing (e.g. a date not
-    in the store) raises ``ValueError`` — appending new coordinates is
-    :func:`write_dataset`'s job, not a region write's. The matched coordinates
-    must also be contiguous; a range straddling a gap (e.g. an out-of-order time
-    axis) raises rather than silently widening the slice to cover the gap.
+    Enforces the overwrite-in-place contract. A range matching nothing (a date not in the
+    store) raises ``ValueError`` — appending new coordinates is :func:`write_dataset`'s job.
+    The matched coordinates must also be contiguous; a range straddling a gap (an
+    out-of-order time axis) raises rather than silently widening the slice over it.
     """
-    # chunks=None: only the 1-D northing/easting/time coords are read here, never
-    # pixels, so skip building a per-chunk dask graph — matters when this is called
-    # repeatedly (e.g. resolving many features against a continental master).
+    # chunks=None: only the 1-D northing/easting/time coords are read here, never pixels, so
+    # skip building a per-chunk dask graph — it matters when this is called repeatedly, e.g.
+    # resolving many features against a continental master.
     ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region, chunks=None, group=group)
     try:
         ranges = {"time": time, "northing": northing, "easting": easting}
@@ -1375,8 +1283,7 @@ def resolve_region(
                 high: Any = np.datetime64(str(raw_high), "ns")
             else:
                 low, high = raw_low, raw_high
-            # Accept the range in either order: a descending axis (northing) is
-            # often addressed high-to-low, so sort the bounds before masking.
+            # Either order: a descending axis (northing) is often addressed high-to-low.
             lo_b, hi_b = (low, high) if low <= high else (high, low)
             mask = (coord >= lo_b) & (coord <= hi_b)
             hits = np.flatnonzero(mask)
@@ -1407,23 +1314,20 @@ def write_region(
 ) -> None:
     """Overwrite a region of an existing store in place, in one atomic commit.
 
-    ``region`` maps dimension names (``time``/``northing``/``easting``) to
-    integer slices — typically from :func:`resolve_region`. Dimensions absent
-    from ``region`` are written in full. ``data`` must already cover exactly the
-    cells the region selects (same shape along each region dim); its own
-    coordinate values are ignored (the store's coords are authoritative) and are
-    dropped before writing.
+    ``region`` maps dimension names (``time``/``northing``/``easting``) to integer slices,
+    typically from :func:`resolve_region`; dimensions absent from it are written in full.
+    ``data`` must cover exactly the cells the region selects (same shape along each region
+    dim), and its own coordinate values are dropped before writing since the store's coords
+    are authoritative.
 
-    The region need not be chunk-aligned: unaligned edges are padded out to the
-    enclosing chunk boundaries and the untouched cells backfilled from the store
-    (read-modify-write), so the caller never has to reason about chunk
-    boundaries. ``update_attrs`` is merged into root attrs after the write
-    (root attrs are otherwise preserved across the write).
+    The region need not be chunk-aligned: unaligned edges are padded out to the enclosing
+    chunk boundaries and the untouched cells backfilled from the store (read-modify-write),
+    so the caller never reasons about chunk boundaries. ``update_attrs`` is merged into root
+    attrs after the write, which otherwise preserves them.
 
-    Contract: every region dim must already exist in the store at the given
-    indices. This overwrites committed data — see the region-writes design doc
-    for the consistency caveats when a single logical region is split across
-    multiple calls.
+    Contract: every region dim must already exist in the store at the given indices. This
+    overwrites committed data — see ``context_docs/design/region-writes.md`` for the
+    consistency caveats when one logical region is split across multiple calls.
     """
     if not region:
         raise ValueError("write_region requires a non-empty region; use write_dataset for full writes.")
@@ -1441,47 +1345,42 @@ def write_region(
 class RegionWriteBatch:
     """Many positional window writes under ONE icechunk commit.
 
-    Handed out by :func:`batched_region_writes`. Direct zarr assignment on the
-    session's store — no Dask, no task graph (the avoid-Dask principle in the
-    live-tile-cropping design note): the caller computes each window to numpy and
-    this places it. Windows must be mutually chunk-disjoint (the chunk-snapped
-    window derivation guarantees it); two writes straddling one chunk in a session
-    are unsupported.
+    Handed out by :func:`batched_region_writes`. Direct zarr assignment on the session's
+    store — no Dask, no task graph (the avoid-Dask principle in
+    ``context_docs/design/ingest-live-tile-cropping.md``): the caller computes each window to
+    numpy and this places it. Windows must be mutually chunk-disjoint, which the chunk-snapped
+    window derivation guarantees; two writes straddling one chunk in a session are
+    unsupported.
     """
 
     def __init__(self, session: "icechunk.Session", store_path: str | None = None) -> None:
-        #: Which store this is, for the refusals below. A session does not carry its own
-        #: path, and a refusal that names only a date tells an operator nothing they can act
-        #: on: the remedy is to wipe and re-ingest ONE store, so the message has to say which.
+        #: Which store this is, for the refusals below. A session does not carry its own path,
+        #: and a refusal naming only a date tells an operator nothing actionable: the remedy is
+        #: to wipe and re-ingest ONE store, so the message has to say which.
         self.store_path = store_path
-        #: The batch's session. Exposed because window PIXEL data at volume should
-        #: be written as ``to_icechunk(win, batch.session, mode="r+", region=...)``
-        #: — placement stays on the Dask workers that computed the pixels instead
-        #: of funnelling the date's live volume through the one worker running the
-        #: caller (dense-zone arithmetic in the design note). Same session, same
-        #: single commit; ``write_window`` below is for volumes that comfortably
-        #: fit on the calling worker.
+        #: The batch's session. Exposed because window PIXEL data at volume should be written
+        #: as ``to_icechunk(win, batch.session, mode="r+", region=...)`` — placement then stays
+        #: on the Dask workers that computed the pixels instead of funnelling the date's live
+        #: volume through the one worker running the caller (dense-zone arithmetic in the
+        #: design note). Same session, same single commit; ``write_window`` below is for
+        #: volumes that comfortably fit on the calling worker.
         self.session = session
-        #: The store's root group, writable. Exposed so callers can read/merge root
-        #: attrs (baselines, doy, last_appended) — attr edits land in the same commit.
+        #: The store's root group, writable. Exposed so callers can read and merge root attrs
+        #: (baselines, doy, last_appended) — attr edits land in the same commit.
         self.group: zarr.Group = zarr.open_group(session.store, mode="r+")
 
     def append_time_slot(self, when: np.datetime64) -> int:
         """Grow the time axis by one date and return its index. Metadata only.
 
-        Resizes the time coord and every time-dimensioned array by one slot —
-        icechunk arrays are sparse, so the new slot costs no chunks until written.
-        The session sees its own uncommitted resize, so window writes into the
-        returned index work immediately (verified by experiment; see the design
-        note).
+        Resizes the time coord and every time-dimensioned array by one slot — icechunk arrays
+        are sparse, so the new slot costs no chunks until written. The session sees its own
+        uncommitted resize, so window writes into the returned index work immediately.
 
         A date already on the axis raises :class:`~tessera_embeddings.errors.DuplicateDateError`.
-        **The likeliest cause is a SECOND WRITER on this store**, not a bug in the
-        caller: the ingest paths read the committed dates and skip what they find, so
-        the only way a date they decided to write is already present is that another
-        process committed it after that read. Chasing it as a date-derivation bug is a
-        long detour past the actual problem. A retry bug double-stamping one date is the
-        remaining possibility, and the rarer one.
+        **The likeliest cause is a SECOND WRITER on this store**, not a caller bug: the ingest
+        paths read the committed dates and skip what they find, so the only way a date they
+        decided to write is already present is that another process committed it after that
+        read. A retry bug double-stamping one date is the remaining, rarer possibility.
         """
         when_ns = np.asarray(when, dtype="datetime64[ns]")
         existing = read_time_values(self.group)
@@ -1493,12 +1392,11 @@ class RegionWriteBatch:
                 "looking for a date-derivation bug."
             )
         # The axis is read POSITIONALLY downstream (the resampler samples by position, not by
-        # timestamp), so appending an older date than one already stored silently changes which
+        # timestamp), so appending a date older than one already stored silently changes which
         # observations a repaired store yields against a clean one holding the same dates.
-        # This append cannot fix that by inserting in place — that would mean moving every
-        # array's data — so it refuses, and the caller has to decide. A batch that discovers
-        # an older date mid-run is the reachable case and it lands here loudly instead of
-        # committing a store nothing downstream can tell is wrong.
+        # Inserting in place would mean moving every array's data, so this refuses instead and
+        # the caller decides — loudly, rather than committing a store nothing downstream can
+        # tell is wrong.
         if len(existing) and when_ns < existing.max():
             raise NonMonotonicDateError(
                 f"date {when_ns} is older than the latest date already on the time axis "
@@ -1519,8 +1417,8 @@ class RegionWriteBatch:
         time_arr.resize((t_index + 1,))
         time_arr[t_index] = when_ns.astype("int64")  # int64 ns per TIME_ENCODING
         for name, arr in self.group.arrays():
-            # zarr v3 metadata carries dimension_names; every engine-written store
-            # is v3, and a v2 array would predate the convention entirely.
+            # zarr v3 metadata carries dimension_names; every engine-written store is v3, and
+            # a v2 array would predate the convention entirely.
             dims = getattr(arr.metadata, "dimension_names", None)
             if name != "time" and dims and dims[0] == "time":
                 arr.resize((t_index + 1, *arr.shape[1:]))
@@ -1544,34 +1442,32 @@ def batched_region_writes(
 ) -> Iterator[RegionWriteBatch]:
     """One writable session, N window writes (+ optional attr edits), one commit.
 
-    The per-date write unit of the live-window ingest path: everything done through
-    the yielded :class:`RegionWriteBatch` lands atomically in a single snapshot on
-    exit. On an exception nothing commits — the abandoned session is invisible to
-    readers, so a retry starts clean from the last committed state.
+    The per-date write unit of the live-window ingest path: everything done through the
+    yielded :class:`RegionWriteBatch` lands atomically in a single snapshot on exit. On an
+    exception nothing commits — the abandoned session is invisible to readers, so a retry
+    starts clean from the last committed state.
 
-    Deliberately NOT the removed Dask-graph batch write (`write_regions`): there is
-    no graph here at all. For a single arbitrary (unaligned) region overwrite, use
-    :func:`write_region`, which pads to chunk boundaries; this path requires
+    There is no Dask graph here at all. For a single arbitrary (unaligned) region overwrite
+    use :func:`write_region`, which pads to chunk boundaries; this path requires
     chunk-disjoint windows and one commit is the point.
     """
     repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
     yield RegionWriteBatch(session, store_path)
-    # Timed because the commit (manifest + snapshot writes) is serial per-date work
-    # no fleet width can compress — the pipeline instrumentation needs it separable
-    # from the window computes it follows.
+    # Timed because the commit (manifest + snapshot writes) is serial per-date work no fleet
+    # width can compress, and the pipeline instrumentation needs it separable from the window
+    # computes it follows. DEBUG, so one line per DATE on the ingest path: the duration is
+    # already inside the caller's per-date/per-batch line, and every ingest task runs on a
+    # Dask worker whose Prefect logs are shipped to the orchestrator API.
     commit_started = time.monotonic()
     session.commit(message)
-    # DEBUG: one per commit, so one per DATE on the ingest path. The commit duration is
-    # already inside the caller's per-date/per-batch timing line, and every ingest task
-    # runs on a Dask worker whose Prefect logs are shipped to the orchestrator API.
     logger.debug("Committed '%s' in %.1fs", message, time.monotonic() - commit_started)
 
 
-#: Fan-in of the tree reduction that merges window changesets back into the session.
-#: Shared by both write paths so they reduce identically — the overlapped path merges
-#: every window's changesets in one reduction, the sequential path one window's at a
-#: time, and a difference here would show up as a behaviour difference between them.
+#: Fan-in of the tree reduction that merges window changesets back into the session. Shared by
+#: both write paths so they reduce identically — the overlapped path merges every window's
+#: changesets in one reduction, the sequential path one window's at a time, and a difference
+#: here would show up as a behaviour difference between them.
 _MERGE_SPLIT_EVERY = 8
 
 
@@ -1597,30 +1493,28 @@ def _write_windows_overlapped(
 ) -> bool:
     """Write every window of one or more dates as ONE dask compute on one forked session.
 
-    The sequential path issues one ``to_icechunk`` per window, and each call runs
-    its graph to completion before the next window starts — so a date costs the SUM
-    of its windows' critical paths while the fleet works on one window at a time.
-    This lifts icechunk's own dask sequence (fork → lazy stored arrays → merge
-    reduction) one level so all windows share a single compute and their critical
-    paths overlap across the fleet. The windows' chunk-disjointness (enforced by the
-    caller's alignment guard) is what makes the merged changesets conflict-free —
-    the same property the sequential path relies on for one-commit-per-date.
+    The sequential path issues one ``to_icechunk`` per window and runs each graph to
+    completion before the next starts, so a date costs the SUM of its windows' critical paths
+    while the fleet works on one window at a time. This lifts icechunk's own dask sequence
+    (fork → lazy stored arrays → merge reduction) one level so all windows share a single
+    compute and overlap across the fleet. The windows' chunk-disjointness, enforced by the
+    caller's alignment guard, is what makes the merged changesets conflict-free — the same
+    property the sequential path relies on for one-commit-per-date.
 
-    ``writes`` carries ``(day_ds, windows, time_index, drop)`` per date. Several
-    dates in one call is the windows→date induction applied once more: distinct
-    time indices make the dates' chunk writes mutually disjoint exactly as windows
-    within a date are, so they share the single fork, compute and merge the same
-    way. What dates cannot share is a session each: every date's append resizes the
-    time axis, so sibling sessions forked from one snapshot conflict on array
-    METADATA even though their chunk data never overlaps. A multi-date batch is
-    therefore one session and one commit by construction, not by preference.
+    ``writes`` carries ``(day_ds, windows, time_index, drop)`` per date. Several dates in one
+    call is the same induction applied once more: distinct time indices make the dates' chunk
+    writes mutually disjoint exactly as windows within a date are, so they share the single
+    fork, compute and merge. What dates cannot share is a session each — every date's append
+    resizes the time axis, so sibling sessions forked from one snapshot conflict on array
+    METADATA even though their chunk data never overlaps. A multi-date batch is therefore one
+    session and one commit by construction, not by preference.
 
-    Returns ``False`` without computing anything when the icechunk internals this
-    lifts are unavailable or have drifted, so the caller falls back to the
-    sequential path. The metadata writes performed before such a fallback change no
-    array values (the windows are region writes into existing arrays), so the
-    sequential rewrite of the same windows is safe. The two paths are byte-identical
-    by test; drift degrades to the shipped behaviour, never to a failure.
+    Returns ``False`` without computing anything when the icechunk internals this lifts are
+    unavailable or have drifted, so the caller falls back to the sequential path. Metadata
+    writes performed before such a fallback change no array values (the windows are region
+    writes into existing arrays), so the sequential rewrite of the same windows is safe. The
+    two paths are byte-identical by test; drift degrades to the shipped behaviour, never to a
+    failure.
     """
     try:
         from icechunk.dask import session_merge_reduction
@@ -1639,8 +1533,8 @@ def _write_windows_overlapped(
                     _window_slice(day_ds, window, drop),
                     store=session.store,
                     safe_chunks=True,
-                    # Same memory rationale as the sequential path: each write task carries
-                    # one store chunk, not one whole load block.
+                    # Same memory rationale as the sequential path below: each write task
+                    # carries one store chunk, not one whole load block.
                     align_chunks=True,
                 )
                 writer._open_group(group=None, mode="r+", append_dim=None, region=_window_region(window, time_index))
@@ -1669,13 +1563,12 @@ def _write_windows_overlapped(
         return False
 
     if stored:
-        # The single compute: every window's loads, masks and chunk writes in one
-        # graph, reduced to one mergeable changeset.
+        # The single compute: every window's loads, masks and chunk writes in one graph,
+        # reduced to one mergeable changeset.
         session.merge(session_merge_reduction(stored, split_every=_MERGE_SPLIT_EVERY))
-    # DEBUG, not INFO: emitted once per write — the chattiest line this path produces —
-    # and Prefect ships task logs to the orchestrator API from whichever Dask worker ran
-    # the task, so this scales with total worker count. Its timing is already covered by
-    # the caller's per-date/per-batch timing line.
+    # DEBUG, not INFO: the chattiest line this path produces, once per write, and Prefect
+    # ships task logs to the orchestrator API from whichever Dask worker ran the task, so it
+    # scales with total worker count. The timing is already in the caller's per-batch line.
     logger.debug(
         "Parallel window compute: %d window(s) across %d date(s) in one graph: %.1fs",
         n_windows,
@@ -1705,14 +1598,13 @@ def write_day_windows(
 ) -> None:
     """Write ONE date's live windows into a mosaic store, one commit for the date.
 
-    The single-date form of :func:`write_days_windows`, kept as the everyday entry
-    point: one call is one date is one snapshot, which is the granularity the
-    resume machinery (``get_existing_dates`` + gap backfill) and the retry story
-    are built around. See :func:`write_days_windows` for everything else — this
-    delegates verbatim.
+    The single-date form of :func:`write_days_windows` and the everyday entry point: one call
+    is one date is one snapshot, the granularity the resume machinery
+    (``get_existing_dates`` + gap backfill) and the retry story are built around. This
+    delegates verbatim; see :func:`write_days_windows` for everything else.
     """
-    # This function's own contract, checked here so its error names the caller's
-    # mistake ("per call") rather than the batch form's ("per entry").
+    # This function's own contract, checked here so the error names the caller's mistake
+    # ("per call") rather than the batch form's ("per entry").
     if day_ds.sizes["time"] != 1:
         raise ValueError(f"write_day_windows writes one date per call; got time size {day_ds.sizes['time']}")
     write_days_windows(
@@ -1747,37 +1639,33 @@ def write_days_windows(
     """Write one or more dates' live windows into a mosaic store, ONE commit for the batch.
 
     ``parallel_windows`` submits every window of every date as a single dask compute
-    (:func:`_write_windows_overlapped`) instead of one blocking compute per window,
-    so all the critical paths overlap across the fleet rather than summing — and
-    with several dates, one date's straggling reads backfill with another date's
-    work. Both paths produce identical stores (pinned by test); when the overlapped
-    machinery is unavailable the sequential path runs regardless, so the flag can
-    never make a write fail that would otherwise have succeeded.
+    (:func:`_write_windows_overlapped`) instead of one blocking compute per window, so the
+    critical paths overlap across the fleet rather than summing — and with several dates, one
+    date's straggling reads backfill with another date's work. Both paths produce identical
+    stores (pinned by test), and when the overlapped machinery is unavailable the sequential
+    path runs regardless, so the flag can never fail a write that would otherwise succeed.
 
-    The batch is one commit BY CONSTRUCTION, not by preference: each date's append
-    resizes the time axis, so per-date sessions forked from one snapshot would
-    conflict on array metadata even though their chunk data is disjoint. The
-    atomicity unit is therefore the batch — a failure commits none of its dates,
-    the retry starts clean from the last committed state, and ``get_existing_dates``
-    sees exactly the committed dates either way. Dates must arrive in strictly
-    increasing order, because their append order IS the time axis's order.
+    The batch is one commit BY CONSTRUCTION: each date's append resizes the time axis, so
+    per-date sessions forked from one snapshot would conflict on array metadata even though
+    their chunk data is disjoint. The atomicity unit is therefore the batch — a failure
+    commits none of its dates, the retry starts clean from the last committed state, and
+    ``get_existing_dates`` sees exactly the committed dates either way. Dates must arrive in
+    strictly increasing order, because their append order IS the time axis's order.
 
-    The cropped counterpart of :func:`write_dataset` (same bookkeeping contract,
-    write volume proportional to live area instead of extent). Each ``day_ds`` is
-    that date's full-extent LAZY dataset (``time`` size 1); each ``(y0, y1, x0, x1)``
-    window — chunk-disjoint, from ``ingest.live_windows`` — is written as a
-    ``to_icechunk`` region on one shared session, so the pixels flow from the Dask
-    workers that computed them (never materialised on the caller — see the design
-    note's dense-zone arithmetic).
+    The cropped counterpart of :func:`write_dataset`: same bookkeeping contract, write volume
+    proportional to live area instead of extent. Each ``day_ds`` is that date's full-extent
+    LAZY dataset (``time`` size 1), and each chunk-disjoint ``(y0, y1, x0, x1)`` window from
+    ``ingest.live_windows`` is written as a ``to_icechunk`` region on one shared session, so
+    pixels flow from the Dask workers that computed them and are never materialised on the
+    caller (dense-zone arithmetic in the design note).
 
     A missing store is seeded all-fill with an EMPTY time axis via
-    :func:`~.empty_store.create_empty_store` (schema-only: cost independent of
-    extent, same attr set :func:`write_dataset` creates); every date — the first
-    included — then appends its time slot atomically WITH its windows and merges
-    attrs exactly as the append path does (baselines union / doy concat /
-    ``last_appended`` bump). The manifest is validated against the store BEFORE
-    anything is written — the per-append structural gate must not be lost to
-    batching.
+    :func:`~.empty_store.create_empty_store` (schema-only, so its cost is independent of
+    extent, with the same attr set :func:`write_dataset` creates); every date, the first
+    included, then appends its time slot atomically WITH its windows and merges attrs exactly
+    as the append path does (baselines union, doy concat, ``last_appended`` bump). The
+    manifest is validated BEFORE anything is written — the per-append structural gate must
+    not be lost to batching.
     """
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 
@@ -1792,10 +1680,10 @@ def write_days_windows(
             raise ValueError(f"write_days_windows writes one date per entry; got time size {day_ds.sizes['time']}")
         # The windowed write does NOT realign the producer's blocks to the store's chunks
         # (see the to_icechunk call below), which is only sound while every store chunk a
-        # window covers is written WHOLLY by that window. Checked here rather than trusted:
-        # a misaligned window would either be rejected by mode="r+" deep in the write or,
-        # worse, straddle a chunk with a neighbouring window and make the result depend on
-        # write order. Ends are exempt — the array's own last chunk is short.
+        # window covers is written WHOLLY by that window. Checked rather than trusted: a
+        # misaligned window would either be rejected by mode="r+" deep in the write or, worse,
+        # straddle a chunk with a neighbour and make the result depend on write order. Ends
+        # are exempt — the array's own last chunk is short.
         for y0, y1, x0, x1 in windows:
             if y0 % _cy or x0 % _cx or (y1 % _cy and y1 != height) or (x1 % _cx and x1 != width):
                 raise ValueError(
@@ -1809,26 +1697,24 @@ def write_days_windows(
     day_ds = days[0][0]  # schema donor for seeding; every date shares the store's schema
     date_str = str(whens[0])[:10]
 
-    # Seed with an EMPTY time axis, so the first date takes the same atomic
-    # append+windows commit as every other date. Seeding times=[when] would
-    # commit the date BEFORE its pixels: a crash between the two leaves an
-    # all-fill timestep that get_existing_dates then reports as ingested — the
-    # retry hits the duplicate-date guard and the STAC dedupe filters the date
-    # forever. Existence is probed on the repo, not the (possibly empty) axis.
+    # Seed with an EMPTY time axis so the first date takes the same atomic append+windows
+    # commit as every other date. Seeding times=[when] would commit the date BEFORE its
+    # pixels: a crash between the two leaves an all-fill timestep that get_existing_dates
+    # reports as ingested, so the retry hits the duplicate-date guard and the STAC dedupe
+    # filters the date forever. Existence is probed on the repo, not the (possibly empty) axis.
     needs_seed = False
     try:
-        # Probe the ROOT GROUP, not just the repo: _create_repo creates the repo
-        # before create_empty_store writes and commits the schema, so a crash in
-        # between leaves a rootless repo. Probing the repo alone would then find
-        # it, skip seeding, and every retry would fail opening the missing group —
-        # wedged forever. (Same failure the global-store seeder hit; see its
-        # GroupNotFoundError handling.)
+        # Probe the ROOT GROUP, not just the repo: _create_repo creates the repo before
+        # create_empty_store writes and commits the schema, so a crash in between leaves a
+        # rootless repo. Probing the repo alone would find it, skip seeding, and leave every
+        # retry failing to open the missing group — wedged forever. (Same failure the
+        # global-store seeder hit; see its GroupNotFoundError handling.)
         open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
     except icechunk.IcechunkError as exc:
-        # ONLY genuine absence means "seed me". Treating every IcechunkError as absence
-        # sends an auth failure, a throttle, a timeout or real corruption into the
-        # create path, where it resurfaces as a dirty-prefix CorruptedStoreError —
-        # masking the real cause and defeating the write retry's ability to report it.
+        # ONLY genuine absence means "seed me". Treating every IcechunkError as absence sends
+        # an auth failure, a throttle, a timeout or real corruption into the create path,
+        # where it resurfaces as a dirty-prefix CorruptedStoreError, masking the real cause
+        # and defeating the write retry's ability to report it.
         if not is_missing_repo(exc):
             raise
         needs_seed = True
@@ -1847,23 +1733,23 @@ def write_days_windows(
             baselines={},  # merged per date below, exactly like the append path
             manifest=manifest,
             # Seed through a repo opened with THIS call's credentials/region. Letting
-            # create_empty_store open its own would use the default storage config,
-            # so the probe above and every write below would honour a callback or a
-            # non-default region while the one-time seed silently did not — failing
-            # the first cropped date of any such deployment.
+            # create_empty_store open its own would use the default storage config, so the
+            # probe above and every write below would honour a callback or a non-default
+            # region while the one-time seed silently did not, failing the first cropped date
+            # of any such deployment.
             #
-            # open_or_create, NOT create: the probe above fires for a MISSING repo and
-            # for an existing-but-ROOTLESS one alike (GroupNotFoundError subclasses
-            # FileNotFoundError). Creating unconditionally would hit Icechunk's
-            # clean-prefix rule on the rootless case and raise CorruptedStoreError on
-            # every retry — wedging exactly the crash window this recovery exists for.
+            # open_or_create, NOT create: the probe above fires alike for a MISSING repo and
+            # an existing-but-ROOTLESS one (GroupNotFoundError subclasses FileNotFoundError).
+            # Creating unconditionally would hit Icechunk's clean-prefix rule on the rootless
+            # case and raise CorruptedStoreError on every retry — wedging exactly the crash
+            # window this recovery exists for.
             repo=open_or_create_repo(store_path, get_credentials=get_credentials, region=s3_region)[0],
         )
 
     total_windows = sum(len(w) for _, w in days)
     if len(days) == 1:
-        # The single-date message format is a stable interface: commit-cadence
-        # tooling and log queries parse `date <iso>:` out of snapshot messages.
+        # A stable interface: commit-cadence tooling and log queries parse `date <iso>:` out
+        # of snapshot messages.
         message = f"date {date_str}: {total_windows} live window(s)"
     else:
         message = f"dates {date_str}..{str(whens[-1])[:10]} ({len(days)} dates): {total_windows} live window(s)"
@@ -1875,10 +1761,10 @@ def write_days_windows(
         s3_region=s3_region,
     ) as batch:
         mixed = manifest.validate_against(extract_manifest(dict(batch.group.attrs)), store_path) if manifest else []
-        # Slots are appended for every date up front — the session sees its own
-        # uncommitted resizes, so each date's windows write into its own index. The
-        # appends and the windows land in the ONE commit together, preserving the
-        # no-date-before-its-pixels invariant at batch granularity.
+        # Slots are appended for every date up front — the session sees its own uncommitted
+        # resizes, so each date's windows write into its own index. Appends and windows land
+        # in the ONE commit together, preserving the no-date-before-its-pixels invariant at
+        # batch granularity.
         writes: list[tuple[xr.Dataset, list[tuple[int, int, int, int]], int, list[str]]] = []
         for (one_ds, one_windows), when in zip(days, whens, strict=True):
             t = batch.append_time_slot(when)
@@ -1904,20 +1790,17 @@ def write_days_windows(
                     batch.session,
                     mode="r+",
                     region=_window_region(window, t),
-                    # align_chunks stays ON, and the reason is memory rather than graph
-                    # size. Dropping it does shrink the graph a little and ran ~4% faster,
-                    # but it makes each write task carry a whole load block instead of one
-                    # store chunk, which pushed workers over their spill threshold: peak
-                    # spill 3.19 GiB across ~30% of scheduler samples, against zero with it
-                    # on. Spill is a hidden cost that scales badly here, so the ~4% is not
-                    # worth it. Untested middle path if it is ever wanted: halve the
-                    # threads per worker to restore the headroom.
+                    # ON for memory, not graph size. Dropping it shrinks the graph a little
+                    # and ran ~4% faster, but each write task then carries a whole load block
+                    # instead of one store chunk, which pushed workers over their spill
+                    # threshold: peak spill 3.19 GiB across ~30% of scheduler samples, against
+                    # zero with it on. Spill scales badly here, so the ~4% is not worth it.
                     align_chunks=True,
                     split_every=_MERGE_SPLIT_EVERY,
                 )
-                # Each window is a blocking compute, so these lines ARE the write
-                # pipeline's decomposition: their sum against the date's write phase says
-                # whether windows serialise, and their spread says what overlap can buy.
+                # Each window is a blocking compute, so these lines ARE the write pipeline's
+                # decomposition: their sum against the date's write phase says whether
+                # windows serialise, and their spread says what overlap can buy.
                 logger.info(
                     "Window %d/%d rows=%d..%d: %.1fs",
                     i,
@@ -1929,10 +1812,7 @@ def write_days_windows(
 
 
 def compute_doy(timestamps: np.ndarray) -> np.ndarray:
-    """Compute day-of-year from datetime64 timestamps.
-
-    Returns (N,) array of int32 DOY values (1-366).
-    """
+    """Compute day-of-year from datetime64 timestamps: an (N,) int32 array of 1-366."""
     years = timestamps.astype("datetime64[Y]")
     return ((timestamps.astype("datetime64[D]") - years).astype(int) + 1).astype(np.int32)
 
@@ -1957,20 +1837,19 @@ def write_dataset(
         tile_id: Tile identifier for store metadata.
         baselines: Dict mapping date strings to baseline integers.
         chunks: Chunk sizes dict with ``time``, ``northing``, and ``easting`` keys.
-        manifest: Typed manifest for append-safety validation.
-            Written on create, validated on append.
-        crs: CRS authority code (e.g. ``"EPSG:32615"``). Stored in root
-            attrs so downstream consumers can determine the projection.
+        manifest: Typed manifest for append-safety validation, written on create and
+            validated on append.
+        crs: CRS authority code (e.g. ``"EPSG:32615"``), stored in root attrs so downstream
+            consumers can determine the projection.
         get_credentials: Optional credential callback for Icechunk's S3 client.
-        s3_region: Optional S3 region override. Threaded through EVERY open below,
-            not just the first: a store outside the default region must be read,
-            created and appended the same way, or the ingest fails partway.
+        s3_region: Optional S3 region override. Threaded through EVERY open below, not just
+            the first: a store outside the default region must be read, created and appended
+            the same way, or the ingest fails partway.
     """
     existing_dates = get_existing_dates(store_path, get_credentials=get_credentials, s3_region=s3_region)
 
-    # Normalize time to nanosecond resolution to match TIME_ENCODING.
-    # Newer pandas/xarray versions may produce datetime64[us]; coerce
-    # so the zarr encoding round-trips correctly.
+    # Normalize time to nanoseconds to match TIME_ENCODING: newer pandas/xarray may produce
+    # datetime64[us], which would not round-trip through the zarr encoding.
     if data.time.dtype != np.dtype("datetime64[ns]"):
         data = data.assign_coords(time=data.time.values.astype("datetime64[ns]"))
 

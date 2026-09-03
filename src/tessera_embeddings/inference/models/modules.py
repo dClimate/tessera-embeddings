@@ -1,7 +1,7 @@
 """Neural network modules for the Tessera dual-Transformer model.
 
-Ported from tessera_infer/src/models/modules.py with type hints and ruff compliance.
-Logic is unchanged from the original implementation.
+Ported from ``tessera_infer/src/models/modules.py``; logic is unchanged, so the layouts here are
+fixed by the checkpoints rather than chosen.
 """
 
 import logging
@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 class CustomGRUCell(nn.Module):
     """GRU cell with explicit separate linear layers for each gate.
 
-    Uses 6 separate ``nn.Linear(bias=False)`` layers for input/hidden gate weights
-    plus 3 bias parameters. This matches the tessera beta QAT checkpoint layout.
+    Six ``nn.Linear(bias=False)`` layers for the input/hidden gate weights plus three bias
+    parameters, matching the tessera beta QAT checkpoint layout.
     """
 
     def __init__(self, input_size: int, hidden_size: int) -> None:
@@ -65,14 +65,10 @@ class CustomGRUCell(nn.Module):
 class CustomGRU(nn.Module):
     """GRU built from ``CustomGRUCell``, matching ``nn.GRU(batch_first=True)`` contract.
 
-    Used to match the tessera beta QAT checkpoint which stores per-gate linear weights
-    instead of the fused weight matrices used by ``nn.GRU``.
-
-    This is a *reference* implementation of the checkpoint's exact recurrence. In the
-    production inference graph it does not run: ``builder._fuse_custom_gru`` replaces
-    every instance with a cuDNN ``nn.GRU`` (one fused kernel vs. this per-step loop)
-    before the model is used. Keep this simple and checkpoint-faithful; the GPU-fast
-    path is the fused ``nn.GRU``, not this module.
+    Exists because the tessera beta QAT checkpoint stores per-gate linear weights rather than
+    ``nn.GRU``'s fused matrices. A *reference* implementation only: ``builder._fuse_custom_gru``
+    swaps every instance for a cuDNN ``nn.GRU`` before the model runs, so keep this simple and
+    checkpoint-faithful and leave the speed to the fused path.
     """
 
     def __init__(self, input_size: int, hidden_size: int) -> None:
@@ -163,9 +159,9 @@ class TemporalAwarePooling(nn.Module):
 class TemporalEncoding(nn.Module):
     """Learnable temporal encoding from day-of-year values.
 
-    Uses learnable frequency parameters and a linear projection, unlike the fixed
-    sinusoidal ``TemporalPositionalEncoder``. Ported from tessera alpha_1.0 for
-    forward-compatibility but NOT currently wired into ``TransformerEncoder``.
+    Learnable frequency parameters and a linear projection, unlike the fixed sinusoidal
+    ``TemporalPositionalEncoder``. Kept from tessera alpha_1.0 for forward-compatibility; NOT
+    wired into ``TransformerEncoder``.
     """
 
     def __init__(self, d_model: int, num_freqs: int = 64) -> None:
@@ -206,11 +202,10 @@ class TemporalPositionalEncoder(nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
         self.d_model = d_model
-        # CHANGED: Pre-compute div_term as a non-persistent buffer. It depends only on
-        # d_model, not on input data, so recomputing it every forward call wastes ~18ms
-        # per backbone. Non-persistent (persistent=False) so it's excluded from state_dict
-        # and doesn't break checkpoint loading. Still moves with .to(device) / .bfloat16().
-        # Stored in FP32 for numerical precision in sin/cos; output is cast to model dtype.
+        # div_term depends only on d_model, so it is a buffer rather than a per-forward compute
+        # (~18 ms per backbone). persistent=False keeps it out of state_dict so checkpoint
+        # loading still works, while it still follows .to(device) / .bfloat16(). Held in FP32 for
+        # sin/cos precision; the output is cast to the model dtype.
         div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * -(math.log(10000.0) / d_model))
         self.register_buffer("div_term", div_term, persistent=False)
 
@@ -223,27 +218,22 @@ class TemporalPositionalEncoder(nn.Module):
         Returns:
             Positional encoding of shape (B, T, d_model).
         """
-        # Compute in FP32 for numerical precision, then cast output to match
-        # the caller's dtype (BF16 when model.bfloat16() is active). Without this cast,
-        # the FP32 positional encoding contaminates all downstream ops via PyTorch's
-        # automatic dtype promotion (BF16 + FP32 = FP32), causing the entire transformer
-        # and GRU to run in FP32 — 7 TFLOPS instead of 20-30 TFLOPS on T4 tensor cores.
-        # See ai/debug/inference_throughput_profiling_2026-02-23.md for full analysis.
+        # FP32 for precision, then cast the OUTPUT back to the caller's dtype (BF16 under
+        # model.bfloat16()). Without that cast PyTorch's dtype promotion (BF16 + FP32 = FP32)
+        # spreads FP32 through the whole transformer and GRU: 7 TFLOPS instead of 20-30 on T4
+        # tensor cores.
         #
-        # Fill an UNINITIALISED (B, T, d_model) buffer by strided sin/cos writes.
-        # vs. the historical torch.zeros: skips the multi-GB zero-fill (every
-        # element is written — 0::2 and 1::2 partition the even d_model). vs. a
-        # stack+reshape: never holds sin and cos live alongside a separate
-        # interleaved output. Values are bit-identical to the zeros version.
+        # torch.empty, not zeros: every element is written because 0::2 and 1::2 partition the
+        # even d_model, so the multi-GB zero-fill is dead work and the values are identical. The
+        # strided writes also avoid holding sin and cos live beside an interleaved output.
         position = doy.unsqueeze(-1).float()
         angles = position * self.div_term.float()  # (B, T, d_model/2)
         pe = torch.empty(doy.shape[0], doy.shape[1], self.d_model, device=doy.device)
         pe[:, :, 0::2] = torch.sin(angles)
         pe[:, :, 1::2] = torch.cos(angles)
-        # Drop angles before the dtype cast: it's ~2.6 GiB at the max
-        # (B=7168, T=256) bucket and unused past this point, so holding it live
-        # through pe.to() needlessly co-resides it with the fp32 pe and the bf16
-        # output — peak VRAM the concurrent s2/s1 backbones can't spare.
+        # Drop angles before the cast: ~2.6 GiB at the largest (B=7168, T=256) bucket and unused
+        # from here, so holding it through pe.to() co-resides it with the fp32 pe and the bf16
+        # output — peak VRAM the concurrent s2/s1 backbones cannot spare.
         del angles
         return pe.to(doy.dtype)
 
@@ -251,11 +241,9 @@ class TemporalPositionalEncoder(nn.Module):
 class TransformerEncoder(nn.Module):
     """Transformer encoder for satellite time series.
 
-    Takes band values + DOY as input. Embeds bands via MLP, adds sinusoidal
-    positional encoding from DOY, runs through transformer encoder layers,
-    then pools via TemporalAwarePooling.
-
-    The last column of input x is treated as DOY; all preceding columns are bands.
+    Embeds bands via MLP, adds sinusoidal positional encoding from DOY, runs the transformer
+    encoder layers, then pools via ``TemporalAwarePooling``. The last column of ``x`` is DOY;
+    every preceding column is a band.
     """
 
     def __init__(

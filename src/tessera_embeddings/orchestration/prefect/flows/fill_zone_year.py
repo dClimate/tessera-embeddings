@@ -1,19 +1,17 @@
 """Fill one (zone, year) of the global embeddings store via Ray (ADR-008 W5).
 
 Provisions a Ray GPU cluster, runs the zone-fill runner
-(:func:`tessera_embeddings.orchestration.runners.zone_fill.fill_zone_year` —
-coverage mask → inference → shard assembly → tag), and tears the cluster down.
-Mirrors :mod:`tessera_embeddings`'s single-flow Ray pattern (``ray_cluster``
-context manager; the cancellation hook is shared via :mod:`._ray_lifecycle`).
+(:func:`tessera_embeddings.orchestration.runners.zone_fill.fill_zone_year` — coverage mask →
+inference → shard assembly → tag), and tears the cluster down. Mirrors
+:mod:`tessera_embeddings`'s single-flow Ray pattern (``ray_cluster`` context manager; the
+cancellation hook is shared via :mod:`._ray_lifecycle`).
 
-**Concurrency model (ADR-008 D6).** Inference is embarrassingly parallel across
-zones — nothing is shared and nothing commits — so many of these flow runs can
-do GPU work at once. Commits are UNGATED: they share a branch tip, but the cost of
-contending for it is seconds (2.2 s at 16 committers, 15 s at 120) with no
-unresolvable conflicts at any measured N. See
-``context_docs/design/commit-gate-removal-2026_08.md``.
-Same-zone serialization (whose attr commits genuinely conflict) is the campaign
-driver's job, not this flow's.
+**Concurrency model (ADR-008 D6).** Inference is embarrassingly parallel across zones — nothing
+is shared and nothing commits — so many of these flow runs can do GPU work at once. Commits are
+UNGATED: they share a branch tip, but contending for it costs seconds (2.2 s at 16 committers,
+15 s at 120) with no unresolvable conflicts at any measured N; see
+``context_docs/design/commit-gate-removal-2026_08.md``. Same-zone serialization (whose attr
+commits genuinely conflict) is the campaign driver's job, not this flow's.
 """
 
 from __future__ import annotations
@@ -92,22 +90,20 @@ def _assert_seeded_model_matches(
 ) -> None:
     """Refuse to fill a store seeded for a different encoder/checkpoint than this build.
 
-    The seed stamps ``geoemb:model`` (the encoder-version URL) once at the store
-    root; the fill re-derives it from the running code. If a model upgrade slipped
-    in between seeding and filling, the fill would write embeddings from a NEW
-    encoder while the root still advertises the OLD one — mixing encoders under a
-    single store and permanently tagging the result. A metadata-only read catches
-    it before Ray. ``allow_model_mismatch`` is the deliberate-override escape hatch
-    (e.g. a store seeded with a custom ``model_url`` the code can't re-derive).
+    The seed stamps ``geoemb:model`` (the encoder-version URL) once at the store root; the fill
+    re-derives it from the running code. A model upgrade slipped in between seeding and filling
+    would write embeddings from a NEW encoder while the root still advertises the OLD one — mixing
+    encoders under a single store and permanently tagging the result. A metadata-only read catches
+    it before Ray. ``allow_model_mismatch`` is the deliberate-override escape hatch (e.g. a store
+    seeded with a custom ``model_url`` the code can't re-derive).
 
-    ``geoemb:model`` versions only the ENCODER (e.g. "1.1"); it does NOT distinguish
-    the concrete checkpoint / norm source (the ``aws`` and ``mpc`` v1.1 checkpoints
-    share one URL). So when the store also recorded a ``checkpoint_id`` (the seed's
-    ``model_version``), require it to match this build's checkpoint (*build_checkpoint*
-    = :func:`checkpoint_filename`) — otherwise two same-URL-but-different checkpoints
-    could be mixed. Absent ``checkpoint_id`` (the default), only the encoder URL is
-    gated. Seed with ``model_version=checkpoint_filename()`` to enable checkpoint-level
-    gating.
+    ``geoemb:model`` versions only the ENCODER (e.g. "1.1"); it does NOT distinguish the concrete
+    checkpoint / norm source (the ``aws`` and ``mpc`` v1.1 checkpoints share one URL). So when the
+    store also recorded a ``checkpoint_id`` (the seed's ``model_version``), require it to match
+    this build's checkpoint (*build_checkpoint* = :func:`checkpoint_filename`) — otherwise two
+    same-URL-but-different checkpoints could be mixed. Absent ``checkpoint_id`` (the default), only
+    the encoder URL is gated; seed with ``model_version=checkpoint_filename()`` to enable
+    checkpoint-level gating.
     """
     root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
     seeded = cast("str | None", root.attrs.get("geoemb:model"))
@@ -175,124 +171,120 @@ def fill_zone_year_flow(
         zone: Zone group name — UTM common name, e.g. ``"30N"``/``"19S"``.
         year: Campaign calendar year to fill (must be on the seeded axis).
         paths: Deployment storage contract (global store, land mask, mosaics).
-        ami_ssm_name: SSM parameter name for the Ray GPU AMI ID (used only when
-            ``ami_id`` is not given).
-        ami_id: Pre-resolved AMI ID the campaign pinned into this fill's staging
-            fingerprint. When set, the cluster boots exactly this image instead of
-            re-reading ``ami_ssm_name`` — so a mid-campaign re-bake can't run new code
-            under a fingerprint that recorded the old image. ``None`` (direct calls)
-            resolves ``ami_ssm_name`` at provisioning as before.
-        time_window_end: End month of the inference window as ``"Month Year"``;
-            defaults to ``"December {year}"`` (the calendar-year window). The
-            runner REQUIRES the exact January-December window for ``year``
-            (the store guarantees calendar-year slots), so any other value fails
-            loudly at the preflight gate — non-calendar 12-month windows belong
-            in the single-ROI ``12mo_window_end`` path, not the global store.
+        ami_ssm_name: SSM parameter name for the Ray GPU AMI ID (used only when ``ami_id`` is
+            not given).
+        ami_id: Pre-resolved AMI ID the campaign pinned into this fill's staging fingerprint.
+            When set, the cluster boots exactly this image instead of re-reading
+            ``ami_ssm_name`` — so a mid-campaign re-bake can't run new code under a fingerprint
+            that recorded the old image. ``None`` (direct calls) resolves ``ami_ssm_name`` at
+            provisioning.
+        time_window_end: End month of the inference window as ``"Month Year"``; defaults to
+            ``"December {year}"``. The runner REQUIRES the exact January-December window for
+            ``year`` (the store guarantees calendar-year slots), so any other value fails loudly
+            at the preflight gate — non-calendar 12-month windows belong in the single-ROI
+            ``12mo_window_end`` path, not the global store.
         store_name: Global-store repo basename (``paths.global_store``).
         mask_name: Coverage-store repo basename (``paths.land_mask_store``).
         ssm_prefix: SSM prefix for the Ray cluster resource IDs.
         cloudwatch_log_group: CloudWatch log group the Ray workers write to.
-        code_bucket: S3 bucket workers pull the source tarball from (``None`` =
-            AMI-baked source). See :mod:`tessera_embeddings`.
+        code_bucket: S3 bucket workers pull the source tarball from (``None`` = AMI-baked
+            source). See :mod:`tessera_embeddings`.
         code_suffix: Source-tarball filename suffix (lets branches coexist).
         num_actors: GPU actor count for inference.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
-        require_s1: Demand radar rather than request it, and **True by default here**
-            because this flow fills ONE cell: an operator naming a single zone-year over
-            terrain that should be imaged wants to be told when its radar is missing, not
-            to receive optical-only embeddings quietly. Set False for a cell that is
-            genuinely radar-free — parts of the globe have no dual-pol coverage at all, and
-            the ingest's per-orbit item count is what distinguishes that from a lost orbit.
-            The global campaign passes False for the same reason.
-        s3_region: Optional S3 region for the global store + mosaics, threaded through
-            the preflight reads and the zone-fill runner (default region if None).
+        require_s1: Demand radar rather than request it, and **True by default here** because
+            this flow fills ONE cell: an operator naming a single zone-year over terrain that
+            should be imaged wants to be told when its radar is missing, not to receive
+            optical-only embeddings quietly. Set False for a cell that is genuinely radar-free —
+            parts of the globe have no dual-pol coverage at all, and the ingest's per-orbit item
+            count is what distinguishes that from a lost orbit. The global campaign passes False
+            for the same reason.
+        s3_region: Optional S3 region for the global store + mosaics, threaded through the
+            preflight reads and the zone-fill runner (default region if None).
         cleanup_staging: Delete staged tiles after a successful fill. Pass False to keep them,
             which is what makes an assembly measurement repeatable against identical input.
         n_assembly_workers: Override the assembly process-pool size for THIS run; ``None`` uses
             ``AssemblyConfig``'s sizing. The pool size, not the runner's instance type, is what
             bounds assembly throughput, so it belongs to the run rather than to the deployment.
-        allow_partial_window: Relax the pre-Ray temporal-coverage gate to
-            "non-empty" (default requires the mosaic's months to span the window).
-        allow_model_mismatch: Fill even when the seeded store advertises a
-            different encoder than this build (default rejects — a mid-campaign
-            model upgrade would otherwise mix encoders under one store).
-        allow_s2_only: Embed S2-valid pixels that have ZERO S1 observations
-            (sub-zone SAR coverage gaps) using the upstream v1.1 missing-S1
-            convention (all-zeros normalized S1 input). Default False: such
-            pixels are skipped. Only the PER-PIXEL gate is relaxed — the
-            zone-level gates (SAR store presence, temporal coverage, grid
-            validation) stay strict, so a zone with NO SAR at all still fails
-            loudly (that signals an ingest bug, not geography). Identify the
-            affected pixels afterwards via ``s1_asc_obs_count +
-            s1_desc_obs_count == 0``. Embedding quality for S2-only pixels is
-            unvalidated — see the optional-S1 ADR before production use.
+        allow_partial_window: Relax the pre-Ray temporal-coverage gate to "non-empty" (default
+            requires the mosaic's months to span the window).
+        allow_model_mismatch: Fill even when the seeded store advertises a different encoder
+            than this build (default rejects — a mid-campaign model upgrade would otherwise mix
+            encoders under one store).
+        allow_s2_only: Embed S2-valid pixels that have ZERO S1 observations (sub-zone SAR
+            coverage gaps) using the upstream v1.1 missing-S1 convention (all-zeros normalized
+            S1 input). Default False: such pixels are skipped. Only the PER-PIXEL gate is
+            relaxed — the zone-level gates (SAR store presence, temporal coverage, grid
+            validation) stay strict, so a zone with NO SAR at all still fails loudly (that
+            signals an ingest bug, not geography). Identify the affected pixels afterwards via
+            ``s1_asc_obs_count + s1_desc_obs_count == 0``. Embedding quality for S2-only pixels
+            is unvalidated — see the optional-S1 ADR before production use.
         mosaic_base: Override for the input mosaic prefix (default
             ``{inputs}/mosaics/{zone}/{year}`` — the campaign's per-year layout).
-        s3_concurrency: This fill's slice of the fleet S3-PUT budget for the shard
-            write (``None`` = the full target, for a lone fill). The campaign passes
+        s3_concurrency: This fill's slice of the fleet S3-PUT budget for the shard write
+            (``None`` = the full target, for a lone fill). The campaign passes
             ``target // max_parallel_zones`` so K concurrent fills stay near target.
-        launch_pacing: Pace this cluster's EC2 launch requests against the account's
-            shared RunInstances quota. Same shape as ``s3_concurrency``: a budget that
+        launch_pacing: Pace this cluster's EC2 launch requests against the account's shared
+            RunInstances quota — the same shape as ``s3_concurrency``, a budget concurrent fills
+            share, except this one is a request RATE whose enforcement lives in the client rather
+            than in a count we divide. Default ``False`` keeps today's launch behaviour; the
+            campaign turns it on when it runs more than one cluster.
         gpu_fallback_instance_types: EC2 instance types this fill may fall back to when the
-            production rung has no capacity (e.g. ``["g5.2xlarge"]``). ``None`` keeps today's behaviour. Opens
-            the card's rung AND installs the capacity-aware autoscaler scorer -- see
-            ``providers.aws.ray._apply_gpu_fallback``.
-        gpu_fallback_vcpu_budget: Optional vCPU budget for this cluster's GPU fleet, used
-            to ceiling each rung at what the G-and-VT quota affords IT rather than at a
-            flat node count.
-            concurrent fills share, except this one is a request RATE and the
-            enforcement lives in the client rather than in a count we divide. Default
-            ``False`` keeps today's launch behaviour; the campaign turns it on when it
-            runs more than one cluster.
-        actor_request_headroom: Hold the actor request to the actor slots this fill has
-            actually placed plus this many, rather than letting it climb toward
-            ``num_actors`` on a region that is not placing them
+            production rung has no capacity (e.g. ``["g5.2xlarge"]``). Opens the card's rung AND
+            installs the capacity-aware autoscaler scorer -- see
+            ``providers.aws.ray._apply_gpu_fallback``. ``None`` keeps today's behaviour.
+        gpu_fallback_vcpu_budget: Optional vCPU budget for this cluster's GPU fleet, used to
+            ceiling each rung at what the G-and-VT quota affords IT rather than at a flat node
+            count.
+        actor_request_headroom: Hold the actor request to the actor slots this fill has actually
+            placed plus this many, rather than letting it climb toward ``num_actors`` on a region
+            that is not placing them
             (:func:`tessera_embeddings.inference.scheduling._batch_actors_to_request`).
             ``None`` keeps today's behaviour;
-            :data:`~tessera_embeddings.inference.scheduling.ACTOR_REQUEST_HEADROOM` is
-            the value to pass.
-        actor_request_batch_size: Actors per batch, overriding the inference default.
-            The quota that batches contend for is a rate over CALLS, so this is the
-            cheapest available relief: a smaller batch is fewer simultaneous launch
-            requests per cluster. ``None`` keeps the default.
+            :data:`~tessera_embeddings.inference.scheduling.ACTOR_REQUEST_HEADROOM` is the value
+            to pass.
+        actor_request_batch_size: Actors per batch, overriding the inference default. The quota
+            batches contend for is a rate over CALLS, so this is the cheapest available relief:
+            a smaller batch is fewer simultaneous launch requests per cluster. ``None`` keeps the
+            default.
         run_id: Reuse a prior run's id to resume it (staged tiles are skipped).
-        fault_injection: A supervised failure drill's request to inject one deliberate
-            fault into THIS run. Absent by default, and this flow hosts only the
-            death between a zone-year's two commits — anything else, and any
-            deployment outside the drill allowlist, is refused before the flow does
-            any work (:mod:`tessera_embeddings.config.fault_injection`). A run that
-            carries it announces itself as a drill in its own logs.
-        validation_deployment: ``flow-name/deployment-name`` of a deployment that
-            validates a landed cell — dispatched once this fill's cell is tagged, and
-            NOT waited on (:mod:`._cell_validation`). ``None`` (the default) validates
-            nothing: the validator is a consumer's flow, so the library names none.
+        fault_injection: A supervised failure drill's request to inject one deliberate fault into
+            THIS run. Absent by default, and this flow hosts only the death between a zone-year's
+            two commits — anything else, and any deployment outside the drill allowlist, is
+            refused before the flow does any work
+            (:mod:`tessera_embeddings.config.fault_injection`). A run that carries it announces
+            itself as a drill in its own logs.
+        validation_deployment: ``flow-name/deployment-name`` of a deployment that validates a
+            landed cell — dispatched once this fill's cell is tagged, and NOT waited on
+            (:mod:`._cell_validation`). ``None`` (the default) validates nothing: the validator
+            is a consumer's flow, so the library names none.
 
     Returns:
-        The zone-fill summary dict (zone, year, run_id, snapshot_id, tag,
-        tile/inference counts, ``empty`` flag, elapsed seconds).
+        The zone-fill summary dict (zone, year, run_id, snapshot_id, tag, tile/inference counts,
+        ``empty`` flag, elapsed seconds).
     """
     log = get_run_logger()
 
-    # Checked HERE, not left to run_inference: this deployment is invoked directly as
-    # well as by the campaign, and on that path the value is only validated after the
-    # flow has cleared preflight and entered `ray_cluster` — so a typo buys a billable
-    # GPU cluster before failing on something knowable at call time. The campaign
-    # wrapper rejects it too; the child is the authority for a direct invocation.
+    # Checked HERE, not left to run_inference: this deployment is invoked directly as well as by
+    # the campaign, and on that path the value is only validated after preflight and
+    # `ray_cluster` — so a typo buys a billable GPU cluster before failing on something knowable
+    # at call time. The campaign wrapper rejects it too; the child is the authority for a direct
+    # invocation.
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
 
-    # BEFORE any store read, any mosaic probe and any cluster: a refused fault must cost
-    # nothing, and an accepted one must be on the record before the run can produce the
-    # failure it was armed for. `ssm_prefix` is the run's injected deployment identity —
-    # arm() resolves it, so this flow cannot claim an account of its own choosing.
+    # BEFORE any store read, any mosaic probe and any cluster: a refused fault must cost nothing,
+    # and an accepted one must be on the record before the run can produce the failure it was
+    # armed for. `ssm_prefix` is the run's injected deployment identity — arm() resolves it, so
+    # this flow cannot claim an account of its own choosing.
     fault = (
         fault_injection.arm(ssm_prefix=ssm_prefix, supports=(DIE_BETWEEN_COMMITS,), log=log)
         if fault_injection is not None
         else None
     )
 
-    # Lazily import the AWS providers so the flow file imports on machines
-    # without ray/boto installed (arch tests, local inspection).
+    # Lazily import the AWS providers so the flow file imports on machines without ray/boto
+    # installed (arch tests, local inspection).
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials, icechunk_credentials_for
     from tessera_embeddings.providers.aws.ray import (
         cluster_name_for_flow_run,
@@ -303,27 +295,25 @@ def fill_zone_year_flow(
     zone = canonicalize_zone(zone)
     store_path = paths.global_store(store_name)
     # THE STORE may live in the partner-owned published bucket, which the task role cannot open.
-    # Only the reads of the STORE take this; the land-mask and mosaic reads below stay on the task
-    # role, which is the only credential that can read OUR buckets. `icechunk_credentials_for`
-    # returns the caller's own callback unchanged for our buckets, so nothing changes in dev.
+    # Only STORE reads take this; the land-mask and mosaic reads below stay on the task role, the
+    # only credential that can read OUR buckets. `icechunk_credentials_for` returns the caller's
+    # own callback unchanged for our buckets, so nothing changes in dev.
     store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
     land_mask_path = paths.land_mask_store(mask_name)
-    # Campaign mosaics live per (zone, year); `mosaic_base` overrides for a
-    # hand-provided mosaic (e.g. a shared multi-year store).
+    # Campaign mosaics live per (zone, year); `mosaic_base` overrides for a hand-provided mosaic
+    # (e.g. a shared multi-year store).
     mosaic_base = mosaic_base or f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}"
 
-    # Preflight in ascending cost order — cheapest global-store metadata reads
-    # first, then the mask, then (only if we will truly infer) the mosaic probe
-    # and Ray. GPU work is needed ONLY for a cell that is on-axis, not already
-    # complete, AND has live coverage. Each cheaper short-circuit avoids the more
-    # expensive reads below it; fill_zone_year re-validates as the authority.
-    #  - already-complete cell: the campaign dispatches landed-but-untagged cells
-    #    for crash recovery, where fill_zone_year merely re-creates the tag. This
-    #    needs ONLY the global store — so it is checked before the land mask,
-    #    whose unavailability must never block a retag-only recovery.
-    #  - off-axis / unseeded year: fill_zone_year rejects it outright, so resolve
-    #    it here (a global-store read) BEFORE standing up a cluster we'd tear
-    #    straight back down.
+    # Preflight in ascending cost order — cheapest global-store metadata reads first, then the
+    # mask, then (only if we will truly infer) the mosaic probe and Ray. GPU work is needed ONLY
+    # for a cell that is on-axis, not already complete, AND has live coverage. Each cheaper
+    # short-circuit avoids the reads below it; fill_zone_year re-validates as the authority.
+    #  - already-complete cell: the campaign dispatches landed-but-untagged cells for crash
+    #    recovery, where fill_zone_year merely re-creates the tag. This needs ONLY the global
+    #    store, so it is checked before the land mask, whose unavailability must never block a
+    #    retag-only recovery.
+    #  - off-axis / unseeded year: fill_zone_year rejects it outright, so resolve it here (a
+    #    global-store read) BEFORE standing up a cluster we'd tear straight back down.
     #  - all-ocean cell (no live tiles): may have no mosaic to probe; fill empty.
     already_complete = zone_year_complete(
         store_path, zone, year, get_credentials=store_credentials, s3_region=s3_region
@@ -331,8 +321,8 @@ def fill_zone_year_flow(
     on_axis = already_complete or zone_year_on_axis(
         store_path, zone, year, get_credentials=store_credentials, s3_region=s3_region
     )
-    # Only touch the mask once completion + axis are cleared: an unavailable mask
-    # must not block retag-only recovery, and an off-axis year needs no mask.
+    # Only touch the mask once completion + axis are cleared: an unavailable mask must not block
+    # retag-only recovery, and an off-axis year needs no mask.
     has_live = (
         zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
         if (on_axis and not already_complete)
@@ -340,11 +330,11 @@ def fill_zone_year_flow(
     )
     needs_cluster = on_axis and not already_complete and has_live
 
-    # CAN THE DESTINATION HOLD WHAT WE ARE ABOUT TO WRITE? One metadata read, and it belongs in this
-    # block for the same reason as its neighbours. The runner checks this too, but only after the GPU
-    # fleet is up — so on 2026-08-18 a seeded dtype the staging writer cannot produce cost a whole
-    # inference before anyone heard about it. Gated on `needs_cluster` like the orbit probe below: a
-    # complete cell writes nothing, and an all-ocean cell has nothing to write.
+    # CAN THE DESTINATION HOLD WHAT WE ARE ABOUT TO WRITE? One metadata read, in this block for the
+    # same reason as its neighbours: the runner checks this too, but only after the GPU fleet is up
+    # — so on 2026-08-18 a seeded dtype the staging writer cannot produce cost a whole inference
+    # before anyone heard about it. Gated like the orbit probe below, since a complete cell writes
+    # nothing and an all-ocean cell has nothing to write.
     if needs_cluster:
         preflight_destination(
             store_path=store_path,
@@ -354,8 +344,8 @@ def fill_zone_year_flow(
             s3_region=s3_region,
         )
 
-    # resolve_s1_orbit probes the mosaics (with the same credential callback / region
-    # the rest of the fill uses), so only do it when we'll actually infer.
+    # resolve_s1_orbit probes the mosaics (with the same credential callback / region the rest of
+    # the fill uses), so only do it when we'll actually infer.
     resolved_s1 = (
         resolve_s1_orbit(
             mosaic_base,
@@ -367,14 +357,13 @@ def fill_zone_year_flow(
         if needs_cluster
         else s1_orbit
     )
-    # The strict Jan-Dec calendar-year window for `year`: `December {year}` yields a
-    # 12-month window spanning exactly Jan-Dec (the store's guaranteed convention).
-    # A `time_window_end` override producing any other window is rejected loudly by
-    # the runner's calendar-year gate — the single enforcement chokepoint.
+    # The strict Jan-Dec calendar-year window for `year`: `December {year}` yields a 12-month
+    # window spanning exactly Jan-Dec (the store's guaranteed convention). A `time_window_end`
+    # override producing any other window is rejected loudly by the runner's calendar-year gate,
+    # the single enforcement chokepoint.
     window = parse_time_window(time_window_end or f"December {year}")
-    # Before ray_cluster: the runner's gate would reject an offset/partial window
-    # anyway, but only after a billable GPU fleet is up. Decidable from config, so
-    # decide it here.
+    # Before ray_cluster: the runner's gate would reject an offset/partial window anyway, but only
+    # after a billable GPU fleet is up. Decidable from config, so decide it here.
     assert_calendar_year_window(window, year)
     config = build_inference_config(
         s1_orbit=resolved_s1,
@@ -382,31 +371,28 @@ def fill_zone_year_flow(
         checkpoint_path=f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}",
         inputs_bucket=paths.inputs,
         output_bucket=paths.outputs,
-        # 1 inference tile == 1 output shard == 2x2 tiles per 4096-px ingest chunk
-        # (D3), so assembly writes whole, lean shards with no read-modify-write.
-        # Passed explicitly even though INFERENCE_CHUNK_SIZE now equals SHARD_PX:
-        # this path REQUIRES the identity, and stating it keeps a retune of the
-        # default from silently unaligning the campaign.
+        # 1 inference tile == 1 output shard == 2x2 tiles per 4096-px ingest chunk (D3), so
+        # assembly writes whole, lean shards with no read-modify-write. Passed explicitly even
+        # though INFERENCE_CHUNK_SIZE equals SHARD_PX: this path REQUIRES the identity, and
+        # stating it keeps a retune of the default from silently unaligning the campaign.
         chunk_size=SHARD_PX,
         allow_s2_only=allow_s2_only,
         actor_request_headroom=actor_request_headroom,
-        # Omitted when unset so the inference default stands — and keyed on None, not on
-        # truthiness, because 0 is a documented mode here rather than an absent value.
+        # Omitted when unset so the inference default stands — keyed on None, not on truthiness,
+        # because 0 is a documented mode here rather than an absent value.
         **set_overrides(actor_request_batch_size=actor_request_batch_size),
     )
 
-    # None when this cell short-circuits before the preflight (an already-complete retag),
-    # which reads correctly on the record: nothing was measured, so nothing is claimed.
+    # None when this cell short-circuits before the preflight (an already-complete retag), which
+    # reads correctly on the record: nothing was measured, so nothing is claimed.
     input_coverage: dict | None = None
 
     # The store's minimum-depth rule, for EVERY runner invocation and not only inference-bound
-    # ones. The runner asserts the config against the root before it checks completion or reads
+    # ones: the runner asserts the config against the root before it checks completion or reads
     # the land mask, so leaving it None on the cheap terminal paths — an all-ocean cell, or a
-    # complete cell needing only its tag repaired — made those paths raise instead of marking
-    # and tagging, which can stop the campaign finishing on work it has no reason to do.
-    #
-    # Resolved once here rather than inside the needs_cluster branch. It is a metadata-only
-    # read, and the branch it used to sit in is the one that does NOT need it cheap.
+    # complete cell needing only its tag repaired — makes those paths raise instead of marking and
+    # tagging, which can stop the campaign finishing on work it has no reason to do. Resolved once
+    # here rather than inside the cluster branch; it is a metadata-only read.
     config = dataclasses.replace(
         config,
         optical_min_obs=_optical_min_obs_from_store(store_path, get_credentials=store_credentials, s3_region=s3_region),
@@ -417,10 +403,9 @@ def fill_zone_year_flow(
     )
 
     if needs_cluster:
-        # Fail loudly BEFORE provisioning Ray if the store was seeded for a
-        # different encoder than this build embeds with — a mid-campaign model
-        # upgrade would otherwise mix encoders under one store and tag it
-        # permanently. A cheap metadata-only read; the escape hatch is explicit.
+        # Fail loudly BEFORE provisioning Ray if the store was seeded for a different encoder
+        # than this build embeds with — a mid-campaign model upgrade would otherwise mix encoders
+        # under one store and tag it permanently. A cheap metadata-only read.
         _assert_seeded_model_matches(
             store_path,
             build_checkpoint=checkpoint_filename(),
@@ -428,15 +413,14 @@ def fill_zone_year_flow(
             get_credentials=store_credentials,
             s3_region=s3_region,
         )
-        # Fail loudly on a partial/absent mosaic BEFORE provisioning Ray: a
-        # zone-wide mosaic missing months is an ingest failure, and the write-once
-        # zone-year tag would otherwise make partial embeddings permanent (the
-        # zone-fill chain has no other temporal-coverage gate). `allow_partial_window`
-        # relaxes the month-span check to "non-empty" for a legitimately partial
-        # edge zone; an empty store still fails.
-        # Kept rather than discarded: what the preflight measured about the INPUT goes onto
-        # the year, because the mosaics it just read are deleted once the cell lands and
-        # nothing afterwards can reconstruct how much of the window they held.
+        # Fail loudly on a partial/absent mosaic BEFORE provisioning Ray: a zone-wide mosaic
+        # missing months is an ingest failure, and the write-once zone-year tag would otherwise
+        # make partial embeddings permanent (the zone-fill chain has no other temporal-coverage
+        # gate). `allow_partial_window` relaxes the month-span check to "non-empty" for a
+        # legitimately partial edge zone; an empty store still fails. The result is KEPT rather
+        # than discarded: what the preflight measured about the INPUT goes onto the year, because
+        # the mosaics it read are deleted once the cell lands and nothing afterwards can
+        # reconstruct how much of the window they held.
         input_coverage = check_time_window_coverage(
             mosaic_base,
             config.time_window,
@@ -452,15 +436,15 @@ def fill_zone_year_flow(
         "year": year,
         "land_mask_path": land_mask_path,
         "mosaic_base": mosaic_base,
-        # Staging is scoped by (zone, year), not just run_id: a reused/retained
-        # run_id can't then match another cell's staged labels+shapes and trick
-        # resume detection into skipping inference for the wrong year.
+        # Staging is scoped by (zone, year), not just run_id: a reused/retained run_id can't then
+        # match another cell's staged labels+shapes and trick resume detection into skipping
+        # inference for the wrong year.
         "staging_base": f"{paths.outputs.rstrip('/')}/staging/{zone}/{year}",
-        # The published registry's ROOT, derived from the STORE THIS RUN WRITES rather than from the
+        # The published registry's ROOT, derived from the STORE THIS RUN WRITES rather than the
         # default repo name — the registry is a sibling of the store, so a registry beside a
         # different store describes a zone-year that store does not contain. Bucket conventions
-        # belong to BucketPaths (§0.3); the part's own name is the registry module's, since it keys
-        # by a run id nothing here knows yet.
+        # belong to BucketPaths (§0.3); the part's own name is the registry module's, since it
+        # keys by a run id nothing here knows yet.
         "registry_root": paths.optical_registry(store_path),
         "config": config,
         "num_actors": num_actors,
@@ -478,11 +462,10 @@ def fill_zone_year_flow(
     def _validate(summary: dict[str, Any]) -> dict[str, Any]:
         """Hand the landed cell to its validation deployment, without waiting for it.
 
-        AFTER the cell is tagged and on both paths, including a retag-only recovery: a
-        cell that landed under an older image may never have been validated at all, and
-        the tag repair is the moment its coordinates are in hand. Returns the summary
-        unchanged — the dispatch is not allowed to affect a landed cell (see
-        :mod:`._cell_validation`).
+        AFTER the cell is tagged and on both paths, including a retag-only recovery: a cell that
+        landed under an older image may never have been validated at all, and the tag repair is
+        the moment its coordinates are in hand. Returns the summary unchanged — the dispatch is
+        not allowed to affect a landed cell (see :mod:`._cell_validation`).
         """
         dispatch_cell_validation(
             validation_deployment,
@@ -512,20 +495,18 @@ def fill_zone_year_flow(
         log.info("Zone %s year %d %s — no Ray cluster", zone, year, reason)
         return _validate(fill_zone_year(**fill_kwargs))
 
-    # Ray path only: terminate the EC2 instance behind each retired idle actor
-    # immediately (the runner's on_actor_retire hook), instead of holding idle
-    # GPU nodes for the rest of a multi-hour fill and relying on the autoscaler's
-    # unreliable-after-ray.kill() idle timeout (providers/aws/gotchas.md). The
-    # callback runs driver-side, so its boto3 client never ships to a Ray worker.
-    # Region matches ray_cluster's default (this flow provisions there).
+    # Ray path only: terminate the EC2 instance behind each retired idle actor immediately (the
+    # runner's on_actor_retire hook), instead of holding idle GPU nodes for the rest of a
+    # multi-hour fill and relying on the autoscaler's unreliable-after-ray.kill() idle timeout
+    # (providers/aws/gotchas.md). The callback runs driver-side, so its boto3 client never ships
+    # to a Ray worker. Region matches ray_cluster's default (this flow provisions there).
     fill_kwargs["on_actor_retire"] = make_instance_terminator(log=log)
 
     try:
-        # Pin a deterministic cluster name from the flow-run id so the cancellation
-        # hook can re-derive it and terminate the fleet by tag even when it runs in a
-        # fresh module import (globals unset) — without this, a cancel before
-        # `activate()` records the name would hit the "no cluster name" path and leak
-        # the GPU fleet.
+        # Pin a deterministic cluster name from the flow-run id so the cancellation hook can
+        # re-derive it and terminate the fleet by tag even in a fresh module import (globals
+        # unset) — without this, a cancel before `activate()` records the name would hit the
+        # "no cluster name" path and leak the GPU fleet.
         with ray_cluster(
             log,
             ami_ssm_name=ami_ssm_name,
@@ -545,9 +526,8 @@ def fill_zone_year_flow(
             fill_kwargs["on_fleet_demand"] = publisher_for_resolved_yaml(resolved_yaml, gpu_fallback_vcpu_budget, log)
             summary = fill_zone_year(**fill_kwargs)
     finally:
-        # Clear the hook state only AFTER the context manager's teardown has
-        # run (or failed into the hook's remit) — and also on the exception
-        # path, which the old success-only clearing missed.
+        # Clear the hook state only AFTER the context manager's teardown has run (or failed into
+        # the hook's remit), and on the exception path too.
         deactivate()
 
     log.info("Zone %s year %d filled: %s", zone, year, summary.get("tag"))

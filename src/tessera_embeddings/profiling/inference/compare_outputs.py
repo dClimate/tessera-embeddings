@@ -1,9 +1,8 @@
 """ADR-012 equivalence gate: compare staged embeddings from two inference runs.
 
-Compares int8 embeddings + per-pixel scales between a reference run and a test
-run (same chunks, different code paths) and applies the validated-equivalence
-thresholds from ``context_docs/decisions/012-validated-equivalence-for-
-inference-outputs.md``:
+Compares int8 embeddings + per-pixel scales between a reference run and a test run (same
+chunks, different code paths) against the validated-equivalence thresholds from
+``context_docs/decisions/012-validated-equivalence-for-inference-outputs.md``:
 
     int8 values exactly equal            >= 99.5%
     max int8 deviation                   <= 1 level
@@ -20,9 +19,9 @@ Usage::
     te-compare-outputs \
         s3://.../ref/chunk_0_2.zarr s3://.../test/chunk_0_2.zarr
 
-Exit code 0 = all chunks pass, 1 = any failure. Bit-identical changes
-(pipelining, resampler vectorization) should report 100% exact / 0 drift;
-harness-gated changes (GRU restructure) must stay within the thresholds.
+Exit code 0 = all chunks pass, 1 = any failure. Bit-identical changes (pipelining, resampler
+vectorization) should report 100% exact / 0 drift; harness-gated changes (GRU restructure)
+must stay within the thresholds.
 """
 
 from __future__ import annotations
@@ -41,13 +40,11 @@ MAX_ABS_DELTA = 1
 MAX_SCALE_REL_DRIFT = 1e-3
 MIN_COSINE = 0.9999
 
-# Cross-config thresholds (--cross-config): runs differing in batch size or
-# library stack are not bit-comparable — cuBLAS kernel selection alone moves
-# outputs. Measured 2026-07-16 (main@3584 vs Phase-1@7168, 3 chunks x 512M
-# values): exact 95.4-98.3%, max|d|=2 at ~0.002% rate, scale drift <= 0.78%
-# (2 BF16 ULPs), cosine >= 0.99990, zero NaN-mask mismatches. These bounds
-# sit just outside that envelope; anything worse indicates a real defect,
-# not config shimmer.
+# Cross-config thresholds (--cross-config): runs differing in batch size or library stack
+# are not bit-comparable — cuBLAS kernel selection alone moves outputs. Measured envelope
+# (main@3584 vs Phase-1@7168, 3 chunks x 512M values): exact 95.4-98.3%, max|d|=2 at ~0.002%
+# rate, scale drift <= 0.78% (2 BF16 ULPs), cosine >= 0.99990, zero NaN-mask mismatches.
+# These bounds sit just outside it; anything worse is a real defect, not config shimmer.
 XCFG_MIN_WITHIN_ONE_FRAC = 0.9999
 XCFG_MAX_ABS_DELTA = 3
 XCFG_MAX_SCALE_REL_DRIFT = 1.6e-2  # 4 BF16 ULPs
@@ -69,17 +66,15 @@ class ChunkComparison:
     nan_mask_mismatches: int
     cosine_min: float
     cosine_mean: float
-    # Obs-count layers (s2/s1_asc/s1_desc) are deterministic per-pixel counts,
-    # independent of batch size or inference — they must match EXACTLY in both
-    # comparison classes. Guards the sparse-read fidelity machinery (full-width
-    # SAR reads + bundle-sourced S2 obs under the easting-bbox crop).
+    # Obs-count layers (s2/s1_asc/s1_desc) are deterministic per-pixel counts, independent of
+    # batch size or inference, so they must match EXACTLY in both comparison classes. Guards
+    # the sparse-read fidelity machinery (full-width SAR reads + bundle-sourced S2 obs under
+    # the easting-bbox crop).
     obs_count_mismatches: int = 0
 
-    # Scales that are neither NaN (invalid-pixel fill) nor finite-positive
-    # (generated): zero, negative, or infinite. These indicate a corrupt
-    # artifact in EITHER store and must be zero — without this counter a
-    # malformed scale is lumped with "not generated" and skipped (e.g.
-    # ref=NaN, test=0.0 would sail through every metric).
+    # Scales that are neither NaN (invalid-pixel fill) nor finite-positive (generated): zero,
+    # negative or infinite, i.e. a corrupt artifact in EITHER store. See the counting site in
+    # `compare_chunk` for why they need their own counter.
     malformed_scales: int = 0
 
     cross_config: bool = False
@@ -87,10 +82,10 @@ class ChunkComparison:
     @property
     def passed(self) -> bool:
         """Whether every threshold for the selected comparison class is met."""
-        # Zero generated pixels (no finite-positive scale in either store) is an
-        # invalid artifact — a no-valid-pixel chunk must be a .skipped marker,
-        # not an embeddings zarr. Without this guard n_values == 0 defaults every
-        # fraction to 1.0, so an empty/corrupt staged pair would "pass".
+        # Zero generated pixels (no finite-positive scale in either store) is an invalid
+        # artifact — a no-valid-pixel chunk must be a .skipped marker, not an embeddings
+        # zarr. Without this guard n_values == 0 defaults every fraction to 1.0, so an
+        # empty/corrupt staged pair would "pass".
         if self.n_values == 0:
             return False
         if self.cross_config:
@@ -154,20 +149,18 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
         s_ref = ref["scales"].isel(northing=rows).values
         s_test = test["scales"].isel(northing=rows).values
 
-        # "Generated" = a real embedding was written: a finite, POSITIVE scale.
-        # Invalid pixels are zero-filled with a NaN scale. Counting them would
-        # (a) dilute int8 exactness toward 100% on sparse chunks (most values
-        # are guaranteed-equal zeros) and (b) admit malformed scales — a zero,
-        # negative, or infinite scale would slip past a bare `~isnan` and make
-        # drift/cosine NaN. So compute EVERY metric over generated pixels only.
+        # "Generated" = a real embedding was written: a finite, POSITIVE scale. Invalid
+        # pixels are zero-filled with a NaN scale, and counting them would (a) dilute int8
+        # exactness toward 100% on sparse chunks (most values are guaranteed-equal zeros) and
+        # (b) admit malformed scales — a zero, negative or infinite scale slips past a bare
+        # `~isnan` and makes drift/cosine NaN. So every metric is over generated pixels only.
         gen_ref = np.isfinite(s_ref) & (s_ref > 0)
         gen_test = np.isfinite(s_test) & (s_test > 0)
         nan_mask_mismatches += int((gen_ref != gen_test).sum())
-        # A scale must be exactly one of: NaN (invalid pixel) or generated
-        # (finite positive). Zero / negative / infinite means a corrupt store;
-        # count it explicitly — the "generated pixels only" masking below
-        # would otherwise silently skip it (e.g. ref=NaN vs test=0.0 agrees
-        # on the mask and touches no metric).
+        # A scale is exactly one of NaN (invalid pixel) or generated (finite positive);
+        # anything else is a corrupt store. Counted explicitly because the generated-only
+        # masking below would otherwise skip it silently — ref=NaN vs test=0.0 agrees on the
+        # mask and touches no metric.
         malformed_scales += int((~np.isnan(s_ref) & ~gen_ref).sum())
         malformed_scales += int((~np.isnan(s_test) & ~gen_test).sum())
         valid = gen_ref & gen_test
@@ -197,13 +190,11 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
                 cosine_sum += float(cos.sum())
                 cosine_count += int(nz.sum())
 
-    # Obs-count layers: deterministic counts, must be EXACT in both classes and
-    # PRESENT in both. (H, W) uint16 — small enough to compare whole. A required
-    # layer missing from one store (or from BOTH) is a FAILURE, not a silent
-    # skip: a run that dropped an obs layer must not pass the gate. A one-sided
-    # absence charges the present layer's whole size as mismatches; a two-sided
-    # absence (neither run wrote it) charges 1 so obs_count_mismatches still goes
-    # non-zero rather than validating nothing.
+    # Obs-count layers: deterministic counts, EXACT and PRESENT in both stores. (H, W) uint16
+    # — small enough to compare whole. A required layer missing from one store, or from BOTH,
+    # is a FAILURE rather than a silent skip: a one-sided absence charges the present layer's
+    # whole size as mismatches, a two-sided absence charges 1, so a run that dropped an obs
+    # layer cannot pass the gate by validating nothing.
     obs_count_mismatches = 0
     for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
         in_ref, in_test = var in ref.data_vars, var in test.data_vars
@@ -234,16 +225,15 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
 def _staged_labels(run_dir: str) -> tuple[set[str], set[str]]:
     """Return (completed zarr labels, skip-marker labels) staged under a run directory.
 
-    Skip markers (``<label>.skipped``) are returned separately so a chunk that
-    produced embeddings in one run but was skip-marked in the other counts as a
-    label-set difference, not a silent omission.
+    Skip markers (``<label>.skipped``) come back separately so a chunk that produced
+    embeddings in one run but was skip-marked in the other counts as a label-set difference
+    rather than a silent omission.
 
     Zarr labels are keyed on the ``<label>.done`` completion marker, matching
-    ``ZarrWriter._list_staged``: a ``.zarr`` whose write was interrupted has data
-    chunks missing that read back as fill values, so comparing it would measure
-    the crash rather than the code under test. Without its marker the label is
-    absent here, which surfaces as a label-set difference (or as an explicit
-    ``--allow-partial`` opt-out) instead of a bogus PASS.
+    ``ZarrWriter._list_staged``: an interrupted ``.zarr`` has missing data chunks that read
+    back as fill values, so comparing it would measure the crash rather than the code under
+    test. Without its marker the label is absent here, which surfaces as a label-set
+    difference (or an explicit ``--allow-partial`` opt-out) instead of a bogus PASS.
     """
     fs, _, (path,) = fsspec.get_fs_token_paths(run_dir)
     # detail=False so s3fs returns path strings, not entry dicts (its default);
@@ -295,12 +285,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             ref_zarr, ref_skip = _staged_labels(ref_dir)
             test_zarr, test_skip = _staged_labels(test_dir)
-            # A label present as BOTH a .zarr and a .skipped marker within one
-            # run is an invalid artifact state that assembly's
-            # verify_staged_completeness rejects — comparing the .zarr could
-            # otherwise report PASS for a run assembly will refuse. Fail
-            # regardless of --allow-partial (this is corruption, not partial
-            # staging).
+            # A label present as BOTH a .zarr and a .skipped marker in one run is the invalid
+            # state assembly's verify_staged_completeness rejects — comparing the .zarr would
+            # report PASS for a run assembly will refuse. Fails regardless of
+            # --allow-partial: this is corruption, not partial staging.
             both_staged = (ref_zarr & ref_skip) | (test_zarr & test_skip)
             if both_staged:
                 print(
@@ -309,9 +297,9 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            # A run is only a valid equivalence reference if it staged the same
-            # chunks with the same skip decisions; otherwise a run that dropped
-            # or skip-marked chunks could "pass" on whatever remained in common.
+            # A run is a valid equivalence reference only if it staged the same chunks with
+            # the same skip decisions; otherwise one that dropped or skip-marked chunks could
+            # "pass" on whatever remained in common.
             if not args.allow_partial and (ref_zarr != test_zarr or ref_skip != test_skip):
                 only_ref = sorted((ref_zarr | ref_skip) - (test_zarr | test_skip))
                 only_test = sorted((test_zarr | test_skip) - (ref_zarr | ref_skip))

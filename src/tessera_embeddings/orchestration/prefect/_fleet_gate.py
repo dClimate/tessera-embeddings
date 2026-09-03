@@ -1,17 +1,17 @@
 """Fleet-wide concurrency gates that HOLD when their limit is lowered below what they need.
 
-The campaign is throttled by two named Prefect global concurrency limits — one bounding how
-many zone ingests run at once, one bounding simultaneous commits. Both are acquired through
+The campaign is throttled by two named Prefect global concurrency limits — one bounding how many
+zone ingests run at once, one bounding simultaneous commits. Both are acquired through
 :class:`FleetGate`.
 
-**Why this exists rather than a bare ``concurrency()`` call.** Prefect's server refuses a
-request for more slots than a limit holds with ``422``, which is a client error the acquisition
-service does not retry: the acquirer raises immediately. So *lowering a gate to zero* — the
-obvious way to hold work back — failed the next thing to reach it instead of making it wait,
-and there was no way to stop a campaign taking on new cells short of cancelling runs. This
-class turns that state into what an operator means by it:
+**Why this exists rather than a bare ``concurrency()`` call.** Prefect's server refuses a request
+for more slots than a limit holds with ``422``, a client error the acquisition service does not
+retry, so the acquirer raises immediately: *lowering a gate to zero* — the obvious way to hold
+work back — fails the next thing to reach it instead of making it wait, leaving no way to stop a
+campaign taking on new cells short of cancelling runs. This class turns that state into what an
+operator means by it:
 
-* **limit at or above what the acquirer needs, slots free** — proceeds, as before.
+* **limit at or above what the acquirer needs, slots free** — proceeds.
 * **limit satisfiable but currently full** — Prefect answers ``423`` and already waits and
   retries. Untouched; that is ordinary queueing.
 * **limit lowered below what the acquirer needs (in practice, zero)** — HOLD. Log it and keep
@@ -19,13 +19,13 @@ class turns that state into what an operator means by it:
 * **limit does not exist** — still fails immediately, loudly, as it must: an absent gate is a
   misconfiguration and running ungated is the thing the gate exists to prevent.
 
-The four cases are distinguished by what the server said, not by reading the limit ourselves:
-a limit read before acquiring is a different fact from the one the acquisition acted on.
+The four cases are distinguished by what the server said, not by reading the limit ourselves: a
+limit read before acquiring is a different fact from the one the acquisition acted on.
 
-**A hold is not free and does not stop a running fleet.** A cluster holds its GPU fleet across
-its whole multi-cell walk, so holding the ingest gate stops new cells being taken up while the
-cell already in flight finishes — after which the fleet idles at full width and full cost.
-Holding is "stop taking on work", not "stop the meter"; only cancelling does that.
+**A hold is not free and does not stop a running fleet.** A cluster holds its GPU fleet across its
+whole multi-cell walk, so holding the ingest gate stops new cells being taken up while the cell
+already in flight finishes — after which the fleet idles at full width and full cost. Holding is
+"stop taking on work", not "stop the meter"; only cancelling does that.
 """
 
 from __future__ import annotations
@@ -43,32 +43,31 @@ from prefect.exceptions import PrefectHTTPStatusError
 if TYPE_CHECKING:
     import logging
 
-#: How long to wait between attempts while a gate is holding. Tens of seconds, not seconds:
-#: the thing being waited for is a human raising a limit, and the cells behind the gate run
-#: for hours, so a tighter poll only adds orchestrator load to a paused campaign.
+#: How long to wait between attempts while a gate is holding. Tens of seconds, not seconds: what
+#: is being waited for is a human raising a limit, and the cells behind the gate run for hours, so
+#: a tighter poll only adds orchestrator load to a paused campaign.
 HOLD_POLL_S = 30.0
-#: How often a holding gate repeats itself in the log. A hold is indefinite by design, so
-#: silence would be indistinguishable from a hung run — and the elapsed time is the number an
-#: operator wants when deciding whether the pause was forgotten.
+#: How often a holding gate repeats itself in the log. A hold is indefinite by design, so silence
+#: would be indistinguishable from a hung run — and the elapsed time is the number an operator
+#: wants when deciding whether the pause was forgotten.
 HOLD_LOG_EVERY_S = 300.0
 
-#: The server's message when a request asks for more slots than the limit holds. Matched only
-#: as a belt-and-braces companion to the 422 status; the status is the signal.
+#: The server's message when a request asks for more slots than the limit holds. Matched only as a
+#: belt-and-braces companion to the 422 status; the status is the signal.
 _TOO_SMALL = "greater than the limit"
 
 
 def gate_is_holding(exc: BaseException) -> bool:
     """Did this acquisition failure mean "the limit is currently too small", or something else?
 
-    ``422`` is the server's answer to a request for more slots than the limit holds — which,
-    with every caller here occupying one slot, means the limit is zero. Anything else (a
-    missing limit under ``strict``, a network failure, an unauthorised client) is a real
-    failure and must propagate: treating those as a hold would park a run forever on a
-    misconfiguration.
+    ``422`` is the server's answer to a request for more slots than the limit holds — which, with
+    every caller here occupying one slot, means the limit is zero. Anything else (a missing limit
+    under ``strict``, a network failure, an unauthorised client) is a real failure and must
+    propagate: treating those as a hold would park a run forever on a misconfiguration.
 
     The status has to be dug out of the cause chain because Prefect wraps the HTTP error in
-    ``ConcurrencySlotAcquisitionError``, whose own message and type say nothing about which of
-    the two happened.
+    ``ConcurrencySlotAcquisitionError``, whose own message and type say nothing about which of the
+    two happened.
     """
     seen: set[int] = set()
     cause: BaseException | None = exc
@@ -85,14 +84,14 @@ def gate_is_holding(exc: BaseException) -> bool:
 class FleetGate(AbstractContextManager):
     """One slot of a named Prefect global concurrency limit, held for the ``with`` body.
 
-    THREAD-SAFE: the active context lives in a per-thread stack rather than an instance slot.
-    One gate object is shared between a chained fill's feeder thread (terminal plans commit
-    inside ``plan``) and its trailing-assembly thread, and an instance slot would let a
-    concurrent enter overwrite the other thread's context and release the wrong slot on exit.
+    THREAD-SAFE: the active context lives in a per-thread stack rather than an instance slot. One
+    gate object is shared between a chained fill's feeder thread (terminal plans commit inside
+    ``plan``) and its trailing-assembly thread, and an instance slot would let a concurrent enter
+    overwrite the other thread's context and release the wrong slot on exit.
 
-    ``strict=True`` on every acquisition: an absent or misspelled limit must fail closed.
-    Prefect defaults to warning and proceeding UNGATED, which would silently reintroduce
-    exactly the contention these gates bound.
+    ``strict=True`` on every acquisition: an absent or misspelled limit must fail closed. Prefect
+    defaults to warning and proceeding UNGATED, which would silently reintroduce exactly the
+    contention these gates bound.
     """
 
     def __init__(
@@ -107,14 +106,14 @@ class FleetGate(AbstractContextManager):
     ) -> None:
         """Args:
         name: The global concurrency limit to acquire from.
-        log: Where a hold announces itself. A hold with no log line is a hung run to
-            anyone reading the run's output.
-        occupy: Slots per acquisition. One everywhere today, which is what makes "limit
-            below what we need" and "limit zero" the same state.
+        log: Where a hold announces itself. A hold with no log line is a hung run to anyone
+            reading the run's output.
+        occupy: Slots per acquisition. One everywhere today, which is what makes "limit below
+            what we need" and "limit zero" the same state.
         poll_s: Seconds between attempts while holding.
-        should_stop: Consulted while holding, so a runner that is winding down abandons
-            the wait instead of parking past its own shutdown. Its exception is the
-            original acquisition error, which is the honest one for the caller.
+        should_stop: Consulted while holding, so a runner that is winding down abandons the wait
+            instead of parking past its own shutdown. Its exception is the original acquisition
+            error, which is the honest one for the caller.
         concurrency_kwargs: Passed through to :func:`concurrency` — lease duration and
             lease-renewal policy differ between the two gates.
         """
@@ -123,12 +122,11 @@ class FleetGate(AbstractContextManager):
         self._occupy = occupy
         self._poll_s = poll_s
         self._should_stop = should_stop
-        # Typed loosely at the splat, deliberately. The parameter above declares what a CALLER
-        # may pass, which is the useful contract; `concurrency` itself takes heterogeneous
-        # parameters (int | None, float, a lease holder, bool | None), and a homogeneous
-        # `**dict[str, X]` cannot be checked against those — mypy reports one error per
-        # parameter whatever X is. That is a limitation of `**kwargs` typing rather than a
-        # defect here, so the looseness is confined to this one attribute.
+        # Typed loosely at the splat, deliberately: the parameter above declares what a CALLER may
+        # pass, which is the useful contract, while `concurrency` itself takes heterogeneous
+        # parameters (int | None, float, a lease holder, bool | None) that a homogeneous
+        # `**dict[str, X]` cannot be checked against — mypy reports one error per parameter
+        # whatever X is. A `**kwargs` typing limitation, confined to this one attribute.
         self._kwargs: dict[str, Any] = dict(concurrency_kwargs)
         self._local = threading.local()
 
@@ -140,9 +138,9 @@ class FleetGate(AbstractContextManager):
             cm = concurrency(self._name, occupy=self._occupy, strict=True, **self._kwargs)
             try:
                 cm.__enter__()
-            # Caught broadly and re-raised unless the cause chain says "limit too small":
-            # Prefect's own ConcurrencySlotAcquisitionError lives in a private module, and the
-            # decision here does not need its type — it needs what the server answered.
+            # Caught broadly and re-raised unless the cause chain says "limit too small": Prefect's
+            # ConcurrencySlotAcquisitionError lives in a private module, and the decision here
+            # needs what the server answered, not its type.
             except Exception as exc:
                 if not gate_is_holding(exc):
                     raise
@@ -179,10 +177,10 @@ class FleetGate(AbstractContextManager):
         cm.__exit__(exc_type, exc, tb)
 
 
-#: How long a pause reading is trusted before the server is asked again. The thing being
-#: watched is a human typing one command, so tens of seconds is responsive enough — and the
-#: read happens on the inference driver of every cluster, which is a Prefect API client like
-#: any other, so a tight poll would spend orchestrator capacity on asking whether to work.
+#: How long a pause reading is trusted before the server is asked again. What is watched is a human
+#: typing one command, so tens of seconds is responsive enough — and the read happens on the
+#: inference driver of every cluster, a Prefect API client like any other, so a tight poll would
+#: spend orchestrator capacity on asking whether to work.
 PAUSE_TTL_S = 30.0
 
 
@@ -195,19 +193,19 @@ def pause_signal(
 ) -> Callable[[], bool]:
     """Is work paused? — a cheap callable for a loop that is not allowed to import Prefect.
 
-    A gate used as a PAUSE FLAG rather than as a capacity cap: the limit is READ, never
-    acquired, and a limit of zero on an active gate means paused. Reading rather than
-    acquiring is what makes this usable inside a dispatch loop — there is no slot to hold, no
-    lease to renew, and nothing to release if the process dies mid-pause.
+    A gate used as a PAUSE FLAG rather than a capacity cap: the limit is READ, never acquired, and
+    a limit of zero on an active gate means paused. Reading rather than acquiring is what makes
+    this usable inside a dispatch loop — no slot to hold, no lease to renew, nothing to release if
+    the process dies mid-pause.
 
-    **Fail-open, always.** A read that errors, a gate that does not exist, a server that is
-    unwell — all answer "not paused". The alternative is a campaign that stops working because
-    a monitoring-adjacent read failed, which is a far worse failure than a pause that takes
-    another ``ttl_s`` to take effect. A pause is an operator's convenience; running is the job.
+    **Fail-open, always.** A read that errors, a gate that does not exist, a server that is unwell
+    — all answer "not paused". A campaign that stops working because a monitoring-adjacent read
+    failed is a far worse failure than a pause that takes another ``ttl_s`` to take effect. A pause
+    is an operator's convenience; running is the job.
 
-    The returned callable is cheap enough to call in a tight loop (one read per ``ttl_s`` at
-    most) and is safe to share across threads: a stale answer by up to ``ttl_s`` is the
-    contract, so a race that returns the previous reading is not a defect.
+    The returned callable is cheap enough for a tight loop (one read per ``ttl_s`` at most) and is
+    safe to share across threads: a stale answer by up to ``ttl_s`` is the contract, so a race that
+    returns the previous reading is not a defect.
 
     Args:
         name: The global concurrency limit read as a flag.
@@ -251,8 +249,8 @@ def pause_signal(
                     state["announced_at"] = held
             else:
                 announce = False
-                # `is not None`, not truthiness: a pause that began at monotonic 0.0 is still
-                # a pause, and treating it as absent loses the resume line for it.
+                # `is not None`, not truthiness: a pause that began at monotonic 0.0 is still a
+                # pause, and treating it as absent loses the resume line for it.
                 resumed_after = now - state["since"] if was and state["since"] is not None else None
                 state["since"] = None
         if log is not None:
@@ -275,12 +273,11 @@ def pause_signal(
 def _read_limit_via_prefect(name: str) -> tuple[int, bool] | None:
     """``(limit, active)`` for one global concurrency limit, or ``None`` if it does not exist.
 
-    Reads BY NAME rather than listing. The list form takes a `limit` whose default the
-    server caps at 200 and truncates silently, so on a workspace holding more limits than
-    that this gate could fall off the page and read as absent — and absent is "not paused".
-    An operator lowering the gate to zero would then watch clusters keep taking cells, with
-    nothing anywhere reporting that the pause had not been seen. Asking for the one name
-    removes the boundary rather than moving it.
+    Reads BY NAME rather than listing. The list form takes a `limit` whose default the server caps
+    at 200 and truncates silently, so on a workspace holding more limits than that this gate could
+    fall off the page and read as absent — and absent is "not paused". An operator lowering the
+    gate to zero would then watch clusters keep taking cells, with nothing reporting that the pause
+    had not been seen. Asking for the one name removes the boundary rather than moving it.
     """
     from prefect.client.orchestration import get_client
     from prefect.exceptions import ObjectNotFound
@@ -291,8 +288,8 @@ def _read_limit_via_prefect(name: str) -> tuple[int, bool] | None:
             try:
                 gl = await client.read_global_concurrency_limit_by_name(name)
             except ObjectNotFound:
-                # A gate that was never created is not a pause — same answer the list form
-                # gave when no row matched, and `pause_signal` documents why.
+                # A gate that was never created is not a pause — same answer the list form gives
+                # when no row matches, and `pause_signal` documents why.
                 return None
             return int(gl.limit), bool(gl.active)
 

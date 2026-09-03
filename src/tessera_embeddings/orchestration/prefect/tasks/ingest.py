@@ -1,11 +1,10 @@
 """Prefect task shells for ingest domain functions.
 
-Each shell is ~20 LOC: pull ``client`` and ``log`` from Prefect / Dask
-context, delegate to the domain function, convert the dataclass
-result to a dict at the boundary.
+Each shell pulls ``client`` and ``log`` from Prefect / Dask context, delegates to the domain
+function, and converts the dataclass result to a dict at the boundary.
 
-This file is one of the few places in the package that imports from
-:mod:`prefect`. Domain modules under ``ingest/`` never do.
+This file is one of the few places in the package that imports from :mod:`prefect`. Domain
+modules under ``ingest/`` never do.
 """
 
 from __future__ import annotations
@@ -49,24 +48,18 @@ def process_roi_reflectance(
 ) -> dict[str, Any]:
     """Prefect task: ingest S2 reflectance for one ROI.
 
-    Pulls the Dask client + run logger from Prefect / Dask context,
-    delegates to :func:`ingest_s2_roi_reflectance`, and returns the
-    resulting dataclass as a dict (Prefect's UI displays dicts cleanly).
+    Returns the domain dataclass as a dict (Prefect's UI displays dicts cleanly).
 
-    Retry policy lives inside the domain function via tenacity (narrow
-    scope: just the ``write_dataset`` call). Do **not** add
-    ``@task(retries=...)`` here — domain retries already cover the
-    transient cases, and outer retries would re-run the whole
-    multi-day loop.
+    Retry policy lives inside the domain function via tenacity, scoped to the
+    ``write_dataset`` call. Do **not** add ``@task(retries=...)`` here — domain retries
+    already cover the transient cases, and an outer retry re-runs the whole multi-day loop.
     """
-    # The store writes below open the reflectance repo WITHOUT an explicit
-    # get_credentials, so in a callback-only deployment they fall back to Icechunk's
-    # ambient chain and fail to create or append the S3 mosaic. The radar task next door
-    # registers the provider for exactly this reason; optical needs it just as much, and
-    # only its being wired first hid that. Gated on the store being on S3 — the import
-    # pulls in botocore, which lives only in the optional `aws` extra, so a local run must
-    # not need it. The ROI's fsspec options default the same way for the same reason: a
-    # plain zarr read does not travel on the Icechunk callback.
+    # The store writes below open the reflectance repo WITHOUT an explicit get_credentials,
+    # so in a callback-only deployment they fall back to Icechunk's ambient chain and fail
+    # to create or append the S3 mosaic. Gated on the store being on S3: the import pulls in
+    # botocore, which lives only in the optional `aws` extra, so a local run must not need
+    # it. The ROI's fsspec options default the same way, because a plain zarr read does not
+    # travel on the Icechunk callback either.
     cred_provider_cm: Any = nullcontext()
     if store_path.startswith("s3://"):
         from tessera_embeddings.providers.aws.credentials import (
@@ -77,7 +70,7 @@ def process_roi_reflectance(
         cred_provider_cm = credentials_provider(iam_icechunk_credentials)
         if storage_options is None and roi_zarr_path.startswith("s3://"):
             # The CALLABLE, not its result: a role credential resolved once here is a
-            # snapshot, and an S2 leg outlives it (see the radar task's note).
+            # snapshot and an S2 leg outlives it (see the radar task's note).
             storage_options = iam_s3_storage_options
 
     # Shard the mosaic's manifests: the store is created and appended to entirely
@@ -128,36 +121,30 @@ def process_roi_sar(
 ) -> dict[str, Any]:
     """Prefect task: ingest S1 OPERA SAR for one ROI.
 
-    The credential callbacks (``edl_credentials_fn``,
-    ``apply_credentials_fn``) are forwarded as-is. Hard rule #5
-    (secrets enter at flow entry only) means the *flow* constructs the
-    closures over Prefect Blocks / env vars; this task shell never
-    reads credentials directly.
+    The credential callbacks (``edl_credentials_fn``, ``apply_credentials_fn``) are forwarded
+    as-is: hard rule #5 (secrets enter at flow entry only) means the *flow* builds the
+    closures over Prefect Blocks / env vars and this shell never reads credentials directly.
 
-    When ``use_s3_direct`` is set, this task resolves IAM credentials in the
-    Dask **worker** process where the domain function's store writes and ROI
-    reads actually run — the worker holds the IAM role, and the credentials
-    (live access key / secret / STS token) stay off the orchestration
-    boundary rather than crossing it as serialized parameters (Hard rule #5):
+    When ``use_s3_direct`` is set, IAM credentials are resolved in the Dask **worker**
+    process where the store writes and ROI reads actually run — the worker holds the IAM
+    role, and the live access key / secret / STS token stay off the orchestration boundary
+    rather than crossing it as serialized parameters (hard rule #5):
 
-    1. Registers an IAM-resolving icechunk credential provider for the
-       duration of the ingest call, so store writes keep using IAM-role
-       creds after ``set_s3_credentials`` overwrites the ``AWS_*`` env vars
-       with OPERA-scoped STS tokens. Scoped to a ``with`` block so a reused
-       Dask worker is not left pinned to the IAM provider for later,
-       unrelated icechunk opens.
-    2. Resolves IAM ``storage_options`` for the ROI-mask reads, so those
-       reads survive the same env-var overwrite.
+    1. An IAM-resolving icechunk credential provider is registered for the duration of the
+       ingest call, so store writes keep using IAM-role creds after ``set_s3_credentials``
+       overwrites the ``AWS_*`` env vars with OPERA-scoped STS tokens. Scoped to a ``with``
+       block so a reused Dask worker is not left pinned to it for later, unrelated opens.
+    2. IAM ``storage_options`` are resolved for the ROI-mask reads, which face the same
+       env-var overwrite.
 
-    Confining the botocore-backed helpers to providers/aws/ (imported
-    lazily) keeps the storage layer cloud-agnostic per the architecture
-    rules.
+    The botocore-backed helpers stay confined to providers/aws/ (imported lazily), keeping
+    the storage layer cloud-agnostic per the architecture rules.
     """
     cred_provider_cm: Any = nullcontext()
     if use_s3_direct:
-        # Lazy import: providers.aws.credentials pulls in botocore, which lives
-        # only in the optional `aws` extra. A prefect-only install (e.g. Prefect
-        # on GCP) must be able to import this task module without it.
+        # Lazy import: providers.aws.credentials pulls in botocore, which lives only in the
+        # optional `aws` extra, and a prefect-only install (e.g. Prefect on GCP) must be able
+        # to import this task module without it.
         from tessera_embeddings.providers.aws.credentials import (
             iam_icechunk_credentials,
             iam_s3_storage_options,
@@ -166,15 +153,14 @@ def process_roi_sar(
         cred_provider_cm = credentials_provider(iam_icechunk_credentials)
 
         if storage_options is None and roi_zarr_path.startswith("s3://"):
-            # The CALLABLE, not its result. Resolved once here it is a snapshot, and the
-            # role credential behind it expires — an ECS task role lasts hours, which a
-            # radar leg outlives, and every mask read after that point fails on a bucket
-            # our role can always read. Passing the provider moves resolution to each read.
+            # The CALLABLE, not its result. Resolved once it is a snapshot, and the role
+            # credential behind it expires — an ECS task role lasts hours, which a radar leg
+            # outlives, after which every mask read fails on a bucket our role can always
+            # read. Passing the provider moves resolution to each read.
             storage_options = iam_s3_storage_options
 
-    # manifest_split for the same reason as the S2 task: this mosaic is
-    # region-written once per date batch, so an unsharded manifest makes each
-    # commit rewrite every ref written so far.
+    # manifest_split for the same reason as the S2 task: this mosaic is region-written once
+    # per date batch, so an unsharded manifest makes each commit rewrite every ref so far.
     with cred_provider_cm, manifest_split(INGEST_MANIFEST_SPLIT):
         result = ingest_s1_roi_sar(
             roi_zarr_path=roi_zarr_path,

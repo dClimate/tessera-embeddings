@@ -1,13 +1,12 @@
 """Per-chunk pixel dataset for Tessera v1.1 bucketed inference.
 
-Groups valid pixels by ``(s2_bin, s1_bin)`` — the bucket sizes chosen for the
-pixel's S2 and merged-S1 observation counts — so the inference loop can feed
-the transformer rectangular batches. Each bucket's batch is pre-resampled via
-``sampling.resample_s2_bucket`` / ``resample_s1_bucket``, which apply per-modality
-normalisation and the deterministic bucketed resampling (see ``sampling.py``).
+Groups valid pixels by ``(s2_bin, s1_bin)`` — the bucket sizes chosen for the pixel's S2 and
+merged-S1 observation counts — so the inference loop can feed the transformer rectangular batches.
+Each bucket's batch is pre-resampled via ``sampling.resample_s2_bucket`` / ``resample_s1_bucket``,
+which apply per-modality normalisation and the deterministic bucketed resampling.
 
-Source arrays stay in their native ``(T, H, W, bands)`` layout; per-batch fancy
-indexing pulls ``(B, T, bands)`` slices as needed.
+Source arrays stay in their native ``(T, H, W, bands)`` layout; per-batch fancy indexing pulls
+``(B, T, bands)`` slices as needed.
 """
 
 from __future__ import annotations
@@ -37,30 +36,26 @@ logger = logging.getLogger(__name__)
 class MosaicChunkInferenceDataset:
     """Bucketed pixel dataset for one spatial chunk.
 
-    Valid pixels are grouped by ``(s2_bin, s1_bin)``. ``iter_buckets()`` yields
-    one bucket at a time; ``get_bucket_batch()`` returns a pre-resampled,
-    standardised numpy slice ready for GPU transfer.
+    Valid pixels are grouped by ``(s2_bin, s1_bin)``. ``iter_buckets()`` yields one bucket at a
+    time; ``get_bucket_batch()`` returns a pre-resampled, standardised numpy slice ready for GPU
+    transfer.
 
     Args:
         chunk_data: Loaded chunk data from ``data_loading.load_chunk()``.
-        num_obs_checkpoints: Sorted bucket sizes. A pixel with ``k`` valid
-            observations is mapped to the smallest checkpoint ``>= k``.
-        s1_orbit: Which S1 orbit direction(s) are active. Only affects logging.
-            ``"none"`` means radar-free land, where every pixel takes the
-            ``allow_s2_only`` branch below.
-        allow_s2_only: Keep S2-valid pixels with ZERO S1 observations (sub-zone
-            SAR coverage gaps, or an ROI with no radar at all). They land in the
-            smallest S1 bucket and receive the upstream v1.1 missing-S1 input: an
-            all-zeros normalized-space S1 slice (``resample_s1_bucket``
-            zero-count rows == ucam-eo/tessera's ``_sample_s1_merged`` zero
-            return). Default False: such pixels are skipped entirely (no
-            embedding — this pipeline's historical gate).
-        optical_min_obs: Minimum valid optical observations for a pixel to be embedded at
-            all. ``None`` embeds every pixel that has any optical input, which is the
-            historical behaviour and what every non-campaign caller wants. A positive value
-            refuses thinner pixels, which is **not** a filter a consumer can undo: the
-            refused pixel has no embedding, so recovering it means re-running its shard.
-            Zero is rejected rather than treated as "off" — see ``__init__``.
+        num_obs_checkpoints: Sorted bucket sizes. A pixel with ``k`` valid observations is mapped
+            to the smallest checkpoint ``>= k``.
+        s1_orbit: Which S1 orbit direction(s) are active. Only affects logging. ``"none"`` means
+            radar-free land, where every pixel takes the ``allow_s2_only`` branch.
+        allow_s2_only: Keep S2-valid pixels with ZERO S1 observations (sub-zone SAR coverage gaps,
+            or an ROI with no radar at all). They land in the smallest S1 bucket and receive the
+            upstream v1.1 missing-S1 input: an all-zeros normalized-space S1 slice
+            (``resample_s1_bucket`` zero-count rows == ucam-eo/tessera's ``_sample_s1_merged``
+            zero return). Default False skips such pixels entirely — this pipeline's default gate.
+        optical_min_obs: Minimum valid optical observations for a pixel to be embedded at all.
+            ``None`` embeds every pixel with any optical input, which is what every non-campaign
+            caller wants. A positive value refuses thinner pixels, which is **not** a filter a
+            consumer can undo: the refused pixel has no embedding, so recovering it means
+            re-running its shard. Zero is rejected rather than treated as "off" — see ``__init__``.
     """
 
     def __init__(
@@ -72,10 +67,9 @@ class MosaicChunkInferenceDataset:
         optical_min_obs: int | None = None,
     ) -> None:
         if optical_min_obs is not None and optical_min_obs <= 0:
-            # Zero would refuse nothing while reading as a configured rule, so a caller that
-            # meant "no minimum" and a caller whose config silently resolved to 0 would be
-            # indistinguishable — and the second is a campaign publishing under no rule while
-            # believing it has one.
+            # Zero refuses nothing while reading as a configured rule, making a caller that meant "no minimum"
+            # indistinguishable from one whose config silently resolved to 0 — the second being a campaign publishing
+            # under no rule while believing it has one.
             raise ValueError(
                 f"optical_min_obs={optical_min_obs} refuses nothing — pass None for no minimum, "
                 "or a positive number of observations."
@@ -108,15 +102,14 @@ class MosaicChunkInferenceDataset:
         s1_asc = chunk_data.s1_asc_bands
         s1_desc = chunk_data.s1_desc_bands
 
-        # Use the pre-pruning s2_obs_count when available so pixels aren't
-        # under-bucketed just because the loader dropped empty S2 timesteps.
+        # The pre-pruning s2_obs_count when available, so pixels are not under-bucketed merely because the loader
+        # dropped empty S2 timesteps.
         if chunk_data.s2_obs_count is not None:
             s2_valid_count = chunk_data.s2_obs_count.astype(np.int32)
         else:
             s2_valid_count = s2_masks.sum(axis=0).astype(np.int32)
 
-        # Any-nonzero S2 check avoids ingesting pixels with zero reflectance
-        # everywhere (sensor gap, out-of-swath).
+        # Any-nonzero S2 check: excludes pixels with zero reflectance everywhere (sensor gap, out-of-swath).
         s2_nonzero = np.zeros((self.H, self.W), dtype=bool)
         for t in range(s2_bands.shape[0]):
             s2_nonzero |= np.any(s2_bands[t] != 0, axis=-1)
@@ -131,17 +124,15 @@ class MosaicChunkInferenceDataset:
             s1_desc_valid = np.any(s1_desc != 0, axis=-1).sum(axis=0).astype(np.int32)
         s1_total_valid = s1_asc_valid + s1_desc_valid
 
-        # A pixel needs real S2 to embed at all. The S1 term is the optional part:
-        # by default a pixel with zero S1 observations is skipped (historical gate);
-        # with allow_s2_only it is kept and flows through as the upstream v1.1
-        # missing-S1 convention (all-zeros normalized S1 slice, smallest bucket via
-        # compute_bin_keys' clip). Per-pixel provenance stays exact either way —
-        # s1_asc/desc_obs_count are written as 0 for these pixels.
-        # THREE refusal reasons, kept apart rather than folded into one boolean: a pixel can
-        # fail for having no optical input at all, for having too little of it, or for having no
-        # radar. Downstream records count them separately — one is a property of the imagery, one
-        # is this campaign's quality rule, and one is a coverage fact — and a caller cannot
-        # recover the distinction from a single mask.
+        # A pixel needs real S2 to embed at all; the S1 term is the optional part. By default a pixel with zero S1
+        # observations is skipped; with allow_s2_only it is kept and flows through as the upstream v1.1 missing-S1
+        # convention (all-zeros normalized S1 slice, smallest bucket via compute_bin_keys' clip). Per-pixel provenance
+        # stays exact either way — s1_asc/desc_obs_count are written as 0 for these pixels.
+        #
+        # THREE refusal reasons, kept apart rather than folded into one boolean: no optical input at all, too little
+        # of it, or no radar. Downstream records count them separately — one is a property of the imagery, one this
+        # campaign's quality rule, one a coverage fact — and a caller cannot recover the distinction from a single
+        # mask.
         has_optical = s2_nonzero & (s2_valid_count > 0)
         deep_enough = (
             np.ones_like(has_optical) if self.optical_min_obs is None else s2_valid_count >= self.optical_min_obs
@@ -151,9 +142,9 @@ class MosaicChunkInferenceDataset:
         valid_mask = has_optical & deep_enough
         if not self.allow_s2_only:
             valid_mask &= has_radar
-        # Kept for the per-chunk record: eligible-but-refused, by reason. "Thin" counts only
-        # pixels that HAD optical and lost on depth, so the two optical reasons partition rather
-        # than overlap, and their sum is the optical refusal total.
+        # For the per-chunk record: eligible-but-refused, by reason. "Thin" counts only pixels that HAD optical and
+        # lost on depth, so the two optical reasons partition rather than overlap and their sum is the optical refusal
+        # total.
         self.refused_no_optical = int((~has_optical).sum())
         self.refused_thin = int((has_optical & ~deep_enough).sum())
         self.refused_no_radar = 0 if self.allow_s2_only else int((has_optical & deep_enough & ~has_radar).sum())
@@ -183,8 +174,8 @@ class MosaicChunkInferenceDataset:
         pixel_s1_counts = s1_total_valid[rows, cols]
         keys = compute_bin_keys(pixel_s2_counts, pixel_s1_counts, self.num_obs_checkpoints)
 
-        # Group pixel indices by (s2, s1) bucket. Pack structured (int32, int32) into
-        # one int64 for a stable argsort.
+        # Group pixel indices by (s2, s1) bucket, packing structured (int32, int32) into one int64 for a stable
+        # argsort.
         flat_keys = keys.view(np.int64)
         sort_order = np.argsort(flat_keys, kind="stable")
         sorted_keys = flat_keys[sort_order]
@@ -211,9 +202,9 @@ class MosaicChunkInferenceDataset:
     def iter_buckets(self, *, largest_first: bool = True) -> Iterator[tuple[tuple[int, int], np.ndarray]]:
         """Yield each ``(bucket_key, pixel_indices_into_valid_arrays)`` pair.
 
-        ``largest_first=True`` sorts by ``s2_target * s1_target`` descending so
-        the GPU's first batch sees the largest sequence lengths — this warms up
-        CUDA kernels at peak memory pressure and stabilises timing telemetry.
+        ``largest_first=True`` sorts by ``s2_target * s1_target`` descending so the GPU's first
+        batch sees the largest sequence lengths, warming CUDA kernels at peak memory pressure and
+        stabilising timing telemetry.
         """
         items = list(self._bucket_pixels.items())
         if largest_first:

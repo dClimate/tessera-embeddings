@@ -1,22 +1,15 @@
 """tessera_embeddings — distributed satellite ingestion + Tessera inference.
 
-The public API is the surface listed in :data:`__all__`. Anything not
-on that list is implementation detail and may change without warning.
-The matching reference doc is ``docs/public-api.md``; CI verifies the
-two stay in sync.
+:data:`__all__` is the entire public API; everything else may change without warning. CI
+verifies it stays in sync with ``docs/public-api.md``.
 
 Conventions:
 
-* Underscore-prefixed module names are fully private.
-* Underscore-prefixed functions / attributes inside any module are
-  private to that module.
-* Classes annotated ``@typing.final`` must not be subclassed; mypy
-  enforces this statically.
-
-Domain code (``ingest``, ``inference``, ``storage``, ``providers``,
-``orchestration.concurrency``) is orchestrator-agnostic — same
-function works under Prefect flows, the plain runner, and any future
-orchestrator.
+* Underscore-prefixed module names, functions and attributes are private.
+* ``@typing.final`` classes must not be subclassed; mypy enforces this.
+* Domain code (``ingest``, ``inference``, ``storage``, ``providers``,
+  ``orchestration.concurrency``) is orchestrator-agnostic — the same function works under
+  Prefect flows, the plain runner, and any future orchestrator.
 """
 
 from tessera_embeddings.config.assembly import AssemblyConfig

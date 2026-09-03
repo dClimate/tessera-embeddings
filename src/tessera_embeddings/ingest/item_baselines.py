@@ -3,21 +3,19 @@
 The single reader for ``s2:processing_baseline``, so the scale and the notion of "unreadable" are
 defined once.
 
-**Scale.** Reported as an integer hundredth: ``"04.00"`` is ``400``, ``"05.10"`` is ``510``. This is
-the space :data:`~tessera_embeddings.config.satellites.S2_BASELINE_THRESHOLD` is expressed in, so a
-comparison against the threshold needs no conversion.
+**Scale.** An integer hundredth: ``"04.00"`` is ``400``, ``"05.10"`` is ``510`` — the same space
+:data:`~tessera_embeddings.config.satellites.S2_BASELINE_THRESHOLD` is expressed in, so comparing
+against the threshold needs no conversion.
 
-**Validated as a version, not as a number.** A baseline is a two-part version — the catalogue emits
-``"05.10"``, ``"02.06"`` — so this matches that shape and converts with integer arithmetic. Parsing
-it into a general numeric type instead accepts a long list of things no version contains, and each
-one becomes a *confident* answer rather than an admission of ignorance: ``"NaN"`` and ``"Infinity"``
-parse, so do negatives, so do exponents that overflow or underflow when scaled, and excess precision
-rounds onto a valid-looking value under the ambient decimal context. Matching the shape first makes
-every one of those unreadable by construction.
+**Validated as a version, not as a number.** A baseline is a two-part version, so this matches that
+shape and converts with integer arithmetic. General numeric parsing instead accepts ``"NaN"``,
+``"Infinity"``, negatives, exponents that overflow or underflow when scaled, and excess precision
+that rounds onto a valid-looking value — each a *confident* answer rather than an admission of
+ignorance. Matching the shape first makes all of them unreadable by construction.
 
-**Unreadable.** ``None`` means the item does not declare a usable baseline. Callers substitute their
-own default explicitly, which keeps "declared 0" distinguishable from "declared nothing"; a baseline
-of 0 is below every threshold, so conflating them hides a correctness question.
+**Unreadable.** ``None`` means the item declares no usable baseline. Callers substitute their own
+default explicitly, keeping "declared 0" distinguishable from "declared nothing"; a baseline of 0 is
+below every threshold, so conflating them hides a correctness question.
 """
 
 from __future__ import annotations
@@ -32,10 +30,10 @@ logger = logging.getLogger(__name__)
 BASELINE_SCALE = 100
 
 #: A processing baseline: one or two ASCII digits, optionally a fractional part of one or two.
-#: Deliberately narrow. The digit limits are what bound the value — no version reaches 100 — so
-#: there is no separate range check to keep in step, and no sign, exponent or special value can
-#: reach the arithmetic below. ``[0-9]`` rather than ``\d``, which also matches Unicode decimal
-#: digits: an Arabic-Indic or fullwidth numeral is not a version, and ``int()`` would accept it.
+#: The digit limits are what bound the value — no version reaches 100 — so there is no separate
+#: range check to keep in step, and no sign, exponent or special value can reach the arithmetic
+#: below. ``[0-9]`` rather than ``\d``, which also matches Unicode decimal digits: an Arabic-Indic
+#: or fullwidth numeral is not a version, and ``int()`` would accept it.
 _BASELINE_RE = re.compile(r"([0-9]{1,2})(?:\.([0-9]{1,2}))?")
 
 

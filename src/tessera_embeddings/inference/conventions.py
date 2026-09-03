@@ -1,12 +1,12 @@
 """GeoZarr convention attribute builders for embedding stores.
 
-Implements the proj:, spatial:, and geoemb: Zarr conventions as purely
-additive metadata on the root group. No store layout changes.
+Implements the proj:, spatial:, and geoemb: Zarr conventions as purely additive
+metadata on the root group. No store layout changes.
 
-The geoembeddings (``geoemb:``) convention supersedes the earlier ``tessera:``
-convention: it records encoder-model provenance, source datasets, and a
-structured quantization/dequantization description (see the ``geoemb:`` fields
-below). The mapping follows the convention repo's own ``tessera_example.json``.
+The geoembeddings (``geoemb:``) convention supersedes the earlier ``tessera:`` one
+(still stripped from pre-existing stores by ``assembly``): it records encoder-model
+provenance, source datasets, and a structured quantization/dequantization description,
+following the convention repo's own ``tessera_example.json``.
 
 References:
     - proj:    https://github.com/zarr-conventions/geo-proj
@@ -37,10 +37,9 @@ def _software_version() -> str:
 def _is_metre_crs(epsg_code: str | None) -> bool:
     """Whether an EPSG code's horizontal axes are metres.
 
-    ``geoemb:gsd`` is defined in metres, so the coordinate spacing may only be
-    used as the GSD for a metre-based (projected) CRS. A geographic CRS
-    (e.g. EPSG:4326, degrees) or a US-survey-foot CRS must not have its spacing
-    mislabelled as metres.
+    ``geoemb:gsd`` is defined in metres, so coordinate spacing may only be used as the GSD
+    for a metre-based (projected) CRS: a geographic CRS (EPSG:4326, degrees) or a
+    US-survey-foot one must not have its spacing mislabelled as metres.
     """
     if not epsg_code:
         return False
@@ -101,11 +100,10 @@ QUANTIZED_DTYPE = "int8"
 def expected_model_url(model_url: str | None = None) -> str:
     """The ``geoemb:model`` URL this build stamps for the current encoder version.
 
-    A seeded store records this once at its root; the fill re-derives it to verify
-    the running code embeds with the SAME encoder the store was seeded for — a
-    mismatch means a model upgrade slipped in between seeding and filling. Passing
-    *model_url* mirrors the seed-time override so a store seeded with a custom URL
-    round-trips.
+    A seeded store records this once at its root; the fill re-derives it to check the
+    running code embeds with the SAME encoder the store was seeded for — a mismatch means a
+    model upgrade slipped in between seeding and filling. Passing *model_url* mirrors the
+    seed-time override so a store seeded with a custom URL round-trips.
     """
     return model_url or _MODEL_URL_TEMPLATE.format(version=ENCODER_VERSION)
 
@@ -113,16 +111,16 @@ def expected_model_url(model_url: str | None = None) -> str:
 def tile_id_to_epsg(tile_id: str) -> str | None:
     """Derive EPSG code from a Sentinel-2 MGRS tile ID.
 
-    The first two characters encode the UTM zone number (01-60). The third
-    character is the latitude band letter: bands N-X are northern hemisphere
-    (EPSG:326xx), bands C-M are southern hemisphere (EPSG:327xx).
+    The first two characters encode the UTM zone number (01-60). The third is the latitude
+    band letter: bands N-X are northern hemisphere (EPSG:326xx), bands C-M southern
+    (EPSG:327xx).
 
     Args:
         tile_id: MGRS tile ID, e.g. ``"37PBM"``, ``"33UWP"``, ``"56HKH"``.
 
     Returns:
-        EPSG authority code string (e.g. ``"EPSG:32637"``), or ``None`` if
-        *tile_id* doesn't look like a valid MGRS tile ID.
+        An EPSG authority code (e.g. ``"EPSG:32637"``), or ``None`` if *tile_id* does not
+        look like a valid MGRS tile ID.
     """
     if not tile_id or len(tile_id) < 3:
         return None
@@ -140,9 +138,7 @@ def tile_id_to_epsg(tile_id: str) -> str | None:
 
 
 def _crs_fields_from_epsg(epsg_code: str) -> dict[str, str | dict]:
-    """Derive all proj: fields from an EPSG code string (e.g. ``"EPSG:32637"``).
-
-    Uses pyproj to produce ``proj:code``, ``proj:wkt2``, and ``proj:projjson``.
+    """Derive ``proj:code``, ``proj:wkt2`` and ``proj:projjson`` from an EPSG code via pyproj.
 
     Returns:
         Dict of ``proj:*`` keys to their values. Empty if derivation fails.
@@ -172,15 +168,12 @@ def _compute_affine_transform(y_coords: np.ndarray, x_coords: np.ndarray) -> lis
 
         [scale_x, 0, origin_x, 0, scale_y, origin_y]
 
-    The pixel size (scale) is derived from the **median** spacing between
-    consecutive coordinate values rather than just ``coords[1] - coords[0]``.
-    This is more robust for non-UTM projections where floating-point
-    representation of geographic coordinates can introduce small rounding
-    differences along the axis.
+    The scale is the **median** spacing between consecutive coordinates, not
+    ``coords[1] - coords[0]``: in non-UTM projections the float representation of
+    geographic coordinates introduces small rounding differences along the axis.
 
-    A warning is logged if the coordinate spacing is not uniform (max
-    deviation > 1 % of the median), which would indicate a non-regular grid
-    where an affine transform is only an approximation.
+    Spacing more than 1 % off the median logs a warning — a non-regular grid, where an
+    affine transform is only an approximation.
     """
     dx = np.diff(x_coords)
     dy = np.diff(y_coords)
@@ -216,9 +209,8 @@ def _compute_affine_transform(y_coords: np.ndarray, x_coords: np.ndarray) -> lis
 def _compute_bbox(y_coords: np.ndarray, x_coords: np.ndarray) -> list[float]:
     """Compute a bounding box [xmin, ymin, xmax, ymax] for pixel-registered data.
 
-    For pixel-registered grids the bbox extends by half a pixel beyond the
-    outermost coordinate centres on all sides, matching the ``spatial:``
-    convention definition of pixel registration.
+    Per the ``spatial:`` convention's pixel registration, the bbox extends half a pixel
+    beyond the outermost coordinate centres on all sides.
     """
     dx = np.diff(x_coords)
     dy = np.diff(y_coords)
@@ -248,11 +240,9 @@ def _geoemb_fields(
     spatial_layout: str | None,
     source_data: tuple[str, ...],
 ) -> dict:
-    """The ``geoemb:*`` (+ ``checkpoint_id``) attrs, shared by the single-ROI root
-    builder and the multi-group root builder.
+    """The ``geoemb:*`` (+ ``checkpoint_id``) attrs, shared by the single-ROI and multi-group builders.
 
-    *gsd* is already resolved to a trustworthy metre value or ``None`` — the caller
-    decides how (derived from a metre-CRS grid, or explicit). See
+    *gsd* arrives already resolved to a trustworthy metre value or ``None``. See
     :func:`build_convention_attrs` for the meaning of each ``geoemb:`` field.
     """
     attrs: dict = {
@@ -293,11 +283,11 @@ def build_geoemb_root_attrs(
 ) -> dict:
     """``geoemb:`` attrs for the ROOT of a multi-group store (``utm_zones`` / ``global``).
 
-    In the geoembeddings ``utm_zones`` layout the encoder/quantization provenance is
-    stated ONCE at the root (it is identical across zones), while ``proj:``/``spatial:``
-    live on each per-zone group (their CRS and grid differ) — build those with
-    :func:`build_convention_attrs` and ``include_geoemb=False``. *gsd* is explicit
-    here because the root has no single coordinate grid to derive it from.
+    In the ``utm_zones`` layout the encoder/quantization provenance is stated ONCE at the
+    root, being identical across zones, while ``proj:``/``spatial:`` live on each per-zone
+    group whose CRS and grid differ — build those with :func:`build_convention_attrs` and
+    ``include_geoemb=False``. *gsd* is explicit here because the root has no single
+    coordinate grid to derive it from.
     """
     attrs = _geoemb_fields(
         embedding_dim=embedding_dim,
@@ -331,42 +321,35 @@ def build_convention_attrs(
 ) -> dict:
     """Build GeoZarr convention attributes for the root group.
 
-    Returns a flat dict of attributes to set on the Zarr root group.
-    Includes ``zarr_conventions`` registration, ``proj:*``, ``spatial:*``,
-    and ``geoemb:*`` metadata (the geoembeddings convention).
-
-    *epsg_code* takes precedence over *tile_id* for determining the CRS.
-    This allows callers who reproject data to record the actual output CRS
-    instead of the original UTM zone derived from the MGRS tile ID.
-
-    If neither *epsg_code* nor *tile_id* resolve to a valid EPSG code,
-    ``proj:`` conventions are omitted (no CRS info available).
+    Returns a flat dict for the Zarr root group: the ``zarr_conventions`` registration plus
+    ``proj:*``, ``spatial:*`` and ``geoemb:*`` metadata. *epsg_code* takes precedence over
+    *tile_id*, so a caller that reprojects records the actual output CRS rather than the
+    MGRS tile's original UTM zone; if neither resolves to a valid EPSG code the ``proj:``
+    convention is omitted.
 
     The ``geoemb:`` fields record encoder-model provenance and quantization:
-    ``geoemb:model`` is the PUBLIC encoder reference URL — *model_url* when a
-    caller supplies the exact public URI for the encoder it used, else derived
-    from :data:`ENCODER_VERSION`. It is NEVER built from *model_version*, which
-    in production is an internal checkpoint filename stem; that is recorded as a
-    plain ``checkpoint_id`` provenance attr. ``geoemb:build_version`` is the
-    software/package version. *data_type* is the quantized storage dtype.
-    *gsd* (metres) is emitted only when trustworthy — derived from a metre-based
-    CRS's coordinate spacing, or an explicit *gsd* the caller vouches for; for a
-    non-metre CRS (e.g. degrees/feet) or absent coords it is OMITTED (optional
-    field, no false metre value). *spatial_layout* is ``"utm_zones"``/``"global"``
-    and OMITTED when ``None`` (a single-ROI store has no utmNN/global groups);
-    *source_data* the source-dataset URLs.
 
-    Set *include_geoemb* to False to emit only ``proj:``/``spatial:`` (no ``geoemb:``):
-    the multi-group campaign store carries geoemb: once at the root
-    (:func:`build_geoemb_root_attrs`) and uses this builder only for each zone's
-    CRS/grid.
+    * ``geoemb:model`` — the PUBLIC encoder reference URL: *model_url* when the caller
+      supplies the exact public URI, else derived from :data:`ENCODER_VERSION`. NEVER built
+      from *model_version*, an internal checkpoint filename stem in production, which is
+      recorded as a plain ``checkpoint_id`` provenance attr instead.
+    * ``geoemb:build_version`` — the software/package version.
+    * ``geoemb:data_type`` — the quantized storage dtype (*data_type*).
+    * ``geoemb:gsd`` — metres, and emitted only when trustworthy: from a metre-based CRS's
+      coordinate spacing, or an explicit *gsd* the caller vouches for. OMITTED for a
+      non-metre CRS (degrees, feet) or absent coords rather than given a false value.
+    * ``geoemb:spatial_layout`` — ``"utm_zones"``/``"global"``; OMITTED when ``None``, since
+      a single-ROI store has no utmNN/global groups.
+    * ``geoemb:source_data`` — the source-dataset URLs.
+
+    *include_geoemb* False emits only ``proj:``/``spatial:``: the multi-group campaign store
+    carries geoemb: once at the root (:func:`build_geoemb_root_attrs`) and uses this builder
+    only for each zone's CRS/grid.
     """
     conventions: list[dict] = []
     attrs: dict = {}
 
     # --- proj: convention ---
-    # An explicit *epsg_code* takes precedence over tile_id derivation so that
-    # callers who reproject data can record the actual output CRS.
     proj_fields: dict[str, str | dict] = {}
     effective_epsg = epsg_code
     if not effective_epsg and tile_id:
@@ -389,15 +372,10 @@ def build_convention_attrs(
         attrs["spatial:registration"] = "pixel"
 
     # --- geoemb: convention ---
-    # Omitted when *include_geoemb* is False: the multi-group campaign store states
-    # geoemb: ONCE at the root (build_geoemb_root_attrs) and uses this function only
-    # for per-zone proj:/spatial:, whose CRS/grid differ by zone.
     if include_geoemb:
         conventions.append(_GEOEMB_CONVENTION)
-        # geoemb:gsd is OPTIONAL and defined in metres, so emit it ONLY with a
-        # trustworthy metric value: derived from the coordinate spacing of a
-        # metre-based CRS, or an explicit gsd the caller vouches for. A non-metre CRS
-        # (EPSG:4326 degrees, foot-based) or missing coords → OMIT it (no false value).
+        # geoemb:gsd is OPTIONAL and in metres, so derive it only from a metre-based CRS's
+        # spacing; otherwise fall back to the caller's explicit value (possibly None).
         if x_coords is not None and len(x_coords) > 1 and _is_metre_crs(effective_epsg):
             gsd_val: float | None = abs(float(np.median(np.diff(x_coords))))
         else:

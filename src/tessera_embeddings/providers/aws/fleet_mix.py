@@ -1,21 +1,18 @@
 """State the GPU fleet's shape, so every instance pool is asked for at once.
 
-Ray's autoscaler picks node types greedily and stops choosing one only when *that
-type's* ``max_workers`` is exhausted. Our production rung packs a one-CPU one-GPU actor
-more tightly than any 8 vCPU fallback, so it wins every unit of demand — and while
-demand stays under its ceiling an open fallback is never asked for at all, however long
-the primary has been refusing capacity.
-
-Neither of Ray's escapes works: autoscaler v2 (the default since Ray 2.50) has no plugin
-point for a scoring function, and its own capacity signal is both a tiebreak these rungs
-never reach and populated only on a launch *timeout* rather than a refusal.
+Ray's autoscaler picks node types greedily and stops choosing one only when *that type's*
+``max_workers`` is exhausted. Our production rung packs a one-CPU one-GPU actor more
+tightly than any 8 vCPU fallback, so it wins every unit of demand — and while demand stays
+under its ceiling an open fallback is never asked for at all, however long the primary has
+been refusing capacity. Neither of Ray's escapes works: autoscaler v2 (the default since
+Ray 2.50) has no plugin point for a scoring function, and its own capacity signal is both
+a tiebreak these rungs never reach and populated only on a launch *timeout*, not a refusal.
 
 So this does not argue with the ranking. It states how many machines of each rung the
 fleet should hold, through ``request_resources``, which v2 satisfies in the same
-scheduling pass as ordinary actor demand.
-
-Three properties of that pass are load-bearing, all measured on a live cluster rather
-than read (evidence in ``temp/simultaneous-gpu-fill-plan.md``):
+scheduling pass as ordinary actor demand. Three properties of that pass are load-bearing,
+all measured on a live cluster rather than read (evidence in
+``temp/simultaneous-gpu-fill-plan.md``):
 
 * an ask above a rung's ceiling provisions **nothing** — a partially infeasible
   constraint is discarded whole, so every bound here is required, not defensive;
@@ -26,7 +23,7 @@ than read (evidence in ``temp/simultaneous-gpu-fill-plan.md``):
 
 What this does NOT bound is everything Ray may launch: ordinary actor demand above the
 requested shape is scheduled normally, so a fleet sized well past what the budget affords
-can exceed it. That is the pre-existing limitation ``_apply_gpu_vcpu_budget`` documents.
+can exceed it — the pre-existing limitation ``_apply_gpu_vcpu_budget`` documents.
 """
 
 from __future__ import annotations
@@ -176,15 +173,13 @@ def fleet_asks(
         return more
 
     # PHASE 1 — a floor for every rung we have never obtained, taken before anything is
-    # distributed. A rung with nothing running is a rung whose availability is UNKNOWN, and
-    # the only way to find out is to keep asking; without this the best rung absorbs the
-    # whole demand, quota or aggregate ceiling and the fallback is never requested at all.
-    # It is keyed on the rung's OWN live count, not the primary's: an earlier version
-    # dropped the reservation once the primary had any machine, on the reasoning that the
-    # scheduler would correct it. The scheduler recomputes THIS function, so it never did.
-    #
-    # Only while the machines we hold cannot already cover the demand: at a draining tail
-    # a probe would buy a machine for work that does not exist.
+    # distributed. A rung with nothing running is a rung whose availability is UNKNOWN and the
+    # only way to find out is to keep asking; without this the best rung absorbs the whole
+    # demand, quota or aggregate ceiling and the fallback is never requested at all. Keyed on
+    # the rung's OWN live count, never the primary's: the scheduler only recomputes THIS
+    # function, so it cannot correct a reservation dropped here. Taken only while the machines
+    # we hold cannot already cover the demand — at a draining tail a probe would buy a machine
+    # for work that does not exist.
     floors = dict.fromkeys(live, 0)
     if want_gpus > sum(live[r.instance_type] * r.gpus_per_node for r in open_rungs):
         for rung in open_rungs:
@@ -279,12 +274,11 @@ def plan_from_resolved_config(config: Mapping[str, Any], vcpu_budget: int | None
     if len(ceilings) < 2:
         return None
     # At most ONE fallback, enforced on the RESOLVED plan and not only on the campaign
-    # parameter. The `gpu-worker-ladder` SSM key can open a third rung without naming it
-    # in `gpu_fallback_instance_types`, which walks straight past both guards. Trimmed
-    # rather than refused: the request is a floor, and ordinary demand above it is still
-    # scored by Ray, which breaks the tie between identically-shaped fallbacks on
-    # node-type name — so a third rung would put a card choice back in Ray's hands, but
-    # dropping the whole mix over it would be worse than running on the best two.
+    # parameter: the `gpu-worker-ladder` SSM key can open a third rung without naming it in
+    # `gpu_fallback_instance_types`, walking straight past both guards. Trimmed rather than
+    # refused — a third rung would put a card choice back in Ray's hands (it breaks ties
+    # between identically-shaped fallbacks on node-type name), but dropping the whole mix
+    # over it would be worse than running on the best two.
     ordered = [r.instance_type for r in GPU_RUNGS if r.instance_type in ceilings]
     if len(ordered) > 2:
         dropped = ordered[2:]
@@ -310,12 +304,12 @@ def plan_from_resolved_yaml(path: str | Path, vcpu_budget: int | None) -> GpuFle
 def _ensure_gcs_client_for_request_resources(ray: ModuleType) -> None:
     """Make ``request_resources`` usable from a driver that connected to a live cluster.
 
-    It reads the GCS address off Ray's *global* internal-KV client, which is a module
-    global set during ``worker.connect()`` and cleared by any ``disconnect()``. A driver
-    that reconnects with ``ignore_reinit_error=True`` returns early and never re-seeds it,
-    so the call fails with ``AssertionError: GCS client is not available`` even though the
-    driver is connected and everything else works — which is exactly what happened on the
-    first end-to-end run, silently, because the whole fleet mix is best-effort.
+    It reads the GCS address off Ray's *global* internal-KV client, a module global set
+    during ``worker.connect()`` and cleared by any ``disconnect()``. A driver that reconnects
+    with ``ignore_reinit_error=True`` returns early and never re-seeds it, so the call fails
+    with ``AssertionError: GCS client is not available`` even though the driver is connected
+    and everything else works — which is what silently disabled the fleet mix on the first
+    end-to-end run, the whole feature being best-effort.
 
     Re-seeding is idempotent and cheap. The address comes from the public runtime context.
     """

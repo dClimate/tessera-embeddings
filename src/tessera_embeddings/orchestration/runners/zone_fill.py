@@ -1,47 +1,40 @@
 """Zone-fill runner: one (zone, year) of the global store, end to end.
 
-The orchestration-facing composition for the global campaign (ADR-008,
-implementation plan W5): enumerate the zone's shard-aligned tile grid against
-the **campaign land-mask coverage bitmap**, run Ray inference over the live
-tiles, assemble the staged tiles into whole shards of the pre-seeded zone
-group, and tag the landed commit. The Prefect/AWS wiring (work queues,
+The orchestration-facing composition for the global campaign (ADR-008, implementation plan
+W5): enumerate the zone's shard-aligned tile grid against the **campaign land-mask coverage
+bitmap**, run Ray inference over the live tiles, assemble the staged tiles into whole shards
+of the pre-seeded zone group, and tag the landed commit. The Prefect/AWS wiring (work queues,
 credentials) lives downstream — this module ships the plain callable it wraps.
 
 Contracts (all caller-owned):
 
-- **Ray**: the caller is already inside a Ray context (``ray.init`` or an
-  attached cluster), exactly as for
-  :func:`tessera_embeddings.inference.runner.run_inference`.
+- **Ray**: the caller is already inside a Ray context (``ray.init`` or an attached cluster),
+  exactly as for :func:`tessera_embeddings.inference.runner.run_inference`.
 - **Land mask**: ``land_mask_path`` is the coverage Icechunk repo
-  (:meth:`BucketPaths.land_mask_store`); this zone's group holds the
-  registry-derived ``tile_live_2048`` bitmap built by
-  :mod:`tessera_embeddings.ingest.land_mask` (ADR-010). A tile is live iff a
-  land cell's footprint intersects it; one ~1 KB GET replaces the per-tile
-  windowed reads of the old pixel mask. Within a live tile every
-  observation-valid pixel is embedded, and water is SCL-valid — the v1.1 mask
-  is all-1s with a ~1-cell sea buffer, so there is no per-pixel land signal to
-  apply, and pixel-level masking inside tiles is moot (not merely deferred).
+  (:meth:`BucketPaths.land_mask_store`); this zone's group holds the registry-derived
+  ``tile_live_2048`` bitmap built by :mod:`tessera_embeddings.ingest.land_mask` (ADR-010). A
+  tile is live iff a land cell's footprint intersects it; one ~1 KB GET replaces the per-tile
+  windowed reads of a pixel mask. Within a live tile every observation-valid pixel is
+  embedded, and water is SCL-valid — the v1.1 mask is all-1s with a ~1-cell sea buffer, so
+  pixel-level masking inside tiles is moot, not merely deferred.
 - **Zone group**: already seeded
-  (:func:`tessera_embeddings.storage.global_store.seed_zone_groups`); the
-  group's array shape and shard size are the grid authority. Nothing is
-  created or resized here (D1).
+  (:func:`tessera_embeddings.storage.global_store.seed_zone_groups`); the group's array shape
+  and shard size are the grid authority. Nothing is created or resized here (D1).
 - **Ingest mosaics**: cover the zone grid exactly; a mismatch is a loud error.
-- **One fill per zone at a time**: concurrent fills of *different* zones
-  commit to disjoint groups and rebase cleanly, but two concurrent fills of
-  the *same* zone (different years) both rewrite that group's
-  ``years_complete``/``runs`` attrs and icechunk's ``ConflictDetector`` cannot
-  auto-merge attribute conflicts — the loser raises ``RebaseFailedError``.
-  Schedule zone-parallel, year-serial.
+- **One fill per zone at a time**: concurrent fills of *different* zones commit to disjoint
+  groups and rebase cleanly, but two concurrent fills of the *same* zone (different years)
+  both rewrite that group's ``years_complete``/``runs`` attrs, and icechunk's
+  ``ConflictDetector`` cannot auto-merge attribute conflicts — the loser raises
+  ``RebaseFailedError``. Schedule zone-parallel, year-serial.
 
-An all-ocean cell (the mask selects no tiles) — or a cell whose live tiles all
-skip (zero valid pixels) — is legitimate: it is marked complete with no data
-(:func:`~tessera_embeddings.storage.campaign.mark_zone_year_empty`) and tagged,
-so the campaign work list converges. A cell that is already complete
-short-circuits without re-running anything (creating the tag if a crash
-landed the fill untagged). Zone-year tags are permanent: icechunk forbids
-recreating even a deleted tag name, so a deliberate refill keeps the old tag
-pointing at the old snapshot and must pin its new snapshot under a fresh,
-manually chosen tag name — campaign history is never silently rewritten.
+An all-ocean cell (the mask selects no tiles) — or one whose live tiles all skip (zero valid
+pixels) — is legitimate: it is marked complete with no data
+(:func:`~tessera_embeddings.storage.campaign.mark_zone_year_empty`) and tagged, so the
+campaign work list converges. An already-complete cell short-circuits, creating the tag if a
+crash landed the fill untagged. Zone-year tags are permanent — icechunk forbids recreating
+even a deleted tag name — so a deliberate refill keeps the old tag on the old snapshot and
+must pin its new snapshot under a fresh, manually chosen name; campaign history is never
+silently rewritten.
 """
 
 from __future__ import annotations
@@ -88,15 +81,15 @@ from tessera_embeddings.storage.zone_grid import zone as zone_spec
 def assert_calendar_year_window(time_window: TimeWindow, year: int) -> None:
     """Reject any window that is not exactly January-December of ``year``.
 
-    The single enforcement point for the calendar-year guarantee. Callable BEFORE
-    a cluster is provisioned as well as inside planning: the request is decidable
-    from config alone, and provisioning a GPU fleet (or starting ingests) for a
-    window that planning will certainly reject is pure spend.
+    The single enforcement point for the calendar-year guarantee. Callable BEFORE a cluster
+    is provisioned as well as inside planning: the request is decidable from config alone,
+    and provisioning a GPU fleet (or starting ingests) for a window planning will certainly
+    reject is pure spend.
 
-    Compares the WHOLE month set, not just "every month falls in ``year``": a
-    same-year partial (e.g. Jan-Jun 2025) also has ``window_years == {year}`` but
-    is only six months, and would otherwise tag the slot complete with a short
-    window while the seeded ``time_bnds`` advertise the full Jan-Dec.
+    Compares the WHOLE month set, not just "every month falls in ``year``": a same-year
+    partial (e.g. Jan-Jun 2025) also has ``window_years == {year}`` but is six months, and
+    would tag the slot complete with a short window while the seeded ``time_bnds`` advertise
+    the full Jan-Dec.
     """
     if set(time_window.months) != {(year, m) for m in range(1, 13)}:
         window_years = sorted({y for y, _ in time_window.months})
@@ -119,37 +112,32 @@ def zone_live_tile_count(
 ) -> int:
     """Number of 2048-px tiles the coverage bitmap marks live for ``zone``.
 
-    The same one-GET read as :func:`zone_has_live_tiles`, kept separate because
-    the multi-zone sequential fill uses the COUNT twice at preflight: ordering
-    its zones largest-first (so a shared cluster's fleet only ever shrinks) and
-    clamping per-zone actor requests. This only reads the liveness bitmap;
-    :func:`fill_zone_year` re-reads and attr-validates the coverage group as
-    the authority, so a wrong-zone mask still fails loudly there rather than
-    being trusted here.
+    The same one-GET read as :func:`zone_has_live_tiles`, kept separate because the
+    multi-zone sequential fill uses the COUNT twice at preflight: ordering its zones
+    largest-first (so a shared cluster's fleet only ever shrinks) and clamping per-zone actor
+    requests. This reads only the liveness bitmap; :func:`fill_zone_year` re-reads and
+    attr-validates the coverage group as the authority, so a wrong-zone mask still fails
+    loudly there rather than being trusted here.
     """
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
     return int(np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool).sum())
 
 
 #: Observations per pixel-year by 20-degree latitude band — the campaign census, from
-#: `context_docs/design/campaign-cost-model.md`. Radar is a CMR granule census of
-#: OPERA RTC-S1 normalised by cos(lat); optical is a Sentinel-2 STAC census of distinct
-#: acquisition dates weighted by mean clear fraction. The value is `S2 + S1`, which is
-#: the token count per pixel and therefore taken to be proportional to inference cost.
+#: `context_docs/design/campaign-cost-model.md`. Radar is a CMR granule census of OPERA RTC-S1
+#: normalised by cos(lat); optical is a Sentinel-2 STAC census of distinct acquisition dates
+#: weighted by mean clear fraction. The value is `S2 + S1`, the token count per pixel, taken to
+#: be proportional to inference cost.
 #:
-#: **That proportionality treats a radar token and an optical token as equally expensive, and
-#: that is an assumption rather than a measurement.** The forward pass encodes optical and radar
-#: as separate sequences, so a chunk carrying radar does work that scales with more than its
-#: token total; whether the per-token cost is the same across the two is unmeasured. If it is
-#: not, this weight under-values a radar-heavy zone relative to a radar-free one, and clusters
-#: balanced on it finish unevenly in that direction. `CHUNK_SUMMARY` now reports the radar
-#: sequence lengths per chunk, which is what would settle it — see the inference profile record.
+#: **That proportionality assumes a radar token and an optical token cost the same, which is
+#: unmeasured.** If they do not, this weight under-values a radar-heavy zone against a
+#: radar-free one and clusters balanced on it finish unevenly in that direction.
+#: `CHUNK_SUMMARY` reports per-chunk radar sequence lengths, which is what would settle it.
 #:
 #: The bands are wide and the absolutes carry sampling error (five points per band), but
-#: cluster balancing only needs the RATIOS between bands, which are the robust part —
-#: both halves were counted on the same grid. The final band runs to -80 rather than -60
-#: because there is negligible land below -60 and no reason for a zone to fall outside
-#: the table.
+#: cluster balancing needs only the RATIOS between bands, which are the robust part — both
+#: halves were counted on the same grid. The final band runs to -80 rather than -60 because
+#: there is negligible land below -60 and no reason for a zone to fall outside the table.
 TOKENS_PER_PX_BY_BAND: tuple[tuple[float, float], ...] = (
     # (band's lower latitude bound, tokens per pixel-year)
     (60.0, 208.0),
@@ -165,9 +153,8 @@ TOKENS_PER_PX_BY_BAND: tuple[tuple[float, float], ...] = (
 def tokens_per_px(latitudes: np.ndarray) -> np.ndarray:
     """Tokens per pixel-year for each latitude, bucketed into :data:`TOKENS_PER_PX_BY_BAND`."""
     # Ascending by lower bound, so a higher band overwrites the ones it contains and the
-    # highest match wins. Iterating the table as written would let every band above -80
-    # be overwritten by the last row, which is why the order is explicit rather than
-    # incidental.
+    # highest match wins. Iterating the table as written would let the last row (-80)
+    # overwrite every band above it, so the sort is load-bearing, not incidental.
     out = np.full(latitudes.shape, TOKENS_PER_PX_BY_BAND[-1][1], dtype="float64")
     for lower, tokens in sorted(TOKENS_PER_PX_BY_BAND):
         out = np.where(latitudes >= lower, tokens, out)
@@ -183,23 +170,22 @@ def zone_work_weight(
 ) -> float:
     """A zone's inference WORK, in tile-token units, for balancing clusters.
 
-    The same one-GET read as :func:`zone_live_tile_count`, but weighted: each live
-    tile row is multiplied by the tokens-per-pixel of its latitude band before
-    summing. Returns tiles x tokens-per-px, so it is proportional to a zone-year's
-    GPU-hours and directly comparable between zones.
+    The same one-GET read as :func:`zone_live_tile_count`, but weighted: each live tile row
+    is multiplied by the tokens-per-pixel of its latitude band before summing. Returns
+    tiles x tokens-per-px, proportional to a zone-year's GPU-hours and directly comparable
+    between zones.
 
-    **Why not just count tiles.** Inference consumes one sequence per pixel, so its
-    cost scales with `pixels x observations`, and observation count varies about
-    twofold with latitude — a boreal tile is worth roughly twice an equatorial one.
-    Balancing on tile counts therefore balances AREA and leaves the real work uneven,
-    which shows up as clusters finishing at materially different times. Two zones
-    with identical tile counts can differ by ~2x in work.
+    **Why not just count tiles.** Inference consumes one sequence per pixel, so cost scales
+    with `pixels x observations`, and observation count varies about twofold with latitude —
+    a boreal tile is worth roughly twice an equatorial one. Two zones with identical tile
+    counts can differ by ~2x in work, so balancing on tile counts balances AREA and leaves
+    clusters finishing at materially different times.
 
-    **This is not a substitute for the tile count.** The chained fill still orders its
-    zones by :func:`zone_live_tile_count` and still clamps actor requests to it,
-    because those are properties of AREA: a zone needs one actor per tile regardless
-    of how many observations each pixel has, and the ordering exists so an autoscaled
-    fleet only ever shrinks. Use tiles for capacity, this for scheduling.
+    **Not a substitute for the tile count.** The chained fill still orders its zones by
+    :func:`zone_live_tile_count` and clamps actor requests to it, because those are
+    properties of AREA: a zone needs one actor per tile however deep its pixels are, and the
+    ordering exists so an autoscaled fleet only ever shrinks. Tiles for capacity, this for
+    scheduling.
     """
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
     live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
@@ -216,10 +202,9 @@ def zone_has_live_tiles(
 ) -> bool:
     """Whether the coverage bitmap marks ANY 2048-px tile live for ``zone``.
 
-    A cheap one-GET preflight: an all-ocean cell (no live tiles) can be filled
-    empty with no GPU work, so a caller can skip provisioning a Ray cluster for
-    it. See :func:`zone_live_tile_count` for the underlying read and its
-    trust boundary.
+    A cheap one-GET preflight: an all-ocean cell can be filled empty with no GPU work, so a
+    caller can skip provisioning a Ray cluster for it. See :func:`zone_live_tile_count` for
+    the underlying read and its trust boundary.
     """
     return zone_live_tile_count(land_mask_path, zone, get_credentials=get_credentials, s3_region=s3_region) > 0
 
@@ -235,9 +220,8 @@ def zone_year_complete(
     """Whether ``(zone, year)`` is already recorded in the group's ``years_complete``.
 
     A cheap metadata read so a caller can skip provisioning a GPU cluster for a
-    crash-recovery retry of a landed-but-untagged cell (:func:`fill_zone_year`
-    re-checks and, for such a cell, only re-creates the tag — no inference).
-    Returns False for an unseeded zone.
+    crash-recovery retry of a landed-but-untagged cell (:func:`fill_zone_year` re-checks and,
+    for such a cell, only re-creates the tag — no inference). False for an unseeded zone.
     """
     repo = open_global_repo(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
@@ -258,10 +242,9 @@ def zone_year_on_axis(
 ) -> bool:
     """Whether ``year`` falls on ``zone``'s pre-allocated time axis.
 
-    A cheap metadata read (no mask, no mosaic) so a caller can decline to
-    provision a GPU cluster for an off-axis / unseeded year: :func:`fill_zone_year`
-    rejects such a year up front, but only after the flow would otherwise have
-    stood up Ray. Returns False for an unseeded zone or an off-axis year.
+    A cheap metadata read (no mask, no mosaic) so a caller can decline to provision a GPU
+    cluster for an off-axis or unseeded year: :func:`fill_zone_year` rejects one up front,
+    but only after the flow would have stood Ray up. False for an unseeded or off-axis year.
     """
     repo = open_global_repo(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
@@ -276,11 +259,10 @@ def zone_year_on_axis(
 class ZoneFillHandoff:
     """State handed from :func:`infer_zone_year` to :func:`assemble_zone_year`.
 
-    Plain data only (labels, counts, per-tile result dicts) — no repo handles
-    or zarr groups — so the assembly phase can run on a different thread than
-    the inference phase (the sequential multi-zone runner trails a cell's
-    assembly behind the NEXT cell's inference) and re-open its own store
-    connections there.
+    Plain data only (labels, counts, per-tile result dicts) — no repo handles or zarr groups
+    — so the assembly phase can run on a different thread than inference (the sequential
+    multi-zone runner trails a cell's assembly behind the NEXT cell's inference) and re-open
+    its own store connections there.
     """
 
     zone: str
@@ -289,12 +271,12 @@ class ZoneFillHandoff:
     t0: float
     # zone/year/run_id/tile-count fields shared by every result dict.
     summary: dict[str, Any]
-    # Live tiles that went to inference — verify_staged_completeness and
-    # assembly worker sizing both need the list, not just its length.
+    # Live tiles that went to inference — verify_staged_completeness and assembly worker
+    # sizing both need the list, not just its length.
     live: list[ChunkSpec]
     results: list[dict[str, Any]]
-    # Terminal result produced by the inference phase (already-complete cell,
-    # or all-ocean empty fill). When set, assembly is a pass-through no-op.
+    # Terminal result from the inference phase (already-complete cell, or all-ocean empty
+    # fill). When set, assembly is a pass-through no-op.
     done: dict[str, Any] | None = None
 
 
@@ -303,18 +285,18 @@ def _store_credentials(
 ) -> Callable[[], icechunk.S3StaticCredentials] | None:
     """The credential for the STORE specifically, which may not be the one for our buckets.
 
-    One fill legitimately spans two accounts. It reads mosaics, staged tiles and the land mask
+    One fill legitimately spans two accounts: it reads mosaics, staged tiles and the land mask
     from our buckets with the task role, and — when the global store is the partner-owned
-    published one — writes embeddings to a bucket that role cannot touch at all. So the callback
-    threaded through this module is correct for everything EXCEPT the store, and handing the
-    store's assumed role to everything would break the land-mask read that happens first, on the
-    path every cell takes.
+    published one — writes embeddings to a bucket that role cannot touch at all. So the
+    callback threaded through this module is correct for everything EXCEPT the store, while
+    handing the store's assumed role to everything would break the land-mask read that happens
+    first, on the path every cell takes.
 
-    Resolved HERE, at each `open_global_repo(store_path, ...)`, rather than threaded as a second
-    parameter through a dozen signatures: keying on the argument means the destination decides,
-    and a site that opens the store cannot be missed or mislabelled by hand. Returns the caller's
-    own callback unchanged for our own buckets and for local paths, so dev behaviour and every
-    test double are untouched by construction.
+    Resolved HERE, at each `open_global_repo(store_path, ...)`, rather than threaded as a
+    second parameter through a dozen signatures: keying on the argument means the destination
+    decides, and a site that opens the store cannot be missed or mislabelled by hand. Returns
+    the caller's own callback unchanged for our own buckets and for local paths, so dev
+    behaviour and every test double are untouched by construction.
 
     The import is lazy and s3-only for the same reason the ingest task's is: this module must
     import on a machine with no boto3.
@@ -329,10 +311,10 @@ def _store_credentials(
 def _check_assembly_workers(n: int | None) -> None:
     """Reject an assembly worker override that cannot build a pool.
 
-    Checked at entry, not at use: the value is only consumed after the cell's whole
-    GPU inference has run, and `n or default` treats 0 as "unset" while passing a
-    negative through to `ProcessPoolExecutor(max_workers=<0)`. Either way the cell
-    dies at assembly having already burned the expensive half of the fill.
+    Checked at entry, not at use: the value is consumed only after the cell's whole GPU
+    inference has run, and `n or default` treats 0 as "unset" while passing a negative
+    through to `ProcessPoolExecutor(max_workers=<0)`. Either way the cell dies at assembly
+    having already burned the expensive half of the fill.
     """
     if n is not None and n < 1:
         raise ValueError(f"n_assembly_workers must be >= 1 when set, got {n}")
@@ -365,10 +347,10 @@ def fill_zone_year(
 ) -> dict[str, Any]:
     """Fill one (zone, year): mask → inference → shard assembly → tag.
 
-    The composition of :func:`infer_zone_year` and :func:`assemble_zone_year`,
-    run back to back — the right shape for a standalone single-cell fill. The
-    multi-zone sequential runner calls the two phases separately so a cell's
-    assembly can trail behind the next cell's inference on a shared cluster.
+    :func:`infer_zone_year` and :func:`assemble_zone_year` run back to back — the right shape
+    for a standalone single-cell fill. The multi-zone sequential runner calls the two phases
+    separately so a cell's assembly can trail behind the next cell's inference on a shared
+    cluster.
 
     Args:
         store_path: URI of the global Icechunk repo (``BucketPaths.global_store()``).
@@ -378,33 +360,31 @@ def fill_zone_year(
         mosaic_base: Base path of the zone's ingest mosaic stores.
         staging_base: Base path for staged inference output.
         registry_root: Root of the published registry dataset
-            (:meth:`BucketPaths.optical_registry`). One Parquet part per cell lands under it, a row
-            per live tile, because the year's summary in the store is pooled and cannot say which
-            refused tile came closest to the depth cutoff. ``None`` writes no part.
-        config: Inference configuration; ``config.chunk_size`` must equal the
-            group's shard size (1 tile == 1 shard, D3).
+            (:meth:`BucketPaths.optical_registry`). One Parquet part per cell lands under it,
+            a row per live tile, because the year's summary in the store is pooled and cannot
+            say which refused tile came closest to the depth cutoff. ``None`` writes no part.
+        config: Inference configuration; ``config.chunk_size`` must equal the group's shard
+            size (1 tile == 1 shard, D3).
         num_actors: Ray inference actor count.
         log: Logger (e.g. Prefect's run logger downstream).
-        run_id: Run identifier; a fresh one is minted when omitted. Reuse a
-            prior run's id to resume it (staged tiles are skipped, the year
-            index is overwritten idempotently).
-        n_assembly_workers: Assembly worker-process count; defaults to
-            ``AssemblyConfig`` sizing from the live-tile count.
+        run_id: Run identifier; a fresh one is minted when omitted. Reuse a prior run's id to
+            resume it (staged tiles are skipped, the year index overwritten idempotently).
+        n_assembly_workers: Assembly worker-process count; defaults to ``AssemblyConfig``
+            sizing from the live-tile count.
         s3_concurrency: This fill's slice of the fleet S3-PUT budget, forwarded to
             ``assemble_global``; ``None`` uses the full aggregate target (a lone fill).
         cleanup_staging: Delete staged tiles after a successful fill.
         get_credentials: Optional icechunk credential callback (actors + store).
         s3_region: Optional S3 region override for the global store.
-        on_actor_retire: Optional callback when a misbehaving actor is retired
-        on_fleet_demand: Optional callback ``(want_gpus) -> None`` letting the AWS
-            provider publish a per-instance-type fleet request; see
-            ``providers.aws.fleet_mix``
-            (the AWS provider injects an EC2 terminator).
+        on_actor_retire: Optional callback when a misbehaving actor is retired (the AWS
+            provider injects an EC2 terminator).
+        on_fleet_demand: Optional callback ``(want_gpus) -> None`` letting the AWS provider
+            publish a per-instance-type fleet request; see ``providers.aws.fleet_mix``.
         input_coverage: How much of the requested window the input mosaics actually held,
             measured by the fill's preflight and recorded on the year. The mosaics are
             deleted once a cell lands, so this is the only lasting record of it.
-        fault: Supervised-drill hook, forwarded to the assembly phase. Inert unless
-            the run was armed for a fault this path hosts and for this cell
+        fault: Supervised-drill hook, forwarded to the assembly phase. Inert unless the run
+            was armed for a fault this path hosts and for this cell
             (:mod:`tessera_embeddings.config.fault_injection`).
 
     Returns:
@@ -449,11 +429,10 @@ def fill_zone_year(
 class ZonePlan:
     """Everything a (zone, year) fill knows before any GPU work starts.
 
-    Produced by :func:`plan_zone_inference`; consumed either by
-    :func:`infer_zone_year` (which runs a per-cell ``run_inference`` over
-    ``live``) or by the chained multi-zone runner (which enqueues ``live``
-    into a shared scheduler session and reassembles a
-    :class:`ZoneFillHandoff` from the streamed results).
+    Produced by :func:`plan_zone_inference`; consumed either by :func:`infer_zone_year`
+    (a per-cell ``run_inference`` over ``live``) or by the chained multi-zone runner, which
+    enqueues ``live`` into a shared scheduler session and reassembles a
+    :class:`ZoneFillHandoff` from the streamed results.
     """
 
     zone: str
@@ -479,14 +458,14 @@ def preflight_destination(
     """Can the seeded destination hold what a fill will write? One metadata read, no fleet.
 
     **The point of this function is WHERE it can be called from.** The same check runs inside
-    :func:`plan_zone_inference`, which is already far earlier than assembly — but the single-cell
-    Prefect flow provisions its GPU cluster and only then calls the fill, so a mismatch there is
-    caught after the fleet is up and billing. This is callable before the cluster exists, needs
-    nothing but the store, and raises the same error with the same message.
+    :func:`plan_zone_inference`, already far earlier than assembly — but the single-cell
+    Prefect flow provisions its GPU cluster and only then calls the fill, so a mismatch there
+    is caught after the fleet is up and billing. This is callable before the cluster exists,
+    needs nothing but the store, and raises the same error with the same message.
 
-    Cheap enough to run in both places and left in both deliberately: a caller that forgets it
-    still fails before inference rather than at assembly, and a caller that remembers pays one
-    metadata read to fail before it spends anything at all.
+    Left in both places deliberately: a caller that forgets it still fails before inference
+    rather than at assembly, and a caller that remembers pays one metadata read to fail before
+    it spends anything at all.
 
     Raises:
         ValueError: If the zone is not seeded, if a REQUIRED array is missing from it, or if its
@@ -499,12 +478,11 @@ def preflight_destination(
     if zone not in root:
         raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
     node = cast(zarr.Group, root[zone])
-    # PRESENCE OF THE REQUIRED ARRAYS, which the type check deliberately does not test: it skips an
-    # absent array so an older store missing an OPTIONAL carried variable still fills. That
-    # tolerance is right for the optional set and wrong for `embeddings`/`scales` — a zone missing
-    # one of those passed this preflight, provisioned a GPU fleet, ran a full inference, and was
-    # rejected by assembly afterwards. Absent is a different fault from mistyped and needs its own
-    # test; the optional set stays tolerated.
+    # PRESENCE OF THE REQUIRED ARRAYS, which the type check deliberately does not test: it skips
+    # an absent array so an older store missing an OPTIONAL carried variable still fills. That
+    # tolerance is right for the optional set and wrong for `embeddings`/`scales` — a zone
+    # missing one of those passed this preflight, provisioned a GPU fleet, ran a full inference,
+    # and was rejected by assembly afterwards. Absent is a different fault from mistyped.
     missing = [var for var in REQUIRED_VARS if var not in node]
     if missing:
         raise ValueError(
@@ -529,11 +507,10 @@ def plan_zone_inference(
 ) -> ZonePlan:
     """Validate a (zone, year) cell and enumerate its live tiles — no GPU work.
 
-    Everything :func:`infer_zone_year` does before ``run_inference``:
-    seeded/axis/window validation, the coverage-mask read (with identity
-    checks), the live-tile enumeration, and the mosaic grid asserts. Terminal
-    cells — already complete (retagged here) or all-ocean (marked complete
-    empty, committed and tagged here) — come back with ``ZonePlan.done`` set.
+    Everything :func:`infer_zone_year` does before ``run_inference``: seeded/axis/window
+    validation, the coverage-mask read (with identity checks), the live-tile enumeration, and
+    the mosaic grid asserts. Terminal cells — already complete (retagged here) or all-ocean
+    (marked complete empty, committed and tagged here) — come back with ``ZonePlan.done`` set.
     """
     t0 = time.monotonic()
     run_id = run_id or uuid.uuid4().hex[:12]
@@ -549,13 +526,11 @@ def plan_zone_inference(
 
     # The store's minimum-depth rule is part of its write-once root identity, so the store —
     # not this call's config — is the authority on what rule its zones were filled under. The
-    # Prefect adapter substitutes the store's value into the config before calling; this ASSERTS
-    # that rather than trusting it, so the domain API is safe to call directly and the adapter's
-    # substitution is verified rather than assumed. Free: `root` is already open above.
-    #
-    # A check and not a substitution, deliberately. Silently replacing a caller's value would
-    # let a direct caller believe it had configured a line it had not, which is the same class
-    # of surprise as the gap it closes.
+    # Prefect adapter substitutes the store's value into the config before calling; this
+    # ASSERTS that rather than trusting it, so the domain API is safe to call directly. Free:
+    # `root` is already open above. A check and not a substitution, deliberately: silently
+    # replacing a caller's value would let a direct caller believe it had configured a line it
+    # had not, the same class of surprise as the gap it closes.
     raw_rule = root.attrs.get("optical_min_obs")
     store_rule = int(cast("int", raw_rule)) if raw_rule is not None else None
     if config.optical_min_obs != store_rule:
@@ -573,31 +548,26 @@ def plan_zone_inference(
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — the axis is fixed at seeding (ADR-008 D1)."
         )
-    # STRICT calendar-year gate: the window must be EXACTLY Jan-Dec of `year`. The
-    # global store's time points are window STARTS (each slot's coordinate is Jan 1
-    # of its year, fixed at seeding), so a window that merely overlaps `year` — e.g.
-    # a rolling Feb-Jan — would sit at a coordinate outside its own real interval
-    # (violating CF §7.1 bounds containment) and be permanently mislabeled under the
-    # write-once zone-year tag; and one slot per year cannot hold two window phases
-    # anyway. Label accuracy is the invariant: `time_convention="calendar_year"` is a
-    # GUARANTEE, and the seeded `time_bnds` ([Jan 1 of y, Jan 1 of y+1) per slot) states each
-    # slot's true interval. Non-calendar 12-month windows belong in a store whose
-    # time points ARE the windows: today the single-ROI `12mo_window_end` path
-    # (assemble(): time = window-end label, extendable axis); zone-scale, the
-    # windowed-variant design in ADR-011 (slots declared at other start months).
-    # Compare the WHOLE month set, not just "every month falls in `year`": a
-    # same-year partial (e.g. Jan-Jun 2025) also has window_years == {year} but is
-    # only six months, and would otherwise pass here and tag the slot complete
-    # with a short window while the seeded time_bnds advertise the full Jan-Dec.
+    # STRICT calendar-year gate: the window must be EXACTLY Jan-Dec of `year` (see the
+    # callee for why the whole month set is compared). The global store's time points are
+    # window STARTS — each slot's coordinate is Jan 1 of its year, fixed at seeding — so a
+    # window that merely overlaps `year`, a rolling Feb-Jan say, would sit at a coordinate
+    # outside its own real interval (violating CF §7.1 bounds containment) and be permanently
+    # mislabeled under the write-once zone-year tag; and one slot per year cannot hold two
+    # window phases anyway. Label accuracy is the invariant: `time_convention="calendar_year"`
+    # is a GUARANTEE and the seeded `time_bnds` ([Jan 1 of y, Jan 1 of y+1) per slot) state
+    # each slot's true interval. Non-calendar 12-month windows belong in a store whose time
+    # points ARE the windows: today the single-ROI `12mo_window_end` path (assemble(): time =
+    # window-end label, extendable axis), or at zone scale the ADR-011 windowed-variant
+    # design (slots declared at other start months).
     assert_calendar_year_window(config.time_window, year)
 
-    # Idempotent retry: a cell that already landed is done — re-running it
-    # would produce a new snapshot that tag_zone_year rightly refuses to move
-    # the tag to. If the crash hit between the fill commit and the tag, tag the
-    # current tip now (the fill commit is an ancestor, so retention holds; see
-    # mark_zone_year_empty's attribution note) instead of re-running inference.
-    # Zone-year tags are write-once forever (icechunk forbids tag-name reuse
-    # even after deletion); deliberate refills need a fresh tag name.
+    # Idempotent retry: a cell that already landed is done — re-running it would produce a new
+    # snapshot that tag_zone_year rightly refuses to move the tag to. If the crash hit between
+    # the fill commit and the tag, tag the current tip now (the fill commit is an ancestor, so
+    # retention holds; see mark_zone_year_empty's attribution note) instead of re-inferring.
+    # Zone-year tags are write-once forever — icechunk forbids tag-name reuse even after
+    # deletion — so deliberate refills need a fresh tag name.
     tag = zone_year_tag(zone, year)
     if year in read_years_complete(node):
         if tag in repo.list_tags():
@@ -627,24 +597,21 @@ def plan_zone_inference(
             "the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
         )
 
-    # CAN THIS DESTINATION HOLD WHAT WE ARE ABOUT TO WRITE? One metadata read, here, rather than
+    # CAN THIS DESTINATION HOLD WHAT WE ARE ABOUT TO WRITE? One metadata read here, rather than
     # the same answer from assembly after the fleet has run: on 2026-08-18 two fills each spent
     # their whole inference before dying on a seeded dtype the staging writer cannot produce.
-    # Beside the shard-pitch check above because it is the same kind of gate — the destination's
-    # shape, tested before anything is billed.
+    # Beside the shard-pitch check above because it is the same kind of gate.
     check_destination_types(node, GLOBAL, where=f"{zone} year {year}")
 
     zone_crs = node.attrs.get("crs")
 
-    # Read the coverage mask BEFORE the mosaic: an all-ocean cell (whose ingest
-    # mosaic may never have been created) must reach the empty-cell path below
-    # rather than failing on a missing reflectance store. The land mask is this
-    # zone's coverage group in the mask repo (ADR-010): registry-derived
-    # tile-liveness bitmaps, not a pixel mask. Validate its identity by attrs —
-    # all 60 same-hemisphere zones share one grid shape, so a wrong-zone mask
-    # would otherwise be read positionally and silently misclassify tiles
-    # (permanently tagging the cell empty). Guarding zone + CRS + grid_shape
-    # closes that hole.
+    # Read the coverage mask BEFORE the mosaic: an all-ocean cell, whose ingest mosaic may
+    # never have been created, must reach the empty-cell path below rather than fail on a
+    # missing reflectance store. The land mask is this zone's coverage group in the mask repo
+    # (ADR-010): registry-derived tile-liveness bitmaps, not a pixel mask. Its identity is
+    # validated by attrs because all 60 same-hemisphere zones share one grid shape, so a
+    # wrong-zone mask would be read positionally and silently misclassify tiles, permanently
+    # tagging the cell empty. Guarding zone + CRS + grid_shape closes that hole.
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
     cov_zone = cov.attrs.get("zone")
     cov_crs = cov.attrs.get("crs")
@@ -663,9 +630,9 @@ def plan_zone_inference(
             f"({n_tile_rows}, {n_tile_cols}) — the coverage build is inconsistent with the seeded grid."
         )
 
-    # 1 inference tile == 1 shard == 1 coverage tile (ADR-008 D3), so a chunk's
-    # (row, col) ARE its coverage-bitmap indices: liveness is a direct lookup,
-    # not the per-tile windowed read the single-ROI pixel mask needs.
+    # 1 inference tile == 1 shard == 1 coverage tile (ADR-008 D3), so a chunk's (row, col) ARE
+    # its coverage-bitmap indices: liveness is a direct lookup, not the per-tile windowed read
+    # the single-ROI pixel mask needs.
     chunks = enumerate_chunks(ny, nx, shard_px)
     live = [c for c in chunks if bool(tile_live[c.row, c.col])]
     log.info(
@@ -686,32 +653,30 @@ def plan_zone_inference(
     }
 
     if not live:
-        # A no-data cell (all-ocean) still lands: years_complete + provenance
-        # in one commit, then the zone-year tag. Terminal here — no staging
-        # exists, so there is nothing for the assembly phase to do.
+        # A no-data cell (all-ocean) still lands: years_complete + provenance in one commit,
+        # then the zone-year tag. Terminal here — no staging exists, so assembly has nothing
+        # to do.
         snapshot = mark_zone_year_empty(repo, zone, year, run_id=run_id)
         tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
         result = {**summary, "empty": True, "snapshot_id": snapshot, "tag": tag, "elapsed_sec": time.monotonic() - t0}
         log.info("Zone %s year %d has no land under the mask — marked complete empty (%s)", zone, year, result["tag"])
         return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], done=result)
 
-    # Live tiles will be inferred, so EVERY active mosaic store must sit on the
-    # zone grid EXACTLY (campaign contract) — not just dimensionally. Every zone
-    # in a hemisphere shares the same pixel extent, so a same-shaped store for the
-    # WRONG zone (or a shifted/reversed grid) would pass a shape check and be
-    # written positionally, silently misgeoreferencing the fill. The SAR stores
-    # are read by positional slice (_load_sar_orbit) with no coords of their own,
-    # so a stale child SAR store or a hand-provided `mosaic_base` on a different
-    # grid than reflectance would otherwise slip through unchecked. Validate the
-    # reflectance store AND each active SAR orbit against the seeded group, the
-    # grid authority. (Read only now — an all-ocean cell already returned above
-    # without touching the mosaic, which may not even exist.)
+    # Live tiles will be inferred, so EVERY active mosaic store must sit on the zone grid
+    # EXACTLY (campaign contract), not just dimensionally: every zone in a hemisphere shares
+    # the same pixel extent, so a same-shaped store for the WRONG zone (or a shifted/reversed
+    # grid) would pass a shape check and be written positionally, silently misgeoreferencing
+    # the fill. The SAR stores are read by positional slice (_load_sar_orbit) with no coords
+    # of their own, so a stale child SAR store or a hand-provided `mosaic_base` on a different
+    # grid than reflectance would otherwise slip through. Validate reflectance AND each active
+    # SAR orbit against the seeded group, the grid authority. (Read only now — an all-ocean
+    # cell already returned above without touching the mosaic, which may not even exist.)
     z_north = cast(zarr.Array, node["northing"])
     z_east = cast(zarr.Array, node["easting"])
-    # Absolute half-pixel tolerance, NOT np.isclose's default relative one: at a
-    # ~9.3e6 m northing the default rtol=1e-5 would admit ~93 m (~9 px) of drift.
-    # A real shift is >=1 px (10 m); half a pixel (5 m) sits safely above float32
-    # coordinate roundtrip (~1 m at this magnitude) yet below one pixel.
+    # Absolute half-pixel tolerance, NOT np.isclose's default relative one: at a ~9.3e6 m
+    # northing the default rtol=1e-5 would admit ~93 m (~9 px) of drift. A real shift is
+    # >=1 px (10 m); half a pixel (5 m) sits above float32 coordinate roundtrip (~1 m at this
+    # magnitude) yet below one pixel.
     atol = PIXEL_M / 2
 
     def _assert_on_zone_grid(label: str, store_path: str, coords: SpatialCoords) -> None:
@@ -739,30 +704,25 @@ def plan_zone_inference(
                 "shifted or reversed axes would silently misgeoreference the fill."
             )
         # Length, CRS and endpoints still do not pin an axis: a REORDERED or non-affine
-        # interior satisfies all three. Inference writes positionally onto the seeded
+        # interior satisfies all three, and inference writes positionally onto the seeded
         # grid, so such a mosaic would publish real pixels at the wrong coordinates with
-        # nothing to signal it.
-        #
-        # Compare the COMPLETE coordinate vectors against the seeded axes, not a
-        # spacing test. A per-step tolerance has to admit float round-trip noise, and
-        # anything it admits per step an adversarial axis can accumulate: half a pixel
-        # of slack per step permits a 5-to-15 m stride, and a pattern that wanders and
-        # returns still matches the length and both endpoints. Comparing every element
-        # against the authority has no such gap and needs no tolerance argument — it is
-        # two 1-D reads per store, once per fill.
-        #
-        # The campaign's own ingest cannot produce a bad axis (odc builds every load
-        # against the zone geobox), but `ingest=False` accepts a mosaic the operator
-        # staged, and that path is supported.
+        # nothing to signal it. Hence the COMPLETE coordinate vectors, element-wise against
+        # the seeded axes, rather than a spacing test — a per-step tolerance must admit float
+        # round-trip noise, and whatever it admits per step an adversarial axis accumulates
+        # (half a pixel of slack permits a 5-to-15 m stride, and a pattern that wanders and
+        # returns still matches length and both endpoints). Two 1-D reads per store, once per
+        # fill. The campaign's own ingest cannot produce a bad axis (odc builds every load
+        # against the zone geobox), but `ingest=False` accepts an operator-staged mosaic, and
+        # that path is supported.
         for axis, values, seeded in (
             ("northing", coords.northing, z_north),
             ("easting", coords.easting, z_east),
         ):
             got = np.asarray(values, dtype="float64")
             want = np.asarray(seeded[:], dtype="float64")
-            # atol is a float round-trip allowance, NOT a geometric one: coordinates
-            # round-trip through float32 at ~1 m near a 9.3e6 m northing, and any real
-            # displacement is a whole pixel (10 m).
+            # atol is a float round-trip allowance, NOT a geometric one: coordinates round-trip
+            # through float32 at ~1 m near a 9.3e6 m northing, and any real displacement is a
+            # whole pixel (10 m).
             bad = ~np.isclose(got, want, rtol=0.0, atol=1.0)
             if bad.any():
                 i = int(np.argmax(bad))
@@ -810,15 +770,14 @@ def infer_zone_year(
 ) -> ZoneFillHandoff:
     """Inference phase of a (zone, year) fill: plan → run_inference.
 
-    :func:`plan_zone_inference` composed with a per-cell ``run_inference``
-    over the plan's live tiles. Terminal cells (already complete / all-ocean)
-    come back with ``ZoneFillHandoff.done`` set.
+    :func:`plan_zone_inference` composed with a per-cell ``run_inference`` over the plan's
+    live tiles. Terminal cells (already complete / all-ocean) come back with
+    ``ZoneFillHandoff.done`` set.
 
-    ``retire_idle_actors=False`` keeps idle actors alive through this cell's
-    tail — a caller running cells as separate sessions passes it for every
-    cell but its last so the shared cluster's instances survive to serve the
-    next zone (the chained runner instead streams every zone through ONE
-    session; see :mod:`.sequential_fill`).
+    ``retire_idle_actors=False`` keeps idle actors alive through this cell's tail — a caller
+    running cells as separate sessions passes it for every cell but its last, so the shared
+    cluster's instances survive to serve the next zone. (The chained runner instead streams
+    every zone through ONE session; see :mod:`.sequential_fill`.)
 
     Raises:
         RuntimeError: If any live tile fails inference.
@@ -890,10 +849,10 @@ def _infer_planned(
 def complete_zone_inference(plan: ZonePlan, *, results: list[dict] | None) -> ZoneFillHandoff:
     """Fold per-tile results back into the handoff the assembly phase consumes.
 
-    Shared by the per-cell path and the chained runner (which collects a
-    zone's results from the streamed session instead of a dedicated
-    ``run_inference`` call). Raises if any tile failed — the zone must not
-    assemble partial output; its cell stays pending in the campaign ledger.
+    Shared by the per-cell path and the chained runner, which collects a zone's results from
+    the streamed session instead of a dedicated ``run_inference`` call. Raises if any tile
+    failed: the zone must not assemble partial output, and its cell stays pending in the
+    campaign ledger.
     """
     if plan.done is not None:
         return ZoneFillHandoff(
@@ -931,19 +890,19 @@ def assemble_zone_year(
     # Root of the published registry dataset; from `BucketPaths.optical_registry`. None writes
     # no part. Mirrors `staging_base`: a location the CALLER resolves.
     registry_root: str | None = None,
-    # The depth rule this cell was filled under, stamped on every registry row. Passed rather than
-    # re-read: `preflight_destination` already asserted the config matches the store's write-once
-    # root value, so the caller's number IS the store's, and an all-refused cell — which opens no
-    # staged tile — must still be able to state it.
+    # The depth rule this cell was filled under, stamped on every registry row. Passed rather
+    # than re-read: `preflight_destination` already asserted the config matches the store's
+    # write-once root value, so the caller's number IS the store's — and an all-refused cell,
+    # which opens no staged tile, must still be able to state it.
     optical_min_obs: int | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     n_assembly_workers: int | None = None,
     s3_concurrency: int | None = None,
     cleanup_staging: bool = True,
-    # How to run the staging delete. None runs it INLINE, which is what every caller did until
-    # 2026-08-31 — and on the trailing-assembly thread that meant the next cell's assembly waited
-    # out a multi-terabyte delete measured at ~2 h per cell in production. A caller with a pool
-    # passes its `submit` here and gets its assembly thread back the moment the cell has landed.
+    # How to run the staging delete. None runs it INLINE, which on the trailing-assembly thread
+    # makes the next cell's assembly wait out a multi-terabyte delete — measured at ~2 h per
+    # cell in production. A caller with a pool passes its `submit` here and gets its assembly
+    # thread back the moment the cell has landed.
     defer_cleanup: Callable[[Callable[[], None]], object] | None = None,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
@@ -952,18 +911,17 @@ def assemble_zone_year(
 ) -> dict[str, Any]:
     """Assembly phase of a (zone, year) fill: verify staged → assemble → tag.
 
-    Consumes an :class:`infer_zone_year` handoff: verifies staged
-    completeness, assembles the staged tiles into the zone group (or marks
-    the cell complete-empty when every live tile skipped), tags the landed
-    commit, and cleans up staging. Opens its own repo/writer connections so
-    the sequential multi-zone runner can run it on a trailing thread while
-    the caller's thread starts the next cell's inference. A terminal handoff
-    (``done`` set) passes straight through.
+    Consumes an :class:`infer_zone_year` handoff: verifies staged completeness, assembles the
+    staged tiles into the zone group (or marks the cell complete-empty when every live tile
+    skipped), tags the landed commit, and cleans up staging. Opens its own repo/writer
+    connections so the sequential multi-zone runner can run it on a trailing thread while the
+    caller's thread starts the next cell's inference. A terminal handoff (``done`` set) passes
+    straight through.
 
-    ``fault`` is the supervised-drill hook, forwarded to the assembly call on both
-    the data and the all-skipped path so the drill does not depend on which one a
-    cell takes. Inert unless the run was armed for a fault this path hosts and for
-    this cell (:mod:`tessera_embeddings.config.fault_injection`).
+    ``fault`` is the supervised-drill hook, forwarded to the assembly call on both the data
+    and the all-skipped path so the drill does not depend on which one a cell takes. Inert
+    unless the run was armed for a fault this path hosts and for this cell
+    (:mod:`tessera_embeddings.config.fault_injection`).
     """
     _check_assembly_workers(n_assembly_workers)
     if handoff.done is not None:
@@ -982,8 +940,8 @@ def assemble_zone_year(
     def _run_cleanup() -> None:
         """Hand the staging delete to the caller's pool, or run it here if it has none.
 
-        Called only where `_cleanup()` was called before — after the cell is marked and tagged
-        — so deferring changes when the bytes go, never whether the cell landed.
+        Called only after the cell is marked and tagged, so deferring changes when the bytes
+        go, never whether the cell landed.
         """
         if defer_cleanup is None:
             _cleanup()
@@ -992,23 +950,21 @@ def assemble_zone_year(
 
     staged_labels = writer.verify_staged_completeness(run_id, live, log=log)
     if not staged_labels:
-        # Every live tile resolved to a skip marker (zero valid pixels under
-        # the validity filters) — a legitimate no-data cell, same as all-ocean.
+        # Every live tile resolved to a skip marker (zero valid pixels under the validity
+        # filters) — a legitimate no-data cell, same as all-ocean.
         #
-        # It still WRITES, over the whole live footprint, for the reason the mixed
-        # path below writes over its skipped tiles: a year lands in two commits, so an
-        # attempt that crashed between them leaves shards on a year nothing has marked,
-        # and the campaign re-dispatches it. If that attempt's mosaic made tiles
-        # productive where this one skips them all, marking the year empty without
-        # writing would leave its embeddings readable under a completion mark and a
-        # zone-year tag that both say the cell holds nothing.
+        # It still WRITES, over the whole live footprint, for the reason the mixed path below
+        # writes over its skipped tiles: a year lands in two commits, so an attempt that
+        # crashed between them leaves shards on a year nothing has marked and the campaign
+        # re-dispatches it. If that attempt's mosaic made tiles productive where this one skips
+        # them all, marking the year empty without writing would leave its embeddings readable
+        # under a completion mark and a zone-year tag that both say the cell holds nothing.
         #
-        # Mark + tag FIRST, clean up after (matching the data path): a crash
-        # after cleanup but before the tag would otherwise force full
-        # re-inference just to regenerate zero-byte skip markers.
+        # Mark + tag FIRST, clean up after (matching the data path): a crash after cleanup but
+        # before the tag would force full re-inference just to regenerate zero-byte markers.
         if live:
-            # The fill write and the completion mark land together, in the one call, so
-            # the year can never be marked empty over shards this run did not clear.
+            # The fill write and the completion mark land together in one call, so the year
+            # can never be marked empty over shards this run did not clear.
             snapshot = writer.assemble_global(
                 store_path,
                 zone,
@@ -1017,11 +973,11 @@ def assemble_zone_year(
                 n_workers=n_assembly_workers or AssemblyConfig().compute_n_workers(len(live)),
                 staged_labels=(),
                 skipped_labels=sorted(c.label for c in live),
-                # THE CELL WITH THE MOST TO SAY, and it was the one saying nothing. Every live tile
-                # refused, so this branch holds the richest refusal record a cell can produce — and
-                # it omitted the registry root, so no part was written. `empty=True` also drops the
-                # pooled summary from the year's provenance, and staging cleanup then destroyed the
-                # only surviving account of which tiles were thin, unimaged, or radar-free.
+                # THE CELL WITH THE MOST TO SAY. Every live tile refused, so this branch holds
+                # the richest refusal record a cell can produce; omitting the registry root
+                # here wrote no part, `empty=True` also drops the pooled summary from the
+                # year's provenance, and staging cleanup then destroyed the only surviving
+                # account of which tiles were thin, unimaged or radar-free.
                 registry_root=registry_root,
                 optical_min_obs=optical_min_obs,
                 s3_concurrency=s3_concurrency,
@@ -1035,8 +991,8 @@ def assemble_zone_year(
                 input_coverage=input_coverage,
             )
         else:
-            # No live tiles at all: nothing was ever written here, so there is nothing
-            # to clear and the attrs alone are the whole job.
+            # No live tiles at all: nothing was ever written here, so there is nothing to
+            # clear and the attrs alone are the whole job.
             snapshot = mark_zone_year_empty(
                 open_global_repo(
                     store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
@@ -1067,27 +1023,26 @@ def assemble_zone_year(
         )
         return result
 
-    # Live tiles that staged nothing because every pixel failed the validity filters.
-    # Passed so assembly writes fill over them instead of leaving them alone: this year
-    # may already hold shards from an attempt that crashed between the shard commit and
-    # the completion attrs, and if THAT attempt's mosaic made a tile productive where
-    # this one skips it, its data would survive under this run's completion mark.
-    # Derived from the STAGING PREFIX (live minus what verify_staged_completeness
-    # resolved as staged), never from `results`: a resumed run's skip markers were
-    # written by earlier legs, which the finishing leg reports as resumed successes —
-    # a results-based set would clear nothing and record zero skips over real gaps.
-    # Assembly also records this set as the year's `optical_skips` provenance.
+    # Live tiles that staged nothing because every pixel failed the validity filters. Passed
+    # so assembly writes fill over them rather than leaving them alone: this year may already
+    # hold shards from an attempt that crashed between the shard commit and the completion
+    # attrs, and if THAT attempt's mosaic made a tile productive where this one skips it, its
+    # data would survive under this run's completion mark. Derived from the STAGING PREFIX
+    # (live minus what verify_staged_completeness resolved as staged), never from `results`:
+    # a resumed run's skip markers were written by earlier legs, which the finishing leg
+    # reports as resumed successes, so a results-based set would clear nothing and record zero
+    # skips over real gaps. Assembly also records this set as the year's `optical_skips`.
     skipped_labels = sorted({c.label for c in live} - staged_labels)
     n_workers = n_assembly_workers or AssemblyConfig().compute_n_workers(len(live))
     # Reduced from what the actors already reported, so it costs no reads. Recorded on the
-    # YEAR's provenance entry: radar coverage is a property of what was acquired, so one
-    # year of a zone can be radar-free where another is not.
+    # YEAR's provenance entry: radar coverage is a property of what was acquired, so one year
+    # of a zone can be radar-free where another is not.
     radar_coverage = summarise_radar_coverage(results)
-    # Per-shard coverage for the shards that DID embed something, keyed by label. A shard the depth
-    # gate partly refused knows how much it lost — the actor accumulates the reasons on the success
-    # path too — and without this the registry describes it as embedded with no refusals recorded,
-    # which reads as fully covered ground. Resumed successes are synthetic and carry no record, so
-    # they are simply absent and publish as null rather than as zero.
+    # Per-shard coverage for the shards that DID embed something, keyed by label. A shard the
+    # depth gate partly refused knows how much it lost (the actor accumulates the reasons on
+    # the success path too); without this the registry describes it as embedded with no
+    # refusals recorded, which reads as fully covered ground. Resumed successes are synthetic
+    # and carry no record, so they are absent and publish as null rather than as zero.
     embedded_records = {
         str(r["chunk"]): r["coverage"]
         for r in results
@@ -1117,8 +1072,8 @@ def assemble_zone_year(
         skipped_labels=skipped_labels,
         s3_concurrency=s3_concurrency,
         radar_coverage=radar_coverage,
-        # The STORE's credential: assemble_global uses it only to open the global store and
-        # to write the registry part beside it — both live in the store's own bucket.
+        # The STORE's credential: assemble_global uses it only to open the global store and to
+        # write the registry part beside it — both live in the store's own bucket.
         get_credentials=_store_credentials(store_path, get_credentials),
         s3_region=s3_region,
         log=log,

@@ -1,12 +1,8 @@
 """TOML allowlist parsing for downstream-extensible architecture rules.
 
-The OSS bundled rules ship strict allowed-path lists. Downstream
-consumers (closed-source repos, community-adapter PRs) sometimes need
-to permit a forbidden import in additional paths — for example, a
-closed-source ``yield_modeling`` repo may legitimately import
-``boto3`` from its own ``yield_modeling/iac/`` Pulumi stack code.
-
-The allowlist TOML lets them extend the rules without forking::
+The bundled rules ship strict allowed-path lists. Downstream consumers need to widen them
+without forking — e.g. a closed-source ``yield_modeling`` repo legitimately importing
+``boto3`` from its own Pulumi stack code::
 
     # downstream-arch-allowlist.toml
     [allowed_imports."no-boto3-outside-aws-provider"]

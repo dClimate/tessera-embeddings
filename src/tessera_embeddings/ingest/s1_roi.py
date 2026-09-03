@@ -1,35 +1,26 @@
 """Sentinel-1 OPERA RTC SAR ingestion for ROI-based regions.
 
-Pure-domain implementation extracted from the reference repo's
-``flows/ingest_s1_roi_sar.py::process_roi_sar``. No Prefect imports,
-no ``get_run_logger``, no ``get_client``, no direct env-var reads for
-secrets — callers supply a connected :class:`dask.distributed.Client`,
-a logger, and (where required) a credential callback.
+Orchestrator-unaware: no Prefect imports, no ``get_run_logger``, no ``get_client``, no direct
+env-var reads for secrets. Callers supply a connected :class:`dask.distributed.Client`, a logger,
+and (where required) a credential callback.
 
-Algorithm (unchanged from the reference):
-
-1. Read ROI metadata + lazy mask once per batch (so Dask graphs
-   reference fresh keys whenever credentials are refreshed).
-2. Walk the date range in batches of ``batch_days`` to keep each
-   ``compute()`` call's task graph manageable.
+1. Read ROI metadata + lazy mask once per batch, so Dask graphs reference fresh keys whenever
+   credentials are refreshed.
+2. Walk the date range in batches of ``batch_days`` to keep each ``compute()`` graph manageable.
 3. Each batch:
 
-   * Renew the OPERA read credentials whenever they are close to expiring.
-     A background ticker owns this, so renewal does not wait for a unit of
-     work to finish; the credential's roughly one-hour life is unrelated to
-     the shape of the loop, and any unit that outlives the remaining margin
-     cannot renew from inside itself. The loop also checks at a batch
-     boundary and before every date's write, which costs nothing while the
-     ticker is keeping the credential fresh.
-   * Build an OPERA RTC item filter for the orbit / bounding box /
-     batch window.
+   * Renew the OPERA read credentials whenever they are close to expiring. A background ticker
+     owns this, so renewal does not wait for a unit of work to finish: the credential's roughly
+     one-hour life is unrelated to the shape of the loop, and any unit that outlives the
+     remaining margin cannot renew from inside itself. The loop also checks at a batch boundary
+     and before every date's write, which costs nothing while the ticker keeps it fresh.
+   * Build an OPERA RTC item filter for the orbit / bounding box / batch window.
    * Call :func:`ingest_tile` to produce a per-batch ``xarray.Dataset``.
    * Apply the ROI mask, then write each date's live windows via
-     :func:`tessera_embeddings.storage.zarr_store.write_day_windows` with a
-     narrow tenacity retry on transient GDAL errors. Past that retry the date
-     is GIVEN UP rather than allowed to fail the leg — but ONLY when the cause
-     recomputes, so a provider refusing reads re-raises and the leg retries in
-     order instead. Up to :data:`MAX_GIVEN_UP_DATES`; past that the leg stops
+     :func:`tessera_embeddings.storage.zarr_store.write_day_windows` with a narrow tenacity retry
+     on transient GDAL errors. Past that retry the date is GIVEN UP rather than allowed to fail
+     the leg — but ONLY when the cause recomputes, so a provider refusing reads re-raises and the
+     leg retries in order instead. Up to :data:`MAX_GIVEN_UP_DATES`; past that the leg stops
      terminally, because nothing counted toward that ceiling can clear.
 """
 
@@ -115,28 +106,20 @@ S1Orbit = Literal["ascending", "descending"]
 MAX_GIVEN_UP_DATES = 10
 """How many dates one radar leg may give up before it stops and refuses the year.
 
-**Its original reasoning no longer holds and the ceiling means something else now.** It was
-"small on purpose, because a provider refusal CLEARS" — a refusal used to be countable here, so
-grinding through an outage converted recoverable imagery into a durable hole and the leg still
-returned success. A refusal is no longer a reason to give up a date at all: it re-raises and the
-leg retries in order.
-
-So every date counted here is now one whose bytes will not read, whatever we do. The ceiling is
-therefore a statement about the DATA — past ten, this orbit-year is too damaged to be worth a
-mosaic — rather than a request to come back when a service recovers. Ten is a small fraction of a
-radar year's couple of hundred dates per orbit.
+A provider refusal is never counted here — it re-raises and the leg retries in order — so every
+date counted is one whose bytes will not read, whatever we do. The ceiling is therefore a
+statement about the DATA: past ten, this orbit-year is too damaged to be worth a mosaic. Ten is a
+small fraction of a radar year's couple of hundred dates per orbit.
 """
 
 
 class TooManyGivenUpDatesError(RuntimeError):
     """A radar leg gave up more dates than the bounded skip permits.
 
-    **NOT retryable, and it used to be.** It was deliberately absent from
-    ``ingest_zone_year._NON_RETRYABLE_LEG_MARKERS`` "because a refusal goes away and a re-dispatch
-    writes the dates this leg gave up". Nothing counted toward the ceiling goes away any more:
-    every one of those dates failed for a cause that recomputes, so a re-dispatch re-reads the
-    same unreadable objects, spends the per-read retry ladder on each of them again, and holds a
-    Dask fleet to reach the identical answer.
+    **NOT retryable**, and listed in ``ingest_zone_year._NON_RETRYABLE_LEG_MARKERS``: every date
+    counted toward the ceiling failed for a cause that recomputes, so a re-dispatch re-reads the
+    same unreadable objects, spends the per-read retry ladder on each again, and holds a Dask
+    fleet to reach the identical answer.
     """
 
 
@@ -150,20 +133,18 @@ def credential_ticker(
 ) -> Iterator[None]:
     """Call ``refresh`` on a timer for the duration of the block, in a daemon thread.
 
-    A read credential renewed only from the work loop can be renewed only *between* units
-    of work, so any single unit that outlives the remaining margin — a long write, a query,
-    a stall — has no opportunity to renew from inside itself. That coupling is
-    self-reinforcing: slower work renews less often, an expired credential fails every
-    read, failing reads stop progress, and no progress means no further renewal. A timer
-    removes the coupling, so renewal no longer depends on the shape or the speed of the
-    loop.
+    A credential renewed only from the work loop can renew only *between* units of work, so any
+    unit that outlives the remaining margin — a long write, a query, a stall — cannot renew from
+    inside itself. That coupling is self-reinforcing: slower work renews less often, an expired
+    credential fails every read, failing reads stop progress, and no progress means no further
+    renewal. A timer removes the coupling entirely.
 
-    ``refresh`` must be idempotent and safe to call concurrently with the loop's own calls;
-    it decides for itself whether a renewal is due.
+    ``refresh`` must be idempotent and safe to call concurrently with the loop's own calls; it
+    decides for itself whether a renewal is due.
 
-    Exceptions from ``refresh`` are logged and swallowed. The ticker must outlive a single
-    failed renewal: the next tick retries well inside the margin, whereas a dead thread
-    would silently return the caller to loop-driven renewal.
+    Exceptions from ``refresh`` are logged and swallowed: the ticker must outlive a single failed
+    renewal, since the next tick retries well inside the margin whereas a dead thread would
+    silently return the caller to loop-driven renewal.
     """
     stop = threading.Event()
 
@@ -210,17 +191,13 @@ def _parse_credential_expiry(creds: dict[str, str]) -> float | None:
 class SarIngestResult:
     """Return value from :func:`ingest_s1_roi_sar`.
 
-    Replaces the dict that the reference repo's ``@task`` returned.
-    Task shells convert back to a dict via ``dataclasses.asdict()`` at
-    the Prefect boundary.
+    Task shells convert it back to a dict via ``dataclasses.asdict()`` at the Prefect boundary.
 
     Attributes:
         roi_path: Echo of the input ``roi_zarr_path``.
-        status: ``"success"`` if at least one date was written, else
-            ``"skipped"``.
-        dates_processed: ``{orbit: count}``. The single-orbit shape
-            mirrors the reference repo and lets a multi-orbit caller
-            merge two results trivially.
+        status: ``"success"`` if at least one date was written, else ``"skipped"``.
+        dates_processed: ``{orbit: count}``; one orbit per call, so a multi-orbit caller merges
+            two results trivially.
     """
 
     roi_path: str
@@ -233,14 +210,13 @@ class SarIngestResult:
 class _PreparedBatch:
     """One batch carried from the catalogue query to the write loop.
 
-    The split is the same one the phase logging measures: everything up to a write-ready
-    dataset on one side (catalogue query plus lazy graph build, no cluster reads), the
-    per-date writes on the other. That boundary is what makes the query hideable — it
-    touches no store and holds no credential, so it can run on a background thread while
-    the previous batch writes.
+    The split is the one the phase logging measures: everything up to a write-ready dataset on
+    one side (catalogue query plus lazy graph build, no cluster reads), the per-date writes on
+    the other. That boundary is what makes the query hideable — it touches no store and holds no
+    credential, so it can run on a background thread while the previous batch writes.
 
-    ``data`` is ``None`` when the batch has no new dates, which is a normal outcome and
-    not an error: a sparse region or an already-ingested range yields nothing to write.
+    ``data`` is ``None`` when the batch has no new dates, which is normal rather than an error:
+    a sparse region or an already-ingested range yields nothing to write.
     """
 
     start: str
@@ -252,24 +228,22 @@ class _PreparedBatch:
     #: leg that writes nothing can say whether the source had anything to write. No default:
     #: ``date_windows`` below has none either, and a defaulted field cannot precede it.
     items_seen: int
-    #: Solar day (keyed by the loaded slice's own timestamp) -> the live windows that day's
-    #: imagery reaches. Empty list = reaches nothing, so skip. Missing key = unknown, so
-    #: write everything. Empty dict = the whole batch falls back.
-    #: Loaded-slice timestamp -> (that slice's SOLAR DAY, the live windows its imagery
-    #: reaches). The solar day is carried because odc labels a slice with its first
-    #: item's timestamp, whose calendar date can differ from the solar day the slice
-    #: actually represents wherever the offset crosses UTC midnight.
+    #: Loaded-slice timestamp -> (that slice's SOLAR DAY, the live windows its imagery reaches).
+    #: The solar day is carried because odc labels a slice with its first item's timestamp, whose
+    #: calendar date can differ from the solar day the slice represents wherever the offset
+    #: crosses UTC midnight. Empty window list = reaches nothing, so skip; missing key = unknown,
+    #: so write everything; empty dict = the whole batch falls back.
     date_windows: dict[str, tuple[str, list[tuple[int, int, int, int]]]]
 
 
 def _baselines_for(baselines: dict[str, int], dates: Iterable[str]) -> dict[str, int]:
     """The baseline entries belonging to ``dates`` only.
 
-    Each cropped per-date write is its own atomic commit, and ``write_day_windows`` merges the
-    map it is handed into the store's ``baselines_applied``. Handing it the whole
-    query's map makes the very first commit claim provenance for every date in the
-    month — including dates a later coverage rejection or crash means the store never
-    receives. Provenance that describes data which is not there is worse than none.
+    Each cropped per-date write is its own atomic commit, and ``write_day_windows`` merges the map
+    it is handed into the store's ``baselines_applied``. Handing it the whole query's map makes
+    the very first commit claim provenance for every date in the month, including dates a later
+    rejection or crash means the store never receives — provenance describing data that is not
+    there is worse than none.
     """
     wanted = {d[:10] for d in dates}
     return {k: v for k, v in baselines.items() if k[:10] in wanted}
@@ -307,58 +281,46 @@ def ingest_s1_roi_sar(
         end_date: Inclusive end date (``YYYY-MM-DD``).
         store_path: Base path for satellite mosaics; the function
             creates ``sar_<orbit>.zarr`` underneath.
-        client: Connected :class:`dask.distributed.Client`. Callers
-            create this; we do not call ``get_client``. Every compute here goes
-            through the AMBIENT client, which constructing one makes current, so
-            this is used for one thing only: registering the worker plugin that
-            keeps a failed read's evidence, which has to name the cluster
-            explicitly because it must reach workers no compute has touched yet.
-            The S2 ingest takes it for the same reason, so the two entry points
-            stay symmetric.
-        orbit: ``"ascending"`` or ``"descending"`` — one orbit per call.
-            Multi-orbit ingestion is a flow-level concern (call twice).
-        batch_days: Days per time batch. Smaller values keep each Dask
-            graph small at the cost of more STAC queries.
-        edl_credentials_fn: Callable returning STS credentials (e.g. the
-            dict from ``get_s3_credentials()``). Called when the cached
-            credentials have aged past ``cred_refresh_interval_sec``.
-            Required when accessing OPERA's S3 direct endpoints; the
-            plain runner passes a closure over env vars, the Prefect
-            flow passes a closure over a credentials block. ``None``
-            means no per-batch refresh — only safe when credentials are
-            already injected by the substrate (e.g. a Dask worker
-            plugin set up at cluster start).
-        apply_credentials_fn: Callable that takes the dict returned by
-            ``edl_credentials_fn`` and applies it (typically by setting
-            env vars on the orchestrator and registering a Dask
-            ``WorkerPlugin``). When ``None``, the credentials returned
-            are still fetched on schedule but not applied — useful for
-            tests, otherwise pair with ``edl_credentials_fn``.
-        use_s3_direct: When ``True``, use ASF's in-region S3 direct
-            endpoints (requires us-west-2 reachability and STS creds).
-            When ``False``, fall back to CloudFront-signed HTTPS URLs;
+        client: Connected :class:`dask.distributed.Client`; callers create it, we do not call
+            ``get_client``. Every compute here goes through the AMBIENT client, so this is used
+            for one thing only: registering the worker plugin that keeps a failed read's
+            evidence, which must name the cluster explicitly because it has to reach workers no
+            compute has touched yet. The S2 ingest takes it for the same reason.
+        orbit: ``"ascending"`` or ``"descending"`` — one orbit per call. Multi-orbit ingestion is
+            a flow-level concern (call twice).
+        batch_days: Days per time batch. Smaller values keep each Dask graph small at the cost of
+            more STAC queries.
+        edl_credentials_fn: Callable returning STS credentials (e.g. from
+            ``get_s3_credentials()``), called when the cached credentials have aged past
+            ``cred_refresh_interval_sec``. Required for OPERA's S3 direct endpoints; the plain
+            runner passes a closure over env vars, the Prefect flow one over a credentials block.
+            ``None`` means no per-batch refresh — safe only when credentials are already injected
+            by the substrate (e.g. a Dask worker plugin set up at cluster start).
+        apply_credentials_fn: Callable that applies the dict ``edl_credentials_fn`` returned,
+            typically by setting env vars on the orchestrator and registering a Dask
+            ``WorkerPlugin``. ``None`` still fetches on schedule but applies nothing — useful for
+            tests, otherwise pair it with ``edl_credentials_fn``.
+        use_s3_direct: ``True`` uses ASF's in-region S3 direct endpoints (requires us-west-2
+            reachability and STS creds); ``False`` falls back to CloudFront-signed HTTPS URLs,
             useful for local development.
-        cred_refresh_interval_sec: Refresh interval for the credential
-            callback.
+        cred_refresh_interval_sec: Refresh interval for the credential callback.
         log: Optional logger; defaults to ``logging.getLogger(__name__)``.
         storage_options: fsspec storage options for the ROI mask reads.
-        overlap_window_writes: Defaults ON. Submit a date's windows as ONE dask compute
-            rather than one blocking compute per window, so their critical paths
-            overlap across the fleet instead of summing. Produces an identical store
-            either way. Also selects the window merge exchange rate, since that prices
-            a window boundary by how it is written — the two must not drift apart.
-        pipeline_batches: Defaults ON. Prepare the NEXT batch's catalogue query while
-            the current batch writes, so only the first batch pays its query on the
-            critical path. Shares ``ingest._pipeline.pipelined`` with the S2 date loop.
-            Look-ahead is fixed at one batch: a batch's write is one long consume, so
-            depth 1 already covers it, and deeper retention is what once deadlocked the
-            S2 driver. Set False to restore the strictly serial query-then-write loop.
-        narrow_windows_per_date: Write only the live windows a date's own imagery can
-            reach, as the S2 path does. **Defaults ON, measured.** A Sentinel-1 pass
-            reaches a minority of a zone's windows — six times fewer in both zones tested
-            — and that converts to 7-20% of per-date wall clock. Dates reaching NO live
-            window are skipped unconditionally, independent of this flag: writing one
-            builds a full graph to store nothing, since all-fill chunks never persist.
+        overlap_window_writes: Defaults ON. Submit a date's windows as ONE dask compute rather
+            than one blocking compute per window, so their critical paths overlap across the
+            fleet instead of summing. Identical store either way. Also selects the window merge
+            exchange rate, which prices a boundary by how it is written — the two must not drift.
+        pipeline_batches: Defaults ON. Prepare the NEXT batch's catalogue query while the current
+            batch writes, so only the first batch pays its query on the critical path. Shares
+            ``ingest._pipeline.pipelined`` with the S2 date loop. Look-ahead is fixed at one
+            batch: a batch's write is one long consume, so depth 1 already covers it, and deeper
+            retention once deadlocked the S2 driver. False restores the strictly serial loop.
+        narrow_windows_per_date: Write only the live windows a date's own imagery can reach, as
+            the S2 path does. **Defaults ON, measured:** a Sentinel-1 pass reaches a minority of
+            a zone's windows — six times fewer in both zones tested — which converts to 7-20% of
+            per-date wall clock. Dates reaching NO live window are skipped unconditionally,
+            independent of this flag: writing one builds a full graph to store nothing, since
+            all-fill chunks never persist.
         allow_ingest_code_mismatch: Off by default. See the field of the same name on
             :class:`~tessera_embeddings.storage.manifest.IngestManifest`.
 
@@ -378,9 +340,9 @@ def ingest_s1_roi_sar(
     roi_label = roi_zarr_path.rstrip("/").rsplit("/", 1)[-1].removesuffix(".zarr")
 
     # Before the first read, because what it keeps is only kept AS the read fails, on whichever
-    # worker fails it. This path needs it more than the optical one, not less: with no
-    # alternate-copy ladder, an undecidable failure leaves only "fail the leg" or "give up the
-    # date", so a cause that arrives is the whole difference between a retry and a hole.
+    # worker fails it. This path needs it more than the optical one: with no alternate-copy
+    # ladder, an undecidable failure leaves only "fail the leg" or "give up the date", so a cause
+    # that survives is the whole difference between a retry and a hole.
     install_capture_everywhere(client)
 
     roi = read_roi_metadata(roi_zarr_path, storage_options=storage_options)
@@ -402,13 +364,13 @@ def ingest_s1_roi_sar(
     def refresh_credentials_if_stale() -> None:
         """Re-fetch the OPERA read credentials when they are close to expiring.
 
-        Driven by the credential's OWN expiry rather than a fixed cadence. The margin must
-        exceed the longest single date write, since a credential valid at the start of a
-        write must still be valid at its end — the reads happen throughout it.
+        Driven by the credential's OWN expiry rather than a fixed cadence. The margin must exceed
+        the longest single date write: a credential valid at the start of a write must still be
+        valid at its end, the reads happening throughout it.
 
-        Callable from the work loop and from the background ticker, so it takes a lock:
-        two concurrent renewals would each broadcast, and the later broadcast could carry
-        the earlier credential.
+        Callable from the work loop and from the background ticker, so it takes a lock — two
+        concurrent renewals would each broadcast, and the later broadcast could carry the earlier
+        credential.
         """
         nonlocal last_cred_refresh, cred_expires_at
         if edl_credentials_fn is None:
@@ -443,16 +405,15 @@ def ingest_s1_roi_sar(
 
     orbit_store = f"{store_path}/sar_{orbit}.zarr"
 
-    # Cropped write path: windows derived once from the same mask this ingest
-    # reads (see ingest.live_windows; identical mechanics to the S2 path).
+    # Cropped write path: windows derived once from the same mask this ingest reads (see
+    # ingest.live_windows; identical mechanics to the S2 path). `run_windows` keeps the window
+    # OBJECTS because per-date narrowing needs them; `live_windows` is the plain-tuple form the
+    # storage layer takes.
     #
-    # `run_windows` keeps the window OBJECTS because per-date narrowing needs them;
-    # `live_windows` is the plain-tuple form the storage layer takes.
-    # The merge exchange rate follows how this run WRITES, exactly as on the S2 path:
-    # overlapped windows share one graph, so a boundary is cheap and the DP should stop
-    # trading ocean area for fewer windows. A sequential writer still pays the serial
-    # cost per boundary and keeps the high rate. Bound once because per-date narrowing
-    # re-merges on the same terms — a second, differing rate there would undo this.
+    # The merge exchange rate follows how this run WRITES, exactly as on the S2 path: overlapped
+    # windows share one graph, so a boundary is cheap and the DP should stop trading ocean area
+    # for fewer windows, while a sequential writer still pays the serial cost per boundary and
+    # keeps the high rate. Bound once because per-date narrowing re-merges on the same terms.
     window_cost = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
     run_windows = live_windows_for_mask(
         roi_zarr_path,
@@ -461,32 +422,30 @@ def ingest_s1_roi_sar(
         storage_options=storage_options,
     )
     live_windows: list[tuple[int, int, int, int]] = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
-    # roi= and orbit both present: this is the first line a leg emits, and at fleet width a
-    # bare count cannot be tied to a cell OR to an orbit — the log stream is the Dask
-    # worker's task id, and the two orbits of one zone are separate runs.
+    # roi= and orbit both present: this is the first line a leg emits, and at fleet width a bare
+    # count ties to neither a cell nor an orbit — the log stream is the Dask worker's task id,
+    # and the two orbits of one zone are separate runs.
     log.info("[%s] Live windows roi=%s: %d", orbit, roi_label, len(live_windows))
 
-    # An ROI with no live window at all — an all-ocean mask — has nowhere to put a
-    # pixel, and every date would otherwise be COMMITTED with zero windows written:
-    # a time slot holding nothing, which `get_existing_dates` then reports as
-    # ingested, so no later run ever revisits it. Stop before the query rather than
-    # bank empty dates. The per-date `{}` fallback cannot cover this, because the set
-    # it falls back TO is the empty one. The campaign screens these cells out with
-    # `zone_has_live_tiles`; the public ROI path has no such preflight, which is why
-    # the S2 path guards its own coverage denominator the same way.
+    # An ROI with no live window at all — an all-ocean mask — has nowhere to put a pixel, and
+    # every date would otherwise be COMMITTED with zero windows written: a time slot holding
+    # nothing, which `get_existing_dates` then reports as ingested, so no later run revisits it.
+    # Stop before the query rather than bank empty dates. The per-date `{}` fallback cannot cover
+    # this, the set it falls back TO being the empty one. The campaign screens these cells out
+    # with `zone_has_live_tiles`; the public ROI path has no such preflight, which is why the S2
+    # path guards its own coverage denominator the same way.
     if not live_windows:
         log.warning("ROI %s has no live window — no SAR date can store a pixel; skipping ingest", roi_zarr_path)
         return SarIngestResult(roi_path=roi_zarr_path, status="skipped", dates_processed={orbit: 0})
 
     # A date's own footprint, keyed so it can be matched back to the loaded time slice.
     #
-    # THE JOIN IS ON AN EXACT TIMESTAMP, not a date string, and that is what makes this
-    # safe. odc groups by solar day but sets each slice's time coordinate to
-    # `group[0].nominal_datetime` — the EARLIEST item's real timestamp, since items are
-    # sorted by time within a group. So the minimum item datetime in a group reproduces
-    # odc's coordinate exactly. Keying by a derived solar-day string instead would
-    # disagree with the coordinate wherever the solar offset crosses UTC midnight, and
-    # would then narrow a date to the wrong footprint and drop real imagery silently.
+    # THE JOIN IS ON AN EXACT TIMESTAMP, not a date string, and that is what makes it safe. odc
+    # groups by solar day but sets each slice's time coordinate to `group[0].nominal_datetime` —
+    # the EARLIEST item's real timestamp, items being time-sorted within a group — so the minimum
+    # item datetime in a group reproduces odc's coordinate exactly. Keying by a derived solar-day
+    # string would disagree with the coordinate wherever the solar offset crosses UTC midnight,
+    # narrowing a date to the wrong footprint and dropping real imagery silently.
     def _footprint_key(when: datetime) -> str:
         """Join key: naive-UTC timestamp to the second, matching odc's coordinate."""
         return when.replace(tzinfo=None).isoformat(timespec="seconds")
@@ -496,14 +455,13 @@ def ingest_s1_roi_sar(
     def _date_footprints(items: list) -> dict[str, tuple[str, list[tuple[int, int, int, int]]]]:
         """Per solar day, the live windows that day's imagery can actually reach.
 
-        Empty list for a day whose imagery reaches NO live window — those days are skipped
-        rather than committed, since writing one stores nothing and pays a full graph.
+        Empty list for a day whose imagery reaches NO live window — those days are skipped rather
+        than committed, since writing one stores nothing and pays a full graph.
 
-        Returns ``{}`` when anything is unusable (no windows, no longitude, no items), which
-        makes the caller fall back to the full window set. That asymmetry is the safety
-        argument: a footprint that is too LARGE only costs computed area that would have
-        been discarded, while one that is too SMALL drops imagery and nothing downstream
-        would notice.
+        Returns ``{}`` when anything is unusable (no windows, no longitude, no items), making the
+        caller fall back to the full window set. That asymmetry is the safety argument: a
+        footprint that is too LARGE only costs computed area that would have been discarded,
+        while one that is too SMALL drops imagery and nothing downstream would notice.
         """
         if not run_windows or mid_longitude is None or not items:
             return {}
@@ -538,16 +496,22 @@ def ingest_s1_roi_sar(
 
     total_processed = 0
 
-    # Batches of up to ``batch_days`` SOLAR days, each querying a UTC range padded a day
-    # either side. The two are different ranges on purpose: cutting on UTC dates and
-    # writing every group the loader returned split any solar day landing on a cut, and
-    # the later batch's half was then discarded as an already-written date — so the day
-    # was committed missing acquisitions, at every boundary, in the zones whose offset
-    # puts UTC midnight near a satellite pass. ingest.solar_days owns that reasoning and
-    # the S2 month slicing uses the same mechanism.
+    # Read ONCE, then maintained in-process as dates are written. A per-batch re-read from the
+    # store is unsafe under a look-ahead: the next batch's query is prepared BEFORE the current
+    # batch has written, so a store read there would miss dates that are about to exist. Tracking
+    # writes in-process is correct whenever the query runs, and drops a per-batch S3 read.
     #
-    # Materialised as a list rather than advanced in the loop because the look-ahead has
-    # to know what comes next before the current batch is done with.
+    # Deduplication is needed at all because batches are cut on UTC dates while the loader groups
+    # by SOLAR day, so an acquisition late on a batch's last UTC day can belong to the next
+    # batch's solar day and two consecutive batches can contain the same day. Probing real
+    # catalogue responses found no such boundary (12 boundaries across a +1 h and a +10 h zone),
+    # but the offset is a translation rather than a split, so nothing rules it out and the cost of
+    # being wrong is a duplicate-date commit. The consume side below is the authority on what has
+    # been written; the query filter is only an optimisation.
+    #
+    # WRITTEN dates only. A date given up on is re-offered by the next attempt and gives up again
+    # for the same reason — every accepted cause is DETERMINISTIC — so re-offering costs one
+    # re-evaluation and a record of the skip would only matter if the verdict could change.
     written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region)
     #: The newest date this store holds. Everything at or below it is closed for good: a Zarr
     #: store's chunks sit at fixed positions, so a day cannot be slotted in behind one already
@@ -555,19 +519,16 @@ def ingest_s1_roi_sar(
     #: store and never shared.
     last_written_date: str | None = max(written_dates, default=None)
 
-    # Everything `fixed_day_ranges` would have rejected is rejected HERE, because a leg can now
-    # decide it has nothing to search for and never reach it — and a configuration that raises
-    # over a partial store while reporting a successful skip over a complete one is worse than
-    # either answer on its own. Both checks live in `solar_days`, so there is one rule and one
-    # message per rule rather than a copy that drifts.
+    # Everything `fixed_day_ranges` would reject is rejected HERE, because a leg can decide it has
+    # nothing to search for and never reach it — and a configuration that raises over a partial
+    # store while reporting a successful skip over a complete one is worse than either answer.
+    # Both checks live in `solar_days`, so there is one rule and one message per rule.
     #
-    # The bounds in particular have to be PARSED, not compared: every comparison the resume makes
-    # is between date strings, and "2018-02-30" sorts like a real date without being one.
-    # Canonical form, taken from the PARSE rather than from the caller's spelling. Every
-    # comparison the resume makes is a string comparison, and `date.fromisoformat` accepts the
-    # compact "20180101" as readily as "2018-01-01" — but "20180101" sorts ABOVE "2018-12-31",
-    # so a leg spelled that way read its own window as entirely closed, skipped every open date
-    # in it, and reported success.
+    # The bounds are PARSED and re-emitted in canonical form, not merely compared: every
+    # comparison the resume makes is a string comparison, "2018-02-30" sorts like a real date
+    # without being one, and `date.fromisoformat` accepts the compact "20180101" as readily as
+    # "2018-01-01" — but "20180101" sorts ABOVE "2018-12-31", so a leg spelled that way read its
+    # own window as entirely closed, skipped every open date in it, and reported success.
     _start, _end = validated_window(start_date, end_date)
     start_date, end_date = _start.isoformat(), _end.isoformat()
     validated_batch_days(batch_days)
@@ -576,16 +537,16 @@ def ingest_s1_roi_sar(
     # so searching back there cannot write anything — and searching is most of what a resumed run
     # does.
     #
-    # `start_date` is deliberately NOT reassigned. It names the window that was REQUESTED, and
-    # that is what `record_assessed_window` below describes: narrowing the record to the resumed
-    # start would retract the earlier leg's assessment of every month beneath it, and the coverage
-    # gate reads an unassessed absent month as an unexplained gap the zone-year can never clear.
+    # `start_date` is deliberately NOT reassigned: it names the window that was REQUESTED, which
+    # is what `record_assessed_window` below describes. Narrowing the record to the resumed start
+    # would retract the earlier leg's assessment of every month beneath it, and the coverage gate
+    # reads an unassessed absent month as an unexplained gap the zone-year can never clear.
     query_start_date = resume_window_start(start_date, last_written_date)
     if query_start_date > end_date:
         # The store already holds this window's last day, so every batch would sit below the line.
         # No ranges, and NO early return: the end of this function repairs an assessed-window
-        # record that an interrupted leg never wrote, and a resume over a complete store is
-        # precisely the run that has to perform that repair.
+        # record an interrupted leg never wrote, and a resume over a complete store is precisely
+        # the run that has to perform that repair.
         log.info(
             "[%s] Nothing to search for roi=%s %s..%s: the store's newest date is %s, so every day "
             "in this window is already closed to it.",
@@ -595,38 +556,25 @@ def ingest_s1_roi_sar(
             end_date,
             last_written_date,
         )
+    # Batches of up to ``batch_days`` SOLAR days, each querying a UTC range padded a day either
+    # side. The two ranges differ on purpose: cutting on UTC dates and writing every group the
+    # loader returned splits any solar day landing on a cut, and the later batch's half is then
+    # discarded as an already-written date — so the day commits missing acquisitions, at every
+    # boundary, in the zones whose offset puts UTC midnight near a satellite pass.
+    # ingest.solar_days owns that reasoning and the S2 month slicing uses the same mechanism.
+    #
+    # Materialised as a list rather than advanced in the loop because the look-ahead has to know
+    # what comes next before the current batch is done with.
     batch_ranges: list[SolarDayRange] = (
         fixed_day_ranges(query_start_date, end_date, batch_days) if query_start_date <= end_date else []
     )
 
-    # Read ONCE, then maintained in-process as dates are written.
-    #
-    # The serial loop re-read this from the store every batch, so that a date written by
-    # an earlier batch would be skipped by a later one. Under a look-ahead that read is
-    # unsafe: the next batch's query is prepared BEFORE the current batch has written, so
-    # a store read there would miss dates that are about to exist. Tracking writes
-    # in-process is correct regardless of when the query runs, and drops a per-batch S3
-    # read as a side effect.
-    #
-    # Why any of this is needed at all: batches are cut on UTC dates while the loader
-    # groups by SOLAR day, so an acquisition late on a batch's last UTC day can belong to
-    # the next batch's solar day, and two consecutive batches can then contain the same
-    # day. Probing real catalogue responses did not find such a boundary (12 boundaries
-    # across a +1 h and a +10 h zone), but the offset is a translation rather than a
-    # split, so nothing rules it out — and the cost of being wrong is a duplicate-date
-    # commit. The consume side below is therefore the authority on what has been written,
-    # and the query filter is only an optimisation.
-    # Written dates only. A date given up on is re-offered by the next attempt and gives up
-    # again for the same reason: every accepted cause is DETERMINISTIC, so the verdict recomputes
-    # and re-offering costs one re-evaluation rather than risking anything. A record of the skip
-    # would only be needed if the verdict could change between attempts, which is what treating a
-    # transient failure as a skip used to allow.
-    # Counted for the assessed-window record: it separates "sparse region" from
-    # "the footprints are wrong", which look identical in a date count alone.
+    # Counted for the assessed-window record: it separates "sparse region" from "the footprints
+    # are wrong", which look identical in a date count alone.
     empty_dates = 0
-    #: Dates given up because their source reads failed, recorded on the store rather than only
-    #: logged: without the record a lost date and a day with no imagery look the same, and
-    #: nothing downstream revisits either.
+    #: Dates given up because their source reads failed. Reported per date and again in an
+    #: end-of-run summary, because without a record a lost date and a day with no imagery look
+    #: the same and nothing downstream revisits either.
     given_up_dates: list[dict[str, str]] = []
     #: The same dates as a membership test. Batch queries are padded a day either side, so a
     #: boundary solar day comes back from two consecutive batches — without this it would be
@@ -635,21 +583,20 @@ def ingest_s1_roi_sar(
     #: Owned items across every batch — the number that distinguishes "the source does not
     #: cover this ROI for this orbit" from "we found items and committed none of them".
     total_items_seen = 0
-    #: Whether THIS leg has read the source successfully at least once, which is the local
-    #: evidence that our access to it is sound.
+    #: Whether THIS leg has read the source successfully at least once — the local evidence that
+    #: our access is sound.
     #:
     #: An authorization refusal on a valid credential is either the provider misbehaving or our
-    #: permissions being genuinely wrong, and the two are the same `AccessDenied` sentence. What
-    #: separates them is not the message but WHEN it arrives: a permissions fault is total and
-    #: deterministic, so it refuses the FIRST date; a provider wobble arrives after this leg has
-    #: already been served. So a refusal before any successful read buys no patience — it fails
-    #: the leg promptly, releasing the fleet — while one after a successful read is waited out.
-    #: Necessary rather than sufficient, which is all it needs to be: it gates only the
-    #: EXPENSIVE response, and the cheap one is unconditional either way.
+    #: permissions being genuinely wrong, and both are the same `AccessDenied` sentence. What
+    #: separates them is WHEN it arrives: a permissions fault is total and deterministic, so it
+    #: refuses the FIRST date, while a provider wobble arrives after this leg has been served. So
+    #: a refusal before any successful read buys no patience and fails the leg promptly, releasing
+    #: the fleet; one after a successful read is waited out. Necessary rather than sufficient is
+    #: all it needs to be: it gates only the EXPENSIVE response.
     #:
-    #: Deliberately not `written_dates`, which a resume pre-seeds from the store: those dates
-    #: were read by an earlier leg, possibly with a credential and a permission set that no
-    #: longer apply, so they say nothing about this leg's access.
+    #: Deliberately not `written_dates`, which a resume pre-seeds from the store: those dates were
+    #: read by an earlier leg, possibly under a credential and permission set that no longer
+    #: apply, so they say nothing about this leg's access.
     read_at_least_once = False
     # Frozen at the start so the background thread reads an object nothing mutates.
     already_present = frozenset(written_dates)
@@ -657,23 +604,21 @@ def ingest_s1_roi_sar(
     def _give_up_date(date_str: str, exc: BaseException) -> bool:
         """Accept the loss of one date, or decline to.
 
-        Returns ``False`` when the failure is not one the source is answerable for, and the
-        caller then re-raises — the fail-closed direction, so an unexamined cause stops the leg
-        instead of quietly thinning its year.
+        Returns ``False`` when the failure is not one the source is answerable for, and the caller
+        then re-raises — the fail-closed direction, so an unexamined cause stops the leg instead
+        of quietly thinning its year.
 
-        **A PROVIDER REFUSAL IS NOT ACCEPTED HERE, and that is a change.** It used to be, under
-        ``scope="provider-refused"``, on the reasoning that a later run over the window would get
-        the imagery. It would not: giving up a date and then committing a LATER one puts the
-        earlier date permanently below the store's append-only maximum, so the re-run that was
-        supposed to recover it is refused instead. A refusal is also transient by definition, so
-        accepting it converts a bad minute at the source into a hole — the mirror of the defect
+        **A PROVIDER REFUSAL IS NEVER ACCEPTED HERE.** Giving up a date and then committing a
+        LATER one puts the earlier date permanently below the store's append-only maximum, so the
+        re-run that would recover it is refused instead; and a refusal is transient by definition,
+        so accepting it converts a bad minute at the source into a hole — the mirror of the defect
         that cost eleven optical stores, where the same refusal was misread as unreadable data.
 
-        So the only accepted cause is data that will never read, which is DETERMINISTIC: it
-        recomputes to the same verdict on every attempt, which is what makes the absence
+        The only accepted cause is therefore data that will never read, which is DETERMINISTIC:
+        it recomputes to the same verdict on every attempt, which is what makes the absence
         explainable rather than a matter of when the leg happened to run. Everything else returns
-        ``False`` and the caller re-raises, failing the leg with the time axis unmoved — and the
-        leg's own retry re-offers the date in order.
+        ``False``, failing the leg with the time axis unmoved, and the leg's own retry re-offers
+        the date in order.
 
         Raises:
             TooManyGivenUpDatesError: Past :data:`MAX_GIVEN_UP_DATES`.
@@ -686,9 +631,8 @@ def ingest_s1_roi_sar(
         entry = {
             "date": date_str,
             "scope": scope,
-            # Truncated: a GDAL chain can run to thousands of characters, and the first line
-            # is what identifies the cause. The rest is in the traceback `read_failure_context`
-            # already logged.
+            # Truncated: a GDAL chain runs to thousands of characters and the first line
+            # identifies the cause; the rest is in the traceback `read_failure_context` logged.
             "error": f"{type(exc).__name__}: {exc}"[:300],
         }
         given_up_dates.append(entry)
@@ -704,8 +648,8 @@ def ingest_s1_roi_sar(
             exc_info=True,
         )
         # After the line above, so the date that crossed the ceiling is described as fully as
-        # every date before it. No assessed window is written by a leg that stops here: that
-        # attribute says the range was examined in full, and this one never reached most of it.
+        # every date before it. A leg that stops here writes no assessed window: that attribute
+        # says the range was examined in full, and this one never reached most of it.
         if len(given_up_dates) > MAX_GIVEN_UP_DATES:
             listed = ", ".join(f"{g['date']}({g['scope']})" for g in given_up_dates)
             raise TooManyGivenUpDatesError(
@@ -740,21 +684,18 @@ def ingest_s1_roi_sar(
             rng.query_end,
         )
 
-        # Rebuild the lazy ROI mask per batch so frozen IAM creds inside any embedded
-        # boto chain are fresh. Graph construction only; the actual S3 reads happen
-        # during the write's compute(), by which point the credential refresh has
-        # applied any new session token.
+        # Rebuild the lazy ROI mask per batch so frozen IAM creds inside any embedded boto chain
+        # are fresh. Graph construction only; the S3 reads happen during the write's compute(),
+        # by which point the credential refresh has applied any new session token.
         batch_mask = read_roi_mask(roi_zarr_path, spatial_chunks, storage_options=storage_options)
-        # Left LAZY on purpose. persist() materialises every chunk of the full
-        # zone grid — for 03S that is 3,706 chunks / ~60 GiB of mostly ocean, pinned for
-        # the run — while the only consumer, apply_roi_mask, is written out to the live
-        # windows and so touches a handful of them. Dask culls the reads to those chunks,
-        # making a per-batch re-read far cheaper than the pin. (S2 does the same, and
-        # additionally crops the coverage denominator, which it alone computes.)
+        # Left LAZY on purpose: persist() materialises every chunk of the full zone grid — for 03S
+        # that is 3,706 chunks / ~60 GiB of mostly ocean, pinned for the run — while the only
+        # consumer, apply_roi_mask, is written out to the live windows and touches a handful.
+        # Dask culls the reads to those, making a per-batch re-read far cheaper than the pin.
 
-        # Wrap the provider to keep the items odc was given. Wrapping rather than querying
-        # twice matters: these must be the SAME objects odc grouped, after any timestamp
-        # normalisation, or the footprints would describe a different set of acquisitions.
+        # Wrap the provider to keep the items odc was given. Wrapping rather than querying twice
+        # matters: these must be the SAME objects odc grouped, after any timestamp normalisation,
+        # or the footprints would describe a different set of acquisitions.
         base_provider = make_s1_item_provider(
             orbit,
             roi.bbox_wgs84,
@@ -766,14 +707,13 @@ def ingest_s1_roi_sar(
         seen_items: list = []
 
         def _capturing_provider() -> list:
-            # OWNERSHIP, applied here rather than after the load. The query deliberately
-            # reaches a day past this batch on both sides so that a solar day straddling
-            # a boundary is complete for whichever batch owns it; handing those pad-day
-            # items to the loader as well would have it build a partial group for the
-            # NEIGHBOUR's day, which the write loop would then commit. Filtering first
-            # means the loader only ever sees whole days that are ours.
-            # Normalise defensively: the provider already does it, but it is injectable
-            # and this is the last point before ownership reads a date. Idempotent.
+            # OWNERSHIP, applied here rather than after the load. The query deliberately reaches
+            # a day past this batch on both sides so a solar day straddling a boundary is complete
+            # for whichever batch owns it; handing those pad-day items to the loader too would
+            # have it build a partial group for the NEIGHBOUR's day, which the write loop would
+            # commit. Filtering first means the loader only sees whole days that are ours.
+            # Normalise defensively: the provider already does it, but it is injectable and this
+            # is the last point before ownership reads a date. Idempotent.
             items = owned_items(normalize_to_solar_day(base_provider(), mid_longitude=mid_longitude), rng)
             seen_items.extend(items)
             return items
@@ -802,12 +742,11 @@ def ingest_s1_roi_sar(
             mid_longitude=mid_longitude,
         )
         query_s = time.monotonic() - query_started
-        # THE most diagnostic line in this flow, and it did not exist. Without the item
-        # count there is no way to tell a zone the source does not cover from a zone whose
-        # items we found and then dropped — the two look identical (a leg that completes
-        # having written nothing) and they need opposite fixes. ``items`` is post-ownership,
-        # so a batch that queried granules and owned none of them says so here rather than
-        # vanishing. roi= because at fleet width nothing else identifies the cell.
+        # THE most diagnostic line in this flow: without the item count there is no telling a
+        # zone the source does not cover from a zone whose items we found and then dropped — the
+        # two look identical (a leg that completes having written nothing) and need opposite
+        # fixes. The count is post-ownership, so a batch that queried granules and owned none says
+        # so here rather than vanishing. roi= because at fleet width nothing else names the cell.
         log.info(
             "[%s] Batch %s..%s roi=%s: %d owned item(s), loaded=%s, query=%.1fs",
             orbit,
@@ -831,16 +770,15 @@ def ingest_s1_roi_sar(
         )
 
     # depth=1: one batch prepared ahead. A batch's write is one long consume, so a single
-    # look-ahead already covers it; more would retain catalogue items to hide nothing.
-    # Unpipelined, `pipelined` is bypassed entirely rather than run at depth 0 — the
-    # serial path must stay available as a rollback that shares no machinery.
+    # look-ahead covers it; more would retain catalogue items to hide nothing. Unpipelined,
+    # `pipelined` is bypassed entirely rather than run at depth 0, so the serial rollback path
+    # shares no machinery.
     def _serially() -> Iterator[tuple[_PreparedBatch, float]]:
         """The rollback path, yielding the same ``(prepared, stall)`` shape as the pipeline.
 
-        ``stall`` is the preparation the consumer had to WAIT for, so serially it is the
-        whole query — not zero. Reporting zero would make ``hidden`` read as the full query
-        and claim the serial path hides everything, which is backwards, and would corrupt
-        any A/B using that log line as its instrument.
+        ``stall`` is the preparation the consumer had to WAIT for, so serially it is the whole
+        query, not zero. Reporting zero would make ``hidden`` read as the full query and claim the
+        serial path hides everything, corrupting any A/B that uses the log line as its instrument.
         """
         for rng in batch_ranges:
             prepared_serial = _prepare_batch(rng)
@@ -848,16 +786,12 @@ def ingest_s1_roi_sar(
 
     prepared_batches = ticked(pipelined(batch_ranges, _prepare_batch, depth=1) if pipeline_batches else _serially())
 
-    # NOT short-circuited on a run of empty batches, and the reason is worth keeping. Zone 23N
-    # paginates ~182,000 granules across a year to write nothing, so abandoning such an orbit
-    # early is worth roughly 190s -> 59s of catalogue time per zone-year. But "no usable item
-    # yet" is ALSO what a summer-only zone looks like in January, and the two are
-    # indistinguishable from the item count alone — so any threshold on it drops real radar
-    # from seasonally-covered land. The safe signal is the polarisation skip count, which
-    # separates them exactly: granules fetched and all rejected for polarisation is a permanent
-    # property of the terrain, while zero granules fetched is a window with no acquisitions and
-    # may be seasonal. That count is computed in ingest.opera_query and currently only logged;
-    # exposing it through the provider is what this optimisation is waiting on.
+    # NOT short-circuited on a run of empty batches. "No usable item yet" is what a zone the
+    # source never covers looks like AND what a summer-only zone looks like in January, and the
+    # item count alone cannot separate them, so any threshold on it drops real radar from
+    # seasonally-covered land. The signal that would separate them is the polarisation skip count
+    # (ingest.opera_query, currently logged but not exposed through the provider) — see
+    # context_docs for the measured saving this optimisation is waiting on.
     for prepared, stall_s in prepared_batches:
         total_items_seen += prepared.items_seen
         batch_start_str, batch_end_str = prepared.start, prepared.end
@@ -871,34 +805,28 @@ def ingest_s1_roi_sar(
             write_total_s = 0.0
             written_this_batch = 0
 
-            # A batch holds many NON-contiguous dates, each its own atomic
-            # commit — so the retry scope is PER DATE. One retry around the
-            # whole loop would restart at a date an earlier attempt already
-            # committed and trip the duplicate-date guard.
+            # A batch holds many NON-contiguous dates, each its own atomic commit, so the retry
+            # scope is PER DATE: one retry around the whole loop would restart at a date an
+            # earlier attempt already committed and trip the duplicate-date guard.
             for i in range(data.sizes["time"]):
-                # Match this slice on its EXACT timestamp — the value odc took from the
-                # group's first item — and take BOTH the solar day and the footprint from
-                # what was grouped. The slice's own label cannot be trusted as the day:
-                # odc stamps it with an item timestamp whose calendar date can be the day
-                # BEFORE the solar day wherever the offset crosses UTC midnight, so two
-                # solar days can normalise onto one date and collide on the time axis.
-                #
-                # Unmatched means the footprint is unknown, so fall back to the label —
-                # the pre-existing behaviour, and the conservative branch.
+                # Match this slice on its EXACT timestamp — the value odc took from the group's
+                # first item — and take BOTH the solar day and the footprint from what was
+                # grouped. The slice's own label cannot be trusted as the day: odc stamps it with
+                # an item timestamp whose calendar date can be the day BEFORE the solar day
+                # wherever the offset crosses UTC midnight, so two solar days can normalise onto
+                # one date and collide on the time axis. Unmatched means the footprint is unknown,
+                # so fall back to the label, which is the conservative branch.
                 entry = prepared.date_windows.get(str(data["time"].values[i])[:19])
                 solar_day, footprint = entry if entry else (None, None)
                 date_str = solar_day or str(data["time"].values[i])[:10]
-                # THE authority on what has been written, checked here rather than
-                # relying on the query filter: under a look-ahead the query for this
-                # batch may have been built before an earlier batch committed, so a
-                # solar day shared across a UTC batch boundary could arrive twice.
-                # Writing it twice would trip the duplicate-date guard mid-run.
+                # THE authority on what has been written, checked here rather than trusting the
+                # query filter: under a look-ahead this batch's query may have been built before
+                # an earlier batch committed, so a solar day shared across a UTC batch boundary
+                # can arrive twice and writing it twice trips the duplicate-date guard mid-run.
                 if date_str in written_dates:
-                    # DEBUG: on a resume this fires for EVERY date the store already
-                    # holds, so a nearly-complete cell logs one line per committed date
-                    # and Prefect ships each from the Dask worker to the orchestrator.
-                    # The batch summary reports what was written, which is the number
-                    # that matters.
+                    # DEBUG: on a resume this fires for EVERY date the store already holds, and
+                    # Prefect ships each line from the Dask worker to the orchestrator. The batch
+                    # summary reports what was written, which is the number that matters.
                     log.debug("[%s] Skipping date %s: already written", orbit, date_str)
                     continue
 
@@ -912,8 +840,8 @@ def ingest_s1_roi_sar(
                 # Belt and braces. The run starts the day after the newest held date, so nothing
                 # here should be closed — but the append this prevents is refused fatally and
                 # leaves the store with no remedy but deletion. Dropped rather than raised:
-                # reaching here means the resume start is wrong, and killing a run over a bug that
-                # is otherwise harmless would cost the cell the bug did not.
+                # reaching here means the resume start is wrong, and killing the run over a bug
+                # that is otherwise harmless would cost the cell that the bug did not.
                 if last_written_date is not None and date_str <= last_written_date:
                     log.error(
                         "[%s] Not offering %s for roi=%s: the store's newest date is %s, so this "
@@ -937,9 +865,9 @@ def ingest_s1_roi_sar(
                     continue
                 date_windows = footprint if (narrow_windows_per_date and footprint) else live_windows
 
-                # Stamp the slice with its solar day. The store's axis is day-granular
-                # either way, so this only decides WHICH day — and taking it from the
-                # grouping is what makes it unique per slice and monotonic across them.
+                # Stamp the slice with its solar day. The store's axis is day-granular either
+                # way; taking the value from the grouping is what makes it unique per slice and
+                # monotonic across them.
                 day_slice = data.isel(time=slice(i, i + 1))
                 if solar_day:
                     day_slice = day_slice.assign_coords(time=[np.datetime64(solar_day, "ns")])
@@ -949,16 +877,14 @@ def ingest_s1_roi_sar(
                 refresh_credentials_if_stale()
                 date_started = time.monotonic()
                 # S1's source read happens INSIDE this write's compute, so the write retry
-                # already covers a transient read here. The asymmetry that cost whole cells
-                # was S2's, whose read fires in its coverage gate, outside any retry. What
-                # this path lacked is attribution: once the retry is exhausted the exception
-                # names neither the zone nor the date.
+                # already covers a transient read here; the context is what supplies attribution,
+                # since once the retry is exhausted the exception names neither zone nor date.
                 #
-                # `wait_out` is what makes the retry long enough to be the answer to a provider
-                # refusal, which for radar is the ONLY answer: OPERA publishes one copy of a
-                # granule, so there is nothing to step down to, and giving the date up would
-                # hole the store. Radar alone asks for it — the optical path's response is the
-                # copy ladder, and a long wait per rung would multiply with it.
+                # `wait_out` makes the retry long enough to be the answer to a provider refusal,
+                # which for radar is the ONLY answer: OPERA publishes one copy of a granule, so
+                # there is nothing to step down to and giving the date up would hole the store.
+                # Radar alone asks for it — the optical path answers with the copy ladder, and a
+                # long wait per rung would multiply with it.
                 #
                 # Withheld until a read has SUCCEEDED, per `read_at_least_once`: before that a
                 # refusal is as likely to be our own permissions as the provider's wobble, and
@@ -967,11 +893,10 @@ def ingest_s1_roi_sar(
                 # patience the moment it has earned the right to.
                 #
                 # `refusal_wait_out` is the same classifier, asked over the same evidence the
-                # verdict below is reached from: the chain PLUS the refusals GDAL logged and
-                # did not raise. Reaching the verdict from the exception alone is why the
-                # patience never armed — a refused object comes back as an error document, the
-                # codec raises the decode failure it fails with, and the words naming the
-                # refusal are one log line away.
+                # verdict below is reached from: the exception chain PLUS the refusals GDAL logged
+                # and did not raise. The exception alone is not enough — a refused object comes
+                # back as an error document and the codec raises the decode failure, so the words
+                # naming the refusal are one log line away.
                 try:
                     with read_failure_context(log, roi=roi_label, date=date_str, client=client):
                         wait_out = refusal_wait_out(client) if read_at_least_once else None
@@ -991,16 +916,13 @@ def ingest_s1_roi_sar(
                                     s3_region=s3_region,
                                 )
                 except Exception as exc:
-                    # The retry is exhausted. THIS is why one refused read used to take the
-                    # zone-year: the exception left the loop, so a date the source would not hand
-                    # over cost every LATER date too. Only a failure the source is answerable for
-                    # is absorbed — anything else repeats on every date and is repairable here,
-                    # so giving up dates one at a time would be the wrong response to it.
+                    # The retry is exhausted. Only a failure the source is answerable for is
+                    # absorbed here; anything else repeats on every date and is repairable, so
+                    # giving up dates one at a time would be the wrong response to it.
                     if is_provider_refusal(exc):
-                        # Fails the leg exactly as it did before, and skips exactly as much:
-                        # nothing. What the type adds is a verdict the CELL can read, because
-                        # the layer that re-dispatches is the only one that can wait longer than
-                        # a leg — and it can only wait longer for a class it can recognise.
+                        # Fails the leg and skips nothing. What the TYPE adds is a verdict the
+                        # CELL can read: the layer that re-dispatches is the only one that can
+                        # wait longer than a leg, and only for a class it can recognise.
                         raise ProviderRefusedReadsError(
                             f"[{orbit}] roi={roi_label} date={date_str}: the source provider "
                             f"refused this read for longer than one write may wait for it. No "
@@ -1019,16 +941,13 @@ def ingest_s1_roi_sar(
                 # commit are one compute here, so a committed date is proof the source served us.
                 read_at_least_once = True
                 written_this_batch += 1
-                # ``mode`` is the load-bearing field: sequential means this date
-                # cost the SUM of its windows' critical paths rather than their
-                # maximum, which is the single largest difference between how S1
-                # and S2 write today.
-                # ``roi=`` is what makes this line attributable at fleet width. A monitor
-                # reading the whole log group cannot otherwise tell WHICH cell a commit
-                # belongs to: the log stream is the Dask worker's ECS task id, and
-                # resolving that to a zone needs a throttled ECS call. Without it the
-                # only answerable question is "is the fleet moving", not "which cell has
-                # stopped" — see yield-embeddings docs/runbooks/campaign-monitoring.md.
+                # ``mode`` is load-bearing: sequential means this date cost the SUM of its
+                # windows' critical paths rather than their maximum, the single largest difference
+                # between how S1 and S2 write today. ``roi=`` is what makes the line attributable
+                # at fleet width — the log stream is the Dask worker's ECS task id, and resolving
+                # that to a zone needs a throttled ECS call, so without it the only answerable
+                # question is "is the fleet moving", not "which cell has stopped". See
+                # yield-embeddings docs/runbooks/campaign-monitoring.md.
                 log.info(
                     "[%s] S1 stage timings roi=%s date=%s: write=%.1fs windows=%d of %d mode=%s",
                     orbit,
@@ -1053,12 +972,11 @@ def ingest_s1_roi_sar(
                 n,
                 total_processed,
             )
-            # `stall` is what the look-ahead failed to hide — how long this batch waited
-            # for its own query after the previous batch's writes finished. Near zero
-            # means the query hid completely; approaching `query` means it hid nothing,
-            # which is the expected reading for the FIRST batch since nothing precedes
-            # it. `hidden` is therefore the saving, and it is what to watch: if it stays
-            # near zero on later batches the look-ahead is not paying.
+            # `stall` is what the look-ahead failed to hide — how long this batch waited for its
+            # own query after the previous batch's writes finished. Near zero means the query hid
+            # completely; approaching `query` means it hid nothing, which is expected for the
+            # FIRST batch. `hidden` is the saving and the figure to watch: staying near zero on
+            # later batches means the look-ahead is not paying.
             log.info(
                 "[%s] S1 batch timings %s..%s roi=%s n=%d: "
                 "query=%.1fs hidden=%.1fs stall=%.1fs write=%.1fs per_date=%.1fs",
@@ -1074,17 +992,17 @@ def ingest_s1_roi_sar(
                 (stall_s + write_total_s) / n if n else 0.0,
             )
 
-    # Record the range examined IN FULL, so a month absent from this store reads as a
-    # finding rather than a gap (see storage.zarr_store.record_assessed_window). Only when a
-    # store exists: with nothing written there is no store to annotate, and that case is
-    # already unambiguous — no store means the orbit is absent and callers downgrade.
+    # Record the range examined IN FULL, so a month absent from this store reads as a finding
+    # rather than a gap (storage.zarr_store.record_assessed_window). Only when a store exists:
+    # with nothing written there is nothing to annotate, and that case is already unambiguous —
+    # no store means the orbit is absent and callers downgrade.
     #
-    # "A store exists", NOT "this invocation wrote a date". A run interrupted after its
-    # last commit but before this line leaves the orbit store complete and unannotated; the
-    # resume then dedupes every date away, writes nothing, and would skip the record again
-    # on every retry, leaving a legitimately empty month permanently indistinguishable from
-    # a gap. `empty_dates` is 0 on such a resume, which is honest — this pass examined no
-    # date — and the gate does not read it. The probe runs ONLY when nothing was written.
+    # "A store exists", NOT "this invocation wrote a date". A run interrupted after its last
+    # commit but before this line leaves the orbit store complete and unannotated; the resume then
+    # dedupes every date away, writes nothing and would skip the record again on every retry,
+    # leaving a legitimately empty month permanently indistinguishable from a gap. `empty_dates`
+    # is 0 on such a resume, which is honest, and the gate does not read it. The probe runs ONLY
+    # when nothing was written.
     if total_processed or get_existing_dates(orbit_store, s3_region=s3_region):
         record_assessed_window(
             orbit_store,
@@ -1110,16 +1028,14 @@ def ingest_s1_roi_sar(
         )
 
     if total_processed == 0:
-        # A leg that writes nothing used to complete SILENTLY, and that silence is what made
-        # five zones undiagnosable: `status="skipped"` is a success to the parent, so the
-        # cell finished green with an orbit absent from the store and no line saying why.
-        # WARNING and not INFO because it is nearly always worth a human's attention — the
-        # legitimate case (the source does not cover this ROI for this orbit) is rare, and
-        # indistinguishable from the illegitimate one WITHOUT this line naming which it was.
-        # ``already_held`` is what keeps this from crying wolf on a RESUME. A leg re-run over a
-        # store that already holds everything it can hold legitimately writes nothing, and a
-        # warning that fires on every such run is one the reader learns to skip — the same
-        # failure as the empty-commit warning this file's assessed-window record used to emit.
+        # A leg that writes nothing must say so: `status="skipped"` reads as success to the
+        # parent, so a silent one finished five cells green with an orbit absent from the store
+        # and no line saying why. WARNING rather than INFO because it is nearly always worth a
+        # human's attention — the legitimate case (the source does not cover this ROI for this
+        # orbit) is rare and indistinguishable from the illegitimate one without this line naming
+        # which it was. ``already_held`` keeps it from crying wolf on a RESUME: a leg re-run over
+        # a store that already holds everything it can legitimately writes nothing, and a warning
+        # that fires on every such run is one the reader learns to skip.
         already_held = len(written_dates)
         log.log(
             # A resume with nothing left to add is routine; one that GAVE UP dates is not,
@@ -1141,13 +1057,12 @@ def ingest_s1_roi_sar(
             already_held,
         )
         if given_up_dates and not already_held:
-            # The WARNING above is not enough on its own. `status="skipped"` reads to the
-            # parent as "the source does not cover this orbit", and for `s1_orbit="both"`
-            # that lets the cell finish with an orbit missing and inference run on optical
-            # alone. A leg that gave up EVERY date it had, onto a store that holds nothing,
-            # is data loss wearing the same clothes as absence — and the two must not be
-            # returned identically. TERMINAL: every date here failed for a cause that
-            # recomputes, so a re-dispatch reads the same objects to the same answer.
+            # The WARNING above is not enough on its own: `status="skipped"` reads to the parent
+            # as "the source does not cover this orbit", and for `s1_orbit="both"` that lets the
+            # cell finish with an orbit missing and inference run on optical alone. A leg that
+            # gave up EVERY date onto a store holding nothing is data loss wearing the clothes of
+            # absence, and the two must not be returned identically. TERMINAL: every date here
+            # failed for a cause that recomputes, so a re-dispatch reaches the same answer.
             raise TooManyGivenUpDatesError(
                 f"[{orbit}] roi={roi_label} window={start_date}..{end_date} gave up every one "
                 f"of its {len(given_up_dates)} date(s) and committed none, so no store exists "

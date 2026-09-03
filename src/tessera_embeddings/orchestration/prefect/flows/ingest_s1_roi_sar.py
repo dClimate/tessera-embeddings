@@ -1,12 +1,12 @@
 """Sentinel-1 OPERA RTC SAR ingestion flow for ROI-based regions.
 
-Outer flow provisions a Dask cluster (AWS Fargate by default) and
-threads EDL credentials into worker env via ``extra_worker_env``; the
-inner flow runs the per-batch task on that cluster.
+The outer flow provisions a Dask cluster (AWS Fargate by default) and threads EDL
+credentials into worker env via ``extra_worker_env``; the inner flow runs the per-batch task
+on that cluster.
 
-EDL credentials enter at the **flow boundary** (read from
-``EARTHDATA_USERNAME`` / ``EARTHDATA_PASSWORD`` env vars or a Prefect
-``Secret`` block) — never inside a domain function. Hard rule #5.
+EDL credentials enter at the **flow boundary** (``EARTHDATA_USERNAME`` /
+``EARTHDATA_PASSWORD`` env vars, or a Prefect ``Secret`` block) — never inside a domain
+function. Hard rule #5.
 """
 
 from __future__ import annotations
@@ -71,13 +71,11 @@ def _ingest_s1_roi_impl(
 def _default_edl_env() -> dict[str, str]:
     """Read EDL credentials from environment variables.
 
-    The credential source for production deployments is the Prefect
-    work-pool job template, which injects ``EARTHDATA_USERNAME`` /
-    ``EARTHDATA_PASSWORD`` as env vars on the flow runner. To source
-    these from a Prefect ``Secret`` block instead, read the block here
-    in the flow body (Hard rule #5: secrets enter at the flow boundary,
-    not via injected callables — which cannot cross the deployment's
-    JSON parameter boundary anyway).
+    Production deployments get these from the Prefect work-pool job template, which injects
+    ``EARTHDATA_USERNAME`` / ``EARTHDATA_PASSWORD`` on the flow runner. To source them from
+    a Prefect ``Secret`` block instead, read the block here in the flow body — hard rule #5:
+    secrets enter at the flow boundary, not via injected callables, which cannot cross the
+    deployment's JSON parameter boundary anyway.
     """
     return {
         "EARTHDATA_USERNAME": os.environ["EARTHDATA_USERNAME"],
@@ -124,43 +122,38 @@ def ingest_s1_roi_sar(
         min_workers: Minimum Dask workers.
         max_workers: Maximum Dask workers.
         batch_days: Days per time batch.
-        orbit: Orbit direction. Multi-orbit ingestion is a flow-level
-            concern (call this flow twice).
-        use_s3_direct: Use ASF in-region S3 endpoints (requires
-            us-west-2 reachability and STS creds). When ``True``, the
-            flow wires ``get_s3_credentials`` / ``set_s3_credentials`` as
-            the STS refresh + broadcast callbacks for the domain function
-            (workers receive EDL env vars via ``extra_worker_env`` but
-            need STS tokens for the OPERA bucket; ``extra_worker_env``
-            alone is not sufficient).
+        orbit: Orbit direction. Multi-orbit ingestion is a flow-level concern (call this
+            flow twice).
+        use_s3_direct: Use ASF in-region S3 endpoints (requires us-west-2 reachability and
+            STS creds). When ``True`` the flow wires ``get_s3_credentials`` /
+            ``set_s3_credentials`` as the STS refresh and broadcast callbacks: workers get
+            EDL env vars via ``extra_worker_env`` but need STS tokens for the OPERA bucket.
         use_local: Use the local Dask provider for testing.
-        storage_options: fsspec storage options forwarded to the
-            domain function.
-        perf_report_uri: Optional fsspec URI; when set, a Dask
-            performance-report HTML for this run is captured and
-            uploaded there (probe-rung profiling; default off).
+        storage_options: fsspec storage options forwarded to the domain function.
+        perf_report_uri: Optional fsspec URI; when set, a Dask performance-report HTML for
+            this run is captured and uploaded there (probe-rung profiling; default off).
             Ignored on the ``use_local`` path, which warns.
-        overlap_window_writes: Submit a date's windows as ONE dask compute rather
-            than one blocking compute per window, so they share the fleet instead of
-            each waiting its turn. Produces an identical store either way. **Defaults
-            ON.** Also selects the window merge exchange rate, which prices a boundary
-            by how it is written, so the two cannot drift apart.
+        overlap_window_writes: Submit a date's windows as ONE dask compute rather than one
+            blocking compute per window, so they share the fleet instead of each waiting its
+            turn. Identical store either way. **Defaults ON.** Also selects the window merge
+            exchange rate, which prices a boundary by how it is written, so the two cannot
+            drift apart.
         narrow_windows_per_date: Write only the live windows a date's own imagery reaches,
             as the S2 path does. **Defaults ON**: six times fewer windows per date in both
             zones measured, worth 7-20% of per-date wall clock. Dates reaching NO live window
             are skipped unconditionally, independent of this flag.
-        pipeline_batches: Prepare the NEXT batch's catalogue query while the current
-            batch writes, so only the first batch pays its query on the critical path.
-            **Defaults ON.** Look-ahead is one batch and not configurable: a batch's
-            write is one long consume, so depth 1 covers it, and deeper retention is
-            what once deadlocked the S2 driver. Set False for a strictly serial
-            query-then-write loop.
-        allow_ingest_code_mismatch: Resume a store built by different ingest code (off by default).
+        pipeline_batches: Prepare the NEXT batch's catalogue query while the current batch
+            writes, so only the first batch pays its query on the critical path. **Defaults
+            ON.** Look-ahead is one batch and not configurable: a batch's write is one long
+            consume, so depth 1 covers it, and deeper retention once deadlocked the S2
+            driver. Set False for a strictly serial query-then-write loop.
+        allow_ingest_code_mismatch: Resume a store built by different ingest code (off by
+            default).
 
-        s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
-            storage layer's default (us-west-2); set it when the input bucket
-            lives elsewhere, or the mosaic writes sign against the wrong region
-            and fail after the preflight checks have already passed.
+        s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the storage
+            layer's default (us-west-2); set it when the input bucket lives elsewhere, or
+            the mosaic writes sign against the wrong region and fail after the preflight
+            checks have already passed.
 
     Returns:
         ``SarIngestResult`` serialised as a dict.
@@ -168,27 +161,24 @@ def ingest_s1_roi_sar(
     log = get_run_logger()
     log.info("Starting ingest_s1_roi_sar for %s (orbit=%s)", roi_zarr_path, orbit)
 
-    # STS credential callbacks for the domain function, gated on
-    # use_s3_direct. Workers receive EARTHDATA_USERNAME/PASSWORD via
-    # extra_worker_env but cannot access s3://asf-cumulus-prod-opera-products
-    # with IAM task-role credentials — they need short-lived STS tokens from
-    # ASF's cumulus endpoint. The plain runner wires these the same way; the
-    # Prefect flow must too, or every batch fails with AccessDenied on the
-    # first S3 read.
+    # STS credential callbacks for the domain function, gated on use_s3_direct. Workers get
+    # EARTHDATA_USERNAME/PASSWORD via extra_worker_env but cannot reach
+    # s3://asf-cumulus-prod-opera-products with IAM task-role credentials — they need
+    # short-lived STS tokens from ASF's cumulus endpoint. The plain runner wires these the
+    # same way; without them every batch fails with AccessDenied on the first S3 read.
     edl_credentials_fn = get_s3_credentials if use_s3_direct else None
     apply_credentials_fn = set_s3_credentials if use_s3_direct else None
 
     # IAM storage_options for the ROI-mask reads are resolved on the worker in
-    # process_roi_sar, not here: they carry a live access key / secret / STS
-    # token, and a flow parameter would be persisted in Prefect's DB and shown
-    # in the UI as a plaintext credential.
+    # process_roi_sar, not here: they carry a live access key / secret / STS token, and a
+    # flow parameter is persisted in Prefect's DB and shown in the UI as plaintext.
 
     if use_local:
         from tessera_embeddings.providers.local.dask import local_cluster
 
         if perf_report_uri:
-            # Say so rather than no-op: an operator who set this and finds nothing
-            # at the URI would otherwise suspect the upload or their credentials.
+            # Say so rather than no-op: an operator who set this and finds nothing at the
+            # URI would otherwise suspect the upload or their credentials.
             log.warning("perf_report_uri is ignored on the local-cluster path (use_local=True)")
         with local_cluster() as cluster:
             log.info("Local Dask cluster ready: scheduler=%s", cluster.scheduler_address)
@@ -220,11 +210,11 @@ def ingest_s1_roi_sar(
         min_workers=min_workers,
         max_workers=max_workers,
         extra_worker_env=edl_env,
-        # A capped task stream silently truncates the report to the run's last few
-        # dates; raise it only when a report is actually being captured.
+        # A capped task stream silently truncates the report to the run's last few dates;
+        # raise it only when a report is actually being captured.
         diagnostic_task_stream=bool(perf_report_uri),
-        # Tag every cluster resource with this run's id so the cancellation/crash
-        # hook can sweep the tasks from a fresh process (see _dask_lifecycle).
+        # Tag every cluster resource with this run's id so the cancellation/crash hook can
+        # sweep the tasks from a fresh process (see _dask_lifecycle).
         resource_tags=dask_resource_tags(flow_run_ctx.id),
     ) as cluster:
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)

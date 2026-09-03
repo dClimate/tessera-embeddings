@@ -1,10 +1,9 @@
 """Symmetric INT8 quantization for embedding outputs.
 
-Quantizes float32 embeddings to int8 with a per-pixel scale factor for ~4x
-storage reduction. Matches the tessera beta QAT pipeline's quantization scheme.
-
-Per-pixel (not per-tensor) scale: each spatial location gets its own scale
-factor computed from the max absolute value across its 128 embedding channels.
+Quantizes float32 embeddings to int8 for ~4x storage reduction, matching the
+tessera beta QAT pipeline's scheme. The scale is per-PIXEL rather than
+per-tensor: each spatial location's scale comes from the max absolute value
+across its own 128 embedding channels.
 """
 
 from __future__ import annotations
@@ -24,21 +23,21 @@ def quantize_rows_torch(rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     quantize cost folds into GPU work instead of running as a separate CPU stage
     (which gates the pipeline on low-observation chunks, where the forward is
     tiny). Returns device tensors — ``(N, D)`` int8 and ``(N,)`` float32 — that
-    the caller copies to host together, shrinking the D2H transfer ~4x vs.
+    the caller copies to host together, shrinking the D2H transfer ~4x against
     copying float32 embeddings and quantizing on the CPU.
 
     The arithmetic mirrors :func:`quantize_rows` exactly (cast to float32, per-row
     max-abs scale with the same 1e-8 floor, round-half-to-even, clip to
     [-127, 127]), so the int8 output is bit-identical to the CPU path on the same
     float32 input. ``rows`` is cast to float32 first because the forward emits
-    bf16/fp16; this matches the CPU path, which quantizes the ``.float()`` output.
+    bf16/fp16; the CPU path likewise quantizes the ``.float()`` output.
 
     Unlike the CPU path, this does NOT validate finiteness on-device: an
-    ``isfinite().all()`` here forces a host sync + an extra full pass over the
-    activations on every sub-batch, stalling the GPU pipeline. Any non-finite
-    row necessarily produces a non-finite scale (NaN/Inf propagates through
-    ``amax``/``clamp``), so callers validate the scales on the host after the
-    D2H copy instead — see :func:`raise_on_nonfinite_scales`.
+    ``isfinite().all()`` here forces a host sync plus an extra full pass over the
+    activations on every sub-batch, stalling the GPU pipeline. Any non-finite row
+    necessarily produces a non-finite scale (NaN/Inf propagates through
+    ``amax``/``clamp``), so callers validate the scales on the host after the D2H
+    copy instead — see :func:`raise_on_nonfinite_scales`.
     """
     import torch
 
@@ -67,8 +66,8 @@ def quantize_rows(rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
     Row-wise variant of :func:`quantize_embeddings` for ``(N, D)`` inputs, so a
     bucket's rows can be quantized as they come off the GPU instead of buffering
-    the whole chunk in float32. Each row's scale comes from its own channels, so
-    this is numerically identical to quantizing the full ``(H, W, D)`` array.
+    the whole chunk in float32. Each row's scale comes from its own channels, so it
+    is numerically identical to quantizing the full ``(H, W, D)`` array.
 
     Args:
         rows: Array of shape ``(N, D)``, dtype float32.

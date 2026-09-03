@@ -128,12 +128,11 @@ def check_destination_types(node: zarr.Group, layout: StoreLayout, *, where: str
     """Raise unless every array the group holds has the dtype and attrs the layout declares.
 
     A PREFLIGHT, run before a fill spends a GPU fleet. Assembly already refuses a staged tile whose
-    dtype the destination cannot hold — that guard is correct and it is what caught the defect below
-    — but it fires at the END, after inference. On 2026-08-18 two fills each ran their full inference
-    (13 and 14 minutes across 20 actors) and then died at assembly because ``s2_month_covered`` had
-    been seeded ``bool`` while the staging writer emits ``int8``. On a campaign that is one wasted
-    cell per attempt, and a schema change mid-campaign makes it every cell. The same comparison
-    costs one metadata read here.
+    dtype the destination cannot hold, but it fires at the END, after inference: on 2026-08-18 two
+    fills each ran their full inference (13 and 14 minutes across 20 actors) and then died at
+    assembly because ``s2_month_covered`` had been seeded ``bool`` while the staging writer emits
+    ``int8``. That is one wasted cell per attempt, and a schema change mid-campaign makes it every
+    cell. The same comparison costs one metadata read here.
 
     Checks dtype and the layout's ``attrs`` (``dtype="bool"`` on an int8 array is part of its type:
     without it a reader gets 0/1 integers). Deliberately NOT chunks or shards — a variable that
@@ -141,10 +140,9 @@ def check_destination_types(node: zarr.Group, layout: StoreLayout, *, where: str
     (``inference.assembly._layout_matching_store``), so comparing geometry would refuse every
     legitimately older store.
 
-    Arrays the group does not hold are skipped: a store seeded before an array existed is not
-    wrong, it simply predates it, and assembly writes only what both sides have. Arrays the LAYOUT
-    does not declare are skipped too, so a store carrying an extra variable is not this gate's
-    business.
+    Arrays the group does not hold are skipped: a store seeded before an array existed simply
+    predates it, and assembly writes only what both sides have. Arrays the LAYOUT does not declare
+    are skipped too, so a store carrying an extra variable is not this gate's business.
     """
     mismatches: list[str] = []
     for var in (*REQUIRED_VARS, *CARRIED_VARS):
@@ -234,13 +232,12 @@ def _root_attrs(layout: StoreLayout, model_version: str | None, optical_min_obs:
     on the root (identical across all zones), with ``spatial_layout="utm_zones"``.
 
     ``optical_min_obs`` is the minimum valid optical observations a pixel needed to be
-    embedded at all, or ``None`` for a store that embedded every pixel it had input for. It
-    lives on the ROOT because it is a property of the whole product rather than of a zone:
-    a user asking "what rule produced this dataset" must be able to answer it from the store
-    without reading provenance per cell, and a fill must be able to check that the rule it
-    is about to apply is the rule the store advertises. Absent rather than zero when there
-    was no rule — zero is a threshold that refuses nothing, which is a different statement
-    from never having had one.
+    embedded at all, or ``None`` for a store that embedded every pixel it had input for. On the
+    ROOT because it is a property of the whole product rather than of a zone: a user asking
+    "what rule produced this dataset" must be able to answer it without reading provenance per
+    cell, and a fill must be able to check that the rule it is about to apply is the one the
+    store advertises. Absent rather than zero when there was no rule — zero is a threshold that
+    refuses nothing, a different statement from never having had one.
     """
     attrs = build_geoemb_root_attrs(
         embedding_dim=_layout_band(layout),
@@ -282,14 +279,13 @@ def missing_seeded_arrays(node: zarr.Group, layout: StoreLayout) -> set[str]:
     """Arrays a seed of *layout* would have written that this group does not have.
 
     EVERY array the seeder writes, not a subset: the layout's own arrays plus the six
-    coordinates it creates beside them. `month` and `time_bnds` were once absent from that
-    set, so a group holding the layout arrays and four coordinates counted as complete
-    without them — leaving `s2_month_covered` with no calendar labels and the time axis with
-    no CF bounds.
+    coordinates it creates beside them. Leave `month` or `time_bnds` out of that set and a group
+    holding the layout arrays and four coordinates counts as complete without them, leaving
+    `s2_month_covered` with no calendar labels and the time axis with no CF bounds.
 
-    Split out so the two callers that must agree share one definition: `seed_zone_groups`
-    asks it per spec while creating, and `seed_global_store` asks it on the path where
-    nothing is created at all, which otherwise never applied a completeness check.
+    Split out so the two callers that must agree share one definition: `seed_zone_groups` asks it
+    per spec while creating, and `seed_global_store` asks it on the path where nothing is created
+    at all, which otherwise applies no completeness check.
     """
     expected = set(layout.arrays) | {"time", "northing", "easting", "band", "month", "time_bnds"}
     return expected - set(node.array_keys())
@@ -298,16 +294,15 @@ def missing_seeded_arrays(node: zarr.Group, layout: StoreLayout) -> set[str]:
 def _check_layout_matches(grp: zarr.Group, gname: str, layout: StoreLayout) -> None:
     """Reject an incremental seed whose layout differs from the seeded groups'.
 
-    The time axis is validated against existing groups but the GEOMETRY was not, so a
-    store could be half-seeded with one shard pitch and half with another. That is not
-    a cosmetic split: ``plan_zone_inference`` requires the inference tile to equal the
-    group's shard pitch, so the later zones are rejected at fill time — after seeding
-    has already committed them — and the store needs hand repair. Cheaper to refuse
-    the mixed seed here, alongside the axis check it belongs with.
+    A store half-seeded with one shard pitch and half with another is not a cosmetic split:
+    ``plan_zone_inference`` requires the inference tile to equal the group's shard pitch, so the
+    later zones are rejected at fill time — after seeding has already committed them — and the
+    store needs hand repair. Cheaper to refuse the mixed seed here, alongside the axis check it
+    belongs with.
 
-    Compared per-variable against what THIS layout would have created at the existing
-    array's own shape, so shape-clamping (a zone smaller than one nominal shard) is not
-    mistaken for a layout change.
+    Compared per-variable against what THIS layout would have created at the existing array's own
+    shape, so shape-clamping (a zone smaller than one nominal shard) is not mistaken for a layout
+    change.
     """
     for var, spec in layout.arrays.items():
         if var not in grp:
@@ -317,11 +312,11 @@ def _check_layout_matches(grp: zarr.Group, gname: str, layout: StoreLayout) -> N
             )
         arr = cast("zarr.Array", grp[var])
         want = spec.create_kwargs(tuple(arr.shape))
-        # The WHOLE schema, not only the geometry. Matching chunks and shards with a
-        # different dtype is the nastier case: same pitch, so a geometry-only check
-        # passes, and the new zones are then created as (say) float32 while the
-        # staging writer emits int8 and refuses to fill them — a heterogeneous store
-        # that only reveals itself at fill time. Fill value and codec go the same way.
+        # The WHOLE schema, not only the geometry. Matching chunks and shards with a different
+        # dtype is the nastier case: same pitch, so a geometry-only check passes, and the new
+        # zones are created as (say) float32 while the staging writer emits int8 and refuses to
+        # fill them — a heterogeneous store that only reveals itself at fill time. Fill value and
+        # codec go the same way.
         checks: tuple[tuple[str, object, object, bool], ...] = (
             ("chunks", tuple(arr.chunks), tuple(want["chunks"]), tuple(arr.chunks) == tuple(want["chunks"])),
             (
@@ -338,11 +333,11 @@ def _check_layout_matches(grp: zarr.Group, gname: str, layout: StoreLayout) -> N
                 _fill_equal(arr.fill_value, want["fill_value"]),
             ),
             ("codec", _codec_id(arr), spec.codec, _codec_id(arr) == spec.codec),
-            # Attrs too, because for one array they are part of the TYPE rather than
-            # decoration: `s2_month_covered` carries `dtype="bool"`, which is how xarray
-            # knows an int8 array represents booleans. Without it a reader gets 0/1
-            # integers back, so an incremental seed could leave existing and new groups
-            # with different logical schemas while every geometry check passed.
+            # Attrs too, because for one array they are part of the TYPE rather than decoration:
+            # `s2_month_covered` carries `dtype="bool"`, which is how xarray knows an int8 array
+            # represents booleans. Without it a reader gets 0/1 integers back, so an incremental
+            # seed could leave existing and new groups with different logical schemas while every
+            # geometry check passed.
             (
                 "attrs",
                 {k: dict(arr.attrs).get(k) for k in dict(spec.attrs or ())},
@@ -370,12 +365,11 @@ def check_root_identity(
 ) -> None:
     """Raise unless *root_attrs* already publishes the identity this seed requests.
 
-    Split out of :func:`seed_zone_groups` so the two callers that must not disagree share
-    one implementation. The seed itself runs it before creating groups; the
-    ``seed_global_store`` flow runs it on the path where every zone already exists and no
-    groups are created at all — which previously returned success without checking, so a
-    rerun requesting a different checkpoint or a different minimum-depth rule reported a
-    clean seed and left the old identity in place for the campaign to follow.
+    Split out of :func:`seed_zone_groups` so the two callers that must not disagree share one
+    implementation. The seed itself runs it before creating groups; the ``seed_global_store``
+    flow runs it on the path where every zone already exists and no groups are created — without
+    it, a rerun requesting a different checkpoint or minimum-depth rule reports a clean seed and
+    leaves the old identity in place for the campaign to follow.
 
     A store with no identity stamped yet passes: the first seed is what stamps it.
     """
@@ -411,13 +405,12 @@ def stamp_root_identity(
     is :func:`check_root_identity`'s, not this one's — a stamped root that DISAGREES is a
     refusal, and re-stamping is exactly what write-once forbids).
 
-    Exists because "already stamped" and "seeding created no groups" are different
-    questions and a store can answer no to both: one seeded before the root carried an
-    identity at all. :func:`seed_zone_groups` stamps as a side effect of creating groups,
-    so a store with all 120 already present never reached that line, and the flow reported
-    a clean seed having recorded neither the checkpoint nor the depth rule the operator
-    asked for — after which the fill-side gates, which pass on an ABSENT attr, would let
-    anything write.
+    Exists because "already stamped" and "seeding created no groups" are different questions and
+    a store seeded before the root carried an identity answers no to both. :func:`seed_zone_groups`
+    stamps as a side effect of creating groups, so a store with all 120 already present never
+    reaches that line: the flow would report a clean seed having recorded neither the checkpoint
+    nor the depth rule the operator asked for, after which the fill-side gates — which pass on an
+    ABSENT attr — let anything write.
 
     The caller must establish that no year has landed yet. Stamping a rule onto a store
     that already holds data would publish a claim about how those pixels were filtered
@@ -449,13 +442,12 @@ def seed_zone_groups(
     conventions). Returns the commit snapshot id.
     """
     specs = list(specs)
-    # The time axis is created from `years` verbatim and is fixed forever after
-    # (ADR-008 D1), so a malformed tuple is not recoverable by reseeding. Duplicates
-    # are the dangerous shape: years=(2025, 2025) makes two identical coordinates,
-    # `time_index_of` always resolves to the first, and `years_complete` then marks
-    # the pair done while the second slot is never written — permanently empty, and
-    # invisible to the campaign because status reports it complete. A non-monotonic
-    # tuple additionally produces a CF-invalid time coordinate.
+    # The time axis is created from `years` verbatim and fixed forever after (ADR-008 D1), so a
+    # malformed tuple is not recoverable by reseeding. Duplicates are the dangerous shape:
+    # years=(2025, 2025) makes two identical coordinates, `time_index_of` always resolves to the
+    # first, and `years_complete` then marks the pair done while the second slot is never written
+    # — permanently empty, and invisible to the campaign because status reports it complete. A
+    # non-monotonic tuple additionally produces a CF-invalid time coordinate.
     if not years or list(years) != sorted(set(years)):
         raise ValueError(
             f"years must be a non-empty, strictly increasing tuple, got {tuple(years)} — the time axis is "
@@ -463,15 +455,14 @@ def seed_zone_groups(
         )
     session = repo.writable_session("main")
     root = zarr.open_group(session.store, mode="a")
-    # geoemb: provenance is stated once on the root (utm_zones layout). It is
-    # WRITE-ONCE: a later fill's model gate (fill_zone_year) trusts it to decide
-    # which encoder may write, so an incremental seed must NOT silently re-stamp it
-    # with a different encoder — that would let already-seeded/filled zones (encoder
-    # A) be mixed with a new one (encoder B) under a root now advertising B. The
-    # first seed stamps it; a matching reseed is a no-op; a changed identity is
-    # rejected. (Software build_version may drift and is not part of the identity.)
-    # Zero cannot be a rule, and a changed identity is a refusal: both in check_root_identity,
-    # which the seed_global_store flow also calls on the every-zone-exists path.
+    # geoemb: provenance is stated once on the root (utm_zones layout). It is WRITE-ONCE: a later
+    # fill's model gate (fill_zone_year) trusts it to decide which encoder may write, so an
+    # incremental seed must NOT silently re-stamp it with a different encoder — that would let
+    # already-seeded/filled zones (encoder A) mix with a new one (encoder B) under a root now
+    # advertising B. First seed stamps it; a matching reseed is a no-op; a changed identity is
+    # rejected. (Software build_version may drift and is not part of the identity.) Both that
+    # refusal and the zero-is-not-a-rule check live in `check_root_identity`, which the
+    # seed_global_store flow also calls on the every-zone-exists path.
     check_root_identity(root.attrs, layout=layout, model_version=model_version, optical_min_obs=optical_min_obs)
     stamped_now = "geoemb:model" not in root.attrs
     if stamped_now:
@@ -481,12 +472,11 @@ def seed_zone_groups(
         # consequence to know is that it makes the rule UNCHANGEABLE for this store — moving the
         # line means a new store, not a migration.
         root.attrs.update(_root_attrs(layout, model_version, optical_min_obs))
-    # The time axis is fixed and UNIFORM across all zone groups (ADR-008 D1):
-    # campaign status/fill code assumes every group shares one axis. A direct
-    # incremental seed passing a different `years` than the groups already present
-    # would silently leave a mixed-axis store, so validate against any seeded group
-    # here — not only in the seed_global_store flow's retry guard, which a
-    # lower-level caller bypasses.
+    # The time axis is fixed and UNIFORM across all zone groups (ADR-008 D1): campaign status and
+    # fill code assume every group shares one axis. An incremental seed passing a different
+    # `years` than the groups already present would silently leave a mixed-axis store, so validate
+    # against any seeded group HERE — not only in the seed_global_store flow's retry guard, which
+    # a lower-level caller bypasses.
     for gname in root.group_keys():
         grp = cast("zarr.Group", root[gname])
         if "time" not in grp:
@@ -520,30 +510,24 @@ def seed_zone_groups(
     for spec in specs:
         node = root.require_group(spec.group_name)
         # A zone already seeded is a NO-OP, not an error. `require_group` returns the existing
-        # group and `create_array` then raises on its first array — which contradicted the
-        # matching-reseed behaviour the identity and layout checks above deliberately allow,
-        # and did it destructively: the raise lands part-way through `specs`, so any remaining
-        # NEW zones in the same call never get seeded either.
+        # group and `create_array` would then raise on its first array — contradicting the
+        # matching-reseed behaviour the identity and layout checks above deliberately allow, and
+        # destructively: the raise lands part-way through `specs`, so any remaining NEW zones in
+        # the same call never get seeded either.
         #
-        # Skipped only when the group is COMPLETE. A partially-seeded group is a real defect
-        # (a crash mid-seed) and still raises, because silently completing it here would write
-        # arrays under a group whose existing ones were sized by an unknown earlier call.
-        # EVERY array this seeder writes, not a subset of them. `month` and `time_bnds` were
-        # missing from this set, so a group holding the layout arrays and the four coordinates
-        # counted as complete without them — and the call then reported an idempotent success while
-        # leaving `s2_month_covered` with no calendar labels and the time axis with no CF bounds.
-        # Derived from what the seeder produces below, so a future array is covered by construction
-        # rather than by someone remembering to extend this literal.
+        # Skipped only when the group is COMPLETE over EVERY array this seeder writes
+        # (`missing_seeded_arrays`, which derives the set from what is produced below). A
+        # partially-seeded group is a real defect — a crash mid-seed — and still raises.
         present = set(node.array_keys())
         missing = missing_seeded_arrays(node, layout)
         if not missing:
             continue
         if present:
-            # PARTIAL, which is a real defect — a crash mid-seed, or a group written by a seeder
-            # older than part of the schema. Refused rather than completed here, because filling in
-            # the gaps would write arrays under a group whose existing ones were sized by an unknown
-            # earlier call. Named explicitly: the alternative is `create_array` raising on whichever
-            # array it happens to reach first, which says nothing about what is wrong.
+            # PARTIAL: a crash mid-seed, or a group written by a seeder older than part of the
+            # schema. Refused rather than completed, because filling the gaps would write arrays
+            # under a group whose existing ones were sized by an unknown earlier call. Named
+            # explicitly, since the alternative is `create_array` raising on whichever array it
+            # reaches first, which says nothing about what is wrong.
             raise ValueError(
                 f"Zone group {spec.group_name} exists but is missing "
                 f"{sorted(missing)} — it was seeded by a different schema or a "
@@ -580,14 +564,13 @@ def seed_zone_groups(
         node.attrs.update(_zone_attrs(spec, north, east, layout))
     if not created and not stamped_now:
         # Every requested zone was already complete AND the root already carried its identity, so
-        # nothing was written — and icechunk refuses an empty commit unless asked. Committing anyway
-        # turned the advertised idempotent reseed into a failure, which is the opposite of what
-        # skipping complete groups was for. The identity and layout checks above still ran, so this
-        # returns having VERIFIED the store rather than having ignored the request.
+        # nothing was written — and icechunk refuses an empty commit unless asked. Committing
+        # anyway turns the advertised idempotent reseed into a failure. The identity and layout
+        # checks above still ran, so this returns having VERIFIED the store, not ignored it.
         #
         # `stamped_now` is in the condition because the identity is written to THIS session above.
-        # Returning the branch tip without committing discarded it: the call reported success, the
-        # root stayed unstamped, and the fill gates — which pass on an ABSENT attr — then accepted
+        # Returning the branch tip without committing would discard it: the call reports success,
+        # the root stays unstamped, and the fill gates — which pass on an ABSENT attr — accept
         # anything, with the operator believing the store had been stamped.
         return repo.lookup_branch("main")
     if not created:

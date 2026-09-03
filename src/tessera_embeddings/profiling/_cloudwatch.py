@@ -1,32 +1,26 @@
 """CloudWatch plumbing shared by every profiling CLI, for both compute stages.
 
-The ingest tools (``watch_scheduler``, ``ingest_log_queries``) and the inference
-tool (``observe_cluster``) all run Logs-Insights queries over a ``--since /
---until`` window. That was three copies of the same query loop and three copies
-of the same timestamp parsing; one copy here keeps the contract below honest for
-all of them, and the ingest and inference harnesses can no longer drift apart on
-what a failed query means.
+The ingest tools (``watch_scheduler``, ``ingest_log_queries``) and the inference tool
+(``observe_cluster``) all run Logs-Insights queries over a ``--since / --until`` window.
+One copy of the query loop and the timestamp parsing keeps the two harnesses from drifting
+apart on what a failed query means.
 
 The Insights runner guarantees:
 
-1. **A failed query returns ``None``, it doesn't abort the command.** Insights
-   rejects a query for reasons that are per-query and recoverable-by-skipping
-   (``MalformedQueryException``), or environmental (``LimitExceededException``
-   when too many concurrent queries are running, throttling, denied
-   permissions). Letting one of those propagate would discard every row already
-   collected in the same run — the dossier's whole point is to gather what IS
-   available, and "couldn't ask" (``rows: null``) is distinguishable from
-   "asked, nothing matched" (``rows: []``).
-2. **Truncation is never silent.** Insights caps a result set, so a wide window
-   or a prefix spanning several streams can return a partial series. Presenting
-   that as a full-run profile would hide the actual peak or saturation onset, so
-   the cap is reported both on stderr and as a ``truncated`` flag in the JSON,
+1. **A failed query returns ``None``, it doesn't abort the command.** Rejections are
+   per-query (``MalformedQueryException``) or environmental (``LimitExceededException``,
+   throttling, denied permissions); propagating one would discard every row already
+   collected in the same run. The dossier's point is to gather what IS available, so
+   "couldn't ask" (``rows: null``) stays distinguishable from "asked, nothing matched"
+   (``rows: []``).
+2. **Truncation is never silent.** Insights caps a result set, so a wide window or a
+   multi-stream prefix can return a partial series that would hide the real peak or
+   saturation onset. The cap is reported on stderr and as a ``truncated`` flag in the JSON,
    which ``report.py`` carries into the dossier.
-3. **An abandoned query is cancelled, not orphaned.** Insights allows a limited
-   number of concurrent queries per account, and walking away from one at the
-   deadline leaves it holding a slot — which then surfaces as
-   ``LimitExceededException`` on an unrelated later query, i.e. as guarantee 1
-   firing for no visible reason. Repeated probe runs make that cumulative.
+3. **An abandoned query is cancelled, not orphaned.** Concurrent queries per account are
+   limited, and walking away from one at the deadline leaves it holding a slot — which
+   surfaces later as ``LimitExceededException`` on an unrelated query, i.e. guarantee 1
+   firing for no visible reason, cumulatively across repeated probe runs.
 """
 
 from __future__ import annotations
@@ -65,9 +59,8 @@ def iso(epoch: float) -> str:
 
 
 def insights_query(
-    # A boto3 ``logs`` client. boto3 generates its clients at runtime, so there is
-    # no static type to name; the tests pass a stub with just the two methods used
-    # here, which is the point of not pinning a concrete type.
+    # A boto3 ``logs`` client: generated at runtime, so there is no static type to name —
+    # which is what lets the tests pass a stub with only the two methods used here.
     logs: Any,  # noqa: ANN401 — boto3 client, no static type exists
     log_group: str,
     query: str,
@@ -79,15 +72,14 @@ def insights_query(
 ) -> tuple[list[dict] | None, bool]:
     """Run one Insights query.
 
-    Returns ``(rows, truncated)``. ``rows`` is ``None`` when the query could not
-    be answered at all (rejected, timed out, denied, unreachable) — never an
-    empty list, so a caller can tell that apart from a query that legitimately
-    matched nothing. ``truncated`` is True when the result hit ``limit`` and the
-    series is therefore incomplete.
+    Returns ``(rows, truncated)``. ``rows`` is ``None`` when the query could not be answered
+    at all (rejected, timed out, denied, unreachable) — never an empty list, so a caller can
+    tell that apart from a query that legitimately matched nothing. ``truncated`` is True
+    when the result hit ``limit`` and the series is therefore incomplete.
 
-    Bounded poll: breaks on any terminal status and caps total wait so a query
-    stuck Scheduled/Running can't spin forever. ``deadline_s`` exists so a test
-    can drive the give-up path without patching the clock or sleeping.
+    Bounded poll: breaks on any terminal status and caps total wait so a query stuck
+    Scheduled/Running can't spin forever. ``deadline_s`` exists so a test can drive the
+    give-up path without patching the clock or sleeping.
     """
     try:
         qid = logs.start_query(
@@ -102,11 +94,8 @@ def insights_query(
         while res["status"] not in _TERMINAL:
             if time.monotonic() > deadline:
                 print(f"CloudWatch query did not finish within {deadline_s}s", file=sys.stderr)
-                # Cancel rather than orphan it: an abandoned query keeps holding
-                # one of the account's concurrent-query slots, and the symptom
-                # surfaces later as an unrelated query being rejected. Suppressed
-                # because a query that reached a terminal state between the poll
-                # and here rejects the cancel, which is not worth reporting.
+                # Cancel rather than orphan it (guarantee 3). Suppressed because a query
+                # that went terminal between the poll and here rejects the cancel.
                 with contextlib.suppress(Exception):
                     logs.stop_query(queryId=qid)
                 return None, False
@@ -119,9 +108,7 @@ def insights_query(
     except Exception as e:
         # Broad by design: boto3 generates its client exceptions dynamically
         # (logs.exceptions.MalformedQueryException et al) and botocore adds
-        # credential/endpoint errors, so there is no useful narrow tuple. The
-        # documented contract is that one bad query yields rows=null and the
-        # command still emits everything else it gathered.
+        # credential/endpoint errors, so there is no useful narrow tuple. Guarantee 1.
         print(f"CloudWatch query failed: {e}", file=sys.stderr)
         return None, False
 

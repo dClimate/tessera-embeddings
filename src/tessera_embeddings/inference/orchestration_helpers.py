@@ -1,8 +1,6 @@
 """Pure helpers shared by Prefect task shells, the plain runner, and tests.
 
-These functions used to live in the reference repo's ``flow_utils/inference.py``
-alongside the ``@task`` shells. They have no Prefect coupling and don't
-belong in any individual flow file, so they live here in the inference
+No Prefect coupling and no home in any individual flow file, so they sit in the inference
 domain layer.
 """
 
@@ -33,10 +31,9 @@ def read_upstream_manifests(
 ) -> dict[str, dict[str, Any] | None]:
     """Read ``_manifest`` attrs from all active ingest stores under ``mosaic_base``.
 
-    Opens via the raw-zarr metadata reader with the caller's credential callback /
-    region (the same ones the assemble write uses), so a callback-only or
-    non-default-region deployment doesn't fall back to the default Icechunk chain
-    and fail this manifest read on the flow runner before ``writer.assemble()``.
+    Uses the caller's credential callback / region — the same ones the assemble write uses — so a
+    callback-only or non-default-region deployment does not fall back to the default Icechunk
+    chain and fail on the flow runner before ``writer.assemble()``.
     """
     store_names = ["reflectance"]
     for orbit in _active_orbits(s1_orbit):
@@ -45,8 +42,8 @@ def read_upstream_manifests(
     manifests: dict[str, dict[str, Any] | None] = {}
     for name in store_names:
         path = f"{mosaic_base}/{name}.zarr"
-        # Raw-zarr open reads only the root attrs off metadata — no Dask graph over
-        # a full-zone mosaic's chunks just to read one attr dict.
+        # Raw-zarr open reads only the root attrs off metadata — no Dask graph over a full-zone
+        # mosaic's chunks just to read one attr dict.
         root = open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
         manifests[name] = extract_manifest(dict(root.attrs))
     return manifests
@@ -55,8 +52,8 @@ def read_upstream_manifests(
 def embedding_store_path(output_bucket: str, roi_name: str, output_name_suffix: str = "") -> str:
     """Where a single-ROI run's embeddings land.
 
-    One definition, because the preflight gate and the assembly task must target
-    the same store — a divergence would validate one path and write another.
+    One definition: the preflight gate and the assembly task must target the same store, or one
+    path gets validated and another written.
     """
     return f"{output_bucket.rstrip('/')}/embeddings/{roi_name}{output_name_suffix}.zarr"
 
@@ -95,14 +92,10 @@ def assert_output_store_accepts(
 ) -> None:
     """Reject an append the output store cannot accept, before any compute is provisioned.
 
-    ``assemble`` validates this manifest anyway, but only once inference has run —
-    so a model or upstream-ingest change against an existing store fails after the
-    GPU bill rather than before it. Metadata-only: one root-attrs read of a store
-    that may not exist yet.
-
-    A store that is absent (first run) or carries no manifest (written before
-    manifests existed) is not a failure — ``validate_against`` treats the latter as
-    a legacy store and warns.
+    ``assemble`` validates the same manifest, but only after inference has run — a model or
+    upstream-ingest change would then fail after the GPU bill rather than before it. Costs one
+    root-attrs read of a store that may not exist yet. Absent (first run) or manifest-less
+    (legacy) stores pass; ``validate_against`` warns on the latter.
 
     Raises:
         ConfigMismatchError: If the existing store's manifest disagrees.
@@ -143,16 +136,15 @@ def enumerate_mosaic_chunks(
 ) -> tuple[list[ChunkSpec], int, int]:
     """Open the reflectance store, enumerate the spatial chunk grid, then close it.
 
-    The store is explicitly closed and garbage-collected after
-    enumeration to release the Icechunk session before the Ray cluster
-    starts (Ray's pickling chokes on a live session). ``get_credentials``/
-    ``s3_region`` are threaded to the open so a callback-only / non-default-region
-    deployment doesn't fall back to the default Icechunk chain on the flow runner.
+    Closed and garbage-collected explicitly so the Icechunk session is released before the Ray
+    cluster starts — Ray's pickling chokes on a live session. ``get_credentials`` / ``s3_region``
+    are threaded through so a callback-only or non-default-region deployment does not fall back
+    to the default Icechunk chain on the flow runner.
     """
     reflectance_path = f"{mosaic_base}/reflectance.zarr"
     log.info("Reading store metadata from %s", reflectance_path)
-    # chunks=None: only the dim sizes are read here (never pixels), so skip
-    # building a Dask task graph over every chunk of the full-zone mosaic.
+    # chunks=None: only dim sizes are read here, never pixels — skip building a Dask task graph
+    # over every chunk of the full-zone mosaic.
     ds = open_store(reflectance_path, chunks=None, get_credentials=get_credentials, region=s3_region)
     try:
         chunks = enumerate_chunks_from_dataset(ds, chunk_size)
@@ -176,10 +168,8 @@ def build_inference_config(
 ) -> InferenceConfig:
     """Build an :class:`InferenceConfig` from flow-level parameters.
 
-    The reference repo's helper used a ``dev: bool`` toggle that
-    selected hardcoded buckets and checkpoints; this version takes
-    them as explicit caller arguments so the same code works for any
-    deployment.
+    Buckets and checkpoint are explicit arguments rather than derived from an environment
+    toggle, so the same code serves any deployment.
     """
     return InferenceConfig(
         time_window=time_window,
