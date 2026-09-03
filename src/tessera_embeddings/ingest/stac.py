@@ -1688,7 +1688,7 @@ def query_stac_items(
 
     # `solar_day_sort_key` owns the order and the reasoning; `load_kwargs` below sets
     # `preserve_original_order=True` so it is that order the loader fuses in. Pinned end to end by
-    # `tests/unit/test_solar_day_fusion.py`, which loads two real scenes of one solar day through
+    # `tests/unit/ingest/test_solar_day_fusion.py`, which loads two real scenes of one solar day through
     # this path and asserts which one survives.
     #
     # Keyed on the SOLAR day, matching `normalize_to_solar_day` just above and the loader's own

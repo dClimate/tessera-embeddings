@@ -2285,7 +2285,7 @@ every `/vsis3/` open) then hands the refreshed `AWSSession`'s frozen credentials
 no `gdal.SetConfigOption` or `VSICurlClearCache` is needed. This reaches into private
 `odc.loader` internals (`_OdcThreadSession`, `_local`) and is a version-sensitive hook — if odc
 renames those symbols, the import fails loudly and the regression tests in
-`tests/unit/test_auth.py` catch the break in CI before it hits a 1hr cloud run.
+`tests/unit/ingest/test_auth.py` catch the break in CI before it hits a 1hr cloud run.
 
 This was empirically verified on a us-west-2 EC2 box (2026-05-20): a four-month S1 ingest
 run at `cred_refresh_interval_sec=60` over a persistent local Dask cluster forced multiple
