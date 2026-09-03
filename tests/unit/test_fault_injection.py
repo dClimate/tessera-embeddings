@@ -31,6 +31,7 @@ from tessera_embeddings.config.fault_injection import (
     FaultInjectionRefusedError,
     deployment_stem,
 )
+from tests._paths import SRC_ROOT
 
 LOG = logging.getLogger("test-fault-injection")
 
@@ -38,7 +39,7 @@ _DRILL_PREFIX = "/global-tessera-dev/ray/"
 _DIE = FaultInjection(fault=DIE_BETWEEN_COMMITS, zone="01N", year=2025)
 _WITHHOLD = FaultInjection(fault=WITHHOLD_WORK, hold_minutes=30)
 
-SRC = pathlib.Path(__file__).resolve().parents[2] / "src" / "tessera_embeddings"
+SRC = SRC_ROOT
 FAULT_MODULE = SRC / "config" / "fault_injection.py"
 
 
