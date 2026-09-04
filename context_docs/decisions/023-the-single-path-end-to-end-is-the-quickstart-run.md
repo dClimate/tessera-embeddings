@@ -55,9 +55,7 @@ the file is four lines of boilerplate plus a selector and is in git history.
 
 **`tests/slow/` stays, as a category rather than a plan.** The tier means **more than 30 seconds**
 — the threshold `pyproject.toml` declares for the `slow` marker, and the complement of the unit
-tier's rule that no test may exceed 30 s. (An earlier draft of this record said "more than a couple
-of minutes", copied from `tests/slow/README.md` before that file was corrected; between them they
-left a 45-second test belonging nowhere.) What the tier no longer has is a canonical occupant
+tier's rule that no test may exceed 30 s. What the tier no longer has is a canonical occupant
 waiting to be written. The marker stays declared so the tier remains usable if something genuinely
 slow ever needs a home.
 

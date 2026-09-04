@@ -17,8 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.12: declared floor in pyproject.toml.
-        # 3.13: current stable (developed against this).
+        # Must match the `Programming Language :: Python :: 3.x` classifiers in
+        # pyproject.toml. Adding a version means a matrix entry and a classifier.
         python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
