@@ -100,7 +100,7 @@ class S2MaskBundle:
     The strip loop reads SCL for the whole chunk once, then slices this bundle per strip. SCL
     chunks on disk are ``(time=1, 4000, 4000)``, so any sub-region read decompresses the whole
     chunk anyway; loading once turns per-strip SCL re-reads into in-memory views. The mask also
-    sizes the strip height (``actors._strip_height_for_density``): its ``T_kept`` is the true
+    sizes the strip height (``read_plan._strip_height_for_density``): its ``T_kept`` is the true
     post-pruning timestep count for *this* chunk, so sparse chunks get tall strips and only
     genuinely dense chunks split.
 

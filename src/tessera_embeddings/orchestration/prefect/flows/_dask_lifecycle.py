@@ -16,8 +16,10 @@ process. Register :func:`dask_cleanup_on_cancellation` as BOTH ``on_cancellation
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
-from prefect_dask import DaskTaskRunner
+if TYPE_CHECKING:
+    from prefect_dask import DaskTaskRunner
 
 #: Tag key stamped on every ECS resource a flow's Dask cluster creates.
 DASK_FLOW_RUN_TAG = "tessera-flow-run-id"
@@ -74,7 +76,14 @@ def get_task_runner_for_cluster(scheduler_address: str) -> DaskTaskRunner:
 
     Apply it via ``inner_flow.with_options(task_runner=...)`` so Prefect binds the runner
     late, after the cluster context manager has produced a real scheduler address.
+
+    ``prefect_dask`` is imported here rather than at module scope to keep this module
+    import-light, matching :mod:`._ray_lifecycle`, which defers its provider import for the
+    same reason. Prefect re-imports a hook module in a fresh process, and a teardown hook is
+    the wrong place to add import-time weight.
     """
+    from prefect_dask import DaskTaskRunner
+
     return DaskTaskRunner(
         address=scheduler_address,
         client_kwargs={"timeout": "300s"},
