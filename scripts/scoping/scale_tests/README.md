@@ -41,12 +41,12 @@ scale_tests/
 
 ## Running
 
-Always run from the `scripts/` directory so the spawned worker processes can
-import `scale_tests`:
+Always run from the **repository root**. The modules import each other as
+`scripts.scoping.scale_tests.*`, so the root must be on `sys.path`, which `python -m` does for
+the working directory. The cold-phase runs spawn a subprocess that inherits this working
+directory, so starting anywhere else fails there rather than at import:
 
 ```bash
-cd scripts
-
 # smoke everything on a laptop (no AWS)
 uv run python -m scripts.scoping.scale_tests.t0_smoke      --run-id dev --backend local --scale tiny
 uv run python -m scripts.scoping.scale_tests.t1_read_bench --run-id dev --backend local --scale tiny --variant c256_full
