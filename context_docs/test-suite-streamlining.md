@@ -1,15 +1,17 @@
 # The test suite: what has been done to it, and what is left
 
 **This is the one record here about the repository's own engineering rather than the data
-pipeline.** Two rounds of work have landed on the test suite and a third is proposed:
+pipeline.** Three rounds of work have landed on the test suite:
 
 | round | what it did | when |
 |---|---|---|
 | **1 — streamlining** | 84.3 s → 24.5 s, three CI gaps closed, one accepted | 2026-08-25, PR #143 |
 | **2 — regrouping** | flat `tests/unit/` → subject directories mirroring `src/` | 2026-09-03, PR #171, [ADR 015](decisions/015-regrouping-the-unit-tests.md) |
-| **3 — follow-ups** | the two regressions round 1's gains had lost, and the standing list re-assessed | 2026-09-03, §6 |
+| **3 — follow-ups** | the two regressions round 1's gains had lost, the standing list re-assessed, and two accepted gaps written down as ADRs | 2026-09-03, §6 |
 
-**Read §1 for what the suite is now, §6 for what round 3 changed, and §7 for what is still open.**
+**Read §1 for what the suite is now, §6 for what round 3 changed, and §7 for the standing list —
+most of which is closed, and two entries of which are closed *by decision* rather than by being
+built.**
 §2–§5 are round 1's method and rulings, kept because they are what a fourth round would need: the
 safety model, the coverage gate, the things that were measured and ruled *not* worth doing, and why.
 
@@ -23,10 +25,10 @@ Measured 2026-09-03 on `main` @ `692655d` (10 cores, `-n auto`), after round 3.
                   files   tests    LOC    runs in CI as
 tests/unit          134    3713   54206   unit.yml (3.12 + 3.13), with coverage
 tests/integration     8      —     1108   integration.yml, path-filtered PRs
-tests/parity         11      —     1181   integration.yml as -m "parity and not slow"
+tests/parity         10      —     1152   integration.yml as -m "parity and not slow"
 tests/architecture    3       3       98  architecture.yml
-tests/slow            1       0        0  nothing — the directory is empty (§7.1)
-tests/gpu             1       0        0  nothing — no GPU runner exists (ADR 023)
+tests/slow            1       0        0  nothing, and none planned — ADR 024 (§7.1)
+tests/gpu             1       0        0  nothing — no GPU runner exists, ADR 023
 ```
 
 **Unit suite: 24.5 s wall, 3,713 passed / 1 skipped.** Line coverage of `src/tessera_embeddings` is
@@ -276,46 +278,50 @@ S3 was not needed and S4 has nothing to report.
 
 ---
 
-## 7. What is still open
+## 7. The standing list
 
-### 7.1 The `slow/` tier is empty, and its occupant is a stub — and the blocker has lifted
+Five entries. **Two are closed by decision rather than by being built** (§7.1, §7.2) and are
+recorded as ADRs precisely so they are not re-proposed; one is a `src/` change deliberately not made
+here (§7.3); one is a guard considered and declined (§7.4); and one is a non-finding recorded so it
+is not mistaken for one (§7.5). **Nothing on this list is queued work.**
 
-`tests/slow/README.md` names the full plain-runner end-to-end — rasterise ROI, S2 and S1 ingest, CPU
-inference, assembly — as the tier's canonical occupant. It exists only as
-`tests/parity/test_full_pipeline_parity.py`, whose body is `raise NotImplementedError` under
-`@pytest.mark.xfail(strict=True)`. It lives in `parity/` because it needs both markers.
-`nightly.yml`'s schedule is suspended because it was pointed at exactly that stub.
+### 7.1 The full-pipeline end-to-end — CLOSED, and not by building it
 
-**Two things that were true when the stub was written are no longer true**, which is the reason to
-revisit it now rather than leave it on a list:
+**Decided 2026-09-03, and final: there will be no automated full-pipeline end-to-end test. Running
+the quickstart by hand IS that verification.**
+[ADR 024](decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md) carries it, including
+the two alternatives that were declined.
 
-- **Its stated precondition is met.** The docstring says "Awaiting upstream S2/S1/inference parity".
-  Those exist and pass: `tests/parity` runs `6 passed, 2 skipped` in 5.4 min, the two skips being
-  the EDL-credential-gated arms.
-- **It is no longer "the slowest parity test in the suite".** The single-ROI path was measured at
-  **~3.5 minutes end to end** on a CPU laptop after the campaign's inference work landed in it —
-  against the "30+ minutes" five documents used to claim — and since PR #174 it resumes by default
-  and cleans up its own staging.
+The reasoning that led here is worth keeping, because it is a case where the *facts* changed and the
+*decision* did not. Round 1 recorded the item as pending on two stated blockers, and by round 3 both
+had lapsed: the upstream per-stage parity tests exist and pass (`6 passed, 2 skipped` in 5.4 min),
+and the single-ROI path had been measured at **~3.5 minutes** end to end rather than the "30+
+minutes" five documents claimed. **So this round proposed building it, and was overruled** — the
+verification it would automate already happens, and a person looking at a quickstart result learns
+more than a green tick would.
 
-**What still has to be decided before this can be built**, and it is not a technical question: the
-test needs Earthdata credentials and live network. The parity tier already has the pattern for that
-(`skipif` on `EARTHDATA_TOKEN` or username/password), so it would skip rather than fail without
-them — but a test that always skips in CI is the situation ADR 023 exists to make visible, not one
-to create silently. **Either the nightly job gets credentials as repository secrets, or this test is
-knowingly a local-only instrument and says so.**
+**The `xfail(strict=True)` stub and `nightly.yml` are deleted**, and that is the operative half of
+the decision rather than tidying. A placeholder for work that will not be done is a standing claim
+that the work is pending, and it produced exactly that: this round re-proposed the test on the
+strength of the stub and the roadmap entry describing it. `nightly.yml`'s only selector matched that
+one stub, so after the deletion a dispatched run would have exited on "no tests collected".
 
-Recommended shape if it is built: one arm, not two. `run_plain` end to end against the quickstart
-config, asserting the store's own invariants rather than comparing against a Prefect flow — the flow
-comparison is what the other five parity tests already do per stage, and the value here is the
-*end-to-end* path, which nothing else exercises.
+`tests/slow/` and the `slow` marker stay, as a **category rather than a plan** — "this test is
+genuinely slow" may need a home again, and there is no CI job for it today.
 
-### 7.2 `run_plain`'s end-to-end path has no automated coverage
+### 7.2 `run_plain`'s end-to-end path has no automated coverage — accepted
 
-The reason §7.1 is worth doing. `tests/unit/orchestration/runners/test_plain_runner_wiring.py`
-covers config precedence, the CLI, the staging identity and cleanup — all with the domain calls
-mocked. The parity suite compares flows to domain functions and never invokes `run_plain`. **So the
-one path an outside user of this library is most likely to take is verified only by someone running
-the quickstart by hand.** A green suite is weak evidence there.
+The consequence of §7.1, stated separately because it is the thing a reader needs to know rather
+than the decision that produced it. `tests/unit/orchestration/runners/test_plain_runner_wiring.py`
+covers config precedence, the CLI, the staging identity and the cleanup, all with the domain calls
+mocked; the parity suite compares flows to domain functions per stage and never invokes `run_plain`.
+**So a green suite is weak evidence about the path an outside user of this library is most likely to
+take.** The quickstart run is the evidence — after a change to `run_plain` or the stages it drives.
+
+**This is the second accepted manual-verification gap here**, and the two should be read together:
+[ADR 023](decisions/023-the-cuda-path-is-verified-by-hand.md) for the pipelined CUDA path,
+[ADR 024](decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md) for this one. Neither
+is a placeholder for automation that is coming, and **neither is to be re-proposed.**
 
 ### 7.3 Two optical warnings carry no ROI attribution
 

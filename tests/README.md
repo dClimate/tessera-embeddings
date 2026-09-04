@@ -10,16 +10,17 @@ records what it would take to light it up.
 | `architecture/` | (default) | `architecture.yml` — PRs to `main` and pushes to `main` | Layer-rule enforcement (no Prefect outside `orchestration/prefect/`, etc.). |
 | `integration/` | `integration` | `integration.yml` — PRs to `main`, filtered to `src/`, `tests/integration/`, `tests/parity/`, `tests/fixtures/`, `pyproject.toml`, `uv.lock` | Hit moto / VCR cassettes / LocalCluster. Minutes. |
 | `parity/` | `parity` | `integration.yml`, same trigger, as `-m "parity and not slow"` | Prefect flow ↔ plain runner output equivalence. 5–30 min. |
-| `slow/` | `slow` | **nothing — the directory is empty.** See Roadmap 1. | Full plain-runner end-to-end. 30+ min. |
+| `slow/` | `slow` | **nothing — the directory is empty and no occupant is planned** ([ADR 024](../context_docs/decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md)). | A home for a genuinely slow test, if one ever needs it. |
 | `gpu/` | `gpu` | **nothing — no GPU runner is available.** See Roadmap 2. | Tiny (< 2 min) checks of GPU code paths. |
 
 Default `pytest` invocation only runs unit + architecture, per
 `addopts = "-m 'not integration and not parity and not slow and not gpu'"` in
 `pyproject.toml`. CI workflows opt in to the heavier markers explicitly.
 
-Two workflows exist but are deliberately dormant, each with the reason and the re-enable
-steps in a comment at the top of the file: `nightly.yml` (Roadmap 1) and
-`downstream-smoke.yml` (waiting on a stable release of the private downstream consumer).
+One workflow exists but is deliberately dormant, with the reason and the re-enable steps in a
+comment at the top of the file: `downstream-smoke.yml`, waiting on a stable release of the private
+downstream consumer. (`nightly.yml` is **deleted** — its only selector matched a stub for a test
+that will not be written; see ADR 024.)
 
 ## Where a new unit test goes
 
@@ -117,9 +118,9 @@ uv run pytest -m parity
 uv run pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
 ```
 
-`-m "slow or parity"` is documented in older notes as the full local end-to-end. It does not do
-that today: **exactly one test carries the `slow` marker and its body is `raise
-NotImplementedError`.** See Roadmap 1.
+`-m "slow or parity"` is documented in older notes as the full local end-to-end. It is not, and
+will not be: **no test carries the `slow` marker**, and the end-to-end path is verified by running
+the quickstart by hand ([ADR 024](../context_docs/decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md)).
 
 ---
 
@@ -129,33 +130,20 @@ Things this suite is *designed* to have and does not yet. Each is a deliberate g
 known shape, not an oversight — recorded here so they can be picked up rather than
 rediscovered. Full analysis in `context_docs/test-suite-streamlining.md`.
 
-### 1. The `slow/` tier is empty, and the nightly workflow is suspended
+### 1. ~~The `slow/` tier and the full-pipeline end-to-end~~ — CLOSED, and not by building it
 
-`tests/slow/README.md` names the full plain-runner end-to-end — rasterise ROI, S2 and S1
-ingest, CPU inference, assembly — as this tier's canonical occupant. That test exists only as
-`tests/parity/test_full_pipeline_parity.py`, whose body is `raise NotImplementedError` under
-`@pytest.mark.xfail(strict=True)`. It lives in `parity/` because it needs both markers.
+**Decided 2026-09-03, and final: there will be no automated full-pipeline end-to-end test.
+Running the quickstart by hand IS that verification.** See
+[ADR 024](../context_docs/decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md).
 
-`nightly.yml` was correctly pointed at it and so spent a daily 120-minute runner confirming a
-placeholder was still a placeholder. **Its schedule is suspended as of 2026-08-25**;
-`workflow_dispatch` is retained. Restore the `schedule:` block when the test is real.
+The `xfail(strict=True)` stub that stood for it and the `nightly.yml` workflow pointed at that stub
+are both deleted. **The stub was not a neutral cost:** it read as queued work, and a review in
+September 2026 re-proposed the test on the strength of it. That is the reason the decision is
+recorded as an ADR rather than as a line here.
 
-**The two reasons this was not written have both lapsed** (re-checked 2026-09-03). Its docstring
-says it awaits upstream S2/S1/inference parity — those exist and pass, `6 passed, 2 skipped` in
-5.4 min. And it is no longer "the slowest parity test in the suite": the single-ROI path runs
-**~3.5 min end to end** on a CPU laptop and, since PR #174, resumes by default and cleans up its own
-staging.
-
-**What is left to decide is not technical.** The test needs Earthdata credentials and live network.
-Without them it would `skipif` like the other credential-gated parity arms — but a test that always
-skips in CI is the situation ADR 023 exists to make visible, not one to create quietly. So: either
-the nightly job gets credentials as repository secrets, or this is knowingly a local-only instrument
-and says so.
-
-**To pick up:** decide the credentials question, implement `test_full_pipeline_parity` as a
-single-arm `run_plain` end-to-end (the per-stage flow comparison is what the other five parity tests
-already do), then uncomment the schedule. Full analysis in
-`context_docs/test-suite-streamlining.md` §7.1.
+What follows for a reader: `run_plain`'s end-to-end path has **no automated coverage, by decision**.
+Run the quickstart after changing `run_plain` or the stages it drives — about three and a half
+minutes on a laptop, resumable, self-cleaning.
 
 ### 2. The `gpu/` tier is empty, and one GPU path is verified by hand
 
