@@ -22,8 +22,9 @@ issue #45) and no longer matches on replay. **Neither reason is the other's fix.
 
 So `-m parity` collects eight — seven comparisons plus `adapter_template/`, which is
 `@pytest.mark.skip`ped on purpose as a template to copy — and a clean local run reports
-**`6 passed, 2 skipped`**. That is the healthy result here, not a fully-verified one: read it as six
-of seven comparisons made, with the template accounting for the other skip.
+**`6 passed, 2 skipped` in about 100 seconds** (measured, replaying cassettes, no Earthdata
+credentials set). That is the healthy result here, not a fully-verified one: read it as six of
+seven comparisons made, with the template accounting for the other skip.
 
 If a parity test fails, one of two things happened:
 
