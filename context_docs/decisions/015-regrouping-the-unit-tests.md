@@ -38,7 +38,7 @@ tests/unit/
 ├── conftest.py                                      fixtures for every subdirectory
 ├── zone_density.py  mosaic_stores.py  coverage_repo.py
 │                                                    shared helpers, imported by absolute path
-├── test_imports.py  test_public_api.py  test_context_docs_index.py
+├── test_imports.py  test_public_api.py
 ├── test_architecture_rules.py  test_prefect_layer.py  test_properties.py
 │                                                    no single subject
 ├── config/                  10 files
@@ -180,3 +180,10 @@ because a file has to be somewhere.
 ## Related
 
 - [ADR 014](014-architecture-rules-scan-the-package.md) — the other deferred structural item
+
+---
+
+**Amended 2026-09-03.** The tree above listed `test_context_docs_index.py` among the root files.
+It is **deleted**: the documentation tree is not a subject for the test suite (repo owner). The
+root population is ten, not eleven — `conftest.py`, three shared helpers, and five cross-cutting
+tests. Nothing else about the layout changes.

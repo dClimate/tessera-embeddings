@@ -49,11 +49,11 @@ theme and mirroring would split it. **`orchestration/flows/` vs `runners/`** kee
 away from its runner's — `test_fill_zone_year_flow.py` and `test_zone_fill.py` are different
 subjects with confusingly similar names.
 
-**Eleven things stay at `unit/` root** and nothing else should join them: `conftest.py`; the three
+**Ten things stay at `unit/` root** and nothing else should join them: `conftest.py`; the three
 shared helpers `zone_density.py`, `mosaic_stores.py` and `coverage_repo.py`, which other tests
-import by absolute path and which therefore must not move; and six tests with no single subject —
-`test_imports`, `test_public_api`, `test_context_docs_index`, `test_architecture_rules`,
-`test_prefect_layer`, `test_properties`.
+import by absolute path and which therefore must not move; and five tests with no single subject —
+`test_imports`, `test_public_api`, `test_architecture_rules`, `test_prefect_layer`,
+`test_properties`.
 
 **Do not locate files by counting directories up from `__file__`.** Import `REPO_ROOT`, `SRC_ROOT`
 or `FIXTURES` from `tests/_paths.py`, which anchors on the directory holding `pyproject.toml` and
@@ -113,8 +113,10 @@ uv run pytest -m integration
 # Parity contract:
 uv run pytest -m parity
 
-# The pipelined CUDA path — NOT covered by CI, run this by hand on a machine
-# with a GPU. See Roadmap 2 for when.
+# The pipelined CUDA path — NOT covered by CI. See Roadmap 2 for when to run it, and
+# ADR 023 for the CUDA-torch setup: `--frozen` installs the CPU wheel, so this SKIPS
+# unless you install a CUDA build first. A skip is not a pass.
+uv run python -c "import torch; assert torch.cuda.is_available()"
 uv run pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
 ```
 
@@ -160,6 +162,11 @@ caught by the default deselection and the test would stop being reported at all.
 **Verify it by hand** with the command under "Running subsets" above, on any machine with a
 CUDA device — after any change to the pipelined loop, the actor pool, or the chunk-staging
 path, and once before a campaign starts.
+
+**Read the outcome, not the exit code.** The lockfile pins torch to the CPU wheel registry on every
+platform, so `uv sync --all-extras --frozen` on a CUDA box installs `torch==2.12.0+cpu` and the test
+**skips** — reporting exactly what it reports in CI. `pytest` exits 0 on a skip, so the only result
+that verifies anything is a *passed*. ADR 023 has the CUDA-wheel install.
 
 `tests/gpu/` and its README are kept as a dormant spec: they describe what a GPU tier would
 look like if a runner ever becomes available, and the `gpu` marker stays declared so those

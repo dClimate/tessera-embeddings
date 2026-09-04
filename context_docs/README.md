@@ -112,10 +112,9 @@ file for weeks. Add a section, not a file.
 **Name a file for its subject, not for when it was written.** Dates belong inside the document, on
 the measurement they qualify.
 
-**Every file here is named in the layout block above**, and
-`tests/unit/test_context_docs_index.py` fails if that stops being true in either direction — a file
-nobody listed, or a row whose file is gone. Update the block in the same commit that adds or removes
-a file.
+**Keep the layout block above current** — add a row in the same commit that adds a file, and remove
+one in the same commit that removes a file. There is no test enforcing this, deliberately: the
+documentation tree is not a subject for the test suite.
 
 ## When to add a new ADR
 

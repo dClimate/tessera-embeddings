@@ -212,25 +212,27 @@ sensor, so the collision is easy to make.
 Round 1's gains had partly eroded, and both causes were introduced *after* it. The unit suite had
 drifted from 24.5 s back to **30.7 s**, and 13.3 s of that was two tests.
 
-### 6.1 The documentation-index guard walked the whole working tree
+### 6.1 The documentation-index guard — deleted
 
-`tests/unit/test_context_docs_index.py` checks that `context_docs/README.md` names nothing that has
-been deleted, and excuses any name that "exists somewhere else in the repo". That excuse was
-implemented as `REPO.rglob("*.md")`.
+`tests/unit/test_context_docs_index.py` asserted that `context_docs/README.md` names every file
+under it and names nothing that is gone. **It is deleted: the documentation tree is not a subject
+for the test suite** (repo owner, 2026-09-03). The layout block in `context_docs/README.md` is now
+kept current by hand, and that file says so.
 
-**It was the slowest test in the suite at 10.3 s — a third of the whole run** — and it was wrong as
-well as slow. `rglob` walks 2,975 markdown files on a checkout carrying git worktrees, of which
-**66 are the repository's**: the rest are `.venv` and `.claude/worktrees/`, the latter holding whole
-checkouts of other branches. So a file deleted on this branch was still on disk and the excuse fired
-for it. That is not hypothetical — nine documents were removed in PR #175 and this guard stayed
-green locally while CI, which has neither directory, would have failed on all nine.
+Two things about it are worth keeping, because both are general.
 
-An earlier fix excluded hidden directories. That corrected the answer and none of the speed, and it
-went on approximating the question instead of asking it. **`git ls-files "*.md"` returns the same 66
-names in ~8 ms** — 1,200× faster, immune to any future build artifact, and it is what "in the
-repository" actually means.
+**It was the slowest test in the suite, at 10.3 s — a third of the whole run** — and for a reason
+that had nothing to do with what it asserted. It excused an index row whose file exists elsewhere in
+the repo, implemented as `REPO.rglob("*.md")`, which walks **2,975 markdown files** on a checkout
+carrying git worktrees. Sixty-six of those are the repository's; the rest are `.venv` and
+`.claude/worktrees/`.
 
-**10.33 s → 0.01 s.** Verified still to have teeth by adding a stale row and watching it fail.
+**And it was wrong, in the direction that made it useless.** Because a file deleted on this branch
+was still on disk under a worktree, the excuse fired for it — nine stale index rows stayed green
+locally in PR #175 while CI, which has neither directory, would have failed on all nine. **A guard
+that asks the filesystem "does this still exist anywhere?" is answered by build artifacts,
+worktrees and caches.** `git ls-files` answers the question actually being asked, in 8 ms rather
+than 9.5 s. That is the transferable part, and it applies to any check of this shape.
 
 ### 6.2 A unit test booted a real local Ray cluster
 
@@ -268,13 +270,15 @@ them filed under `tests/`.
 | | before | after |
 |---|---|---|
 | unit suite wall time | 30.7 s | **24.5 s** |
-| slowest single test | 10.3 s | **3.3 s** |
+| slowest single test | 10.3 s | **3.2 s** |
 | unit tests that boot a real Ray cluster | 1 | **0** |
-| src lines covered | 11,745 | **11,746 — none lost**, by the S2 gate |
-| tests added, removed or renamed | — | **none** |
+| src lines covered | 11,745 | **11,748 — none lost**, by the S2 gate |
+| tests removed | — | **the documentation-index guard, and the end-to-end stub** (§6.1, §7.1) |
 
-**No test changed what it asserts.** Both fixes are to how a test reaches its subject, which is why
-S3 was not needed and S4 has nothing to report.
+**No surviving test changed what it asserts.** The Ray fix is to how a test reaches its subject;
+the two removals are subjects ruled out of the suite. The S2 gate reports no source line lost by
+either, which is the S4 accounting: the documentation guard covered no `src/` line, and the stub
+never ran.
 
 ---
 
@@ -292,13 +296,25 @@ the quickstart by hand IS that verification.**
 [ADR 024](decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md) carries it, including
 the two alternatives that were declined.
 
-The reasoning that led here is worth keeping, because it is a case where the *facts* changed and the
-*decision* did not. Round 1 recorded the item as pending on two stated blockers, and by round 3 both
-had lapsed: the upstream per-stage parity tests exist and pass (`6 passed, 2 skipped` in 5.4 min),
-and the single-ROI path had been measured at **~3.5 minutes** end to end rather than the "30+
-minutes" five documents claimed. **So this round proposed building it, and was overruled** — the
-verification it would automate already happens, and a person looking at a quickstart result learns
-more than a green tick would.
+The reasoning that led here is worth keeping, and so is the fact that **half of it was wrong**.
+Round 1 recorded the item as pending on two stated blockers, and this round claimed both had lapsed:
+that the upstream per-stage parity tests pass, and that the single-ROI path runs in **~3.5 minutes**
+end to end rather than the "30+ minutes" five documents claimed.
+
+**The second is right; the first is not, and review caught it.** `6 passed, 2 skipped` does not mean
+S1 parity passes. `test_ingest_s1_roi_parity.py` carries **both** a `skipif` on Earthdata credentials
+**and** an `xfail(raises=Exception)` — its committed cassette was recorded against the old CMR-STAC
+search path, and OPERA now resolves items through the native CMR granule API, so the cassette no
+longer matches on replay (issue #45,
+[ADR 009](decisions/009-native-cmr-granule-query.md)). Re-recording it trips the credential-safety
+guard at ~116 MB. And the second skip in that run was the deliberately-skipped
+`adapter_template`, not a second credential-gated arm. **So the S1 precondition was never verified,
+and "both blockers lapsed" overstated the evidence by one.**
+
+**The decision is unaffected and would have been the same either way** — it rests on the manual
+check being sufficient, not on the stub being unblocked. But it is recorded because the proposal
+that got overruled was argued partly on a claim that does not hold, and a reader coming back to this
+should not inherit it.
 
 **The `xfail(strict=True)` stub and `nightly.yml` are deleted**, and that is the operative half of
 the decision rather than tidying. A placeholder for work that will not be done is a standing claim

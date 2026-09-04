@@ -41,12 +41,32 @@ test class's own docstring, and in
 [`../test-suite-streamlining.md`](../test-suite-streamlining.md). A skip that nobody explains reads
 as "not applicable here".
 
-**Verification is one command, with a named trigger.** On any machine with a CUDA device:
+**Verification has a named trigger — and the environment is the part to get right.**
+
+> **`uv sync --all-extras --frozen` alone is NOT sufficient, and fails silently.** The lockfile
+> pins torch to the **CPU wheel registry** (`download.pytorch.org/whl/cpu`) on every platform, so
+> on a CUDA machine that command installs `torch==2.12.0+cpu`, `torch.cuda.is_available()` returns
+> False, and the one test this ADR rests on **skips** — reporting exactly as it does in CI, which
+> is to say reporting nothing. An operator following a bare `--frozen` would believe they had
+> verified the path and would not have.
+
+So the run has two steps, and the first is a check rather than an instruction:
 
 ```bash
+# 1. Get a CUDA build of torch. The lockfile will not give you one; install it outside the
+#    frozen resolution, matching the driver on the box.
 uv sync --all-extras --frozen
+uv pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu124  # or the cuXXX matching the host
+
+# 2. CONFIRM the device is visible before trusting anything the test says.
+uv run python -c "import torch; assert torch.cuda.is_available(), 'CPU torch — the test will skip'; print(torch.__version__)"
+
+# 3. Then run it. A PASS is the verification; a SKIP means step 1 did not take.
 uv run pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
 ```
+
+**Read the outcome, not the exit code.** `pytest` exits 0 on a skip, so "the command succeeded" is
+not evidence. The only result that verifies anything here is a **passed**.
 
 Run it **after any change to the pipelined loop, the actor pool, or the chunk-staging path, and once
 before a campaign starts.** Manual verification with no trigger attached does not happen.

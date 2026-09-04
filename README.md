@@ -3,7 +3,6 @@
 [![Lint](https://github.com/dClimate/tessera-embeddings/actions/workflows/lint.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/lint.yml)
 [![Unit tests](https://github.com/dClimate/tessera-embeddings/actions/workflows/unit.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/unit.yml)
 [![Architecture](https://github.com/dClimate/tessera-embeddings/actions/workflows/architecture.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/architecture.yml)
-[![Nightly](https://github.com/dClimate/tessera-embeddings/actions/workflows/nightly.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/nightly.yml)
 
 Generate per-pixel (10m^2) TESSERA satellite embeddings at any scale. Ports the HPC-based
 [Tessera](https://github.com/ucam-eo/tessera) embedding pipeline to a
@@ -525,8 +524,10 @@ Why end-to-end on CPU is the credibility bar we chose:
   they'll need to reproduce.
 
 For CI: `plain.py --skip-inference` is the fast PR check (minutes).
-The end-to-end run on the quickstart ROI runs as a nightly or
-opt-in job (too slow for every PR). Fast PR checks also use
+**The end-to-end run on the quickstart ROI is not automated at all** — it
+is verified by running it by hand, which takes about three and a half
+minutes on a laptop
+([ADR 024](context_docs/decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md)). Fast PR checks also use
 AST-based architecture rules (§Architecture) to catch Prefect leaks
 at the import level without running the pipeline.
 
