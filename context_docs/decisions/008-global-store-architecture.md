@@ -313,9 +313,10 @@ concurrency limit (`commit_limit_name`) held around each commit, and `run_global
 upserted its VALUE at preflight to
 `min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS=8)`. Previously only the
 limit's *name* was threaded through and the number lived on the server, where it
-could silently drift from this constraint. Duty-cycle measurements showing how
-much headroom this leaves are in
-[`../campaign/campaign-cost-model.md`](../campaign/campaign-cost-model.md).
+could silently drift from this constraint. The simultaneous-committer timings, the
+queueing this actually bound, and the threshold that would reopen it are in
+[`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §5 —
+**which also records that this limit is now REMOVED**, so read it before restoring one.
 
 ### D7 — Snapshot hygiene: tags + expiry policy (FIRM policy; cadence PENDING T6)
 

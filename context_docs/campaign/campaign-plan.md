@@ -26,7 +26,7 @@ land** — the other 8 are all ocean (`10S 11S 13S 14S 27S 44S 45S 46S`).
 Each zone is processed independently, one calendar year at a time. A **cell** is one zone in one
 year, so the campaign is 112 zones × 9 years ≈ **1,008 cells**, over 360,953 live 2048-pixel tiles.
 Every per-cell cost multiplies by that 112, so the count is worth being exact about:
-`scripts/rank_zones.py` reads it from the mask, and it is the authority if the mask is ever
+`yield-embeddings/scripts/rank_zones.py` reads it from the mask, and it is the authority if the mask is ever
 rebuilt.
 
 Every cell goes through the same four steps:
@@ -435,7 +435,7 @@ reconciliation. All three consumers share one definition of the validated set, s
 read as a missing verdict.
 
 **A corrected cell needs a fresh tag name** — icechunk tags are write-once forever, so a refill can
-never re-pin the canonical name (`scripts/reopen_zone_year.py`).
+never re-pin the canonical name (`yield-embeddings/scripts/reopen_zone_year.py`).
 
 The whole design, its costs and its limits:
 [`campaign-validation-and-monitoring.md`](campaign-validation-and-monitoring.md). A closing sweep over every

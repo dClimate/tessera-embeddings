@@ -889,7 +889,7 @@ Genuinely open:
 - **Does the scheduler's auxiliary-thread behaviour change at 250+ workers?**
 
 Questions needing more workers than the quota allows are tracked as S-1..S-6 in the downstream
-repo's `docs/global-tessera-test-plan.md`.
+repo's `yield-embeddings/docs/global-tessera-test-plan.md`.
 
 ## 7b. STAC query streaming — shipped and validated
 
@@ -1716,7 +1716,7 @@ re-investigated without new evidence** — that is the point of recording them.
 |---|---|
 | **Width stops working at scale** | 6× workers buys 3.7–4.9×, against an Amdahl bound of 4.4–4.6× from the serial fraction at 10w. Width works about as well as arithmetic allows. The 2.7–4.0× that suggested otherwise was a **zone-mix artefact** — it compared different zones, and the two 10-worker zones were the two cheapest-per-chunk in the wave |
 | **The orchestrator** | Direct refutation: over the window where per-date cost rose 32%, orchestrator CPU fell 13%→5.6%, requests 12.4→4.1/s, latency 146→39 ms, zero dropped events. Corroborated by the server gaining 8× capacity between waves while the *later* wave was slower |
-| **The Dask schedulers** | CPU 10–40%, event-loop lag 0.0–0.03 s, graphs oversubscribing their fleets rather than starving them. Well under the ~250-worker threshold in `docs/dask-scheduler-plan.md` |
+| **The Dask schedulers** | CPU 10–40%, event-loop lag 0.0–0.03 s, graphs oversubscribing their fleets rather than starving them. Well under the ~250-worker threshold in `yield-embeddings/docs/dask-scheduler-plan.md` |
 | **Capacity, quota, launch rate** | 20 live fleets, 519 workers, 2,236 vCPU of 10,000, and `no-worker=0` on every fleet — no task anywhere waiting for a worker, at 22% of quota |
 | **Commit serialisation** | Commits are ~1 s; the per-date cadence leaves only 5–8 s unaccounted after build + gate + write + stall |
 | **Store growth under accumulating dates** | Per-date cost rose 36% through 53N's run, but **write cost per window is flat at 16.4–18.3 s** across all four quartiles and build per window flat at ~1.2 s. Cost rose because windows per date rose 45% (7.3 → 10.6). Manifest sharding is doing its job |

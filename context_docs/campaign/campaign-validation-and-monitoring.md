@@ -74,7 +74,7 @@ exclusion cannot read as a missing verdict.
 
 ### 1.2 Closing sweep
 
-`scripts/validate_all_cells.py` over every published cell, for final peace of mind rather than as a
+`yield-embeddings/scripts/validate_all_cells.py` over every published cell, for final peace of mind rather than as a
 gate the campaign waits on. It **re-runs the whole check per cell**, one subprocess each and
 concurrently, with `--max-shards` and `--seam-boundaries` raised above the defaults and the values
 recorded — then rolls the results into an exception list, a per-cell table, and aggregate
@@ -126,8 +126,8 @@ output channel, invisible in any picture because three components make the image
 blocking is less the wasted dimension than what it implies about the rest.
 
 A corrected cell needs a **fresh tag name** — icechunk tags are write-once forever.
-`scripts/reopen_zone_year.py` clears the completion mark and pins a fresh tag;
-`scripts/drop_run_field.py` removes a provenance field known wrong.
+`yield-embeddings/scripts/reopen_zone_year.py` clears the completion mark and pins a fresh tag;
+`yield-embeddings/scripts/drop_run_field.py` removes a provenance field known wrong.
 
 ## 3. The two seam rows are different findings
 
@@ -323,7 +323,7 @@ the case that breaks the fast path is exactly the case you need an alarm in.
 
 Four things go wrong in a way the orchestrator observes the instant it happens, so for those a
 Prefect automation posts with no polling and no code of ours running.
-`scripts/register_alert_automations.py` registers them, and they are live on both accounts:
+`yield-embeddings/scripts/register_alert_automations.py` registers them, and they are live on both accounts:
 
 | automation | fires on | urgency in the message |
 |---|---|---|
@@ -560,11 +560,11 @@ it recommends a decision and a human takes it, for the same reason the flow muta
 **The reviewer is a committed skill**, `.claude/skills/campaign-review/SKILL.md`, so it is
 versioned, reviewable in a pull request, and its commit is stamped into every review it produces —
 which is how a later reader tells which instructions produced a verdict. It drives
-`scripts/review_cells.py` and nothing else: that script hands out cells worst-first, validates and
+`yield-embeddings/scripts/review_cells.py` and nothing else: that script hands out cells worst-first, validates and
 stores reviews, and posts prefixed messages, and none of it can modify the store, a run or a
 deployment. **That is what makes "the agent acts on nothing" mechanical rather than advisory.**
 
-**It is measured before it is trusted.** `scripts/review_calibration.py` builds a labelled set from
+**It is measured before it is trusted.** `yield-embeddings/scripts/review_calibration.py` builds a labelled set from
 real published windows, half damaged in six ways a placement, quantization or write defect would
 produce, with opaque names, with the flat-but-healthy windows deliberately among the clean cases,
 and with each window's damaged twin in the opposite arm so damage cannot be found by comparing. The

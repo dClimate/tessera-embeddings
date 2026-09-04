@@ -1352,7 +1352,7 @@ def _query_stac_items(
     # takes a list of boxes and already dedupes by item id across them. What it needs is the
     # bands' provenance: they must derive from the LIVE TILE range, which `roi.geobox` does not
     # carry. Measurements and the schema addition required are in
-    # context_docs/ingest/ingest-performance.md section 11.
+    # context_docs/ingest/ingest-performance.md section 12.9.
     roots = [_WindowWalk(sub_bbox, (start_date, end_date)) for sub_bbox in split_antimeridian_bbox(bbox)]
     budget = _RePartitionBudget(_MAX_REFUSAL_RE_PARTITIONS)
     _fill_window_tree(

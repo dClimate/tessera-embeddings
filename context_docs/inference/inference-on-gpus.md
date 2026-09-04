@@ -1035,7 +1035,7 @@ just its neighbourhood.**
 
 ### An independent cross-check of the inference line, from the coverage mask
 
-`scripts/rank_zones.py` reads the campaign coverage mask directly: **360,953 live tiles across 112
+`yield-embeddings/scripts/rank_zones.py` reads the campaign coverage mask directly: **360,953 live tiles across 112
 zones**, i.e. per campaign year. Nine years is **3.25 M chunk-years**, and this run measured cost per
 delivered chunk at **$0.101–0.214** depending on depth.
 

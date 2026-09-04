@@ -55,7 +55,7 @@ way out of the Dask worker — so four of the causes below were diagnosed as gap
 when three of them were one architectural loss in different clothes. See "Why the reason was hard
 to read" at the end; read it before widening any predicate in `ingest/duplicates.py`.
 
-**Correction, in place.** `docs/runbooks/incident-response.md` previously attributed this error to
+**Correction, in place.** `yield-embeddings/docs/runbooks/incident-response.md` previously attributed this error to
 "a Dask worker task definition missing a `ulimit` the library needed", citing the
 `mirror-a-pinned-resource-field-for-field` episode. **That attribution was wrong for these
 failures.** A missing ulimit did cause a warp failure once, which is why the guess was available;

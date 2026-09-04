@@ -322,7 +322,7 @@ here: **713 windows from 40 cells**, sampled by depth so the bands that decide a
 on purpose rather than by accident. The pilot is why the second pass exists — it had one window
 separating a cutoff of 20 from one of 30.
 
-**Blinded in code, not by instruction** (`scripts/depth_legibility_probe.py` in `yield-embeddings`).
+**Blinded in code, not by instruction** (`yield-embeddings/scripts/depth_legibility_probe.py` in `yield-embeddings`).
 The reviewer received opaque filenames in shuffled order and one fact per window — how much of the
 frame the land mask calls land, without which an ocean window cannot be told from a failed land one.
 **Depth was withheld**, and so was the flatness figure: it is computed from the same pixels, so a
@@ -419,7 +419,7 @@ to be judged against.
 
 ### The first sweep established a direction and could not locate anything
 
-81 blocks across four adjacent pairs (`scripts/zone_overlap_drift.py`). **The noise floor: 0.00050** —
+81 blocks across four adjacent pairs (`yield-embeddings/scripts/zone_overlap_drift.py`). **The noise floor: 0.00050** —
 two completely independent embeddings of the same ground, at matched depth, differ by that much in
 cosine distance (n=59, 90th percentile 0.00232).
 
@@ -982,7 +982,7 @@ top-up cycle naturally re-selects every cell it wants.
 
 ### What this means for the refill tooling, which lives in `yield-embeddings`
 
-An earlier draft called `scripts/reopen_zone_year.py` a missing tool. **That was wrong and is
+An earlier draft called `yield-embeddings/scripts/reopen_zone_year.py` a missing tool. **That was wrong and is
 retracted** — it exists, along with `drop_run_field.py`, `validate_zone_group.py`, `campaign_health.py`
 and `validate_all_cells.py`, in the sibling **`yield-embeddings`** repository, which is where the
 validation instrument lives.

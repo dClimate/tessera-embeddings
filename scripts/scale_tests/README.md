@@ -134,15 +134,21 @@ estimate below is priced against, so the two belong together.
 
 **Teardown**, in the order that works:
 
+**Teardown is scoped by `--run-id`, and the sequence above uses TWO** — `run1` for T0–T7 and
+`d3` for T8. Both need tearing down or the bucket cannot be emptied.
+
 ```bash
-# 1. Stores only. Results are KEPT by default — they are the run's product.
+# 1. Stores only, once per run id. Results are KEPT by default — they are the run's product.
 uv run python -m scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/
+uv run python -m scale_tests.teardown --run-id d3   --backend s3 --bucket <bucket>/global-embeddings/
 
 # 2. Archive the collated report.py output alongside ADR-008, and mirror the
 #    results locally, BEFORE step 3 removes them from the bucket.
 
 # 3. Results too, once they are safe elsewhere.
 uv run python -m scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/ \
+    --purge-results
+uv run python -m scale_tests.teardown --run-id d3   --backend s3 --bucket <bucket>/global-embeddings/ \
     --purge-results
 ```
 

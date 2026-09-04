@@ -117,8 +117,17 @@ Repository.total_chunks_storage(...) -> int
 ```
 
 Tags (`repo.create_tag(name, snapshot_id=…)`) protect snapshots from expiry. **Tags are write-once
-forever** — a corrected cell needs a fresh tag name, which is why the campaign moved idempotence off
-tags entirely ([`../inference/minimum-optical-depth.md`](../inference/minimum-optical-depth.md) §10).
+forever**, so a corrected cell needs a fresh tag name.
+
+> **The campaign's idempotence still keys on tags, and that is a live invariant — do not remove
+> it.** `run_global_campaign` reads `repo.list_tags()` and hands them to `campaign_work_list`, which
+> counts a cell done only when it is BOTH in `years_complete` AND tagged. The asymmetry is
+> deliberate: a crash between the fill's commit and its tag leaves a cell complete but untagged, and
+> such a cell is **deliberately re-dispatched** so the fill runner's idempotent retag path runs.
+> Filtering on `years_complete` alone would skip it forever and the year's all-120 milestone tag
+> would never land. Moving idempotence onto cycle records is **proposed and not built** —
+> [`../inference/minimum-optical-depth.md`](../inference/minimum-optical-depth.md) §10 sets out the
+> model and names this migration as the one real hazard in it.
 
 **GC deletes require delete permission on the prefix.** Without it, superseded manifests become
 permanent — which is why the published-store access request asks for `s3:DeleteObject` explicitly.

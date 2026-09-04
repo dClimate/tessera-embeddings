@@ -63,7 +63,8 @@ Three differences from the proposal:
 
 1. **Nine directories, not seven.** `profiling/` was added because it exists in `src/` and the
    proposal omitted it. `orchestration/` was split into `flows/` and `runners/`, mirroring
-   `src/orchestration/prefect/flows/` and `src/orchestration/runners/`, which also separates
+   `src/tessera_embeddings/orchestration/prefect/flows/` and
+   `src/tessera_embeddings/orchestration/runners/`, which also separates
    `test_fill_zone_year_flow.py` from `test_zone_fill.py` — different subjects whose names sat
    adjacent and read as near-duplicates.
 2. **Two of the proposal's hints were overridden by the placement rule.** It lists `campaign` and
