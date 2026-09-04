@@ -64,17 +64,11 @@ scripts/
 
 ## The tier distinction is the part that matters most
 
-The mechanism is a `scripts/README.md` listing **every** script in one of two tiers: supported
-tooling, or a kept-for-reference instrument that is not maintained.
+**Every script belongs in one of two tiers: supported tooling, or a kept-for-reference instrument
+that is not maintained.** The distinction has to be written down somewhere a reader meets before the
+scripts themselves, because it cannot be recovered from the code.
 
-> **Amended 2026-09-03: this said "Both repositories now carry" one. `yield-embeddings` does;
-> THIS REPOSITORY DOES NOT.** There is no `scripts/README.md` here and no script tiering anywhere
-> else in the tree, so the enforcement rule below — a script added without a README row is the
-> failure this ADR exists to prevent — has nothing to enforce against on this side. That is an open
-> item, not a decision reversal: the 28 scripts and 4,864 lines this repo holds are exactly the
-> population the tiering is for.
-
-This exists because of a specific near-miss. On 2026-08-17 three scripts were shortlisted for
+That matters because of a specific near-miss. On 2026-08-17 three scripts were shortlisted for
 deletion on the evidence that nothing referenced them. Reading them showed all three were
 still useful — one a deliberately reusable surgical tool with a name that reads like a
 migration, one already documented at length, one cited by name inside a live test.
@@ -108,10 +102,8 @@ being built against is the worst available timing.
 
 - The subdirectory reorganisation is blocked on the module move, and neither happens before
   the current branch merges.
-- Until then, `scripts/README.md` is the mechanism that distinguishes live tooling from kept
-  instruments. **A script added without a README row is the failure this ADR exists to
-  prevent** — add the row in the same commit. **In this repository that file does not exist yet
-  (see the amendment above), so the rule is currently unenforceable here.**
+- Until then, the tier distinction above is what separates live tooling from kept instruments.
+  **A script that nobody can place in a tier is the failure this ADR exists to prevent.**
 - The moved modules become subject to the architecture rules, mypy, and `ruff format` in CI.
   Expect the move to surface type errors that the unscanned tree never reported.
 - Downstream, this supersedes the standalone plan in that repository's

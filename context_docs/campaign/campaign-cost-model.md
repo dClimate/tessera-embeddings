@@ -537,8 +537,9 @@ work.
 **Re-derive it, do not quote it — and ONE of the two ways re-derives it.**
 
 ```bash
-# The work-weighted split. Reads each zone's live-tile bitmap and runs the campaign's own
-# partitioner with the real `zone_work_weight`. A few minutes; one GET per zone.
+# The work-weighted split. Runs the campaign's own partitioner with the real `zone_work_weight`.
+# A few minutes: it reads each land zone TWICE — once for the work weight, once for the raw
+# live-tile count it compares against.
 uv run python scripts/cluster_work_spread.py --mask s3://<inputs-bucket>/masks/global.icechunk \
     --clusters 8 10 16
 

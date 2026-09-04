@@ -97,10 +97,21 @@ zone-years). Run sequentially, that full volume is held at once and storage alon
 >
 > So GPUs now wait for nothing but their own input: ingest runs `1 + look_ahead` per cluster,
 > inference admits without bound and waits on its chosen cell's mosaic, and assembly runs one
-> trailing thread per cluster that may lag arbitrarily far behind. **What stays bounded is FAILURE,
-> not throughput** — a failed cell keeps its mosaic for staged resume, and the feeder stops
-> admitting once `max_retained_failures` are outstanding. The price is an assembly backlog, which
-> is the cheap direction to fail. Assembly's own margin against the next cell's inference is in
+> trailing thread per cluster that may lag arbitrarily far behind. A failed cell keeps its mosaic
+> for staged resume and is counted, and on reaching `max_retained_failures` the feeder logs
+> `FAILURE CAP EXCEEDED`, stops admitting, and finishes its in-flight work — it does not tear the
+> fill down, because ending a fill spends its Ray cluster and every actor on it. The price of
+> decoupling is an assembly backlog, which is the cheap direction to fail.
+>
+> **That cap is a ceiling against a systematic fault, not a bound on retained mosaics.** The feeder
+> checks it only before admitting, so when mosaics have already landed it can admit a whole
+> cluster before any inference or assembly failure is reported — the cap observes zero, and more
+> than `look_ahead + 2` mosaics are retained. **Do not size retained-mosaic exposure to the
+> configured value.** This was reviewed twice as a P1 and declined both times: the alternatives are
+> an admission bound released by inference, which is exactly the coupling this change removes, or
+> halting at the cap, which would destroy inference throughput that is wanted. A run that infers
+> everything and fails everything is an acceptable outcome — the staged tiles are kept and a re-run
+> assembles from staging. Assembly's own margin against the next cell's inference is in
 > [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §1.
 
 **Every year is dispatched in one batch** (`overlap_years=true`), **so there is no year barrier.**
@@ -518,7 +529,8 @@ answer — cost-model §4.
      scoped to the two published prefixes, so handing it to everything would break every read and
      write against our OWN buckets — mosaics, staging, land mask, ROI masks. The credentials have to
      be chosen from the destination URI, which is the same structural rule that stopped the registry
-     landing beside the wrong store (§ optical-registry-2026-08-19).
+     landing beside the wrong store
+     ([`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §6).
 
    Measured, not inferred: `DeleteObject` on `v1.1/dclimate.icechunk/` returns `AccessDenied`
    reproducibly while `ListObjectsV2` on the same prefix succeeds in the same breath — so it is a
