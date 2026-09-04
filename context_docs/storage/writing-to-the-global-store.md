@@ -133,8 +133,12 @@ was actually seen.
 - **The `2 *` factor in the campaign's budget divisor is left alone.** Whether the staging and
   published buckets carry independent request budgets was not established.
 - **The 800-PUT `SlowDown` figure is the repo's own code comment** and was not traced to a primary
-  record. The `t7_ramp.py` PUT-ramp harness exists in `scripts/scoping/scale_tests/` but no recorded results
-  exist in this repository.
+  record. The `t7_ramp.py` PUT-ramp harness now has recorded results —
+  [`scale_testing_results.md`](../../scripts/scoping/scale_tests/scale_testing_results.md) §t7 —
+  but they do not reach the figure in question: 4 observations at **68-82 PUT/s**, with
+  `slowdown_503_count` **0 across all four**. That is an order of magnitude below 800 PUT/s, so it
+  neither confirms nor refutes the comment; it establishes only that nothing throttled at the rate
+  actually measured.
 
 > **Read §4 next, not in isolation.** This change tripled the fork count on every assembly, which
 > tripled the number of processes each fetching a storage credential. The credential incident

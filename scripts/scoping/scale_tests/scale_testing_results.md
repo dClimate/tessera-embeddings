@@ -24,7 +24,7 @@ measurements to a run that did not produce them.
 |---|---|---|---|
 | D1 pre-alloc | data-chunks==0; shift conflict unresolvable | data chunks=0 confirmed; shift-vs-write conflict=unresolvable | escape hatch only |
 | D2 chunk shape | T1 point p95/p50 by variant | best=c256_full; c256_full p95=193.272/p50=120.948ms; c256_sharded p95=199.146/p50=28.954ms; c500_band4 p95=219.233/p50=117.291ms; c384_full p95=333.982/p50=229.350ms; c500_full p95=338.621/p50=211.441ms | 256+full band; smaller=faster/point |
-| D3 sharding | sharded vs full (p95/p50/write) | p95 199.146 vs 193.272ms (~tie); p50 28.954 vs 120.948ms; write 2.8x slower; ~64x fewer objects | see ADR-008 D3 |
+| D3 sharding | sharded vs full (p95/p50/write) | p95 199.146 vs 193.272ms (~tie); p50 28.954 vs 120.948ms; ~64x fewer objects. **The "write 2.8x slower" figure from this T1 sweep is SUPERSEDED** — it measured a chunkwise writer. `d3v2` (§t8) measured the shard-aligned + land-masked writer at **0.46x** the unsharded build, and that is what settled D3 in FAVOUR of sharding | [ADR-008 D3](../../../context_docs/decisions/008-global-store-architecture.md) |
 | D4 manifest split | T2 per-year commit trend | commit 0.367s->0.353s (flat) | rising => icechunk #1600 |
 | D5 one repo | T4 snapshot growth + T5 contention | snapshot 4973.000->38102.000B @120g; max retries=118.000 | kill: >2x serial or storms |
 | D7 GC/hygiene | T6 GC objects/s + reclaimed | 19 objs @ 33.3/s, 8.405e+06B reclaimed | extrapolate to 10^8 objects |
