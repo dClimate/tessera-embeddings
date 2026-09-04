@@ -38,22 +38,15 @@ from tessera_embeddings.config.store_layout import (
 )
 from tessera_embeddings.storage.conventions import build_convention_attrs, build_geoemb_root_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
-from tessera_embeddings.storage.zarr_store import (
-    TIME_ENCODING,
-    _create_storage,
-    global_store_config,
-    read_time_values,
-)
-from tessera_embeddings.storage.zone_grid import (
+from tessera_embeddings.storage.time_axis import (
     CAMPAIGN_YEARS,
-    PIXEL_M,
-    ZONE_SCHEME,
-    ZoneSpec,
+    TIME_ENCODING,
     calendar_year_times,
-    easting_coords,
-    northing_coords,
+    read_time_values,
     year_of,
 )
+from tessera_embeddings.storage.zarr_store import _create_storage, global_store_config
+from tessera_embeddings.storage.zone_grid import PIXEL_M, ZONE_SCHEME, ZoneSpec, easting_coords, northing_coords
 
 
 def create_global_repo(

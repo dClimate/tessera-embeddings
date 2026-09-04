@@ -87,15 +87,14 @@ from tessera_embeddings.storage.shard_writer import (
     shard_pitch,
     write_year_shards,
 )
+from tessera_embeddings.storage.time_axis import read_time_values, time_index_of, year_timestamp
 from tessera_embeddings.storage.zarr_store import (
     manifest_split,
     open_or_create_repo,
     open_store_as_zarr_group,
     plain_zarr_storage_options,
-    read_time_values,
-    time_index_of,
 )
-from tessera_embeddings.storage.zone_grid import PIXEL_M, year_timestamp
+from tessera_embeddings.storage.zone_grid import PIXEL_M
 
 logger = logging.getLogger(__name__)
 

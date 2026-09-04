@@ -62,12 +62,10 @@ from tessera_embeddings.storage.region_writes import (
     _drop_region_coords,
     _pad_region_to_chunks,
 )
+from tessera_embeddings.storage.time_axis import TIME_ENCODING, compute_doy, read_time_values
 from tessera_embeddings.utils import utcnow_iso
 
 logger = logging.getLogger(__name__)
-
-# Standard time encoding for all stores
-TIME_ENCODING = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"}
 
 
 class DuplicateDateError(ValueError):
@@ -203,28 +201,6 @@ def store_write_retrying(
         retry=retry_if_not_exception_type(CONCURRENT_WRITER_ERRORS),
         reraise=True,
     )
-
-
-def read_time_values(node: zarr.Group) -> np.ndarray:
-    """Decode a group's ``time`` coordinate to ``datetime64[ns]`` values.
-
-    Raw-zarr counterpart to xarray's CF decoding for the one convention every engine-written
-    store uses (:data:`TIME_ENCODING`); anything else is a loud error, not a silent misread.
-    """
-    time_arr = node["time"]
-    units = str(time_arr.attrs.get("units", ""))
-    if not units.startswith("nanoseconds since 1970-01-01"):
-        raise ValueError(
-            f"Unsupported time units {units!r} on {node.store!r} — every engine-written "
-            "store uses TIME_ENCODING (nanoseconds since 1970-01-01)."
-        )
-    return np.asarray(time_arr[:]).astype("int64").astype("datetime64[ns]")  # type: ignore[index]
-
-
-def time_index_of(node: zarr.Group, value: np.datetime64) -> int | None:
-    """Index of ``value`` on a group's time axis, or ``None`` if absent."""
-    hits = np.flatnonzero(read_time_values(node) == value)
-    return int(hits[0]) if hits.size else None
 
 
 # =============================================================================
@@ -1836,12 +1812,6 @@ def write_days_windows(
                     window[1],
                     time.monotonic() - window_started,
                 )
-
-
-def compute_doy(timestamps: np.ndarray) -> np.ndarray:
-    """Compute day-of-year from datetime64 timestamps: an (N,) int32 array of 1-366."""
-    years = timestamps.astype("datetime64[Y]")
-    return ((timestamps.astype("datetime64[D]") - years).astype(int) + 1).astype(np.int32)
 
 
 def write_dataset(

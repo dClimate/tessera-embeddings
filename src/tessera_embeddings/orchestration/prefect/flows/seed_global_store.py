@@ -31,8 +31,9 @@ from tessera_embeddings.storage.global_store import (
     seed_zone_groups,
     stamp_root_identity,
 )
-from tessera_embeddings.storage.zarr_store import is_missing_repo, read_time_values
-from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES, year_of
+from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS, read_time_values, year_of
+from tessera_embeddings.storage.zarr_store import is_missing_repo
+from tessera_embeddings.storage.zone_grid import ZONES
 
 
 @flow(name="seed-global-store")

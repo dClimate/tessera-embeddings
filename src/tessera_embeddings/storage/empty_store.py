@@ -41,7 +41,8 @@ import zarr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.config.store_layout import clamp_chunks_and_shards
-from tessera_embeddings.storage.zarr_store import TIME_ENCODING, _create_repo, _delete_store, compute_doy
+from tessera_embeddings.storage.time_axis import TIME_ENCODING, compute_doy
+from tessera_embeddings.storage.zarr_store import _create_repo, _delete_store
 from tessera_embeddings.utils import utcnow_iso
 
 if TYPE_CHECKING:
@@ -60,26 +61,6 @@ def _fill_for_dtype(dtype: np.dtype) -> float | int:
     ``da.full(..., np.nan, dtype="uint16")`` would silently cast NaN to 0 with a RuntimeWarning.
     """
     return np.nan if np.issubdtype(dtype, np.floating) else 0
-
-
-def daily_times(start: str, end: str) -> np.ndarray:
-    """Return one ``datetime64[ns]`` timestamp per day in ``[start, end]`` (inclusive).
-
-    Both bounds are ``YYYY-MM-DD`` strings and ``end`` must not precede ``start``;
-    ``2025-01-01`` → ``2025-12-31`` yields 365 timestamps.
-
-    A daily axis pre-seeds every day a later infill might land on, so a region-overwrite of any
-    single date aligns to an existing coordinate without an append. Seeding instead from the
-    union of a collection of input stores' time axes belongs to the batch region-merge's
-    date-union helper.
-    """
-    start_d = np.datetime64(start, "D")
-    end_d = np.datetime64(end, "D")
-    if end_d < start_d:
-        msg = f"end {end!r} precedes start {start!r}"
-        raise ValueError(msg)
-    days = np.arange(start_d, end_d + np.timedelta64(1, "D"), dtype="datetime64[D]")
-    return days.astype("datetime64[ns]")
 
 
 # Sentinel for "no explicit fill", so a requested integer fill of 0 is not confused with "use the
@@ -335,5 +316,4 @@ __all__ = [
     "VarSpec",
     "create_empty_store",
     "create_empty_store_from_coords",
-    "daily_times",
 ]

@@ -88,8 +88,9 @@ from tessera_embeddings.storage.campaign import (
 )
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
+from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store_group_and_tip
-from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, canonicalize_zone
+from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 # S1/S2 grandchild ingest refs derive from this single source rather than duplicated string
 # literals, so a rename of the ingest deployments stays in ingest_zone_year.IngestDeployments.

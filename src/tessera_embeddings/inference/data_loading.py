@@ -29,12 +29,8 @@ from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.storage.zarr_store import (
-    ASSESSED_WINDOW_ATTR,
-    compute_doy,
-    is_missing_repo,
-    open_store_as_zarr_group,
-)
+from tessera_embeddings.storage.time_axis import compute_doy
+from tessera_embeddings.storage.zarr_store import ASSESSED_WINDOW_ATTR, is_missing_repo, open_store_as_zarr_group
 
 logger = logging.getLogger(__name__)
 
