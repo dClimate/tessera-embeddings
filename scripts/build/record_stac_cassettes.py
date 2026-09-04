@@ -40,7 +40,23 @@ DATETIME = "2024-07-01/2024-07-31"
 START_DATE = "2024-07-01"
 END_DATE = "2024-07-31"
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+def _repo_root() -> Path:
+    """The directory holding ``pyproject.toml``, found by walking up from this file.
+
+    Anchored on a marker rather than a parent count, which is what ``tests/_paths.py``
+    does and for the same reason: a count encodes this file's depth, so moving the script
+    one directory down silently retargets everything derived from it. That happened —
+    ``parents[1]`` pointed at ``scripts/`` once this moved into ``scripts/build/``, and the
+    recorder would have written cassettes to ``scripts/tests/fixtures/`` and reported
+    success while the tests kept reading the real ones.
+    """
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "pyproject.toml").is_file():
+            return parent
+    raise RuntimeError(f"no pyproject.toml above {__file__}; cannot locate the repo root")
+
+
+REPO_ROOT = _repo_root()
 CASSETTE_DIR = REPO_ROOT / "tests" / "fixtures" / "stac_cassettes"
 
 VCR_CONFIG = {
