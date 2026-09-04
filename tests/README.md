@@ -175,8 +175,13 @@ path.
 **Use the repository's own GPU install** — `docs/environment-setup.md` "GPU installs", which
 explains why `--extra-index-url` alone is not enough (PyPI's CPU wheel stays in the candidate pool
 and can win). **Check the index before pinning a build**: `torch==2.6.0` publishes `cu118`, `cu124`
-and `cu126`, and `https://download.pytorch.org/whl/<cuXXX>/torch/` is the list. Do not improvise an
-unpinned `--force-reinstall`; it takes whatever that index tops out at.
+and `cu126`, and `https://download.pytorch.org/whl/<cuXXX>/torch/` is the list.
+
+**The `==` in that command is load-bearing, not decoration.** `uv pip install torch` — no version —
+is already satisfied by the CPU wheel `uv sync` just installed, so uv audits it and reports *"Would
+make no changes"*. You get a clean-looking setup, still on `+cpu`, and a skip. Measured, not
+assumed. Pin the version so the requirement genuinely differs from what is installed; do not reach
+for an unpinned `--force-reinstall` instead, which takes whatever that index tops out at.
 
 ```bash
 uv sync --all-extras --frozen

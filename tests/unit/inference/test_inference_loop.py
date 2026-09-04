@@ -303,12 +303,18 @@ class TestPipelinedGpuLoop:
     the lockfile by default, so a bare invocation SKIPS rather than verifying anything::
 
         uv sync --all-extras --frozen
-        uv pip install torch --index-url https://download.pytorch.org/whl/cu124  # a build your driver supports
+        uv pip install "torch==2.6.0+cu124" --index-url https://download.pytorch.org/whl/cu124
         uv run --no-sync python -c "import torch; assert torch.cuda.is_available()"
         uv run --no-sync pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
 
-    ``pytest`` exits 0 on a skip, so only a PASS verifies anything here.
-    See ``tests/README.md`` → Roadmap 2 for the full setup and the version caveat.
+    **Pin the version.** An unconstrained ``uv pip install torch`` is already satisfied by the
+    locked CPU wheel and does nothing — verified, uv reports "Would make no changes" — leaving you
+    on ``+cpu`` with a passing-looking setup and a skipped test. ``pytest`` exits 0 on a skip, so
+    only a PASS verifies anything here.
+
+    See ``tests/README.md`` → Roadmap 2 for the rest of the setup, and check
+    ``https://download.pytorch.org/whl/<cuXXX>/torch/`` before changing that pin: the build must
+    exist and must match your driver.
     """
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for the pipelined GPU loop")
