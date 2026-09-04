@@ -38,11 +38,36 @@ CUDA wheels on a laptop.
 
 For GPU production, install torch with the CUDA wheel explicitly first,
 then install the package. `--extra-index-url` alone is not sufficient
-because PyPI's CPU wheel stays in the candidate pool and can win:
+because PyPI's CPU wheel stays in the candidate pool and can win.
+
+> **Corrected 2026-09-03: this said `cu121`, and `torch==2.6.0+cu121` does not exist.** Verified
+> against the indexes: 2.6.0 publishes `cu118`, `cu124` and `cu126`, not `cu121`, so the command
+> below failed to resolve. **Check the index before pinning a CUDA build** —
+> `https://download.pytorch.org/whl/<cuXXX>/torch/` lists what is actually there — and pick the one
+> your driver supports; `cu118` is the other published option for this version.
+
+**The CUDA pin does not cover every Python this package advertises.** Three statements about
+Python support currently disagree, and it is worth seeing them together:
+
+| where | says |
+|---|---|
+| `pyproject.toml` `requires-python` | `>=3.12` — open-ended |
+| `pyproject.toml` classifiers | 3.12, 3.13 **and 3.14**, explicitly |
+| `unit.yml` CI matrix | 3.12 and 3.13 only |
+| this page's GPU install | cu124 publishes `cp39`-`cp313`; **no `cp314`** |
+
+So the package advertises a Python version that CI does not exercise and on which the documented
+GPU install cannot resolve — cu124 tops out at `torch 2.6.0`, so there is no newer build on that
+index to move to. Verified against the index listings; `cu126` and `cu128` do publish `cp314`
+wheels and are the route if you need 3.14.
+
+**Treat Python 3.12-3.13 with cu124 as the supported GPU combination** — the one CI covers and
+these instructions are written for. Whether the 3.14 classifier should stay is a support-scope
+question for the maintainers, not a documentation one, and it is deliberately left as it is here.
 
 ```bash
-# 1. Install CUDA torch from the pytorch index
-pip install "torch==2.6.0+cu121" --index-url https://download.pytorch.org/whl/cu121
+# 1. Install CUDA torch from the pytorch index (CPython 3.9-3.13)
+pip install "torch==2.6.0+cu124" --index-url https://download.pytorch.org/whl/cu124
 
 # 2. Install the package — pip sees torch already satisfied, keeps the CUDA wheel
 pip install "tessera_embeddings[inference]"
@@ -55,11 +80,27 @@ your deployment repo:
 uv pip compile pyproject.toml \
     --extra inference --extra prefect --extra aws \
     --python-platform linux --python-version 3.12 \
-    --extra-index-url https://download.pytorch.org/whl/cu121 \
-    --index-strategy unsafe-best-match \
+    --extra-index-url https://download.pytorch.org/whl/cu124 \
     --no-sources \
-    -o constraints-cu121.txt
+    -o constraints-cu124.txt
+
+# Verify, every time. The filename is not a guarantee:
+grep -E '^(torch|nvidia-cuda-runtime)' constraints-cu124.txt
+# torch==2.6.0+cu124
+# nvidia-cuda-runtime-cu12==12.4.127
 ```
+
+> **Corrected 2026-09-03: this command used to carry `--index-strategy unsafe-best-match`, and with
+> it the output was not a CUDA 12.4 pin at all.** Run as documented it resolved
+> **`torch==2.14.0` with `nvidia-cuda-*==13.0.x`** — the newest release from PyPI, CUDA 13, written
+> to a file called `constraints-cu124.txt`. Three things combined: `torch` is unpinned in
+> `pyproject.toml`, `--no-sources` drops the `[tool.uv.sources]` mapping that otherwise holds torch
+> to one index, and `unsafe-best-match` searches every index and takes the best *version* it finds
+> anywhere. Dropping the flag restores uv's default `first-index`, which keeps torch on the CUDA
+> index it was found on. Verified both ways by running the compile.
+>
+> On uv 0.11.28 and later, `--torch-backend cu124` does the same thing more explicitly and needs no
+> `--extra-index-url`; either is fine, but **check the output** rather than trusting the filename.
 
 That file belongs in your deployment repo alongside your Dockerfiles, not
 in this OSS library.
@@ -74,7 +115,7 @@ Untested. CPU is the supported laptop path.
 
 The blessed deployment platform. For GPU production, follow the explicit
 two-step install in the [CUDA section above](#cuda): install
-`torch==...+cu121` with `--index-url` first, then install the package.
+`torch==...+cu124` with `--index-url` first, then install the package.
 
 ### macOS arm64 (Apple Silicon)
 

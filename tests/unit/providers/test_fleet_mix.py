@@ -382,6 +382,15 @@ class TestTheRunnerLifecycle:
             patch.object(runner_mod, "wait_for_actors", side_effect=_wait),
             patch.object(runner_mod, "ZarrWriter") as writer,
             patch("tessera_embeddings.inference.scheduling.time.sleep"),
+            # WITHOUT THIS, THIS TEST BOOTS A REAL LOCAL RAY CLUSTER. `wait_for_actors`
+            # raises above, but the actor factory has already handed back stand-ins, so
+            # `run_inference`'s `finally` reaches `ray.kill(actor)` — and `ray.kill` is
+            # wrapped in Ray's auto-init hook, which calls `ray.init()`. That init hashes and
+            # uploads the whole working directory; the same hazard once ate ~60 GB of RAM
+            # across three concurrent runs, and here it cost ~3 s, making this the
+            # second-slowest test in the unit suite. `test_scheduling.py` patches `ray.kill`
+            # in an autouse fixture for exactly this reason; this file needs it too.
+            patch.object(runner_mod.ray, "kill"),
         ):
             writer.return_value.scan_existing_staged_artifacts.return_value = SimpleNamespace(done=set(), skipped=set())
             actor.options.return_value.remote.return_value = object()

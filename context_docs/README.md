@@ -13,7 +13,8 @@ try that failed?" — one per pipeline stage, so a question about ingest has exa
 ```
 context_docs/
 ├── corrections-register.md        EVERY withdrawn figure, grouped by how it went wrong
-├── test-suite-streamlining.md     this repo's own test suite: where its time went, what was cut
+├── test-suite-streamlining.md     this repo's own test suite: what has been done to it, and
+│                                  what is left
 │
 ├── decisions/                     Architecture Decision Records — 1 page each, append-only
 │   ├── 001-thin-prefect-wrapping.md
@@ -37,7 +38,8 @@ context_docs/
 │   ├── 019-validation-modules-belong-in-the-library.md
 │   ├── 020-boa-offset-applies-to-every-valid-dn.md
 │   ├── 021-correct-the-boa-offset-per-image.md
-│   └── 022-resolve-the-roi-mask-credential-at-read-time.md
+│   ├── 022-resolve-the-roi-mask-credential-at-read-time.md
+│   └── 023-the-single-path-end-to-end-is-the-quickstart-run.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
@@ -109,10 +111,9 @@ file for weeks. Add a section, not a file.
 **Name a file for its subject, not for when it was written.** Dates belong inside the document, on
 the measurement they qualify.
 
-**Every file here is named in the layout block above**, and
-`tests/unit/test_context_docs_index.py` fails if that stops being true in either direction — a file
-nobody listed, or a row whose file is gone. Update the block in the same commit that adds or removes
-a file.
+**Keep the layout block above current** — add a row in the same commit that adds a file, and remove
+one in the same commit that removes a file. There is no test enforcing this, deliberately: the
+documentation tree is not a subject for the test suite.
 
 ## When to add a new ADR
 
