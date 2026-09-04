@@ -118,29 +118,36 @@ entries makes a laptop compute `e33a72ea…`, which is what Linux computes today
 fleet has already built changes identity. Not done here; it is a code change, in the mechanism that
 gates everything else.
 
-## 4. Held: sixteen moves and the deeper work
+## 4. Still open
 
-Sixteen in-scope moves are held only by §1. The substantive ones, by confidence:
+**Nothing in-scope is blocked any more.** §1's fingerprint cost was accepted (the downstream pin is
+not updated until the campaign finishes), so the eleven moves in §2 landed. What remains:
 
-- **`inference/conventions.py` → `storage/conventions.py`** (398 L). Proposed independently by the
-  inference and storage auditors. It is store metadata; moving it removes `storage/`'s only runtime
-  upward import. **Also breaks `yield-embeddings/src/yield_embeddings/domain/coarsen.py:68`.**
-- Three exception classes (`DuplicateDateError`, `InconclusiveStoreProbeError`,
-  `StoreHoldsCommittedDataError`) from root `errors.py` into `storage/zarr_store.py`, their only
-  raiser and catcher — matching the convention seven other modules already follow.
-- Two private subjects buried in `inference/actors.py`: the strip/read planner (four modules
-  already reach for it as `actors.<name>`) and the checkpoint downloader.
-- Nine time-axis symbols in `storage/` into a new `storage/time_axis.py`; `global_store_config()`
-  out of `zarr_store.py`.
-- Retry/failure-context symbols out of `ingest/loader_failures.py`; `StorageOptions` out of
-  `ingest/roi.py`.
+**Three in-scope moves, unscheduled rather than blocked** — small, and not worth a second pass on
+their own: `global_store_config` out of `zarr_store.py` (see §2 for why it should wait for the
+`zarr_store` split), the `_coverage_record` consolidation, and the `roi_processing` retry symbols.
 
-Deeper items (real code edits, a separate PR): splitting `providers/aws/ray.py` (1,316 L, three
-subjects) and `dask.py` (979 L, four); splitting `zarr_store.py` (1,965 L); separating
-`config/fault_injection.py`'s schema from its runtime half; and a **naming pass on "code
-identity"** — five distinct fingerprints of three different things (installed build, staged-content
-source hash, campaign-resolved AMI/tarball identity) all share that name across `config/`,
-`storage/` and `run_global_campaign.py`. Every one is correctly placed; the confusion is lexical.
+**Deeper work, needing real code edits and a separate PR:**
+
+- Split `providers/aws/ray.py` (1,316 L — GPU capacity policy, code-identity fingerprinting, and
+  cluster lifecycle) and `dask.py` (979 L — scheduler diagnostics, retry classification, Fargate
+  provisioning, ECS cleanup).
+- Split `storage/zarr_store.py` (1,965 L), and move the whole `RepositoryConfig` builder family
+  into a `storage/repo_config.py` while doing it.
+- Separate `config/fault_injection.py`'s configuration schema from its runtime half.
+- **The `ingest_code_identity()` platform bug in §3.** Its own PR, after this one merges.
+- **A naming pass on "code identity."** Five distinct fingerprints of three different things —
+  installed build, staged-content source hash, campaign-resolved AMI/tarball identity — share that
+  name across `config/`, `storage/` and `run_global_campaign.py`. `config/environment.py` even
+  defines a `code_identity()` beside a whole `config/code_identity.py` computing something else.
+  Every one is correctly placed; the confusion is purely lexical, which is why it is a rename pass
+  and not a move.
+
+**One test-suite gap worth knowing about, not fixed here.** `inference/actors.py` documents that it
+must import on a Fargate flow runner that has Ray but not torch. This PR broke that invariant with a
+module-scope import and **CI could not catch it**, because torch is installed in every CI job. Two
+reviewers caught it by reading. A test that blocks `torch` in `sys.meta_path` and imports the
+module would cover it in about ten lines.
 
 ## 5. Paths that must not move, whatever else does
 

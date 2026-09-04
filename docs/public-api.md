@@ -95,7 +95,14 @@ rather than re-exported from the top-level package:
   `zarr_store` (open / create / append / region-write / windowed
   per-date batch — `write_day_windows`, the cropped-ingest write path) and
   `empty_store` (all-fill store seeding — `create_empty_store`,
-  `create_empty_store_from_coords`, `VarSpec`, `daily_times`).
+  `create_empty_store_from_coords`, `VarSpec`) and `time_axis` (how a store
+  encodes its time axis — `TIME_ENCODING`, `read_time_values`, `time_index_of`,
+  `compute_doy`, `daily_times`, and the campaign calendar `CAMPAIGN_YEARS`,
+  `year_timestamp`, `year_of`, `calendar_year_times`).
+
+  **`daily_times` moved from `empty_store` to `time_axis`.** An explicit public-API
+  change rather than a re-export: it belongs with the other time-axis symbols, and a
+  second import path for one name is the sprawl this move exists to remove.
 
 ## Privacy conventions
 

@@ -280,6 +280,8 @@ def run_inference(
 #: placement intervals instead of 6. NOT to be confused with `max_leg_wall_clock_s`, which is also
 #: six hours and bounds an INGEST leg's retries — a different stage, a different quantity.
 ACTOR_INIT_TIMEOUT_SEC = 21600
+"""Maximum wall-clock seconds to wait for actor ``__init__``: instance launch, container pull,
+checkpoint download and model load to GPU. Override via ``run_inference``, not by patching this."""
 
 
 def wait_for_actors(
