@@ -46,11 +46,24 @@ because PyPI's CPU wheel stays in the candidate pool and can win.
 > `https://download.pytorch.org/whl/<cuXXX>/torch/` lists what is actually there — and pick the one
 > your driver supports; `cu118` is the other published option for this version.
 
-**The CUDA pin does not cover every Python this package accepts.** `requires-python` is `>=3.12`,
-open-ended, so 3.14 is allowed — but the cu124 index tops out at `torch 2.6.0` and publishes
-`cp39`-`cp313` wheels only, so on 3.14 the command below has nothing to resolve. Verified against
-the index listings; `cu126` and `cu128` do publish `cp314` builds and are the route on 3.14. **The
-supported GPU combination is Python 3.12-3.13 with cu124**, which is also what CI exercises.
+**The CUDA pin does not cover every Python this package advertises.** Three statements about
+Python support currently disagree, and it is worth seeing them together:
+
+| where | says |
+|---|---|
+| `pyproject.toml` `requires-python` | `>=3.12` — open-ended |
+| `pyproject.toml` classifiers | 3.12, 3.13 **and 3.14**, explicitly |
+| `unit.yml` CI matrix | 3.12 and 3.13 only |
+| this page's GPU install | cu124 publishes `cp39`-`cp313`; **no `cp314`** |
+
+So the package advertises a Python version that CI does not exercise and on which the documented
+GPU install cannot resolve — cu124 tops out at `torch 2.6.0`, so there is no newer build on that
+index to move to. Verified against the index listings; `cu126` and `cu128` do publish `cp314`
+wheels and are the route if you need 3.14.
+
+**Treat Python 3.12-3.13 with cu124 as the supported GPU combination** — the one CI covers and
+these instructions are written for. Whether the 3.14 classifier should stay is a support-scope
+question for the maintainers, not a documentation one, and it is deliberately left as it is here.
 
 ```bash
 # 1. Install CUDA torch from the pytorch index (CPython 3.9-3.13)
