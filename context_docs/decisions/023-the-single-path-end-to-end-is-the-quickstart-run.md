@@ -21,13 +21,14 @@ that both stated blockers had lapsed and proposed building it.
 > minutes" the tier README claimed. But "the upstream per-stage parity tests pass" was read off a
 > `6 passed, 2 skipped` summary line and does not hold: `test_ingest_s1_roi_parity.py` does not run,
 > for **two independent reasons that are easy to read as one**. It carries a credentials `skipif`
-> — Earthdata Login, which many contributor laptops cannot basic-auth against — so with no
-> `EARTHDATA_TOKEN` it never starts; that is the skip you see, and refreshing the cassette does not
-> remove it. Supply a token and it starts, then `xfail`s, for the separate reason that its committed
-> cassette predates the native CMR granule query
-> ([ADR 009](009-native-cmr-granule-query.md), issue #45). The other skip is the adapter template,
-> skipped on purpose. **So the S1 precondition was never verified**, and clearing either reason
-> alone would not have verified it. The decision below is unaffected — it rests on the manual check being sufficient, not
+> that accepts **either** supported Earthdata Login form — `EARTHDATA_TOKEN`, or
+> `EARTHDATA_USERNAME` **and** `EARTHDATA_PASSWORD` together — so it skips only when *neither* is
+> present; refreshing the cassette does not remove that skip. Supply either and it starts, then
+> `xfail`s, for the separate reason that its committed cassette predates the native CMR granule
+> query ([ADR 009](009-native-cmr-granule-query.md), issue #45). The other skip is the adapter
+> template, skipped on purpose. Measured both ways: **no credentials → `6 passed, 2 skipped`;
+> credentials → `6 passed, 1 skipped, 1 xfailed`** — six comparisons either way. **So the S1
+> precondition was never verified**, and clearing either reason alone would not have verified it. The decision below is unaffected — it rests on the manual check being sufficient, not
 > on the stub being unblocked — but the proposal it declined was argued partly on a claim that does
 > not hold.
 
