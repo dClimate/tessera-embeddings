@@ -46,7 +46,9 @@ Roadmap 2.
 ### The layout, after round 2
 
 `tests/unit/` is grouped into **subject directories mirroring `src/tessera_embeddings/`**, so an
-edit to one subsystem can be verified without running the other 3,600 tests. `tests/README.md` is
+edit to one subsystem can be verified without running the whole 3,675. Measured with `-n auto`: the
+directories are 84–1,387 tests and run in 3–9 s against the full suite's 23 s, with about three of
+those seconds being startup that no subset avoids. `tests/README.md` is
 the authority on where a new file goes; ADR 015 carries the reasoning and the two departures from a
 strict mirror. Every `src/` subpackage that holds testable code has a matching directory, and the
 ten files that stay at `tests/unit/` root are named in `tests/README.md` and should not grow.

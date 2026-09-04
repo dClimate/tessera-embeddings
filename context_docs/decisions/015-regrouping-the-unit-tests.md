@@ -186,5 +186,5 @@ because a file has to be somewhere.
 **Amended 2026-09-03.** The tree above is left as executed, per this record's own rule that a
 corrected statement stays and the correction is appended. What changed since: **`test_context_docs_index.py`
 is deleted** — the documentation tree is not a subject for the test suite (repo owner) — so the
-root population is **ten**, not eleven: `conftest.py`, the three shared helpers, and five
-cross-cutting tests. Nothing else about the layout changes.
+root population is **ten**, not eleven: `__init__.py`, `conftest.py`, the three shared helpers, and
+five cross-cutting tests. Nothing else about the layout changes.

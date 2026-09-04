@@ -24,12 +24,19 @@ that will not be written; see ADR 023.)
 
 ## Where a new unit test goes
 
-`unit/` is grouped into **subject directories mirroring `src/tessera_embeddings/`**, so an edit
-to one subsystem can be verified without running the other 3,700 tests:
+`unit/` is grouped into **subject directories mirroring `src/tessera_embeddings/`**, so an edit to
+one subsystem can be verified without running the whole of it:
 
 ```bash
-uv run pytest tests/unit/ingest        # ~36 files, a few seconds
+uv run pytest tests/unit/ingest -n auto   # 36 files, 1,387 tests, ~9 s
+uv run pytest tests/unit/config -n auto   # 10 files, 170 tests, ~4 s
 ```
+
+**Measured, so you know what to expect:** the full unit suite is 3,675 tests in about 23 s, and the
+directories run 84–1,387 tests in 3–9 s. The saving is real but not dramatic in wall-clock terms —
+interpreter start, collection and the `xdist` workers cost roughly three seconds before any test
+runs, so even the smallest directory does not drop below that. What you actually get is a **focused
+failure list**: a red run names something in the subsystem you touched.
 
 ```
 unit/
