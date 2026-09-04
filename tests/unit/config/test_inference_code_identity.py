@@ -41,7 +41,7 @@ def _covered() -> set[str]:
 @pytest.mark.parametrize(
     ("module", "why"),
     [
-        ("storage/zarr_store.py", "compute_doy builds a model input from the timestamps"),
+        ("storage/time_axis.py", "compute_doy builds a model input from the timestamps"),
         ("config/time_windows.py", "TimeWindow decides which observations are used"),
         ("inference/dataset.py", "the valid-pixel gate decides which pixels are embedded"),
         ("inference/sampling.py", "the sampler decides which observations reach the model"),
@@ -65,6 +65,7 @@ def test_the_closure_is_reached_transitively_not_listed() -> None:
     beyond_the_seed = {c for c in covered if not (c.startswith("inference/") or c in seeded)}
     assert beyond_the_seed, "the closure added nothing — it has stopped following imports"
     assert "storage/zarr_store.py" in beyond_the_seed
+    assert "storage/time_axis.py" in beyond_the_seed
 
 
 def test_orchestration_and_providers_stay_out() -> None:

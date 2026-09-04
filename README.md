@@ -28,7 +28,7 @@ store carries the [`proj:`](https://github.com/zarr-conventions/geo-proj) and
 CRS/affine metadata, plus the
 [`geoemb:` geoembeddings convention](https://github.com/geo-embeddings/embeddings-zarr-convention)
 for encoder-model provenance and quantization (built in
-[`inference/conventions.py`](src/tessera_embeddings/inference/conventions.py)).
+[`storage/conventions.py`](src/tessera_embeddings/storage/conventions.py)).
 
 The domain code — the scientific transformations, the inference
 engine, the Zarr I/O — is cloud-agnostic and orchestrator-agnostic.

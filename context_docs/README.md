@@ -15,8 +15,6 @@ context_docs/
 ├── corrections-register.md        EVERY withdrawn figure, grouped by how it went wrong
 ├── test-suite-streamlining.md     this repo's own test suite: what has been done to it, and
 │                                  what is left
-├── src-reorganisation-audit.md    where the package's modules live and why; the code-identity
-│                                  fingerprints that freeze half of them
 │
 ├── decisions/                     Architecture Decision Records — 1 page each, append-only
 │   ├── 001-thin-prefect-wrapping.md
