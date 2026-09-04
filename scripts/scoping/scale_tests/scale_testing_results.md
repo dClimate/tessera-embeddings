@@ -1,20 +1,35 @@
-# Scale-test report - runs `run1` (T0-T7) and `d3`/`d3v2` (T8)
+# Scale-test report - runs `run1` (T0-T7) and `d3` (T8)
 
 **This file aggregates more than one run, and the sections have different provenance.**
 Read the header per section, not for the file:
 
 | sections | run | revision | observations |
 |---|---|---|---|
-| T0-T7 | `run1` | git `c490616` | 898 |
-| T8 | `d3` / `d3v2` — the sharding experiments E1-E4 ([ADR 008](../../../context_docs/decisions/008-global-store-architecture.md)) | not recorded here | 30 |
+| T0-T7 | `run1` | git `c490616` | 898 (but see below) |
+| T8 | `d3` — the first sharding pass | not recorded here | 30 |
 | | | | **928 total** |
 
 - backend: **s3**, scale: **bench**
 - icechunk **2.1.1**, zarr **3.2.1**
 
 The 898 figure counts T0-T7 alone — it is the sum of the `n` column across those sections,
-and T8 adds 30 on top. Attributing all 928 to `run1` at `c490616` would credit the sharding
-measurements to a run that did not produce them.
+and T8 adds 30 on top. Attributing all 928 to `run1` would credit the sharding measurements
+to a run that did not produce them.
+
+**Two things this archive does NOT establish, recorded so nobody reconstructs them from it:**
+
+- **`d3v2` is not in this file.** The T8 rows here are `d3`. The current `t8_sharding.py`
+  defines four modes and emits `objects_listed` both pre- and post-GC, so a `d3v2` E4 pass
+  would carry eight of those observations and four `manifest_bytes`; this archive has three
+  and three, one per mode of an earlier three-mode schema. So the **0.46x** aligned-writer
+  figure that settled D3 comes from
+  [ADR 008](../../../context_docs/decisions/008-global-store-architecture.md) §D3 and cannot
+  be derived from anything here.
+- **The 898 count disagrees with ADR 008.** Its "Run 1 evidence" section records `run1` as
+  **689 metric rows**; summing the `n` column over T0-T7 in this file gives **898**. Both
+  cannot describe the same dataset. Which is right is unresolved — most likely later
+  executions were appended under the same run id — so treat the run id alone as insufficient
+  provenance until someone reconciles them.
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
 
@@ -24,7 +39,7 @@ measurements to a run that did not produce them.
 |---|---|---|---|
 | D1 pre-alloc | data-chunks==0; shift conflict unresolvable | data chunks=0 confirmed; shift-vs-write conflict=unresolvable | escape hatch only |
 | D2 chunk shape | T1 point p95/p50 by variant | best=c256_full; c256_full p95=193.272/p50=120.948ms; c256_sharded p95=199.146/p50=28.954ms; c500_band4 p95=219.233/p50=117.291ms; c384_full p95=333.982/p50=229.350ms; c500_full p95=338.621/p50=211.441ms | 256+full band; smaller=faster/point |
-| D3 sharding | sharded vs full (p95/p50/write) | p95 199.146 vs 193.272ms (~tie); p50 28.954 vs 120.948ms; ~64x fewer objects. **The "write 2.8x slower" figure from this T1 sweep is SUPERSEDED** — it measured a chunkwise writer. `d3v2` (§t8) measured the shard-aligned + land-masked writer at **0.46x** the unsharded build, and that is what settled D3 in FAVOUR of sharding | [ADR-008 D3](../../../context_docs/decisions/008-global-store-architecture.md) |
+| D3 sharding | sharded vs full (p95/p50/write) | p95 199.146 vs 193.272ms (~tie); p50 28.954 vs 120.948ms; ~64x fewer objects. **The "write 2.8x slower" figure from this T1 sweep is SUPERSEDED** — it measured a chunkwise writer. `d3v2` measured the shard-aligned + land-masked writer at **0.46x** the unsharded build (per ADR-008; the `d3v2` rows are NOT in this archive — §t8 here is `d3`), and that is what settled D3 in FAVOUR of sharding | [ADR-008 D3](../../../context_docs/decisions/008-global-store-architecture.md) |
 | D4 manifest split | T2 per-year commit trend | commit 0.367s->0.353s (flat) | rising => icechunk #1600 |
 | D5 one repo | T4 snapshot growth + T5 contention | snapshot 4973.000->38102.000B @120g; max retries=118.000 | kill: >2x serial or storms |
 | D7 GC/hygiene | T6 GC objects/s + reclaimed | 19 objs @ 33.3/s, 8.405e+06B reclaimed | extrapolate to 10^8 objects |
