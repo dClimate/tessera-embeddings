@@ -44,6 +44,17 @@ to a run that did not produce them.
 | D5 one repo | T4 snapshot growth + T5 contention | snapshot 4973.000->38102.000B @120g; max retries=118.000 | kill: >2x serial or storms |
 | D7 GC/hygiene | T6 GC objects/s + reclaimed | 19 objs @ 33.3/s, 8.405e+06B reclaimed | extrapolate to 10^8 objects |
 
+**This matrix covers the decisions these runs MEASURED, which is not all of ADR 008's.**
+D1-D5 and D7 have rows. The other three, so their absence is not read as missing evidence:
+
+- **D6** (commit strategy; two commits per zone-year) *is* backed by run 1 — its pacing cap
+  comes from the same cross-group contention data as D5, in §t0 and §t5 below. It has no row
+  here; the derived committer caps are written up in
+  [ADR 008](../../../context_docs/decisions/008-global-store-architecture.md) §D6, and are not
+  re-derived in this file.
+- **D8** (everything opt-in) and **D9** (pin icechunk >= 2.1.1) are policy and pinning
+  decisions with no scale-test evidence to carry. Correctly absent.
+
 ## Per-test metrics
 
 ### t0
