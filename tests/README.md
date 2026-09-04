@@ -107,6 +107,11 @@ Profiles are configured in `tests/conftest.py`:
 
 ## Running subsets
 
+**Pass `-n auto`.** It is not in `addopts`, so a bare `uv run pytest` runs serially and is several
+times slower than the timings quoted in this file. CI passes it (`unit.yml`), and so does the
+coverage gate (`scripts/test_coverage_gate.py`) — parallel and coverage compose fine. Add it to any
+run you are waiting on; leave it off when you want a debugger to stop somewhere useful.
+
 ```bash
 # Default (unit + architecture):
 uv run pytest

@@ -6,8 +6,13 @@
 > a final decision. The `xfail` stub that used to stand for it, and the nightly workflow pointed at
 > that stub, are both deleted.
 
-Tests that take more than about two minutes to run. Marked `@pytest.mark.slow`, which the default
+Tests that take **more than 30 seconds** to run. Marked `@pytest.mark.slow`, which the default
 `addopts` deselect, so nothing here runs unless a job or a person opts in.
+
+> **The threshold is 30 s, not the "~2 minutes" this file used to say.** That figure contradicted
+> the marker's own declaration in `pyproject.toml` (`slow: >30s runtime`) and the unit tier's rule
+> that no test should exceed 30 s — between them they left a 45-second test belonging nowhere.
+> Corrected here rather than recorded as a discrepancy.
 
 **The tier is a category, not a plan.** It is kept because "this test is genuinely slow" is a real
 thing that may need a home again, and the marker stays declared in `pyproject.toml` so it can be
