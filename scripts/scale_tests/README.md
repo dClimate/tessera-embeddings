@@ -130,7 +130,7 @@ estimate below is priced against, so the two belong together.
 | Bucket | fresh, us-west-2, same account | throwaway; expect a `SlowDown` ramp on the first heavy writes |
 | IAM | `s3:*` on the test bucket only | |
 | Env | `uv` venv; **icechunk ≥ 2.1.1** (ADR-008 D9), zarr 3.2.1 pinned; package installed from the branch under test | |
-| Results | `s3://<bucket>/results/<run-id>/*.jsonl` plus a local mirror | survives instance death |
+| Results | `s3://<bucket>/<prefix>/results/<run-id>/*.jsonl` plus a local mirror — with the documented `--bucket <bucket>/global-embeddings/` that is `s3://<bucket>/global-embeddings/results/<run-id>/` | survives instance death. The mirror sits UNDER the `--bucket` prefix, beside the stores rather than at the bucket root, because a prefix-scoped bucket only grants write access under its prefix |
 
 **Teardown**, in the order that works:
 

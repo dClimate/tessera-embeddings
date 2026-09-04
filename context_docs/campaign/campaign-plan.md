@@ -1045,8 +1045,12 @@ do not cite each other. **Read it before publishing a figure or reusing one.**
 - [`../decisions/013-optional-s1-s2-only-pixels.md`](../decisions/013-optional-s1-s2-only-pixels.md)
   — what the `allow_s2_only` flag does, the neutral-input convention, and the scientific
   validation it left open. **The flag is on for this campaign** (§3).
-- `tests/unit/orchestration/flows/test_cluster_balance.py` — the offline diagnostic behind §10's
-  cluster-balance figures, derived in [`campaign-cost-model.md`](campaign-cost-model.md) §5b. It
-  runs against a snapshot of the tile counts, so **after a mask rebuild use
-  `scripts/cluster_work_spread.py --mask …` instead**, or refresh the snapshot first; cost model
-  §5b gives both commands and what differs between them.
+- `scripts/cluster_work_spread.py` — **the only thing that re-derives §10's cluster-balance
+  figures**: it reads the current mask and runs the campaign's partitioner with the real
+  `zone_work_weight`. Rerun it if the mask is rebuilt.
+- `tests/unit/orchestration/flows/test_cluster_balance.py` — a related but DIFFERENT diagnostic. It
+  substitutes raw tile counts for the work weights, deliberately, because its subject is the
+  longest-processing-time dealing and the density ordering rather than the weighting — so it reports
+  the **area-only** split, which is the metric §10 says is wrong. It also reads a 2026-07-24
+  snapshot. Do not quote a campaign figure from it; see
+  [`campaign-cost-model.md`](campaign-cost-model.md) §5b.

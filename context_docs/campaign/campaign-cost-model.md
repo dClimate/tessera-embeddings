@@ -534,25 +534,32 @@ Within a cluster, zones are ordered by tile count rather than by work. That is c
 inconsistency: ordering and actor clamping are properties of area, while the split is a property of
 work.
 
-**Re-derive it, do not quote it — and the two ways of re-deriving it are not interchangeable.**
+**Re-derive it, do not quote it — and ONE of the two ways re-derives it.**
 
 ```bash
-# Against the LIVE mask. This is the one to run after a mask rebuild: it reads each zone's
-# live-tile bitmap and runs the campaign's own partitioner over what it finds.
+# The work-weighted split. Reads each zone's live-tile bitmap and runs the campaign's own
+# partitioner with the real `zone_work_weight`. A few minutes; one GET per zone.
 uv run python scripts/cluster_work_spread.py --mask s3://<inputs-bucket>/masks/global.icechunk \
     --clusters 8 10 16
 
-# Offline, against the SNAPSHOT. Fast and deterministic, and correct only while the snapshot is.
+# The AREA-ONLY diagnostic. Offline and deterministic — and it does NOT reproduce the figures
+# above; see below before reading anything off it.
 TE_CLUSTERS=8,16,24 uv run pytest tests/unit/orchestration/flows/test_cluster_balance.py -k report -s
 ```
 
-Both drive the shipped `_partition_by_live_tiles` and the shipped densest-first sort, so both report
-what a campaign would actually do rather than a model of it. **What differs is where the tile counts
-come from.** The script reads them from the mask, one GET per zone, and takes a few minutes. The
-test reads them from `tests/unit/zone_density.py`, a snapshot taken 2026-07-24 — deliberately, so
-the diagnostic runs offline — so **after a mask rebuild the test reproduces the old answer with no
-sign that it has.** `zone_density.py`'s own docstring carries the recipe for refreshing it; refresh
-it, or use the script.
+**Only the script measures the split this section is about.** Both drive the shipped
+`_partition_by_live_tiles` and the shipped densest-first sort, so both describe real campaign
+mechanics — but `zone_density.plan()` **substitutes raw tile counts for `zone_work_weight`**, on
+purpose. Its subject is the longest-processing-time dealing and the density ordering, and holding
+the weights equal to tiles is what keeps those comparable against the counts its snapshot records;
+the weighting itself is covered separately by `test_zone_work_weight`. So the test reports the
+**area-only** split — the very thing the 21.8% figure above says is wrong — and a reader who took
+its spread as the campaign's would be quoting the superseded metric.
+
+Two further reasons not to read a campaign figure off the test: its tile counts come from
+`tests/unit/zone_density.py`, a snapshot taken 2026-07-24, so **after a mask rebuild it reproduces
+the old answer with no sign that it has**; and that file's docstring carries the refresh recipe,
+which fixes the staleness but not the weighting. **Use the script.**
 
 **Provenance of the coverage figures.** `s3://global-tessera-inputs-dev/masks/global.icechunk`,
 built 2026-07-24 from `s3://tessera-embeddings/v1.1/global_0.1_degree_tiff_all/`, registry sha256
