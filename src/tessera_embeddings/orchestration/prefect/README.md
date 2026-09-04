@@ -243,9 +243,18 @@ Two subtleties worth knowing:
 
 How this plays out on the real world — 112 live UTM zones, 360,953 land tiles —
 and what happens if you move off 8 clusters is measured in
-[`context_docs/design/campaign-cluster-sizing.md`](../../../../context_docs/design/campaign-cluster-sizing.md).
-Short version: 8 splits the year to within 0.0%, 16 costs 0.6% and roughly halves
-wall clock, and past ~20 the largest zones start to dominate.
+[`context_docs/campaign/campaign-cost-model.md`](../../../../context_docs/campaign/campaign-cost-model.md)
+§5b.
+
+**Read the short version below as the SUPERSEDED area-only diagnostic**: 8 splits
+the year to within 0.0%, 16 costs 0.6%, and past ~20 the largest zones start to
+dominate. Those figures balance on raw live-tile count, which is balancing on
+AREA. The shipped partition weights each zone's tiles by its latitude band's
+observation count — proportional to GPU-hours — and by the years it still carries,
+and on that basis the campaign's **10** clusters spread by **0.009%** where the
+tile-count split would give **21.8%**. Do not quote the row above for a cluster
+count; run `scripts/cluster_work_spread.py --mask … --clusters …`, which reads the
+current mask through the campaign's own partitioner.
 
 > **Size the fleets to match.** These caps count *clusters* and *zones*, not
 > machines. Eight inference clusters at the default `num_actors` plus forty
@@ -260,7 +269,7 @@ years at once, and within a sequential run the depth-1 trailing assembly can
 never overlap a commit for the same zone group. **Commits are otherwise ungated.**
 They contend on the branch-tip CAS, since all 120 zone groups share one repo, but
 run 1 measured that as 2.2 s at 16 committers and 15 s at 120 with zero
-unresolvable conflicts. See `context_docs/design/commit-gate-removal-2026_08.md`. `build_land_mask` and `seed_global_store` are
+unresolvable conflicts. See `context_docs/storage/writing-to-the-global-store.md`. `build_land_mask` and `seed_global_store` are
 cluster-less (they run on the flow runner like `generate_roi`); only
 `fill_zone_year` / `fill_zones_sequential` provision Ray.
 

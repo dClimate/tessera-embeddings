@@ -14,7 +14,7 @@ A cell is validated by a SEPARATE flow run, dispatched the moment the cell's tag
 
 The fill dispatches in-band rather than via an automation on completion because Prefect's
 event broker is in-memory and drops events under load — measured, see
-context_docs/design/campaign-monitoring-plan.md. An event-driven trigger would silently
+context_docs/campaign/campaign-validation-and-monitoring.md. An event-driven trigger would silently
 skip exactly the cells filled while the server was busiest; an in-band dispatch is missed
 only when the fill itself is interrupted, and its log line says so.
 

@@ -374,7 +374,7 @@ class TestIcechunkCredentialVisibility:
     """The boundary that records WHICH credential icechunk is using.
 
     Rationale and the incident behind it:
-    ``context_docs/design/icechunk-credential-stampede-2026_08.md``.
+    ``context_docs/storage/writing-to-the-global-store.md``.
     """
 
     @staticmethod

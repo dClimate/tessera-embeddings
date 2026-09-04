@@ -1,4 +1,4 @@
-"""T2 — write path, commit scaling, manifest behaviour (test plan §4 T2).
+"""T2 — write path, commit scaling, manifest behaviour (T2).
 
 Feeds ADR D4 (split config) and D6 (batch size, refs/commit ceiling), and probes
 the open upstream bugs directly: commit-time RSS vs refs (~400 B/ref; icechunk

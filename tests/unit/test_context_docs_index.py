@@ -60,6 +60,19 @@ def test_every_document_is_listed(doc: Path) -> None:
     )
 
 
+def _repo_markdown_names() -> set[str]:
+    """Markdown filenames anywhere in the working tree, excluding hidden directories.
+
+    The exclusion is load-bearing rather than tidiness. ``.venv`` holds vendored docs, and
+    ``.claude/worktrees/`` holds whole checkouts of other branches — so a file deleted on this
+    branch is still on disk under a worktree, and counting it here makes the staleness check
+    below pass on a developer machine and fail in CI. That happened: nine documents were removed
+    from the index's tree and the guard stayed green locally because old worktrees still held
+    them.
+    """
+    return {p.name for p in REPO.rglob("*.md") if not any(part.startswith(".") for part in p.relative_to(REPO).parts)}
+
+
 def test_the_index_names_nothing_that_is_gone() -> None:
     """The other direction: a row surviving its file sends readers after a dead path.
 
@@ -69,7 +82,7 @@ def test_the_index_names_nothing_that_is_gone() -> None:
     on_disk = {p.name for p in _tracked_docs()} | {INDEX.name}
     named = {Path(m).name for m in _MARKDOWN_NAME.findall(_index_text())}
     # Names that exist somewhere else in the repo are legitimate cross-references.
-    elsewhere = {p.name for p in REPO.rglob("*.md") if ".venv" not in p.parts}
+    elsewhere = _repo_markdown_names()
     stale = sorted(named - on_disk - elsewhere)
     assert not stale, (
         f"context_docs/README.md names {stale}, which no longer exist. "

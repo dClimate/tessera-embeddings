@@ -1047,7 +1047,7 @@ class TestDefaultRepoConfig:
     def test_storage_timeouts_and_retries_applied(self):
         # Every repo open inherits finite per-attempt timeouts and a backed-off
         # retry budget so a wedged socket fails the attempt instead of hanging
-        # forever (see context_docs/design/region-merge.md → "Hang protection").
+        # forever (see context_docs/ingest/ingest-performance.md §14.4, gotcha 12).
         storage = _default_repo_config().storage
         assert storage is not None
         assert storage.timeouts.connect_timeout_ms == _DEFAULT_CONNECT_TIMEOUT_MS

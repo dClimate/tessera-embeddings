@@ -34,7 +34,8 @@ that rationale, and the flow and README point here.
   What stays bounded is FAILURE, not throughput: a failed cell keeps its mosaic for staged
   resume and is counted, and the feeder stops admitting once ``max_retained_failures`` are
   outstanding. The price of decoupling is an assembly backlog, which is the cheap direction to
-  fail. Measurements: ``context_docs/design/stage_decoupling_2026_08.md``.
+  fail. Measurements — 60 configured ingests running 7, and the ~1,380 tiles/hour that makes an
+  assembly-released gate bind on the slowest stage: ``context_docs/campaign/campaign-plan.md`` §1.
 - **In-child retry**: a failed cell is re-attempted on the still-provisioned cluster before the
   run ends (``attempts_per_cell_in_cluster``), reusing the per-cell ``infer_single`` path and
   the mosaic retained for exactly this. Without it the driver's retry unit is a whole dispatch,

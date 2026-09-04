@@ -227,7 +227,7 @@ A10G_TOTAL_GIB = 22.06
 
 #: Deepest sub-batch an A10G was measured to complete, in tokens: 7,168 pixels at 325
 #: tokens each, the last rung of the forward sweep in
-#: ``context_docs/design/gpu-card-choice-2026_08.md``. The rung above it refuses.
+#: ``context_docs/inference/inference-on-gpus.md``. The rung above it refuses.
 A10G_MEASURED_TOKEN_CEILING = TUNED_BATCH_SIZE * 325
 
 #: Most tokens one pixel can carry: the sampler clips each of the two streams to the

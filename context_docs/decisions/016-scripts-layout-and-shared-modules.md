@@ -25,7 +25,7 @@ Downstream, the scripts import one another by bare module name:
 
 Those resolve only because every script sits in one directory and Python puts a script's own
 directory on `sys.path`. Move a script one level down and its imports stop resolving. The 28
-test files under `tests/unit/scripts/` import the same modules and break identically.
+test files under `yield-embeddings/tests/unit/scripts/` import the same modules and break identically.
 
 This repository has the same pattern in miniature: `scripts/scale_tests/` is already a
 package and imports work there, but the standalone scripts share nothing, so the coupling is
@@ -47,7 +47,7 @@ Three things this buys beyond the layout:
    replaced.
 2. **800 lines move from the unscanned tree into the scanned one** (ADR 014), which is the
    only mechanism that actually shrinks that gap.
-3. **The tests stop depending on directory adjacency.** `tests/unit/scripts/` currently
+3. **The tests stop depending on directory adjacency.** `yield-embeddings/tests/unit/scripts/` currently
    imports modules that are importable only by accident of layout.
 
 The target layout, once the prerequisite is done:
@@ -64,10 +64,11 @@ scripts/
 
 ## The tier distinction is the part that matters most
 
-Both repositories now carry a `scripts/README.md` listing **every** script in one of two
-tiers: supported tooling, or a kept-for-reference instrument that is not maintained.
+**Every script belongs in one of two tiers: supported tooling, or a kept-for-reference instrument
+that is not maintained.** The distinction has to be written down somewhere a reader meets before the
+scripts themselves, because it cannot be recovered from the code.
 
-This exists because of a specific near-miss. On 2026-08-17 three scripts were shortlisted for
+That matters because of a specific near-miss. On 2026-08-17 three scripts were shortlisted for
 deletion on the evidence that nothing referenced them. Reading them showed all three were
 still useful — one a deliberately reusable surgical tool with a name that reads like a
 migration, one already documented at length, one cited by name inside a live test.
@@ -101,9 +102,8 @@ being built against is the worst available timing.
 
 - The subdirectory reorganisation is blocked on the module move, and neither happens before
   the current branch merges.
-- Until then, `scripts/README.md` is the mechanism that distinguishes live tooling from kept
-  instruments. **A script added without a README row is the failure this ADR exists to
-  prevent** — add the row in the same commit.
+- Until then, the tier distinction above is what separates live tooling from kept instruments.
+  **A script that nobody can place in a tier is the failure this ADR exists to prevent.**
 - The moved modules become subject to the architecture rules, mypy, and `ruff format` in CI.
   Expect the move to surface type errors that the unscanned tree never reported.
 - Downstream, this supersedes the standalone plan in that repository's

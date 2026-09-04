@@ -168,7 +168,7 @@ class TestCampaignDefaults:
     def test_ten_clusters_share_sixty_ingest_slots(self):
         """Six UTM zones ingesting per cluster: 10 x 6 = the 60-zone fleet-wide cap.
 
-        The campaign's planned width (``context_docs/design/campaign-plan.md`` §3), and 10 x 250
+        The campaign's planned width (``context_docs/campaign/campaign-plan.md`` §3), and 10 x 250
         actors is what reaches the 2,500-actor quota.
 
         The two numbers are a pair, not independent knobs — the per-cluster ingest window is the cap
@@ -295,7 +295,7 @@ class TestCampaignDefaults:
         share one repo and one branch tip, and run 1 measured that contention as 2.2 s commits
         at 16 simultaneous committers and 15 s at 120, with ZERO unresolvable conflicts at every
         N. The curve itself is kept in
-        ``context_docs/design/commit-gate-removal-2026_08.md`` together with the scale
+        ``context_docs/storage/writing-to-the-global-store.md`` together with the scale
         (N>=16) at which it would matter again — this is parametrised past that scale on
         purpose, so a reader sees the removal is unconditional rather than tuned.
         """
@@ -1410,7 +1410,7 @@ def test_overlapping_years_is_now_the_default(wired, monkeypatch):
     default, on the reasoning that year-serial was the path that had actually been run and a silent
     flip would change the campaign's shape. That premise expired: `overlap_years` was certified on
     six cells each carrying both radar orbits, including a same-zone year rollover inside one
-    cluster, and `context_docs/design/campaign-plan.md` §3 makes it the campaign's shape.
+    cluster, and `context_docs/campaign/campaign-plan.md` §3 makes it the campaign's shape.
 
     The guard's PURPOSE is unchanged and is why this still exists rather than being deleted — the
     default must not move without a test saying so. Overlapping years is what makes the 60-zone

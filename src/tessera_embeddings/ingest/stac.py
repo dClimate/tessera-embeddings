@@ -163,7 +163,7 @@ _STAC_TIMEOUT = (10, 60)
 # fat those particular hundred are), and is not used here only because `pystac_client` bakes the
 # limit into a search and offers no way to resume from a cursor at a different size. Re-cutting
 # the window reaches the same end through the library's own API.
-# Measurements in context_docs/design/ingest_optimization_campaign_2026_07.md.
+# Measurements in context_docs/ingest/ingest-performance.md.
 _MAX_QUERY_ITEMS = 10_000
 
 # Date windows of ONE query walked at the same time.
@@ -182,7 +182,7 @@ _MAX_QUERY_ITEMS = 10_000
 # answer an overload with (429, 503) is a load refusal the whole leg then waits out. At 6, Earth
 # Search answered the fleet with 403; 2 keeps the fleet's stream count in the range that ran
 # clean for a whole campaign. Measurements, including per-page latency against concurrency, are
-# in context_docs/design/ingest_optimization_campaign_2026_07.md.
+# in context_docs/ingest/ingest-performance.md.
 #
 # A module constant rather than a setting: nothing in `ingest/` reads `IngestSettings`, and the
 # query is reached from three call sites that would each have to carry one.
@@ -1352,7 +1352,7 @@ def _query_stac_items(
     # takes a list of boxes and already dedupes by item id across them. What it needs is the
     # bands' provenance: they must derive from the LIVE TILE range, which `roi.geobox` does not
     # carry. Measurements and the schema addition required are in
-    # context_docs/design/ingest-graph-and-stac-budget.md section 11.
+    # context_docs/ingest/ingest-performance.md section 12.9.
     roots = [_WindowWalk(sub_bbox, (start_date, end_date)) for sub_bbox in split_antimeridian_bbox(bbox)]
     budget = _RePartitionBudget(_MAX_REFUSAL_RE_PARTITIONS)
     _fill_window_tree(

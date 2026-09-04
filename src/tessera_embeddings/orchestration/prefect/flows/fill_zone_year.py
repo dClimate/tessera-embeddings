@@ -10,7 +10,7 @@ cancellation hook is shared via :mod:`._ray_lifecycle`).
 is shared and nothing commits — so many of these flow runs can do GPU work at once. Commits are
 UNGATED: they share a branch tip, but contending for it costs seconds (2.2 s at 16 committers,
 15 s at 120) with no unresolvable conflicts at any measured N; see
-``context_docs/design/commit-gate-removal-2026_08.md``. Same-zone serialization (whose attr
+``context_docs/storage/writing-to-the-global-store.md``. Same-zone serialization (whose attr
 commits genuinely conflict) is the campaign driver's job, not this flow's.
 """
 

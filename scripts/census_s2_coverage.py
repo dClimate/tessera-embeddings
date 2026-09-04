@@ -1,7 +1,7 @@
 """Global Sentinel-2 usable-observation census on the campaign's own land grid.
 
 The optical counterpart to ``census_s1_coverage.py``, and the instrument behind
-``context_docs/design/optical_depth_census_2026_08.md``. For each point it asks
+``context_docs/inference/minimum-optical-depth.md``. For each point it asks
 earth-search how many DISTINCT acquisition dates cover that point in each
 campaign year, and how cloudy each of those dates was, giving
 

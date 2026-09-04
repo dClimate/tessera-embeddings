@@ -3,8 +3,8 @@
 **Dated 2026-07-29.** Extends the July-27 ingest cost estimate — which costed **ingest
 only** — to the whole campaign: ingest, inference, assembly, and the permanent output
 store. Nine years × **112 land zones**. The ingest measurements it rests on are recorded in
-[`ingest_optimization_campaign_2026_07.md`](ingest_optimization_campaign_2026_07.md);
-section references below of the form "ingest estimate §N" point at that working note.
+[`../ingest/ingest-performance.md`](../ingest/ingest-performance.md); section references below of
+the form "ingest estimate §N" point at that record.
 
 **This is the figures annex to [`campaign-plan.md`](campaign-plan.md).** That document owns
 operations — what runs and with what settings; this one owns every number in it and the
@@ -122,7 +122,7 @@ transfer (everything is in us-west-2, so there is no egress); engineering time.
 |---|---|---|
 | Land zones | 111 (census lists 112 with land; the estimate uses 111) | ingest estimate §4 |
 | Campaign years | 9 → **999 zone-years** | settled |
-| Live 2048-px tiles | 360,953 per year | coverage census, `campaign-cluster-sizing.md` |
+| Live 2048-px tiles | 360,953 per year | coverage census; §5b |
 | **Pixels inferred** | **1.363 × 10¹³** | 360,953 × 2048² × 9 |
 | S2 duration basis | 6,354 cell-hours at 60 workers | ingest estimate §5 |
 | S2 worker-hours | 381,240 | 6,354 × 60 |
@@ -287,7 +287,8 @@ the cheap half of the campaign. It does not change the inference line, which §6
    sooner, so re-scaling `max_workers` is not where the money is.
 3. **The fit's own basis** is five regions at R² 0.954, on code that has since changed.
 
-**Investigation and plan: `ingest_concurrency_investigation_2026_08.md`.** Six candidate causes
+**Investigation and plan: [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md)
+§11, "Throughput at fleet scale".** Six candidate causes
 are ruled out, including the orchestrator, the Dask schedulers, capacity, and store growth. Two
 findings bear directly on this section. Per-date cost rises through a run because **windows per
 date rise** — on 53N, write cost per window held flat at 16.4–18.3 s over 137 dates while
@@ -368,7 +369,8 @@ majority of land, which is token-poor. Reducing tokens pays proportionally to to
 where the cost is not.
 
 Stratified figures, the projection interval, and what remains unmeasured:
-`campaign_inference_profile_2026_08.md`.
+[`../inference/inference-on-gpus.md`](../inference/inference-on-gpus.md) §6, "Measured on the
+campaign path".
 
 **What this means for the durations above: raise them, but for seasonality.** The fit is built on
 January-conditions dates and a zone-year is not twelve Januaries — on one zone at one width,
@@ -380,8 +382,8 @@ chunks or one completed full-year cell before committing a schedule to it. **The
 difference from the withdrawn claim is large: seasonality is predictable and schedulable, so peak
 months can be planned around instead of hunted as a defect.**
 
-Full derivation and withdrawal: `ingest_concurrency_investigation_2026_08.md` §"The withdrawn
-claim, and the mechanism behind it".
+Full derivation and withdrawal: [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md)
+§11, "The withdrawn claim, and the mechanism behind it".
 
 Two properties of the fit matter for anything that reasons about *individual* zones rather
 than the aggregate, and the aggregate basis hides both:
@@ -505,6 +507,69 @@ campaign's duration.
 > whichever mosaic lands first, so the pipeline does not idle *within* a cluster. What the
 > table above measures is different and coarser: whether the campaign as a whole generates
 > mosaics fast enough to justify the fleet size you provisioned.
+
+---
+
+## 5b. How the zones divide across those clusters
+
+The fleet is a number of actors; the schedule is set by how the *work* is dealt out to them.
+**Clusters are balanced on work, not on area**, and the difference is worth measuring rather than
+assuming.
+
+A zone's cost is its live tiles weighted by its latitude band's observation count — which is
+proportional to GPU-hours — and by the number of years the zone still carries. Balancing on raw
+tile count instead is balancing on area, and the two diverge with latitude, because a high-latitude
+zone's tiles each carry far more observations. At the campaign's 10 clusters the resulting spread in
+true work is **0.009%** (heaviest cluster over lightest), where balancing on tile counts alone gives
+**21.8%**.
+
+**Why an uneven split is not averaged away.** Clusters are long-lived and the campaign's date is set
+by the last one to finish, so an imbalance is added to the schedule rather than absorbed by it. The
+imbalance is also **not random**: latitude drives it, so a cluster drawing high-latitude zones is
+heavy in *every* year. And with every year dispatched in one batch, a split that ignored the year
+count would leave one cluster draining extra years while the rest sat idle. A zone with no years
+left weighs zero, which subsumes the retag-only case and skips its mask read.
+
+Within a cluster, zones are ordered by tile count rather than by work. That is correct and not an
+inconsistency: ordering and actor clamping are properties of area, while the split is a property of
+work.
+
+**Re-derive it, do not quote it — and ONE of the two ways re-derives it.**
+
+```bash
+# The work-weighted split. Runs the campaign's own partitioner with the real `zone_work_weight`.
+# A few minutes: it reads each land zone TWICE — once for the work weight, once for the raw
+# live-tile count it compares against.
+uv run python scripts/cluster_work_spread.py --mask s3://<inputs-bucket>/masks/global.icechunk \
+    --clusters 8 10 16
+
+# The AREA-ONLY diagnostic. Offline and deterministic — and it does NOT reproduce the figures
+# above; see below before reading anything off it.
+TE_CLUSTERS=8,16,24 uv run pytest tests/unit/orchestration/flows/test_cluster_balance.py -k report -s
+```
+
+**Only the script measures the split this section is about.** Both drive the shipped
+`_partition_by_live_tiles` and the shipped densest-first sort, so both describe real campaign
+mechanics — but `zone_density.plan()` **substitutes raw tile counts for `zone_work_weight`**, on
+purpose. Its subject is the longest-processing-time dealing and the density ordering, and holding
+the weights equal to tiles is what keeps those comparable against the counts its snapshot records;
+the weighting itself is covered separately by `test_zone_work_weight`. So the test reports the
+**area-only** split — the very thing the 21.8% figure above says is wrong — and a reader who took
+its spread as the campaign's would be quoting the superseded metric.
+
+Two further reasons not to read a campaign figure off the test: its tile counts come from
+`tests/unit/zone_density.py`, a snapshot taken 2026-07-24, so **after a mask rebuild it reproduces
+the old answer with no sign that it has**; and that file's docstring carries the refresh recipe,
+which fixes the staleness but not the weighting. **Use the script.**
+
+**Provenance of the coverage figures.** `s3://global-tessera-inputs-dev/masks/global.icechunk`,
+built 2026-07-24 from `s3://tessera-embeddings/v1.1/global_0.1_degree_tiff_all/`, registry sha256
+`5ea80dd9…c794e`. That is the **dev** coverage store; the distribution of land does not change, but
+regenerate the snapshot against production once its mask is built.
+
+**Commits do not constrain the cluster count.** This was once thought to, and the gate that enforced
+it has been removed — [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md)
+§5 carries the measurement, the committer-count threshold, and the signal that would reopen it.
 
 ---
 
@@ -973,16 +1038,14 @@ uncertainty list that carries its own retired entries is one nobody reads to the
 
 ## 11. Where the underlying detail lives
 
-- [`ingest_optimization_campaign_2026_07.md`](ingest_optimization_campaign_2026_07.md) —
-  the authoritative record of every ingest measurement this rests on: what each change
-  bought, what failed, and the constraints future work must respect. The July-27 cost
-  estimate is a working note derived from it.
-- [`inference_gpu_saturation_profile_2026_07.md`](inference_gpu_saturation_profile_2026_07.md)
-  — where the throughput figures and the tensor-utilisation reading come from.
-- [`campaign-cluster-sizing.md`](campaign-cluster-sizing.md) — the coverage census, the
-  cluster partitioning, and the wall-clock arithmetic for the GPU side.
-- `config/inference.py` on `feature/v2-large-model` — the two `ModelArch` definitions §6
-  compares.
+- [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md) — the authoritative record of
+  every ingest measurement this rests on: what each change bought, what failed, the fleet-scale
+  throughput investigation behind §4, and the constraints future work must respect.
+- [`../inference/inference-on-gpus.md`](../inference/inference-on-gpus.md) — where the throughput
+  figures, the tensor-utilisation reading and the per-cell campaign measurements come from.
+- [`campaign-plan.md`](campaign-plan.md) — what runs, with what settings. This document owns the
+  numbers in it; that one owns the operations.
 - `scripts/census_s1_coverage.py` — the radar census behind §6. Re-run it to refresh the
   observation counts, or to check whether OPERA coverage has expanded again. Unauthenticated;
   a few minutes per year queried.
+- `scripts/cluster_work_spread.py` — the cluster split of §5b, re-derived from the current mask.

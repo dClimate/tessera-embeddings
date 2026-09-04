@@ -124,7 +124,7 @@ def zone_live_tile_count(
 
 
 #: Observations per pixel-year by 20-degree latitude band — the campaign census, from
-#: `context_docs/design/campaign-cost-model.md`. Radar is a CMR granule census of OPERA RTC-S1
+#: `context_docs/campaign/campaign-cost-model.md`. Radar is a CMR granule census of OPERA RTC-S1
 #: normalised by cos(lat); optical is a Sentinel-2 STAC census of distinct acquisition dates
 #: weighted by mean clear fraction. The value is `S2 + S1`, the token count per pixel, taken to
 #: be proportional to inference cost.

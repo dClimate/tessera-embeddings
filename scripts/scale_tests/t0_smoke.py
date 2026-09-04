@@ -1,4 +1,4 @@
-"""T0 — smoke + cross-group conflict probe (test plan §4 T0).
+"""T0 — smoke + cross-group conflict probe (T0).
 
 Cheap, first, and load-bearing: if concurrent commits to *different* groups do
 not auto-rebase cleanly (the cross-group conflict-freedom inference), the

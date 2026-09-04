@@ -155,7 +155,7 @@ PROVIDERS: dict[str, STACProvider] = {
         # so do not reason from the average. Lowering further is deliberately NOT the answer: it
         # taxes every query in every year for six months of a ten-year archive, and
         # `ingest/stac.py` already re-asks a refused page at half the size. Measurements:
-        # context_docs/design/ingest_optimization_campaign_2026_07.md §7c.
+        # context_docs/ingest/ingest-performance.md §7c.
         max_page_size=100,
         refuses_oversized_pages=True,
         # Public and unauthenticated — we send no credential — so a 403 here cannot be about who

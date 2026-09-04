@@ -1,4 +1,4 @@
-"""T7 — fresh-bucket PUT ramp (test plan §4 T7, optional).
+"""T7 — fresh-bucket PUT ramp (T7, optional).
 
 Deliberately provokes S3 ``503 SlowDown`` on a cold bucket to calibrate the
 campaign warm-up and confirm/adjust ``TARGET_AGGREGATE_S3_CONCURRENCY``. Raw

@@ -35,7 +35,7 @@ is measured, not modelled: the per-cell radar-telemetry measurements are first-c
 below, and the combined-token rate and the GPU-hour interval are derived from them live
 rather than quoted. :func:`test_cost_report` prints the line and its interval. The
 measurement history behind the tables is in `campaign-cost-model.md` §6b-6c and
-`campaign_inference_profile_2026_08.md`.
+`context_docs/inference/inference-on-gpus.md` §6.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ PX_PER_TILE = 2048 * 2048
 
 # --- ingest duration ---------------------------------------------------------------------
 # Both fits are from the CANONICAL ingest record,
-# `ingest_optimization_campaign_2026_07.md`.
+# `context_docs/ingest/ingest-performance.md`.
 #
 # DENSITY — five regions, k=1 (one commit per date), each arm launched together so time-of-day
 # and catalogue conditions cancel:
@@ -80,7 +80,7 @@ PX_PER_TILE = 2048 * 2048
 #   6-tile island costs about an hour, not minutes. No floor needs inventing.
 # * Area does NOT determine duration tightly. 35N and 47N differ by 3 chunks in 2,418 and by
 #   27% in per-date time, and per-zone residuals run to +-35%. This is the same limitation
-#   `campaign-cluster-sizing.md` records as "the balance is spatial, not temporal". Treat every
+#   `context_docs/campaign/campaign-cost-model.md` §5b records as "the balance is spatial, not temporal". Treat every
 #   per-zone duration here as +-35%, and the conclusions as ones that survive that.
 DENSITY_FIXED_S = 10.16
 DENSITY_PER_CHUNK_S = 0.06022
@@ -124,7 +124,7 @@ def ingest_hours(tiles: int, workers: int = SHIPPED_WORKERS) -> float:
 # --- inference cost basis ------------------------------------------------------------------
 # The measured figures in this section come from CloudWatch `CHUNK_SUMMARY` radar telemetry
 # (`t_s1_asc`/`t_s1_desc`); the query window, corpus size and derivation are in
-# `campaign_inference_profile_2026_08.md`, the resulting cost basis in
+# `context_docs/inference/inference-on-gpus.md` §6, the resulting cost basis in
 # `campaign-cost-model.md` §5-6. Latitudes are derived from tile rows via the campaign land
 # mask, never guessed from a zone's name — a UTM zone is a longitude band and its live tiles
 # can span most latitudes.

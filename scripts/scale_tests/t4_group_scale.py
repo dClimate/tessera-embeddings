@@ -1,4 +1,4 @@
-"""T4 — 120-group repo metadata scale (test plan §4 T4, ADR D5).
+"""T4 — 120-group repo metadata scale (T4; settles ADR-008 D5).
 
 Feeds the snapshot/open-time arm of the one-repo go/no-go: seed groups
 incrementally and watch (a) snapshot-file growth and constant-write commit cost

@@ -1,7 +1,7 @@
 """Collate scale-test metrics into a decision-oriented markdown report.
 
-Reads every ``*.jsonl`` under ``<results>/<run-id>/`` and renders the test-plan
-§5 decision matrix — one section per ADR-008 decision — plus per-test metric
+Reads every ``*.jsonl`` under ``<results>/<run-id>/`` and renders the
+decision matrix — one section per ADR-008 decision — plus per-test metric
 tables. Missing tests render as "no data (not run)" rather than failing, so a
 partial run still produces a useful report.
 
@@ -126,7 +126,7 @@ def _decision_matrix(rows: list[dict]) -> list[str]:
 
     # D3 — sharding: prefer the T8 settlement (write ratio, wire bytes, scattered
     # p95) and apply the decision rule; fall back to the T1 sweep if T8 absent.
-    out.append(f"| D3 sharding | T8 write/wire/scattered (else T1) | {_d3_summary(rows)} | see d3-sharding-plan |")
+    out.append(f"| D3 sharding | T8 write/wire/scattered (else T1) | {_d3_summary(rows)} | see ADR-008 D3 |")
 
     # D4 — split config (T2 year-fill trend)
     out.append(f"| D4 manifest split | T2 per-year commit trend | {_t2_trend(rows)} | rising => icechunk #1600 |")

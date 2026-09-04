@@ -1,7 +1,7 @@
 """Global OPERA RTC-S1 coverage census on an equal-area-weighted land grid.
 
 Produces the radar half of the observation-count model in
-``context_docs/design/campaign-cost-model.md`` section 6: for each point on a
+``context_docs/campaign/campaign-cost-model.md`` section 6: for each point on a
 5 deg x 10 deg grid it asks CMR how many OPERA RTC-S1 granules exist per orbit
 direction in a given year, which classifies the point as dual-orbit,
 single-orbit or uncovered and gives a granule count. Dividing the count by

@@ -20,7 +20,7 @@ committed over a competing writer in silence, where stock icechunk correctly rai
 move.
 
 Measurements and the full incident record are in
-``context_docs/design/keeping-the-assembly-session-current-2026_08.md``.
+``context_docs/storage/writing-to-the-global-store.md``.
 """
 
 from __future__ import annotations

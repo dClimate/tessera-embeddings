@@ -248,7 +248,7 @@ def icechunk_credentials_for(
     handing it to everything breaks every other access — and the task role cannot write the
     published store. Deriving the answer from where the bytes are going is what makes both work
     without any call site having to know which case it is in. Same shape as the registry mistake
-    one layer down (``context_docs/design/optical-registry-2026-08-19.md``), where an artifact took
+    one layer down (``context_docs/storage/writing-to-the-global-store.md``), where an artifact took
     its location from a default rather than the resolved target and published beside the wrong
     store; here the resolved target is the argument.
 
@@ -340,7 +340,7 @@ def _serve_icechunk_credential(
     leaves the other's failures unexplained. Records the access-key id, which is an identifier
     rather than a secret and is what CloudTrail indexes on, plus the pid and a sequence number.
     **Never the secret key or the session token.** Background:
-    ``context_docs/design/icechunk-credential-stampede-2026_08.md``.
+    ``context_docs/storage/writing-to-the-global-store.md``.
 
     Announces NOVELTY, never a transition: nothing reaching here records when a credential was
     ACQUIRED (the expiry is computed after it is frozen), so a thread descheduled past a refresh

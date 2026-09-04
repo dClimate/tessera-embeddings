@@ -56,7 +56,7 @@ dependencies = [
     # than breaking it. `tests/unit/ingest/test_loader_failure_attribution.py` drives a real `CPLError`
     # through the real map and asserts the whole line, so drift fails CI; the bound is what keeps
     # a fresh resolution from walking into it unasked. See
-    # context_docs/design/ingest_read_failure_causes_2026_08.md.
+    # context_docs/ingest/source-read-failures.md.
     "rasterio>=1.5.0,<1.6",
     "rioxarray",
     "pystac",

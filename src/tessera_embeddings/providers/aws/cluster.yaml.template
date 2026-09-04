@@ -139,7 +139,7 @@ available_node_types:
     # work than what we already run, so neither is a preferred type — but an idle fleet
     # costs infinitely more per token, which is what makes the A10G worth opening under
     # capacity pressure. The L4 ships here so the ladder can name it, and is NOT
-    # recommended. Full comparison: `context_docs/design/gpu-card-choice-2026_08.md`.
+    # recommended. Full comparison: `context_docs/inference/inference-on-gpus.md` §4.
     #
     # EVERY rung DECLARES `resources:`, including these inert ones, and it is not
     # optional. Ray's schema lists `resources` as REQUIRED; it autofills the block from

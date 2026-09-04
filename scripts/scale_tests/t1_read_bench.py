@@ -1,4 +1,4 @@
-"""T1 — retrieval benchmark across chunk/shard variants (test plan §4 T1).
+"""T1 — retrieval benchmark across chunk/shard variants (T1).
 
 Builds one ~70%-land store per variant (one timestep) and measures the read
 workloads that decide the chunk shape (ADR D2) and whether sharding earns its

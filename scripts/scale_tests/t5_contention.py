@@ -1,4 +1,4 @@
-"""T5 — commit contention across concurrent zone writers (test plan §4 T5).
+"""T5 — commit contention across concurrent zone writers (T5).
 
 Feeds the contention arm of the one-repo go/no-go (ADR D5) and commit pacing
 (D6): N processes each region-write a distinct group and commit at once

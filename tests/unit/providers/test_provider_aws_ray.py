@@ -1308,10 +1308,16 @@ class TestL4Rungs:
         0.32x an L40S against the A10G's 0.46x, and costs +65% per unit of work against
         the A10G's +42%. Nothing in the design chose that; a letter in a name did.
 
-        So `gpu-card-choice-2026_08.md` records the rule as: open the A10G rung alone.
-        This test exists so that rule is not merely written down — if a future rename
-        flipped the tie the other way, or Ray started reading a resource that separates
-        the cards, the reason for the rule would be gone and this would say so.
+        `context_docs/inference/inference-on-gpus.md` §4 recorded the rule that followed:
+        open the A10G rung alone. **That rule is superseded and this is now a record of
+        the trap, not of current policy.** Autoscaler v2 is what runs, `fleet_mix.py`
+        states the fleet's shape so both pools are asked for at once, and `GPU_RUNGS` is
+        ordered by throughput per vCPU — so the rung order is explicit and nothing ties.
+
+        The test is kept because the tie is a property of Ray's scorer, not of our
+        configuration: it would decide again the moment anything went back to relying on
+        the ranking. If a future rename flipped the tie, or Ray started reading a resource
+        that separates the cards, this would say so.
         """
         from ray.autoscaler._private.resource_demand_scheduler import get_nodes_for
 

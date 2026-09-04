@@ -5,7 +5,7 @@ Waiting is the whole remedy for a busy upstream, and refusing the cell early thr
 coverage the source would have served. An upstream that answers one particular request with an
 error every time cannot be outwaited: more patience only spends the cell's attempt budget more
 slowly while a fleet idles against it. Incidents and full derivation:
-``context_docs/design/ingest_read_failure_causes_2026_08.md`` (causes 3 and 6).
+``context_docs/ingest/source-read-failures.md`` (causes 3 and 6).
 
 **Our layer sits ABOVE a retry ladder, and only partly behind it.** ``_http.make_logging_retry``
 mounts a ``urllib3`` ``Retry`` on the catalogue session, so a page fetch failing on a status in

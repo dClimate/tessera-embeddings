@@ -313,7 +313,7 @@ pre-allocated with a 2017–2025 annual time axis and filled one
 (zone, year) at a time. The architecture is settled in
 [ADR-008](context_docs/decisions/008-global-store-architecture.md), and the
 operational plan for running the campaign is
-[`context_docs/design/campaign-plan.md`](context_docs/design/campaign-plan.md).
+[`context_docs/campaign/campaign-plan.md`](context_docs/campaign/campaign-plan.md).
 
 **What "global" means here: land between 59.45°S and 83.65°N**, which is the
 extent of the coverage registry the campaign is built from.
@@ -351,7 +351,7 @@ fourth):
    2048-px shards into a pre-allocated zone group, one fork/merge commit
    per (zone, year). Commits are ungated: they contend on the repo's single
    branch tip, but that costs seconds and never a conflict — see
-   `context_docs/design/commit-gate-removal-2026_08.md`.
+   `context_docs/storage/writing-to-the-global-store.md`.
 
 ### Anatomy of a shard: what a write emits, what a read fetches
 

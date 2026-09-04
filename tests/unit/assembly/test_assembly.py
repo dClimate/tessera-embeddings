@@ -90,7 +90,7 @@ def test_the_campaigns_own_parameters_no_longer_shrink_the_pool():
     Pinned with the campaign's real numbers rather than a synthetic pair, because
     the clamp was invisible precisely where it bound — the requested count stayed
     16 everywhere it was configured, and only the emitted `workers_used` disagreed.
-    The measured cost is in `context_docs/design/assembly-worker-clamp-2026_08.md`.
+    The measured cost is in `context_docs/storage/writing-to-the-global-store.md`.
     """
     assert _s3_budget_split(5, 16) == (16, 1)
 

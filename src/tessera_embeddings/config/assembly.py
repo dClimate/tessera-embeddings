@@ -31,7 +31,7 @@ class AssemblyConfig:
     is the worker count itself. That is deliberate — the fork pool is not sacrificed to the
     request ceiling — so ``max_workers`` is also what bounds a fill's contribution to the
     fleet's PUT rate. See ``assembly._s3_budget_split`` and
-    ``context_docs/design/assembly-worker-clamp-2026_08.md``.
+    ``context_docs/storage/writing-to-the-global-store.md``.
     """
 
     chunks_per_worker: int = 10
@@ -39,7 +39,7 @@ class AssemblyConfig:
     #: worker count did not scale with the job. 16 is what `consumer_stack.py` sized the runner for
     #: ("16 vCPU / 64 GiB leaves headroom for n_workers=16 (~19 GiB)"). Beyond 16 the box saturates
     #: and the next step is the registered 32-vCPU `assembly_large` family — with evidence, not
-    #: before. Measurements: context_docs/design/assembly-worker-clamp-2026_08.md
+    #: before. Measurements: context_docs/storage/writing-to-the-global-store.md
     max_workers: int = 16
 
     def __post_init__(self) -> None:

@@ -4,7 +4,7 @@ Both are known only on the reading process, and neither reaches the caller on it
 never put in the exception, the other does not survive serialisation out of the worker. Both
 rescues have to be running BEFORE the read fails, on every worker, so both are installed by
 :func:`install_capture_everywhere`: one call per ingest, and where a third such rescue would go.
-Background: ``context_docs/design/ingest_read_failure_causes_2026_08.md``.
+Background: ``context_docs/ingest/source-read-failures.md``.
 
 Naming the object
 -----------------
@@ -248,7 +248,7 @@ def hear_gdal_from_every_thread() -> None:
     cannot see them — the message was never a log record. A refusal stated only there is invisible
     to the capture and its read is judged on its exception alone, which is how a transient refusal
     comes to be given up as unreadable. See
-    ``context_docs/design/ingest_read_failure_causes_2026_08.md``.
+    ``context_docs/ingest/source-read-failures.md``.
 
     **Chained, not replaced.** The handler already installed is called first, so GDAL's stderr
     line still appears where an operator greps for it and ``CE_Fatal`` still aborts through it.

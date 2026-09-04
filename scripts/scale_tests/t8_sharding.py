@@ -1,4 +1,4 @@
-"""T8 — settle D3: shard or not shard (see design/d3-sharding-plan.md).
+"""T8 — settle D3: shard or not shard (settled as ADR-008 D3).
 
 Run 1's T1 sweep showed sharded reads tie/beat unsharded and cut object count
 ~64x, at a 2.8x write cost — but that cost came from unaligned (chunk-by-chunk)

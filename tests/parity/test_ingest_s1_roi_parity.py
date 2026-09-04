@@ -23,7 +23,7 @@ concerns specific to OPERA:
    ~116 MB cassette (COG bodies + auth redirects) that trips the
    credential-safety guard and is too large to commit. Tracked in
    https://github.com/dClimate/tessera-embeddings/issues/45 — see
-   context_docs/decisions/007-native-cmr-granule-query.md.
+   context_docs/decisions/009-native-cmr-granule-query.md.
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ def _bearer_session_factory(token: str) -> requests.Session:
         "no longer matches on replay. Re-recording trips the credential-safety "
         "guard (~116 MB). Tracked in "
         "https://github.com/dClimate/tessera-embeddings/issues/45 — see "
-        "context_docs/decisions/007-native-cmr-granule-query.md."
+        "context_docs/decisions/009-native-cmr-granule-query.md."
     ),
     strict=False,
     raises=Exception,

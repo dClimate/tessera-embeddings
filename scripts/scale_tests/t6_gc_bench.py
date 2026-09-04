@@ -1,4 +1,4 @@
-"""T6 — GC, expiration, rollback (test plan §4 T6, ADR D7).
+"""T6 — GC, expiration, rollback (T6; settles ADR-008 D7).
 
 Builds a realistic mess (multi-commit history + superseded chunks from an
 overwrite), then exercises the snapshot-hygiene runbook: tag -> expire -> GC

@@ -1,7 +1,7 @@
 """Store-layout variants under test — the single source of truth for T1/T2/T3.
 
 Variant names are stable join keys in the metrics, so this registry is exactly
-the five entries from test-plan §3; extend it rather than forking per-test
+the five entries the read benchmark was specified over; extend it rather than forking per-test
 layouts. Each variant fixes only the chunk/shard geometry; dtype, serializer,
 fill, and dim order are constant across variants (below) because those are
 decided (ADR D2) and not what the variants probe.

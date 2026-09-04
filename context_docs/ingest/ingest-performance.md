@@ -1,31 +1,35 @@
-# Ingest optimization campaign — July 2026
+# Ingest: what it costs, what made it faster, and what limits it now
 
-> **Superseded in part.** Throughput at fleet scale was re-measured on 2026-08-04 and every
-> zone ran 1.8-2.1x slower than the figures here at the same zone and the same width. The
-> width conclusions below still hold (6x workers buys 3.7-4.9x, confirmed by same-zone
-> pairs); the DURATION basis does not. See
-> `ingest_concurrency_investigation_2026_08.md` before quoting any per-date or per-zone
-> duration from this document.
+**The authoritative record of the campaign-ingest optimization work** — what was changed, how much
+each change bought, what was tried and abandoned, and the constraints future work must respect. The
+empirical basis for why the ingest path looks the way it does.
 
-Authoritative record of the campaign-ingest optimization work: what was changed, how much
-each change bought, what was tried and abandoned, and the constraints future work must
-respect. The empirical basis for why the ingest path looks the way it does.
+Four measurement campaigns are folded together here. The July 2026 optimization work is the spine
+(§1–§10); the fleet-scale throughput investigation that corrected its duration basis is §11; the
+graph and catalogue budgets that limit it now are §12; the live-tile cropping derivation that §3.1
+and §3.2 summarise is §13; and the region-write primitive the whole windowed design rests on is §14.
 
-Companion to `inference_gpu_saturation_profile_2026_07.md`, which is the same kind of record
-for the GPU side. Read that one before touching anything the fill reads — several decisions
-here were made *because* of what it measured.
+> **The duration basis was re-measured, and the correction matters more than it looks.** A 2026-08
+> reading found every zone running 1.8–2.1× slower than the figures here. **That claim is
+> withdrawn** — it compared summer dates against a January baseline, and matched on all three
+> conditions the gap is 1.17× (§11). What survives is that a zone-year is not twelve Januaries: a
+> seasonally weighted year lands materially above the January-rate basis, so **treat every per-date
+> and per-zone duration below as a January figure** and read §11 before quoting one. The width
+> conclusions are unaffected — 6× workers buys 3.7–4.9×, confirmed by same-zone pairs.
 
-Related notes: `ingest-live-tile-cropping.md` (why ingest crops at all, and how windows are
-derived), `ingest-graph-and-stac-budget.md` (the living working notes this summarises),
-`region-writes.md`, ADR-011 (campaign zone ingestion).
+Companion to [`../inference/inference-on-gpus.md`](../inference/inference-on-gpus.md), which is the
+same kind of record for the GPU side. Read that one before touching anything the fill reads —
+several decisions here were made *because* of what it measured. Source-read *failures*, as opposed
+to source-read cost, are [`source-read-failures.md`](source-read-failures.md). See also
+[ADR-011](../decisions/011-campaign-zone-ingestion.md) on campaign zone ingestion.
 
 Unless a figure says otherwise, every wall-clock number here is the **same cell** — zone `35N`,
 January 2024, on a 120-worker Dask-on-Fargate fleet against one frozen ROI mask — so the rows
 compare directly. §10 records the finer measurement caveats and how to keep this document.
 
-**Start with §1.** It is the whole story at a level you can act on. Detail deepens as the
-document goes: §2 gives the cost model, §3 and §4 are the per-change archive, and §8 holds the
-numbers of record.
+**Start with §1.** It is the whole story at a level you can act on. Detail deepens as the document
+goes: §2 gives the cost model, §3 and §4 are the per-change archive, §8 holds the numbers of record,
+and §11–§14 are the four detailed investigations.
 
 ---
 
@@ -176,7 +180,7 @@ Ingest computed the full declared zone grid regardless of land content. On the f
 campaign cell, zone `03S` (4 live tiles of 14,355) built a **119,002-task graph and spilled
 ~1 TB** of worker memory before being cancelled. Measured across all 112 land zones, **~78% of
 campaign ingest compute was ocean**. Cropping restricts loads and writes to chunk-aligned
-windows intersecting the ROI mask. Details in `ingest-live-tile-cropping.md`.
+windows intersecting the ROI mask. Full derivation and the per-strategy measurement: §13.
 
 Two follow-ups were needed before cropping actually paid:
 
@@ -203,7 +207,8 @@ a serial stall rather than distributed work.
 tasks in flight (6% → 85% of slots); mean graph size 482 → 13,400.
 
 This also explained, from the other direction, an earlier fleet-scaling result that showed only
-**35% efficiency**: adding workers could never help while the fleet was idle between windows.
+**35% efficiency**: adding workers could never help while the fleet was idle between windows. The
+grouping algorithm, the cap sweep behind it and the per-zone effect are in §13.
 
 ### 3.3 The masking collapse — 1.28× graph, free
 
@@ -234,7 +239,7 @@ direction.
 > (Iowa, 126 store chunks → ~27 load blocks → ~297-wide graphs against 480 slots) the write ran
 > **~5× slower than its own work content**, measured against a main-code control doing 1.6× the
 > executed work in half the wall clock. The dispatch saving that justified 8192 was real but is
-> a *fleet-width-independent* floor (`~44 × blocks / R`), and at the campaign's chosen 40–60w
+> a *fleet-width-independent* floor (`~44 × blocks / R`, §12), and at the campaign's chosen 40–60w
 > cells it roughly coincides with the fleet-work line — §3.8's config table shows the two walls
 > meeting at ~185 s at 120w, which was misread at the time as "8192 costs nothing". Densest-zone
 > cells at wide fleets are the one regime that genuinely benefited; date batching (planned)
@@ -586,18 +591,20 @@ tried. Sweep before generalising, or scope the setting to where it was measured.
 ### 4.1-4.8 What was tried and rejected — the table, so none of it is retried
 
 Eight approaches measured and turned down. Each had its working; what a future reader needs is the
-verdict and the reason, because the cost of losing these is someone re-running them.
+verdict and the reason, because the cost of losing these is someone re-running them. **The rows keep
+their numbers** — they had one section each before this was condensed, and §4.4, §4.6, §4.7 and §4.8
+are cited by number elsewhere in this document.
 
 | approach | verdict | why |
 |---|---|---|
-| **coarsen the STORE chunk to 8192** | rejected | the GPU side vetoes it: inference reads whole chunks, so a coarser store chunk multiplies read volume for every consumer. Measured, not argued |
-| **cost-model window grouping** | rejected | over-merged into the scheduler; the optimiser traded real area for a boundary cost that had already stopped existing (§3.17) |
-| **spatial manifest sharding** | rejected | a **30–50% regression** — the axis matters more than the size, and time is the right axis |
-| **double load blocks again, 8192 → 16384** | not worth it | measured **1.35×**, against a prediction of 2–3×, at 537 MB per band-block |
-| **several rejected without testing** | defensible | each contradicted a measured constraint already in hand; the section records which, so "untested" is not read as "unconsidered" |
-| **remove the realignment** | reverted | projected 3.85× and ~5% materialised, because the census modelled the write layer instead of measuring it — and the memory claim came from the first twelve heartbeats of a run that later spilled |
-| **narrow window geometry further** | rejected | three variants, all worse. The best any rectangle strategy achieves is 0.50× current area; the shipped one already achieves 0.75× |
-| **worker memory back to 16 GiB** | ADOPTED, then WITHDRAWN (§8) | rejected while the driver held unpruned catalogue items, and it looked affordable once §3.13's pruning landed — but the peak it was sized against came from dates carrying half the windows of a 2019 optical date, and those denser dates paused workers at this size. Now **24576 MiB** |
+| **4.1** coarsen the STORE chunk to 8192 | rejected | the GPU side vetoes it: inference reads whole chunks, so a coarser store chunk multiplies read volume for every consumer. Measured, not argued |
+| **4.2** cost-model window grouping | rejected | over-merged into the scheduler; the optimiser traded real area for a boundary cost that had already stopped existing (§3.17) |
+| **4.3** spatial manifest sharding | rejected | a **30–50% regression** — the axis matters more than the size, and time is the right axis |
+| **4.4** double load blocks again, 8192 → 16384 | not worth it | measured **1.35×**, against a prediction of 2–3×, at 537 MB per band-block |
+| **4.5** several rejected without testing | defensible | each contradicted a measured constraint already in hand; the section records which, so "untested" is not read as "unconsidered" |
+| **4.6** remove the realignment | reverted | projected 3.85× and ~5% materialised, because the census modelled the write layer instead of measuring it — and the memory claim came from the first twelve heartbeats of a run that later spilled |
+| **4.7** narrow window geometry further | rejected | three variants, all worse. The best any rectangle strategy achieves is 0.50× current area; the shipped one already achieves 0.75× |
+| **4.8** worker memory back to 16 GiB | ADOPTED, then WITHDRAWN (§8) | rejected while the driver held unpruned catalogue items, and it looked affordable once §3.13's pruning landed — but the peak it was sized against came from dates carrying half the windows of a 2019 optical date, and those denser dates paused workers at this size. Now **24576 MiB** |
 
 **The transferable one is the realignment revert**: a projection built by modelling a layer rather
 than measuring it, and a memory figure taken from the opening minutes of a run that later spilled.
@@ -701,7 +708,7 @@ remedies. It now emits per-date `write` and window `mode`, and per-batch `query`
 
 The radar path renewed its read credential against the wrong clock, so a long leg expired mid-run.
 Fixed; the mechanism and the guard are cause 1 of
-[`ingest_read_failure_causes_2026_08.md`](ingest_read_failure_causes_2026_08.md), which is where that
+[`source-read-failures.md`](source-read-failures.md), which is where that
 class of failure is documented rather than duplicated here.
 
 ### 4.11-4.12 Three definitions of "a day", and they blocked four zones outright
@@ -740,7 +747,7 @@ about the run. **Before this, the two were indistinguishable and the gate treate
 The cropping shipped behind `crop_to_live_windows`, defaulting OFF, so the smallest land zone in the
 scheme still built a full-extent graph and died. **The flag is gone** — removed once no scenario
 wanted cropping disabled — and the validation that depended on it went with it, its precondition now
-holding by construction (`ingest-live-tile-cropping.md`).
+holding by construction (`ingest-performance.md`).
 
 The lesson is about defaults rather than about this flag: a correctness-preserving optimisation
 shipped OFF is a change nobody is running, and the first real cell is where you discover that.
@@ -882,7 +889,7 @@ Genuinely open:
 - **Does the scheduler's auxiliary-thread behaviour change at 250+ workers?**
 
 Questions needing more workers than the quota allows are tracked as S-1..S-6 in the downstream
-repo's `docs/global-tessera-test-plan.md`.
+repo's `yield-embeddings/docs/global-tessera-test-plan.md`.
 
 ## 7b. STAC query streaming — shipped and validated
 
@@ -1551,7 +1558,7 @@ defect fix.
 | tasks per (block × band) / per output block | ~4 / ~44 | measured census; culled-graph predictions within 0.5% of observed |
 | gate graph | 4,834 tasks (3,876 scl + 956 open-scl, one per item) | measured census |
 | `R`, scheduler dispatch rate | ~600–800 tasks/s | derived across three window configurations |
-| `F`, per-window blocking cost | 7.04 s | fitted by differencing two runs (constants cancel) |
+| `F`, per-window blocking cost | 7.04 s | fitted by differencing two runs (constants cancel). **Do not use the linear model it belongs to** — `cost = n_windows x F + area x V` failed its first out-of-sample test and is superseded by §12's dispatch-floor model. `F` survives inside that model as the per-window floor, binding only when a window is small |
 | scheduler envelope | one core of 4 saturated, never >100%; RSS peak 1.79 / 8 GiB | 114 heartbeats |
 | per-date client graph build | 7.2 s (3.47 gate + 3.74 bands), one now removed | measured |
 | STAC query | 5.58 ms/item; 164 s/month; ~34 min/year; 368,248 items/year | measured, linear 3→14 days |
@@ -1630,7 +1637,7 @@ All installed as console scripts; do not rebuild these.
   saturation (SMACT/TENSO) and the per-chunk phase-split table from the actors'
   `CHUNK_SUMMARY` lines.
 - `te-compare-outputs` — the numerical parity gate for any change that could alter values.
-- Per-run provenance belongs in `context_docs/design/inference-perf-run-ledger.md`.
+- Per-run provenance belongs in `context_docs/inference/inference-on-gpus.md`.
 
 The scheduler heartbeat self-reports every 30 s: CPU, RSS, memory percentage, queue lag, worker
 and task counts, tasks processing, and fleet memory including spill and the hottest worker.
@@ -1677,3 +1684,766 @@ path a future reader would otherwise re-walk. The same goes for withdrawn claims
 that a plausible idea already measured and killed is not revived a third time.
 
 **New measurements belong in §8**, one row each, with what they supersede named in the row.
+
+---
+
+## 11. Throughput at fleet scale — what we know, and what we still need
+
+**Status: resolved as posed.** The headline finding — a 1.8–2.1× slowdown against the July record —
+**was an artefact of comparing summer dates against a January baseline, and is withdrawn.** Matched
+on zone, width AND dates the gap is 1.12–1.17×. A paired A/B then measured the contention term at
+**zero** (the quiet arm came out 3.3% dearer per window, not cheaper), so none of that residual is
+load at the width tested.
+
+**What is left.** Contention at 45–61 concurrent cells is unmeasured — the A/B ran at about a sixth
+of campaign width — but the ladder that would measure it is on hold by decision (2026-08-05) and
+blocked on the quota raise regardless. The live item is the campaign's duration basis, which needs
+re-fitting on a **seasonally weighted** year rather than a January rate. That is the one correction
+here which genuinely raises the ingest line.
+
+> **Condensed from 431 lines.** The stage plan, the per-arm run narrative, the decision not to run a
+> third arm, and this investigation's own list of self-corrections were the working of a question now
+> answered; they are in git history. What is kept is what would otherwise be re-derived: the causes
+> ruled out, the effects established, and the two methodological traps that produced the withdrawn
+> claim.
+
+### 11.1 What is ruled out
+
+Six candidate explanations, each with the evidence that closed it. **None of these should be
+re-investigated without new evidence** — that is the point of recording them.
+
+| candidate | why it is out |
+|---|---|
+| **Width stops working at scale** | 6× workers buys 3.7–4.9×, against an Amdahl bound of 4.4–4.6× from the serial fraction at 10w. Width works about as well as arithmetic allows. The 2.7–4.0× that suggested otherwise was a **zone-mix artefact** — it compared different zones, and the two 10-worker zones were the two cheapest-per-chunk in the wave |
+| **The orchestrator** | Direct refutation: over the window where per-date cost rose 32%, orchestrator CPU fell 13%→5.6%, requests 12.4→4.1/s, latency 146→39 ms, zero dropped events. Corroborated by the server gaining 8× capacity between waves while the *later* wave was slower |
+| **The Dask schedulers** | CPU 10–40%, event-loop lag 0.0–0.03 s, graphs oversubscribing their fleets rather than starving them. Well under the ~250-worker threshold in `yield-embeddings/docs/dask-scheduler-plan.md` |
+| **Capacity, quota, launch rate** | 20 live fleets, 519 workers, 2,236 vCPU of 10,000, and `no-worker=0` on every fleet — no task anywhere waiting for a worker, at 22% of quota |
+| **Commit serialisation** | Commits are ~1 s; the per-date cadence leaves only 5–8 s unaccounted after build + gate + write + stall |
+| **Store growth under accumulating dates** | Per-date cost rose 36% through 53N's run, but **write cost per window is flat at 16.4–18.3 s** across all four quartiles and build per window flat at ~1.2 s. Cost rose because windows per date rose 45% (7.3 → 10.6). Manifest sharding is doing its job |
+
+> **A trap worth keeping.** ECS `describe-clusters` reported **763 pending against 67 running**
+> during this investigation, which reads as catastrophic launch starvation. It is an artefact:
+> cluster statistics are eventually-consistent and the account carried **204 registered ephemeral
+> worker families** from a day of fleet churn. 760 genuinely pending tasks cannot coexist with seven
+> fleets sitting at 56–60 workers and committing dates. **Use the schedulers' own `workers=` and
+> `no-worker=` fields; they are ground truth for width.**
+
+### 11.2 What is established
+
+- **A per-date serial floor of 19–24% at 60 workers** (7–8% at 10w). Bounds the width benefit, and is
+  worth more than per-zone width tuning: the unhidden preparation stall alone is 20–45 s median on
+  writes of 160–300 s that ought to hide it.
+- **Adaptive churn cost ~10–12% of effective width.** `adapt(minimum=1)` retired workers in every
+  inter-date gap and relaunched them cold; one 60-slot fleet registered 1,250 distinct workers in
+  5 h. **Fixed** — `min_workers` now follows each leg's derived width.
+- **Per-date cost grows within a run, for a benign reason.** Later dates image more of a zone's land:
+  northern-hemisphere January is snow- and cloud-limited, by May footprints are wider.
+  **Consequence: every velocity figure measured early in a run UNDERSTATES the full-year cost.**
+- **Width is nearly cost-neutral.** vCPU-seconds per date at 60w vs 10w averages ~1.1× over six
+  same-zone pairs. Sixty workers costs about what ten does per date and finishes 4–5× sooner, so
+  re-scaling `max_workers` is not where money is saved.
+- **The per-tile cost gap is intrinsic, not width waste.** 53N costs ~$0.14/tile-year against 12N's
+  ~$0.09, and that is 53N doing **1.38× the per-tile work** (9.7 against 7.0 worker-seconds per
+  chunk-date, fewer tiles amortising the same per-date floor) — not an oversized fleet. 53N at 60
+  workers is still ~80% write-bound, so it *can* use the fleet; narrowing sparse zones would recover
+  single-digit percent of campaign ingest compute.
+
+### 11.3 The withdrawn claim, and the mechanism behind it
+
+**The claim:** every zone runs 1.8–2.1× slower than the July record at the same zone and width.
+**It compared summer dates against a January baseline.**
+
+| | zone | width | dates | windows/date | s/date |
+|---|---|---|---|---:|---:|
+| July record §3.10/§3.16 | 35N | 60w | **January 2024** | — | **167.9 / 175.6** |
+| the withdrawn figure | 35N | 60w | **May–Sep 2021** (n=128) | 18.0 | **330.7** |
+| matched re-measurement | 35N | 60w | **January 2024** (n=27) | 15.0 | **196.3** |
+
+Matched on all three conditions the gap is **1.17×** — and the matched arm carried 17 concurrent
+fleets while the July figure did not, so 1.17× is an upper bound on contention *plus* drift, not a
+floor.
+
+The mechanism is §11.2's within-run effect applied across seasons: 18.0 windows/date against 15.0 is
+1.20× more work, and summer windows are individually dearer (write per window 16.7 s against 11.0 s).
+Together those carry the 1.68× ratio with no appeal to a regression.
+
+**This document's own reading instructions state the condition that was violated** — *"unless a
+figure says otherwise, every timing is zone 35N, January 2024."* The claim honoured zone and width
+and silently violated the third, which is the one that moves cost most.
+
+### 11.4 What this changes: the duration basis, not the code
+
+**The code has not regressed**, and the six ruled-out causes stay ruled out. But the July fit
+(5.95 h/zone-year at 60w) is built from January-conditions measurements, and a zone-year is not
+twelve Januaries. 35N at 60 workers, six of twelve months measured:
+
+| month | windows/date | s/date | write/window |
+|---|---:|---:|---:|
+| Jan (2024) | 15.0 | **196.3** | 11.04 |
+| Feb (2024) | 16.0 | **218.4** | 10.21 |
+| Mar–Apr | — | ~250–290 *(interpolated)* | — |
+| May (2021) | 18.0 | **330.5** | — |
+| Jun (2021) | 18.0 | **381.6** | 18.71 |
+| Jul (2021) | 18.0 | **317.6** | 16.11 |
+| Aug (2021) | 18.0 | **309.6** | 14.15 |
+| Sep (2021) | 18.0 | **320.6** | — |
+| Oct–Dec | — | ~210–290 **(extrapolated, no data)** | — |
+
+Two things a single multiplier hides. **Windows per date saturates at 18.0 by May and stays there** —
+it plateaus once the zone is fully imaged rather than following a smooth sinusoid. And the summer
+premium is mostly *not* window count: 1.20× on count against 1.68× on cost, the rest being that a
+window with less cloud and snow carries more valid pixels.
+
+Averaging gives **~280 s/date against the fit's 167.9, i.e. ~1.67×**. A quarter of that year is
+extrapolated, so **treat the band and not the point.** The fix is a seasonal weighting of the basis,
+not a hunt for a performance defect. Pin it with per-date covered chunks or one completed full-year
+60-worker cell; the seven complete 2021 zone-years cannot serve, because they ran at 10 workers.
+
+**The practical difference from the withdrawn claim is large: seasonality is predictable and
+schedulable, so peak months can be planned around instead of hunted as a defect.**
+
+### 11.5 The one concurrency signal left, and why it is weak
+
+Two observations point in opposite directions: across waves, more cells looked slower; within a run,
+fewer cells looked slower. The within-run one is largely the seasonal effect confounded with elapsed
+time — the run progressed as the wave emptied — so **it is not a concurrency signal at all.** That
+leaves the across-wave observation, and it is weak: three of its six zones showed no degradation, and
+its two waves differ in server size, time of day and date range as well as cell count.
+
+Four candidates remain and the data cannot separate them: source-read contention above ~20 cells
+(July measured only to 20 and left large-count elasticity explicitly unmeasured); time-of-day load on
+the public archive; the 2021 catalogue versus the 2024 dates every July figure used; and post-July
+configuration drift — 35N now writes 18 windows/date against 13 in §3.15, which by the
+windows-per-date arithmetic alone accounts for ~1.4× of the gap.
+
+**Contention at campaign width was then measured directly, and is ABSENT** (55-cell rung on prod,
+2026-08-06). 55 concurrent cells — 20,316 vCPU, i.e. actual campaign scale — paired against the same
+zone and month at ~3,200 vCPU came out at **10.4 s/window against 13.1**. The claim this supports is
+**no contention penalty at 55 cells**, NOT a 21% improvement: the two arms sit in different accounts
+and per-window cost is not perfectly stable, so the sign of the residual is not interpretable — only
+the absence of a penalty is. Everything around the cells held too: the orchestrator sat at 25% CPU
+with zero dropped events; ECS placement was exact (5,086 tasks against ~5,115 implied); achieved
+fleet widths held throughout; and `no-worker=0` on all 40 schedulers, every pass. **Nothing of ours
+throttled**: every 503 in the window was upstream.
+
+### 11.6 Two methodological rules this investigation earned
+
+**Match on every condition that moves the number, and list them before comparing.** Three claims here
+were withdrawn for the same reason: a real measurement compared against another real measurement
+whose conditions differed in a dimension nobody had enumerated. Zone and width were checked; season
+was not. §10's reading-instructions block names zone, width and dates as the three that must match —
+consulting it would have caught the season error in one minute.
+
+**Verify achieved width from the scheduler, not from the parameters requested.** The quiet arm of the
+A/B ran on a different account — the loaded account could not host a quiet arm — so account, VPC, ECS
+cluster, Prefect server and S3 bucket were all unmatched, and only a *small* difference would have
+been interpretable. What made it interpretable at all was reading achieved width off the scheduler
+health lines: median 57, max 60 workers with `no-worker=0` on all 48 samples, against 28
+loaded-account fleets of which 14 sat at max 60. **Nominal width is a request, not a fact** — fleets
+hold only 85–90% of nominal.
+
+---
+
+## 12. The graph budget and the serial phase — what limits ingest now
+
+**Living reference.** Append findings with dates; correct superseded numbers in place and note the
+correction.
+
+**Why it needs a record:** graph task count has been the recurring failure mode of every iteration of
+this stack, campaign and single-ROI alike. Each time it has been rediscovered from scratch. The point
+of this section is that the next person inherits the budget rather than re-deriving it.
+
+### 12.1 The budget equation
+
+```
+graph_tasks_per_date  ≈  4  ×  n_bands (11)  ×  area_in_chunks    ≈  44 × area_in_chunks
+```
+
+**Measured, not estimated.** One date's real graph was built for a zone geobox and classified by
+task-key prefix. The submitted (culled) graph is ~4 tasks per (chunk × band): the `odc.stac.load`
+fetch/mosaic, the ROI-mask `where`, a `getitem`, and the store write. Predictions match observed
+cluster graphs almost exactly:
+
+| window area | predicted (4 × 11 × area) | observed live graph |
+|---|---|---|
+| 972 chunks | 42,768 | 42,588 |
+| 1,904 chunks | 83,776 | 84,054 |
+
+**`odc.stac.load` emits ONE `open-<band>` task per source item, not per (item, chunk).** For a solar
+day over a 6° zone that is ~956 open tasks against ~84,000 total — the per-chunk path is already lean
+and there is no elementwise fat to fuse away. An earlier hypothesis that per-(chunk, item) overlap
+tasks dominated was **wrong**; recorded here so it is not re-proposed. The coverage gate's SCL-only
+graph is 4,834 tasks (3,876 `scl` + 956 `open-scl`). Cheap.
+
+**The levers are therefore the multiplicands**, and only one has real room:
+
+| lever | effect | cost |
+|---|---|---|
+| `area_in_chunks` via chunk size | ÷4 for 4096 → 8192 | store-side change reaches inference (§12.4) |
+| the constant 4 → 3 (fold the mask into the load) | ~25% | second order |
+| `n_bands` = 11 | fixed — contractual | — |
+| window strategy | already at the frontier | spend nothing more |
+
+### 12.2 The cost model: a dispatch floor, not a linear sum
+
+A linear fit `cost = n_windows × F + area × V` (F = 7.04 s/window, V = 0.0346 s/chunk) was fitted
+from two runs and **failed its first out-of-sample test**: it predicted 122 s/date at 3 windows and
+the run measured 193.9 s. **This supersedes it, and supersedes the same fit wherever else it appears
+in this document:**
+
+```
+per_date  ≈  C  +  Σ_windows  max( F , tasks_w / R )
+```
+
+- **R ≈ 600–800 tasks/s** — the single-threaded scheduler's dispatch rate.
+- **F ≈ 7.04 s** — per-window blocking cost; binds only when a window is small enough that
+  `tasks_w / R < F`.
+- **C ≈ 15–20 s** — per-date constant on the ingest worker (client graph build + gate + commit).
+
+Reconciliation against all three configurations of the same zone-month at 120 workers:
+
+| windows | area | per-window tasks | regime | predicted | measured |
+|---|---|---|---|---|---|
+| 197 | 2,428 | ~540 | latency (F binds) | ~1,407 s | 1,329–1,471 s |
+| 15 | 2,563 | ~7.5k | dispatch | ~180 s | 194–242 s |
+| 3 | 2,924 | 0.7k/43k/84k | dispatch | ~199 s | 193.9 s |
+
+**The 15↔3-window plateau is the dispatch floor.** `V` was never fleet work — it was dispatch. About
+86% of a dense date is scheduler dispatch, ~4% is the single-threaded client build, and the fleet's
+real fetch/resample/write work hides under both. The fleet-bound floor is still unknown and only
+becomes visible once tasks shrink.
+
+**Consequence:** two single threads (scheduler dispatch, the ingest worker) serialise ≥95% of a run,
+so **widening one cell with more workers buys ≤1.1×**. Scaling comes from running more cells
+concurrently — each cell has its own scheduler — not from wider cells.
+
+### 12.3 Scheduler telemetry
+
+114 heartbeats at 120 workers, 60 with a live graph: CPU 19–100%, **twelve samples at exactly 100 and
+none above**. Ten threads, but never more than one core — the Dask event loop is single-threaded and
+GIL-bound. RSS peak 1.79 GiB of an 8 GiB limit (22%), having grown from 0.33 GiB within one month.
+`lag` ≤ 0.3 s throughout; worker spill 0 GiB; hottest worker 6.6 GiB of 16.
+
+**Raising the scheduler's 4 vCPU cannot lift the ceiling.** Signs that WOULD justify a bigger box, so
+this is not re-debated: any sustained sample above ~110% CPU (auxiliary threads genuinely using cores
+— plausible at much larger fleets, unobserved at 120); RSS above ~50% of the limit or climbing across
+a cell; `lag` rising while CPU is below 100% (contention, not compute — profile instead of resizing).
+Memory is cheap insurance against a scheduler OOM killing a multi-hour cell; vCPU is not indicated.
+
+### 12.4 Chunk size: measured variants, and why the store chunk cannot be coarsened
+
+Task census over a FIXED pixel window (12 × 4 chunks at 4096, one date, 11 bands), graph construction
+only, counting optimised graphs plus one write task per (store chunk, band):
+
+| variant | read+mask tasks | write tasks | total | vs today | reaches inference? |
+|---|---|---|---|---|---|
+| load 4096 / store 4096 (today) | 2,673 | 528 | 3,201 | — | — |
+| load 8192 / store 4096 | 1,749 | 528 | 2,277 | **1.41×** | **no** |
+| load 8192 / store 8192 | 693 | 132 | 825 | **3.88×** | yes |
+
+**Writes are emitted per STORE chunk, not per dask block** — the write count is unchanged at 528
+across the first two variants. So coarsening only the load blocks buys 1.41×, and the full 4× requires
+coarsening the store. A hypothesis that load-only coarsening might capture the whole win is therefore
+**disproved**. Alignment is fine either way: `SHARD_PX` = 2048 divides 8192 exactly.
+
+**Enlarging the store chunk would shrink the ingest graph, and the inference side vetoes it:**
+inference reads whole chunks, so a coarser store chunk multiplies read volume for every consumer of
+the store. That was measured rather than argued, and the measurement is what closed it. What shipped
+instead was load blocks decoupled from store chunks — and that was itself later removed, for the
+reason in §3.5.
+
+**Baseline discipline for any inference-touching change:** GPU utilisation, VRAM peak, host RAM
+against its ceiling, and GPU-idle per chunk, all captured before the change. A graph win that costs
+read amplification is not a win, and only a paired baseline shows it.
+
+### 12.5 The ingest worker's serial phase
+
+**The STAC query runs once per run**, not per date, before any date is processed.
+
+| quantity | value |
+|---|---|
+| rate | 5.58 ms/item; ~1.34 s per 250-item page |
+| one month, one 6° zone | 164 s, 31,507 items, ~1,006 items/solar-day |
+| linearity | confirmed 3 → 7 → 14 days |
+| one calendar year, extrapolated | **368,248 items, 1,473 pages, ~34 min** |
+| resident memory | **~80 KB per retained item** (from 484 / 809 / 1,382 MiB at 2.9k / 6.8k / 14.1k items) |
+| a year, extrapolated | **~27–30 GB** |
+
+**A year-long query as written exhausts its host before the first date processes.** This is a
+feasibility blocker, not a speed problem, and it needs a longer *window* to observe — not a bigger
+fleet. **Page size is capped at 250**: measured, `limit=500` and `limit=1000` both fail against
+earth-search with repeated server errors while 250 succeeds. There is no free win there. (The
+campaign runs at 100 for a different reason — see §7c.)
+
+**Streaming, and why prefetch depth 1 is enough.** Stream month by month, prefetching month *m+1*'s
+query on a thread while the cluster processes month *m*. That bounds retained items to one or two
+months (~2.5–5 GB) and gives clean resume. Depth 1 suffices, and deeper prefetch is waste: a month's
+*processing* is ~31 dates × ~194 s ≈ 100 min, while a month's *query* is 164 s — under 3% of it. Only
+the FIRST month's query is exposed, and the lever for that is concurrent sub-range queries (weekly
+threads → ~45 s), not more buffering. Shipped and validated; see §7b.
+
+> **CORRECTION (2026-07-25): the memory that matters is a DASK WORKER's, not the flow runner's.**
+> The whole ingest body — query, retained items, grouping, and the per-date loop — runs inside ONE
+> Prefect task on a single Dask worker (verified: the "Cropping writes to N live window(s)" line
+> appears in a `dask/dask-worker/...` log stream; corroborated by the orphaned fleet committing a
+> further date seven minutes after the flow runner was killed). Workers are **4 vCPU / 16 GiB**. So a
+> year-long query exhausts a WORKER, and Dask's response is to kill and restart it, which re-runs the
+> task — a bounded retry loop rather than a clean failure. Raising flow-runner memory is irrelevant;
+> raising worker memory multiplies across 120 workers. Streaming is close to the only fix.
+
+**Per-date client-side cost.** Two `odc.stac.load` graph builds per date — 3.47 s for the gate's
+SCL-only load and 3.74 s for the bands — ≈ **7.2 s per date**, single-threaded on the ingest worker
+while all 480 fleet task slots idle. Over ~250 kept dates that is ~30 min per zone-year. **The gate
+load is now fused into the band load** (§3.4), removing one of the two. What remains is fixable by
+pipelining one date's graph build against the previous date's cluster work.
+
+### 12.6 Results of record (2026-07-25 session)
+
+Same zone (35N), month (January 2024), fleet (120 workers) and mask throughout, so the rows are
+comparable. Per-date figures are means over the dates the run completed.
+
+| configuration | windows | per-date | scheduler cpu mean/max | graph mean/max | hottest worker |
+|---|---|---|---|---|---|
+| row bands | 197 | 1471, 1329 s | — | 482 / 1,048 | — |
+| grouped, greedy | 15 | 225 s (n=8) | 66% / 93% | 17,380 / 22,836 | 5.6 GiB |
+| grouped, cost-model DP | 3 | 194 → 269 s, degrading | 65% / **100% pinned** | 50,875 / 84,054 | 7.2 GiB |
+| **load blocks 8192, store 4096** | **7** | **187.9 s (n=12)** | **27% / 40%** | **5,069 / 6,020** | 8.0–10.3 GiB |
+
+**Per-date variance is 19% (SD 36 s on n=12).** Detecting a 10% change needs ~14 dates per arm, so
+**verify further graph work by TASK COUNT, not wall clock** — the count is deterministic and readable
+from a single date's graph. Collapsing the two masking passes into one, counted on a real window's
+optimised graph, gives 99.9 → **77.9** tasks per load block: **1.28× fewer graph tasks**, matching
+the predicted ~25%. That is the pattern to follow for the remaining shaves.
+
+Two claims made during that session and then withdrawn, recorded so they are not revived:
+
+- *"1.41× from the load-block change"* — that was one cherry-picked date. On matched means it is
+  **1.23×** (187.9 against the greedy configuration's 225 s).
+- *"Per-date cost drifts upward within a run"* — visible in the first six dates (180.2 → 195.5) but
+  **not established over twelve**: the later half contains a single 289 s outlier and two of the
+  fastest dates in the run. (§11 later established the real mechanism, which is windows per date
+  rising rather than a drift in per-window cost.)
+
+### 12.7 Manifest sharding: the axis matters more than the size
+
+Same zone, month and fleet; two dates each, so directly comparable.
+
+| configuration | date 1 | date 2 | manifest objects | manifest bytes |
+|---|---|---|---|---|
+| no split | 179.5 s | 147.8 s | — | ~3.3 MB (fitted) |
+| `{northing:4, easting:4, time:8}` | **245.8 s** | **281.3 s** | **10,195** | 3.85 MB |
+| `{time: 8}` | 179.8 s | 146.8 s | **161** | 1.99 MB |
+
+The spatial split cost **30–50% wall clock** — not from bytes but from object count: ~5,097 manifest
+objects rewritten per commit against ~14, and the PUT latency dominates. Time-only restores no-split
+speed while already writing fewer manifest bytes, and it grows LINEARLY with dates where unsharded
+grows as N²/2.
+
+**The rule, generalised:** split the axis along which a single commit is NARROW. Campaign ingest
+commits one date across every live window, so it is narrow in time and wide in space — the exact
+inverse of the region-write merge workload the module default was written for. Both regimes are
+documented at `storage/zarr_store.py`'s split constants.
+
+### 12.8 Task-count levers: what is left, and what is ruled out
+
+Current: **4 tasks per (chunk × band)**, ~44 per output chunk, 77.9 per load block.
+
+| lever | expected | LOC | effort | status |
+|---|---|---|---|---|
+| Load blocks 8192 → 16384 | area in blocks ÷ 4, so **~2–3×** on load-side terms | ~5 | 30 min | **next** — memory per task ×4 (134 → 536 MB per band); raising worker memory is sanctioned if the gain is real |
+| Drop `align_chunks`, rely on windows already landing on load blocks | ~1 of 4 per chunk-band (**~25%**) | ~20 | 2–3 h | **after** — measure, do not assume: dropping it was 11% SLOWER when blocks and chunks matched |
+| Coarsen `INGEST_CHUNKS["time"]` beyond 1 | none per date; fewer commits | ~10 | — | **REJECTED** — breaks the property that a date's time slot lands atomically with its pixels, which is what makes a crashed ingest safely retryable |
+| Fold the ROI mask inside `odc.stac.load` | ~1 more per chunk-band | 80+ | 1–2 d | **REJECTED** — no clean hook; high risk for a second-order gain |
+
+On worker memory for the 16384 experiment: the hottest worker already reached 10.3 GiB of 16 at 8192
+blocks, so 16384 is expected to press it. Raising the worker size is an accepted trade if the
+task-count gain is real, but the gain must be demonstrated by task count first, and spill must be
+zero.
+
+### 12.9 The optical query bbox asks for far more ground than the zone occupies — NOT yet fixed
+
+The Sentinel-2 query area is `roi.bbox_wgs84`, the axis-aligned WGS84 envelope of a UTM zone raster. A
+UTM zone is 6° of longitude, but meridians converge, so the envelope of a zone running from the
+equator to ~84°N is **54.4° wide**. Most of what that box returns is discarded: measured on one
+January window, the as-run 34.6° × 80.2° envelope walked 95 pages for 9,383 items, of which **81% lay
+outside the zone's own longitude band**.
+
+**The safe fix is latitude banding**, one box per band asking for the longitude the zone actually
+occupies at that latitude. A fixed 6° box is NOT valid — the zone's raster genuinely widens toward the
+pole, which is what inflates the envelope in the first place, so a fixed box silently drops polar
+land.
+
+Measured offline on the real zone specs, via `zone_grid.tile_range_bbox_wgs84`, as the ratio of the
+single envelope's area to the summed area of N banded boxes:
+
+| bands | 33N / 47N / 23N / 01N | 33S |
+|---|---|---|
+| 2 | 1.74× | 1.63× |
+| 4 | 2.63× | 2.25× |
+| 8 | **3.38×** | 2.68× |
+| 16 | 3.81× | 2.90× |
+| 32 | 3.91× | 2.94× |
+
+It saturates by 16, so **8 bands captures most of the available saving** and is the sensible default.
+This is a ground-area ratio, not an item-count claim: item density is not uniform, and the 2.5× page
+saving measured on one January window had two polar bands empty from polar night — a summer window
+would put data in those wide bands and save less.
+
+**Safety verified, offline, at 8 bands on zones 33N, 01N, 33S, 47N.** 175,600 sampled points per zone
+across the projected rectangle, with band seams and their immediate neighbourhoods sampled explicitly:
+the count uncovered by the banded union equals the count uncovered by today's single envelope exactly
+(12, 12, 20, 12 — the documented ~9.8 m densification residue at the top edge). **Banding therefore
+introduces no additional loss.** Every band box is a subset of the envelope, no band is degenerate,
+and the antimeridian zones are fine.
+
+**The query layer needs almost nothing.** `stac._query_stac_items` already seeds a LIST of root boxes
+and already dedupes by `item.id` across every root and node, first-occurrence-wins in tree order — put
+there precisely because the antimeridian halves return overlapping items. Latitude bands overlap only
+at their shared seam, which that dedupe absorbs for free.
+
+**What blocks it is provenance, not plumbing.** The bands must come from the LIVE TILE range, the same
+range that produced `bbox_wgs84`. `roi.geobox` cannot supply it: `land_mask.export_zone_roi` writes the
+ROI at the **whole zone**'s shape, ocean left as fill, and crops only the `bbox_wgs84` attr. Banding a
+geobox-derived rectangle would ask for a LARGER latitude range than today, i.e. a regression. So it
+needs an ROI schema addition (`bbox_wgs84_bands` written beside `bbox_wgs84`, read with a fallback so
+existing ROIs keep working), its validator, and the boxes threaded from the three `s2_roi.py` call
+sites. Note also that `_roi_is_current` short-circuits the export when the coverage sha is unchanged,
+so **already-exported ROIs would not gain the attr** without forcing a re-export.
+
+Deliberately left out of the 403/stagger/polarisation change: it is efficiency rather than
+survivability, it changes which items a query returns, and it touches an on-disk schema.
+
+### 12.10 Open questions
+
+Non-issue, recorded so it is not re-raised: **ingest-side commit contention across concurrent cells**,
+because each `(zone, year)` writes its own repo under `…/mosaics/{zone}/{year}/`. The shared-repo
+concern belongs to the global embeddings store —
+[`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md).
+
+1. **Does the 8192 store change hold the GPU duty cycle?** The decisive question for the 3.88× lever,
+   and it is a duty-cycle question rather than a memory one (§12.4). Needs an end-to-end small-zone run
+   measured against the 15S baseline: duty cycle 79.8%, infer-phase GPU utilisation 99%, load-phase
+   host RAM 35%.
+2. **Does the 1.41× load-only variant behave as the census predicts on a real run?** Task counts are a
+   graph-construction prediction; confirm live. It cannot touch inference by construction.
+3. **What is the fleet-bound floor?** Invisible while dispatch dominates; appears once tasks shrink.
+4. **Commit time growth with manifest size** — the last unmeasured per-date term.
+5. **Is `F` fleet-invariant?** Determines whether a cap tuned at 120 workers transfers.
+6. **Do the scheduler's auxiliary threads use extra cores at larger fleets?** Re-check the "one core"
+   finding before resizing at scale.
+
+---
+
+## 13. Cropping ingest to live tiles — the full derivation
+
+**Status: shipped, unconditional, and no longer behind a flag** (amended 2026-07-29). It was
+`IngestSettings.crop_to_live_windows`, defaulting off; the flag was removed outright once no scenario
+wanted cropping disabled, and the one validation that depended on it (`batch_dates > 1 requires
+crop_to_live_windows`) went with it, its precondition now holding by construction. Anywhere below that
+names the flag is describing how a measurement was taken rather than a switch that still exists.
+
+### 13.1 The problem
+
+Campaign ingest mosaics a zone's **entire grid** regardless of how much of it is land, so its cost
+scales with EXTENT, not content. The STAC *search* is already narrowed — `export_zone_roi` writes a
+WGS84 bbox tight to the live tiles — but the raster computation is not: the ROI mask is deliberately
+written on the fixed full zone grid, so `roi.geobox` is full-extent and both sensor paths hand that
+straight to `odc.stac.load`.
+
+Observed on the first real campaign cell (zone `03S`, 2024), chosen as the cheapest possible
+end-to-end test because it is the smallest land zone in the scheme — 4 live 2048-px tiles:
+
+| | |
+| --- | --- |
+| Dask tasks in one graph | 119,002 |
+| Worker memory | 517 GiB resident + 468 GiB spilled |
+| Worker churn | 62 registered / 44 removed |
+| Scheduler | healthy throughout (0.94 GiB RSS, 0.0 s loop lag, no backlog) |
+
+Spill drove memory pressure, workers were killed, completed tasks were lost and recomputed, and the
+run would likely never have finished. **The scheduler was never implicated; the graph was.**
+
+`03S` is 890,880 × 67,584 px, which at `INGEST_CHUNK_SIZE = 4096` is 218 × 17 = **3,706 chunks per
+band, per date** — the exact per-band counts the dashboard showed. One uint16 chunk at 4096² is 34 MB,
+so a single band-date materializes ~124 GB. **Empty ocean chunks still allocate and still run a task.**
+
+### 13.2 The measurement that chose the strategy
+
+A one-off script coarsened each zone's frozen `tile_live_2048` bitmap ([ADR-010](../decisions/010-landmask-registry-coverage.md))
+onto the 4096-px ingest grid and costed three cropping strategies against the full-extent baseline,
+reading a few KB per zone from the coverage repo — no cluster, no mosaic, no writes. It was **deleted
+once the strategy was chosen** (`scripts/measure_live_chunk_cropping.py`, removed 2026-08-11): it
+exists to pick between the three rows below, and the mask it reads is frozen for the campaign's
+duration. Recover it from history if a future delivery changes the coverage enough to reopen the
+choice.
+
+All 112 land zones, chunks computed per band-date:
+
+| strategy | chunks | vs today |
+| --- | --- | --- |
+| today (full extent) | 425,272 | — |
+| `bbox` — one window enclosing all live chunks | 230,686 | 1.8× |
+| `rows` — one window per chunk-row, spanning that row's live columns | 99,847 | **4.3×** |
+| `exact` — the live chunks themselves (the floor) | 97,597 | 4.4× |
+
+Two results decide the design.
+
+**A single bounding box is not enough.** It gives only 1.8× campaign-wide. It is spectacular where
+land is clustered (`03S`: 3,706 → 4) and worthless where a zone holds scattered islands across a long
+north-south extent (`31S`: 3,706 → 1,152 by bbox, → 3 by rows) or where land is dense (`35N`: 3,876 →
+3,723, a 4% saving).
+
+**Row-bands capture essentially the whole win.** They land within 1.0% of the exact floor at the
+median and 2.3% campaign-wide. A full rectangle decomposition is therefore not worth building: it
+would recover ~2% for materially more complexity. Window counts stay modest — a median of 74 per zone
+and a maximum of 220 — which matters because each window is one load and one write.
+
+### 13.3 The design
+
+**The mosaic's declared grid stays full-extent.** The zone fill validates the mosaic against the exact
+`ZoneSpec` grid and that check is load-bearing. Zarr and Icechunk are sparse, so the grid can stay full
+while only live windows are computed and written; unwritten chunks read back as fill. Zarr 3 elides
+all-fill chunks on write by default, so this costs no storage either.
+
+1. Derive live windows from the ROI mask, coarsened to the ingest chunk grid.
+2. On the first passing date, seed the mosaic full-extent and all-fill with that date's slot
+   (`create_empty_store` is schema-only — zero chunks, no graph — so creation cost is independent of
+   spatial extent).
+3. Per passing date, ONE session: extend the time axis by that date, then `to_icechunk(mode="r+",
+   region=...)` each live window, then commit — one commit per date. Explicitly NOT per-window
+   `zarr_store.write_region` (which commits per call), and NOT a full-extent all-fill append through
+   dask (that rebuilds a ~44K-task graph of zero-work per date — extend the axis as metadata, not as
+   data).
+
+**Dates stay discovery-as-you-go**: the time axis only ever contains dates that passed the coverage
+filter and were written. That single property is what keeps today's semantics intact for every reader
+that treats the time axis as the record of what was ingested (`get_existing_dates` dedupe,
+`check_time_window_coverage`, the empty-timestep prunes) — a pre-seeded daily axis would have broken
+all three, which is why the bookkeeping `write_dataset` and its two callers owned mostly **dissolved
+rather than moved**.
+
+**Windows are snapped to the 4096 chunk grid deliberately.** That makes them chunk-disjoint, which
+removes the shared-boundary-chunk reconciliation the region-merge tier has to handle, and it is what
+makes the single-session write safe: two writes into the same chunk in one session are a lost update
+(§14).
+
+**Interoperability with single-ROI runs.** Windows are derived from **the ROI mask itself**, not from
+the zone coverage bitmap. `export_zone_roi` already upsamples `tile_live_2048` onto the zone grid to
+produce that mask, so reading the mask serves both callers: a campaign zone and a single-ROI run whose
+mask came from `rasterize_roi_zarr`. A sparse single ROI — scattered fields, a coastline, any footprint
+much smaller than its bounding box — gets the same reduction from the same code path, and the ingest
+flows need no knowledge of whether they are in a campaign.
+
+### 13.4 What the first cropped run found
+
+**Crop the coverage denominator too.** Cropping the computation left the coverage GATE measuring
+against the full extent, so a cropped run's coverage ratio collapsed against a denominator that no
+longer described what it was computing. Fixed by cropping the denominator with it.
+
+**The general shape is worth more than the instance**, and it recurs: an optimisation that narrows what
+is COMPUTED silently changes every ratio whose denominator was the old extent. The same error appears
+as §3.9's granularity artefact, and as the "presence counted where coverage was meant" family in the
+corrections register. **When you crop a numerator, go and find its denominators.**
+
+**The profiler was blind to spill.** The scheduler heartbeat recorded no worker-side memory at all, so
+the residual had to be diagnosed from a screenshot of the Dask dashboard. The heartbeat now carries
+fleet totals (`wmem`/`wmanaged`/`wspill`/`wmax`) summed from the per-worker state the scheduler already
+tracks, and `te-watch-scheduler` alerts on `worker-spill`. This does not demote the scheduler: it
+remains the named saturation risk at scale, and a clean fleet is the precondition for a
+high-worker-count rung to measure a scheduler envelope rather than a doomed run.
+
+**A hard-cancelled ingest leaks its Dask cluster** — 23 workers and a scheduler left running in ECS.
+The original write-up attributed this to `skip_cleanup: True`, but that flag only disables
+dask-cloudprovider's startup sweep for debris from *prior* runs, and turning it off breaks cluster
+construction outright on AWS SSO because the sweep iterates IAM roles. The actual cause is that
+`ecs_cluster` tears down in a `finally`, which a hard cancel skips, and the ingest flows register no
+cancellation hook. The GPU flows already solved this: `_ray_lifecycle.ray_cleanup_on_cancellation`,
+registered as both `on_cancellation` and `on_crashed`, re-derives the cluster name from the flow-run
+id and terminates by tag. Ingest needs that same treatment for ECS.
+
+**The 50-worker ceiling was hit for a 4-tile zone**, which is a symptom of the uncropped graph rather
+than a limit to raise. Once cropping lands, worker counts should be sized from a cell's live-chunk
+count. External services were not implicated — one store-write retry, no catalog throttling.
+
+**Consequences for the test programme.** The ingest scaling ladder cannot measure a scheduler envelope
+until it stops benchmarking ocean: as it stands the memory wall arrives long before any scheduler
+limit, so it would tune the wrong bottleneck. Fargate worker-count and quota sizing derived from
+full-extent mosaics likewise overstate what the campaign needs, by roughly the 4.3× above.
+
+### 13.5 Grouping row bands: why window COUNT was the real limit (2026-07-25)
+
+Cropping to row bands fixed the *area* problem and exposed a different one. Row bands minimise computed
+area, and **area turned out not to be what a windowed ingest is billed for.**
+
+Dense zone `35N`, January 2024, a 120-worker Fargate fleet (4 vCPU each, so 480 task slots), 197 live
+windows:
+
+| quantity | value |
+|---|---|
+| date `2024-01-01` | 1471.3 s |
+| date `2024-01-02` | 1329.2 s |
+| per window | ~7.1 s |
+| sparse-zone comparison, far smaller fleet | ~6 s per window |
+| mean tasks processing | 30.6 of 480 slots = **6%** |
+| scheduler samples with an EMPTY graph | **16 of 44 (36%)**, twice for 2 min straight |
+| worker spill | 0 GiB |
+| scheduler cpu / rss / lag | 20–50% / 0.78 GiB / ~0 s |
+
+Per-window cost is flat from a sparse zone on a small fleet to a dense zone on 120 workers. **That is
+a fixed serial cost, not distributed work** — and it is the same phenomenon the earlier fleet-scaling
+rung reported as "35% efficiency", seen from the other end. **More workers was never going to help.**
+
+The cause is structural: `write_day_windows` loops `to_icechunk` once per window, each call blocking.
+A `35N` row band is at most 17 chunks wide and only ~3 of those hold a given day's swath, so each graph
+is a few dozen tasks against 480 slots, 197 times in series.
+
+**Measured A/B outcome at 15 windows: 194.4 / 207.8 / 230.4 / 222.8 / 239.5 s for the first five dates
+against 1471.3 / 1329.2 s — a ~6.6× speedup.** Fleet occupancy went from 30.6 to ~407 tasks in flight
+(6% → 85% of slots), mean graph size from 482 to ~13,400 tasks, spill stayed at zero, hottest worker
+3.96 → 5.6 GiB of 16.
+
+That A/B pair is also what fitted `F = 7.04 s per window, V = 0.0346 s per chunk`, so one saved write is
+worth ≈200 chunks of extra computed area. **The linear model is superseded by §12.2; the RATIO it
+expresses is what the grouping algorithm still uses**, and that is the part that was ever load-bearing.
+
+### 13.6 Why the first cut was a greedy heuristic, and why it was replaced
+
+The first implementation merged greedily while the added area stayed within 25% of the row-band
+baseline. With the cost model in hand that bound is simply the wrong shape: a fixed waste *fraction*
+cannot express "extra area is nearly free", so it stopped merging on sparse zones — exactly where a tiny
+absolute area makes merging almost costless.
+
+Evaluated on all 112 real zone masks, predicted per-date cost summed:
+
+| strategy | total | vs row bands | max graph |
+|---|---|---|---|
+| row bands (one per live chunk-row) | 73,636 s | 100% | 1,650 tasks |
+| greedy, 25% waste bound, 512-chunk cap | 13,143 s | 17.8% | 5,632 tasks |
+| **cost-model DP** | **6,733 s** | **9.1%** | 21,692 tasks |
+| single bounding box per zone | 8,770 s | 11.9% | 42,636 tasks |
+
+The greedy pass left **+95%** on the table. The DP also beats the pure bounding box, because it adapts
+per zone instead of committing to one shape; the worst greedy zones were the sparse ones (`07S` +402%,
+`08S` +311%, `03N` +292%).
+
+So `merge_bands` now minimises `n_windows × WINDOW_COST_IN_CHUNKS + total_area` exactly, by dynamic
+programming over groupings of consecutive bands. O(n²) with n = a zone's live chunk-rows (≤ ~230), and
+the unit tests hold it against brute-force enumeration on small inputs.
+
+**Choosing the graph-size cap.** `MAX_CHUNKS_PER_WINDOW` exists to bound one region write's graph, not
+to bound cost. Sweeping it against the DP optimum:
+
+| area cap | max graph (tasks) | total | vs uncapped |
+|---|---|---|---|
+| none | 28,050 | 6,728 s | — |
+| 2,560 | 28,050 | 6,728 s | +0.0% |
+| **2,048** | **21,692** | **6,733 s** | **+0.07%** |
+| 1,536 | 16,874 | 6,794 s | +1.0% |
+| 1,024 | 11,264 | 6,909 s | +2.7% |
+| 512 | 5,632 | 7,463 s | +10.9% |
+
+2,048 is the pick: it costs 0.07%, and it holds every graph at or below 21,692 tasks — just under the
+22,812 a live run has actually driven with zero spill and a 5.6 GiB hottest worker. Note that even the
+512-cap DP (7,463 s) beats the greedy pass (13,143 s) by 1.76×, so **the win comes from optimising the
+right objective rather than from taking memory risk.**
+
+Per-zone effect: `03S` 4 live chunks, 2 row bands → 1 window (+0.0% area); `15S` 22 → 5 → 1 (+45.5%);
+`40S` 26 → 12 → 2 (+50.0%); `35N` 2,415 → 197 → 3 (+20.4%). Median 2 windows per zone, maximum 5.
+**Sparse zones group *harder* in relative terms** — which is the correction, not a regression: their
+added area is a large fraction of a tiny total, and a tiny total is where extra area cannot matter.
+
+**What this leaves.** The empty-graph samples did not disappear — 3 of 10 after grouping against 16 of
+44 before, a similar fraction of a much shorter date. Those gaps are the serial phase *between* dates:
+the STAC query and graph construction, single-threaded on the ingest worker while the fleet waits.
+That is §12.5, and it is a different fix from this one.
+
+---
+
+## 14. The region-write primitive and its contract
+
+The region-write primitive lets a caller write one spatial window of an existing store without
+rewriting the whole array, **which is what makes a windowed ingest possible at zone scale at all.**
+`storage/zarr_store.py` is the record of what was built and its tests pin the contract. What this
+section carries is the reasoning the code cannot: why the alignment problem is shaped the way it is,
+what the multi-write-per-commit contract actually guarantees, and why the batch path was removed.
+
+Verified against **icechunk 2.0.4 / zarr 3.2.1 / xarray 2026.4.0**.
+
+### 14.1 Why `align_chunks=True` is not enough
+
+A region that does not land on chunk boundaries forces a read-modify-write of the boundary chunks, and
+`align_chunks` handles that inside one call — but **two calls writing into the SAME chunk in one
+session are a lost update**, because each reads the chunk before the other's write is visible. That is
+why the ingest snaps its windows to the chunk grid (§13.3): chunk-disjoint windows make the problem not
+arise rather than handling it, which is also what lets N windows share one session and one commit.
+
+The reconciliation the region-merge tier has to do — overlapping windows, shared boundary chunks — is
+exactly the work this path avoids by construction. **That tier — merging many grid-aligned feature
+stores into one master — is not in this package**; a `storage/region_merge.py` was planned for it and
+never landed here, and §14.3 is what became of the batch path it would have used. What survives is
+the design consequence: the merge tier has to reconcile overlapping windows and shared boundary
+chunks, and the ingest does not, because it snapped its windows to the chunk grid.
+
+### 14.2 The multi-write-per-commit contract (verified 2026-07-24)
+
+Six tests, and what they establish is one contract the ingest still depends on:
+
+**N `to_icechunk` region writes CAN share one `writable_session` and one commit** — twenty disjoint
+chunk-aligned windows produced exactly one snapshot with no cross-window interference, ~10 ms per write
+locally with no degradation. `to_icechunk`'s internal fork/merge tolerates a session that already
+carries uncommitted changes.
+
+**A session sees its own uncommitted append**, so `mode="a"` along time followed by `mode="r+"` region
+writes into the just-appended date commits as ONE snapshot. That is what lets dates stay
+discovery-as-you-go: append the slot, write its live windows, commit once, with no pre-enumeration.
+
+**Uncommitted writes are invisible to readers on separate repo handles**, so commit atomicity holds.
+
+**The caveat that is still the contract:** every window tested was exactly chunk-aligned, so
+`align_chunks` never had to read-modify-write a boundary chunk. **Two writes straddling the SAME chunk
+in one session remain forbidden** — disjoint chunk-aligned windows is the contract, not "multiple
+writes work".
+
+Without this, the per-window loop could not use `zarr_store.write_region`, which writes **one region
+per commit**: at a median of 74 windows and ~50 dates that is ~3,700 commits per zone-year, against a
+store whose commit pressure is a governed constraint ([ADR-008](../decisions/008-global-store-architecture.md)
+D5/D6).
+
+### 14.3 The batch path was removed
+
+`write_regions` / `_write_regions` / `_aligned_region_sources`, built on `icechunk.dask.store_dask`,
+was **removed as unused**: its `O(runs × bands × spatial_chunks)` Dask task graph — built
+single-threaded on the flow runner before any compute ran — made continental merges take days. Its
+replacement is a process-parallel raw-Zarr region merge with no Dask. The single-region `write_region`
+path is current.
+
+### 14.4 Gotchas that cost real time
+
+1. **`align_chunks=True` ≠ chunk-boundary safety.** It rechunks producer-side dask blocks and avoids
+   parallel races; it does **not** pad partial boundary chunks and **rejects** unaligned regions in
+   `r+`. The read-modify-write pad in `_pad_region_to_chunks` is what makes arbitrary regions safe.
+2. **Drop coords** — region-dim coords *and* non-region-dim coords; store coords are authoritative.
+3. **Attrs are clobbered** — `to_icechunk` overwrites root attrs; snapshot and restore as
+   `_write_append` already does.
+4. **Read chunk sizes from the store**, not config — the store is authoritative and config may drift.
+5. **Overwriting committed data.** A partial overwrite of an existing region exposes *stale real data
+   mixed with new* to concurrent readers. Keep one commit per logical region; only split for memory.
+   Also: "unwritten" and "real NaN" remain indistinguishable — do not infer population from contents.
+6. **One session per region or slab**, committed per slab — bounds the changeset.
+7. **`to_icechunk` is already distributed** on a dask-backed dataset (internal fork/merge across the
+   graph). Per-region commit is the chosen strategy.
+8. **Conflict detection.** Concurrent region writes to *disjoint* chunks do not conflict; overlapping
+   chunks raise `ChunkDoubleUpdate`, resolvable via `BasicConflictSolver(on_chunk_conflict=UseOurs)`
+   plus `rebase`. Only relevant if a future flow parallelizes uncoordinated writes to one array.
+9. **No true mid-array insert is in scope** — deferred (resize + back-to-front shift + coord rewrite
+   across commits; icechunk #1873 ordering hazard).
+10. **Region slices are normalized and validated** — `_pad_region_to_chunks` resolves open bounds via
+    `slice.indices`, rejects non-unit steps and empty slices, transposes incoming data to the store's
+    dim order, and asserts each variable's shape matches the region, so a broadcastable smaller array
+    cannot silently fill the whole region.
+11. **`resolve_region` requires contiguous hits** — a coordinate range that straddles a gap on an
+    unsorted axis is rejected rather than silently widened. Forward `get_credentials` / `s3_region` so
+    the resolve and the write open the same store.
+12. **Storage hang protection.** Icechunk defaults to unbounded timeouts and a single try, so a wedged
+    socket blocks a write forever. `_default_repo_config` applies finite per-attempt timeouts and
+    backed-off retries at every repo open — region writes inherit it for free.

@@ -242,7 +242,7 @@ def _s3_budget_split(s3_concurrency: int | None, n_workers: int) -> tuple[int, i
     ``AssemblyConfig.max_workers`` times the fleet's cluster count.
 
     Measured cost of the clamp and the concurrency evidence:
-    ``context_docs/design/assembly-worker-clamp-2026_08.md``.
+    ``context_docs/storage/writing-to-the-global-store.md``.
     """
     budget = s3_concurrency if s3_concurrency is not None else TARGET_AGGREGATE_S3_CONCURRENCY
     workers = max(1, n_workers)

@@ -1,5 +1,9 @@
 # Ingest source-read failures: twelve causes, and the retry budget they share
 
+**Investigation record.** Twelve ways a source read fails during ingest, how each was identified,
+what guard each earned, and — in §13 — the patience budget the imagery read path actually has,
+which is what every one of those guards sits on top of.
+
 Investigation record. Causes 1 and 2 traced 2026-08-04/05 on `global-tessera-dev`; cause 3 absorbed
 2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20,
 cause 5 on 2026-08-21, causes 6 and 7 on 2026-08-22/23, causes 8, 9 and 10 on 2026-08-24, and causes
@@ -27,8 +31,8 @@ nothing could ever fill. A lost date is still logged per date and again in an en
 what survives a fill is the embeddings store's per-pixel observation counts and per-month coverage
 masks. `assessed_window` and `assessed_empty_dates` are unaffected.
 
-Companion to `ingest_optimization_campaign_2026_07.md` (the authoritative ingest record) and
-`ingest_concurrency_investigation_2026_08.md` (the fleet-width contention work).
+Companion to [`ingest-performance.md`](ingest-performance.md), which is the authoritative record of
+what ingest *costs* and of the fleet-width contention work. This one is about what makes it *fail*.
 
 ## Headline
 
@@ -51,7 +55,7 @@ way out of the Dask worker — so four of the causes below were diagnosed as gap
 when three of them were one architectural loss in different clothes. See "Why the reason was hard
 to read" at the end; read it before widening any predicate in `ingest/duplicates.py`.
 
-**Correction, in place.** `docs/runbooks/incident-response.md` previously attributed this error to
+**Correction, in place.** `yield-embeddings/docs/runbooks/incident-response.md` previously attributed this error to
 "a Dask worker task definition missing a `ulimit` the library needed", citing the
 `mirror-a-pinned-resource-field-for-field` episode. **That attribution was wrong for these
 failures.** A missing ulimit did cause a warp failure once, which is why the guess was available;
@@ -402,26 +406,51 @@ When it fires, the loop breaks exactly as a terminal failure does — `errors` s
 cell raises — and the ERROR line names the elapsed time, the configured budget, and the fact
 that the cell returns to the campaign work list and will RESUME from committed dates.
 
-### The default (36 h = 129,600 s), derived from measured leg durations
+### The default is 6 h — and the 36 h it replaced rested on a misreading of what this bounds
 
-Two facts pin it, both from `ingest_optimization_campaign_2026_07.md`:
+**`IngestSettings.max_leg_wall_clock_s` is `6 * 3600`.** An earlier version of this section derived
+36 h and is **withdrawn**. The arithmetic in it was fine; its first premise was wrong, and the wrong
+premise is the part worth keeping, because it is the natural thing to assume about any deadline.
 
-1. **It must comfortably exceed the longest legitimate single leg at the default width.**
-   The densest measured zone-year (35N, 2,415 live chunks) ran **175.6 s/date at ~60
-   workers** (the five-region k=1 column, §3.16), and a zone-year is **365 dates** — so the
-   S2 leg alone is **~17.8 h**. Per-zone residuals on that fit run **±35%**, and a legitimate
-   leg can additionally carry in-leg catalogue patience (364 s ladders that eventually
-   succeed), so the legitimate band edge is **roughly a day**. This fact is load-bearing for
-   the multi-leg case: if S2 succeeds slowly while an S1 orbit fails transiently, the elapsed
-   at the re-dispatch decision is S2's whole runtime — a deadline inside the legitimate band
-   would refuse that S1 orbit its *first* retry on every dense cell.
-2. **A stuck cell must release its campaign slot promptly.** No bound can release it in less
-   time than the longest legitimate leg without cutting legs that are merely slow, so the
-   best achievable is "within about a working day of outliving the legitimate band":
-   36 h ≈ the ~24 h band edge plus ~12 h.
+**The withdrawn premise: "it must comfortably exceed the longest legitimate single leg."** From that,
+the densest measured zone-year (35N, 2,415 live chunks) at **175.6 s/date on ~60 workers** across
+**365 dates** gives an optical leg of ~17.8 h, a legitimate band edge of roughly a day once ±35%
+per-zone residuals and in-leg catalogue patience are allowed for, and therefore a bound of 36 h.
 
-Re-derive the number if per-date cost or the default fleet width changes; both live in the
-ingest optimisation record.
+**Three things make that premise false, and each alone is enough.**
+
+**The deadline is checked only when deciding to START another attempt.** A running leg is never
+judged against it, so **a slow-but-succeeding leg cannot trip it however long it takes**. What the
+bound actually limits is *patience* — wall clock a leg spends not getting anywhere — and the loop's
+true worst case is the deadline plus one final attempt. The longest legitimate leg is simply not the
+quantity it has to exceed.
+
+**Firing costs latency, not work.** Icechunk commits each date's time slot atomically with its
+pixels, so a leg that gives up returns the cell to the campaign work list and the next dispatch
+**resumes from the dates already committed** (`ingest-performance.md` §4.15). A shorter bound does
+not discard a long slow leg's output; it releases the campaign slot sooner and picks the work up
+where it stopped.
+
+**A leg that is being productive earns more time anyway.** `leg_progress_extension_s` (1 h) grants
+extra wall clock each time the deadline would otherwise refuse the next attempt — but only if the
+store has GAINED DATES since the last grant, so a leg that commits nothing never leaves the 6 h.
+That is precisely the case the 36 h premise was worried about, handled by a mechanism that
+distinguishes a leg making progress from one that is stuck, which a single flat deadline cannot. The
+ceiling is `max_leg_wall_clock_s + (max_leg_attempts − 1) × 3600` = **8 h**.
+
+Two smaller errors in the same arithmetic, noted because they compound rather than cancel: it used
+**365 dates where a zone-year keeps ~250** after the coverage gate, and it used a January per-date
+figure, which §11.4 of the ingest record shows understates a full seasonally-weighted year. Those
+move the number in opposite directions and neither matters once the premise is gone.
+
+**What survives, and it is the half that still pins the number: a stuck cell must release its
+campaign slot promptly.** 6 h clears three legs of a slow dense cell plus their expansive backoff,
+while still releasing a pathological cell's slot inside a working day.
+
+**Re-derive against measured leg durations if the retry stack changes** — in particular if the
+progress extension is ever turned off (`leg_progress_extension_s = 0` restores the plain deadline
+exactly), because then the flat bound is the only thing standing between a productive-but-slow leg
+and a refusal, and the withdrawn premise becomes relevant again.
 
 ### What a legitimately slow-but-recovering source loses
 
@@ -498,7 +527,7 @@ That check is validated on **append**, not on the completion marker, so:
   `ConfigMismatchError`, which is a non-retryable leg marker; the resolution is either
   `allow_ingest_code_mismatch` on the resuming run — off by default, and it relaxes only the
   code-identity term — or a human deleting the interrupted store. See
-  `staging-identity-and-resume.md` section 5.
+  `../storage/staging-identity-and-resume.md` section 5.
 
 There is no way to add request naming to the catalogue query without this, because the query is
 inside the closure. It is the cost every ingest change pays.
@@ -515,7 +544,7 @@ succeed:
 - A neighbouring year's search over the same coverage succeeded, so the data is published and
   the fault is in serving that request.
 - This is the **second independent observation** of earth-search 502s under repeated querying;
-  the first is in `ingest_read_failure_causes_2026_08.md` ("Caveat on the sample"), where it
+  the first is in `source-read-failures.md` ("Caveat on the sample"), where it
   prevented a duplicate-item survey from converging.
 
 **What we cannot yet give them is the search body**, because the code that records it is the
@@ -1687,6 +1716,122 @@ about itself and wrong about the question. Before trusting a predicate, ask what
 evidence covers and whether that is the interval the decision is about — and if two readers of one
 failure can disagree, the narrower one is the one to widen, not the one to freeze.
 
+## 13. What patience the imagery read path actually has — and the three options odc shadows
+
+Record, 2026-08-27, from a live S3 us-west-2 degradation. **This shipped no code.** The scope is far
+smaller than the investigation first claimed, and every closure of the remaining gap was worse than
+leaving it open — both of which are the point of the record. It belongs here because every guard above
+is layered on top of a GDAL retry ladder nobody in this repository controls.
+
+### The mechanism
+
+`odc.loader.capture_rio_env()` composes its readers' GDAL environment from odc's own config object and
+the active rasterio `Env` — never from `os.environ` — and returns its three-entry
+`GDAL_CLOUD_DEFAULTS` when both are empty. odc then applies that as an **explicit** `rasterio.Env`, and
+explicit Env options beat process environment variables.
+
+```python
+GDAL_CLOUD_DEFAULTS = {
+    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    "GDAL_HTTP_MAX_RETRY": "10",
+    "GDAL_HTTP_RETRY_DELAY": "0.5",
+}
+```
+
+### Correction 1: three options are shadowed, not five
+
+**The first version of this record said five settings were "absent from the read path entirely". That
+was wrong.** GDAL falls back to `os.environ` for any option the explicit `Env` does not name, and
+`configure_gdal_environment()` puts all of them there — including on remote workers, verified by
+launching one from a deliberately emptied environment and finding a value that could only have come
+from our own setup code running there.
+
+`configure_gdal_environment()` sets **ten** GDAL options. odc names three of them, so **seven remain
+effective** and three are shadowed: `GDAL_HTTP_MAX_RETRY`, `GDAL_HTTP_RETRY_DELAY` and
+`GDAL_DISABLE_READDIR_ON_OPEN`.
+
+### Correction 2: the ladder is exponential — and odc's config is MORE patient than ours
+
+`GDAL_HTTP_RETRY_DELAY` is the BASE of a doubling ladder with no cap. Measured against a server
+refusing every request, arrival times recorded server-side:
+
+```
+0.5, 1.01, 2.07, 4.92, 10.96, 24.82, 52.36, 105.94 s
+```
+
+Total scales linearly in the base (confirmed at a ratio of 9.99 for a tenfold change). **But the
+multiplier is RANDOM between 2.0 and 2.5, not a clean doubling** — GDAL draws it per retry
+(`port/cpl_http.cpp`). The measured ratios above are 2.02, 2.05, 2.38, 2.23, 2.26, 2.11, 2.02: one
+sample of a random process, which I first read as "roughly doubles" and used as though it were the
+rule. **A single ladder is therefore a lower bound, not a typical case.**
+
+Two budgets, and they ADD rather than overlapping — sleep between attempts, and the attempts
+themselves. `GDAL_HTTP_TIMEOUT=120` is not shadowed, so a permanently hanging request costs up to
+120 s per attempt, and `n` retries means `n+1` attempts:
+
+| config | backoff sleep (×2.0 → ×2.5) | request time, worst | worst total |
+|---|---:|---:|---:|
+| **ours** — 5 retries, base 5 s | 2.6 → **5.4 min** | 12 min (6 × 120 s) | **~17 min** |
+| **odc** — 10 retries, base 0.5 s | 8.5 → **53 min** | 22 min (11 × 120 s) | **~75 min** |
+| 10 retries at base 5 s | 85 min → **8.8 h** | 22 min | **~9.2 h** |
+
+**odc's read path is still the more patient of the two** — roughly 3–4× ours depending where in the
+random range each lands — which is the point that matters, and the opposite of what I assumed before
+review. Only the base is 10× smaller; the retry COUNT is twice as large and the ladder's total is
+dominated by its last rungs. **Forcing our values onto the read path would have REDUCED patience
+there.**
+
+**And note the last row.** Raising our base to 5 s while leaving odc's count of 10 would give a worst
+case near **nine hours for one unreadable object**, not the 2.5 h an average-multiplier model
+suggests. The S2 coverage gate then wraps the read in `source_read_retrying()` —
+`SOURCE_READ_ATTEMPTS = 8` passed to `stop_after_attempt`, so eight attempts in total, seven after the
+first — while `max_leg_wall_clock_s` cannot interrupt a running leg. That is the budget every cause
+above is nested inside, and it is why cause 5's credential-refresh defect (which silently drops those
+ten GDAL retries for the rest of a task's life) mattered as much as it did.
+
+### What shipped: nothing but this record
+
+**No code change.** The gap is real — an operator's override of the three shadowed options never
+reaches the imagery path — but every way of closing it is worse than leaving it open:
+
+* **Forward options whose value differs from our default.** Breaks for the most likely override there
+  is: an operator setting `GDAL_HTTP_RETRY_DELAY=5`, our own documented default, is indistinguishable
+  from no override at all.
+* **Record provenance before `setdefault()`.** Breaks across process boundaries. A worker inherits our
+  defaults from its parent's environment, so at the moment it runs, every option is already present
+  and would read as operator-supplied — pushing our values into odc on every worker and changing the
+  read path by accident.
+* **A dedicated override interface.** Works, and is a new public knob plus its plumbing for a
+  capability nobody has needed: no incident so far, including the one that prompted this, has been
+  handled by tuning GDAL at runtime.
+
+**So there is currently NO knob that changes those three options on the imagery path.** Editing
+`os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", ...)` in `config/environment.py` changes the
+environment, which odc shadows — it affects direct rasterio use only. Anyone who needs to tune
+imagery-read patience has to build the dedicated interface first. **Reopen this if an incident is ever
+actually blocked on that**; that is the evidence it would need, and it does not exist yet.
+
+### Validation
+
+17 ingest runs against real Sentinel-2 imagery — 6 baseline, 6 branch, 5 with multiplexing off.
+
+**Every run produced identical embedding arrays and time indexes, and an identical set of committed
+dates.** Not byte-identical *stores*: each fresh store stamps `created_at` and `last_appended` via
+`utcnow_iso()`, and the runs used different builds whose manifest identities differ. Those metadata
+fields were excluded from the comparison by design; the pixel data and the date coverage were not.
+
+Branch 1.1% faster than baseline. **Slowest single chunk read on the multiplex-on arms: 6.92 s.**
+Across all 17 runs the slowest was **93.66 s**, on a multiplex-off run.
+
+`GDAL_HTTP_MULTIPLEX` was kept. The caution in our source refers to a macOS development problem, and
+the option has been active in production all along through the environment, so removing it would be a
+behaviour change rather than a rollback — and the multiplex-off arm produced that 93.66 s outlier.
+
+**That 93.66 s is a CHUNK duration, not a single request**, and one chunk read issues several COG range
+requests. `GDAL_HTTP_TIMEOUT=120` caps each individual request, so a sequence of short requests can
+produce a 93.66 s chunk with nothing approaching the cap. The validation therefore says nothing about
+timeout headroom in either direction.
+
 ## Coupling to the leg retry
 
 `orchestration/prefect/flows/ingest_zone_year.py` retries a failed leg up to
@@ -1726,9 +1871,15 @@ the arithmetic.
 **A third instance, resolved for the radar read itself:** Cause 5 above. The prescription is the
 same and was followed literally — `is_provider_refusal` classifies at the point the read fails,
 the verdict is carried into the store's own record as `scope`, and the layer holding the budget
-acts on the count rather than on the message. What is new is the direction of the verdict: the
-error the ceiling raises is left OUT of `_NON_RETRYABLE_LEG_MARKERS` on purpose, because a
-refusal clears and the retry is what recovers the dates.
+acts on the count rather than on the message.
+
+> **Corrected in place: the ceiling's error is IN `_NON_RETRYABLE_LEG_MARKERS`, not out of it.**
+> This paragraph said `TooManyGivenUpDatesError` was left out on purpose, "because a refusal clears
+> and the retry is what recovers the dates". It is listed, and the code's own comment gives the
+> opposite and correct reasoning: **a provider refusal is not a reason to give up a date**, so every
+> date the ceiling counts is one whose bytes will not read. A re-dispatch re-reads the same objects,
+> spends the per-read retry ladder on each, and holds a fleet to reach the identical answer. The
+> classification advice above is unaffected — only the disposition of this one marker was wrong.
 
 ### Some failures say enough to be judged, and those skip the retries
 

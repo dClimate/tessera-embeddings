@@ -1326,7 +1326,7 @@ def write_region(
     attrs after the write, which otherwise preserves them.
 
     Contract: every region dim must already exist in the store at the given indices. This
-    overwrites committed data — see ``context_docs/design/region-writes.md`` for the
+    overwrites committed data — see ``context_docs/ingest/ingest-performance.md`` for the
     consistency caveats when one logical region is split across multiple calls.
     """
     if not region:
@@ -1347,7 +1347,7 @@ class RegionWriteBatch:
 
     Handed out by :func:`batched_region_writes`. Direct zarr assignment on the session's
     store — no Dask, no task graph (the avoid-Dask principle in
-    ``context_docs/design/ingest-live-tile-cropping.md``): the caller computes each window to
+    ``context_docs/ingest/ingest-performance.md``): the caller computes each window to
     numpy and this places it. Windows must be mutually chunk-disjoint, which the chunk-snapped
     window derivation guarantees; two writes straddling one chunk in a session are
     unsupported.

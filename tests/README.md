@@ -127,7 +127,7 @@ See Roadmap 1.
 
 Things this suite is *designed* to have and does not yet. Each is a deliberate gap with a
 known shape, not an oversight — recorded here so they can be picked up rather than
-rediscovered. Full analysis in `context_docs/design/test-suite-streamlining-plan.md`.
+rediscovered. Full analysis in `context_docs/test-suite-streamlining.md`.
 
 ### 1. The `slow/` tier is empty, and the nightly workflow is suspended
 

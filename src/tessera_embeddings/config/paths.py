@@ -132,7 +132,7 @@ class BucketPaths(BaseModel):
         direction — production publishes through :attr:`global_store_uri` to a bucket that
         is not ours, so the registry would sit in our bucket and the store in the public
         one. One input, and it IS the store. Incident and schema:
-        context_docs/design/optical-registry-2026-08-19.md.
+        context_docs/storage/writing-to-the-global-store.md.
 
         A SIBLING of the store rather than a path inside it, because Icechunk owns every key
         under its own prefix: garbage collection enumerates that prefix and reconciles it
