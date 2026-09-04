@@ -133,7 +133,7 @@ was actually seen.
 - **The `2 *` factor in the campaign's budget divisor is left alone.** Whether the staging and
   published buckets carry independent request budgets was not established.
 - **The 800-PUT `SlowDown` figure is the repo's own code comment** and was not traced to a primary
-  record. The `t7_ramp.py` PUT-ramp harness exists in `scripts/scale_tests/` but no recorded results
+  record. The `t7_ramp.py` PUT-ramp harness exists in `scripts/scoping/scale_tests/` but no recorded results
   exist in this repository.
 
 > **Read §4 next, not in isolation.** This change tripled the fork count on every assembly, which

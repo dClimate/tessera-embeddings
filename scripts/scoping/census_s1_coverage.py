@@ -10,7 +10,7 @@ cos(lat) turns granules-per-box into observations-per-pixel.
 Ocean needs no land mask: OPERA is a land product, so a point with zero
 granules in both directions is either ocean or genuinely uncovered.
 
-    python scripts/census_s1_coverage.py 2017 2019 2022 2024 2025
+    python scripts/scoping/census_s1_coverage.py 2017 2019 2022 2024 2025
 
 Unauthenticated - CMR granule search needs no Earthdata login. Roughly 1,000
 requests per year queried; a few minutes each.

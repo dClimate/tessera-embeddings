@@ -1,11 +1,11 @@
 # Global store scale tests
 
 Standalone benchmarks (NOT pytest) that settled the PENDING decisions in
-[`context_docs/decisions/008-global-store-architecture.md`](../../context_docs/decisions/008-global-store-architecture.md).
+[`context_docs/decisions/008-global-store-architecture.md`](../../../context_docs/decisions/008-global-store-architecture.md).
 **These scripts ARE the program of record** — every D1–D9 is now FIRM in that ADR, annotated with
 the run that confirmed it, and the per-test method, thresholds and cost budgets that once stood in
 a separate plan are the code here plus git history.
-[`context_docs/storage/icechunk-api-ledger.md`](../../context_docs/storage/icechunk-api-ledger.md)
+[`context_docs/storage/icechunk-api-ledger.md`](../../../context_docs/storage/icechunk-api-ledger.md)
 is the surviving half of that plan: the verified icechunk and zarr signatures and gotchas these
 scripts were built against, not the benchmark contract.
 

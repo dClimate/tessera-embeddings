@@ -125,5 +125,4 @@ coming.
 
 ## Related
 
-- [`../test-suite-streamlining.md`](../test-suite-streamlining.md) §7 — the open list this closes
 - `tests/slow/README.md` — what the tier means now

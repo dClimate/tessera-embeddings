@@ -540,7 +540,7 @@ work.
 # The work-weighted split. Runs the campaign's own partitioner with the real `zone_work_weight`.
 # A few minutes: it reads each land zone TWICE — once for the work weight, once for the raw
 # live-tile count it compares against.
-uv run python scripts/cluster_work_spread.py --mask s3://<inputs-bucket>/masks/global.icechunk \
+uv run python scripts/scoping/cluster_work_spread.py --mask s3://<inputs-bucket>/masks/global.icechunk \
     --clusters 8 10 16
 
 # The AREA-ONLY diagnostic. Offline and deterministic — and it does NOT reproduce the figures
@@ -1045,7 +1045,7 @@ uncertainty list that carries its own retired entries is one nobody reads to the
   figures, the tensor-utilisation reading and the per-cell campaign measurements come from.
 - [`campaign-plan.md`](campaign-plan.md) — what runs, with what settings. This document owns the
   numbers in it; that one owns the operations.
-- `scripts/census_s1_coverage.py` — the radar census behind §6. Re-run it to refresh the
+- `scripts/scoping/census_s1_coverage.py` — the radar census behind §6. Re-run it to refresh the
   observation counts, or to check whether OPERA coverage has expanded again. Unauthenticated;
   a few minutes per year queried.
-- `scripts/cluster_work_spread.py` — the cluster split of §5b, re-derived from the current mask.
+- `scripts/scoping/cluster_work_spread.py` — the cluster split of §5b, re-derived from the current mask.

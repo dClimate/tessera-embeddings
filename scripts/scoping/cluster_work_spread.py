@@ -19,8 +19,8 @@ matters.
 
 Usage::
 
-    uv run python scripts/cluster_work_spread.py --mask s3://<bucket>/masks/global.icechunk
-    uv run python scripts/cluster_work_spread.py --mask s3://<bucket>/masks/global.icechunk \
+    uv run python scripts/scoping/cluster_work_spread.py --mask s3://<bucket>/masks/global.icechunk
+    uv run python scripts/scoping/cluster_work_spread.py --mask s3://<bucket>/masks/global.icechunk \
         --clusters 8 10 16
 
 Credentials come from the ambient AWS environment, so set whatever profile reaches the

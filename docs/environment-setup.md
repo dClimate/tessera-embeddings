@@ -115,7 +115,7 @@ Use WSL2. We don't ship Windows-native wheels.
 ## Verifying the install
 
 ```bash
-uv run python scripts/check_env.py
+uv run python scripts/diagnostic/check_env.py
 ```
 
 Prints:

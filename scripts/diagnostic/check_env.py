@@ -1,7 +1,7 @@
 """Print the installed torch variant and CUDA availability.
 
 Useful for diagnosing which lock file the current environment was built from.
-Run via: ``uv run python scripts/check_env.py``
+Run via: ``uv run python scripts/diagnostic/check_env.py``
 """
 
 from __future__ import annotations

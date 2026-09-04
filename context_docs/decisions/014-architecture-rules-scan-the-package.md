@@ -16,7 +16,7 @@ Seven rules are enforced: `solar-offset-applied-only-in-solar-days`,
 `no-botocore-outside-aws-provider`, and `no-profiling-imports-outside-profiling`.
 
 **`scripts/` is not scanned.** That is 28 files and 4,895 lines, of which
-`scripts/scale_tests/` is roughly two thirds. Downstream, the same shape is far more
+`scripts/scoping/scale_tests/` is roughly two thirds. Downstream, the same shape is far more
 pronounced: `yield-embeddings` scans `src/yield_embeddings/` (12,458 lines) while its
 `scripts/` holds **16,984 lines** — 36% larger than the tree the rules cover — plus 6,033
 lines of CDK infrastructure. Sixteen files there import `prefect` or `boto3` from paths

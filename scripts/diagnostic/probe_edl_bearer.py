@@ -3,7 +3,7 @@
 
 Run from the repo root::
 
-    EARTHDATA_TOKEN=<token> uv run python scripts/probe_edl_bearer.py
+    EARTHDATA_TOKEN=<token> uv run python scripts/diagnostic/probe_edl_bearer.py
 
 Prints the final HTTP status code and the full redirect chain. Used
 to debug ``tests/parity/test_ingest_s1_roi_parity.py`` failures where

@@ -1005,7 +1005,7 @@ tokens/px, range 66–147** (cost model §6b).
 `zone_work_weight` weights live tiles by their latitude band's observation count, and by the number
 of years a zone carries. At the campaign's **10 clusters** the resulting spread in true work is
 **0.009%** (heaviest cluster over lightest), where balancing on tile counts alone would give
-**21.8%**. Re-derive it with `scripts/cluster_work_spread.py`, which reads the current mask and runs
+**21.8%**. Re-derive it with `scripts/scoping/cluster_work_spread.py`, which reads the current mask and runs
 the campaign's own partitioner; rerun it if the mask is ever rebuilt. Both halves are load-bearing: cost
 scales with area × observations, and a batch spanning years (which is the campaign setting) would
 otherwise leave one cluster draining the extra years while the rest sit idle. A zone with no years
@@ -1057,7 +1057,7 @@ do not cite each other. **Read it before publishing a figure or reusing one.**
 - [`../decisions/013-optional-s1-s2-only-pixels.md`](../decisions/013-optional-s1-s2-only-pixels.md)
   — what the `allow_s2_only` flag does, the neutral-input convention, and the scientific
   validation it left open. **The flag is on for this campaign** (§3).
-- `scripts/cluster_work_spread.py` — **the only thing that re-derives §10's cluster-balance
+- `scripts/scoping/cluster_work_spread.py` — **the only thing that re-derives §10's cluster-balance
   figures**: it reads the current mask and runs the campaign's partitioner with the real
   `zone_work_weight`. Rerun it if the mask is rebuilt.
 - `tests/unit/orchestration/flows/test_cluster_balance.py` — a related but DIFFERENT diagnostic. It

@@ -13,8 +13,12 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+# Root-anchored: an unanchored `build/` matches a directory of that name at ANY depth, and
+# `scripts/build/` is real source. These patterns are for artifacts at the repo root, so the
+# leading slash is load-bearing — the same applies to `lib/`, `var/` and `parts/` below if a
+# source directory ever takes one of those names.
 .Python
-build/
+/build/
 develop-eggs/
 dist/
 downloads/

@@ -22,8 +22,8 @@ rather than a regular lattice: binning keeps small islands, which a subsample
 drops. 1 deg is about the scale an MGRS tile spans and therefore about the scale
 on which acquisition dates are actually constant.
 
-    python scripts/census_s2_coverage.py grid   --registry s3://.../registry.txt
-    python scripts/census_s2_coverage.py census --workers 40 --rate 9
+    python scripts/scoping/census_s2_coverage.py grid   --registry s3://.../registry.txt
+    python scripts/scoping/census_s2_coverage.py census --workers 40 --rate 9
 
 Unauthenticated - earth-search needs no credentials. About 19,000 requests, ~35
 minutes at the default rate. RATE IS LOAD-BEARING: earth-search answers a burst
