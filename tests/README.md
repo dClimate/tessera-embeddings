@@ -239,6 +239,6 @@ are recorded here rather than left reading as open work:
   test reached `ray.kill` on its teardown path, which is wrapped in Ray's auto-init hook, so it
   **booted a real local Ray cluster** every run — the third occurrence of a hazard this repo
   documents. And the documentation-index guard walked the whole working tree (2,975 markdown files,
-  of which 66 are the repository's) and took 10.3 s. **That guard is now deleted**, not optimised:
+  of which 67 are the repository's) and took 10.3 s. **That guard is now deleted**, not optimised:
   the documentation tree is not a subject for this suite, and `context_docs/README.md` keeps its
   layout block current by hand. Both in `context_docs/test-suite-streamlining.md` §6.

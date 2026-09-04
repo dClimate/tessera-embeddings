@@ -257,8 +257,8 @@ Two things about it are worth keeping, because both are general.
 **It was the slowest test in the suite, at 10.3 s — a third of the whole run** — and for a reason
 that had nothing to do with what it asserted. It excused an index row whose file exists elsewhere in
 the repo, implemented as `REPO.rglob("*.md")`, which walks **2,975 markdown files** on a checkout
-carrying git worktrees. Sixty-six of those are the repository's; the rest are `.venv` and
-`.claude/worktrees/`.
+carrying git worktrees. **Sixty-seven** of those are the repository's (`git ls-files '*.md' | wc -l`
+— it was 66 before this round added ADR 023); the rest are `.venv` and `.claude/worktrees/`.
 
 **And it was wrong, in the direction that made it useless.** Because a file deleted on this branch
 was still on disk under a worktree, the excuse fired for it — nine stale index rows stayed green
