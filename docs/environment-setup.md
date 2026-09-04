@@ -38,11 +38,17 @@ CUDA wheels on a laptop.
 
 For GPU production, install torch with the CUDA wheel explicitly first,
 then install the package. `--extra-index-url` alone is not sufficient
-because PyPI's CPU wheel stays in the candidate pool and can win:
+because PyPI's CPU wheel stays in the candidate pool and can win.
+
+> **Corrected 2026-09-03: this said `cu121`, and `torch==2.6.0+cu121` does not exist.** Verified
+> against the indexes: 2.6.0 publishes `cu118`, `cu124` and `cu126`, not `cu121`, so the command
+> below failed to resolve. **Check the index before pinning a CUDA build** —
+> `https://download.pytorch.org/whl/<cuXXX>/torch/` lists what is actually there — and pick the one
+> your driver supports; `cu118` is the other published option for this version.
 
 ```bash
 # 1. Install CUDA torch from the pytorch index
-pip install "torch==2.6.0+cu121" --index-url https://download.pytorch.org/whl/cu121
+pip install "torch==2.6.0+cu124" --index-url https://download.pytorch.org/whl/cu124
 
 # 2. Install the package — pip sees torch already satisfied, keeps the CUDA wheel
 pip install "tessera_embeddings[inference]"
@@ -55,10 +61,10 @@ your deployment repo:
 uv pip compile pyproject.toml \
     --extra inference --extra prefect --extra aws \
     --python-platform linux --python-version 3.12 \
-    --extra-index-url https://download.pytorch.org/whl/cu121 \
+    --extra-index-url https://download.pytorch.org/whl/cu124 \
     --index-strategy unsafe-best-match \
     --no-sources \
-    -o constraints-cu121.txt
+    -o constraints-cu124.txt
 ```
 
 That file belongs in your deployment repo alongside your Dockerfiles, not
@@ -74,7 +80,7 @@ Untested. CPU is the supported laptop path.
 
 The blessed deployment platform. For GPU production, follow the explicit
 two-step install in the [CUDA section above](#cuda): install
-`torch==...+cu121` with `--index-url` first, then install the package.
+`torch==...+cu124` with `--index-url` first, then install the package.
 
 ### macOS arm64 (Apple Silicon)
 

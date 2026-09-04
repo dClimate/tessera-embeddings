@@ -82,8 +82,8 @@ pip install tessera_embeddings[inference]
 # Full production stack — inference + Prefect orchestration + AWS:
 pip install tessera_embeddings[inference,prefect,aws]
 
-# GPU (CUDA 12.1) — install torch first so pip keeps the CUDA wheel:
-pip install "torch==2.6.0+cu121" --index-url https://download.pytorch.org/whl/cu121
+# GPU (CUDA 12.4) — install torch first so pip keeps the CUDA wheel:
+pip install "torch==2.6.0+cu124" --index-url https://download.pytorch.org/whl/cu124
 pip install "tessera_embeddings[inference]"
 ```
 
@@ -105,6 +105,9 @@ installs and platform guidance.
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
 uv sync --all-extras   # resolves uv.lock; all extras + dev tools
+source .venv/bin/activate   # REQUIRED — and use plain `python`, never `uv run python`:
+                            # uv run spawns a subprocess that kills Ray's GCS on macOS.
+                            # docs/quickstart.md has the detail.
 
 # End-to-end pipeline on the bundled Denver, CO quickstart ROI.
 # Ingest → cloud mask → CPU inference → assemble. ~3-4 minutes on a laptop,

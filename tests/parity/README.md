@@ -6,6 +6,18 @@ orchestrator-decoupling story:
 > For every flow, the Prefect-orchestrated path and the plain runner
 > path produce **identical outputs** for the same inputs.
 
+**Read "every flow" literally: this tier compares one stage at a time.** Each test pairs a single
+Prefect flow against the domain function beneath it. Nothing here runs the two paths over the whole
+pipeline at once, and nothing here invokes `run_plain` — that comparison was a deleted stub, and the
+end-to-end path is now verified by running the quickstart by hand
+([ADR 023](../../context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)).
+So the contract holds per stage; it is not evidence that a full run of the two paths agrees.
+
+**And one of the stage comparisons is not running.** `test_ingest_s1_roi_parity.py` carries both a
+credentials `skipif` and an `xfail`, because its committed cassette predates the native CMR granule
+query ([ADR 009](../../context_docs/decisions/009-native-cmr-granule-query.md), issue #45). A
+`6 passed, 2 skipped` summary is the healthy result, not a fully-verified one.
+
 If a parity test fails, one of two things happened:
 
 1. A regression separated the two paths.

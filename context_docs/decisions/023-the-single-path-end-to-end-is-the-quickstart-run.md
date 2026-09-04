@@ -77,9 +77,25 @@ against domain functions per stage and never invoke `run_plain`. **A green suite
 evidence about that path specifically** — the quickstart run is the evidence.
 
 **When to run it:** after a change to `run_plain` or to the stages it drives, and before relying on
-the single-ROI path for anything that matters. It takes about three and a half minutes on a laptop,
-resumes if interrupted, and cleans up its own staging (PR #174). The command and its credential
-setup are in the repository README's quickstart.
+the single-ROI path for anything that matters. It takes about three and a half minutes on a laptop.
+Follow [`docs/quickstart.md`](../../docs/quickstart.md) rather than improvising the command — it
+carries the `source .venv/bin/activate` step and the reason `uv run python -m` must not be used
+(the subprocess it spawns kills Ray's GCS on macOS).
+
+**Two things make the difference between a real check and a green-looking no-op**, and both come
+from the same property that makes the run pleasant to repeat:
+
+* **Delete the input stores first.** Resume is per-store and per-date, not per-run: `s2_roi` reads
+  the dates already committed and treats everything at or below the newest one as closed, and
+  `s1_roi` narrows its query to the window after the last written date and can return without
+  fetching anything. So a second run against a populated `/tmp/tessera/inputs` **skips the ingest
+  stages entirely** and verifies nothing about them. `rm -rf /tmp/tessera/inputs` (or point
+  `stores.inputs` somewhere fresh) before a run that is meant to check an ingest change. Only
+  inference staging cleans itself up.
+* **Pin the device.** `examples/quickstart/config.yaml` ships `device: auto`, which resolves to one
+  GPU whenever `torch.cuda.is_available()`. On a GPU box the run therefore exercises the CUDA path,
+  not the CPU path it is being cited for. Set `device: cpu` when the CPU path is what you mean to
+  verify.
 
 **This is one of two things in this repository verified by hand rather than by CI**, the other
 being the pipelined CUDA path, which has no GPU runner to run on (`tests/README.md`, Roadmap 2).

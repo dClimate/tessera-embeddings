@@ -298,12 +298,17 @@ class TestPipelinedGpuLoop:
     nothing to notice the gap by.
 
     Run it on any CUDA machine after touching the pipelined loop, the actor pool or the
-    chunk-staging path, and once before a campaign starts::
+    chunk-staging path, and once before a campaign starts. **The setup is the part that goes
+    wrong**: ``uv sync --frozen`` installs the locked CPU wheel, and ``uv run`` re-syncs from
+    the lockfile by default, so a bare invocation SKIPS rather than verifying anything::
 
         uv sync --all-extras --frozen
-        uv run pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
+        uv pip install torch --index-url https://download.pytorch.org/whl/cu124  # a build your driver supports
+        uv run --no-sync python -c "import torch; assert torch.cuda.is_available()"
+        uv run --no-sync pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
 
-    See ``tests/README.md`` → Roadmap 2.
+    ``pytest`` exits 0 on a skip, so only a PASS verifies anything here.
+    See ``tests/README.md`` → Roadmap 2 for the full setup and the version caveat.
     """
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for the pipelined GPU loop")

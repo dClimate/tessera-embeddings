@@ -49,11 +49,11 @@ theme and mirroring would split it. **`orchestration/flows/` vs `runners/`** kee
 away from its runner's — `test_fill_zone_year_flow.py` and `test_zone_fill.py` are different
 subjects with confusingly similar names.
 
-**Ten things stay at `unit/` root** and nothing else should join them: `conftest.py`; the three
-shared helpers `zone_density.py`, `mosaic_stores.py` and `coverage_repo.py`, which other tests
-import by absolute path and which therefore must not move; and five tests with no single subject —
-`test_imports`, `test_public_api`, `test_architecture_rules`, `test_prefect_layer`,
-`test_properties`.
+**Ten things stay at `unit/` root** and nothing else should join them: `__init__.py` and
+`conftest.py`; the three shared helpers `zone_density.py`, `mosaic_stores.py` and
+`coverage_repo.py`, which other tests import by absolute path and which therefore must not move;
+and five tests with no single subject — `test_imports`, `test_public_api`,
+`test_architecture_rules`, `test_prefect_layer`, `test_properties`.
 
 **Do not locate files by counting directories up from `__file__`.** Import `REPO_ROOT`, `SRC_ROOT`
 or `FIXTURES` from `tests/_paths.py`, which anchors on the directory holding `pyproject.toml` and
@@ -144,7 +144,12 @@ recorded as an ADR rather than as a line here.
 
 What follows for a reader: `run_plain`'s end-to-end path has **no automated coverage, by decision**.
 Run the quickstart after changing `run_plain` or the stages it drives — about three and a half
-minutes on a laptop, resumable, self-cleaning.
+minutes on a laptop, following [`docs/quickstart.md`](../docs/quickstart.md).
+
+**Two ways that run silently checks less than you think**, both in ADR 023: ingest resumes off the
+dates already in the store, so a rerun against a populated `/tmp/tessera/inputs` skips ingest
+altogether — delete it first; and the shipped config says `device: auto`, so on a GPU box it is not
+the CPU path being verified — set `device: cpu`.
 
 ### 2. The `gpu/` tier is empty, and one GPU path is verified by hand
 
@@ -167,14 +172,15 @@ to `download.pytorch.org/whl/cpu` for *every* platform, so a bare `--frozen` ins
 exactly what it reports in CI. An operator following that alone would believe they had verified the
 path.
 
-**Use the repository's own GPU install** — `docs/environment-setup.md` "GPU installs", which pins
-`torch==2.6.0+cu121` against the cu121 index and explains why `--extra-index-url` alone is not
-enough (PyPI's CPU wheel stays in the candidate pool and can win). Do not improvise an index: an
-unpinned `--force-reinstall` takes whatever version that index happens to top out at.
+**Use the repository's own GPU install** — `docs/environment-setup.md` "GPU installs", which
+explains why `--extra-index-url` alone is not enough (PyPI's CPU wheel stays in the candidate pool
+and can win). **Check the index before pinning a build**: `torch==2.6.0` publishes `cu118`, `cu124`
+and `cu126`, and `https://download.pytorch.org/whl/<cuXXX>/torch/` is the list. Do not improvise an
+unpinned `--force-reinstall`; it takes whatever that index tops out at.
 
 ```bash
 uv sync --all-extras --frozen
-uv pip install "torch==2.6.0+cu121" --index-url https://download.pytorch.org/whl/cu121
+uv pip install "torch==2.6.0+cu124" --index-url https://download.pytorch.org/whl/cu124
 
 # --no-sync on everything after this. `uv run` re-syncs from the lockfile by default, which
 # would put the CPU wheel straight back.
