@@ -56,17 +56,27 @@ helpers and three of the campaign flows.
 
 ## 3. A live bug, found while establishing the above
 
-**`ingest_code_identity()` and `inference_code_identity()` return different values on macOS than on
-Linux.** `first_party_import_closure` resolves a candidate module to a file with `Path.exists()`.
+**`ingest_code_identity()` returns a different value on macOS than on Linux.**
+`first_party_import_closure` resolves a candidate module to a file with `Path.exists()`.
 `from .providers import PROVIDERS` offers `config.providers.PROVIDERS` as a candidate, and on a
-case-insensitive filesystem `config/PROVIDERS.py` exists — it resolves to `providers.py`. Confirmed
-on a dev laptop: the closure holds 34 entries including a phantom `config/PROVIDERS.py` that
-`git ls-files` does not know about; on Linux it would hold 33. The digest hashes path strings, so
-the two disagree.
+case-insensitive filesystem `config/PROVIDERS.py` exists — it resolves to `providers.py`. The digest
+hashes path strings, so the extra entry moves it.
 
-Consequence: **a mosaic started from a laptop and appended to from the fleet is rejected as built by
-different code**, and vice versa. The fix is to filter candidates to real, case-exact directory
-entries. Not done here — it is a code change, and it is in the mechanism that gates everything else.
+Measured on a dev laptop:
+
+| fingerprint | closure here | phantoms | digest here | digest on Linux |
+|---|---|---|---|---|
+| `ingest_code_identity()` | 34 | 1 (`config/PROVIDERS.py`) | `81011e3965a35cb5` | `e33a72eacd58a56a` |
+| `inference_code_identity()` | 45 | 0 | `70f4d3036d83ccbe` | `70f4d3036d83ccbe` |
+
+**Only the ingest one is affected**; the staged-output closure contains no uppercase candidate and
+already agrees across platforms.
+
+Consequence: a mosaic started from a laptop and appended to from the fleet is rejected as built by
+different code. **The fix only moves the macOS value**: filtering candidates to case-exact directory
+entries makes a laptop compute `e33a72ea…`, which is what Linux computes today — so no mosaic the
+fleet has already built changes identity. Not done here; it is a code change, in the mechanism that
+gates everything else.
 
 ## 4. Held: sixteen moves and the deeper work
 
