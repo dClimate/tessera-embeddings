@@ -8,9 +8,12 @@ fuses CustomGRU to nn.GRU for cuDNN performance, then freezes and moves to the t
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+import fsspec
 import torch
 
 from .modules import CustomGRU, TemporalAwarePooling, TransformerEncoder
@@ -209,3 +212,75 @@ def build_inference_model(
 
     logger.info("Built v1.1 inference model on %s", device)
     return model
+
+
+# Schemes that mean "fetch this from somewhere else first". A local filesystem path (or an explicit file:// URI) is
+# loaded in place by torch.
+_REMOTE_CKPT_SCHEMES = ("s3://", "http://", "https://", "gs://", "az://", "abfs://")
+
+
+def _is_remote_uri(path: str) -> bool:
+    """True if ``path`` must be downloaded before torch.load can open it."""
+    return path.startswith(_REMOTE_CKPT_SCHEMES)
+
+
+def _default_checkpoint_cache() -> str:
+    """Pick a download cache dir that exists on the running host.
+
+    On AWS DLAMI GPU boxes the NVMe instance store (~1.5 GB/s) is the right target: the root EBS
+    volume (~42 MB/s) is too slow and torch.load with mmap hangs on it. Off that path (laptops,
+    CI, non-AWS GPUs) the NVMe mount does not exist, so fall back to the system temp dir.
+    """
+    nvme = Path("/opt/dlami/nvme")
+    if nvme.is_dir():
+        return str(nvme / "tessera-checkpoints")
+    return str(Path(tempfile.gettempdir()) / "tessera-checkpoints")
+
+
+def download_checkpoint(remote_path: str, local_dir: str | None = None) -> str:
+    """Download a model checkpoint from a remote URI to local storage.
+
+    Handles any fsspec-supported remote scheme — ``s3://``, ``https://`` (e.g. a HuggingFace
+    ``resolve/main`` URL), ``gs://``. The file is staged locally because torch.load wants a real
+    path and reads it twice.
+
+    Args:
+        remote_path: Remote URI (e.g. ``"s3://bucket/path/model.pt"`` or
+            ``"https://huggingface.co/.../tessera_v1_1_aws_encoder.pt"``).
+        local_dir: Local directory for downloads. Defaults to the NVMe instance store on AWS
+            DLAMI hosts, else a system temp dir.
+
+    Returns:
+        Local file path.
+
+    Concurrency: many actors on one host may call this with the same ``remote_path`` and shared
+    cache dir at once (cold cache, hundreds of actors). The download writes to a unique temp file
+    and is published with an atomic rename, so a concurrent reader never sees a partially-written
+    checkpoint and concurrent writers cannot corrupt each other — the last rename wins and every
+    byte is identical.
+    """
+    filename = remote_path.rsplit("/", 1)[-1]
+
+    local = Path(local_dir or _default_checkpoint_cache())
+    local.mkdir(parents=True, exist_ok=True)
+    local_path = local / filename
+
+    if local_path.exists():
+        logger.info("Checkpoint already cached: %s", local_path)
+        return str(local_path)
+
+    logger.info("Downloading checkpoint: %s → %s", remote_path, local_path)
+    # Checkpoints are ~200 MB, so reading the whole file into memory is fine.
+    with fsspec.open(remote_path, "rb") as remote:
+        data = remote.read()
+    # Staged into a unique temp file in the SAME dir, so the rename stays on one filesystem and is atomic: concurrent
+    # actors publishing the same checkpoint cannot see a half-written file.
+    with tempfile.NamedTemporaryFile(dir=local, prefix=f"{filename}.", suffix=".part", delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(local_path)
+
+    downloaded_size = local_path.stat().st_size
+    logger.info("Download complete: %s (%.1f MB)", local_path, downloaded_size / 1024 / 1024)
+
+    return str(local_path)

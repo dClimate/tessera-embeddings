@@ -18,7 +18,8 @@ import ray
 import torch
 
 from tessera_embeddings.inference import actors as actors_mod
-from tessera_embeddings.inference.actors import InferenceActor, _gpu_total_gib, download_checkpoint
+from tessera_embeddings.inference.actors import InferenceActor, _gpu_total_gib
+from tessera_embeddings.inference.models.builder import download_checkpoint
 
 
 def test_actor_class_has_no_static_gpu_reservation() -> None:
