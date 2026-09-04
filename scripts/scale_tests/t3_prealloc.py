@@ -1,4 +1,4 @@
-"""T3 — pre-allocate vs prepend A/B (test plan §4 T3, ADR D1).
+"""T3 — pre-allocate vs prepend A/B (T3; settles ADR-008 D1).
 
 Confirms the decided path (seed the full 2017-2025 axis for free, then fill years
 as region writes) and characterizes the ``shift_array`` prepend escape hatch:

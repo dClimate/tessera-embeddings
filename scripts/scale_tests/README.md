@@ -136,20 +136,26 @@ estimate below is priced against, so the two belong together.
 
 ```bash
 # 1. Stores only. Results are KEPT by default — they are the run's product.
-uv run python -m scale_tests.teardown --run-id <id> --backend s3 --bucket <bucket>
+uv run python -m scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/
 
 # 2. Archive the collated report.py output alongside ADR-008, and mirror the
 #    results locally, BEFORE step 3 removes them from the bucket.
 
 # 3. Results too, once they are safe elsewhere.
-uv run python -m scale_tests.teardown --run-id <id> --backend s3 --bucket <bucket> \
+uv run python -m scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/ \
     --purge-results
 ```
 
-**`teardown.py` verifies the STORE ROOT is empty, not the bucket.** Without
-`--purge-results` the results prefix survives, and a `DeleteBucket` on a non-empty
-bucket fails — so run step 3 before deleting the bucket, then confirm the bucket is
-empty yourself. Finally terminate the instance and confirm no EBS orphans.
+**Pass the SAME `--bucket` value the run used, prefix and all.** `--bucket` resolves the
+store root: `<bucket>/global-embeddings/` gives `s3://<bucket>/global-embeddings/<run-id>`,
+while a bare `<bucket>` gives `s3://<bucket>/scale_tests/<run-id>`. So a teardown that drops
+the prefix cheerfully verifies an empty, unrelated prefix and reports success **while the
+real 0.5–1 TB benchmark store stays billed.**
+
+**And `teardown.py` verifies the STORE ROOT is empty, not the bucket.** Without
+`--purge-results` the results prefix survives, and a `DeleteBucket` on a non-empty bucket
+fails — so run step 3 before deleting the bucket, then confirm the bucket is empty yourself.
+Finally terminate the instance and confirm no EBS orphans.
 
 ## Cost
 

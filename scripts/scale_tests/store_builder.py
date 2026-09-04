@@ -129,7 +129,7 @@ def fill_year(
 
     The merge and commit run in this (coordinator) process, so wrapping the call
     in :func:`harness.rss_sampler` captures the coordinator RSS that validates
-    the ~400 B/ref model (test plan T2).
+    the ~400 B/ref model (T2).
     """
     if not chunk_list:
         raise ValueError("chunk_list is empty; nothing to fill")

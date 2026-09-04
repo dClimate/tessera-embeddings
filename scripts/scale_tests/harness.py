@@ -530,7 +530,7 @@ def rss_sampler(
     """Sample this process (and optionally children) RSS at ``interval_s``.
 
     Emits ``peak_rss_bytes`` on exit. Used to validate the ~400 B/ref commit
-    memory model (test plan T2) and to watch fork/merge coordinator RSS.
+    memory model (T2) and to watch fork/merge coordinator RSS.
     """
     try:
         import psutil

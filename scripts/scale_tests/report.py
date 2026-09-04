@@ -1,7 +1,7 @@
 """Collate scale-test metrics into a decision-oriented markdown report.
 
-Reads every ``*.jsonl`` under ``<results>/<run-id>/`` and renders the test-plan
-§5 decision matrix — one section per ADR-008 decision — plus per-test metric
+Reads every ``*.jsonl`` under ``<results>/<run-id>/`` and renders the
+decision matrix — one section per ADR-008 decision — plus per-test metric
 tables. Missing tests render as "no data (not run)" rather than failing, so a
 partial run still produces a useful report.
 

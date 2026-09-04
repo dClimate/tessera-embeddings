@@ -32,7 +32,7 @@ def _open_repo(store_uri: str, max_concurrent_requests: int | None = None) -> ic
 def write_fork(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns an icechunk ForkSession
     """Write assigned chunks into a forked session and return it for merge.
 
-    The cooperative-write worker (test plan T1/T2/T3 store builder): receives a
+    The cooperative-write worker (the T1/T2/T3 store builder): receives a
     pickled ``ForkSession``, writes its share of spatial chunks (all bands) for
     one year into ``group/embeddings`` and ``group/scales`` using deterministic
     synth data, and returns the fork so the coordinator can ``merge`` it.
@@ -64,7 +64,7 @@ def write_fork(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns an i
 
 
 def write_fork_shards(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns a ForkSession
-    """Shard-aligned variant of :func:`write_fork` (test plan D3 / E2).
+    """Shard-aligned variant of :func:`write_fork` (ADR-008 D3).
 
     One full shard-sized block per assigned shard in a single array assignment,
     so the Zarr sharding codec emits each shard object once with no
