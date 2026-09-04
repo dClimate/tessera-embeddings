@@ -7,9 +7,13 @@ what each test measures; ``context_docs/storage/icechunk-api-ledger.md`` carries
 verified icechunk and zarr signatures they were built against. ``README.md`` here is how
 to run them.
 
-Run from the ``scripts/`` directory so ``scale_tests`` is importable by the
+Run from the REPOSITORY ROOT — the modules import each other as
+``scripts.scoping.scale_tests.x``, so the root must be on ``sys.path``, which ``python -m``
+does for the working directory. ``scripts/`` and ``scripts/scoping/`` have no ``__init__.py``
+and resolve as namespace packages. The cold-run subprocess inherits this working directory,
+so starting anywhere else breaks the cold phases rather than the imports.
 spawned worker processes::
 
     cd scripts
-    uv run python -m scale_tests.t0_smoke --run-id dev --backend local --scale tiny
+    uv run python -m scripts.scoping.scale_tests.t0_smoke --run-id dev --backend local --scale tiny
 """

@@ -8,7 +8,7 @@ bounded by the touched manifest window or grows with cumulative refs (#1600).
 Conceptually consumes T3's pre-allocated store; kept independently runnable by
 seeding its own. Run from ``scripts/``::
 
-    uv run python -m scale_tests.t2_write_bench --run-id dev --backend local --scale tiny
+    uv run python -m scripts.scoping.scale_tests.t2_write_bench --run-id dev --backend local --scale tiny
 """
 
 from __future__ import annotations

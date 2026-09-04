@@ -7,7 +7,7 @@ cold (fresh process) and warm, swept over ``async.concurrency``.
 
 Run from ``scripts/``::
 
-    uv run python -m scale_tests.t1_read_bench --run-id dev --backend local --scale tiny --variant c256_full
+    uv run python -m scripts.scoping.scale_tests.t1_read_bench --run-id dev --backend local --scale tiny --variant c256_full
 """
 
 from __future__ import annotations
@@ -213,7 +213,7 @@ def read_variant(cfg: harness.RunConfig, variant: V.Variant) -> None:
 
         # open (cold + warm)
         otags = {"variant": variant.name, "concurrency": conc}
-        cold = harness.run_cold("scale_tests.t1_read_bench.cold_open", base)
+        cold = harness.run_cold("scripts.scoping.scale_tests.t1_read_bench.cold_open", base)
         harness.emit_metric(cfg, TEST, phase, "open_wall_s", cold["open_wall_s"], "s", cache="cold", **otags)
         wt0 = time.monotonic()
         _open_group(store_uri, GROUP, conc)
@@ -221,7 +221,7 @@ def read_variant(cfg: harness.RunConfig, variant: V.Variant) -> None:
 
         # point-vector (cold + warm)
         pp = {**base, "n_points": n_points, "sample_seed": 1, "mean_chunk_bytes": mean_bytes}
-        cold = harness.run_cold("scale_tests.t1_read_bench.cold_point_read", pp)
+        cold = harness.run_cold("scripts.scoping.scale_tests.t1_read_bench.cold_point_read", pp)
         _emit_point(cfg, phase, variant, conc, "cold", cold)
         warm = _warm_point_read(store_uri, variant, year, zone_hw, n_points, mean_bytes, conc)
         _emit_point(cfg, phase, variant, conc, "warm", warm)
@@ -229,7 +229,7 @@ def read_variant(cfg: harness.RunConfig, variant: V.Variant) -> None:
         # region workloads (cold + warm)
         for label, dy, dx, n_bands in WORKLOADS:
             rp = {**base, "dy": dy, "dx": dx, "n_bands": n_bands}
-            cold = harness.run_cold("scale_tests.t1_read_bench.cold_region_read", rp)
+            cold = harness.run_cold("scripts.scoping.scale_tests.t1_read_bench.cold_region_read", rp)
             _emit_region(cfg, phase, variant, conc, "cold", label, cold)
             warm = _warm_region_read(store_uri, variant, year, zone_hw, dy, dx, n_bands, conc)
             _emit_region(cfg, phase, variant, conc, "warm", label, warm)

@@ -10,7 +10,7 @@ Self-contained (builds its own mess) so it runs independently; on a full
 campaign run it would instead target the store T2-T5 left behind. Run from
 ``scripts/``::
 
-    uv run python -m scale_tests.t6_gc_bench --run-id dev --backend local --scale tiny
+    uv run python -m scripts.scoping.scale_tests.t6_gc_bench --run-id dev --backend local --scale tiny
 """
 
 from __future__ import annotations

@@ -8,7 +8,7 @@ grows. Kill threshold (D5): at N=16, total wall > 2x serial or retry storms.
 Contention counts are only meaningful on ``--backend s3`` (real object-store
 CAS); local runs validate the mechanism. Run from ``scripts/``::
 
-    uv run python -m scale_tests.t5_contention --run-id dev --backend local --scale tiny
+    uv run python -m scripts.scoping.scale_tests.t5_contention --run-id dev --backend local --scale tiny
 """
 
 from __future__ import annotations

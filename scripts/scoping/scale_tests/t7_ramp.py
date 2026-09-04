@@ -7,7 +7,7 @@ boto3 PUTs of fixed-size objects at ramped concurrency; no icechunk involved.
 **S3 only** — a no-op on ``--backend local``. Run it LAST (or against a second
 throwaway bucket) since it stresses the bucket. Run from ``scripts/``::
 
-    uv run python -m scale_tests.t7_ramp --run-id dev --backend s3 --bucket my-throwaway
+    uv run python -m scripts.scoping.scale_tests.t7_ramp --run-id dev --backend s3 --bucket my-throwaway
 """
 
 from __future__ import annotations

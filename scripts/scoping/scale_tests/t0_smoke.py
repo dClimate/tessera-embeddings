@@ -8,7 +8,7 @@ the disjoint-region vs same-chunk conflict taxonomy.
 
 Run from ``scripts/``::
 
-    uv run python -m scale_tests.t0_smoke --run-id dev --backend local --scale tiny
+    uv run python -m scripts.scoping.scale_tests.t0_smoke --run-id dev --backend local --scale tiny
 """
 
 from __future__ import annotations

@@ -7,7 +7,7 @@ partial run still produces a useful report.
 
 Run from ``scripts/``::
 
-    uv run python -m scale_tests.report --run-id dev --results-dir /path/to/results
+    uv run python -m scripts.scoping.scale_tests.report --run-id dev --results-dir /path/to/results
 """
 
 from __future__ import annotations

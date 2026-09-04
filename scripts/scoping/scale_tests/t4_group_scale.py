@@ -8,7 +8,7 @@ single-group vs whole-repo open time, default vs tuned manifest preload
 
 Run from ``scripts/``::
 
-    uv run python -m scale_tests.t4_group_scale --run-id dev --backend local --scale tiny
+    uv run python -m scripts.scoping.scale_tests.t4_group_scale --run-id dev --backend local --scale tiny
 """
 
 from __future__ import annotations
@@ -105,7 +105,7 @@ def phase_open_and_preload(cfg: harness.RunConfig) -> None:
 
     for label, arrays, refs in (("default", None, None), ("tuned", 1000, 1_000_000)):
         payload = {"store_uri": store_uri, "group": group, "preload_arrays": arrays, "preload_refs": refs}
-        cold = harness.run_cold("scale_tests.t4_group_scale.cold_open_group", payload)
+        cold = harness.run_cold("scripts.scoping.scale_tests.t4_group_scale.cold_open_group", payload)
         harness.emit_metric(
             cfg, TEST, "open_and_preload", "open_wall_s", cold["open_wall_s"], "s", preload=label, scope="single_group"
         )

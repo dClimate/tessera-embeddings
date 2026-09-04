@@ -15,7 +15,7 @@ hinges on:
 
 Run from ``scripts/`` (bench, in-region)::
 
-    uv run python -m scale_tests.t8_sharding --run-id d3 --backend s3 --scale bench \
+    uv run python -m scripts.scoping.scale_tests.t8_sharding --run-id d3 --backend s3 --scale bench \
       --bucket <bucket> --store-root s3://<bucket>/global-embeddings
 """
 
@@ -184,7 +184,7 @@ def phase_bytes_on_wire(cfg: harness.RunConfig) -> None:
             "n_points": n,
             "sample_seed": 1,
         }
-        r = harness.run_cold("scale_tests.t8_sharding.cold_bytes_on_wire", payload)
+        r = harness.run_cold("scripts.scoping.scale_tests.t8_sharding.cold_bytes_on_wire", payload)
         harness.emit_metric(
             cfg,
             TEST,
@@ -232,7 +232,7 @@ def phase_scattered_reads(cfg: harness.RunConfig) -> None:
             "n_points": n,
             "sample_seed": 7,
         }
-        r = harness.run_cold("scale_tests.t8_sharding.cold_scattered_read", payload)
+        r = harness.run_cold("scripts.scoping.scale_tests.t8_sharding.cold_scattered_read", payload)
         harness.emit_metric(
             cfg,
             TEST,

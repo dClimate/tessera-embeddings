@@ -6,8 +6,8 @@ product); pass ``--purge-results`` to remove them too.
 
 Run from ``scripts/``::
 
-    uv run python -m scale_tests.teardown --run-id dev --backend local
-    uv run python -m scale_tests.teardown --run-id dev --backend s3 --bucket my-throwaway
+    uv run python -m scripts.scoping.scale_tests.teardown --run-id dev --backend local
+    uv run python -m scripts.scoping.scale_tests.teardown --run-id dev --backend s3 --bucket my-throwaway
 """
 
 from __future__ import annotations
