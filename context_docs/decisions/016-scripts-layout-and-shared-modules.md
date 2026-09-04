@@ -27,7 +27,7 @@ Those resolve only because every script sits in one directory and Python puts a 
 directory on `sys.path`. Move a script one level down and its imports stop resolving. The 28
 test files under `yield-embeddings/tests/unit/scripts/` import the same modules and break identically.
 
-This repository has the same pattern in miniature: `scripts/scale_tests/` is already a
+This repository has the same pattern in miniature: `scripts/scoping/scale_tests/` is already a
 package and imports work there, but the standalone scripts share nothing, so the coupling is
 latent rather than active.
 

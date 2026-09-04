@@ -7,9 +7,9 @@ years (including empty ocean positions) stay intact, and that a shift conflicts
 unresolvably with a concurrent chunk writer (why prepends are banned during
 fills).
 
-Run from ``scripts/``::
+Run from the REPOSITORY ROOT::
 
-    uv run python -m scale_tests.t3_prealloc --run-id dev --backend local --scale tiny
+    uv run python -m scripts.scoping.scale_tests.t3_prealloc --run-id dev --backend local --scale tiny
 """
 
 from __future__ import annotations
@@ -22,11 +22,12 @@ import icechunk
 import numpy as np
 import zarr
 
-from scale_tests import harness, synth
-from scale_tests import store_builder as SB
-from scale_tests import variants as V
-from scale_tests.seeding import embedding_group_spec, seed_groups
-from scale_tests.zone_geometry import YEARS, MockZone, zone_for
+from scripts.scoping.scale_tests import synth
+from scripts.scoping.scale_tests import store_builder as SB
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests.seeding import embedding_group_spec, seed_groups
+from scripts.scoping.scale_tests.zone_geometry import YEARS, MockZone, zone_for
+from scripts.scoping.scale_tests import harness
 
 logger = logging.getLogger("scale_tests.t3")
 

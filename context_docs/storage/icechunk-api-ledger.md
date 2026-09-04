@@ -4,14 +4,14 @@
 call sites.** This is the durable half of the T0–T8 global-store scale-test programme: the tests all
 ran, and the decisions they settled are recorded in
 [ADR-008](../decisions/008-global-store-architecture.md), where every D1–D9 is now FIRM and annotated
-with the run that confirmed it. The harness itself is code, under `scripts/scale_tests/`.
+with the run that confirmed it. The harness itself is code, under `scripts/scoping/scale_tests/`.
 
 > **What was cut, and where it went.** The pre-run specification — the shared harness contract, the
 > metrics schema, one subsection per test giving its method and its pass/kill thresholds, and the
 > decision matrix mapping evidence to decisions — described work that is now code and conclusions
 > that are now ADR-008. It is in git history if the reasoning behind a threshold is ever wanted.
 > **The infrastructure spec and the cost basis were NOT cut**: an operator budgeting a real bench
-> run needs them, so they moved to `scripts/scale_tests/README.md` beside the estimate they price,
+> run needs them, so they moved to `scripts/scoping/scale_tests/README.md` beside the estimate they price,
 > along with the teardown checklist. The build-order handoff spec (`global-store-test-impl-spec.md`) was absorbed into this
 > ledger on 2026-08-17 and deleted.
 

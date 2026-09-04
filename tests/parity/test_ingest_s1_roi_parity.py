@@ -61,7 +61,7 @@ def _bearer_session_factory(token: str) -> requests.Session:
     cross-domain redirects.
 
     Verified working against the full ASF redirect chain by
-    ``scripts/probe_edl_bearer.py``: a single GET reaches
+    ``scripts/diagnostic/probe_edl_bearer.py``: a single GET reaches
     ``cloudfront.net`` with HTTP 200 across 5 redirect hops
     (datapool → cumulus → URS → cumulus/login → cumulus/RTC → cloudfront).
 

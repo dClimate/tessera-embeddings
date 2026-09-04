@@ -6,9 +6,9 @@ vs group count (every commit re-serializes the whole snapshot), and (b)
 single-group vs whole-repo open time, default vs tuned manifest preload
 (``max_arrays_to_scan`` default 50 < our node count — icechunk #1464/#1462).
 
-Run from ``scripts/``::
+Run from the REPOSITORY ROOT::
 
-    uv run python -m scale_tests.t4_group_scale --run-id dev --backend local --scale tiny
+    uv run python -m scripts.scoping.scale_tests.t4_group_scale --run-id dev --backend local --scale tiny
 """
 
 from __future__ import annotations
@@ -18,11 +18,11 @@ import logging
 import time
 from typing import Any
 
-from scale_tests import harness
-from scale_tests import store_builder as SB
-from scale_tests import variants as V
-from scale_tests.seeding import embedding_group_spec, seed_groups
-from scale_tests.zone_geometry import YEARS, MockZone, zone_for
+from scripts.scoping.scale_tests import harness
+from scripts.scoping.scale_tests import store_builder as SB
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests.seeding import embedding_group_spec, seed_groups
+from scripts.scoping.scale_tests.zone_geometry import YEARS, MockZone, zone_for
 
 logger = logging.getLogger("scale_tests.t4")
 
@@ -48,7 +48,7 @@ def cold_open_group(payload: dict[str, Any]) -> dict[str, Any]:
     import icechunk
     import zarr
 
-    from scale_tests import harness as _h
+    from scripts.scoping.scale_tests import harness as _h
     from tessera_embeddings.storage import zarr_store
 
     config = _h.layered_config(
@@ -105,7 +105,7 @@ def phase_open_and_preload(cfg: harness.RunConfig) -> None:
 
     for label, arrays, refs in (("default", None, None), ("tuned", 1000, 1_000_000)):
         payload = {"store_uri": store_uri, "group": group, "preload_arrays": arrays, "preload_refs": refs}
-        cold = harness.run_cold("scale_tests.t4_group_scale.cold_open_group", payload)
+        cold = harness.run_cold("scripts.scoping.scale_tests.t4_group_scale.cold_open_group", payload)
         harness.emit_metric(
             cfg, TEST, "open_and_preload", "open_wall_s", cold["open_wall_s"], "s", preload=label, scope="single_group"
         )

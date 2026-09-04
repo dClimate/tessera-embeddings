@@ -1,11 +1,11 @@
 # Global store scale tests
 
 Standalone benchmarks (NOT pytest) that settled the PENDING decisions in
-[`context_docs/decisions/008-global-store-architecture.md`](../../context_docs/decisions/008-global-store-architecture.md).
+[`context_docs/decisions/008-global-store-architecture.md`](../../../context_docs/decisions/008-global-store-architecture.md).
 **These scripts ARE the program of record** — every D1–D9 is now FIRM in that ADR, annotated with
 the run that confirmed it, and the per-test method, thresholds and cost budgets that once stood in
 a separate plan are the code here plus git history.
-[`context_docs/storage/icechunk-api-ledger.md`](../../context_docs/storage/icechunk-api-ledger.md)
+[`context_docs/storage/icechunk-api-ledger.md`](../../../context_docs/storage/icechunk-api-ledger.md)
 is the surviving half of that plan: the verified icechunk and zarr signatures and gotchas these
 scripts were built against, not the benchmark contract.
 
@@ -41,37 +41,37 @@ scale_tests/
 
 ## Running
 
-Always run from the `scripts/` directory so the spawned worker processes can
-import `scale_tests`:
+Always run from the **repository root**. The modules import each other as
+`scripts.scoping.scale_tests.*`, so the root must be on `sys.path`, which `python -m` does for
+the working directory. The cold-phase runs spawn a subprocess that inherits this working
+directory, so starting anywhere else fails there rather than at import:
 
 ```bash
-cd scripts
-
 # smoke everything on a laptop (no AWS)
-uv run python -m scale_tests.t0_smoke      --run-id dev --backend local --scale tiny
-uv run python -m scale_tests.t1_read_bench --run-id dev --backend local --scale tiny --variant c256_full
-uv run python -m scale_tests.t2_write_bench --run-id dev --backend local --scale tiny
-uv run python -m scale_tests.t3_prealloc   --run-id dev --backend local --scale tiny
-uv run python -m scale_tests.t4_group_scale --run-id dev --backend local --scale tiny
-uv run python -m scale_tests.t5_contention --run-id dev --backend local --scale tiny
-uv run python -m scale_tests.t6_gc_bench   --run-id dev --backend local --scale tiny
+uv run python -m scripts.scoping.scale_tests.t0_smoke      --run-id dev --backend local --scale tiny
+uv run python -m scripts.scoping.scale_tests.t1_read_bench --run-id dev --backend local --scale tiny --variant c256_full
+uv run python -m scripts.scoping.scale_tests.t2_write_bench --run-id dev --backend local --scale tiny
+uv run python -m scripts.scoping.scale_tests.t3_prealloc   --run-id dev --backend local --scale tiny
+uv run python -m scripts.scoping.scale_tests.t4_group_scale --run-id dev --backend local --scale tiny
+uv run python -m scripts.scoping.scale_tests.t5_contention --run-id dev --backend local --scale tiny
+uv run python -m scripts.scoping.scale_tests.t6_gc_bench   --run-id dev --backend local --scale tiny
 
 # the real campaign, in-region on the throwaway bucket
-uv run python -m scale_tests.t0_smoke      --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
-uv run python -m scale_tests.t1_read_bench --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/ --variant c256_full
-uv run python -m scale_tests.t2_write_bench --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
-uv run python -m scale_tests.t3_prealloc   --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
-uv run python -m scale_tests.t4_group_scale --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
-uv run python -m scale_tests.t5_contention --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
-uv run python -m scale_tests.t6_gc_bench   --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
-uv run python -m scale_tests.t7_ramp       --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scripts.scoping.scale_tests.t0_smoke      --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scripts.scoping.scale_tests.t1_read_bench --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/ --variant c256_full
+uv run python -m scripts.scoping.scale_tests.t2_write_bench --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scripts.scoping.scale_tests.t3_prealloc   --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scripts.scoping.scale_tests.t4_group_scale --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scripts.scoping.scale_tests.t5_contention --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scripts.scoping.scale_tests.t6_gc_bench   --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scripts.scoping.scale_tests.t7_ramp       --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
 
 # D3 settlement (separate run; see ADR-008 D3)
-uv run python -m scale_tests.t8_sharding   --run-id d3   --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scripts.scoping.scale_tests.t8_sharding   --run-id d3   --backend s3 --scale bench --bucket <bucket>/global-embeddings/
 
 # collate + tear down
-uv run python -m scale_tests.report   --run-id run1
-uv run python -m scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/
+uv run python -m scripts.scoping.scale_tests.report   --run-id run1
+uv run python -m scripts.scoping.scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/
 ```
 
 Install the extra deps once: `uv sync --group scale-tests`.
@@ -139,16 +139,16 @@ estimate below is priced against, so the two belong together.
 
 ```bash
 # 1. Stores only, once per run id. Results are KEPT by default — they are the run's product.
-uv run python -m scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/
-uv run python -m scale_tests.teardown --run-id d3   --backend s3 --bucket <bucket>/global-embeddings/
+uv run python -m scripts.scoping.scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/
+uv run python -m scripts.scoping.scale_tests.teardown --run-id d3   --backend s3 --bucket <bucket>/global-embeddings/
 
 # 2. Archive the collated report.py output alongside ADR-008, and mirror the
 #    results locally, BEFORE step 3 removes them from the bucket.
 
 # 3. Results too, once they are safe elsewhere.
-uv run python -m scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/ \
+uv run python -m scripts.scoping.scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/ \
     --purge-results
-uv run python -m scale_tests.teardown --run-id d3   --backend s3 --bucket <bucket>/global-embeddings/ \
+uv run python -m scripts.scoping.scale_tests.teardown --run-id d3   --backend s3 --bucket <bucket>/global-embeddings/ \
     --purge-results
 ```
 

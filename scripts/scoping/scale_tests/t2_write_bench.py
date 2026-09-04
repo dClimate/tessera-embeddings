@@ -6,9 +6,9 @@ the open upstream bugs directly: commit-time RSS vs refs (~400 B/ref; icechunk
 bounded by the touched manifest window or grows with cumulative refs (#1600).
 
 Conceptually consumes T3's pre-allocated store; kept independently runnable by
-seeding its own. Run from ``scripts/``::
+seeding its own. Run from the REPOSITORY ROOT::
 
-    uv run python -m scale_tests.t2_write_bench --run-id dev --backend local --scale tiny
+    uv run python -m scripts.scoping.scale_tests.t2_write_bench --run-id dev --backend local --scale tiny
 """
 
 from __future__ import annotations
@@ -19,11 +19,11 @@ import logging
 import numpy as np
 import zarr
 
-from scale_tests import harness
-from scale_tests import store_builder as SB
-from scale_tests import variants as V
-from scale_tests.seeding import embedding_group_spec, seed_groups
-from scale_tests.zone_geometry import YEARS, zone_for
+from scripts.scoping.scale_tests import harness
+from scripts.scoping.scale_tests import store_builder as SB
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests.seeding import embedding_group_spec, seed_groups
+from scripts.scoping.scale_tests.zone_geometry import YEARS, zone_for
 
 logger = logging.getLogger("scale_tests.t2")
 

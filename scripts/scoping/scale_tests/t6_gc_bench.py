@@ -7,10 +7,9 @@ to the campaign's 10^8+ objects) and bytes reclaimed, plus a ``reset_branch``
 rollback drill.
 
 Self-contained (builds its own mess) so it runs independently; on a full
-campaign run it would instead target the store T2-T5 left behind. Run from
-``scripts/``::
+campaign run it would instead target the store T2-T5 left behind. Run from the REPOSITORY ROOT::
 
-    uv run python -m scale_tests.t6_gc_bench --run-id dev --backend local --scale tiny
+    uv run python -m scripts.scoping.scale_tests.t6_gc_bench --run-id dev --backend local --scale tiny
 """
 
 from __future__ import annotations
@@ -23,11 +22,11 @@ import time
 import numpy as np
 import zarr
 
-from scale_tests import harness
-from scale_tests import store_builder as SB
-from scale_tests import variants as V
-from scale_tests.seeding import embedding_group_spec, seed_groups
-from scale_tests.zone_geometry import YEARS, MockZone
+from scripts.scoping.scale_tests import harness
+from scripts.scoping.scale_tests import store_builder as SB
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests.seeding import embedding_group_spec, seed_groups
+from scripts.scoping.scale_tests.zone_geometry import YEARS, MockZone
 
 logger = logging.getLogger("scale_tests.t6")
 

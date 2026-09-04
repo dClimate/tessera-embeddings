@@ -6,9 +6,9 @@ Feeds the contention arm of the one-repo go/no-go (ADR D5) and commit pacing
 grows. Kill threshold (D5): at N=16, total wall > 2x serial or retry storms.
 
 Contention counts are only meaningful on ``--backend s3`` (real object-store
-CAS); local runs validate the mechanism. Run from ``scripts/``::
+CAS); local runs validate the mechanism. Run from the REPOSITORY ROOT::
 
-    uv run python -m scale_tests.t5_contention --run-id dev --backend local --scale tiny
+    uv run python -m scripts.scoping.scale_tests.t5_contention --run-id dev --backend local --scale tiny
 """
 
 from __future__ import annotations
@@ -22,11 +22,11 @@ from typing import Any
 
 import numpy as np
 
-from scale_tests import harness
-from scale_tests import variants as V
-from scale_tests._workers import commit_to_group
-from scale_tests.seeding import embedding_group_spec, seed_groups
-from scale_tests.zone_geometry import YEARS, MockZone
+from scripts.scoping.scale_tests import harness
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests._workers import commit_to_group
+from scripts.scoping.scale_tests.seeding import embedding_group_spec, seed_groups
+from scripts.scoping.scale_tests.zone_geometry import YEARS, MockZone
 
 logger = logging.getLogger("scale_tests.t5")
 

@@ -266,7 +266,7 @@ AREA. The shipped partition weights each zone's tiles by its latitude band's
 observation count — proportional to GPU-hours — and by the years it still carries,
 and on that basis the campaign's **10** clusters spread by **0.009%** where the
 tile-count split would give **21.8%**. Do not quote the row above for a cluster
-count; run `scripts/cluster_work_spread.py --mask … --clusters …`, which reads the
+count; run `scripts/scoping/cluster_work_spread.py --mask … --clusters …`, which reads the
 current mask through the campaign's own partitioner.
 
 > **Size the fleets to match.** These caps count *clusters* and *zones*, not

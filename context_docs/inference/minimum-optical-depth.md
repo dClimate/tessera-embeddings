@@ -108,7 +108,7 @@ about with numbers. The radar half is
 [`../campaign/radar-coverage-by-zone.md`](../campaign/radar-coverage-by-zone.md); the
 observation-count model this refines is
 [`../campaign/campaign-cost-model.md`](../campaign/campaign-cost-model.md) §6. Instrument:
-[`scripts/census_s2_coverage.py`](../../scripts/census_s2_coverage.py).
+[`scripts/scoping/census_s2_coverage.py`](../../scripts/scoping/census_s2_coverage.py).
 
 ### The headline
 

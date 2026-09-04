@@ -5,9 +5,9 @@ decision matrix — one section per ADR-008 decision — plus per-test metric
 tables. Missing tests render as "no data (not run)" rather than failing, so a
 partial run still produces a useful report.
 
-Run from ``scripts/``::
+Run from the REPOSITORY ROOT::
 
-    uv run python -m scale_tests.report --run-id dev --results-dir /path/to/results
+    uv run python -m scripts.scoping.scale_tests.report --run-id dev --results-dir /path/to/results
 """
 
 from __future__ import annotations

@@ -604,11 +604,11 @@ def run_cold(func_dotpath: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     Used for cold-cache read measurements: a new interpreter means no cached
     manifests, sessions, or repositories. ``func_dotpath`` is a dotted path like
-    ``scale_tests.t1_read_bench.cold_point_read`` resolving to a function that
+    ``scripts.scoping.scale_tests.t1_read_bench.cold_point_read`` resolving to a function that
     takes one dict and returns a JSON-serializable dict.
     """
     proc = subprocess.run(
-        [sys.executable, "-m", "scale_tests._subrunner", func_dotpath],
+        [sys.executable, "-m", "scripts.scoping.scale_tests._subrunner", func_dotpath],
         input=json.dumps(payload),
         capture_output=True,
         text=True,

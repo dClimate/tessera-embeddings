@@ -6,9 +6,9 @@ one-repo/120-group design is re-planned before anything expensive runs. Also
 validates the harness end-to-end (metrics, markers, spawn multiprocessing) and
 the disjoint-region vs same-chunk conflict taxonomy.
 
-Run from ``scripts/``::
+Run from the REPOSITORY ROOT::
 
-    uv run python -m scale_tests.t0_smoke --run-id dev --backend local --scale tiny
+    uv run python -m scripts.scoping.scale_tests.t0_smoke --run-id dev --backend local --scale tiny
 """
 
 from __future__ import annotations
@@ -19,11 +19,11 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any
 
-from scale_tests import harness
-from scale_tests import variants as V
-from scale_tests._workers import commit_to_group
-from scale_tests.seeding import ArraySpec, GroupSpec, seed_groups
-from scale_tests.zone_geometry import YEARS, MockZone, coords
+from scripts.scoping.scale_tests import harness
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests._workers import commit_to_group
+from scripts.scoping.scale_tests.seeding import ArraySpec, GroupSpec, seed_groups
+from scripts.scoping.scale_tests.zone_geometry import YEARS, MockZone, coords
 
 logger = logging.getLogger("scale_tests.t0")
 

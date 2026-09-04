@@ -2,7 +2,7 @@
 
 **Status:** **Accepted — scoping concluded (2026-07-14).** All decisions
 D1–D9 are FIRM, each backed by S3-bench evidence from runs `run1`, `d3`, and
-`d3v2` (test program: `scripts/scale_tests/`). One
+`d3v2` (test program: `scripts/scoping/scale_tests/`). One
 operational measurement is explicitly *deferred, not blocking* — GC duration at
 10⁸-object scale (D7) — to be taken against a large repo before/while the
 campaign runs. The next work is **implementation** of the group-aware, sharded,
@@ -484,5 +484,5 @@ zarr PR #3004 (partial-shard-read); it only improves the sharded read path.
 
 **Next:** implement this write path in `tessera_embeddings.storage` (group-aware
 seeding, sharded land-masked writer, commit-concurrency cap, GC/expiry helpers).
-The scale-test scripts (`scripts/scale_tests/`) remain as regression harness and
+The scale-test scripts (`scripts/scoping/scale_tests/`) remain as regression harness and
 for the deferred GC-at-scale measurement.

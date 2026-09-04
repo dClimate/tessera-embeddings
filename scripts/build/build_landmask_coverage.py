@@ -10,13 +10,13 @@ laptop in well under a minute (a couple of minutes with a full spot-check).
 Subcommands::
 
     # Guard the v1.1 all-1s assumption before trusting a build:
-    ./scripts/build_landmask_coverage.py verify --spot-check 500
+    ./scripts/build/build_landmask_coverage.py verify --spot-check 500
 
     # Build all 120 zone groups into a destination repo (one commit):
-    ./scripts/build_landmask_coverage.py build --dest s3://.../masks/global.icechunk
+    ./scripts/build/build_landmask_coverage.py build --dest s3://.../masks/global.icechunk
 
     # Structural + geographic self-checks on a built store:
-    ./scripts/build_landmask_coverage.py validate --dest s3://.../masks/global.icechunk
+    ./scripts/build/build_landmask_coverage.py validate --dest s3://.../masks/global.icechunk
 
 Credentials use the ambient AWS chain (env / instance profile). ``--zones`` (a
 comma-separated list of UTM common names, e.g. ``33N,15S``) restricts

@@ -13,9 +13,9 @@ hinges on:
   pattern (does the p50 win survive when points don't share shards?).
 * **E4 `object_count`** — actual objects + manifest bytes, sharded vs full.
 
-Run from ``scripts/`` (bench, in-region)::
+Run from the REPOSITORY ROOT (bench, in-region)::
 
-    uv run python -m scale_tests.t8_sharding --run-id d3 --backend s3 --scale bench \
+    uv run python -m scripts.scoping.scale_tests.t8_sharding --run-id d3 --backend s3 --scale bench \
       --bucket <bucket> --store-root s3://<bucket>/global-embeddings
 """
 
@@ -28,12 +28,12 @@ from typing import Any
 
 import numpy as np
 
-from scale_tests import harness
-from scale_tests import store_builder as SB
-from scale_tests import variants as V
-from scale_tests.seeding import embedding_group_spec, seed_groups
-from scale_tests.t1_read_bench import _open_group, _point_read
-from scale_tests.zone_geometry import YEARS, MockZone
+from scripts.scoping.scale_tests import harness
+from scripts.scoping.scale_tests import store_builder as SB
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests.seeding import embedding_group_spec, seed_groups
+from scripts.scoping.scale_tests.t1_read_bench import _open_group, _point_read
+from scripts.scoping.scale_tests.zone_geometry import YEARS, MockZone
 
 logger = logging.getLogger("scale_tests.t8")
 
@@ -184,7 +184,7 @@ def phase_bytes_on_wire(cfg: harness.RunConfig) -> None:
             "n_points": n,
             "sample_seed": 1,
         }
-        r = harness.run_cold("scale_tests.t8_sharding.cold_bytes_on_wire", payload)
+        r = harness.run_cold("scripts.scoping.scale_tests.t8_sharding.cold_bytes_on_wire", payload)
         harness.emit_metric(
             cfg,
             TEST,
@@ -232,7 +232,7 @@ def phase_scattered_reads(cfg: harness.RunConfig) -> None:
             "n_points": n,
             "sample_seed": 7,
         }
-        r = harness.run_cold("scale_tests.t8_sharding.cold_scattered_read", payload)
+        r = harness.run_cold("scripts.scoping.scale_tests.t8_sharding.cold_scattered_read", payload)
         harness.emit_metric(
             cfg,
             TEST,
