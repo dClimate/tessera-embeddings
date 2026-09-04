@@ -345,14 +345,23 @@ that the upstream per-stage parity tests pass, and that the single-ROI path runs
 end to end rather than the "30+ minutes" five documents claimed.
 
 **The second is right; the first is not, and review caught it.** `6 passed, 2 skipped` does not mean
-S1 parity passes. `test_ingest_s1_roi_parity.py` carries **both** a `skipif` on Earthdata credentials
-**and** an `xfail(raises=Exception)` — its committed cassette was recorded against the old CMR-STAC
-search path, and OPERA now resolves items through the native CMR granule API, so the cassette no
-longer matches on replay (issue #45,
-[ADR 009](decisions/009-native-cmr-granule-query.md)). Re-recording it trips the credential-safety
-guard at ~116 MB. And the second skip in that run was the deliberately-skipped
-`adapter_template`, not a second credential-gated arm. **So the S1 precondition was never verified,
-and "both blockers lapsed" overstated the evidence by one.**
+S1 parity passes. `test_ingest_s1_roi_parity.py` does not run at all, for **two reasons that are
+independent of each other** — a distinction review had to make three times before all three copies
+of this claim stated it:
+
+* a `skipif` on Earthdata credentials, accepting **either** `EARTHDATA_TOKEN` **or**
+  `EARTHDATA_USERNAME` and `EARTHDATA_PASSWORD` together, so it skips only when neither form is set;
+* and separately an `xfail(raises=Exception)`, because the committed cassette was recorded against
+  the old CMR-STAC search path while OPERA now resolves items through the native CMR granule API, so
+  it no longer matches on replay (issue #45,
+  [ADR 009](decisions/009-native-cmr-granule-query.md)). Re-recording trips the credential-safety
+  guard at ~116 MB.
+
+Supplying credentials therefore changes the *label*, not the verdict — measured both ways: **no
+credentials → `6 passed, 2 skipped`; credentials → `6 passed, 1 skipped, 1 xfailed`**, six
+comparisons either way. The other skip is the deliberately-skipped `adapter_template`, not a second
+credential-gated arm. **So the S1 precondition was never verified, and "both blockers lapsed"
+overstated the evidence by one.**
 
 **The decision is unaffected and would have been the same either way** — it rests on the manual
 check being sufficient, not on the stub being unblocked. But it is recorded because the proposal
