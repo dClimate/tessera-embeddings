@@ -107,13 +107,15 @@ ai/
 !tests/fixtures/**/*.geojson
 !tests/fixtures/**/*.zarr
 
-# Local scale-test artifacts (multi-GB icechunk stores) — never commit
-scripts/scale_test_stores/
-scripts/scale_test_results/
-# NOT scripts/scale_tests/ — that is maintained source now. Ignoring the package
-# meant a new benchmark added beside the tracked ones never showed up in git status.
-scripts/scale_tests/**/results/
-scripts/scale_tests/scale_testing_results.md
+# Local scale-test artifacts (multi-GB icechunk stores) — never commit.
+# Unanchored on purpose: the harness derives these from Path.cwd(), so they land wherever
+# it was launched from, not beside the package. Anchoring them to one directory is what
+# left them untracked-but-visible after the package moved under scripts/scoping/.
+scale_test_stores/
+scale_test_results/
+# NOT the scale_tests/ package itself — that is maintained source. Ignoring it meant a new
+# benchmark added beside the tracked ones never showed up in git status.
+scripts/scoping/scale_tests/**/results/
 # Report output pasted from a terminal rather than redirected — the prompt
 # ends up in the filename. Regenerate with `python -m scale_tests.report`.
 scripts/scale_tests/(tessera-embeddings)*
