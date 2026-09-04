@@ -62,10 +62,26 @@ uv pip compile pyproject.toml \
     --extra inference --extra prefect --extra aws \
     --python-platform linux --python-version 3.12 \
     --extra-index-url https://download.pytorch.org/whl/cu124 \
-    --index-strategy unsafe-best-match \
     --no-sources \
     -o constraints-cu124.txt
+
+# Verify, every time. The filename is not a guarantee:
+grep -E '^(torch|nvidia-cuda-runtime)' constraints-cu124.txt
+# torch==2.6.0+cu124
+# nvidia-cuda-runtime-cu12==12.4.127
 ```
+
+> **Corrected 2026-09-03: this command used to carry `--index-strategy unsafe-best-match`, and with
+> it the output was not a CUDA 12.4 pin at all.** Run as documented it resolved
+> **`torch==2.14.0` with `nvidia-cuda-*==13.0.x`** — the newest release from PyPI, CUDA 13, written
+> to a file called `constraints-cu124.txt`. Three things combined: `torch` is unpinned in
+> `pyproject.toml`, `--no-sources` drops the `[tool.uv.sources]` mapping that otherwise holds torch
+> to one index, and `unsafe-best-match` searches every index and takes the best *version* it finds
+> anywhere. Dropping the flag restores uv's default `first-index`, which keeps torch on the CUDA
+> index it was found on. Verified both ways by running the compile.
+>
+> On uv 0.11.28 and later, `--torch-backend cu124` does the same thing more explicitly and needs no
+> `--extra-index-url`; either is fine, but **check the output** rather than trusting the filename.
 
 That file belongs in your deployment repo alongside your Dockerfiles, not
 in this OSS library.

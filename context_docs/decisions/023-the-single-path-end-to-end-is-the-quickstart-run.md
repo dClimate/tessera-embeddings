@@ -19,11 +19,15 @@ that both stated blockers had lapsed and proposed building it.
 > premise its own supporting document has withdrawn.** The single-ROI path had genuinely been
 > measured at about **three and a half minutes** end to end on a CPU laptop, against the "30+
 > minutes" the tier README claimed. But "the upstream per-stage parity tests pass" was read off a
-> `6 passed, 2 skipped` summary line and does not hold: `test_ingest_s1_roi_parity.py` carries both
-> a credentials `skipif` **and** an `xfail(raises=Exception)`, because its committed cassette
-> predates the native CMR granule query ([ADR 009](009-native-cmr-granule-query.md), issue #45), and
-> the second skip was the deliberately-skipped adapter template. **So the S1 precondition was never
-> verified.** The decision below is unaffected — it rests on the manual check being sufficient, not
+> `6 passed, 2 skipped` summary line and does not hold: `test_ingest_s1_roi_parity.py` does not run,
+> for **two independent reasons that are easy to read as one**. It carries a credentials `skipif`
+> — Earthdata Login, which many contributor laptops cannot basic-auth against — so with no
+> `EARTHDATA_TOKEN` it never starts; that is the skip you see, and refreshing the cassette does not
+> remove it. Supply a token and it starts, then `xfail`s, for the separate reason that its committed
+> cassette predates the native CMR granule query
+> ([ADR 009](009-native-cmr-granule-query.md), issue #45). The other skip is the adapter template,
+> skipped on purpose. **So the S1 precondition was never verified**, and clearing either reason
+> alone would not have verified it. The decision below is unaffected — it rests on the manual check being sufficient, not
 > on the stub being unblocked — but the proposal it declined was argued partly on a claim that does
 > not hold.
 
@@ -48,10 +52,13 @@ stub and now matches nothing — a dispatched run would exit on "no tests collec
 fails when triggered is worse than no workflow. If a slow test is ever written for another reason,
 the file is four lines of boilerplate plus a selector and is in git history.
 
-**`tests/slow/` stays, as a category rather than a plan.** The tier still means "takes more than a
-couple of minutes"; what it no longer has is a canonical occupant waiting to be written. The `slow`
-marker stays declared in `pyproject.toml` so the tier remains usable if something genuinely slow
-ever needs a home.
+**`tests/slow/` stays, as a category rather than a plan.** The tier means **more than 30 seconds**
+— the threshold `pyproject.toml` declares for the `slow` marker, and the complement of the unit
+tier's rule that no test may exceed 30 s. (An earlier draft of this record said "more than a couple
+of minutes", copied from `tests/slow/README.md` before that file was corrected; between them they
+left a 45-second test belonging nowhere.) What the tier no longer has is a canonical occupant
+waiting to be written. The marker stays declared so the tier remains usable if something genuinely
+slow ever needs a home.
 
 ## Rejected alternatives
 
