@@ -1379,7 +1379,7 @@ class RegionWriteBatch:
         are sparse, so the new slot costs no chunks until written. The session sees its own
         uncommitted resize, so window writes into the returned index work immediately.
 
-        A date already on the axis raises :class:`~tessera_embeddings.errors.DuplicateDateError`.
+        A date already on the axis raises :class:`DuplicateDateError`.
         **The likeliest cause is a SECOND WRITER on this store**, not a caller bug: the ingest
         paths read the committed dates and skip what they find, so the only way a date they
         decided to write is already present is that another process committed it after that

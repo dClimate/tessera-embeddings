@@ -23,8 +23,8 @@ from tessera_embeddings.ingest.s1_roi import S1Orbit
 from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
     dask_cleanup_on_cancellation,
     dask_resource_tags,
-    get_task_runner_for_cluster,
 )
+from tessera_embeddings.orchestration.prefect.flows._dask_runner import get_task_runner_for_cluster
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_sar
 
 

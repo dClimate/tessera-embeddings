@@ -28,7 +28,9 @@ orchestration/prefect/
 │   │  shared private helpers (underscore = not a public import surface)
 │   ├── _cell_validation.py          # hand a tagged cell to its validator, don't wait
 │   ├── _child_runs.py               # child deployment runs: cancel sweeps, terminal-state check
-│   ├── _dask_lifecycle.py           # Dask/ECS teardown hook + the DaskTaskRunner factory
+│   ├── _dask_lifecycle.py           # Dask/ECS teardown hook (deliberately import-light:
+│   │                                #   Prefect re-imports it in a fresh hook process)
+│   ├── _dask_runner.py              # the prefect_dask DaskTaskRunner factory
 │   ├── _ray_lifecycle.py            # Ray teardown hook (the Ray analogue of the above)
 │   ├── _fleet_gate.py               # hold dispatch while the GPU fleet is saturated
 │   └── _overrides.py                # per-run flow option overrides

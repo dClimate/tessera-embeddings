@@ -107,7 +107,7 @@ rather than re-exported from the top-level package:
 ## Privacy conventions
 
 - `_`-prefixed module names → fully private (e.g.
-  `orchestration.prefect.flows._dask_lifecycle`).
+  `orchestration.prefect.flows._dask_runner`).
 - `_`-prefixed function / attribute names → private to that module.
 - `@typing.final` on public dataclasses / pydantic models → no
   subclassing. mypy enforces statically.
