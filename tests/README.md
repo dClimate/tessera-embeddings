@@ -158,10 +158,13 @@ What follows for a reader: `run_plain`'s end-to-end path has **no automated cove
 Run the quickstart after changing `run_plain` or the stages it drives — about three and a half
 minutes on a laptop, following [`docs/quickstart.md`](../docs/quickstart.md).
 
-**Two ways that run silently checks less than you think**, both in ADR 023: ingest resumes off the
+**Three ways that run silently checks less than you think**, all in ADR 023. Ingest resumes off the
 dates already in the store, so a rerun against a populated `/tmp/tessera/inputs` skips ingest
-altogether — delete it first; and the shipped config says `device: auto`, so on a GPU box it is not
-the CPU path being verified — set `device: cpu`.
+altogether. Inference staging survives a *failed* run by design and its run id excludes the
+inference code identity, so a retry after an inference change can reuse the old tiles and report
+success. And the shipped config says `device: auto`, so on a GPU box it is not the CPU path being
+verified. **For a verification run, start from nothing**: fresh inputs, no staging prefix,
+`device: cpu` stated.
 
 ### 2. The `gpu/` tier is empty, and one GPU path is verified by hand
 

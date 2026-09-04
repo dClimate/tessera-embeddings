@@ -89,20 +89,35 @@ Follow [`docs/quickstart.md`](../../docs/quickstart.md) rather than improvising 
 carries the `source .venv/bin/activate` step and the reason `uv run python -m` must not be used
 (the subprocess it spawns kills Ray's GCS on macOS).
 
-**Two things make the difference between a real check and a green-looking no-op**, and both come
-from the same property that makes the run pleasant to repeat:
+**Three things make the difference between a real check and a green-looking no-op.** The first two
+come from the same property that makes the run pleasant to repeat — it resumes — and resume is
+exactly what a verification run does not want:
 
 * **Delete the input stores first.** Resume is per-store and per-date, not per-run: `s2_roi` reads
   the dates already committed and treats everything at or below the newest one as closed, and
   `s1_roi` narrows its query to the window after the last written date and can return without
   fetching anything. So a second run against a populated `/tmp/tessera/inputs` **skips the ingest
-  stages entirely** and verifies nothing about them. `rm -rf /tmp/tessera/inputs` (or point
-  `stores.inputs` somewhere fresh) before a run that is meant to check an ingest change. Only
-  inference staging cleans itself up.
+  stages entirely** and verifies nothing about them. `rm -rf /tmp/tessera/inputs` — or point
+  `paths.inputs` somewhere fresh; the key is `paths`, and a `stores` section would simply be
+  ignored — before a run meant to check an ingest change.
+* **Delete the staging prefix too, if the last run did not finish.** Staging is removed only after
+  `assemble` *returns* (`plain.py`), so a crashed or interrupted run leaves it behind on purpose,
+  for the next attempt to resume onto. And `_staging_run_id` **deliberately excludes the inference
+  code identity** — that is the documented single-ROI trade-off, not an oversight, and its own
+  docstring states the consequence: *edit inference code between a crash and its retry and the
+  retry reuses tiles the old code staged.* On the one-chunk quickstart that is the whole product,
+  so the rerun can report success having executed none of the changed inference code. The prefix is
+  logged at the top of every run — `Staging prefix for this run: … (delete it to force a clean
+  re-inference)` — so copy it from there rather than guessing. **"Inference staging cleans itself
+  up" is true only of a run that succeeded**, which is not the run you are most likely to be
+  retrying.
 * **Pin the device.** `examples/quickstart/config.yaml` ships `device: auto`, which resolves to one
   GPU whenever `torch.cuda.is_available()`. On a GPU box the run therefore exercises the CUDA path,
   not the CPU path it is being cited for. Set `device: cpu` when the CPU path is what you mean to
   verify.
+
+The blunt version of all three: **for a verification run, start from nothing** — fresh inputs, no
+staging, device stated. Resume is a feature of the ordinary run, not of this one.
 
 **This is one of two things in this repository verified by hand rather than by CI**, the other
 being the pipelined CUDA path, which has no GPU runner to run on (`tests/README.md`, Roadmap 2).

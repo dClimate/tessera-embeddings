@@ -24,9 +24,16 @@ Measured 2026-09-03 on **this branch after round 3** (10 cores, `-n auto`) — n
 `main` @ `692655d`, which still carries the deleted documentation-index test and so has 134 unit
 files rather than 133.
 
+**Recount it rather than trusting the LOC column**, which moves whenever a test file is edited —
+it drifted by 11 lines within this PR when a docstring grew:
+
+```bash
+git ls-files 'tests/unit/**/*.py' 'tests/unit/*.py' | xargs wc -l | tail -1
+```
+
 ```
                   files   tests    LOC    runs in CI as
-tests/unit          133    3675   54125   unit.yml (3.12 + 3.13), with coverage
+tests/unit          133    3675   54136   unit.yml (3.12 + 3.13), with coverage
 tests/integration     8      —     1108   integration.yml, path-filtered PRs
 tests/parity         10      —     1152   integration.yml as -m "parity and not slow"
 tests/architecture    3       3       98  architecture.yml
