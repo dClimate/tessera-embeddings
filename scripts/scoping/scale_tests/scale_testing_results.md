@@ -1,8 +1,20 @@
-# Scale-test report - run `run1`
+# Scale-test report - runs `run1` (T0-T7) and `d3`/`d3v2` (T8)
+
+**This file aggregates more than one run, and the sections have different provenance.**
+Read the header per section, not for the file:
+
+| sections | run | revision | observations |
+|---|---|---|---|
+| T0-T7 | `run1` | git `c490616` | 898 |
+| T8 | `d3` / `d3v2` — the sharding experiments E1-E4 ([ADR 008](../../../context_docs/decisions/008-global-store-architecture.md)) | not recorded here | 30 |
+| | | | **928 total** |
 
 - backend: **s3**, scale: **bench**
-- icechunk **2.1.1**, zarr **3.2.1**, git `c490616`
-- rows: 898
+- icechunk **2.1.1**, zarr **3.2.1**
+
+The 898 figure counts T0-T7 alone — it is the sum of the `n` column across those sections,
+and T8 adds 30 on top. Attributing all 928 to `run1` at `c490616` would credit the sharding
+measurements to a run that did not produce them.
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
 
