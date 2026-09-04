@@ -19,13 +19,13 @@ import asyncio
 import zarr
 from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
-from prefect.states import StateType
 from pydantic import BaseModel
 
 from tessera_embeddings.config.dask import compute_pipeline_cluster_sizing
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.data_loading import _active_orbits
+from tessera_embeddings.orchestration.prefect.flows._child_runs import _check_completed
 from tessera_embeddings.orchestration.prefect.flows.generate_roi import _crs_suffix
 
 
@@ -50,14 +50,6 @@ def _count_roi_chunks(roi_zarr_path: str) -> int:
     height, width = z.shape
     chunk_h, chunk_w = z.chunks
     return math.ceil(height / chunk_h) * math.ceil(width / chunk_w)
-
-
-def _check_completed(flow_run: object, stage: str) -> None:
-    """Raise if a child flow run did not complete successfully."""
-    state = getattr(flow_run, "state", None)
-    if state is None or state.type != StateType.COMPLETED:
-        state_name = state.name if state else "UNKNOWN"
-        raise RuntimeError(f"{stage} did not complete successfully (state={state_name})")
 
 
 @flow(name="tessera-full-pipeline", log_prints=True)

@@ -64,6 +64,7 @@ from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENC
 from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.orchestration.prefect.flows._child_runs import (
     CANCELLATION_CONFIRM_S,
+    _check_completed,
     child_run_tag,
     make_child_cancel_hook,
 )
@@ -73,7 +74,6 @@ from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
     _optical_min_obs_from_store,
 )
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import IngestDeployments
-from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_has_live_tiles,
     zone_work_weight,

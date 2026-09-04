@@ -59,7 +59,6 @@ from tessera_embeddings.inference.orchestration_helpers import build_inference_c
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.inference.scheduling import WorkItem
 from tessera_embeddings.ingest.source_coverage import SourceFinding, preflight_optical_source
-from tessera_embeddings.orchestration.prefect._fleet_gate import FleetGate, pause_signal
 from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
     cell_validation_parameters,
     dispatch_cell_validation,
@@ -67,9 +66,11 @@ from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
 )
 from tessera_embeddings.orchestration.prefect.flows._child_runs import (
     CANCELLATION_CONFIRM_S,
+    _check_completed,
     child_run_tag,
     make_child_cancel_hook,
 )
+from tessera_embeddings.orchestration.prefect.flows._fleet_gate import FleetGate, pause_signal
 from tessera_embeddings.orchestration.prefect.flows._overrides import set_overrides
 from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     activate,
@@ -86,7 +87,6 @@ from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import (
     _resolve_code_identity,
     _staging_run_id,
 )
-from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.sequential_fill import (
     PreparedCell,
     SequentialCell,

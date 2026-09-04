@@ -8,21 +8,34 @@ enforce that rule.
 ```
 orchestration/prefect/
 ├── flows/                  Layer 3: @flow definitions
+│   │
+│   │  single-ROI path
 │   ├── generate_roi.py
 │   ├── ingest_s2_roi_reflectance.py
 │   ├── ingest_s1_roi_sar.py
-│   ├── tessera_embeddings.py        # single-ROI: ROI → mosaic → inference → assembly
+│   ├── tessera_embeddings.py        # single-ROI: ROI -> mosaic -> inference -> assembly
 │   ├── tessera_full_pipeline.py     # single-ROI master: chains the four above via run_deployment
-│   ├── build_land_mask.py           # global campaign: registry → per-zone coverage bitmaps (no cluster)
-│   ├── seed_global_store.py         # global campaign: seed the 120 UTM-zone groups (no cluster)
-│   ├── fill_zone_year.py            # global campaign: one (zone, year) via Ray → assembly → tag
-│   ├── _cell_validation.py          # internal helper: hand a tagged cell to its validator, don't wait
-│   └── run_global_campaign.py       # global campaign driver: dispatch every pending (zone, year)
-├── tasks/                  Layer 2: thin @task wrappers (~20 LOC each)
-│   ├── ingest.py                    # process_roi_reflectance, process_roi_sar
-│   ├── inference.py                 # run_inference_task, assemble_embeddings_task
-│   └── land_mask.py                 # build / verify / validate coverage (no-cluster steps)
-└── _dask_runner.py         internal helper: prefect_dask DaskTaskRunner factory
+│   │
+│   │  global campaign (ADR-008)
+│   ├── build_land_mask.py           # registry -> per-zone coverage bitmaps (no cluster)
+│   ├── export_zone_rois.py          # per-zone ROI Zarrs from the coverage bitmaps
+│   ├── seed_global_store.py         # seed the 120 UTM-zone groups (metadata only, no cluster)
+│   ├── ingest_zone_year.py          # one (zone, year) mosaic build
+│   ├── fill_zone_year.py            # one (zone, year) via Ray -> assembly -> tag
+│   ├── fill_zones_sequential.py     # many cells on one long-lived Ray cluster
+│   ├── run_global_campaign.py       # driver: dispatch every pending (zone, year)
+│   │
+│   │  shared private helpers (underscore = not a public import surface)
+│   ├── _cell_validation.py          # hand a tagged cell to its validator, don't wait
+│   ├── _child_runs.py               # child deployment runs: cancel sweeps, terminal-state check
+│   ├── _dask_lifecycle.py           # Dask/ECS teardown hook + the DaskTaskRunner factory
+│   ├── _ray_lifecycle.py            # Ray teardown hook (the Ray analogue of the above)
+│   ├── _fleet_gate.py               # hold dispatch while the GPU fleet is saturated
+│   └── _overrides.py                # per-run flow option overrides
+└── tasks/                  Layer 2: thin @task wrappers (~20 LOC each, ADR-002)
+    ├── ingest.py                    # process_roi_reflectance, process_roi_sar
+    ├── inference.py                 # run_inference_task, assemble_embeddings_task
+    └── land_mask.py                 # build / verify / validate coverage (no-cluster steps)
 ```
 
 ## Global campaign (120 UTM zones)

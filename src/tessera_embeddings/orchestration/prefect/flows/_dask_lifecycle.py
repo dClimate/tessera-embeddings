@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 
+from prefect_dask import DaskTaskRunner
+
 #: Tag key stamped on every ECS resource a flow's Dask cluster creates.
 DASK_FLOW_RUN_TAG = "tessera-flow-run-id"
 
@@ -65,3 +67,15 @@ def _stop_ecs_tasks_by_tag(tag_key: str, tag_value: str, *, log: logging.Logger)
         return
 
     stop_ecs_tasks_by_tag(tag_key, tag_value, log=log)
+
+
+def get_task_runner_for_cluster(scheduler_address: str) -> DaskTaskRunner:
+    """Create a ``DaskTaskRunner`` connected to ``scheduler_address``.
+
+    Apply it via ``inner_flow.with_options(task_runner=...)`` so Prefect binds the runner
+    late, after the cluster context manager has produced a real scheduler address.
+    """
+    return DaskTaskRunner(
+        address=scheduler_address,
+        client_kwargs={"timeout": "300s"},
+    )

@@ -76,8 +76,11 @@ from tessera_embeddings.inference.data_loading import (
 from tessera_embeddings.ingest.catalogue_refusal import RefusalKind, refusal_in, repeat_is_deterministic
 from tessera_embeddings.ingest.duplicates import unreadable_source_in
 from tessera_embeddings.ingest.land_mask import export_zone_roi, live_chunk_count
-from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
-from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
+from tessera_embeddings.orchestration.prefect.flows._child_runs import (
+    _check_completed,
+    child_run_tag,
+    make_child_cancel_hook,
+)
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles
 from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
 from tessera_embeddings.storage.zarr_store import (
