@@ -20,8 +20,15 @@ jobs:
         # THIS LIST AND THE `Programming Language :: Python :: 3.x` CLASSIFIERS IN
         # pyproject.toml MUST MATCH. They are the same claim in two files: the classifiers
         # advertise a version, this matrix is the only thing that substantiates it. 3.14 was
-        # advertised and never tested here, which is why the classifier was dropped rather
-        # than this matrix widened -- widening it also needs a CUDA wheel that exists.
+        # advertised and never tested here, so the classifier was dropped.
+        #
+        # Adding 3.14 back is cheap and does NOT depend on CUDA: this job syncs WITHOUT
+        # `--no-sources`, so `[tool.uv.sources] torch = { index = "pytorch-cpu" }` applies and
+        # the run is CPU-only. The committed lock already resolves for 3.14 -- its torch entry
+        # carries `python_full_version == '3.14.*'` markers -- and `uv sync --python 3.14
+        # --all-extras --frozen` resolves 237 packages with torch 2.12.0 from the CPU registry.
+        # The GPU wheel gap on 3.14 is a SEPARATE constraint (docs/environment-setup.md) and is
+        # not a reason to keep this matrix narrow. Add the entry and the classifier together.
         #   3.12: declared floor in pyproject.toml (`requires-python`).
         #   3.13: current stable, and what every other workflow pins.
         python-version: ["3.12", "3.13"]

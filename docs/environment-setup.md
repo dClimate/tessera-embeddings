@@ -56,11 +56,18 @@ what the GPU instructions below are written for:
 | `unit.yml` CI matrix | 3.12 and 3.13 |
 | this page's GPU install | cu124 publishes `cp39`-`cp313` |
 
-> **Changed 2026-09-04: the 3.14 classifier is gone.** It advertised a version CI never exercised
-> and on which this GPU install cannot resolve — cu124 tops out at `torch 2.6.0`, which publishes
-> `cp39`-`cp313` and no `cp314`, and there is no newer cu124 build to move to. The classifier was
-> dropped rather than the CI matrix widened, because widening it would also have required a CUDA
-> wheel that does not exist.
+> **Changed 2026-09-04: the 3.14 classifier is gone.** It advertised a version CI has never
+> exercised, so nothing substantiated it.
+>
+> **Two constraints were conflated in the first version of this note, and they are independent.**
+> *(1) CPU test coverage:* adding 3.14 to `unit.yml` needs no CUDA wheel at all — that job syncs
+> without `--no-sources`, so `[tool.uv.sources]` holds torch to the CPU index, and the committed
+> lock already resolves for 3.14 (its torch entry carries `python_full_version == '3.14.*'`
+> markers; `uv sync --python 3.14 --all-extras --frozen` resolves 237 packages with torch 2.12.0
+> from the CPU registry). **So a 3.14 CPU job is available today and is the thing that would
+> justify re-adding the classifier.** *(2) GPU wheels:* separately, cu124 tops out at `torch 2.6.0`,
+> which publishes `cp39`-`cp313` and no `cp314`, so the GPU instructions below would still not
+> apply on 3.14. That is a real gap, but it is not a reason to keep the CPU matrix narrow.
 
 **`requires-python` stays `>=3.12` with no upper bound, and that is a choice rather than an
 oversight.** So 3.14 still *installs* — it is untested, not blocked. An upper bound would be the
@@ -70,7 +77,8 @@ the moment 3.14 is tested, which is a worse failure than an untested install. If
 
 **The classifiers and the CI matrix are the same claim in two files** — the classifiers advertise a
 version and the matrix is the only thing substantiating it. Change them together or not at all;
-both carry a comment saying so.
+both carry a comment saying so. Adding 3.14 means one matrix entry, one classifier, and a decision
+about whether the GPU gap above is acceptable — three separate things, in that order.
 
 ```bash
 # 1. Install CUDA torch from the pytorch index (supported: Python 3.12-3.13)
