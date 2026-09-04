@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -40,6 +39,7 @@ from shapely.ops import unary_union
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.storage.manifest import RoiManifest
+from tessera_embeddings.storage.zarr_store import StorageOptions, resolve_storage_options
 
 logger = logging.getLogger(__name__)
 
@@ -116,22 +116,6 @@ def read_roi_metadata(roi_path: str, *, storage_options: StorageOptions = None) 
         width=width,
         height=height,
     )
-
-
-StorageOptions = dict | Callable[[], "dict | None"] | None
-"""fsspec options, or a callable resolving them — see :func:`resolve_storage_options`."""
-
-
-def resolve_storage_options(storage_options: StorageOptions) -> dict | None:
-    """Resolve ``storage_options``, calling it if it is a provider.
-
-    **Accepting a callable is what keeps these credentials fresh.** A dict is a snapshot: resolved
-    once, it is still the value in use however much later the read happens, and an IAM credential
-    outlives neither a long leg nor its own TTL. A provider is re-invoked at each read, where the
-    credential is actually consumed. Resolving inside the reader rather than at each call site
-    means a new call site cannot silently reintroduce the frozen behaviour.
-    """
-    return storage_options() if callable(storage_options) else storage_options
 
 
 def read_roi_mask(

@@ -18,8 +18,8 @@ import pytest
 import tessera_embeddings.inference.scheduling as _sched_mod
 from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.inference.lifecycle import ACTOR_INIT_TIMEOUT_SEC
 from tessera_embeddings.inference.progress import chunk_uid
+from tessera_embeddings.inference.runner import ACTOR_INIT_TIMEOUT_SEC
 from tessera_embeddings.inference.scheduling import (
     ACTOR_REQUEST_HEADROOM,
     ActorPool,

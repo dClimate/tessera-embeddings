@@ -54,7 +54,6 @@ def test_inference_modules_import() -> None:
         dataset,
         diagnostics,
         inference,
-        lifecycle,
         orchestration_helpers,
         profiling,
         progress,

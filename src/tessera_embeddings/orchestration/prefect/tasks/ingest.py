@@ -18,11 +18,10 @@ from dask.distributed import get_client
 from prefect import get_run_logger, task
 
 from tessera_embeddings.config.ingest import INGEST_MANIFEST_SPLIT
-from tessera_embeddings.ingest.roi import StorageOptions
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
-from tessera_embeddings.storage.zarr_store import credentials_provider, manifest_split
+from tessera_embeddings.storage.zarr_store import StorageOptions, credentials_provider, manifest_split
 
 
 @task(name="process-roi-reflectance")

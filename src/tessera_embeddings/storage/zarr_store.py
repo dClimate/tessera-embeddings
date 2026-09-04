@@ -1960,3 +1960,19 @@ def set_s3_config(config: S3Config | None) -> None:
     """Set a global S3 configuration override for testing."""
     global _s3_config_override
     _s3_config_override = config
+
+
+StorageOptions = dict | Callable[[], "dict | None"] | None
+"""fsspec options, or a callable resolving them — see :func:`resolve_storage_options`."""
+
+
+def resolve_storage_options(storage_options: StorageOptions) -> dict | None:
+    """Resolve ``storage_options``, calling it if it is a provider.
+
+    **Accepting a callable is what keeps these credentials fresh.** A dict is a snapshot: resolved
+    once, it is still the value in use however much later the read happens, and an IAM credential
+    outlives neither a long leg nor its own TTL. A provider is re-invoked at each read, where the
+    credential is actually consumed. Resolving inside the reader rather than at each call site
+    means a new call site cannot silently reintroduce the frozen behaviour.
+    """
+    return storage_options() if callable(storage_options) else storage_options

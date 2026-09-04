@@ -297,7 +297,7 @@ def iam_s3_storage_options() -> dict[str, str]:
     role credential behind it expires (instance-metadata ~1h, ECS task role ~6h) — a leg can run
     longer, so options resolved once at leg entry stop working partway through, on a bucket the
     role can always read. Every consumer accepts a callable for exactly this reason (see
-    :func:`tessera_embeddings.ingest.roi.resolve_storage_options`) and re-invokes it at each read.
+    :func:`tessera_embeddings.storage.zarr_store.resolve_storage_options`) and re-invokes it at each read.
     That is cheap: :func:`_resolve_iam_credentials` caches a live refreshable credential, so each
     call is a frozen copy of an already-resolved one and botocore refreshes underneath.
 
