@@ -41,18 +41,58 @@ on whether a fingerprint change is acceptable now (§3).
 
 ## 2. What moved
 
-1. **`_check_completed`** → `flows/_child_runs.py` from `flows/tessera_full_pipeline.py`. A shared
+Nineteen in-scope moves were proposed. **Eleven were made; five were declined on their merits;
+three were held only by §1 and are now unblocked but not yet scheduled.**
+
+**Orchestration** — the three that are free of §1 entirely:
+
+1. `_check_completed` → `flows/_child_runs.py` from `flows/tessera_full_pipeline.py`. A shared
    "did this child run finish?" predicate parked in the single-ROI master flow, which the three
    campaign flows imported for that one function and nothing else. Three module edges → zero.
-2. **`flows/_fleet_gate.py`** moved down from `prefect/`. The seventh shared private flow helper,
-   and the only one a level above the other six. Its test already lived in the flows directory.
-3. **`get_task_runner_for_cluster`** → `flows/_dask_lifecycle.py`; the 17-line `_dask_runner.py`
-   is gone. One factory whose two consumers were exactly its Dask sibling's two consumers.
-   `_ray_lifecycle.py` and `_dask_lifecycle.py` are **not** merged — disjoint consumers, different
-   substrates, each documenting a different incident.
+2. `flows/_fleet_gate.py` moved down from `prefect/` — the seventh shared private flow helper,
+   and the only one a level above the other six.
+3. `get_task_runner_for_cluster` → `flows/_dask_lifecycle.py`; the 17-line `_dask_runner.py` is
+   gone. `_ray_lifecycle.py` is **not** merged with it: disjoint consumers, different substrates.
 
-Also regenerated `orchestration/prefect/README.md`'s tree, which listed none of the seven private
-helpers and three of the campaign flows.
+**Across sections**, once the fingerprint cost was accepted:
+
+4. `inference/conventions.py` → `storage/conventions.py` (398 L). Store metadata, proposed
+   independently by two auditors; removes `storage/`'s only runtime upward import.
+5. Three exceptions — `DuplicateDateError`, `InconclusiveStoreProbeError`,
+   `StoreHoldsCommittedDataError` — from root `errors.py` into `storage/zarr_store.py`, their only
+   raiser. Measured first: those are the only three of the module's eight with a single consumer,
+   and ten other modules already keep their single-consumer exceptions locally.
+6. **`storage/time_axis.py`** gathers nine symbols that answered "how does a store encode time?"
+   from three different files — the general store module, the *spatial* zone-grid module, and the
+   all-fill seeder. Callers were reaching into two of them on adjacent lines. 25 files repointed.
+7. **`inference/read_plan.py`** takes 17 symbols out of `actors.py` (1,663 L → 1,325 L): the
+   strip/crop/prefetch arithmetic, which has no Ray, no torch and no actor state, and which four
+   other modules already cited by name in their own prose.
+8. `download_checkpoint` and three helpers → `models/builder.py`, which already owns
+   `load_checkpoint`.
+9. `inference/lifecycle.py` folded into `runner.py` and deleted — 133 lines, one public function,
+   a docstring naming its sole importer.
+10. `StorageOptions` and `resolve_storage_options` → `storage/zarr_store.py`, joining the producer
+    half of the same credential-freshness contract.
+11. `orchestration/prefect/README.md`'s tree, which listed none of the seven private helpers.
+
+**Declined on their merits**, not blocked:
+
+- `global_store_config()` out of `zarr_store.py` — splits the `RepositoryConfig` builder family,
+  and the better answer (a `storage/repo_config.py` holding all three) is blocked behind the
+  `zarr_store` split. Doing it now would be undone.
+- The coverage-record consolidation — trades one separation for another by splitting
+  `read_skip_records` from its two consumers.
+- Renaming `inference/profiling.py` — resolves a name collision with `profiling/`, but the
+  placement is already right and a rename of an imported module is churn.
+- The `roi_processing` retry symbols — the auditor named a cheaper alternative (widen that
+  module's docstring), so this is a question of reading, not a defect.
+
+**Four changes to non-import source lines**, each forced by a move and each surfaced by the
+symbol-identity check rather than slipped through: `empty_store.__all__` lost a name that moved
+out; `read_plan.py` defines its own `logger`, being a new module whose code logs; and two
+docstrings carry a `:func:` cross-reference to a symbol that moved
+(`providers/aws/credentials.py`, `inference/runner.py`).
 
 ## 3. A live bug, found while establishing the above
 
