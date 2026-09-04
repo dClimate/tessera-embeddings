@@ -149,11 +149,6 @@ rediscovered. Full analysis in `context_docs/test-suite-streamlining.md`.
 Running the quickstart by hand IS that verification.** See
 [ADR 023](../context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md).
 
-The `xfail(strict=True)` stub that stood for it and the `nightly.yml` workflow pointed at that stub
-are both deleted. **The stub was not a neutral cost:** it read as queued work, and a review in
-September 2026 re-proposed the test on the strength of it. That is the reason the decision is
-recorded as an ADR rather than as a line here.
-
 What follows for a reader: `run_plain`'s end-to-end path has **no automated coverage, by decision**.
 Run the quickstart after changing `run_plain` or the stages it drives — about three and a half
 minutes on a laptop, following [`docs/quickstart.md`](../docs/quickstart.md).
@@ -226,19 +221,12 @@ remain valid.
 
 ### Closed, for reference
 
-Two further items were on this list and were fixed in the same change that added it, so they
-are recorded here rather than left reading as open work:
+Items that were on this list and are now closed, so they do not read as open work. Detail in
+`context_docs/test-suite-streamlining.md`.
 
-- **Two tests no CI job ran.** Both sat in `tests/unit/` behind a marker the default
-  `addopts` deselects. The local-Ray smoke test was deleted; the Dask scheduler-plugin test
-  moved to `tests/integration/`, where `integration.yml` runs it.
-- **A unit test that broke the 30-second bound above.** The source-read resilience test sat
-  through the real 8-attempt retry ladder, 61 s of genuine backoff. It now asserts the
-  ladder's shape instead of waiting it out, which checks more and takes 0.5 s.
-- **Two tests that had quietly given back a fifth of the suite's speed** (2026-09-03). A fleet-mix
-  test reached `ray.kill` on its teardown path, which is wrapped in Ray's auto-init hook, so it
-  **booted a real local Ray cluster** every run — the third occurrence of a hazard this repo
-  documents. And the documentation-index guard walked the whole working tree (2,975 markdown files,
-  of which 67 are the repository's) and took 10.3 s. **That guard is now deleted**, not optimised:
-  the documentation tree is not a subject for this suite, and `context_docs/README.md` keeps its
-  layout block current by hand. Both in `context_docs/test-suite-streamlining.md` §6.
+- Two tests no CI job ran — one deleted, one moved to `tests/integration/`.
+- A unit test that broke the 30-second bound; it now asserts the retry ladder's shape rather
+  than waiting it out.
+- Two slow tests: a fleet-mix test that booted a real Ray cluster via `ray.kill`, and the
+  documentation-index guard, which is deleted — **the documentation tree is not a subject for
+  this suite.**

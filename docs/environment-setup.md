@@ -40,45 +40,18 @@ For GPU production, install torch with the CUDA wheel explicitly first,
 then install the package. `--extra-index-url` alone is not sufficient
 because PyPI's CPU wheel stays in the candidate pool and can win.
 
-> **Corrected 2026-09-03: this said `cu121`, and `torch==2.6.0+cu121` does not exist.** Verified
-> against the indexes: 2.6.0 publishes `cu118`, `cu124` and `cu126`, not `cu121`, so the command
-> below failed to resolve. **Check the index before pinning a CUDA build** —
-> `https://download.pytorch.org/whl/<cuXXX>/torch/` lists what is actually there — and pick the one
-> your driver supports; `cu118` is the other published option for this version.
+**Check the build exists before pinning it.**
+`https://download.pytorch.org/whl/<cuXXX>/torch/` lists what each index carries; `torch 2.6.0`
+publishes `cu118`, `cu124` and `cu126`. Pick the one your driver supports.
 
-**Supported Python is 3.12-3.13.** That is what CI exercises, what the classifiers advertise, and
-what the GPU instructions below are written for:
+**Supported Python is 3.12-3.13** — what CI tests, what the classifiers advertise, and what these
+instructions assume. `requires-python` is `>=3.12` with no upper bound, so 3.14 installs but is
+untested; `cu126` and `cu128` publish the `cp314` wheels if you go there. cu124 has none: it tops
+out at `torch 2.6.0`, which is `cp39`-`cp313`.
 
-| where | says |
-|---|---|
-| `pyproject.toml` `requires-python` | `>=3.12` — open-ended, deliberately |
-| `pyproject.toml` classifiers | 3.12 and 3.13 |
-| `unit.yml` CI matrix | 3.12 and 3.13 |
-| this page's GPU install | cu124 publishes `cp39`-`cp313` |
-
-> **Changed 2026-09-04: the 3.14 classifier is gone.** It advertised a version CI has never
-> exercised, so nothing substantiated it.
->
-> **Two constraints were conflated in the first version of this note, and they are independent.**
-> *(1) CPU test coverage:* adding 3.14 to `unit.yml` needs no CUDA wheel at all — that job syncs
-> without `--no-sources`, so `[tool.uv.sources]` holds torch to the CPU index, and the committed
-> lock already resolves for 3.14 (its torch entry carries `python_full_version == '3.14.*'`
-> markers; `uv sync --python 3.14 --all-extras --frozen` resolves 237 packages with torch 2.12.0
-> from the CPU registry). **So a 3.14 CPU job is available today and is the thing that would
-> justify re-adding the classifier.** *(2) GPU wheels:* separately, cu124 tops out at `torch 2.6.0`,
-> which publishes `cp39`-`cp313` and no `cp314`, so the GPU instructions below would still not
-> apply on 3.14. That is a real gap, but it is not a reason to keep the CPU matrix narrow.
-
-**`requires-python` stays `>=3.12` with no upper bound, and that is a choice rather than an
-oversight.** So 3.14 still *installs* — it is untested, not blocked. An upper bound would be the
-stricter statement, but a `<3.14` cap propagates into every downstream resolution and goes stale
-the moment 3.14 is tested, which is a worse failure than an untested install. If you do run 3.14,
-`cu126` and `cu128` publish `cp314` wheels; you are ahead of CI, so expect to find things.
-
-**The classifiers and the CI matrix are the same claim in two files** — the classifiers advertise a
-version and the matrix is the only thing substantiating it. Change them together or not at all;
-both carry a comment saying so. Adding 3.14 means one matrix entry, one classifier, and a decision
-about whether the GPU gap above is acceptable — three separate things, in that order.
+To support a new version: add it to the `unit.yml` matrix and the `pyproject.toml` classifiers,
+which must stay in step. Neither depends on CUDA — that job syncs without `--no-sources`, so
+`[tool.uv.sources]` holds torch to the CPU index.
 
 ```bash
 # 1. Install CUDA torch from the pytorch index (supported: Python 3.12-3.13)
@@ -105,17 +78,11 @@ grep -E '^(torch|nvidia-cuda-runtime)' constraints-cu124.txt
 # nvidia-cuda-runtime-cu12==12.4.127
 ```
 
-> **Corrected 2026-09-03: this command used to carry `--index-strategy unsafe-best-match`, and with
-> it the output was not a CUDA 12.4 pin at all.** Run as documented it resolved
-> **`torch==2.14.0` with `nvidia-cuda-*==13.0.x`** — the newest release from PyPI, CUDA 13, written
-> to a file called `constraints-cu124.txt`. Three things combined: `torch` is unpinned in
-> `pyproject.toml`, `--no-sources` drops the `[tool.uv.sources]` mapping that otherwise holds torch
-> to one index, and `unsafe-best-match` searches every index and takes the best *version* it finds
-> anywhere. Dropping the flag restores uv's default `first-index`, which keeps torch on the CUDA
-> index it was found on. Verified both ways by running the compile.
->
-> On uv 0.11.28 and later, `--torch-backend cu124` does the same thing more explicitly and needs no
-> `--extra-index-url`; either is fine, but **check the output** rather than trusting the filename.
+**No `--index-strategy unsafe-best-match` here, deliberately.** It searches every index and takes
+the best *version* found anywhere, so PyPI's newest torch beats the CUDA index and you get a
+CUDA 13 pin in a file named `cu124`. uv's default `first-index` keeps torch on the CUDA index.
+`--torch-backend cu124` (uv 0.11.28+) is the explicit alternative and needs no `--extra-index-url`.
+Either way, grep the output — the filename guarantees nothing.
 
 That file belongs in your deployment repo alongside your Dockerfiles, not
 in this OSS library.
