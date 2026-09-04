@@ -1,4 +1,4 @@
-# 024 — The end-to-end path is verified by running the quickstart, not by an automated test
+# 023 — The end-to-end path is verified by running the quickstart, not by an automated test
 
 **Status:** Accepted (2026-09-03, repo owner). **Final — this is not an open item and is not to be
 re-proposed.**
@@ -51,10 +51,9 @@ credentials in CI, a 120-minute runner, and a test whose failures would most oft
 rather than the code.
 
 **Build it as a local-only instrument that skips in CI.** The parity tier already has that pattern
-for credential-gated tests. But a test that always skips is the situation
-[ADR 023](023-the-cuda-path-is-verified-by-hand.md) exists to make *visible* rather than one to
-create deliberately — and here there is nothing to make visible, because the manual check is not a
-gap being tolerated, it is the chosen method.
+for credential-gated tests. But a test that always skips reports nothing while looking like
+coverage, and here there is nothing to make visible anyway: the manual check is not a gap being
+tolerated, it is the chosen method.
 
 **Keep the stub as a design record.** The design is not lost: this ADR states it and the tier README
 describes the shape. What the stub added over those was a false signal that it was queued work.
@@ -72,13 +71,12 @@ the single-ROI path for anything that matters. It takes about three and a half m
 resumes if interrupted, and cleans up its own staging (PR #174). The command and its credential
 setup are in the repository README's quickstart.
 
-**This is the second accepted manual-verification gap in this repository**, and the pair should be
-read together: [ADR 023](023-the-cuda-path-is-verified-by-hand.md) for the pipelined CUDA path,
-this one for the single-ROI end-to-end. Both are deliberate, both are cheap to run by hand, and
-neither is a placeholder for automation that is coming.
+**This is one of two things in this repository verified by hand rather than by CI**, the other
+being the pipelined CUDA path, which has no GPU runner to run on (`tests/README.md`, Roadmap 2).
+Both are deliberate, both are cheap to run, and neither is a placeholder for automation that is
+coming.
 
 ## Related
 
 - [`../test-suite-streamlining.md`](../test-suite-streamlining.md) §7 — the open list this closes
-- [ADR 023](023-the-cuda-path-is-verified-by-hand.md) — the other accepted manual gap
 - `tests/slow/README.md` — what the tier means now

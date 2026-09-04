@@ -10,7 +10,7 @@ records what it would take to light it up.
 | `architecture/` | (default) | `architecture.yml` — PRs to `main` and pushes to `main` | Layer-rule enforcement (no Prefect outside `orchestration/prefect/`, etc.). |
 | `integration/` | `integration` | `integration.yml` — PRs to `main`, filtered to `src/`, `tests/integration/`, `tests/parity/`, `tests/fixtures/`, `pyproject.toml`, `uv.lock` | Hit moto / VCR cassettes / LocalCluster. Minutes. |
 | `parity/` | `parity` | `integration.yml`, same trigger, as `-m "parity and not slow"` | Prefect flow ↔ plain runner output equivalence. 5–30 min. |
-| `slow/` | `slow` | **nothing — the directory is empty and no occupant is planned** ([ADR 024](../context_docs/decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md)). | A home for a genuinely slow test, if one ever needs it. |
+| `slow/` | `slow` | **nothing — the directory is empty and no occupant is planned** ([ADR 023](../context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)). | A home for a genuinely slow test, if one ever needs it. |
 | `gpu/` | `gpu` | **nothing — no GPU runner is available.** See Roadmap 2. | Tiny (< 2 min) checks of GPU code paths. |
 
 Default `pytest` invocation only runs unit + architecture, per
@@ -20,7 +20,7 @@ Default `pytest` invocation only runs unit + architecture, per
 One workflow exists but is deliberately dormant, with the reason and the re-enable steps in a
 comment at the top of the file: `downstream-smoke.yml`, waiting on a stable release of the private
 downstream consumer. (`nightly.yml` is **deleted** — its only selector matched a stub for a test
-that will not be written; see ADR 024.)
+that will not be written; see ADR 023.)
 
 ## Where a new unit test goes
 
@@ -113,16 +113,15 @@ uv run pytest -m integration
 # Parity contract:
 uv run pytest -m parity
 
-# The pipelined CUDA path — NOT covered by CI. See Roadmap 2 for when to run it, and
-# ADR 023 for the CUDA-torch setup: `--frozen` installs the CPU wheel, so this SKIPS
-# unless you install a CUDA build first. A skip is not a pass.
-uv run python -c "import torch; assert torch.cuda.is_available()"
-uv run pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
+# The pipelined CUDA path — NOT covered by CI. Roadmap 2 has the setup and when to run
+# it; the short version is that the lockfile gives you CPU torch, so this SKIPS unless
+# you install a CUDA build first, and a skip is not a pass.
+uv run --no-sync pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
 ```
 
 `-m "slow or parity"` is documented in older notes as the full local end-to-end. It is not, and
 will not be: **no test carries the `slow` marker**, and the end-to-end path is verified by running
-the quickstart by hand ([ADR 024](../context_docs/decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md)).
+the quickstart by hand ([ADR 023](../context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)).
 
 ---
 
@@ -136,7 +135,7 @@ rediscovered. Full analysis in `context_docs/test-suite-streamlining.md`.
 
 **Decided 2026-09-03, and final: there will be no automated full-pipeline end-to-end test.
 Running the quickstart by hand IS that verification.** See
-[ADR 024](../context_docs/decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md).
+[ADR 023](../context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md).
 
 The `xfail(strict=True)` stub that stood for it and the `nightly.yml` workflow pointed at that stub
 are both deleted. **The stub was not a neutral cost:** it read as queued work, and a review in
@@ -152,30 +151,42 @@ minutes on a laptop, resumable, self-cleaning.
 **No GPU CI runner is available to this project, and one will not be provisioned. This gap is
 accepted, as of 2026-08-25.**
 
-`tests/unit/inference/test_inference_loop.py::TestRunInference::test_pipelined_matches_serial` is the
-only coverage of the pinned-buffer / CUDA-event / two-deep-drain / backbone-stream-ordering
+`tests/unit/inference/test_inference_loop.py::TestPipelinedGpuLoop::test_pipelined_matches_serial`
+is the only coverage of the pinned-buffer / CUDA-event / two-deep-drain / backbone-stream-ordering
 path. It is gated on `torch.cuda.is_available()`, so it skips on every CI runner — it is the
-`1 skipped` you see in each unit run. That skip is the standing signal that this gap exists,
-which is why the test keeps its `skipif` rather than taking the `gpu` marker: the marker is
-caught by the default deselection and the test would stop being reported at all.
+`1 skipped` you see in each unit run. **That skip is the standing signal that this gap exists**,
+which is why the test keeps its `skipif` rather than taking the `gpu` marker: the marker is caught
+by the default deselection, so a marked test would stop being reported at all. Tidier, and it would
+hide the one visible sign that the path is unverified.
 
-**Verify it by hand** with the command under "Running subsets" above, on any machine with a
-CUDA device — after any change to the pipelined loop, the actor pool, or the chunk-staging
-path, and once before a campaign starts.
+#### Running it by hand — the setup is the part that goes wrong
 
-**Read the outcome, not the exit code.** The lockfile pins torch to the CPU wheel registry on every
-platform, so `uv sync --all-extras --frozen` on a CUDA box installs `torch==2.12.0+cpu` and the test
-**skips** — reporting exactly what it reports in CI. `pytest` exits 0 on a skip, so the only result
-that verifies anything is a *passed*. ADR 023 has the CUDA-wheel install.
+**`uv sync --all-extras --frozen` gives you CPU torch on a CUDA machine.** The lockfile pins torch
+to `download.pytorch.org/whl/cpu` for *every* platform, so a bare `--frozen` installs
+`torch==2.12.0+cpu`, `torch.cuda.is_available()` is False, and the test **skips** — reporting
+exactly what it reports in CI. An operator following that alone would believe they had verified the
+path.
 
-`tests/gpu/` and its README are kept as a dormant spec: they describe what a GPU tier would
-look like if a runner ever becomes available, and the `gpu` marker stays declared so those
-instructions remain valid.
+```bash
+uv sync --all-extras --frozen
+# A CUDA build, outside the frozen resolution, matching the driver on the box:
+uv pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu124
 
-**This is a recorded decision, not an omission:**
-`context_docs/decisions/023-the-cuda-path-is-verified-by-hand.md` carries it, including the
-alternatives that were rejected — in particular why adding `@pytest.mark.gpu` to that test would
-make things worse rather than tidier.
+# --no-sync on everything after this. `uv run` re-syncs from the lockfile by default, which
+# would put the CPU wheel straight back.
+uv run --no-sync python -c "import torch; assert torch.cuda.is_available(), 'CPU torch — this will skip'"
+uv run --no-sync pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
+```
+
+**Read the outcome, not the exit code.** `pytest` exits 0 on a skip, so "the command succeeded" is
+not evidence. The only result that verifies anything here is a **passed**.
+
+**When:** after any change to the pipelined loop, the actor pool, or the chunk-staging path, and
+once before a campaign starts. Manual verification with no trigger attached does not happen.
+
+`tests/gpu/` and its README are kept as a dormant spec: they describe what a GPU tier would look
+like if a runner ever becomes available, and the `gpu` marker stays declared so those instructions
+remain valid.
 
 ### Closed, for reference
 
@@ -188,9 +199,10 @@ are recorded here rather than left reading as open work:
 - **A unit test that broke the 30-second bound above.** The source-read resilience test sat
   through the real 8-attempt retry ladder, 61 s of genuine backoff. It now asserts the
   ladder's shape instead of waiting it out, which checks more and takes 0.5 s.
-- **Two tests that had quietly given back a fifth of the suite's speed** (2026-09-03). The
-  documentation-index guard walked the whole working tree — 2,975 markdown files, of which 66 are
-  the repository's — and took 10.3 s; it asks `git ls-files` now and takes 0.01 s. And a fleet-mix
+- **Two tests that had quietly given back a fifth of the suite's speed** (2026-09-03). A fleet-mix
   test reached `ray.kill` on its teardown path, which is wrapped in Ray's auto-init hook, so it
-  **booted a real local Ray cluster** every run. Both in
-  `context_docs/test-suite-streamlining.md` §6.
+  **booted a real local Ray cluster** every run — the third occurrence of a hazard this repo
+  documents. And the documentation-index guard walked the whole working tree (2,975 markdown files,
+  of which 66 are the repository's) and took 10.3 s. **That guard is now deleted**, not optimised:
+  the documentation tree is not a subject for this suite, and `context_docs/README.md` keeps its
+  layout block current by hand. Both in `context_docs/test-suite-streamlining.md` §6.

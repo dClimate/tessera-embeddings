@@ -23,27 +23,30 @@ Measured 2026-09-03 on `main` @ `692655d` (10 cores, `-n auto`), after round 3.
 
 ```
                   files   tests    LOC    runs in CI as
-tests/unit          134    3713   54206   unit.yml (3.12 + 3.13), with coverage
+tests/unit          133    3675   54125   unit.yml (3.12 + 3.13), with coverage
 tests/integration     8      —     1108   integration.yml, path-filtered PRs
 tests/parity         10      —     1152   integration.yml as -m "parity and not slow"
 tests/architecture    3       3       98  architecture.yml
-tests/slow            1       0        0  nothing, and none planned — ADR 024 (§7.1)
-tests/gpu             1       0        0  nothing — no GPU runner exists, ADR 023
+tests/slow            1       0        0  nothing, and none planned — ADR 023 (§7.1)
+tests/gpu             1       0        0  nothing — no GPU runner exists (Roadmap 2)
 ```
 
-**Unit suite: 24.5 s wall, 3,713 passed / 1 skipped.** Line coverage of `src/tessera_embeddings` is
+**Unit suite: 24.5 s wall, 3,674 passed / 1 skipped** (3,675 collected). Line coverage of `src/tessera_embeddings` is
 **84%** (13,950 statements, 2,205 missed). The slowest single test is **3.3 s**, so the tier's
 documented "no test should exceed 30 s" bound holds with an order of magnitude to spare.
 
-The `1 skipped` is the pipelined CUDA path, and it is deliberate — [ADR 023](decisions/023-the-cuda-path-is-verified-by-hand.md).
+The `1 skipped` is the pipelined CUDA path, and it is deliberate: no GPU CI runner is available to
+this project and one will not be provisioned, so that path is verified by hand. The setup, the
+trigger, and why the test keeps its `skipif` rather than the `gpu` marker are in `tests/README.md`
+Roadmap 2.
 
 ### The layout, after round 2
 
 `tests/unit/` is grouped into **subject directories mirroring `src/tessera_embeddings/`**, so an
-edit to one subsystem can be verified without running the other 3,700 tests. `tests/README.md` is
+edit to one subsystem can be verified without running the other 3,600 tests. `tests/README.md` is
 the authority on where a new file goes; ADR 015 carries the reasoning and the two departures from a
 strict mirror. Every `src/` subpackage that holds testable code has a matching directory, and the
-eleven files that stay at `tests/unit/` root are named in `tests/README.md` and should not grow.
+ten files that stay at `tests/unit/` root are named in `tests/README.md` and should not grow.
 
 **Round 1's §1 described a flat `tests/unit/` of 120 files.** That is no longer the shape of the
 thing, which is why this section was rewritten rather than annotated.
@@ -119,8 +122,8 @@ after, and diff the IDs):
   guard, and one auto-parametrised row because this document exists.
 
 **Three CI gaps closed, one accepted.** A nightly runner that confirmed a placeholder; two tests no
-job executed; a regex guard nothing exercised. The GPU path stays uncovered by decision — now
-[ADR 023](decisions/023-the-cuda-path-is-verified-by-hand.md).
+job executed; a regex guard nothing exercised. The GPU path stays uncovered by decision —
+`tests/README.md` Roadmap 2.
 
 **Line count was not the lever, and round 1's own first estimate of it was wrong** — 157 lines net
 against an estimate of ~300, because the estimate counted helper *names* rather than comparing their
@@ -141,7 +144,9 @@ uv run python scripts/test_coverage_gate.py before.json after.json
 
 A file can gain lines and lose others while the percentage holds, which is why this compares sets
 rather than ratios. The artefact takes about 40 s to produce, so the gate costs one extra coverage
-run per change. Round 3's run: **11,745 lines before, 11,746 after, none lost.**
+run per change. Round 3's run: **11,745 lines before, 11,747 after, none lost** — the
+gate's verdict is *none lost*, not the total, which drifts by a line or two with parallel execution
+order.
 
 Gate S3 has no script — it is a judgement call per file, and §5 is the worked example of doing it
 properly.
@@ -257,13 +262,21 @@ that asserts on kills is silenced. **4.18 s → 1.17 s for the file**, and no Ra
 anywhere in `tests/unit` afterwards — checked by running every candidate file with `-s` and grepping
 for the banner.
 
-### 6.3 The GPU decision became an ADR
+### 6.3 The GPU decision stays in the test tree
 
-Round 1 recommended it — *"a standing decision with a consequence a future reader will trip over"* —
-and it had not been done. It is now [ADR 023](decisions/023-the-cuda-path-is-verified-by-hand.md).
-The decision itself is unchanged; what it adds is a home outside the test tree, since a reader
-arriving from `src/` and asking why the CUDA path is untested previously had three answers, all of
-them filed under `tests/`.
+Round 1 recommended promoting it to an ADR — *"a standing decision with a consequence a future
+reader will trip over"*. One was written and then **removed**: the decision was already stated in
+`tests/README.md` Roadmap 2, in the test class's own docstring, and here, and a fourth copy in the
+decision tree earned nothing (repo owner, 2026-09-03).
+
+What the exercise did surface, and what the Roadmap entry now carries, is that **the documented
+manual command did not work.** `uv sync --all-extras --frozen` installs CPU torch on a CUDA machine
+— the lockfile pins the CPU wheel registry for every platform — so `torch.cuda.is_available()` is
+False and the test **skips**, reporting exactly what it reports in CI. `uv run` then re-syncs from
+the lockfile by default, which would undo a manual CUDA install, so every invocation after it needs
+`--no-sync`. And the node ID in the instructions named the wrong class. **A manual verification
+whose command silently does nothing is worse than no instruction**, because it converts "unverified"
+into "believed verified".
 
 ### Round 3, measured
 
@@ -272,7 +285,7 @@ them filed under `tests/`.
 | unit suite wall time | 30.7 s | **24.5 s** |
 | slowest single test | 10.3 s | **3.2 s** |
 | unit tests that boot a real Ray cluster | 1 | **0** |
-| src lines covered | 11,745 | **11,748 — none lost**, by the S2 gate |
+| src lines covered | 11,745 | **11,747 — none lost**, by the S2 gate |
 | tests removed | — | **the documentation-index guard, and the end-to-end stub** (§6.1, §7.1) |
 
 **No surviving test changed what it asserts.** The Ray fix is to how a test reaches its subject;
@@ -293,7 +306,7 @@ is not mistaken for one (§7.5). **Nothing on this list is queued work.**
 
 **Decided 2026-09-03, and final: there will be no automated full-pipeline end-to-end test. Running
 the quickstart by hand IS that verification.**
-[ADR 024](decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md) carries it, including
+[ADR 023](decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md) carries it, including
 the two alternatives that were declined.
 
 The reasoning that led here is worth keeping, and so is the fact that **half of it was wrong**.
@@ -334,10 +347,11 @@ mocked; the parity suite compares flows to domain functions per stage and never 
 **So a green suite is weak evidence about the path an outside user of this library is most likely to
 take.** The quickstart run is the evidence — after a change to `run_plain` or the stages it drives.
 
-**This is the second accepted manual-verification gap here**, and the two should be read together:
-[ADR 023](decisions/023-the-cuda-path-is-verified-by-hand.md) for the pipelined CUDA path,
-[ADR 024](decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md) for this one. Neither
-is a placeholder for automation that is coming, and **neither is to be re-proposed.**
+**This is one of two things in this repository verified by hand rather than by CI**, and the two
+should be read together: the pipelined CUDA path (`tests/README.md` Roadmap 2), which has no GPU
+runner to run on, and this one, which is
+[ADR 023](decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md). Neither is a
+placeholder for automation that is coming, and **neither is to be re-proposed.**
 
 ### 7.3 Two optical warnings carry no ROI attribution
 

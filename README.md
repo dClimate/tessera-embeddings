@@ -527,7 +527,7 @@ For CI: `plain.py --skip-inference` is the fast PR check (minutes).
 **The end-to-end run on the quickstart ROI is not automated at all** — it
 is verified by running it by hand, which takes about three and a half
 minutes on a laptop
-([ADR 024](context_docs/decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md)). Fast PR checks also use
+([ADR 023](context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)). Fast PR checks also use
 AST-based architecture rules (§Architecture) to catch Prefect leaks
 at the import level without running the pipeline.
 

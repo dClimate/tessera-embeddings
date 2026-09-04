@@ -22,7 +22,7 @@ uv run pytest -m parity                 # all of them
 
 There is no `-m "parity and slow"` target. It used to select a full-pipeline stub, which is
 deleted — the end-to-end path is verified by running the quickstart by hand
-([ADR 024](../../context_docs/decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md)).
+([ADR 023](../../context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)).
 
 The default `pytest` invocation excludes `parity` so contributors
 don't accidentally run the slow ones.

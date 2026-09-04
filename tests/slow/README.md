@@ -2,7 +2,7 @@
 
 > **STATUS: empty, and no occupant is planned.** The full plain-runner end-to-end this tier was
 > created for is **verified by running the quickstart by hand, not by an automated test** —
-> [ADR 024](../../context_docs/decisions/024-the-single-path-end-to-end-is-the-quickstart-run.md),
+> [ADR 023](../../context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md),
 > a final decision. The `xfail` stub that used to stand for it, and the nightly workflow pointed at
 > that stub, are both deleted.
 
@@ -23,7 +23,6 @@ uv run pytest -m "slow or parity"
 
 ## What does NOT go here
 
-* Anything that requires a GPU. See `tests/gpu/`, and
-  [ADR 023](../../context_docs/decisions/023-the-cuda-path-is-verified-by-hand.md).
+* Anything that requires a GPU. See `tests/gpu/`, and `tests/README.md` Roadmap 2.
 * Tests that *could* be quick but are slow because they hit live services. Use cassettes; if they
   are still slow, find out why. Two tests reached 61 s and 10 s that way and neither needed to.
