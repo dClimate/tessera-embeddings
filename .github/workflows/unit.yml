@@ -17,8 +17,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.12: declared floor in pyproject.toml.
-        # 3.13: current stable (developed against this).
+        # THIS LIST AND THE `Programming Language :: Python :: 3.x` CLASSIFIERS IN
+        # pyproject.toml MUST MATCH. They are the same claim in two files: the classifiers
+        # advertise a version, this matrix is the only thing that substantiates it. 3.14 was
+        # advertised and never tested here, which is why the classifier was dropped rather
+        # than this matrix widened -- widening it also needs a CUDA wheel that exists.
+        #   3.12: declared floor in pyproject.toml (`requires-python`).
+        #   3.13: current stable, and what every other workflow pins.
         python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

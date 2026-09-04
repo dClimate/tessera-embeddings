@@ -14,7 +14,9 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
+    # No 3.14: it is untested (see .github/workflows/unit.yml) and the GPU install has no
+    # cu124 wheel for it. `requires-python` stays open-ended, so 3.14 still installs --
+    # untested, not blocked. Add the classifier and a matrix entry together, or neither.
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",

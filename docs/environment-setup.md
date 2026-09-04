@@ -46,27 +46,34 @@ because PyPI's CPU wheel stays in the candidate pool and can win.
 > `https://download.pytorch.org/whl/<cuXXX>/torch/` lists what is actually there — and pick the one
 > your driver supports; `cu118` is the other published option for this version.
 
-**The CUDA pin does not cover every Python this package advertises.** Three statements about
-Python support currently disagree, and it is worth seeing them together:
+**Supported Python is 3.12-3.13.** That is what CI exercises, what the classifiers advertise, and
+what the GPU instructions below are written for:
 
 | where | says |
 |---|---|
-| `pyproject.toml` `requires-python` | `>=3.12` — open-ended |
-| `pyproject.toml` classifiers | 3.12, 3.13 **and 3.14**, explicitly |
-| `unit.yml` CI matrix | 3.12 and 3.13 only |
-| this page's GPU install | cu124 publishes `cp39`-`cp313`; **no `cp314`** |
+| `pyproject.toml` `requires-python` | `>=3.12` — open-ended, deliberately |
+| `pyproject.toml` classifiers | 3.12 and 3.13 |
+| `unit.yml` CI matrix | 3.12 and 3.13 |
+| this page's GPU install | cu124 publishes `cp39`-`cp313` |
 
-So the package advertises a Python version that CI does not exercise and on which the documented
-GPU install cannot resolve — cu124 tops out at `torch 2.6.0`, so there is no newer build on that
-index to move to. Verified against the index listings; `cu126` and `cu128` do publish `cp314`
-wheels and are the route if you need 3.14.
+> **Changed 2026-09-04: the 3.14 classifier is gone.** It advertised a version CI never exercised
+> and on which this GPU install cannot resolve — cu124 tops out at `torch 2.6.0`, which publishes
+> `cp39`-`cp313` and no `cp314`, and there is no newer cu124 build to move to. The classifier was
+> dropped rather than the CI matrix widened, because widening it would also have required a CUDA
+> wheel that does not exist.
 
-**Treat Python 3.12-3.13 with cu124 as the supported GPU combination** — the one CI covers and
-these instructions are written for. Whether the 3.14 classifier should stay is a support-scope
-question for the maintainers, not a documentation one, and it is deliberately left as it is here.
+**`requires-python` stays `>=3.12` with no upper bound, and that is a choice rather than an
+oversight.** So 3.14 still *installs* — it is untested, not blocked. An upper bound would be the
+stricter statement, but a `<3.14` cap propagates into every downstream resolution and goes stale
+the moment 3.14 is tested, which is a worse failure than an untested install. If you do run 3.14,
+`cu126` and `cu128` publish `cp314` wheels; you are ahead of CI, so expect to find things.
+
+**The classifiers and the CI matrix are the same claim in two files** — the classifiers advertise a
+version and the matrix is the only thing substantiating it. Change them together or not at all;
+both carry a comment saying so.
 
 ```bash
-# 1. Install CUDA torch from the pytorch index (CPython 3.9-3.13)
+# 1. Install CUDA torch from the pytorch index (supported: Python 3.12-3.13)
 pip install "torch==2.6.0+cu124" --index-url https://download.pytorch.org/whl/cu124
 
 # 2. Install the package — pip sees torch already satisfied, keeps the CUDA wheel

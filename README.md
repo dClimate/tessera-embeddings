@@ -86,9 +86,9 @@ pip install tessera_embeddings[inference,prefect,aws]
 pip install "torch==2.6.0+cu124" --index-url https://download.pytorch.org/whl/cu124
 pip install "tessera_embeddings[inference]"
 
-# 3.12-3.13 is the overlap of two ranges, not a typo: this package needs >=3.12, and cu124
-# tops out at torch 2.6.0, which publishes cp39-cp313 and no cp314. On 3.14, use the cu126
-# or cu128 index, which do ship cp314 builds.
+# 3.12-3.13 is the supported range: it is what CI tests, and cu124 tops out at torch 2.6.0,
+# which publishes cp39-cp313 and no cp314. Python 3.14 is untested rather than blocked --
+# see docs/environment-setup.md if you intend to run it anyway.
 ```
 
 For contributors:
