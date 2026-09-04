@@ -82,9 +82,12 @@ pip install tessera_embeddings[inference]
 # Full production stack — inference + Prefect orchestration + AWS:
 pip install tessera_embeddings[inference,prefect,aws]
 
-# GPU (CUDA 12.4) — install torch first so pip keeps the CUDA wheel:
+# GPU (CUDA 12.4, CPython 3.9-3.13) — install torch first so pip keeps the CUDA wheel:
 pip install "torch==2.6.0+cu124" --index-url https://download.pytorch.org/whl/cu124
 pip install "tessera_embeddings[inference]"
+
+# On Python 3.14 this pin has no wheel: cu124 tops out at torch 2.6.0 and publishes
+# cp39-cp313 only. Use the cu126 or cu128 index, which do ship cp314 builds.
 ```
 
 For contributors:

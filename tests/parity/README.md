@@ -14,17 +14,22 @@ end-to-end path is now verified by running the quickstart by hand
 So the contract holds per stage; it is not evidence that a full run of the two paths agrees.
 
 **And one of the seven real comparisons is not running, for two unrelated reasons at once.**
-`test_ingest_s1_roi_parity.py` carries a credentials `skipif` — Earthdata Login, which many
-contributor laptops cannot basic-auth against — so without `EARTHDATA_TOKEN` it never starts. Set
-the token and it starts and then `xfail`s, for a separate reason: its committed cassette predates
-the native CMR granule query ([ADR 009](../../context_docs/decisions/009-native-cmr-granule-query.md),
-issue #45) and no longer matches on replay. **Neither reason is the other's fix.**
+`test_ingest_s1_roi_parity.py` carries a credentials `skipif` that accepts **either** supported
+Earthdata Login form — `EARTHDATA_TOKEN`, or `EARTHDATA_USERNAME` **and** `EARTHDATA_PASSWORD`
+together — so it skips only when none of them is set. (The token is the one to prefer: many
+contributor accounts are SAML- or MFA-linked and cannot basic-auth at all.) Supply either and the
+test starts, and then `xfail`s for a separate reason: its committed cassette predates the native CMR
+granule query ([ADR 009](../../context_docs/decisions/009-native-cmr-granule-query.md), issue #45)
+and no longer matches on replay. **Neither reason is the other's fix**, so what you see depends on
+your environment — a skip with no credentials, an xfail with any of them.
 
 So `-m parity` collects eight — seven comparisons plus `adapter_template/`, which is
-`@pytest.mark.skip`ped on purpose as a template to copy — and a clean local run reports
-**`6 passed, 2 skipped` in about 100 seconds** (measured, replaying cassettes, no Earthdata
-credentials set). That is the healthy result here, not a fully-verified one: read it as six of
-seven comparisons made, with the template accounting for the other skip.
+`@pytest.mark.skip`ped on purpose as a template to copy. **With no Earthdata credentials in the
+environment** a clean run reports **`6 passed, 2 skipped` in about 100 seconds** (measured, cassette
+replay) — the template and S1 being the two skips. **With credentials set** the same run reports
+`6 passed, 1 skipped, 1 xfailed` in 101.8 s — the same six comparisons, the same wall clock, and a
+different label on S1, because it fails on the cassette mismatch before doing real work.
+Either way, read it as six of seven comparisons made, not as a full verification.
 
 If a parity test fails, one of two things happened:
 

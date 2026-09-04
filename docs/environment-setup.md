@@ -46,8 +46,14 @@ because PyPI's CPU wheel stays in the candidate pool and can win.
 > `https://download.pytorch.org/whl/<cuXXX>/torch/` lists what is actually there — and pick the one
 > your driver supports; `cu118` is the other published option for this version.
 
+**The CUDA pin does not cover every Python this package accepts.** `requires-python` is `>=3.12`,
+open-ended, so 3.14 is allowed — but the cu124 index tops out at `torch 2.6.0` and publishes
+`cp39`-`cp313` wheels only, so on 3.14 the command below has nothing to resolve. Verified against
+the index listings; `cu126` and `cu128` do publish `cp314` builds and are the route on 3.14. **The
+supported GPU combination is Python 3.12-3.13 with cu124**, which is also what CI exercises.
+
 ```bash
-# 1. Install CUDA torch from the pytorch index
+# 1. Install CUDA torch from the pytorch index (CPython 3.9-3.13)
 pip install "torch==2.6.0+cu124" --index-url https://download.pytorch.org/whl/cu124
 
 # 2. Install the package — pip sees torch already satisfied, keeps the CUDA wheel
