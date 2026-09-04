@@ -12,7 +12,7 @@ import dataclasses
 
 import numpy as np
 
-from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, calendar_year_times
+from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS, calendar_year_times
 
 #: The annual timesteps of the campaign (2025 filled first, then backwards) —
 #: the library's axis, so the harness's join keys can't drift from it.

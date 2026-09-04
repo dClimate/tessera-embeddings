@@ -23,7 +23,7 @@ from collections.abc import Callable
 from typing import Any
 
 from prefect.client.orchestration import get_client
-from prefect.states import Cancelling
+from prefect.states import Cancelling, StateType
 
 #: Runs fetched per page when sweeping children by tag. Prefect's server-side default is 200;
 #: asking explicitly is what makes "a short page means the last page" true.
@@ -107,3 +107,11 @@ def make_child_cancel_hook(prefix: str, what: str) -> Callable[..., None]:
             log.warning("%s sweep failed — check the Prefect UI for tag %r", what.capitalize(), tag, exc_info=True)
 
     return _hook
+
+
+def _check_completed(flow_run: object, stage: str) -> None:
+    """Raise if a child flow run did not complete successfully."""
+    state = getattr(flow_run, "state", None)
+    if state is None or state.type != StateType.COMPLETED:
+        state_name = state.name if state else "UNKNOWN"
+        raise RuntimeError(f"{stage} did not complete successfully (state={state_name})")

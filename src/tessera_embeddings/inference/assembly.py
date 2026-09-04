@@ -72,8 +72,8 @@ from tessera_embeddings.config.store_layout import (
     trailing_extent,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
-from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage import zone_grid
+from tessera_embeddings.storage.conventions import build_convention_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.icechunk_logging import traced_commit
@@ -87,15 +87,14 @@ from tessera_embeddings.storage.shard_writer import (
     shard_pitch,
     write_year_shards,
 )
+from tessera_embeddings.storage.time_axis import read_time_values, time_index_of, year_timestamp
 from tessera_embeddings.storage.zarr_store import (
     manifest_split,
     open_or_create_repo,
     open_store_as_zarr_group,
     plain_zarr_storage_options,
-    read_time_values,
-    time_index_of,
 )
-from tessera_embeddings.storage.zone_grid import PIXEL_M, year_timestamp
+from tessera_embeddings.storage.zone_grid import PIXEL_M
 
 logger = logging.getLogger(__name__)
 

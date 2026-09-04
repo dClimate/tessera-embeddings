@@ -32,6 +32,7 @@ from icechunk.xarray import to_icechunk
 
 from tessera_embeddings.config import S2_L2A_BANDS
 from tessera_embeddings.storage.region_writes import _pad_region_to_chunks
+from tessera_embeddings.storage.time_axis import compute_doy
 from tessera_embeddings.storage.zarr_store import (
     _DEFAULT_CONNECT_TIMEOUT_MS,
     _DEFAULT_OPERATION_ATTEMPT_TIMEOUT_MS,
@@ -43,7 +44,6 @@ from tessera_embeddings.storage.zarr_store import (
     _default_repo_config,
     _open_writable_session,
     _write_new,
-    compute_doy,
     get_existing_dates,
     open_repo,
     open_store,

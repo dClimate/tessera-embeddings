@@ -20,7 +20,7 @@ import zarr
 
 from scale_tests import variants as V
 from scale_tests.zone_geometry import YEARS, MockZone, coords
-from tessera_embeddings.storage.zarr_store import TIME_ENCODING
+from tessera_embeddings.storage.time_axis import TIME_ENCODING
 
 
 @dataclasses.dataclass(frozen=True)

@@ -29,8 +29,8 @@ import icechunk
 import zarr
 
 from tessera_embeddings.storage.shard_writer import commit_year_attrs
-from tessera_embeddings.storage.zarr_store import time_index_of
-from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES, year_timestamp
+from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS, time_index_of, year_timestamp
+from tessera_embeddings.storage.zone_grid import ZONES
 
 logger = logging.getLogger(__name__)
 

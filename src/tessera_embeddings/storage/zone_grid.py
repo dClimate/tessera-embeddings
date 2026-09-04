@@ -44,8 +44,6 @@ PIXEL_M: float = 10.0
 #: Shard pitch in metres — extents snap to this so the grid is shard-aligned.
 PITCH_M: float = SHARD_PX * PIXEL_M  # 20 480 m
 
-#: The campaign's annual timesteps (2025 filled first, then backwards).
-CAMPAIGN_YEARS: tuple[int, ...] = tuple(range(2017, 2026))
 
 #: Machine-readable marker of the boundary policy, for dataset attrs.
 ZONE_SCHEME: str = "utm_6deg_nominal"
@@ -249,18 +247,3 @@ def tile_row_latitudes(spec: ZoneSpec, n_rows: int) -> np.ndarray:
     if spec.hemisphere == "S":
         northing = northing - 10_000_000.0
     return northing / 111_320.0
-
-
-def year_timestamp(year: int) -> np.datetime64:
-    """The Q2 calendar-year convention, encoded once: ``year`` → ``YYYY-01-01`` ns."""
-    return np.datetime64(f"{year}-01-01", "ns")
-
-
-def year_of(value: np.datetime64 | np.ndarray) -> int:
-    """Inverse of :func:`year_timestamp`: a (scalar) timestamp's calendar year."""
-    return int(np.asarray(value).astype("datetime64[Y]").astype(int)) + 1970
-
-
-def calendar_year_times(years: tuple[int, ...] = CAMPAIGN_YEARS) -> np.ndarray:
-    """Return one ``datetime64[ns]`` per year at ``YYYY-01-01`` (Q2 convention)."""
-    return np.array([year_timestamp(y) for y in years])

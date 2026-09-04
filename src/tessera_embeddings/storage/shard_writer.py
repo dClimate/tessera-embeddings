@@ -63,8 +63,7 @@ from tessera_embeddings.storage.session_catch_up import (
     rehome_after_a_wedged_catch_up,
     ticking,
 )
-from tessera_embeddings.storage.zarr_store import read_time_values
-from tessera_embeddings.storage.zone_grid import year_of
+from tessera_embeddings.storage.time_axis import read_time_values, year_of
 
 _log = logging.getLogger(__name__)
 

@@ -68,13 +68,9 @@ from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
 from tessera_embeddings.storage.shard_writer import read_years_complete, shard_pitch
-from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, time_index_of
-from tessera_embeddings.storage.zone_grid import (
-    PIXEL_M,
-    canonicalize_zone,
-    tile_row_latitudes,
-    year_timestamp,
-)
+from tessera_embeddings.storage.time_axis import time_index_of, year_timestamp
+from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
+from tessera_embeddings.storage.zone_grid import PIXEL_M, canonicalize_zone, tile_row_latitudes
 from tessera_embeddings.storage.zone_grid import zone as zone_spec
 
 

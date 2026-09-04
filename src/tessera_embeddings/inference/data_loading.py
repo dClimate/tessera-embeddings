@@ -29,12 +29,8 @@ from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.storage.zarr_store import (
-    ASSESSED_WINDOW_ATTR,
-    compute_doy,
-    is_missing_repo,
-    open_store_as_zarr_group,
-)
+from tessera_embeddings.storage.time_axis import compute_doy
+from tessera_embeddings.storage.zarr_store import ASSESSED_WINDOW_ATTR, is_missing_repo, open_store_as_zarr_group
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +100,7 @@ class S2MaskBundle:
     The strip loop reads SCL for the whole chunk once, then slices this bundle per strip. SCL
     chunks on disk are ``(time=1, 4000, 4000)``, so any sub-region read decompresses the whole
     chunk anyway; loading once turns per-strip SCL re-reads into in-memory views. The mask also
-    sizes the strip height (``actors._strip_height_for_density``): its ``T_kept`` is the true
+    sizes the strip height (``read_plan._strip_height_for_density``): its ``T_kept`` is the true
     post-pruning timestep count for *this* chunk, so sparse chunks get tall strips and only
     genuinely dense chunks split.
 

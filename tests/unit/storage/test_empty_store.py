@@ -29,12 +29,8 @@ from odc.geo.geobox import GeoBox
 
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest.roi import ROIMetadata
-from tessera_embeddings.storage.empty_store import (
-    VarSpec,
-    create_empty_store,
-    create_empty_store_from_coords,
-    daily_times,
-)
+from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store, create_empty_store_from_coords
+from tessera_embeddings.storage.time_axis import daily_times
 from tessera_embeddings.storage.zarr_store import open_store, open_store_as_zarr_group, write_dataset
 
 _CRS = "EPSG:32615"

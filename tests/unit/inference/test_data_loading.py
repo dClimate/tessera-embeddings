@@ -24,7 +24,7 @@ from tessera_embeddings.inference.data_loading import (
     make_store_opener,
     resolve_s1_orbit,
 )
-from tessera_embeddings.storage.zarr_store import compute_doy
+from tessera_embeddings.storage.time_axis import compute_doy
 from tests.unit.mosaic_stores import make_s2_group, make_sar_group, store_opener
 
 

@@ -189,7 +189,7 @@ def read_host_ram_gib() -> tuple[float, float] | None:
     """``(used, total)`` host RAM in GiB from /proc/meminfo, or ``None`` off Linux.
 
     Used is ``MemTotal - MemAvailable``, the figure the per-actor budget at
-    :data:`~tessera_embeddings.inference.actors._S2_STRIP_BYTE_BUDGET` is sized against.
+    :data:`~tessera_embeddings.inference.read_plan._S2_STRIP_BYTE_BUDGET` is sized against.
     Whole-HOST, not per-process: where several actors share a box this is their sum plus the
     system's — the right denominator for "did we fit in this instance size", the wrong one for
     "how much did THIS actor use".

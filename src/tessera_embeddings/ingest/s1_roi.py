@@ -52,10 +52,8 @@ from tessera_embeddings.ingest.live_windows import (
 from tessera_embeddings.ingest.loader_failures import install_capture_everywhere, refusal_wait_out
 from tessera_embeddings.ingest.opera_query import make_s1_item_provider
 from tessera_embeddings.ingest.roi import (
-    StorageOptions,
     read_roi_mask,
     read_roi_metadata,
-    resolve_storage_options,
 )
 from tessera_embeddings.ingest.roi_processing import apply_roi_mask, read_failure_context
 from tessera_embeddings.ingest.solar_days import (
@@ -72,8 +70,10 @@ from tessera_embeddings.ingest.stac import ingest_tile
 from tessera_embeddings.ingest.transforms import amplitude_to_db
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
+    StorageOptions,
     get_existing_dates,
     record_assessed_window,
+    resolve_storage_options,
     store_write_retrying,
     write_day_windows,
 )

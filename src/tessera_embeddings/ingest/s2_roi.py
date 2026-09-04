@@ -71,10 +71,8 @@ from tessera_embeddings.ingest.loader_failures import (
     label_objects,
 )
 from tessera_embeddings.ingest.roi import (
-    StorageOptions,
     read_roi_mask,
     read_roi_metadata,
-    resolve_storage_options,
 )
 from tessera_embeddings.ingest.roi_processing import (
     DEFAULT_MIN_VALID_COVERAGE,
@@ -102,8 +100,10 @@ from tessera_embeddings.ingest.stac import (
 )
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
+    StorageOptions,
     get_existing_dates,
     record_assessed_window,
+    resolve_storage_options,
     store_write_retrying,
     write_day_windows,
     write_days_windows,

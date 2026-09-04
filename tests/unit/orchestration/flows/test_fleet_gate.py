@@ -21,8 +21,8 @@ import httpx
 import pytest
 from prefect.exceptions import PrefectHTTPStatusError
 
-from tessera_embeddings.orchestration.prefect import _fleet_gate as mod
-from tessera_embeddings.orchestration.prefect._fleet_gate import FleetGate, gate_is_holding
+from tessera_embeddings.orchestration.prefect.flows import _fleet_gate as mod
+from tessera_embeddings.orchestration.prefect.flows._fleet_gate import FleetGate, gate_is_holding
 
 
 def _server_said(status: int, detail: str) -> PrefectHTTPStatusError:

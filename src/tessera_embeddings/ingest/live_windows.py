@@ -40,7 +40,7 @@ import numpy as np
 import zarr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
-from tessera_embeddings.ingest.roi import StorageOptions, resolve_storage_options
+from tessera_embeddings.storage.zarr_store import StorageOptions, resolve_storage_options
 
 logger = logging.getLogger(__name__)
 

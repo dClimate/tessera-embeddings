@@ -247,7 +247,7 @@ PREFETCH_DEPTH = 2
 # together.
 #
 # A tile's peak host RAM is not T x H x W: the resident input working set is bounded by
-# density-sized northing strips (actors._strip_height_for_density), so sparse tiles load in
+# density-sized northing strips (read_plan._strip_height_for_density), so sparse tiles load in
 # one full-height strip and only dense ones split.
 INFERENCE_CHUNK_SIZE = 2048
 

@@ -12,15 +12,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tessera_embeddings.errors import DuplicateDateError, NonMonotonicDateError
+from tessera_embeddings.errors import NonMonotonicDateError
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
+from tessera_embeddings.storage.time_axis import read_time_values
 from tessera_embeddings.storage.zarr_store import (
     CONCURRENT_WRITER_ERRORS,
+    DuplicateDateError,
     batched_region_writes,
     get_existing_dates,
     open_repo,
     open_store_as_zarr_group,
-    read_time_values,
 )
 
 D1, D2 = np.datetime64("2024-06-01", "ns"), np.datetime64("2024-06-11", "ns")

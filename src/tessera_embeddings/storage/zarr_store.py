@@ -56,24 +56,49 @@ from tenacity import (
     wait_random,
 )
 
-from tessera_embeddings.errors import (
-    CorruptedStoreError,
-    DuplicateDateError,
-    InconclusiveStoreProbeError,
-    NonMonotonicDateError,
-    StoreHoldsCommittedDataError,
-)
+from tessera_embeddings.errors import CorruptedStoreError, NonMonotonicDateError
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
 from tessera_embeddings.storage.region_writes import (
     _drop_region_coords,
     _pad_region_to_chunks,
 )
+from tessera_embeddings.storage.time_axis import TIME_ENCODING, compute_doy, read_time_values
 from tessera_embeddings.utils import utcnow_iso
 
 logger = logging.getLogger(__name__)
 
-# Standard time encoding for all stores
-TIME_ENCODING = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"}
+
+class DuplicateDateError(ValueError):
+    """Raised when a date being appended is already on a store's time axis.
+
+    A ``ValueError`` subclass so callers that catch ``ValueError`` keep working. The distinct
+    type lets a retry single this failure out as never worth retrying: the ingest paths dedupe
+    against the store before writing, so a duplicate reaching the append means something outside
+    this process moved the branch. See
+    :data:`~tessera_embeddings.storage.zarr_store.CONCURRENT_WRITER_ERRORS`.
+    """
+
+
+class InconclusiveStoreProbeError(Exception):
+    """The emptiness probe on the create path could not answer.
+
+    Exempt from ``cleanup_on_failure``'s delete. The probe reads the network, so a transient
+    failure — or a decode error while inspecting a repo another writer is creating — is ordinary.
+    Treating "could not tell" as "safe to delete" turns a blip into the erasure of somebody else's
+    committed store, so deletion happens only on POSITIVE evidence that the prefix is ours.
+    """
+
+
+class StoreHoldsCommittedDataError(Exception):
+    """Raised when the create path is handed a store that already holds committed data.
+
+    Exempt from ``cleanup_on_failure``'s delete, which is the whole point of the type. That
+    decorator removes the half-written store a failed create leaves behind; here the store was
+    NOT written by this attempt but was already there and intact, and the create was reached
+    only because a date probe misreported it as empty. Deleting it would turn a refusal to
+    overwrite data into the deletion of that same data.
+    """
+
 
 #: Write failures that mean **another writer holds this store**, and so must never be
 #: retried. Pass to ``tenacity``'s ``retry_if_not_exception_type`` wherever a store write
@@ -176,28 +201,6 @@ def store_write_retrying(
         retry=retry_if_not_exception_type(CONCURRENT_WRITER_ERRORS),
         reraise=True,
     )
-
-
-def read_time_values(node: zarr.Group) -> np.ndarray:
-    """Decode a group's ``time`` coordinate to ``datetime64[ns]`` values.
-
-    Raw-zarr counterpart to xarray's CF decoding for the one convention every engine-written
-    store uses (:data:`TIME_ENCODING`); anything else is a loud error, not a silent misread.
-    """
-    time_arr = node["time"]
-    units = str(time_arr.attrs.get("units", ""))
-    if not units.startswith("nanoseconds since 1970-01-01"):
-        raise ValueError(
-            f"Unsupported time units {units!r} on {node.store!r} — every engine-written "
-            "store uses TIME_ENCODING (nanoseconds since 1970-01-01)."
-        )
-    return np.asarray(time_arr[:]).astype("int64").astype("datetime64[ns]")  # type: ignore[index]
-
-
-def time_index_of(node: zarr.Group, value: np.datetime64) -> int | None:
-    """Index of ``value`` on a group's time axis, or ``None`` if absent."""
-    hits = np.flatnonzero(read_time_values(node) == value)
-    return int(hits[0]) if hits.size else None
 
 
 # =============================================================================
@@ -1376,7 +1379,7 @@ class RegionWriteBatch:
         are sparse, so the new slot costs no chunks until written. The session sees its own
         uncommitted resize, so window writes into the returned index work immediately.
 
-        A date already on the axis raises :class:`~tessera_embeddings.errors.DuplicateDateError`.
+        A date already on the axis raises :class:`DuplicateDateError`.
         **The likeliest cause is a SECOND WRITER on this store**, not a caller bug: the ingest
         paths read the committed dates and skip what they find, so the only way a date they
         decided to write is already present is that another process committed it after that
@@ -1811,12 +1814,6 @@ def write_days_windows(
                 )
 
 
-def compute_doy(timestamps: np.ndarray) -> np.ndarray:
-    """Compute day-of-year from datetime64 timestamps: an (N,) int32 array of 1-366."""
-    years = timestamps.astype("datetime64[Y]")
-    return ((timestamps.astype("datetime64[D]") - years).astype(int) + 1).astype(np.int32)
-
-
 def write_dataset(
     store_path: str,
     data: xr.Dataset,
@@ -1963,3 +1960,19 @@ def set_s3_config(config: S3Config | None) -> None:
     """Set a global S3 configuration override for testing."""
     global _s3_config_override
     _s3_config_override = config
+
+
+StorageOptions = dict | Callable[[], "dict | None"] | None
+"""fsspec options, or a callable resolving them — see :func:`resolve_storage_options`."""
+
+
+def resolve_storage_options(storage_options: StorageOptions) -> dict | None:
+    """Resolve ``storage_options``, calling it if it is a provider.
+
+    **Accepting a callable is what keeps these credentials fresh.** A dict is a snapshot: resolved
+    once, it is still the value in use however much later the read happens, and an IAM credential
+    outlives neither a long leg nor its own TTL. A provider is re-invoked at each read, where the
+    credential is actually consumed. Resolving inside the reader rather than at each call site
+    means a new call site cannot silently reintroduce the frozen behaviour.
+    """
+    return storage_options() if callable(storage_options) else storage_options

@@ -5,7 +5,7 @@ from importlib.metadata import version as _dist_version
 import numpy as np
 import pytest
 
-from tessera_embeddings.inference.conventions import (
+from tessera_embeddings.storage.conventions import (
     ENCODER_VERSION,
     build_convention_attrs,
     build_geoemb_root_attrs,

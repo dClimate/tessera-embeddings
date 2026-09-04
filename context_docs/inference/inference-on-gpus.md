@@ -1083,7 +1083,9 @@ cross-chunk prefetch without re-deriving the arithmetic at the constant. The pai
 plus the ~2 GiB prefetch stash is what keeps peak host RAM under 60%. The prefetch MUST skip
 pair-budget plans — their last strip is not a RAM trough. (The guard is no longer a named list of
 unsafe strategies: **every** strategy now respects the same resident-pair ceiling in `_strip_plan`,
-and the `_XCHUNK_*` constants in `inference/actors.py` are the prefetch's own caps.)
+and the `_XCHUNK_*` caps live in `inference/read_plan.py`, except the three the actor's
+execution path owns — `_XCHUNK_DISABLE_ENV`, `_XCHUNK_MASK_TRANSIENT_CAP_BYTES` and
+`_XCHUNK_T_ALL_EST` — which stay in `inference/actors.py`.)
 
 **The strip-plan estimator is strategy-only.** `_EST_*` constants pick which safe strategy is
 fastest; they are NEVER a RAM bound. Every branch is RAM-safe regardless of estimate accuracy.
@@ -1131,7 +1133,7 @@ gap exists. See [`../../tests/README.md`](../../tests/README.md).
 | the allocator flag | `inference/actors.py`, the `@ray.remote(runtime_env=...)` decorator |
 | the checkpoint ladder and its clipping | `inference/sampling.py`, `compute_bin_keys` |
 | deepest bucket first | `inference/dataset.py`, `iter_buckets(largest_first=True)` |
-| the strip plan and its RAM budget | `inference/actors.py`, `_strip_plan`, `_S2_STRIP_BYTE_BUDGET`, `_XCHUNK_*` |
+| the strip plan and its RAM budget | `inference/read_plan.py`, `_strip_plan`, `_S2_STRIP_BYTE_BUDGET`, `_XCHUNK_PREFETCH_CAP_BYTES` |
 | the pipelined forward loop | `inference/inference.py`, `_pipelined_gpu_loop` |
 | how many actors Ray packs on a card | `inference/scheduling.py`, `FleetDemand.machines` |
 | which instance rungs may be opened | `providers/aws/fleet_mix.py`, `GPU_RUNGS` |

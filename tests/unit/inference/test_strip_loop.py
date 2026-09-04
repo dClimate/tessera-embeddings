@@ -21,6 +21,7 @@ import zarr
 
 import tessera_embeddings.inference.actors as _actors_mod
 import tessera_embeddings.inference.data_loading as _dl_mod
+import tessera_embeddings.inference.read_plan as _read_plan_mod
 from tessera_embeddings.config.inference import S2_BAND_ORDER
 from tessera_embeddings.config.store_layout import (
     MONTH_COVERED_FOR_OBS,
@@ -28,19 +29,21 @@ from tessera_embeddings.config.store_layout import (
 )
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.actors import (
+    _XCHUNK_DISABLE_ENV,
+    InferenceActor,
+)
+from tessera_embeddings.inference.assembly import summarise_optical_skips
+from tessera_embeddings.inference.chunk_spec import ChunkSpec
+from tessera_embeddings.inference.read_plan import (
     _MIN_STRIP_H,
     _S2_FOREGROUND_DECODE_READERS,
     _S2_STRIP_BYTE_BUDGET,
-    _XCHUNK_DISABLE_ENV,
-    InferenceActor,
     _strip_height_for_density,
     _strip_plan,
     _strip_slices,
     _StripPlan,
     _xchunk_rung,
 )
-from tessera_embeddings.inference.assembly import summarise_optical_skips
-from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 from tests.unit.mosaic_stores import S2_SEED, make_s2_group, make_sar_group, store_opener
 
@@ -322,14 +325,14 @@ class TestProcessChunkStriping:
         # Force the tiling via _strip_plan so the test controls both the strip
         # count and the prefetch branch, regardless of the synthetic chunk's
         # density. strip_h > height -> one strip (== unstriped path).
-        with patch.object(_actors_mod, "_strip_plan", _force_strip_plan(10**6, prefetch=False)):
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(10**6, prefetch=False)):
             res_one, write_one = _run_process_chunk(inference_config, test_model)
         # A small strip height forces a multi-strip split of this tiny chunk,
         # exercised on BOTH the prefetch-on (dense) and prefetch-off (sparse)
         # paths — all three tilings must yield bit-identical output.
-        with patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)):
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)):
             res_pf, write_pf = _run_process_chunk(inference_config, test_model)
-        with patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=False)):
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4, prefetch=False)):
             res_nopf, write_nopf = _run_process_chunk(inference_config, test_model)
 
         assert res_one["status"] == res_pf["status"] == res_nopf["status"] == "success"
@@ -364,7 +367,7 @@ class TestProcessChunkStriping:
         Nothing downstream can tell those apart, so the check has to be that the flags are
         both PRESENT and consistent with the count they partition.
         """
-        with patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=False)):
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4, prefetch=False)):
             result, write = _run_process_chunk(inference_config, test_model, n_t_sar=_N_T_SAR_SPANNING_MARCH)
 
         assert result["status"] == "success"
@@ -445,7 +448,7 @@ class TestProcessChunkStriping:
             with (
                 patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
                 patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-                patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)),
+                patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)),
                 patch.object(_actors_mod, "load_chunk", side_effect=_blocking_load),
             ):
                 result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
@@ -649,7 +652,7 @@ class TestEmptyStripBandReadSkip:
         with (
             patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._make_half_empty_stores()),
             patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-            patch.object(_actors_mod, "_strip_plan", _force_strip_plan(strip_h, prefetch=True)),
+            patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(strip_h, prefetch=True)),
             patch.object(_dl_mod, "_load_s2_bands", wraps=_dl_mod._load_s2_bands) as band_spy,
         ):
             result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
@@ -722,7 +725,7 @@ class TestEastingBboxCrop:
         with (
             patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._make_sliver_stores()),
             patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-            patch.object(_actors_mod, "_X_CROP_MIN_SAVING", crop_threshold),
+            patch.object(_read_plan_mod, "_X_CROP_MIN_SAVING", crop_threshold),
             patch.object(_dl_mod, "_load_s2_bands", wraps=_dl_mod._load_s2_bands) as band_spy,
         ):
             result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
@@ -855,7 +858,7 @@ class TestXChunkPrefetch:
         # loaded first strip; the consuming prologue must produce identical
         # output to a serial run under the same tiling.
         patches = (
-            patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)),
+            patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)),
             patch.object(_actors_mod, "_xchunk_rung", lambda *a, **k: "starter"),
         )
         chained, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)], patches)
@@ -882,7 +885,7 @@ class TestXChunkPrefetch:
         # NOT a RAM trough — so the cross-chunk prefetch must be skipped or it
         # could breach the ceiling.
         patches = (
-            patch.object(_actors_mod, "_strip_plan", _force_strip_plan(10**6, prefetch=False, pair_budget=True)),
+            patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(10**6, prefetch=False, pair_budget=True)),
         )
         _, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B)], patches)
         assert getattr(actor, "_xchunk_prefetched", {}) == {}

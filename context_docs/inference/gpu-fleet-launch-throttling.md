@@ -128,7 +128,7 @@ autoscaler goes on trying to place — against the same five-token bucket — fo
 as the fill lives.
 
 **That exposure just got 12x longer.** The first-actor wait was raised from 30 minutes
-to 6 hours (`inference/lifecycle.py::ACTOR_INIT_TIMEOUT_SEC = 21600`), for good reasons
+to 6 hours (`inference/runner.py::ACTOR_INIT_TIMEOUT_SEC = 21600`), for good reasons
 of its own. With a 300-second placement interval a fill now sits through up to 72
 expiries instead of 6. Under the old rule it reaches its target after four of them and
 then holds 245 unplaceable requests against the account for the remaining five and a

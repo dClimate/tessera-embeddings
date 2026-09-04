@@ -50,15 +50,11 @@ from tessera_embeddings.inference.assembly import (
     _write_granularity,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks, filter_chunks_by_roi_mask
-from tessera_embeddings.inference.conventions import ENCODER_VERSION
 from tessera_embeddings.inference.quantization import quantize_embeddings
+from tessera_embeddings.storage.conventions import ENCODER_VERSION
 from tessera_embeddings.storage.global_store import create_global_repo, create_layout_arrays, open_global_repo
-from tessera_embeddings.storage.zarr_store import (
-    TIME_ENCODING,
-    open_or_create_repo,
-    open_store,
-    plain_zarr_storage_options,
-)
+from tessera_embeddings.storage.time_axis import TIME_ENCODING
+from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store, plain_zarr_storage_options
 
 
 @pytest.mark.parametrize(

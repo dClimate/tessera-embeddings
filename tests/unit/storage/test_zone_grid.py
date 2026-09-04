@@ -7,6 +7,7 @@ import pytest
 
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage import zone_grid as zg
+from tessera_embeddings.storage.time_axis import calendar_year_times
 
 
 def test_120_zones_named_by_common_name():
@@ -49,7 +50,7 @@ def test_coords_monotonic_and_sized():
 
 
 def test_calendar_year_times():
-    t = zg.calendar_year_times()
+    t = calendar_year_times()
     assert t.dtype == np.dtype("datetime64[ns]")
     assert len(t) == 9
     assert str(t[0]).startswith("2017-01-01") and str(t[-1]).startswith("2025-01-01")

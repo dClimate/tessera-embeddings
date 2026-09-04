@@ -51,7 +51,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS
+from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS
 
 URL = "https://earth-search.aws.element84.com/v1/search"
 COLLECTION = "sentinel-2-l2a"
