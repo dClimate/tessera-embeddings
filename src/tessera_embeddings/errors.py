@@ -17,8 +17,9 @@ class NonMonotonicDateError(ValueError):
     """Raised when a date being appended is OLDER than a date already on the time axis.
 
     Deliberately not a :data:`CONCURRENT_WRITER_ERRORS` member and not a sibling of
-    :class:`DuplicateDateError`: a duplicate means another writer moved the branch, while this
-    means one writer offered its own dates out of order — a bug in the caller.
+    :class:`~tessera_embeddings.storage.zarr_store.DuplicateDateError`: a duplicate means
+    another writer moved the branch, while this means one writer offered its own dates out of
+    order — a bug in the caller.
 
     The time axis is read POSITIONALLY downstream (the deterministic resampler selects
     observations by position, not by timestamp), so an out-of-order axis yields different
