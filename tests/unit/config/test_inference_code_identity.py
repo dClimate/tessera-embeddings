@@ -133,6 +133,41 @@ def test_a_relative_re_export_does_not_stop_the_closure(tmp_path: Path) -> None:
     assert providers in reached, "the re-exported module must be reached through the package"
 
 
+def test_the_closure_holds_only_files_that_really_exist(tmp_path: Path) -> None:
+    """Every reached path must be a real directory entry, matched case-exactly.
+
+    The same ``from .providers import PROVIDERS`` above offers ``config.providers.PROVIDERS``
+    as a candidate module. Resolved with ``Path.exists()``, that candidate ANSWERS on a
+    case-insensitive filesystem — ``config/PROVIDERS.py`` resolves to ``providers.py`` — and
+    the closure gains an entry for a file the repository does not contain.
+
+    That is not cosmetic. :func:`source_identity` hashes each path string as well as its
+    bytes, so the phantom moves the digest, and the same source then fingerprints differently
+    on macOS than on Linux: a mosaic begun on a laptop is refused by the fleet as built by
+    different code.
+
+    **This assertion only discriminates on a case-insensitive filesystem** — macOS, where
+    this is developed. On Linux the phantom cannot arise and the test passes either way. It
+    is here because that is where the bug occurs, and because "the closure contains only real
+    files" is the property worth pinning however it might be broken.
+    """
+    root = tmp_path / "pkg"
+    (root / "ingest").mkdir(parents=True)
+    (root / "config").mkdir()
+    (root / "ingest" / "leg.py").write_text("from tessera_embeddings.config import PROVIDERS\n")
+    (root / "config" / "__init__.py").write_text("from .providers import PROVIDERS\n")
+    (root / "config" / "providers.py").write_text("PROVIDERS = {'earth-search': 1}\n")
+
+    reached = first_party_import_closure([root / "ingest" / "leg.py"], root)
+
+    for path in reached:
+        siblings = {entry.name for entry in path.parent.iterdir()}
+        assert path.name in siblings, (
+            f"{path.relative_to(root)} is in the closure but is not a case-exact entry of "
+            f"its directory, which holds {sorted(siblings)}"
+        )
+
+
 def test_the_real_ingest_fingerprint_covers_the_collection_settings() -> None:
     """The case the miniature package stands in for, asserted on the tree that ships."""
     from tessera_embeddings.config.ingest import _MOSAIC_CONTENT_SOURCES

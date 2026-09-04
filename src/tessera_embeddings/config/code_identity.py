@@ -41,15 +41,47 @@ def first_party_import_closure(seed: list[Path], root: Path) -> set[Path]:
     Parses rather than imports — this runs on a flow runner that has no torch, and
     importing to inspect would execute module bodies for a hash. ``from x import y``
     contributes both ``x`` and ``x.y`` as candidates, since either may name the module.
-    Non-package imports and names that resolve to no file are skipped.
+    Non-package imports and names that resolve to no file are skipped — where *resolve*
+    means a case-exact match against a real directory listing, not ``Path.exists()``; see
+    :func:`resolve_case_exactly`.
     """
+    listings: dict[Path, frozenset[str]] = {}
+
+    def names_in(directory: Path) -> frozenset[str]:
+        """The exact filenames *directory* holds. Cached per closure computation."""
+        if directory not in listings:
+            try:
+                listings[directory] = frozenset(entry.name for entry in directory.iterdir())
+            except OSError:  # not a directory, or unreadable
+                listings[directory] = frozenset()
+        return listings[directory]
+
+    def resolve_case_exactly(relative: str) -> Path | None:
+        """*relative* under ``root``, requiring every component to match case EXACTLY.
+
+        ``Path.exists()`` is not enough, and the difference is not cosmetic. On a
+        case-insensitive filesystem — macOS, which is where this is developed —
+        ``config/PROVIDERS.py`` "exists" because it resolves to ``providers.py``. A
+        ``from .providers import PROVIDERS`` therefore contributes a *candidate module* whose
+        name is the imported constant, and the closure gains an entry for a file that is not
+        in the repository. Since :func:`source_identity` hashes each path STRING as well as
+        its bytes, that phantom moves the digest, and the same source yields a different
+        identity on macOS than on Linux — so a mosaic begun on a laptop is refused by the
+        fleet as built by different code.
+
+        Checking against a real directory listing is what makes the answer independent of
+        the filesystem's case behaviour. Do not simplify this back to ``exists()``.
+        """
+        current = root
+        for part in relative.split("/"):
+            if part not in names_in(current):
+                return None
+            current = current / part
+        return current
 
     def module_file(dotted: str) -> Path | None:
         rel = dotted.removeprefix(_PACKAGE + ".").replace(".", "/")
-        for candidate in (root / f"{rel}.py", root / rel / "__init__.py"):
-            if candidate.exists():
-                return candidate
-        return None
+        return resolve_case_exactly(f"{rel}.py") or resolve_case_exactly(f"{rel}/__init__.py")
 
     def absolute_module(node: ast.ImportFrom, path: Path) -> str | None:
         """The dotted name ``node`` imports from, resolved against ``path`` if relative.
