@@ -31,7 +31,6 @@ from collections.abc import Callable
 import icechunk
 import pytest
 
-from tessera_embeddings.errors import DuplicateDateError, InconclusiveStoreProbeError
 from tessera_embeddings.ingest import s1_roi, s2_roi
 from tessera_embeddings.ingest.duplicates import is_provider_refusal
 from tessera_embeddings.ingest.loader_failures import (
@@ -44,6 +43,8 @@ from tessera_embeddings.storage.zarr_store import (
     CONCURRENT_WRITER_ERRORS,
     STORE_WRITE_ATTEMPTS,
     WAIT_OUT_BACKOFF_S,
+    DuplicateDateError,
+    InconclusiveStoreProbeError,
     store_write_retrying,
 )
 

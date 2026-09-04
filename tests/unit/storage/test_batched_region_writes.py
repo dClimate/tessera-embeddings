@@ -12,10 +12,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tessera_embeddings.errors import DuplicateDateError, NonMonotonicDateError
+from tessera_embeddings.errors import NonMonotonicDateError
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
 from tessera_embeddings.storage.zarr_store import (
     CONCURRENT_WRITER_ERRORS,
+    DuplicateDateError,
     batched_region_writes,
     get_existing_dates,
     open_repo,

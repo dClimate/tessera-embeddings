@@ -34,10 +34,10 @@ import xarray as xr
 import zarr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
-from tessera_embeddings.errors import StoreHoldsCommittedDataError
 from tessera_embeddings.storage import zarr_store
 from tessera_embeddings.storage.zarr_store import (
     CorruptedStoreError,
+    StoreHoldsCommittedDataError,
     get_existing_dates,
     open_or_create_repo,
     write_dataset,

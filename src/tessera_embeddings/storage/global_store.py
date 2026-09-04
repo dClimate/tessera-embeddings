@@ -13,7 +13,7 @@ Lives above the low-level primitives on purpose: it pulls together
 
 Convention placement follows the geoembeddings ``utm_zones`` layout: the encoder
 and quantization provenance (``geoemb:``) is written ONCE on the root group
-(:func:`~tessera_embeddings.inference.conventions.build_geoemb_root_attrs`, with
+(:func:`~tessera_embeddings.storage.conventions.build_geoemb_root_attrs`, with
 ``spatial_layout="utm_zones"``), while each zone group carries only its own
 ``proj:``/``spatial:`` (``build_convention_attrs(..., include_geoemb=False)``) —
 their CRS and grid differ by zone.
@@ -36,7 +36,7 @@ from tessera_embeddings.config.store_layout import (
     REQUIRED_VARS,
     StoreLayout,
 )
-from tessera_embeddings.inference.conventions import build_convention_attrs, build_geoemb_root_attrs
+from tessera_embeddings.storage.conventions import build_convention_attrs, build_geoemb_root_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.zarr_store import (
     TIME_ENCODING,

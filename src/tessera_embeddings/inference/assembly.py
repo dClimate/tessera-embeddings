@@ -72,8 +72,8 @@ from tessera_embeddings.config.store_layout import (
     trailing_extent,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
-from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage import zone_grid
+from tessera_embeddings.storage.conventions import build_convention_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.icechunk_logging import traced_commit

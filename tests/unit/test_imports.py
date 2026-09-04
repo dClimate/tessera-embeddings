@@ -50,7 +50,6 @@ def test_inference_modules_import() -> None:
         actors,
         assembly,
         chunk_spec,
-        conventions,
         data_loading,
         dataset,
         diagnostics,
@@ -74,7 +73,7 @@ def test_inference_models_import() -> None:
 
 def test_storage_modules_import() -> None:
     """Storage submodules import."""
-    from tessera_embeddings.storage import manifest, zarr_store  # noqa: F401
+    from tessera_embeddings.storage import conventions, manifest, zarr_store  # noqa: F401
 
 
 def test_provider_modules_import() -> None:
