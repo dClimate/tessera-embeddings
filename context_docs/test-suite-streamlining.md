@@ -7,11 +7,12 @@ pipeline.** Three rounds of work have landed on the test suite:
 |---|---|---|
 | **1 — streamlining** | 84.3 s → 24.5 s, three CI gaps closed, one accepted | 2026-08-25, PR #143 |
 | **2 — regrouping** | flat `tests/unit/` → subject directories mirroring `src/` | 2026-09-03, PR #171, [ADR 015](decisions/015-regrouping-the-unit-tests.md) |
-| **3 — follow-ups** | the two regressions round 1's gains had lost, the standing list re-assessed, and two accepted gaps written down as ADRs | 2026-09-03, §6 |
+| **3 — follow-ups** | the two regressions round 1's gains had lost, the standing list re-assessed, and the end-to-end gap settled as [ADR 023](decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md) | 2026-09-03, §6 |
 
 **Read §1 for what the suite is now, §6 for what round 3 changed, and §7 for the standing list —
 most of which is closed, and two entries of which are closed *by decision* rather than by being
-built.**
+built.** Only one of those two is an ADR; the other, the CUDA gap, lives in `tests/README.md`
+Roadmap 2 (§6.3).
 §2–§5 are round 1's method and rulings, kept because they are what a fourth round would need: the
 safety model, the coverage gate, the things that were measured and ruled *not* worth doing, and why.
 
@@ -19,7 +20,9 @@ safety model, the coverage gate, the things that were measured and ruled *not* w
 
 ## 1. What the suite is now
 
-Measured 2026-09-03 on `main` @ `692655d` (10 cores, `-n auto`), after round 3.
+Measured 2026-09-03 on **this branch after round 3** (10 cores, `-n auto`) — not on its parent
+`main` @ `692655d`, which still carries the deleted documentation-index test and so has 134 unit
+files rather than 133.
 
 ```
                   files   tests    LOC    runs in CI as
@@ -56,11 +59,27 @@ thing, which is why this section was rewritten rather than annotated.
 **Collection is not slow.** It looks like ~26 s on a first run; that is cold bytecode compilation.
 Warm, it is ~2 s. Do not chase it.
 
-**The suite does not repeat itself.** Round 1 found only 32 collapsible tests across 120 files by
-AST scan. Re-run repo-wide after the suite grew by 350 tests and ~6,000 lines: **zero pairs of tests
-share an identical body, anywhere in the suite.** It is verbose because it pins a great many
-behaviours in deliberately long names, not because it copies. **Line count is not an available lever
-here**, and §5 is the evidence for the strongest-looking counter-example.
+**The suite barely repeats itself — 18 tests in 8 groups share an identical body**, out of 3,675.
+Round 1 found 32 collapsible tests across 120 files and judged most meaningfully distinct; that
+holds, and the same is true of these.
+
+> **Corrected 2026-09-03: this said "zero pairs", and that was a measurement error of exactly the
+> kind round 1 warned about.** Round 1's first estimate compared helper *names* and called distinct
+> things duplicates. Mine hashed each `FunctionDef` *including its name*, so two tests with
+> different names and identical bodies came out distinct — the same mistake inverted. **Comparing
+> bodies is the whole point; do not let the name into the digest.**
+
+**They are retained deliberately, and the two shapes are worth knowing.** Some are one assertion
+standing for two different *claims* — `test_a_harmonised_bucket_is_recognised` is the basic case,
+while `test_the_live_catalogue_serves_the_configured_alias_keys` carries a docstring explaining why
+`UNKNOWN` never fires in production. Same line, different property, which is §5's characterisation
+argument in miniature. The rest are `parametrize` pairs whose bodies are identical *by construction*
+because the inputs are the subject — `test_parse_cell_name_rejects_malformed` against
+`..._rejects_invalid_coords`. Collapsing either shape trades a name that says what is being claimed
+for a line of saved text.
+
+**So line count is still not an available lever here**, and §5 is the evidence for the
+strongest-looking counter-example.
 
 ---
 
@@ -297,10 +316,12 @@ never ran.
 
 ## 7. The standing list
 
-Five entries. **Two are closed by decision rather than by being built** (§7.1, §7.2) and are
-recorded as ADRs precisely so they are not re-proposed; one is a `src/` change deliberately not made
-here (§7.3); one is a guard considered and declined (§7.4); and one is a non-finding recorded so it
-is not mistaken for one (§7.5). **Nothing on this list is queued work.**
+Five entries. **Two are closed by decision rather than by being built** (§7.1, §7.2) — the
+end-to-end one as [ADR 023](decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)
+precisely so it is not re-proposed, the CUDA one in `tests/README.md` Roadmap 2. One is a `src/`
+change deliberately not made here (§7.3); one is a guard considered and declined (§7.4); and one is
+a non-finding recorded so it is not mistaken for one (§7.5). **Nothing on this list is queued
+work.**
 
 ### 7.1 The full-pipeline end-to-end — CLOSED, and not by building it
 
@@ -355,8 +376,8 @@ placeholder for automation that is coming, and **neither is to be re-proposed.**
 
 ### 7.3 Two optical warnings carry no ROI attribution
 
-`s2_roi.py:485` ("ROI has no live pixels — every date will fail the coverage gate") and
-`s2_roi.py:652` ("Load failed on asset-incomplete STAC item(s)") are warnings a reader would want to
+`s2_roi.py:443` ("ROI has no live pixels — every date will fail the coverage gate") and
+`s2_roi.py:595` ("Load failed on asset-incomplete STAC item(s)") are warnings a reader would want to
 trace to a cell, and the radar argument in §5 transfers to them even though the blanket optical rule
 does not. **This is a `src/` change and is deliberately not made here** (gate S1); recorded so the
 omission is a decision.

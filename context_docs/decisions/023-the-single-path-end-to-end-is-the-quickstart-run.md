@@ -13,9 +13,19 @@ was `raise NotImplementedError`, filed under `parity/` because it needed both ma
 confirming that a placeholder was still a placeholder; its schedule was suspended on 2026-08-25.
 
 The 2026-08 test-suite review recorded it as pending work. The 2026-09-03 follow-up then observed
-that both stated blockers had lapsed — the upstream per-stage parity tests exist and pass, and the
-single-ROI path had been measured at about **three and a half minutes** end to end on a CPU laptop
-rather than the "30+ minutes" the tier README claimed — and proposed building it.
+that both stated blockers had lapsed and proposed building it.
+
+> **One of those two observations was wrong, and it is recorded here so this ADR does not carry a
+> premise its own supporting document has withdrawn.** The single-ROI path had genuinely been
+> measured at about **three and a half minutes** end to end on a CPU laptop, against the "30+
+> minutes" the tier README claimed. But "the upstream per-stage parity tests pass" was read off a
+> `6 passed, 2 skipped` summary line and does not hold: `test_ingest_s1_roi_parity.py` carries both
+> a credentials `skipif` **and** an `xfail(raises=Exception)`, because its committed cassette
+> predates the native CMR granule query ([ADR 009](009-native-cmr-granule-query.md), issue #45), and
+> the second skip was the deliberately-skipped adapter template. **So the S1 precondition was never
+> verified.** The decision below is unaffected — it rests on the manual check being sufficient, not
+> on the stub being unblocked — but the proposal it declined was argued partly on a claim that does
+> not hold.
 
 **That proposal was declined.** The reason is that the verification it would automate already
 happens: **running the quickstart on a laptop IS this test.** It exercises the same path, over the
