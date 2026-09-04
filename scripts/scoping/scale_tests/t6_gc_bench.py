@@ -7,8 +7,7 @@ to the campaign's 10^8+ objects) and bytes reclaimed, plus a ``reset_branch``
 rollback drill.
 
 Self-contained (builds its own mess) so it runs independently; on a full
-campaign run it would instead target the store T2-T5 left behind. Run from
-``scripts/``::
+campaign run it would instead target the store T2-T5 left behind. Run from the REPOSITORY ROOT::
 
     uv run python -m scripts.scoping.scale_tests.t6_gc_bench --run-id dev --backend local --scale tiny
 """

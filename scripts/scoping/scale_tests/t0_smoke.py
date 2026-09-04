@@ -6,7 +6,7 @@ one-repo/120-group design is re-planned before anything expensive runs. Also
 validates the harness end-to-end (metrics, markers, spawn multiprocessing) and
 the disjoint-region vs same-chunk conflict taxonomy.
 
-Run from ``scripts/``::
+Run from the REPOSITORY ROOT::
 
     uv run python -m scripts.scoping.scale_tests.t0_smoke --run-id dev --backend local --scale tiny
 """

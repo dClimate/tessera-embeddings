@@ -4,7 +4,7 @@ Deletes the run's store prefixes so a throwaway bucket returns to $0, and
 verifies the prefix is empty. Results are kept by default (they are the run's
 product); pass ``--purge-results`` to remove them too.
 
-Run from ``scripts/``::
+Run from the REPOSITORY ROOT::
 
     uv run python -m scripts.scoping.scale_tests.teardown --run-id dev --backend local
     uv run python -m scripts.scoping.scale_tests.teardown --run-id dev --backend s3 --bucket my-throwaway

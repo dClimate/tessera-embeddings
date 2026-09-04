@@ -7,7 +7,7 @@ years (including empty ocean positions) stay intact, and that a shift conflicts
 unresolvably with a concurrent chunk writer (why prepends are banned during
 fills).
 
-Run from ``scripts/``::
+Run from the REPOSITORY ROOT::
 
     uv run python -m scripts.scoping.scale_tests.t3_prealloc --run-id dev --backend local --scale tiny
 """

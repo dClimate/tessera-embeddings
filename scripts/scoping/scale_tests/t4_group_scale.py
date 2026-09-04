@@ -6,7 +6,7 @@ vs group count (every commit re-serializes the whole snapshot), and (b)
 single-group vs whole-repo open time, default vs tuned manifest preload
 (``max_arrays_to_scan`` default 50 < our node count — icechunk #1464/#1462).
 
-Run from ``scripts/``::
+Run from the REPOSITORY ROOT::
 
     uv run python -m scripts.scoping.scale_tests.t4_group_scale --run-id dev --backend local --scale tiny
 """

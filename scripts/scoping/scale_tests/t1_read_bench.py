@@ -5,7 +5,7 @@ workloads that decide the chunk shape (ADR D2) and whether sharding earns its
 keep (ADR D3): point-vector, patch, tile, band-subset, bulk-slab, and open time,
 cold (fresh process) and warm, swept over ``async.concurrency``.
 
-Run from ``scripts/``::
+Run from the REPOSITORY ROOT::
 
     uv run python -m scripts.scoping.scale_tests.t1_read_bench --run-id dev --backend local --scale tiny --variant c256_full
 """

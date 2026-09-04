@@ -13,7 +13,7 @@ hinges on:
   pattern (does the p50 win survive when points don't share shards?).
 * **E4 `object_count`** — actual objects + manifest bytes, sharded vs full.
 
-Run from ``scripts/`` (bench, in-region)::
+Run from the REPOSITORY ROOT (bench, in-region)::
 
     uv run python -m scripts.scoping.scale_tests.t8_sharding --run-id d3 --backend s3 --scale bench \
       --bucket <bucket> --store-root s3://<bucket>/global-embeddings
