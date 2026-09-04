@@ -17,7 +17,8 @@ whenever someone adds or removes a file and forgets the index.
 from __future__ import annotations
 
 import re
-from pathlib import Path
+import subprocess
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -61,16 +62,26 @@ def test_every_document_is_listed(doc: Path) -> None:
 
 
 def _repo_markdown_names() -> set[str]:
-    """Markdown filenames anywhere in the working tree, excluding hidden directories.
+    """Markdown filenames the REPOSITORY holds, asked of git rather than of the filesystem.
 
-    The exclusion is load-bearing rather than tidiness. ``.venv`` holds vendored docs, and
-    ``.claude/worktrees/`` holds whole checkouts of other branches — so a file deleted on this
-    branch is still on disk under a worktree, and counting it here makes the staleness check
-    below pass on a developer machine and fail in CI. That happened: nine documents were removed
-    from the index's tree and the guard stayed green locally because old worktrees still held
-    them.
+    The staleness check below excuses an index row whose file exists somewhere else in the
+    repo, and "somewhere else in the repo" has to mean *tracked*. Walking the working tree
+    answers a different question, and gets it wrong twice over.
+
+    **Wrong answer.** ``.venv`` holds vendored documentation and ``.claude/worktrees/`` holds
+    whole checkouts of other branches, so a file deleted on this branch is still on disk and
+    the excuse fires for it. That happened: nine documents were removed and this guard stayed
+    green locally, while CI — which has neither directory — would have failed on all nine.
+
+    **Slow answer.** ``rglob("*.md")`` walks 2,975 files in ~9.5 s on a checkout carrying
+    worktrees, of which 66 are the repository's, and that made this the slowest test in the
+    unit suite by a factor of two. ``git ls-files`` returns the same 66 in ~8 ms.
+
+    Excluding hidden directories fixes the correctness half and none of the speed, and it
+    goes on guessing at the question instead of asking it.
     """
-    return {p.name for p in REPO.rglob("*.md") if not any(part.startswith(".") for part in p.relative_to(REPO).parts)}
+    out = subprocess.run(["git", "ls-files", "*.md"], cwd=REPO, capture_output=True, text=True, check=True)
+    return {PurePosixPath(line).name for line in out.stdout.splitlines() if line}
 
 
 def test_the_index_names_nothing_that_is_gone() -> None:

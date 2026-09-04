@@ -117,9 +117,9 @@ uv run pytest -m parity
 uv run pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
 ```
 
-`-m "slow or parity"` is documented in older notes as the full local end-to-end. It does not
-do that today — the only `slow` tests are one Ray-cluster check and an unimplemented stub.
-See Roadmap 1.
+`-m "slow or parity"` is documented in older notes as the full local end-to-end. It does not do
+that today: **exactly one test carries the `slow` marker and its body is `raise
+NotImplementedError`.** See Roadmap 1.
 
 ---
 
@@ -140,7 +140,22 @@ ingest, CPU inference, assembly — as this tier's canonical occupant. That test
 placeholder was still a placeholder. **Its schedule is suspended as of 2026-08-25**;
 `workflow_dispatch` is retained. Restore the `schedule:` block when the test is real.
 
-**To pick up:** implement `test_full_pipeline_parity`, then uncomment the schedule.
+**The two reasons this was not written have both lapsed** (re-checked 2026-09-03). Its docstring
+says it awaits upstream S2/S1/inference parity — those exist and pass, `6 passed, 2 skipped` in
+5.4 min. And it is no longer "the slowest parity test in the suite": the single-ROI path runs
+**~3.5 min end to end** on a CPU laptop and, since PR #174, resumes by default and cleans up its own
+staging.
+
+**What is left to decide is not technical.** The test needs Earthdata credentials and live network.
+Without them it would `skipif` like the other credential-gated parity arms — but a test that always
+skips in CI is the situation ADR 023 exists to make visible, not one to create quietly. So: either
+the nightly job gets credentials as repository secrets, or this is knowingly a local-only instrument
+and says so.
+
+**To pick up:** decide the credentials question, implement `test_full_pipeline_parity` as a
+single-arm `run_plain` end-to-end (the per-stage flow comparison is what the other five parity tests
+already do), then uncomment the schedule. Full analysis in
+`context_docs/test-suite-streamlining.md` §7.1.
 
 ### 2. The `gpu/` tier is empty, and one GPU path is verified by hand
 
@@ -162,6 +177,11 @@ path, and once before a campaign starts.
 look like if a runner ever becomes available, and the `gpu` marker stays declared so those
 instructions remain valid.
 
+**This is a recorded decision, not an omission:**
+`context_docs/decisions/023-the-cuda-path-is-verified-by-hand.md` carries it, including the
+alternatives that were rejected — in particular why adding `@pytest.mark.gpu` to that test would
+make things worse rather than tidier.
+
 ### Closed, for reference
 
 Two further items were on this list and were fixed in the same change that added it, so they
@@ -173,3 +193,9 @@ are recorded here rather than left reading as open work:
 - **A unit test that broke the 30-second bound above.** The source-read resilience test sat
   through the real 8-attempt retry ladder, 61 s of genuine backoff. It now asserts the
   ladder's shape instead of waiting it out, which checks more and takes 0.5 s.
+- **Two tests that had quietly given back a fifth of the suite's speed** (2026-09-03). The
+  documentation-index guard walked the whole working tree — 2,975 markdown files, of which 66 are
+  the repository's — and took 10.3 s; it asks `git ls-files` now and takes 0.01 s. And a fleet-mix
+  test reached `ray.kill` on its teardown path, which is wrapped in Ray's auto-init hook, so it
+  **booted a real local Ray cluster** every run. Both in
+  `context_docs/test-suite-streamlining.md` §6.

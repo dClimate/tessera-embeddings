@@ -1,503 +1,351 @@
-# Streamlining the test suite
+# The test suite: what has been done to it, and what is left
 
-**Where the unit suite's time went, what was safe to cut, and the coverage-equivalence gate that made
-it safe.** This is the one record here about the repository's own engineering rather than the data
-pipeline.
+**This is the one record here about the repository's own engineering rather than the data
+pipeline.** Two rounds of work have landed on the test suite and a third is proposed:
 
-**Status: EXECUTED**, and §5 is the measured outcome — 84.3 s to 24.5 s with the same 10,817
-source lines covered. **One phase is a partial**, and it says so where it sits: Phase 3 landed
-only in part and its estimate was wrong, for the reason in its own heading. §7 is a list of
-things the review turned up that were deliberately NOT part of this work and still need a
-decision.
+| round | what it did | when |
+|---|---|---|
+| **1 — streamlining** | 84.3 s → 24.5 s, three CI gaps closed, one accepted | 2026-08-25, PR #143 |
+| **2 — regrouping** | flat `tests/unit/` → subject directories mirroring `src/` | 2026-09-03, PR #171, [ADR 015](decisions/015-regrouping-the-unit-tests.md) |
+| **3 — follow-ups** | the two regressions round 1's gains had lost, and the standing list re-assessed | 2026-09-03, §6 |
 
-**The phase sections below are kept in their proposal voice on purpose.** They say what to
-change, what to leave alone, and what had to hold true before any change landed — and the last
-of those is the part worth keeping, because it is the argument the coverage-equivalence gate
-(§6) exists to enforce and it applies to the next such exercise as much as to this one. Read
-§5 first if you want to know what actually happened.
-
-Drawn up 2026-08-25 against `main` @ `76aeda9`, the tip including PRs #133–#140 — the
-GDAL-forwarder, ranged-reader-status, radar-refusal and GPU-hours work that landed that day.
-Every measurement below was taken on that commit.
-
-Every measurement below was taken on this machine (10 cores, `-n auto`) against `main`. The
-two headline fixes were prototyped and measured, not estimated; where a number is an
-estimate it says so.
+**Read §1 for what the suite is now, §6 for what round 3 changed, and §7 for what is still open.**
+§2–§5 are round 1's method and rulings, kept because they are what a fourth round would need: the
+safety model, the coverage gate, the things that were measured and ruled *not* worth doing, and why.
 
 ---
 
-## 1. What the suite looks like today
+## 1. What the suite is now
+
+Measured 2026-09-03 on `main` @ `692655d` (10 cores, `-n auto`), after round 3.
 
 ```
-             files    tests    LOC     runs in CI as
-tests/unit     120     3367   48387    unit.yml (3.12 + 3.13)
-tests/integration 4       9      602    integration.yml
-tests/parity      9       9     1139    integration.yml (fast), nightly.yml (slow)
-tests/architecture 2       3       98    architecture.yml
-tests/gpu          0       0        0    nothing — no tests exist
-tests/slow         0       0        0    nothing — no tests exist
+                  files   tests    LOC    runs in CI as
+tests/unit          134    3713   54206   unit.yml (3.12 + 3.13), with coverage
+tests/integration     8      —     1108   integration.yml, path-filtered PRs
+tests/parity         11      —     1181   integration.yml as -m "parity and not slow"
+tests/architecture    3       3       98  architecture.yml
+tests/slow            1       0        0  nothing — the directory is empty (§7.1)
+tests/gpu             1       0        0  nothing — no GPU runner exists (ADR 023)
 ```
 
-Unit suite: **84.3 s wall, 168 s CPU, 3366 passed / 1 skipped.** Line coverage of
-`src/tessera_embeddings` is **83 %** (13,038 statements, 2,221 missed).
+**Unit suite: 24.5 s wall, 3,713 passed / 1 skipped.** Line coverage of `src/tessera_embeddings` is
+**84%** (13,950 statements, 2,205 missed). The slowest single test is **3.3 s**, so the tier's
+documented "no test should exceed 30 s" bound holds with an order of magnitude to spare.
 
-### The tiers as documented vs. as wired
+The `1 skipped` is the pipelined CUDA path, and it is deliberate — [ADR 023](decisions/023-the-cuda-path-is-verified-by-hand.md).
 
-`tests/README.md` describes a six-tier design. Three of the six are not wired the way it
-says, and the drift is the source of most of §2's findings:
+### The layout, after round 2
 
-| Tier | README says it runs | What actually runs it |
-|---|---|---|
-| `unit/` | every PR | `unit.yml` (3.12 + 3.13) — correct. Note `downstream-smoke.yml` also runs this suite but is deliberately disabled to manual-only, pending a stable release of the private downstream consumer |
-| `architecture/` | every PR | `architecture.yml` — correct |
-| `integration/` | path-filtered PRs **+ nightly** | `integration.yml` on path-filtered PRs only. **Never nightly.** |
-| `parity/` | flow-touching PRs + nightly | correct — but see Phase 2 item 2.3 for what nightly actually selects |
-| `slow/` | nightly + on-demand | **directory is empty.** Its documented occupant is an `xfail` stub in `parity/` |
-| `gpu/` | inference-touching PRs only | **directory is empty, marker has zero uses, no workflow runs `-m gpu`** |
+`tests/unit/` is grouped into **subject directories mirroring `src/tessera_embeddings/`**, so an
+edit to one subsystem can be verified without running the other 3,700 tests. `tests/README.md` is
+the authority on where a new file goes; ADR 015 carries the reasoning and the two departures from a
+strict mirror. Every `src/` subpackage that holds testable code has a matching directory, and the
+eleven files that stay at `tests/unit/` root are named in `tests/README.md` and should not grow.
 
-`tests/README.md` also states that unit tests are "< 30s each". One is 61 s (§3, item 1.1),
-so the suite's own documented bound is being broken by the slowest test in it.
+**Round 1's §1 described a flat `tests/unit/` of 120 files.** That is no longer the shape of the
+thing, which is why this section was rewritten rather than annotated.
 
-Separately, and *not* a defect: collecting `tests/unit` in a plain checkout produces 17
-import errors for `ray`, `prefect`, `httpx` and `s3fs`. `tests/README.md` explains this — the
-`inference` extra is optional because torch is large. CI installs `--all-extras` and never
-sees it. Reproducing CI locally needs `uv sync --all-extras --frozen`.
+### Two things worth not re-discovering
 
-Two things I expected to find and did not:
+**Collection is not slow.** It looks like ~26 s on a first run; that is cold bytecode compilation.
+Warm, it is ~2 s. Do not chase it.
 
-- **Collection is not slow.** It looked like 26 s on the first run; that was cold bytecode
-  compilation. Warm, it is 2.2 s. No action.
-- **There is very little copy-paste between tests.** An AST scan for near-identical test
-  bodies inside each file found only 32 collapsible tests across all 120 files, and most of
-  those pairs are meaningfully distinct (ascending vs descending, S1 vs S2). A parametrise
-  sweep is not worth doing.
+**The suite does not repeat itself.** Round 1 found only 32 collapsible tests across 120 files by
+AST scan. Re-run repo-wide after the suite grew by 350 tests and ~6,000 lines: **zero pairs of tests
+share an identical body, anywhere in the suite.** It is verbose because it pins a great many
+behaviours in deliberately long names, not because it copies. **Line count is not an available lever
+here**, and §5 is the evidence for the strongest-looking counter-example.
 
 ---
 
 ## 2. Safety model
 
-The suite is the only thing standing between a code change and a corrupted global campaign.
-This plan is therefore constrained hard:
+The suite is the only thing standing between a code change and a corrupted global campaign. Any
+work on it is constrained hard, and these five held for rounds 1 and 3 alike:
 
-**S1 — Test files only.** Nothing under `src/` is touched. Where the review found a
-production-code concern it is written up in §7 for a separate decision, not folded in here.
+**S1 — Test files only.** Nothing under `src/` is touched. Where a review finds a production-code
+concern it is written up in §7 for a separate decision, not folded in.
 
-**S2 — Coverage equivalence gate.** Before-and-after, the set of *executed lines* in
-`src/tessera_embeddings` must be identical or a superset. Not the percentage — the actual
-line set, per file. `scripts/test_coverage_gate.py` (§6) produces and diffs the artefact.
-Any line that loses its last covering test is a blocker, and the diff names it.
+**S2 — Coverage equivalence gate.** Before and after, the set of *executed lines* in
+`src/tessera_embeddings` must be identical or a superset. Not the percentage — the actual line set,
+per file. `scripts/test_coverage_gate.py` (§4) produces and diffs the artefact. Any line that loses
+its last covering test is a blocker, and the diff names it.
 
-**S3 — Mutation spot-check.** Coverage equivalence proves a line still *runs*; it does not
-prove anything still *asserts* on it. So for any file where tests are deleted or merged, pick
-the behaviours those tests named, mutate the production line behind each one, and confirm the
-surviving suite goes red. §4 is the worked example of why this gate exists.
+**S3 — Mutation spot-check.** Coverage equivalence proves a line still *runs*; it does not prove
+anything still *asserts* on it. For any file where tests are deleted or merged, pick the behaviours
+those tests named, mutate the production line behind each, and confirm the surviving suite goes red.
+§5 is the worked example of why this gate exists.
 
-**S4 — Every removed test is named.** Test count goes from 3367 to a number that is
-accounted for line by line in the PR description, with a reason per test. No net-count
+**S4 — Every removed test is named**, with a reason, in the PR description. No net-count
 hand-waving.
 
-**S5 — One phase per PR.** Phases 1, 2 and 3 are independent and land separately, so a
-revert is cheap and blast radius is one category at a time.
+**S5 — One phase per PR**, so a revert is cheap and the blast radius is one category at a time.
 
 ---
 
-## 3. The plan
-
-### Phase 1 — Make it fast (no tests removed)
-
-This is where nearly all the value is. **Six tests account for 59 s of the 84 s wall time.**
-Deselecting exactly those six drops the suite to **24.9 s — a 3.4× speedup** (measured, not
-projected). Nothing is deleted; each test keeps its assertions.
-
-| # | Test | Now | Cause | Fix |
-|---|------|-----|-------|-----|
-| 1.1 | `test_source_read_resilience.py::test_a_permanent_read_still_surfaces` | **61.1 s** | Calls the real `source_read_retrying` ladder — 8 attempts with 7 exponential sleeps, which is ~61 s of genuine `time.sleep` | Neutralise the sleep on the `Retrying` object in the test's `_read` helper |
-| 1.2 | `test_scheduling.py::TestReplace::test_replace_creates_new_actor_and_marks_initializing` | 10.1 s | Calls `pool.replace()` without patching `ray.kill` | Hoist `patch.object(_sched_mod.ray, "kill")` into the existing autouse fixture |
-| 1.3 | `test_pipeline.py::test_abandoning_the_generator_does_not_wait_on_the_in_flight_preparation` | 10.0 s | Two worker threads each block on `release.wait(5)` | Signal `release` before joining, or cut the timeout |
-| 1.4 | `test_scheduling.py::test_replace_carries_credentials_and_region_to_new_actor` | 9.1 s | Same as 1.2 | Same as 1.2 |
-| 1.5 | `test_assembly.py::TestDetectStagedChunkSize::test_uses_first_available_chunk` | 8.8 s | Writes a real 2000×2000×128 quantised chunk to detect a chunk size | Shrink the `ChunkSpec` extent and assert the smaller size |
-| 1.6 | `test_catalogue_refusal.py::TestTheFailingRequestIsNamed::test_a_refusal_before_any_search_is_named_as_the_catalogue_root` | 6.0 s | Retry/backoff on the catalogue-root path | Neutralise the sleep as in 1.1 |
-
-**1.1 in detail.** `SOURCE_READ_ATTEMPTS = 8` with `wait_exponential(multiplier=1, min=2,
-max=15)` is about 61 s of backoff, and the docstring in `roi_processing.py` says so
-deliberately — that ladder is a production decision and this plan does not touch it. Note
-that at 61 s this single test breaks the "< 30s each" bound `tests/README.md` sets for the
-unit tier, by a factor of two. The test
-does not need to *experience* the ladder to assert that a permanent read still raises.
-Verified:
-
-```python
-r = source_read_retrying(log)
-r.sleep = lambda _seconds: None   # tenacity calls this between attempts
-```
-
-Attempt count stays 8, the `wait_exponential` policy object is untouched, elapsed time goes
-from 61 s to 0.000 s. If we also want the ladder's *duration* pinned, assert on the policy
-parameters directly — that is a stronger test than sitting through it, and it is free.
-
-**1.2 / 1.4 in detail — this one is a latent hazard, not just slowness.** The file already
-carries a comment explaining that an unpatched `ray.kill` from a test silently boots a real
-local Ray cluster, which hashes and uploads the whole working directory, and that this once
-ate ~60 GB of RAM. The shared `_do_replace` helper patches it. These two tests call
-`pool.replace()` directly and do not. Prototyped the fix and measured the file:
-
-```
-before:  97 passed in 4.08s
-after:   97 passed in 0.85s
-```
-
-Checked for vacuity, because a file-wide `ray.kill` patch could silence the tests that assert
-on kills. It does not: every such test opens its own `patch.object(...)` which nests inside
-and shadows the fixture's. Proved it by mutating the production retire path to not call
-`ray.kill` and confirming `TestRetireIdle::test_idle_actor_killed_after_grace` still fails.
-Both the source mutation and the test prototype were reverted.
-
-**Expected result: 84.3 s → ~25 s**, on every PR and every push to `main`, across both
-Python versions in the `unit.yml` matrix — and on every local `uv run pytest`, which is where
-it will be felt most.
-
-### Phase 2 — Remove dead weight (zero behavioural risk)
-
-Each item verified by exhaustive grep across `tests/`, not by inference.
-
-**2.1 — Five unused conftest fixtures, 99 of 377 lines.** `sample_sar_data`,
-`roi_mask_array`, `mock_roi_metadata`, `icechunk_s3_config`, `icechunk_s3_store_path`. Each
-is referenced only inside `tests/unit/conftest.py`; the last two only reference each other,
-so the set is closed. Zero references anywhere else — including as `usefixtures` strings and
-`getfixturevalue` strings, which a name-based grep catches because fixture lookup is by name.
-
-**2.2 — The `gpu` tier is empty, and the one real GPU test is filed outside it.** The `gpu`
-marker has zero uses and `tests/gpu/` holds only `__init__.py` and a README. But that README
-is not junk — it is a carefully written contract (tiny inputs, tiny model, compare GPU output
-to a CPU reference, ≤ 2 CI minutes per run). It is an unimplemented design, not dead code,
-so **do not just delete it.**
-
-Meanwhile `tests/unit/inference/test_inference_loop.py::TestRunInference::test_pipelined_matches_serial`
-is gated by `@pytest.mark.skipif(not torch.cuda.is_available())` rather than
-`@pytest.mark.gpu`, and its own docstring says it is "the only coverage of the pinned-buffer /
-CUDA-event / two-deep-drain / backbone-stream-ordering path". No CI runner has a GPU, so it
-skips everywhere — it is the `1 skipped` in every run. **That inference hot path has no CI
-coverage at all today.**
-
-**Decision, 2026-08-25: the gap is accepted.** A GPU CI runner is not available to this
-project and will not be provisioned. The pinned-buffer / CUDA-event / stream-ordering path in
-the pipelined inference loop is therefore **verified manually, not by CI**. What follows from
-that is a documentation and ergonomics job, not a coverage one:
-
-- **Keep the `skipif`; do not add `@pytest.mark.gpu` to this test.** The marker would be
-  caught by the default `addopts` deselection and the test would vanish from the unit run
-  entirely. The `skipif` keeps it collected, so it reports as `1 skipped` on every CI run —
-  which is the only standing signal that the gap exists. Losing that is worse than the tidiness
-  of a used marker.
-- **State the gap where a reader will hit it.** `tests/README.md` and the class docstring
-  should say plainly that this path has no automated coverage and is checked by hand. A skip
-  that nobody explains reads as "not applicable here", which is how an accepted gap turns
-  into an assumed one.
-- **Make the manual run one documented command**, so "verified manually" is a thing someone
-  can actually do on any CUDA machine:
-  ```bash
-  uv sync --all-extras --frozen
-  uv run pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
-  ```
-- **Name when to run it**: after any change to the pipelined loop, the actor pool, or the
-  chunk-staging path, and once before a campaign starts. Manual verification with no trigger
-  attached to it does not happen.
-- **Keep `tests/gpu/` and its README.** With the decision made, that directory is a dormant
-  spec rather than a plan-in-progress — it describes what a GPU tier would look like if a
-  runner ever appears. Say that in the README so it is not mistaken for work in flight, and
-  leave the `gpu` marker declared in `pyproject.toml` so the README's instructions stay valid.
-
-Consider adding this to `context_docs/decisions/` as an ADR. It is a standing decision with a
-consequence a future reader will trip over ("why is the CUDA path untested?"), and the ADR
-tree is where this repo answers that kind of question.
-
-**2.3 — The nightly workflow runs one unimplemented test. — DONE 2026-08-25.** `nightly.yml` fires daily at
-06:00 with a 120-minute timeout and runs `pytest tests/parity -m "parity and slow"`. That
-selector matches exactly one test: `test_full_pipeline_parity`, whose body is `raise
-NotImplementedError` under `@pytest.mark.xfail(strict=True)`.
-
-The wiring is not an accident — `tests/slow/README.md` names the full plain-runner end-to-end
-as that tier's canonical occupant, and this stub is it, written in `parity/` because it needs
-both markers. So the honest description is: the nightly job is correctly pointed at a test
-nobody has written yet. Recommend suspending the schedule (keep `workflow_dispatch`) until
-the test is real, rather than paying a daily runner to confirm a placeholder is still a
-placeholder.
-
-**2.4 — `tests/README.md` needs correcting either way. — DONE 2026-08-25.** Its tier table
-claimed integration runs nightly (it does not), and that `slow/` and `gpu/` are populated
-(they are not). It also listed `downstream-smoke.yml` as a runner of the unit suite; that
-workflow is deliberately disabled to manual-only, pending a stable release of the private
-downstream consumer.
-
-The table now describes what is wired, and a **Roadmap** section at the end of
-`tests/README.md` carries the four undone things — the empty `slow/` tier and the suspended
-nightly, the accepted GPU gap, the two orphaned tests from Phase 2 item 2.5, and the 30-second bound
-broken by §3 item 1.1 — so they can be scooped up rather than rediscovered. Status banners
-were added to `tests/slow/README.md` and `tests/gpu/README.md` so the tier docs no longer
-contradict the top-level one.
-
-**2.5 — Two tests that no CI job ever runs.** The root `addopts` deselects
-`integration`, `parity`, `slow` and `gpu`; `integration.yml` runs only `tests/integration`
-and `tests/parity`. So these two, which live in `tests/unit/`, are executed by nothing:
-
-- `tests/unit/test_provider_local_ray.py::test_local_ray_cluster_enters_and_exits` (`slow`)
-- `tests/unit/providers/test_provider_aws_dask.py:585` (`integration`)
-
-They are not protecting anything today. Decide per test: move it to the tier whose job would
-run it, or delete it. Do not leave it where it is — a test that never runs reads as coverage
-and is not.
-
-### Phase 3 — DRY the stubs — MOSTLY NOT DONE, and the estimate was wrong
-
-The plan sized this at "27 duplicated stub definitions, 217 lines" and estimated ~175 lines
-saved. **That measurement counted definitions sharing a NAME as duplication.** Comparing the
-actual bodies by AST digest shows most are not duplicates at all:
-
-| Stub | Definitions | Distinct bodies |
-|---|---|---|
-| `_Item` | 6 | **6** |
-| `_item` | 9 | 7 |
-| `_day_ds` | 3 | 3 |
-| `_snapshots` | 4 | 3 |
-| `_Roi` | 3 | 1 |
-| `_gdal_logs`, `_mask_store`, `_completed_run`, `_stage_quickstart_roi` | 2 each | 1 each |
-
-The `_Item` and `_item` stubs are **deliberately minimal**, each carrying exactly the surface
-the code under test reads, and several say so in their own docstrings — "carrying only what
-the baseline decision reads", "the minimum of a STAC item the date loop touches", "minimum
-surface both ingests' items expose to the ownership filter". That is a feature: each stub
-documents what the production function actually requires of its input. A shared superset stub
-would delete that information, hand every test fields it does not use, and create a coupling
-point where a change made for one file silently reaches nine.
-
-The genuinely identical helpers are 2–5 lines each. Hoisting the five that live in
-`tests/unit/` would save ~20 lines gross and cost ~26 in a new module header plus import
-lines — a net loss, for the price of making a reader jump files to see what a four-line stub
-is. **Not done.**
-
-**One consolidation was worth it and is done:** `_stage_quickstart_roi` was byte-identical
-across the two ROI-parity tests, both of which already import from `tests/parity/helpers.py`.
-It moves there as `stage_quickstart_roi`, with the duplicated `FORCE_CRS` constant. No new
-module, and the parity suite is green after the move (6 passed, 2 skipped, 121 s).
-
-**The finding to carry forward: this suite is not repetitive.** Reducing its line count is not
-an available lever, and the review's own first pass overstated it by measuring names instead
-of bodies.
-
-### Phase 4 — the source-text assertion pass
-
-45 functions across `tests/` read source with `read_text`, `ast.parse` or `inspect.getsource`.
-Read one at a time against what each is really protecting, they sort into four groups.
-
-**Not source assertions at all — the §7.2 count was wrong.** The six
-`test_provider_aws_ray.py` hits read the YAML that `_resolve_ray_config` **writes**. That is
-its output, so those are ordinary behavioural tests and nothing needs doing. The same is true
-of `test_context_docs_index.py` (reads a Markdown index), `test_public_api.py`'s doc check,
-and the code-identity tests, whose whole subject is hashing source — reading it is the point.
-
-**One was superseded by a linter, and is deleted.**
-`test_source_read_resilience.py::test_placeholders_match_arguments` walked the AST of
-`ingest/s1_roi.py` counting `%`-placeholders against arguments. Ruff's `PLE1205` and `PLE1206`
-make exactly that check across every file in the repo. Both rules are now enabled in
-`ruff.toml`, verified to fire nothing on `src/`, `tests/` and `scripts/` as they stand, and
-verified **equivalent by mutation**: a too-many mutant and a too-few mutant in `s1_roi.py`
-each fail the lint exactly as they used to fail the test. Net effect is wider coverage, one
-module to all of them, for 18 fewer lines of test.
-
-**The rest are project-specific invariants with no linter equivalent, and they stay put.**
-Things like "no Prefect import outside the orchestration subtree", "every caller of
-`apply_roi_mask` supplies the mask", "no ingest module builds its own retry policy". Each
-encodes a real past incident, and each already runs on every PR in `unit.yml`. Moving them to
-`tests/architecture/` would relocate the same hand-rolled AST walks into a folder whose job
-runs on the same trigger — churn with no gain, and a real chance of losing context in the
-move. The one thing that would genuinely improve them is expressing them as rules in
-`src/tessera_embeddings/architecture_tests/`, which is production code and out of scope here.
-
-**The pass turned up an asymmetry, now ruled on.** Two of these rules read only
-`ingest/s1_roi.py`, the radar path:
-
-- `test_placeholders_match_arguments` — moot, since the linter covers both sensors.
-- `test_every_informational_line_carries_the_roi` — "a line without `roi=` cannot be tied to
-  a cell: the log stream is a task id". `ingest/s2_roi.py` has 12 informational lines and 6
-  carry no ROI, so widening the test would fail today.
-
-**Ruling 2026-08-25: radar-only is correct, keep it.** Attribution earns its cost where dates
-are actually abandoned, and radar is that path — `s1_roi.py` carries 25 mentions of data
-loss, giving up and skipping against `s2_roi.py`'s 7. The optical path is the more forgiving
-one, so a log line there is far less likely to be the only surviving record of a lost date.
-
-Note for anyone reading the test later: the ``roi=`` it demands is the **region of interest**,
-the cell being processed, taken from the ROI Zarr's filename. It is unrelated to the AWS
-region locality that decides which copy of a granule to read — an easy collision, since both
-are called "region" in this codebase and radar is genuinely the in-region-only sensor.
-
-**One narrower observation left open.** Four of the six unattributed optical lines are
-progress telemetry, where the run context is already obvious. The other two are warnings:
-
-```
-s2_roi.py:485  ROI has no live pixels — every date will fail the coverage gate
-s2_roi.py:652  Load failed on asset-incomplete STAC item(s): %s
-```
-
-Those two are the ones where the radar argument transfers — a warning you would want to trace
-to a cell. Naming them is a change to `src/` and out of scope here; recorded so the decision
-is a decision rather than an omission.
-
----
-
-## 4. What NOT to do, and why
-
-**Do not consolidate the read-failure cluster.** Six files touch `ingest/duplicates.py` and
-`ingest/loader_failures.py` — `test_duplicate_granules.py` (189 tests, 2656 lines),
-`test_loader_failure_attribution.py`, `test_read_failure_verdict.py`,
-`test_source_read_resilience.py`, `test_catalogue_refusal.py`,
-`test_read_failure_cause_over_dask.py`. It is the largest apparent consolidation target in
-the suite and it looks compelling: pairwise coverage overlap runs 78–100 %, and
-`test_read_failure_verdict.py` (360 lines, 164 tests) has **zero unique line coverage** —
-every line it touches is touched by `test_duplicate_granules.py`.
-
-That file is a **characterisation table**: a 20-row matrix pinning the verdict for each
-failure cause, plus mutual-exclusivity checks and boundary cases like "a URL port is not
-mistaken for a status" and "a signed URL does not outrun the pattern". It has no unique
-coverage because it walks the same lines to assert *different properties* about them.
-Deleting it on a coverage-subsumption argument would be a serious regression, and coverage
-subsumption is precisely the argument that would have justified it.
-
-Two mutation probes on `ingest/duplicates.py` settle the method question:
-
-| Mutant | Caught by |
-|---|---|
-| Drop the `(?![\d/])` lookahead in `_HTTP_STATUS_RE` | **nobody** — survived all five files |
-| Remove `408` from `_TRANSIENT_4XX` | `test_read_failure_verdict` **and** `test_duplicate_granules` |
-
-So the overlap is real for some behaviours and the cluster has genuine gaps for others, and
-neither coverage nor a single mutant can tell you which is which per test. The payoff for
-merging is LOC only — these files are already fast — and the downside is losing the one
-assertion that mattered. Leave the structure alone; Phase 1 and Phase 3 still apply to them.
-
-**Do not do a parametrise sweep.** 32 collapsible tests repo-wide, most meaningfully
-distinct. Not worth the churn.
-
-**Do not chase collection time.** 2.2 s warm.
-
-**Do not delete the assertion-free tests.** The AST scan flags 38 tests with no `assert` and
-no `pytest.raises`. Nearly all are the legitimate does-not-raise pattern — `test_imports.py`
-smoke-imports every module, `test_all_present_passes` calls a validator that raises on
-failure. They are cheap and they catch circular imports. Leave them.
-
----
-
-## 5. Outcome — MEASURED, all phases landed
+## 3. Round 1 — what it did, measured
 
 | | before | after |
 |---|---|---|
 | unit suite wall time | 84.3 s | **24.5 s** (3.4×) |
 | tests, all tiers | 3398 | 3402 |
-| tests deleted | — | **1**, plus 1 moved and 1 superseded (§5.1) |
-| test LOC | 49,953 | 49,796 |
-| src lines covered | 10,817 | **10,817 — none lost**, by the §6 gate |
+| tests deleted | — | **1**, plus 1 moved and 1 superseded |
+| src lines covered | 10,817 | **10,817 — none lost**, by the S2 gate |
 | daily CI runners doing nothing | 1 | 0 |
 | tests no CI job ran | 2 | 0 |
-| GPU inference path | uncovered, unstated | uncovered, **stated and runnable by hand** (Phase 2 item 2.2) |
 
-### 5.1 Every test movement, named
+**The speedup was the whole prize, and five of the six offending tests were *waiting*, not
+working.** The worst sat through a real 8-attempt retry ladder — about 61 s of genuine
+`time.sleep`, breaking the tier's own 30 s bound by a factor of two — to assert that a permanent
+read still raises. It now asserts the ladder's *shape* instead, which checks more and takes 0.5 s.
+Two others called `pool.replace()` without patching `ray.kill`; see §6.2, because that one came
+back.
 
-The S4 gate: collect all tiers with markers disabled, before and after, and diff the IDs.
+**Every test movement, named** (the S4 gate: collect all tiers with markers disabled, before and
+after, and diff the IDs):
 
-**Removed (3)**
-- `test_provider_aws_dask.py::TestSchedulerResourceLoggerOnCluster::test_registered_plugin_emits_on_real_scheduler`
-  — **moved**, not deleted; reappears under `tests/integration/`.
-- `test_provider_local_ray.py::test_local_ray_cluster_enters_and_exits` — **deleted.** The only
-  genuine deletion in the whole exercise. Marked `slow` inside `tests/unit/`, so no CI job had
-  ever run it; `test_imports.py` already imports the module, and the coverage gate confirms
-  nothing was lost.
-- `test_source_read_resilience.py::TestZeroDateOutcomeIsAttributable::test_placeholders_match_arguments`
-  — **superseded** by ruff `PLE1205`/`PLE1206`, which check the same thing repo-wide (Phase 4).
+- **moved** — the Dask scheduler-plugin test, from `tests/unit/` to `tests/integration/`, where a
+  job actually runs it.
+- **deleted** — `test_local_ray_cluster_enters_and_exits`, the only genuine deletion. Marked `slow`
+  inside `tests/unit/`, so no CI job had ever run it.
+- **superseded** — an AST walk counting `%`-placeholders against arguments, replaced by ruff
+  `PLE1205`/`PLE1206`, which check the same thing across every file in the repo. Verified equivalent
+  by mutation: a too-many and a too-few mutant each fail the lint exactly as they used to fail the
+  test.
+- **added** — the retry-ladder shape assertion, four parametrised rows closing an untested regex
+  guard, and one auto-parametrised row because this document exists.
 
-**Added (4 tests, 6 IDs)**
-- the moved scheduler-plugin test, in its new tier;
-- `test_the_retry_ladder_is_the_one_production_pays_for` — pins the retry budget that Phase 1
-  stopped waiting out;
-- `test_a_longer_number_is_not_a_status_with_its_tail_ignored` (4 parametrised rows) — closes
-  the untested regex guard from §7.1;
-- one auto-parametrised row of `test_every_document_is_listed`, because this document exists.
+**Three CI gaps closed, one accepted.** A nightly runner that confirmed a placeholder; two tests no
+job executed; a regex guard nothing exercised. The GPU path stays uncovered by decision — now
+[ADR 023](decisions/023-the-cuda-path-is-verified-by-hand.md).
 
-### 5.2 What the exercise was actually worth
-
-**The speedup is the whole prize.** 84.3 s to 24.5 s, on every PR, both Python versions, and
-every local `uv run pytest`. Five of the six offending tests were *waiting*, not working.
-
-**Line count was not an available lever, and the plan's own first estimate of it was wrong.**
-157 lines net, against an estimate of ~300, and Phase 3's share of that estimate rested on
-counting helper NAMES rather than comparing their bodies (§3, Phase 3). This suite is verbose
-because it pins a great many behaviours in deliberately long names, not because it repeats
-itself.
-
-**Three CI gaps closed, one accepted.** A nightly runner that confirmed a placeholder; two
-tests no job executed; a regex guard nothing exercised. The GPU path stays uncovered by
-decision, and is now written down in the three places a reader will meet it.
-
-**LOC reduction is a small lever here and the plan says so.** About 300 lines of 49,953,
-roughly 0.6 %. The suite is not bloated with copy-paste; it is verbose because the behaviours
-it pins are genuinely numerous and the naming is deliberately long. The 3.4× speedup and the
-two closed CI gaps are the real wins. If a larger LOC cut is wanted, it has to come from
-§4 — and §4 is the part I would not do.
-
-**One gap is accepted rather than closed.** Per Phase 2 item 2.2 the pipelined CUDA path stays outside
-CI, because no GPU runner is available. Nothing in this plan changes that; what changes is
-that it stops being silent. The honest reading of the "after" column is *84 % of the codebase
-verified automatically, one hot path verified by hand on a documented trigger* — which is a
-weaker guarantee than the coverage number alone suggests, and is written down here so the
-number is not read as more than it is.
+**Line count was not the lever, and round 1's own first estimate of it was wrong** — 157 lines net
+against an estimate of ~300, because the estimate counted helper *names* rather than comparing their
+bodies. See §5.
 
 ---
 
-## 6. The coverage-equivalence gate
+## 4. The coverage-equivalence gate
 
-```python
-# scripts/test_coverage_gate.py — run before and after, then diff
-#   uv run pytest tests/unit -n auto -q --cov=src/tessera_embeddings \
-#       --cov-report=json:before.json
-#   ... make changes ...
-#   uv run pytest tests/unit -n auto -q --cov=src/tessera_embeddings \
-#       --cov-report=json:after.json
-#   uv run python scripts/test_coverage_gate.py before.json after.json
-import json, sys
+`scripts/test_coverage_gate.py` diffs two `--cov-report=json` runs by executed-line **set**:
 
-def executed(path):
-    files = json.load(open(path))["files"]
-    return {(f, l) for f, v in files.items() for l in v["executed_lines"]}
-
-before, after = executed(sys.argv[1]), executed(sys.argv[2])
-lost = sorted(before - after)
-if lost:
-    print(f"BLOCKED: {len(lost)} source lines lost their last covering test")
-    for f, l in lost[:50]:
-        print(f"  {f}:{l}")
-    sys.exit(1)
-print(f"OK: {len(before)} lines covered before, {len(after)} after, none lost")
+```bash
+uv run pytest tests/unit -n auto -q --cov=src/tessera_embeddings --cov-report=json:before.json
+# ... make changes ...
+uv run pytest tests/unit -n auto -q --cov=src/tessera_embeddings --cov-report=json:after.json
+uv run python scripts/test_coverage_gate.py before.json after.json
 ```
 
-The `main` baseline is 10,817 executed lines across 124 files. The artefact takes ~90 s to
-produce, so the gate costs one extra coverage run per phase.
+A file can gain lines and lose others while the percentage holds, which is why this compares sets
+rather than ratios. The artefact takes about 40 s to produce, so the gate costs one extra coverage
+run per change. Round 3's run: **11,745 lines before, 11,746 after, none lost.**
 
-Gate S3 has no script — it is a judgement call per file, and §4 is the worked example of
-doing it properly.
+Gate S3 has no script — it is a judgement call per file, and §5 is the worked example of doing it
+properly.
 
 ---
 
-## 7. Found during the review, needs a decision — NOT part of this plan
+## 5. What NOT to do, and why
 
-These touch `src/` and are deliberately excluded. Listed so they are not lost.
+Each of these was measured and turned down. They are here so the same idea is not re-proposed on
+the same evidence.
 
-**7.1 — `_HTTP_STATUS_RE` has an untested guard.** The `(?![\d/])` lookahead in
-`ingest/duplicates.py` stops a 4-digit number or a `403/`-style fragment being read as a
-status. Removing it breaks no test in the suite. This is a **test gap, not a bug** — the
-guard looks correct, nothing exercises it. Adding a row to the characterisation table in
-`test_read_failure_verdict.py` is a test-only fix and could be folded into Phase 2 if wanted.
+**Do not consolidate the read-failure cluster.** Six files touch `ingest/duplicates.py` and
+`ingest/loader_failures.py`, and it is the largest apparent consolidation target in the suite:
+pairwise coverage overlap runs 78–100%, and `test_read_failure_verdict.py` has **zero unique line
+coverage** — every line it touches is touched by `test_duplicate_granules.py`.
 
-**7.2 — Tests that assert on source text. — DONE as Phase 4 (§3).** One test was replaced by a
-ruff rule; the rest stay. The radar-only scope of the ROI-logging rule was **ruled correct**
-on 2026-08-25 — attribution earns its cost where dates are abandoned, and radar is that path.
-Two optical *warnings* remain unattributed and would be worth naming; that is a `src/` change
-and is not made here.
+That file is a **characterisation table**: a 20-row matrix pinning the verdict for each failure
+cause, plus mutual-exclusivity checks and boundary cases like "a URL port is not mistaken for a
+status". It has no unique coverage because it walks the same lines to assert *different properties*
+about them. Two mutation probes settle the method question:
+
+| Mutant in `ingest/duplicates.py` | Caught by |
+|---|---|
+| Drop the `(?![\d/])` lookahead in `_HTTP_STATUS_RE` | **nobody** — survived all five files |
+| Remove `408` from `_TRANSIENT_4XX` | `test_read_failure_verdict` **and** `test_duplicate_granules` |
+
+So the overlap is real for some behaviours and the cluster has genuine gaps for others, and neither
+coverage nor a single mutant can tell you which is which per test. **Coverage subsumption is not
+redundancy**, and it is precisely the argument that would have justified deleting the one file whose
+assertions mattered.
+
+**Do not DRY the stubs.** Round 1 sized this at "27 duplicated definitions, ~175 lines saved" by
+counting definitions that shared a *name*. Comparing actual bodies by AST digest: `_Item` has 6
+definitions and **6 distinct bodies**; `_item` has 9 and 7. They are deliberately minimal, each
+carrying exactly the surface the code under test reads, and several say so in their own docstrings.
+That is a feature — each stub documents what the production function requires of its input. A shared
+superset stub would delete that information and create a coupling point where a change for one file
+silently reaches nine. The genuinely identical helpers are 2–5 lines each; hoisting them would save
+~20 lines and cost ~26. **Not done, and not to be re-proposed.**
+
+**Do not do a parametrise sweep**, do not chase collection time, and **do not delete the
+assertion-free tests** — the AST scan flags 38 with no `assert` and no `pytest.raises`, and nearly
+all are the legitimate does-not-raise pattern. `test_imports.py` smoke-imports every module and
+catches circular imports for almost nothing.
+
+**Do not move the source-text assertions to `tests/architecture/`.** 45 functions across `tests/`
+read source with `read_text`, `ast.parse` or `inspect.getsource`. Most are not source assertions at
+all — they read YAML that the code under test *writes*, or a Markdown index, or (for the
+code-identity tests) source whose hashing is the entire subject. The rest are project-specific
+invariants with no linter equivalent — "no Prefect import outside the orchestration subtree", "every
+caller of `apply_roi_mask` supplies the mask" — each encoding a real past incident and each already
+running on every PR. Relocating them would move the same hand-rolled AST walks into a folder whose
+job runs on the same trigger. The one thing that would genuinely improve them is expressing them as
+rules in `src/tessera_embeddings/architecture_tests/`, which is production code and out of scope.
+
+**Keep the ROI-logging rule radar-only.** `test_every_informational_line_carries_the_roi` reads only
+`ingest/s1_roi.py`. Widening it to the optical path would fail today, and **radar-only is correct**:
+attribution earns its cost where dates are actually abandoned, and `s1_roi.py` carries 25 mentions
+of data loss against `s2_roi.py`'s 7. Note for anyone reading that test later — the `roi=` it
+demands is the **region of interest**, the cell being processed, not the AWS region locality that
+picks a granule copy. Both are called "region" here and radar is separately the in-region-only
+sensor, so the collision is easy to make.
+
+---
+
+## 6. Round 3 — the follow-ups, 2026-09-03
+
+Round 1's gains had partly eroded, and both causes were introduced *after* it. The unit suite had
+drifted from 24.5 s back to **30.7 s**, and 13.3 s of that was two tests.
+
+### 6.1 The documentation-index guard walked the whole working tree
+
+`tests/unit/test_context_docs_index.py` checks that `context_docs/README.md` names nothing that has
+been deleted, and excuses any name that "exists somewhere else in the repo". That excuse was
+implemented as `REPO.rglob("*.md")`.
+
+**It was the slowest test in the suite at 10.3 s — a third of the whole run** — and it was wrong as
+well as slow. `rglob` walks 2,975 markdown files on a checkout carrying git worktrees, of which
+**66 are the repository's**: the rest are `.venv` and `.claude/worktrees/`, the latter holding whole
+checkouts of other branches. So a file deleted on this branch was still on disk and the excuse fired
+for it. That is not hypothetical — nine documents were removed in PR #175 and this guard stayed
+green locally while CI, which has neither directory, would have failed on all nine.
+
+An earlier fix excluded hidden directories. That corrected the answer and none of the speed, and it
+went on approximating the question instead of asking it. **`git ls-files "*.md"` returns the same 66
+names in ~8 ms** — 1,200× faster, immune to any future build artifact, and it is what "in the
+repository" actually means.
+
+**10.33 s → 0.01 s.** Verified still to have teeth by adding a stale row and watching it fail.
+
+### 6.2 A unit test booted a real local Ray cluster
+
+`tests/unit/providers/test_fleet_mix.py::TestTheRunnerLifecycle::test_a_drought_that_kills_the_actor_wait_has_still_asked`
+cost ~3 s and printed `Started a local Ray instance`. Traced to its exact cause rather than guessed:
+
+```
+runner.py:252   ray.kill(actor)
+ray/_private/auto_init_hook.py:21   auto_init_wrapper → auto_init_ray → ray.init()
+```
+
+The test makes `wait_for_actors` raise, but the actor factory has already handed back stand-ins, so
+`run_inference`'s `finally` reaches `ray.kill(actor)` — and `ray.kill` is wrapped in Ray's auto-init
+hook. **This is the third occurrence of a hazard this repository already documents**: Ray's init
+hashes and uploads the whole working directory, which here includes every sibling worktree, and the
+same hazard once ate ~60 GB of RAM across three concurrent runs. Round 1 fixed two instances of it
+(`test_scheduling.py`, which now patches `ray.kill` in an autouse fixture); this one was written
+afterwards and did not inherit the patch.
+
+Fixed by patching `ray.kill` inside the helper's existing `with` block. Not file-wide, so nothing
+that asserts on kills is silenced. **4.18 s → 1.17 s for the file**, and no Ray instance is started
+anywhere in `tests/unit` afterwards — checked by running every candidate file with `-s` and grepping
+for the banner.
+
+### 6.3 The GPU decision became an ADR
+
+Round 1 recommended it — *"a standing decision with a consequence a future reader will trip over"* —
+and it had not been done. It is now [ADR 023](decisions/023-the-cuda-path-is-verified-by-hand.md).
+The decision itself is unchanged; what it adds is a home outside the test tree, since a reader
+arriving from `src/` and asking why the CUDA path is untested previously had three answers, all of
+them filed under `tests/`.
+
+### Round 3, measured
+
+| | before | after |
+|---|---|---|
+| unit suite wall time | 30.7 s | **24.5 s** |
+| slowest single test | 10.3 s | **3.3 s** |
+| unit tests that boot a real Ray cluster | 1 | **0** |
+| src lines covered | 11,745 | **11,746 — none lost**, by the S2 gate |
+| tests added, removed or renamed | — | **none** |
+
+**No test changed what it asserts.** Both fixes are to how a test reaches its subject, which is why
+S3 was not needed and S4 has nothing to report.
+
+---
+
+## 7. What is still open
+
+### 7.1 The `slow/` tier is empty, and its occupant is a stub — and the blocker has lifted
+
+`tests/slow/README.md` names the full plain-runner end-to-end — rasterise ROI, S2 and S1 ingest, CPU
+inference, assembly — as the tier's canonical occupant. It exists only as
+`tests/parity/test_full_pipeline_parity.py`, whose body is `raise NotImplementedError` under
+`@pytest.mark.xfail(strict=True)`. It lives in `parity/` because it needs both markers.
+`nightly.yml`'s schedule is suspended because it was pointed at exactly that stub.
+
+**Two things that were true when the stub was written are no longer true**, which is the reason to
+revisit it now rather than leave it on a list:
+
+- **Its stated precondition is met.** The docstring says "Awaiting upstream S2/S1/inference parity".
+  Those exist and pass: `tests/parity` runs `6 passed, 2 skipped` in 5.4 min, the two skips being
+  the EDL-credential-gated arms.
+- **It is no longer "the slowest parity test in the suite".** The single-ROI path was measured at
+  **~3.5 minutes end to end** on a CPU laptop after the campaign's inference work landed in it —
+  against the "30+ minutes" five documents used to claim — and since PR #174 it resumes by default
+  and cleans up its own staging.
+
+**What still has to be decided before this can be built**, and it is not a technical question: the
+test needs Earthdata credentials and live network. The parity tier already has the pattern for that
+(`skipif` on `EARTHDATA_TOKEN` or username/password), so it would skip rather than fail without
+them — but a test that always skips in CI is the situation ADR 023 exists to make visible, not one
+to create silently. **Either the nightly job gets credentials as repository secrets, or this test is
+knowingly a local-only instrument and says so.**
+
+Recommended shape if it is built: one arm, not two. `run_plain` end to end against the quickstart
+config, asserting the store's own invariants rather than comparing against a Prefect flow — the flow
+comparison is what the other five parity tests already do per stage, and the value here is the
+*end-to-end* path, which nothing else exercises.
+
+### 7.2 `run_plain`'s end-to-end path has no automated coverage
+
+The reason §7.1 is worth doing. `tests/unit/orchestration/runners/test_plain_runner_wiring.py`
+covers config precedence, the CLI, the staging identity and cleanup — all with the domain calls
+mocked. The parity suite compares flows to domain functions and never invokes `run_plain`. **So the
+one path an outside user of this library is most likely to take is verified only by someone running
+the quickstart by hand.** A green suite is weak evidence there.
+
+### 7.3 Two optical warnings carry no ROI attribution
+
+`s2_roi.py:485` ("ROI has no live pixels — every date will fail the coverage gate") and
+`s2_roi.py:652` ("Load failed on asset-incomplete STAC item(s)") are warnings a reader would want to
+trace to a cell, and the radar argument in §5 transfers to them even though the blanket optical rule
+does not. **This is a `src/` change and is deliberately not made here** (gate S1); recorded so the
+omission is a decision.
+
+### 7.4 Considered and not proposed: a guard against the Ray-boot class
+
+§6.2 is the third occurrence, so the obvious move is an autouse fixture that fails any unit test
+which initialises Ray. It would be about ten lines and it would work.
+
+**It is not proposed, because the standing direction on this repository is to reduce gates rather
+than add them**, and this one guards a hazard whose cost is seconds of local wall clock plus a
+memory risk that has materialised once in the project's life. The cheaper mitigation is already in
+place: the cause is now documented at all three sites, and the detection is one command —
+
+```bash
+uv run pytest tests/unit -q -s | grep "Started a local Ray instance"
+```
+
+Worth running after any change that touches `inference/runner.py` or the actor pool. If a fourth
+occurrence appears, that is the evidence for the guard, and this paragraph is what it supersedes.
+
+### 7.5 Two large files, still not split
+
+`tests/unit/assembly/test_assembly.py` (2,884 lines) and `tests/unit/inference/test_scheduling.py`
+(2,392) are the largest in the suite. Round 2 put them in the right directories and deliberately did
+not split them. Neither is slow and neither is duplicated (§1), so the only argument for splitting
+is navigability — which the subject directories already improved. **No action proposed**; noted so
+that "these files are large" is not mistaken for a finding.

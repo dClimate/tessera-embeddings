@@ -13,7 +13,8 @@ try that failed?" — one per pipeline stage, so a question about ingest has exa
 ```
 context_docs/
 ├── corrections-register.md        EVERY withdrawn figure, grouped by how it went wrong
-├── test-suite-streamlining.md     this repo's own test suite: where its time went, what was cut
+├── test-suite-streamlining.md     this repo's own test suite: what has been done to it, and
+│                                  what is left
 │
 ├── decisions/                     Architecture Decision Records — 1 page each, append-only
 │   ├── 001-thin-prefect-wrapping.md
@@ -37,7 +38,8 @@ context_docs/
 │   ├── 019-validation-modules-belong-in-the-library.md
 │   ├── 020-boa-offset-applies-to-every-valid-dn.md
 │   ├── 021-correct-the-boa-offset-per-image.md
-│   └── 022-resolve-the-roi-mask-credential-at-read-time.md
+│   ├── 022-resolve-the-roi-mask-credential-at-read-time.md
+│   └── 023-the-cuda-path-is-verified-by-hand.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
