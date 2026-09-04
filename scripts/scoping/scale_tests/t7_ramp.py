@@ -17,7 +17,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from scale_tests import harness
+from scripts.scoping.scale_tests import harness
 
 logger = logging.getLogger("scale_tests.t7")
 

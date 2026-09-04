@@ -19,11 +19,11 @@ import logging
 import numpy as np
 import zarr
 
-from scale_tests import harness
-from scale_tests import store_builder as SB
-from scale_tests import variants as V
-from scale_tests.seeding import embedding_group_spec, seed_groups
-from scale_tests.zone_geometry import YEARS, zone_for
+from scripts.scoping.scale_tests import harness
+from scripts.scoping.scale_tests import store_builder as SB
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests.seeding import embedding_group_spec, seed_groups
+from scripts.scoping.scale_tests.zone_geometry import YEARS, zone_for
 
 logger = logging.getLogger("scale_tests.t2")
 

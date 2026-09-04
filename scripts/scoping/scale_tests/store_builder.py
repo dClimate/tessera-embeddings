@@ -17,11 +17,11 @@ from concurrent.futures import ProcessPoolExecutor
 
 import zarr
 
-from scale_tests import harness
-from scale_tests import variants as V
-from scale_tests._workers import write_fork, write_fork_shards
-from scale_tests.synth import land_mask
-from scale_tests.zone_geometry import YEARS, MockZone
+from scripts.scoping.scale_tests import harness
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests._workers import write_fork, write_fork_shards
+from scripts.scoping.scale_tests.synth import land_mask
+from scripts.scoping.scale_tests.zone_geometry import YEARS, MockZone
 from tessera_embeddings.storage.shard_writer import partition_round_robin as _partition
 
 logger = logging.getLogger("scale_tests.builder")

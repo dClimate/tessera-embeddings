@@ -22,11 +22,11 @@ from typing import Any
 
 import numpy as np
 
-from scale_tests import harness
-from scale_tests import variants as V
-from scale_tests._workers import commit_to_group
-from scale_tests.seeding import embedding_group_spec, seed_groups
-from scale_tests.zone_geometry import YEARS, MockZone
+from scripts.scoping.scale_tests import harness
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests._workers import commit_to_group
+from scripts.scoping.scale_tests.seeding import embedding_group_spec, seed_groups
+from scripts.scoping.scale_tests.zone_geometry import YEARS, MockZone
 
 logger = logging.getLogger("scale_tests.t5")
 

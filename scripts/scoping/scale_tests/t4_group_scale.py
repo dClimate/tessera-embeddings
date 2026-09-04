@@ -18,11 +18,11 @@ import logging
 import time
 from typing import Any
 
-from scale_tests import harness
-from scale_tests import store_builder as SB
-from scale_tests import variants as V
-from scale_tests.seeding import embedding_group_spec, seed_groups
-from scale_tests.zone_geometry import YEARS, MockZone, zone_for
+from scripts.scoping.scale_tests import harness
+from scripts.scoping.scale_tests import store_builder as SB
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests.seeding import embedding_group_spec, seed_groups
+from scripts.scoping.scale_tests.zone_geometry import YEARS, MockZone, zone_for
 
 logger = logging.getLogger("scale_tests.t4")
 
@@ -48,7 +48,7 @@ def cold_open_group(payload: dict[str, Any]) -> dict[str, Any]:
     import icechunk
     import zarr
 
-    from scale_tests import harness as _h
+    from scripts.scoping.scale_tests import harness as _h
     from tessera_embeddings.storage import zarr_store
 
     config = _h.layered_config(

@@ -17,7 +17,7 @@ import logging
 
 import fsspec
 
-from scale_tests import harness
+from scripts.scoping.scale_tests import harness
 from tessera_embeddings.storage.object_store import delete_prefix
 
 logger = logging.getLogger("scale_tests.teardown")

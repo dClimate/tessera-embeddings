@@ -17,7 +17,7 @@ import icechunk
 import numpy as np
 import zarr
 
-from scale_tests import synth
+from scripts.scoping.scale_tests import synth
 from tessera_embeddings.storage import zarr_store
 
 

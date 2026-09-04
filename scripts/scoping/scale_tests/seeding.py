@@ -18,8 +18,8 @@ import icechunk
 import numpy as np
 import zarr
 
-from scale_tests import variants as V
-from scale_tests.zone_geometry import YEARS, MockZone, coords
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests.zone_geometry import YEARS, MockZone, coords
 from tessera_embeddings.storage.time_axis import TIME_ENCODING
 
 

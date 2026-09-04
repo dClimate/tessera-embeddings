@@ -1,0 +1,1 @@
+The scripts directory holds code that is used in production on a strictly ad-hoc basis and therefore has no obvious home within the orchestrated stack. Scripts we've used when building one-time features, diagnosing issues, or scoping possible architectural decisions are included here for reference and reuse.

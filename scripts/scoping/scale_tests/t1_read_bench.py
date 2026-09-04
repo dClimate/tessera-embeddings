@@ -20,11 +20,11 @@ from typing import Any
 import numpy as np
 import zarr
 
-from scale_tests import harness
-from scale_tests import store_builder as SB
-from scale_tests import variants as V
-from scale_tests.seeding import embedding_group_spec, seed_groups
-from scale_tests.zone_geometry import YEARS, MockZone, zone_for
+from scripts.scoping.scale_tests import harness
+from scripts.scoping.scale_tests import store_builder as SB
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests.seeding import embedding_group_spec, seed_groups
+from scripts.scoping.scale_tests.zone_geometry import YEARS, MockZone, zone_for
 
 logger = logging.getLogger("scale_tests.t1")
 
@@ -54,7 +54,7 @@ WORKLOADS = (
 
 def _open_group(store_uri: str, group: str, async_concurrency: int) -> zarr.Group:
     """Open a store read-only as a raw zarr group at a given async concurrency."""
-    from scale_tests._workers import _open_repo
+    from scripts.scoping.scale_tests._workers import _open_repo
 
     zarr.config.set({"async.concurrency": async_concurrency})
     session = _open_repo(store_uri).readonly_session(branch="main")
