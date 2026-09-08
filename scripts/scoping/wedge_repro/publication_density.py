@@ -111,6 +111,10 @@ class IdentitySource:
     coordinator: int
     load_delay_s: float
     hang_shard: int | None = None
+    #: When set, the hang happens only until this marker file exists: the first worker to reach
+    #: the shard creates it and hangs, the re-run's worker finds it and writes. Without it the
+    #: hang is deterministic and the re-run stalls again — the fail-after-one-retry path.
+    hang_once_marker: str | None = None
 
     def live_shards(self) -> list[tuple[int, int]]:
         """The first ``SHARDS_PER_CELL`` shards of column 0."""
@@ -119,7 +123,11 @@ class IdentitySource:
     def load(self, shard: tuple[int, int]) -> dict[str, np.ndarray]:
         """One land inner chunk carrying this coordinator's id; hangs forever on ``hang_shard``."""
         if self.hang_shard is not None and shard[0] == self.hang_shard:
-            time.sleep(24 * 3600)  # never returns within any test's horizon
+            marker = Path(self.hang_once_marker) if self.hang_once_marker else None
+            if marker is None or not marker.exists():
+                if marker is not None:
+                    marker.write_text("hung once")
+                time.sleep(24 * 3600)  # never returns within any test's horizon
         time.sleep(self.load_delay_s)
         emb = np.zeros((1, SHARD_PX, SHARD_PX, EMBEDDING_DIM), dtype="int8")
         emb[0, :INNER_PX, :INNER_PX, :] = np.int8(self.coordinator + 1)
@@ -235,6 +243,11 @@ def coordinator(k: int, cfg: dict[str, Any], lock: synchronize.Lock | None, star
     _configure_logging(results / f"coord-{k}.log")
     _install_gate(lock)
     if cfg["fork_stall_timeout_s"]:
+        # `write_year_shards` runs the fork phase through `run_forks`; `run_forked` is the per-ROI
+        # wrapper. Patch both, so the shortened timeout reaches whichever path a caller takes.
+        shard_writer.run_forks = functools.partial(  # type: ignore[assignment]
+            shard_writer.run_forks, fork_stall_timeout_s=cfg["fork_stall_timeout_s"]
+        )
         shard_writer.run_forked = functools.partial(  # type: ignore[assignment]
             shard_writer.run_forked, fork_stall_timeout_s=cfg["fork_stall_timeout_s"]
         )
@@ -261,8 +274,13 @@ def coordinator(k: int, cfg: dict[str, Any], lock: synchronize.Lock | None, star
     time.sleep(start_delay_s)
     out = results / f"coord-{k}.jsonl"
     for zone, year in cfg["assignments"][str(k)]:
-        hang_shard = 1 if (cfg["wedge"] == "worker" and k == cfg["wedge_coordinator"]) else None
-        source = IdentitySource(k, cfg["fork_seconds"] / SHARDS_PER_CELL, hang_shard=hang_shard)
+        wedged_here = k == cfg["wedge_coordinator"] and cfg["wedge"] in ("worker", "worker_always")
+        source = IdentitySource(
+            k,
+            cfg["fork_seconds"] / SHARDS_PER_CELL,
+            hang_shard=1 if wedged_here else None,
+            hang_once_marker=str(results / f"coord-{k}.worker-hung") if cfg["wedge"] == "worker" else None,
+        )
         telemetry: dict[str, Any] = {}
         record: dict[str, Any] = {"coordinator": k, "zone": zone, "year": year, "started": time.time()}
         t0 = time.monotonic()
@@ -538,7 +556,12 @@ def main(argv: list[str] | None = None) -> int:
         "--seed-snapshots", type=int, default=300, help="Terminal marks committed before the run, for snapshot volume."
     )
     ap.add_argument("--spacing", choices=["on", "off"], default="on")
-    ap.add_argument("--wedge", choices=["none", "catch_up", "worker", "publish"], default="none")
+    ap.add_argument(
+        "--wedge",
+        choices=["none", "catch_up", "worker", "worker_always", "publish"],
+        default="none",
+        help="worker: one partition hangs ONCE (the re-run succeeds); worker_always: it hangs every time (fails after one re-run).",
+    )
     ap.add_argument(
         "--publish-step-timeout-s", type=float, default=60.0, help="Per-step publish timeout under --wedge publish."
     )
@@ -611,7 +634,8 @@ def main(argv: list[str] | None = None) -> int:
         mk.start()
     # A wedged coordinator is the point of two arms, so the join is bounded: give the watchdog or
     # the catch-up recovery time to act, then move on and let the report say what did not return.
-    deadline = time.monotonic() + horizon + (args.fork_stall_timeout_s or shard_writer.FORK_STALL_TIMEOUT_S) + 120.0
+    stall = args.fork_stall_timeout_s or shard_writer.FORK_STALL_TIMEOUT_S
+    deadline = time.monotonic() + horizon + 2 * stall + 2 * args.publish_step_timeout_s + 120.0
     for p in procs:
         p.join(timeout=max(1.0, deadline - time.monotonic()))
     stuck = [p.name for p in procs if p.is_alive()]
