@@ -2506,6 +2506,7 @@ class ZarrWriter:
                 # healthy commit looks identical whether the session was kept current or merely got
                 # lucky — without it the mechanism has no evidence it ran at all.
                 catch_ups=telemetry.get("catch_ups"),
+                rehomed=telemetry.get("rehomed", False),
                 total_s=round(time.monotonic() - t0, 3),
                 fused_compress_put=True,
                 workers=workers,

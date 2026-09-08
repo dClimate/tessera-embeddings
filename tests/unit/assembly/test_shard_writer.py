@@ -1772,3 +1772,21 @@ class TestForkStallWatchdog:
         """
         assert shard_writer.FORK_STALL_TIMEOUT_S >= 3 * shard_writer.PROGRESS_INTERVAL_S
         assert shard_writer.FORK_STALL_TIMEOUT_S <= 4 * 3600, "longer than an entire dense-zone write"
+
+
+class TestARehomeIsVisibleInTheSummary:
+    """The 2026-09-08 dev run re-homed a wedged coordinator and the log said so — but the
+    ASSEMBLY_SUMMARY record said nothing, because `write_year_shards` never forwarded the flag.
+    A recovery an operator cannot see in the record they read is a recovery nobody will notice."""
+
+    def test_write_year_shards_reports_rehomed_in_its_telemetry(self, tmp_path):
+        _, repo = _seed(tmp_path)
+        telemetry: dict = {}
+        write_year_shards(
+            repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD, telemetry=telemetry
+        )
+        assert telemetry["rehomed"] is False, "the key must be present on every fill, not only after a re-home"
+
+    def test_assemble_global_forwards_it_into_the_record(self):
+        source = inspect.getsource(assembly.ZarrWriter.assemble_global)
+        assert "rehomed=telemetry.get(" in source, "assemble_global does not forward rehomed into ASSEMBLY_SUMMARY"

@@ -1006,6 +1006,10 @@ def write_year_shards(
             # how often the guard refused. A healthy commit looks identical either way, so
             # without this the fix is unobservable in production.
             catch_ups=fill.get("catch_ups", {}),
+            # And whether the finished forks had to be re-homed onto a fresh session (#165): the
+            # dev proof read it off run_forked's dict, but nothing forwarded it here, so no
+            # production ASSEMBLY_SUMMARY has ever said a re-home happened.
+            rehomed=bool(fill.get("rehomed", False)),
             commit_s=round(t_attrs - t_commit, 3),
             attrs_commit_s=round(time.monotonic() - t_attrs, 3),
         )
