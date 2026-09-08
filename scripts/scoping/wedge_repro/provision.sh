@@ -26,11 +26,26 @@ MAIN_REF="${MAIN_REF:-origin/main}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-c7i.48xlarge}"
 TTL_HOURS="${TTL_HOURS:-8}"
 PROFILE_NAME="global-tessera-dev-ray-worker"
-SUBNET="${SUBNET:-subnet-0fb32f9a147121485}"   # default VPC, us-west-2a, public
-SG="${SG:-sg-0d4480cc757678477}"               # default VPC default SG (egress only)
+SUBNET="${SUBNET:-subnet-0fb32f9a147121485}"   # IsolatedVPC public subnet, us-west-2a (IGW route, public IP)
+# The Ray fleet's own security group: all egress permitted, and the same fleet whose instance
+# profile this box borrows. NOT the VPC's "default" group — that one has NO egress rules, and the
+# first attempt (2026-09-08) sat unreachable for 15 minutes because of it. Resolved by NAME below
+# and checked for egress before launch, so a wrong id fails here rather than on the box.
+SG_NAME="${SG_NAME:-global-tessera-dev-ray-cluster}"
 
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 [ "$ACCOUNT" = "658132200637" ] || { echo "refusing: this is not the dev account ($ACCOUNT)"; exit 1; }
+
+# --- pre-flight: the box must be able to reach the internet, S3 and SSM, or nothing else matters ---
+VPC=$(aws ec2 describe-subnets --subnet-ids "$SUBNET" --query 'Subnets[0].VpcId' --output text)
+SG="${SG:-$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC" "Name=group-name,Values=$SG_NAME" --query 'SecurityGroups[0].GroupId' --output text)}"
+[ -n "$SG" ] && [ "$SG" != "None" ] || { echo "refusing: security group '$SG_NAME' not found in $VPC"; exit 1; }
+EGRESS=$(aws ec2 describe-security-groups --group-ids "$SG" --query 'length(SecurityGroups[0].IpPermissionsEgress)' --output text)
+[ "$EGRESS" -ge 1 ] || { echo "refusing: security group $SG has no egress rules; the box could reach nothing"; exit 1; }
+IGW=$(aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=$SUBNET" --query 'RouteTables[0].Routes[?GatewayId!=null && starts_with(GatewayId, `igw-`)].GatewayId | [0]' --output text)
+[ -n "$IGW" ] && [ "$IGW" != "None" ] || { echo "refusing: subnet $SUBNET has no internet-gateway route"; exit 1; }
+aws iam get-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/null || { echo "refusing: instance profile $PROFILE_NAME missing"; exit 1; }
+echo "pre-flight ok: vpc=$VPC subnet=$SUBNET (igw $IGW) sg=$SG ($SG_NAME, $EGRESS egress rule(s)) profile=$PROFILE_NAME"
 git rev-parse --is-inside-work-tree >/dev/null || { echo "run from the tessera-embeddings repo"; exit 1; }
 git fetch -q origin
 
