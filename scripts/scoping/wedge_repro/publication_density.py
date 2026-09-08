@@ -143,6 +143,19 @@ class _LockGate:
         self._lock.release()
 
 
+def _wedging_publish_child(conn, repo, group, base, forks, fill_message, attrs, mode, step_timeout_s):  # noqa: ANN001
+    """A publish child that hangs on its first attempt per marker file, then behaves.
+
+    The 2026-09-04 shape at the publish: the coordinator's commit path parks inside icechunk.
+    The parent must kill it and retry on a fresh session with the forks it still holds.
+    """
+    marker = Path(attrs.pop("_marker"))
+    if not marker.exists():
+        marker.write_text("wedged once")
+        time.sleep(24 * 3600)
+    shard_writer._publish_child(conn, repo, group, base, forks, fill_message, attrs, mode, step_timeout_s)
+
+
 def _install_gate(lock: synchronize.Lock | None) -> None:
     if lock is None:
         publication_spacing.install_publication_gate(None)
@@ -226,6 +239,12 @@ def coordinator(k: int, cfg: dict[str, Any], lock: synchronize.Lock | None, star
     shard_writer.catch_up_best_effort = _recording_catch_up(  # type: ignore[assignment]
         shard_writer.catch_up_best_effort, ticks, hang_after
     )
+    if cfg["wedge"] == "publish" and k == cfg["wedge_coordinator"]:
+        shard_writer.publish_forks_in_child = functools.partial(  # type: ignore[assignment]
+            shard_writer.publish_forks_in_child,
+            _child=_wedging_publish_child,
+            step_timeout_s=cfg["publish_step_timeout_s"],
+        )
     repo = _open(cfg["store_uri"], cfg["region"])
     time.sleep(start_delay_s)
     out = results / f"coord-{k}.jsonl"
@@ -236,6 +255,15 @@ def coordinator(k: int, cfg: dict[str, Any], lock: synchronize.Lock | None, star
         record: dict[str, Any] = {"coordinator": k, "zone": zone, "year": year, "started": time.time()}
         t0 = time.monotonic()
         try:
+            if cfg["wedge"] == "publish" and k == cfg["wedge_coordinator"]:
+                # The marker rides in the attrs the child receives; `_wedging_publish_child` pops it.
+                real_publish = shard_writer.publish_forks_in_child
+
+                def _with_marker(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+                    kw["attrs"] = {**kw["attrs"], "_marker": str(results / f"coord-{k}.publish-wedged")}
+                    return real_publish(*a, **kw)
+
+                shard_writer.publish_forks_in_child = _with_marker  # type: ignore[assignment]
             snapshot = shard_writer.write_year_shards(
                 repo,
                 zone,
@@ -376,6 +404,7 @@ def _scan_logs(results: Path) -> dict[str, Any]:
             text += p.read_text()
     return {
         "watchdog_fired": text.count("ASSEMBLY FORK PHASE STALLED"),
+        "publish_wedged": text.count("PUBLISH WEDGED"),
         "stacks_dumped": text.count("Thread 0x"),
         "rehomed": text.count("Re-homing"),
         "catch_up_did_not_stop": text.count("CatchUpDidNotStopError") + text.count("still running"),
@@ -418,6 +447,8 @@ def _report(cfg: dict[str, Any], seed: dict[str, Any], started: float, wall: flo
             "published": sum(r["outcome"] == "published" for r in records),
             "failed": sum(r["outcome"] == "failed" for r in records),
             "rehomed": sum(bool(r.get("telemetry", {}).get("rehomed")) for r in records),
+            "publish_retries": sum(int(r.get("telemetry", {}).get("publish_retries", 0) or 0) for r in records),
+            "partitions_rerun": sum(len(r.get("telemetry", {}).get("partitions_rerun", []) or []) for r in records),
             "failures": [
                 {"coordinator": r["coordinator"], "cell": f"{r['zone']}-{r['year']}", "error": r.get("error")}
                 for r in records
@@ -502,7 +533,10 @@ def main(argv: list[str] | None = None) -> int:
         "--seed-snapshots", type=int, default=300, help="Terminal marks committed before the run, for snapshot volume."
     )
     ap.add_argument("--spacing", choices=["on", "off"], default="on")
-    ap.add_argument("--wedge", choices=["none", "catch_up", "worker"], default="none")
+    ap.add_argument("--wedge", choices=["none", "catch_up", "worker", "publish"], default="none")
+    ap.add_argument(
+        "--publish-step-timeout-s", type=float, default=60.0, help="Per-step publish timeout under --wedge publish."
+    )
     ap.add_argument("--wedge-coordinator", type=int, default=3)
     ap.add_argument(
         "--fork-stall-timeout-s",
@@ -536,6 +570,7 @@ def main(argv: list[str] | None = None) -> int:
         "wedge": args.wedge,
         "wedge_coordinator": args.wedge_coordinator,
         "fork_stall_timeout_s": args.fork_stall_timeout_s,
+        "publish_step_timeout_s": args.publish_step_timeout_s,
         "assignments": assignments,
     }
     log.info(
