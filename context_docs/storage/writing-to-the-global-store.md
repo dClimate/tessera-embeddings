@@ -3,7 +3,7 @@
 **Assembly is the campaign's last stage and its longest.** It reads a cell's staged inference tiles
 out of S3 and writes them into the published Icechunk store as whole shards, then marks the cell
 complete. On a dense zone-year that is **4.97 TB across 2.34 M objects**, about three and a half
-hours, sixteen worker processes, and — at fleet width — up to ten coordinators doing it at once into
+hours, thirty-two worker processes (sixteen until 2026-09-08), and — at fleet width — up to ten coordinators doing it at once into
 **one repository on one branch**.
 
 Five things went wrong in that stage during August 2026, and they are one document because they are
@@ -31,7 +31,7 @@ commit re-serialises the repo-global snapshot through a branch-tip compare-and-s
 groups and a shared compare-and-swap are different things**, and conflating them is an error this
 document has made once already (§5).
 
-**A coordinator forks its session to sixteen workers.** `run_forked` opens a writable session, forks
+**A coordinator forks its session to thirty-two workers** (sixteen before 2026-09-08; the incidents below happened at sixteen). `run_forked` opens a writable session, forks
 it, hands one fork to each of sixteen spawned worker processes, and merges their forks back at the
 end. The forks pickle across process boundaries; a fork can be merged into a session it was not
 created from, which is what makes §3's recovery possible.
