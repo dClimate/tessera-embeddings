@@ -244,11 +244,19 @@ def coordinator(k: int, cfg: dict[str, Any], lock: synchronize.Lock | None, star
         shard_writer.catch_up_best_effort, ticks, hang_after
     )
     if cfg["wedge"] == "publish" and k == cfg["wedge_coordinator"]:
-        shard_writer.publish_forks_in_child = functools.partial(  # type: ignore[assignment]
+        wedging = functools.partial(
             shard_writer.publish_forks_in_child,
             _child=_wedging_publish_child,
             step_timeout_s=cfg["publish_step_timeout_s"],
         )
+        marker = str(results / f"coord-{k}.publish-wedged")
+
+        def _with_marker(*a: Any, **kw: Any) -> Any:
+            # The marker rides in the attrs the child receives; `_wedging_publish_child` pops it.
+            kw["attrs"] = {**kw["attrs"], "_marker": marker}
+            return wedging(*a, **kw)
+
+        shard_writer.publish_forks_in_child = _with_marker  # type: ignore[assignment]
     repo = _open(cfg["store_uri"], cfg["region"])
     time.sleep(start_delay_s)
     out = results / f"coord-{k}.jsonl"
@@ -259,15 +267,6 @@ def coordinator(k: int, cfg: dict[str, Any], lock: synchronize.Lock | None, star
         record: dict[str, Any] = {"coordinator": k, "zone": zone, "year": year, "started": time.time()}
         t0 = time.monotonic()
         try:
-            if cfg["wedge"] == "publish" and k == cfg["wedge_coordinator"]:
-                # The marker rides in the attrs the child receives; `_wedging_publish_child` pops it.
-                real_publish = shard_writer.publish_forks_in_child
-
-                def _with_marker(*a, **kw):  # noqa: ANN002, ANN003, ANN202
-                    kw["attrs"] = {**kw["attrs"], "_marker": str(results / f"coord-{k}.publish-wedged")}
-                    return real_publish(*a, **kw)
-
-                shard_writer.publish_forks_in_child = _with_marker  # type: ignore[assignment]
             snapshot = shard_writer.write_year_shards(
                 repo,
                 zone,

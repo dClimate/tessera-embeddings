@@ -23,7 +23,8 @@ returns — so the recovery paths run end to end in a multi-process, real-store 
 | control | `--spacing off` | today's `main`: depth histogram at the ticks; expect ≥4 when finishes cluster |
 | spacing | `--spacing on` | depth ≤2 at every tick; min publication gap from the store's own timestamps ≥ `PUBLICATION_SPACING_S` |
 | wedged catch-up | `--wedge catch_up` | `CatchUpDidNotStopError` → re-home → the cell still publishes (#165), neighbours untouched |
-| wedged worker | `--wedge worker --fork-stall-timeout-s 90` | `ASSEMBLY FORK PHASE STALLED`, stacks on stderr, the cell fails cleanly, neighbours publish |
+| wedged worker | `--wedge worker --fork-stall-timeout-s 90` | `ASSEMBLY FORK PHASE STALLED`, stacks on stderr; the stalled partition is re-run once (`partitions_rerun`) and the cell publishes; neighbours unaffected |
+| wedged publish | `--wedge publish --publish-step-timeout-s 60` | `PUBLISH WEDGED`: the child is killed (its stacks on stderr), the publish retried once on a fresh session, the cell publishes (`publish_retries`) |
 
 Every arm reads its data back: each coordinator writes its own id into its chunks, so a merged
 wrong fork or a neighbour's overwrite is a wrong number, not a silent pass.
