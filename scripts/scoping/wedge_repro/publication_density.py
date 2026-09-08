@@ -560,7 +560,10 @@ def main(argv: list[str] | None = None) -> int:
         "--wedge",
         choices=["none", "catch_up", "worker", "worker_always", "publish"],
         default="none",
-        help="worker: one partition hangs ONCE (the re-run succeeds); worker_always: it hangs every time (fails after one re-run).",
+        help=(
+            "worker: one partition hangs ONCE (the re-run succeeds); "
+            "worker_always: it hangs every time (fails after one re-run)."
+        ),
     )
     ap.add_argument(
         "--publish-step-timeout-s", type=float, default=60.0, help="Per-step publish timeout under --wedge publish."
