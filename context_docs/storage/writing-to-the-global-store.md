@@ -533,6 +533,28 @@ the cause, because the gap opens during the write rather than during the commit.
 about serialising and wrong about **spacing**: the gap does open during the write, but its depth is
 set by how many publications land in it, which is a property of the commit side.
 
+
+### 2026-09-04: the wedge landed where the recovery could not reach
+
+**The claim above that needs correcting:** *"`rehome` above makes the remaining case survivable
+instead of fatal."* It does — but only when the wedging catch-up is noticed at the fork phase's
+EXIT, i.e. after every worker has returned. On 2026-09-04 five fills stopped in the shard-write
+tail, after their last "1/16 outstanding" progress line and before any commit, and none of them
+raised `CatchUpDidNotStopError`, none re-homed, none tripped the commit alarm and none failed:
+each simply stopped, and because a cluster assembles on one trailing thread, each froze its
+cluster's entire assembly backlog (177 cells across the five) for days. The fill that finished
+its inference first then parked for good in `finalizer.shutdown(wait=True)`.
+
+The mechanism, the evidence, and why every safeguard in this section was blind to it are in
+`../assembly/assembly-wedges-during-fork-phase-2026-09-04.md`, with the three bounds built in
+response: a fork-phase watchdog that fails a stalled write inside thirty minutes and dumps every
+thread's stack, a per-assembly ceiling on the end-of-inference drain, and a rule that a drain
+which gave up ends its process rather than reporting `FAILED` — because `FAILED` is what the
+campaign driver reads as "stopped writing", and a thread parked inside icechunk has not.
+
+**What is unchanged: the root cure is still publication spacing**, as the paragraph above argues.
+The bounds make a wedge cost thirty minutes to six hours and one re-dispatch instead of days and a
+cluster's whole backlog; they do not stop it happening.
 ---
 
 ## 4. The 28 August storage-credential incident
