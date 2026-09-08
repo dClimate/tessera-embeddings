@@ -4,9 +4,11 @@
 # What it does, in order:
 #   1. Packages TWO source trees from this repository — the pre-fix `main` and the fix stack — as
 #      tarballs, plus the branch-agnostic driver, and uploads them to the dev embeddings bucket.
-#   2. Launches ONE c7i.48xlarge (192 vCPU / 384 GB / 50 Gbps) on Amazon Linux 2023 in the default
-#      VPC, on the EXISTING `global-tessera-dev-ray-worker` instance profile (it already grants
-#      read/write/delete on the dev store, SSM, and CloudWatch) — no IAM is created.
+#   2. Launches ONE c7i.48xlarge (192 vCPU / 384 GB / 50 Gbps) on Amazon Linux 2023 in the dev
+#      account's IsolatedVPC public subnet, in the Ray fleet's security group (all egress) and on
+#      the EXISTING `global-tessera-dev-ray-worker` instance profile (it already grants
+#      read/write/delete on the dev store, SSM, and CloudWatch) — no IAM is created. A pre-flight
+#      checks egress, the internet-gateway route and the profile before anything launches.
 #   3. User data installs uv, py-spy and s5cmd, builds one virtualenv per source tree, and writes a
 #      READY marker to S3. The instance SELF-TERMINATES after $TTL_HOURS whatever happens: shutdown
 #      behaviour is `terminate` and a `shutdown -h` is scheduled at boot, so a forgotten box cannot
