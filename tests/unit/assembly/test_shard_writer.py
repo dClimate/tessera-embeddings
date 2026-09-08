@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import multiprocessing
@@ -22,8 +23,10 @@ from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, DRILL
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.inference import assembly
 from tessera_embeddings.storage import (
+    campaign,
     global_store,
     icechunk_logging,
+    publication_spacing,
     session_catch_up,
     shard_writer,
     zarr_store,
@@ -2065,3 +2068,56 @@ class TestAStalledPartitionIsReRunKeepingTheFinishedForks:
         assert telemetry["partitions_rerun"] == [1]
         assert merged == ["fork-0", "fork-1"], "merge order must be payload order, with the salvaged fork kept"
         assert state["pools"] == 2
+
+
+class TestPublicationsAreSpacedAtTheChokepoints:
+    """A filled cell is ONE publication of two commits; a terminal mark is one of one. Each holds
+    the fleet's slot across all of its commits and then for the spacing — so the slot is taken
+    exactly once per publication, never per commit, and released only after the last commit.
+    """
+
+    @pytest.fixture
+    def recording_gate(self, monkeypatch):
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def gate():
+            events.append("acquire")
+            try:
+                yield
+            finally:
+                events.append("release")
+
+        previous = publication_spacing.install_publication_gate(gate)
+        monkeypatch.setattr(publication_spacing.time, "sleep", lambda s: events.append(f"space:{s:.0f}"))
+        real = shard_writer.commit_with_rebase
+        monkeypatch.setattr(
+            shard_writer, "commit_with_rebase", lambda s, m, **k: (events.append("commit"), real(s, m, **k))[1]
+        )
+        yield events
+        publication_spacing.install_publication_gate(previous)
+
+    def test_a_filled_cell_holds_the_slot_across_its_whole_publish(self, tmp_path, recording_gate, monkeypatch):
+        """Both commits happen inside the publish child; the slot wraps the whole child run and then
+        the spacing, so the next writer's pair cannot start inside one catch-up interval of this.
+        """
+        monkeypatch.setattr(
+            shard_writer,
+            "publish_forks_in_child",
+            lambda *a, **k: (recording_gate.append("publish"), ("snap", {"commit_s": 0.1, "attrs_commit_s": 0.1}))[1],
+        )
+        _, repo = _seed(tmp_path)
+        write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
+        assert recording_gate == ["acquire", "publish", "space:15", "release"], recording_gate
+
+    def test_a_terminal_mark_is_one_spaced_publication(self, tmp_path, recording_gate):
+        _, repo = _seed(tmp_path)
+        campaign.mark_zone_year_empty(repo, "01N", 2025, run_id="r-empty")
+        assert recording_gate == ["acquire", "commit", "space:15", "release"], recording_gate
+
+    def test_with_no_gate_installed_nothing_changes(self, tmp_path, monkeypatch):
+        slept: list[float] = []
+        monkeypatch.setattr(publication_spacing.time, "sleep", lambda s: slept.append(s))
+        _, repo = _seed(tmp_path)
+        write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
+        assert slept == []
