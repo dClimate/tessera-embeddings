@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 
 import numpy as np
@@ -13,7 +14,7 @@ from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
-from tessera_embeddings.storage import global_store, shard_writer
+from tessera_embeddings.storage import global_store, session_catch_up, shard_writer
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
 from tessera_embeddings.storage.zarr_store import open_or_create_repo
 from tessera_embeddings.storage.zone_grid import ZoneSpec, easting_coords, northing_coords
@@ -463,6 +464,16 @@ def test_all_tiles_skipped_marks_complete_empty(tmp_path, monkeypatch):
     assert repo.lookup_tag("zone-01N-2025") == summary["snapshot_id"]
 
 
+def _land_the_fill_then_fail_the_mark(conn, repo, group, base, forks, fill_message, attrs, mode, step_timeout_s):
+    """A publish child for the gap `write_year_shards` documents: shards committed, attrs not."""
+    session = session_catch_up.fresh_session_checked(repo, group, base=base)
+    session.merge(*forks)
+    snapshot = shard_writer.commit_with_rebase(session, fill_message)
+    conn.send(("fill", snapshot, 0.0, 0.0))
+    conn.recv()
+    conn.send(("error", "RuntimeError: attrs commit exhausted its retries"))
+
+
 def test_an_all_skipped_retry_clears_the_previous_attempt_s_shards(tmp_path, monkeypatch):
     """A year marked empty must not leave an earlier attempt's embeddings readable.
 
@@ -483,10 +494,13 @@ def test_an_all_skipped_retry_clears_the_previous_attempt_s_shards(tmp_path, mon
     staged: dict[str, np.ndarray] = {}
     monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
 
-    def _attrs_commit_fails(*_a, **_k):
-        raise RuntimeError("attrs commit exhausted its retries")
-
-    monkeypatch.setattr(shard_writer, "commit_year_attrs", _attrs_commit_fails)
+    # The commits run in the publish child now, so the failure is injected through its seam: a
+    # child that lands the fill, answers the parent, and then reports the mark's failure.
+    monkeypatch.setattr(
+        shard_writer,
+        "publish_forks_in_child",
+        functools.partial(shard_writer.publish_forks_in_child, _child=_land_the_fill_then_fail_the_mark),
+    )
     with pytest.raises(RuntimeError, match="attrs commit"):
         _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base, run_id="run1")
     monkeypatch.undo()
