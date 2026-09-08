@@ -43,6 +43,7 @@ import argparse
 import contextlib
 import dataclasses
 import datetime as dt
+import faulthandler
 import functools
 import itertools
 import json
@@ -143,7 +144,7 @@ class _LockGate:
         self._lock.release()
 
 
-def _wedging_publish_child(conn, repo, group, base, forks, fill_message, attrs, mode, step_timeout_s):  # noqa: ANN001
+def _wedging_publish_child(conn, repo, group, base, forks, fill_message, attrs, mode, step_timeout_s) -> None:  # noqa: ANN001
     """A publish child that hangs on its first attempt per marker file, then behaves.
 
     The 2026-09-04 shape at the publish: the coordinator's commit path parks inside icechunk.
@@ -152,6 +153,9 @@ def _wedging_publish_child(conn, repo, group, base, forks, fill_message, attrs, 
     marker = Path(attrs.pop("_marker"))
     if not marker.exists():
         marker.write_text("wedged once")
+        # As the real child does: arm the stack dump inside the parent's timeout, so the wedge
+        # this arm injects leaves the artefact a production wedge would.
+        faulthandler.dump_traceback_later(max(step_timeout_s - 5.0, 1.0), repeat=False)
         time.sleep(24 * 3600)
     shard_writer._publish_child(conn, repo, group, base, forks, fill_message, attrs, mode, step_timeout_s)
 
@@ -472,8 +476,10 @@ def _report(cfg: dict[str, Any], seed: dict[str, Any], started: float, wall: flo
         "condition_reached (depth >= 4 seen)": report["catch_up_depth"]["at_or_above_4"] > 0,
         # The property spacing exists for: no tick ever sees more than one publication (two
         # snapshots) since the last. Measured at every tick, this is the primary verdict.
+        # None (JSON null) when no tick fired: a fork phase shorter than the tick interval is not
+        # evidence either way, and must not read as a failed verdict.
         "depth_bounded (max catch-up depth <= 2)": (
-            report["catch_up_depth"]["max"] is not None and report["catch_up_depth"]["max"] <= 2
+            None if report["catch_up_depth"]["max"] is None else report["catch_up_depth"]["max"] <= 2
         ),
         # The mechanism, checked against the store's own clock: consecutive publications at least
         # one spacing apart (a hair of tolerance for timestamp rounding).
