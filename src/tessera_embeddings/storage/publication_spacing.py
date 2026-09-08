@@ -17,9 +17,10 @@ precondition is the job of this module. ``context_docs/storage/writing-to-the-gl
 **How.** Every campaign publication passes through :func:`publication`, a context manager
 that takes a fleet-wide slot — a Prefect global concurrency limit of ONE, held through a
 :class:`~tessera_embeddings.orchestration.prefect.flows._fleet_gate.FleetGate` — around the
-cell's commits, and then keeps holding it until :data:`PUBLICATION_SPACING_S` has elapsed since
-it was taken. Consecutive publications are therefore at least that far apart, fleet-wide, by
-construction: no shared clock, no coordination beyond the one slot.
+cell's commits, and then keeps holding it for a further :data:`PUBLICATION_SPACING_S` after the
+last of them. Consecutive publications are therefore at least that far apart — as the store's own
+snapshot timestamps record them — fleet-wide, by construction: no shared clock, no coordination
+beyond the one slot.
 
 **This is a SPACING MUTEX, not a committer cap, and the distinction is the whole reason it can
 exist.** TE #151 removed a fleet-wide commit gate on cost: what it bounded was a slowdown measured
@@ -93,9 +94,9 @@ def publication(
     """Hold the fleet's publication slot around a cell's commits, then for the rest of the spacing.
 
     Wrap a WHOLE publication — both commits of a filled cell, or the one commit of a terminal
-    mark — so the two snapshots land together and the next writer's publication starts no
-    sooner than ``spacing_s`` after this one began. On an exception the slot is released at once:
-    nothing was published, so there is nothing to space.
+    mark — so the two snapshots land together and the next writer's first snapshot lands no
+    sooner than ``spacing_s`` after this one's last. On an exception the slot is released at
+    once: nothing was published, so there is nothing to space.
 
     No gate installed means no-op, by design (see the module docstring).
     """
@@ -106,9 +107,11 @@ def publication(
     wait_s = PUBLICATION_SPACING_S if spacing_s is None else spacing_s
     logger = log or _log
     with factory():
-        started = time.monotonic()
         yield
-        remaining = wait_s - (time.monotonic() - started)
-        if remaining > 0:
-            logger.debug("Publication done; holding the fleet's slot %.1fs more to space the next one", remaining)
-            time.sleep(remaining)
+        # A FULL spacing after the last commit, not the remainder of one measured from the
+        # acquire: measured from the acquire, a slow commit eats into the gap the next writer
+        # sees — the 2026-09-08 dev run recorded 12.1 s between publications against a 15 s
+        # spacing when one commit took 3 s. Counting from the last snapshot makes the gap the
+        # STORE observes at least the spacing, exactly, whatever the commits cost.
+        logger.debug("Publication done; holding the fleet's slot %.1fs to space the next one", wait_s)
+        time.sleep(wait_s)

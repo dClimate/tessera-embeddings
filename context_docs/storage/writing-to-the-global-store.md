@@ -965,7 +965,7 @@ reintroduced with this section's arguments read against it, and they do not carr
   behind and never at two; two publications inside one catch-up interval is exactly "four behind".
   Spacing makes that unreachable, which the periodic catch-up alone could only make unlikely.
 - **Its cost is bounded and small.** A publication holds the slot for a second or two of committing
-  plus the rest of a fifteen-second interval; even ten coordinators finishing together delay the
+  plus a full fifteen-second hold after its last commit; even ten coordinators finishing together delay the
   last by minutes against assemblies of hours, and terminal marks — the dominant commit — cost
   fifteen seconds each on the feeder thread.
 - **It is not sized to the fleet.** The old cap was `min(clusters, 8)`; this is 1 under any cluster

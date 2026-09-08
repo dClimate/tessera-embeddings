@@ -49,21 +49,22 @@ def test_nothing_installed_means_no_op_and_no_sleep(monkeypatch):
     assert slept == [], "with no gate there is nothing to space against; sleeping would only slow a lone writer"
 
 
-def test_the_slot_is_held_through_the_body_and_then_for_the_rest_of_the_spacing(monkeypatch):
+def test_the_slot_is_held_through_the_body_and_then_for_a_full_spacing(monkeypatch):
     rec = _Recording()
     mod.install_publication_gate(rec.gate)
-    clock = {"t": 100.0}
     slept: list[float] = []
-    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(mod.time, "sleep", lambda s: slept.append(s))
     with mod.publication(spacing_s=15.0):
         rec.events.append("commit")
-        clock["t"] += 2.0  # the commits took two seconds
     assert rec.events == ["acquire", "commit", "release"], "the slot must be taken before and released after"
-    assert slept == [13.0], "the holder sleeps the REMAINDER of the spacing, not the whole of it"
+    assert slept == [15.0]
 
 
-def test_a_body_longer_than_the_spacing_does_not_sleep(monkeypatch):
+def test_the_hold_after_the_commits_is_the_full_spacing_however_long_they_took(monkeypatch):
+    """Measured from the acquire, a slow commit ate into the gap the next writer saw — 12.1 s
+    against a 15 s spacing in the 2026-09-08 dev run. Counting from the last commit makes the
+    store-observed gap at least the spacing, exactly.
+    """
     rec = _Recording()
     mod.install_publication_gate(rec.gate)
     clock = {"t": 0.0}
@@ -72,7 +73,7 @@ def test_a_body_longer_than_the_spacing_does_not_sleep(monkeypatch):
     monkeypatch.setattr(mod.time, "sleep", lambda s: slept.append(s))
     with mod.publication(spacing_s=15.0):
         clock["t"] += 40.0  # eight mark-commit retries later
-    assert slept == []
+    assert slept == [15.0], "the hold is not shortened by however long the commits took"
 
 
 def test_an_exception_releases_the_slot_at_once_without_spacing(monkeypatch):
