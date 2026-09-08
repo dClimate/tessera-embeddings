@@ -204,6 +204,8 @@ groups at production layout, hundreds of pre-seeded snapshots, terminal marks ev
 | wedged catch-up | `Re-homing` fired, the cell published; neighbours untouched |
 | wedged worker | `ASSEMBLY FORK PHASE STALLED`, four thread stacks captured, the cell failed as `ForkPhaseStalledError`, five neighbours published |
 
-Two defects the run surfaced were fixed in the same PRs: the spacing hold was measured from slot
-acquisition (a 3 s commit left a 12.1 s gap against 15) and is now a full spacing after the last
-commit; and `rehomed` never reached `ASSEMBLY_SUMMARY`. Full tables in the harness README.
+Two defects the run surfaced were fixed in the same PRs and confirmed by a re-run: the spacing hold
+was measured from slot acquisition (a 3 s commit left a 12.1 s gap against 15) and is now a full
+spacing after the last commit — every gap by the store's clock then read ≥ 15.9 s over 110 ticks with
+max depth 2; and `rehomed` never reached `ASSEMBLY_SUMMARY` — it now does (1 / 1 on the wedged arm).
+Full tables in the harness README.

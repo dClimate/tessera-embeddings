@@ -58,5 +58,13 @@ arm never reached depth 2. The wedged catch-up re-homed and published. The wedge
 failed as `ForkPhaseStalledError` after the watchdog fired and dumped four thread stacks, while its
 five neighbours published. Nothing was left in the bucket after `--cleanup`.
 
-¹ Measured from slot acquisition at the time, so a 3 s commit ate into the gap; the hold is now a
-full spacing after the last commit, which makes the store-observed gap at least the spacing.
+¹ Measured from slot acquisition at the time, so a 3 s commit ate into the gap. The hold is now a
+full spacing after the last commit; re-run with that change (`density-spaced-v2`, `wedge-catchup-v2`):
+
+| arm | published / failed | max depth | ticks | min publication gap | re-homed (report / log) | data intact |
+|---|---|---|---|---|---|---|
+| spacing on, 10 coordinators | 10 / 0 | 2 | 110 | **15.96 s** | 0 / 0 | yes |
+| wedged catch-up, 6 coordinators | 6 / 0 | 2 | 45 | **15.90 s** | **1 / 1** | yes |
+
+Every gap by the store's clock is now at or above the 15 s spacing, and the re-home reaches the
+summary telemetry as well as the log.
