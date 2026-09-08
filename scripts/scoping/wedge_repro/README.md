@@ -40,3 +40,23 @@ coordinator (per-cell record with every tick's depth), one `.log` and one `.stde
 (the stack dumps are on stderr). `--cleanup` deletes the store afterwards.
 
 A credential-free local smoke: `--store-uri /tmp/x.icechunk --coordinators 3 --fork-seconds 6 --seed-snapshots 8`.
+
+## Results, dev account, 2026-09-08
+
+Real S3 (`global-tessera-embeddings-dev`), 120 zone groups at production layout, 300 (arms 1-2) or
+100 (arms 3-4) terminal marks pre-seeded for snapshot volume, terminal marks interleaved every 3 s.
+
+| arm | published / failed | max depth | ticks | ticks ≥ 4 | min publication gap | watchdog | stacks | re-homed | data intact |
+|---|---|---|---|---|---|---|---|---|---|
+| control, spacing off, 10 coordinators | 10 / 0 | **4** | 100 | 1 | 0.79 s | 0 | 0 | 0 | yes |
+| spacing on, 10 coordinators | 10 / 0 | **1** | 110 | 0 | 12.1 s¹ | 0 | 0 | 0 | yes |
+| wedged catch-up, 6 coordinators | 6 / 0 | 1 | 43 | 0 | 13.0 s¹ | 0 | 0 | **1** | yes |
+| wedged worker, 6 coordinators, 90 s timeout | 5 / **1** | 2 | 53 | 0 | 13.2 s¹ | **1** | **4** | 0 | yes |
+
+The unspaced control reached the hang's precondition (depth 4) against a real store; the spaced
+arm never reached depth 2. The wedged catch-up re-homed and published. The wedged worker's cell
+failed as `ForkPhaseStalledError` after the watchdog fired and dumped four thread stacks, while its
+five neighbours published. Nothing was left in the bucket after `--cleanup`.
+
+¹ Measured from slot acquisition at the time, so a 3 s commit ate into the gap; the hold is now a
+full spacing after the last commit, which makes the store-observed gap at least the spacing.

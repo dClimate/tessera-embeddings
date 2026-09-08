@@ -191,3 +191,19 @@ apart, which needs the fleet-wide lock TE #151 removed. `../storage/writing-to-t
 §3 and §5 had deferred that twice; this incident is its justification. `storage/publication_spacing.py`
 now holds a limit-ONE fleet-wide slot around every publication and then for three catch-up intervals,
 so two publications can never land inside one interval — see the §3 and §5 addenda there.
+
+## Dev evidence, 2026-09-08
+
+`scripts/scoping/wedge_repro/publication_density.py` against real S3 in the dev account, 120 zone
+groups at production layout, hundreds of pre-seeded snapshots, terminal marks every 3 s:
+
+| arm | outcome |
+|---|---|
+| unspaced control, 10 coordinators | catch-up depth reached **4** — the hang's precondition — with publications 0.8 s apart; the hang itself did not appear (it never has at this scale) |
+| spaced, 10 coordinators | max depth **1** across 110 ticks; all published; data intact |
+| wedged catch-up | `Re-homing` fired, the cell published; neighbours untouched |
+| wedged worker | `ASSEMBLY FORK PHASE STALLED`, four thread stacks captured, the cell failed as `ForkPhaseStalledError`, five neighbours published |
+
+Two defects the run surfaced were fixed in the same PRs: the spacing hold was measured from slot
+acquisition (a 3 s commit left a 12.1 s gap against 15) and is now a full spacing after the last
+commit; and `rehomed` never reached `ASSEMBLY_SUMMARY`. Full tables in the harness README.

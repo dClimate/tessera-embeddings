@@ -439,9 +439,16 @@ def _report(cfg: dict[str, Any], seed: dict[str, Any], started: float, wall: flo
     }
     report["verdicts"] = {
         "condition_reached (depth >= 4 seen)": report["catch_up_depth"]["at_or_above_4"] > 0,
+        # The property spacing exists for: no tick ever sees more than one publication (two
+        # snapshots) since the last. Measured at every tick, this is the primary verdict.
+        "depth_bounded (max catch-up depth <= 2)": (
+            report["catch_up_depth"]["max"] is not None and report["catch_up_depth"]["max"] <= 2
+        ),
+        # The mechanism, checked against the store's own clock: consecutive publications at least
+        # one spacing apart (a hair of tolerance for timestamp rounding).
         "spacing_held (min publication gap >= spacing)": (
             report["publication_gaps_from_store"]["min_gap_s"] is not None
-            and report["publication_gaps_from_store"]["min_gap_s"] >= publication_spacing.PUBLICATION_SPACING_S * 0.9
+            and report["publication_gaps_from_store"]["min_gap_s"] >= publication_spacing.PUBLICATION_SPACING_S * 0.98
         ),
         "no_data_clobbered": report["integrity"]["ok"],
         "icechunk_hang_observed": report["logs"]["commit_alarm"] > 0
