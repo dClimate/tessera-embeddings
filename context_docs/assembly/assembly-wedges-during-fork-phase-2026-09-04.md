@@ -164,6 +164,21 @@ was missing.
    which the driver already treats as "cannot infer who stopped": the cells wait for the next round,
    exactly as any crash's do. The thread dies with the process, so nothing can commit later.
 
+4. **The write is recovered, not discarded — #165's re-home, generalised and made killable**
+   (`shard_writer.run_forks`, `_run_pool`, `publish_forks_in_child`). Robert's point, and the right
+   one: a wedge should cost a retry of the commit, never the hours of shard writes or a cluster
+   restart. Three changes deliver it. A partition whose worker stalls is re-run once on a fresh pool
+   with every finished fork kept; a second stall on the same partition is a deterministic fault and
+   fails the cell. Finished workers are terminated and never joined — their forks are already the
+   parent's — so a worker process that will not exit costs nothing. And the publish (fresh session at
+   the tip, conflict check over `base..tip`, merge, shard commit, completion mark) runs in a child
+   process under a per-step timeout; a child that wedges is killed and the step retried once on a new
+   session, mark-only if the shards already landed. The forks never leave the parent, so the write is
+   never at risk. Why a child: the 09-04 coordinators were parked inside icechunk where no Python
+   mechanism unwinds a thread, and a coordinator already wedged cannot start its own retry. The child
+   arms `faulthandler.dump_traceback_later` inside the parent's timeout, so the next wedge prints the
+   stack this incident could not.
+
 Every claim above was checked by breaking the source and watching the tests go red (five mutations
 of the watchdog, each caught; a hang is turned into a red test by running the subject under a
 deadline). The tests inject a wedge deterministically — a worker future that never resolves, a pool

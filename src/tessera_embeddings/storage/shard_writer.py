@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import ctypes
 import faulthandler
+import functools
 import logging
 import multiprocessing
 import threading
@@ -62,7 +63,7 @@ from tessera_embeddings.storage.session_catch_up import (
     CatchUpAbortedTheWaitError,
     CatchUpDidNotStopError,
     catch_up_best_effort,
-    rehome_after_a_wedged_catch_up,
+    fresh_session_checked,
     ticking,
 )
 from tessera_embeddings.storage.time_axis import read_time_values, year_of
@@ -90,6 +91,14 @@ PROGRESS_INTERVAL_S = 300.0
 #: band. The failure it guards against sat for days, so erring long costs nothing: the point is
 #: to convert an unbounded hang into a bounded, re-dispatchable failure, not to trim minutes.
 FORK_STALL_TIMEOUT_S = 1800.0
+
+#: How long each step of the publish child gets — re-home, merge and fill commit; then the
+#: completion mark. Every commit ever measured finished in 0.6-5 s and the read-only conflict diff
+#: in under half a second; unpickling sixteen forks and importing the child's dependencies add tens
+#: of seconds at most. Ten minutes is far past all of that and far short of the hang, which sat for
+#: days. When it expires the child is killed and the step is retried ONCE in a fresh child on a
+#: fresh session — the finished forks are the parent's, so nothing written is lost.
+PUBLISH_STEP_TIMEOUT_S = 600.0
 
 
 class PhaseTimer:
@@ -452,6 +461,323 @@ def _fork_stall_watchdog(
         stopped.set()
 
 
+def _run_pool(
+    worker_fn: Callable[[dict[str, Any]], Any],
+    payloads: list[dict[str, Any]],
+    indices: list[int],
+    *,
+    progress_interval_s: float,
+    fork_stall_timeout_s: float,
+    unit: str,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None,
+    abort: threading.Event,
+) -> tuple[dict[int, Any], list[int]]:
+    """Run ``payloads[i]`` for ``i in indices`` on a fresh spawn pool; salvage what finishes.
+
+    Returns ``(finished, stalled)``: results by payload index, and the indices whose worker had
+    not returned when the watchdog tore the pool down. A clean run returns every index and an
+    empty list. Any failure OTHER than a stall — a worker's deterministic fault, a catch-up that
+    failed (``abort``) — propagates after the pool is terminated, as before.
+
+    **Finished workers are terminated, never joined.** Their result — the fork — is already in
+    the parent's hands, so a worker process that will not exit (one of the four places the
+    2026-09-04 fills could have parked) costs nothing to kill and everything to wait for.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    # `initializer` runs once per spawned child before any payload. A spawned process inherits no
+    # logging config, so without it the root WARNING default discards every INFO record a worker
+    # produces. Slots are sized for EVERY payload so a re-run's worker indices still address them.
+    slots = ctx.Array("l", 2 * len(payloads), lock=False)
+    ex = ProcessPoolExecutor(max_workers=len(indices), mp_context=ctx, initializer=_init_fork_worker, initargs=(slots,))
+    stalled = threading.Event()
+    futures: list[Future] = []
+    try:
+        with _fork_stall_watchdog(slots, len(payloads), stalled, ex, timeout_s=fork_stall_timeout_s, log=log):
+            futures = [ex.submit(worker_fn, payloads[i]) for i in indices]
+            try:
+                results = _await_forks(
+                    futures, progress_interval_s, unit=unit, log=log, slots=slots, abort=abort, stalled=stalled
+                )
+            except ForkPhaseStalledError:
+                finished = {
+                    i: f.result()
+                    for i, f in zip(indices, futures, strict=True)
+                    if f.done() and not f.cancelled() and f.exception() is None
+                }
+                return finished, [i for i in indices if i not in finished]
+        return dict(zip(indices, results, strict=True)), []
+    finally:
+        # Every exit: the workers' results are in hand or the pool is being abandoned; either
+        # way nothing is gained by joining a process and a wedged one would never be joined.
+        _terminate_pool(ex)
+
+
+class PublishWedgedError(RuntimeError):
+    """The publish child did not finish a step within its timeout, twice.
+
+    Both children were killed; the forks are still the parent's and nothing was lost — but the
+    cell has not landed and is retained for resume. Its own type so the failure reads as what it
+    is: the store's commit path hung, rather than any of the things a generic failure could mean.
+    """
+
+
+def _publish_child(
+    conn: Any,  # noqa: ANN401 — a multiprocessing Connection
+    repo: icechunk.Repository,
+    group: str,
+    base: str,
+    forks: list[Any],
+    fill_message: str,
+    attrs: dict[str, Any],
+    mode: str,
+    step_timeout_s: float,
+) -> None:
+    """The publish, in a process the parent can kill: fresh session, merge, commit, then mark.
+
+    Two phases over ``conn`` so the parent can run the between-commits drill hook and the
+    publication spacing around both: ``("fill", snapshot, seconds)`` after the shard commit,
+    then wait for the parent's go-ahead, then ``("done", snapshot, seconds)`` after the mark.
+    ``mode="mark"`` skips to the mark — used when the fill landed but the mark wedged, so a retry
+    does not commit the shards twice. Any exception is sent as ``("error", repr)``.
+
+    ``faulthandler.dump_traceback_later`` is armed a few seconds inside the parent's timeout, so
+    a child that is about to be killed for wedging prints every thread's stack first — the
+    diagnostic the 2026-09-04 fills could not produce.
+    """
+    configure_logging()
+    faulthandler.dump_traceback_later(max(step_timeout_s - 5.0, 1.0), repeat=False)
+    try:
+        if mode == "publish":
+            session = fresh_session_checked(repo, group, base=base)
+            t_merge = time.monotonic()
+            session.merge(*forks)
+            t0 = time.monotonic()
+            snapshot = commit_with_rebase(session, fill_message)
+            conn.send(("fill", snapshot, round(time.monotonic() - t0, 3), round(t0 - t_merge, 3)))
+            faulthandler.cancel_dump_traceback_later()
+            if conn.recv() != "go":
+                return
+            faulthandler.dump_traceback_later(max(step_timeout_s - 5.0, 1.0), repeat=False)
+        t1 = time.monotonic()
+        marked = commit_year_attrs(repo, group, **attrs)
+        conn.send(("done", marked, round(time.monotonic() - t1, 3)))
+    except BaseException as exc:  # the parent must hear about it; a dead child says nothing
+        with suppress(Exception):
+            conn.send(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
+def publish_forks_in_child(
+    repo: icechunk.Repository,
+    group: str,
+    forks: list[Any],
+    *,
+    base: str,
+    fill_message: str,
+    attrs: dict[str, Any],
+    fault: ArmedFault | None = None,
+    year_label: int | None = None,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+    step_timeout_s: float = PUBLISH_STEP_TIMEOUT_S,
+    retries: int = 1,
+    _child: Callable[..., None] = _publish_child,
+) -> tuple[str, dict[str, Any]]:
+    """Merge finished forks into a fresh session and publish them, in a child the parent can kill.
+
+    **This is #165's recovery made the normal path and made killable.** The coordinator never
+    commits from its own session: the finished forks are pickled to a child that opens a fresh
+    session at the tip, checks the skipped range for a same-group commit
+    (:func:`fresh_session_checked`), merges, commits the shards, and — after the parent's
+    go-ahead — commits the completion mark. Each step runs under ``step_timeout_s``. A child that
+    does not answer in time is killed and the step is retried once in a new child on a new
+    session. The forks stay in the parent throughout, so a wedge costs one kill and one retry,
+    not the write.
+
+    Why a child and not a thread: the 2026-09-04 fills parked their coordinator INSIDE icechunk,
+    where no Python mechanism unwinds a thread. A process can be killed. Why always, not only on a
+    wedge: a coordinator already wedged cannot start a retry, and pickling the forks after a
+    wedge would touch objects the stuck thread may hold.
+
+    The parent runs ``fault.die_between_commits`` between the two phases, where the drill has to
+    land, and the caller wraps this whole call in the publication spacing slot.
+
+    Returns:
+        ``(mark_snapshot, timings)`` — the snapshot a tag must point at, and ``merge_s``,
+        ``commit_s``, ``attrs_commit_s``, ``publish_retries``.
+
+    Raises:
+        PublishWedgedError: a step timed out in both attempts.
+        RuntimeError: the child reported a failure (message carried verbatim).
+    """
+    logger = log or _log
+    ctx = multiprocessing.get_context("spawn")
+    timings: dict[str, Any] = {"publish_retries": 0}
+    mode = "publish"
+    fill_snapshot: str | None = None
+    for attempt in range(1, retries + 2):
+        parent, child_end = ctx.Pipe()
+        proc = ctx.Process(
+            target=_child,
+            args=(child_end, repo, group, base, forks, fill_message, attrs, mode, step_timeout_s),
+            name=f"publish-{group}",
+            daemon=True,
+        )
+        proc.start()
+        child_end.close()
+        try:
+            if mode == "publish":
+                if not parent.poll(step_timeout_s):
+                    raise TimeoutError("fill")
+                kind, *rest = parent.recv()
+                if kind == "error":
+                    raise RuntimeError(f"publish child failed: {rest[0]}")
+                fill_snapshot, timings["commit_s"], timings["merge_s"] = rest
+                if fault is not None and year_label is not None:
+                    # The drill's death lands HERE, between the two commits — in the parent, which
+                    # is the process the drill means to kill. The child is a daemon and dies with it.
+                    fault.die_between_commits(group, year_label, log=logger)
+                parent.send("go")
+            if not parent.poll(step_timeout_s):
+                raise TimeoutError("mark")
+            kind, *rest = parent.recv()
+            if kind == "error":
+                raise RuntimeError(f"publish child failed: {rest[0]}")
+            marked, timings["attrs_commit_s"] = rest
+            proc.join(timeout=30)
+            if proc.is_alive():
+                proc.kill()
+            return marked, timings
+        except TimeoutError as step:
+            proc.kill()
+            proc.join(timeout=30)
+            timings["publish_retries"] += 1
+            with suppress(Exception):
+                logger.critical(
+                    "PUBLISH WEDGED: the %s step for %s did not return in %.0f s (attempt %d). The child was "
+                    "killed; its thread stacks are on its stderr. %s",
+                    step,
+                    group,
+                    step_timeout_s,
+                    attempt,
+                    "Retrying once on a fresh session." if attempt <= retries else "No retries left.",
+                )
+            if attempt > retries:
+                raise PublishWedgedError(
+                    f"the publish {step} step for {group} wedged {attempt} times; the cell is retained for resume"
+                ) from None
+            # The fill landed and only the mark wedged: retry the mark alone, so the shards are
+            # not committed twice.
+            if str(step) == "mark" and fill_snapshot is not None:
+                mode = "mark"
+        finally:
+            parent.close()
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def run_forks(
+    session: icechunk.Session,
+    worker_fn: Callable[[dict[str, Any]], Any],
+    payloads: list[dict[str, Any]],
+    *,
+    progress_interval_s: float = PROGRESS_INTERVAL_S,
+    fork_stall_timeout_s: float = FORK_STALL_TIMEOUT_S,
+    unit: str = "partitions",
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+    catch_up: Callable[[], str] | None = None,
+) -> tuple[dict[str, Any], list[Any], bool]:
+    """The fork phase alone: fork, run every payload, hand back the finished forks.
+
+    Returns ``(telemetry, results in payload order, catch_up_wedged)``. ``catch_up_wedged`` is
+    True when the periodic catch-up thread was still inside a call after the workers finished
+    (2026-08-31's failure): the coordinator's session is then unsafe to touch, which the callers
+    handle — :func:`run_forked` re-homes, :func:`write_year_shards` never commits from it anyway.
+
+    **A stalled partition is re-run once, on a fresh pool, keeping every finished fork.** The
+    watchdog's stall (:data:`FORK_STALL_TIMEOUT_S`) used to fail the cell and discard hours of
+    shard writes; now the finished forks are salvaged, the stuck worker is killed, and only its
+    partition is written again (whole-shard overwrites, so a re-run is safe). A second stall on
+    the same partition raises :class:`ForkPhaseStalledError` — the fault is then deterministic and
+    the cell is retained for resume.
+    """
+    t0 = time.monotonic()
+    fork = session.fork()
+    # Copies, not mutation: callers keep their payload dicts fork-free.
+    payloads = [
+        {**payload, "fork": fork, "worker_index": i, "progress_interval_s": progress_interval_s}
+        for i, payload in enumerate(payloads)
+    ]
+    catch_ups: Counter[str] = Counter()
+    tally_lock = threading.Lock()
+
+    def _tick() -> None:
+        if catch_up is None:
+            return
+        outcome = catch_up()
+        with tally_lock:  # the timer thread and this one both reach it
+            catch_ups[outcome] += 1
+
+    abort = threading.Event()
+    # WORKERS FINISHED, not "we reached the exit". `ticking` raises from its `finally`, which
+    # runs on the failure path too — and an exception raised there REPLACES the body's own. So a
+    # worker that died while the ticker happened to be wedged would arrive at the handler looking
+    # exactly like a clean run whose catch-up hung. This flag is the only thing that tells the two
+    # apart.
+    workers_finished = False
+    catch_up_wedged = False
+    rerun: list[int] = []
+    try:
+        with ticking(CATCH_UP_INTERVAL_S, _tick if catch_up is not None else None, abort=abort):
+            if len(payloads) == 1:
+                results = [worker_fn(payloads[0])]
+            else:
+                run_pool = functools.partial(
+                    _run_pool,
+                    worker_fn,
+                    payloads,
+                    progress_interval_s=progress_interval_s,
+                    fork_stall_timeout_s=fork_stall_timeout_s,
+                    unit=unit,
+                    log=log,
+                    abort=abort,
+                )
+                finished, rerun = run_pool(list(range(len(payloads))))
+                if rerun:
+                    (log or _log).warning(
+                        "Fork phase stalled on %d of %d %s; keeping the %d finished fork(s) and re-running the "
+                        "stalled partition(s) %s once on a fresh pool.",
+                        len(rerun),
+                        len(payloads),
+                        unit,
+                        len(finished),
+                        rerun,
+                    )
+                    again, still = run_pool(rerun)
+                    finished.update(again)
+                    if still:
+                        raise ForkPhaseStalledError(
+                            f"{unit} {still} stalled again on the re-run; the fault is deterministic and this "
+                            f"cell is retained for resume"
+                        )
+                results = [finished[i] for i in range(len(payloads))]
+            workers_finished = True
+    except CatchUpDidNotStopError:
+        if not workers_finished:
+            raise
+        # THE WORKERS ARE DONE AND THE SESSION IS NOT SAFE. The write survives; only the
+        # coordinator's session is lost, and the caller decides what to commit from instead.
+        catch_up_wedged = True
+    telemetry: dict[str, Any] = {
+        "workers": [stats for _, stats in results],
+        "wall_s": round(time.monotonic() - t0, 3),
+    }
+    if rerun:
+        telemetry["partitions_rerun"] = rerun
+    if catch_up is not None:
+        telemetry["catch_ups"] = dict(catch_ups)
+    return telemetry, results, catch_up_wedged
+
+
 def run_forked(
     session: icechunk.Session,
     worker_fn: Callable[[dict[str, Any]], Any],
@@ -514,109 +840,32 @@ def run_forked(
     :func:`~tessera_embeddings.storage.session_catch_up.catch_up_to_branch` for why an assembly
     needs this and when it deliberately refuses.
     """
-    t0 = time.monotonic()
-    fork = session.fork()
-    # Copies, not mutation: callers keep their payload dicts fork-free.
-    payloads = [
-        {**payload, "fork": fork, "worker_index": i, "progress_interval_s": progress_interval_s}
-        for i, payload in enumerate(payloads)
-    ]
-    catch_ups: Counter[str] = Counter()
-    tally_lock = threading.Lock()
-
-    def _tick() -> None:
-        if catch_up is None:
-            return
-        outcome = catch_up()
-        with tally_lock:  # the timer thread and this one both reach it
-            catch_ups[outcome] += 1
-
-    # ONE timer around the whole fork phase, so BOTH paths get the periodic catch-up.
-    abort = threading.Event()
-    # WORKERS FINISHED, not "we reached the exit". `ticking` raises from its `finally`, which
-    # runs on the failure path too — and an exception raised there REPLACES the body's own. So
-    # a worker that died while the ticker happened to be wedged would arrive here looking
-    # exactly like a clean run whose catch-up hung, and re-homing it would commit a partial
-    # write. This flag is the only thing that tells the two apart.
-    workers_finished = False
+    telemetry, results, catch_up_wedged = run_forks(
+        session,
+        worker_fn,
+        payloads,
+        progress_interval_s=progress_interval_s,
+        fork_stall_timeout_s=fork_stall_timeout_s,
+        unit=unit,
+        log=log,
+        catch_up=catch_up,
+    )
     rehomed = False
-    try:
-        with ticking(CATCH_UP_INTERVAL_S, _tick if catch_up is not None else None, abort=abort):
-            if len(payloads) == 1:
-                results = [worker_fn(payloads[0])]
-            else:
-                ctx = multiprocessing.get_context("spawn")
-                # `initializer` runs once per spawned child before any payload. A spawned process
-                # inherits no logging config, so without it the root WARNING default discards every
-                # INFO record a worker produces. Set HERE rather than in each worker body so a
-                # worker added later cannot omit it. The single-payload path above runs in the
-                # already-configured coordinator and needs nothing.
-                slots = ctx.Array("l", 2 * len(payloads), lock=False)
-                ex = ProcessPoolExecutor(
-                    max_workers=len(payloads),
-                    mp_context=ctx,
-                    initializer=_init_fork_worker,
-                    initargs=(slots,),
-                )
-                try:
-                    # The watchdog wraps BOTH the wait and the shutdown join — either can hang
-                    # (a stuck worker leaves a future pending; `ex.shutdown(wait=True)` then
-                    # joins a process that will not exit). On a stall it dumps stacks, sets
-                    # `abort`, and terminates the pool, so `_await_forks` raises and `shutdown`
-                    # returns rather than either waiting forever.
-                    stalled = threading.Event()
-                    with _fork_stall_watchdog(
-                        slots, len(payloads), stalled, ex, timeout_s=fork_stall_timeout_s, log=log
-                    ):
-                        futures = [ex.submit(worker_fn, payload) for payload in payloads]
-                        results = _await_forks(
-                            futures, progress_interval_s, unit=unit, log=log, slots=slots, abort=abort, stalled=stalled
-                        )
-                        ex.shutdown()
-                except BaseException:
-                    # The watchdog may already have torn the pool down; this covers every other
-                    # unwind (a worker's deterministic fault, `CatchUpAbortedTheWaitError`). Idempotent
-                    # with the watchdog: a second shutdown is a no-op and terminating a dead process
-                    # is a no-op. See :func:`_terminate_pool` for why a kill here loses no committed
-                    # data.
-                    _terminate_pool(ex)
-                    raise
-            workers_finished = True
-    except CatchUpDidNotStopError:
-        # THE WORKERS ARE DONE AND THE SESSION IS NOT SAFE. Separable, and separating them is the
-        # whole point: the write survives, only the session is lost. Re-home the finished forks
-        # onto one no other thread holds; without `rehome` this is a failed cell with hours of
-        # shard writes discarded.
-        if rehome is None or not workers_finished:
-            raise
+    if catch_up_wedged:
+        # Separable, and separating them is the whole point: the write survives, only the session
+        # is lost. Re-home the finished forks onto one no other thread holds; without `rehome`
+        # this is a failed cell with hours of shard writes discarded.
+        if rehome is None:
+            raise CatchUpDidNotStopError(
+                "a catch-up was still running after the workers finished; the session cannot be merged or "
+                "committed while it is in use, and this caller gave no way to re-home"
+            )
         session = rehome()
         rehomed = True
-
-    # NO FINAL CATCH-UP HERE, deliberately: such a call sits OUTSIDE `ticking`, so nothing bounds
-    # it, and if it entered the stalling path it would hang forever at the one step this whole
-    # mechanism protects — silently, where a stalled COMMIT at least trips `traced_commit`'s alarm.
-    # The residual gap is whatever published since the last tick, at most one CATCH_UP_INTERVAL_S
-    # of commits, which the commit's own rebase closes from a depth that has never failed.
-    #
-    # THE RESIDUAL THAT LEAVES. A cell publishes TWO snapshots, the fill and the mark, so TWO
-    # publications inside one interval put a coordinator four snapshots behind — the depth that
-    # wedges. Measured 2026-08-31: 36 catch-ups crossing one publication all succeeded, and both
-    # of the two that had to cross a pair wedged. Two things answer it: CATCH_UP_INTERVAL_S is 5 s
-    # rather than 60, shrinking the window a second publication can land in, and `rehome` above
-    # makes the remaining case survivable instead of fatal. Neither is a guarantee — only a
-    # minimum spacing between publications, set above the tick interval, makes depth 4
-    # unreachable, and that needs a fleet-wide lock deliberately not built here. See
-    # ``context_docs/storage/writing-to-the-global-store.md``.
     t_merge = time.monotonic()
     session.merge(*(fork_result for fork_result, _ in results))
-    done = time.monotonic()
-    telemetry: dict[str, Any] = {
-        "workers": [stats for _, stats in results],
-        "wall_s": round(done - t0, 3),
-        "merge_s": round(done - t_merge, 3),
-    }
-    if catch_up is not None:
-        telemetry["catch_ups"] = dict(catch_ups)
+    telemetry["merge_s"] = round(time.monotonic() - t_merge, 3)
+    telemetry["wall_s"] = round(telemetry["wall_s"] + telemetry["merge_s"], 3)
     if rehomed:
         telemetry["rehomed"] = True
     return telemetry, session
@@ -960,57 +1209,67 @@ def write_year_shards(
     # the safe answer — the range base..tip is a superset of what was skipped, so checking it
     # can only refuse more often than strictly necessary, never less.
     base_before_forking = session.snapshot_id
-    fill, session = run_forked(
+    year_label = _year_label(_group_node(session.store, group), year_index)
+    fill, forks, catch_up_wedged = run_forks(
         session,
         _write_shards_worker,
         payloads,
         unit="tile partitions",
         log=log,
-        # Keep the session current WHILE the workers write. Without this the commit below has
-        # to walk every snapshot published during the write, and that walk is where seven of
-        # nine assemblies stopped dead on 2026-08-29. See `catch_up_to_branch`.
+        # Keep the session current WHILE the workers write. The commit no longer happens from
+        # this session (see below), so the catch-up's remaining value is the depth telemetry it
+        # produces — and a wedged one costs a daemon thread, not the write.
         catch_up=lambda: catch_up_best_effort(repo, session, group, log=log),
-        # And if that catch-up wedges — twice on 2026-08-31 — hand the finished forks a
-        # session no one else is inside, rather than throwing the write away.
-        rehome=lambda: rehome_after_a_wedged_catch_up(repo, group, base=base_before_forking, log=log),
     )
-
-    year_label = _year_label(_group_node(session.store, group), year_index)
-    t_commit = time.monotonic()
-    commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}")
-    if fault is not None:
-        # The drill's death lands HERE, between the two commits, and nowhere else can
-        # produce this state on purpose. Inert for any other fault or any other cell.
-        fault.die_between_commits(group, year_label, log=log or _log)
-    t_attrs = time.monotonic()
-    # The per-year attrs go in their OWN commit (see `commit_year_attrs`), so a same-zone
-    # collision costs a sub-second retry instead of this whole assembly. Return that
-    # snapshot rather than the shard one: a tag must point at a state where the year is
-    # both written AND marked.
-    snapshot = commit_year_attrs(
+    if catch_up_wedged:
+        (log or _log).warning(
+            "The catch-up for %s wedged and cannot be stopped; the coordinator's session is abandoned. "
+            "The publish below runs from a fresh session regardless, so the write is unaffected.",
+            group,
+        )
+    # THE PUBLISH RUNS IN A CHILD THE COORDINATOR CAN KILL, from a fresh session at the tip after
+    # the conflict check over base..tip (#165's re-home, made the normal path). The 2026-09-04
+    # fills parked their coordinator thread inside icechunk with the shard write complete and
+    # nothing able to unwind it; a wedged child is killed and the step retried once, and the
+    # forks — the hours of shard writes — never leave this process. The between-commits drill
+    # hook runs in the parent, between the child's two phases.
+    snapshot, timings = publish_forks_in_child(
         repo,
         group,
-        year_label,
-        run_id=run_id,
-        radar_coverage=radar_coverage,
-        optical_skips=optical_skips,
-        input_coverage=input_coverage,
-        empty=empty,
+        [fork_result for fork_result, _ in forks],
+        base=base_before_forking,
+        fill_message=commit_msg or f"fill {group} year {year_label}",
+        attrs={
+            "year_label": year_label,
+            "run_id": run_id,
+            "radar_coverage": radar_coverage,
+            "optical_skips": optical_skips,
+            "input_coverage": input_coverage,
+            "empty": empty,
+        },
+        fault=fault,
+        year_label=year_label,
+        log=log,
     )
     if telemetry is not None:
         telemetry.update(
             workers=fill["workers"],
             fill_wall_s=fill["wall_s"],
-            merge_s=fill["merge_s"],
-            # Carried so ASSEMBLY_SUMMARY records whether the session was kept current, and
-            # how often the guard refused. A healthy commit looks identical either way, so
-            # without this the fix is unobservable in production.
+            merge_s=timings.get("merge_s", 0.0),
+            # Carried so ASSEMBLY_SUMMARY records whether the session was kept current, and how
+            # often the guard refused. A healthy commit looks identical either way, so without
+            # this the fix is unobservable in production.
             catch_ups=fill.get("catch_ups", {}),
-            # And whether the finished forks had to be re-homed onto a fresh session (#165): the
-            # dev proof read it off run_forked's dict, but nothing forwarded it here, so no
-            # production ASSEMBLY_SUMMARY has ever said a re-home happened.
-            rehomed=bool(fill.get("rehomed", False)),
-            commit_s=round(t_attrs - t_commit, 3),
-            attrs_commit_s=round(time.monotonic() - t_attrs, 3),
+            # True when the catch-up ticker wedged and the coordinator's session was abandoned.
+            # The publish always runs from a fresh session now, so this records the WEDGE, not a
+            # different commit path; kept under its historical name for the readers of the record.
+            rehomed=catch_up_wedged,
+            # The recovery counters: partitions written twice because their worker stalled, and
+            # publish steps retried in a fresh child because the first wedged. Zero on a healthy
+            # cell; anything else is a wedge that was survived and should be looked at.
+            partitions_rerun=fill.get("partitions_rerun", []),
+            publish_retries=timings.get("publish_retries", 0),
+            commit_s=timings.get("commit_s"),
+            attrs_commit_s=timings.get("attrs_commit_s"),
         )
     return snapshot

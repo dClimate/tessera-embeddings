@@ -288,14 +288,8 @@ def rehome_after_a_wedged_catch_up(
             re-homing would put a same-group collision beyond conflict detection. The cell
             fails, which is the cheap outcome.
     """
-    fresh = repo.writable_session(branch)
+    fresh = fresh_session_checked(repo, group, base=base, branch=branch)
     landed = fresh.snapshot_id
-    if base != landed and _diff_touches(repo.diff(from_snapshot_id=base, to_snapshot_id=landed), group):
-        raise CaughtUpPastAConflictError(
-            f"cannot re-home {group} onto a fresh session: a commit between the abandoned base "
-            f"{base} and the tip {landed} touched {group}, so the re-homed commit could not "
-            f"detect a collision with it"
-        )
     (log or _log).warning(
         "Re-homing %s onto a fresh session at %s: its catch-up wedged and cannot be stopped, so "
         "the finished forks are merged onto a session no other thread holds. The abandoned "
@@ -304,6 +298,37 @@ def rehome_after_a_wedged_catch_up(
         landed,
         base,
     )
+    return fresh
+
+
+def fresh_session_checked(
+    repo: icechunk.Repository,
+    group: str,
+    *,
+    base: str,
+    branch: str = "main",
+) -> icechunk.Session:
+    """A fresh writable session at the tip, refused if anything since ``base`` touched ``group``.
+
+    The conflict check a commit from ``base`` would have done, performed on the range a fresh
+    session skips — so finished forks can be merged and committed from the tip without losing
+    collision detection over the write's lifetime. The walk is a read-only diff (0.1-0.4 s
+    throughout every stall observed), never a rebase, so it is not on the path that wedges.
+
+    This is the mechanism under :func:`rehome_after_a_wedged_catch_up`, split out because the
+    global publish now ALWAYS commits from a fresh session in a killable child
+    (``shard_writer.publish_forks_in_child``), whether or not anything wedged.
+
+    Raises:
+        CaughtUpPastAConflictError: a commit in ``base..tip`` touched ``group``.
+    """
+    fresh = repo.writable_session(branch)
+    landed = fresh.snapshot_id
+    if base != landed and _diff_touches(repo.diff(from_snapshot_id=base, to_snapshot_id=landed), group):
+        raise CaughtUpPastAConflictError(
+            f"cannot commit {group} from a fresh session: a commit between the base {base} and the "
+            f"tip {landed} touched {group}, so the commit could not detect a collision with it"
+        )
     return fresh
 
 

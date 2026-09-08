@@ -728,6 +728,18 @@ onward", not as a count of collisions — and note that the fill is then back to
 behaviour and exposed to the stall that
 `context_docs/storage/writing-to-the-global-store.md` describes.
 
+**A wedge is recovered, not just bounded.** Three things now happen where a wedge used to cost
+the write. A partition whose worker stalls is **re-run once** on a fresh pool while every finished
+fork is kept (`partitions_rerun` in the record). Finished workers are **terminated, never joined**,
+so a worker process that will not exit costs nothing. And the publish itself — fresh session at
+the tip, conflict check over the skipped range, merge, shard commit, completion mark — runs in a
+**child process the coordinator can kill** (`shard_writer.publish_forks_in_child`): a step that
+does not answer in ten minutes is killed and retried once on a new session, with the forks never
+leaving the parent (`publish_retries` in the record). This is #165's re-home made the normal path
+and made killable; the coordinator never commits from its own session. The child arms its own
+`faulthandler` dump a few seconds inside the parent's timeout, so a child about to be killed prints
+the stacks the 2026-09-04 fills could not.
+
 **The fork phase is watched, and bounded.** While the forks write, a daemon thread in
 `shard_writer.run_forked` watches the shard counters the workers update in shared memory. If
 they stop moving for `FORK_STALL_TIMEOUT_S` (thirty minutes — roughly six times the longest

@@ -2507,6 +2507,8 @@ class ZarrWriter:
                 # lucky — without it the mechanism has no evidence it ran at all.
                 catch_ups=telemetry.get("catch_ups"),
                 rehomed=telemetry.get("rehomed", False),
+                partitions_rerun=telemetry.get("partitions_rerun", []),
+                publish_retries=telemetry.get("publish_retries", 0),
                 total_s=round(time.monotonic() - t0, 3),
                 fused_compress_put=True,
                 workers=workers,

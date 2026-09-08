@@ -552,6 +552,14 @@ thread's stack, a per-assembly ceiling on the end-of-inference drain, and a rule
 which gave up ends its process rather than reporting `FAILED` — because `FAILED` is what the
 campaign driver reads as "stopped writing", and a thread parked inside icechunk has not.
 
+**And the write is recovered rather than discarded (2026-09-08, same change).** The re-home this
+section describes — abandon the poisoned session, merge the finished forks into a fresh one — is now
+the normal path and runs in a child process the coordinator can kill: `publish_forks_in_child`
+opens a fresh session at the tip, walks `base..tip` for a same-group commit, merges, commits the
+shards, and marks, each step under a ten-minute timeout with one retry on a new session (mark-only
+if the shards landed). The forks stay in the parent. Upstream, a partition whose worker stalls is
+re-run once with the finished forks kept, and finished workers are terminated rather than joined.
+
 **What is unchanged: the root cure is still publication spacing**, as the paragraph above argues.
 The bounds make a wedge cost thirty minutes to six hours and one re-dispatch instead of days and a
 cluster's whole backlog; they do not stop it happening.
