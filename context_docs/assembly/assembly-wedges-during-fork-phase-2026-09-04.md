@@ -209,3 +209,14 @@ was measured from slot acquisition (a 3 s commit left a 12.1 s gap against 15) a
 spacing after the last commit — every gap by the store's clock then read ≥ 15.9 s over 110 ticks with
 max depth 2; and `rehomed` never reached `ASSEMBLY_SUMMARY` — it now does (1 / 1 on the wedged arm).
 Full tables in the harness README.
+
+### Dev evidence for the recovery, 2026-09-08
+
+| arm | outcome |
+|---|---|
+| wedged publish (child killed at 60 s) | retried on a fresh session, cell **published**, `publish_retries` 1, the killed child's stack captured; 6/6 published |
+| wedged worker, once | watchdog at 90 s, partition re-run, cell **published**, `partitions_rerun` [1]; 6/6 published |
+| wedged worker, always | re-run stalled too; that cell failed as `ForkPhaseStalledError` after one re-run, 5/6 published |
+
+All three: data intact, spacing held (≥ 16 s by the store's clock), max catch-up depth 2, nothing
+left in the dev bucket. A wedge now costs a kill and a retry, not the write.

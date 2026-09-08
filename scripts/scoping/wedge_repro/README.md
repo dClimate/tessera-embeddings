@@ -70,3 +70,17 @@ full spacing after the last commit; re-run with that change (`density-spaced-v2`
 
 Every gap by the store's clock is now at or above the 15 s spacing, and the re-home reaches the
 summary telemetry as well as the log.
+
+### Recovery arms, dev account, 2026-09-08 (after the recovery landed in #181)
+
+| arm | published / failed | partitions re-run | publish retries | max depth | min gap | watchdog | stacks | data intact |
+|---|---|---|---|---|---|---|---|---|
+| wedged publish, 6 coordinators, 60 s step timeout | 6 / 0 | 0 | **1** | 1 | 16.2 s | 0 | **1** (the killed child's) | yes |
+| wedged worker, hangs once, 6 coordinators, 90 s | 6 / 0 | **1** | 0 | 2 | 16.1 s | 1 | 6 | yes |
+| wedged worker, hangs always, 6 coordinators, 90 s | 5 / **1** | 0 | 0 | 2 | 16.1 s | 2 | 12 | yes |
+
+The publish wedge was killed at 60 s and retried on a fresh session; the cell published and the
+killed child's stack dump names the wedged frame. The once-only worker hang was recovered: the
+stalled partition re-ran and the cell published. The deterministic worker hang failed exactly one
+cell, as `ForkPhaseStalledError` after one re-run, with its neighbours unaffected. Nothing was left
+in the bucket.
