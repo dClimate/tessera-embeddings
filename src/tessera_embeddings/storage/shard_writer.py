@@ -247,6 +247,7 @@ def _await_forks(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     slots: ctypes.Array[ctypes.c_long] | None = None,
     abort: threading.Event | None = None,
+    stalled: threading.Event | None = None,
 ) -> list[Any]:
     """Collect ``futures`` in submission order, logging what is still outstanding.
 
@@ -272,6 +273,13 @@ def _await_forks(
     pending: set[Future] = set(futures)
     while pending:
         done, pending = wait(pending, timeout=progress_interval_s, return_when=FIRST_COMPLETED)
+        if stalled is not None and stalled.is_set():
+            # The watchdog tore the pool down: the WRITE stopped, which is a different fact from a
+            # failed catch-up and must read as one in the failure.
+            raise ForkPhaseStalledError(
+                "the fork phase made no shard progress for the stall timeout; the worker pool was "
+                "terminated and this cell is retained for resume"
+            )
         if abort is not None and abort.is_set():
             # The caller will raise the real cause; this only stops the waiting. Returning
             # instead would look like success, and the fill would merge forks it must not.
@@ -310,6 +318,16 @@ def _await_forks(
     return [future.result() for future in futures]
 
 
+class ForkPhaseStalledError(RuntimeError):
+    """The fork phase made no shard progress for the watchdog's timeout and was torn down.
+
+    Its own type, distinct from :class:`CatchUpAbortedTheWaitError`: both end the wait, but one
+    means "a catch-up failed, so this fill cannot commit safely" and the other means "the write
+    itself stopped moving" — and an operator reading the failure needs to know which. The cell is
+    retained for resume either way.
+    """
+
+
 def _terminate_pool(ex: ProcessPoolExecutor) -> None:
     """Tear a fork pool down without waiting on it, then kill whatever is still alive.
 
@@ -341,7 +359,7 @@ def _terminate_pool(ex: ProcessPoolExecutor) -> None:
 def _fork_stall_watchdog(
     slots: ctypes.Array[ctypes.c_long] | None,
     n_workers: int,
-    abort: threading.Event,
+    stalled: threading.Event,
     ex: ProcessPoolExecutor | None,
     *,
     timeout_s: float,
@@ -363,8 +381,8 @@ def _fork_stall_watchdog(
        that could not be got any other way (Fargate denies ``CAP_SYS_PTRACE``, so ``py-spy`` and
        ``/proc/<pid>/stack`` are refused, and the process runs pre-3.14 so thread names are
        invisible too), so the next wedge names its own stuck call;
-    2. sets ``abort``, so :func:`_await_forks` raises ``CatchUpAbortedTheWaitError`` at its next
-       wake rather than waiting out another timeout; and
+    2. sets ``stalled``, so :func:`_await_forks` raises :class:`ForkPhaseStalledError` at its
+       next wake rather than waiting out another timeout; and
     3. terminates the worker pool (:func:`_terminate_pool`), which resolves any pending future
        as ``BrokenProcessPool`` and lets a ``wait=True`` shutdown join return — so a coordinator
        parked in ``_await_forks`` or ``ex.shutdown`` is freed and the fill fails cleanly, its
@@ -421,7 +439,7 @@ def _fork_stall_watchdog(
                 )
             with suppress(Exception):
                 faulthandler.dump_traceback()
-            abort.set()
+            stalled.set()
             with suppress(Exception):
                 _terminate_pool(ex)
             return  # one shot: the pool is gone, so there is nothing left to watch
@@ -546,10 +564,13 @@ def run_forked(
                     # joins a process that will not exit). On a stall it dumps stacks, sets
                     # `abort`, and terminates the pool, so `_await_forks` raises and `shutdown`
                     # returns rather than either waiting forever.
-                    with _fork_stall_watchdog(slots, len(payloads), abort, ex, timeout_s=fork_stall_timeout_s, log=log):
+                    stalled = threading.Event()
+                    with _fork_stall_watchdog(
+                        slots, len(payloads), stalled, ex, timeout_s=fork_stall_timeout_s, log=log
+                    ):
                         futures = [ex.submit(worker_fn, payload) for payload in payloads]
                         results = _await_forks(
-                            futures, progress_interval_s, unit=unit, log=log, slots=slots, abort=abort
+                            futures, progress_interval_s, unit=unit, log=log, slots=slots, abort=abort, stalled=stalled
                         )
                         ex.shutdown()
                 except BaseException:

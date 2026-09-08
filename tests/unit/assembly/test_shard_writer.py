@@ -1634,7 +1634,7 @@ class TestForkStallWatchdog:
 
         with (
             caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.shard_writer"),
-            pytest.raises(session_catch_up.CatchUpAbortedTheWaitError),
+            pytest.raises(shard_writer.ForkPhaseStalledError, match="no shard progress"),
         ):
             self._within(
                 10,
@@ -1728,6 +1728,13 @@ class TestForkStallWatchdog:
         assert all(p.terminated for p in procs)
         assert dumps and self._stall_lines(caplog), "a stall that was recovered from must still be reported"
         assert len(telemetry["workers"]) == 2, "the finished results were thrown away"
+
+    def test_a_stall_reads_as_a_stall_not_as_a_failed_catch_up(self):
+        """The two abort paths end the same wait but mean different things; an operator reading
+        "a periodic catch-up failed" for a write that stopped moving would look in the wrong place.
+        """
+        assert issubclass(shard_writer.ForkPhaseStalledError, RuntimeError)
+        assert not issubclass(shard_writer.ForkPhaseStalledError, session_catch_up.CatchUpAbortedTheWaitError)
 
     def test_the_single_payload_path_gets_no_watchdog_thread(self):
         """One payload runs in-process and writes one shard: there is nothing to watch, and a
