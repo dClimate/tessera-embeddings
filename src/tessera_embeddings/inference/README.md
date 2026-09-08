@@ -728,6 +728,20 @@ onward", not as a count of collisions — and note that the fill is then back to
 behaviour and exposed to the stall that
 `context_docs/storage/writing-to-the-global-store.md` describes.
 
+**The fork phase is watched, and bounded.** While the forks write, a daemon thread in
+`shard_writer.run_forked` watches the shard counters the workers update in shared memory. If
+they stop moving for `FORK_STALL_TIMEOUT_S` (thirty minutes — roughly six times the longest
+gap a healthy dense write has ever shown), it dumps every thread's Python stack to the log with
+`faulthandler`, terminates the worker pool, and the fill fails as a normal assembly failure —
+the cell keeps its mosaic and staged tiles and is re-dispatched. Until 2026-09-04 nothing
+watched this phase: five fills stopped in the write's tail with no exception and no progress,
+and each one froze its cluster's single trailing-assembly thread for days
+(`context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md`). The log line to
+alert on is `ASSEMBLY FORK PHASE STALLED`, and the stack dump that follows it is the artefact
+no external tool can produce on Fargate. What it cannot do is unwind a coordinator thread parked
+inside icechunk itself; that case still fires the dump, and preventing it is the job of
+publication spacing.
+
 The **campaign land mask** is not a pixel ROI but a per-zone *coverage bitmap*
 (`tile_live_2048`) built from the partner's delivery registry by
 `ingest/land_mask.py` and the `build-land-mask-coverage` flow (ADR-010). v1.1 tiles are

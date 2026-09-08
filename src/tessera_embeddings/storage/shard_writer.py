@@ -37,13 +37,15 @@ can only use the module logger of its own spawned process.
 from __future__ import annotations
 
 import ctypes
+import faulthandler
 import logging
 import multiprocessing
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
@@ -74,6 +76,20 @@ _log = logging.getLogger(__name__)
 #: log — and the operator's only recourse is to guess. Set far enough apart to stay
 #: quiet for short writes and close enough to bound how long a stall hides.
 PROGRESS_INTERVAL_S = 300.0
+
+#: How long the fork phase may make NO shard progress before the watchdog declares it wedged,
+#: dumps every thread's stack, and tears the worker pool down so the fill fails instead of
+#: hanging. On 2026-09-04 five assemblies hung in the shard-write tail and never returned — no
+#: exception, no CPU — each blocking its cluster's entire single-threaded assembly backlog for
+#: days (see ``context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md``).
+#:
+#: THIRTY MINUTES, and the choice is one-sided. Healthy workers write shards continuously —
+#: measured 200-260 shards every five minutes on dense zones, and no healthy run has ever paused
+#: shard writing for even one full progress interval. A stall that lasts thirty minutes is ~6x
+#: the longest gap a healthy run produces and cannot be reached by normal S3 jitter or a slow
+#: band. The failure it guards against sat for days, so erring long costs nothing: the point is
+#: to convert an unbounded hang into a bounded, re-dispatchable failure, not to trim minutes.
+FORK_STALL_TIMEOUT_S = 1800.0
 
 
 class PhaseTimer:
@@ -294,12 +310,137 @@ def _await_forks(
     return [future.result() for future in futures]
 
 
+def _terminate_pool(ex: ProcessPoolExecutor) -> None:
+    """Tear a fork pool down without waiting on it, then kill whatever is still alive.
+
+    The one place two callers reach — the ``except BaseException`` unwind and the stall
+    watchdog — so the "how" of killing a pool lives once. ``cancel_futures`` reaches only
+    queued work, so a multi-hour shard writer already running keeps running (and keeps writing
+    fork objects) after the coordinator has moved on unless the live processes are terminated
+    too; Python's own executor atexit hook would then block interpreter shutdown on them.
+
+    Killing them is safe because nothing a worker has written is IN the store: workers write
+    into a fork, and a fork joins the repository only when the coordinator merges and commits.
+    A dropped, unmerged ``ForkSession`` is icechunk's own documented way to orphan chunks, so a
+    kill costs unreferenced objects that GC reclaims — never committed data.
+
+    ``_processes`` is private (there is no public terminate API) and read BEFORE ``shutdown``:
+    ``shutdown`` sets ``_processes = None`` unconditionally, so reading it afterwards yields
+    ``None`` and ``.values()`` raises ``AttributeError``, masking the failure this exists to
+    surface. Guarded so a future Python that renames the attribute degrades to a wait-free
+    shutdown rather than an ``AttributeError``.
+    """
+    procs = list((getattr(ex, "_processes", None) or {}).values())
+    ex.shutdown(wait=False, cancel_futures=True)
+    for proc in procs:
+        if proc.is_alive():
+            proc.terminate()
+
+
+@contextmanager
+def _fork_stall_watchdog(
+    slots: ctypes.Array[ctypes.c_long] | None,
+    n_workers: int,
+    abort: threading.Event,
+    ex: ProcessPoolExecutor | None,
+    *,
+    timeout_s: float,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+) -> Iterator[None]:
+    """Fail a wedged fork phase instead of letting it hang forever.
+
+    The forks write for hours and then, on 2026-09-04, five of them stopped in the write's tail
+    and never returned — no exception, no CPU, no shard progress — each freezing the one trailing
+    thread its whole cluster assembles on. The commit alarm (:func:`traced_commit`) could not see
+    it: the wedge is upstream of the commit. Nothing watched the fork phase, and nothing bounded
+    it. This does both.
+
+    On its own daemon thread it watches the shard counters the workers write straight into shared
+    memory (``slots``), which advance whether or not the coordinator thread is running. If the
+    total does not move for ``timeout_s`` it:
+
+    1. dumps every thread's Python stack with :func:`faulthandler.dump_traceback` — the stack
+       that could not be got any other way (Fargate denies ``CAP_SYS_PTRACE``, so ``py-spy`` and
+       ``/proc/<pid>/stack`` are refused, and the process runs pre-3.14 so thread names are
+       invisible too), so the next wedge names its own stuck call;
+    2. sets ``abort``, so :func:`_await_forks` raises ``CatchUpAbortedTheWaitError`` at its next
+       wake rather than waiting out another timeout; and
+    3. terminates the worker pool (:func:`_terminate_pool`), which resolves any pending future
+       as ``BrokenProcessPool`` and lets a ``wait=True`` shutdown join return — so a coordinator
+       parked in ``_await_forks`` or ``ex.shutdown`` is freed and the fill fails cleanly, its
+       cell retained for the campaign to re-dispatch.
+
+    **What it does NOT recover, stated plainly.** If the coordinator thread is itself parked
+    inside a pyo3 call into icechunk (a catch-up ``rebase`` or the ``merge``), no Python action
+    unwinds it and terminating the workers cannot free it. The stack dump still fires, so the
+    wedge is diagnosed; preventing that case is the job of publication spacing, not this net.
+    See ``context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md``.
+
+    Best-effort throughout: a watchdog that dies on one failed read, or that could itself end a
+    healthy write, is worse than none. ``slots`` or ``ex`` being ``None`` (the single-payload
+    in-process path builds neither) makes it a no-op — that path writes one shard and cannot
+    exhibit the multi-worker stall this guards.
+    """
+    logger = log or _log
+    if slots is None or ex is None:
+        yield
+        return
+
+    def _written() -> int:
+        # Best-effort read of a lock-free shared array; a torn long only misreads the total by
+        # one worker's count for one tick, which cannot manufacture a 30-minute stall.
+        try:
+            return sum(slots[2 * i] for i in range(n_workers))
+        except Exception:
+            return -1
+
+    stopped = threading.Event()
+
+    def _watch() -> None:
+        last_seen = _written()
+        last_change = time.monotonic()
+        # Poll well inside the timeout so a real stall is caught promptly and a brief pause is
+        # not; the timeout, not this period, is what a healthy write is judged against.
+        period = min(30.0, timeout_s / 10.0)
+        while not stopped.wait(period):
+            now = _written()
+            if now != last_seen:
+                last_seen, last_change = now, time.monotonic()
+                continue
+            if time.monotonic() - last_change < timeout_s:
+                continue
+            with suppress(Exception):
+                logger.critical(
+                    "ASSEMBLY FORK PHASE STALLED: no shard progress for %.0f min (%d shards "
+                    "written across %d workers). The fill publishes nothing further; tearing the "
+                    "worker pool down so it fails and its cell can be re-dispatched. Thread stacks "
+                    "follow.",
+                    (time.monotonic() - last_change) / 60.0,
+                    max(last_seen, 0),
+                    n_workers,
+                )
+            with suppress(Exception):
+                faulthandler.dump_traceback()
+            abort.set()
+            with suppress(Exception):
+                _terminate_pool(ex)
+            return  # one shot: the pool is gone, so there is nothing left to watch
+
+    watcher = threading.Thread(target=_watch, name="fork-stall-watchdog", daemon=True)
+    watcher.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+
+
 def run_forked(
     session: icechunk.Session,
     worker_fn: Callable[[dict[str, Any]], Any],
     payloads: list[dict[str, Any]],
     *,
     progress_interval_s: float = PROGRESS_INTERVAL_S,
+    fork_stall_timeout_s: float = FORK_STALL_TIMEOUT_S,
     unit: str = "partitions",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     catch_up: Callable[[], str] | None = None,
@@ -400,39 +541,25 @@ def run_forked(
                     initargs=(slots,),
                 )
                 try:
-                    futures = [ex.submit(worker_fn, payload) for payload in payloads]
-                    results = _await_forks(futures, progress_interval_s, unit=unit, log=log, slots=slots, abort=abort)
+                    # The watchdog wraps BOTH the wait and the shutdown join — either can hang
+                    # (a stuck worker leaves a future pending; `ex.shutdown(wait=True)` then
+                    # joins a process that will not exit). On a stall it dumps stacks, sets
+                    # `abort`, and terminates the pool, so `_await_forks` raises and `shutdown`
+                    # returns rather than either waiting forever.
+                    with _fork_stall_watchdog(slots, len(payloads), abort, ex, timeout_s=fork_stall_timeout_s, log=log):
+                        futures = [ex.submit(worker_fn, payload) for payload in payloads]
+                        results = _await_forks(
+                            futures, progress_interval_s, unit=unit, log=log, slots=slots, abort=abort
+                        )
+                        ex.shutdown()
                 except BaseException:
-                    # Cancel what has not started, then TERMINATE what has. `cancel_futures` only
-                    # reaches queued work, so without the second step a multi-hour shard writer
-                    # keeps running — and keeps writing fork objects — after the coordinator has
-                    # raised, and Python's own executor atexit hook then blocks interpreter
-                    # shutdown on it. A `with` block would be worse: it joins every worker here,
-                    # the whole delay `_await_forks` exists to avoid.
-                    #
-                    # Killing them is safe because nothing they have written is IN the store.
-                    # Workers write into a fork, and a fork joins the repository only when the
-                    # coordinator merges and commits, neither of which happens on this path —
-                    # dropping a ForkSession unmerged is icechunk's own documented way to orphan
-                    # chunks. So a kill costs unreferenced objects that GC reclaims, while NOT
-                    # killing costs CPU, S3 writes, and a retry racing the previous attempt in the
-                    # same process.
-                    #
-                    # `_processes` is private: ProcessPoolExecutor exposes no terminate API.
-                    # Guarded so a future Python that renames it degrades to the wait-free shutdown
-                    # rather than masking the original failure with an AttributeError. SNAPSHOT
-                    # BEFORE SHUTDOWN: `shutdown` sets `_processes = None` unconditionally (it
-                    # drops references to objects holding file descriptors), so reading it
-                    # afterwards yields None and `.values()` raises AttributeError, masking the
-                    # assembly failure this handler exists to propagate. A stub executor whose
-                    # `shutdown` does not null the attribute cannot catch that in a test.
-                    procs = list((getattr(ex, "_processes", None) or {}).values())
-                    ex.shutdown(wait=False, cancel_futures=True)
-                    for proc in procs:
-                        if proc.is_alive():
-                            proc.terminate()
+                    # The watchdog may already have torn the pool down; this covers every other
+                    # unwind (a worker's deterministic fault, `CatchUpAbortedTheWaitError`). Idempotent
+                    # with the watchdog: a second shutdown is a no-op and terminating a dead process
+                    # is a no-op. See :func:`_terminate_pool` for why a kill here loses no committed
+                    # data.
+                    _terminate_pool(ex)
                     raise
-                ex.shutdown()
             workers_finished = True
     except CatchUpDidNotStopError:
         # THE WORKERS ARE DONE AND THE SESSION IS NOT SAFE. Separable, and separating them is the
