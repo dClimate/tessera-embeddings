@@ -251,7 +251,7 @@ def coordinator(k: int, cfg: dict[str, Any], lock: synchronize.Lock | None, star
         )
         marker = str(results / f"coord-{k}.publish-wedged")
 
-        def _with_marker(*a: Any, **kw: Any) -> Any:
+        def _with_marker(*a: Any, **kw: Any) -> Any:  # noqa: ANN401 — a pass-through wrapper
             # The marker rides in the attrs the child receives; `_wedging_publish_child` pops it.
             kw["attrs"] = {**kw["attrs"], "_marker": marker}
             return wedging(*a, **kw)
