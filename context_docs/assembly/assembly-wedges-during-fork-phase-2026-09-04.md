@@ -185,8 +185,9 @@ deadline). The tests inject a wedge deterministically — a worker future that n
 shutdown that never returns, an assembly that never returns — rather than reproducing the icechunk
 hang itself, which ten prior attempts and the 08-31 harness never managed at small scale.
 
-**Still open — the root cure.** None of the above prevents the icechunk hang; they bound its cost
+**The root cure, built on top of this (`feat/space-publications`).** None of the three bounds above prevents the icechunk hang; they bound its cost
 and capture its stack. Preventing it means keeping catch-up depth below 4, i.e. spacing publications
 apart, which needs the fleet-wide lock TE #151 removed. `../storage/writing-to-the-global-store.md`
-§3 and §5 have deferred that twice; this incident is its justification, and it belongs in its own
-reviewed change.
+§3 and §5 had deferred that twice; this incident is its justification. `storage/publication_spacing.py`
+now holds a limit-ONE fleet-wide slot around every publication and then for three catch-up intervals,
+so two publications can never land inside one interval — see the §3 and §5 addenda there.

@@ -504,14 +504,23 @@ neighbour would show up: none did.
 mid-run SSO expiry killed four coordinators outright, writing no result at all. Neither was in the
 subject.
 
-#### What is still open: spacing publications apart
+#### Spacing publications apart — open until 2026-09-08, now built
 
 Shortening the interval buys odds. **The guarantee needs a minimum spacing between publications set
 strictly above the tick interval**, so at most one publication can land between consecutive ticks —
 a 30 s interval with publications at least 31 s apart, and the arithmetic holds provided a tick's own
 work stays inside the one-second margin.
 
-**It is not built, and the reason is a prior decision rather than a technical one.** A minimum spacing
+**Built 2026-09-08, after the 09-04 wedges (`../assembly/assembly-wedges-during-fork-phase-2026-09-04.md`)
+made the case: `storage/publication_spacing.py`, a limit-ONE Prefect global concurrency limit
+(`tessera-global-publications`) held around a cell's two commits and then for
+`PUBLICATION_SPACING_S = 3 × CATCH_UP_INTERVAL_S` (15 s), so consecutive publications are at least three
+tick intervals apart fleet-wide — a ten-second margin for the tick's own rebase against the one-second
+margin the paragraph below worried about. It is a spacing MUTEX, not the committer cap §5 removed;
+§5's addendum says why that distinction holds. The text below is kept as the record of why it was
+deferred.**
+
+**It was not built at first, and the reason was a prior decision rather than a technical one.** A minimum spacing
 needs a fleet-wide lock, and this repo removed exactly that (§5): `_PrefectCommitGate` is deleted,
 `commit_limit_name` is gone from `run_global_campaign`, and a test asserts no knob remains to
 reintroduce one. That removal was argued on cost — the gate bound queueing on a 0.5–2.2 s commit and
@@ -944,6 +953,30 @@ commit, not a lost or torn one.
 
 ---
 
+
+### 2026-09-08 addendum: a spacing mutex is not the cap this section removed
+
+`tessera-global-publications` (`storage/publication_spacing.py`) is a Prefect global concurrency
+limit of ONE, held around a cell's two commits and then for three catch-up intervals. It is
+reintroduced with this section's arguments read against it, and they do not carry over:
+
+- **What the old gate bounded was a slowdown of seconds; what this removes is the precondition of a
+  hang that cost days.** §3 records that `rebase` hung every time a session was four snapshots
+  behind and never at two; two publications inside one catch-up interval is exactly "four behind".
+  Spacing makes that unreachable, which the periodic catch-up alone could only make unlikely.
+- **Its cost is bounded and small.** A publication holds the slot for a second or two of committing
+  plus the rest of a fifteen-second interval; even ten coordinators finishing together delay the
+  last by minutes against assemblies of hours, and terminal marks — the dominant commit — cost
+  fifteen seconds each on the feeder thread.
+- **It is not sized to the fleet.** The old cap was `min(clusters, 8)`; this is 1 under any cluster
+  count and either strategy, because it is mutual exclusion plus a hold, not capacity.
+- **Its occupancy means nothing about progress.** The old gate's `active_slots` was twice misread
+  as a progress signal. This one reads 0 or 1; the module docstring says so where a reader will
+  meet it.
+
+The decision above — no committer cap — stands; `tessera-global-commits` is still gone and a
+structural test still asserts the driver takes no `commit_limit_name`. What the driver now takes is
+`publication_limit_name`, and the same test pins that the two are different knobs.
 ## 6. The registry published beside the store
 
 The registry is a Parquet dataset beside the embeddings store, **one row per 2048-pixel tile per

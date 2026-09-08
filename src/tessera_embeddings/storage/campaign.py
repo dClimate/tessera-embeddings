@@ -28,6 +28,7 @@ from typing import cast
 import icechunk
 import zarr
 
+from tessera_embeddings.storage.publication_spacing import publication
 from tessera_embeddings.storage.shard_writer import commit_year_attrs
 from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS, time_index_of, year_timestamp
 from tessera_embeddings.storage.zone_grid import ZONES
@@ -179,7 +180,10 @@ def mark_zone_year_empty(
         )
     # Delegated so there is exactly ONE writer of years_complete/runs, with one retry-on-conflict
     # policy — what makes a no-land mark safe to run concurrently with another year of the zone.
-    return commit_year_attrs(repo, zone, year, run_id=run_id, empty=True, skip_if_marked=True)
+    # A terminal mark is a publication too — one snapshot, and 72 of the first 78 completions —
+    # so it takes the fleet's spacing slot like a filled cell does (`publication_spacing`).
+    with publication():
+        return commit_year_attrs(repo, zone, year, run_id=run_id, empty=True, skip_if_marked=True)
 
 
 @dataclass(frozen=True)

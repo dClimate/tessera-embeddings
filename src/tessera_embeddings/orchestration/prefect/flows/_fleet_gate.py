@@ -1,7 +1,8 @@
 """Fleet-wide concurrency gates that HOLD when their limit is lowered below what they need.
 
 The campaign is throttled by two named Prefect global concurrency limits — one bounding how many
-zone ingests run at once, one bounding simultaneous commits. Both are acquired through
+zone ingests run at once, and one of limit ONE that SPACES publications apart
+(:func:`publication_gate`; see ``storage/publication_spacing.py``). Both are acquired through
 :class:`FleetGate`.
 
 **Why this exists rather than a bare ``concurrency()`` call.** Prefect's server refuses a request
@@ -175,6 +176,33 @@ class FleetGate(AbstractContextManager):
     ) -> None:
         cm = self._local.stack.pop()
         cm.__exit__(exc_type, exc, tb)
+
+
+#: How long the publication slot's lease runs before the server reclaims it from a holder that
+#: died. A publication holds the slot for a second or two of committing plus the spacing
+#: interval (fifteen seconds today), with a bounded retry loop on the mark commit — so a lease of
+#: two minutes is far more than any live holder needs and short enough that a crashed one cannot
+#: stall the fleet's publishing for long.
+_PUBLICATION_LEASE_S = 120.0
+
+
+def publication_gate(name: str, *, log: logging.Logger | logging.LoggerAdapter | None = None) -> FleetGate:
+    """The fleet-wide publication slot, ready to be installed as the storage layer's gate factory.
+
+    A :class:`FleetGate` on a limit of ONE — a mutex, not a cap — so the campaign's publications
+    are serialised and, held for the spacing interval by ``publication_spacing.publication``,
+    kept apart. ``should_stop`` is deliberately absent: a holder is committing, and an abandoned
+    wait here would mean a cell that neither published nor failed.
+    """
+    return FleetGate(
+        name,
+        occupy=1,
+        log=log,
+        lease_duration=_PUBLICATION_LEASE_S,
+        # A renewal blip must not fail a commit already in flight; the lease is a crash backstop,
+        # not the correctness mechanism (that is the slot itself).
+        raise_on_lease_renewal_failure=False,
+    )
 
 
 #: How long a pause reading is trusted before the server is asked again. What is watched is a human

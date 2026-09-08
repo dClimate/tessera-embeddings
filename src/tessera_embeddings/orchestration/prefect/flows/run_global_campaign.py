@@ -164,8 +164,8 @@ def _still_running(live: dict[asyncio.Task[Any], int | None]) -> bool:
 def _upsert_limit(name: str, limit: int, *, what: str, log: logging.Logger | LoggerAdapter) -> None:
     """Set a Prefect global concurrency limit to ``limit``.
 
-    Both fleet-wide caps this campaign relies on — simultaneous ingests and simultaneous
-    committers — are enforced by gates in CHILD flow runs on other machines, which nothing
+    The fleet-wide limits this campaign relies on — simultaneous ingests, the inference pause
+    flag, and the publication-spacing slot — are enforced by gates in CHILD flow runs on other machines, which nothing
     in-process can see across, so the number lives on the Prefect server. Writing it from
     the flow parameter makes that parameter the single source of truth, instead of a
     server-side number an operator keeps in step by hand.
@@ -529,6 +529,7 @@ async def run_global_campaign(
     overlap_years: bool = True,
     ingest_limit_name: str = "tessera-global-ingests",
     inference_pause_gate: str = "tessera-global-inference",
+    publication_limit_name: str = "tessera-global-publications",
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     allow_partial_window: bool = False,
@@ -790,6 +791,16 @@ async def run_global_campaign(
             to the cells already in flight. **Neither stops the bill** — a cluster holds its
             GPU fleet for its whole multi-cell walk, so a paused fleet idles at full width.
             Only cancelling ends the spend.
+        publication_limit_name: Prefect global concurrency limit of ONE that SPACES the fleet's
+            publications apart. Upserted to 1 at start and forwarded to every fill, whose
+            storage layer holds the slot around a cell's commits and then for
+            ``PUBLICATION_SPACING_S`` (three catch-up intervals), so no coordinator's catch-up
+            ever has to cross two publications — the depth at which icechunk's rebase has hung
+            every time it was reached (2026-08-29, 08-31, 09-04). **A spacing mutex, not a
+            committer cap**: the committer cap #151 removed bounded a slowdown of seconds; this
+            removes the precondition of a hang that cost days. Its occupancy is 0 or 1 and says
+            nothing about progress. Not a pause lever — zero would hold every publication.
+            ``storage/publication_spacing.py`` and ``writing-to-the-global-store.md`` §3/§5.
         cleanup_mosaics: Delete ``mosaics/{zone}/{year}`` (all versions) after the fill lands
             (default; the mosaic is a transient input). Keep for dev. Nothing throttles
             ingest against fill throughput, so at these defaults a year's mosaics can
@@ -1015,6 +1026,10 @@ async def run_global_campaign(
     if work:
         if ingest and fill_strategy == "chained-clusters":
             _upsert_limit(ingest_limit_name, max_parallel_ingest, what="ingest", log=log)
+        if publication_limit_name:
+            # ONE, always, under either strategy: this is a mutex that spaces publications,
+            # not a cap sized to the fleet. Both fill flows publish, so both are forwarded it.
+            _upsert_limit(publication_limit_name, 1, what="publication spacing", log=log)
         if inference_pause_gate and fill_strategy == "chained-clusters":
             # Upserted to ONE, and one is not a cap: the gate is read as a flag rather than
             # acquired, so any positive value means "run" and nothing consumes a slot.
@@ -1199,6 +1214,8 @@ async def run_global_campaign(
             # forwarding the override it rejects the same store after its ingest has been
             # paid for. The campaign-level flag has to reach the gate that fires.
             "allow_model_mismatch": allow_model_mismatch,
+            # The fleet's publication-spacing slot: per-cell fills publish concurrently too.
+            "publication_limit_name": publication_limit_name,
             # Divide the fleet S3-PUT budget across concurrent fills so K shard-write phases
             # don't burst K times the target PUTs (the ~800-req SlowDown). D6 gates
             # committers; this bounds the ungated upload phase.
@@ -1511,6 +1528,10 @@ async def run_global_campaign(
                         # And the shared pause. Same reason it is one name for every
                         # cluster: an operator pauses the CAMPAIGN, not a cluster.
                         "inference_pause_gate": inference_pause_gate,
+                        # And the shared publication spacing — one slot for the whole fleet,
+                        # which is the only way "no two publications inside one catch-up
+                        # interval" can be true across separate machines.
+                        "publication_limit_name": publication_limit_name,
                         # As in _fill_params: omitted when unset, so the child's own registered
                         # validator stands. The child dispatches each cell's validation off
                         # its trailing assembly thread as that cell is tagged.

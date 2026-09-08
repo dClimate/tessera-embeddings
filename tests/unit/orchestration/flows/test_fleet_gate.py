@@ -446,3 +446,31 @@ def test_the_gate_is_reentrant_within_a_thread(monkeypatch):
         pass
     # LIFO pairing: the inner exit releases the inner context, not the outer.
     assert entered == ["enter:outer", "enter:inner", "exit:inner", "exit:outer"]
+
+
+def test_the_publication_gate_is_a_mutex_with_a_crash_backstop_lease(monkeypatch):
+    """occupy=1 on a limit of 1 is the mutex; the lease is what frees the fleet if a holder dies
+    mid-publication, and a renewal blip must not fail a commit already in flight.
+    """
+    seen: list[dict] = []
+
+    class _CM:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_concurrency(name, occupy=1, strict=True, **kw):
+        seen.append({"name": name, "occupy": occupy, "strict": strict, **kw})
+        return _CM()
+
+    monkeypatch.setattr(mod, "concurrency", fake_concurrency)
+    with mod.publication_gate("tessera-global-publications"):
+        pass
+    [call] = seen
+    assert call["name"] == "tessera-global-publications" and call["occupy"] == 1 and call["strict"] is True
+    assert call["lease_duration"] == mod._PUBLICATION_LEASE_S and call["raise_on_lease_renewal_failure"] is False
+    assert 30.0 <= mod._PUBLICATION_LEASE_S <= 600.0, (
+        "long enough for a spaced publication, short enough to unblock a fleet"
+    )

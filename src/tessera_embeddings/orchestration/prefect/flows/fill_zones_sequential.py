@@ -70,7 +70,7 @@ from tessera_embeddings.orchestration.prefect.flows._child_runs import (
     child_run_tag,
     make_child_cancel_hook,
 )
-from tessera_embeddings.orchestration.prefect.flows._fleet_gate import FleetGate, pause_signal
+from tessera_embeddings.orchestration.prefect.flows._fleet_gate import FleetGate, pause_signal, publication_gate
 from tessera_embeddings.orchestration.prefect.flows._overrides import set_overrides
 from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     activate,
@@ -105,6 +105,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_on_axis,
 )
 from tessera_embeddings.storage.object_store import delete_prefix
+from tessera_embeddings.storage.publication_spacing import install_publication_gate
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 if TYPE_CHECKING:
@@ -602,6 +603,22 @@ def _end_process_after_wedged_drain(
     )
 
 
+def _publication_gate_factory(
+    limit_name: str | None, log: logging.Logger | logging.LoggerAdapter[logging.Logger]
+) -> Callable[[], FleetGate] | None:
+    """The factory `publication_spacing` installs: one shared FleetGate, handed out per publication.
+
+    One gate object rather than one per call because :class:`FleetGate` keeps a per-thread
+    context stack and is safe to share, and because the publications this spaces come from two
+    threads of one process. ``None`` when no limit is named — a direct invocation outside a
+    campaign — so publications go unspaced, which is only safe because nothing else then writes.
+    """
+    if not limit_name:
+        return None
+    gate = publication_gate(limit_name, log=log)
+    return lambda: gate
+
+
 def _ingest_child_tag(flow_run_id: object) -> str | None:
     """Deterministic tag for this run's child ingest deployments."""
     return child_run_tag(_INGEST_TAG_PREFIX, flow_run_id)
@@ -660,6 +677,7 @@ def fill_zones_sequential_flow(
     attempts_per_cell_in_cluster: int = 2,
     inference_pause_gate: str | None = None,
     ingest_limit_name: str | None = None,
+    publication_limit_name: str | None = None,
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     fault_injection: FaultInjection | None = None,
@@ -769,6 +787,12 @@ def fill_zones_sequential_flow(
             many as fit under the fleet-wide cap and the rest queue. ``None`` disables the gate
             — every submitted zone starts immediately, which suits a direct single-cluster run
             and not a campaign.
+        publication_limit_name: Prefect global concurrency limit of ONE that spaces the fleet's
+            publications apart. Installed process-wide for this run (both publishing threads —
+            the trailing assembly and the feeder's terminal marks — take it), held around a
+            cell's commits and then for ``PUBLICATION_SPACING_S``, so no coordinator's catch-up
+            ever has to cross two publications. ``None`` publishes unspaced, which is only safe
+            when nothing else is writing the store. See ``storage/publication_spacing.py``.
         attempts_per_cell_in_cluster: Attempts per cell within THIS cluster, including the
             first; 2 means one retry on the still-provisioned fleet. Distinct from the campaign
             driver's `max_dispatch_rounds`, which counts whole-dispatch rounds — see
@@ -1332,6 +1356,10 @@ def fill_zones_sequential_flow(
     # above the `try` let any failure in between — a raising `start`, an unexpected error in the
     # wait — return without cancelling them, leaving children writing mosaic prefixes that a
     # prompt retry of this flow would then race.
+    # The fleet's publication-spacing slot, installed process-wide so BOTH publishing threads —
+    # the trailing assembly and the feeder's terminal marks — take it without the Prefect-free
+    # runner being handed a gate. Reversed in the `finally`, before the process may end.
+    previous_gate = install_publication_gate(_publication_gate_factory(publication_limit_name, log))
     wedged: TrailingAssemblyWedgedError | None = None
     try:
         if inputs is not None:
@@ -1431,6 +1459,7 @@ def fill_zones_sequential_flow(
         # cancellation) — clear the hook state even when the runner raises (its partial-failure
         # RuntimeError is a NORMAL exit path).
         deactivate()
+        install_publication_gate(previous_gate)
         if wedged is not None:
             # LAST, after the fleet is down and the ingests are cancelled: this does not return.
             _end_process_after_wedged_drain(wedged, log)

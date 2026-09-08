@@ -58,6 +58,7 @@ from tessera_embeddings.config.environment import code_identity, configure_loggi
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage.icechunk_logging import traced_commit
+from tessera_embeddings.storage.publication_spacing import publication
 from tessera_embeddings.storage.session_catch_up import (
     CATCH_UP_INTERVAL_S,
     CatchUpAbortedTheWaitError,
@@ -1233,24 +1234,29 @@ def write_year_shards(
     # nothing able to unwind it; a wedged child is killed and the step retried once, and the
     # forks — the hours of shard writes — never leave this process. The between-commits drill
     # hook runs in the parent, between the child's two phases.
-    snapshot, timings = publish_forks_in_child(
-        repo,
-        group,
-        [fork_result for fork_result, _ in forks],
-        base=base_before_forking,
-        fill_message=commit_msg or f"fill {group} year {year_label}",
-        attrs={
-            "year_label": year_label,
-            "run_id": run_id,
-            "radar_coverage": radar_coverage,
-            "optical_skips": optical_skips,
-            "input_coverage": input_coverage,
-            "empty": empty,
-        },
-        fault=fault,
-        year_label=year_label,
-        log=log,
-    )
+    # ONE publication, both commits: the fleet's spacing slot is held from the shard commit
+    # through the completion mark — both happen in the child below — and then for a full
+    # spacing interval, so the next writer's publication cannot land inside one catch-up
+    # interval of this one. See `publication_spacing`. A no-op when no gate is installed.
+    with publication(log=log):
+        snapshot, timings = publish_forks_in_child(
+            repo,
+            group,
+            [fork_result for fork_result, _ in forks],
+            base=base_before_forking,
+            fill_message=commit_msg or f"fill {group} year {year_label}",
+            attrs={
+                "year_label": year_label,
+                "run_id": run_id,
+                "radar_coverage": radar_coverage,
+                "optical_skips": optical_skips,
+                "input_coverage": input_coverage,
+                "empty": empty,
+            },
+            fault=fault,
+            year_label=year_label,
+            log=log,
+        )
     if telemetry is not None:
         telemetry.update(
             workers=fill["workers"],

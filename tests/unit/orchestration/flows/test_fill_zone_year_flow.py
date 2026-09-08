@@ -8,6 +8,7 @@ mosaic fails BEFORE a cluster is provisioned.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import logging
 import pathlib
 from contextlib import contextmanager
@@ -386,3 +387,20 @@ def test_a_complete_cell_does_not_pay_for_the_schema_check(wired):
 
     mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami")
     assert calls == []
+
+
+class TestThePublicationSpacingGateOnThePerCellFill:
+    """Per-cell fills publish concurrently with each other, so this flow installs the fleet's
+    spacing gate too, and reverses it in its `finally`.
+    """
+
+    def test_the_flow_installs_the_gate_before_the_fill_and_reverses_it_in_finally(self):
+        src = inspect.getsource(mod.fill_zone_year_flow)
+        assert "publication_gate(publication_limit_name" in src
+        install_at = src.index("previous_gate = install_publication_gate(")
+        assert install_at < src.index("with ray_cluster("), "the gate must be in place before any cell can publish"
+        tail = src[src.index("finally:") :]
+        assert tail.index("deactivate()") < tail.index("install_publication_gate(previous_gate)")
+
+    def test_the_parameter_is_optional_and_defaults_to_unspaced(self):
+        assert inspect.signature(mod.fill_zone_year_flow.fn).parameters["publication_limit_name"].default is None

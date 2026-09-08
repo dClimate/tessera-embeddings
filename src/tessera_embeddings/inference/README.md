@@ -754,6 +754,16 @@ no external tool can produce on Fargate. What it cannot do is unwind a coordinat
 inside icechunk itself; that case still fires the dump, and preventing it is the job of
 publication spacing.
 
+**Publications are spaced, fleet-wide.** Every campaign publication — a filled cell's two commits,
+or a terminal mark's one — takes `tessera-global-publications`, a Prefect global concurrency limit
+of ONE, and holds it for `PUBLICATION_SPACING_S` (three catch-up intervals, fifteen seconds), so no
+coordinator's catch-up ever has to cross two publications: the depth at which icechunk's rebase has
+hung every time it was reached. The runner stays Prefect-free — the flow installs the gate through
+`storage.publication_spacing.install_publication_gate` and the storage layer wraps its commits in
+`publication()`, a no-op when nothing is installed. It is a spacing mutex, not a committer cap
+(`context_docs/storage/writing-to-the-global-store.md` §5 addendum); its occupancy says nothing
+about progress.
+
 The **campaign land mask** is not a pixel ROI but a per-zone *coverage bitmap*
 (`tile_live_2048`) built from the partner's delivery registry by
 `ingest/land_mask.py` and the `build-land-mask-coverage` flow (ADR-010). v1.1 tiles are

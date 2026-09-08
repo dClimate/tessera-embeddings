@@ -201,12 +201,15 @@ class TestCampaignDefaults:
         pausing reachable without an operator creating anything first.
 
         There were three. The commit gate is gone — nothing bounds committers any more, and
-        `test_no_committer_gate_is_published` pins that it stays gone.
+        `test_no_committer_gate_is_published` pins that it stays gone. The publication SPACING
+        slot (2026-09-08) is a fourth, and a different thing: always 1, it keeps publications
+        apart in time rather than bounding how many commit at once.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
         assert dict(wired["limits"]) == {
             "tessera-global-ingests": 60,
             "tessera-global-inference": 1,
+            "tessera-global-publications": 1,
         }
         assert wired["arun"][0][1]["ingest_limit_name"] == "tessera-global-ingests"
         assert wired["arun"][0][1]["inference_pause_gate"] == "tessera-global-inference"
@@ -284,7 +287,7 @@ class TestCampaignDefaults:
         available.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False))
-        assert dict(wired["limits"]) == {"tessera-global-inference": 1}
+        assert dict(wired["limits"]) == {"tessera-global-inference": 1, "tessera-global-publications": 1}
 
     @pytest.mark.parametrize("clusters", [1, 4, 8, 16, 40])
     def test_no_committer_gate_is_published_at_any_cluster_count(self, wired, clusters):
@@ -300,16 +303,37 @@ class TestCampaignDefaults:
         purpose, so a reader sees the removal is unconditional rather than tuned.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=clusters))
-        assert "tessera-global-commits" not in dict(wired["limits"])
+        limits = dict(wired["limits"])
+        assert "tessera-global-commits" not in limits
+        # The publication SPACING slot is a different thing from the removed cap, and the proof
+        # is right here: it is 1 at every cluster count. A cap would scale with `clusters`.
+        assert limits["tessera-global-publications"] == 1
 
-    def test_the_flow_takes_no_commit_limit_parameter(self):
-        """Structural: there is no knob left to re-enable a fleet-wide committer bound, so a
-        dispatch cannot reintroduce one without a code change.
+    def test_the_flow_takes_no_commit_limit_parameter_but_does_take_a_spacing_one(self):
+        """Structural: there is no knob to re-enable a fleet-wide committer BOUND, so a dispatch
+        cannot reintroduce one without a code change. There IS a knob for publication SPACING
+        (2026-09-08), and the two are different things: a bound is sized to the fleet and limits
+        how many commit at once; the spacing slot is always 1 and keeps publications apart in
+        TIME so a catch-up never crosses two. See `storage/publication_spacing.py`.
         """
-        import inspect
-
         flow = getattr(mod.run_global_campaign, "fn", mod.run_global_campaign)
-        assert "commit_limit_name" not in inspect.signature(flow).parameters
+        params = inspect.signature(flow).parameters
+        assert "commit_limit_name" not in params
+        assert params["publication_limit_name"].default == "tessera-global-publications"
+
+    def test_the_spacing_slot_is_published_under_either_strategy(self, wired):
+        """Per-cell fills publish concurrently too, so the slot is not a chained-clusters extra."""
+        _per_cell()
+        assert dict(wired["limits"]).get("tessera-global-publications") == 1
+
+    def test_both_fill_children_are_told_the_spacing_slot(self, wired):
+        # Chained clusters...
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        # ...and per-cell fills: every fill dispatch names the ONE fleet-wide slot.
+        _per_cell()
+        fills = [p for _, p in wired["arun"] if "cells" in p or ("zone" in p and "year" in p)]
+        assert fills, "no fill was dispatched"
+        assert {p.get("publication_limit_name") for p in fills} == {"tessera-global-publications"}
 
     def test_nothing_bounds_mosaics_in_flight(self, wired, monkeypatch):
         """A whole year's mosaics may coexist: no backpressure from fill onto ingest.

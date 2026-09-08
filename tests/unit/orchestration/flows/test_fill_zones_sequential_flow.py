@@ -10,6 +10,7 @@ provisioned once with the idle-timeout override.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import time
@@ -1372,3 +1373,38 @@ class TestWedgedDrainEndsTheProcess:
             assert step in tail, f"teardown step {step!r} missing from the flow's finally"
         exit_at = tail.index("_end_process_after_wedged_drain(")
         assert exit_at > tail.index("deactivate()"), "the process exit must come AFTER deactivate()"
+
+
+class TestThePublicationSpacingGateIsInstalledForTheRun:
+    """The runner is Prefect-free, so the flow installs the fleet's spacing gate process-wide for
+    the run and reverses it afterwards — BOTH publishing threads then take it.
+    """
+
+    def test_installed_when_a_limit_is_named_and_reversed_after(self, wired, monkeypatch):
+        calls: list = []
+        monkeypatch.setattr(mod, "publication_gate", lambda name, log=None: f"gate:{name}")
+        monkeypatch.setattr(mod, "install_publication_gate", lambda f: (calls.append(f), "previous")[1])
+        _run(publication_limit_name="tessera-global-publications")
+        assert len(calls) == 2, f"install must be called once to set and once to reverse: {calls}"
+        factory, restored = calls
+        assert callable(factory) and factory() == "gate:tessera-global-publications"
+        assert restored == "previous", "the previous gate must be put back, not None"
+
+    def test_nothing_installed_without_a_limit(self, wired, monkeypatch):
+        calls: list = []
+        monkeypatch.setattr(mod, "install_publication_gate", lambda f: (calls.append(f), None)[1])
+        _run()
+        assert calls == [None, None], "no limit means publications go unspaced, explicitly"
+
+    def test_the_gate_is_reversed_before_the_process_may_end(self):
+        """Structural: the uninstall sits in the flow's `finally`, after `deactivate()` and BEFORE
+        the wedged-drain exit — a process that ends with the gate installed is fine, one that
+        returns to a caller with it installed is not.
+        """
+        src = inspect.getsource(mod.fill_zones_sequential_flow)
+        tail = src[src.index("finally:") :]
+        assert (
+            tail.index("deactivate()")
+            < tail.index("install_publication_gate(previous_gate)")
+            < tail.index("_end_process_after_wedged_drain(")
+        )

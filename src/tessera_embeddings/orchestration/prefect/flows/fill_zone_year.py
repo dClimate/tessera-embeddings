@@ -35,6 +35,7 @@ from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
     dispatch_cell_validation,
     validation_run_tag,
 )
+from tessera_embeddings.orchestration.prefect.flows._fleet_gate import publication_gate
 from tessera_embeddings.orchestration.prefect.flows._overrides import set_overrides
 from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     activate,
@@ -50,6 +51,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_on_axis,
 )
 from tessera_embeddings.storage.conventions import expected_model_url
+from tessera_embeddings.storage.publication_spacing import install_publication_gate
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
@@ -164,6 +166,7 @@ def fill_zone_year_flow(
     run_id: str | None = None,
     fault_injection: FaultInjection | None = None,
     validation_deployment: str | None = None,
+    publication_limit_name: str | None = None,
 ) -> dict[str, Any]:
     """Fill one ``(zone, year)`` cell of the global store on a Ray cluster.
 
@@ -258,6 +261,11 @@ def fill_zone_year_flow(
             landed cell — dispatched once this fill's cell is tagged, and NOT waited on
             (:mod:`._cell_validation`). ``None`` (the default) validates nothing: the validator
             is a consumer's flow, so the library names none.
+        publication_limit_name: Prefect global concurrency limit of ONE that spaces the fleet's
+            publications apart; the campaign forwards it so a cluster-per-zone fill's commit
+            cannot land inside one catch-up interval of another fill's. Held around this cell's
+            commits and then for ``PUBLICATION_SPACING_S``. ``None`` (a direct invocation)
+            publishes unspaced. See ``storage/publication_spacing.py``.
 
     Returns:
         The zone-fill summary dict (zone, year, run_id, snapshot_id, tag, tile/inference counts,
@@ -502,6 +510,10 @@ def fill_zone_year_flow(
     # to a Ray worker. Region matches ray_cluster's default (this flow provisions there).
     fill_kwargs["on_actor_retire"] = make_instance_terminator(log=log)
 
+    # The fleet's publication-spacing slot (see `publication_spacing`): installed for this run,
+    # reversed in the `finally`. One gate object, shared, because FleetGate is thread-safe.
+    spacing_gate = publication_gate(publication_limit_name, log=log) if publication_limit_name else None
+    previous_gate = install_publication_gate((lambda: spacing_gate) if spacing_gate is not None else None)
     try:
         # Pin a deterministic cluster name from the flow-run id so the cancellation hook can
         # re-derive it and terminate the fleet by tag even in a fresh module import (globals
@@ -529,6 +541,7 @@ def fill_zone_year_flow(
         # Clear the hook state only AFTER the context manager's teardown has run (or failed into
         # the hook's remit), and on the exception path too.
         deactivate()
+        install_publication_gate(previous_gate)
 
     log.info("Zone %s year %d filled: %s", zone, year, summary.get("tag"))
     return _validate(summary)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import multiprocessing
@@ -22,8 +23,10 @@ from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, DRILL
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.inference import assembly
 from tessera_embeddings.storage import (
+    campaign,
     global_store,
     icechunk_logging,
+    publication_spacing,
     session_catch_up,
     shard_writer,
     zarr_store,
