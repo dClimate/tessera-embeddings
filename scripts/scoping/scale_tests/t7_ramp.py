@@ -28,8 +28,10 @@ CONCURRENCY_RAMP_BENCH = (50, 100, 200, 400)
 OBJECTS_PER_LEVEL = 400
 
 
-def _put_many(bucket: str, prefix: str, concurrency: int, n_objects: int) -> tuple[int, float]:
-    """PUT ``n_objects`` at the given concurrency; return (503 count, wall_s)."""
+def _put_many(
+    bucket: str, prefix: str, concurrency: int, n_objects: int, object_bytes: int = OBJECT_BYTES
+) -> tuple[int, float]:
+    """PUT ``n_objects`` of ``object_bytes`` at the given concurrency; return (503 count, wall_s)."""
     import boto3
     from botocore.config import Config
     from botocore.exceptions import ClientError
@@ -47,7 +49,7 @@ def _put_many(bucket: str, prefix: str, concurrency: int, n_objects: int) -> tup
             retries={"total_max_attempts": 1, "mode": "standard"},
         ),
     )
-    body = b"\0" * OBJECT_BYTES
+    body = b"\0" * object_bytes
     slowdowns = 0
 
     def put(i: int) -> int:
@@ -69,33 +71,72 @@ def _put_many(bucket: str, prefix: str, concurrency: int, n_objects: int) -> tup
     return slowdowns, time.monotonic() - t0
 
 
-def phase_ramp(cfg: harness.RunConfig) -> None:
-    """Ramp PUT concurrency, recording 503 rate and throughput per level."""
-    ramp = CONCURRENCY_RAMP_TINY if cfg.is_tiny else CONCURRENCY_RAMP_BENCH
-    n = OBJECTS_PER_LEVEL
+def phase_ramp(
+    cfg: harness.RunConfig,
+    ramp: tuple[int, ...] | None = None,
+    object_bytes: int | None = None,
+    objects_per_level: int | None = None,
+) -> None:
+    """Ramp PUT concurrency, recording 503 rate and throughput per level.
+
+    ``object_bytes`` exists because the throttle and the pipe are different limits. S3 answers
+    ``SlowDown`` to REQUESTS per second per prefix (about 3,500 PUT/s), so locating the onset needs
+    request rate, not bytes. At the default 8 MB a run from anything without fleet-grade uplink
+    saturates its own bandwidth long before the prefix throttles and then reports a clean ramp it
+    never actually drove — a false negative. Small objects isolate the request rate; keep 8 MB when
+    the question is byte throughput on a box that can push it.
+    """
+    ramp = ramp or (CONCURRENCY_RAMP_TINY if cfg.is_tiny else CONCURRENCY_RAMP_BENCH)
+    n = objects_per_level or OBJECTS_PER_LEVEL
+    size = object_bytes or OBJECT_BYTES
     for concurrency in ramp:
         # Under the configured store root (which is run_id-scoped), so
         # teardown.py's recursive delete actually removes the ramp objects.
         uri = harness.store_uri(cfg, f"t7_ramp/c{concurrency}")
         bucket, _, prefix = uri.removeprefix("s3://").partition("/")
-        slowdowns, wall = _put_many(bucket, prefix, concurrency, n)
+        slowdowns, wall = _put_many(bucket, prefix, concurrency, n, size)
         puts_per_s = n / wall if wall > 0 else 0.0
         harness.emit_metric(cfg, TEST, "ramp", "slowdown_503_count", slowdowns, "count", concurrency=concurrency, n=n)
-        harness.emit_metric(cfg, TEST, "ramp", "puts_per_s", puts_per_s, "count/s", concurrency=concurrency)
-        logger.info("concurrency=%d: %d/%d SlowDown, %.0f PUT/s", concurrency, slowdowns, n, puts_per_s)
+        harness.emit_metric(
+            cfg, TEST, "ramp", "puts_per_s", puts_per_s, "count/s", concurrency=concurrency, object_bytes=size
+        )
+        logger.info(
+            "concurrency=%d objsize=%dB: %d/%d SlowDown, %.0f PUT/s",
+            concurrency,
+            size,
+            slowdowns,
+            n,
+            puts_per_s,
+        )
 
 
 def main() -> int:
     """Parse args; run the ramp only on S3, else cleanly skip."""
     parser = argparse.ArgumentParser(description=__doc__)
     harness.add_common_args(parser)
-    cfg = harness.config_from_args(parser.parse_args())
+    parser.add_argument(
+        "--ramp",
+        default=None,
+        help="Comma-separated PUT concurrency levels, e.g. 400,800,1600,3200. Default: the built-in ramp.",
+    )
+    parser.add_argument(
+        "--object-bytes",
+        type=int,
+        default=None,
+        help="Bytes per PUT. Small (e.g. 65536) isolates REQUEST rate, which is what SlowDown answers to.",
+    )
+    parser.add_argument(
+        "--objects-per-level", type=int, default=None, help=f"PUTs per level (default {OBJECTS_PER_LEVEL})."
+    )
+    args = parser.parse_args()
+    ramp = tuple(int(x) for x in args.ramp.split(",")) if args.ramp else None
+    cfg = harness.config_from_args(args)
     harness.configure_logging()
 
     if not cfg.is_s3:
         logger.info("T7 is S3-only; nothing to do on --backend local. Skipping.")
         return 0
-    harness.run_phase(cfg, TEST, "ramp", lambda: phase_ramp(cfg))
+    harness.run_phase(cfg, TEST, "ramp", lambda: phase_ramp(cfg, ramp, args.object_bytes, args.objects_per_level))
     logger.info("T7 complete.")
     return 0
 
