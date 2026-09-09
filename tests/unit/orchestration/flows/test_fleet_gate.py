@@ -446,3 +446,20 @@ def test_the_gate_is_reentrant_within_a_thread(monkeypatch):
         pass
     # LIFO pairing: the inner exit releases the inner context, not the outer.
     assert entered == ["enter:outer", "enter:inner", "exit:inner", "exit:outer"]
+
+
+def test_a_failed_release_does_not_fail_the_work(monkeypatch, caplog) -> None:
+    """A release failure has nothing to say about work that is already finished. The clean-release
+    path is pinned by the hold and reentrancy tests above.
+    """
+
+    class _FailsToRelease(_Opens):
+        def __exit__(self, *exc):
+            raise _server_said(503, "Service Unavailable")
+
+    monkeypatch.setattr(mod, "concurrency", _FailsToRelease(RuntimeError(), fail_times=0))
+    completed = False
+    with caplog.at_level(logging.WARNING), FleetGate("tessera-global-ingests", log=logging.getLogger("t")):
+        completed = True
+    assert completed
+    assert any("could not be released" in r.getMessage() for r in caplog.records)

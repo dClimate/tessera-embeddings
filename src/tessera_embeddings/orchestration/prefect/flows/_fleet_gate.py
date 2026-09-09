@@ -173,8 +173,22 @@ class FleetGate(AbstractContextManager):
     def __exit__(
         self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
     ) -> None:
+        """Release the slot; a failure to release never fails the work the slot guarded.
+
+        The work is already done, and the slot is LEASED so the server reclaims it. The ``pop``
+        stays outside the guard: an unbalanced stack is our own bug, not a server condition.
+        """
         cm = self._local.stack.pop()
-        cm.__exit__(exc_type, exc, tb)
+        try:
+            cm.__exit__(exc_type, exc, tb)
+        except Exception as release_exc:
+            if self._log is not None:
+                self._log.warning(
+                    "Gate %r could not be released (%s: %s); continuing — the work is done and the slot is leased.",
+                    self._name,
+                    type(release_exc).__name__,
+                    release_exc,
+                )
 
 
 #: How long a pause reading is trusted before the server is asked again. What is watched is a human
