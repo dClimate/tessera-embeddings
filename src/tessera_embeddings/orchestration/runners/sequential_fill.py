@@ -216,6 +216,7 @@ class _ZoneTally:
 
 #: The most wall-clock ONE trailing assembly may take before the assembly backlog drain stops
 #: waiting for it.
+#:
 #: The trailing thread assembles a cluster's cells one at a time, and once inference is complete
 #: the run's only remaining work is that queue — so a single assembly that never returns holds
 #: the whole run, and the flow, forever. That is exactly what happened on 2026-09-04: a fill
