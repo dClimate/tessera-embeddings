@@ -728,23 +728,14 @@ onward", not as a count of collisions — and note that the fill is then back to
 behaviour and exposed to the stall that
 `context_docs/storage/writing-to-the-global-store.md` describes.
 
-**The fork phase is watched, and bounded — and this is the assembly's ONE backstop.** While the
-forks write, a daemon thread in `shard_writer.run_forked` watches the shard counters the workers
-update in shared memory. If they stop moving for `FORK_STALL_TIMEOUT_S` (thirty minutes — roughly
-six times the longest gap a healthy dense write has ever shown), it dumps every thread's Python
-stack to the log with `faulthandler`, terminates the worker pool, and the fill fails as a normal
-assembly failure: the cell keeps its mosaic and staged tiles and is re-dispatched. Finished workers
-are terminated rather than joined, because their forks are already the coordinator's and a
-`shutdown(wait=True)` on a worker that will not exit is itself an unbounded park.
-
-Until 2026-09-04 nothing watched this phase: five fills stopped in the write's tail with no
-exception and no progress, and each froze its cluster's single trailing-assembly thread for days
-(`context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md`). That cause — an icechunk
-deadlock at a request cap of 1 — is now removed at the source, so the watchdog is not a fix for it;
-it is the net under whatever the next unknown cause turns out to be, and the only way to get a stack
-out of a Fargate task that denies `CAP_SYS_PTRACE`. The log line to alert on is `ASSEMBLY FORK PHASE
-STALLED`. What it cannot do is unwind a coordinator thread parked inside icechunk itself; that case
-still fires the dump.
+**The fork phase is watched — the assembly's ONE backstop.** A daemon thread in
+`shard_writer.run_forked` watches the shard counters the workers update in shared memory; if they
+stop for `FORK_STALL_TIMEOUT_S` (thirty minutes) it dumps every thread's stack with `faulthandler`,
+terminates the pool, and the fill fails normally with its cell re-dispatched. Alert on `ASSEMBLY
+FORK PHASE STALLED`. It cannot unwind a coordinator parked inside icechunk; the dump still fires.
+Not a fix for 2026-09-04 — that cause is removed at the source — but the net under the next unknown
+one, and the only way to get a stack where `CAP_SYS_PTRACE` is denied
+(`context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md`).
 
 The **campaign land mask** is not a pixel ROI but a per-zone *coverage bitmap*
 (`tile_live_2048`) built from the partner's delivery registry by
@@ -783,12 +774,10 @@ The commit row is the manifest-splitting story: an Icechunk manifest maps
 chunks → objects, one per array by default, so unsplit commits are O(store).
 See the README's "Manifest splitting" diagram for the visual.
 
-**S3 concurrency.** None is imposed: the repo opens at icechunk's default (256) and the
-forks inherit it through pickling. A per-fork cap used to be computed from a fleet PUT
-budget, and it floored at 1 on every campaign fill — the value at which icechunk deadlocks
-`commit` and `rebase`/`diff` under concurrent writers
-(`context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md`). Measured uncapped at
-32 workers per fill across the fleet: zero throttling.
+**S3 concurrency.** None is imposed: the repo opens at icechunk's default (256) and the forks
+inherit it through pickling. A per-fork cap used to be divided out of a fleet PUT budget and floored
+at 1 on every campaign fill — the value at which icechunk deadlocks
+(`context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md`).
 
 **Manifest splitting.** `assemble` opens the repo under `manifest_split({"time": 1})`. By
 default icechunk keeps one manifest object per array, so every commit rewrites the entire

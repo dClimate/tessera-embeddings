@@ -1454,10 +1454,8 @@ def test_a_nonpositive_cap_is_refused_before_anything_expensive():
 
 @pytest.fixture
 def _stack_dumps(monkeypatch):
-    """Record the stack dump, and FAIL if the runner ever tries to end the process itself.
-
-    Ending the process is the flow's decision, after its teardown; a runner that did it could
-    orphan a fleet mid-teardown — and would kill this test process.
+    """Record the stack dump, and fail if the runner tries to end the process itself — that is
+    the flow's decision, after its teardown.
     """
     dumps: list[int] = []
     monkeypatch.setattr(
@@ -1470,12 +1468,8 @@ def _stack_dumps(monkeypatch):
 
 
 class TestDrainTrailingAssemblies:
-    """`drain_trailing_assemblies` waits for completions with a PER-ASSEMBLY ceiling.
-
-    `finalizer.shutdown(wait=True)` was the drain until 2026-09-04 and it has no bound: a fill
-    that finished its inference announced it was draining 67 assemblies and then parked, for
-    good, behind one wedged cell. These tests drive the function directly with a real
-    single-thread pool, so a wedge is one blocking call and nothing else is faked.
+    """`drain_trailing_assemblies` waits for completions with a PER-ASSEMBLY ceiling, driven
+    directly against a real single-thread pool so a wedge is one blocking call.
     """
 
     def test_a_wedged_assembly_is_abandoned_and_the_queue_behind_it_cancelled(self, _stack_dumps):
@@ -1497,9 +1491,7 @@ class TestDrainTrailingAssemblies:
             pool.shutdown(wait=True)
 
     def test_the_ceiling_is_per_assembly_not_for_the_whole_backlog(self, _stack_dumps):
-        """A backlog longer than the ceiling drains completely as long as each assembly finishes.
-
-        The ceiling resets on every completion. A total-wall-clock bound would abandon a healthy
+        """The ceiling resets on each completion; a wall-clock bound would abandon a healthy
         cluster whose 60-cell backlog simply takes a day.
         """
         pool = ThreadPoolExecutor(max_workers=1)
@@ -1512,71 +1504,24 @@ class TestDrainTrailingAssemblies:
             pool.shutdown(wait=True)
 
     def test_a_wedge_is_a_typed_error_the_flow_can_tell_apart(self):
-        """`FAILED` reads as "stopped writing" to the campaign driver, and that is false here, so
-        the runner raises its own type rather than a plain RuntimeError the flow would let through.
-        """
+        """Its own type, because the flow must intercept it rather than let it become FAILED."""
         assert issubclass(mod.TrailingAssemblyWedgedError, RuntimeError)
         exc = mod.TrailingAssemblyWedgedError(3)
         assert exc.abandoned == 3 and "abandoned" in str(exc)
 
 
-def test_a_wedged_trailing_assembly_raises_instead_of_hanging_the_run(monkeypatch, _stack_dumps, caplog):
-    """End to end through the runner: inference completes, one assembly never returns.
-
-    Before: `finalizer.shutdown(wait=True)` — the flow, and its ECS task, sit forever. After: the
-    run raises the typed error within the ceiling, names the abandoned count, and the cells
-    behind the wedge are left unmarked for re-dispatch rather than silently dropped.
+def test_a_wedge_raises_even_when_the_session_itself_failed(monkeypatch, _stack_dumps, caplog):
+    """END TO END, AND THE HOLE THE RAISING SHAPE CLOSES: with the session already unwinding, a
+    count returned for the caller to check later is a count the in-flight exception skips past,
+    and the run reports FAILED. The session's own failure survives as `__context__`.
     """
     monkeypatch.setattr(mod, "TRAILING_ASSEMBLY_CEILING_S", 0.3)
     hold = threading.Event()
     assembled: list[str] = []
 
     def wedging_assemble(handoff, prep):
-        if handoff.zone == "01N":
-            hold.wait(timeout=30.0)  # released by the test's finally, never by the run
-        assembled.append(handoff.zone)
-        return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
-
-    log = logging.getLogger("test-wedged-drain")
-    try:
-        with (
-            caplog.at_level(logging.CRITICAL, logger="test-wedged-drain"),
-            pytest.raises(mod.TrailingAssemblyWedgedError, match="abandoned") as raised,
-        ):
-            run_under_deadline(
-                15, lambda: _run(_cells(3), assemble=wedging_assemble, inputs=RecordingInputs([]), log=log)
-            )
-    finally:
-        hold.set()
-    assert raised.value.abandoned == 3, "the wedged cell and the two queued behind it"
-    assert any("TRAILING ASSEMBLY WEDGED" in r.getMessage() for r in caplog.records)
-    assert _stack_dumps, "a wedge must dump the stacks"
-    # The cells queued behind the wedge were CANCELLED, not run: only the wedged cell itself can
-    # ever appear here (it completes when the test releases it), never 02N or 03N.
-    assert set(assembled) <= {"01N"}, f"cells behind the wedge were assembled anyway: {assembled}"
-
-
-def test_a_healthy_run_drains_completely(_stack_dumps):
-    summary = run_under_deadline(15, lambda: _run(_cells(4), inputs=RecordingInputs([])))
-    assert summary["succeeded"] == 4
-    assert not _stack_dumps
-
-
-def test_a_wedge_raises_even_when_the_session_itself_failed(monkeypatch, _stack_dumps, caplog):
-    """THE HOLE THIS SHAPE CLOSES. The drain runs from the runner's `finally`, so when the session
-    is already unwinding, a count returned for the caller to check LATER is a count the in-flight
-    exception skips past — and the run reports FAILED, which the campaign driver reads as
-    quiescent and may answer by admitting a replacement writer for the same zones while the
-    wedged assembly thread is still alive.
-
-    So the drain raises from inside the `finally`. The session's own failure survives as the
-    exception's `__context__`, which is what a chained raise is for.
-    """
-    monkeypatch.setattr(mod, "TRAILING_ASSEMBLY_CEILING_S", 0.3)
-    hold = threading.Event()
-
-    def wedging_assemble(handoff, prep):
         hold.wait(timeout=30.0)  # released by the test's finally, never by the run
+        assembled.append(handoff.zone)
         return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
 
     def session_that_finishes_a_cell_then_blows_up(more_work, on_item_done):
@@ -1608,6 +1553,9 @@ def test_a_wedge_raises_even_when_the_session_itself_failed(monkeypatch, _stack_
     finally:
         hold.set()
     assert raised.value.abandoned >= 1
+    assert any("TRAILING ASSEMBLY WEDGED" in r.getMessage() for r in caplog.records)
+    assert _stack_dumps, "a wedge must dump the stacks"
+    assert assembled == [], "a cell behind the wedge was assembled anyway"
     chain = []
     exc: BaseException | None = raised.value
     while exc is not None:

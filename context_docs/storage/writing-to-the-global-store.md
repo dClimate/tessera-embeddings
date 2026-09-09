@@ -149,42 +149,41 @@ was actually seen.
 ### 2a. 2026-09-09: the request cap is REMOVED, and it was the cause of §3's hang
 
 **The whole budget is gone** — `TARGET_AGGREGATE_S3_CONCURRENCY`, `_s3_budget_split`, the
-`per_worker_s3_cap` field and the `s3_concurrency` flow parameter. The repository now opens at
+`per_worker_s3_cap` field and the `s3_concurrency` flow parameter. The repository opens at
 icechunk's default request concurrency (256) and nothing in the library overrides it.
 
-**Why: the value the arithmetic produced deadlocks icechunk.** A repository opened with
-`max_concurrent_requests = 1` parks forever in `Session.commit` and in `Repository.diff`/`rebase`
-inside icechunk's tokio runtime, under concurrent writers. That is the value the campaign produced
-on every assembly — the table above shows `per_worker_s3_cap: 1` in all seven recorded runs — and it
-is the cause of the 2026-09-04 wedges that stranded five clusters for four days. Full record:
+**Why: the value the arithmetic produced deadlocks icechunk.** At `max_concurrent_requests = 1`,
+`Session.commit` and `Repository.diff`/`rebase` park forever under concurrent writers. That is the
+value the campaign produced on every assembly — `per_worker_s3_cap: 1` in all seven runs above —
+and it stranded five clusters for four days on 2026-09-04. Full record:
 [`../assembly/icechunk-max-concurrent-requests-1-deadlock.md`](../assembly/icechunk-max-concurrent-requests-1-deadlock.md)
 and [`../assembly/assembly-wedges-during-fork-phase-2026-09-04.md`](../assembly/assembly-wedges-during-fork-phase-2026-09-04.md).
 
-**The measured evidence, in full:**
-
 | what was measured | result |
 |---|---|
-| cap 1, four coordinators x eight fork workers on real S3 | three of four parked in ~3 min, never returned; reproduced on icechunk **2.1.1 and 2.2.0** |
-| cap 2, identical load and store geometry | every cell published, clean, 146 s |
-| cap 4, identical load | every cell published, clean |
+| cap 1, four coordinators x eight fork workers on real S3 | 2-3 of 4 parked in ~3 min, never returned; reproduced on **2.1.1 and 2.2.0** |
+| cap 2, identical load and geometry | every cell published, clean, 146 s |
+| cap 4, identical load | clean |
 | **uncapped (icechunk default), 32 fork workers per fill at production fan-out** | **zero throttling on every arm** |
-| a standalone ~130-statement reproducer at cap 1 (icechunk + zarr + numpy + a bucket) | 2-3 of 4 writers park permanently; `--no-forks` deadlocks too, so the fork pool is not the ingredient |
-| four earlier reductions at cap 1 | all clean — none had a write in flight while a rebase had real commits to cross, which is the actual ingredient |
+| a standalone ~130-statement reproducer at cap 1 | 2-3 of 4 park; `--no-forks` deadlocks too, so the fork pool is not the ingredient |
 
-**So nothing was bought by capping it.** The justification for the cap was a `SlowDown` at 800
-concurrent PUTs, recorded as a code comment; §2's "What was not verified" already flagged that it
-was never traced to a primary record, and the `t7_ramp` harness reached only 68-82 PUT/s with zero
-`slowdown_503_count`. **That figure is not established and is no longer relied on.** What is
-established is the row above: uncapped at 32 workers per fill across the fleet, nothing throttled.
+**So capping bought nothing.** Its justification was a `SlowDown` at 800 concurrent PUTs, recorded
+as a code comment; §2's "What was not verified" already flagged that it was never traced to a
+primary record, and `t7_ramp` reached only 68-82 PUT/s with zero `slowdown_503_count`. **That
+figure is not established and is no longer relied on.**
 
-**Removed with it: `rehome_after_a_wedged_catch_up`** (§3's recovery). Its own `Repository.diff`
-call parks in the identical deadlock, so it never recovered a cell — which is why the fallback
-re-commit did nothing for the 09-04 clusters. `run_forked` no longer returns a session pair.
+**Removed with it: `rehome_after_a_wedged_catch_up`** (§3's recovery), whose own `diff` parks in
+the identical deadlock — which is why the fallback re-commit did nothing for the 09-04 clusters.
+`run_forked` no longer returns a session pair.
 
-**Kept:** the periodic catch-up itself and `CATCH_UP_INTERVAL_S` (a performance feature — see §3);
-the storage timeouts and retries (a different, separately observed failure — §3's socket wedge); and
-two bounds that turn an unbounded hang into a diagnosable crash, `shard_writer`'s fork-phase
-watchdog and `sequential_fill`'s bounded assembly backlog drain. Neither is a fix for this incident.
+**Kept:** the periodic catch-up and `CATCH_UP_INTERVAL_S` (a performance feature, §3); the storage
+timeouts and retries (a separately observed socket wedge, §3); and two bounds that turn an
+unbounded hang into a diagnosable crash — `shard_writer`'s fork-phase watchdog and
+`sequential_fill`'s bounded assembly backlog drain. Neither is a fix for this incident.
+
+**Worker count: 32, on the chained fill only.** Passed as `n_assembly_workers` from the campaign
+rather than as the library default of 16, because ~48 GB needs the 244 GiB `assembly_large` runner
+and would oversubscribe every other caller.
 
 ---
 
@@ -492,14 +491,11 @@ cannot be killed, but **re-homing finished work onto a session no one else holds
 
 #### The fix: re-home the finished forks, and halve the interval
 
-> **REMOVED 2026-09-09. The re-home never worked, and this subsection records why it looked as
-> though it did.** Everything below about `rehome_after_a_wedged_catch_up` — the function, the
-> `(telemetry, session)` pair, the `workers_finished` guard and its test — is deleted. Its own
-> `Repository.diff` call parks in the same icechunk deadlock as the catch-up it recovers from, so on
-> production it recovered nothing; the dev arm that showed 10/10 ran at icechunk's DEFAULT request
-> concurrency, where the deadlock does not occur, while production ran at a cap of 1, where it does.
-> That is the whole discrepancy. See §2a. The interval change (60 s → 30 s → 5 s) and
-> `catch_up_best_effort` **stay**: keeping the session near the tip is a performance feature.
+> **REMOVED 2026-09-09 (§2a).** Everything below about `rehome_after_a_wedged_catch_up` is
+> deleted: its own `diff` parks in the same deadlock, so it recovered nothing in production. Its
+> dev arm showed 10/10 only because the harness ran at icechunk's DEFAULT concurrency, where the
+> deadlock does not occur. The interval change and `catch_up_best_effort` stay — keeping the
+> session near the tip is a performance feature.
 
 **1. `rehome_after_a_wedged_catch_up`.** `run_forked` now returns `(telemetry, session)` rather than a
 bare dict. That is deliberate friction: after a re-home the session the caller must commit is not the

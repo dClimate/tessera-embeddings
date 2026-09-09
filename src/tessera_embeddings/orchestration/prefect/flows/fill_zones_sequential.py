@@ -562,8 +562,7 @@ class _DeploymentCellInputs:
 _INGEST_TAG_PREFIX = "chained-ingest"
 
 
-#: Exit status when this process ends itself because a trailing-assembly thread could not be
-#: stopped. ``EX_TEMPFAIL`` (75): the work is retryable — its cells are unmarked and re-dispatch.
+#: ``EX_TEMPFAIL``: the work is retryable — the abandoned cells are unmarked and re-dispatch.
 WEDGED_DRAIN_EXIT_STATUS = 75
 
 
@@ -572,34 +571,25 @@ def _end_process_after_wedged_drain(
 ) -> None:
     """End the process rather than report ``FAILED``, because a writer thread may still be alive.
 
-    The campaign driver reads a fill that returned or raised as having stopped writing
-    (``FAILED`` and ``COMPLETED`` are its quiescent states), and five minutes after one it may
-    hand that fill's zones to a replacement cluster. The README's replacement-admission rule
-    rests on exactly that: "a fill that returned or raised has, by then, joined the trailing
-    assembly thread that does its committing". An assembly backlog drain that gave up on a wedged
-    assembly has
-    NOT joined that thread — it is parked inside icechunk holding a writable session — so
-    letting this surface as ``FAILED`` would make the rule's premise false and open the one
-    outcome the campaign is built to prevent: two writers on one zone.
+    The README's replacement-admission rule rests on "a fill that returned or raised has, by
+    then, joined the trailing assembly thread that does its committing". A drain that gave up has
+    not joined it, so ``FAILED`` would make that premise false and open the outcome the campaign
+    exists to prevent: two writers on one zone. Crashing is the honest state — the thread dies
+    with the process, and Prefect's CRASHED is what the driver already treats conservatively.
 
-    Ending the process is the honest state. The thread dies with it, so nothing can commit
-    later; Prefect records the run as CRASHED from the missed heartbeats, which the driver
-    already treats as "cannot infer who stopped" — the cells wait for the next round and are
-    re-dispatched, resuming from their staged tiles. Called from the flow's ``finally`` AFTER
-    the fleet is down and the ingests cancelled, so the exit can never orphan either. The exit
-    itself goes through the package's one sanctioned hard-exit site,
-    :func:`~tessera_embeddings.config.fault_injection.hard_exit_after_flush`.
+    Called from the flow's ``finally`` AFTER the fleet is down and the ingests cancelled, so the
+    exit can never orphan either.
     """
     hard_exit_after_flush(
         WEDGED_DRAIN_EXIT_STATUS,
         log=log,
         message=(
-            "Ending this process: %d trailing assembly/assemblies were abandoned behind a wedged one, and "
-            "the thread running it cannot be stopped. Reporting FAILED would tell the campaign this fill has "
-            "stopped writing, which is not known to be true; exiting makes it true. The run will surface as "
-            "CRASHED and its %d unfinished cell(s) will be re-dispatched next round from their staged tiles."
+            "Ending this process: %d trailing assembly/assemblies were abandoned behind a wedged one whose "
+            "thread cannot be stopped. Reporting FAILED would tell the campaign this fill has stopped "
+            "writing, which is not known to be true; exiting makes it true. The run surfaces as CRASHED "
+            "and its cells are re-dispatched next round from their staged tiles."
         ),
-        args=(exc.abandoned, exc.abandoned),
+        args=(exc.abandoned,),
     )
 
 
@@ -1378,31 +1368,35 @@ def fill_zones_sequential_flow(
             # handed. `_session` closes over the name and is called below, so assigning here
             # reaches every session this cluster runs.
             publish_fleet_mix = publisher_for_resolved_yaml(resolved_yaml, gpu_fallback_vcpu_budget, log)
-            seq = fill_zones_sequential(
-                cells=live,
-                prepare=_prepare,
-                plan=_plan,
-                session=_session,
-                assemble=_assemble,
-                housekeeping=housekeeping,
-                infer_single=_infer_single,
-                session_s1_orbit=s1_orbit,
-                log=log,
-                inputs=inputs,
-                look_ahead=look_ahead,
-                max_retained_failures=max_retained_failures,
-                attempts_per_cell_in_cluster=attempts_per_cell_in_cluster,
-                fault=fault,
-                # Built here rather than in the runner: the runner is Prefect-free, so "is
-                # inference paused" reaches it as a plain callable.
-                paused=(pause_signal(inference_pause_gate, log=log) if inference_pause_gate else None),
-            )
-    except TrailingAssemblyWedgedError as exc:
-        # Remembered, not handled: the teardown below must run first, and only then may the
-        # process end (see `_end_process_after_wedged_drain`). Re-raised so a teardown that
-        # itself fails still propagates something rather than swallowing the wedge.
-        wedged = exc
-        raise
+            try:
+                seq = fill_zones_sequential(
+                    cells=live,
+                    prepare=_prepare,
+                    plan=_plan,
+                    session=_session,
+                    assemble=_assemble,
+                    housekeeping=housekeeping,
+                    infer_single=_infer_single,
+                    session_s1_orbit=s1_orbit,
+                    log=log,
+                    inputs=inputs,
+                    look_ahead=look_ahead,
+                    max_retained_failures=max_retained_failures,
+                    attempts_per_cell_in_cluster=attempts_per_cell_in_cluster,
+                    fault=fault,
+                    # Built here rather than in the runner: the runner is Prefect-free, so "is
+                    # inference paused" reaches it as a plain callable.
+                    paused=(pause_signal(inference_pause_gate, log=log) if inference_pause_gate else None),
+                )
+            except TrailingAssemblyWedgedError as exc:
+                # LATCHED AT THE POINT OF DETECTION, inside the Ray context. The crash-not-fail
+                # invariant must not depend on this exception surviving the unwinding: leaving the
+                # `with` runs `ray_cluster`'s teardown (`ray.shutdown`, `ray down`, tag
+                # termination), and an exception THERE replaces this one, after which the outer
+                # `finally` would see no wedge and report FAILED with the assembly thread alive.
+                # Every layer between detection and action is a place the signal can be dropped.
+                wedged = exc
+                raise
     finally:
         # Joined HERE because this `finally` is the only place covering every way the runner can
         # exit — the normal return, its partial-failure RuntimeError (a normal exit path, per

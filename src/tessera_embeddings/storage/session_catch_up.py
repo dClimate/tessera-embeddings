@@ -72,11 +72,8 @@ class CatchUpDidNotStopError(RuntimeError):
     fill — or, if the catch-up later returns, moves the base AFTER the write was merged, which is
     the expensive replay this module exists to avoid.
 
-    Nothing recovers from it: it fails the fill, whose cell is unmarked and re-dispatched. A
-    recovery that re-homed the finished forks onto a fresh session existed until 2026-09-09 and
-    was removed with the cap that caused the wedge — its own ``diff`` call parked in the same
-    icechunk deadlock, so it never recovered anything. This exception's job is to make a hung
-    catch-up a CRASH rather than an indefinite park, which is the only thing it ever did.
+    Nothing recovers from it: it fails the fill, whose cell is unmarked and re-dispatched. Its
+    job is to make a hung catch-up a crash rather than an indefinite park.
     """
 
 

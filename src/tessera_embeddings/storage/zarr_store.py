@@ -566,12 +566,9 @@ def _default_repo_config() -> icechunk.RepositoryConfig:
     default). When active it bounds a commit's manifest rewrite to the shards it touched, the
     dominant region-write cost on large continental stores.
 
-    **Request concurrency is icechunk's default (256) and is never overridden.** Assembly used
-    to divide a fleet PUT budget into a per-fork ``max_concurrent_requests``, which floored at 1
-    on every campaign fill — and at 1 icechunk deadlocks ``commit`` and ``rebase``/``diff`` in
-    its tokio runtime under concurrent writers, which stranded five clusters on 2026-09-04. See
-    ``context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md``. Measured uncapped
-    at 32 workers per fill across the fleet: zero throttling.
+    **Request concurrency is icechunk's default (256) and is never overridden**, because at 1 —
+    what assembly's old per-fork budget produced — icechunk deadlocks ``commit`` and
+    ``rebase``/``diff``. ``context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md``.
 
     **Storage timeouts + retries** are always applied, because icechunk defaults to unbounded
     per-attempt timeouts and a single try, so a wedged socket (diagnosed in production: a

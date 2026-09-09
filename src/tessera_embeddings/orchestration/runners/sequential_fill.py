@@ -214,35 +214,20 @@ class _ZoneTally:
     failed: bool = False
 
 
-#: The most wall-clock ONE trailing assembly may take before the assembly backlog drain stops
-#: waiting for it.
-#:
-#: The trailing thread assembles a cluster's cells one at a time, and once inference is complete
-#: the run's only remaining work is that queue — so a single assembly that never returns holds
-#: the whole run, and the flow, forever. That is exactly what happened on 2026-09-04: a fill
-#: finished its inference days later, announced it was draining 67 assemblies, and parked in
-#: ``finalizer.shutdown(wait=True)`` behind one wedged cell.
-#:
-#: SIX HOURS, and the bound is one-sided. The longest healthy global assembly measured is ~3.5 h
-#: on the densest zone-year (4.97 TB), and the fork-phase watchdog in ``shard_writer`` already
-#: fails a stalled WRITE inside thirty minutes — so the only way a cell reaches this ceiling is a
-#: hang the watchdog cannot unwind (a coordinator thread parked inside icechunk itself). Being
-#: generous costs one idle head node for a few hours, once; being short would abandon a legitimate
-#: dense assembly. The abandoned cells stay unmarked and are re-dispatched, resuming from staging.
+#: The most wall-clock ONE trailing assembly may take before the backlog drain gives up on it.
+#: One-sided: the longest healthy global assembly measured is ~3.5 h, and the fork watchdog
+#: already fails a stalled WRITE in thirty minutes, so only a hang it cannot unwind reaches this.
+#: ``context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md``.
 TRAILING_ASSEMBLY_CEILING_S = 6 * 3600.0
 
 
 class TrailingAssemblyWedgedError(RuntimeError):
     """The assembly backlog drain gave up on one that never returned, and its thread is still alive.
 
-    Its own type because the caller must treat it differently from every other failure: a fill
-    that RAISES is read by the campaign driver as having stopped writing (``FAILED`` is a
-    quiescent state there, and a replacement cluster may take over its zones five minutes
-    later). That reading is false here — a thread parked inside icechunk may still hold a
-    writable session. So the flow that owns the process must not let this surface as
-    ``FAILED``: it tears down and then ends the process, which the driver records as ``CRASHED``
-    and treats conservatively (the cells wait for the next round). See
-    ``prefect/flows/fill_zones_sequential.py`` and the README's replacement-admission rule.
+    Its own type because the flow must NOT let it surface as ``FAILED``: the campaign driver
+    reads that as quiescent and may admit a replacement writer, while a thread parked inside
+    icechunk may still hold a writable session. The flow tears down and ends the process instead
+    (``prefect/flows/fill_zones_sequential.py``).
     """
 
     def __init__(self, abandoned: int) -> None:
@@ -261,31 +246,16 @@ def drain_trailing_assemblies(
     ceiling_s: float = TRAILING_ASSEMBLY_CEILING_S,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
 ) -> None:
-    """Wait for every queued trailing assembly to finish — but never for one of them forever.
+    """Wait for every queued trailing assembly — but never for one of them forever.
 
-    ``finalizer.shutdown(wait=True)`` was the assembly backlog drain until 2026-09-04, and it has
-    no bound: one
-    assembly that never returns holds the run, the flow, and the ECS task indefinitely, while
-    every cell queued behind it is neither published nor failed. This waits for completions with
-    a per-assembly ceiling instead. The ceiling resets on each completion, so a long backlog of
-    healthy assemblies drains however long it takes; only an individual assembly that exceeds
-    ``ceiling_s`` with nothing completing is declared wedged.
+    The ceiling resets on each completion, so a long backlog drains however long it takes and
+    only an individual assembly that exceeds ``ceiling_s`` is declared wedged. On a wedge it dumps
+    stacks, cancels what is queued, and RAISES here rather than returning a count: this runs from
+    the caller's ``finally``, where a count to check afterwards is a count an in-flight exception
+    skips past — and the run would then report ``FAILED``, which is the one outcome the exit-75
+    crash exists to prevent. An exception already in flight is chained as ``__context__``.
 
-    On a wedge it dumps every thread's stack (the artefact no external tool can get on
-    Fargate), cancels the assemblies still queued, and **raises**. Raising HERE rather than
-    returning a count is the whole safety property: this runs from the caller's ``finally``, so a
-    count the caller must remember to check afterwards is a count an in-flight exception skips
-    past — and the run then reports ``FAILED``, which the campaign driver reads as quiescent and
-    may answer by admitting a replacement writer while the wedged assembly thread is still alive.
-    That is the one outcome the exit-75 crash exists to prevent, so it must not be reachable only
-    through a later branch. An exception already in flight becomes this one's ``__context__``, so
-    nothing is lost.
-
-    It does NOT end the process: the wedged thread is a non-daemon pool worker that will hold the
-    interpreter open at exit, but how and when to end the process is the process owner's decision
-    — the flow does it after its own teardown, so a forced exit can never orphan a fleet
-    mid-teardown. Nothing here rewrites or deletes: the abandoned cells' staged tiles and mosaics
-    stay where they are, and the campaign re-dispatches them as unmarked cells.
+    It does NOT end the process; that is the process owner's call, after its own teardown.
 
     Raises:
         TrailingAssemblyWedgedError: no assembly completed within ``ceiling_s``.
@@ -926,9 +896,8 @@ def fill_zones_sequential(
             )
         with lock:
             queued = list(assembly_futures)
-        # Read at CALL time, not bound as defaults, so an operator override (or a test) of the
-        # module constants takes effect on the run that is actually draining. This RAISES on a
-        # wedge, from inside this `finally` — see the function for why that is not optional.
+        # Read at CALL time so an operator override of the module constant takes effect. RAISES
+        # on a wedge, from inside this `finally` — see the function for why that is not optional.
         drain_trailing_assemblies(
             finalizer,
             queued,

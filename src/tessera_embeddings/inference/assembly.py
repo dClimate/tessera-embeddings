@@ -431,10 +431,8 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     assignments (encode and upload fused, see ``_assembly_summary_line``); clear-to-fill
     assignments count as writes too, since they emit output objects like any other.
 
-    Progress is published into ``run_forked``'s shared counters after every tile, which is that
-    function's contract and not decoration: the fork-phase stall watchdog reads those counters and
-    a worker that never reports is indistinguishable from one that has wedged. One unit is one
-    tile, cleared or staged alike.
+    Reports progress after every tile — ``run_forked``'s contract, since the stall watchdog reads
+    those counters and would kill a worker that never reports.
     """
     fork = payload["fork"]
     t = int(payload["time_index"])
@@ -446,8 +444,7 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     tiles = writes = nbytes = 0
     done = 0
     total = len(payload["clear"]) + len(payload["tiles"])
-    # The DENOMINATOR before any work, as `_write_shards_worker` does: the coordinator sums
-    # totals across workers and withholds the figure until every worker has reported one.
+    # The denominator first: the coordinator withholds its figure until every worker has one.
     report_shard_progress(worker_index, 0, total)
     # Unindexed trailing dims (band) are written in full, so each assignment below covers both
     # the 3-D and 4-D arrays.
@@ -2262,10 +2259,8 @@ class ZarrWriter:
             raise IncompleteStageError(f"Run {run_id!r} has no staged chunks under {self.staging_base}")
         shards = tuple(sorted(parse_chunk_label(label) for label in labels))
 
-        # NO REQUEST CAP: the repo takes icechunk's default concurrency. A cap of 1 — which the
-        # campaign's own budget arithmetic produced on every assembly — deadlocks `commit` and
-        # `rebase`/`diff` inside icechunk's tokio runtime under concurrent writers, and that is
-        # what stranded five clusters on 2026-09-04. See
+        # NO REQUEST CAP: icechunk's default. A cap of 1 — what the old budget arithmetic
+        # produced on every assembly — deadlocks commit and rebase. See
         # `context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md`.
         repo = open_global_repo(
             store_path,

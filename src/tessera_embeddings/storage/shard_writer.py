@@ -75,30 +75,17 @@ _log = logging.getLogger(__name__)
 #: quiet for short writes and close enough to bound how long a stall hides.
 PROGRESS_INTERVAL_S = 300.0
 
-#: How long the fork phase may make NO shard progress before the watchdog declares it wedged,
-#: dumps every thread's stack, and tears the worker pool down so the fill fails instead of
-#: hanging. On 2026-09-04 five assemblies hung in the shard-write tail and never returned — no
-#: exception, no CPU — each blocking its cluster's entire single-threaded assembly backlog for
-#: days (see ``context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md``). The
-#: cause was an icechunk deadlock at a request cap of 1, and that cap is gone — this is the net
-#: under whatever the next unknown cause turns out to be, and the only way to get a stack.
-#:
-#: THIRTY MINUTES, and the choice is one-sided. Healthy workers write shards continuously —
-#: measured 200-260 shards every five minutes on dense zones, and no healthy run has ever paused
-#: shard writing for even one full progress interval. A stall that lasts thirty minutes is ~6x
-#: the longest gap a healthy run produces and cannot be reached by normal S3 jitter or a slow
-#: band. The failure it guards against sat for days, so erring long costs nothing: the point is
-#: to convert an unbounded hang into a bounded, re-dispatchable failure, not to trim minutes.
+#: No shard progress for this long and the fork phase is declared wedged. One-sided: ~6x the
+#: longest gap a healthy dense write produces, and the failure it bounds sat for days, so erring
+#: long costs nothing. ``context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md``.
 FORK_STALL_TIMEOUT_S = 1800.0
 
 
 class ForkPhaseStalledError(RuntimeError):
     """The fork phase made no shard progress for the watchdog's timeout and was torn down.
 
-    Its own type, distinct from :class:`CatchUpAbortedTheWaitError`: both end the wait, but one
-    means "a catch-up failed, so this fill cannot commit safely" and the other means "the write
-    itself stopped moving" — and an operator reading the failure needs to know which. The cell is
-    retained for resume either way.
+    Its own type, not :class:`CatchUpAbortedTheWaitError`: both end the wait, but an operator
+    needs to know whether a catch-up failed or the write itself stopped. The cell is retained.
     """
 
 
@@ -331,27 +318,12 @@ def _await_forks(
 def _terminate_pool(ex: ProcessPoolExecutor) -> None:
     """Tear a fork pool down without waiting on it, then kill whatever is still alive.
 
-    The one place two callers reach — every exit from the fork phase, and the stall watchdog —
-    so the "how" of killing a pool lives once. ``cancel_futures`` reaches only queued work, so a
-    multi-hour shard writer already running keeps running (and keeps writing fork objects) after
-    the coordinator has moved on unless the live processes are terminated too; Python's own
-    executor atexit hook would then block interpreter shutdown on them.
-
-    **Terminated, never joined, even on the clean path.** A worker's result — its fork — is
-    already the parent's by the time this runs, so a worker process that will not exit costs
-    nothing to kill and everything to wait for: ``shutdown(wait=True)`` on one is an unbounded
-    park, and it would make the watchdog inert.
-
-    Killing them is safe because nothing a worker has written is IN the store: workers write into
-    a fork, and a fork joins the repository only when the coordinator merges and commits. A
-    dropped, unmerged ``ForkSession`` is icechunk's own documented way to orphan chunks, so a kill
-    costs unreferenced objects that GC reclaims — never committed data.
-
-    ``_processes`` is private (there is no public terminate API) and read BEFORE ``shutdown``:
-    ``shutdown`` sets ``_processes = None`` unconditionally, so reading it afterwards yields
-    ``None`` and ``.values()`` raises ``AttributeError``, masking the failure this exists to
-    surface. Guarded so a future Python that renames the attribute degrades to a wait-free
-    shutdown rather than an ``AttributeError``.
+    Never joined, even on the clean path: a worker's fork is already the parent's, so
+    ``shutdown(wait=True)`` on one that will not exit is an unbounded park that would make the
+    watchdog inert. Safe because an unmerged ``ForkSession`` is icechunk's own way to orphan
+    chunks — a kill costs unreferenced objects, never committed data. ``_processes`` is private
+    (no public terminate API) and read BEFORE ``shutdown``, which nulls it; guarded so a rename
+    degrades to a wait-free shutdown.
     """
     procs = list((getattr(ex, "_processes", None) or {}).values())
     ex.shutdown(wait=False, cancel_futures=True)
@@ -370,40 +342,15 @@ def _fork_stall_watchdog(
     timeout_s: float,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
 ) -> Iterator[None]:
-    """Fail a wedged fork phase instead of letting it hang forever.
+    """Fail a wedged fork phase instead of letting it hang forever — the assembly's one backstop.
 
-    The forks write for hours and then, on 2026-09-04, five of them stopped in the write's tail
-    and never returned — no exception, no CPU, no shard progress — each freezing the one trailing
-    thread its whole cluster assembles on. The commit alarm (:func:`traced_commit`) could not see
-    it: the wedge is upstream of the commit. Nothing watched the fork phase, and nothing bounded
-    it. This does both. **It is the assembly's single backstop**: the recovery machinery built for
-    the earlier stalls is gone, along with the request cap that caused them, so this is what
-    converts an unbounded strand into a bounded failure with stacks.
-
-    On its own daemon thread it watches the shard counters the workers write straight into shared
-    memory (``slots``), which advance whether or not the coordinator thread is running. If the
-    total does not move for ``timeout_s`` it:
-
-    1. dumps every thread's Python stack with :func:`faulthandler.dump_traceback` — the stack
-       that could not be got any other way (Fargate denies ``CAP_SYS_PTRACE``, so ``py-spy`` and
-       ``/proc/<pid>/stack`` are refused, and the process runs pre-3.14 so thread names are
-       invisible too), so the next wedge names its own stuck call;
-    2. sets ``stalled``, so :func:`_await_forks` raises :class:`ForkPhaseStalledError` at its
-       next wake rather than waiting out another timeout; and
-    3. terminates the worker pool (:func:`_terminate_pool`), which resolves any pending future
-       as ``BrokenProcessPool`` and lets a ``wait=True`` shutdown join return — so a coordinator
-       parked in ``_await_forks`` or ``ex.shutdown`` is freed and the fill fails cleanly, its
-       cell retained for the campaign to re-dispatch.
-
-    **What it does NOT recover, stated plainly.** If the coordinator thread is itself parked
-    inside a pyo3 call into icechunk (a catch-up ``rebase`` or the ``merge``), no Python action
-    unwinds it and terminating the workers cannot free it. The stack dump still fires, so the
-    wedge is diagnosed. See
-    ``context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md``.
-
-    Best-effort throughout: a watchdog that dies on one failed read, or that could itself end a
-    healthy write, is worse than none. Every fork phase gets one, whatever its payload count —
-    the in-process shortcut for a lone payload is gone, precisely because it was a hole here.
+    A daemon thread watches the shard counters the workers write into shared memory, which advance
+    whether or not the coordinator thread is running. If the total stops moving for ``timeout_s``
+    it dumps every thread's stack (unobtainable otherwise: Fargate denies ``CAP_SYS_PTRACE``),
+    sets ``stalled`` so :func:`_await_forks` raises, and terminates the pool — which also frees a
+    coordinator parked in the wait. It canNOT unwind a coordinator parked inside icechunk itself;
+    the dump still fires. Best-effort throughout: a watchdog that could end a healthy write, or
+    that dies on one failed read, is worse than none.
     """
     logger = log or _log
 
@@ -480,11 +427,9 @@ def run_forked(
     a spawned process pool, so ``worker_fn`` must be a module-level function and
     every payload picklable.
 
-    **A worker MUST call :func:`report_shard_progress` as it works** — the stall watchdog below
-    reads those counters, so a worker that never reports is indistinguishable from one that has
-    wedged and will be killed as stalled. This is a contract rather than an option on purpose: a
-    flag to disable the watchdog would let the next caller opt silently into no hang protection at
-    all.
+    **A worker MUST call :func:`report_shard_progress` as it works**: the stall watchdog reads
+    those counters, so one that never reports is killed as stalled. A contract rather than a flag,
+    which would let the next caller opt silently into no hang protection.
 
     Every payload gets its own process, so the pool never queues and the whole
     write is as long as its slowest band. Hence progress on a TIMER rather than
@@ -505,10 +450,7 @@ def run_forked(
       that does not stall looks the same whether the session was kept current or simply got
       lucky. The tally is the only evidence that it ran.
 
-    ``fork_stall_timeout_s`` bounds the fork phase: a daemon watchdog
-    (:func:`_fork_stall_watchdog`) fails the fill with :class:`ForkPhaseStalledError`, after
-    dumping every thread's stack, if the workers' shard counters stop moving for that long. It is
-    the one backstop under an assembly that stops writing for an unknown reason.
+    ``fork_stall_timeout_s`` bounds the fork phase — see :func:`_fork_stall_watchdog`.
 
     ``catch_up`` is called on a timer for the whole fork phase and NOT again afterwards. The
     periodic calls are the entire point: they keep each catch-up short, where a single deep one
@@ -538,11 +480,8 @@ def run_forked(
     # ONE timer around the whole fork phase, so BOTH paths get the periodic catch-up.
     abort = threading.Event()
     with ticking(CATCH_UP_INTERVAL_S, _tick if catch_up is not None else None, abort=abort):
-        # ONE payload goes through the pool like any other. Running a lone payload in-process was
-        # a shortcut that saved one spawn and cost the watchdog its coverage: `compute_n_workers`
-        # returns 1 for a small cell, and then EVERY shard of that cell is in the one payload, so
-        # the in-process branch was an unbounded stall in exactly the phase the watchdog exists to
-        # bound. A subprocess spawn is milliseconds against a write measured in hours.
+        # ONE payload goes through the pool like any other: `compute_n_workers` returns 1 for a
+        # small cell, so the old in-process shortcut left every shard of that cell unwatched.
         ctx = multiprocessing.get_context("spawn")
         # `initializer` runs once per spawned child before any payload. A spawned process
         # inherits no logging config, so without it the root WARNING default discards every
@@ -569,24 +508,13 @@ def run_forked(
                     stalled=stalled,
                 )
         finally:
-            # EVERY exit — the clean one included: the results are in hand or the pool is
-            # being abandoned, and either way nothing is gained by joining a process while
-            # a wedged one would never be joined at all. A `finally` rather than an
-            # enumeration of exits, so a path added later cannot leak the pool.
+            # A `finally` rather than an enumeration of exits, so a path added later cannot leak
+            # the pool. See `_terminate_pool` for why the clean path terminates too.
             _terminate_pool(ex)
 
-    # NO FINAL CATCH-UP HERE, deliberately: such a call sits OUTSIDE `ticking`, so nothing bounds
-    # it, and if it entered the stalling path it would hang forever at the one step this whole
-    # mechanism protects — silently, where a stalled COMMIT at least trips `traced_commit`'s alarm.
-    # The residual gap is whatever published since the last tick, at most one CATCH_UP_INTERVAL_S
-    # of commits, which the commit's own rebase closes from a depth that has never failed.
-    #
-    # THE RESIDUAL THAT LEAVES. A cell publishes TWO snapshots, the fill and the mark, so TWO
-    # publications inside one interval put a coordinator four snapshots behind. That depth used to
-    # wedge, and the reason was the request cap of 1 the store was opened at, removed 2026-09-09
-    # (`context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md`); at icechunk's
-    # default concurrency no depth has been observed to hang. CATCH_UP_INTERVAL_S is 5 s, which
-    # keeps the depth low regardless. See ``context_docs/storage/writing-to-the-global-store.md``.
+    # NO FINAL CATCH-UP HERE: it would sit outside `ticking` with nothing bounding it. The
+    # residual is at most one CATCH_UP_INTERVAL_S of commits, which the commit's own rebase
+    # closes. See `context_docs/storage/writing-to-the-global-store.md`.
     t_merge = time.monotonic()
     session.merge(*(fork_result for fork_result, _ in results))
     done = time.monotonic()

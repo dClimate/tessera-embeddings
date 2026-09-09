@@ -337,13 +337,9 @@ class TestTheSharedHardExit:
         assert any("going down: reason" in r.getMessage() for r in caplog.records), "the announcement was lost"
 
     def test_a_handler_that_raises_while_flushing_does_not_cancel_the_exit(self, monkeypatch):
-        """THE EXIT IS THE CONTRACT; the announcement is best-effort.
-
-        A log handler can raise while flushing — a Prefect API handler answering 503, which this
-        campaign has seen — and without the `finally` that exception escapes and leaves the
-        process ALIVE. For the drill that means a death that did not happen; for the wedged
-        assembly backlog drain it means reporting FAILED with a writer thread still running,
-        which is the one outcome the exit exists to prevent.
+        """The exit is the contract; the announcement is best-effort. Without the `finally` a
+        handler raising mid-flush (a Prefect API 503) leaves the process alive — for the drill a
+        death that did not happen, for the wedged drain a writer thread still running.
         """
         import logging as _logging
         import os as _os

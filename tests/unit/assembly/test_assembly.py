@@ -2829,13 +2829,9 @@ def test_radar_coverage_counts_fully_free_tiles_from_a_generator():
 
 
 class TestTheFillBandWorkerReportsProgress:
-    """`run_forked`'s contract: a worker MUST advance the shared shard counters.
-
-    The stall watchdog reads only those counters, so a worker that never reports is
-    indistinguishable from one that has wedged. `_fill_band_worker` did not report at all, which
-    made every standalone `assemble` longer than FORK_STALL_TIMEOUT_S (30 min) a false positive:
-    its healthy workers were terminated as stalled. The campaign path was unaffected because it
-    runs `_write_shards_worker`, which always reported.
+    """`run_forked`'s contract: a worker MUST advance the shared shard counters, since the stall
+    watchdog reads only those. `_fill_band_worker` reported nothing, which made every standalone
+    `assemble` longer than FORK_STALL_TIMEOUT_S kill its own healthy workers.
     """
 
     @staticmethod
@@ -2847,54 +2843,31 @@ class TestTheFillBandWorkerReportsProgress:
         root.create_array("embeddings", shape=(1, 4, 4, 2), chunks=(1, 2, 2, 2), dtype="int8", fill_value=0)
         root.create_array("scales", shape=(1, 4, 4), chunks=(1, 2, 2), dtype="float32", fill_value=0.0)
         session.commit("schema")
-        session = repo.writable_session("main")
-        return session.fork()
+        return repo.writable_session("main").fork()
 
-    def test_every_cleared_tile_advances_the_shared_counter(self, tmp_path):
+    def test_the_denominator_comes_first_then_one_report_per_tile(self, tmp_path):
+        """Denominator first because the coordinator withholds its figure until every worker has
+        reported one; then per tile, so the counter moves while the worker is still working.
+        """
         slots = multiprocessing.get_context("spawn").Array("l", 4, lock=False)
         shard_writer._init_fork_worker(slots)
-        try:
-            payload = {
-                "fork": self._fork_over_a_tiny_store(tmp_path),
-                "time_index": 0,
-                "band": (0, 4),
-                "variables": ["embeddings", "scales"],
-                "clear": [ChunkSpec(0, 0, 0, 2, 0, 4), ChunkSpec(1, 0, 2, 4, 0, 4)],
-                "tiles": [],
-                "worker_index": 1,
-            }
-            _fill_band_worker(payload)
-            # done == total == 2 cleared tiles, published under THIS worker's index.
-            assert list(slots)[2:] == [2, 2], f"the worker did not report its progress: {list(slots)}"
-            assert list(slots)[:2] == [0, 0], "another worker's slot was written"
-        finally:
-            shard_writer._PROGRESS_SLOTS = None
-
-    def test_the_denominator_is_published_before_any_work(self, tmp_path):
-        """The coordinator withholds its percentage until every worker has reported a total, so a
-        worker that only reports at the end makes the whole fill's progress line silent.
-        """
-        slots = multiprocessing.get_context("spawn").Array("l", 2, lock=False)
-        shard_writer._init_fork_worker(slots)
-        seen: list[list[int]] = []
+        seen: list[tuple] = []
         real = shard_writer.report_shard_progress
         try:
-            shard_writer.report_shard_progress = lambda *a: (seen.append(list(a)), real(*a))[1]
-            _assembly_mod.report_shard_progress = shard_writer.report_shard_progress
+            _assembly_mod.report_shard_progress = lambda *a: (seen.append(a), real(*a))[1]
             _fill_band_worker(
                 {
                     "fork": self._fork_over_a_tiny_store(tmp_path),
                     "time_index": 0,
                     "band": (0, 4),
-                    "variables": ["scales"],
-                    "clear": [ChunkSpec(0, 0, 0, 2, 0, 4)],
+                    "variables": ["embeddings", "scales"],
+                    "clear": [ChunkSpec(0, 0, 0, 2, 0, 4), ChunkSpec(1, 0, 2, 4, 0, 4)],
                     "tiles": [],
-                    "worker_index": 0,
+                    "worker_index": 1,
                 }
             )
         finally:
-            shard_writer.report_shard_progress = real
             _assembly_mod.report_shard_progress = real
             shard_writer._PROGRESS_SLOTS = None
-        assert seen[0] == [0, 0, 1], f"the first report must be the denominator, got {seen[0]}"
-        assert seen[-1] == [0, 1, 1]
+        assert seen == [(1, 0, 2), (1, 1, 2), (1, 2, 2)], f"wrong report sequence: {seen}"
+        assert list(slots) == [0, 0, 2, 2], "reported under the wrong worker index, or not at all"

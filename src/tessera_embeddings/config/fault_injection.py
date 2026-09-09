@@ -42,14 +42,9 @@ environment variable was tried and rejected separately: one can be left behind i
 definition and inherited by an ordinary run, which
 ``test_nothing_about_a_fault_is_read_from_the_environment`` pins.
 
-ONE THING HERE IS NOT A DRILL. :func:`hard_exit_after_flush` is the package's single hard-exit
-primitive — announce, flush, ``os._exit`` — and it lives in this module because the structural
-test that keeps hard exits to one file already guards it here. The drill is one of its two
-callers and stays behind every gate above; the other is the sequential fill's response to a
-trailing-assembly thread it cannot join (see the function's docstring), a production safety exit
-that is deliberate and announced but needs no operator request. The invariant this module holds
-is therefore precisely: **no FAULT fires without a human's request, and no hard exit happens
-anywhere but here.**
+ONE THING HERE IS NOT A DRILL. :func:`hard_exit_after_flush` lives here because the structural
+test keeping hard exits to one file already guards this module. So the invariant is precisely:
+**no FAULT fires without a human's request, and no hard exit happens anywhere but here.**
 """
 
 from __future__ import annotations
@@ -114,28 +109,15 @@ def hard_exit_after_flush(
 ) -> None:
     """Announce, flush every log handler, and end this process without unwinding anything.
 
-    THE ONE PLACE THE PACKAGE HARD-EXITS, and a structural test keeps it that way: a hard exit
-    skips every handler and every ``finally`` by design, which is what makes it a faithful death
-    for a drill and an unacceptable thing to have scattered about. Two callers, both deliberate:
+    THE ONE PLACE THE PACKAGE HARD-EXITS, and a structural test keeps it that way. Two callers:
+    :meth:`ArmedFault.die_between_commits` (the supervised drill) and
+    ``fill_zones_sequential._end_process_after_wedged_drain`` (a trailing-assembly thread that
+    cannot be joined). ``os._exit`` rather than ``sys.exit`` because the second caller's whole
+    reason for being here is a non-daemon thread a normal shutdown would wait on forever.
 
-    * :meth:`ArmedFault.die_between_commits` — the supervised drill, behind the deployment
-      allowlist and the hosted-fault gate.
-    * ``prefect.flows.fill_zones_sequential._end_process_after_wedged_drain`` — a fill whose
-      trailing-assembly thread is parked inside icechunk and cannot be joined. It must not report
-      ``FAILED`` (the campaign driver reads that as "stopped writing" and may hand its zones to a
-      replacement cluster), so after its teardown it ends the process and surfaces as CRASHED,
-      which the driver treats conservatively. See
-      ``context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md``.
-
-    The message goes to BOTH the caller's logger and this module's, then every handler is
-    flushed, so the announcement survives the exit as far as a batching API handler allows.
-    ``os._exit`` rather than ``sys.exit``: the second caller's whole reason for being here is a
-    non-daemon thread that a normal interpreter shutdown would wait on forever.
-
-    **THE EXIT IS THE CONTRACT AND THE ANNOUNCEMENT IS BEST-EFFORT**, hence the ``finally``. A
-    log handler can raise while flushing — a Prefect API handler answering 503, which this
-    campaign has seen — and an exception escaping here would leave the process ALIVE, which is
-    the single outcome both callers exist to prevent.
+    **The exit is the contract; the announcement is best-effort**, hence the ``finally``: a
+    handler raising mid-flush (a Prefect API 503, seen in this campaign) must not leave the
+    process alive.
     """
     try:
         log.error(message, *args)

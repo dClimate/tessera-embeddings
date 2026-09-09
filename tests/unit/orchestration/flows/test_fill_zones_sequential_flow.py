@@ -1331,8 +1331,8 @@ def test_a_store_declaring_no_rule_leaves_the_config_unconstrained(wired, monkey
 
 
 class TestWedgedDrainEndsTheProcess:
-    """`FAILED` tells the campaign driver a fill stopped writing; after a wedged drain that is not
-    known, so the flow must end its process instead — AFTER teardown, and via `os._exit`.
+    """`FAILED` tells the driver a fill stopped writing, which a wedged drain does not establish,
+    so the flow ends its process instead — AFTER teardown, and via the one hard-exit site.
     """
 
     def test_the_helper_exits_through_the_one_sanctioned_site_with_the_temp_fail_status(self, monkeypatch, caplog):
@@ -1357,9 +1357,35 @@ class TestWedgedDrainEndsTheProcess:
         # across the tree; this pins that THIS module never grows one.
         assert "_exit(" not in _inspect.getsource(flowmod), "the flow must exit only through hard_exit_after_flush"
 
+    def test_a_ray_teardown_that_also_raises_cannot_swallow_the_wedge(self, wired, monkeypatch):
+        """THE THIRD PLACE THIS INVARIANT LEAKED. The wedge is raised inside the Ray context, so
+        leaving it runs `ray.shutdown()` and `ray down` — and an exception there REPLACES the
+        wedge, after which the outer `finally` sees none and Prefect reports FAILED with the
+        assembly thread alive. Latching at detection is what closes it.
+        """
+        from tessera_embeddings.orchestration.runners.sequential_fill import TrailingAssemblyWedgedError
+
+        @contextmanager
+        def exploding_teardown(log, **kwargs):
+            try:
+                yield None
+            finally:
+                raise RuntimeError("ray down failed")
+
+        monkeypatch.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", exploding_teardown, raising=False)
+        monkeypatch.setattr(
+            mod, "fill_zones_sequential", lambda **k: (_ for _ in ()).throw(TrailingAssemblyWedgedError(3))
+        )
+        exited: list[int] = []
+        monkeypatch.setattr(mod, "hard_exit_after_flush", lambda status, **k: exited.append(status))
+
+        with pytest.raises(RuntimeError, match="ray down failed"):
+            _run(zones=["33N"])
+        assert exited == [mod.WEDGED_DRAIN_EXIT_STATUS], "the teardown failure swallowed the wedge"
+
     def test_the_flow_ends_the_process_only_after_its_teardown(self):
-        """Structural: the exit sits at the END of the flow's `finally`, after ingest shutdown, the
-        housekeeping join and `deactivate()` — never before, where it could orphan a fleet.
+        """Structural: the exit sits at the END of the flow's `finally`, never before, where it
+        could orphan a fleet.
         """
         import inspect as _inspect
 
