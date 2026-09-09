@@ -59,7 +59,7 @@ class CatchUpAbortedTheWaitError(RuntimeError):
 
     Raised only to END THE WAIT; the real cause is the tick's own exception, which
     :func:`ticking` re-raises when its block exits. This one stops an assembly spending another
-    three hours and sixteen workers on a fill that can no longer commit.
+    three hours and thirty-two workers on a fill that can no longer commit.
     """
 
 
@@ -267,7 +267,7 @@ def ticking(
 
     ``abort`` is set the moment a tick fails, so a caller waiting on hours of work can stop early
     instead of finishing a fill already known to be uncommittable. Without it the failure surfaces
-    only when this block exits — for an assembly, up to three hours and sixteen workers' worth of
+    only when this block exits — for an assembly, up to three hours and thirty-two workers' worth of
     object-store writes later.
 
     **Only a caller that can act on it will.** ``run_forked`` always passes one, but its
