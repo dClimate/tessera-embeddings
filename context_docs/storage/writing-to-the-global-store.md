@@ -3,8 +3,8 @@
 **Assembly is the campaign's last stage and its longest.** It reads a cell's staged inference tiles
 out of S3 and writes them into the published Icechunk store as whole shards, then marks the cell
 complete. On a dense zone-year that is **4.97 TB across 2.34 M objects**, about three and a half
-hours, sixteen worker processes, and — at fleet width — up to ten coordinators doing it at once into
-**one repository on one branch**.
+hours, thirty-two worker processes (sixteen until 2026-09-08), and — at fleet width — up to ten
+coordinators doing it at once into **one repository on one branch**.
 
 Five things went wrong in that stage during August 2026, and they are one document because they are
 one machine. A fix to the first raised the write concurrency the second happened under; the third is
@@ -16,6 +16,7 @@ no longer exists. The fifth is the index published beside the store, which the s
 | 2 | assembly ran five of its sixteen forks, on every cell, for weeks | 2026-08-28 |
 | 3 | seven of nine assemblies hung before committing, and the fix relocated the wedge | 2026-08-29 → 31 |
 | 4 | 227 writes refused as incorrectly signed, in two accounts at once | 2026-08-28 |
+| 2a | the request cap removed — it was §3's hang all along | 2026-09-09 |
 | 5 | why nothing bounds committers any more, and what would reopen it | 2026-08-27 |
 | 6 | the per-tile registry published beside the store | 2026-08-19 |
 
@@ -31,10 +32,11 @@ commit re-serialises the repo-global snapshot through a branch-tip compare-and-s
 groups and a shared compare-and-swap are different things**, and conflating them is an error this
 document has made once already (§5).
 
-**A coordinator forks its session to sixteen workers.** `run_forked` opens a writable session, forks
-it, hands one fork to each of sixteen spawned worker processes, and merges their forks back at the
-end. The forks pickle across process boundaries; a fork can be merged into a session it was not
-created from, which is what makes §3's recovery possible.
+**A coordinator forks its session to thirty-two workers** (sixteen before 2026-09-08; every
+incident below happened at sixteen). `run_forked` opens a writable session, forks it, hands one fork
+to each spawned worker process, and merges their forks back at the end. The forks pickle across
+process boundaries; a fork can be merged into a session it was not created from, which is what made
+§3's recovery possible — that recovery has since been removed (§2a).
 
 **The write is almost all shard writing.** Measured to completion on a dense zone-year:
 
@@ -59,8 +61,8 @@ than 8. Assembly stays off the critical path, but by 10% rather than comfortably
 
 ## 2. The S3 budget clamp cost assembly two thirds of its fork pool
 
-**Status: fixed.** `_s3_budget_split` reduced the assembly fork count to fit a per-fill S3 request
-budget. On the global campaign that budget is always far below the requested worker count, so the
+**Status: fixed, then the budget itself was REMOVED — read §2a with this.** `_s3_budget_split`
+reduced the assembly fork count to fit a per-fill S3 request budget. On the global campaign that budget is always far below the requested worker count, so the
 clamp bound on *every* assembly.
 
 ### What was measured
@@ -143,6 +145,45 @@ was actually seen.
 > **Read §4 next, not in isolation.** This change tripled the fork count on every assembly, which
 > tripled the number of processes each fetching a storage credential. The credential incident
 > happened the same week.
+
+### 2a. 2026-09-09: the request cap is REMOVED, and it was the cause of §3's hang
+
+**The whole budget is gone** — `TARGET_AGGREGATE_S3_CONCURRENCY`, `_s3_budget_split`, the
+`per_worker_s3_cap` field and the `s3_concurrency` flow parameter. The repository now opens at
+icechunk's default request concurrency (256) and nothing in the library overrides it.
+
+**Why: the value the arithmetic produced deadlocks icechunk.** A repository opened with
+`max_concurrent_requests = 1` parks forever in `Session.commit` and in `Repository.diff`/`rebase`
+inside icechunk's tokio runtime, under concurrent writers. That is the value the campaign produced
+on every assembly — the table above shows `per_worker_s3_cap: 1` in all seven recorded runs — and it
+is the cause of the 2026-09-04 wedges that stranded five clusters for four days. Full record:
+[`../assembly/icechunk-max-concurrent-requests-1-deadlock.md`](../assembly/icechunk-max-concurrent-requests-1-deadlock.md)
+and [`../assembly/assembly-wedges-during-fork-phase-2026-09-04.md`](../assembly/assembly-wedges-during-fork-phase-2026-09-04.md).
+
+**The measured evidence, in full:**
+
+| what was measured | result |
+|---|---|
+| cap 1, four coordinators x eight fork workers on real S3 | three of four parked in ~3 min, never returned; reproduced on icechunk **2.1.1 and 2.2.0** |
+| cap 2, identical load and store geometry | every cell published, clean, 146 s |
+| cap 4, identical load | every cell published, clean |
+| **uncapped (icechunk default), 32 fork workers per fill at production fan-out** | **zero throttling on every arm** |
+| four minimal reductions at cap 1 (cross-process commits; background rebase; a 4,096-reference commit; a concurrent reader) | all clean — the fault is not isolated to a small shape |
+
+**So nothing was bought by capping it.** The justification for the cap was a `SlowDown` at 800
+concurrent PUTs, recorded as a code comment; §2's "What was not verified" already flagged that it
+was never traced to a primary record, and the `t7_ramp` harness reached only 68-82 PUT/s with zero
+`slowdown_503_count`. **That figure is not established and is no longer relied on.** What is
+established is the row above: uncapped at 32 workers per fill across the fleet, nothing throttled.
+
+**Removed with it: `rehome_after_a_wedged_catch_up`** (§3's recovery). Its own `Repository.diff`
+call parks in the identical deadlock, so it never recovered a cell — which is why the fallback
+re-commit did nothing for the 09-04 clusters. `run_forked` no longer returns a session pair.
+
+**Kept:** the periodic catch-up itself and `CATCH_UP_INTERVAL_S` (a performance feature — see §3);
+the storage timeouts and retries (a different, separately observed failure — §3's socket wedge); and
+two bounds that turn an unbounded hang into a diagnosable crash, `shard_writer`'s fork-phase
+watchdog and `sequential_fill`'s bounded assembly backlog drain. Neither is a fix for this incident.
 
 ---
 
@@ -449,6 +490,15 @@ wedging path); merge the forks already in `results` and commit.
 cannot be killed, but **re-homing finished work onto a session no one else holds.**
 
 #### The fix: re-home the finished forks, and halve the interval
+
+> **REMOVED 2026-09-09. The re-home never worked, and this subsection records why it looked as
+> though it did.** Everything below about `rehome_after_a_wedged_catch_up` — the function, the
+> `(telemetry, session)` pair, the `workers_finished` guard and its test — is deleted. Its own
+> `Repository.diff` call parks in the same icechunk deadlock as the catch-up it recovers from, so on
+> production it recovered nothing; the dev arm that showed 10/10 ran at icechunk's DEFAULT request
+> concurrency, where the deadlock does not occur, while production ran at a cap of 1, where it does.
+> That is the whole discrepancy. See §2a. The interval change (60 s → 30 s → 5 s) and
+> `catch_up_best_effort` **stay**: keeping the session near the tip is a performance feature.
 
 **1. `rehome_after_a_wedged_catch_up`.** `run_forked` now returns `(telemetry, session)` rather than a
 bare dict. That is deliberate friction: after a re-home the session the caller must commit is not the
@@ -1058,10 +1108,11 @@ rather than lazy.
 
 | what | where |
 |---|---|
-| the sixteen-worker fork split | `storage/shard_writer.py`, `run_forked` and `write_year_shards` |
-| the fork-count clamp, and the budget it divides | `inference/assembly.py`, `_s3_budget_split`; `config/assembly.py`, `AssemblyConfig.max_workers` |
+| the thirty-two-worker fork split | `storage/shard_writer.py`, `run_forked` and `write_year_shards` |
+| the fork pool's ceiling (no request budget divides it any more) | `config/assembly.py`, `AssemblyConfig.max_workers` |
+| the fork-phase stall watchdog | `storage/shard_writer.py`, `_fork_stall_watchdog`, `FORK_STALL_TIMEOUT_S` |
+| the bounded assembly backlog drain, and the crash that follows a wedged one | `orchestration/runners/sequential_fill.py`, `drain_trailing_assemblies`; `orchestration/prefect/flows/fill_zones_sequential.py`, `_end_process_after_wedged_drain` |
 | the session catch-up: constant, error type, predicate, operation, wrapper, timer | `storage/session_catch_up.py` |
-| re-homing after a wedged catch-up | `storage/session_catch_up.py`, `rehome_after_a_wedged_catch_up` |
 | the commit itself, and the `COMMIT <secs>` detector line | `storage/shard_writer.py`, `commit_with_rebase` |
 | the two assembly paths that copy a connection to workers | `inference/assembly.py`, `assemble` and `assemble_global` |
 | the single place every storage credential is built and logged | `providers/aws/credentials.py`, `_serve_icechunk_credential` |
