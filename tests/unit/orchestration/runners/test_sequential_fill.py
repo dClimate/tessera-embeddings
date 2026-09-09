@@ -1890,6 +1890,168 @@ def test_a_landed_queued_cell_counts_while_the_feeder_is_free():
     assert answers == [True], f"a landed cell the free feeder will enqueue is available work: {answers}"
 
 
+def test_every_adapter_call_the_feeder_makes_publishes_the_park():
+    """THE STRUCTURAL HALF of "available means deliverable".
+
+    Flagging ``inputs.wait`` alone shipped once and came straight back: it missed ``cleanup`` on
+    the terminal-plan path and ``discard`` on the re-ingest path, both of which park the single
+    feeder for minutes to hours. An enumeration of call sites is only ever as complete as the
+    list someone thought of, so the subject here is the PROTOCOL — every method
+    :class:`CellInputs` declares must publish the park, and must publish it AROUND the call
+    rather than after it.
+    """
+    calls: list[str] = []
+
+    class _Naming:
+        """Every method records itself, so the oracle can be the ORDER."""
+
+        def start(self, zone: str, year: int) -> None:
+            calls.append("start")
+
+        def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+            calls.append("wait")
+
+        def cleanup(self, zone: str, year: int) -> None:
+            calls.append("cleanup")
+
+        def discard(self, zone: str, year: int) -> None:
+            calls.append("discard")
+
+        def cancel_unstarted(self, cells: Iterable[tuple[str, int]] | None = None) -> int:
+            calls.append("cancel_unstarted")
+            return 0
+
+        def ready(self, zone: str, year: int) -> bool:
+            calls.append("ready")
+            return True
+
+    view = mod._FeederInputs(_Naming(), lambda: calls.append("parked"), lambda: calls.append("free"))
+    declared = {name for name, member in vars(mod.CellInputs).items() if not name.startswith("_") and callable(member)}
+    # The control on the loop below: it really is walking the whole protocol, so a method added
+    # to `CellInputs` cannot pass this test by being invisible to it.
+    assert declared == {"start", "wait", "cleanup", "discard", "cancel_unstarted", "ready"}, declared
+    for name in sorted(declared):
+        calls.clear()
+        getattr(view, name)() if name == "cancel_unstarted" else getattr(view, name)("01N", 2025)
+        assert calls == ["parked", name, "free"], f"{name} does not publish the feeder's park: {calls}"
+
+
+def test_a_landed_cell_the_re_ingesting_feeder_cannot_reach_does_not_hold_the_fleet():
+    """The behavioural half, on the site the first fix missed.
+
+    An ingest failure is re-ingested from ``_readmit``, and on the feeder's own thread:
+    ``discard`` has to confirm the previous attempt is dead before a replacement starts, which
+    is minutes of the sole feeder. A different cell landing during it is work the feeder cannot
+    reach, so reporting it available holds the whole GPU fleet against an empty queue.
+    """
+    parked = threading.Event()  # the feeder is inside inputs.discard, re-ingesting 01N
+    release = threading.Event()
+    answers: list[bool] = []
+
+    class _Inputs(RecordingInputs):
+        def ready(self, zone: str, year: int) -> bool:
+            return zone == "02N" and parked.is_set()
+
+        def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+            if zone == "01N":
+                raise RuntimeError("ingest failed for 01N-2025")
+
+        def discard(self, zone: str, year: int) -> None:
+            # Ordered, not raced: the park is published BEFORE the call, so once this is
+            # visible the flag is already set and 02N is already ready.
+            parked.set()
+            release.wait(timeout=20.0)
+
+    def session(more_work, on_item_done):
+        assert parked.wait(timeout=20.0), "the feeder never reached the re-ingest"
+        assert more_work() == [], "nothing is prepared, so the poll must be empty"
+        answers.append(bool(more_work.has_work()))
+        release.set()
+        return []
+
+    with contextlib.suppress(RuntimeError):
+        _run_with_deadline(_cells(2), inputs=_Inputs([]), session=session)
+    release.set()
+    assert answers == [False], f"a cell the re-ingesting feeder cannot hand over is not available: {answers}"
+
+
+def test_a_terminal_cells_mosaic_delete_does_not_park_the_feeder():
+    """The other half of the same finding, fixed at the source instead of published.
+
+    A cell that plans out TERMINAL (already complete, all ocean) is committed and tagged inside
+    ``plan``, so deleting its mosaic is housekeeping on work that has landed — and a
+    multi-terabyte delete has no business on the one thread the rest of the roster is admitted
+    by. Run inline it stopped every other cell being admitted for the length of the delete, with
+    the fleet idle and nothing able to arrive.
+
+    The oracle is ORDER: 02N reaches the stream while 01N's delete is provably still running.
+    """
+    release = threading.Event()
+    events: list[str] = []
+
+    class _Inputs(RecordingInputs):
+        def cleanup(self, zone: str, year: int) -> None:
+            with self._lock:
+                self.events.append(f"delete-start:{zone}")
+            release.wait(timeout=10.0)
+            with self._lock:
+                self.events.append(f"delete-end:{zone}")
+
+    def session(more_work, on_item_done):
+        results: list[dict[str, Any]] = []
+        while True:
+            batch = more_work()
+            if batch is None:
+                return results
+            for item in batch:
+                events.append(f"infer:{item.ctx.run_id}")
+                release.set()  # 02N is streaming, so the parked delete may finish
+                result = {"chunk": item.chunk.label, "status": "success"}
+                results.append(result)
+                on_item_done(item, result)
+
+    _run_with_deadline(
+        _cells(2),
+        inputs=_Inputs(events),
+        plan=_plan_for(done_zones={"01N"}),
+        session=session,
+        deadline_s=30.0,
+    )
+    release.set()
+    assert "delete-start:01N" in events, f"01N was not terminal, so nothing was deleted: {events}"
+    assert events.index("infer:r-02N") < events.index("delete-end:01N"), (
+        f"02N waited for 01N's mosaic delete to finish: {events}"
+    )
+
+
+def test_an_assembly_retry_does_not_re_publish_a_cell_the_first_attempt_landed():
+    """``assemble`` commits the year and tags it BEFORE it returns, and it can raise after doing
+    both — a failed deferred-cleanup submission does exactly that.
+
+    Retrying from the same tally then writes a second snapshot, and the zone-year tag is
+    write-once, so it refuses to move: every remaining attempt fails and a cell that is
+    published and correct is reported as failed.
+    """
+    calls: list[str] = []
+    published: set[str] = set()
+
+    def assemble(handoff, prep):
+        calls.append(f"assemble:{handoff.zone}")
+        published.add(handoff.zone)  # committed and tagged...
+        raise RuntimeError("cannot schedule new futures after shutdown")  # ...and then raised
+
+    def plan(cell: SequentialCell, prep: PreparedCell) -> ZonePlan:
+        if cell.zone in published:
+            return ZonePlan(
+                cell.zone, cell.year, prep.run_id, 0.0, {}, [], done={"zone": cell.zone, "already_complete": True}
+            )
+        return _plan_for()(cell, prep)
+
+    summary = _run(_cells(1), plan=plan, assemble=assemble, attempts_per_cell_in_cluster=2)
+    assert calls == ["assemble:01N"], f"the retry assembled a cell that had already published: {calls}"
+    assert (summary["succeeded"], summary["failed"]) == (1, 0), f"a published cell was reported as failed: {summary}"
+
+
 def test_a_pause_holding_available_inference_work_keeps_the_fleet():
     """Withheld work is not absent work. A pause over a cell whose mosaic has landed must report
     work available, so retirement is suppressed and a resume dispatches immediately.

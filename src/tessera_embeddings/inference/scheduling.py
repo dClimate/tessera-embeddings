@@ -249,6 +249,10 @@ class ActorPool:
         self._initializing: set[int] = set()
         self._retired: set[int] = set()
         self._idle_since: dict[int, float] = {}
+        # When each still-initializing slot became cancellable — its own clock, because an
+        # unplaced slot is never "idle" and so never enters `_idle_since`. See
+        # `retire_initializing`.
+        self._unplaced_since: dict[int, float] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -555,6 +559,10 @@ class ActorPool:
         self._pending_iid_refs[actor_idx] = self.actors[actor_idx].get_instance_id.remote()  # type: ignore[union-attr]
         self.actor_instance_ids[actor_idx] = placeholder_iid
         self._initializing.add(actor_idx)
+        # Every ENTRY into the initializing state starts the cancellation clock over. `replace`
+        # re-marks a slot the pool has used before, and a clock left from that slot's previous
+        # initialization would make the replacement cancellable the moment it was created.
+        self._unplaced_since.pop(actor_idx, None)
 
     def add_actors(self, new_actors: list[ray.actor.ActorHandle]) -> None:
         """Append a freshly-requested batch of actors to the pool.
@@ -667,18 +675,82 @@ class ActorPool:
             if live - 1 < outstanding_work or ready - 1 < floor:
                 continue
 
-            self.resolve_iid(actor_idx)  # pick up lazily-resolved EC2 instance ID
-            instance_id = self.actor_instance_ids[actor_idx] if actor_idx < len(self.actor_instance_ids) else "unknown"
-            with contextlib.suppress(Exception):
-                ray.kill(self.actors[actor_idx])
-            self._retired.add(actor_idx)
-            self._idle_since.pop(actor_idx, None)
+            instance_id = self._retire_slot(actor_idx)
             live -= 1
             ready -= 1
             self.log.info("Killed idle actor %d (instance %s) — releasing GPU node", actor_idx, instance_id)
-            if self._on_retire is not None and instance_id.startswith("i-"):
-                with contextlib.suppress(Exception):
-                    self._on_retire(instance_id)
+
+    def retire_initializing(self, outstanding_work: int, floor: int = 0) -> None:
+        """Cancel slots that have not placed yet, once there is no work left for them to run.
+
+        An initializing slot is invisible to :meth:`retire_idle` — dispatch skips it, so it is
+        never seen idle — but it is not free. A Ray actor waiting on placement holds a GPU
+        resource request the autoscaler forwards to AWS, and it counts in :attr:`requested`,
+        which is what the fleet publisher advertises. Through an ingest drought that keeps asking
+        for machines the run has no work for, and if the capacity does arrive the instances boot,
+        load the checkpoint and bill a full idle grace before the wind-down can reach them.
+
+        REFUSED WHILE ANY WORK IS OUTSTANDING (it needs the capacity), and refused unless a
+        READY actor is already standing: an unplaced slot is otherwise the session's only route
+        to a live actor, and cancelling it would leave a live work source with nothing that can
+        ever run its chunks — the teardown the wind-down's floor exists to avoid. Retiring these
+        never lowers :attr:`ready_count`, so the floor cannot be crossed from here.
+
+        The SAME GRACE as the idle wind-down, on its own clock: a zone boundary answers "nothing
+        right now" for a few seconds, and cancelling on that first answer would throw a batch
+        away mid-boot and re-request it moments later.
+
+        Args:
+            outstanding_work: len(pending) + len(chunk_queue) + reservations at call time.
+            floor: READY actors the caller keeps whatever happens, as in :meth:`retire_idle`.
+        """
+        if outstanding_work > 0 or self.ready_count < max(floor, 1):
+            return
+        now = time.monotonic()
+        for actor_idx in sorted(self._initializing):
+            if actor_idx not in self._unplaced_since:
+                self._unplaced_since[actor_idx] = now
+                continue
+            if now - self._unplaced_since[actor_idx] < self.idle_grace_sec:
+                continue
+            instance_id = self._retire_slot(actor_idx)
+            self.log.info(
+                "Cancelled unplaced actor %d (was %s) — no outstanding work, so it is no longer advertising GPU demand",
+                actor_idx,
+                instance_id,
+            )
+
+    def _retire_slot(self, actor_idx: int) -> str:
+        """Kill one slot's actor and mark the slot retired; return the instance ID it was on.
+
+        The one retirement primitive, shared by the idle wind-down and by the cancellation of
+        unplaced slots so both leave the same state behind — and so both honour the packing rule:
+
+        THE INSTANCE IS TERMINATED ONLY WHEN THIS SLOT WAS THE LAST LIVE ONE ON IT. Under
+        ``config.num_gpus < 1`` several actors share one GPU instance, and firing the terminator
+        per retired actor then kills a machine still hosting a busy sibling — or the one actor
+        the liveness floor just kept, leaving the session believing it has a live slot whose
+        handle is dead. Whole-GPU actors (the default, and what the campaign runs) are alone on
+        their instance, so the check passes on the first retirement and nothing changes for them;
+        on a packed instance the LAST retirement terminates it, which is the same outcome one
+        step later.
+        """
+        self.resolve_iid(actor_idx)  # pick up lazily-resolved EC2 instance ID
+        instance_id = self.actor_instance_ids[actor_idx] if actor_idx < len(self.actor_instance_ids) else "unknown"
+        with contextlib.suppress(Exception):
+            ray.kill(self.actors[actor_idx])
+        self._retired.add(actor_idx)
+        self._initializing.discard(actor_idx)
+        self._pending_iid_refs.pop(actor_idx, None)
+        self._idle_since.pop(actor_idx, None)
+        self._unplaced_since.pop(actor_idx, None)
+        still_hosted = any(
+            iid == instance_id and idx not in self._retired for idx, iid in enumerate(self.actor_instance_ids)
+        )
+        if self._on_retire is not None and instance_id.startswith("i-") and not still_hosted:
+            with contextlib.suppress(Exception):
+                self._on_retire(instance_id)
+        return instance_id
 
 
 # ---------------------------------------------------------------------------
@@ -1552,8 +1624,20 @@ def _process_chunks_work_stealing(
         # now. NOT merely "unexhausted": a cluster waiting on an ingest held a full idle fleet
         # for the whole wait. The session stays alive, so ingest and the assembly backlog carry
         # on and the pool re-grows through the batch machinery when work arrives.
-        if retire_idle_actors and (not source_active or source_idle):
+        # A MID-RUN wind-down is only safe where the pool can grow back, and `batching_enabled`
+        # is the whole of what recreates a retired slot. `actor_request_batch_size = 0` (request
+        # the fleet all at once) turns it off, as does a caller that hands over its whole fleet
+        # with no target — and then a single ingest gap would cut the fleet to the liveness floor
+        # for the rest of the run, with every later cell inferred on one actor. The TAIL
+        # wind-down is unaffected: the source is exhausted, so there is nothing to grow back for.
+        if retire_idle_actors and (not source_active or (source_idle and batching_enabled)):
             # One actor is kept while more work may still arrive — see `retire_idle`'s `floor`.
-            pool.retire_idle(pool.outstanding_work(len(chunk_queue)), floor=1 if source_active else 0)
+            floor = 1 if source_active else 0
+            outstanding = pool.outstanding_work(len(chunk_queue))
+            pool.retire_idle(outstanding, floor=floor)
+            # Slots still waiting on placement are retired too, and they need saying separately:
+            # `retire_idle` cannot see them, yet they are what the autoscaler is still being
+            # asked for. See `retire_initializing`.
+            pool.retire_initializing(outstanding, floor=floor)
 
     return results

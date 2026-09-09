@@ -11,6 +11,7 @@ import itertools
 import logging
 import time
 from collections import deque
+from unittest import mock
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -643,6 +644,111 @@ class TestRetireIdle:
         with patch.object(_sched_mod.ray, "kill") as mock_kill:
             pool.retire_idle(outstanding_work=1)
         mock_kill.assert_not_called()
+
+
+class TestRetireInitializing:
+    """Cancelling slots that have not placed yet, once there is no work for them.
+
+    `retire_idle` cannot see these: dispatch skips an initializing slot, so it is never
+    observed idle. They are not free, though — a Ray actor waiting on placement holds a GPU
+    resource request the autoscaler forwards to AWS, and it counts in `requested`, which is what
+    the fleet publisher advertises.
+    """
+
+    @staticmethod
+    def _pool_with_unplaced(n_unplaced: int, n_ready: int = 1, **kwargs) -> ActorPool:
+        # A long grace, so "inside the grace period" cannot be reached by the clock moving
+        # between two calls; the tests wind `_unplaced_since` back to cross it deliberately.
+        kwargs.setdefault("idle_grace_sec", 120)
+        pool = _make_pool(n_ready + n_unplaced, **kwargs)
+        for idx in range(n_ready, n_ready + n_unplaced):
+            pool._initializing.add(idx)
+            pool.actor_instance_ids[idx] = "pending-init"
+        return pool
+
+    def test_unplaced_slots_are_cancelled_once_no_work_is_outstanding(self) -> None:
+        """THE POINT. Through an ingest drought these keep asking AWS for machines the run has
+        no work for, and if the capacity arrives they boot, load the checkpoint and bill a whole
+        idle grace before the wind-down can reach them.
+        """
+        pool = self._pool_with_unplaced(3)
+        assert pool.requested == 4, "control: the run is asking for four actors"
+        with patch.object(_sched_mod.ray, "kill") as mock_kill:
+            pool.retire_initializing(outstanding_work=0, floor=1)  # first sighting starts the clock
+            # THE GRACE, and it needs its own call to be measured: the first one only ever
+            # starts the clock. A zone boundary answers "nothing right now" for a few seconds,
+            # and cancelling on that would throw a batch away mid-boot and re-request it.
+            pool.retire_initializing(outstanding_work=0, floor=1)
+            assert not mock_kill.called, "cancelled inside the grace period"
+            for idx in (1, 2, 3):
+                pool._unplaced_since[idx] = time.monotonic() - 200
+            pool.retire_initializing(outstanding_work=0, floor=1)
+        assert pool.requested == 1, f"the run is still advertising demand for {pool.requested} actors"
+        assert mock_kill.call_count == 3
+        assert pool.ready_count == 1, "the ready floor actor must survive the cancellation"
+
+    def test_the_grace_period_is_reset_by_a_replacement_on_the_same_slot(self) -> None:
+        """Slot indices are the pool's identity and `replace` re-marks one it has used before, so
+        a clock left over from that slot's previous initialization would make a freshly created
+        replacement cancellable the instant it appeared.
+        """
+        pool = self._pool_with_unplaced(1)
+        pool._unplaced_since[1] = time.monotonic() - 200
+        pool.actors[1].get_instance_id.remote.return_value = MagicMock()
+        pool.mark_initializing(1)
+        with (
+            patch.object(_sched_mod.ray, "kill") as mock_kill,
+            patch.object(_sched_mod.ray, "wait", return_value=([], [])),
+        ):
+            pool.retire_initializing(outstanding_work=0, floor=1)
+        assert not mock_kill.called, "a re-marked slot inherited the previous initialization's clock"
+
+    @pytest.mark.parametrize(
+        ("outstanding", "n_ready", "why"),
+        [
+            (1, 1, "work outstanding needs the capacity these slots are waiting for"),
+            (0, 0, "with no ready actor these slots are the session's only route to a live one"),
+        ],
+    )
+    def test_unplaced_slots_are_kept(self, outstanding: int, n_ready: int, why: str) -> None:
+        """The two bounds on the cancellation, and the second is the important one: cancelling
+        the last unplaced slot when nothing is ready leaves a live work source with nothing that
+        can ever run its chunks — the teardown the wind-down's floor exists to prevent.
+        """
+        pool = self._pool_with_unplaced(2, n_ready=n_ready)
+        for idx in pool._initializing:
+            pool._unplaced_since[idx] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill") as mock_kill:
+            pool.retire_initializing(outstanding_work=outstanding, floor=1)
+        assert not mock_kill.called, why
+
+
+class TestRetiringAPackedInstance:
+    """`config.num_gpus < 1` packs several actors onto one GPU instance, and retirement fires the
+    EC2 terminator per retired ACTOR. Terminating the instance on the first of them kills a
+    machine still hosting a busy sibling — or the one actor the liveness floor just kept, leaving
+    the session believing it holds a live slot whose handle is dead.
+    """
+
+    def test_the_instance_is_terminated_only_by_the_last_actor_to_leave_it(self) -> None:
+        callback = MagicMock()
+        pool = _make_pool(3, idle_grace_sec=1, on_retire=callback)
+        pool.actor_instance_ids = ["i-shared", "i-shared", "i-alone"]
+        pool._idle_since[0] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=0, floor=2)
+        # The control: slot 0 really was retired, and slot 1 really is still live on that
+        # instance — so "not terminated" is the rule under test and not an untaken branch.
+        assert pool._retired == {0}, f"the wind-down did not retire exactly one actor: {pool._retired}"
+        callback.assert_not_called()
+
+        pool._idle_since[1] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=0, floor=1)
+        assert pool._retired == {0, 1}
+        assert callback.call_args_list == [mock.call("i-shared")], (
+            f"the last actor off the instance must release it: {callback.call_args_list}"
+        )
 
 
 # ===========================================================================
@@ -2265,6 +2371,83 @@ class TestRetireIdleGate:
         assert not self._run_one_chunk(retire_idle_actors=False).called
 
 
+class TestMidRunWindDownNeedsRegrowth:
+    """A wind-down mid-run is only safe where the pool can grow back.
+
+    `_maybe_request_next_batch` is the whole of what recreates a retired slot, and it does
+    nothing unless batching is enabled. `actor_request_batch_size = 0` is a supported mode
+    meaning "request the whole fleet at once", and it disables batching — so a single ingest gap
+    would cut the fleet to the liveness floor for the rest of the run, with every later cell
+    inferred on one actor. The default is 50 and the campaign passes 25, so this is a documented
+    mode rather than the one we run.
+    """
+
+    @staticmethod
+    def _floors(batch_size: int) -> tuple[list[int], list[int]]:
+        """Run the loop over one chunk with a source that answers `[]` once, then exhausts.
+
+        Returns the ``floor`` each retirement call was made with, for both retirement entry
+        points. The floor is the discriminator: the loop passes 1 while the source is still
+        ACTIVE (the mid-run wind-down under test) and 0 once it has exhausted (the tail
+        wind-down, which needs no regrowth and must be unaffected).
+        """
+        actor = MagicMock(name="actor_0")
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        config.actor_request_batch_size = batch_size
+        config.actor_request_headroom = None
+        config.num_gpus = 1.0
+        seed_ref = MagicMock(name="seed_ref")
+        actor.process_chunk.remote.return_value = seed_ref
+        actor.get_instance_id.remote.return_value = MagicMock(name="iid_ref")
+        polls = itertools.chain([[]], itertools.repeat(None))
+
+        def fake_get(ref, *args, **kwargs):
+            return {"chunk": "c0", "status": "ok"} if ref is seed_ref else "i-0000"
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
+            patch.object(_sched_mod.ray, "get", side_effect=fake_get),
+            patch.object(_sched_mod.ray, "nodes", return_value=[{"Alive": True, "Resources": {"GPU": 1}}]),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.time, "sleep"),
+            patch.object(_sched_mod.ActorPool, "retire_idle") as idle_mock,
+            patch.object(_sched_mod.ActorPool, "retire_initializing") as init_mock,
+        ):
+            results = _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=[_fake_chunk("c0")],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                log=logging.getLogger("test"),
+                more_work=lambda: next(polls),
+                actor_factory=lambda n: [],
+                total_actors_target=4,
+                placement_timeout_sec=300.0,
+            )
+        assert len(results) == 1, "the loop did not run its chunk, so its retirement calls mean nothing"
+        return (
+            [call.kwargs["floor"] for call in idle_mock.call_args_list],
+            [call.kwargs["floor"] for call in init_mock.call_args_list],
+        )
+
+    def test_an_idle_source_winds_the_fleet_down_where_it_can_regrow(self) -> None:
+        """THE CONTROL, and the reason the test below is about regrowth and not about the
+        source: with batching on, an idle source retires while it is still active (floor 1).
+        """
+        idle_floors, init_floors = self._floors(batch_size=25)
+        assert 1 in idle_floors, f"no mid-run wind-down happened at all: {idle_floors}"
+        assert 1 in init_floors, f"unplaced slots were not cancelled with the rest: {init_floors}"
+
+    def test_an_idle_source_does_not_wind_down_a_fleet_that_cannot_regrow(self) -> None:
+        idle_floors, init_floors = self._floors(batch_size=0)
+        assert idle_floors == [0], f"the fleet was wound down with nothing able to recreate it: {idle_floors}"
+        assert init_floors == [0], f"unplaced slots were cancelled with nothing able to replace them: {init_floors}"
+
+
 # ===========================================================================
 # _process_chunks_work_stealing — chained multi-zone work source
 # ===========================================================================
@@ -2416,6 +2599,12 @@ class TestChainedWorkSource:
 
         config = MagicMock()
         config.checkpoint_path = "s3://bucket/ckpt.pt"
+        # A session that CAN grow back, as every real one can: `run_inference` always hands the
+        # loop an actor factory and a target, and a mid-run wind-down is gated on being able to
+        # undo itself (see `test_an_idle_source_does_not_wind_down_a_fleet_that_cannot_regrow`).
+        config.actor_request_batch_size = 25
+        config.actor_request_headroom = None
+        config.num_gpus = 1.0
         # Two empty answers, then exhaustion. Retirement must be offered on the empty ones.
         answers: list = [[], [], None]
         offered_while_active: list[int] = []
@@ -2446,6 +2635,8 @@ class TestChainedWorkSource:
                 config=config,
                 log=logging.getLogger("test"),
                 more_work=more_work,
+                actor_factory=lambda n: [],
+                total_actors_target=1,
             )
         assert offered_while_active and offered_while_active[0] >= 2, (
             f"retirement was not offered while the source was still unexhausted: {offered_while_active}"
@@ -2460,6 +2651,10 @@ class TestChainedWorkSource:
         actors = [MagicMock(name=f"actor_{i}") for i in range(4)]
         config = MagicMock()
         config.checkpoint_path = "s3://bucket/ckpt.pt"
+        # A session that can grow back — see the same note in the test above.
+        config.actor_request_batch_size = 25
+        config.actor_request_headroom = None
+        config.num_gpus = 1.0
         polls = {"n": 0}
         live_seen: list[int] = []
 
@@ -2494,6 +2689,8 @@ class TestChainedWorkSource:
                 config=config,
                 log=logging.getLogger("test"),
                 more_work=more_work,
+                actor_factory=lambda n: [],
+                total_actors_target=4,
             )
         assert polls["n"] > 6, f"the session ended before the source was exhausted ({polls['n']} polls)"
         assert live_seen, "nothing retired, so this proves nothing"
@@ -2700,7 +2897,12 @@ class TestSessionScopedStateIsNotPerCell:
         actors = [MagicMock(name=f"actor_{i}") for i in range(30)]
         config = MagicMock()
         config.checkpoint_path = "s3://bucket/ckpt.pt"
-        config.actor_request_batch_size = 0  # no batching; only the publisher is under test
+        # Only the publisher is under test, but the wind-down that gives it something to report
+        # is gated on the pool being able to grow back — see the note in
+        # `test_retirement_runs_while_the_source_is_merely_waiting`. The factory returns nothing,
+        # so what is published still comes from the retirements alone.
+        config.actor_request_batch_size = 25
+        config.actor_request_headroom = None
         config.num_gpus = 1.0
         fleet = MagicMock(name="fleet")
         polls = {"n": 0}
@@ -2730,6 +2932,7 @@ class TestSessionScopedStateIsNotPerCell:
                 log=logging.getLogger("test"),
                 more_work=more_work,
                 fleet=fleet,
+                actor_factory=lambda n: [],
                 total_actors_target=60,
             )
         published = [c.kwargs["requested"] for c in fleet.send.call_args_list if "requested" in c.kwargs]

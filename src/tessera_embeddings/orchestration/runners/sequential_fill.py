@@ -76,11 +76,12 @@ months.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
@@ -164,6 +165,70 @@ class CellInputs(Protocol):
         conservative ``False`` is always safe: the feeder then blocks on its head cell.
         """
         ...
+
+
+class _FeederInputs:
+    """:class:`CellInputs` as the runner uses it — every call publishes whether the FEEDER is
+    inside it.
+
+    The feeder is ONE thread, so while it sits in an adapter call it cannot admit another cell
+    however ready that cell is, and these durations are unbounded by design: ``wait`` parks for
+    a cell's remaining ingest (4-10 h at the opening of a cluster's window), ``cleanup`` deletes
+    a multi-terabyte mosaic, ``discard`` has to confirm a previous ingest is dead before a
+    replacement starts. :func:`fill_zones_sequential`'s ``_source_has_work`` has to know,
+    because a queued cell a parked feeder cannot reach is not AVAILABLE work — reporting it held
+    the whole GPU fleet idle for as long as the park lasted, which is the one outcome the
+    wind-down exists to prevent.
+
+    A WRAPPER rather than a flag at each call site. Flagging ``wait`` alone shipped once and came
+    straight back: it missed ``cleanup`` on the terminal-plan path and ``discard`` on the
+    re-ingest path, and an enumeration is only ever as complete as the list someone thought of.
+    Here the whole protocol is covered, and a method ADDED to :class:`CellInputs` later cannot
+    slip through unmarked — this class is what the runner passes as its ``CellInputs``, so the
+    type checker refuses it until the new method is wrapped too.
+
+    Only the feeder's own calls park the feeder; the marker it is given is what decides, by
+    thread. The same adapter is also called from the scheduler thread (a tally whose tiles failed
+    re-ingests through ``_readmit``), from the cleanup pool (a landed cell's mosaic delete) and
+    from the main thread (the closing retry pass), and none of those stop the feeder admitting.
+    """
+
+    def __init__(self, inputs: CellInputs, on_enter: Callable[[], None], on_exit: Callable[[], None]) -> None:
+        self._inputs = inputs
+        self._on_enter = on_enter
+        self._on_exit = on_exit
+
+    @contextlib.contextmanager
+    def _parked(self) -> Iterator[None]:
+        self._on_enter()
+        try:
+            yield
+        finally:
+            self._on_exit()
+
+    def start(self, zone: str, year: int) -> None:
+        with self._parked():
+            self._inputs.start(zone, year)
+
+    def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+        with self._parked():
+            self._inputs.wait(zone, year, stop=stop)
+
+    def cleanup(self, zone: str, year: int) -> None:
+        with self._parked():
+            self._inputs.cleanup(zone, year)
+
+    def discard(self, zone: str, year: int) -> None:
+        with self._parked():
+            self._inputs.discard(zone, year)
+
+    def cancel_unstarted(self, cells: Iterable[tuple[str, int]] | None = None) -> int:
+        with self._parked():
+            return self._inputs.cancel_unstarted(cells)
+
+    def ready(self, zone: str, year: int) -> bool:
+        with self._parked():
+            return self._inputs.ready(zone, year)
 
 
 @dataclass
@@ -386,12 +451,15 @@ def fill_zones_sequential(
     #: never be settled, so the feeder must stop waiting or it parks until its join times out.
     #: Distinct from ``stop``, which means the session RAISED.
     session_over = threading.Event()
-    #: Set while the feeder is BLOCKED in ``inputs.wait`` on the cell it has taken. The feeder is
-    #: a SINGLE thread, so while this is set it cannot admit anything else however ready that
-    #: work is — which is what ``_source_has_work`` needs to know, and why the flag lives beside
-    #: the queue rather than inside the feeder. Written by the feeder thread only, read under
-    #: ``lock``.
+    #: Set while the feeder is inside a ``CellInputs`` call on the cell it has taken — any of
+    #: them, which is what :class:`_FeederInputs` is for. The feeder is a SINGLE thread, so while
+    #: this is set it cannot admit anything else however ready that work is, which is what
+    #: ``_source_has_work`` needs to know and why the flag lives beside the queue rather than
+    #: inside the feeder. Written for the feeder's own calls only, read under ``lock``.
     feeder_blocked = False
+    #: The feeder thread's identity, claimed by ``_feed`` as its first act. ``None`` until then,
+    #: so an adapter call made before the feeder is running marks nothing.
+    feeder_ident: int | None = None
     # NOTHING bounds admission to the inference stream except this cap — see the module
     # docstring and the `max_retained_failures` argument above.
     if max_retained_failures < 1:
@@ -495,6 +563,27 @@ def fill_zones_sequential(
             max_retained_failures,
         )
 
+    def _feeder_entered_adapter() -> None:
+        """The feeder is inside an adapter call — publish it. A no-op from any other thread."""
+        nonlocal feeder_blocked
+        if threading.get_ident() != feeder_ident:
+            return
+        with lock:
+            feeder_blocked = True
+
+    def _feeder_left_adapter() -> None:
+        nonlocal feeder_blocked
+        if threading.get_ident() != feeder_ident:
+            return
+        with lock:
+            feeder_blocked = False
+
+    # EVERY adapter call in this runner goes through the view, from every thread; the markers
+    # above are what make only the feeder's own calls count. Wrapped once, here, so no call site
+    # has to remember (see `_FeederInputs`).
+    if inputs is not None:
+        inputs = _FeederInputs(inputs, _feeder_entered_adapter, _feeder_left_adapter)
+
     def _record_failure(cell: SequentialCell, phase: str, exc: BaseException) -> None:
         with lock:
             failures.append({"zone": cell.zone, "year": cell.year, "phase": phase, "error": str(exc)})
@@ -553,7 +642,12 @@ def fill_zones_sequential(
                 assembly_pending -= 1
 
     def _delete_mosaic(cell: SequentialCell) -> None:
-        """Delete a landed cell's mosaics, on the cleanup pool rather than the assembly thread.
+        """Delete a landed cell's mosaics, on the cleanup pool rather than a thread that matters.
+
+        Submitted from the assembly thread once a streamed cell lands, and from the FEEDER for a
+        cell that planned out terminal (committed and tagged inside ``plan``). Both are deletes
+        of work that has already published, and both would otherwise hold a thread the rest of
+        the roster is waiting on.
 
         A transient S3 error or a missing delete permission must not append a second,
         contradictory `assembly` failure for a cell that succeeded — which is what sharing the
@@ -728,7 +822,10 @@ def fill_zones_sequential(
         Ends only when the queue is empty AND no taken cell is still undecided — see
         ``undecided`` for why both halves are needed.
         """
-        nonlocal undecided, feeder_blocked
+        nonlocal undecided, feeder_ident
+        # Claimed HERE rather than from `Thread.ident` after `start()`: the feeder can reach its
+        # first adapter call before the starting thread gets to assign it.
+        feeder_ident = threading.get_ident()
         #: Set once the retained-failure cap has refused the rest of the roster. New cells stop
         #: being admitted; cells already streaming still get their answer, and a retry of one of
         #: them is still taken — it adds no mosaic the cap has not already counted.
@@ -842,17 +939,10 @@ def fill_zones_sequential(
                         # set, so a crashed session is never stuck behind a running ingest for
                         # its full duration. A cell `ready()` picked returns immediately.
                         #
-                        # FLAGGED for `_source_has_work`, in a try/finally so every exit clears
-                        # it: this is the one call in the loop that can park the single feeder
-                        # for hours, and a fleet held against work it cannot reach is the exact
-                        # cost the wind-down exists to avoid.
-                        with lock:
-                            feeder_blocked = True
-                        try:
-                            inputs.wait(cell.zone, cell.year, stop=stop)
-                        finally:
-                            with lock:
-                                feeder_blocked = False
+                        # The longest park the feeder takes, and `_FeederInputs` publishes it
+                        # for `_source_has_work`: a fleet held against work this thread cannot
+                        # reach is the exact cost the wind-down exists to avoid.
+                        inputs.wait(cell.zone, cell.year, stop=stop)
                     prep = prepare(cell)
                 except Exception as exc:
                     if stop.is_set():
@@ -898,21 +988,17 @@ def fill_zones_sequential(
                     _readmit(cell, attempt, "plan", exc)
                     continue
                 if terminal_done:
-                    # OUTSIDE the try, for the same reason the trailing assembly's cleanup is:
-                    # plan() has already committed, tagged and recorded this cell, so a failed
-                    # mosaic delete must not be caught above and recorded as a `plan` failure
-                    # for a cell that succeeded.
-                    if inputs is not None:
-                        try:
-                            inputs.cleanup(cell.zone, cell.year)
-                        except Exception:
-                            log.exception(
-                                "Mosaic cleanup failed for %s-%d after a TERMINAL plan; the cell "
-                                "stands, its mosaics are retained and will need sweeping.",
-                                cell.zone,
-                                cell.year,
-                            )
-                            _leak_mosaic(cell)
+                    # HANDED OFF, exactly as a landed cell's delete is (`_finalize`), and for
+                    # both of that path's reasons. plan() has already committed, tagged and
+                    # recorded this cell, so its mosaic delete is housekeeping on work that has
+                    # landed: a failure there must not be caught above and recorded as a `plan`
+                    # failure for a cell that succeeded, and a multi-terabyte delete must not
+                    # own the one thread the rest of the roster is admitted by. Run inline, it
+                    # parked the feeder for the length of the delete with the fleet idle.
+                    if inputs is None:
+                        _leak_mosaic(cell)
+                    else:
+                        mosaic_cleaner.submit(_delete_mosaic, cell)
                     # Terminal plans are DECIDED inside `plan()`, and nothing streams for them,
                     # so no later thread will settle them.
                     _settle(cell)
@@ -1036,16 +1122,23 @@ def fill_zones_sequential(
 
         AVAILABLE means DELIVERABLE, and that is a fact about the feeder as well as the queue.
         The bounded-by-one-plan argument above holds only while the feeder is free to act: it is
-        a single thread, and ``_take_next`` hands it the queue HEAD when nothing has landed, so
-        it can be parked in ``inputs.wait`` for that cell's whole remaining ingest — hours, on
-        the real coverage counts. Another cell landing during that park is work the feeder cannot
-        reach, and reporting it kept the full fleet billed with an empty queue for exactly as
-        long as the head took. So a queued cell counts only when ``feeder_blocked`` is clear.
-        When the park ends the feeder enqueues, the poll returns work and the pool re-grows.
+        a single thread, and every call it makes into ``inputs`` parks it for that call's whole
+        duration. ``_take_next`` hands it the queue HEAD when nothing has landed, so ``wait``
+        alone can hold it for that cell's entire remaining ingest — hours, on the real coverage
+        counts — and a re-ingest's ``discard`` or a mosaic delete are minutes each. Another cell
+        landing during a park is work the feeder cannot reach, and reporting it kept the full
+        fleet billed with an empty queue for exactly as long as the park lasted. So a queued cell
+        counts only when ``feeder_blocked`` is clear; when the park ends the feeder enqueues, the
+        poll returns work and the pool re-grows.
 
-        The flag is also raised for the instant a ``ready()`` cell's ``wait`` takes, and one
-        poll reading ``False`` there retires nothing: retirement needs the actor to have been
-        seen idle on a PREVIOUS call and then to pass the 120 s idle grace.
+        EVERY adapter call is covered, by construction rather than by a list of them:
+        :class:`_FeederInputs` is what raises the flag. What it deliberately does not cover is
+        the feeder's own bounded work on the cell it has taken (``prepare``, ``plan``, the
+        staged-resume scan), which is seconds and ends with that cell's tiles on ``ready``. Nor
+        does the flag need to be brief to be safe: it is also raised for the instant a
+        ``ready()`` cell's ``wait`` takes, and one poll reading ``False`` retires nothing —
+        retirement needs the actor to have been seen idle on a PREVIOUS call and then to pass
+        the 120 s idle grace.
 
         Non-blocking, as the scheduler requires: ``ready`` is a probe with no I/O.
         """
@@ -1225,8 +1318,25 @@ def fill_zones_sequential(
                 cell = tally.cell
                 tally.attempt += 1
                 try:
-                    handoff = complete_zone_inference(tally.plan, results=tally.results)
-                    _record_outcome(assemble(handoff, tally.prep))
+                    # DID THE FAILED ATTEMPT ALREADY PUBLISH? `assemble` commits the year and
+                    # tags it BEFORE it returns, and it can raise after doing both — a failed
+                    # deferred-cleanup submission does exactly that. Assembling again from the
+                    # same tally then writes a SECOND snapshot, and the zone-year tag is
+                    # write-once (icechunk forbids reusing a tag name, even a deleted one), so
+                    # it refuses to move: every remaining attempt fails and a cell that is
+                    # published and correct is reported as failed. Its staging may be gone too.
+                    #
+                    # `plan` is the check the deleted per-cell planning path made before every
+                    # assembly, and it answers off the STORE for the price of a metadata read:
+                    # a complete year comes back terminal with nothing to infer or assemble,
+                    # tagging the tip first if the failure landed between commit and tag.
+                    replan = plan(cell, tally.prep)
+                    if replan.done is not None:
+                        log.info("Cell %s-%d was already published by the failed attempt", cell.zone, cell.year)
+                        _record_outcome(replan.done)
+                    else:
+                        handoff = complete_zone_inference(tally.plan, results=tally.results)
+                        _record_outcome(assemble(handoff, tally.prep))
                 except Exception as exc:
                     # Leave the original failure record in place and log the retry's own error,
                     # so the summary still names the cell and the driver still sees it pending.

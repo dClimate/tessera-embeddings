@@ -80,6 +80,15 @@ no way for a later edit to build a fleet there.
 A cell is consequently settled where it is handed to the assembly queue, not where its assembly
 returns. `undecided` counts inference, not whole cells.
 
+**That retry has to ask whether the cell already published.** `assemble` commits the year and tags
+it before it returns, and it can raise after doing both — a failed deferred-cleanup submission does
+exactly that. Retrying straight from the tally then writes a second snapshot, and a zone-year tag
+is write-once (icechunk refuses to reuse a tag name, even a deleted one), so the tag will not move:
+every remaining attempt fails and a cell that is published and correct is reported as failed, its
+staging possibly already deleted. The retry therefore re-runs `plan` first, which is the check the
+deleted per-cell path made before every assembly: a complete year comes back terminal with nothing
+to infer or assemble, and it tags the tip first if the failure landed between commit and tag.
+
 ## The termination question
 
 Two threads add to the feeder's queue — the feeder itself and the scheduler thread — and the
@@ -135,8 +144,64 @@ feeder is handed the queue *head* and blocks on that cell's ingest, which at the
 cluster's window is 4-10 h. Another cell landing during that block is work the feeder cannot
 reach until the head returns, so the predicate answered "available" while the queue was empty and
 the whole fleet was billed idle for the head's remaining ingest — the exact outcome the wind-down
-was built to prevent. The feeder now publishes whether it is blocked on an ingest, and a queued
-cell counts only when it is not. When the block ends the feeder enqueues and the pool re-grows.
+was built to prevent. The feeder now publishes whether it is parked, and a queued cell counts only
+when it is not. When the park ends the feeder enqueues and the pool re-grows.
+
+**The first version of that flag covered the ingest wait alone, and that was not enough.** The
+feeder parks in other adapter calls for as long or nearly so: `cleanup` deletes a multi-terabyte
+mosaic, and `discard` — the re-ingest of a failed cell — has to confirm the previous attempt is
+dead before a replacement starts. Naming the calls one at a time is only ever as complete as the
+list someone thought of, so the flag is no longer set at call sites at all. Every call the runner
+makes into `CellInputs` goes through one wrapper (`_FeederInputs`), which publishes the park for
+the duration of any method, and a method added to the protocol later cannot be forwarded unmarked
+— the wrapper is what the runner passes as its `CellInputs`, so the type checker refuses it until
+the new method is wrapped too. Only the feeder's own calls count; the same adapter is called from
+the scheduler thread, the cleanup pool and the main thread, and none of those stop the feeder
+admitting work.
+
+One of those calls should not have been on the feeder at all. A cell that plans out TERMINAL
+(already complete, all ocean) is committed and tagged inside `plan`, so deleting its mosaic is
+housekeeping on work that has already landed — and it is now handed to the cleanup pool exactly as
+a landed cell's delete is. Run inline it stopped the rest of the roster being admitted for the
+length of the delete.
+
+What the flag deliberately does not cover is the feeder's own bounded work on the cell it holds:
+`prepare`, `plan`, and the staged-resume scan. Those are seconds and they end with that cell's
+tiles on the hand-over queue, where the predicate sees them anyway. The 120 s idle grace is what
+absorbs a brief answer of "nothing right now"; the predicate's job is to be honest, not brief.
+
+### A wind-down needs a way back
+
+Retirement mid-run is only safe where the pool can grow back, and `_maybe_request_next_batch` is
+the whole of what recreates a retired slot. `actor_request_batch_size = 0` is a documented mode
+meaning "request the whole fleet at once", and it disables batching — so one ingest gap would have
+cut the fleet to the liveness floor for the rest of the run, with every later cell inferred on a
+single actor. The mid-run wind-down is now skipped outright in that mode rather than taught to
+regrow in it: refusing a bad combination is smaller than supporting one. The TAIL wind-down is
+unaffected, since an exhausted source has nothing to grow back for. The campaign passes 25 and the
+default is 50, so this was never the configuration we run.
+
+### Slots that never placed
+
+`retire_idle` cannot see a slot that is still initializing — dispatch skips it, so it is never
+observed idle — but such a slot is not free. A Ray actor waiting on placement holds a GPU resource
+request the autoscaler forwards to AWS, and it counts in the pool's `requested`, which is what the
+fleet publisher advertises. Through an ingest drought that kept asking for machines the run had no
+work for, and if the capacity arrived the instances booted, loaded the checkpoint and billed a
+whole idle grace before the wind-down could reach them. `retire_initializing` cancels them after
+the same grace, on its own clock, and never while any work is outstanding or while no READY actor
+is standing — an unplaced slot is otherwise the session's only route to a live actor, and
+cancelling the last one leaves a live source with nothing that can ever run its chunks.
+
+### One instance, several actors
+
+Retirement fires the EC2 terminator per retired ACTOR, which is right only while an actor is alone
+on its instance. Under `num_gpus < 1` the scheduler packs several onto one, and terminating on the
+first retirement kills a machine still hosting a busy sibling — or the one actor the liveness floor
+just kept, leaving the session believing it holds a live slot whose handle is dead. The actor is
+still killed; the instance is now terminated only when no live slot is left on it, so the last
+actor off a packed instance releases it and whole-GPU fleets (the default, and what the campaign
+runs) behave exactly as before.
 
 ### The fleet the thresholds are judged against
 
