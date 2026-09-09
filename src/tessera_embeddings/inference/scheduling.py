@@ -537,14 +537,23 @@ class ActorPool:
         self.actors[actor_idx] = new_actor
         self.mark_initializing(actor_idx, placeholder_iid=f"pending-replacement-of-{instance_id}")
 
-    def retire_idle(self, outstanding_work: int) -> None:
+    def retire_idle(self, outstanding_work: int, floor: int = 0) -> None:
         """Kill actors that have been idle past the grace period.
 
         Never kills an actor if it would leave fewer live actors than there
-        is outstanding work (floor check).
+        is outstanding work, or fewer than ``floor``.
 
         Args:
             outstanding_work: len(pending) + len(chunk_queue) at call time.
+            floor: Live actors to keep whatever happens. The chained session passes ``1`` while
+                its work source is unexhausted, and that one actor is doing two jobs. It is a
+                LIVENESS floor: with a slot still live, work that arrives is dispatched at once
+                and `_maybe_request_next_batch` grows the fleet from there, whereas an empty
+                pool has nothing to dispatch to and the loop would keep asking a source it can
+                never serve. It also keeps `live_count > 0`, which the dispatch loop's own
+                condition reads — an empty pool would end the session, turning a wind-down into
+                the teardown it exists to avoid. One GPU against the ~170 released is a rounding
+                error; the alternative was a second timeout nobody could tune.
         """
         busy = self.busy_actors
         now = time.monotonic()
@@ -569,8 +578,9 @@ class ActorPool:
             if now - self._idle_since.get(actor_idx, now) < grace:
                 continue
 
-            # Don't kill if it would leave fewer live actors than remaining work
-            if live - 1 < outstanding_work:
+            # Don't kill if it would leave fewer live actors than remaining work, or drop below
+            # the caller's liveness floor
+            if live - 1 < max(outstanding_work, floor):
                 continue
 
             self.resolve_iid(actor_idx)  # pick up lazily-resolved EC2 instance ID
@@ -1056,7 +1066,14 @@ def _process_chunks_work_stealing(
         last_joined_gpus = _joined_gpu_count(last_joined_gpus, config.num_gpus)
         placed_actor_slots = _placed_actor_slots(last_joined_gpus, config.num_gpus)
         n, timed_out = _batch_actors_to_request(
-            requested=len(pool.actors),
+            # LIVE slots, not every slot ever created. Retired slots stay in `pool.actors`
+            # forever (indices are the identity used by `pending`, `reserved`, `_initializing`
+            # and `actor_instance_ids`, so the list cannot be compacted), and with the headroom
+            # rule the request is bounded by `placed_actor_slots + headroom - requested` — so a
+            # wound-down pool of 173 retired slots could never ask for another actor, and the
+            # fleet would never come back. Reading live slots also gives `target` its natural
+            # meaning: how WIDE the fleet should be, not how many were ever asked for.
+            requested=pool.live_count,
             target=total_actors_target,
             outstanding=pool.outstanding_work(len(chunk_queue)),
             placed_actor_slots=placed_actor_slots,
@@ -1255,14 +1272,28 @@ def _process_chunks_work_stealing(
     # starts at zero right here. ``t0`` keeps its other uses (run summaries, provenance).
     inference_t0 = last_tick
     # A chained session's work source: while unexhausted the loop must stay alive through
-    # empty-queue gaps (the next zone may still be ingesting) and must not retire "idle" actors
-    # (they are the next zone's fleet).
+    # empty-queue gaps (the next zone may still be ingesting).
     source_active = more_work is not None
+    # ...but "unexhausted" is not "has work". A source that answers `[]` has nothing to give
+    # RIGHT NOW — its next cell is still ingesting, or a failed cell is being re-ingested — and
+    # holding a full GPU fleet against that is the most expensive way to wait for anything in
+    # this system. Tracked separately so retirement can proceed while the session stays alive.
+    #
+    # Stale while the queue is deep, because the poll below is conditional; harmless, because
+    # `retire_idle`'s floor refuses to retire below the outstanding work count either way.
+    source_idle = False
     # Stay alive while any work remains: in-flight chunks, deferred writes awaiting confirmation,
     # queued chunks with a live actor to run them, or an unexhausted work source. The queue clause
     # must NOT be gated on _initializing alone — a failed tail flush (_flush_idle_writes, after
     # dispatch) requeues its chunk when no actor is initializing, and that retry would be dropped.
     # `live_count > 0` prevents a busy-spin when every actor has died.
+    #
+    # UNCHANGED by the wind-down, deliberately. Degating it on `source_active` was tried and
+    # reverted: it let a pool that had wound all the way to zero keep polling a source it could
+    # not serve, and if the fleet could not be re-provisioned the loop never made progress and
+    # never exited. Retirement keeps a floor of one live actor instead while the source is
+    # unexhausted (`retire_idle`'s `floor`), so this condition holds without knowing anything
+    # about the wind-down.
     while pool.pending or pending_write or ((chunk_queue or source_active) and pool.live_count > 0):
         # Top up from the work source BEFORE waiting so freshly-ready zones dispatch this
         # iteration. Polled only when the queue is at or below the live actor count. For zones at
@@ -1273,17 +1304,21 @@ def _process_chunks_work_stealing(
             fetched = more_work()  # type: ignore[misc]  # source_active implies more_work is not None
             if fetched is None:
                 source_active = False
+                source_idle = False
                 log.info(
                     "Work source exhausted — %d queued + %d in-flight chunk(s) remain",
                     len(chunk_queue),
                     len(pool.pending),
                 )
             elif fetched:
+                source_idle = False
                 chunk_queue.extend(fetched)
                 n_total += len(fetched)
                 log.info(
                     "Work source added %d chunk(s) (queue now %d, total %d)", len(fetched), len(chunk_queue), n_total
                 )
+            else:
+                source_idle = True
         if pool.pending:
             # Block for any one chunk to finish. At a zone boundary — source still active and the
             # queue drained to the poll trigger — the next zone may become ready momentarily, so
@@ -1431,9 +1466,19 @@ def _process_chunks_work_stealing(
         # its zone-tail writes confirmed before that zone's assembly can verify staged
         # completeness.
         _flush_idle_writes()
-        # Retirement additionally waits for source exhaustion: while more zones may arrive, an
-        # idle actor is the next zone's fleet and retiring it idle-drains the shared cluster.
-        if retire_idle_actors and not source_active:
-            pool.retire_idle(pool.outstanding_work(len(chunk_queue)))
+        # Retire when there is no inference work to be had — either the source is exhausted, or
+        # it is unexhausted but has nothing to give right now. NOT merely "unexhausted": a
+        # cluster waiting on an ingest held a full idle fleet for the whole wait, which is the
+        # most expensive way this system can wait for anything. The session stays alive either
+        # way, so ingest and the assembly backlog drain carry on and the pool re-grows through
+        # the ordinary batch machinery when work arrives — no teardown, no second `ray up`, no
+        # re-created ProgressTracker, no fresh `wait_for_actors`.
+        #
+        # `retire_idle`'s own floor still refuses to retire below the outstanding work count, and
+        # its grace period means an actor must have been idle across calls, so a cell that
+        # becomes ready within the grace retires nothing at all.
+        if retire_idle_actors and (not source_active or source_idle):
+            # One actor is kept while more work may still arrive — see `retire_idle`'s `floor`.
+            pool.retire_idle(pool.outstanding_work(len(chunk_queue)), floor=1 if source_active else 0)
 
     return results

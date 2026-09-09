@@ -541,6 +541,40 @@ class TestRetireIdle:
         if exclusion == "busy":
             assert 0 not in pool._idle_since  # timer cleared for active actors
 
+    def test_the_floor_keeps_a_live_actor_with_no_work_outstanding(self) -> None:
+        """The wind-down's liveness floor, tested on the pool rather than through the loop.
+
+        With no outstanding work the work-based floor permits retiring everything, and an empty
+        pool ends the dispatch loop — turning the chained session's wind-down into a teardown.
+        `floor=1` is what the loop passes while its work source is unexhausted.
+        """
+        pool = _make_pool(3, idle_grace_sec=1)
+        for idx in range(3):
+            pool._idle_since[idx] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=0, floor=1)
+        assert pool.live_count == 1, f"the floor was not honoured: {pool.live_count} live"
+
+    def test_without_a_floor_the_pool_empties(self) -> None:
+        """The complement, so the test above is known to be measuring the floor and not the
+        grace period, the exclusions or the work count.
+        """
+        pool = _make_pool(3, idle_grace_sec=1)
+        for idx in range(3):
+            pool._idle_since[idx] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=0)
+        assert pool.live_count == 0
+
+    def test_outstanding_work_still_outranks_a_smaller_floor(self) -> None:
+        """The floor is a minimum, not a cap: real work keeps more actors than the floor does."""
+        pool = _make_pool(4, idle_grace_sec=1)
+        for idx in range(4):
+            pool._idle_since[idx] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=3, floor=1)
+        assert pool.live_count == 3
+
     def test_kill_exception_suppressed(self) -> None:
         pool = _make_pool(2, idle_grace_sec=1)
         pool._idle_since[0] = time.monotonic() - 200
@@ -2286,14 +2320,216 @@ class TestChainedWorkSource:
         assert 5 in timeouts  # boundary wait while the source was still active
         assert 60 in timeouts  # long wait after the source was exhausted
 
-    def test_retirement_suppressed_until_source_exhausted(self):
+    def test_retirement_runs_once_the_source_is_exhausted(self):
         actor = MagicMock(name="actor_0")
         zone_a = self._zone_items("zone-a", ["c0"])
         _, _, retire_mock = self._drive(actor, [[], zone_a], retire_idle_actors=True)
-        # The source returned items then None; retirement may only run in
-        # iterations AFTER exhaustion. With one chunk and instant completion
-        # the final iteration retires — but never before the source was live.
-        assert retire_mock.called  # ran after exhaustion (gate passed through)
+        assert retire_mock.called  # the gate passes through to the pool
+
+    def test_retirement_runs_while_the_source_is_merely_waiting(self):
+        """The wind-down. A source with nothing to give right now must not hold the fleet.
+
+        `[]` means "not yet" — the next cell is still ingesting, or a failed cell is being
+        re-ingested. Suppressing retirement for the whole of that wait held a full GPU fleet
+        idle against a multi-hour ingest, which is the most expensive way this system can wait
+        for anything. The session stays alive regardless, so ingest and the assembly backlog
+        drain carry on and the pool re-grows when work arrives.
+
+        The oracle is that retirement is offered on an iteration where the source is still
+        UNEXHAUSTED, which the previous gate forbade outright.
+        """
+        actor = MagicMock(name="actor_0")
+        seen: list[bool] = []
+
+        def spy(self_pool, outstanding, floor=0):
+            seen.append(True)
+
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        # Two empty answers, then exhaustion. Retirement must be offered on the empty ones.
+        answers: list = [[], [], None]
+        offered_while_active: list[int] = []
+
+        def more_work():
+            if answers:
+                got = answers.pop(0)
+                # Record how many retirement offers happened before the source went None.
+                if got is None:
+                    offered_while_active.append(len(seen))
+                return got
+            return None
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
+            patch.object(_sched_mod.ray, "get", return_value=MagicMock()),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.time, "sleep"),
+            patch.object(_sched_mod.ActorPool, "retire_idle", spy),
+        ):
+            _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=[],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                log=logging.getLogger("test"),
+                more_work=more_work,
+            )
+        assert offered_while_active and offered_while_active[0] >= 2, (
+            f"retirement was not offered while the source was still unexhausted: {offered_while_active}"
+        )
+
+    def test_the_wind_down_keeps_one_actor_while_the_source_is_live(self):
+        """The wind-down must not become a teardown. One slot stays live.
+
+        The dispatch loop's own condition reads `live_count > 0`, so a pool that retired every
+        slot would END the session — `run_inference`'s `finally` fires, the ProgressTracker is
+        killed, the fleet demand is retracted, and the retry still to come has nothing to run
+        on. An empty pool also has nothing to dispatch to, so the loop would keep asking a
+        source it could never serve.
+
+        One GPU against the ~170 released is a rounding error, and it buys the property outright
+        rather than through a second timeout nobody could tune.
+
+        The oracle is that the source is polled to EXHAUSTION: the session outlives the
+        wind-down. Asserting the live count alone would pass on a build that ended early.
+        """
+        actors = [MagicMock(name=f"actor_{i}") for i in range(4)]
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        polls = {"n": 0}
+        live_seen: list[int] = []
+
+        def real_retire(self_pool, outstanding, floor=0):
+            # The floor is what is under test, so honour it exactly as the pool does.
+            for idx in range(len(self_pool.actors)):
+                if idx in self_pool._retired:
+                    continue
+                if self_pool.live_count - 1 < max(outstanding, floor):
+                    break
+                self_pool._retired.add(idx)
+            live_seen.append(self_pool.live_count)
+
+        def more_work():
+            polls["n"] += 1
+            return None if polls["n"] > 6 else []
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
+            patch.object(_sched_mod.ray, "get", return_value=MagicMock()),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.time, "sleep"),
+            patch.object(_sched_mod.ActorPool, "retire_idle", real_retire),
+        ):
+            _process_chunks_work_stealing(
+                actors=actors,
+                actor_instance_ids=["i-0000"] * len(actors),
+                chunks=[],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                log=logging.getLogger("test"),
+                more_work=more_work,
+            )
+        assert polls["n"] > 6, f"the session ended before the source was exhausted ({polls['n']} polls)"
+        assert live_seen, "nothing retired, so this proves nothing"
+        assert min(live_seen[:-1]) == 1, f"the fleet did not wind down to its floor: {live_seen}"
+
+    def test_a_wound_down_pool_asks_for_actors_again_when_work_arrives(self):
+        """The other half of the wind-down: the fleet has to be able to come BACK.
+
+        The batch request is bounded by `placed_actor_slots + headroom - requested`, and retired
+        slots stay in `pool.actors` forever because the indices are the pool's identity. Passing
+        every slot ever created as `requested` therefore left a wound-down pool permanently
+        unable to ask for anything — the wind-down would have been one-way.
+
+        The fleet here is deliberately WIDER than the headroom. With a handful of retired slots
+        the bound does not bite and the mutation passes; it is `placed + headroom - requested`
+        going non-positive that freezes the pool, so the test has to start above `headroom`.
+        A real cluster retires 170-odd slots against a headroom of 25.
+        """
+        actors = [MagicMock(name=f"actor_{i}") for i in range(30)]
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        config.actor_request_batch_size = 25
+        config.actor_request_headroom = 25
+        config.num_gpus = 1.0
+        made: list[int] = []
+        polls = {"n": 0}
+
+        def retire_everything(self_pool, outstanding, floor=0):
+            # Honour the floor exactly as the pool does: the wind-down keeps one slot live.
+            self_pool._retired.update(range(max(floor, 0), len(self_pool.actors)))
+
+        def more_work():
+            polls["n"] += 1
+            if polls["n"] <= 2:
+                return []  # nothing yet — the pool winds down here
+            if polls["n"] == 3:
+                return TestChainedWorkSource._zone_items("zone-b", [f"c{i}" for i in range(40)])
+            return None
+
+        def factory(n: int) -> list:
+            made.append(n)
+            return [MagicMock(name=f"new{i}") for i in range(n)]
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
+            patch.object(_sched_mod.ray, "get", return_value=MagicMock()),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.time, "sleep"),
+            patch.object(_sched_mod, "_joined_gpu_count", lambda last, per: 0.0),
+            patch.object(_sched_mod.ActorPool, "retire_idle", retire_everything),
+        ):
+            _process_chunks_work_stealing(
+                actors=actors,
+                actor_instance_ids=["i-0000"] * len(actors),
+                chunks=[],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                log=logging.getLogger("test"),
+                more_work=more_work,
+                actor_factory=factory,
+                total_actors_target=60,
+            )
+        assert made, "a wound-down pool never asked for another actor — the fleet could not return"
+
+    def test_a_non_chained_run_still_ends_when_its_fleet_is_gone(self):
+        """The degated loop condition must not change a single-zone run.
+
+        `source_active` is False from the start when `more_work is None`, so the clause it was
+        added to cannot fire — but a mistake here would turn every plain fill into a spin.
+        """
+        actor = MagicMock(name="actor_0")
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+
+        def retire_everything(self_pool, outstanding, floor=0):
+            self_pool._retired.update(range(len(self_pool.actors)))
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
+            patch.object(_sched_mod.ray, "get", return_value={"chunk": "c0", "status": "ok"}),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.time, "sleep"),
+            patch.object(_sched_mod.ActorPool, "retire_idle", retire_everything),
+        ):
+            results = _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=[_fake_chunk("c0")],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                log=logging.getLogger("test"),
+            )
+        assert len(results) == 1
 
     def test_attempts_do_not_alias_across_zones(self):
         """Same label in two zones keeps independent retry budgets."""
