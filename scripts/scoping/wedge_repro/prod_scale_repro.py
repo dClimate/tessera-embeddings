@@ -59,6 +59,7 @@ import numpy as np
 
 from tessera_embeddings.config.store_layout import EMBEDDING_DIM, INNER_PX, SHARD_PX
 from tessera_embeddings.storage import campaign, global_store, shard_writer
+from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS
 from tessera_embeddings.storage.zone_grid import ZONES
 
 log = logging.getLogger("prod_scale_repro")
@@ -70,7 +71,10 @@ try:
 except ImportError:  # pragma: no cover - main / pre-fix
     install_publication_gate = None  # type: ignore[assignment]
 
-YEARS: tuple[int, ...] = (2023, 2024, 2025)
+#: The store's time axis IS the snapshot's weight: the snapshot object lists every array node, and
+#: the skeleton alone (120 zones x 9 years) is what puts production's object at ~250-375 KB. A
+#: three-year axis capped the 2026-09-08 runs at 127 KB no matter how many cells were seeded.
+YEARS: tuple[int, ...] = CAMPAIGN_YEARS
 
 
 def _credentials(uri: str):  # noqa: ANN202 - icechunk credentials callable or None
@@ -178,6 +182,58 @@ def _snapshot_max_bytes(uri: str, region: str | None) -> int:
 
 
 # --------------------------------------------------------------------------------------------
+# catch-up depth: how far behind the tip a coordinator is at every catch-up tick
+# --------------------------------------------------------------------------------------------
+
+#: Ancestry steps walked before giving up. Each step is one snapshot fetch, so the cap bounds the
+#: instrumentation's own S3 load; the hang's precondition is 4, so anything at the cap is "deep".
+DEPTH_CAP = 8
+
+
+def _depth(repo: Any, base: str, tip: str, cap: int = DEPTH_CAP) -> int:  # noqa: ANN401
+    """Snapshots between the session's base and the branch tip (0 = current), capped."""
+    if base == tip:
+        return 0
+    for depth, snap in enumerate(repo.ancestry(snapshot_id=tip)):
+        if snap.id == base:
+            return depth
+        if depth + 1 >= cap:
+            return cap
+    return cap
+
+
+def _recording_catch_up(real: Any, sink: list[dict[str, Any]]) -> Any:  # noqa: ANN401
+    """Wrap ``catch_up_best_effort`` so every tick records its depth, outcome and duration.
+
+    The wrapper walks the ancestry from the tip BEFORE the real catch-up runs, so the depth is the
+    one the catch-up then faces. That walk fetches up to ``DEPTH_CAP`` snapshot objects per tick on
+    top of the subject's own traffic — the same perturbation the small harness carried. Both source
+    trees import the function into ``shard_writer`` and call it through a module-level name, so the
+    patch reaches the real call on ``main`` and on the fix stack alike.
+    """
+
+    def wrapper(repo: Any, session: Any, group: str, *, log: logging.Logger | None = None) -> str:  # noqa: ANN401
+        depth = _depth(repo, session.snapshot_id, repo.lookup_branch("main"))
+        started = time.monotonic()
+        outcome = real(repo, session, group, log=log)
+        sink.append({"depth": depth, "outcome": outcome, "s": round(time.monotonic() - started, 3)})
+        return outcome
+
+    return wrapper
+
+
+def _depth_summary(ticks: list[dict[str, Any]]) -> dict[str, Any]:
+    depths = [t["depth"] for t in ticks]
+    return {
+        "ticks": len(depths),
+        "max": max(depths) if depths else None,
+        "histogram": {str(d): depths.count(d) for d in sorted(set(depths))},
+        "at_or_above_4": sum(d >= 4 for d in depths),
+        "slowest_s": max((t["s"] for t in ticks), default=None),
+    }
+
+
+# --------------------------------------------------------------------------------------------
 # coordinator and marker processes
 # --------------------------------------------------------------------------------------------
 
@@ -196,9 +252,12 @@ def _coordinator(k: int, cfg: dict[str, Any], lock: Any | None, start_delay_s: f
     spacing = _install_spacing(lock if cfg["arm"] == "fixed" else None)
     logging.getLogger("prod_scale_repro").info("coordinator %d starting (spacing installed: %s)", k, spacing)
     repo = _open(cfg["store_uri"], cfg["region"])
+    ticks: list[dict[str, Any]] = []
+    shard_writer.catch_up_best_effort = _recording_catch_up(shard_writer.catch_up_best_effort, ticks)
     time.sleep(start_delay_s)
     out = results / f"coord-{k}.jsonl"
     for idx in range(cfg["cells_per_coordinator"]):
+        ticks.clear()
         zone = cfg["assignments"][str(k)]
         year = YEARS[idx % len(YEARS)]
         source = RandomShardSource(k, cfg["live_shards"])
@@ -220,7 +279,10 @@ def _coordinator(k: int, cfg: dict[str, Any], lock: Any | None, start_delay_s: f
         except BaseException as exc:  # a hung arm is killed by the monitor; other failures recorded
             rec.update(outcome="failed", error=f"{type(exc).__name__}: {exc}"[:400])
         rec.update(
-            wall_s=round(time.monotonic() - t0, 3), telemetry={k_: v for k_, v in telemetry.items() if k_ != "workers"}
+            wall_s=round(time.monotonic() - t0, 3),
+            telemetry={k_: v for k_, v in telemetry.items() if k_ != "workers"},
+            catch_up_depth=_depth_summary(ticks),
+            depths=[t["depth"] for t in ticks],
         )
         with out.open("a") as f:
             f.write(json.dumps(rec) + "\n")
@@ -334,11 +396,15 @@ def _assign(coordinators: int) -> tuple[dict[str, str], list[tuple[str, int]]]:
 
 
 def _seed(cfg: dict[str, Any], marker_pool: list[tuple[str, int]]) -> dict[str, Any]:
-    """Seed the groups, then pre-publish REAL cells until the snapshot object hits the target weight.
+    """Seed the groups, then pre-publish REAL fills until the snapshot object hits the target weight.
 
-    Empty marks are cheap but light; the snapshot object grows with the manifest references a real
-    fill adds, so weight comes from real published cells — of COMPRESSIBLE shards, so every chunk
-    is committed at almost no byte cost. Self-calibrating: publish, measure, stop at
+    Empty marks are cheap but light; the snapshot object grows by a roughly constant ~130 B per
+    published FILL (the manifest reference and run attrs), independent of how many shards the fill
+    wrote, so the weight comes from the NUMBER of fills: production's ~250 KB mean is the ~127 KB
+    skeleton plus several hundred publications. Seeds therefore cycle over a small reserved slice of
+    the pool (``seed_pool_cells``), re-filling the same cells with one compressible shard each —
+    the cheapest publication there is — and leave the rest of the pool to the marker, whose marks
+    are idempotent and cannot be repeated. Self-calibrating: publish, measure every ten, stop at
     ``seed_target_snapshot_kb`` (or ``seed_cells`` as a hard cap). A failure here is a broken
     environment and stops the run; it is never skipped.
     """
@@ -351,10 +417,12 @@ def _seed(cfg: dict[str, Any], marker_pool: list[tuple[str, int]]) -> dict[str, 
     target_bytes = cfg["seed_target_snapshot_kb"] * 1024
     used: list[tuple[str, int]] = []
     t1 = time.monotonic()
-    for zone, year in marker_pool:
+    biggest = _snapshot_max_bytes(cfg["store_uri"], cfg["region"])
+    for zone, year in itertools.cycle(marker_pool[: cfg["seed_pool_cells"]]):
         if len(used) >= cfg["seed_cells"]:
             break
-        biggest = _snapshot_max_bytes(cfg["store_uri"], cfg["region"])
+        if len(used) % 10 == 0:
+            biggest = _snapshot_max_bytes(cfg["store_uri"], cfg["region"])
         if target_bytes and biggest >= target_bytes:
             break
         shard_writer.write_year_shards(
@@ -367,11 +435,11 @@ def _seed(cfg: dict[str, Any], marker_pool: list[tuple[str, int]]) -> dict[str, 
         )
         used.append((zone, year))
         log.info(
-            "seed cell %d (%s-%d) published; snapshot_max %d B",
+            "seed fill %d (%s-%d) published; snapshot_max %d B (as of the last measurement)",
             len(used),
             zone,
             year,
-            _snapshot_max_bytes(cfg["store_uri"], cfg["region"]),
+            biggest,
         )
     return {
         "seed_groups_s": round(groups_s, 1),
@@ -474,12 +542,20 @@ def _report(cfg: dict[str, Any], seed: dict[str, Any], started: float, wall: flo
             "partitions_rerun": sum(len(r.get("telemetry", {}).get("partitions_rerun", []) or []) for r in records),
             "wall_s": [r.get("wall_s") for r in records],
         },
+        "catch_up_depth": _depth_summary(
+            [
+                {"depth": d, "s": r.get("catch_up_depth", {}).get("slowest_s") or 0.0}
+                for r in records
+                for d in r.get("depths", [])
+            ]
+        ),
         "coordinators_stuck_at_teardown": stuck,
         "pyspy_dumps": pyspy,
         "publication_gaps_from_store": _publication_gaps(history, since=started),
         "integrity": _verify(repo, records),
         "hang_captured": bool(pyspy),
     }
+    report["condition_reached"] = report["catch_up_depth"]["at_or_above_4"] > 0
     return report
 
 
@@ -498,8 +574,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--live-shards", type=int, default=1500, help="Real shards per cell; sets the fork-phase duration.")
     ap.add_argument("--stagger-seconds", type=float, default=3.0)
     ap.add_argument("--marker-rate-s", type=float, default=3.0)
-    ap.add_argument("--seed-cells", type=int, default=40, help="Hard cap on pre-published seed cells.")
-    ap.add_argument("--seed-shards", type=int, default=60, help="Shards per seed cell (weight, cheaply).")
+    ap.add_argument("--seed-cells", type=int, default=40, help="Hard cap on pre-published seed fills.")
+    ap.add_argument(
+        "--seed-shards", type=int, default=1, help="Shards per seed fill; weight is per FILL, not per shard."
+    )
+    ap.add_argument(
+        "--seed-pool-cells",
+        type=int,
+        default=200,
+        help="Pool cells reserved for (repeated) seed fills; the rest of the pool feeds the marker.",
+    )
     ap.add_argument(
         "--seed-target-snapshot-kb",
         type=float,
@@ -539,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
         "marker_rate_s": args.marker_rate_s,
         "seed_cells": args.seed_cells,
         "seed_shards": args.seed_shards,
+        "seed_pool_cells": args.seed_pool_cells,
         "seed_target_snapshot_kb": args.seed_target_snapshot_kb,
         "stall_seconds": args.stall_seconds,
         "stall_dumps": args.stall_dumps,
@@ -554,7 +639,7 @@ def main(argv: list[str] | None = None) -> int:
         seed["snapshot_max_bytes"],
         seed["snapshot_max_bytes"] / 1024,
     )
-    cfg["marker_cells"] = [c for c in pool if c not in set(map(tuple, seed["seed_used"]))]
+    cfg["marker_cells"] = pool[args.seed_pool_cells :]
 
     if args.no_pyspy:
         cfg["stall_dumps"] = 0
@@ -606,6 +691,8 @@ def main(argv: list[str] | None = None) -> int:
                     "arm",
                     "seed",
                     "cells",
+                    "catch_up_depth",
+                    "condition_reached",
                     "publication_gaps_from_store",
                     "coordinators_stuck_at_teardown",
                     "pyspy_dumps",

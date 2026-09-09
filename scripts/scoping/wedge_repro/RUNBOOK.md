@@ -95,9 +95,50 @@ That is itself a result. Record it, then run **one** escalation and stop: arm A 
 (`RUN=repro-main-02`), which lengthens the fork phase and tightens the publication clustering.
 Do not improvise further arms.
 
+## 5b. Run 2 (2026-09-09): production snapshot weight, depth measured
+
+Run 1 (sections 3-5, results in the README) never reached production weight: the snapshot object
+sat at 127 KB in every arm because its size is the store skeleton plus ~110 B per published FILL,
+not per shard, and the 60-fill cap added almost nothing. Run 1 also could not say whether the
+depth-4 precondition ever occurred, because the driver did not record catch-up depth. Both are
+fixed in the driver (`_recording_catch_up`, `--seed-pool-cells`, per-fill seeding). Arms run in
+SERIES on one box: the concurrent attempt in run 1 hit an instance-profile credential failure.
+
+Refresh the driver on the box first (the venvs are unchanged; only the driver moved):
+```
+ssm $IID "aws s3 cp --only-show-errors s3://global-tessera-embeddings-dev/scoping/prod-repro/box/prod_scale_repro.py /opt/repro/prod_scale_repro.py && grep -c _recording_catch_up /opt/repro/prod_scale_repro.py"
+```
+Expect `4` or more; `0` means the old driver.
+
+Arm A, `main`:
+```
+RUN=repro-main-03
+ssm $IID "cd /opt/repro && nohup main/.venv/bin/python prod_scale_repro.py --arm reproduce --run-id $RUN \
+  --coordinators 10 --cells-per-coordinator 4 --live-shards 1500 --n-workers 12 \
+  --stagger-seconds 2 --marker-rate-s 3 --seed-target-snapshot-kb 300 --seed-cells 2000 --seed-pool-cells 200 \
+  --stall-seconds 900 --stall-dumps 5 --results-dir results/$RUN \
+  --s3-results s3://global-tessera-embeddings-dev/scoping/prod-repro/results/$RUN > results/$RUN.out 2>&1 &"
+```
+Seeding now takes 60-90 min (≈1,600 one-shard fills at 2-3 s each; the log line
+`seed fill N ... snapshot_max` shows the weight climbing every ten fills), then four rounds of ten
+1500-shard cells, ~40 min. Poll as in section 3. The report gains `catch_up_depth` (ticks, max,
+histogram, `at_or_above_4`) and `condition_reached`; a run with `condition_reached: false` did not
+even present the precondition and must be reported as such, not as "no hang".
+
+Arm B, the fix stack, the same flags with `--arm fixed --run-id fixed-03` in `fix/.venv`, started
+only after arm A's `report.json` exists.
+
+Escalation, ONLY if arm A ended with `condition_reached: true` and no stall: `RUN=repro-main-04`
+with `--cells-per-coordinator 4 --live-shards 2500 --stagger-seconds 1 --marker-rate-s 2`, other
+flags unchanged. Do not improvise further arms.
+
+Budget: the box self-terminates 8 h after launch (this box: launched 01:27Z, terminates ~09:27Z).
+A + B + escalation is about 6 h. If the schedule threatens the deadline, say so in a message
+rather than shortening a run; only the operator (Robert) extends the box.
+
 ## 6. Collect, per arm
 
-From `report.json`: `seed` (achieved `snapshot_max_bytes`), `cells`, `publication_gaps_from_store`,
+From `report.json`: `seed` (achieved `snapshot_max_bytes`), `cells`, `catch_up_depth`, `condition_reached`, `publication_gaps_from_store`,
 `coordinators_stuck_at_teardown`, `pyspy_dumps`, `hang_captured`, `integrity`, `wall_s`. From the
 logs: every `STALLED` line verbatim; for each py-spy dump, the first 60 lines verbatim, and separately
 every frame line containing `icechunk`, `rebase`, `fetch_snapshot`, `list_nodes`, `commit`,
@@ -113,6 +154,7 @@ Confirm the instance is terminating and only `results/` remains. Then report.
 
 ## 8. Final report shape
 
-One table: arm | hang captured (yes/no) | stalled coordinators | py-spy dumps | published / failed |
-publish_retries | partitions_rerun | achieved snapshot KB | min publication gap | integrity | wall.
+One table: arm | hang captured (yes/no) | condition reached (ticks at depth ≥ 4 / ticks) | max depth |
+stalled coordinators | py-spy dumps | published / failed | publish_retries | partitions_rerun |
+achieved snapshot KB | min publication gap | integrity | wall.
 Then the verbatim STALLED lines and dump excerpts, then tracebacks, then the teardown confirmation.
