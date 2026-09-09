@@ -76,11 +76,15 @@ publish, per-step publish timeout, partition re-run, salvage-finished-forks.
 1. **Storage timeouts and retries** (`zarr_store._default_repo_config`). A different, separately
    observed failure: a socket wedged mid-response, diagnosed with a worker stuck in `sk_wait_data`.
 2. **The fork-phase watchdog** (`shard_writer._fork_stall_watchdog`, 30 min). A daemon thread
-   watches the shard counters the workers write into shared memory; on a stall it dumps every
-   thread's stack, terminates the pool, and the fill fails as an ordinary assembly failure with its
-   cell retained. Log line `ASSEMBLY FORK PHASE STALLED`. Not a fix for this incident — the net
-   under the next unknown cause, and the only way to get a stack where `CAP_SYS_PTRACE` is denied.
-   It cannot unwind a coordinator parked inside icechunk; the dump still fires.
+   watches the shard counters the workers write into shared memory; on a stall it raises the
+   failure flag and terminates the pool, and only THEN dumps every thread's stack, after which the
+   fill fails as an ordinary assembly failure with its cell retained. Log line
+   `ASSEMBLY FORK PHASE STALLED`. That order matters: the critical log line and the stack dump are
+   both writes to stderr, which BLOCK rather than raise when the container's log pipe fills, and
+   `suppress` covers only the raising case — diagnosing first would let the one component whose
+   purpose is to end a hang be ended by one. Not a fix for this incident — the net under the next
+   unknown cause, and the only way to get a stack where `CAP_SYS_PTRACE` is denied. It cannot
+   unwind a coordinator parked inside icechunk; the dump still fires.
 3. **The bounded assembly backlog drain** (`sequential_fill.drain_trailing_assemblies`, 6 h
    per assembly, resetting on each completion). `finalizer.shutdown(wait=True)` had no bound, which
    is what parked vociferous-earthworm behind one wedged cell after its inference finished. The

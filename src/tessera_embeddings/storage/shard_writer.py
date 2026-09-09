@@ -346,9 +346,10 @@ def _fork_stall_watchdog(
 
     A daemon thread watches the shard counters the workers write into shared memory, which advance
     whether or not the coordinator thread is running. If the total stops moving for ``timeout_s``
-    it dumps every thread's stack (unobtainable otherwise: Fargate denies ``CAP_SYS_PTRACE``),
-    sets ``stalled`` so :func:`_await_forks` raises, and terminates the pool — which also frees a
-    coordinator parked in the wait. It canNOT unwind a coordinator parked inside icechunk itself;
+    it sets ``stalled`` so :func:`_await_forks` raises and terminates the pool — which also frees
+    a coordinator parked in the wait — and only THEN dumps every thread's stack (unobtainable
+    otherwise: Fargate denies ``CAP_SYS_PTRACE``). It canNOT unwind a coordinator parked inside
+    icechunk itself;
     the dump still fires. Best-effort throughout: a watchdog that could end a healthy write, or
     that dies on one failed read, is worse than none.
     """
@@ -377,21 +378,27 @@ def _fork_stall_watchdog(
                 continue
             if time.monotonic() - last_change < timeout_s:
                 continue
+            # SIGNAL AND TEAR DOWN FIRST, DIAGNOSE AFTERWARDS. `suppress` covers a diagnostic
+            # that RAISES; nothing covers one that never RETURNS, and both of these block rather
+            # than raise when the container's log pipe is full or a remote handler is unreachable.
+            # Diagnosing first is how the one component whose purpose is to end a hang gets ended
+            # by one, leaving the pool up and the fill outstanding forever.
+            stalled_min = (time.monotonic() - last_change) / 60.0
+            stalled.set()
+            with suppress(Exception):
+                _terminate_pool(ex)
             with suppress(Exception):
                 logger.critical(
                     "ASSEMBLY FORK PHASE STALLED: no shard progress for %.0f min (%d shards "
                     "written across %d workers). The fill publishes nothing further; tearing the "
                     "worker pool down so it fails and its cell can be re-dispatched. Thread stacks "
                     "follow.",
-                    (time.monotonic() - last_change) / 60.0,
+                    stalled_min,
                     max(last_seen, 0),
                     n_workers,
                 )
             with suppress(Exception):
                 faulthandler.dump_traceback()
-            stalled.set()
-            with suppress(Exception):
-                _terminate_pool(ex)
             return  # one shot: the pool is gone, so there is nothing left to watch
 
     watcher = threading.Thread(target=_watch, name="fork-stall-watchdog", daemon=True)

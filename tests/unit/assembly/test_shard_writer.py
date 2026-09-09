@@ -1661,6 +1661,48 @@ class TestForkStallWatchdog:
             "the watchdog thread outlived the fork phase"
         )
 
+    @pytest.mark.parametrize("blocking", ["logger", "dump"])
+    def test_a_diagnostic_that_blocks_does_not_stop_the_teardown(self, blocking, tmp_path, monkeypatch):
+        """BLOCKING, not raising: `suppress(Exception)` covers the second and nothing covers the
+        first. A full container log pipe or an unreachable remote handler parks the write to
+        stderr, so a watchdog that diagnosed before it signalled could be wedged by the very
+        thing it exists to end. Both diagnostics are exercised because both are downstream.
+        """
+        gate = threading.Event()  # never set while the subject runs: the diagnostic never returns
+
+        class _BlockingCritical(logging.Logger):
+            def critical(self, *args, **kwargs):  # type: ignore[override]
+                gate.wait()
+
+        fake, procs = self._executor(lambda p: Future())
+        monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", fake)
+        if blocking == "dump":
+            monkeypatch.setattr(shard_writer.faulthandler, "dump_traceback", gate.wait)
+            log: logging.Logger | None = None
+        else:
+            monkeypatch.setattr(shard_writer.faulthandler, "dump_traceback", lambda: None)
+            log = _BlockingCritical("blocking-critical")
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+
+        try:
+            with pytest.raises(shard_writer.ForkPhaseStalledError, match="no shard progress"):
+                run_under_deadline(
+                    15,
+                    lambda: run_forked(
+                        session,
+                        lambda p: p,
+                        [{"tag": "a"}, {"tag": "b"}],
+                        progress_interval_s=0.02,
+                        fork_stall_timeout_s=0.3,
+                        log=log,
+                    ),
+                    what="the fill whose watchdog blocked in a diagnostic",
+                )
+            assert all(p.terminated for p in procs), "the pool was left up by a blocked diagnostic"
+        finally:
+            gate.set()  # let the parked watchdog thread finish rather than leaking it
+
     def test_the_production_timeout_is_far_outside_a_healthy_gap(self):
         """One-sided: healthy writes never pause for even one progress interval, and the failure
         it bounds sat for days, so there is nothing to gain by trimming.
