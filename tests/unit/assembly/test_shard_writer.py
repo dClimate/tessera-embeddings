@@ -1501,7 +1501,13 @@ class TestForkStallWatchdog:
         fake, procs = self._executor(lambda p: Future())
         monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", fake)
         dumps: list[int] = []
-        monkeypatch.setattr(shard_writer.faulthandler, "dump_traceback", lambda: dumps.append(1))
+        dumped = threading.Event()
+
+        def _dump() -> None:
+            dumps.append(1)
+            dumped.set()
+
+        monkeypatch.setattr(shard_writer.faulthandler, "dump_traceback", _dump)
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
 
@@ -1520,7 +1526,11 @@ class TestForkStallWatchdog:
                 ),
             )
         assert all(p.terminated for p in procs), "the stuck workers must be killed, not left to run"
-        assert dumps == [1], "the stall must dump every thread's stack: the only way to get one here"
+        # WAITED FOR, not assumed: the diagnostics deliberately run AFTER the signal and the
+        # teardown, so the fill can raise before the watchdog thread has finished dumping. The
+        # critical line is emitted before the dump, so this wait covers both.
+        assert dumped.wait(10.0), "the stall must dump every thread's stack: the only way to get one here"
+        assert dumps == [1], "the stall dumped more than once; the watchdog is meant to be one-shot"
         assert len(self._stall_lines(caplog)) == 1
 
     def test_the_workers_are_killed_when_the_stall_is_declared_not_at_the_next_wake(
