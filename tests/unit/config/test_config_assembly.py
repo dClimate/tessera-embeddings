@@ -32,9 +32,10 @@ def test_invalid_max_workers_raises() -> None:
 
 
 def test_the_default_pool_is_sixteen_and_the_campaign_asks_for_thirty_two() -> None:
-    """The worker count belongs to the runner that can hold it. 16 peaks around ~24 GB and fits
-    the 64 GiB host every default-taking caller runs on; 32 peaks around ~48 GB and only the
-    chained campaign fill is on the 244 GiB family, so it asks explicitly.
+    """The worker count belongs to the runner that can hold it. Measured at ~2.4 GiB per worker,
+    16 peaks near 40 GiB and fits the 64 GiB host every default-taking caller runs on; 32 peaks
+    near 75 GiB, which does NOT fit it, and only the chained campaign fill is on the 244 GiB
+    family, so only it asks explicitly.
     """
     assert AssemblyConfig().max_workers == 16
     assert AssemblyConfig().compute_n_workers(10_000) == 16
