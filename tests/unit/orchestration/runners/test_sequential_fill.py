@@ -35,6 +35,7 @@ from tessera_embeddings.orchestration.runners.sequential_fill import (
     fill_zones_sequential,
 )
 from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff, ZonePlan
+from tests.unit.deadline import run_under_deadline
 
 LOG = logging.getLogger("test-sequential-fill")
 
@@ -1451,29 +1452,6 @@ def test_a_nonpositive_cap_is_refused_before_anything_expensive():
 # --- the trailing-assembly drain is bounded (2026-09-04) ---------------------------------------
 
 
-def _within(seconds: float, fn):
-    """Run ``fn`` and FAIL if it has not returned in ``seconds``.
-
-    The defect under test is a drain that never returns, and a test that merely calls it can only
-    hang when the fix is absent — which no runner reports as red. This makes the hang the assertion.
-    """
-    box: dict = {}
-
-    def _go():
-        try:
-            box["ret"] = fn()
-        except BaseException as exc:  # re-raised on the test thread
-            box["exc"] = exc
-
-    t = threading.Thread(target=_go, daemon=True)
-    t.start()
-    t.join(seconds)
-    assert not t.is_alive(), f"did not return within {seconds}s: the drain hung"
-    if "exc" in box:
-        raise box["exc"]
-    return box["ret"]
-
-
 @pytest.fixture
 def _stack_dumps(monkeypatch):
     """Record the stack dump, and FAIL if the runner ever tries to end the process itself.
@@ -1508,7 +1486,9 @@ class TestDrainTrailingAssemblies:
             wedged = pool.submit(hold.wait, 30.0)
             queued = pool.submit(lambda: None)
             with pytest.raises(mod.TrailingAssemblyWedgedError, match="abandoned") as raised:
-                _within(10, lambda: mod.drain_trailing_assemblies(pool, [fast, wedged, queued], ceiling_s=0.2, log=LOG))
+                run_under_deadline(
+                    10, lambda: mod.drain_trailing_assemblies(pool, [fast, wedged, queued], ceiling_s=0.2, log=LOG)
+                )
             assert raised.value.abandoned == 2, "the wedged assembly AND everything queued behind it are abandoned"
             assert queued.cancelled(), "work queued behind the wedge must not run later against a torn-down run"
             assert _stack_dumps, "the stacks must be dumped: they are the only diagnosis available on Fargate"
@@ -1525,7 +1505,7 @@ class TestDrainTrailingAssemblies:
         pool = ThreadPoolExecutor(max_workers=1)
         try:
             futures = [pool.submit(time.sleep, 0.08) for _ in range(6)]  # 0.48 s of work, ceiling 0.2 s
-            _within(10, lambda: mod.drain_trailing_assemblies(pool, futures, ceiling_s=0.2, log=LOG))
+            run_under_deadline(10, lambda: mod.drain_trailing_assemblies(pool, futures, ceiling_s=0.2, log=LOG))
             assert all(f.done() and not f.cancelled() for f in futures)
             assert not _stack_dumps, "a clean drain must not dump stacks"
         finally:
@@ -1563,7 +1543,9 @@ def test_a_wedged_trailing_assembly_raises_instead_of_hanging_the_run(monkeypatc
             caplog.at_level(logging.CRITICAL, logger="test-wedged-drain"),
             pytest.raises(mod.TrailingAssemblyWedgedError, match="abandoned") as raised,
         ):
-            _within(15, lambda: _run(_cells(3), assemble=wedging_assemble, inputs=RecordingInputs([]), log=log))
+            run_under_deadline(
+                15, lambda: _run(_cells(3), assemble=wedging_assemble, inputs=RecordingInputs([]), log=log)
+            )
     finally:
         hold.set()
     assert raised.value.abandoned == 3, "the wedged cell and the two queued behind it"
@@ -1575,7 +1557,7 @@ def test_a_wedged_trailing_assembly_raises_instead_of_hanging_the_run(monkeypatc
 
 
 def test_a_healthy_run_drains_completely(_stack_dumps):
-    summary = _within(15, lambda: _run(_cells(4), inputs=RecordingInputs([])))
+    summary = run_under_deadline(15, lambda: _run(_cells(4), inputs=RecordingInputs([])))
     assert summary["succeeded"] == 4
     assert not _stack_dumps
 
@@ -1613,7 +1595,7 @@ def test_a_wedge_raises_even_when_the_session_itself_failed(monkeypatch, _stack_
             caplog.at_level(logging.CRITICAL, logger="test-wedge-under-failure"),
             pytest.raises(mod.TrailingAssemblyWedgedError) as raised,
         ):
-            _within(
+            run_under_deadline(
                 15,
                 lambda: _run(
                     _cells(2),

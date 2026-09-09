@@ -37,6 +37,7 @@ from tessera_embeddings.storage.shard_writer import (
     write_year_shards,
 )
 from tessera_embeddings.storage.zone_grid import ZoneSpec
+from tests.unit.deadline import run_under_deadline
 
 _BAND = 8  # small band for a light test
 _SHARD = 512
@@ -1500,30 +1501,6 @@ class TestForkStallWatchdog:
     def _stall_lines(caplog):
         return [r for r in caplog.records if "FORK PHASE STALLED" in r.getMessage()]
 
-    @staticmethod
-    def _within(seconds, fn):
-        """Run ``fn`` and FAIL if it has not returned in ``seconds``.
-
-        The failure under test is a call that never returns, so a test that simply calls it
-        can only hang when the fix is absent — which no test runner reports as red. This turns
-        the hang itself into the assertion.
-        """
-        box: dict = {}
-
-        def _run():
-            try:
-                box["ret"] = fn()
-            except BaseException as exc:  # re-raised on the test thread below
-                box["exc"] = exc
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        thread.join(seconds)
-        assert not thread.is_alive(), f"run_forked did not return within {seconds}s: the fill hung"
-        if "exc" in box:
-            raise box["exc"]
-        return box["ret"]
-
     def test_a_worker_that_never_finishes_fails_the_fill_in_bounded_time(self, tmp_path, monkeypatch, caplog):
         """The 2026-09-04 shape: one partition outstanding, forever. Before this, forever meant days.
 
@@ -1549,7 +1526,7 @@ class TestForkStallWatchdog:
             caplog.at_level(logging.WARNING, logger="tessera_embeddings.storage.shard_writer"),
             pytest.raises(shard_writer.ForkPhaseStalledError, match="no shard progress"),
         ):
-            self._within(
+            run_under_deadline(
                 15,
                 lambda: run_forked(
                     session,
@@ -1639,7 +1616,7 @@ class TestForkStallWatchdog:
         with caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.shard_writer"):
             fake.instances.clear()
             monkeypatch.setattr(type(session), "merge", lambda self, *forks: None)
-            telemetry = self._within(
+            telemetry = run_under_deadline(
                 15,
                 lambda: run_forked(
                     session,
@@ -1670,7 +1647,7 @@ class TestForkStallWatchdog:
         monkeypatch.setattr(type(session), "merge", lambda self, *forks: None)
 
         with caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.shard_writer"):
-            telemetry = self._within(
+            telemetry = run_under_deadline(
                 10,
                 lambda: run_forked(
                     session,
@@ -1707,7 +1684,7 @@ class TestForkStallWatchdog:
             caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.shard_writer"),
             pytest.raises(shard_writer.ForkPhaseStalledError),
         ):
-            self._within(
+            run_under_deadline(
                 15,
                 lambda: run_forked(
                     session, _no_stats_worker, [{"tag": "only"}], progress_interval_s=0.02, fork_stall_timeout_s=0.3
