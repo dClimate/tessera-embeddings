@@ -15,6 +15,7 @@ import pathlib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -774,6 +775,102 @@ def test_feeder_crash_is_surfaced_not_silent_success():
 
     with pytest.raises(RuntimeError, match="zone feeder crashed"):
         _run(_cells(3), inputs=ExplodingInputs([]), look_ahead=1)
+
+
+# --- the feeder's termination accounting ----------------------------------------------------
+#
+# Three threads add to the feeder's queue and the feeder is what decides when no more inference
+# work can arrive. The two ways of getting that wrong are asymmetric: finishing EARLY drops a
+# cell silently, finishing LATE holds a GPU cluster open. Both tests below are HANG-SHAPED, so
+# each carries its own deadline — a regression has to be a red test, not a stalled suite.
+
+
+def _run_with_deadline(*args, deadline_s: float = 20.0, **kwargs):
+    """Run the fill on a worker thread and fail if it does not return inside ``deadline_s``.
+
+    The failures these tests guard against present as "never finishes", which under a plain
+    call is indistinguishable from a slow suite and blocks every other test behind it.
+    """
+    box: dict[str, Any] = {}
+
+    def go() -> None:
+        try:
+            box["out"] = _run(*args, **kwargs)
+        except BaseException as exc:  # re-raised on the calling thread below
+            box["exc"] = exc
+
+    worker = threading.Thread(target=go, name="fill-under-deadline", daemon=True)
+    worker.start()
+    worker.join(timeout=deadline_s)
+    if worker.is_alive():
+        raise AssertionError(f"the fill did not return within {deadline_s}s — the stream never exhausted")
+    if "exc" in box:
+        raise box["exc"]
+    return box["out"]
+
+
+def test_a_crashed_feeder_releases_the_stream_instead_of_holding_it():
+    """A feeder that dies owes the stream an answer.
+
+    Exhaustion is read from the work queue and the undecided count rather than from the feeder
+    thread being alive, which is what stops a feeder wedged inside a caller-supplied probe from
+    holding the session, its actors and the whole GPU cluster open with no bound. The price is
+    this case: a feeder that crashes with cells still queued must clear them, or the source
+    stays unexhausted forever and the session never returns.
+
+    The oracle is that the run RETURNS (raising the feeder error), inside a deadline. Asserting
+    only the exception type would pass on a build that hangs.
+    """
+
+    class ExplodingInputs(RecordingInputs):
+        def start(self, zone: str, year: int) -> None:
+            raise RuntimeError("feeder boom")
+
+    with pytest.raises(RuntimeError, match="zone feeder crashed"):
+        _run_with_deadline(_cells(3), inputs=ExplodingInputs([]), look_ahead=1)
+
+
+def test_the_source_exhausts_before_the_assembly_backlog_drains():
+    """Exhaustion means "no more inference", not "the cell is finished".
+
+    Whether the source is exhausted decides how long the session — and so the GPU fleet — stays
+    up. Assembly is single-threaded, needs no GPU, and may lag hours behind inference, so a
+    source that waited for it would hold a whole cluster idle through the backlog. This is not
+    hypothetical: counting a cell as undecided until its `assemble` returned made the pause
+    test's source miss exhaustion for 200 polls while one assembly was still running.
+
+    The oracle is the ORDER of two events, not a duration: the source must answer `None` while
+    an assembly is provably still parked.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    exhausted_first = threading.Event()
+
+    def blocking_assemble(handoff, prep):
+        started.set()
+        if not release.wait(timeout=10.0):
+            raise AssertionError("the source never exhausted, so the assembly was never released")
+        return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
+
+    def session(more_work, on_item_done):
+        results: list[dict] = []
+        while True:
+            batch = more_work()
+            if batch is None:
+                # Exhausted. The assembly is still inside its wait — nothing has released it —
+                # so exhaustion cannot have waited for it.
+                assert started.wait(timeout=10.0), "the assembly never started, so this proves nothing"
+                exhausted_first.set()
+                release.set()
+                return results
+            for item in batch:
+                result = {"chunk": item.chunk.label, "status": "success"}
+                results.append(result)
+                on_item_done(item, result)
+
+    out = _run_with_deadline(_cells(1), session=session, assemble=blocking_assemble)
+    assert exhausted_first.is_set(), "the source waited for the assembly to finish"
+    assert out["succeeded"] == 1 and out["failed"] == 0, out
 
 
 class _StaggeredInputs(RecordingInputs):

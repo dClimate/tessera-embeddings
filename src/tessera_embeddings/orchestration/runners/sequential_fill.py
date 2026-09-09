@@ -212,6 +212,16 @@ class _ZoneTally:
     failed: bool = False
 
 
+#: How long the feeder sleeps when its queue is empty but a taken cell is still undecided.
+#:
+#: A LIVENESS BELT, not a poll interval: every add to the queue and every settle notifies the
+#: condition, so the feeder normally wakes at once and this timeout expires only if a settle
+#: never arrives at all. Seconds rather than minutes so such a lapse costs a short delay rather
+#: than a stalled cluster, and long enough that a feeder waiting out a cluster's assembly
+#: backlog wakes a few times an hour rather than continuously.
+_FEEDER_WAIT_S = 5.0
+
+
 def fill_zones_sequential(
     *,
     cells: list[SequentialCell],
@@ -337,6 +347,37 @@ def fill_zones_sequential(
     failures: list[dict[str, Any]] = []
     tallies: dict[str, _ZoneTally] = {}  # run_id → tally
     ready: deque[list[WorkItem]] = deque()  # zones awaiting injection, in cell order
+    #: The feeder's own queue of cells to admit, each with the attempt number it will be taken
+    #: at. A QUEUE rather than the list it used to walk, because three threads can add to it —
+    #: the feeder (its own ingest and plan guards), the scheduler thread (a failed tally, via
+    #: ``_account_failed_inference``) and the trailing assembly thread (a failed assembly). Every
+    #: mutation is under ``lock``.
+    work_queue: deque[tuple[SequentialCell, int]] = deque((cell, 1) for cell in cells)
+    #: Cells TAKEN from ``work_queue`` whose INFERENCE outcome is not yet decided — mid-plan on
+    #: the feeder thread, queued for the stream, or streaming.
+    #:
+    #: INFERENCE, not the whole cell: a cell handed to the assembly queue is settled at that
+    #: moment, because what this count gates is how long the work source stays unexhausted, and
+    #: an unexhausted source keeps the GPU fleet standing. Counting a cell until its assembly
+    #: returned held the fleet through the entire single-threaded assembly backlog — hours of
+    #: work that needs no GPU. An assembly that FAILS is consequently retried after the backlog
+    #: drains rather than re-admitted to the stream, which costs nothing: every tile of such a
+    #: cell is staged, so a per-cell session returns before it creates an actor.
+    #:
+    #: THE INVARIANT, and the only thing keeping the feeder's termination honest: every take
+    #: from ``work_queue`` is matched by exactly one ``_settle``, so at any instant a cell is in
+    #: exactly one of — in ``work_queue``, counted here, or decided. Read only together with
+    #: ``work_queue``, under ``lock``. Exactly one site increments it (``_take_next``) and
+    #: exactly one decrements it (``_settle``); ``_feed``'s ``finally`` abandons the count
+    #: outright, which is the one documented exception.
+    #:
+    #: The two failure modes it stands between are asymmetric, which is why it exists rather
+    #: than a simpler "has the feeder finished its list" flag: finishing EARLY silently drops a
+    #: cell that was about to be re-admitted, and finishing LATE would hold a whole GPU cluster.
+    undecided = 0
+    #: Wakes the feeder when work is added or a cell settles, so an empty queue with cells still
+    #: in flight is a wait rather than a spin.
+    work_available = threading.Condition(lock)
     feeder_done = threading.Event()
     feeder_error: list[BaseException] = []  # an exception outside the per-cell guards
     stop = threading.Event()  # session crashed — unwind the feeder
@@ -529,6 +570,7 @@ def fill_zones_sequential(
             tally.cell, "inference", RuntimeError(f"{len(bad)}/{len(tally.results)} tiles failed (e.g. {bad[0]})")
         )
         _retain_failed_mosaic(tally.cell)
+        _settle(tally.cell)
 
     def _submit_assembly(tally: _ZoneTally) -> None:
         """Route a completed cell. Failures are accounted NOW; only successes are queued.
@@ -541,12 +583,42 @@ def fill_zones_sequential(
             _account_failed_inference(tally)
             return
         nonlocal assembly_pending
+        # SETTLED HERE, not when the assembly finishes: what ``undecided`` tracks is whether a
+        # cell's INFERENCE outcome is still open, and this cell's is now known. Settling at the
+        # end of assembly instead held the work source unexhausted for the whole assembly
+        # backlog — so the session, its actors and the GPU cluster stayed up through hours of
+        # single-threaded assembly that needs no GPU at all. Measured while building this: the
+        # pause test's source never reached exhaustion within 200 polls because it was waiting
+        # on `assemble`. An assembly that FAILS is therefore not re-admitted to the stream; it
+        # needs no fleet (every tile is staged, so a per-cell session returns before creating
+        # an actor) and is retried after the backlog drains.
+        _settle(tally.cell)
         with lock:
             assembly_pending += 1
         finalizer.submit(_finalize, tally)
 
-    def _take_next(pending: list[SequentialCell]) -> SequentialCell:
-        """Pop the first PENDING cell whose mosaic has LANDED, else the head.
+    def _settle(cell: SequentialCell) -> None:
+        """One taken cell's fate is now decided — published, terminally failed, or re-queued.
+
+        THE ONLY site that decrements ``undecided``; ``_take_next`` is the only one that
+        increments it. Keeping each to a single site is what makes the invariant above
+        checkable by eye rather than by tracing every branch of ``_feed``.
+        """
+        nonlocal undecided
+        with lock:
+            undecided -= 1
+            now = undecided
+            work_available.notify_all()
+        if now < 0:  # pragma: no cover - a take/settle imbalance is a bug in this module
+            log.error("Cell accounting went negative at %s-%d — the feeder may finish early", cell.zone, cell.year)
+
+    def _take_next() -> tuple[SequentialCell, int] | None:
+        """Take the first QUEUED cell whose mosaic has LANDED, else the head. ``None`` if empty.
+
+        Readiness is probed OUTSIDE ``lock``: ``ready`` is a caller-supplied adapter method, and
+        holding the runner's lock across foreign code to save a re-acquire is not a trade worth
+        making. The index it picks stays valid because only this thread ever REMOVES from
+        ``work_queue`` — the other two threads append to the tail.
 
         The readiest-first rationale is in the module docstring; measured on the real coverage
         counts, a cluster's opening window spans ~4 h to ~10 h of ingest, so strict density
@@ -563,20 +635,48 @@ def fill_zones_sequential(
         the cell is recorded as failed, and the cluster continues with its others. Blocking
         forever on a mosaic that will never arrive is the worse outcome.
         """
+        nonlocal undecided
+        with lock:
+            snapshot = list(work_queue)
+        if not snapshot:
+            return None
+        picked = 0
         if inputs is not None:
-            for idx, cell in enumerate(pending):
+            for idx, (cell, _) in enumerate(snapshot):
                 try:
                     if inputs.ready(cell.zone, cell.year):
-                        return pending.pop(idx)
+                        picked = idx
+                        break
                 except Exception:  # a broken probe must never stall the feeder
                     log.warning("Readiness probe failed for %s-%d", cell.zone, cell.year, exc_info=True)
-        return pending.pop(0)
+        with lock:
+            del work_queue[picked]
+            undecided += 1
+            return snapshot[picked]
 
     def _feed() -> None:
-        """Drain cells: inputs → prepare → plan → scan → enqueue, readiest first."""
+        """Drain the work queue: inputs → prepare → plan → scan → enqueue, readiest first.
+
+        Ends only when the queue is empty AND no taken cell is still undecided — see
+        ``undecided`` for why both halves are needed.
+        """
+        nonlocal undecided
         try:
-            pending = list(cells)
-            while pending:
+            while True:
+                with work_available:
+                    while not work_queue and undecided > 0 and not stop.is_set():
+                        # Nothing to admit right now, but a cell already taken can still come
+                        # back: the scheduler thread re-queues a failed tally and the trailing
+                        # thread re-queues a failed assembly. Waiting here rather than finishing
+                        # is what stops such a cell being dropped. The timeout is a liveness
+                        # belt against a settle that never arrives, not a poll — every add and
+                        # every settle notifies.
+                        work_available.wait(timeout=_FEEDER_WAIT_S)
+                    if not work_queue:
+                        return
+                    pending = [cell for cell, _ in work_queue]
+                if stop.is_set():
+                    return
                 # Stop admitting once too many failed cells are retaining mosaics off-budget:
                 # a systematic failure would otherwise keep freeing slots and pile up every
                 # cluster's multi-TB input.
@@ -607,8 +707,13 @@ def fill_zones_sequential(
                                 "phase": "unattempted",
                                 "error": "never admitted: the feeder stopped at the retained-failure cap",
                             }
-                            for cell in pending
+                            for cell, _ in work_queue
                         )
+                        # EMPTIED, not just abandoned: the queue is half of the exhaustion
+                        # predicate the session reads, so leaving cells on it would keep the
+                        # stream alive forever waiting for work this feeder has just refused.
+                        work_queue.clear()
+                        work_available.notify_all()
                     return
                 # Start ingests for every pending cell before choosing, so the pick can only
                 # ever be a cell whose ingest is already under way.
@@ -618,7 +723,10 @@ def fill_zones_sequential(
                 # Admission is UNBOUNDED: the feeder's only pacing is `inputs.wait` below,
                 # which blocks on the chosen cell's ingest. Nothing here waits on an assembly,
                 # so the GPU fleet never idles behind one.
-                cell = _take_next(pending)
+                taken = _take_next()
+                if taken is None:  # another thread emptied the queue between the peek and here
+                    continue
+                cell, _attempt = taken
                 try:
                     if inputs is not None:
                         # stop-aware: the adapter must return promptly (raising) once stop is
@@ -632,6 +740,7 @@ def fill_zones_sequential(
                         return
                     _record_failure(cell, "inputs/prepare", exc)
                     _retain_failed_mosaic(cell)  # mosaic (if any) retained for resume, counted
+                    _settle(cell)
                     continue
                 if prep.config.s1_orbit != session_s1_orbit:
                     # NOT a deferral: the orbit travels on the cell's ZoneContext, so an actor
@@ -670,6 +779,7 @@ def fill_zones_sequential(
                 except Exception as exc:
                     _record_failure(cell, "plan", exc)
                     _retain_failed_mosaic(cell)  # mosaic retained for resume, counted
+                    _settle(cell)
                     continue
                 if terminal_done:
                     # OUTSIDE the try, for the same reason the trailing assembly's cleanup is:
@@ -687,6 +797,9 @@ def fill_zones_sequential(
                                 cell.year,
                             )
                             _leak_mosaic(cell)
+                    # Terminal plans are DECIDED — committed, tagged and recorded inside
+                    # `plan()`. Nothing streams for them, so no later thread will settle them.
+                    _settle(cell)
                     continue
                 assert restored is not None  # only None on the terminal path, which continued
                 live = [c for c in zplan.live if c.label not in already]
@@ -740,16 +853,42 @@ def fill_zones_sequential(
             feeder_error.append(exc)
             log.error("Zone feeder crashed — remaining cells were not enqueued: %s", exc, exc_info=exc)
         finally:
+            # RELEASE THE STREAM. The session reads exhaustion from the queue and the undecided
+            # count (see `_prepared_zone`), not from this thread being alive — deliberately, so
+            # that a feeder stuck inside a probe cannot hold a GPU cluster open. The price is
+            # that a feeder which DIES owes the stream an answer: without this, cells left on
+            # the queue and cells taken but never settled would keep the source unexhausted
+            # forever and the session would never return.
+            with lock:
+                abandoned = [cell for cell, _ in work_queue]
+                work_queue.clear()
+                # The one site that touches `undecided` outside the take/settle pair, and it
+                # ABANDONS the count rather than balancing it: a crashed feeder cannot know
+                # which of the cells it had taken will still be settled by another thread.
+                undecided = 0
+                work_available.notify_all()
+            if abandoned:
+                log.error(
+                    "Zone feeder abandoned %d queued cell(s); they stay pending for the next campaign pass: %s",
+                    len(abandoned),
+                    ", ".join(f"{c.zone}-{c.year}" for c in abandoned),
+                )
             feeder_done.set()
 
     def _prepared_zone() -> list[WorkItem] | None:
-        """One prepared zone, ``[]`` if none is ready YET, ``None`` once none can be."""
+        """One prepared zone, ``[]`` if none is ready YET, ``None`` once none can be.
+
+        Exhaustion is read from the SHARED state — an empty work queue with nothing undecided —
+        rather than from ``feeder_done``. Keying it on the feeder thread having exited meant a
+        feeder wedged inside a caller-supplied probe held the session, its actors and the whole
+        GPU cluster open with no bound; the predicate here is false only while real work is
+        outstanding, and a feeder that dies releases it explicitly (see ``_feed``'s ``finally``).
+        """
         with lock:
             if ready:
                 return ready.popleft()
-        if feeder_done.is_set():
-            with lock:
-                return ready.popleft() if ready else None
+            if not work_queue and undecided == 0:
+                return None
         return []  # nothing ready YET (ingest/plan still running) — keep polling
 
     def _more_work() -> list[WorkItem] | None:
