@@ -41,6 +41,15 @@ call into ``config`` — the latter forbidden by ``no-botocore-outside-aws-provi
 environment variable was tried and rejected separately: one can be left behind in a task
 definition and inherited by an ordinary run, which
 ``test_nothing_about_a_fault_is_read_from_the_environment`` pins.
+
+ONE THING HERE IS NOT A DRILL. :func:`hard_exit_after_flush` is the package's single hard-exit
+primitive — announce, flush, ``os._exit`` — and it lives in this module because the structural
+test that keeps hard exits to one file already guards it here. The drill is one of its two
+callers and stays behind every gate above; the other is the sequential fill's response to a
+trailing-assembly thread it cannot join (see the function's docstring), a production safety exit
+that is deliberate and announced but needs no operator request. The invariant this module holds
+is therefore precisely: **no FAULT fires without a human's request, and no hard exit happens
+anywhere but here.**
 """
 
 from __future__ import annotations
@@ -94,6 +103,39 @@ _CANONICAL_ZONE = re.compile(r"(0[1-9]|[1-5][0-9]|60)[NS]")
 #: the log knows the idleness is deliberate, sparse enough not to bury the run's own
 #: lines.
 _HOLD_REPORT_S = 120.0
+
+
+def hard_exit_after_flush(
+    status: int,
+    *,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    message: str,
+    args: tuple[Any, ...] = (),
+) -> None:
+    """Announce, flush every log handler, and end this process without unwinding anything.
+
+    THE ONE PLACE THE PACKAGE HARD-EXITS, and a structural test keeps it that way: a hard exit
+    skips every handler and every ``finally`` by design, which is what makes it a faithful death
+    for a drill and an unacceptable thing to have scattered about. Two callers, both deliberate:
+
+    * :meth:`ArmedFault.die_between_commits` — the supervised drill, behind the deployment
+      allowlist and the hosted-fault gate.
+    * ``prefect.flows.fill_zones_sequential._end_process_after_wedged_drain`` — a fill whose
+      trailing-assembly thread is parked inside icechunk and cannot be joined. It must not report
+      ``FAILED`` (the campaign driver reads that as "stopped writing" and may hand its zones to a
+      replacement cluster), so after its teardown it ends the process and surfaces as CRASHED,
+      which the driver treats conservatively. See
+      ``context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md``.
+
+    The message goes to BOTH the caller's logger and this module's, then every handler is
+    flushed, so the announcement survives the exit as far as a batching API handler allows.
+    ``os._exit`` rather than ``sys.exit``: the second caller's whole reason for being here is a
+    non-daemon thread that a normal interpreter shutdown would wait on forever.
+    """
+    log.error(message, *args)
+    _log.error(message, *args)
+    logging.shutdown()  # flush every handler; nothing below here logs
+    os._exit(status)
 
 
 class FaultInjectionRefusedError(RuntimeError):
@@ -286,16 +328,16 @@ class ArmedFault:
             return
         if (zone, year) != (self._request.zone, self._request.year):
             return
-        message = (
-            "%s FIRING die_between_commits for %s year %d: the shard commit has landed and "
-            "this process is exiting with status %d BEFORE the commit that marks the year "
-            "complete. The year now holds data that nothing marks and nothing tags. Deliberate."
+        hard_exit_after_flush(
+            DRILL_EXIT_STATUS,
+            log=log,
+            message=(
+                "%s FIRING die_between_commits for %s year %d: the shard commit has landed and "
+                "this process is exiting with status %d BEFORE the commit that marks the year "
+                "complete. The year now holds data that nothing marks and nothing tags. Deliberate."
+            ),
+            args=(FAULT_LOG_PREFIX, zone, year, DRILL_EXIT_STATUS),
         )
-        args = (FAULT_LOG_PREFIX, zone, year, DRILL_EXIT_STATUS)
-        log.error(message, *args)
-        _log.error(message, *args)
-        logging.shutdown()  # flush every handler; nothing below here logs
-        os._exit(DRILL_EXIT_STATUS)
 
     def withhold(
         self,

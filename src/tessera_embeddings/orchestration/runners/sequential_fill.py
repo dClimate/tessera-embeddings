@@ -73,12 +73,14 @@ months.
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -210,6 +212,97 @@ class _ZoneTally:
     remaining: int
     results: list[dict[str, Any]] = field(default_factory=list)
     failed: bool = False
+
+
+#: The most wall-clock ONE trailing assembly may take before the assembly backlog drain stops
+#: waiting for it.
+#: The trailing thread assembles a cluster's cells one at a time, and once inference is complete
+#: the run's only remaining work is that queue — so a single assembly that never returns holds
+#: the whole run, and the flow, forever. That is exactly what happened on 2026-09-04: a fill
+#: finished its inference days later, announced it was draining 67 assemblies, and parked in
+#: ``finalizer.shutdown(wait=True)`` behind one wedged cell.
+#:
+#: SIX HOURS, and the bound is one-sided. The longest healthy global assembly measured is ~3.5 h
+#: on the densest zone-year (4.97 TB), and the fork-phase watchdog in ``shard_writer`` already
+#: fails a stalled WRITE inside thirty minutes — so the only way a cell reaches this ceiling is a
+#: hang the watchdog cannot unwind (a coordinator thread parked inside icechunk itself). Being
+#: generous costs one idle head node for a few hours, once; being short would abandon a legitimate
+#: dense assembly. The abandoned cells stay unmarked and are re-dispatched, resuming from staging.
+TRAILING_ASSEMBLY_CEILING_S = 6 * 3600.0
+
+
+class TrailingAssemblyWedgedError(RuntimeError):
+    """The assembly backlog drain gave up on one that never returned, and its thread is still alive.
+
+    Its own type because the caller must treat it differently from every other failure: a fill
+    that RAISES is read by the campaign driver as having stopped writing (``FAILED`` is a
+    quiescent state there, and a replacement cluster may take over its zones five minutes
+    later). That reading is false here — a thread parked inside icechunk may still hold a
+    writable session. So the flow that owns the process must not let this surface as
+    ``FAILED``: it tears down and then ends the process, which the driver records as ``CRASHED``
+    and treats conservatively (the cells wait for the next round). See
+    ``prefect/flows/fill_zones_sequential.py`` and the README's replacement-admission rule.
+    """
+
+    def __init__(self, abandoned: int, failures: list[dict[str, Any]]) -> None:
+        self.abandoned = abandoned
+        self.failures = failures
+        super().__init__(
+            f"{abandoned} trailing assembly/assemblies abandoned behind a wedged one (their cells stay "
+            f"unmarked and will be re-dispatched); {len(failures)} other cell(s) failed: {failures}"
+        )
+
+
+def drain_trailing_assemblies(
+    finalizer: ThreadPoolExecutor,
+    futures: list[Future[None]],
+    *,
+    ceiling_s: float = TRAILING_ASSEMBLY_CEILING_S,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+) -> int:
+    """Wait for every queued trailing assembly to finish — but never for one of them forever.
+
+    ``finalizer.shutdown(wait=True)`` was the assembly backlog drain until 2026-09-04, and it has
+    no bound: one
+    assembly that never returns holds the run, the flow, and the ECS task indefinitely, while
+    every cell queued behind it is neither published nor failed. This waits for completions with
+    a per-assembly ceiling instead. The ceiling resets on each completion, so a long backlog of
+    healthy assemblies drains however long it takes; only an individual assembly that exceeds
+    ``ceiling_s`` with nothing completing is declared wedged.
+
+    On a wedge it dumps every thread's stack (the artefact no external tool can get on
+    Fargate), cancels the assemblies still queued, and returns how many were abandoned so the
+    caller can raise :class:`TrailingAssemblyWedgedError`. It does NOT end the process: the
+    wedged thread is a non-daemon pool worker that will hold the interpreter open at exit, but
+    how and when to end the process is the process owner's decision — the flow does it after its
+    own teardown, so a forced exit can never orphan a fleet mid-teardown. Nothing here rewrites
+    or deletes: the abandoned cells' staged tiles and mosaics stay where they are, and the
+    campaign re-dispatches them as unmarked cells.
+
+    Returns:
+        The number of assemblies abandoned — ``0`` when the whole backlog drained.
+    """
+    finalizer.shutdown(wait=False)  # no new submissions; what is queued still runs, in order
+    pending = [f for f in futures if not f.done()]
+    while pending:
+        done, _ = wait(pending, timeout=ceiling_s, return_when=FIRST_COMPLETED)
+        if not done:
+            n = len(pending)
+            with suppress(Exception):
+                log.critical(
+                    "TRAILING ASSEMBLY WEDGED: no assembly completed in %.1f h. Abandoning the %d still "
+                    "pending — their cells stay unmarked and will be re-dispatched, resuming from their "
+                    "staged tiles. Thread stacks follow.",
+                    ceiling_s / 3600.0,
+                    n,
+                )
+            with suppress(Exception):
+                faulthandler.dump_traceback()
+            with suppress(Exception):
+                finalizer.shutdown(wait=False, cancel_futures=True)
+            return n
+        pending = [f for f in pending if not f.done()]
+    return 0
 
 
 def fill_zones_sequential(
@@ -360,6 +453,11 @@ def fill_zones_sequential(
     #: Cells submitted to the trailing finalizer and not yet assembled. Reported at the
     #: drain, where the backlog can be most of a cluster's cells and take hours.
     assembly_pending = 0
+    #: Every future the finalizer has been handed, so the backlog drain can wait on completions
+    #: with a
+    #: ceiling rather than on the pool's unbounded shutdown. See `drain_trailing_assemblies`.
+    assembly_futures: list[Future[None]] = []
+    assemblies_abandoned = 0
     finalizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trailing-assembly")
     #: A landed cell's deletes — its STAGING prefix and its MOSAIC prefix — run HERE, not on
     #: the assembly thread. A mosaic is multi-terabyte and its delete takes as long as it
@@ -543,7 +641,7 @@ def fill_zones_sequential(
         nonlocal assembly_pending
         with lock:
             assembly_pending += 1
-        finalizer.submit(_finalize, tally)
+            assembly_futures.append(finalizer.submit(_finalize, tally))
 
     def _take_next(pending: list[SequentialCell]) -> SequentialCell:
         """Pop the first PENDING cell whose mosaic has LANDED, else the head.
@@ -820,7 +918,16 @@ def fill_zones_sequential(
                 "Actors are already retired, so GPU workers idle down while this runs.",
                 n_pending,
             )
-        finalizer.shutdown(wait=True)
+        with lock:
+            queued = list(assembly_futures)
+        # Read at CALL time, not bound as defaults, so an operator override (or a test) of the
+        # module constants takes effect on the run that is actually draining.
+        assemblies_abandoned = drain_trailing_assemblies(
+            finalizer,
+            queued,
+            ceiling_s=TRAILING_ASSEMBLY_CEILING_S,
+            log=log,
+        )
         # `mosaic_cleaner` is DELIBERATELY still alive here. Draining it at this point was a
         # real defect: the in-child retry pass below calls `assemble()` again, and this flow's
         # assemble submits staging cleanup into this pool — so the retry committed and tagged
@@ -985,7 +1092,13 @@ def fill_zones_sequential(
         "failures": failures,
         "outcomes": outcomes,
         "elapsed_sec": elapsed,
+        "assemblies_abandoned": assemblies_abandoned,
     }
+    if assemblies_abandoned:
+        # Distinct from `failures`, and a distinct TYPE: these cells neither published nor
+        # failed, and the thread that was assembling one of them is still alive. The flow must
+        # not let this become FAILED — see the exception's docstring.
+        raise TrailingAssemblyWedgedError(assemblies_abandoned, failures)
     if failures:
         raise RuntimeError(
             f"{len(failures)}/{len(cells)} cell(s) failed in the chained fill "

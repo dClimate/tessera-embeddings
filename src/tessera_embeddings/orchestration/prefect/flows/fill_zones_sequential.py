@@ -48,7 +48,7 @@ from prefect.deployments import run_deployment
 from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import Cancelling
 
-from tessera_embeddings.config.fault_injection import WITHHOLD_WORK, FaultInjection
+from tessera_embeddings.config.fault_injection import WITHHOLD_WORK, FaultInjection, hard_exit_after_flush
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
@@ -90,6 +90,7 @@ from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import (
 from tessera_embeddings.orchestration.runners.sequential_fill import (
     PreparedCell,
     SequentialCell,
+    TrailingAssemblyWedgedError,
     fill_zones_sequential,
 )
 from tessera_embeddings.orchestration.runners.zone_fill import (
@@ -559,6 +560,47 @@ class _DeploymentCellInputs:
 
 #: Tag prefix for this flow's child ingest deployments.
 _INGEST_TAG_PREFIX = "chained-ingest"
+
+
+#: Exit status when this process ends itself because a trailing-assembly thread could not be
+#: stopped. ``EX_TEMPFAIL`` (75): the work is retryable — its cells are unmarked and re-dispatch.
+WEDGED_DRAIN_EXIT_STATUS = 75
+
+
+def _end_process_after_wedged_drain(
+    exc: TrailingAssemblyWedgedError, log: logging.Logger | logging.LoggerAdapter[logging.Logger]
+) -> None:
+    """End the process rather than report ``FAILED``, because a writer thread may still be alive.
+
+    The campaign driver reads a fill that returned or raised as having stopped writing
+    (``FAILED`` and ``COMPLETED`` are its quiescent states), and five minutes after one it may
+    hand that fill's zones to a replacement cluster. The README's replacement-admission rule
+    rests on exactly that: "a fill that returned or raised has, by then, joined the trailing
+    assembly thread that does its committing". An assembly backlog drain that gave up on a wedged
+    assembly has
+    NOT joined that thread — it is parked inside icechunk holding a writable session — so
+    letting this surface as ``FAILED`` would make the rule's premise false and open the one
+    outcome the campaign is built to prevent: two writers on one zone.
+
+    Ending the process is the honest state. The thread dies with it, so nothing can commit
+    later; Prefect records the run as CRASHED from the missed heartbeats, which the driver
+    already treats as "cannot infer who stopped" — the cells wait for the next round and are
+    re-dispatched, resuming from their staged tiles. Called from the flow's ``finally`` AFTER
+    the fleet is down and the ingests cancelled, so the exit can never orphan either. The exit
+    itself goes through the package's one sanctioned hard-exit site,
+    :func:`~tessera_embeddings.config.fault_injection.hard_exit_after_flush`.
+    """
+    hard_exit_after_flush(
+        WEDGED_DRAIN_EXIT_STATUS,
+        log=log,
+        message=(
+            "Ending this process: %d trailing assembly/assemblies were abandoned behind a wedged one, and "
+            "the thread running it cannot be stopped. Reporting FAILED would tell the campaign this fill has "
+            "stopped writing, which is not known to be true; exiting makes it true. The run will surface as "
+            "CRASHED and its %d unfinished cell(s) will be re-dispatched next round from their staged tiles."
+        ),
+        args=(exc.abandoned, exc.abandoned),
+    )
 
 
 def _ingest_child_tag(flow_run_id: object) -> str | None:
@@ -1278,6 +1320,7 @@ def fill_zones_sequential_flow(
     # above the `try` let any failure in between — a raising `start`, an unexpected error in the
     # wait — return without cancelling them, leaving children writing mosaic prefixes that a
     # prompt retry of this flow would then race.
+    wedged: TrailingAssemblyWedgedError | None = None
     try:
         if inputs is not None:
             # EVERY live cell, not a look-ahead window: the driver's `max_parallel` is what
@@ -1354,6 +1397,12 @@ def fill_zones_sequential_flow(
                 # inference paused" reaches it as a plain callable.
                 paused=(pause_signal(inference_pause_gate, log=log) if inference_pause_gate else None),
             )
+    except TrailingAssemblyWedgedError as exc:
+        # Remembered, not handled: the teardown below must run first, and only then may the
+        # process end (see `_end_process_after_wedged_drain`). Re-raised so a teardown that
+        # itself fails still propagates something rather than swallowing the wedge.
+        wedged = exc
+        raise
     finally:
         # Joined HERE because this `finally` is the only place covering every way the runner can
         # exit — the normal return, its partial-failure RuntimeError (a normal exit path, per
@@ -1370,6 +1419,9 @@ def fill_zones_sequential_flow(
         # cancellation) — clear the hook state even when the runner raises (its partial-failure
         # RuntimeError is a NORMAL exit path).
         deactivate()
+        if wedged is not None:
+            # LAST, after the fleet is down and the ingests are cancelled: this does not return.
+            _end_process_after_wedged_drain(wedged, log)
 
     log.info(
         "Year %d sequential fill: %d/%d live cells landed (plus %d retagged, %d empty)",

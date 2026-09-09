@@ -316,3 +316,29 @@ class TestTheGuaranteeIsStructural:
             sig = inspect.signature(getattr(fn, "fn", fn))
             assert param in sig.parameters, f"{fn.__name__} should carry {param}"
             assert sig.parameters[param].default is None, f"{fn.__name__}.{param} must default to nothing"
+
+
+class TestTheSharedHardExit:
+    """`hard_exit_after_flush` is the one hard-exit site; both its callers depend on this order."""
+
+    def test_it_announces_flushes_and_only_then_exits(self, monkeypatch, caplog):
+        import logging as _logging
+        import os as _os
+
+        from tessera_embeddings.config import fault_injection as fi
+
+        order: list[str] = []
+        monkeypatch.setattr(_logging, "shutdown", lambda: order.append("flush"))
+        monkeypatch.setattr(_os, "_exit", lambda status: order.append(f"exit:{status}"))
+        log = _logging.getLogger("test-hard-exit")
+        with caplog.at_level(_logging.ERROR, logger="test-hard-exit"):
+            fi.hard_exit_after_flush(75, log=log, message="going down: %s", args=("reason",))
+        assert order == ["flush", "exit:75"], "flush must precede the exit, and the exit must be last"
+        assert any("going down: reason" in r.getMessage() for r in caplog.records), "the announcement was lost"
+
+    def test_the_drill_still_goes_through_it(self):
+        import inspect as _inspect
+
+        from tessera_embeddings.config import fault_injection as fi
+
+        assert "hard_exit_after_flush(" in _inspect.getsource(fi.ArmedFault.die_between_commits)
