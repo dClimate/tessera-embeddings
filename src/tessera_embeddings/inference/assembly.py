@@ -2048,7 +2048,7 @@ class ZarrWriter:
             # `_log` is the caller's logger (the flow's run logger under Prefect), so the
             # coordinator's progress lines reach the orchestrator too. No catch-up on this path,
             # so no timer and nothing that can wedge; the session comes back unchanged.
-            fill, _ = run_forked(session, _fill_band_worker, payloads, unit="band writes", log=_log)
+            fill = run_forked(session, _fill_band_worker, payloads, unit="band writes", log=_log)
 
         # --- Phase 3: root attrs + one data commit ----------------------------
         node = zarr.open_group(session.store, mode="a")
