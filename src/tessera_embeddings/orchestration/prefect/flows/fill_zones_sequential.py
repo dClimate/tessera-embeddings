@@ -604,7 +604,6 @@ def fill_zones_sequential_flow(
     allow_s2_only: bool = False,
     allow_model_mismatch: bool = False,
     allow_ingest_code_mismatch: bool = False,
-    s3_concurrency: int | None = None,
     launch_pacing: bool = False,
     gpu_fallback_instance_types: list[str] | None = None,
     gpu_fallback_vcpu_budget: int | None = None,
@@ -678,14 +677,11 @@ def fill_zones_sequential_flow(
         allow_model_mismatch: Fill even when the seeded store advertises a different
             encoder/checkpoint than this build (default rejects).
         allow_ingest_code_mismatch: Resume a store built by different ingest code (off by default).
-        s3_concurrency: Each trailing assembly's slice of the fleet S3-PUT budget. ``None`` =
-            the aggregate target halved, leaving headroom for the live cell's concurrent
-            staging writes.
         launch_pacing: Pace this cluster's EC2 launch requests against the account's shared
-            RunInstances quota — the same shape as ``s3_concurrency``, a budget concurrent
-            clusters share, except this one is a request RATE whose enforcement lives in the
-            client rather than in a count we divide. Default ``False`` keeps today's launch
-            behaviour; the campaign turns it on when it runs more than one cluster.
+            RunInstances quota — a budget concurrent clusters share, except it is a request RATE
+            whose enforcement lives in the client rather than in a count we divide. Default
+            ``False`` keeps today's launch behaviour; the campaign turns it on when it runs more
+            than one cluster.
         gpu_fallback_instance_types: EC2 instance types this fill may fall back to when the
             production rung has no capacity (e.g. ``["g5.2xlarge"]``). Opens the card's rung AND
             installs the capacity-aware autoscaler scorer -- see
@@ -1136,14 +1132,6 @@ def fill_zones_sequential_flow(
             input_coverage=coverage,
         )
 
-    # One assembly at a time trails the live cell's staging writes, so split the fleet PUT
-    # budget between them rather than letting the pair burst ~2x the target (the parallel
-    # driver divides by max_parallel_zones for the same reason).
-    if s3_concurrency is None:
-        from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
-
-        s3_concurrency = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // 2)
-
     # on_actor_retire fires only from idle retirement, which the scheduler suppresses while the
     # zone stream is unexhausted — so this terminator is inert mid-stream and only drains the
     # fleet early during the true cluster tail. A dead actor's abandoned instance is reclaimed
@@ -1263,7 +1251,6 @@ def fill_zones_sequential_flow(
                 optical_min_obs=_store_optical_min_obs(),
                 input_coverage=prep.input_coverage,
                 log=log,
-                s3_concurrency=s3_concurrency,
                 cleanup_staging=cleanup_staging,
                 # OFF the assembly thread: measured at ~2 h per cell inline, during which the
                 # next cell's assembly could not start even with its tiles fully staged.

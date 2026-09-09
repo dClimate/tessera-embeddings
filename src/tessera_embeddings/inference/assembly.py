@@ -203,51 +203,6 @@ class SpatialCoords:
     crs: str | None = None
 
 
-TARGET_AGGREGATE_S3_CONCURRENCY = 100
-"""Fleet-wide ceiling on concurrent S3 PUTs during assembly, divided across workers.
-
-icechunk's ``max_concurrent_requests`` is per-Repository-instance and each assembly worker
-process carries its own pickled fork of the session, so aggregate concurrency is
-``n_workers * per_worker_cap``, not the per-worker cap alone. ~100 fleet-wide is roughly 1/35 of
-S3's ~3500 req/s/prefix ceiling at ~100 ms PUT latency, leaving headroom for retries. The
-coordinator opens the repo with ``max_concurrent_requests = target // n_workers`` and the forks
-inherit it; no ``save_config`` persistence is needed because forks travel by pickle rather than
-re-opening the repo from its URI.
-
-icechunk's flat ``chunks/<random-id>`` keyspace spreads across S3 partitions well, but partition
-splitting is adaptive and a hard burst overruns the per-prefix rate before (and even after) S3
-adapts — the SlowDown observed at 800 concurrent PUTs. Because ``per_worker_cap`` floors at 1, a
-fill's aggregate is ``max(budget, n_workers)`` rather than ``<= budget``: the floor and the
-ceiling cannot both hold and the ceiling gives way. ``AssemblyConfig.max_workers`` bounds the
-overshoot — see :func:`_s3_budget_split` for why that is the right way round.
-"""
-
-
-def _s3_budget_split(s3_concurrency: int | None, n_workers: int) -> tuple[int, int]:
-    """``(effective_workers, per_worker_cap)`` honoring the fleet S3-PUT budget.
-
-    Each fork worker opens its own repo capped at ``per_worker_cap``, so a fill issues up to
-    ``effective_workers * per_worker_cap`` concurrent requests. ``s3_concurrency=None`` uses the
-    full aggregate target (a lone fill). Both returned values are ``>= 1``.
-
-    **The worker count is NOT reduced to fit the budget.** A per-fill budget is the fleet target
-    divided by the cluster count, so on a wide campaign it lands well below the requested worker
-    count, and clamping to it would silently cost most of the fork pool on the campaign's longest
-    stage. Because ``per_worker_cap`` floors at 1, a worker count above the budget makes the
-    aggregate ``max(budget, n_workers)``: the ceiling gives way, not the floor, because the costs
-    are asymmetric. Overshooting risks 503s, which retry, and the target sits far below the
-    concurrency at which SlowDown was actually observed; holding the target by dropping forks
-    costs wall-clock unconditionally on every cell. The overshoot is bounded by
-    ``AssemblyConfig.max_workers`` times the fleet's cluster count.
-
-    Measured cost of the clamp and the concurrency evidence:
-    ``context_docs/storage/writing-to-the-global-store.md``.
-    """
-    budget = s3_concurrency if s3_concurrency is not None else TARGET_AGGREGATE_S3_CONCURRENCY
-    workers = max(1, n_workers)
-    return workers, max(1, budget // workers)
-
-
 def _assembly_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogeneous JSON payload
     """One machine-readable per-assembly record for the profiling tools.
 
@@ -268,11 +223,9 @@ def _assembly_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogene
       round-robin partition order for the global one). ``wall_s - read_s - write_s`` per worker is
       time outside both phases (validation, partitioning, interpreter start); the slowest worker's
       ``wall_s`` bounds the fill, since every payload gets its own process.
-    * ``workers_requested`` vs ``workers_used`` — what was asked for vs how many forks ran. The S3
-      budget and the work partition can each cap the count, and this pair is what exposes a fill
-      quietly running below its requested width.
-    * ``per_worker_s3_cap`` — each fork's concurrent-request cap (``budget // workers``, see
-      :data:`TARGET_AGGREGATE_S3_CONCURRENCY`).
+    * ``workers_requested`` vs ``workers_used`` — what was asked for vs how many forks ran. The
+      work partition can cap the count, and this pair is what exposes a fill quietly running
+      below its requested width.
     * ``tiles``/``writes``/``bytes`` — tile loads, region assignments and uncompressed bytes handed
       to zarr, summed across workers, so rates derive without a store listing.
       ``tiles_staged``/``tiles_cleared`` are the caller's intent: real data vs fill-over-skip.
@@ -1792,9 +1745,7 @@ class ZarrWriter:
                 provenance attr (``geoemb:model`` is the public encoder URL, derived separately).
             manifest: Typed manifest for append-safety validation. Written on create, validated
                 before extending an existing store.
-            n_workers: Worker *process* count. Also divides ``TARGET_AGGREGATE_S3_CONCURRENCY``
-                into the per-fork request cap, keeping fleet-wide PUT concurrency under S3's
-                ceiling.
+            n_workers: Worker *process* count.
             get_credentials: Optional icechunk credential callback for the output store (see
                 ``zarr_store._create_storage``).
             s3_region: Optional S3 region override for the output store.
@@ -1880,11 +1831,6 @@ class ZarrWriter:
             variables.append("embedding_std")
         variables += [v for v in CARRIED_VARS if v != "embedding_std" and v in staged_extra]
 
-        # Divide the fleet-wide S3 concurrency target across worker forks (see
-        # TARGET_AGGREGATE_S3_CONCURRENCY). Forks inherit the repo config through the pickled
-        # session, so no save_config round-trip is needed.
-        per_worker_cap = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // max(1, n_workers))
-
         # Time-only, matching the global store (zarr_store.global_store_config) and the rule
         # documented there: split the axis along which a single commit is NARROW. An assemble
         # writes ONE timestep across the whole spatial extent, so time@1 keeps the write off every
@@ -1893,7 +1839,6 @@ class ZarrWriter:
         with manifest_split({"time": 1}):
             repo, is_new = open_or_create_repo(
                 output_path,
-                max_concurrent_requests=per_worker_cap,
                 get_credentials=get_credentials,
                 region=s3_region,
                 scatter_initial_credentials=True,  # see assemble_global's call site
@@ -2165,7 +2110,6 @@ class ZarrWriter:
                 tiles_cleared=len(clear_chunks),
                 workers_requested=n_workers,
                 workers_used=len(payloads),
-                per_worker_s3_cap=per_worker_cap,
                 fill_wall_s=fill["wall_s"],
                 merge_s=fill["merge_s"],
                 commit_s=commit_s,
@@ -2188,7 +2132,6 @@ class ZarrWriter:
         n_workers: int = 8,
         staged_labels: Iterable[str] | None = None,
         skipped_labels: Iterable[str] | None = None,
-        s3_concurrency: int | None = None,
         radar_coverage: dict | None = None,
         empty: bool = False,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
@@ -2244,8 +2187,7 @@ class ZarrWriter:
                 label, as the actors reported it. Merged with the refused shards' marker records so
                 a partly-refused tile reports what the depth gate removed; a label in both takes
                 the marker, written at the end of a wholly refused shard.
-            n_workers: Worker process count; also divides ``TARGET_AGGREGATE_S3_CONCURRENCY`` into
-                the per-fork cap.
+            n_workers: Worker process count.
             staged_labels: Pre-listed staged tile labels (e.g. the return of
                 :meth:`verify_staged_completeness`); ``None`` lists the prefix.
             radar_coverage: This YEAR's radar-coverage summary, from
@@ -2266,9 +2208,6 @@ class ZarrWriter:
             empty: Record the year as holding no data. For the all-skipped case, where the fill
                 write and the completion mark must agree the year is empty — marking it without
                 the write leaves a previous attempt's shards readable underneath.
-            s3_concurrency: This fill's slice of the fleet S3-PUT budget (divided
-                across ``n_workers`` for the per-fork cap); ``None`` uses the full
-                ``TARGET_AGGREGATE_S3_CONCURRENCY`` (a lone fill).
             get_credentials: Optional icechunk credential callback.
             s3_region: Optional S3 region override.
             log: Optional logger.
@@ -2307,20 +2246,15 @@ class ZarrWriter:
             raise IncompleteStageError(f"Run {run_id!r} has no staged chunks under {self.staging_base}")
         shards = tuple(sorted(parse_chunk_label(label) for label in labels))
 
-        # S3 budget: divide the FLEET target across concurrent fills, not just this fill's forks.
-        # TARGET_AGGREGATE_S3_CONCURRENCY // n_workers alone bounds ONE fill to ~target, so K
-        # concurrent fills burst K times the target PUTs (the 800-req SlowDown). The campaign
-        # passes `s3_concurrency = target // max_parallel_zones`; None = full target.
-        #
-        # The budget sets the per-fork REQUEST CAP only and never reduces the fork count. Since
-        # that cap floors at 1, the fleet may exceed the target by up to
-        # `max_workers * n_clusters`; see `_s3_budget_split`.
-        n_workers, per_worker_cap = _s3_budget_split(s3_concurrency, n_workers)
+        # NO REQUEST CAP: the repo takes icechunk's default concurrency. A cap of 1 — which the
+        # campaign's own budget arithmetic produced on every assembly — deadlocks `commit` and
+        # `rebase`/`diff` inside icechunk's tokio runtime under concurrent writers, and that is
+        # what stranded five clusters on 2026-09-04. See
+        # `context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md`.
         repo = open_global_repo(
             store_path,
             get_credentials=get_credentials,
             region=s3_region,
-            max_concurrent_requests=per_worker_cap,
             # `write_year_shards` PICKLES this session to spawned children; without this each
             # deserialises with no credential and calls back per S3 request for the life of the
             # fork (icechunk#2077). Opt-in per call site because the pickle carries a live secret —
@@ -2497,7 +2431,6 @@ class ZarrWriter:
                 tiles_cleared=len(cleared),
                 workers_requested=workers_requested,
                 workers_used=len(workers),
-                per_worker_s3_cap=per_worker_cap,
                 fill_wall_s=telemetry.get("fill_wall_s"),
                 merge_s=telemetry.get("merge_s"),
                 commit_s=telemetry.get("commit_s"),

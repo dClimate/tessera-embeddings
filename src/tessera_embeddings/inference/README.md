@@ -765,10 +765,12 @@ The commit row is the manifest-splitting story: an Icechunk manifest maps
 chunks → objects, one per array by default, so unsplit commits are O(store).
 See the README's "Manifest splitting" diagram for the visual.
 
-**S3 concurrency.** The coordinator opens the repo with `max_concurrent_requests =
-TARGET_AGGREGATE_S3_CONCURRENCY // n_workers`; forks inherit it through pickling (no
-`save_config` round-trip needed), so fleet-wide PUT concurrency stays under S3's
-per-prefix ceiling regardless of worker count.
+**S3 concurrency.** None is imposed: the repo opens at icechunk's default (256) and the
+forks inherit it through pickling. A per-fork cap used to be computed from a fleet PUT
+budget, and it floored at 1 on every campaign fill — the value at which icechunk deadlocks
+`commit` and `rebase`/`diff` under concurrent writers
+(`context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md`). Measured uncapped at
+32 workers per fill across the fleet: zero throttling.
 
 **Manifest splitting.** `assemble` opens the repo under `manifest_split({"time": 1})`. By
 default icechunk keeps one manifest object per array, so every commit rewrites the entire

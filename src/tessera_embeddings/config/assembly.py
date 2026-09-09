@@ -3,7 +3,7 @@
 Assembly runs as a pool of local worker processes driving raw-zarr fork/merge writes
 (see :mod:`tessera_embeddings.inference.assembly`) — there is no Dask cluster to
 provision. :class:`AssemblyConfig` scales the process count from the number of *live*
-(ROI-intersecting) spatial chunks and caps it at a RAM- and S3-budgeted ceiling.
+(ROI-intersecting) spatial chunks and caps it at a RAM-budgeted ceiling.
 """
 
 from __future__ import annotations
@@ -24,14 +24,8 @@ class AssemblyConfig:
     memory (~1-1.5 GB at a 2048-px full-band tile), so the pool peaks around ~24 GB —
     inside the flow runner's 64 GiB, and measured at 20 GB peak when the pool was 8.
 
-    It also bounds this fill's S3 PUT concurrency. For a LONE fill the per-fork cap is
-    ``TARGET_AGGREGATE_S3_CONCURRENCY // n_workers``, so aggregate stays at or under the
-    target whenever ``max_workers <= target``. A campaign fill is passed a DIVIDED budget,
-    which can fall below the worker count; the per-fork cap then floors at 1 and aggregate
-    is the worker count itself. That is deliberate — the fork pool is not sacrificed to the
-    request ceiling — so ``max_workers`` is also what bounds a fill's contribution to the
-    fleet's PUT rate. See ``assembly._s3_budget_split`` and
-    ``context_docs/storage/writing-to-the-global-store.md``.
+    Each fork opens the store at icechunk's default request concurrency; nothing here caps
+    it. Measurements: ``context_docs/storage/writing-to-the-global-store.md``.
     """
 
     chunks_per_worker: int = 10
