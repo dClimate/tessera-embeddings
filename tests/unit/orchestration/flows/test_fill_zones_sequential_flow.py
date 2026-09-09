@@ -24,6 +24,7 @@ from prefect.states import StateType
 import tessera_embeddings.orchestration.prefect.flows._child_runs as _child_runs
 import tessera_embeddings.orchestration.prefect.flows.fill_zones_sequential as mod
 from tessera_embeddings.config.paths import BucketPaths
+from tests.unit.deadline import run_under_deadline
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
@@ -1325,3 +1326,112 @@ def test_a_store_declaring_no_rule_leaves_the_config_unconstrained(wired, monkey
     monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: None)
     _run(zones=["33N"])
     assert built and {c.get("optical_min_obs") for c in built} == {None}
+
+
+# --- a wedged trailing assembly ends the process rather than reporting FAILED (2026-09-04) ------
+
+
+class TestWedgedDrainEndsTheProcess:
+    """`FAILED` tells the driver a fill stopped writing, which a wedged drain does not establish,
+    so the flow ends its process instead — AFTER teardown, and via the one hard-exit site.
+    """
+
+    def test_the_helper_exits_through_the_one_sanctioned_site_with_the_temp_fail_status(self, monkeypatch, caplog):
+        import inspect as _inspect
+        import logging as _logging
+
+        from tessera_embeddings.orchestration.prefect.flows import fill_zones_sequential as flowmod
+        from tessera_embeddings.orchestration.runners.sequential_fill import TrailingAssemblyWedgedError
+
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            flowmod, "hard_exit_after_flush", lambda status, **kw: calls.append({"status": status, **kw})
+        )
+        log = _logging.getLogger("test-wedged-exit")
+        flowmod._end_process_after_wedged_drain(TrailingAssemblyWedgedError(4), log)
+        assert [c["status"] for c in calls] == [flowmod.WEDGED_DRAIN_EXIT_STATUS]
+        assert flowmod.WEDGED_DRAIN_EXIT_STATUS == 75, "EX_TEMPFAIL: the work is retryable"
+        assert "Ending this process" in calls[0]["message"] and calls[0]["args"][0] == 4, (
+            "the exit must say why, and how many cells it leaves"
+        )
+        # Structural: no second hard-exit site. The package's test for that counts `_exit` calls
+        # across the tree; this pins that THIS module never grows one.
+        assert "_exit(" not in _inspect.getsource(flowmod), "the flow must exit only through hard_exit_after_flush"
+
+    def test_a_ray_teardown_that_also_raises_cannot_swallow_the_wedge(self, wired, monkeypatch):
+        """THE THIRD PLACE THIS INVARIANT LEAKED. The wedge is raised inside the Ray context, so
+        leaving it runs `ray.shutdown()` and `ray down` — and an exception there REPLACES the
+        wedge, after which the outer `finally` sees none and Prefect reports FAILED with the
+        assembly thread alive. Latching at detection is what closes it.
+        """
+        from tessera_embeddings.orchestration.runners.sequential_fill import TrailingAssemblyWedgedError
+
+        @contextmanager
+        def exploding_teardown(log, **kwargs):
+            try:
+                yield None
+            finally:
+                raise RuntimeError("ray down failed")
+
+        monkeypatch.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", exploding_teardown, raising=False)
+        monkeypatch.setattr(
+            mod, "fill_zones_sequential", lambda **k: (_ for _ in ()).throw(TrailingAssemblyWedgedError(3))
+        )
+        exited: list[int] = []
+        monkeypatch.setattr(mod, "hard_exit_after_flush", lambda status, **k: exited.append(status))
+
+        with pytest.raises(RuntimeError, match="ray down failed"):
+            _run(zones=["33N"])
+        assert exited == [mod.WEDGED_DRAIN_EXIT_STATUS], "the teardown failure swallowed the wedge"
+
+    def test_a_cleanup_that_never_returns_cannot_hold_up_the_wedged_exit(self, wired, monkeypatch):
+        """The housekeeping pool runs prefix deletes with THREE unbounded legs — the `s5cmd`
+        subprocess, the `fsspec` recursive `rm` it falls back to, and the read-back that lists
+        objects — so joining it on the wedged path is the six-hour drain ceiling guaranteeing
+        nothing: the flow parks forever with the abandoned assembly thread alive. Only the
+        wedged path skips the join; the healthy one still waits, which its own comment explains.
+        """
+        from tessera_embeddings.orchestration.runners.sequential_fill import TrailingAssemblyWedgedError
+
+        hold = threading.Event()  # never set while the flow runs: the delete never returns
+        started = threading.Event()
+
+        def wedge_behind_a_hung_delete(**kwargs):
+            def _delete_that_never_returns() -> None:
+                started.set()
+                hold.wait(60.0)
+
+            kwargs["housekeeping"].submit(_delete_that_never_returns)
+            assert started.wait(5.0), "the delete never started, so the join would not have blocked"
+            raise TrailingAssemblyWedgedError(2)
+
+        monkeypatch.setattr(mod, "fill_zones_sequential", wedge_behind_a_hung_delete)
+        exited: list[int] = []
+        monkeypatch.setattr(mod, "hard_exit_after_flush", lambda status, **k: exited.append(status))
+
+        try:
+            with pytest.raises(TrailingAssemblyWedgedError):
+                run_under_deadline(
+                    20,
+                    lambda: _run(zones=["33N"]),
+                    what="the flow whose cleanup hung behind a wedge",
+                )
+        finally:
+            hold.set()
+        assert exited == [mod.WEDGED_DRAIN_EXIT_STATUS], "the hung delete kept the process alive"
+
+    def test_the_flow_ends_the_process_only_after_its_teardown(self):
+        """Structural: the exit sits at the END of the flow's `finally`, never before, where it
+        could orphan a fleet.
+        """
+        import inspect as _inspect
+
+        from tessera_embeddings.orchestration.prefect.flows import fill_zones_sequential as flowmod
+
+        src = _inspect.getsource(flowmod.fill_zones_sequential_flow)
+        assert "except TrailingAssemblyWedgedError as exc:" in src, "the flow does not recognise a wedged drain"
+        tail = src[src.index("finally:") :]
+        for step in ("inputs.shutdown()", "housekeeping.shutdown(wait=True)", "deactivate()"):
+            assert step in tail, f"teardown step {step!r} missing from the flow's finally"
+        exit_at = tail.index("_end_process_after_wedged_drain(")
+        assert exit_at > tail.index("deactivate()"), "the process exit must come AFTER deactivate()"

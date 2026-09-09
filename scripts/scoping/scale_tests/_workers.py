@@ -22,11 +22,15 @@ from tessera_embeddings.storage import zarr_store
 
 
 def _open_repo(store_uri: str, max_concurrent_requests: int | None = None) -> icechunk.Repository:
-    """Open a repo directly from a URI (workers have no ``RunConfig``)."""
-    return icechunk.Repository.open(
-        zarr_store._create_storage(store_uri),
-        config=zarr_store._default_repo_config(max_concurrent_requests),
-    )
+    """Open a repo directly from a URI (workers have no ``RunConfig``).
+
+    ``max_concurrent_requests`` is applied here rather than by the library, which always takes
+    icechunk's default — see :func:`harness.layered_config`.
+    """
+    config = zarr_store._default_repo_config()
+    if max_concurrent_requests is not None:
+        config.max_concurrent_requests = max_concurrent_requests
+    return icechunk.Repository.open(zarr_store._create_storage(store_uri), config=config)
 
 
 def write_fork(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns an icechunk ForkSession

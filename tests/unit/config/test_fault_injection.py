@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import logging
 import pathlib
+import threading
 
 import pytest
 from pydantic import ValidationError
@@ -316,3 +317,85 @@ class TestTheGuaranteeIsStructural:
             sig = inspect.signature(getattr(fn, "fn", fn))
             assert param in sig.parameters, f"{fn.__name__} should carry {param}"
             assert sig.parameters[param].default is None, f"{fn.__name__}.{param} must default to nothing"
+
+
+class TestTheSharedHardExit:
+    """`hard_exit_after_flush` is the one hard-exit site; both its callers depend on this order."""
+
+    def test_it_announces_flushes_and_only_then_exits(self, monkeypatch, caplog):
+        import logging as _logging
+        import os as _os
+
+        from tessera_embeddings.config import fault_injection as fi
+
+        order: list[str] = []
+        monkeypatch.setattr(_logging, "shutdown", lambda: order.append("flush"))
+        monkeypatch.setattr(_os, "_exit", lambda status: order.append(f"exit:{status}"))
+        log = _logging.getLogger("test-hard-exit")
+        with caplog.at_level(_logging.ERROR, logger="test-hard-exit"):
+            fi.hard_exit_after_flush(75, log=log, message="going down: %s", args=("reason",))
+        assert order == ["flush", "exit:75"], "flush must precede the exit, and the exit must be last"
+        assert any("going down: reason" in r.getMessage() for r in caplog.records), "the announcement was lost"
+
+    def test_a_handler_that_raises_while_flushing_does_not_cancel_the_exit(self, monkeypatch):
+        """The exit is the contract; the announcement is best-effort. Without the `finally` a
+        handler raising mid-flush (a Prefect API 503) leaves the process alive — for the drill a
+        death that did not happen, for the wedged drain a writer thread still running.
+        """
+        import logging as _logging
+        import os as _os
+
+        from tessera_embeddings.config import fault_injection as fi
+
+        exited: list[int] = []
+        monkeypatch.setattr(_logging, "shutdown", lambda: (_ for _ in ()).throw(OSError("log API said 503")))
+        monkeypatch.setattr(_os, "_exit", lambda status: exited.append(status))
+        with pytest.raises(OSError, match="503"):
+            fi.hard_exit_after_flush(75, log=_logging.getLogger("test-flush-boom"), message="going down")
+        assert exited == [75], "the flush raised and the process was left alive"
+
+    def test_a_flush_that_never_returns_does_not_cancel_the_exit(self, monkeypatch):
+        """BLOCKING, not raising — and the `finally` covers only the second. A handler parked on
+        its lock, its socket or a full output pipe never reaches a `finally` at all, so on the
+        wedged-drain path the process would stay alive with exactly the non-daemon writer thread
+        this exit exists to kill. The exit is therefore armed BEFORE the announcement.
+
+        The recorded status is the oracle, not the call returning: the stub stands in for a real
+        `os._exit`, so the subject stays parked in the blocked flush afterwards either way.
+        """
+        import logging as _logging
+        import os as _os
+
+        from tessera_embeddings.config import fault_injection as fi
+
+        # NEVER SET, and deliberately never released. The subject runs on a daemon thread that
+        # must not proceed past the flush: `monkeypatch` restores the real `os._exit` when this
+        # test returns, so a subject allowed to resume would reach it and kill the test worker.
+        # Parking it forever models the failure exactly and costs one blocked daemon thread.
+        never_flushes = threading.Event()
+        exited: list[int] = []
+        recorded = threading.Event()
+
+        def _record(status: int) -> None:
+            exited.append(status)
+            recorded.set()
+
+        monkeypatch.setattr(_os, "_exit", _record)
+        monkeypatch.setattr(_logging, "shutdown", never_flushes.wait)
+        monkeypatch.setattr(fi, "_ANNOUNCE_BUDGET_S", 0.3)
+
+        threading.Thread(
+            target=lambda: fi.hard_exit_after_flush(
+                75, log=_logging.getLogger("test-flush-hangs"), message="going down"
+            ),
+            daemon=True,
+        ).start()
+        assert recorded.wait(10.0), "the blocked flush kept the process alive: nothing exited"
+        assert exited == [75], f"the exit fired with the wrong status: {exited}"
+
+    def test_the_drill_still_goes_through_it(self):
+        import inspect as _inspect
+
+        from tessera_embeddings.config import fault_injection as fi
+
+        assert "hard_exit_after_flush(" in _inspect.getsource(fi.ArmedFault.die_between_commits)

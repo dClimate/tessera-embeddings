@@ -1019,7 +1019,7 @@ class TestWriteRegion:
 
 
 class TestDefaultRepoConfig:
-    """No chunk-cache override is applied; max_concurrent_requests stays optional.
+    """No chunk-cache override is applied, and no request-concurrency cap.
 
     A real-store A/B showed a chunk cache does not help striped inference (it
     caches compressed bytes — a hit saves the S3 GET but not the decompression —
@@ -1028,7 +1028,7 @@ class TestDefaultRepoConfig:
     default cache in place rather than pinning a large one that only burned RAM.
     """
 
-    def test_no_cache_override_without_concurrency_cap(self):
+    def test_no_cache_override(self):
         config = _default_repo_config()
         assert config is not None
         # We no longer override caching: it stays at the icechunk default,
@@ -1036,13 +1036,14 @@ class TestDefaultRepoConfig:
         # its own internal cache sizing).
         assert config.caching == icechunk.RepositoryConfig.default().caching
 
-    def test_concurrency_cap_applied(self):
-        config = _default_repo_config(max_concurrent_requests=64)
-        assert config.max_concurrent_requests == 64
-
-    def test_returns_config_not_none_by_default(self):
-        # Must always build a config even when no cap is passed.
-        assert _default_repo_config() is not None
+    def test_the_request_concurrency_cap_is_icechunks_default(self):
+        # NEVER capped by us. A cap of 1 — what the old per-fork budget split produced on every
+        # campaign fill — deadlocks commit and rebase/diff inside icechunk's tokio runtime under
+        # concurrent writers (context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md).
+        assert (
+            _default_repo_config().max_concurrent_requests
+            == icechunk.RepositoryConfig.default().max_concurrent_requests
+        )
 
     def test_storage_timeouts_and_retries_applied(self):
         # Every repo open inherits finite per-attempt timeouts and a backed-off
@@ -1056,15 +1057,6 @@ class TestDefaultRepoConfig:
         assert storage.retries.max_tries == _DEFAULT_STORAGE_MAX_TRIES
         assert storage.retries.initial_backoff_ms == _DEFAULT_STORAGE_INITIAL_BACKOFF_MS
         assert storage.retries.max_backoff_ms == _DEFAULT_STORAGE_MAX_BACKOFF_MS
-
-    def test_timeouts_compose_with_concurrency_cap(self):
-        # The cap and the storage timeouts must coexist in one config — setting the
-        # concurrency cap must not drop the hang-protection settings.
-        config = _default_repo_config(max_concurrent_requests=64)
-        assert config.max_concurrent_requests == 64
-        assert config.storage is not None
-        assert config.storage.timeouts.read_timeout_ms == _DEFAULT_READ_TIMEOUT_MS
-        assert config.storage.retries.max_tries == _DEFAULT_STORAGE_MAX_TRIES
 
 
 class TestEmptyChunkElision:

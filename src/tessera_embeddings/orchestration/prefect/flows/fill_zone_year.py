@@ -155,7 +155,6 @@ def fill_zone_year_flow(
     allow_model_mismatch: bool = False,
     allow_s2_only: bool = False,
     mosaic_base: str | None = None,
-    s3_concurrency: int | None = None,
     launch_pacing: bool = False,
     gpu_fallback_instance_types: list[str] | None = None,
     gpu_fallback_vcpu_budget: int | None = None,
@@ -221,14 +220,11 @@ def fill_zone_year_flow(
             is unvalidated — see the optional-S1 ADR before production use.
         mosaic_base: Override for the input mosaic prefix (default
             ``{inputs}/mosaics/{zone}/{year}`` — the campaign's per-year layout).
-        s3_concurrency: This fill's slice of the fleet S3-PUT budget for the shard write
-            (``None`` = the full target, for a lone fill). The campaign passes
-            ``target // max_parallel_zones`` so K concurrent fills stay near target.
         launch_pacing: Pace this cluster's EC2 launch requests against the account's shared
-            RunInstances quota — the same shape as ``s3_concurrency``, a budget concurrent fills
-            share, except this one is a request RATE whose enforcement lives in the client rather
-            than in a count we divide. Default ``False`` keeps today's launch behaviour; the
-            campaign turns it on when it runs more than one cluster.
+            RunInstances quota — a budget concurrent fills share, except it is a request RATE
+            whose enforcement lives in the client rather than in a count we divide. Default
+            ``False`` keeps today's launch behaviour; the campaign turns it on when it runs more
+            than one cluster.
         gpu_fallback_instance_types: EC2 instance types this fill may fall back to when the
             production rung has no capacity (e.g. ``["g5.2xlarge"]``). Opens the card's rung AND
             installs the capacity-aware autoscaler scorer -- see
@@ -452,7 +448,6 @@ def fill_zone_year_flow(
         "run_id": run_id,
         "cleanup_staging": cleanup_staging,
         "n_assembly_workers": n_assembly_workers,
-        "s3_concurrency": s3_concurrency,
         "get_credentials": iam_icechunk_credentials,
         "s3_region": s3_region,
         "fault": fault,

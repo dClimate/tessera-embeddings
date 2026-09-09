@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tessera_embeddings.config.assembly import AssemblyConfig
-from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
+from tessera_embeddings.orchestration.prefect.flows import run_global_campaign as campaign
 
 
 def test_compute_n_workers_scales_linearly() -> None:
@@ -31,28 +31,11 @@ def test_invalid_max_workers_raises() -> None:
         AssemblyConfig(max_workers=0)
 
 
-def test_default_max_workers_honors_s3_concurrency_target() -> None:
-    """Default process cap must not exceed the aggregate S3 PUT target.
-
-    ``per_worker_cap`` floors at 1, so aggregate PUT concurrency is
-    ``>= n_workers``. If the default cap exceeded
-    ``TARGET_AGGREGATE_S3_CONCURRENCY`` the pool would burst over S3's
-    per-prefix rate and draw ``503 SlowDown``. Locks the two constants
-    in sync (see assembly.TARGET_AGGREGATE_S3_CONCURRENCY).
+def test_the_default_pool_is_sixteen_and_the_campaign_asks_for_thirty_two() -> None:
+    """The worker count belongs to the runner that can hold it. 16 peaks around ~24 GB and fits
+    the 64 GiB host every default-taking caller runs on; 32 peaks around ~48 GB and only the
+    chained campaign fill is on the 244 GiB family, so it asks explicitly.
     """
-    assert AssemblyConfig().max_workers <= TARGET_AGGREGATE_S3_CONCURRENCY
-
-
-def test_aggregate_put_concurrency_stays_under_target_at_cap() -> None:
-    """At any live-chunk count, n_workers * per_worker_cap <= target.
-
-    Mirrors the ``per_worker_cap = max(1, target // n_workers)`` math in
-    ``ZarrWriter.assemble`` and checks the product never blows the target,
-    including chunk counts that pin n_workers at the cap.
-    """
-    cfg = AssemblyConfig()
-    target = TARGET_AGGREGATE_S3_CONCURRENCY
-    for n_live in (1, 50, 250, 850, 2761, 10_000):
-        n_workers = cfg.compute_n_workers(n_live)
-        per_worker_cap = max(1, target // n_workers)
-        assert n_workers * per_worker_cap <= target, f"{n_live=} blew target"
+    assert AssemblyConfig().max_workers == 16
+    assert AssemblyConfig().compute_n_workers(10_000) == 16
+    assert campaign.ASSEMBLY_WORKERS_ON_THE_LARGE_RUNNER == 32

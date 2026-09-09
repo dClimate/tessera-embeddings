@@ -229,8 +229,15 @@ def layered_config(
     Reuses :func:`zarr_store._default_repo_config` (finite timeouts + backed-off
     retries) and layers manifest splitting and/or preload tuning on top. All
     arguments are optional; with none set this is exactly the library default.
+
+    ``max_concurrent_requests`` is set HERE and nowhere in the library: production takes
+    icechunk's default (256) after a cap of 1 was found to deadlock ``commit`` and
+    ``rebase``/``diff`` (``context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md``).
+    The scale tests are what bisected that, so they keep the knob.
     """
-    config = zarr_store._default_repo_config(max_concurrent_requests)
+    config = zarr_store._default_repo_config()
+    if max_concurrent_requests is not None:
+        config.max_concurrent_requests = max_concurrent_requests
     splitting = zarr_store._manifest_splitting_config(split_sizes) if split_sizes else None
     preload = None
     if preload_max_total_refs is not None or preload_max_arrays_to_scan is not None:

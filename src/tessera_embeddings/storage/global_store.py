@@ -73,7 +73,6 @@ def open_global_repo(
     *,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     region: str | None = None,
-    max_concurrent_requests: int | None = None,
     scatter_initial_credentials: bool = False,
 ) -> icechunk.Repository:
     """Open the global-store repo with the global config layered on.
@@ -89,7 +88,7 @@ def open_global_repo(
             region=region,
             scatter_initial_credentials=scatter_initial_credentials,
         ),
-        config=global_store_config(max_concurrent_requests),
+        config=global_store_config(),
     )
 
 

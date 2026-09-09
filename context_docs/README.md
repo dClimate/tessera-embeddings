@@ -70,6 +70,13 @@ context_docs/
 │   └── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once
 │                                                  throttle each other, and the two bounds
 │
+├── assembly/                      WHEN AN ASSEMBLY STOPS
+│   ├── assembly-wedges-during-fork-phase-2026-09-04.md   five fills froze in the shard-write tail
+│   │                                                      for four days; the root cause, what was
+│   │                                                      removed, and the two bounds kept
+│   └── icechunk-max-concurrent-requests-1-deadlock.md    the upstream fault behind it: a request
+│                                                          cap of 1 deadlocks commit and rebase
+│
 └── storage/                       WRITING AND KEEPING THE RESULT
     ├── writing-to-the-global-store.md          assembly's fork pool, the session catch-up, the
     │                                              credential incident, why commits are ungated,

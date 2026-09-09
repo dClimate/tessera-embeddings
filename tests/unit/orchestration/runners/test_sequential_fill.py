@@ -35,6 +35,7 @@ from tessera_embeddings.orchestration.runners.sequential_fill import (
     fill_zones_sequential,
 )
 from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff, ZonePlan
+from tests.unit.deadline import run_under_deadline
 
 LOG = logging.getLogger("test-sequential-fill")
 
@@ -1446,3 +1447,182 @@ def test_a_nonpositive_cap_is_refused_before_anything_expensive():
     for bad in (0, -1):
         with pytest.raises(ValueError, match="max_retained_failures must be >= 1"):
             _run(_cells(2), max_retained_failures=bad)
+
+
+# --- the trailing-assembly drain is bounded (2026-09-04) ---------------------------------------
+
+
+class _StackDumps:
+    """The recorded stack dumps, plus a wait — because the dump is no longer synchronous.
+
+    WAITED FOR, NOT ASSUMED: the wedge diagnostics run on a daemon thread started AFTER the
+    wedge is raised, so asserting the instant the exception arrives is a race (the same one CI
+    caught for the fork watchdog). The critical line is emitted before the dump, so one
+    ``wait`` covers both.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+        self._dumped = threading.Event()
+
+    def record(self) -> None:
+        self.calls.append(1)
+        self._dumped.set()
+
+    def wait(self, timeout: float = 10.0) -> bool:
+        return self._dumped.wait(timeout)
+
+
+@pytest.fixture
+def _stack_dumps(monkeypatch):
+    """Record the stack dump, and fail if the runner tries to end the process itself — that is
+    the flow's decision, after its teardown.
+    """
+    dumps = _StackDumps()
+    monkeypatch.setattr(
+        mod.faulthandler,
+        "dump_traceback_later",
+        lambda *a, **k: pytest.fail("the runner must not arm a process exit; that is the flow's job"),
+    )
+    monkeypatch.setattr(mod.faulthandler, "dump_traceback", lambda *a, **k: dumps.record())
+    return dumps
+
+
+class TestDrainTrailingAssemblies:
+    """`drain_trailing_assemblies` waits for completions with a PER-ASSEMBLY ceiling, driven
+    directly against a real single-thread pool so a wedge is one blocking call.
+    """
+
+    def test_a_wedged_assembly_is_abandoned_and_the_queue_behind_it_cancelled(self, _stack_dumps):
+        hold = threading.Event()
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            fast = pool.submit(lambda: None)
+            wedged = pool.submit(hold.wait, 30.0)
+            queued = pool.submit(lambda: None)
+            with pytest.raises(mod.TrailingAssemblyWedgedError, match="abandoned") as raised:
+                run_under_deadline(
+                    10, lambda: mod.drain_trailing_assemblies(pool, [fast, wedged, queued], ceiling_s=0.2, log=LOG)
+                )
+            assert raised.value.abandoned == 2, "the wedged assembly AND everything queued behind it are abandoned"
+            assert queued.cancelled(), "work queued behind the wedge must not run later against a torn-down run"
+            assert _stack_dumps.wait(), "the stacks must be dumped: they are the only diagnosis available on Fargate"
+        finally:
+            hold.set()
+            pool.shutdown(wait=True)
+
+    def test_the_ceiling_is_per_assembly_not_for_the_whole_backlog(self, _stack_dumps):
+        """The ceiling resets on each completion; a wall-clock bound would abandon a healthy
+        cluster whose 60-cell backlog simply takes a day.
+        """
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            futures = [pool.submit(time.sleep, 0.08) for _ in range(6)]  # 0.48 s of work, ceiling 0.2 s
+            run_under_deadline(10, lambda: mod.drain_trailing_assemblies(pool, futures, ceiling_s=0.2, log=LOG))
+            assert all(f.done() and not f.cancelled() for f in futures)
+            assert not _stack_dumps.calls, "a clean drain must not dump stacks"
+        finally:
+            pool.shutdown(wait=True)
+
+    @pytest.mark.parametrize("blocking", ["logger", "dump"])
+    def test_a_diagnostic_that_blocks_cannot_swallow_the_wedge(self, blocking, monkeypatch):
+        """BLOCKING, not raising: `suppress(Exception)` covers a diagnostic that raises and
+        nothing covers one that never returns. A full container log pipe or an unreachable
+        remote handler parks the write to stderr, and a diagnostic in front of the raise would
+        then keep the flow from ever learning it must hard-exit — the bounded drain becomes the
+        indefinite hang it exists to end. Both diagnostics are exercised because both are
+        downstream of the raise. Same rule, same shape as `_fork_stall_watchdog`.
+        """
+        gate = threading.Event()  # never set while the subject runs: the diagnostic never returns
+
+        class _BlockingCritical(logging.Logger):
+            def critical(self, *args, **kwargs):  # type: ignore[override]
+                gate.wait()
+
+        if blocking == "dump":
+            monkeypatch.setattr(mod.faulthandler, "dump_traceback", gate.wait)
+            log: logging.Logger = LOG
+        else:
+            monkeypatch.setattr(mod.faulthandler, "dump_traceback", lambda: None)
+            log = _BlockingCritical("blocking-critical")
+
+        hold = threading.Event()
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            stuck = pool.submit(hold.wait, 30.0)
+            queued = pool.submit(lambda: None)
+            with pytest.raises(mod.TrailingAssemblyWedgedError, match="abandoned"):
+                run_under_deadline(
+                    10,
+                    lambda: mod.drain_trailing_assemblies(pool, [stuck, queued], ceiling_s=0.2, log=log),
+                    what="the drain whose diagnostic blocked",
+                )
+            assert queued.cancelled(), "the queue behind the wedge was left runnable by a blocked diagnostic"
+        finally:
+            gate.set()  # release the parked diagnostics thread rather than leaking it
+            hold.set()
+            pool.shutdown(wait=True)
+
+    def test_a_wedge_is_a_typed_error_the_flow_can_tell_apart(self):
+        """Its own type, because the flow must intercept it rather than let it become FAILED."""
+        assert issubclass(mod.TrailingAssemblyWedgedError, RuntimeError)
+        exc = mod.TrailingAssemblyWedgedError(3)
+        assert exc.abandoned == 3 and "abandoned" in str(exc)
+
+
+def test_a_wedge_raises_even_when_the_session_itself_failed(monkeypatch, _stack_dumps, caplog):
+    """END TO END, AND THE HOLE THE RAISING SHAPE CLOSES: with the session already unwinding, a
+    count returned for the caller to check later is a count the in-flight exception skips past,
+    and the run reports FAILED. The session's own failure survives as `__context__`.
+    """
+    monkeypatch.setattr(mod, "TRAILING_ASSEMBLY_CEILING_S", 0.3)
+    hold = threading.Event()
+    assembled: list[str] = []
+
+    def wedging_assemble(handoff, prep):
+        hold.wait(timeout=30.0)  # released by the test's finally, never by the run
+        assembled.append(handoff.zone)
+        return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
+
+    def session_that_finishes_a_cell_then_blows_up(more_work, on_item_done):
+        """Land the first cell — so an assembly IS queued and wedges — then fail the session."""
+        results = []
+        batch = more_work()
+        for item in batch or ():
+            result = {"chunk": item.chunk.label, "status": "success"}
+            results.append(result)
+            on_item_done(item, result)
+        raise RuntimeError("the session itself blew up")
+
+    log = logging.getLogger("test-wedge-under-failure")
+    try:
+        with (
+            caplog.at_level(logging.CRITICAL, logger="test-wedge-under-failure"),
+            pytest.raises(mod.TrailingAssemblyWedgedError) as raised,
+        ):
+            run_under_deadline(
+                15,
+                lambda: _run(
+                    _cells(2),
+                    session=session_that_finishes_a_cell_then_blows_up,
+                    assemble=wedging_assemble,
+                    inputs=RecordingInputs([]),
+                    log=log,
+                ),
+            )
+        # SNAPSHOT WHILE THE WEDGE IS STILL HELD. Releasing `hold` lets the wedged assembly
+        # itself finish and append, so reading the list after the release is a race — one that
+        # only ever passed because the assertions used to run before the released thread woke.
+        assembled_at_the_wedge = list(assembled)
+    finally:
+        hold.set()
+    assert raised.value.abandoned >= 1
+    assert assembled_at_the_wedge == [], "a cell behind the wedge was assembled anyway"
+    assert _stack_dumps.wait(), "a wedge must dump the stacks"
+    assert any("TRAILING ASSEMBLY WEDGED" in r.getMessage() for r in caplog.records)
+    chain = []
+    exc: BaseException | None = raised.value
+    while exc is not None:
+        chain.append(str(exc))
+        exc = exc.__context__ or exc.__cause__
+    assert any("blew up" in c for c in chain), f"the session's own failure was lost: {chain}"

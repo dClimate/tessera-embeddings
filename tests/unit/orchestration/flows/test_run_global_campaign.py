@@ -849,6 +849,19 @@ def test_ingest_disabled_skips_ingest_and_cleanup(wired):
     assert wired["deletes"] == []
 
 
+def test_the_per_cell_fill_is_never_given_the_large_runners_worker_count(wired):
+    """`fill-zone-year` runs on the 16 vCPU / 64 GiB inference family, where a 32-process
+    assembly pool (~48 GB) leaves no headroom for the coordinator and the Ray head. Only the
+    chained fill's deployment is the 244 GiB `assembly_large` family, so only it is told 32.
+    """
+    _per_cell()
+    for dep, params in wired["arun"]:
+        if dep.startswith("fill-zone-year"):
+            assert "n_assembly_workers" not in params, (
+                "the per-cell fill was handed the large runner's worker count; its host cannot hold it"
+            )
+
+
 def test_rejects_zero_parallel_ingest(wired):
     with pytest.raises(ValueError, match="max_parallel_ingest"):
         _per_cell(max_parallel_ingest=0)
@@ -905,6 +918,10 @@ def test_sequential_strategy_dispatches_one_run_per_year(wired):
     # its window: cap 60 means 59 cells BEYOND the current one.
     assert params["ingest"] is True and 1 + params["look_ahead"] == 60
     assert params["ingest_deployment"] == "ingest-zone-year/ingest-zone-year"
+    # 32 assembly workers, asked for EXPLICITLY. The library default is 16, safe on the 64 GiB
+    # inference family that every other caller runs on; only this deployment is the 244 GiB
+    # `assembly_large` family that can hold a 32-process pool. See AssemblyConfig.
+    assert params["n_assembly_workers"] == mod.ASSEMBLY_WORKERS_ON_THE_LARGE_RUNNER == 32
     # Mosaic lifecycle belongs to the child in this mode.
     assert wired["deletes"] == []
     assert result["dispatched"] == 1
