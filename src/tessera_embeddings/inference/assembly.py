@@ -83,6 +83,7 @@ from tessera_embeddings.storage.registry import part_uri, registry_rows, write_r
 from tessera_embeddings.storage.shard_writer import (
     PhaseTimer,
     commit_with_rebase,
+    report_shard_progress,
     run_forked,
     shard_pitch,
     write_year_shards,
@@ -429,14 +430,25 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     timings and counts. ``read`` covers the staged opens and slice fetches, ``write`` the zarr
     assignments (encode and upload fused, see ``_assembly_summary_line``); clear-to-fill
     assignments count as writes too, since they emit output objects like any other.
+
+    Progress is published into ``run_forked``'s shared counters after every tile, which is that
+    function's contract and not decoration: the fork-phase stall watchdog reads those counters and
+    a worker that never reports is indistinguishable from one that has wedged. One unit is one
+    tile, cleared or staged alike.
     """
     fork = payload["fork"]
     t = int(payload["time_index"])
     y0b, y1b = payload["band"]
+    worker_index = payload.get("worker_index", 0)
     root = zarr.open_group(fork.store, mode="a")
     arrays = {var: cast(zarr.Array, root[var]) for var in payload["variables"]}
     timer = PhaseTimer()
     tiles = writes = nbytes = 0
+    done = 0
+    total = len(payload["clear"]) + len(payload["tiles"])
+    # The DENOMINATOR before any work, as `_write_shards_worker` does: the coordinator sums
+    # totals across workers and withholds the figure until every worker has reported one.
+    report_shard_progress(worker_index, 0, total)
     # Unindexed trailing dims (band) are written in full, so each assignment below covers both
     # the 3-D and 4-D arrays.
     for tile in payload["clear"]:
@@ -447,6 +459,8 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
             with timer.phase("write"):
                 arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = arr.fill_value
             writes += 1
+        done += 1
+        report_shard_progress(worker_index, done, total)
     for tile, path in payload["tiles"]:
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
         with timer.phase("read"):
@@ -481,6 +495,8 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
         # Drop the group reference so its file handles / S3 connections are collectable before
         # the next tile's read.
         del staged
+        done += 1
+        report_shard_progress(worker_index, done, total)
     return fork, {
         "tiles": tiles,
         "cleared": len(payload["clear"]),

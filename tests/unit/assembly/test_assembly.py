@@ -12,6 +12,7 @@ import datetime
 import itertools
 import json
 import logging
+import multiprocessing
 from importlib.metadata import version as _dist_version
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,7 @@ from tessera_embeddings.inference.assembly import (
     IncompleteStageError,
     SpatialCoords,
     ZarrWriter,
+    _fill_band_worker,
     _layout_matching_store,
     _partition_bands,
     _staged_storage_options,
@@ -49,6 +51,7 @@ from tessera_embeddings.inference.assembly import (
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.quantization import quantize_embeddings
+from tessera_embeddings.storage import shard_writer
 from tessera_embeddings.storage.conventions import ENCODER_VERSION
 from tessera_embeddings.storage.global_store import create_global_repo, create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.time_axis import TIME_ENCODING
@@ -2823,3 +2826,75 @@ def test_radar_coverage_counts_fully_free_tiles_from_a_generator():
     assert from_list is not None and from_generator is not None
     assert from_list["tiles_fully_s1_free"] == 2, "two of the three tiles are entirely radar-free"
     assert from_generator == from_list, "a one-shot iterable must give the same answer as a list"
+
+
+class TestTheFillBandWorkerReportsProgress:
+    """`run_forked`'s contract: a worker MUST advance the shared shard counters.
+
+    The stall watchdog reads only those counters, so a worker that never reports is
+    indistinguishable from one that has wedged. `_fill_band_worker` did not report at all, which
+    made every standalone `assemble` longer than FORK_STALL_TIMEOUT_S (30 min) a false positive:
+    its healthy workers were terminated as stalled. The campaign path was unaffected because it
+    runs `_write_shards_worker`, which always reported.
+    """
+
+    @staticmethod
+    def _fork_over_a_tiny_store(tmp_path):
+        """A fork of a single-ROI-shaped store: `embeddings` and `scales` at the ROOT."""
+        repo, _ = open_or_create_repo(str(tmp_path / "out.zarr"))
+        session = repo.writable_session("main")
+        root = zarr.open_group(session.store, mode="a")
+        root.create_array("embeddings", shape=(1, 4, 4, 2), chunks=(1, 2, 2, 2), dtype="int8", fill_value=0)
+        root.create_array("scales", shape=(1, 4, 4), chunks=(1, 2, 2), dtype="float32", fill_value=0.0)
+        session.commit("schema")
+        session = repo.writable_session("main")
+        return session.fork()
+
+    def test_every_cleared_tile_advances_the_shared_counter(self, tmp_path):
+        slots = multiprocessing.get_context("spawn").Array("l", 4, lock=False)
+        shard_writer._init_fork_worker(slots)
+        try:
+            payload = {
+                "fork": self._fork_over_a_tiny_store(tmp_path),
+                "time_index": 0,
+                "band": (0, 4),
+                "variables": ["embeddings", "scales"],
+                "clear": [ChunkSpec(0, 0, 0, 2, 0, 4), ChunkSpec(1, 0, 2, 4, 0, 4)],
+                "tiles": [],
+                "worker_index": 1,
+            }
+            _fill_band_worker(payload)
+            # done == total == 2 cleared tiles, published under THIS worker's index.
+            assert list(slots)[2:] == [2, 2], f"the worker did not report its progress: {list(slots)}"
+            assert list(slots)[:2] == [0, 0], "another worker's slot was written"
+        finally:
+            shard_writer._PROGRESS_SLOTS = None
+
+    def test_the_denominator_is_published_before_any_work(self, tmp_path):
+        """The coordinator withholds its percentage until every worker has reported a total, so a
+        worker that only reports at the end makes the whole fill's progress line silent.
+        """
+        slots = multiprocessing.get_context("spawn").Array("l", 2, lock=False)
+        shard_writer._init_fork_worker(slots)
+        seen: list[list[int]] = []
+        real = shard_writer.report_shard_progress
+        try:
+            shard_writer.report_shard_progress = lambda *a: (seen.append(list(a)), real(*a))[1]
+            _assembly_mod.report_shard_progress = shard_writer.report_shard_progress
+            _fill_band_worker(
+                {
+                    "fork": self._fork_over_a_tiny_store(tmp_path),
+                    "time_index": 0,
+                    "band": (0, 4),
+                    "variables": ["scales"],
+                    "clear": [ChunkSpec(0, 0, 0, 2, 0, 4)],
+                    "tiles": [],
+                    "worker_index": 0,
+                }
+            )
+        finally:
+            shard_writer.report_shard_progress = real
+            _assembly_mod.report_shard_progress = real
+            shard_writer._PROGRESS_SLOTS = None
+        assert seen[0] == [0, 0, 1], f"the first report must be the denominator, got {seen[0]}"
+        assert seen[-1] == [0, 1, 1]

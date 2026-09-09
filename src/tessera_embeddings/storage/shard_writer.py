@@ -362,10 +362,10 @@ def _terminate_pool(ex: ProcessPoolExecutor) -> None:
 
 @contextmanager
 def _fork_stall_watchdog(
-    slots: ctypes.Array[ctypes.c_long] | None,
+    slots: ctypes.Array[ctypes.c_long],
     n_workers: int,
     stalled: threading.Event,
-    ex: ProcessPoolExecutor | None,
+    ex: ProcessPoolExecutor,
     *,
     timeout_s: float,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
@@ -402,14 +402,10 @@ def _fork_stall_watchdog(
     ``context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md``.
 
     Best-effort throughout: a watchdog that dies on one failed read, or that could itself end a
-    healthy write, is worse than none. ``slots`` or ``ex`` being ``None`` (the single-payload
-    in-process path builds neither) makes it a no-op — that path writes one shard and cannot
-    exhibit the multi-worker stall this guards.
+    healthy write, is worse than none. Every fork phase gets one, whatever its payload count —
+    the in-process shortcut for a lone payload is gone, precisely because it was a hole here.
     """
     logger = log or _log
-    if slots is None or ex is None:
-        yield
-        return
 
     def _written() -> int:
         # Best-effort read of a lock-free shared array; a torn long only misreads the total by
@@ -480,18 +476,22 @@ def run_forked(
     self-reports does so against the same clock as the coordinator. The worker
     writes into its fork and returns ``(fork, stats)`` — the fork for the
     coordinator to merge, and a JSON-serialisable dict of whatever the worker
-    measured about its own run (``{}`` when it measured nothing). One payload
-    runs in-process; more spawn a process pool (``spawn`` context — workers must
-    be module-level functions and payloads picklable).
+    measured about its own run (``{}`` when it measured nothing). Payloads run on
+    a spawned process pool, so ``worker_fn`` must be a module-level function and
+    every payload picklable.
+
+    **A worker MUST call :func:`report_shard_progress` as it works** — the stall watchdog below
+    reads those counters, so a worker that never reports is indistinguishable from one that has
+    wedged and will be killed as stalled. This is a contract rather than an option on purpose: a
+    flag to disable the watchdog would let the next caller opt silently into no hang protection at
+    all.
 
     Every payload gets its own process, so the pool never queues and the whole
     write is as long as its slowest band. Hence progress on a TIMER rather than
     per completion: waiting on completions alone says nothing until the first band
     lands, which on a dense zone is the bulk of the write. ``progress_interval_s``
-    is the reporting period; a single payload runs in-process and the coordinator
-    reports nothing, having no concurrency to describe — a worker body's own
-    progress lines are then the only signal. ``unit`` and ``log`` are the
-    coordinator lines' payload noun and destination (see :func:`_await_forks`).
+    is the reporting period, and ``unit`` and ``log`` are the coordinator lines'
+    payload noun and destination (see :func:`_await_forks`).
 
     Returns the write's telemetry rather than nothing, because this is the only
     scope that sees all three of the fork, the workers, and the merge:
@@ -538,41 +538,42 @@ def run_forked(
     # ONE timer around the whole fork phase, so BOTH paths get the periodic catch-up.
     abort = threading.Event()
     with ticking(CATCH_UP_INTERVAL_S, _tick if catch_up is not None else None, abort=abort):
-        if len(payloads) == 1:
-            results = [worker_fn(payloads[0])]
-        else:
-            ctx = multiprocessing.get_context("spawn")
-            # `initializer` runs once per spawned child before any payload. A spawned process
-            # inherits no logging config, so without it the root WARNING default discards every
-            # INFO record a worker produces. Set HERE rather than in each worker body so a
-            # worker added later cannot omit it. The single-payload path above runs in the
-            # already-configured coordinator and needs nothing.
-            slots = ctx.Array("l", 2 * len(payloads), lock=False)
-            ex = ProcessPoolExecutor(
-                max_workers=len(payloads),
-                mp_context=ctx,
-                initializer=_init_fork_worker,
-                initargs=(slots,),
-            )
-            stalled = threading.Event()
-            try:
-                with _fork_stall_watchdog(slots, len(payloads), stalled, ex, timeout_s=fork_stall_timeout_s, log=log):
-                    futures = [ex.submit(worker_fn, payload) for payload in payloads]
-                    results = _await_forks(
-                        futures,
-                        progress_interval_s,
-                        unit=unit,
-                        log=log,
-                        slots=slots,
-                        abort=abort,
-                        stalled=stalled,
-                    )
-            finally:
-                # EVERY exit — the clean one included: the results are in hand or the pool is
-                # being abandoned, and either way nothing is gained by joining a process while
-                # a wedged one would never be joined at all. A `finally` rather than an
-                # enumeration of exits, so a path added later cannot leak the pool.
-                _terminate_pool(ex)
+        # ONE payload goes through the pool like any other. Running a lone payload in-process was
+        # a shortcut that saved one spawn and cost the watchdog its coverage: `compute_n_workers`
+        # returns 1 for a small cell, and then EVERY shard of that cell is in the one payload, so
+        # the in-process branch was an unbounded stall in exactly the phase the watchdog exists to
+        # bound. A subprocess spawn is milliseconds against a write measured in hours.
+        ctx = multiprocessing.get_context("spawn")
+        # `initializer` runs once per spawned child before any payload. A spawned process
+        # inherits no logging config, so without it the root WARNING default discards every
+        # INFO record a worker produces. Set HERE rather than in each worker body so a
+        # worker added later cannot omit it.
+        slots = ctx.Array("l", 2 * len(payloads), lock=False)
+        ex = ProcessPoolExecutor(
+            max_workers=len(payloads),
+            mp_context=ctx,
+            initializer=_init_fork_worker,
+            initargs=(slots,),
+        )
+        stalled = threading.Event()
+        try:
+            with _fork_stall_watchdog(slots, len(payloads), stalled, ex, timeout_s=fork_stall_timeout_s, log=log):
+                futures = [ex.submit(worker_fn, payload) for payload in payloads]
+                results = _await_forks(
+                    futures,
+                    progress_interval_s,
+                    unit=unit,
+                    log=log,
+                    slots=slots,
+                    abort=abort,
+                    stalled=stalled,
+                )
+        finally:
+            # EVERY exit — the clean one included: the results are in hand or the pool is
+            # being abandoned, and either way nothing is gained by joining a process while
+            # a wedged one would never be joined at all. A `finally` rather than an
+            # enumeration of exits, so a path added later cannot leak the pool.
+            _terminate_pool(ex)
 
     # NO FINAL CATCH-UP HERE, deliberately: such a call sits OUTSIDE `ticking`, so nothing bounds
     # it, and if it entered the stalling path it would hang forever at the one step this whole

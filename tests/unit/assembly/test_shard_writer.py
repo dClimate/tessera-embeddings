@@ -52,6 +52,30 @@ _ZONE = ZoneSpec("32601", "N", 1, (0.0, 5_120.0), (0.0, 10_240.0))
 _ZONE_B = ZoneSpec("32701", "S", 1, (0.0, 5_120.0), (1_105_920.0, 1_116_160.0))
 
 
+# Worker bodies for `run_forked` live at MODULE level because every payload count now goes
+# through a spawned pool: `ex.submit` pickles `worker_fn`, and a lambda or a function defined
+# inside a test cannot be pickled at all. They take the place of the in-process shortcut that
+# used to let a test hand `run_forked` a closure.
+def _echo_tag_worker(payload):
+    return payload["fork"], {"tag": payload["tag"]}
+
+
+def _echo_injection_worker(payload):
+    return payload["fork"], {"idx": payload["worker_index"], "interval": payload["progress_interval_s"]}
+
+
+def _no_stats_worker(payload):
+    return payload["fork"], {}
+
+
+def _slow_no_stats_worker(payload):
+    # Long enough for a catch-up on a 0.05 s timer to fire, and to WEDGE, well before this
+    # returns. A parent-side `threading.Event` cannot be used any more: the worker is a spawned
+    # process and would never see it set.
+    time.sleep(0.4)
+    return payload["fork"], {}
+
+
 class _OneInnerChunkSource:
     """Writes shard (0,0): one 256^2 inner chunk of real data, the rest fill."""
 
@@ -191,7 +215,7 @@ class TestForkTelemetry:
     def test_run_forked_returns_worker_stats_in_payload_order(self, tmp_path):
         store, repo = _seed(tmp_path)
         session = repo.writable_session("main")
-        result = run_forked(session, lambda p: (p["fork"], {"tag": p["tag"]}), [{"tag": "only"}])
+        result = run_forked(session, _echo_tag_worker, [{"tag": "only"}])
         assert result["workers"] == [{"tag": "only"}]
         assert result["wall_s"] >= result["merge_s"] >= 0
 
@@ -437,12 +461,7 @@ class TestWorkerProgressReporting:
         # interval and a caller-tuned period never takes effect.
         store, repo = _seed(tmp_path)
         session = repo.writable_session("main")
-        result = run_forked(
-            session,
-            lambda p: (p["fork"], {"idx": p["worker_index"], "interval": p["progress_interval_s"]}),
-            [{}],
-            progress_interval_s=1.25,
-        )
+        result = run_forked(session, _echo_injection_worker, [{}], progress_interval_s=1.25)
         assert result["workers"] == [{"idx": 0, "interval": 1.25}]
 
     def test_write_year_shards_threads_log_and_unit_through(self, tmp_path, monkeypatch):
@@ -1269,7 +1288,7 @@ class TestRunForkedCatchUp:
     def test_no_tally_when_no_catch_up_was_asked_for(self, tmp_path):
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
-        assert "catch_ups" not in run_forked(session, lambda p: (p["fork"], {}), [{"tag": "only"}])
+        assert "catch_ups" not in run_forked(session, _no_stats_worker, [{"tag": "only"}])
 
     def test_every_catch_up_happens_before_the_merge(self, tmp_path, monkeypatch):
         """Ordering is the safety argument: a catch-up must only ever see an EMPTY session.
@@ -1325,19 +1344,13 @@ class TestRunForkedCatchUp:
         monkeypatch.setattr(session_catch_up, "CATCH_UP_STOP_TIMEOUT_S", 0.2)
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
-        wedged = threading.Event()
 
         def never_returns() -> str:
-            wedged.set()
             time.sleep(30)  # the daemon dies with the test; nothing waits on it
             return "current"
 
-        def worker_until_wedged(payload):
-            wedged.wait(timeout=5)
-            return payload["fork"], {}
-
         with pytest.raises(session_catch_up.CatchUpDidNotStopError, match="still running"):
-            run_forked(session, worker_until_wedged, [{"tag": "only"}], catch_up=never_returns)
+            run_forked(session, _slow_no_stats_worker, [{"tag": "only"}], catch_up=never_returns)
 
     def test_a_failed_catch_up_stops_the_wait_instead_of_finishing_the_fill(self):
         """A fill already known to be uncommittable must not spend three more hours writing."""
@@ -1383,21 +1396,15 @@ class TestRunForkedCatchUp:
         """
         monkeypatch.setattr(shard_writer, "CATCH_UP_INTERVAL_S", 0.05)
         monkeypatch.setattr(session_catch_up, "CATCH_UP_STOP_TIMEOUT_S", 0.2)
-        wedged = threading.Event()
 
         def never_returns() -> str:
-            wedged.set()
             time.sleep(30)  # daemon; dies with the test
             return "current"
-
-        def worker(payload):
-            wedged.wait(timeout=5)
-            return payload["fork"], {}
 
         _, repo = _seed(tmp_path)
         session = repo.writable_session("main")
         with pytest.raises(session_catch_up.CatchUpDidNotStopError, match="still running"):
-            run_forked(session, worker, [{"tag": "only"}], catch_up=never_returns)
+            run_forked(session, _slow_no_stats_worker, [{"tag": "only"}], catch_up=never_returns)
 
     def test_a_failing_catch_up_is_not_swallowed(self, tmp_path, monkeypatch):
         # `run_forked` itself does not catch — best-effort is applied at the CALL SITE by
@@ -1523,6 +1530,13 @@ class TestForkStallWatchdog:
         The fill fails as its own error type, so an operator reads "the write stopped" rather
         than "a catch-up failed", and the stacks are dumped — the artefact the incident could
         not produce.
+
+        This is also the test that pins ``run_forked``'s reporting CONTRACT. The watchdog reads
+        only the shared shard counters, so a worker still running that never calls
+        ``report_shard_progress`` — which is what the fake worker here is — is killed as stalled.
+        That is deliberate: a non-reporting worker is a bug, and the alternative (a flag to
+        disable the watchdog) would let the next caller opt silently into no hang protection.
+        ``inference/assembly._fill_band_worker`` was exactly this bug until 2026-09-09.
         """
         fake, procs = self._executor(lambda p: Future())
         monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", fake)
@@ -1678,14 +1692,28 @@ class TestForkStallWatchdog:
         assert issubclass(shard_writer.ForkPhaseStalledError, RuntimeError)
         assert not issubclass(shard_writer.ForkPhaseStalledError, session_catch_up.CatchUpAbortedTheWaitError)
 
-    def test_the_single_payload_path_gets_no_watchdog_thread(self):
-        """One payload runs in-process and writes one shard: there is nothing to watch, and a
-        thread per one-shard cell would be pure cost. The context manager is a no-op there.
+    def test_a_lone_payload_is_watched_like_any_other(self, tmp_path, monkeypatch, caplog):
+        """`compute_n_workers` returns 1 for a small cell, and then EVERY shard of that cell is
+        in the one payload — so the in-process shortcut for a lone payload was an unbounded stall
+        in exactly the phase this watchdog exists to bound. The shortcut is gone; one payload
+        spawns a pool and is watched.
         """
-        before = {t.name for t in threading.enumerate()}
-        with shard_writer._fork_stall_watchdog(None, 1, threading.Event(), None, timeout_s=0.1):
-            during = {t.name for t in threading.enumerate()} - before
-        assert not any("stall" in n for n in during), f"a watchdog thread was started: {during}"
+        fake, procs = self._executor(lambda p: Future())
+        monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", fake)
+        monkeypatch.setattr(shard_writer.faulthandler, "dump_traceback", lambda: None)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        with (
+            caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.shard_writer"),
+            pytest.raises(shard_writer.ForkPhaseStalledError),
+        ):
+            self._within(
+                15,
+                lambda: run_forked(
+                    session, _no_stats_worker, [{"tag": "only"}], progress_interval_s=0.02, fork_stall_timeout_s=0.3
+                ),
+            )
+        assert self._stall_lines(caplog), "a lone payload's stall was not detected"
 
     def test_the_watchdog_stops_with_the_fork_phase(self):
         """Leaving the thread running past the block would fire on the merge and commit, which

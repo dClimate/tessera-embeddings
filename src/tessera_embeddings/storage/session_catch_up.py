@@ -270,11 +270,8 @@ def ticking(
     only when this block exits — for an assembly, up to three hours and thirty-two workers' worth of
     object-store writes later.
 
-    **Only a caller that can act on it will.** ``run_forked`` always passes one, but its
-    single-payload branch runs the worker inline and never looks at it. That branch is a one-shard
-    cell or ``n_workers=1``, a short write by construction, so the abort would arrive at a fill
-    about to end anyway; interrupting it would need a second cancellation mechanism that is not
-    worth carrying for that case.
+    ``run_forked`` always passes one, and since every payload count now goes through the worker
+    pool there is no branch that ignores it.
     """
     if tick is None:
         yield
