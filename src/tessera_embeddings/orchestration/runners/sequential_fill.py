@@ -33,8 +33,9 @@ that rationale, and the flow and README point here.
 
   What stays bounded is FAILURE, not throughput: a failed cell keeps its mosaic for staged
   resume and is counted, and the feeder stops admitting once ``max_retained_failures`` are
-  outstanding. The price of decoupling is an assembly backlog, which is the cheap direction to
-  fail. Measurements — 60 configured ingests running 7, and the ~1,380 tiles/hour that makes an
+  outstanding, cancelling the queued ingests of the cells it refuses (which the adapter would
+  otherwise produce anyway). The price of decoupling is an assembly backlog, which is the cheap
+  direction to fail. Measurements — 60 configured ingests running 7, and the ~1,380 tiles/hour that makes an
   assembly-released gate bind on the slowest stage: ``context_docs/campaign/campaign-plan.md`` §1.
 - **In-child retry, on the STANDING fleet**: a failed cell goes to the BACK of the feeder's
   queue and is served by the same session as everything else (``_readmit``, bounded by
@@ -79,7 +80,7 @@ import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
@@ -143,9 +144,14 @@ class CellInputs(Protocol):
         """
         ...
 
-    def cancel_unstarted(self) -> int:
+    def cancel_unstarted(self, cells: Iterable[tuple[str, int]] | None = None) -> int:
         """Cancel input production that has not begun yet; return how many. Never
         touches work already running.
+
+        ``cells`` restricts it to those ``(zone, year)`` keys; ``None`` means every cell whose
+        production has not begun. The restricted form is what the retained-failure cap uses:
+        it refuses only the never-attempted cells and must leave the queued re-ingest of a cell
+        it is still retrying alone.
         """
         ...
 
@@ -325,7 +331,10 @@ def fill_zones_sequential(
             hour to reach turns an exogenous failure wave into a fleet-wide teardown.
 
             Reaching it **alerts and continues**: the run logs ``FAILURE CAP EXCEEDED``, stops
-            admitting, and finishes its in-flight work normally. It does NOT tear itself down.
+            admitting, cancels the not-yet-started ingests of the cells it just refused (the
+            flow submits one per live cell up front, so a refusal that only emptied the queue
+            left the adapter producing their mosaics off-budget anyway), and finishes its
+            in-flight work normally. It does NOT tear itself down.
             Ending a fill spends its Ray cluster and every actor on it — hours to rebuild, and
             the most expensive thing the campaign owns — so that is a campaign-manager
             decision, not one a child process takes on its own judgement.
@@ -377,6 +386,12 @@ def fill_zones_sequential(
     #: never be settled, so the feeder must stop waiting or it parks until its join times out.
     #: Distinct from ``stop``, which means the session RAISED.
     session_over = threading.Event()
+    #: Set while the feeder is BLOCKED in ``inputs.wait`` on the cell it has taken. The feeder is
+    #: a SINGLE thread, so while this is set it cannot admit anything else however ready that
+    #: work is — which is what ``_source_has_work`` needs to know, and why the flag lives beside
+    #: the queue rather than inside the feeder. Written by the feeder thread only, read under
+    #: ``lock``.
+    feeder_blocked = False
     # NOTHING bounds admission to the inference stream except this cap — see the module
     # docstring and the `max_retained_failures` argument above.
     if max_retained_failures < 1:
@@ -713,7 +728,7 @@ def fill_zones_sequential(
         Ends only when the queue is empty AND no taken cell is still undecided — see
         ``undecided`` for why both halves are needed.
         """
-        nonlocal undecided
+        nonlocal undecided, feeder_blocked
         #: Set once the retained-failure cap has refused the rest of the roster. New cells stop
         #: being admitted; cells already streaming still get their answer, and a retry of one of
         #: them is still taken — it adds no mosaic the cap has not already counted.
@@ -762,6 +777,7 @@ def fill_zones_sequential(
                         # streaming cell as never admitted. The cap gates new admissions.
                         refused = [(cell, n) for cell, n in work_queue if n == 1]
                         keep = [(cell, n) for cell, n in work_queue if n > 1]
+                        cancel_keys = [(cell.zone, cell.year) for cell, _ in refused]
                         failures.extend(
                             {
                                 "zone": cell.zone,
@@ -774,6 +790,32 @@ def fill_zones_sequential(
                         work_queue.clear()
                         work_queue.extend(keep)
                         work_available.notify_all()
+                    # STOP THE INGESTS THE CAP JUST REFUSED. The flow starts an ingest for
+                    # every live cell before this runner is entered, so a refusal that only
+                    # empties the queue leaves the adapter working through the rest of the
+                    # roster — writing every one of their multi-terabyte mosaics off-budget,
+                    # for cells this run has said it will not attempt, while inference and the
+                    # assembly drain run on for hours. Only the UNSTARTED ones, and only the
+                    # refused: a running ingest is inside the concurrency the campaign already
+                    # budgeted and cancelling it needs a confirmation wait this thread cannot
+                    # afford (it still owes an answer to every streaming cell). `refused` is
+                    # attempt-1 entries only, so the `keep` entries — whose queued re-ingest a
+                    # retry is waiting on — are excluded by construction.
+                    if inputs is not None and cancel_keys:
+                        try:
+                            n_cancelled = inputs.cancel_unstarted(cancel_keys)
+                        except Exception:
+                            log.warning(
+                                "Could not cancel the ingests of the cells the failure cap refused; "
+                                "their mosaics may still be produced",
+                                exc_info=True,
+                            )
+                        else:
+                            log.warning(
+                                "Cancelled %d not-yet-started ingest(s) for the %d cell(s) the failure cap refused",
+                                n_cancelled,
+                                len(cancel_keys),
+                            )
                     # NOT a return. The cap closes ADMISSION of new cells; it does not end the
                     # feeder, which still owes an answer to every cell already streaming. Ending
                     # here ran the crash release — draining the queue and abandoning the count —
@@ -799,7 +841,18 @@ def fill_zones_sequential(
                         # stop-aware: the adapter must return promptly (raising) once stop is
                         # set, so a crashed session is never stuck behind a running ingest for
                         # its full duration. A cell `ready()` picked returns immediately.
-                        inputs.wait(cell.zone, cell.year, stop=stop)
+                        #
+                        # FLAGGED for `_source_has_work`, in a try/finally so every exit clears
+                        # it: this is the one call in the loop that can park the single feeder
+                        # for hours, and a fleet held against work it cannot reach is the exact
+                        # cost the wind-down exists to avoid.
+                        with lock:
+                            feeder_blocked = True
+                        try:
+                            inputs.wait(cell.zone, cell.year, stop=stop)
+                        finally:
+                            with lock:
+                                feeder_blocked = False
                     prep = prepare(cell)
                 except Exception as exc:
                     if stop.is_set():
@@ -981,11 +1034,26 @@ def fill_zones_sequential(
         than available work, and a cell awaiting assembly is in neither structure, having been
         settled when it was handed to the assembly queue.
 
+        AVAILABLE means DELIVERABLE, and that is a fact about the feeder as well as the queue.
+        The bounded-by-one-plan argument above holds only while the feeder is free to act: it is
+        a single thread, and ``_take_next`` hands it the queue HEAD when nothing has landed, so
+        it can be parked in ``inputs.wait`` for that cell's whole remaining ingest — hours, on
+        the real coverage counts. Another cell landing during that park is work the feeder cannot
+        reach, and reporting it kept the full fleet billed with an empty queue for exactly as
+        long as the head took. So a queued cell counts only when ``feeder_blocked`` is clear.
+        When the park ends the feeder enqueues, the poll returns work and the pool re-grows.
+
+        The flag is also raised for the instant a ``ready()`` cell's ``wait`` takes, and one
+        poll reading ``False`` there retires nothing: retirement needs the actor to have been
+        seen idle on a PREVIOUS call and then to pass the 120 s idle grace.
+
         Non-blocking, as the scheduler requires: ``ready`` is a probe with no I/O.
         """
         with lock:
             if ready:
                 return True
+            if feeder_blocked:
+                return False
             queued = [cell for cell, _ in work_queue]
         if not queued:
             return False

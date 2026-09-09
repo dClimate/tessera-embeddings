@@ -983,6 +983,41 @@ def test_cancel_unstarted_drops_queued_ingests_but_not_running_ones():
         adapter.shutdown()
 
 
+def test_cancel_unstarted_can_be_restricted_to_named_cells():
+    """The retained-failure cap must be able to cancel ONLY what it refused.
+
+    It refuses the never-attempted cells while the run keeps retrying others, and a retry's
+    re-ingest sits in this same queue — so a blanket cancel would strand the retry the standing
+    fleet exists to serve. A key with nothing queued (a running or already-finished cell, or one
+    this adapter never saw) is a no-op rather than an error.
+    """
+    adapter = _adapter(max_parallel=1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def _occupy(zone: str, year: int) -> None:
+        started.set()
+        release.wait(timeout=10.0)
+
+    adapter._run = _occupy  # the one worker is busy from here on
+    try:
+        for i in range(1, 6):
+            adapter.start(f"{i:02d}N", 2024)
+        assert started.wait(timeout=5.0), "the first ingest never started"
+
+        cancelled = adapter.cancel_unstarted([("03N", 2024), ("04N", 2024), ("99N", 2024)])
+
+        assert cancelled == 2, f"only the two named queued cells may be cancelled, got {cancelled}"
+        for kept in (("01N", 2024), ("02N", 2024), ("05N", 2024)):
+            assert kept in adapter._futures, f"{kept} was not named and must be left queued"
+            assert not adapter._futures[kept].cancelled()
+        assert ("03N", 2024) not in adapter._futures
+        assert ("04N", 2024) not in adapter._futures
+    finally:
+        release.set()
+        adapter.shutdown()
+
+
 def test_wait_first_does_not_abort_while_a_first_wave_cell_can_still_land():
     """The false abort a running failure COUNT introduces — worse than the bug it fixed.
 

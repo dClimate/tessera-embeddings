@@ -866,6 +866,16 @@ class TestAddActors:
         pool.add_actors(extra)
         assert pool.max_actor_deaths == 5
 
+    def test_the_thresholds_follow_the_target_the_run_was_given(self) -> None:
+        """With a target, the fleet the thresholds are judged against is the target — not the
+        one batch the caller happened to hand over. A first batch of one otherwise makes the
+        very first death "the whole fleet has died" on a run building towards 200.
+        """
+        pool = _make_pool(1, fleet_target=200)
+        assert pool.fleet_size == 200
+        assert pool.max_actor_deaths == 200
+        assert pool.systemic_stall_threshold == 20
+
     def test_added_actor_gets_work_via_dispatch_idle(self) -> None:
         """An appended actor receives queued work once it resolves."""
         pool = _make_pool(1)
@@ -884,6 +894,77 @@ class TestAddActors:
             pool.dispatch_idle(queue, "m", "s", "r", None)
         assert 1 in {aidx for _, aidx in pool.pending.values()}
         assert len(queue) == 0
+
+
+# ===========================================================================
+# ActorPool.fleet_size — the systemic-failure thresholds across a wind-down
+# ===========================================================================
+
+
+class TestFleetSizeAcrossDroughts:
+    """A chained session winds the fleet down through an ingest drought and regrows it after.
+
+    A retired slot stays in ``actors`` forever — the indices are the pool's identity — so that
+    list is a HISTORY of every generation the run has held, and each regrowth makes it longer.
+    Any threshold scaled by its length therefore loosens once per drought, which is the wrong
+    direction for a guard.
+    """
+
+    @staticmethod
+    def _resolve_all(pool: ActorPool) -> None:
+        """Let every initializing slot report itself alive, as the loop does each iteration."""
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
+            patch.object(_sched_mod.ray, "get", return_value="i-joined"),
+        ):
+            pool.resolve_initializing()
+
+    def _drought_and_regrowth(self, pool: ActorPool, target: int) -> None:
+        """One cycle: wind down to the liveness floor of one, then re-request up to ``target``."""
+        self._resolve_all(pool)
+        for idx in range(len(pool.actors)):
+            pool._idle_since[idx] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=0, floor=1)
+        assert pool.live_count == 1, f"the wind-down did not reach the floor: {pool.live_count} live"
+        regrown = [MagicMock() for _ in range(target - pool.live_count)]
+        for a in regrown:
+            a.get_instance_id.remote.return_value = MagicMock()
+        pool.add_actors(regrown)
+        assert pool.live_count == target, f"the regrowth did not reach the target: {pool.live_count} live"
+
+    def test_droughts_do_not_loosen_either_systemic_threshold(self) -> None:
+        """THE POINT. Two droughts on a 40-actor fleet leave 118 entries in ``actors``, so a
+        threshold read off its length would need 118 deaths to call a 40-actor fleet dead and 11
+        simultaneous stalls to call it wedged rather than 4 — and the stall one aborts the run.
+        """
+        pool = _make_pool(40, idle_grace_sec=1, fleet_target=40)
+        assert (pool.max_actor_deaths, pool.systemic_stall_threshold) == (40, 4)
+
+        for _ in range(2):
+            self._drought_and_regrowth(pool, 40)
+
+        # The control: the pathology really is present in this pool, so the assertions below
+        # are measuring the fix rather than an absence of droughts.
+        assert len(pool.actors) == 118, f"the cycles did not accumulate generations: {len(pool.actors)}"
+        assert pool.fleet_size == 40
+        assert pool.max_actor_deaths == 40, "the death threshold drifted with the retired slots"
+        assert pool.systemic_stall_threshold == 4, "the stall ABORT threshold desensitised across droughts"
+
+    def test_a_drought_does_not_tighten_them_either(self) -> None:
+        """The complement, and why the live count is not the answer: mid-drought the pool holds
+        one actor, so a threshold read off ``live_count`` would call the next single death
+        systemic and abort on three stalls out of a fleet of forty.
+        """
+        pool = _make_pool(40, idle_grace_sec=1, fleet_target=40)
+        self._resolve_all(pool)
+        for idx in range(len(pool.actors)):
+            pool._idle_since[idx] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=0, floor=1)
+        assert pool.live_count == 1  # control: the wind-down happened
+        assert pool.max_actor_deaths == 40, "one death during a drought must not read as systemic"
+        assert pool.systemic_stall_threshold == 4
 
 
 # ===========================================================================

@@ -13,6 +13,7 @@ import contextlib
 import logging
 import threading
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from unittest import mock
@@ -163,13 +164,14 @@ class RecordingInputs:
         with self._lock:
             self.events.append(f"discard:{zone}")
 
-    def cancel_unstarted(self) -> int:
-        """Recorded, not simulated: the fake has no queue, and what the runner's
-        contract requires is that it asks BEFORE retrying.
+    def cancel_unstarted(self, cells: Iterable[tuple[str, int]] | None = None) -> int:
+        """Recorded, not simulated: the fake has no queue, so what the runner's contract turns
+        on is WHICH cells it names, and when. ``None`` (the whole queue) records as ``all``.
         """
+        named = list(cells) if cells is not None else None
         with self._lock:
-            self.events.append("cancel_unstarted")
-        return 0
+            self.events.append(f"cancel_unstarted:{'all' if named is None else ','.join(sorted(z for z, _ in named))}")
+        return 0 if named is None else len(named)
 
 
 class MosaicCountingInputs(RecordingInputs):
@@ -1140,7 +1142,9 @@ def test_an_ingest_failure_is_re_ingested_on_retry():
     # old post-stream retry cleared the queue first, because its own `start` would otherwise have
     # waited behind the whole roster; cancelling now would discard cells this run will still
     # fill. `cancel_unstarted` survives for the crashed-session unwind alone.
-    assert "cancel_unstarted" not in events, f"a healthy run must not cancel its own ingests: {events}"
+    assert not [e for e in events if e.startswith("cancel_unstarted")], (
+        f"a healthy run must not cancel its own ingests: {events}"
+    )
 
 
 def test_a_retry_after_inference_does_not_re_ingest():
@@ -1461,6 +1465,46 @@ def test_the_cap_alert_fires_for_a_failure_that_arrives_after_the_feeder_finishe
         )
 
 
+def test_the_failure_cap_cancels_the_ingests_of_the_cells_it_refuses():
+    """A refusal that only empties the queue leaves the ingests running.
+
+    The flow submits an ingest for EVERY live cell before this runner is entered
+    (`fill_zones_sequential` in the flow: `for cell in ingest_window: inputs.start(...)`), so
+    the cap's "left unattempted" cells still have queued ingests. Left alone, the adapter works
+    through the rest of the roster and writes every one of those multi-terabyte mosaics
+    off-budget — for cells this run has said it will not attempt — while inference and the
+    assembly drain run on for hours.
+    """
+    events: list[str] = []
+    inputs = FailingWaitInputs(events)
+    with pytest.raises(RuntimeError, match="cell"):
+        _run(_cells(6), inputs=inputs, look_ahead=1, max_retained_failures=2, attempts_per_cell_in_cluster=1)
+    # 01N and 02N were admitted and failed, tripping a cap of 2; 03N-06N were never attempted.
+    cancels = [e for e in events if e.startswith("cancel_unstarted")]
+    assert cancels == ["cancel_unstarted:03N,04N,05N,06N"], (
+        f"the cap must cancel exactly the cells it refused: {cancels}"
+    )
+
+
+def test_the_failure_cap_leaves_a_retrys_queued_ingest_alone(caplog: pytest.LogCaptureFixture):
+    """The complement, and the bound on the fix: a cell at attempt > 1 is work this run is still
+    doing. Its re-ingest was dispatched by `_readmit` and its retry is waiting on it, so a
+    blanket cancel would strand the retry the standing fleet exists to serve.
+
+    Every queued entry here is a retry when the cap trips, so nothing may be cancelled at all.
+    """
+    events: list[str] = []
+    inputs = FailingWaitInputs(events)
+    with caplog.at_level(logging.ERROR, logger=LOG.name), pytest.raises(RuntimeError, match="cell"):
+        _run(_cells(6), inputs=inputs, look_ahead=1, max_retained_failures=2, attempts_per_cell_in_cluster=2)
+    # THE CONTROL, both halves: the cap really tripped, and every entry still queued when it did
+    # was a retry — so "nothing cancelled" is the rule under test and not an untaken branch.
+    assert any("Feeder stopping at the failure cap" in r.message for r in caplog.records), "the cap never tripped"
+    assert "discard:06N" in events, f"06N was never re-ingested, so no retry was queued: {events}"
+    cancels = [e for e in events if e.startswith("cancel_unstarted")]
+    assert cancels == [], f"a queue of retries must not be cancelled: {cancels}"
+
+
 def test_a_nonpositive_cap_is_refused_before_anything_expensive():
     """`0 >= max_retained_failures` is true before any cell fails, so a non-positive cap would
     tear the run down AFTER the ingests were primed and the Ray cluster started. Refused in the
@@ -1765,6 +1809,85 @@ def _paused_run(cells, *, ready_zones: set[str] | None = None, **kw):
     worker.join(timeout=25.0)
     stop_flag.set()
     return answers
+
+
+def test_a_landed_cell_the_blocked_feeder_cannot_reach_does_not_hold_the_fleet():
+    """AVAILABLE has to mean DELIVERABLE, and that is a fact about the feeder too.
+
+    `_take_next` hands the feeder the queue HEAD when nothing has landed, and the feeder is a
+    single thread, so it parks in `inputs.wait` for that cell's whole remaining ingest — 4-10 h
+    at the opening of a cluster's window. A different cell landing during that park is work the
+    feeder cannot reach until the head returns, and reporting it available held the full GPU
+    fleet against an empty queue for exactly as long as the head took: the one outcome the
+    wind-down exists to prevent.
+    """
+    parked = threading.Event()  # the feeder is inside inputs.wait on the head
+    release = threading.Event()  # ...and stays there until this test lets it go
+    answers: list[bool] = []
+
+    class _Inputs(RecordingInputs):
+        def ready(self, zone: str, year: int) -> bool:
+            # 02N lands only AFTER the feeder has parked, so the take that chose the head saw
+            # nothing ready — which is the branch that produces the park in the first place.
+            return zone == "02N" and parked.is_set()
+
+        def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+            with self._lock:
+                self.events.append(f"wait:{zone}")
+            if zone == "01N":
+                parked.set()
+                release.wait(timeout=20.0)
+
+    def session(more_work, on_item_done):
+        # Ordered, not raced: `feeder_blocked` is set before `inputs.wait` is entered, so once
+        # `parked` is visible the flag is already true and 02N is already ready.
+        assert parked.wait(timeout=20.0), "the feeder never parked on the head"
+        assert more_work() == [], "nothing is prepared, so the poll must be empty"
+        answers.append(bool(more_work.has_work()))
+        release.set()
+        return []
+
+    events: list[str] = []
+    with contextlib.suppress(RuntimeError):
+        _run_with_deadline(_cells(2), inputs=_Inputs(events), session=session)
+    release.set()
+    assert answers == [False], (
+        f"a cell the parked feeder cannot hand over is not available work: {answers}, events={events}"
+    )
+
+
+def test_a_landed_queued_cell_counts_while_the_feeder_is_free():
+    """The BOUND on the guard above, so it cannot be satisfied by reporting only `ready`.
+
+    Here the feeder is inside `plan` — seconds, not hours — and the cell queued behind it has
+    landed. That work IS deliverable, the feeder enqueues it on its next turn, and a fleet
+    retired against it would have to be re-gathered for work that was already there.
+    """
+    planning = threading.Event()
+    release = threading.Event()
+    answers: list[bool] = []
+
+    class _Inputs(RecordingInputs):
+        def ready(self, zone: str, year: int) -> bool:
+            return True
+
+    def plan(cell: SequentialCell, prep: PreparedCell) -> ZonePlan:
+        if cell.zone == "01N":
+            planning.set()
+            release.wait(timeout=20.0)
+        return _plan_for()(cell, prep)
+
+    def session(more_work, on_item_done):
+        assert planning.wait(timeout=20.0), "the feeder never reached plan()"
+        assert more_work() == [], "01N is still being planned, so nothing is prepared yet"
+        answers.append(bool(more_work.has_work()))
+        release.set()
+        return []
+
+    with contextlib.suppress(RuntimeError):
+        _run_with_deadline(_cells(2), inputs=_Inputs([]), session=session, plan=plan)
+    release.set()
+    assert answers == [True], f"a landed cell the free feeder will enqueue is available work: {answers}"
 
 
 def test_a_pause_holding_available_inference_work_keeps_the_fleet():

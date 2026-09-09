@@ -192,6 +192,7 @@ class ActorPool:
         on_retire: Callable[[str], None] | None = None,
         get_credentials: Callable[[], Any] | None = None,
         s3_region: str | None = None,
+        fleet_target: int | None = None,
     ) -> None:
         """Initialise the pool from already-ready actor handles.
 
@@ -211,6 +212,10 @@ class ActorPool:
                 replacements) so a non-default-region fill's reads — and the
                 retries after a chunk failure/OOM — open the mosaic in the right
                 region. See :class:`InferenceActor`.
+            fleet_target: Total actors the run intends to hold. It is what the
+                systemic-failure thresholds are judged against — see
+                :attr:`fleet_size`. ``None`` (a caller that supplies its whole
+                fleet up front) falls back to the slot count.
         """
         self.actors = actors
         self.actor_instance_ids = actor_instance_ids
@@ -220,6 +225,7 @@ class ActorPool:
         self._on_retire = on_retire
         self._get_credentials = get_credentials
         self._s3_region = s3_region
+        self._fleet_target = fleet_target
 
         self.actor_deaths: int = 0
 
@@ -297,13 +303,47 @@ class ActorPool:
         return len(self.pending) + queued + len(self.reserved)
 
     @property
-    def max_actor_deaths(self) -> int:
-        """Death count that signals a systemic failure.
+    def fleet_size(self) -> int:
+        """The fleet SIZE the systemic-failure thresholds are judged against.
 
-        Tracks the CURRENT pool size so the threshold scales as later batches are added; a fixed
-        batch-1 count trips the alarm far too early on a fleet built up incrementally.
+        The run's TARGET where the caller gave one, because it is the only fleet quantity that
+        is stable over a session's lifetime. Neither count the pool itself holds is:
+
+        * ``len(self.actors)`` is CUMULATIVE. Retired slots stay in it forever (the indices are
+          the pool's identity), so a session that winds down through an ingest drought and
+          regrows counts every generation — a 40-actor fleet reads 79 after one drought and 118
+          after two, and a threshold derived from it desensitises without bound.
+        * ``live_count`` collapses to the wind-down floor, which would make the FIRST death
+          after a drought read as "the whole fleet has died".
+
+        Falls back to the slot count when no target was given: such a caller supplies its whole
+        fleet up front and never regrows, so the two agree.
         """
-        return len(self.actors)
+        return self._fleet_target or len(self.actors)
+
+    @property
+    def max_actor_deaths(self) -> int:
+        """Death count that signals a systemic failure — as many deaths as the fleet has slots.
+
+        Judged against :attr:`fleet_size`, so it scales with the fleet the run is building
+        towards and does not drift as a wound-down pool regrows. LOG-ONLY: it decides the level
+        :meth:`replace` reports a death at and nothing else. Compare
+        :attr:`systemic_stall_threshold`, which aborts.
+        """
+        return self.fleet_size
+
+    @property
+    def systemic_stall_threshold(self) -> int:
+        """Simultaneously-stalled chunks that mean the FLEET is wedged, not one chunk.
+
+        A tenth of :attr:`fleet_size`, floor three, so it scales with the EVENTUAL fleet and
+        not the batch the caller was handed — a threshold frozen at batch-1/10 aborts a large
+        run after a handful of stalls once later batches join. Beside :attr:`max_actor_deaths`
+        because they are the same judgement about the same fleet, and this is the half that
+        ABORTS: read off the cumulative slot list it climbed with every wind-down cycle, which
+        made the guard less sensitive the longer a session ran.
+        """
+        return max(3, self.fleet_size // 10)
 
     # ------------------------------------------------------------------
     # Instance-ID resolution
@@ -551,17 +591,18 @@ class ActorPool:
         self.actor_deaths += 1
         if self.actor_deaths >= self.max_actor_deaths:
             self.log.critical(
-                "!!! %d actor deaths — every actor slot has died at least once. "
+                "!!! %d actor deaths — as many as the fleet has slots (%d). "
                 "This is systemic (bad checkpoint? memory leak? instance type too small?). "
                 "KILL THIS FLOW and investigate before burning more GPU spend.",
                 self.actor_deaths,
+                self.fleet_size,
             )
         elif self.actor_deaths >= self.max_actor_deaths // 2:
             self.log.error(
-                "!!! %d / %d actor slots have died — possible systemic issue. "
+                "!!! %d deaths against a fleet of %d slots — possible systemic issue. "
                 "Monitor closely or consider killing this flow.",
                 self.actor_deaths,
-                len(self.actors),
+                self.fleet_size,
             )
         else:
             self.log.warning(
@@ -897,7 +938,7 @@ def _batch_actors_to_request(
     Full derivation: ``context_docs/inference/gpu-fleet-launch-throttling.md``.
 
     Args:
-        requested: Actors requested so far (``len(pool.actors)``).
+        requested: Actors requested so far and still wanted (``pool.requested``).
         target: Total actors the run should eventually reach.
         outstanding: In-flight + queued chunks. Caps requests so we do not provision more
             actors than there is work left.
@@ -1008,7 +1049,9 @@ def _process_chunks_work_stealing(
             the first, later ones are requested here. ``None`` disables batching — the caller's
             ``actors`` list is the whole fleet.
         total_actors_target: Total actors the run should eventually reach; requesting stops
-            once ``len(pool.actors)`` reaches it. Ignored when ``actor_factory`` is None.
+            once ``pool.requested`` reaches it. Also the fleet the systemic-failure thresholds
+            are judged against (:attr:`ActorPool.fleet_size`). Ignored when ``actor_factory``
+            is None.
         placement_timeout_sec: Max seconds to wait for a batch's instances to be placed before
             requesting the next anyway (capacity-shortfall escape hatch).
         retire_idle_actors: Kill actors idle past the grace period (the default). A chained
@@ -1053,6 +1096,7 @@ def _process_chunks_work_stealing(
         on_retire=on_actor_retire,
         get_credentials=get_credentials,
         s3_region=s3_region,
+        fleet_target=total_actors_target,
     )
 
     # Mark actors that haven't finished __init__ yet. seed() skips them; they receive work via
@@ -1074,14 +1118,6 @@ def _process_chunks_work_stealing(
     #: slowest whole chunk yet observed took ~480 s in total and the wedge this exists for sat
     #: 14,396 s. The choice is between minutes and forever, so anywhere in that range works.
     stall_recovery_sec = 4 * stall_threshold_sec
-
-    # Scales with the EVENTUAL fleet size, not just the first batch: with batching, ``actors``
-    # holds only the initial subset, so a threshold frozen at batch-1/10 would abort a large run
-    # after a handful of stalls once later batches join. Recomputed each iteration against the
-    # larger of the current pool and the target.
-    def _stall_threshold() -> int:
-        fleet = max(len(pool.actors), total_actors_target or 0)
-        return max(3, fleet // 10)
 
     # --- Actor-batch requesting ---
     # The caller supplies only the first batch; the loop requests the rest here, pacing the
@@ -1142,7 +1178,7 @@ def _process_chunks_work_stealing(
         log.info(
             "Requested actor batch: +%d (%d/%d total, %d actor slots placed)%s",
             n,
-            len(pool.actors),
+            pool.requested,
             total_actors_target,
             placed_actor_slots,
             " — placement timed out, requesting anyway" if timed_out else "",
@@ -1405,7 +1441,7 @@ def _process_chunks_work_stealing(
                 len(results),
                 n_total,
                 stall_threshold_sec,
-                _stall_threshold(),
+                pool.systemic_stall_threshold,
                 log,
                 elapsed_min=(time.monotonic() - inference_t0) / 60,
                 gpu_hours=gpu_seconds / 3600,

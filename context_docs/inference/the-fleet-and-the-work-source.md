@@ -123,6 +123,48 @@ Two things had to be true, and one was not.
 No hysteresis. Retirement requires an actor to have been seen idle on a *previous* call and then
 to exceed the 120 s idle grace, so a cell that becomes ready inside two minutes retires nothing.
 
+### Available means deliverable
+
+The wind-down is suppressed while the source says inference work is available *right now*, which
+exists so that an operator pause — work withheld, not absent — does not read as a drought. The
+predicate counted a prepared zone, and also a still-queued cell whose mosaic had landed, on the
+argument that the feeder plans such a cell within seconds.
+
+That argument assumes the feeder is free to act, and it is one thread. When nothing has landed the
+feeder is handed the queue *head* and blocks on that cell's ingest, which at the opening of a
+cluster's window is 4-10 h. Another cell landing during that block is work the feeder cannot
+reach until the head returns, so the predicate answered "available" while the queue was empty and
+the whole fleet was billed idle for the head's remaining ingest — the exact outcome the wind-down
+was built to prevent. The feeder now publishes whether it is blocked on an ingest, and a queued
+cell counts only when it is not. When the block ends the feeder enqueues and the pool re-grows.
+
+### The fleet the thresholds are judged against
+
+Two systemic-failure guards were still scaled by the length of the pool's actor list: the death
+count that reports a fleet as dead, and the number of simultaneously-stalled chunks that *aborts*
+the run. Retired slots never leave that list, so it is a history of every generation the run has
+held — a 40-actor fleet reads 79 entries after one drought and 118 after two. The death threshold
+is log-only, but the stall threshold aborts, and taking the larger of the list and the target made
+it strictly less sensitive with every cycle: 11 simultaneous stalls demanded of a 40-actor fleet
+instead of 4.
+
+The live count is not the answer either, because it collapses to the wind-down floor and would
+make the first death after a drought read as the whole fleet dying. Both now read one
+`ActorPool.fleet_size`, which is the run's actor *target* — the only fleet quantity stable across
+a session's lifetime — falling back to the slot count for a caller that supplies its whole fleet
+up front and never regrows.
+
+### A refusal has to stop the ingests it refuses
+
+The flow submits an ingest for every live cell before the runner is entered, so the retained-failure
+cap's "left unattempted" cells still have queued ingests. Emptying the work queue does not stop
+them: the adapter would work through the rest of the roster and write every one of those
+multi-terabyte mosaics off-budget, for cells the run has said it will not attempt, while inference
+and the assembly drain carry on for hours. The cap now names those cells to
+`CellInputs.cancel_unstarted`. Only the never-attempted ones, and only the ones not yet started — a
+running ingest is inside the concurrency the campaign already budgeted, and cancelling it needs a
+confirmation wait the feeder cannot afford while it still owes an answer to every streaming cell.
+
 ## The gate that caused most of it
 
 Of 71 cell failures in ten days — 62 ingest, 7 inference, 2 assembly — **42 were not failures.**

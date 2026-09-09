@@ -37,7 +37,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
 from functools import cache, partial
 from typing import TYPE_CHECKING, Any
@@ -459,20 +459,26 @@ class _DeploymentCellInputs:
             f"mosaic prefix — those commits do not rebase, so the loser's failure is terminal."
         )
 
-    def cancel_unstarted(self) -> int:
+    def cancel_unstarted(self, cells: Iterable[tuple[str, int]] | None = None) -> int:
         """Cancel queued ingests that have not begun, and forget them. Returns how many.
 
         ``Future.cancel()`` succeeds only for a task still sitting in the pool's queue, so a
         running or finished ingest is untouched — this drops work, never interrupts it.
 
-        Called before the in-child retry pass: every pending cell's ingest is submitted up
-        front, so a retry's fresh ``start`` would otherwise sit behind most of a cluster in this
-        FIFO queue and block for hours on a still-billing cluster. Those cells are unattempted
-        either way and stay pending for the next campaign pass.
+        ``cells`` restricts it to those keys; ``None`` means every cell. Both callers exist
+        because every live cell's ingest is submitted up front: the crashed-session unwind takes
+        the whole queue, since nothing is left to serve, while the retained-failure cap names
+        only the cells it refused and must leave a retry's queued re-ingest alone.
+
+        Forgetting a cancelled cell restores ``start``'s meaning — the cell has no attempt in
+        flight — so a later ``start`` (a retry) submits a real one rather than joining a
+        cancelled future.
         """
+        keys = list(self._futures) if cells is None else list(cells)
         cancelled = 0
-        for key, fut in list(self._futures.items()):
-            if fut.cancel():
+        for key in keys:
+            fut = self._futures.get(key)
+            if fut is not None and fut.cancel():
                 self._futures.pop(key, None)
                 cancelled += 1
         if cancelled:
