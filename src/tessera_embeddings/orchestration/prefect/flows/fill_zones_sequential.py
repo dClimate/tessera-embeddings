@@ -97,7 +97,6 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     assemble_zone_year,
     assert_calendar_year_window,
     fill_zone_year,
-    infer_zone_year,
     plan_zone_inference,
     zone_live_tile_count,
     zone_year_complete,
@@ -1206,28 +1205,6 @@ def fill_zones_sequential_flow(
             on_item_done=on_item_done,
         )
 
-    def _infer_single(cell: SequentialCell, prep: PreparedCell, final: bool) -> ZoneFillHandoff:
-        # A per-cell session with the cell's own config, on the still-provisioned cluster, for
-        # the cells the shared stream did not finish — a crashed session's survivors, and the
-        # retry pass.
-        return infer_zone_year(
-            store_path=store_path,
-            zone=cell.zone,
-            year=cell.year,
-            land_mask_path=land_mask_path,
-            mosaic_base=prep.mosaic_base,
-            staging_base=prep.staging_base,
-            config=prep.config,
-            num_actors=cell.num_actors,
-            log=log,
-            run_id=prep.run_id,
-            get_credentials=iam_icechunk_credentials,
-            s3_region=s3_region,
-            on_actor_retire=terminator,
-            on_fleet_demand=publish_fleet_mix,
-            retire_idle_actors=final,
-        )
-
     #: Where a landed cell's deletes go. Owned here rather than by the runner because the
     #: STAGING delete is issued from inside `assemble_zone_year`, which the runner cannot reach;
     #: the runner is handed this same pool and is what joins it at the drain. Both deletes of a
@@ -1355,7 +1332,6 @@ def fill_zones_sequential_flow(
                 session=_session,
                 assemble=_assemble,
                 housekeeping=housekeeping,
-                infer_single=_infer_single,
                 session_s1_orbit=s1_orbit,
                 log=log,
                 inputs=inputs,

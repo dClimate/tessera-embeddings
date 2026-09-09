@@ -356,13 +356,18 @@ def test_duplicate_and_lowercase_zones_are_canonicalized(wired):
 
 
 def test_stream_contract_wired(wired):
-    """The runner receives the stream contract: plan/session/infer_single +
-    the session orbit the feeder gates zone deferral on.
+    """The runner receives the stream contract: plan/session + the session orbit.
+
+    `infer_single` is deliberately absent. It was the per-cell inference path the retry pass
+    used, and a per-cell path means a second `run_inference` — which builds a GPU fleet from
+    nothing and kills it again, once per retried cell. Retries now re-enter the shared session,
+    so the runner is handed no way to start inference twice.
     """
     _run(s1_orbit="both")
     kw = wired["seq_kwargs"]
     assert kw["session_s1_orbit"] == "both"
-    assert callable(kw["plan"]) and callable(kw["session"]) and callable(kw["infer_single"])
+    assert callable(kw["plan"]) and callable(kw["session"])
+    assert "infer_single" not in kw, "a second inference entry point is what rebuilt the fleet"
     assert "infer" not in kw and "max_consecutive_failures" not in kw
 
 

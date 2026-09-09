@@ -431,8 +431,13 @@ class TestTheRunnerLifecycle:
         assert published[-1] == 0
 
     def test_every_session_that_gets_a_terminator_also_gets_the_publisher(self) -> None:
-        """Structural, because two reviewers missed the same call site independently: the
-        sequential flow starts inference from two places and only one was wired.
+        """Structural, because two reviewers missed the same call site independently when the
+        sequential flow started inference from two places and only one was wired.
+
+        ONE site now: the per-cell retry path is gone, since a retry re-enters the shared
+        session instead of opening a second one. The invariant is unchanged and still worth
+        enforcing structurally — any future entry point that reserves GPU actors must also
+        publish the fleet's shape, or the autoscaler is asked for a mix nobody described.
         """
         import ast
         import inspect
@@ -444,7 +449,7 @@ class TestTheRunnerLifecycle:
             for node in ast.walk(ast.parse(inspect.getsource(mod)))
             if isinstance(node, ast.Call) and any(kw.arg == "on_actor_retire" for kw in node.keywords)
         ]
-        assert len(sites) >= 2, "expected the shared session and the per-cell retry"
+        assert len(sites) >= 1, "the shared session must still pass a terminator"
         for site in sites:
             assert "on_fleet_demand" in {kw.arg for kw in site.keywords}, f"line {site.lineno}"
 
