@@ -28,3 +28,18 @@ def test_invalid_max_workers_raises() -> None:
     """``max_workers`` must be a positive integer."""
     with pytest.raises(ValueError, match="max_workers must be > 0"):
         AssemblyConfig(max_workers=0)
+
+
+def test_the_default_pool_is_thirty_two_on_the_large_runner() -> None:
+    """32 assembly workers, and the pair of facts that makes it safe and worth doing.
+
+    RAM: each worker holds at most one staged-tile slice (~1-1.5 GB), so 32 peaks around
+    ~48 GB — inside the 244 GiB ``assembly_large`` flow runner and NOT inside the 64 GiB
+    inference family, which is why the number and the runner family move together.
+
+    Concurrency: 32 was refused while assembly divided a fleet S3-request budget into a
+    per-fork cap, because more forks pushed that cap down to 1 — the value at which icechunk
+    deadlocks. The cap is gone, so the worker count is bounded by the box alone.
+    """
+    assert AssemblyConfig().max_workers == 32
+    assert AssemblyConfig().compute_n_workers(10_000) == 32
