@@ -9,6 +9,8 @@ import os
 import threading
 import time
 from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
+from typing import ClassVar
 
 import icechunk
 import numpy as np
@@ -1410,3 +1412,305 @@ class TestRunForkedCatchUp:
 
         with pytest.raises(RuntimeError, match="catch-up exploded"):
             run_forked(session, self._slow_worker, [{"tag": "only"}], catch_up=boom)
+
+
+class TestForkStallWatchdog:
+    """A fork phase that stops making progress fails in bounded time instead of hanging.
+
+    On 2026-09-04 five assemblies stopped in the shard-write tail and never returned — no
+    exception, no CPU, no shard progress — each freezing the single trailing thread its whole
+    cluster assembles on, for days. Nothing watched the fork phase and nothing bounded it. The
+    cause was an icechunk deadlock at a request cap of 1, and that cap is gone; this is the net
+    under the next unknown cause, and the only way to obtain a stack on Fargate.
+
+    Every test here drives the REAL ``run_forked`` through a fake executor, so a never-resolving
+    future (a worker that will not finish) and a shutdown that will not return (a worker that
+    will not exit) can both be produced deterministically; the timeout is shrunk, not the
+    mechanism.
+    """
+
+    class _Proc:
+        def __init__(self, alive: bool = True) -> None:
+            self.alive, self.terminated = alive, False
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminated, self.alive = True, False
+
+    @classmethod
+    def _executor(cls, futures_for, *, shutdown_blocks_until_terminated: bool = False):
+        """A stand-in pool. ``futures_for(payload)`` says what ``submit`` hands back.
+
+        ``shutdown_blocks_until_terminated`` models a worker process that has returned its
+        result but will not exit: a ``shutdown(wait=True)`` joins it forever, until something
+        kills it.
+        """
+        procs = [cls._Proc(), cls._Proc()]
+        released = threading.Event()
+
+        class _Fake:
+            instances: ClassVar[list] = []
+
+            def __init__(self, *a, **k):
+                self._processes = dict(enumerate(procs))
+                self.shutdown_calls: list[dict] = []
+                self.handed_out: list[Future] = []
+                self.terminated_after_done: list[bool] = []
+                _Fake.instances.append(self)
+
+            def submit(self, fn, payload):
+                future = futures_for(payload)
+                self.handed_out.append(future)
+                return future
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                self.shutdown_calls.append({"wait": wait, "cancel_futures": cancel_futures})
+                if wait and shutdown_blocks_until_terminated:
+                    released.wait(timeout=10)
+                # CPython drops the reference here; the stub must too (see the terminate test
+                # in TestForkProgressReporting).
+                self._processes = None
+
+        def _terminate(p, real=cls._Proc.terminate):
+            real(p)
+            released.set()
+            for fake in _Fake.instances:
+                fake.terminated_after_done.append(all(f.done() for f in fake.handed_out))
+            # A real pool resolves every pending future as BrokenProcessPool once a worker dies;
+            # the stub must too, or a test can only hang where production would raise.
+            for fake in _Fake.instances:
+                for future in fake.handed_out:
+                    if not future.done():
+                        future.set_exception(BrokenProcessPool("worker terminated"))
+
+        for p in procs:
+            p.terminate = _terminate.__get__(p)  # type: ignore[method-assign]
+        return _Fake, procs
+
+    @staticmethod
+    def _stall_lines(caplog):
+        return [r for r in caplog.records if "FORK PHASE STALLED" in r.getMessage()]
+
+    @staticmethod
+    def _within(seconds, fn):
+        """Run ``fn`` and FAIL if it has not returned in ``seconds``.
+
+        The failure under test is a call that never returns, so a test that simply calls it
+        can only hang when the fix is absent — which no test runner reports as red. This turns
+        the hang itself into the assertion.
+        """
+        box: dict = {}
+
+        def _run():
+            try:
+                box["ret"] = fn()
+            except BaseException as exc:  # re-raised on the test thread below
+                box["exc"] = exc
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(seconds)
+        assert not thread.is_alive(), f"run_forked did not return within {seconds}s: the fill hung"
+        if "exc" in box:
+            raise box["exc"]
+        return box["ret"]
+
+    def test_a_worker_that_never_finishes_fails_the_fill_in_bounded_time(self, tmp_path, monkeypatch, caplog):
+        """The 2026-09-04 shape: one partition outstanding, forever. Before this, forever meant days.
+
+        The fill fails as its own error type, so an operator reads "the write stopped" rather
+        than "a catch-up failed", and the stacks are dumped — the artefact the incident could
+        not produce.
+        """
+        fake, procs = self._executor(lambda p: Future())
+        monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", fake)
+        dumps: list[int] = []
+        monkeypatch.setattr(shard_writer.faulthandler, "dump_traceback", lambda: dumps.append(1))
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+
+        with (
+            caplog.at_level(logging.WARNING, logger="tessera_embeddings.storage.shard_writer"),
+            pytest.raises(shard_writer.ForkPhaseStalledError, match="no shard progress"),
+        ):
+            self._within(
+                15,
+                lambda: run_forked(
+                    session,
+                    lambda p: p,
+                    [{"tag": "a"}, {"tag": "b"}],
+                    progress_interval_s=0.02,
+                    fork_stall_timeout_s=0.3,
+                ),
+            )
+        assert all(p.terminated for p in procs), "the stuck workers must be killed, not left to run"
+        assert dumps == [1], "the stall must dump every thread's stack: it is the only way to get one here"
+        assert len(self._stall_lines(caplog)) == 1
+
+    def test_the_workers_are_killed_when_the_stall_is_declared_not_at_the_next_wake(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The watchdog tears the pool down ITSELF rather than only setting a flag.
+
+        ``_await_forks`` notices ``stalled`` on its next wake, and in production that is up to
+        ``PROGRESS_INTERVAL_S`` — five minutes — away: five more minutes of a wedged pool holding
+        processes and writing fork objects nobody will ever merge. Here the reporting interval is
+        far LONGER than the stall timeout, so a pool killed only at the next wake fails this.
+        """
+        fake, procs = self._executor(lambda p: Future())
+        monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", fake)
+        monkeypatch.setattr(shard_writer.faulthandler, "dump_traceback", lambda: None)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        outcome: dict = {}
+
+        def _go():
+            try:
+                run_forked(
+                    session,
+                    lambda p: p,
+                    [{"tag": "a"}, {"tag": "b"}],
+                    progress_interval_s=30.0,
+                    fork_stall_timeout_s=0.3,
+                )
+            except BaseException as exc:  # inspected on the test thread below
+                outcome["exc"] = exc
+
+        with caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.shard_writer"):
+            thread = threading.Thread(target=_go, daemon=True)
+            thread.start()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not all(p.terminated for p in procs):
+                time.sleep(0.02)
+            assert all(p.terminated for p in procs), (
+                "the pool was still alive long past the stall timeout: the watchdog only set a flag"
+            )
+            thread.join(5.0)
+        assert not thread.is_alive(), "the fill never returned"
+        assert isinstance(outcome.get("exc"), shard_writer.ForkPhaseStalledError)
+
+    def test_a_healthy_write_is_never_interrupted(self, tmp_path, monkeypatch, caplog):
+        """A write slower than the timeout but still WRITING must run to completion.
+
+        The watchdog watches progress, not elapsed time: a timeout on wall-clock alone would
+        kill every dense zone, whose fork phase runs three hours. Here the worker takes several
+        timeouts' worth of wall time while the shard counter keeps moving. Workers are terminated
+        only AFTER their results are in hand — that is the terminate-not-join rule, not a kill.
+        """
+        done: Future = Future()
+        fake, procs = self._executor(lambda p: done)
+        monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", fake)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        slots_seen: list = []
+        real_watchdog = shard_writer._fork_stall_watchdog
+
+        def capturing(slots, *a, **k):
+            slots_seen.append(slots)
+            return real_watchdog(slots, *a, **k)
+
+        monkeypatch.setattr(shard_writer, "_fork_stall_watchdog", capturing)
+
+        def keep_writing():
+            deadline = time.monotonic() + 1.0  # > 3x the timeout below
+            while time.monotonic() < deadline:
+                if slots_seen:
+                    slots_seen[0][0] += 1  # worker 0 wrote one more shard
+                time.sleep(0.02)
+            done.set_result(("fork", {}))
+
+        threading.Thread(target=keep_writing, daemon=True).start()
+        with caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.shard_writer"):
+            fake.instances.clear()
+            monkeypatch.setattr(type(session), "merge", lambda self, *forks: None)
+            telemetry = self._within(
+                15,
+                lambda: run_forked(
+                    session,
+                    lambda p: p,
+                    [{"tag": "a"}, {"tag": "b"}],
+                    progress_interval_s=0.02,
+                    fork_stall_timeout_s=0.3,
+                ),
+            )
+        assert telemetry["wall_s"] >= 0.9, "the write did not actually outlast the timeout; the test proves nothing"
+        assert not self._stall_lines(caplog), "a write that kept making progress was declared stalled"
+        assert all(fake.instances[0].terminated_after_done), "a worker was terminated before its result was in hand"
+
+    def test_finished_workers_are_terminated_never_joined(self, tmp_path, monkeypatch, caplog):
+        """Every result is in hand, but a worker process will not exit.
+
+        `shutdown(wait=True)` used to join it — forever, in one of the places the 2026-09-04
+        fills could have parked, and a join like that would make the watchdog inert. The results
+        are the forks and they are already ours, so the worker is simply terminated. No stall, no
+        alarm: there is nothing to recover from.
+        """
+        resolved: Future = Future()
+        resolved.set_result(("fork", {}))
+        fake, procs = self._executor(lambda p: resolved, shutdown_blocks_until_terminated=True)
+        monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", fake)
+        _, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        monkeypatch.setattr(type(session), "merge", lambda self, *forks: None)
+
+        with caplog.at_level(logging.CRITICAL, logger="tessera_embeddings.storage.shard_writer"):
+            telemetry = self._within(
+                10,
+                lambda: run_forked(
+                    session,
+                    lambda p: p,
+                    [{"tag": "a"}, {"tag": "b"}],
+                    progress_interval_s=0.02,
+                    fork_stall_timeout_s=0.3,
+                ),
+            )
+        assert all(p.terminated for p in procs)
+        assert not any(c["wait"] for c in fake.instances[0].shutdown_calls), "the pool must never be joined"
+        assert not self._stall_lines(caplog), "nothing stalled; terminating a finished worker is not a recovery"
+        assert len(telemetry["workers"]) == 2, "the finished results were thrown away"
+
+    def test_a_stall_reads_as_a_stall_not_as_a_failed_catch_up(self):
+        """The two abort paths end the same wait but mean different things; an operator reading
+        "a periodic catch-up failed" for a write that stopped moving would look in the wrong place.
+        """
+        assert issubclass(shard_writer.ForkPhaseStalledError, RuntimeError)
+        assert not issubclass(shard_writer.ForkPhaseStalledError, session_catch_up.CatchUpAbortedTheWaitError)
+
+    def test_the_single_payload_path_gets_no_watchdog_thread(self):
+        """One payload runs in-process and writes one shard: there is nothing to watch, and a
+        thread per one-shard cell would be pure cost. The context manager is a no-op there.
+        """
+        before = {t.name for t in threading.enumerate()}
+        with shard_writer._fork_stall_watchdog(None, 1, threading.Event(), None, timeout_s=0.1):
+            during = {t.name for t in threading.enumerate()} - before
+        assert not any("stall" in n for n in during), f"a watchdog thread was started: {during}"
+
+    def test_the_watchdog_stops_with_the_fork_phase(self):
+        """Leaving the thread running past the block would fire on the merge and commit, which
+        write no shards by definition — a false stall on every healthy fill.
+        """
+        ctx = multiprocessing.get_context("spawn")
+        slots = ctx.Array("l", 4, lock=False)
+
+        class _Ex:
+            _processes: ClassVar[dict] = {}
+
+            def shutdown(self, **k):
+                pass
+
+        with shard_writer._fork_stall_watchdog(slots, 2, threading.Event(), _Ex(), timeout_s=0.1):  # type: ignore[arg-type]
+            pass
+        time.sleep(0.05)
+        assert not [t for t in threading.enumerate() if t.name == "fork-stall-watchdog" and t.is_alive()], (
+            "the watchdog thread outlived the fork phase"
+        )
+
+    def test_the_production_timeout_is_far_outside_a_healthy_gap(self):
+        """The bound is one-sided by design: healthy writes never pause shard writing for even one
+        progress interval (300 s), so anything shorter than several of those risks killing a slow
+        band, and the failure it guards sat for DAYS, so there is nothing to gain by trimming.
+        """
+        assert shard_writer.FORK_STALL_TIMEOUT_S >= 3 * shard_writer.PROGRESS_INTERVAL_S
+        assert shard_writer.FORK_STALL_TIMEOUT_S <= 4 * 3600, "longer than an entire dense-zone write"
