@@ -148,6 +148,22 @@ _QUIESCENT_TERMINAL_STATES = frozenset({StateType.FAILED, StateType.COMPLETED})
 #: act — the teardown that waits for children, and the orphan sweep — finish.
 _SETTLE_DELAY_S = CANCELLATION_CONFIRM_S
 
+#: Assembly worker processes the CHAINED fill is asked for, overriding ``AssemblyConfig``'s
+#: default of 16. It lives here rather than in the library because it is a fact about a host, not
+#: about assembly: 32 workers peak around ~48 GB and the chained fill's deployment is the 32 vCPU
+#: / 244 GiB ``assembly_large`` family (yield-embeddings ``FAMILY_ASSEMBLY_LARGE``), while every
+#: other caller of the default — ``fill-zone-year`` on the 16 vCPU / 64 GiB inference family, the
+#: plain runner, a hand-run fill — would be oversubscribed by it.
+#:
+#: Worth spending because assembly is the campaign's longest stage and, once inference is done,
+#: its ONLY remaining one: a cluster's whole backlog drains through one trailing thread, one
+#: assembly at a time, so its speed is the campaign's tail. Doubling the workers on a box with
+#: twice the cores costs one Fargate task per cluster against a GPU fleet of hundreds. Safe only
+#: because the per-fork S3 request cap is gone — it was the cap of 1, not the worker count, that
+#: deadlocked icechunk, and 32 uncapped workers per fill measured zero throttling at fleet width.
+#: See ``context_docs/storage/writing-to-the-global-store.md``.
+ASSEMBLY_WORKERS_ON_THE_LARGE_RUNNER = 32
+
 
 def _still_running(live: dict[asyncio.Task[Any], int | None]) -> bool:
     """Is any dispatch in ``live`` genuinely unfinished?
@@ -1480,6 +1496,11 @@ async def run_global_campaign(
                         # This cluster's OWN zone count, so its admission gates never limit
                         # fleet fill (see the dispatch comment above).
                         "look_ahead": cell_look_ahead,
+                        # THE CHAINED FILL ONLY. Its deployment is the 32-vCPU / 244 GiB
+                        # `assembly_large` family, so it can hold a 32-process pool (~48 GB);
+                        # `_fill_params` above dispatches `fill-zone-year`, which runs on the
+                        # 16 vCPU / 64 GiB inference family and must keep the library default.
+                        "n_assembly_workers": ASSEMBLY_WORKERS_ON_THE_LARGE_RUNNER,
                         # As in _fill_params: the account's RunInstances quota is the
                         # fleet-wide rate these clusters share, and each autoscaler enforces
                         # its own share client-side rather than being handed a divided count.

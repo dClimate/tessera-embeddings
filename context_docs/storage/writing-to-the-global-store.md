@@ -168,7 +168,8 @@ and [`../assembly/assembly-wedges-during-fork-phase-2026-09-04.md`](../assembly/
 | cap 2, identical load and store geometry | every cell published, clean, 146 s |
 | cap 4, identical load | every cell published, clean |
 | **uncapped (icechunk default), 32 fork workers per fill at production fan-out** | **zero throttling on every arm** |
-| four minimal reductions at cap 1 (cross-process commits; background rebase; a 4,096-reference commit; a concurrent reader) | all clean — the fault is not isolated to a small shape |
+| a standalone ~130-statement reproducer at cap 1 (icechunk + zarr + numpy + a bucket) | 2-3 of 4 writers park permanently; `--no-forks` deadlocks too, so the fork pool is not the ingredient |
+| four earlier reductions at cap 1 | all clean — none had a write in flight while a rebase had real commits to cross, which is the actual ingredient |
 
 **So nothing was bought by capping it.** The justification for the cap was a `SlowDown` at 800
 concurrent PUTs, recorded as a code comment; §2's "What was not verified" already flagged that it

@@ -2,9 +2,8 @@
 
 **Status 2026-09-09: root cause of the 2026-09-04 assembly wedges, confirmed on real S3 with native
 stacks, on our pinned 2.1.1 AND the current release 2.2.0.** Python 3.12. This is our record of the
-fault and our mitigation; the upstream issue drafted from it is not yet filed. There is **no minimal
-reproducer** — four progressively closer reductions all completed cleanly, and the reproducing
-workload is our own shard writer.
+fault and our mitigation; the upstream issue drafted from it is not yet filed. **A standalone
+minimal reproducer exists** and fired on its first attempt — see Reproduction.
 
 ## Summary
 
@@ -13,9 +12,11 @@ A `Repository` opened with `RepositoryConfig.max_concurrent_requests = 1` deadlo
 never returns. The process stays alive with no runnable thread, writes nothing further, and does not
 time out.
 
-It requires concurrency, but the minimal form of that concurrency is **not isolated** — see
-Reproduction. A lone sequential writer at cap 1 is fine. Raising the value to 2 clears it completely
-under identical load, which is the cleanest evidence that the value itself is the trigger.
+**The necessary ingredient is ordinary object-store writes happening at the same time as a
+``rebase`` that has real commits to cross, through one request permit.** A lone sequential writer at
+cap 1 is fine. A fork pool is NOT required (``--no-forks`` deadlocks too); forks only change which
+call is caught holding the permit. Raising the value to 2 clears it completely under identical load,
+which is the cleanest evidence that the value itself is the trigger.
 
 It stranded five compute clusters for four days and cost roughly 177 units of work, because the
 operations that never return are the same ones our recovery path used.
@@ -32,23 +33,24 @@ operations that never return are the same ones our recovery path used.
 
 ## Reproduction
 
-Reliable in about four minutes, but **only with the full write path**, not with a small script.
+**Standalone script, ~130 statements, depending only on icechunk, zarr, numpy and an S3 bucket:
+`mre_v3_fork_pool.py`, staged with the upstream issue rather than committed here.** It reproduced on
+the first attempt, and on both 2.1.1 and 2.2.0.
 
-The reproducing workload is our shard writer: four coordinator processes, each spawning eight fork
-worker processes that receive a *pickled* session and write large shard objects through their own
-repository handle, while the coordinator concurrently rebases its session and then commits the
-merged result. Every one of those 36 processes opens the repository with
-`max_concurrent_requests = 1`. Three of the four coordinators parked within about three minutes of
-the write phase starting and never recovered.
+| arm | outcome |
+|---|---|
+| cap 1 | two to three of four coordinator processes park **permanently** in `commit`/`merge` with the background `rebase` parked; native frames identical across dumps 86-127 s apart; ~3 CPU ticks in 20 minutes |
+| cap 1, `--no-forks` | also deadlocks — the fork pool is not the necessary ingredient |
+| cap 2, identical load | clean in ~100 s, with 66 catch-ups that each did real work |
 
-The harness is `prod_scale_repro.py` in the `wedge_repro` scoping directory on the unmerged branch
-`dev/publication-density-harness`: `--arm reproduce --max-concurrent-requests 1 --process-shape
-production --coordinators 4 --cells-per-coordinator 1 --live-shards 200 --n-workers 8`.
+A runtime census of a parked process: all 191 tokio worker threads idle in `park_internal`. Nothing
+in flight, nothing on the network.
 
-### What does NOT reproduce it
-
-All four were written and run against real S3 at `max_concurrent_requests = 1`. All four completed
-cleanly.
+**Why the four earlier reductions failed, which is the useful part.** None of them had a write
+running concurrently with a rebase that had real work to do; in one, the rebase kept
+short-circuiting with "No rebase is needed" because the branch tip had not moved. A control whose
+catch-ups have nothing to cross proves nothing, and that is what made this look irreducible for a
+day. All four ran against real S3 at `max_concurrent_requests = 1` and all four completed cleanly:
 
 | reduction | result |
 |---|---|
@@ -57,14 +59,21 @@ cleanly.
 | one process, one commit carrying 4,096 chunk references | no deadlock, committed in 0.7 s |
 | one process committing while a background thread holds a read-only session and lists nodes | no deadlock, committed in under 0.02 s |
 
-So: cross-process commit contention alone is not sufficient, a background rebase is not sufficient,
-commit size and manifest fan-out are not sufficient, and read concurrency within a process is not
-sufficient. The element present in the reproducing path and absent from every reduction is the fork
-pool — many processes per coordinator, each on a pickled session, each capped at 1, writing
-concurrently while their coordinator rebases and commits.
-
 **A local-filesystem store can never show this**, because `max_concurrent_requests` governs HTTP
 request concurrency and is therefore inert without an object store.
+
+**Tooling note.** `py-spy --native` failed with `UNW_EBADREG` on the reproducing host; `gdb` gave
+the native frames.
+
+### Our own workload, for the record
+
+The fault was first pinned with the full write path: four coordinator processes, each spawning eight
+fork workers that receive a *pickled* session and write large shard objects through their own
+repository handle, while the coordinator concurrently rebases its session and commits the merged
+result. All 36 processes opened the repository at `max_concurrent_requests = 1`, and three of four
+coordinators parked within about three minutes and never recovered. The harness is
+`prod_scale_repro.py` in the `wedge_repro` scoping directory on the unmerged branch
+`dev/publication-density-harness`.
 
 ### Also reproduces on the current release, 2.2.0
 
@@ -124,7 +133,9 @@ A hypothesis, not a diagnosis: a single in-flight operation appears to need more
 request internally, so with exactly one permit available it holds that permit while awaiting a
 second that cannot be granted. That would explain why 2 is sufficient, why a lone sequential writer
 is unaffected, and why the deadlock lands inside the rebase-and-commit path, which is the part that
-fans out across snapshot and manifest objects.
+fans out across snapshot and manifest objects. The reproducer sharpens it: what is needed is a write
+in flight AT THE SAME TIME as a rebase with real commits to cross, which is exactly the pair that
+would contend for one permit.
 
 ## Why it mattered so much
 

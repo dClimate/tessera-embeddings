@@ -43,7 +43,8 @@ completion mark.
 > `max_concurrent_requests = 1` — the value our S3-budget split produces on a wide campaign
 > (`per_worker_s3_cap: 1` in the live assembly summary). Reproduced on real S3 with native stacks
 > (the `wedge_repro` harness on the unmerged branch `dev/publication-density-harness`, run
-> `repro-main-05`): under concurrent writers, `Session.commit`
+> `repro-main-05`; since reduced to a ~130-statement standalone script staged with the upstream
+> issue): under concurrent writers, `Session.commit`
 > AND `Repository.diff`/`rebase` park forever in icechunk's tokio runtime; a control at cap 2, load
 > identical, publishes cleanly. Bisection: cap 1 deadlocks, cap ≥ 2 clean. See
 > `icechunk-max-concurrent-requests-1-deadlock.md`. Two consequences correct the analysis below:
