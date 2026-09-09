@@ -37,13 +37,7 @@ def _server_said(status: int, detail: str) -> PrefectHTTPStatusError:
 
 
 def _request_was_rejected(*fields: str) -> PrefectHTTPStatusError:
-    """The OTHER 422: FastAPI refusing the request before the concurrency router sees it.
-
-    The body shape is FastAPI's, reproduced from the two bounds the server declares on the
-    ``increment-with-lease`` body (``slots`` must be ``> 0``, ``lease_duration`` must sit within
-    ``[60, 86400]``): ``detail`` is a LIST of per-field objects, each carrying ``loc``. The hold's
-    own 422 puts a plain string there instead, which is the only thing separating them.
-    """
+    """The OTHER 422: FastAPI's own rejection, whose ``detail`` is a LIST of objects with ``loc``."""
     request = httpx.Request("POST", "http://prefect/api/v2/concurrency_limits/increment-with-lease")
     detail = [
         {"type": "greater_than", "loc": ["body", field], "msg": f"Input should be greater than 0 for {field}"}
@@ -106,29 +100,14 @@ def test_a_422_from_the_server_is_a_hold() -> None:
     assert gate_is_holding(exc)
 
 
-def test_a_lease_duration_the_server_refuses_is_not_a_hold() -> None:
-    """A ``lease_duration`` outside the server's [60, 86400] bounds shares the hold's status.
-
-    It is a permanent mistake in our own call, so holding on it parks the gate forever with a log
-    line inviting an operator to raise a limit that was never the problem. The wording arm of the
-    matcher would not have saved this: ``isinstance(cause, PrefectHTTPStatusError)`` matches every
-    Prefect HTTP error whatever it says, so the status alone decided it.
-    """
-    assert not gate_is_holding(_wrapped(_request_was_rejected("lease_duration")))
-
-
-def test_an_occupy_the_server_refuses_is_not_a_hold() -> None:
-    """``slots`` at or below zero — the same class of mistake, through the other bound."""
-    assert not gate_is_holding(_wrapped(_request_was_rejected("slots")))
+@pytest.mark.parametrize("field", ["lease_duration", "slots"])
+def test_a_request_the_server_refuses_is_not_a_hold(field: str) -> None:
+    """A malformed call is permanent, so holding on it parks the gate forever."""
+    assert not gate_is_holding(_wrapped(_request_was_rejected(field)))
 
 
 def test_a_422_whose_body_cannot_be_read_still_holds() -> None:
-    """The deliberate direction of the doubt: an unparseable 422 is treated as the server's own.
-
-    A 422 with a non-JSON body is far more likely to be the concurrency router's than FastAPI's,
-    and the two outcomes are not symmetric — a wrong hold is visible and recoverable (an operator
-    sees a gate that will not release), while a wrong propagation has already failed a cell.
-    """
+    """The doubt goes towards holding: a wrong hold is recoverable, a wrong propagation is not."""
     request = httpx.Request("POST", "http://prefect/api/v2/concurrency_limits/increment-with-lease")
     response = httpx.Response(422, content=b"<html>gateway</html>", request=request)
     try:

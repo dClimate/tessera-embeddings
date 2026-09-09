@@ -71,8 +71,8 @@ context_docs/
 │   │                                              throttle each other, and the two bounds
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
-│                                                  work queue, the wind-down, and the two gate
-│                                                  bugs behind 42 of 71 cell failures
+│                                                  wind-down, and why the fleet is not held
+│                                                  through the assembly backlog drain
 │
 └── storage/                       WRITING AND KEEPING THE RESULT
     ├── writing-to-the-global-store.md          assembly's fork pool, the session catch-up, the

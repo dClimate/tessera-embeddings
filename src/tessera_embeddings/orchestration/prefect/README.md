@@ -63,14 +63,11 @@ loop), under one of two strategies:
   bringup (minutes of billed GPU idle each), the per-worker model-load cold
   start, and the EC2 capacity roll across the whole cluster instead of per zone
   (`max_parallel_clusters=1` = a single cluster for the whole year). Zones whose
-  mosaics resolve a different S1 orbit than the session stream anyway, under their
-  own orbit, carried per cell on the work item. **A failed cell is retried on that
-  same fleet**, by going to the back of the feeder's queue rather than through a
-  second inference session — a fleet's lifetime is exactly one `run_inference`
-  call, so a per-cell retry path built and destroyed one per retried cell
-  (`context_docs/inference/the-fleet-and-the-work-source.md`). When the source has
-  nothing ready the fleet **winds down** to one actor and re-grows when work
-  arrives, so ingest and the assembly backlog never hold idle GPUs.
+  mosaics resolve a different S1 orbit stream anyway, under their own orbit. **A
+  failed cell is retried on that same fleet**, from the back of the feeder's queue
+  rather than through a second inference session; when the source has nothing ready
+  the fleet **winds down** to one actor and re-grows when work arrives
+  (`context_docs/inference/the-fleet-and-the-work-source.md`).
   The shared fleet is kept busy at the seams by **ingest look-ahead**
   (the next zones' mosaics ingest while the current one infers) and **trailing
   assembly** (a zone's shard write runs on a background thread — assembly is

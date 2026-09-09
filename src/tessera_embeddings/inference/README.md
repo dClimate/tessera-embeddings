@@ -1029,7 +1029,7 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | >50% of actor slots dead | `ActorPool.replace()` escalates log severity to ERROR / CRITICAL |
 | Replacement actor still initialising | `dispatch_idle()` queues work to it anyway — Ray buffers the call until `__init__` completes |
 | Idle actor after work drains | `ActorPool.retire_idle()` kills actors idle past `idle_grace_sec` (default 120s), freeing GPU nodes; never drops below the remaining work count, nor below the caller's `floor` |
-| Idle fleet while a chained source waits | A source answering `[]` has nothing ready right now (its next cell is still ingesting, or a failed cell is being re-ingested), so the fleet WINDS DOWN through the wait — all but one actor, the liveness floor — and re-grows through the ordinary batch machinery when work arrives. The session stays alive throughout, so nothing is torn down or rebuilt. See `context_docs/inference/the-fleet-and-the-work-source.md` |
+| Idle fleet while a chained source waits | A source answering `[]` has nothing ready right now, so the fleet WINDS DOWN through the wait — all but one ready actor, the liveness floor — and re-grows through the batch machinery when work arrives, the session staying alive throughout. See `context_docs/inference/the-fleet-and-the-work-source.md` |
 | Chunk stalls (no batch update for 5 min) | `ProgressTracker` detects per-chunk staleness; `_poll_tracker()` aborts if ≥3 chunks stall simultaneously |
 | Flow cancelled in Prefect UI | `on_cancellation` hook runs `ray down` |
 

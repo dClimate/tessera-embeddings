@@ -95,13 +95,9 @@ def _sync_session(
 ):
     """A session that drains more_work synchronously, completing every item.
 
-    ``fail`` fails a zone's tiles on every attempt. ``fail_once`` fails only its FIRST attempt,
-    which is what a transient failure now looks like from here: a retry reaches the fleet
-    through this same source rather than through a separate per-cell path, so the fake has to
-    tell attempts apart instead of telling paths apart.
-
-    ``session.rounds`` counts how many times each zone was handed to the stream — the oracle
-    for "the retry ran on the standing fleet", since there is no second session to observe.
+    ``fail`` fails a zone on every attempt, ``fail_once`` only on its first. ``session.rounds``
+    counts how many times each zone was handed to the stream — the oracle for "the retry ran on
+    the standing fleet", since there is no second session to observe.
     """
     rounds: dict[str, int] = {}
 
@@ -781,19 +777,12 @@ def test_feeder_crash_is_surfaced_not_silent_success():
         _run(_cells(3), inputs=ExplodingInputs([]), look_ahead=1)
 
 
-# --- the feeder's termination accounting ----------------------------------------------------
-#
-# Three threads add to the feeder's queue and the feeder is what decides when no more inference
-# work can arrive. The two ways of getting that wrong are asymmetric: finishing EARLY drops a
-# cell silently, finishing LATE holds a GPU cluster open. Both tests below are HANG-SHAPED, so
-# each carries its own deadline — a regression has to be a red test, not a stalled suite.
+# --- the feeder's termination accounting: finishing early drops a cell, late holds a cluster --
 
 
 def _run_with_deadline(*args, deadline_s: float = 20.0, **kwargs):
-    """Run the fill on a worker thread and fail if it does not return inside ``deadline_s``.
-
-    The failures these tests guard against present as "never finishes", which under a plain
-    call is indistinguishable from a slow suite and blocks every other test behind it.
+    """Run the fill on a worker thread; fail if it does not return. These regressions present as
+    "never finishes", which under a plain call stalls the suite instead of failing.
     """
     box: dict[str, Any] = {}
 
@@ -814,16 +803,8 @@ def _run_with_deadline(*args, deadline_s: float = 20.0, **kwargs):
 
 
 def test_a_crashed_feeder_releases_the_stream_instead_of_holding_it():
-    """A feeder that dies owes the stream an answer.
-
-    Exhaustion is read from the work queue and the undecided count rather than from the feeder
-    thread being alive, which is what stops a feeder wedged inside a caller-supplied probe from
-    holding the session, its actors and the whole GPU cluster open with no bound. The price is
-    this case: a feeder that crashes with cells still queued must clear them, or the source
-    stays unexhausted forever and the session never returns.
-
-    The oracle is that the run RETURNS (raising the feeder error), inside a deadline. Asserting
-    only the exception type would pass on a build that hangs.
+    """Exhaustion is read from shared state, not from this thread, so a feeder that dies must
+    clear the queue or the source stays unexhausted forever. The oracle is that the run RETURNS.
     """
 
     class ExplodingInputs(RecordingInputs):
@@ -835,16 +816,9 @@ def test_a_crashed_feeder_releases_the_stream_instead_of_holding_it():
 
 
 def test_the_source_exhausts_before_the_assembly_backlog_drains():
-    """Exhaustion means "no more inference", not "the cell is finished".
-
-    Whether the source is exhausted decides how long the session — and so the GPU fleet — stays
-    up. Assembly is single-threaded, needs no GPU, and may lag hours behind inference, so a
-    source that waited for it would hold a whole cluster idle through the backlog. This is not
-    hypothetical: counting a cell as undecided until its `assemble` returned made the pause
-    test's source miss exhaustion for 200 polls while one assembly was still running.
-
-    The oracle is the ORDER of two events, not a duration: the source must answer `None` while
-    an assembly is provably still parked.
+    """Exhaustion means "no more inference", not "the cell is finished" — a source that waited
+    for assembly would hold the whole fleet idle through a backlog needing no GPU. The oracle is
+    ORDER: the source answers `None` while an assembly is provably still parked.
     """
     started = threading.Event()
     release = threading.Event()
@@ -965,45 +939,25 @@ def test_the_readiest_cell_is_taken_wherever_it_sits():
 # --- in-child retry (attempts_per_cell_in_cluster) -----------------------------------------------
 
 
-def test_a_failed_cell_is_retried_in_child_and_recovers():
-    """The whole point: recovery is LOCAL, without the driver dispatching anything.
-
-    Without this the driver's retry unit is a whole dispatch, so a cell failing early
-    waits for every cluster to finish its entire list before being re-attempted.
-    """
-    events: list[str] = []
-    inputs = RecordingInputs(events)
-    session = _sync_session(fail_once={"02N"})
-    summary = _run_with_deadline(_cells(3), session=session, inputs=inputs)
-    assert summary["failed"] == 0 and summary["succeeded"] == 3
-    # The recovered cell's mosaic is cleaned, like any cell that landed.
-    assert "cleanup:02N" in events
-
-
 def test_a_retry_runs_on_the_standing_fleet_not_a_rebuilt_one():
-    """THE DEFECT THIS EXISTS FOR. A retry must reach the fleet through the live work source.
-
-    A fleet's lifetime is exactly one `run_inference` call, so a retry served by a second call
-    creates a fleet from nothing and kills it again at the end of the cell — on a cluster whose
-    GPU nodes the autoscaler has already reclaimed. Observed in production: seven retried cells,
-    seven fleet builds, each ramping from zero and ending smaller than the last.
-
-    The oracle is that the retried cell is handed to the SAME session a second time, and that
-    the session is entered exactly once for the whole run. Counting only the recovery would pass
-    on a build that rebuilt a fleet to get it.
+    """THE DEFECT THIS EXISTS FOR. A fleet's lifetime is one `run_inference` call, so a retry
+    served by a second call rebuilds one — seven retried cells meant seven fleet builds in
+    production. The oracle is both halves: the cell is re-streamed, and the session is entered
+    exactly ONCE. Counting only the recovery would pass on a build that rebuilt a fleet for it.
     """
     entries = {"n": 0}
+    events: list[str] = []
     session = _sync_session(fail_once={"02N"})
 
     def counting_session(more_work, on_item_done):
         entries["n"] += 1
         return session(more_work, on_item_done)
 
-    summary = _run_with_deadline(_cells(3), session=counting_session, inputs=RecordingInputs([]))
+    summary = _run_with_deadline(_cells(3), session=counting_session, inputs=RecordingInputs(events))
     assert entries["n"] == 1, "the retry must not open a second session — that is what rebuilds a fleet"
-    assert session.rounds["02N"] == 2, f"the failed cell must be re-streamed, rounds={session.rounds}"
-    assert session.rounds["01N"] == 1 and session.rounds["03N"] == 1, session.rounds
+    assert session.rounds == {"01N": 1, "02N": 2, "03N": 1}, session.rounds
     assert summary["failed"] == 0 and summary["succeeded"] == 3
+    assert "cleanup:02N" in events, "a recovered cell's mosaic is cleaned like any that landed"
 
 
 class _FlakyIngestInputs(RecordingInputs):
@@ -1171,12 +1125,8 @@ def test_a_base_exception_from_a_retry_still_joins_a_runner_owned_pool():
 
 
 def test_an_ingest_failure_is_re_ingested_on_retry():
-    """The attempt budget has to buy a NEW ingest, not a re-read of the dead one.
-
-    `start` is idempotent, so a cell that failed while producing its inputs keeps that
-    failure cached — and a retry that only re-plans would probe the same missing mosaic
-    every time, making `attempts_per_cell_in_cluster` worthless for exactly the transient ingest
-    failures it exists to absorb.
+    """The attempt budget must buy a NEW ingest, not a re-read of the dead one: `start` is
+    idempotent, so a retry that only re-planned would probe the same missing mosaic forever.
     """
     events: list[str] = []
     inputs = _FlakyIngestInputs(events, fail_first={"02N"})
@@ -1186,13 +1136,16 @@ def test_an_ingest_failure_is_re_ingested_on_retry():
     assert inputs.attempts["02N"] == 2, "the retry must submit a second ingest"
     assert "discard:02N" in events, "the dead attempt must be dropped before restarting"
     assert summary["failed"] == 0 and summary["succeeded"] == 3
+    # THE REVERSAL: a re-ingest belongs at the BACK of the queue, so nothing is cancelled. The
+    # old post-stream retry cleared the queue first, because its own `start` would otherwise have
+    # waited behind the whole roster; cancelling now would discard cells this run will still
+    # fill. `cancel_unstarted` survives for the crashed-session unwind alone.
+    assert "cancel_unstarted" not in events, f"a healthy run must not cancel its own ingests: {events}"
 
 
 def test_a_retry_after_inference_does_not_re_ingest():
-    """A cell that failed AFTER its inputs landed keeps the mosaic it retained.
-
-    Retention is the whole reason those cells stay eligible, so re-running their ingest
-    would redo work already on disk and re-admit budget the retention keeps out.
+    """A cell that failed AFTER its inputs landed keeps its mosaic, so re-ingesting would redo
+    work already on disk and re-admit budget the retention exists to keep out.
     """
     events: list[str] = []
     inputs = RecordingInputs(events)
@@ -1205,7 +1158,7 @@ def test_a_retry_after_inference_does_not_re_ingest():
 
 
 def test_a_deterministic_failure_survives_its_retries_and_still_raises():
-    """A retry that cannot help must not swallow the failure."""
+    """A retry that cannot help must not swallow the failure, and the budget must bound it."""
     session = _sync_session(fail={"02N"})
     with pytest.raises(RuntimeError, match="1/3 cell"):
         _run_with_deadline(
@@ -1231,47 +1184,10 @@ def test_attempts_per_cell_in_cluster_of_one_disables_the_retry():
     assert session.rounds["01N"] == 1, "no retry may run at attempts_per_cell_in_cluster=1"
 
 
-def test_a_reingest_is_not_preceded_by_cancelling_the_ingest_queue():
-    """THE REVERSAL. A re-ingest belongs at the BACK of the queue, so nothing is cancelled.
-
-    The old retry pass ran after the whole stream, when a fresh `start` would have queued
-    behind the entire roster and waited hours on a cluster that was already billing — so it
-    cleared the queue first. Now the retry re-enters the live stream: its ingest is dispatched
-    at once, waits its turn behind the roster's other ingests, and the fleet keeps consuming
-    everything else meanwhile. Cancelling those queued ingests would throw away cells that are
-    still going to be filled by this very run.
-
-    `cancel_unstarted` survives for one caller only — the unwind after a crashed session.
-    """
-    events: list[str] = []
-
-    class _ReingestFailing(RecordingInputs):
-        """01N's ingest fails once, so the retry takes the re-ingest path."""
-
-        def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
-            with self._lock:
-                self.events.append(f"wait:{zone}")
-            if zone == "01N" and "discard:01N" not in self.events:
-                raise RuntimeError("ingest failed for 01N")
-
-    out = _run_with_deadline(_cells(2), inputs=_ReingestFailing(events), attempts_per_cell_in_cluster=2)
-
-    assert "discard:01N" in events, "the retry did not re-ingest, so this proves nothing"
-    assert "cancel_unstarted" not in events, f"a healthy run must not cancel its own queued ingests: {events}"
-    assert out["failed"] == 0 and out["succeeded"] == 2, out
-
-
 def test_a_reingest_is_dispatched_while_the_stream_is_still_running():
-    """The re-ingest must go out IMMEDIATELY, concurrently with inference and assembly.
-
-    Robert's requirement: "the ingests should retry as soon as all the other ingests finish,
-    even if inference or assembly are still ongoing. We should not be waiting until everything
-    finishes to do all the retries." Deferring the dispatch to a pass at the end serialises the
-    whole ingest behind the run, which for a multi-hour ingest is the difference between a cell
-    landing in this run and waiting for the driver's next dispatch.
-
-    The oracle is ORDER within one shared event list: the discard and restart must appear
-    before the last tile is inferred.
+    """The re-ingest goes out IMMEDIATELY, concurrently with inference and assembly — deferring
+    it to a pass at the end serialises a multi-hour ingest behind the whole run. The oracle is
+    ORDER in one shared event list: the discard precedes the last tile inferred.
     """
     events: list[str] = []
 
@@ -1555,19 +1471,10 @@ def test_a_nonpositive_cap_is_refused_before_anything_expensive():
             _run(_cells(2), max_retained_failures=bad)
 
 
-# --- retries on the standing fleet: the properties the queue exists for ----------------------
-
-
 def test_an_ingest_retry_does_not_block_a_ready_cell_behind_it():
-    """THE CRUX of putting a retry at the BACK of the queue. Hang-shaped, so it has a deadline.
-
-    The feeder is strictly serial and blocks in `inputs.wait` on the cell it takes, so a retry
-    whose fresh ingest takes hours must not be waited on inline. `_readmit` therefore dispatches
-    the re-ingest and returns; the cell is only picked up once its mosaic has landed, or once
-    nothing else is left. Meanwhile the fleet keeps consuming the rest of the roster.
-
-    The oracle is that the other three cells land while the re-ingest is still parked — the
-    re-ingest is only released once they have.
+    """THE CRUX of the back of the queue. The feeder is serial and blocks in `inputs.wait`, so a
+    retry whose ingest takes hours must not be waited on inline. The oracle is that the other
+    three cells land while the re-ingest is still parked — it is released only once they have.
     """
     release = threading.Event()
     landed: list[str] = []
@@ -1608,12 +1515,8 @@ def test_an_ingest_retry_does_not_block_a_ready_cell_behind_it():
 
 
 def test_the_retained_failure_cap_does_not_close_the_gate_on_its_own_retry():
-    """A cell awaiting its retry holds a mosaic, but it must not count against the cap.
-
-    Counting it made a cell's own failure stop the feeder that was about to retry it — and at a
-    cap of one, the only thing that could have cleared the cap was the thing the cap forbade.
-    The cap exists to stop a SYSTEMATIC failure accumulating mosaics off-budget, not to stop the
-    recovery of the cell that tripped it.
+    """The cap stops a SYSTEMATIC failure accumulating mosaics, not the recovery of the cell that
+    tripped it: counting a cell awaiting retry made its own failure close the gate on it.
     """
     events: list[str] = []
     session = _sync_session(fail_once={"01N"})
@@ -1629,15 +1532,9 @@ def test_the_retained_failure_cap_does_not_close_the_gate_on_its_own_retry():
 
 
 def test_an_assembly_retry_streams_nothing_and_so_can_provision_nothing():
-    """An assembly failure is retried without touching the fleet, by construction.
-
-    It is the one phase still retried after the stream, because it is discovered on the trailing
-    thread — too late to re-admit. That is only acceptable because the retry re-runs `assemble`
-    over the tally the cell already holds: no plan, no prepare, no inference. The previous
-    version went through a per-cell path that called `run_inference`, which built and destroyed
-    a fleet for every retried cell.
-
-    The oracle is that no second round of work items reaches the session.
+    """The one phase still retried after the stream, being found too late to re-admit. Acceptable
+    only because it re-runs `assemble` over the tally already held: no plan, prepare or
+    inference. The oracle is that no second round of work items reaches the session.
     """
     seen: dict[str, int] = {}
 
@@ -1656,12 +1553,8 @@ def test_an_assembly_retry_streams_nothing_and_so_can_provision_nothing():
 
 
 def test_every_cell_is_reported_even_when_the_session_ends_early():
-    """The closing reconciliation, replacing cover the per-cell retry pass used to provide.
-
-    A tally is only accounted when it COMPLETES, so a session that returns with tiles still
-    queued — a fleet that died out from under the stream — left its cells in neither `outcomes`
-    nor `failures`, and the run reported fewer cells than it was given. Nothing was published
-    for such a cell, so this is a reporting fix rather than a data one.
+    """The closing reconciliation. A tally is only accounted when it COMPLETES, so a session
+    returning with tiles still queued left its cells in neither `outcomes` nor `failures`.
     """
 
     def quitting_session(more_work, on_item_done):

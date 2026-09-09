@@ -542,11 +542,8 @@ class TestRetireIdle:
             assert 0 not in pool._idle_since  # timer cleared for active actors
 
     def test_the_floor_keeps_a_live_actor_with_no_work_outstanding(self) -> None:
-        """The wind-down's liveness floor, tested on the pool rather than through the loop.
-
-        With no outstanding work the work-based floor permits retiring everything, and an empty
-        pool ends the dispatch loop — turning the chained session's wind-down into a teardown.
-        `floor=1` is what the loop passes while its work source is unexhausted.
+        """With no outstanding work the work-based floor permits retiring everything, and an empty
+        pool ends the dispatch loop — turning the wind-down into a teardown.
         """
         pool = _make_pool(3, idle_grace_sec=1)
         for idx in range(3):
@@ -556,9 +553,7 @@ class TestRetireIdle:
         assert pool.live_count == 1, f"the floor was not honoured: {pool.live_count} live"
 
     def test_without_a_floor_the_pool_empties(self) -> None:
-        """The complement, so the test above is known to be measuring the floor and not the
-        grace period, the exclusions or the work count.
-        """
+        """The control, so the test above is known to measure the floor and not the grace period."""
         pool = _make_pool(3, idle_grace_sec=1)
         for idx in range(3):
             pool._idle_since[idx] = time.monotonic() - 200
@@ -2327,16 +2322,9 @@ class TestChainedWorkSource:
         assert retire_mock.called  # the gate passes through to the pool
 
     def test_retirement_runs_while_the_source_is_merely_waiting(self):
-        """The wind-down. A source with nothing to give right now must not hold the fleet.
-
-        `[]` means "not yet" — the next cell is still ingesting, or a failed cell is being
-        re-ingested. Suppressing retirement for the whole of that wait held a full GPU fleet
-        idle against a multi-hour ingest, which is the most expensive way this system can wait
-        for anything. The session stays alive regardless, so ingest and the assembly backlog
-        drain carry on and the pool re-grows when work arrives.
-
-        The oracle is that retirement is offered on an iteration where the source is still
-        UNEXHAUSTED, which the previous gate forbade outright.
+        """A source answering `[]` has nothing right now, and holding a full fleet through that
+        wait is the most expensive way to wait for anything. The oracle is that retirement is
+        offered while the source is still UNEXHAUSTED, which the previous gate forbade outright.
         """
         actor = MagicMock(name="actor_0")
         seen: list[bool] = []
@@ -2382,19 +2370,10 @@ class TestChainedWorkSource:
         )
 
     def test_the_wind_down_keeps_one_actor_while_the_source_is_live(self):
-        """The wind-down must not become a teardown. One slot stays live.
-
-        The dispatch loop's own condition reads `live_count > 0`, so a pool that retired every
-        slot would END the session — `run_inference`'s `finally` fires, the ProgressTracker is
-        killed, the fleet demand is retracted, and the retry still to come has nothing to run
-        on. An empty pool also has nothing to dispatch to, so the loop would keep asking a
-        source it could never serve.
-
-        One GPU against the ~170 released is a rounding error, and it buys the property outright
-        rather than through a second timeout nobody could tune.
-
-        The oracle is that the source is polled to EXHAUSTION: the session outlives the
-        wind-down. Asserting the live count alone would pass on a build that ended early.
+        """The wind-down must not become a teardown: the loop reads `live_count > 0`, so a pool
+        that retired every slot would end the session and the retry still to come would have
+        nothing to run on. The oracle is that the source is polled to EXHAUSTION — asserting the
+        live count alone would pass on a build that ended early.
         """
         actors = [MagicMock(name=f"actor_{i}") for i in range(4)]
         config = MagicMock()
@@ -2439,17 +2418,10 @@ class TestChainedWorkSource:
         assert min(live_seen[:-1]) == 1, f"the fleet did not wind down to its floor: {live_seen}"
 
     def test_a_wound_down_pool_asks_for_actors_again_when_work_arrives(self):
-        """The other half of the wind-down: the fleet has to be able to come BACK.
-
-        The batch request is bounded by `placed_actor_slots + headroom - requested`, and retired
-        slots stay in `pool.actors` forever because the indices are the pool's identity. Passing
-        every slot ever created as `requested` therefore left a wound-down pool permanently
-        unable to ask for anything — the wind-down would have been one-way.
-
-        The fleet here is deliberately WIDER than the headroom. With a handful of retired slots
-        the bound does not bite and the mutation passes; it is `placed + headroom - requested`
-        going non-positive that freezes the pool, so the test has to start above `headroom`.
-        A real cluster retires 170-odd slots against a headroom of 25.
+        """The fleet has to come BACK. A request is bounded by `placed + headroom - requested`,
+        and retired slots stay in `pool.actors` forever, so counting them froze a wound-down pool
+        permanently. The fleet here is WIDER than the headroom, since below it the bound does not
+        bite and the mutation would pass.
         """
         actors = [MagicMock(name=f"actor_{i}") for i in range(30)]
         config = MagicMock()
@@ -2500,10 +2472,8 @@ class TestChainedWorkSource:
         assert made, "a wound-down pool never asked for another actor — the fleet could not return"
 
     def test_a_non_chained_run_still_ends_when_its_fleet_is_gone(self):
-        """The degated loop condition must not change a single-zone run.
-
-        `source_active` is False from the start when `more_work is None`, so the clause it was
-        added to cannot fire — but a mistake here would turn every plain fill into a spin.
+        """A single-zone run must still end when its fleet is gone: `source_active` is False from
+        the start when `more_work is None`, and a mistake here would spin every plain fill.
         """
         actor = MagicMock(name="actor_0")
         config = MagicMock()

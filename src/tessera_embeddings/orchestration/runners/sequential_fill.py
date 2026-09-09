@@ -37,14 +37,11 @@ that rationale, and the flow and README point here.
   fail. Measurements — 60 configured ingests running 7, and the ~1,380 tiles/hour that makes an
   assembly-released gate bind on the slowest stage: ``context_docs/campaign/campaign-plan.md`` §1.
 - **In-child retry, on the STANDING fleet**: a failed cell goes to the BACK of the feeder's
-  work queue and is served by the same session as everything else (``_readmit``, bounded by
-  ``attempts_per_cell_in_cluster``). Without an in-child retry at all the driver's retry unit is
-  a whole dispatch, so an early failure would wait for every cluster to finish its list; with
-  one that ran after the stream, every retried cell built a GPU fleet from nothing and killed it
-  again, because a fleet's lifetime is one ``run_inference`` call. An ingest failure gets a new
-  ingest dispatched immediately and non-blockingly, then waits its turn behind the roster's
-  other ingests while inference and assembly carry on. Only an ASSEMBLY failure is retried after
-  the stream, because it is discovered too late to re-admit — and it provisions nothing.
+  queue and is served by the same session as everything else (``_readmit``, bounded by
+  ``attempts_per_cell_in_cluster``). A fleet's lifetime is one ``run_inference`` call, so a retry
+  through a second call rebuilt one per cell. Only an ASSEMBLY failure is retried after the
+  stream, being discovered too late to re-admit — and it provisions nothing. Why the fleet is not
+  held through the assembly backlog: ``context_docs/inference/the-fleet-and-the-work-source.md``.
 - **Trailing assembly**: a completed zone's shard assembly runs on a background thread while
   later zones' tiles keep the GPUs busy. Assemblies serialise on one thread; a zone's mosaic
   delete is HANDED TO A SECOND POOL once its assembly lands, so the next assembly is not stuck
@@ -213,21 +210,16 @@ class _ZoneTally:
     prep: PreparedCell
     plan: ZonePlan
     remaining: int
-    #: Which attempt at this cell the streamed tiles belong to. Carried here because a tally is
-    #: the only thing the SCHEDULER thread holds when it discovers that a cell's tiles failed,
-    #: and deciding whether to re-queue the cell needs its attempt number.
+    #: Which attempt the streamed tiles belong to. Carried here because a tally is all the
+    #: SCHEDULER thread holds when it finds a cell's tiles failed, and re-queueing needs it.
     attempt: int = 1
     results: list[dict[str, Any]] = field(default_factory=list)
     failed: bool = False
 
 
-#: How long the feeder sleeps when its queue is empty but a taken cell is still undecided.
-#:
-#: A LIVENESS BELT, not a poll interval: every add to the queue and every settle notifies the
-#: condition, so the feeder normally wakes at once and this timeout expires only if a settle
-#: never arrives at all. Seconds rather than minutes so such a lapse costs a short delay rather
-#: than a stalled cluster, and long enough that a feeder waiting out a cluster's assembly
-#: backlog wakes a few times an hour rather than continuously.
+#: How long the feeder sleeps when its queue is empty but a taken cell is still undecided. A
+#: liveness belt, not a poll interval: every add and every settle notifies the condition, so this
+#: expires only if a settle never arrives at all.
 _FEEDER_WAIT_S = 5.0
 
 
@@ -308,11 +300,8 @@ def fill_zones_sequential(
             the feeder's queue and is served by the session that is already running, its mosaic
             was kept and its staged tiles resume, so it costs the tiles it actually lost.
 
-            Nothing about it provisions hardware, and that is deliberate rather than incidental.
-            A retry that ran after the stream had to call ``run_inference`` again, and a fleet's
-            lifetime is exactly one such call — so each retried cell created a fleet on a
-            cluster whose GPU nodes the autoscaler had already reclaimed, ramped it from zero
-            against the launch-rate bound, and killed it at the end of the cell.
+            Nothing about it provisions hardware, deliberately: a retry that ran after the
+            stream had to call ``run_inference`` again, and a fleet's lifetime is one such call.
 
             It covers "the work failed but the machine is fine" and nothing else; it cannot
             help when this run itself dies (a killed container, a lost Ray head, a cancelled
@@ -358,33 +347,18 @@ def fill_zones_sequential(
     failures: list[dict[str, Any]] = []
     tallies: dict[str, _ZoneTally] = {}  # run_id → tally
     ready: deque[list[WorkItem]] = deque()  # zones awaiting injection, in cell order
-    #: The feeder's own queue of cells to admit, each with the attempt number it will be taken
-    #: at. A QUEUE rather than the list it used to walk, because three threads can add to it —
-    #: the feeder (its own ingest and plan guards), the scheduler thread (a failed tally, via
-    #: ``_account_failed_inference``) and the trailing assembly thread (a failed assembly). Every
-    #: mutation is under ``lock``.
+    #: Cells still to admit, with the attempt each will be taken at. A queue rather than a list
+    #: walked once, because the scheduler thread adds to it too. Mutated only under ``lock``.
     work_queue: deque[tuple[SequentialCell, int]] = deque((cell, 1) for cell in cells)
-    #: Cells TAKEN from ``work_queue`` whose INFERENCE outcome is not yet decided — mid-plan on
-    #: the feeder thread, queued for the stream, or streaming.
+    #: Cells taken from ``work_queue`` whose INFERENCE outcome is still open. Inference, not the
+    #: whole cell: this count gates how long the work source stays unexhausted, and an
+    #: unexhausted source holds the GPU fleet — counting a cell until its assembly returned held
+    #: the fleet through the whole assembly backlog.
     #:
-    #: INFERENCE, not the whole cell: a cell handed to the assembly queue is settled at that
-    #: moment, because what this count gates is how long the work source stays unexhausted, and
-    #: an unexhausted source keeps the GPU fleet standing. Counting a cell until its assembly
-    #: returned held the fleet through the entire single-threaded assembly backlog — hours of
-    #: work that needs no GPU. An assembly that FAILS is consequently retried after the backlog
-    #: drains rather than re-admitted to the stream, which costs nothing: every tile of such a
-    #: cell is staged, so a per-cell session returns before it creates an actor.
-    #:
-    #: THE INVARIANT, and the only thing keeping the feeder's termination honest: every take
-    #: from ``work_queue`` is matched by exactly one ``_settle``, so at any instant a cell is in
-    #: exactly one of — in ``work_queue``, counted here, or decided. Read only together with
-    #: ``work_queue``, under ``lock``. Exactly one site increments it (``_take_next``) and
-    #: exactly one decrements it (``_settle``); ``_feed``'s ``finally`` abandons the count
-    #: outright, which is the one documented exception.
-    #:
-    #: The two failure modes it stands between are asymmetric, which is why it exists rather
-    #: than a simpler "has the feeder finished its list" flag: finishing EARLY silently drops a
-    #: cell that was about to be re-admitted, and finishing LATE would hold a whole GPU cluster.
+    #: THE INVARIANT: every take from ``work_queue`` is matched by exactly one ``_settle``, so a
+    #: cell is always in exactly one of — the queue, this count, or decided. One site increments
+    #: (``_take_next``), one decrements (``_settle``). Finishing early drops a cell silently;
+    #: finishing late holds a cluster.
     undecided = 0
     #: Wakes the feeder when work is added or a cell settles, so an empty queue with cells still
     #: in flight is a wait rather than a spin.
@@ -392,10 +366,9 @@ def fill_zones_sequential(
     feeder_done = threading.Event()
     feeder_error: list[BaseException] = []  # an exception outside the per-cell guards
     stop = threading.Event()  # session crashed — unwind the feeder
-    #: Set once ``session`` has RETURNED, however it returned. A cell still undecided at that
-    #: point will never be settled — nothing is left to stream it — so the feeder must stop
-    #: waiting on the count or it parks until its join times out. Distinct from ``stop``, which
-    #: means the session RAISED and the run is unwinding.
+    #: Set once ``session`` has RETURNED, however it returned: a cell still undecided then will
+    #: never be settled, so the feeder must stop waiting or it parks until its join times out.
+    #: Distinct from ``stop``, which means the session RAISED.
     session_over = threading.Event()
     # NOTHING bounds admission to the inference stream except this cap — see the module
     # docstring and the `max_retained_failures` argument above.
@@ -600,31 +573,21 @@ def fill_zones_sequential(
             _account_failed_inference(tally)
             return
         nonlocal assembly_pending
-        # SETTLED HERE, not when the assembly finishes: what ``undecided`` tracks is whether a
-        # cell's INFERENCE outcome is still open, and this cell's is now known. Settling at the
-        # end of assembly instead held the work source unexhausted for the whole assembly
-        # backlog — so the session, its actors and the GPU cluster stayed up through hours of
-        # single-threaded assembly that needs no GPU at all. Measured while building this: the
-        # pause test's source never reached exhaustion within 200 polls because it was waiting
-        # on `assemble`. An assembly that FAILS is therefore not re-admitted to the stream; it
-        # needs no fleet (every tile is staged, so a per-cell session returns before creating
-        # an actor) and is retried after the backlog drains.
+        # SETTLED HERE, not when the assembly finishes. Settling at the end of `assemble` held
+        # the work source unexhausted for the whole assembly backlog, so the session and its
+        # actors stayed up through hours of single-threaded work needing no GPU. Hence an
+        # assembly FAILURE is retried after the backlog drains rather than re-admitted — and it
+        # needs no fleet, since every tile is staged.
         _settle(tally.cell)
         with lock:
             assembly_pending += 1
         finalizer.submit(_finalize, tally)
 
     def _settle(cell: SequentialCell, *, requeue: tuple[SequentialCell, int] | None = None) -> None:
-        """One taken cell's inference outcome is now decided — landed, failed, or re-queued.
-
-        THE ONLY site that decrements ``undecided``; ``_take_next`` is the only one that
-        increments it. Keeping each to a single site is what makes the invariant above
-        checkable by eye rather than by tracing every branch of ``_feed``.
-
-        ``requeue`` re-appends the cell in the SAME lock block as the decrement, which is the
-        point of putting it here rather than at the caller: the feeder's exit predicate reads
-        the queue and the count together, so a re-admission split across two acquisitions would
-        leave an instant in which the cell is in neither and the feeder could finish on it.
+        """One taken cell's inference outcome is decided — landed, failed, or re-queued. The ONLY
+        site that decrements ``undecided`` — a single site is what makes the invariant checkable
+        by eye. ``requeue`` re-appends under the SAME lock as the decrement, so no instant exists
+        in which the cell is in neither the queue nor the count.
         """
         nonlocal undecided
         with lock:
@@ -640,28 +603,20 @@ def fill_zones_sequential(
         """A cell failed. Send it to the BACK of the work queue, or record it as final.
 
         THE SINGLE DECISION POINT for a recoverable failure, called from the feeder thread (its
-        ingest and plan guards) and from the scheduler thread (a tally whose tiles failed). Both
-        outcomes settle the cell exactly once, so the count stays balanced whichever way it goes.
+        ingest and plan guards) and the scheduler thread (a tally whose tiles failed). Both
+        outcomes settle the cell exactly once, so the count stays balanced either way.
 
-        **The back of the queue, not a pass at the end.** A retry used to run after the whole
-        stream had finished, through a per-cell path that called ``run_inference`` again — which
-        creates a fleet from nothing and kills it at the end of the cell. On a cluster whose GPU
-        nodes the autoscaler has already reclaimed that is minutes of instance launch and model
-        load per cell, and it happened once per retried cell. Re-queueing instead means the
-        standing fleet serves the retry, because the work source is still live.
+        The BACK of the queue, so the standing fleet serves the retry — a pass at the end had to
+        call ``run_inference`` again, which builds and destroys a fleet per cell.
 
-        **An ingest failure gets a NEW ingest, immediately and without blocking.** ``start`` is
-        idempotent, so a failed production attempt is remembered and a retry that only re-planned
-        would re-read the same failure and spend the attempt on nothing; ``discard`` drops it
-        first. Neither call waits for the mosaic — the adapter's own pool and the fleet-wide
-        ingest gate decide when it actually runs, so the retry queues behind the roster's other
-        ingests exactly as a fresh cell would, while inference and assembly carry on. The feeder
-        is not held either: ``_take_next`` skips a cell whose mosaic has not landed, so this one
-        is only picked up when its ingest is done or when nothing else is left.
+        An ingest failure gets a NEW ingest, dispatched here and not waited on: ``discard`` drops
+        the memoised failed attempt (``start`` is idempotent, so without it the retry re-reads
+        the same failure), then ``start`` submits. The adapter's pool and the fleet-wide ingest
+        gate decide when it runs, so the cell queues behind the roster's other ingests while
+        inference and assembly carry on, and ``_take_next`` skips it until its mosaic lands.
 
-        ``discard`` MAY RAISE by contract, and refusing the retry is the right answer when it
-        does: it means the previous child could not be confirmed stopped, and two runs writing
-        one mosaic prefix is a fault nothing downstream detects and no retry repairs.
+        ``discard`` MAY RAISE, and refusing the retry is then right: the previous child could not
+        be confirmed stopped, and two runs writing one mosaic prefix is undetectable downstream.
         """
         _record_failure(cell, phase, exc)
         _retain_failed_mosaic(cell)  # mosaic retained for resume, counted against the cap
@@ -699,10 +654,8 @@ def fill_zones_sequential(
     def _take_next() -> tuple[SequentialCell, int] | None:
         """Take the first QUEUED cell whose mosaic has LANDED, else the head. ``None`` if empty.
 
-        Readiness is probed OUTSIDE ``lock``: ``ready`` is a caller-supplied adapter method, and
-        holding the runner's lock across foreign code to save a re-acquire is not a trade worth
-        making. The index it picks stays valid because only this thread ever REMOVES from
-        ``work_queue`` — the other two threads append to the tail.
+        Readiness is probed OUTSIDE ``lock``, since ``ready`` is a caller-supplied method; the
+        index stays valid because only this thread ever REMOVES from the queue.
 
         The readiest-first rationale is in the module docstring; measured on the real coverage
         counts, a cluster's opening window spans ~4 h to ~10 h of ingest, so strict density
@@ -748,13 +701,9 @@ def fill_zones_sequential(
         try:
             while True:
                 with work_available:
+                    # Nothing to admit, but a cell already taken can still be re-queued by the
+                    # scheduler thread. Waiting rather than finishing stops it being dropped.
                     while not work_queue and undecided > 0 and not stop.is_set() and not session_over.is_set():
-                        # Nothing to admit right now, but a cell already taken can still come
-                        # back: the scheduler thread re-queues a failed tally and the trailing
-                        # thread re-queues a failed assembly. Waiting here rather than finishing
-                        # is what stops such a cell being dropped. The timeout is a liveness
-                        # belt against a settle that never arrives, not a poll — every add and
-                        # every settle notifies.
                         work_available.wait(timeout=_FEEDER_WAIT_S)
                     if not work_queue or session_over.is_set():
                         return
@@ -765,13 +714,9 @@ def fill_zones_sequential(
                 # a systematic failure would otherwise keep freeing slots and pile up every
                 # cluster's multi-TB input.
                 #
-                # A cell AWAITING ITS RETRY is not counted, and that exclusion is load-bearing
-                # now that a retry comes back through this queue. Its mosaic is retained the
-                # same way, but as work in progress rather than as a stuck failure: it will
-                # either land (and have its mosaic deleted) or be recorded terminally, at which
-                # point it counts. Counting it here instead let a cell's own failure close the
-                # gate on its own retry — at a low cap, a deadlock in which the one thing that
-                # would clear the cap is the one thing the cap forbids.
+                # `retained_failed` holds TERMINAL failures only, so a cell awaiting its retry is
+                # absent by construction — counting one let a cell's own failure close the gate on
+                # its own retry, which at a low cap is a deadlock.
                 with lock:
                     awaiting_retry = {(cell.zone, cell.year) for cell, _ in work_queue}
                     n_failed = len(retained_failed - awaiting_retry)
@@ -802,9 +747,8 @@ def fill_zones_sequential(
                             }
                             for cell, _ in work_queue
                         )
-                        # EMPTIED, not just abandoned: the queue is half of the exhaustion
-                        # predicate the session reads, so leaving cells on it would keep the
-                        # stream alive forever waiting for work this feeder has just refused.
+                        # EMPTIED: the queue is half the exhaustion predicate, so cells left on
+                        # it would keep the stream waiting for work the feeder has refused.
                         work_queue.clear()
                         work_available.notify_all()
                     return
@@ -886,8 +830,8 @@ def fill_zones_sequential(
                                 cell.year,
                             )
                             _leak_mosaic(cell)
-                    # Terminal plans are DECIDED — committed, tagged and recorded inside
-                    # `plan()`. Nothing streams for them, so no later thread will settle them.
+                    # Terminal plans are DECIDED inside `plan()`, and nothing streams for them,
+                    # so no later thread will settle them.
                     _settle(cell)
                     continue
                 assert restored is not None  # only None on the terminal path, which continued
@@ -944,24 +888,19 @@ def fill_zones_sequential(
             feeder_error.append(exc)
             log.error("Zone feeder crashed — remaining cells were not enqueued: %s", exc, exc_info=exc)
         finally:
-            # RELEASE THE STREAM. The session reads exhaustion from the queue and the undecided
-            # count (see `_prepared_zone`), not from this thread being alive — deliberately, so
-            # that a feeder stuck inside a probe cannot hold a GPU cluster open. The price is
-            # that a feeder which DIES owes the stream an answer: without this, cells left on
-            # the queue and cells taken but never settled would keep the source unexhausted
-            # forever and the session would never return.
+            # RELEASE THE STREAM. Exhaustion is read from the queue and the count, not from this
+            # thread being alive, so a feeder that DIES owes the stream an answer — without this
+            # the source stays unexhausted forever and the session never returns.
             with lock:
                 abandoned = [cell for cell, _ in work_queue]
                 work_queue.clear()
-                # The one site that touches `undecided` outside the take/settle pair, and it
-                # ABANDONS the count rather than balancing it: a crashed feeder cannot know
-                # which of the cells it had taken will still be settled by another thread.
+                # Abandons the count rather than balancing it: a crashed feeder cannot know
+                # which of the cells it took another thread will still settle.
                 undecided = 0
                 work_available.notify_all()
             if abandoned:
-                # RECORDED, not merely logged: an abandoned cell that appears in neither
-                # `outcomes` nor `failures` makes this run report fewer cells than it was
-                # given, and the campaign driver reads that report.
+                # RECORDED, not merely logged: a cell in neither `outcomes` nor `failures` makes
+                # this run report fewer cells than it was given, and the driver reads that.
                 with lock:
                     failures.extend(
                         {
@@ -982,11 +921,9 @@ def fill_zones_sequential(
     def _prepared_zone() -> list[WorkItem] | None:
         """One prepared zone, ``[]`` if none is ready YET, ``None`` once none can be.
 
-        Exhaustion is read from the SHARED state — an empty work queue with nothing undecided —
-        rather than from ``feeder_done``. Keying it on the feeder thread having exited meant a
-        feeder wedged inside a caller-supplied probe held the session, its actors and the whole
-        GPU cluster open with no bound; the predicate here is false only while real work is
-        outstanding, and a feeder that dies releases it explicitly (see ``_feed``'s ``finally``).
+        Exhaustion is read from the SHARED state — empty queue, nothing undecided — not from
+        ``feeder_done``: a feeder wedged inside a caller-supplied probe would otherwise hold the
+        session, its actors and the cluster open with no bound.
         """
         with lock:
             if ready:
@@ -1048,9 +985,8 @@ def fill_zones_sequential(
         session_raised = True
         raise
     finally:
-        # The feeder waits on cells it has already taken, and nothing will settle them now that
-        # the session has returned — so tell it before joining, or it parks for the full join
-        # timeout on every run that ends with work in flight.
+        # Nothing will settle the cells the feeder took now that the session has returned, so
+        # tell it before joining or it parks for the full join timeout.
         with work_available:
             session_over.set()
             work_available.notify_all()
@@ -1109,17 +1045,12 @@ def fill_zones_sequential(
                 "(unattempted cells remain pending for the next campaign pass)"
             ) from feeder_error[0]
 
-        # THE CLOSING RECONCILIATION. Every cell must be reported as either succeeded or
-        # failed, which is what the summary below asserts and what the campaign driver reads.
-        # A tally is only accounted when it COMPLETES (`_submit_assembly` fires at
-        # `remaining <= 0`), so a session that returned with tiles still queued — a fleet that
-        # died out from under the stream, a source held past the end — left its cells in
-        # neither list and the run silently reported fewer cells than it was given. This
-        # replaces the cover the per-cell retry pass used to provide by re-attempting them.
-        #
-        # It is a REPORTING fix, not a data one: such a cell never reached `_submit_assembly`,
-        # so nothing was assembled or published for it, and even a tally that did complete with
-        # a tile missing is refused by `verify_staged_completeness` inside the assembly.
+        # THE CLOSING RECONCILIATION, replacing cover the deleted retry pass provided. A tally
+        # is only accounted when it COMPLETES, so a session that returned with tiles still queued
+        # left its cells in neither `outcomes` nor `failures` and the run reported fewer cells
+        # than it was given. A REPORTING fix: such a cell never reached `_submit_assembly`, so
+        # nothing was published, and a completed tally missing a tile is refused by
+        # `verify_staged_completeness` inside the assembly anyway.
         with lock:
             abandoned_tallies = [t for t in tallies.values() if t.remaining > 0]
         for tally in abandoned_tallies:
@@ -1128,25 +1059,15 @@ def fill_zones_sequential(
             )
             _retain_failed_mosaic(tally.cell)
 
-        # ---------------------------------------------------------------------
-        # In-child retry of the cells whose ASSEMBLY failed.
+        # In-child retry of the cells whose ASSEMBLY failed — the one phase not retried on the
+        # stream, because its failures surface on the trailing thread after the feeder has been
+        # joined. This pass CANNOT provision anything, which is the property that matters: it
+        # re-runs `assemble` over the tally the cell already holds, with no plan, prepare or
+        # inference, so no edit here can build a fleet.
         #
-        # Every other phase is retried ON THE STREAM now (see `_readmit`), which is the whole
-        # point of the queue: a retry runs on the fleet that is already standing instead of
-        # rebuilding one. Assembly is the exception, and only because of WHEN its failures are
-        # discovered — on the trailing thread, potentially long after the last tile inferred and
-        # after the feeder has been joined, so there is no live stream left to re-admit them to.
-        #
-        # This pass CANNOT provision anything, which is the property that matters. It re-runs
-        # `assemble` over the tally the cell already has — no plan, no prepare, no inference —
-        # so a fleet cannot be built here however this code is edited later. The previous
-        # version went through the per-cell `infer_single` path, which called `run_inference`
-        # and so created and destroyed a fleet for every retried cell.
-        #
-        # SAME-ZONE SAFETY, unchanged: the single assembly thread has been joined by now, so a
-        # retry of (Z, y) cannot collide with this child's own (Z, y+1); across children the
-        # partition is zone-disjoint. The mosaic-cleanup pool is deliberately still alive, since
-        # `assemble` hands its staging delete to it.
+        # SAME-ZONE SAFETY, unchanged: the single assembly thread has been joined, so a retry of
+        # (Z, y) cannot collide with this child's own (Z, y+1), and across children the partition
+        # is zone-disjoint. The mosaic-cleanup pool is still alive because `assemble` uses it.
         if attempts_per_cell_in_cluster >= 2:
             with lock:
                 failed_assembly = {(f["zone"], f["year"]) for f in failures if f["phase"] == "assembly"}
