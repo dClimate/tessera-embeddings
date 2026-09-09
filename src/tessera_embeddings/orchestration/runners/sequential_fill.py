@@ -285,12 +285,19 @@ def fill_zones_sequential(
             (no starts, no waits, no cleanup).
         paused: Asked before each hand-over whether inference is paused. While it answers true
             no further cell enters the stream: the chunks already queued run to completion and
-            land, the actors stay alive holding nothing, and the session does not finish. Two
-            properties elsewhere make an indefinite hold safe, and both are load-bearing —
-            idle actors are retired only once the source reports EXHAUSTED (so a paused fleet
-            keeps the actors a resume needs, and is billed for them), and a finished chunk is
-            removed from the progress tracker (so a drained fleet has no entry whose staleness
-            could grow into the systemic-stall abort).
+            land, and the session does not finish.
+
+            **What happens to the FLEET depends on whether the pause is holding work.** A pause
+            over inference work that is available right now — a prepared zone, or a queued cell
+            whose mosaic has landed — keeps the actors, because withheld work is not absent work
+            and a resume must be immediate. A pause over an empty queue, or over cells that are
+            still ingesting or only need assembly, is genuinely no work: the fleet winds down
+            after the idle grace exactly as it does in a drought, and a resume ramps back through
+            the normal batch requests inside the same session (no teardown, no rebuild). The
+            distinction is made by ``_source_has_work``, not by asking whether a pause is on.
+
+            A finished chunk is removed from the progress tracker, so a drained fleet has no
+            entry whose staleness could grow into the systemic-stall abort.
 
             Cheap and fail-open by contract (see ``pause_signal``): a loop that has to ask
             permission to work must never stop working because the asking failed. ``None``
@@ -383,6 +390,11 @@ def fill_zones_sequential(
     #: else reads it: a cap trip does not signal teardown and does not abandon queued work.
     #: See ``_retain_failed_mosaic`` for why ending a fill is a campaign-manager decision.
     cap_alerted = False
+    #: Cells whose failure is TERMINAL — no attempt left, or refused a retry — and which are
+    #: therefore holding a mosaic off-budget with nothing coming to clear it. A cell awaiting its
+    #: retry is deliberately absent: its mosaic is retained the same way, but as work in progress.
+    #: Counting one here let a cell's own failure trip the cap and stop the feeder that was about
+    #: to retry it, which at a low cap is a deadlock.
     retained_failed: set[tuple[str, int]] = set()
     #: Cells that LANDED but whose mosaic delete failed. Tracked apart from
     #: ``retained_failed`` because these must not stop the feeder — see ``_leak_mosaic``.
@@ -619,8 +631,8 @@ def fill_zones_sequential(
         be confirmed stopped, and two runs writing one mosaic prefix is undetectable downstream.
         """
         _record_failure(cell, phase, exc)
-        _retain_failed_mosaic(cell)  # mosaic retained for resume, counted against the cap
         if attempt >= attempts_per_cell_in_cluster or stop.is_set():
+            _retain_failed_mosaic(cell)  # terminal: the mosaic is now held with nothing coming
             _settle(cell)
             return
         if phase == "inputs/prepare" and inputs is not None:
@@ -635,12 +647,16 @@ def fill_zones_sequential(
                     cell.year,
                     exc_info=True,
                 )
+                _retain_failed_mosaic(cell)  # the retry was refused, so this failure is terminal
                 _settle(cell)
                 return
         # Dropped BEFORE the re-queue: a cell in flight for a retry must carry at most one
-        # failure record, or the closing reconciliation would name it twice and the summary
-        # would count one cell as two failures.
+        # failure record, or the closing reconciliation would name it twice. It leaves
+        # `retained_failed` for the same reason — that set is terminal failures only, and a cell
+        # about to be retried must not trip the cap against its own retry.
         _clear_failure(cell)
+        with lock:
+            retained_failed.discard((cell.zone, cell.year))
         log.warning(
             "Cell %s-%d failed during %s — re-queued for attempt %d/%d on the standing fleet",
             cell.zone,
@@ -698,6 +714,10 @@ def fill_zones_sequential(
         ``undecided`` for why both halves are needed.
         """
         nonlocal undecided
+        #: Set once the retained-failure cap has refused the rest of the roster. New cells stop
+        #: being admitted; cells already streaming still get their answer, and a retry of one of
+        #: them is still taken — it adds no mosaic the cap has not already counted.
+        admission_closed = False
         try:
             while True:
                 with work_available:
@@ -715,12 +735,10 @@ def fill_zones_sequential(
                 # cluster's multi-TB input.
                 #
                 # `retained_failed` holds TERMINAL failures only, so a cell awaiting its retry is
-                # absent by construction — counting one let a cell's own failure close the gate on
-                # its own retry, which at a low cap is a deadlock.
+                # absent by construction.
                 with lock:
-                    awaiting_retry = {(cell.zone, cell.year) for cell, _ in work_queue}
-                    n_failed = len(retained_failed - awaiting_retry)
-                if inputs is not None and n_failed >= max_retained_failures:
+                    n_failed = len(retained_failed)
+                if inputs is not None and n_failed >= max_retained_failures and not admission_closed:
                     # NOT the `FAILURE CAP EXCEEDED` prefix: `_retain_failed_mosaic` already
                     # emitted that once for this event, and monitoring matches on the text — a
                     # second line with the same prefix would double-count one cap event.
@@ -729,7 +747,7 @@ def fill_zones_sequential(
                         "off-budget; %d cell(s) left unattempted, which stay pending for the next "
                         "campaign pass. This run finishes its in-flight work normally.",
                         n_failed,
-                        len(pending),
+                        sum(1 for _, n in work_queue if n == 1),
                     )
                     # Recorded as failures, not just logged: the cells that triggered the cap
                     # can RECOVER in the in-child retry pass, and if every one does `failures`
@@ -738,6 +756,12 @@ def fill_zones_sequential(
                     # protection, but a child that under-reports its outcome is not worth
                     # shipping.
                     with lock:
+                        # NEVER-ATTEMPTED cells only. An entry at attempt > 1 is a RETRY of a
+                        # cell this run already took, holding a mosaic the cap has already
+                        # counted, so refusing it would abandon recoverable work and report a
+                        # streaming cell as never admitted. The cap gates new admissions.
+                        refused = [(cell, n) for cell, n in work_queue if n == 1]
+                        keep = [(cell, n) for cell, n in work_queue if n > 1]
                         failures.extend(
                             {
                                 "zone": cell.zone,
@@ -745,13 +769,19 @@ def fill_zones_sequential(
                                 "phase": "unattempted",
                                 "error": "never admitted: the feeder stopped at the retained-failure cap",
                             }
-                            for cell, _ in work_queue
+                            for cell, _ in refused
                         )
-                        # EMPTIED: the queue is half the exhaustion predicate, so cells left on
-                        # it would keep the stream waiting for work the feeder has refused.
                         work_queue.clear()
+                        work_queue.extend(keep)
                         work_available.notify_all()
-                    return
+                    # NOT a return. The cap closes ADMISSION of new cells; it does not end the
+                    # feeder, which still owes an answer to every cell already streaming. Ending
+                    # here ran the crash release — draining the queue and abandoning the count —
+                    # so a later `_readmit` appended work after the feeder was gone and the
+                    # source either polled `[]` forever or had already exhausted and skipped the
+                    # retry silently. The loop continues on the ordinary termination predicate.
+                    admission_closed = True
+                    continue
                 # Start ingests for every pending cell before choosing, so the pick can only
                 # ever be a cell whose ingest is already under way.
                 _start_ingests(pending)
@@ -864,6 +894,10 @@ def fill_zones_sequential(
                     prep.run_id,
                     prep.config.time_window,
                     prep.config.s1_orbit,
+                    # The scheduler's per-chunk retry budget keys on this: a re-admitted cell
+                    # reuses its run_id and labels, so without it the new attempt inherits the
+                    # exhausted counts of the one that failed.
+                    attempt,
                 )
                 with lock:
                     tallies[prep.run_id] = tally
@@ -932,15 +966,47 @@ def fill_zones_sequential(
                 return None
         return []  # nothing ready YET (ingest/plan still running) — keep polling
 
+    def _source_has_work() -> bool:
+        """Is there INFERENCE work available right now that a ``[]`` poll merely withheld?
+
+        Asked by the scheduler whenever the poll comes back empty, and it is what stops an
+        operator pause being read as a drought. Withheld work is not absent work, so the fleet
+        is kept for it; genuine absence lets the fleet wind down.
+
+        INFERENCE work, specifically. A prepared zone on ``ready`` is exactly that. A queued cell
+        whose mosaic has LANDED counts too — the feeder plans it within seconds and enqueues its
+        tiles — and if it plans out terminal (already complete, all ocean) the next poll sees
+        nothing and the fleet winds down one grace period later, so the over-hold is bounded by
+        one plan. Nothing else counts: a cell whose ingest is still running is future work rather
+        than available work, and a cell awaiting assembly is in neither structure, having been
+        settled when it was handed to the assembly queue.
+
+        Non-blocking, as the scheduler requires: ``ready`` is a probe with no I/O.
+        """
+        with lock:
+            if ready:
+                return True
+            queued = [cell for cell, _ in work_queue]
+        if not queued:
+            return False
+        if inputs is None:
+            return True  # mosaics exist upstream, so a queued cell is immediately admissible
+        for cell in queued:
+            try:
+                if inputs.ready(cell.zone, cell.year):
+                    return True
+            except Exception:  # a broken probe must not decide the fleet's fate either way
+                log.warning("Readiness probe failed for %s-%d", cell.zone, cell.year, exc_info=True)
+        return False
+
     def _more_work() -> list[WorkItem] | None:
         """Scheduler-thread source: one prepared zone per poll, None = done."""
         # An operator pause is checked BEFORE the source is consulted, and returns the
         # "nothing ready yet" answer rather than the "exhausted" one. Both halves matter: not
         # consulting keeps the prepared zone on the queue (a hand-over REMOVES it, so asking
         # and discarding would delete prepared work), and `[]` rather than `None` keeps the
-        # session alive with its actors — `None` would retire the fleet and finalize the run,
-        # a teardown rather than a pause. This is the same site and contract the starvation
-        # drill withholds from, which makes "actors stay, nothing fails" tested, not hoped for.
+        # session alive — `None` would finalize the run, a teardown rather than a pause. Whether
+        # the ACTORS are kept through the pause is answered separately, by `_source_has_work`.
         if paused is not None and paused():
             return []
         # The fault takes the source as a CALLABLE, so a withheld poll never asks for a zone:
@@ -969,6 +1035,12 @@ def fill_zones_sequential(
         look_ahead,
         session_s1_orbit,
     )
+    #: Published ON the source callable rather than as a third ``session`` argument, so the
+    #: two-argument contract every caller and fake already implements is untouched. The flow's
+    #: session reads it back with ``getattr(more_work, "has_work", None)`` and hands it to
+    #: ``run_inference``; a caller that ignores it simply gets ``[]`` taken at face value.
+    _more_work.has_work = _source_has_work  # type: ignore[attr-defined]
+
     feeder = threading.Thread(target=_feed, name="zone-feeder", daemon=True)
     feeder.start()
     #: Set when `session` raises, because that path re-raises out of the `finally` below and
@@ -1068,13 +1140,22 @@ def fill_zones_sequential(
         # SAME-ZONE SAFETY, unchanged: the single assembly thread has been joined, so a retry of
         # (Z, y) cannot collide with this child's own (Z, y+1), and across children the partition
         # is zone-disjoint. The mosaic-cleanup pool is still alive because `assemble` uses it.
-        if attempts_per_cell_in_cluster >= 2:
+        for _round in range(attempts_per_cell_in_cluster):
             with lock:
                 failed_assembly = {(f["zone"], f["year"]) for f in failures if f["phase"] == "assembly"}
                 by_cell = {(t.cell.zone, t.cell.year): t for t in tallies.values() if not t.failed}
-            for key in sorted(failed_assembly & by_cell.keys()):
+            # BUDGETED per cell, from where inference left it. A cell that already spent attempt
+            # 2 on the stream has none left, and a limit above 2 buys more than one reassembly —
+            # a single unconditional pass got both wrong in opposite directions.
+            pending_assembly = sorted(
+                key for key in failed_assembly & by_cell.keys() if by_cell[key].attempt < attempts_per_cell_in_cluster
+            )
+            if not pending_assembly:
+                break
+            for key in pending_assembly:
                 tally = by_cell[key]
                 cell = tally.cell
+                tally.attempt += 1
                 try:
                     handoff = complete_zone_inference(tally.plan, results=tally.results)
                     _record_outcome(assemble(handoff, tally.prep))

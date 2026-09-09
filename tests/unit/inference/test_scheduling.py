@@ -373,11 +373,12 @@ class TestSubmit:
             item, actor_idx = pool.pending[ref]
             assert (item.chunk.label, actor_idx) == ("c0", 0)
             assert item.ctx == _sched_mod.ZoneContext("s3://mosaic", "s3://stage", "run1")
-            # Attempts are keyed run_id-qualified: bare labels collide across
-            # a chained session's zones.
-            assert pool.chunk_attempts["run1:c0"] == 1
+            # The retry budget is keyed run_id-qualified (bare labels collide across a chained
+            # session's zones) AND attempt-qualified, so a re-admitted cell gets a fresh budget
+            # rather than inheriting the exhausted counts of the attempt that failed.
+            assert pool.chunk_attempts["a1:run1:c0"] == 1
             pool.submit(0, chunk, "s3://mosaic", "s3://stage", "run1", tracker=None)
-            assert pool.chunk_attempts["run1:c0"] == 2
+            assert pool.chunk_attempts["a1:run1:c0"] == 2
 
 
 class TestReservations:
@@ -2596,3 +2597,83 @@ class TestChunkUid:
         )
         assert za.chunk.label == zb.chunk.label  # labels collide across zones...
         assert za.uid != zb.uid  # ...but the run-qualified uids do not
+
+
+# ===========================================================================
+# State that used to die with each run_inference call and now outlives a cell
+# ===========================================================================
+
+
+class TestSessionScopedStateIsNotPerCell:
+    """A standing session means pool state outlives the cell that created it. Every quantity
+    keyed on "this cell" or "every slot ever made" has to be re-derived or attempt-qualified.
+    """
+
+    def test_the_fleet_demand_publisher_reports_the_wound_down_fleet(self) -> None:
+        """ONE definition of "requested", so the publisher and the batch request cannot diverge.
+
+        The publisher used to send every slot ever created, so a 173-to-1 wind-down advertised
+        ~198 GPUs instead of ~26 — defeating launch pacing and driving the fallback fleet against
+        the account launch quota. The oracle is what actually reaches `fleet.send`.
+        """
+        actors = [MagicMock(name=f"actor_{i}") for i in range(30)]
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        config.actor_request_batch_size = 0  # no batching; only the publisher is under test
+        config.num_gpus = 1.0
+        fleet = MagicMock(name="fleet")
+        polls = {"n": 0}
+
+        def retire_most(self_pool, outstanding, floor=0):
+            self_pool._retired.update(range(max(floor, 1), len(self_pool.actors)))
+
+        def more_work():
+            polls["n"] += 1
+            return None if polls["n"] > 3 else []
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
+            patch.object(_sched_mod.ray, "get", return_value=MagicMock()),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.time, "sleep"),
+            patch.object(_sched_mod.ActorPool, "retire_idle", retire_most),
+        ):
+            _process_chunks_work_stealing(
+                actors=actors,
+                actor_instance_ids=["i-0000"] * len(actors),
+                chunks=[],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                log=logging.getLogger("test"),
+                more_work=more_work,
+                fleet=fleet,
+                total_actors_target=60,
+            )
+        published = [c.kwargs["requested"] for c in fleet.send.call_args_list if "requested" in c.kwargs]
+        assert published, "the publisher was never called, so this proves nothing"
+        assert published[-1] == 1, f"the wound-down fleet must not advertise retired slots: {published}"
+
+    def test_a_reused_uid_gets_a_fresh_retry_budget_on_a_new_attempt(self) -> None:
+        """A re-admitted cell reuses its run_id (staging resume needs that) and its labels, so
+        the uid is unchanged; without attempt-qualification the new attempt inherits the
+        exhausted counts and its first transient failure is declared permanent at once.
+        """
+        chunk = _fake_chunk("c0")
+        first = _sched_mod.WorkItem(chunk=chunk, ctx=_sched_mod.ZoneContext("m", "s", "run1", attempt=1))
+        second = _sched_mod.WorkItem(chunk=chunk, ctx=_sched_mod.ZoneContext("m", "s", "run1", attempt=2))
+        assert first.uid == second.uid, "the tracker key must NOT change — the actor builds it too"
+        assert first.retry_key != second.retry_key, "the retry budget must be per attempt"
+
+    def test_the_liveness_floor_counts_only_dispatchable_actors(self) -> None:
+        """`live_count` includes initializing slots, which retire_idle skips and which cannot
+        dispatch. A floor satisfied by slots that may never place retires the last usable actor.
+        """
+        pool = _make_pool(4, idle_grace_sec=1)
+        for idx in range(4):
+            pool._idle_since[idx] = time.monotonic() - 200
+        pool._initializing.update({1, 2, 3})  # one ready actor, three still coming up
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=0, floor=1)
+        assert pool.ready_count == 1, f"the only dispatchable actor was retired: {pool._retired}"

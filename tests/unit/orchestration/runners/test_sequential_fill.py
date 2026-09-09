@@ -1572,3 +1572,213 @@ def test_every_cell_is_reported_even_when_the_session_ends_early():
     assert "never ran before the stream ended" in message, message
     # The invariant the summary asserts: nothing silently vanishes.
     assert "01N" in message, message
+
+
+# --- review findings: state that now outlives the cell, and the cap exit ---------------------
+
+
+def test_a_transient_failure_gets_a_fresh_chunk_retry_budget_on_its_new_attempt():
+    """A re-admitted cell reuses its run_id and labels, so the scheduler's per-chunk budget must
+    be attempt-qualified or the new attempt starts already exhausted. Asserted through the
+    runner: the ZoneContext it builds for the retry must carry the new attempt number.
+    """
+    seen: list[int] = []
+
+    def session(more_work, on_item_done):
+        results: list[dict] = []
+        while True:
+            batch = more_work()
+            if batch is None:
+                return results
+            for item in batch:
+                seen.append(item.ctx.attempt)
+                broken = item.ctx.attempt == 1
+                result = {"chunk": item.chunk.label, "status": "failed" if broken else "success"}
+                results.append(result)
+                on_item_done(item, result)
+
+    out = _run_with_deadline(_cells(1), session=session, inputs=RecordingInputs([]))
+    assert sorted(set(seen)) == [1, 2], f"the retry must stream under a NEW attempt: {seen}"
+    assert out["failed"] == 0 and out["succeeded"] == 1, out
+
+
+def test_a_cell_awaiting_its_retry_is_not_a_retained_failure():
+    """`retained_failed` is TERMINAL failures only. While a cell is between attempts its mosaic
+    is retained the same way, but as work in progress — counting it there let the cap stop the
+    feeder mid-retry and abandon the rest of the roster, which at a cap of 1 is a deadlock.
+
+    Deterministic because the failure is an INGEST failure, raised inside the feeder itself, so
+    the very next cap check provably sees whatever the retained set holds while the rest of the
+    roster is still queued.
+    """
+    events: list[str] = []
+
+    class _FirstIngestFailsOnce(RecordingInputs):
+        def ready(self, zone: str, year: int) -> bool:
+            return True
+
+        def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+            with self._lock:
+                self.events.append(f"wait:{zone}")
+                first = zone == "01N" and "discard:01N" not in self.events
+            if first:
+                raise RuntimeError("ingest failed for 01N")
+
+    out = _run_with_deadline(
+        _cells(4),
+        inputs=_FirstIngestFailsOnce(events),
+        max_retained_failures=1,
+        attempts_per_cell_in_cluster=2,
+    )
+    assert "discard:01N" in events, "the retry never ran, so this proves nothing"
+    assert out["succeeded"] == 4 and out["failed"] == 0, out
+    assert not [f for f in out["failures"] if f["phase"] == "unattempted"], (
+        f"the cap abandoned the roster over a cell that was about to be retried: {out['failures']}"
+    )
+
+
+def test_the_cap_stops_admission_without_abandoning_a_streaming_cell():
+    """FINDING (v). The cap must close ADMISSION, not end the feeder.
+
+    Ending it ran the crash release — draining the queue and abandoning the undecided count — so
+    a `_readmit` from the scheduler thread appended work after the feeder was gone and the source
+    polled `[]` forever. The oracle is both halves: the run RETURNS inside the deadline, and the
+    still-streaming cell is named rather than silently dropped.
+    """
+    events: list[str] = []
+
+    class _TwoIngestsFail(RecordingInputs):
+        """01N and 02N fail in inputs, tripping a cap of 2 while 03N is still streaming."""
+
+        def ready(self, zone: str, year: int) -> bool:
+            return True
+
+        def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+            with self._lock:
+                self.events.append(f"wait:{zone}")
+            if zone in {"01N", "02N"}:
+                raise RuntimeError(f"ingest failed for {zone}")
+
+    session = _sync_session(fail={"03N"})
+    with pytest.raises(RuntimeError) as exc_info:
+        _run_with_deadline(
+            _cells(4),
+            session=session,
+            inputs=_TwoIngestsFail(events),
+            max_retained_failures=2,
+            attempts_per_cell_in_cluster=2,
+        )
+    message = str(exc_info.value)
+    # Re-queued after the cap had already closed admission, and still served.
+    assert session.rounds.get("03N") == 2, f"the retry of the streaming cell was lost: {session.rounds}"
+    assert "03N" in message, f"the streaming cell was dropped from the report: {message}"
+
+
+def test_the_assembly_retry_honours_the_attempt_budget():
+    """FINDING (vi). It performed exactly one reassembly regardless of the budget, and ignored
+    the attempt inference had already spent.
+    """
+    seen: dict[str, int] = {}
+
+    def always_failing_assemble(handoff, prep):
+        seen[handoff.zone] = seen.get(handoff.zone, 0) + 1
+        raise RuntimeError("assembly is deterministically broken")
+
+    with pytest.raises(RuntimeError, match="1/1 cell"):
+        _run_with_deadline(
+            _cells(1),
+            assemble=always_failing_assemble,
+            inputs=RecordingInputs([]),
+            attempts_per_cell_in_cluster=3,
+        )
+    assert seen["01N"] == 3, f"a limit of 3 buys two reassemblies after the first: {seen}"
+
+
+def test_a_cell_that_spent_its_budget_on_inference_gets_no_reassembly():
+    """The other direction: attempt 2 of 2 was used on the stream, so nothing is left."""
+    seen: dict[str, int] = {}
+
+    def assemble_failing_on_the_retry(handoff, prep):
+        seen[handoff.zone] = seen.get(handoff.zone, 0) + 1
+        raise RuntimeError("assembly broken")
+
+    with pytest.raises(RuntimeError, match="1/1 cell"):
+        _run_with_deadline(
+            _cells(1),
+            session=_sync_session(fail_once={"01N"}),
+            assemble=assemble_failing_on_the_retry,
+            inputs=RecordingInputs([]),
+            attempts_per_cell_in_cluster=2,
+        )
+    # One assembly, for the attempt-2 tally. No third attempt exists to reassemble under.
+    assert seen["01N"] == 1, f"the budget was already spent on inference: {seen}"
+
+
+# --- the pause holds the fleet only while inference work is actually available ---------------
+
+
+def _paused_run(cells, *, ready_zones: set[str] | None = None, **kw):
+    """Run with the pause always on, and report what the source said about availability."""
+    answers: list[bool] = []
+
+    class _Inputs(RecordingInputs):
+        def ready(self, zone: str, year: int) -> bool:
+            return ready_zones is not None and zone in ready_zones
+
+        def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+            with self._lock:
+                self.events.append(f"wait:{zone}")
+            if not (ready_zones and zone in ready_zones) and not stop_flag.is_set():
+                stop_flag.wait(timeout=10.0)
+
+    stop_flag = threading.Event()
+
+    def session(more_work, on_item_done):
+        for _ in range(6):
+            batch = more_work()
+            if batch:
+                for item in batch:
+                    on_item_done(item, {"chunk": item.chunk.label, "status": "success"})
+            answers.append(bool(more_work.has_work()))
+        stop_flag.set()
+        return []
+
+    box: dict = {}
+
+    def go():
+        with contextlib.suppress(BaseException):
+            box["out"] = fill_zones_sequential(
+                cells=cells,
+                prepare=_prepare_for(None),
+                plan=_plan_for(),
+                session=session,
+                assemble=_assemble(),
+                session_s1_orbit="both",
+                log=LOG,
+                inputs=_Inputs([]),
+                paused=lambda: True,
+                **kw,
+            )
+
+    worker = threading.Thread(target=go, daemon=True)
+    worker.start()
+    worker.join(timeout=25.0)
+    stop_flag.set()
+    return answers
+
+
+def test_a_pause_holding_available_inference_work_keeps_the_fleet():
+    """Withheld work is not absent work. A pause over a cell whose mosaic has landed must report
+    work available, so retirement is suppressed and a resume dispatches immediately.
+    """
+    answers = _paused_run(_cells(2), ready_zones={"01N", "02N"})
+    assert answers and any(answers), f"a pause holding a ready cell must report work: {answers}"
+
+
+def test_a_pause_over_cells_that_are_still_ingesting_lets_the_fleet_go():
+    """The complement, and the whole point of the rule: a cell whose ingest is still running is
+    FUTURE work, not available work, so the fleet winds down like any drought rather than
+    idling ~170 GPUs through it.
+    """
+    answers = _paused_run(_cells(2), ready_zones=set())
+    assert answers and not any(answers), f"nothing was available, so the fleet must go: {answers}"

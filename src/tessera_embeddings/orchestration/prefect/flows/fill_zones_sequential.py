@@ -1202,6 +1202,11 @@ def fill_zones_sequential_flow(
             s3_region=s3_region,
             retire_idle_actors=True,  # the scheduler holds off until the source is exhausted
             more_work=more_work,
+            # The runner publishes its availability predicate on the source callable (see
+            # `sequential_fill`), so the session contract stays two-argument. Without it a `[]`
+            # poll is taken at face value and an operator pause holding real work would let the
+            # fleet go.
+            source_has_work=getattr(more_work, "has_work", None),
             on_item_done=on_item_done,
         )
 
