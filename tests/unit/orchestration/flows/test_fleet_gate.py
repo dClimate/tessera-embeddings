@@ -446,3 +446,86 @@ def test_the_gate_is_reentrant_within_a_thread(monkeypatch):
         pass
     # LIFO pairing: the inner exit releases the inner context, not the outer.
     assert entered == ["enter:outer", "enter:inner", "exit:inner", "exit:outer"]
+
+
+# --- releasing the slot ----------------------------------------------------------------
+#
+# The mirror image of the hold tests above. Those are about not failing work when the slot cannot
+# be ACQUIRED; these are about not failing work when it cannot be RELEASED. On 2026-09-09 six
+# cells with complete, correctly-marked mosaics were recorded as `inputs/prepare` failures and
+# sent to the retry pass — which tears down the GPU fleet and rebuilds it per cell — because a
+# Prefect 503 on `/concurrency_limits/decrement` escaped the gate's `__exit__` AFTER the ingest
+# had already succeeded and been polled to a terminal state.
+
+
+def _release_error() -> Exception:
+    """The real shape: a 503 from the decrement endpoint, through Prefect's own wrapper."""
+    request = httpx.Request("POST", "http://prefect/api/v2/concurrency_limits/decrement")
+    response = httpx.Response(503, text="Service Unavailable", request=request)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return PrefectHTTPStatusError.from_httpx_error(exc)
+    raise AssertionError("503 did not raise")  # pragma: no cover
+
+
+class _FailsToRelease:
+    """A concurrency context that admits, then refuses to give the slot back."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.entered = 0
+
+    def __call__(self, name, occupy=1, strict=True, **kw):
+        return self
+
+    def __enter__(self):
+        self.entered += 1
+
+    def __exit__(self, *exc):
+        raise self.error
+
+
+def test_a_failed_release_does_not_fail_the_work(monkeypatch) -> None:
+    """The guarded work is DONE by the time the slot is released, so a release failure has nothing
+    to say about it. Letting it raise is what turned six completed ingests into retried cells.
+    """
+    cm = _FailsToRelease(_release_error())
+    monkeypatch.setattr(mod, "concurrency", cm)
+    reached_the_end = False
+    with FleetGate("tessera-global-ingests", log=logging.getLogger("release-test")):
+        pass
+    reached_the_end = True
+    assert cm.entered == 1
+    assert reached_the_end
+
+
+def test_a_failed_release_is_announced(monkeypatch, caplog) -> None:
+    """Swallowed is not the same as silent: a slot we could not hand back is idle until its lease
+    expires, and an operator reading the run needs to know it happened.
+    """
+    monkeypatch.setattr(mod, "concurrency", _FailsToRelease(_release_error()))
+    with caplog.at_level(logging.WARNING), FleetGate("tessera-global-ingests", log=logging.getLogger("release-test")):
+        pass
+    assert any("could not be released" in r.getMessage() for r in caplog.records)
+
+
+def test_the_bodys_own_exception_still_propagates(monkeypatch) -> None:
+    """The guard covers the RELEASE, not the work. Swallowing the caller's exception would hide a
+    genuine cell failure behind a slot that happened to release badly.
+    """
+    monkeypatch.setattr(mod, "concurrency", _FailsToRelease(_release_error()))
+    with (
+        pytest.raises(ValueError, match="the ingest itself failed"),
+        FleetGate("tessera-global-ingests", log=logging.getLogger("release-test")),
+    ):
+        raise ValueError("the ingest itself failed")
+
+
+def test_an_unbalanced_release_still_raises(monkeypatch) -> None:
+    """The stack ``pop`` is deliberately outside the guard: an unbalanced stack is a bug in this
+    class rather than a server condition, and hiding it would make the next one undebuggable.
+    """
+    gate = FleetGate("gate", log=logging.getLogger("release-test"))
+    with pytest.raises((IndexError, AttributeError)):
+        gate.__exit__(None, None, None)

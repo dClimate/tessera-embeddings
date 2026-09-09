@@ -173,8 +173,42 @@ class FleetGate(AbstractContextManager):
     def __exit__(
         self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
     ) -> None:
+        """Release the slot. A failure to release NEVER fails the work the slot protected.
+
+        By the time this runs the guarded work is finished; all that is left is telling the server
+        we are done with the slot. Letting that raise cost six cells on 2026-09-04/09: a Prefect
+        ``503`` on ``/concurrency_limits/decrement`` propagated out of the ingest wait and was
+        recorded as an ``inputs/prepare`` failure, so six cells whose mosaics were complete and
+        correctly marked went to the retry pass — which tears the GPU fleet down and rebuilds it
+        per cell. The ingest had already succeeded and been polled to a terminal state before this
+        point, so the exception described nothing about the work.
+
+        Swallowing is safe because a slot is LEASED, not owned: renewal stops when we exit and the
+        server reclaims the slot once the lease expires. MEASURED against the dev server, not
+        assumed: a slot whose holder was killed without decrementing came back at 1.22 lease
+        periods — the lease, plus one cycle of the server's 15 s reclaim loop. So the ingest gate's
+        ``_INGEST_LEASE_S`` of 900 s costs one idle slot for about 15 minutes, and the erosion is
+        temporary rather than cumulative. A clean release still frees its slot immediately (0.16 s
+        measured), so this changes nothing on the happy path. The cost of raising instead is a
+        completed cell reported as failed. Same reasoning as the
+        ``raise_on_lease_renewal_failure=False`` the ingest gate already passes.
+
+        The ``pop`` is deliberately left outside the guard: an unbalanced stack is a bug in this
+        class, not a server condition, and must not be hidden.
+        """
         cm = self._local.stack.pop()
-        cm.__exit__(exc_type, exc, tb)
+        try:
+            cm.__exit__(exc_type, exc, tb)
+        except Exception as release_exc:
+            if self._log is not None:
+                self._log.warning(
+                    "Gate %r could not be released (%s: %s) — continuing. The slot is leased, so "
+                    "the server reclaims it within one lease period, and the work it guarded is "
+                    "already done.",
+                    self._name,
+                    type(release_exc).__name__,
+                    release_exc,
+                )
 
 
 #: How long a pause reading is trusted before the server is asked again. What is watched is a human
