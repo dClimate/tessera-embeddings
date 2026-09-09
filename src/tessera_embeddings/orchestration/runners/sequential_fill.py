@@ -245,12 +245,12 @@ class TrailingAssemblyWedgedError(RuntimeError):
     ``prefect/flows/fill_zones_sequential.py`` and the README's replacement-admission rule.
     """
 
-    def __init__(self, abandoned: int, failures: list[dict[str, Any]]) -> None:
+    def __init__(self, abandoned: int) -> None:
         self.abandoned = abandoned
-        self.failures = failures
         super().__init__(
-            f"{abandoned} trailing assembly/assemblies abandoned behind a wedged one (their cells stay "
-            f"unmarked and will be re-dispatched); {len(failures)} other cell(s) failed: {failures}"
+            f"{abandoned} trailing assembly/assemblies abandoned behind a wedged one; their cells stay "
+            f"unmarked and will be re-dispatched. Any cell that failed earlier in this run was logged "
+            f"as it failed."
         )
 
 
@@ -260,7 +260,7 @@ def drain_trailing_assemblies(
     *,
     ceiling_s: float = TRAILING_ASSEMBLY_CEILING_S,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
-) -> int:
+) -> None:
     """Wait for every queued trailing assembly to finish — but never for one of them forever.
 
     ``finalizer.shutdown(wait=True)`` was the assembly backlog drain until 2026-09-04, and it has
@@ -272,16 +272,23 @@ def drain_trailing_assemblies(
     ``ceiling_s`` with nothing completing is declared wedged.
 
     On a wedge it dumps every thread's stack (the artefact no external tool can get on
-    Fargate), cancels the assemblies still queued, and returns how many were abandoned so the
-    caller can raise :class:`TrailingAssemblyWedgedError`. It does NOT end the process: the
-    wedged thread is a non-daemon pool worker that will hold the interpreter open at exit, but
-    how and when to end the process is the process owner's decision — the flow does it after its
-    own teardown, so a forced exit can never orphan a fleet mid-teardown. Nothing here rewrites
-    or deletes: the abandoned cells' staged tiles and mosaics stay where they are, and the
-    campaign re-dispatches them as unmarked cells.
+    Fargate), cancels the assemblies still queued, and **raises**. Raising HERE rather than
+    returning a count is the whole safety property: this runs from the caller's ``finally``, so a
+    count the caller must remember to check afterwards is a count an in-flight exception skips
+    past — and the run then reports ``FAILED``, which the campaign driver reads as quiescent and
+    may answer by admitting a replacement writer while the wedged assembly thread is still alive.
+    That is the one outcome the exit-75 crash exists to prevent, so it must not be reachable only
+    through a later branch. An exception already in flight becomes this one's ``__context__``, so
+    nothing is lost.
 
-    Returns:
-        The number of assemblies abandoned — ``0`` when the whole backlog drained.
+    It does NOT end the process: the wedged thread is a non-daemon pool worker that will hold the
+    interpreter open at exit, but how and when to end the process is the process owner's decision
+    — the flow does it after its own teardown, so a forced exit can never orphan a fleet
+    mid-teardown. Nothing here rewrites or deletes: the abandoned cells' staged tiles and mosaics
+    stay where they are, and the campaign re-dispatches them as unmarked cells.
+
+    Raises:
+        TrailingAssemblyWedgedError: no assembly completed within ``ceiling_s``.
     """
     finalizer.shutdown(wait=False)  # no new submissions; what is queued still runs, in order
     pending = [f for f in futures if not f.done()]
@@ -301,9 +308,8 @@ def drain_trailing_assemblies(
                 faulthandler.dump_traceback()
             with suppress(Exception):
                 finalizer.shutdown(wait=False, cancel_futures=True)
-            return n
+            raise TrailingAssemblyWedgedError(n)
         pending = [f for f in pending if not f.done()]
-    return 0
 
 
 def fill_zones_sequential(
@@ -455,10 +461,9 @@ def fill_zones_sequential(
     #: drain, where the backlog can be most of a cluster's cells and take hours.
     assembly_pending = 0
     #: Every future the finalizer has been handed, so the backlog drain can wait on completions
-    #: with a
-    #: ceiling rather than on the pool's unbounded shutdown. See `drain_trailing_assemblies`.
+    #: with a ceiling rather than on the pool's unbounded shutdown. See
+    #: `drain_trailing_assemblies`.
     assembly_futures: list[Future[None]] = []
-    assemblies_abandoned = 0
     finalizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trailing-assembly")
     #: A landed cell's deletes — its STAGING prefix and its MOSAIC prefix — run HERE, not on
     #: the assembly thread. A mosaic is multi-terabyte and its delete takes as long as it
@@ -922,8 +927,9 @@ def fill_zones_sequential(
         with lock:
             queued = list(assembly_futures)
         # Read at CALL time, not bound as defaults, so an operator override (or a test) of the
-        # module constants takes effect on the run that is actually draining.
-        assemblies_abandoned = drain_trailing_assemblies(
+        # module constants takes effect on the run that is actually draining. This RAISES on a
+        # wedge, from inside this `finally` — see the function for why that is not optional.
+        drain_trailing_assemblies(
             finalizer,
             queued,
             ceiling_s=TRAILING_ASSEMBLY_CEILING_S,
@@ -1093,13 +1099,7 @@ def fill_zones_sequential(
         "failures": failures,
         "outcomes": outcomes,
         "elapsed_sec": elapsed,
-        "assemblies_abandoned": assemblies_abandoned,
     }
-    if assemblies_abandoned:
-        # Distinct from `failures`, and a distinct TYPE: these cells neither published nor
-        # failed, and the thread that was assembling one of them is still alive. The flow must
-        # not let this become FAILED — see the exception's docstring.
-        raise TrailingAssemblyWedgedError(assemblies_abandoned, failures)
     if failures:
         raise RuntimeError(
             f"{len(failures)}/{len(cells)} cell(s) failed in the chained fill "

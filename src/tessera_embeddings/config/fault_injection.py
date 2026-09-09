@@ -131,11 +131,18 @@ def hard_exit_after_flush(
     flushed, so the announcement survives the exit as far as a batching API handler allows.
     ``os._exit`` rather than ``sys.exit``: the second caller's whole reason for being here is a
     non-daemon thread that a normal interpreter shutdown would wait on forever.
+
+    **THE EXIT IS THE CONTRACT AND THE ANNOUNCEMENT IS BEST-EFFORT**, hence the ``finally``. A
+    log handler can raise while flushing — a Prefect API handler answering 503, which this
+    campaign has seen — and an exception escaping here would leave the process ALIVE, which is
+    the single outcome both callers exist to prevent.
     """
-    log.error(message, *args)
-    _log.error(message, *args)
-    logging.shutdown()  # flush every handler; nothing below here logs
-    os._exit(status)
+    try:
+        log.error(message, *args)
+        _log.error(message, *args)
+        logging.shutdown()  # flush every handler; nothing below here logs
+    finally:
+        os._exit(status)
 
 
 class FaultInjectionRefusedError(RuntimeError):

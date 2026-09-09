@@ -1507,8 +1507,9 @@ class TestDrainTrailingAssemblies:
             fast = pool.submit(lambda: None)
             wedged = pool.submit(hold.wait, 30.0)
             queued = pool.submit(lambda: None)
-            n = _within(10, lambda: mod.drain_trailing_assemblies(pool, [fast, wedged, queued], ceiling_s=0.2, log=LOG))
-            assert n == 2, "the wedged assembly AND everything queued behind it are abandoned"
+            with pytest.raises(mod.TrailingAssemblyWedgedError, match="abandoned") as raised:
+                _within(10, lambda: mod.drain_trailing_assemblies(pool, [fast, wedged, queued], ceiling_s=0.2, log=LOG))
+            assert raised.value.abandoned == 2, "the wedged assembly AND everything queued behind it are abandoned"
             assert queued.cancelled(), "work queued behind the wedge must not run later against a torn-down run"
             assert _stack_dumps, "the stacks must be dumped: they are the only diagnosis available on Fargate"
         finally:
@@ -1524,7 +1525,7 @@ class TestDrainTrailingAssemblies:
         pool = ThreadPoolExecutor(max_workers=1)
         try:
             futures = [pool.submit(time.sleep, 0.08) for _ in range(6)]  # 0.48 s of work, ceiling 0.2 s
-            assert _within(10, lambda: mod.drain_trailing_assemblies(pool, futures, ceiling_s=0.2, log=LOG)) == 0
+            _within(10, lambda: mod.drain_trailing_assemblies(pool, futures, ceiling_s=0.2, log=LOG))
             assert all(f.done() and not f.cancelled() for f in futures)
             assert not _stack_dumps, "a clean drain must not dump stacks"
         finally:
@@ -1535,7 +1536,7 @@ class TestDrainTrailingAssemblies:
         the runner raises its own type rather than a plain RuntimeError the flow would let through.
         """
         assert issubclass(mod.TrailingAssemblyWedgedError, RuntimeError)
-        exc = mod.TrailingAssemblyWedgedError(3, [])
+        exc = mod.TrailingAssemblyWedgedError(3)
         assert exc.abandoned == 3 and "abandoned" in str(exc)
 
 
@@ -1575,6 +1576,59 @@ def test_a_wedged_trailing_assembly_raises_instead_of_hanging_the_run(monkeypatc
 
 def test_a_healthy_run_drains_completely(_stack_dumps):
     summary = _within(15, lambda: _run(_cells(4), inputs=RecordingInputs([])))
-    assert summary["assemblies_abandoned"] == 0
     assert summary["succeeded"] == 4
     assert not _stack_dumps
+
+
+def test_a_wedge_raises_even_when_the_session_itself_failed(monkeypatch, _stack_dumps, caplog):
+    """THE HOLE THIS SHAPE CLOSES. The drain runs from the runner's `finally`, so when the session
+    is already unwinding, a count returned for the caller to check LATER is a count the in-flight
+    exception skips past — and the run reports FAILED, which the campaign driver reads as
+    quiescent and may answer by admitting a replacement writer for the same zones while the
+    wedged assembly thread is still alive.
+
+    So the drain raises from inside the `finally`. The session's own failure survives as the
+    exception's `__context__`, which is what a chained raise is for.
+    """
+    monkeypatch.setattr(mod, "TRAILING_ASSEMBLY_CEILING_S", 0.3)
+    hold = threading.Event()
+
+    def wedging_assemble(handoff, prep):
+        hold.wait(timeout=30.0)  # released by the test's finally, never by the run
+        return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
+
+    def session_that_finishes_a_cell_then_blows_up(more_work, on_item_done):
+        """Land the first cell — so an assembly IS queued and wedges — then fail the session."""
+        results = []
+        batch = more_work()
+        for item in batch or ():
+            result = {"chunk": item.chunk.label, "status": "success"}
+            results.append(result)
+            on_item_done(item, result)
+        raise RuntimeError("the session itself blew up")
+
+    log = logging.getLogger("test-wedge-under-failure")
+    try:
+        with (
+            caplog.at_level(logging.CRITICAL, logger="test-wedge-under-failure"),
+            pytest.raises(mod.TrailingAssemblyWedgedError) as raised,
+        ):
+            _within(
+                15,
+                lambda: _run(
+                    _cells(2),
+                    session=session_that_finishes_a_cell_then_blows_up,
+                    assemble=wedging_assemble,
+                    inputs=RecordingInputs([]),
+                    log=log,
+                ),
+            )
+    finally:
+        hold.set()
+    assert raised.value.abandoned >= 1
+    chain = []
+    exc: BaseException | None = raised.value
+    while exc is not None:
+        chain.append(str(exc))
+        exc = exc.__context__ or exc.__cause__
+    assert any("blew up" in c for c in chain), f"the session's own failure was lost: {chain}"

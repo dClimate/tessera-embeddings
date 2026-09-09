@@ -1347,7 +1347,7 @@ class TestWedgedDrainEndsTheProcess:
             flowmod, "hard_exit_after_flush", lambda status, **kw: calls.append({"status": status, **kw})
         )
         log = _logging.getLogger("test-wedged-exit")
-        flowmod._end_process_after_wedged_drain(TrailingAssemblyWedgedError(4, []), log)
+        flowmod._end_process_after_wedged_drain(TrailingAssemblyWedgedError(4), log)
         assert [c["status"] for c in calls] == [flowmod.WEDGED_DRAIN_EXIT_STATUS]
         assert flowmod.WEDGED_DRAIN_EXIT_STATUS == 75, "EX_TEMPFAIL: the work is retryable"
         assert "Ending this process" in calls[0]["message"] and calls[0]["args"][0] == 4, (
