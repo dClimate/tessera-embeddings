@@ -97,8 +97,10 @@ def run_inference(
         s3_region: Optional S3 region for the mosaic repos, injected into every actor so its
             reads open the store in the same region the caller's preflight/assembly opens
             use. ``None`` uses icechunk's default region.
-        retire_idle_actors: Kill actors idle past the grace period at the run tail (default);
-            see ``scheduling._process_chunks_work_stealing`` for when a caller passes False.
+        retire_idle_actors: Kill actors idle past the grace period (default). For a chained
+            session this also winds the fleet down whenever its work source has nothing ready,
+            keeping one actor alive; see ``scheduling._process_chunks_work_stealing`` for the
+            full rule and for when a caller passes False.
         more_work: Optional chained-session work source (see the scheduler's docstring). With
             a source, ``chunks`` is typically empty and every item carries its own
             :class:`~tessera_embeddings.inference.scheduling.ZoneContext`; the single-zone

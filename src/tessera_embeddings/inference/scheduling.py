@@ -966,18 +966,27 @@ def _process_chunks_work_stealing(
             once ``len(pool.actors)`` reaches it. Ignored when ``actor_factory`` is None.
         placement_timeout_sec: Max seconds to wait for a batch's instances to be placed before
             requesting the next anyway (capacity-shortfall escape hatch).
-        retire_idle_actors: Kill actors idle past the grace period as the run's tail drains
-            (the default). A chained multi-zone fill leaves this True and relies on the
-            ``more_work`` gate below; a caller managing zones as separate calls passes False
-            for every zone but its last, since the "surplus" workers are the NEXT zone's fleet
-            and retiring them idle-drains the shared cluster's instances at every zone tail
-            (see ``orchestration.runners.sequential_fill``).
+        retire_idle_actors: Kill actors idle past the grace period (the default). A chained
+            multi-zone fill leaves this True and relies on the ``more_work`` gate below; a
+            caller managing zones as separate calls passes False for every zone but its last,
+            since the "surplus" workers are the NEXT zone's fleet and retiring them idle-drains
+            the shared cluster's instances at every zone tail (see
+            ``orchestration.runners.sequential_fill``).
         more_work: Optional pull source for a chained multi-zone session. Polled (non-blocking)
             whenever the queue is at or below the live actor count: a list extends the queue
             (its items carry their own :class:`ZoneContext`), ``[]`` means nothing ready YET
             (the loop stays alive and keeps polling), ``None`` means exhausted forever. While
-            unexhausted, idle retirement is suppressed — apparently-idle actors are the next
-            zone's fleet — and the loop does not exit on an empty queue.
+            unexhausted the loop does not exit on an empty queue.
+
+            **The three answers drive retirement differently, and ``[]`` is not ``None``.** A
+            list means work is arriving, so nothing is retired. ``None`` retires freely — the
+            run is over. ``[]`` means the source has nothing RIGHT NOW: its next cell is still
+            ingesting, or a failed cell is being re-ingested. The fleet WINDS DOWN through that
+            wait, all but one actor, because holding ~170 idle GPUs against a multi-hour ingest
+            is the most expensive way this system can wait for anything. The session stays
+            alive, so ingest and the caller's assembly backlog carry on and the pool re-grows
+            here when work arrives — nothing is torn down or rebuilt. The one actor kept is a
+            liveness floor, not a compromise: see :meth:`ActorPool.retire_idle`.
         on_item_done: Optional callback fired exactly once per work item at its FINAL outcome —
             success (after any deferred write confirms) or permanent failure — with the item
             and its result dict. A chained session uses it for per-zone completion accounting;
