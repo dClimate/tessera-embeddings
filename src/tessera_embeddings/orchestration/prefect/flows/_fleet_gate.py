@@ -57,6 +57,49 @@ HOLD_LOG_EVERY_S = 300.0
 _TOO_SMALL = "greater than the limit"
 
 
+def _is_request_validation_error(response: Any) -> bool:  # noqa: ANN401 — httpx.Response, kept loose for fakes
+    """Is this ``422`` FastAPI refusing the REQUEST, rather than the server refusing the ask?
+
+    Both arrive as ``422`` from the same endpoint, and only one of them is a hold.
+
+    * The hold is raised by the concurrency router itself as
+      ``HTTPException(422, detail="Slots requested is greater than the limit")``, which FastAPI
+      serialises with ``detail`` as a plain **string**.
+    * A parameter-validation failure — ``slots`` at or below zero, a ``lease_duration`` outside
+      the server's ``ge=60, le=86400`` bounds — never reaches that code at all. FastAPI rejects
+      it first, with ``detail`` as a **list** of per-field objects each carrying ``loc``.
+
+    Verified against the installed Prefect (3.7.0) and its FastAPI rather than inferred: the two
+    parameter bounds are declared at ``prefect/server/api/concurrency_limits_v2.py`` on the
+    ``increment-with-lease`` body, and the list-of-``loc`` shape was reproduced from them.
+
+    The alternative discrimination — requiring the ``"greater than the limit"`` wording — was
+    rejected deliberately. The wording is present today, but making the campaign's pause lever
+    depend on a server-side message staying phrased the same way trades a latent bug for a
+    brittle one: a rephrasing upstream would turn every deliberate pause into a hard failure of
+    the next cell to reach the gate. The status stays the signal; this only carves out the one
+    shape that provably is not a hold.
+
+    Unreadable bodies answer ``False`` — i.e. still a hold. A 422 whose body cannot be parsed is
+    far more likely to be the server's own than FastAPI's, and holding is the recoverable
+    direction: an operator sees a gate that will not release and raises the limit, whereas a
+    wrongly-propagated failure has already failed a cell by the time anyone looks.
+    """
+    getter = getattr(response, "json", None)
+    if not callable(getter):
+        return False
+    try:
+        body = getter()
+    except Exception:
+        return False
+    if not isinstance(body, dict):
+        return False
+    detail = body.get("detail")
+    if not isinstance(detail, list):
+        return False
+    return any(isinstance(entry, dict) and "loc" in entry for entry in detail)
+
+
 def gate_is_holding(exc: BaseException) -> bool:
     """Did this acquisition failure mean "the limit is currently too small", or something else?
 
@@ -68,6 +111,12 @@ def gate_is_holding(exc: BaseException) -> bool:
     The status has to be dug out of the cause chain because Prefect wraps the HTTP error in
     ``ConcurrencySlotAcquisitionError``, whose own message and type say nothing about which of the
     two happened.
+
+    One ``422`` is excluded: a FastAPI request-validation failure, which shares the status but is
+    a permanent client-side mistake rather than a lowered limit. Treating it as a hold parked the
+    gate forever on a malformed call, and the ``isinstance`` arm below matches every Prefect HTTP
+    error regardless of wording, so nothing else would have caught it. See
+    :func:`_is_request_validation_error` for how the two are told apart and why not by wording.
     """
     seen: set[int] = set()
     cause: BaseException | None = exc
@@ -75,7 +124,11 @@ def gate_is_holding(exc: BaseException) -> bool:
         seen.add(id(cause))
         response = getattr(cause, "response", None)
         status = getattr(response, "status_code", None)
-        if status == 422 and (isinstance(cause, PrefectHTTPStatusError) or _TOO_SMALL in str(cause)):
+        if (
+            status == 422
+            and not _is_request_validation_error(response)
+            and (isinstance(cause, PrefectHTTPStatusError) or _TOO_SMALL in str(cause))
+        ):
             return True
         cause = cause.__cause__
     return False

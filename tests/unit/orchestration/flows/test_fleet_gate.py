@@ -36,6 +36,27 @@ def _server_said(status: int, detail: str) -> PrefectHTTPStatusError:
     raise AssertionError(f"{status} did not raise")  # pragma: no cover
 
 
+def _request_was_rejected(*fields: str) -> PrefectHTTPStatusError:
+    """The OTHER 422: FastAPI refusing the request before the concurrency router sees it.
+
+    The body shape is FastAPI's, reproduced from the two bounds the server declares on the
+    ``increment-with-lease`` body (``slots`` must be ``> 0``, ``lease_duration`` must sit within
+    ``[60, 86400]``): ``detail`` is a LIST of per-field objects, each carrying ``loc``. The hold's
+    own 422 puts a plain string there instead, which is the only thing separating them.
+    """
+    request = httpx.Request("POST", "http://prefect/api/v2/concurrency_limits/increment-with-lease")
+    detail = [
+        {"type": "greater_than", "loc": ["body", field], "msg": f"Input should be greater than 0 for {field}"}
+        for field in fields
+    ]
+    response = httpx.Response(422, json={"detail": detail}, request=request)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return PrefectHTTPStatusError.from_httpx_error(exc)
+    raise AssertionError("422 did not raise")  # pragma: no cover
+
+
 def _wrapped(inner: BaseException) -> Exception:
     """The shape Prefect delivers: its own error with the HTTP error as the cause."""
     exc = RuntimeError("Unable to acquire concurrency slots on ['tessera-global-ingests']")
@@ -83,6 +104,38 @@ def test_a_422_from_the_server_is_a_hold() -> None:
     """
     exc = _wrapped(_server_said(422, "Slots requested is greater than the limit"))
     assert gate_is_holding(exc)
+
+
+def test_a_lease_duration_the_server_refuses_is_not_a_hold() -> None:
+    """A ``lease_duration`` outside the server's [60, 86400] bounds shares the hold's status.
+
+    It is a permanent mistake in our own call, so holding on it parks the gate forever with a log
+    line inviting an operator to raise a limit that was never the problem. The wording arm of the
+    matcher would not have saved this: ``isinstance(cause, PrefectHTTPStatusError)`` matches every
+    Prefect HTTP error whatever it says, so the status alone decided it.
+    """
+    assert not gate_is_holding(_wrapped(_request_was_rejected("lease_duration")))
+
+
+def test_an_occupy_the_server_refuses_is_not_a_hold() -> None:
+    """``slots`` at or below zero — the same class of mistake, through the other bound."""
+    assert not gate_is_holding(_wrapped(_request_was_rejected("slots")))
+
+
+def test_a_422_whose_body_cannot_be_read_still_holds() -> None:
+    """The deliberate direction of the doubt: an unparseable 422 is treated as the server's own.
+
+    A 422 with a non-JSON body is far more likely to be the concurrency router's than FastAPI's,
+    and the two outcomes are not symmetric — a wrong hold is visible and recoverable (an operator
+    sees a gate that will not release), while a wrong propagation has already failed a cell.
+    """
+    request = httpx.Request("POST", "http://prefect/api/v2/concurrency_limits/increment-with-lease")
+    response = httpx.Response(422, content=b"<html>gateway</html>", request=request)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        inner = PrefectHTTPStatusError.from_httpx_error(exc)
+    assert gate_is_holding(_wrapped(inner))
 
 
 def test_a_missing_limit_is_not_a_hold() -> None:
