@@ -88,10 +88,23 @@ publish, per-step publish timeout, partition re-run, salvage-finished-forks.
 3. **The bounded assembly backlog drain** (`sequential_fill.drain_trailing_assemblies`, 6 h
    per assembly, resetting on each completion). `finalizer.shutdown(wait=True)` had no bound, which
    is what parked vociferous-earthworm behind one wedged cell after its inference finished. The
-   watchdog covers the fork phase only.
+   watchdog covers the fork phase only. Same ordering rule as the watchdog, in the shape the
+   drain's position forces: the watchdog signals through a flag another thread reads, so it can
+   diagnose in line; the drain signals by RAISING on the caller's own thread, so a diagnostic in
+   front of that raise can swallow it. It therefore cancels, raises, and leaves the critical line
+   and the stack dump to a daemon thread (`_diagnose_wedge_off_thread`) that may park forever.
 4. **Crash, not FAILED, after a wedged drain** (`_end_process_after_wedged_drain`, exit 75). The
    driver treats FAILED as quiescent and may admit a replacement cluster; the README's admission
-   rule rests on the wedged thread having been joined, which it has not.
+   rule rests on the wedged thread having been joined, which it has not. Two things sit between
+   detecting the wedge and this exit and are deliberately not allowed to hold it up. The flow's
+   `finally` SKIPS the housekeeping join on the wedged path only (`shutdown(wait=False,
+   cancel_futures=True)`): that join has three unbounded legs — the `s5cmd` subprocess, the
+   `fsspec` recursive `rm` fallback, and the read-back that lists objects — so bounding any one of
+   them would read as a fix and bound nothing. Abandoning an in-flight delete leaks a storage
+   prefix, which is recoverable and costs storage; not exiting leaves a cluster the driver may
+   read as quiescent. And `hard_exit_after_flush` ARMS the exit on a 5 s daemon timer before it
+   announces, because its `finally` guaranteed the exit only against a flush that raises, not one
+   that blocks on a handler lock, socket or full pipe.
 5. **`CatchUpDidNotStopError`** and `ticking`'s bounded join. Nothing recovers from it; it makes a
    hung catch-up a crash rather than an indefinite park, in a window the watchdog has already left.
 

@@ -24,6 +24,7 @@ from prefect.states import StateType
 import tessera_embeddings.orchestration.prefect.flows._child_runs as _child_runs
 import tessera_embeddings.orchestration.prefect.flows.fill_zones_sequential as mod
 from tessera_embeddings.config.paths import BucketPaths
+from tests.unit.deadline import run_under_deadline
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
@@ -1382,6 +1383,42 @@ class TestWedgedDrainEndsTheProcess:
         with pytest.raises(RuntimeError, match="ray down failed"):
             _run(zones=["33N"])
         assert exited == [mod.WEDGED_DRAIN_EXIT_STATUS], "the teardown failure swallowed the wedge"
+
+    def test_a_cleanup_that_never_returns_cannot_hold_up_the_wedged_exit(self, wired, monkeypatch):
+        """The housekeeping pool runs prefix deletes with THREE unbounded legs — the `s5cmd`
+        subprocess, the `fsspec` recursive `rm` it falls back to, and the read-back that lists
+        objects — so joining it on the wedged path is the six-hour drain ceiling guaranteeing
+        nothing: the flow parks forever with the abandoned assembly thread alive. Only the
+        wedged path skips the join; the healthy one still waits, which its own comment explains.
+        """
+        from tessera_embeddings.orchestration.runners.sequential_fill import TrailingAssemblyWedgedError
+
+        hold = threading.Event()  # never set while the flow runs: the delete never returns
+        started = threading.Event()
+
+        def wedge_behind_a_hung_delete(**kwargs):
+            def _delete_that_never_returns() -> None:
+                started.set()
+                hold.wait(60.0)
+
+            kwargs["housekeeping"].submit(_delete_that_never_returns)
+            assert started.wait(5.0), "the delete never started, so the join would not have blocked"
+            raise TrailingAssemblyWedgedError(2)
+
+        monkeypatch.setattr(mod, "fill_zones_sequential", wedge_behind_a_hung_delete)
+        exited: list[int] = []
+        monkeypatch.setattr(mod, "hard_exit_after_flush", lambda status, **k: exited.append(status))
+
+        try:
+            with pytest.raises(TrailingAssemblyWedgedError):
+                run_under_deadline(
+                    20,
+                    lambda: _run(zones=["33N"]),
+                    what="the flow whose cleanup hung behind a wedge",
+                )
+        finally:
+            hold.set()
+        assert exited == [mod.WEDGED_DRAIN_EXIT_STATUS], "the hung delete kept the process alive"
 
     def test_the_flow_ends_the_process_only_after_its_teardown(self):
         """Structural: the exit sits at the END of the flow's `finally`, never before, where it

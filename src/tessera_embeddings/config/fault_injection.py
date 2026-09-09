@@ -52,8 +52,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 from collections.abc import Callable, Iterable
+from contextlib import suppress
 from typing import Any, Literal, final
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -94,10 +96,25 @@ MAX_HOLD_MINUTES = 45.0
 #: emits: zero-padded zone number 01-60 followed by the hemisphere.
 _CANONICAL_ZONE = re.compile(r"(0[1-9]|[1-5][0-9]|60)[NS]")
 
+#: How long the announcement gets before the armed timer ends the process without it. A healthy
+#: flush is milliseconds, so this is three orders of magnitude of headroom; and it is small
+#: enough to still be an emergency, because what it bounds is a wedged campaign writer. The
+#: normal path does not wait for it — a clean flush exits immediately.
+_ANNOUNCE_BUDGET_S = 5.0
+
 #: How often a running hold restates itself. Frequent enough that an operator reading
 #: the log knows the idleness is deliberate, sparse enough not to bury the run's own
 #: lines.
 _HOLD_REPORT_S = 120.0
+
+
+def _exit_now(status: int) -> None:
+    """The package's single hard exit, reached from the two paths in the function below.
+
+    One function so there is still exactly ONE ``os._exit`` call in the package, which the
+    structural test asserts by counting call sites rather than by naming allowed ones.
+    """
+    os._exit(status)
 
 
 def hard_exit_after_flush(
@@ -115,16 +132,33 @@ def hard_exit_after_flush(
     cannot be joined). ``os._exit`` rather than ``sys.exit`` because the second caller's whole
     reason for being here is a non-daemon thread a normal shutdown would wait on forever.
 
-    **The exit is the contract; the announcement is best-effort**, hence the ``finally``: a
-    handler raising mid-flush (a Prefect API 503, seen in this campaign) must not leave the
-    process alive.
+    **The exit is the contract; the announcement is best-effort.** The ``finally`` delivers that
+    against an announcement that RAISES — a handler dying mid-flush on a Prefect API 503, seen
+    in this campaign. It delivers nothing against one that never RETURNS, and a handler blocking
+    on its lock, its socket or a full output pipe never reaches a ``finally`` at all, which for
+    the wedged drain means the process stays alive with the writer thread it exists to kill. So
+    the exit is ARMED BEFORE the announcement is attempted: whichever comes first ends the
+    process, and a clean flush still exits immediately rather than waiting out the timer.
     """
+    # Same rule as `runners.sequential_fill._diagnose_wedge_off_thread` and
+    # `storage.shard_writer._fork_stall_watchdog`: never put a diagnostic in front of the thing
+    # that has to happen. Armed best-effort — a process that cannot spawn this thread is no
+    # worse off than it was with the `finally` alone.
+    timer: threading.Timer | None = None
+    with suppress(Exception):
+        timer = threading.Timer(_ANNOUNCE_BUDGET_S, _exit_now, args=(status,))
+        timer.daemon = True
+        timer.start()
     try:
         log.error(message, *args)
         _log.error(message, *args)
         logging.shutdown()  # flush every handler; nothing below here logs
     finally:
-        os._exit(status)
+        # Superseded by the exit on the next line. Cancelled rather than left armed so that a
+        # test which stubs the exit out does not inherit a live timer.
+        if timer is not None:
+            timer.cancel()
+        _exit_now(status)
 
 
 class FaultInjectionRefusedError(RuntimeError):

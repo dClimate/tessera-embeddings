@@ -1408,7 +1408,17 @@ def fill_zones_sequential_flow(
         # retry. Nothing about the join needs ingest alive, so the urgent stop goes first.
         if inputs is not None:
             inputs.shutdown()
-        housekeeping.shutdown(wait=True)
+        if wedged is None:
+            housekeeping.shutdown(wait=True)
+        else:
+            # ON THE WEDGED PATH THERE IS NO JOIN. This join has THREE unbounded legs — the
+            # `s5cmd` subprocess, the `fsspec` recursive `rm` it falls back to, and the
+            # read-back that lists objects — so waiting here is waiting forever, and the exit
+            # below is the one thing that must happen. Abandoning an in-flight delete can leak
+            # a storage prefix: recoverable, and it costs storage. Failing to exit leaves a
+            # cluster the campaign driver may read as quiescent and dispatch a second writer
+            # onto, which is the outcome the exit exists to prevent. Dying wins.
+            housekeeping.shutdown(wait=False, cancel_futures=True)
         # The context manager has already torn the cluster down (or the hook will, on
         # cancellation) — clear the hook state even when the runner raises (its partial-failure
         # RuntimeError is a NORMAL exit path).

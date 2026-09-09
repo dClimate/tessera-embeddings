@@ -1452,18 +1452,39 @@ def test_a_nonpositive_cap_is_refused_before_anything_expensive():
 # --- the trailing-assembly drain is bounded (2026-09-04) ---------------------------------------
 
 
+class _StackDumps:
+    """The recorded stack dumps, plus a wait — because the dump is no longer synchronous.
+
+    WAITED FOR, NOT ASSUMED: the wedge diagnostics run on a daemon thread started AFTER the
+    wedge is raised, so asserting the instant the exception arrives is a race (the same one CI
+    caught for the fork watchdog). The critical line is emitted before the dump, so one
+    ``wait`` covers both.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+        self._dumped = threading.Event()
+
+    def record(self) -> None:
+        self.calls.append(1)
+        self._dumped.set()
+
+    def wait(self, timeout: float = 10.0) -> bool:
+        return self._dumped.wait(timeout)
+
+
 @pytest.fixture
 def _stack_dumps(monkeypatch):
     """Record the stack dump, and fail if the runner tries to end the process itself — that is
     the flow's decision, after its teardown.
     """
-    dumps: list[int] = []
+    dumps = _StackDumps()
     monkeypatch.setattr(
         mod.faulthandler,
         "dump_traceback_later",
         lambda *a, **k: pytest.fail("the runner must not arm a process exit; that is the flow's job"),
     )
-    monkeypatch.setattr(mod.faulthandler, "dump_traceback", lambda *a, **k: dumps.append(1))
+    monkeypatch.setattr(mod.faulthandler, "dump_traceback", lambda *a, **k: dumps.record())
     return dumps
 
 
@@ -1485,7 +1506,7 @@ class TestDrainTrailingAssemblies:
                 )
             assert raised.value.abandoned == 2, "the wedged assembly AND everything queued behind it are abandoned"
             assert queued.cancelled(), "work queued behind the wedge must not run later against a torn-down run"
-            assert _stack_dumps, "the stacks must be dumped: they are the only diagnosis available on Fargate"
+            assert _stack_dumps.wait(), "the stacks must be dumped: they are the only diagnosis available on Fargate"
         finally:
             hold.set()
             pool.shutdown(wait=True)
@@ -1499,8 +1520,47 @@ class TestDrainTrailingAssemblies:
             futures = [pool.submit(time.sleep, 0.08) for _ in range(6)]  # 0.48 s of work, ceiling 0.2 s
             run_under_deadline(10, lambda: mod.drain_trailing_assemblies(pool, futures, ceiling_s=0.2, log=LOG))
             assert all(f.done() and not f.cancelled() for f in futures)
-            assert not _stack_dumps, "a clean drain must not dump stacks"
+            assert not _stack_dumps.calls, "a clean drain must not dump stacks"
         finally:
+            pool.shutdown(wait=True)
+
+    @pytest.mark.parametrize("blocking", ["logger", "dump"])
+    def test_a_diagnostic_that_blocks_cannot_swallow_the_wedge(self, blocking, monkeypatch):
+        """BLOCKING, not raising: `suppress(Exception)` covers a diagnostic that raises and
+        nothing covers one that never returns. A full container log pipe or an unreachable
+        remote handler parks the write to stderr, and a diagnostic in front of the raise would
+        then keep the flow from ever learning it must hard-exit — the bounded drain becomes the
+        indefinite hang it exists to end. Both diagnostics are exercised because both are
+        downstream of the raise. Same rule, same shape as `_fork_stall_watchdog`.
+        """
+        gate = threading.Event()  # never set while the subject runs: the diagnostic never returns
+
+        class _BlockingCritical(logging.Logger):
+            def critical(self, *args, **kwargs):  # type: ignore[override]
+                gate.wait()
+
+        if blocking == "dump":
+            monkeypatch.setattr(mod.faulthandler, "dump_traceback", gate.wait)
+            log: logging.Logger = LOG
+        else:
+            monkeypatch.setattr(mod.faulthandler, "dump_traceback", lambda: None)
+            log = _BlockingCritical("blocking-critical")
+
+        hold = threading.Event()
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            stuck = pool.submit(hold.wait, 30.0)
+            queued = pool.submit(lambda: None)
+            with pytest.raises(mod.TrailingAssemblyWedgedError, match="abandoned"):
+                run_under_deadline(
+                    10,
+                    lambda: mod.drain_trailing_assemblies(pool, [stuck, queued], ceiling_s=0.2, log=log),
+                    what="the drain whose diagnostic blocked",
+                )
+            assert queued.cancelled(), "the queue behind the wedge was left runnable by a blocked diagnostic"
+        finally:
+            gate.set()  # release the parked diagnostics thread rather than leaking it
+            hold.set()
             pool.shutdown(wait=True)
 
     def test_a_wedge_is_a_typed_error_the_flow_can_tell_apart(self):
@@ -1550,12 +1610,16 @@ def test_a_wedge_raises_even_when_the_session_itself_failed(monkeypatch, _stack_
                     log=log,
                 ),
             )
+        # SNAPSHOT WHILE THE WEDGE IS STILL HELD. Releasing `hold` lets the wedged assembly
+        # itself finish and append, so reading the list after the release is a race — one that
+        # only ever passed because the assertions used to run before the released thread woke.
+        assembled_at_the_wedge = list(assembled)
     finally:
         hold.set()
     assert raised.value.abandoned >= 1
+    assert assembled_at_the_wedge == [], "a cell behind the wedge was assembled anyway"
+    assert _stack_dumps.wait(), "a wedge must dump the stacks"
     assert any("TRAILING ASSEMBLY WEDGED" in r.getMessage() for r in caplog.records)
-    assert _stack_dumps, "a wedge must dump the stacks"
-    assert assembled == [], "a cell behind the wedge was assembled anyway"
     chain = []
     exc: BaseException | None = raised.value
     while exc is not None:

@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import logging
 import pathlib
+import threading
 
 import pytest
 from pydantic import ValidationError
@@ -352,6 +353,45 @@ class TestTheSharedHardExit:
         with pytest.raises(OSError, match="503"):
             fi.hard_exit_after_flush(75, log=_logging.getLogger("test-flush-boom"), message="going down")
         assert exited == [75], "the flush raised and the process was left alive"
+
+    def test_a_flush_that_never_returns_does_not_cancel_the_exit(self, monkeypatch):
+        """BLOCKING, not raising — and the `finally` covers only the second. A handler parked on
+        its lock, its socket or a full output pipe never reaches a `finally` at all, so on the
+        wedged-drain path the process would stay alive with exactly the non-daemon writer thread
+        this exit exists to kill. The exit is therefore armed BEFORE the announcement.
+
+        The recorded status is the oracle, not the call returning: the stub stands in for a real
+        `os._exit`, so the subject stays parked in the blocked flush afterwards either way.
+        """
+        import logging as _logging
+        import os as _os
+
+        from tessera_embeddings.config import fault_injection as fi
+
+        # NEVER SET, and deliberately never released. The subject runs on a daemon thread that
+        # must not proceed past the flush: `monkeypatch` restores the real `os._exit` when this
+        # test returns, so a subject allowed to resume would reach it and kill the test worker.
+        # Parking it forever models the failure exactly and costs one blocked daemon thread.
+        never_flushes = threading.Event()
+        exited: list[int] = []
+        recorded = threading.Event()
+
+        def _record(status: int) -> None:
+            exited.append(status)
+            recorded.set()
+
+        monkeypatch.setattr(_os, "_exit", _record)
+        monkeypatch.setattr(_logging, "shutdown", never_flushes.wait)
+        monkeypatch.setattr(fi, "_ANNOUNCE_BUDGET_S", 0.3)
+
+        threading.Thread(
+            target=lambda: fi.hard_exit_after_flush(
+                75, log=_logging.getLogger("test-flush-hangs"), message="going down"
+            ),
+            daemon=True,
+        ).start()
+        assert recorded.wait(10.0), "the blocked flush kept the process alive: nothing exited"
+        assert exited == [75], f"the exit fired with the wrong status: {exited}"
 
     def test_the_drill_still_goes_through_it(self):
         import inspect as _inspect

@@ -239,6 +239,37 @@ class TrailingAssemblyWedgedError(RuntimeError):
         )
 
 
+def _diagnose_wedge_off_thread(
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger], ceiling_s: float, abandoned: int
+) -> None:
+    """Emit the wedge's diagnostics on a daemon thread, so nothing they do can hold up the raise.
+
+    The same rule ``storage.shard_writer._fork_stall_watchdog`` follows: ``suppress`` covers a
+    diagnostic that RAISES, nothing covers one that never RETURNS, and both of these are writes
+    to stderr, which block rather than raise when the container's log pipe is full or a remote
+    handler is unreachable. The watchdog can diagnose in line because it signals through a flag
+    another thread reads; the drain signals by RAISING on the caller's own thread, so a
+    diagnostic in front of that raise is a diagnostic that can swallow it — and the flow then
+    never learns it must hard-exit. Off-thread and daemon: it may park forever and die with the
+    process, which is the correct trade when the alternative is not exiting at all.
+    """
+
+    def _emit() -> None:
+        with suppress(Exception):
+            log.critical(
+                "TRAILING ASSEMBLY WEDGED: no assembly completed in %.1f h. Abandoning the %d still "
+                "pending — their cells stay unmarked and will be re-dispatched, resuming from their "
+                "staged tiles. Thread stacks follow.",
+                ceiling_s / 3600.0,
+                abandoned,
+            )
+        with suppress(Exception):
+            faulthandler.dump_traceback()
+
+    with suppress(Exception):
+        threading.Thread(target=_emit, name="trailing-assembly-wedge-diagnostics", daemon=True).start()
+
+
 def drain_trailing_assemblies(
     finalizer: ThreadPoolExecutor,
     futures: list[Future[None]],
@@ -249,11 +280,12 @@ def drain_trailing_assemblies(
     """Wait for every queued trailing assembly — but never for one of them forever.
 
     The ceiling resets on each completion, so a long backlog drains however long it takes and
-    only an individual assembly that exceeds ``ceiling_s`` is declared wedged. On a wedge it dumps
-    stacks, cancels what is queued, and RAISES here rather than returning a count: this runs from
-    the caller's ``finally``, where a count to check afterwards is a count an in-flight exception
+    only an individual assembly that exceeds ``ceiling_s`` is declared wedged. On a wedge it
+    cancels what is queued and RAISES here rather than returning a count: this runs from the
+    caller's ``finally``, where a count to check afterwards is a count an in-flight exception
     skips past — and the run would then report ``FAILED``, which is the one outcome the exit-75
-    crash exists to prevent. An exception already in flight is chained as ``__context__``.
+    crash exists to prevent. An exception already in flight is chained as ``__context__``. The
+    stacks are dumped by :func:`_diagnose_wedge_off_thread`, AFTER that raise is on its way.
 
     It does NOT end the process; that is the process owner's call, after its own teardown.
 
@@ -265,19 +297,12 @@ def drain_trailing_assemblies(
     while pending:
         done, _ = wait(pending, timeout=ceiling_s, return_when=FIRST_COMPLETED)
         if not done:
+            # SIGNAL AND TEAR DOWN FIRST, DIAGNOSE AFTERWARDS, as `_fork_stall_watchdog` does.
+            # The count is read before the teardown so the number stays honest.
             n = len(pending)
             with suppress(Exception):
-                log.critical(
-                    "TRAILING ASSEMBLY WEDGED: no assembly completed in %.1f h. Abandoning the %d still "
-                    "pending — their cells stay unmarked and will be re-dispatched, resuming from their "
-                    "staged tiles. Thread stacks follow.",
-                    ceiling_s / 3600.0,
-                    n,
-                )
-            with suppress(Exception):
-                faulthandler.dump_traceback()
-            with suppress(Exception):
                 finalizer.shutdown(wait=False, cancel_futures=True)
+            _diagnose_wedge_off_thread(log, ceiling_s, n)
             raise TrailingAssemblyWedgedError(n)
         pending = [f for f in pending if not f.done()]
 
