@@ -116,8 +116,22 @@ def _credentials(uri: str):  # noqa: ANN202 - icechunk credentials callable or N
     return harness_credentials if uri.startswith("s3://") else None
 
 
-def _open(uri: str, region: str | None):  # noqa: ANN202
-    return global_store.open_global_repo(uri, get_credentials=_credentials(uri), region=region)
+def _open(uri: str, region: str | None, cfg: dict[str, Any] | None = None):  # noqa: ANN202
+    """Open the store the way production's coordinator does when ``cfg`` says so.
+
+    ``assemble_global`` opens with ``max_concurrent_requests = target // n_workers`` — the
+    2026-09-09 mellow-walrus summary shows ``per_worker_s3_cap: 1`` — and
+    ``scatter_initial_credentials=True`` so the pickled session carries a credential to the fork
+    workers. The harness had used icechunk's defaults (256 concurrent requests, no scatter).
+    """
+    cfg = cfg or {}
+    return global_store.open_global_repo(
+        uri,
+        get_credentials=_credentials(uri),
+        region=region,
+        max_concurrent_requests=cfg.get("max_concurrent_requests") or None,
+        scatter_initial_credentials=bool(cfg.get("scatter_credentials")) and uri.startswith("s3://"),
+    )
 
 
 # --------------------------------------------------------------------------------------------
@@ -318,7 +332,7 @@ def _coordinator(k: int, cfg: dict[str, Any], lock: Any | None, start_delay_s: f
     spacing = _install_spacing(lock if cfg["arm"] == "fixed" else None)
     plog.info("coordinator %d starting (spacing installed: %s, shape: %s)", k, spacing, cfg["process_shape"])
     _pin_cpus(k, cfg["cpus_per_coordinator"], plog)
-    repo = _open(cfg["store_uri"], cfg["region"])
+    repo = _open(cfg["store_uri"], cfg["region"], cfg)
     # The production shape: the write runs on the trailing-assembly thread, the main thread reads.
     from concurrent.futures import ThreadPoolExecutor
 
@@ -606,6 +620,8 @@ def _report(cfg: dict[str, Any], seed: dict[str, Any], started: float, wall: flo
                 "credential_ttl_s",
                 "process_shape",
                 "cpus_per_coordinator",
+                "max_concurrent_requests",
+                "scatter_credentials",
             )
         },
         "seed": {k: v for k, v in seed.items() if k != "seed_used"},
@@ -696,6 +712,18 @@ def main(argv: list[str] | None = None) -> int:
         "--main-thread-read-s", type=float, default=2.0, help="Main-thread store read period (production shape)."
     )
     ap.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=0,
+        help="Per-repository HTTP concurrency for each coordinator's repo, as assemble_global sets it "
+        "(production: target // n_workers, observed 1). 0 = icechunk's default (256).",
+    )
+    ap.add_argument(
+        "--scatter-credentials",
+        action="store_true",
+        help="Open with scatter_initial_credentials=True, as assemble_global does for the pickled session.",
+    )
+    ap.add_argument(
         "--cpus-per-coordinator",
         type=int,
         default=0,
@@ -738,6 +766,8 @@ def main(argv: list[str] | None = None) -> int:
         "process_shape": args.process_shape,
         "main_thread_read_s": args.main_thread_read_s,
         "cpus_per_coordinator": args.cpus_per_coordinator,
+        "max_concurrent_requests": args.max_concurrent_requests,
+        "scatter_credentials": args.scatter_credentials,
         "assignments": assignments,
     }
     log.info("[%s] seeding %s to a %.0f KB snapshot target", args.arm, store_uri, args.seed_target_snapshot_kb)
