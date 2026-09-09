@@ -38,7 +38,23 @@ while a fork is still outstanding, so when the sixteenth finishes the loop exits
 **neither** the summary nor any failure — the assembly thread stopped between the last worker and the
 completion mark.
 
-**Where in that tail cannot be pinned from logs, and the honest envelope is what matters.** After the
+> **ROOT CAUSE CONFIRMED 2026-09-09 (supersedes the "cannot be pinned from logs" paragraph below).**
+> The hang is not a mystery tail wait. It is an icechunk deadlock triggered by opening the store with
+> `max_concurrent_requests = 1` — the value our S3-budget split produces on a wide campaign
+> (`per_worker_s3_cap: 1` in the live assembly summary). Reproduced on real S3 with native stacks
+> (`scripts/scoping/wedge_repro/`, run `repro-main-05`): under concurrent writers, `Session.commit`
+> AND `Repository.diff`/`rebase` park forever in icechunk's tokio runtime; a control at cap 2, load
+> identical, publishes cleanly. Bisection: cap 1 deadlocks, cap ≥ 2 clean. See
+> `icechunk-max-concurrent-requests-1-deadlock.md`. Two consequences correct the analysis below:
+> (1) the **commit is NOT excluded** — one captured stack is parked in `commit`, and the earlier runs'
+> stall alarm never fired only because those runs used icechunk's default cap of 256, not the
+> production cap of 1; (2) `rehome_after_a_wedged_catch_up` does not merely fail to reach the wedge —
+> its `diff` call parks in the **same** deadlock, which is why the fallback re-commit never recovered
+> the 09-04 clusters. The real cure is to never open at cap 1 (floor the per-worker cap at 2 in
+> `_s3_budget_split`); publication spacing and the rehome recovery do not address the cause.
+
+**[Original hypothesis, retained for the record.] Where in that tail cannot be pinned from logs, and
+the honest envelope is what matters.** After the
 last progress line the assembly thread still has several *unbounded, silent* waits ahead of it, any
 one of which fits the evidence: the worker-pool shutdown join (`ex.shutdown()`, wait=True, no
 timeout — hangs if a worker process will not exit), the post-write catch-up handling at
