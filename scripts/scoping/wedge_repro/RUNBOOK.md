@@ -136,6 +136,43 @@ Budget: the box self-terminates 8 h after launch (this box: launched 01:27Z, ter
 A + B + escalation is about 6 h. If the schedule threatens the deadline, say so in a message
 rather than shortening a run; only the operator (Robert) extends the box.
 
+## 5c. Run 3 (2026-09-09): the process, not the store
+
+Run 2's arm A (`repro-main-03`) reached depth ≥ 4 at 128 of 3,810 catch-up ticks, on a 4,784-snapshot
+store, with publication gaps down to 0.38 s — and nothing hung. So the precondition the fix stack
+targets is not, by itself, sufficient. Snapshot weight also turned out to be per DISTINCT published
+cell (~150 B), so re-filling a 200-cell slice saturated at 137 KB; production's 250 KB is ~800
+distinct cells, which the harness pool can reach only by giving up the marker.
+
+Run 3 changes the PROCESS to match production and leaves the store alone. Three factors, all on
+at once first (bisect only if it hangs):
+
+- `--credential-ttl-s 5`: icechunk re-invokes the Python credential callback — the one Rust→Python
+  call — on nearly every S3 operation instead of every 15 min (the 08-29 record's un-run experiment).
+- `--process-shape production`: the write runs on a `trailing-assembly` thread while the main
+  thread reads the store every 2 s, as the fill runner's other threads do.
+- `--cpus-per-coordinator 16`: each coordinator and its fork workers see 16 CPUs, the production
+  task size, so icechunk's runtime and the pools size themselves as they do there.
+
+```
+RUN=repro-main-05
+ssm $IID "cd /opt/repro && nohup main/.venv/bin/python prod_scale_repro.py --arm reproduce --run-id $RUN \
+  --coordinators 10 --cells-per-coordinator 4 --live-shards 1500 --n-workers 12 \
+  --stagger-seconds 2 --marker-rate-s 3 --seed-target-snapshot-kb 0 --seed-cells 200 --seed-pool-cells 200 \
+  --credential-ttl-s 5 --process-shape production --cpus-per-coordinator 16 \
+  --stall-seconds 900 --stall-dumps 5 --results-dir results/$RUN \
+  --s3-results s3://global-tessera-embeddings-dev/scoping/prod-repro/results/$RUN > results/$RUN.out 2>&1 &"
+```
+Seeding is ~5 min (200 fills, no weight target), the run ~40 min. Report fields to quote in
+addition to section 5b's: `config.credential_ttl_s`, `config.process_shape`,
+`config.cpus_per_coordinator`, and per cell `main_thread_reads` (must be > 0 in the production shape).
+Also grep each `coord-N.log` for `pinned to cpus` (must appear) and count the `icechunk credential`
+lines in `results/$RUN.out` (should be hundreds, not a handful).
+
+If it hangs: the dumps are the result; then bisect by re-running with ONE factor at a time. If it
+does not: `repro-main-06` = the same plus `--seed-pool-cells 700 --seed-cells 700 --marker-rate-s 6
+--cells-per-coordinator 2` (distinct seeds to ~230 KB; the marker keeps 290 cells).
+
 ## 6. Collect, per arm
 
 From `report.json`: `seed` (achieved `snapshot_max_bytes`), `cells`, `catch_up_depth`, `condition_reached`, `publication_gaps_from_store`,

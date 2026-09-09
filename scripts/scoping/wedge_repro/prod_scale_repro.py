@@ -43,10 +43,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import functools
 import itertools
 import json
 import logging
 import multiprocessing as mp
+import os
 import subprocess
 import sys
 import threading
@@ -55,7 +57,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import icechunk
 import numpy as np
+import zarr
 
 from tessera_embeddings.config.store_layout import EMBEDDING_DIM, INNER_PX, SHARD_PX
 from tessera_embeddings.storage import campaign, global_store, shard_writer
@@ -77,12 +81,39 @@ except ImportError:  # pragma: no cover - main / pre-fix
 YEARS: tuple[int, ...] = CAMPAIGN_YEARS
 
 
-def _credentials(uri: str):  # noqa: ANN202 - icechunk credentials callable or None
-    if not uri.startswith("s3://"):
-        return None
-    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+#: ``--credential-ttl-s`` travels to every spawned process (fork workers included) through the
+#: environment: a module constant patched in the driver would not survive the spawn.
+_CRED_TTL_ENV = "WEDGE_CRED_TTL_S"
 
-    return iam_icechunk_credentials
+
+def harness_credentials() -> icechunk.S3StaticCredentials:
+    """The production credential provider, optionally with a much shorter reuse window.
+
+    icechunk re-invokes ``get_credentials`` from its Rust runtime — the ONE place Rust calls back
+    into Python — whenever the served credential's ``expires_after`` has passed. Production serves
+    a 15-minute window, so the callback lands inside a catch-up rebase only occasionally; a TTL of
+    a few seconds makes nearly every S3 operation of a rebase start with that callback, which is
+    the 2026-08-29 record's un-run "next experiment". With no TTL set this IS the production
+    provider, same announce lock, same logging.
+    """
+    from tessera_embeddings.providers.aws import credentials as creds
+
+    ttl = float(os.environ.get(_CRED_TTL_ENV, "0") or 0)
+    if ttl <= 0:
+        return creds.iam_icechunk_credentials()
+    # The provider's own two steps, private on purpose there; reused so the path is identical.
+    frozen = creds._resolve_iam_credentials().get_frozen_credentials()
+    return creds._serve_icechunk_credential(
+        source="task-role",
+        access_key=frozen.access_key,
+        secret_key=frozen.secret_key,
+        session_token=frozen.token,
+        expires_after=dt.datetime.now(dt.UTC) + dt.timedelta(seconds=ttl),
+    )
+
+
+def _credentials(uri: str):  # noqa: ANN202 - icechunk credentials callable or None
+    return harness_credentials if uri.startswith("s3://") else None
 
 
 def _open(uri: str, region: str | None):  # noqa: ANN202
@@ -246,12 +277,52 @@ def _log_to(path: Path) -> None:
     root.setLevel(logging.INFO)
 
 
+def _pin_cpus(k: int, per_coordinator: int, log: logging.Logger) -> list[int]:
+    """Confine this coordinator AND everything it spawns to ``per_coordinator`` CPUs.
+
+    A production assembly runs in a 16-vCPU task: icechunk's tokio runtime, zarr's thread pools
+    and the fork pool all size themselves from that count. On a 192-CPU box every process sees
+    192, so a hang that needs a saturated thread pool cannot show. Affinity is inherited by the
+    children, so pinning here pins the fork workers too. No-op where the OS has no affinity API.
+    """
+    if per_coordinator <= 0 or not hasattr(os, "sched_setaffinity"):
+        return []
+    n = os.cpu_count() or 1
+    cpus = sorted({(k * per_coordinator + i) % n for i in range(per_coordinator)})
+    os.sched_setaffinity(0, cpus)
+    log.info("coordinator %d pinned to cpus %s", k, cpus)
+    return cpus
+
+
+def _main_thread_reads(repo: Any, zone: str, fut: Any, period_s: float) -> int:  # noqa: ANN401
+    """While the write runs on its thread, keep the main thread reading the store like the runner.
+
+    In production the trailing-assembly thread writes while the SAME process's other threads read
+    campaign state from the store (status, marks, the ingest adapter) through the same repository
+    and credential provider. The write on a bare main thread never has that company.
+    """
+    reads = 0
+    while not fut.done():
+        session = repo.readonly_session("main")
+        _ = dict(zarr.open_group(session.store, mode="r")[zone].attrs)
+        reads += 1
+        with contextlib.suppress(TimeoutError):
+            fut.result(timeout=period_s)
+    return reads
+
+
 def _coordinator(k: int, cfg: dict[str, Any], lock: Any | None, start_delay_s: float) -> None:  # noqa: ANN401
     results = Path(cfg["results_dir"])
     _log_to(results / f"coord-{k}.log")
+    plog = logging.getLogger("prod_scale_repro")
     spacing = _install_spacing(lock if cfg["arm"] == "fixed" else None)
-    logging.getLogger("prod_scale_repro").info("coordinator %d starting (spacing installed: %s)", k, spacing)
+    plog.info("coordinator %d starting (spacing installed: %s, shape: %s)", k, spacing, cfg["process_shape"])
+    _pin_cpus(k, cfg["cpus_per_coordinator"], plog)
     repo = _open(cfg["store_uri"], cfg["region"])
+    # The production shape: the write runs on the trailing-assembly thread, the main thread reads.
+    from concurrent.futures import ThreadPoolExecutor
+
+    trailing = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trailing-assembly")
     ticks: list[dict[str, Any]] = []
     shard_writer.catch_up_best_effort = _recording_catch_up(shard_writer.catch_up_best_effort, ticks)
     time.sleep(start_delay_s)
@@ -264,21 +335,30 @@ def _coordinator(k: int, cfg: dict[str, Any], lock: Any | None, start_delay_s: f
         telemetry: dict[str, Any] = {}
         rec: dict[str, Any] = {"coordinator": k, "zone": zone, "year": year, "started": time.time()}
         t0 = time.monotonic()
+        write = functools.partial(
+            shard_writer.write_year_shards,
+            repo,
+            zone,
+            YEARS.index(year),
+            source,
+            n_workers=cfg["n_workers"],
+            run_id=f"{cfg['run_id']}-{k}-{idx}",
+            telemetry=telemetry,
+            log=logging.getLogger(f"coord.{k}"),
+        )
+        reads = 0
         try:
-            snap = shard_writer.write_year_shards(
-                repo,
-                zone,
-                YEARS.index(year),
-                source,
-                n_workers=cfg["n_workers"],
-                run_id=f"{cfg['run_id']}-{k}-{idx}",
-                telemetry=telemetry,
-                log=logging.getLogger(f"coord.{k}"),
-            )
+            if cfg["process_shape"] == "production":
+                fut = trailing.submit(write)
+                reads = _main_thread_reads(repo, zone, fut, cfg["main_thread_read_s"])
+                snap = fut.result()
+            else:
+                snap = write()
             rec.update(outcome="published", snapshot=snap)
         except BaseException as exc:  # a hung arm is killed by the monitor; other failures recorded
             rec.update(outcome="failed", error=f"{type(exc).__name__}: {exc}"[:400])
         rec.update(
+            main_thread_reads=reads,
             wall_s=round(time.monotonic() - t0, 3),
             telemetry={k_: v for k_, v in telemetry.items() if k_ != "workers"},
             catch_up_depth=_depth_summary(ticks),
@@ -523,6 +603,9 @@ def _report(cfg: dict[str, Any], seed: dict[str, Any], started: float, wall: flo
                 "stagger_seconds",
                 "stall_seconds",
                 "seed_target_snapshot_kb",
+                "credential_ttl_s",
+                "process_shape",
+                "cpus_per_coordinator",
             )
         },
         "seed": {k: v for k, v in seed.items() if k != "seed_used"},
@@ -596,9 +679,32 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--monitor-period-s", type=float, default=30.0)
     ap.add_argument("--no-pyspy", action="store_true", help="Skip native dumps (local smoke).")
     ap.add_argument("--max-run-seconds", type=float, default=6 * 3600, help="Hard ceiling on the run phase.")
+    ap.add_argument(
+        "--credential-ttl-s",
+        type=float,
+        default=0.0,
+        help="Serve icechunk credentials that expire this soon, so the Rust->Python callback fires "
+        "on nearly every S3 operation (0 = production's 15 min).",
+    )
+    ap.add_argument(
+        "--process-shape",
+        choices=["plain", "production"],
+        default="plain",
+        help="production: the write runs on a trailing-assembly thread while the main thread reads the store.",
+    )
+    ap.add_argument(
+        "--main-thread-read-s", type=float, default=2.0, help="Main-thread store read period (production shape)."
+    )
+    ap.add_argument(
+        "--cpus-per-coordinator",
+        type=int,
+        default=0,
+        help="Pin each coordinator and its workers to this many CPUs (production assembly runs on 16). 0 = unpinned.",
+    )
     ap.add_argument("--cleanup", action="store_true")
     args = ap.parse_args(argv)
 
+    os.environ[_CRED_TTL_ENV] = str(args.credential_ttl_s)  # before any spawn: children inherit it
     store_uri = args.store_uri or f"s3://global-tessera-embeddings-dev/scoping/prod-repro/{args.run_id}.icechunk"
     results = Path(args.results_dir or f"temp/prod_repro/{args.run_id}")
     results.mkdir(parents=True, exist_ok=True)
@@ -628,6 +734,10 @@ def main(argv: list[str] | None = None) -> int:
         "stall_seconds": args.stall_seconds,
         "stall_dumps": args.stall_dumps,
         "monitor_period_s": args.monitor_period_s,
+        "credential_ttl_s": args.credential_ttl_s,
+        "process_shape": args.process_shape,
+        "main_thread_read_s": args.main_thread_read_s,
+        "cpus_per_coordinator": args.cpus_per_coordinator,
         "assignments": assignments,
     }
     log.info("[%s] seeding %s to a %.0f KB snapshot target", args.arm, store_uri, args.seed_target_snapshot_kb)
