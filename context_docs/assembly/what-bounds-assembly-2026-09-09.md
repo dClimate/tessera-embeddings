@@ -48,16 +48,22 @@ stays 16, and only the campaign's chained fill — the sole deployment on the 24
 
 **16 workers has less headroom than it looks.** 63% of the 64 GiB box on the per-task figure, and
 the metric route saw 73% during the earlier run on 09-09 (46.7 GiB, outside the log's retention and
-so not attributable to a task). Either way, about 17-24 GiB is left for the coordinator, the Ray
-head and the commit, so a 16-worker pool wants the full 64 GiB.
+so not attributable to a task). Either way, about 17-24 GiB is left for the fill's own coordinator
+and the commit, so a 16-worker pool wants the full 64 GiB. (**Not** for the Ray head: `ray up`
+launches that on its own EC2 node and the flow runner only connects to it, so no head memory is in
+these task figures at all.)
 
 **Per worker is 2.5 GiB at 16 and 2.9 GiB at 32 — so the pool is NOT linear in worker count, and
-these are whole-task ratios rather than per-worker footprints.** They include the coordinator, the
-Ray head and the runtime. Fitting a line to the two points gives 3.34 GiB per worker and a
-*negative* fixed overhead of −13 GiB, which is nonsense: two points from different runner families
-running different cells cannot separate overhead from per-worker cost. **For sizing, use the larger
-ratio, ~2.9 GiB per worker, as an upper bound** — it predicts the 94 GiB actually observed at 32 and
-is conservative at 16.
+these are whole-task ratios rather than per-worker footprints.** They include the fill's
+coordinator and the Python runtime. Fitting a line to the two points gives 3.34 GiB per worker and
+a *negative* fixed overhead of −13 GiB, which is the arithmetic saying two points from different
+runner families running different cells cannot separate overhead from per-worker cost.
+
+**So there is no per-worker sizing rule here, and the larger ratio is not an upper bound either.**
+Taking 2.9 GiB per worker as a bound was tried and withdrawn: nothing measured stops a third pool
+size — different fixed overhead, different cell geometry, a different runner family — from
+exceeding it, and an operator sizing a runner from a bound that does not hold gets the OOM this
+document exists to prevent. **Two sizes are measured. Any other needs its own measurement.**
 
 **Assembly is compute-heavy, but the processor is NOT established as the binding constraint.**
 A 16-worker task reached 96.8% of its 16 vCPU, so that pool very nearly saturates its box. A
@@ -85,6 +91,10 @@ Three rounds, each understated or misattributed, all reaching the same decision:
    coincidence, and the 99.7% CPU was a cross-task artefact of independent aggregation — no single
    task exceeded 87.8%. **The lesson is the one at the top: a per-metric `Maximum` over a family is
    not a measurement of any task.**
+
+All three are filed in [`../corrections-register.md`](../corrections-register.md) under the
+mechanisms that produced them — 1 (a condition left unlisted, here *which task*), 6 (a model
+fitted on two points) and 7 (a mechanism asserted before being measured).
 
 ## Care with the throughput figures
 
