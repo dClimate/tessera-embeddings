@@ -36,6 +36,20 @@ below, and the combined-token rate and the GPU-hour interval are derived from th
 rather than quoted. :func:`test_cost_report` prints the line and its interval. The
 measurement history behind the tables is in `campaign-cost-model.md` §6b-6c and
 `context_docs/inference/inference-on-gpus.md` §6.
+
+**AND, since 2026-09-10, what the finished campaign actually did.** The campaign ran, so the
+model can be checked rather than only self-checked: the ``CAMPAIGN_*`` constants hold the
+outturn from `campaign-cost-model.md` §12 and
+:func:`test_the_model_reconciles_against_the_campaign_outturn` welds the two together. Read
+that test before trusting a prediction from the tables — the model was 15% light on work and
+8% high on the card bill, in opposite directions and for different reasons.
+
+**Two things in this file were withdrawn by that campaign**, and both are named rather than
+deleted so they can be recognised where they are still quoted. Assembly per tile was
+re-measured 1.7x slower than the figure ``SUPERSEDED_ASSEMBLY_S_PER_TILE`` holds, and the
+"~275-actor assembly ceiling" it produced does not survive: the crossover is a function of the
+assembly POOL WIDTH, near 158 actors at the shipped 16 workers and near 383 at the campaign's
+32. :func:`test_the_assembly_crossover_depends_on_the_pool_width` replaces it.
 """
 
 from __future__ import annotations
@@ -860,15 +874,72 @@ def test_the_campaign_costs_more_per_pixel_than_the_site_every_rate_came_from() 
 # completed dense zone-year (`campaign-cost-model.md` §6c), and both are linear in tiles —
 # which is an assumption this model rests on, not a measured property of the whole range.
 
-#: Wall seconds of assembly per live tile, from a completed dense zone-year.
-ASSEMBLY_S_PER_TILE = 196.6 * 60 / 8714
-#: GPU-hours of inference per live tile, from the same cell.
+#: Wall seconds of assembly per live tile, MEASURED, keyed by the assembly pool's width.
+#:
+#: **Keyed rather than scalar because the width is what moves it, and that turned out to decide
+#: whether assembly is on the critical path at all.** The two entries are whole completed cells:
+#: 48N-2017 at the shipped 16 workers (20,815 s over 8,803 live tiles, 2026-08-26) and 51S at the
+#: campaign's 32 (58.2 min over 3,590 tiles, the median of that zone's five assemblies on
+#: 2026-09-10). Note the ratio is 2.4x for a 2x pool, which is more than linear and is not
+#: explained here -- different cells, so it is a pair of measurements rather than a scaling law.
+ASSEMBLY_S_PER_TILE_BY_WORKERS = {16: 20_815 / 8_803, 32: 58.2 * 60 / 3_590}
+
+#: The shipped default. `AssemblyConfig.max_workers` is 16 and every caller but one takes it.
+ASSEMBLY_S_PER_TILE = ASSEMBLY_S_PER_TILE_BY_WORKERS[16]
+
+#: WITHDRAWN. The original figure came from a 3.28 h assembly of a dense cell, and a second
+#: measurement of a comparable cell took 5.78 h -- 1.7x -- partly because the estimate was built
+#: on the STAGED tile count when skipped tiles are still written as fill over the whole live
+#: footprint. Kept named so the crossover it produced can be recognised where it is still quoted:
+#: `campaign-cost-model.md` §6c and its withdrawal.
+SUPERSEDED_ASSEMBLY_S_PER_TILE = 196.6 * 60 / 8714
+
+#: GPU-hours of inference per live tile, from one completed dense zone-year.
+#:
+#: Kept per-cell rather than replaced by the campaign-wide outturn, because the starvation
+#: timeline below is a per-cell model and the two figures answer different questions. The
+#: campaign-wide equivalent is `CAMPAIGN_GPU_H_PER_TILE_YEAR`, 5.7% higher because it divides
+#: by delivered work every card that was BILLED, ramp and idleness included;
+#: :func:`test_the_model_reconciles_against_the_campaign_outturn` welds the two.
 INFERENCE_GPU_H_PER_TILE = 902.1 / 8714
 #: Campaign years, every one dispatched together (the `overlap_years` decision).
 CAMPAIGN_YEARS = 9
 
+# --- What the campaign ACTUALLY ran, 2026-08-25 to 2026-09-10 -------------------------------
+# The constants above are the plan. These are the outturn, from `campaign-cost-model.md` §12 and
+# reproducible by `scripts/scoping/campaign_cost_actuals.py` and `campaign_delivery_census.py`.
+# They are here so the model can be reconciled against reality rather than only against itself:
+# a table edit that breaks the reconciliation should fail, and until this block existed nothing
+# in the suite could notice that the model had been overtaken by a finished campaign.
 
-def assembly_queue(tiles_in_dealt_order: Sequence[int], *, actors: int) -> dict[str, float]:
+#: 25 clusters of 100 actors, not the planned 8 of 228. The narrower cluster is what kept the
+#: campaign under the assembly crossover once that crossover was re-measured -- see
+#: :func:`test_the_assembly_crossover_depends_on_the_pool_width`.
+CAMPAIGN_CLUSTERS = 25
+CAMPAIGN_ACTORS_PER_CLUSTER = 100
+#: The chained fill passed 32 assembly workers on the 244 GiB runner; every other caller took 16.
+CAMPAIGN_ASSEMBLY_WORKERS = 32
+#: Billed graphics-card hours, from Cost Explorer usage: 203,394 g5.2xlarge + 151,347 g6e.xlarge.
+CAMPAIGN_GPU_HOURS = 354_742
+#: Tile-years published with data -- 990 cells, 99.83% of the 3,248,577 roster.
+CAMPAIGN_TILE_YEARS = 3_243_043
+#: Graphics cards at on-demand list. NOT a bill: this account's cost metrics read as zero, so the
+#: figure is measured usage times published list price. See the cost script's docstring.
+CAMPAIGN_GPU_COST_USD = 528_172
+#: Delivered work per billed card-hour. Higher than the per-cell basis because it absorbs ramp,
+#: lulls and three orphaned clusters -- which is what makes it the right figure for planning.
+CAMPAIGN_GPU_H_PER_TILE_YEAR = CAMPAIGN_GPU_HOURS / CAMPAIGN_TILE_YEARS
+#: Blended card price the campaign actually paid, against the $1.861 single-card figure the model
+#: divides by: the fleet was 57.3% of the cheaper A10G by hours.
+CAMPAIGN_BLENDED_GPU_HOUR_USD = CAMPAIGN_GPU_COST_USD / CAMPAIGN_GPU_HOURS
+
+
+def assembly_queue(
+    tiles_in_dealt_order: Sequence[int],
+    *,
+    actors: int,
+    assembly_s_per_tile: float = ASSEMBLY_S_PER_TILE,
+) -> dict[str, float]:
     """Simulate one cluster's assembly queue; return the tail and the peak backlog, in hours.
 
     Each cell's assembly can start only when BOTH its own inference has finished and the
@@ -880,13 +951,17 @@ def assembly_queue(tiles_in_dealt_order: Sequence[int], *, actors: int) -> dict[
 
     A HIGHER actor count is the adverse case, not the safe one: more actors shorten inference
     while assembly is unchanged, so the margin narrows. Evaluate at the planned width.
+
+    ``assembly_s_per_tile`` defaults to the shipped 16-worker pool. It is a parameter because the
+    pool width is what decides whether the queue drains, so a caller asking about the campaign's
+    32-worker fill must be able to say so rather than inherit the default silently.
     """
     now_inference = 0.0
     thread_free = 0.0
     peak = 0.0
     for tiles in tiles_in_dealt_order:
         now_inference += tiles * INFERENCE_GPU_H_PER_TILE * 3600 / actors
-        thread_free = max(now_inference, thread_free) + tiles * ASSEMBLY_S_PER_TILE
+        thread_free = max(now_inference, thread_free) + tiles * assembly_s_per_tile
         peak = max(peak, thread_free - now_inference)
     return {"tail_h": (thread_free - now_inference) / 3600, "peak_backlog_h": peak / 3600}
 
@@ -898,66 +973,135 @@ def test_the_trailing_assembly_thread_is_not_the_critical_path() -> None:
     year of every zone it owns queues them all behind each other. If that queue outlived its
     inference, the fix would be the runner's size or the pool width — both settable per run.
 
-    It does not. The queue builds to roughly ONE dense cell's assembly and drains, and the tail
-    past the end of inference is minutes against a campaign of days. What this pins is the
-    conclusion AND its direction of safety: per tile, assembly must stay cheaper than inference,
-    because that inequality is what makes the queue drain at all. Reverse it and the backlog
-    compounds over a cluster's cells instead of clearing.
+    **Evaluated at the shape that RAN, not the shape that was planned**, and the distinction is
+    the finding. At the campaign's 100 actors per cluster the queue drains on either assembly
+    measurement. At the planned 228 it does not: with assembly measured at the shipped 16-worker
+    width, per-tile assembly is DEARER than per-tile inference, so the backlog compounds over a
+    cluster's cells instead of clearing. The campaign avoided that twice over — narrower clusters
+    and a wider assembly pool — and neither margin was chosen for this reason.
     """
-    inference_s = INFERENCE_GPU_H_PER_TILE * 3600 / ACTORS_PER_CLUSTER
-    assert inference_s > ASSEMBLY_S_PER_TILE, (
-        "assembly is now dearer per tile than inference — the queue compounds instead of draining"
+    a16 = ASSEMBLY_S_PER_TILE_BY_WORKERS[16]
+    a32 = ASSEMBLY_S_PER_TILE_BY_WORKERS[32]
+
+    # The direction of safety, at the width that ran: per tile, assembly must stay cheaper than
+    # inference, because that inequality is what makes the queue drain at all.
+    inference_s_campaign = INFERENCE_GPU_H_PER_TILE * 3600 / CAMPAIGN_ACTORS_PER_CLUSTER
+    assert inference_s_campaign > a16 > a32, (
+        "at the campaign's actor count assembly is no longer cheaper per tile than inference — "
+        "the queue compounds instead of draining"
+    )
+
+    # And the planned width fails that same test on the 16-worker measurement. Asserted rather
+    # than noted, because it is the reason the withdrawn 275-actor crossover mattered.
+    inference_s_planned = INFERENCE_GPU_H_PER_TILE * 3600 / ACTORS_PROVISIONED
+    assert inference_s_planned < a16, (
+        "the planned 228 actors now sits under the measured 16-worker assembly rate — the "
+        "crossover has moved again and the conclusions resting on it need re-deriving"
     )
 
     for cluster in plan(CLUSTERS):
         cells = [t for t in cluster.tiles for _ in range(CAMPAIGN_YEARS)]
-        q = assembly_queue(cells, actors=ACTORS_PER_CLUSTER)
-        # Minutes, not hours: anything approaching a cell's own assembly means the queue stopped
-        # draining, and the tail is then bounded by the cluster's length rather than by one cell.
-        assert q["tail_h"] < 0.5, f"assembly tail {q['tail_h']:.2f} h is on the critical path"
-        # The backlog is expected and benign — one dense assembly in flight. Much more than that
-        # means cells are arriving faster than the single thread retires them.
-        assert q["peak_backlog_h"] < 2 * ASSEMBLY_S_PER_TILE * max(cluster.tiles) / 3600 + 1.0
+        for workers, rate in ASSEMBLY_S_PER_TILE_BY_WORKERS.items():
+            q = assembly_queue(cells, actors=CAMPAIGN_ACTORS_PER_CLUSTER, assembly_s_per_tile=rate)
+            # Minutes, not hours: anything approaching a cell's own assembly means the queue
+            # stopped draining, and the tail is then bounded by the cluster's length rather than
+            # by one cell.
+            assert q["tail_h"] < 0.5, (
+                f"at {workers} assembly workers the tail is {q['tail_h']:.2f} h — on the critical path"
+            )
+            # The backlog is expected and benign — one dense assembly in flight. Much more than
+            # that means cells are arriving faster than the single thread retires them.
+            assert q["peak_backlog_h"] < 2 * rate * max(cluster.tiles) / 3600 + 1.0
 
 
-def test_the_assembly_ceiling_is_an_actor_count_and_the_policy_is_what_stays_under_it() -> None:
-    """Where the trailing thread becomes binding, and what keeps the campaign below it.
+def test_the_assembly_crossover_depends_on_the_pool_width() -> None:
+    """Where the trailing thread becomes binding — and that the answer is a pool width, not a number.
 
-    The margin is not a property of assembly; it is a property of the RATIO, and the actor
-    count sets it. Inference time per tile falls as actors rise while assembly does not move,
-    so there is a width at which the two cross and the queue stops draining. Above it, extra
-    actors buy less than proportionally: they shorten inference and lengthen the tail.
+    The margin is not a property of assembly; it is a property of the RATIO, and both terms move.
+    Inference time per tile falls as actors rise, and assembly time per tile falls as the assembly
+    pool widens, so the crossing point is set by both together.
 
-    The consequence worth knowing is a COUPLING nobody chose. The 85%-provisioning policy
-    exists to stop a fleet idling on a shallow queue, and it is also the thing holding the
-    campaign under this ceiling. Anyone raising the fleet toward matched, for throughput, is
-    also spending this margin — so the two decisions cannot be taken independently.
+    **This supersedes a single "275-actor ceiling".** That figure came from an assembly rate since
+    re-measured 1.7x slower, and quoting one crossover hid the term that actually controls it: on
+    the shipped 16-worker pool the crossover is near 158 actors, and on the campaign's 32 it is
+    near 383. The planned 228 straddles them. (Both use the per-cell inference basis this module
+    models with; the campaign-wide rate, which absorbs ramp and idleness, puts them at 167 and
+    405 — the same conclusion either way, which is why only one basis is asserted.) So "how many
+    actors can a cluster hold" has no answer without the assembly width beside it, which is what
+    this test pins.
 
-    The remedy, if a wider fleet is ever wanted, is the assembly side rather than the fleet:
-    the runner's pool is settable per run and its box has CPU left idle at the shipped width.
+    The consequence worth keeping is the COUPLING nobody chose: widening the fleet for throughput
+    spends this margin, and the remedy is the assembly side rather than the fleet, because the
+    pool is settable per run and its box has processor left idle at the shipped width.
     """
-    break_even = INFERENCE_GPU_H_PER_TILE * 3600 / ASSEMBLY_S_PER_TILE
 
-    def worst_tail(actors: int) -> float:
+    def break_even(assembly_s_per_tile: float) -> float:
+        return INFERENCE_GPU_H_PER_TILE * 3600 / assembly_s_per_tile
+
+    be16 = break_even(ASSEMBLY_S_PER_TILE_BY_WORKERS[16])
+    be32 = break_even(ASSEMBLY_S_PER_TILE_BY_WORKERS[32])
+
+    # Widening the pool moves the crossover, which is the whole claim.
+    assert be32 > 2 * be16 / 1.5, "doubling the assembly pool no longer buys actor headroom"
+    assert be16 == pytest.approx(158, rel=0.02)
+    assert be32 == pytest.approx(383, rel=0.02)
+
+    # The campaign's width sits under BOTH, which is why its tail was minutes.
+    assert CAMPAIGN_ACTORS_PER_CLUSTER < be16 < be32
+
+    # The planned width sits between them: safe only if assembly had been widened, which at the
+    # time it had not been. This is the finding the withdrawn single ceiling could not express.
+    assert be16 < ACTORS_PROVISIONED < be32, (
+        "the planned 228 no longer straddles the two measured crossovers — re-derive the coupling"
+    )
+
+    def worst_tail(actors: int, rate: float) -> float:
         return max(
-            assembly_queue([t for t in c.tiles for _ in range(CAMPAIGN_YEARS)], actors=actors)["tail_h"]
+            assembly_queue(
+                [t for t in c.tiles for _ in range(CAMPAIGN_YEARS)], actors=actors, assembly_s_per_tile=rate
+            )["tail_h"]
             for c in plan(CLUSTERS)
         )
 
-    # The planned width sits UNDER the ceiling, which is the whole reason the tail is minutes.
-    assert break_even > ACTORS_PER_CLUSTER
-    assert worst_tail(ACTORS_PER_CLUSTER) < 0.5
-
-    # And it is not a comfortable distance: the OTHER configuration this module already models
-    # crosses it. That is the finding, so it is asserted rather than left as a footnote.
-    assert break_even * 1.05 > ACTORS_MATCHED, "matched width no longer sits near the ceiling — re-derive"
-    assert worst_tail(ACTORS_MATCHED) > worst_tail(ACTORS_PER_CLUSTER), (
-        "raising the fleet to matched must be seen to lengthen the assembly tail"
-    )
-
-    # Above the ceiling the queue compounds over a cluster's cells rather than clearing, so the
+    # Above the crossover the queue compounds over a cluster's cells rather than clearing, so the
     # tail is bounded by the cluster's length and not by one cell. Pin the shape, not a number.
-    assert worst_tail(int(break_even * 1.5)) > 5 * worst_tail(ACTORS_PER_CLUSTER)
+    slow = ASSEMBLY_S_PER_TILE_BY_WORKERS[16]
+    assert worst_tail(int(be16 * 1.5), slow) > 5 * worst_tail(CAMPAIGN_ACTORS_PER_CLUSTER, slow)
+    # And raising the fleet must be seen to lengthen the tail, at a fixed assembly width.
+    assert worst_tail(ACTORS_MATCHED, slow) > worst_tail(CAMPAIGN_ACTORS_PER_CLUSTER, slow)
+
+
+def test_the_model_reconciles_against_the_campaign_outturn() -> None:
+    """The model's prediction against what the finished campaign actually did.
+
+    Nothing else in this suite could notice that the model had been overtaken by reality. These
+    are not assertions that the model was right — it was not, in two places — but that the size
+    and DIRECTION of each gap are still what §12 records. A table edit that changes the
+    prediction without changing this reconciliation fails here.
+    """
+    live_tiles = sum(b.live_tiles for b in OPTICAL_DEPTH_BY_BAND)
+    px_years = live_tiles * PX_PER_TILE * CAMPAIGN_YEARS
+    predicted_gpu_hours = px_years * CAMPAIGN_TOK_PER_PX / COMBINED_TOK_PER_SEC / 3600
+
+    # Work: the model was 15% light. It predicted per-pixel cost well and per-card delivery badly,
+    # because the delivered figure absorbs ramp and idleness that the model has no term for.
+    assert CAMPAIGN_GPU_HOURS / predicted_gpu_hours == pytest.approx(1.15, rel=0.03), (
+        "the work gap between model and outturn has moved from the +15% §12 records"
+    )
+    assert pytest.approx(1.057, rel=0.03) == CAMPAIGN_GPU_H_PER_TILE_YEAR / INFERENCE_GPU_H_PER_TILE
+
+    # Money: the card line came in UNDER the plan despite more work, because the fleet was more
+    # than half the cheaper card and the model divides by the dearer one throughout.
+    assert CAMPAIGN_BLENDED_GPU_HOUR_USD < GPU_HOUR_USD, (
+        "the blended price no longer sits below the single-card figure the model uses — the "
+        "fleet mix has changed and every cost line divides by the wrong rate"
+    )
+    assert pytest.approx(1.489, rel=0.02) == CAMPAIGN_BLENDED_GPU_HOUR_USD
+    assert pytest.approx(predicted_gpu_hours * GPU_HOUR_USD * 0.92, rel=0.03) == CAMPAIGN_GPU_COST_USD
+
+    # The roster is the one input that reproduced exactly, so it is welded rather than approximated.
+    assert live_tiles * CAMPAIGN_YEARS == 3_248_577
+    assert CAMPAIGN_TILE_YEARS / (live_tiles * CAMPAIGN_YEARS) == pytest.approx(0.9983, abs=0.0005)
 
 
 def test_the_bank_holds_across_the_whole_envelope() -> None:
