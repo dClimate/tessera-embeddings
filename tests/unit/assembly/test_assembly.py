@@ -1056,10 +1056,27 @@ class TestAssembly:
 class TestCleanupStaging:
     """cleanup_staging delegates to the shared prefix-delete helper.
 
-    The delete internals (s5cmd --all-versions, fsspec fallback) are
-    object_store.delete_prefix's concern (see test_object_store); here we only
-    pin that the staging dir for the given run is what gets removed.
+    The delete internals (the s5cmd invocation, the fsspec fallback) are
+    object_store.delete_prefix's concern; here we pin the two things this
+    method decides — which prefix goes, and that it opts out of the
+    all-versions delete.
     """
+
+    def test_the_all_versions_delete_is_opted_out_of(self):
+        """An assertion that staging is on an unversioned bucket, pinned so it cannot drift.
+
+        `delete_prefix` defaults the flag ON because that is the safe choice for a caller
+        whose bucket it does not know. Here it is known: every bucket the flows reaching this
+        method can address was measured to have versioning never enabled, and the flag is not
+        free — it raises the required permission to `s3:DeleteObjectVersion`, measured to fail
+        on `global-tessera-inputs` where a plain delete succeeds. A deployment pointing
+        `BucketPaths` at a versioned bucket has to revisit this, and flipping the flag alone
+        would not be enough: the read-back lists current keys only.
+        """
+        writer = ZarrWriter("s3://bucket/staging")
+        with patch.object(_assembly_mod, "delete_prefix") as delete_prefix:
+            writer.cleanup_staging("run123")
+        assert delete_prefix.call_args.kwargs["all_versions"] is False
 
     def test_delegates_to_delete_prefix_with_run_target(self):
         writer = ZarrWriter("s3://bucket/staging")
