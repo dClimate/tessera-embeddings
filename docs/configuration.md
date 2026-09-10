@@ -165,9 +165,10 @@ n_workers = cfg.compute_n_workers(25)                 # → 3
 The default cap of 16 was **measured peaking near 40 GiB** on the task as a
 whole, about two thirds of the flow runner's 64 GiB. So **size a custom
 flow-runner container at the full 64 GiB for a 16-worker pool**: assembly is
-where the peak is, and what is left over is the fill's own coordinator and the
-commit. A pool of 32 was measured near 94 GiB and does not fit a 64 GiB host at
-all. **Only those two sizes have been measured, and the two do not imply a
+where the peak is, the figure is whole-task (so the coordinator and the runtime
+are already inside it), and what is left over is unused reservation rather than
+a second allocation — there is simply less slack than it looks. A pool of 32 was
+measured near 94 GiB and does not fit a 64 GiB host at all. **Only those two sizes have been measured, and the two do not imply a
 per-worker rule** — the 32-worker pool used more per worker than the 16-worker
 one, so any other pool size needs its own measurement rather than an
 extrapolation. Override
