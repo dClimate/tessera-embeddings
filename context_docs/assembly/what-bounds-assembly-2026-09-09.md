@@ -82,8 +82,13 @@ Three rounds, each understated or misattributed, all reaching the same decision:
 1. **The `AssemblyConfig` docstring's estimate** — 1 to 1.5 GB per worker, a pool peaking around
    24 GB, 32 workers around 48 GB. Never measured at 16; low by about half.
 2. **A first measurement round, 2026-09-09** — "~38 GiB mean, 41.1 GiB peak; 79% CPU mean, 94%
-   peak". Forty one-minute samples on a single task. The memory figure was close to right by luck;
-   the arithmetic in the published percentages did not match the figures beside it.
+   peak". Those are the mean and maximum of **forty one-minute samples on one task**, published as
+   the pool's figures. What is wrong with them is the generalisation, not the arithmetic of the
+   sample: forty minutes of one task cannot state a population peak. And it cannot be checked now
+   either — that run is outside the performance log's 24-hour retention, so where 41.1 GiB fell in
+   its own run's distribution is unrecoverable. Read it as what it is: the largest of forty
+   samples from one task. (The percentages published beside it were separately inconsistent with
+   the figures they described.)
 3. **A second round from the CloudWatch metric route, 2026-09-10** — "46.7 GiB and 93.5 GiB peaks,
    2.92 GiB per worker at both sizes, linear, CPU saturating at 96.8% and 99.7%". The 32-worker
    memory peak survives; everything else does not. The equal per-worker quotients were a
@@ -92,9 +97,10 @@ Three rounds, each understated or misattributed, all reaching the same decision:
    task exceeded 87.8%. **The lesson is the one at the top: a per-metric `Maximum` over a family is
    not a measurement of any task.**
 
-All three are filed in [`../corrections-register.md`](../corrections-register.md) under the
-mechanisms that produced them — 1 (a condition left unlisted, here *which task*), 6 (a model
-fitted on two points) and 7 (a mechanism asserted before being measured).
+All three rounds are filed in [`../corrections-register.md`](../corrections-register.md) under the
+mechanisms that produced them — 1 (a condition left unlisted, here *which task*), 6 (a model fitted
+on two points, and one sample generalised) and 7 (a figure published without measurement, and a
+mechanism asserted before being measured).
 
 ## Care with the throughput figures
 

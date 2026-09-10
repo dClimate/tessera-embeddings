@@ -2,7 +2,10 @@
 
 **Assembly is the campaign's last stage and its longest.** It reads a cell's staged inference tiles
 out of S3 and writes them into the published Icechunk store as whole shards, then marks the cell
-complete. On a dense zone-year that is **4.97 TB across 2.34 M objects**, about three and a half
+complete. On a dense zone-year that is **4.97 TB of logical, uncompressed volume across 2.34 M
+objects** — the blocks handed to zarr, which is neither S3 ingress nor egress; see
+[`../assembly/what-bounds-assembly-2026-09-09.md`](../assembly/what-bounds-assembly-2026-09-09.md)
+§"Care with the throughput figures" — about three and a half
 hours, thirty-two worker processes (sixteen until 2026-09-08), and — at fleet width — up to ten
 coordinators doing it at once into **one repository on one branch**.
 
@@ -45,7 +48,13 @@ process boundaries; a fork can be merged into a session it was not created from,
 | shard-write phase | **195.9 min** (3.27 h) |
 | merge + commit | **37 s — 0.32% of assembly** |
 | total | **196.6 min** (3.28 h) |
-| effective read rate | **423 MB/s** |
+| effective logical rate | **423 MB/s** |
+
+The rate is **logical volume over wall-clock, not measured S3 traffic.** It comes from
+`ASSEMBLY_SUMMARY.bytes`, which counts uncompressed blocks handed to zarr: a cell with cleared
+tiles includes blocks built locally with no staged read, and the outbound side crosses the wire
+compressed. It is the right basis for how long a cell takes and the wrong one for sizing object-store
+bandwidth.
 
 **For planning, assembly IS the shard write**, with no second phase to model. That also means the
 commit is negligible, which is the fact §5 turns on.

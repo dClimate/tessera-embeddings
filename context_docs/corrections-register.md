@@ -61,9 +61,11 @@ that was entirely an artefact.
   the Container Insights performance log, no task exceeded 87.8% of 32 vCPU and the 32-worker
   peak-memory minutes ran at 25-33%. Withdrawn in
   [`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md).
-- **The same pool's "41.1 GiB peak", one round earlier.** Forty one-minute samples on a single
-  task, published as a population peak; it was a typical minute. The generalising half of this is
-  mechanism 6.
+- **The same pool's "41.1 GiB peak", one round earlier.** The largest of forty one-minute samples
+  on a **single task**, published as the pool's peak. Note what cannot be said about it: that run
+  is outside the performance log's 24-hour retention, so where the figure fell in its own run's
+  distribution is unrecoverable — it is neither confirmed nor shown to be typical, only shown to
+  be ungeneralisable. The generalising half of this is mechanism 6.
 
 **The cure is written down already and it is mechanical:** before comparing two figures,
 write down the conditions of each side and diff them. The July record carries a
@@ -173,6 +175,15 @@ needs enough points to show it is monotonic before one of them becomes a recomme
 
 ### 7. A mechanism asserted to explain a result, before being measured
 
+- **The assembly pool's "1 to 1.5 GB per worker", and the 24 GB and 48 GB pool figures built on
+  it.** Published in the `AssemblyConfig` docstring and in two **public** documents as sizing
+  guidance, having never been measured at any pool size; a 16-worker pool measures near 40 GiB, so
+  the figure was low by more than half and an operator following it would have under-provisioned a
+  runner into an OOM. Filed here because an unmeasured estimate presented as a measurement is the
+  same failure as an unmeasured mechanism presented as a cause. Its *propagation* is mechanism 8:
+  the estimate reached `docs/configuration.md`, `docs/prefect-setup.md`, the storage record and two
+  test docstrings, and the public guidance was the last of them to be corrected.
+  ([`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md))
 - **"Assembly is CPU-bound"**, then **"assembly saturates the processor of whatever box it is
   given."** Asserted from utilisation, which shows the processor is busy, not that it is the
   constraint that binds — while the per-task network allowance Fargate publishes is *nothing*, so
