@@ -57,6 +57,29 @@ HOLD_LOG_EVERY_S = 300.0
 _TOO_SMALL = "greater than the limit"
 
 
+def _is_request_validation_error(response: Any) -> bool:  # noqa: ANN401 — httpx.Response, loose for fakes
+    """Is this ``422`` FastAPI refusing our REQUEST, rather than the server refusing the ask?
+
+    Both arrive as ``422`` and only one is a hold. The concurrency router raises
+    ``HTTPException(422, detail="Slots requested is greater than the limit")``, which serialises
+    ``detail`` as a **string**; a parameter-validation failure (``slots`` at or below zero, a
+    ``lease_duration`` outside the server's ``ge=60, le=86400``) never reaches that code and
+    carries ``detail`` as a **list** of per-field objects with ``loc``. Verified against Prefect
+    3.7.0. An unreadable body answers False — still a hold, the recoverable direction.
+    """
+    getter = getattr(response, "json", None)
+    if not callable(getter):
+        return False
+    try:
+        body = getter()
+    except Exception:
+        return False
+    if not isinstance(body, dict):
+        return False
+    detail = body.get("detail")
+    return isinstance(detail, list) and any(isinstance(e, dict) and "loc" in e for e in detail)
+
+
 def gate_is_holding(exc: BaseException) -> bool:
     """Did this acquisition failure mean "the limit is currently too small", or something else?
 
@@ -68,6 +91,11 @@ def gate_is_holding(exc: BaseException) -> bool:
     The status has to be dug out of the cause chain because Prefect wraps the HTTP error in
     ``ConcurrencySlotAcquisitionError``, whose own message and type say nothing about which of the
     two happened.
+
+    One ``422`` is excluded — a FastAPI request-validation failure, which shares the status but
+    is a permanent mistake in our own call, so holding on it parks the gate forever. Matching on
+    the status rather than the message keeps the pause lever robust to Prefect rephrasing it; see
+    :func:`_is_request_validation_error`.
     """
     seen: set[int] = set()
     cause: BaseException | None = exc
@@ -75,7 +103,11 @@ def gate_is_holding(exc: BaseException) -> bool:
         seen.add(id(cause))
         response = getattr(cause, "response", None)
         status = getattr(response, "status_code", None)
-        if status == 422 and (isinstance(cause, PrefectHTTPStatusError) or _TOO_SMALL in str(cause)):
+        if (
+            status == 422
+            and not _is_request_validation_error(response)
+            and (isinstance(cause, PrefectHTTPStatusError) or _TOO_SMALL in str(cause))
+        ):
             return True
         cause = cause.__cause__
     return False

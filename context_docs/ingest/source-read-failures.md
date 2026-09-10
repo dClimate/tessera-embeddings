@@ -287,7 +287,7 @@ Three nested budgets, none of which knew anything about the failure's class:
 | layer | knob | default | how a catalogue 502 is treated |
 |---|---|---|---|
 | leg | `IngestSettings.max_leg_attempts` | 3 | retried, because nothing marks it permanent and retrying is the default. **Corrected in place:** this row used to say the permanent-failure list "names no HTTP failure", which stopped being the whole test once the parent also began asking whether the bytes are gone (see "Some failures say enough to be judged"). The answer does not change: that check recognises a status code only in the specific form GDAL writes it, and this text is not in that form |
-| cell | `attempts_per_cell_in_cluster` (`sequential_fill` / `fill_zones_sequential`) | 2 | eligible — retry eligibility is by **phase**, and this is `inputs/prepare`, which additionally gets `discard()` + `start()`, re-dispatching the whole ingest |
+| cell | `attempts_per_cell_in_cluster` (`sequential_fill` / `fill_zones_sequential`) | 2 | eligible. **Corrected in place:** this row used to describe eligibility as being by phase, decided in a pass after the whole inference stream. Every phase is eligible now and the retry re-enters the LIVE stream, from the back of the feeder's queue; an `inputs/prepare` failure additionally gets `discard()` + `start()`, dispatched at once and non-blockingly |
 | zone round | `max_dispatch_rounds` (`run_global_campaign`) | 2 | re-dispatched; the zero-progress guard only breaks *after* a whole round has made none |
 
 So one deterministically-502ing query could cost up to **3 × 2 × 2 = 12 dispatches of the

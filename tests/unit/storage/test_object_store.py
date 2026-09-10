@@ -45,7 +45,19 @@ def _never_called():
     raise AssertionError("the fsspec fallback must not run for a verified-but-incomplete delete")
 
 
-def test_delete_prefix_s3_defaults_to_all_versions(monkeypatch):
+def test_delete_prefix_defaults_to_the_safe_choice_not_the_cheap_one(monkeypatch):
+    """ON by default, because the wrong default is not a cost mistake but a FALSE SUCCESS.
+
+    An earlier version of this PR defaulted it OFF to save the heavier request pattern on the
+    campaign's unversioned buckets. Two reviewers independently pointed out what that costs any
+    OTHER caller: on a VERSIONED bucket an all_versions=False delete leaves delete markers,
+    `_survivors` reads back current keys only and sees an empty prefix, so even `strict=True`
+    returns success — and a caller releases a storage-budget slot while every non-current version
+    is still stored and still billed.
+
+    A cheaper default that can affirm a delete that did not happen is the wrong trade. The saving
+    is now asserted per call site, where the bucket is actually known.
+    """
     seen: dict = {}
 
     def fake_s5(uri, log, *, all_versions):
@@ -55,6 +67,32 @@ def test_delete_prefix_s3_defaults_to_all_versions(monkeypatch):
     _cleared(monkeypatch)
     object_store.delete_prefix("s3://bucket/mosaics/33N/2025")
     assert seen == {"uri": "s3://bucket/mosaics/33N/2025", "all_versions": True}
+
+
+def test_the_cheap_path_is_opt_in_per_call(monkeypatch):
+    """The saving is still available — it just has to be asked for by a caller that knows."""
+    seen: dict = {}
+
+    def fake_s5(uri, log, *, all_versions):
+        seen.update(all_versions=all_versions)
+
+    monkeypatch.setattr(object_store, "_s5cmd_rm", fake_s5)
+    _cleared(monkeypatch)
+    object_store.delete_prefix("s3://bucket/p", all_versions=False)
+    assert seen == {"all_versions": False}
+
+
+def test_delete_prefix_forwards_all_versions_when_asked(monkeypatch):
+    """The flag still WORKS — it is opt-in, not removed. A versioned bucket needs it."""
+    seen: dict = {}
+
+    def fake_s5(uri, log, *, all_versions):
+        seen.update(all_versions=all_versions)
+
+    monkeypatch.setattr(object_store, "_s5cmd_rm", fake_s5)
+    _cleared(monkeypatch)
+    object_store.delete_prefix("s3://bucket/p", all_versions=True)
+    assert seen == {"all_versions": True}
 
 
 def test_delete_prefix_verifies_and_stops_after_one_clean_pass(monkeypatch):
@@ -127,13 +165,15 @@ def test_delete_prefix_strict_raises_when_delete_fails(monkeypatch):
 
     object_store.delete_prefix("s3://b/p")  # best-effort: swallows
 
-    # strict + all_versions (the default) is refused BEFORE the fallback runs: fsspec cannot
-    # remove non-current versions, so the promise cannot be kept whatever the fallback does.
+    # strict + all_versions is refused BEFORE the fallback runs: fsspec cannot remove
+    # non-current versions, so the promise cannot be kept whatever the fallback does. This is
+    # the DEFAULT arm now, which is the point — a strict caller is refused rather than told a
+    # versioned prefix is clean.
     with pytest.raises(object_store.DeleteUnverifiedError):
         object_store.delete_prefix("s3://b/p", strict=True)
 
-    # With all_versions=False the fallback CAN keep the promise, so it runs — and its own
-    # failure propagates under strict, which is what this test was written to pin.
+    # Opting out explicitly, the fallback CAN keep the (narrower) promise, so it runs — and its
+    # own failure propagates under strict, which is what this test was written to pin.
     with pytest.raises(OSError, match="access denied"):
         object_store.delete_prefix("s3://b/p", strict=True, all_versions=False)
 
@@ -213,6 +253,12 @@ def test_strict_all_versions_refuses_the_fsspec_fallback(monkeypatch):
         def rm(self, p, recursive):
             return None
 
+        def invalidate_cache(self, p=None):
+            return None
+
+        def find(self, p):
+            return []  # the delete worked; see the strict-verification test for when it did not
+
     monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _FS())
 
     # Best-effort: the fallback runs and the caller is warned, not stopped.
@@ -221,5 +267,70 @@ def test_strict_all_versions_refuses_the_fsspec_fallback(monkeypatch):
     with pytest.raises(object_store.DeleteUnverifiedError, match="non-current versions"):
         object_store.delete_prefix("s3://b/p", all_versions=True, strict=True)
 
-    # all_versions=False is a different promise and the fallback CAN keep it.
+    # all_versions=False is a different promise and the fallback CAN keep it — but only once it
+    # READS BACK. This assertion used to pass against a fallback that verified nothing, which
+    # pinned the defect as the contract: it proved the version promise and was silent about the
+    # verification one. It now also requires the prefix to come back empty.
     object_store.delete_prefix("s3://b/p", all_versions=False, strict=True)
+
+
+def _fallback_fs(monkeypatch, *, find):
+    """s5cmd absent, so the fsspec fallback runs; `find` decides what it reads back."""
+
+    def _s5_missing(*a, **k):
+        raise FileNotFoundError("s5cmd not on PATH")
+
+    monkeypatch.setattr(object_store, "_s5cmd_rm", _s5_missing)
+    monkeypatch.setattr(object_store.time, "sleep", lambda _s: None)
+
+    class _FS:
+        def exists(self, p):
+            return True
+
+        def rm(self, p, recursive):
+            return None
+
+        def invalidate_cache(self, p=None):
+            return None
+
+        def find(self, p):
+            return find()
+
+    monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _FS())
+
+
+def test_a_strict_fsspec_fallback_is_verified_not_assumed(monkeypatch):
+    """`strict` promises to raise when the delete ran and left objects behind. `fs.rm` returning
+    without error is not that: it reports per call, not per prefix.
+
+    This path used to be unreachable for a strict caller — `all_versions` defaulted ON, so the
+    `strict and all_versions` refusal fired before fsspec was tried. Making the flag opt-in made
+    the fallback reachable, and an unverified success there answers the one caller whose next move
+    is to release a retention slot for the prefix.
+    """
+    _fallback_fs(monkeypatch, find=lambda: ["s3://b/p/left-behind.zarr/c/0"])
+    # `all_versions=False` explicitly: with the flag ON, strict is refused BEFORE the fallback
+    # (fsspec cannot honour it), so exercising the fallback means opting out as the campaign does.
+    with pytest.raises(object_store.PrefixNotEmptyError, match="still holds 1 object"):
+        object_store.delete_prefix("s3://b/p", strict=True, all_versions=False)
+
+
+def test_a_strict_fsspec_fallback_treats_an_unlistable_prefix_as_unknown(monkeypatch):
+    """Symmetrical with the s5cmd path: a listing that failed proves nothing, and reporting it as
+    clean is how an unverified delete comes to look verified.
+    """
+
+    def _boom():
+        raise OSError("AccessDenied on ListBucket")
+
+    _fallback_fs(monkeypatch, find=_boom)
+    with pytest.raises(object_store.DeleteUnverifiedError, match="could not list it to confirm"):
+        object_store.delete_prefix("s3://b/p", strict=True, all_versions=False)
+
+
+def test_a_best_effort_fsspec_fallback_still_returns_when_objects_survive(monkeypatch):
+    """The verification is for `strict` only. Best-effort cleanup after a success must not start
+    failing cells over residue it was never asked to guarantee.
+    """
+    _fallback_fs(monkeypatch, find=lambda: ["s3://b/p/left-behind.zarr/c/0"])
+    object_store.delete_prefix("s3://b/p", all_versions=False)  # must not raise

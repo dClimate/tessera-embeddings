@@ -2476,9 +2476,21 @@ class ZarrWriter:
         _log = log or logger
         target = f"{self.staging_base}/{run_id}"
         _log.info("Cleaning up staging: %s", target)
-        # Shared prefix delete: s5cmd --all-versions, so a versioned bucket does not keep the
-        # staged tiles as non-current versions; fsspec fallback.
-        delete_prefix(target, log=_log)
+        # Shared prefix delete: s5cmd with an fsspec fallback.
+        #
+        # all_versions=False asserts that `staging_base` is on an unversioned bucket. Every
+        # bucket the flows that reach here can address was measured to have versioning never
+        # enabled, and the CDK creates them that way because Icechunk carries its own history.
+        # The assertion is worth making rather than defaulting safe: `--all-versions` raises the
+        # required permission to `s3:DeleteObjectVersion`, which is measured to fail on
+        # `global-tessera-inputs` where a plain delete succeeds.
+        #
+        # A deployment that points `BucketPaths` at a VERSIONED bucket must revisit this, and
+        # cannot fix it by flipping the flag: `_survivors` reads back with `fs.find`, which lists
+        # current keys only, so an all-versions delete that left history behind still reads as
+        # verified-empty. Version-aware listing is the prerequisite. Staging cleanup is
+        # best-effort — the callers log and continue — so nothing here depends on verification.
+        delete_prefix(target, log=_log, all_versions=False)
 
 
 #: The refusal reasons a skip record may carry, in the order a reader should weigh them: a fact

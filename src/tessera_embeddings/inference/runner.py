@@ -61,6 +61,7 @@ def run_inference(
     s3_region: str | None = None,
     retire_idle_actors: bool = True,
     more_work: Callable[[], list[WorkItem] | None] | None = None,
+    source_has_work: Callable[[], bool] | None = None,
     on_item_done: Callable[[WorkItem, dict], None] | None = None,
 ) -> list[dict]:
     """Create Ray actors, run work-stealing inference, return per-chunk results.
@@ -97,13 +98,18 @@ def run_inference(
         s3_region: Optional S3 region for the mosaic repos, injected into every actor so its
             reads open the store in the same region the caller's preflight/assembly opens
             use. ``None`` uses icechunk's default region.
-        retire_idle_actors: Kill actors idle past the grace period at the run tail (default);
-            see ``scheduling._process_chunks_work_stealing`` for when a caller passes False.
+        retire_idle_actors: Kill actors idle past the grace period (default). For a chained
+            session this also winds the fleet down whenever its work source has nothing ready,
+            keeping one actor alive; see ``scheduling._process_chunks_work_stealing`` for the
+            full rule and for when a caller passes False.
         more_work: Optional chained-session work source (see the scheduler's docstring). With
             a source, ``chunks`` is typically empty and every item carries its own
             :class:`~tessera_embeddings.inference.scheduling.ZoneContext`; the single-zone
             resume scan is skipped, since the source's feeder scans per zone before
             enqueueing.
+        source_has_work: Optional non-blocking predicate — is there inference work available
+            right now that a ``[]`` poll merely withheld? Keeps the fleet through an operator
+            pause that is holding real work; see the scheduler's docstring.
         on_item_done: Optional per-item final-outcome callback (chained sessions use it for
             per-zone completion accounting). Runs on the scheduler thread — must not block.
 
@@ -241,6 +247,7 @@ def run_inference(
             placement_timeout_sec=config.actor_batch_placement_timeout_sec,
             retire_idle_actors=retire_idle_actors,
             more_work=more_work,
+            source_has_work=source_has_work,
             on_item_done=on_item_done,
         )
     finally:
