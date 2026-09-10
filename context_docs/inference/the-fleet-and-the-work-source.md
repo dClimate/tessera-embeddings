@@ -132,6 +132,23 @@ Two things had to be true, and one was not.
 No hysteresis. Retirement requires an actor to have been seen idle on a *previous* call and then
 to exceed the 120 s idle grace, so a cell that becomes ready inside two minutes retires nothing.
 
+### Retiring a slot is not terminating its machine
+
+`_retire_slot` fires the EC2 terminator only when the slot it just killed was the last live one on
+its instance. That matters only under `config.num_gpus < 1`, where several actors share a GPU
+machine; the campaign's whole-GPU actors are alone on theirs, so the first retirement is also the
+last and the check is a no-op.
+
+**The subtlety is that co-residency is decided by instance ID, and a slot that is still placing
+does not have one.** An initializing actor carries the `pending-init` placeholder until its
+constructor and its `get_instance_id` round-trip finish, and a placeholder never equals an `i-` ID
+— so the comparison on its own would read a booting sibling's machine as empty and terminate it
+mid-boot. Under packing, the pending IDs are resolved first (non-blocking, so an actor still in
+`__init__` stays unresolved), and any slot left unresolved defers termination: co-residency cannot
+be *disproved*, and the two errors do not cost the same. Deferring leaves a machine up until the
+fleet's own teardown reclaims it. Terminating kills a live actor, and if that actor was the
+liveness floor, leaves the session holding a handle to nothing.
+
 ### Available means deliverable
 
 The wind-down is suppressed while the source says inference work is available *right now*, which

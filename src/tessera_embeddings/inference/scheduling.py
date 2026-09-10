@@ -734,6 +734,16 @@ class ActorPool:
         their instance, so the check passes on the first retirement and nothing changes for them;
         on a packed instance the LAST retirement terminates it, which is the same outcome one
         step later.
+
+        **Co-residency is decided by instance ID, so a sibling that has none yet cannot be seen.**
+        An initializing actor carries the ``pending-init`` placeholder until its constructor and
+        ``get_instance_id`` round-trip finish, and a placeholder never equals an ``i-`` ID — so on
+        a packed instance the comparison alone would read a booting sibling's machine as empty and
+        terminate it. Under packing the pending IDs are therefore resolved first, and any slot
+        still unresolved defers termination: co-residency cannot be *disproved*, and the costs are
+        not symmetric. Deferring leaves an instance up until the fleet's own teardown reclaims it;
+        terminating kills a live actor mid-boot. The default whole-GPU path skips all of this,
+        where one actor per instance makes a sibling impossible.
         """
         self.resolve_iid(actor_idx)  # pick up lazily-resolved EC2 instance ID
         instance_id = self.actor_instance_ids[actor_idx] if actor_idx < len(self.actor_instance_ids) else "unknown"
@@ -744,10 +754,24 @@ class ActorPool:
         self._pending_iid_refs.pop(actor_idx, None)
         self._idle_since.pop(actor_idx, None)
         self._unplaced_since.pop(actor_idx, None)
+        packed = self.config.num_gpus < 1
+        if packed:
+            for idx in list(self._pending_iid_refs):
+                self.resolve_iid(idx)  # non-blocking; a sibling mid-``__init__`` stays unresolved
         still_hosted = any(
             iid == instance_id and idx not in self._retired for idx, iid in enumerate(self.actor_instance_ids)
         )
-        if self._on_retire is not None and instance_id.startswith("i-") and not still_hosted:
+        unplaced_sibling = packed and any(
+            idx not in self._retired and not iid.startswith("i-") for idx, iid in enumerate(self.actor_instance_ids)
+        )
+        if unplaced_sibling and not still_hosted:
+            self.log.info(
+                "Not terminating %s after retiring actor %d — a packed fleet has a slot whose "
+                "instance is not yet known, so this machine cannot be shown to be empty",
+                instance_id,
+                actor_idx,
+            )
+        if self._on_retire is not None and instance_id.startswith("i-") and not still_hosted and not unplaced_sibling:
             with contextlib.suppress(Exception):
                 self._on_retire(instance_id)
         return instance_id

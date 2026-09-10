@@ -71,6 +71,9 @@ def _make_pool(n: int = 3, **kwargs) -> ActorPool:
     actors = [MagicMock(name=f"actor_{i}") for i in range(n)]
     config = MagicMock()
     config.checkpoint_path = "s3://bucket/ckpt.pt"
+    # A real number, not a mock: retirement branches on whether actors are packed onto shared
+    # instances, and 1.0 is the whole-GPU default every test here assumes unless it says otherwise.
+    config.num_gpus = 1.0
     return ActorPool(actors, [f"i-{i:04d}" for i in range(n)], config, logging.getLogger("test"), **kwargs)  # type: ignore[arg-type]
 
 
@@ -635,6 +638,57 @@ class TestRetireIdle:
             pool.retire_idle(outstanding_work=0)
         assert pool.actor_instance_ids[0] == "i-newly-resolved"
         callback.assert_called_once_with("i-newly-resolved")
+
+    def test_a_packed_instance_is_not_terminated_while_a_sibling_is_still_placing(self) -> None:
+        """Co-residency is decided by instance ID, and an initializing sibling has none yet.
+
+        The placeholder never equals an `i-` ID, so on a packed fleet the comparison alone reads
+        the booting sibling's machine as empty. Termination has to defer instead.
+        """
+        callback = MagicMock()
+        pool = _make_pool(2, idle_grace_sec=1, on_retire=callback)
+        pool.config.num_gpus = 0.5
+        pool.actor_instance_ids[1] = "pending-init"
+        pool._pending_iid_refs[1] = MagicMock()
+        pool._initializing.add(1)
+        pool._idle_since[0] = time.monotonic() - 200
+        with (
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.ray, "wait", return_value=([], [MagicMock()])),  # still in __init__
+        ):
+            pool.retire_idle(outstanding_work=0)
+        assert 0 in pool._retired
+        callback.assert_not_called()
+
+    def test_a_packed_sibling_that_resolves_elsewhere_does_not_defer_termination(self) -> None:
+        """The deferral is for what cannot be decided, not for every initializing slot."""
+        callback = MagicMock()
+        pool = _make_pool(2, idle_grace_sec=1, on_retire=callback)
+        pool.config.num_gpus = 0.5
+        pool.actor_instance_ids[1] = "pending-init"
+        ref = MagicMock()
+        pool._pending_iid_refs[1] = ref
+        pool._initializing.add(1)
+        pool._idle_since[0] = time.monotonic() - 200
+        with (
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.ray, "wait", return_value=([ref], [])),
+            patch.object(_sched_mod.ray, "get", return_value="i-somewhere-else"),
+        ):
+            pool.retire_idle(outstanding_work=0)
+        callback.assert_called_once_with("i-0000")
+
+    def test_a_whole_gpu_fleet_still_terminates_with_a_slot_initializing(self) -> None:
+        """One actor per instance makes a sibling impossible, so the default path is unchanged."""
+        callback = MagicMock()
+        pool = _make_pool(2, idle_grace_sec=1, on_retire=callback)
+        pool.actor_instance_ids[1] = "pending-init"
+        pool._pending_iid_refs[1] = MagicMock()
+        pool._initializing.add(1)
+        pool._idle_since[0] = time.monotonic() - 200
+        with patch.object(_sched_mod.ray, "kill"):
+            pool.retire_idle(outstanding_work=0)
+        callback.assert_called_once_with("i-0000")
 
     def test_grace_period_always_applies(self) -> None:
         """Actors are never retired without the grace period elapsing, even with no queued work."""

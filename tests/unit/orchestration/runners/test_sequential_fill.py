@@ -2068,6 +2068,8 @@ def test_a_pause_over_cells_that_are_still_ingesting_lets_the_fleet_go():
     """
     answers = _paused_run(_cells(2), ready_zones=set())
     assert answers and not any(answers), f"nothing was available, so the fleet must go: {answers}"
+
+
 # --- the trailing-assembly drain is bounded (2026-09-04) ---------------------------------------
 
 
