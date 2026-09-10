@@ -100,6 +100,12 @@ census's 143 tokens, so had `t_kept` included radar the two could not have agree
 **They agreed *because* both were optical.** An agreement that a hypothesis predicts should
 be impossible is evidence against the hypothesis, not for it.
 
+- **"62% of the fleet is the cheaper card."** A share by *instantaneous count*, quoted where the
+  cost argument needs a share by *card-hours*; by hours it is **57.3%**. The two are different
+  measurements of a fleet whose composition changes hour to hour, and only one of them multiplies
+  against a price.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
+
 ### 3. Presence counted where coverage was meant
 
 Three withdrawals, one instrument, and the error is always in the same direction: an
@@ -126,6 +132,15 @@ are different questions, and a percentage that does not say which is not yet a f
   and **0.1–32.1°** complete, and its radar depth 146.8 partial against **89.9** complete.
   ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c; originally recorded in
   a since-deleted working note, in git history)
+
+- **Three of the campaign cost model's §12 figures, all taken on 2026-09-02 while the campaign
+  was a third done.** "The whole campaign will cost **$555,000**" became **$816,901** measured;
+  "the ingest containers use 964 of 25,000 vCPU, **under 4%**" became a **73% peak** on 08-27,
+  because the reading was taken after the heavy ingest had finished; and "**83%** of single-card
+  basis" became **86.6%**, because it multiplied a snapshot fleet count by an elapsed period
+  instead of using the billed hours. The pattern is one reading, taken mid-campaign, phrased as a
+  property of the campaign.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
 
 **A partial run's whole-cell summary is biased, not merely imprecise** — the chunks that
 have finished are not a random sample of the cell, because scheduling order correlates with
@@ -192,6 +207,12 @@ needs enough points to show it is monotonic before one of them becomes a recomme
   the estimate reached `docs/configuration.md`, `docs/prefect-setup.md`, the storage record and two
   test docstrings, and the public guidance was the last of them to be corrected.
   ([`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md))
+- **The campaign cost model's two smallest lines, "S3 requests ~$1,600" and "transient mosaic
+  storage ~$3,000."** Neither was ever measured; the outturns are **$26,167** and **$70,821**, 16×
+  and 24× low, and together $92,000. The storage estimate even names the sensitivity that broke it
+  — "if inference lags, it grows linearly with the backlog" — and then does not size it. An
+  estimate small enough to skip re-deriving is exactly the one nobody checks.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §7, §12)
 - **"Assembly is CPU-bound."** Asserted from utilisation, which shows the processor is busy at
   moments, not that it is the constraint that binds the rate of work — while Fargate publishes no
   per-task network allowance, so the competing candidate was never measurable from outside. The
