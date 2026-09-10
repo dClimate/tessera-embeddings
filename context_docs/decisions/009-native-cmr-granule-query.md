@@ -172,7 +172,7 @@ archive. That claim only holds now that both polarisations are required server-s
   latency.
 - **Con:** items are now hand-constructed from granule JSON rather than
   parsed by pystac-client. The mapping (`_granule_to_item`) is covered
-  by `tests/unit/test_opera_query.py`, but we own its correctness.
+  by `tests/unit/ingest/test_opera_query.py`, but we own its correctness.
 - **Con:** the provider re-queries CMR on every invocation (it no longer
   caches at construction). The current S1 flow invokes it once per
   batch, so this is fine; sharing one provider across `has_new_stac_dates`

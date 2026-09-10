@@ -2,15 +2,12 @@
 
 Two input modes (mutually exclusive):
 
-* **GeoJSON mode** (``roi_name``): reads
-  ``{roi_bucket}/geojsons/{roi_name}.geojson`` and writes to
-  ``{roi_bucket}/zarrs/{roi_name}.zarr``.
-* **Tile mode** (``tile_names``): fetches Sentinel-2 MGRS tile
-  footprints from a GeoJSON index on S3 and writes to
-  ``{roi_bucket}/zarrs/{tile1}_{tile2}.zarr``.
+* **GeoJSON mode** (``roi_name``): reads ``{roi_bucket}/geojsons/{roi_name}.geojson``,
+  writes ``{roi_bucket}/zarrs/{roi_name}.zarr``.
+* **Tile mode** (``tile_names``): fetches Sentinel-2 MGRS tile footprints from a GeoJSON
+  index on S3, writes ``{roi_bucket}/zarrs/{tile1}_{tile2}.zarr``.
 
-No Dask cluster required — rasterisation is chunked and sequential,
-running entirely on the flow runner.
+No Dask cluster required — rasterisation is chunked and sequential, on the flow runner.
 """
 
 from __future__ import annotations
@@ -31,8 +28,7 @@ from tessera_embeddings.storage.manifest import RoiManifest, extract_manifest
 def _crs_suffix(crs: str | None) -> str:
     """Return a path-friendly suffix for the given CRS string.
 
-    Empty string when ``crs`` is ``None`` so the caller's filename
-    convention round-trips through the auto-CRS path unchanged.
+    Empty when ``crs`` is ``None``, so filenames round-trip unchanged through auto-CRS.
     """
     return f"_{crs.replace(':', '').lower()}" if crs else ""
 
@@ -53,25 +49,17 @@ def generate_roi(
     Exactly one of ``roi_name`` or ``tile_names`` must be provided.
 
     Args:
-        roi_bucket: Base URI for ROI storage (e.g.
-            ``"s3://my-bucket/rois"`` or a local path). Caller-supplied
-            so the flow works for any deployment — the reference repo's
-            ``dev: bool`` toggle is gone.
-        roi_name: Name of the ROI. Reads the GeoJSON from
-            ``{roi_bucket}/geojsons/{roi_name}.geojson`` and writes to
-            ``{roi_bucket}/zarrs/{roi_name}.zarr``.
-        tile_names: Comma-separated Sentinel-2 MGRS tile IDs (e.g.
-            ``"14TPK"`` or ``"14TPK,14TQK"``). Output name is derived
-            from the tile IDs unless ``output_name`` is set.
-        output_name: Override for the derived output filename in tile
-            mode. Ignored in GeoJSON mode (use ``roi_name`` directly).
+        roi_bucket: Base URI for ROI storage (``"s3://my-bucket/rois"`` or a local path).
+            Caller-supplied so the flow works for any deployment.
+        roi_name: GeoJSON-mode ROI name; see the module docstring for the paths used.
+        tile_names: Comma-separated Sentinel-2 MGRS tile IDs (``"14TPK,14TQK"``). The
+            output name is derived from them unless ``output_name`` is set.
+        output_name: Override for the derived tile-mode filename. Ignored in GeoJSON mode.
         resolution: Output pixel size in metres.
-        chunk_size: Spatial chunk size in pixels (default
-            ``INGEST_CHUNK_SIZE``, matches the ingestion pipeline's
-            ``INGEST_CHUNKS``).
-        force_crs: Override CRS as an EPSG string (e.g.
-            ``"EPSG:32633"``). Default: auto-select UTM zone from the
-            geometry centroid.
+        chunk_size: Spatial chunk size in pixels; must match the ingestion pipeline's
+            ``INGEST_CHUNKS``.
+        force_crs: Override CRS as an EPSG string. Default: auto-select the UTM zone from
+            the geometry centroid.
 
     Returns:
         Output Zarr URI.

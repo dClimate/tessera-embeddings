@@ -24,13 +24,11 @@ import ray
 def chunk_uid(run_id: str, chunk_label: str) -> str:
     """The run-qualified progress key: ``"{run_id}:{chunk_label}"``.
 
-    Chunk labels are grid-relative positions (e.g. ``"5_5"``) that REPEAT across
-    zones, so a shared multi-zone session (chained fill) can have two zones'
-    identically-labelled chunks in flight at once during tail/head overlap.
-    Qualifying by the per-zone ``run_id`` keeps their tracker entries distinct so
-    one zone's completion can't evict the other's and hang a live GPU task. This
-    is the same key :attr:`WorkItem.uid` uses for retry bookkeeping; both build it
-    here so the actor's ``report`` and the scheduler's ``remove`` cannot drift.
+    Chunk labels are grid-relative positions (e.g. ``"5_5"``) that REPEAT across zones, so a
+    chained multi-zone session can hold two zones' identically-labelled chunks at once during
+    tail/head overlap; unqualified, one zone's completion evicts the other's entry and hangs a
+    live GPU task. :attr:`WorkItem.uid` builds its retry key here too, so the actor's ``report``
+    and the scheduler's ``remove`` cannot drift.
     """
     return f"{run_id}:{chunk_label}"
 

@@ -8,21 +8,34 @@ enforce that rule.
 ```
 orchestration/prefect/
 ├── flows/                  Layer 3: @flow definitions
+│   │
+│   │  single-ROI path
 │   ├── generate_roi.py
 │   ├── ingest_s2_roi_reflectance.py
 │   ├── ingest_s1_roi_sar.py
-│   ├── tessera_embeddings.py        # single-ROI: ROI → mosaic → inference → assembly
+│   ├── tessera_embeddings.py        # single-ROI: ROI -> mosaic -> inference -> assembly
 │   ├── tessera_full_pipeline.py     # single-ROI master: chains the four above via run_deployment
-│   ├── build_land_mask.py           # global campaign: registry → per-zone coverage bitmaps (no cluster)
-│   ├── seed_global_store.py         # global campaign: seed the 120 UTM-zone groups (no cluster)
-│   ├── fill_zone_year.py            # global campaign: one (zone, year) via Ray → assembly → tag
-│   ├── _cell_validation.py          # internal helper: hand a tagged cell to its validator, don't wait
-│   └── run_global_campaign.py       # global campaign driver: dispatch every pending (zone, year)
-├── tasks/                  Layer 2: thin @task wrappers (~20 LOC each)
-│   ├── ingest.py                    # process_roi_reflectance, process_roi_sar
-│   ├── inference.py                 # run_inference_task, assemble_embeddings_task
-│   └── land_mask.py                 # build / verify / validate coverage (no-cluster steps)
-└── _dask_runner.py         internal helper: prefect_dask DaskTaskRunner factory
+│   │
+│   │  global campaign (ADR-008)
+│   ├── build_land_mask.py           # registry -> per-zone coverage bitmaps (no cluster)
+│   ├── export_zone_rois.py          # per-zone ROI Zarrs from the coverage bitmaps
+│   ├── seed_global_store.py         # seed the 120 UTM-zone groups (metadata only, no cluster)
+│   ├── ingest_zone_year.py          # one (zone, year) mosaic build
+│   ├── fill_zone_year.py            # one (zone, year) via Ray -> assembly -> tag
+│   ├── fill_zones_sequential.py     # many cells on one long-lived Ray cluster
+│   ├── run_global_campaign.py       # driver: dispatch every pending (zone, year)
+│   │
+│   │  shared private helpers (underscore = not a public import surface)
+│   ├── _cell_validation.py          # hand a tagged cell to its validator, don't wait
+│   ├── _child_runs.py               # child deployment runs: cancel sweeps, terminal-state check
+│   ├── _dask_lifecycle.py           # Dask/ECS teardown hook + the DaskTaskRunner factory
+│   ├── _ray_lifecycle.py            # Ray teardown hook (the Ray analogue of the above)
+│   ├── _fleet_gate.py               # hold dispatch while the GPU fleet is saturated
+│   └── _overrides.py                # per-run flow option overrides
+└── tasks/                  Layer 2: thin @task wrappers (~20 LOC each, ADR-002)
+    ├── ingest.py                    # process_roi_reflectance, process_roi_sar
+    ├── inference.py                 # run_inference_task, assemble_embeddings_task
+    └── land_mask.py                 # build / verify / validate coverage (no-cluster steps)
 ```
 
 ## Global campaign (120 UTM zones)
@@ -105,7 +118,11 @@ today:
    returned or raised has, by then, joined the trailing assembly thread that does its
    committing, cancelled its child ingests and waited for them to confirm terminal, and
    torn down its fleet — all inside `finally` blocks that complete before the state is
-   set. A **crash** carries none of that (the process that would run the `finally` is the
+   set. The one case where that thread CANNOT be joined — a trailing assembly wedged inside
+   icechunk, which `drain_trailing_assemblies` gives up on after `TRAILING_ASSEMBLY_CEILING_S`
+   (2026-09-04) — is deliberately never allowed to become `FAILED`: the flow tears down and
+   then ends its own process (`_end_process_after_wedged_drain`), so it surfaces as a crash
+   and its cells wait for the round like any other crash's. A **crash** carries none of that (the process that would run the `finally` is the
    process that died, and the verdict can be reached from missed heartbeats while the run
    is still writing), and a **cancellation** is a request rather than a fact. Both wait.
 2. **Enough time has passed for its descendants to have stopped.** Condition 1 covers the
@@ -243,9 +260,18 @@ Two subtleties worth knowing:
 
 How this plays out on the real world — 112 live UTM zones, 360,953 land tiles —
 and what happens if you move off 8 clusters is measured in
-[`context_docs/design/campaign-cluster-sizing.md`](../../../../context_docs/design/campaign-cluster-sizing.md).
-Short version: 8 splits the year to within 0.0%, 16 costs 0.6% and roughly halves
-wall clock, and past ~20 the largest zones start to dominate.
+[`context_docs/campaign/campaign-cost-model.md`](../../../../context_docs/campaign/campaign-cost-model.md)
+§5b.
+
+**Read the short version below as the SUPERSEDED area-only diagnostic**: 8 splits
+the year to within 0.0%, 16 costs 0.6%, and past ~20 the largest zones start to
+dominate. Those figures balance on raw live-tile count, which is balancing on
+AREA. The shipped partition weights each zone's tiles by its latitude band's
+observation count — proportional to GPU-hours — and by the years it still carries,
+and on that basis the campaign's **10** clusters spread by **0.009%** where the
+tile-count split would give **21.8%**. Do not quote the row above for a cluster
+count; run `scripts/scoping/cluster_work_spread.py --mask … --clusters …`, which reads the
+current mask through the campaign's own partitioner.
 
 > **Size the fleets to match.** These caps count *clusters* and *zones*, not
 > machines. Eight inference clusters at the default `num_actors` plus forty
@@ -260,7 +286,7 @@ years at once, and within a sequential run the depth-1 trailing assembly can
 never overlap a commit for the same zone group. **Commits are otherwise ungated.**
 They contend on the branch-tip CAS, since all 120 zone groups share one repo, but
 run 1 measured that as 2.2 s at 16 committers and 15 s at 120 with zero
-unresolvable conflicts. See `context_docs/design/commit-gate-removal-2026_08.md`. `build_land_mask` and `seed_global_store` are
+unresolvable conflicts. See `context_docs/storage/writing-to-the-global-store.md`. `build_land_mask` and `seed_global_store` are
 cluster-less (they run on the flow runner like `generate_roi`); only
 `fill_zone_year` / `fill_zones_sequential` provision Ray.
 

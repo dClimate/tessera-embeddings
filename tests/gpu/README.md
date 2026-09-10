@@ -6,7 +6,7 @@
 > tier *would* look like if a runner ever becomes available; it is not work in flight.
 >
 > The one GPU-dependent test that exists today lives in
-> `tests/unit/test_inference_loop.py` behind a `torch.cuda.is_available()` check — not the
+> `tests/unit/inference/test_inference_loop.py` behind a `torch.cuda.is_available()` check — not the
 > `gpu` marker, deliberately, so it keeps reporting as a skip on every CI run. It is verified
 > by hand. See `tests/README.md` → Roadmap 2 for the command and when to run it.
 

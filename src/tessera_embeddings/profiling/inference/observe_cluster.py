@@ -1,37 +1,32 @@
 """Observe GPU/RAM utilization + per-chunk phase splits on a Ray inference cluster.
 
-General-purpose profiling tool for any Tessera Ray inference deployment (built
-during the GPU-saturation campaign; equally aimed at global-tessera runs).
-Workers are discovered by the Ray autoscaler's own tags (``ray-cluster-name``
-+ ``ray-node-type=worker``) — the same tags teardown uses — so any cluster is
-reachable via ``--cluster``/``--cluster-prefix`` regardless of naming scheme.
+General-purpose for any Tessera Ray inference deployment. Workers are discovered by the
+Ray autoscaler's own tags (``ray-cluster-name`` + ``ray-node-type=worker``) — the same
+tags teardown uses — so any cluster is reachable via ``--cluster``/``--cluster-prefix``
+regardless of naming scheme.
 
-1. ``--start-pollers`` — start 1 s pollers on every GPU worker via SSM:
-   ``nvidia-smi``, DCGM (``dcgmi dmon``: GRACT/SMACT/TENSO/DRAMA/PCIe), a
-   host-RAM sampler (used/avail/pct + top-3 process RSS each second), and an
-   outbound-:443 socket sampler standing in for staging-write concurrency. The
-   RAM sampler writes where the CloudWatch agent's dedicated ``ram_poll`` entry
-   ships it — so 1 s RAM data SURVIVES cluster teardown (the GPU/DCGM/socket
-   captures stay in /tmp and die with the worker; summarize them live).
-2. ``--report`` — fetch a fleet report from live workers: per-worker GPU-poll
-   summary (avg/max util, avg power, busy fraction), a 1 s RAM summary (peak,
-   time ≥55%/60%, top spikes), a staging-write concurrency histogram, OOM
-   forensics (kernel OOM-killer + Ray memory monitor events), and a per-chunk
-   phase-split table. The table prefers the actors' machine-readable
-   ``CHUNK_SUMMARY`` JSON lines and falls back to legacy prose-log regex
+1. ``--start-pollers`` — start 1 s pollers on every GPU worker via SSM: ``nvidia-smi``,
+   DCGM (``dcgmi dmon``: GRACT/SMACT/TENSO/DRAMA/PCIe), a host-RAM sampler (used/avail/pct
+   + top-3 process RSS each second), and an outbound-:443 socket sampler standing in for
+   staging-write concurrency. The RAM sampler writes where the CloudWatch agent's dedicated
+   ``ram_poll`` entry ships it, so 1 s RAM data SURVIVES cluster teardown; the
+   GPU/DCGM/socket captures stay in /tmp and die with the worker, so summarize those live.
+2. ``--report`` — fetch a fleet report from live workers: per-worker GPU-poll summary
+   (avg/max util, avg power, busy fraction), a 1 s RAM summary (peak, time ≥55%/60%, top
+   spikes), a staging-write concurrency histogram, OOM forensics (kernel OOM-killer + Ray
+   memory monitor events), and a per-chunk phase-split table. The table prefers the actors'
+   machine-readable ``CHUNK_SUMMARY`` JSON lines and falls back to legacy prose-log regex
    parsing for runs from older code.
 
-   The concurrency histogram answers a question the phase table cannot: when a
-   staging write costs more wall time than its byte volume explains, is the
-   writer's concurrency cap binding, or is each request slow? Sockets piling
-   onto a single level say the cap binds and raising it should help; a spread
-   below the cap says the writer is not saturating what it already has, and the
-   cost lies in host CPU contention or S3 throttling instead.
-3. ``--ram-report`` — post-hoc, from CloudWatch (no live cluster needed):
-   per-worker peak host RAM + GPU-util distribution from the 30 s RESOURCES
-   lines, plus — when the 1 s RAM poller ran — a per-worker 1 s rollup
-   (peak/p99) and the top spike samples with timestamps. Scope with
-   --since/--until.
+   The concurrency histogram answers what the phase table cannot: when a staging write
+   costs more wall time than its byte volume explains, is the writer's concurrency cap
+   binding, or is each request slow? Sockets piling onto a single level say the cap binds
+   and raising it should help; a spread below the cap says the writer is not saturating
+   what it has, and the cost lies in host CPU contention or S3 throttling instead.
+3. ``--ram-report`` — post-hoc, from CloudWatch (no live cluster needed): per-worker peak
+   host RAM + GPU-util distribution from the 30 s RESOURCES lines, plus — when the 1 s RAM
+   poller ran — a per-worker 1 s rollup (peak/p99) and the top spike samples with
+   timestamps. Scope with --since/--until.
 
 Usage::
 
@@ -46,11 +41,10 @@ Usage::
     # scope to one run's fleet when several clusters share the account
     te-observe-cluster --cluster tessera-inference-a60550ae --report
 
---report/--start-pollers require workers reachable via SSM (the production AMI
-runs the agent). --ram-report only needs CloudWatch Logs read access. Credentials
-come from the ambient AWS chain (``AWS_PROFILE``, instance role, …) unless
-``--profile`` names one; note ``--log-group`` still defaults to the yield
-deployment's group, so pass it for any other account.
+--report/--start-pollers require workers reachable via SSM (the production AMI runs the
+agent); --ram-report only needs CloudWatch Logs read access. Credentials come from the
+ambient AWS chain (``AWS_PROFILE``, instance role, …) unless ``--profile`` names one, and
+``--log-group`` defaults to the yield deployment's group, so pass it for any other account.
 """
 
 from __future__ import annotations
@@ -65,22 +59,19 @@ import boto3
 
 from tessera_embeddings.profiling._cloudwatch import insights_query, parse_ts
 
-# CloudWatch log group the workers' ResourceMonitor lines ship to (yield deploy
-# default — pass --log-group for other deployments).
+# CloudWatch log group the workers' ResourceMonitor lines ship to (yield deploy default —
+# pass --log-group for other deployments).
 DEFAULT_RAM_LOG_GROUP = "/ec2/yield-embeddings/ray"
 
-# 1 s host-RAM sampler, uploaded to each worker and run with nohup. Writes to
-# the Ray session log dir when it exists: the CloudWatch agent ships that exact
-# path via a DEDICATED collect_list entry (stream ``<instance>/ram_poll``; see
-# providers/aws/cloudwatch-agent.json.tpl), so the 1 s samples survive teardown
-# and feed --ram-report's spike analysis. A dedicated entry is required — the
-# agent tails only the NEWEST file matching a wildcard entry, so relying on the
-# ``**/*.log`` catch-all would both drop samples and let this once-a-second
-# file displace every other log behind that glob (it is blacklisted there for
-# the same reason). Clusters launched from AMIs/templates predating the entry
-# keep the data worker-local — the --report path still summarizes it live.
-# /tmp is the fallback when no Ray session exists yet (worker-local only).
-# Reads /proc directly (no psutil dependency on the host python).
+# 1 s host-RAM sampler, uploaded to each worker and run with nohup. Writes to the Ray session
+# log dir when it exists: the CloudWatch agent ships that exact path via a DEDICATED
+# collect_list entry (stream ``<instance>/ram_poll``; see providers/aws/cloudwatch-agent.json.tpl),
+# so the samples survive teardown and feed --ram-report's spike analysis. A dedicated entry is
+# required — the agent tails only the NEWEST file matching a wildcard entry, so the ``**/*.log``
+# catch-all would both drop samples and let this once-a-second file displace every other log
+# behind that glob (it is blacklisted there for the same reason). Where the entry is absent the
+# data stays worker-local and --report still summarizes it live. /tmp is the fallback when no
+# Ray session exists yet. Reads /proc directly (no psutil on the host python).
 RAM_POLLER_PY = r"""
 import os, time
 from datetime import datetime, timezone
@@ -139,27 +130,16 @@ while True:
     time.sleep(1)
 """
 
-# 1 s sampler for OUTBOUND HTTPS socket count — a proxy for how many staging
-# PUTs are actually in flight at once.
+# 1 s sampler for OUTBOUND HTTPS socket count — a proxy for how many staging PUTs are in
+# flight at once. The staging write is a Zarr store write, capped at ``async.concurrency``;
+# counting established sockets tells a binding cap (the count pins at it) apart from slow
+# individual requests (it sits below), which look identical from the outside and want
+# opposite fixes.
 #
-# The staging write is a Zarr store write, and Zarr caps its own concurrent
-# store operations at ``async.concurrency``. When a write is slower than its
-# byte volume can explain, two very different causes look identical from the
-# outside: the concurrency cap is binding (the writer wants more parallelism
-# than it is allowed), or each individual request is slow (host CPU starved by
-# inference prep, or S3 throttling the prefix). Raising the cap only helps in
-# the first case, so the two must be told apart before tuning anything.
-#
-# Counting established sockets separates them directly. If the count pins at
-# the configured cap for the duration of a write, the cap binds. If it sits
-# below the cap, the writer is not even saturating what it already has and the
-# latency is elsewhere. The report prints a full histogram rather than a mean
-# for exactly this reason — a plateau is the signal, and an average smears it.
-#
-# Caveat: this counts ALL outbound :443, not S3 specifically. A GPU worker's
-# other TLS talkers (SSM agent, CloudWatch agent) are few and long-lived, so
-# they form a small constant floor; the write-driven swing above that floor is
-# what carries meaning. Reads /proc/net directly — no `ss` or psutil needed.
+# Caveat: this counts ALL outbound :443, not S3 specifically. A GPU worker's other TLS
+# talkers (SSM agent, CloudWatch agent) are few and long-lived, so they form a small constant
+# floor; the write-driven swing above it is what carries meaning. Reads /proc/net directly —
+# no `ss` or psutil needed.
 S3_POLLER_PY = r"""
 import os, time
 from datetime import datetime, timezone
@@ -204,14 +184,13 @@ while True:
     time.sleep(1)
 """
 
-# Kill any prior pollers before starting new ones. Match the actual long-lived
-# processes (the `nvidia-smi --query-gpu ... -l`, `dcgmi dmon`, ram_poll.py and
-# s3_poll.py command lines), not just the redirect-filename wrapper — otherwise
-# re-running --start-pollers leaves the old samplers writing concurrently to the
-# same files and corrupts the measurements. The `[n]`/`[d]`/`[r]`/`[s]` bracket
-# idiom keeps the pattern from matching any shell whose own command line
-# contains it (e.g. an SSM wrapper), which pkill -f would otherwise kill before
-# the poller-start commands run.
+# Kill any prior pollers before starting new ones. Match the actual long-lived processes
+# (the `nvidia-smi --query-gpu ... -l`, `dcgmi dmon`, ram_poll.py and s3_poll.py command
+# lines), not just the redirect-filename wrapper, or re-running --start-pollers leaves the
+# old samplers writing concurrently to the same files and corrupts the measurements. The
+# `[n]`/`[d]`/`[r]`/`[s]` bracket idiom keeps the pattern from matching any shell whose own
+# command line contains it (e.g. an SSM wrapper), which pkill -f would kill before the
+# poller-start commands run.
 POLLER_COMMANDS = [
     (
         "pkill -f '[n]vidia-smi --query-gpu' 2>/dev/null; pkill -f '[d]cgmi dmon' 2>/dev/null; "
@@ -253,11 +232,9 @@ RAM_SUMMARY_CMD = (
     "grep -h '^RAMPOLL' \"$F\" 2>/dev/null | sort -t= -k5 -rn | head -5; true"
 )
 
-# 1 s outbound-:443 socket summary. The HISTOGRAM is the point, not the mean:
-# the question this answers is whether the writer's concurrency cap is binding,
-# and that shows up as the sample count piling onto one value (the cap) rather
-# than spreading. A mean over a run that is mostly inference — few sockets —
-# and briefly writing — many — lands in between and says nothing.
+# 1 s outbound-:443 socket summary. The HISTOGRAM is the point, not the mean: a binding cap
+# shows up as samples piling onto one value, and a mean over a run that is mostly inference
+# (few sockets) and briefly writing (many) lands in between and says nothing.
 S3_SUMMARY_CMD = (
     'F=/tmp/s3_poll.log; [ -f "$F" ] || { echo "no s3_poll data (pollers not started?)"; exit 0; }; '
     'awk \'/^S3POLL/{split($3,a,"="); e=a[2]+0; split($4,b,"="); s=b[2]+0; '
@@ -269,11 +246,10 @@ S3_SUMMARY_CMD = (
     'for(k=0;k<=mx;k++) if(h[k]>0) printf "  %3d -> %d\\n", k, h[k]}\' "$F"'
 )
 
-# Runs on the worker: build the per-chunk phase table. Preferred source is the
-# actors' machine-readable CHUNK_SUMMARY JSON lines (see actors.py
-# _chunk_summary_line — stable keys, immune to prose-wording drift). The legacy
-# prose-regex path below remains as a fallback so the tool still works against
-# runs from code that predates the summary lines.
+# Runs on the worker: build the per-chunk phase table. Preferred source is the actors'
+# machine-readable CHUNK_SUMMARY JSON lines (see actors.py _chunk_summary_line — stable keys,
+# immune to prose-wording drift); the legacy prose-regex path is the fallback for runs from
+# code predating them.
 PHASE_PARSER = r"""
 import glob, json, os, re
 from datetime import datetime
@@ -400,15 +376,14 @@ REPORT_COMMANDS = [
 def find_workers(session: boto3.session.Session, cluster: str | None, cluster_prefix: str) -> list[str]:
     """Return running, SSM-registered GPU workers of the target cluster(s).
 
-    Discovery keys on the Ray autoscaler's own EC2 tags — ``ray-cluster-name``
-    (the same tag teardown terminates by) and ``ray-node-type=worker`` — so it
-    works for any deployment regardless of instance-naming scheme. ``cluster``
-    scopes to one run's fleet exactly; otherwise ``cluster_prefix`` matches all
-    clusters whose name starts with it.
+    Discovery keys on the Ray autoscaler's own EC2 tags — ``ray-cluster-name`` (the same
+    tag teardown terminates by) and ``ray-node-type=worker`` — so it works for any
+    deployment regardless of instance-naming scheme. ``cluster`` scopes to one run's fleet
+    exactly; otherwise ``cluster_prefix`` matches every cluster whose name starts with it.
 
-    Freshly-launched autoscaler workers take a minute to register with SSM, and
-    one unregistered instance in a ``send_command`` batch fails the whole call —
-    so intersect the EC2 listing with SSM's registered set and report the rest.
+    Freshly-launched autoscaler workers take a minute to register with SSM, and one
+    unregistered instance fails a whole ``send_command`` batch — so intersect the EC2
+    listing with SSM's registered set and report the rest.
     """
     ec2 = session.client("ec2")
     tag_values = [cluster] if cluster else [f"{cluster_prefix}*"]
@@ -426,10 +401,9 @@ def find_workers(session: boto3.session.Session, cluster: str | None, cluster_pr
     ssm = session.client("ssm")
     registered: set[str] = set()
     paginator = ssm.get_paginator("describe_instance_information")
-    # The InstanceIds filter caps Values at 50; the fleet can exceed that
-    # (cluster.yaml.template allows max_workers=500), so query in batches or a
-    # >50-worker run raises ValidationException here. _SSM_MAX_INSTANCES (=50)
-    # is defined below for the same cap on SendCommand.
+    # The InstanceIds filter caps Values at 50 and the fleet can exceed that
+    # (cluster.yaml.template allows max_workers=500), so batch or a >50-worker run raises
+    # ValidationException here. _SSM_MAX_INSTANCES (=50) below is the same cap on SendCommand.
     for i in range(0, len(running), _SSM_MAX_INSTANCES):
         batch = running[i : i + _SSM_MAX_INSTANCES]
         for page in paginator.paginate(Filters=[{"Key": "InstanceIds", "Values": batch}]):
@@ -441,8 +415,8 @@ def find_workers(session: boto3.session.Session, cluster: str | None, cluster_pr
     return [iid for iid in running if iid in registered]
 
 
-# SSM SendCommand caps InstanceIds at 50; the GPU fleet can reach the 80-actor
-# cap (config.dask.NUM_ACTORS_CAP), so send in batches of 50.
+# SSM SendCommand caps InstanceIds at 50; the GPU fleet can reach the 80-actor cap
+# (config.dask.NUM_ACTORS_CAP), so send in batches of 50.
 _SSM_MAX_INSTANCES = 50
 
 
@@ -461,10 +435,9 @@ def run_on_workers(session: boto3.session.Session, instance_ids: list[str], comm
 
     outputs: dict[str, str] = {}
     for cmd_id, batch in cmd_ids.items():
-        # Round-robin across the batch's instances so the ~60s wait is shared,
-        # not serialized: a single slow/unresponsive instance mustn't delay
-        # collecting results from the rest (sequential per-instance waits would
-        # be up to 60s x len(batch) in the worst case).
+        # Round-robin across the batch so the ~60s wait is shared, not serialized: one slow
+        # instance must not delay collecting from the rest (sequential per-instance waits
+        # would be up to 60s x len(batch)).
         pending = set(batch)
         for _ in range(30):
             if not pending:
@@ -474,9 +447,8 @@ def run_on_workers(session: boto3.session.Session, instance_ids: list[str], comm
                 try:
                     inv = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
                 except ssm.exceptions.InvocationDoesNotExist:
-                    # SSM Run Command is eventually consistent — the invocation
-                    # can be briefly invisible right after send_command. Leave the
-                    # instance pending and retry on the next poll.
+                    # SSM Run Command is eventually consistent — the invocation can be
+                    # briefly invisible right after send_command. Retry on the next poll.
                     continue
                 if inv["Status"] in ("Success", "Failed", "TimedOut", "Cancelled"):
                     outputs[iid] = inv["StandardOutputContent"] + (
@@ -499,15 +471,15 @@ def _insights_query(
 ) -> list[dict[str, str]] | None:
     """Run one Insights query and return its rows, or None on a hard failure.
 
-    A thin adapter over the shared runner in ``profiling/_cloudwatch.py``, which
-    owns the bounded poll, the never-abort contract (rows=None rather than a
-    raised botocore error, so one bad query doesn't discard the rollup already
-    printed) and cancelling a query it gives up on.
+    A thin adapter over the shared runner in ``profiling/_cloudwatch.py``, which owns the
+    bounded poll, the never-abort contract (rows=None rather than a raised botocore error,
+    so one bad query doesn't discard the rollup already printed) and cancelling a query it
+    gives up on.
 
-    The truncation flag is dropped on purpose: every query below is a per-stream
-    AGGREGATE (``stats … by @logStream`` — one row per worker) or carries its own
-    ``limit``, so the 10k-row cap is unreachable here. The shared runner still
-    warns on stderr if that ever stops being true.
+    The truncation flag is dropped on purpose: every query below is a per-stream AGGREGATE
+    (``stats … by @logStream`` — one row per worker) or carries its own ``limit``, so the
+    10k-row cap is unreachable here. The shared runner still warns on stderr if that stops
+    being true.
     """
     rows, _truncated = insights_query(logs, log_group, query, start_epoch, end_epoch)
     return rows
@@ -516,9 +488,9 @@ def _insights_query(
 def _worker_label(stream: str) -> str:
     """Per-worker label from a ``<instance-id>/<suffix>`` CloudWatch stream name.
 
-    The instance id is the discriminating part — the suffix (``actors``,
-    ``ram_poll``, …) is the SAME for every worker, so labelling by the suffix
-    (a trailing ``rsplit('/', 1)[-1]``) collapses all rows to one name.
+    The instance id is the discriminating part — the suffix (``actors``, ``ram_poll``, …) is
+    the SAME for every worker, so labelling by it (a trailing ``rsplit('/', 1)[-1]``)
+    collapses every row to one name.
     """
     return stream.split("/", 1)[0][:20]
 
@@ -526,17 +498,17 @@ def _worker_label(stream: str) -> str:
 def ram_util_report(session: boto3.session.Session, log_group: str, start_epoch: int, end_epoch: int) -> int:
     """Per-worker peak host RAM + GPU-util distribution from CloudWatch.
 
-    Sources two line families the workers ship to ``log_group``, so it works
-    AFTER a run's cluster has torn down — unlike the SSM ``--report`` path:
+    Sources two line families the workers ship to ``log_group``, so unlike the SSM
+    ``--report`` path it works AFTER a run's cluster has torn down:
 
-    - ``RESOURCES`` (30 s, always on): per-stream peak RAM + GPU-util rollup.
-      30 s cadence MISSES sub-30 s spikes — treat its peak as a floor.
-    - ``RAMPOLL`` (1 s, present when ``--start-pollers`` ran): per-stream 1 s
-      peak/p99 rollup plus the top spike samples with timestamps and the top
-      RSS processes at that instant — the spike-forensics view.
+    - ``RESOURCES`` (30 s, always on): per-stream peak RAM + GPU-util rollup. The 30 s
+      cadence MISSES sub-30 s spikes — treat its peak as a floor.
+    - ``RAMPOLL`` (1 s, present when ``--start-pollers`` ran): per-stream 1 s peak/p99
+      rollup plus the top spike samples with timestamps and the top RSS processes at that
+      instant — the spike-forensics view.
 
-    NOTE: the log group is shared across runs, so scope the window tightly to
-    the run of interest; streams from an overlapping run share the same group.
+    The log group is shared across runs, so scope the window tightly: an overlapping run's
+    streams land in the same group.
     """
     logs = session.client("logs")
     resources_q = (
@@ -553,13 +525,12 @@ def ram_util_report(session: boto3.session.Session, log_group: str, start_epoch:
     win += f" → {datetime.datetime.fromtimestamp(end_epoch, datetime.UTC):%Y-%m-%d %H:%M} UTC"
     print(f"RAM + GPU-util from {log_group}  [{win}]")
 
-    # The two sources are INDEPENDENT: a short run (or a worker OOM-killed
-    # before its first 30 s RESOURCES sample) may have only RAMPOLL — the very
-    # 1 s evidence this feature targets — so an empty RESOURCES set must not
-    # short-circuit the RAMPOLL section. `_insights_query` returns None on a
-    # HARD failure (permission/timeout/failed status), [] for "no such lines":
-    # None → return nonzero (never mask a failed query as "no data"); [] →
-    # note it and try the other source; fail only if NEITHER produced data.
+    # The two sources are INDEPENDENT: a short run (or a worker OOM-killed before its first
+    # 30 s RESOURCES sample) may have only RAMPOLL — the very 1 s evidence this targets — so
+    # an empty RESOURCES set must not short-circuit the RAMPOLL section. `_insights_query`
+    # returns None on a HARD failure (permission/timeout/failed status) and [] for "no such
+    # lines": None → return nonzero, never masking a failed query as "no data"; [] → note it
+    # and try the other source; fail only if NEITHER produced data.
 
     # --- 30 s RESOURCES rollup (always-on monitor) ---
     rows = _insights_query(logs, log_group, resources_q, start_epoch, end_epoch)
@@ -686,8 +657,8 @@ def main(argv: list[str] | None = None) -> int:
         if not (args.start_pollers or args.report):
             return rc
 
-    # Tolerate the old Name-style prefix (instance Names are "ray-<cluster>-...",
-    # the tag value is the bare cluster name).
+    # Tolerate a Name-style prefix: instance Names are "ray-<cluster>-...", while the tag
+    # value is the bare cluster name.
     prefix = args.cluster_prefix.removeprefix("ray-")
     workers = find_workers(session, args.cluster, prefix)
     if not workers:

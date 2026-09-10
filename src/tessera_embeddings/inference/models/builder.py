@@ -1,17 +1,19 @@
 """Model construction and checkpoint loading for Tessera v1.1.
 
-Builds the v1.1 inference model (two TransformerEncoder backbones + MLP
-dim_reducer), loads the v1.1 encoder checkpoint, strips training-only keys
-(projector and segmented-matryoshka-projector), fuses CustomGRU to nn.GRU for
-cuDNN performance, then freezes and moves to the target device.
+Builds the inference model (two TransformerEncoder backbones + MLP dim_reducer), loads the v1.1
+encoder checkpoint, strips training-only keys (projector and segmented-matryoshka-projector),
+fuses CustomGRU to nn.GRU for cuDNN performance, then freezes and moves to the target device.
 """
 
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+import fsspec
 import torch
 
 from .modules import CustomGRU, TemporalAwarePooling, TransformerEncoder
@@ -22,30 +24,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# State-dict prefixes emitted by v1.1 training that are not part of the
-# inference graph. ``projector`` is the BarlowTwins head; the segmented
-# matryoshka projector is used for the variable-width training objective.
+# State-dict prefixes emitted by v1.1 training that are not part of the inference graph: ``projector`` is the
+# BarlowTwins head, the segmented matryoshka projector serves the variable-width training objective.
 _TRAINING_ONLY_PREFIXES: tuple[str, ...] = ("projector.", "segmented_matryoshka_projector.")
 
 
 def _fuse_custom_gru(module: torch.nn.Module) -> None:
     """Replace CustomGRU with nn.GRU by fusing per-gate weights.
 
-    Walks the module tree, finds TemporalAwarePooling instances with CustomGRU,
-    and swaps in nn.GRU with fused weight matrices. This recovers cuDNN
-    performance (~1 kernel launch vs ~480).
+    Walks the module tree, finds TemporalAwarePooling instances holding a CustomGRU, and swaps in
+    nn.GRU with fused weight matrices — recovering cuDNN performance (~1 kernel launch vs ~480).
 
     The tessera CustomGRUCell differs from nn.GRU in two ways:
 
-    1. **Update gate convention is inverted.** Tessera: h' = (1-z)*h + z*n (z selects
-       the new candidate). nn.GRU: h' = (1-z)*n + z*h (z keeps old state). Since
-       1 - sigmoid(x) = sigmoid(-x), we negate all z gate weights and biases.
+    1. **Update gate convention is inverted.** Tessera: h' = (1-z)*h + z*n (z selects the new
+       candidate). nn.GRU: h' = (1-z)*n + z*h (z keeps old state). Since 1 - sigmoid(x) =
+       sigmoid(-x), all z gate weights and biases are negated.
 
-    2. **Reset gate placement differs.** Tessera: W_hh @ (r * h) — reset applied
-       before matmul. nn.GRU: r * (W_hh @ h + b_hh) — reset applied after matmul.
-       This is NOT equivalent for dense weight matrices, but is a small approximation
-       in practice because the reset gate is close to 1 for most dimensions after
-       training. b_h is placed in bias_ih (input-side) since tessera adds it outside
+    2. **Reset gate placement differs.** Tessera applies reset BEFORE the matmul, W_hh @ (r * h);
+       nn.GRU applies it after, r * (W_hh @ h + b_hh). NOT equivalent for dense weight matrices,
+       but a small approximation in practice because the reset gate is close to 1 for most
+       dimensions after training. b_h goes in bias_ih (input-side) since tessera adds it outside
        the reset gate product.
     """
     for _name, child in module.named_modules():
@@ -76,9 +75,9 @@ def _fuse_custom_gru(module: torch.nn.Module) -> None:
 def _build_inference_model(config: InferenceConfig, device: torch.device) -> MultimodalBTInferenceModel:
     """Construct the v1.1 inference model (pre-checkpoint-load) on *device*.
 
-    The two backbones share architecture hyperparameters. Both consume
-    ``band_num + 1`` input features (the ``+1`` is DOY appended by the sampler).
-    S2 is 10 bands; the merged S1 stream (asc + desc concatenated) is 2 bands.
+    The two backbones share architecture hyperparameters and both consume ``band_num + 1`` input
+    features, the ``+1`` being DOY appended by the sampler. S2 is 10 bands; the merged S1 stream
+    (asc + desc concatenated) is 2.
     """
     max_seq_len = max(config.num_obs_checkpoints)
 
@@ -163,10 +162,10 @@ def build_inference_model(
 ) -> MultimodalBTInferenceModel:
     """Build the v1.1 inference model from config and checkpoint.
 
-    Constructs the model on CPU, loads the checkpoint with ``strict=False``
-    (projector/matryoshka keys are already filtered in ``load_checkpoint``),
-    fuses CustomGRU to nn.GRU, freezes, zeros TransformerEncoderLayer
-    dropouts for the fused-attention fast path, and moves to *device* in eval mode.
+    Constructs on CPU, loads the checkpoint with ``strict=False`` (projector/matryoshka keys are
+    already filtered in ``load_checkpoint``), fuses CustomGRU to nn.GRU, freezes, zeros
+    TransformerEncoderLayer dropouts for the fused-attention fast path, and moves to *device* in
+    eval mode.
 
     Args:
         config: Inference configuration.
@@ -213,3 +212,75 @@ def build_inference_model(
 
     logger.info("Built v1.1 inference model on %s", device)
     return model
+
+
+# Schemes that mean "fetch this from somewhere else first". A local filesystem path (or an explicit file:// URI) is
+# loaded in place by torch.
+_REMOTE_CKPT_SCHEMES = ("s3://", "http://", "https://", "gs://", "az://", "abfs://")
+
+
+def _is_remote_uri(path: str) -> bool:
+    """True if ``path`` must be downloaded before torch.load can open it."""
+    return path.startswith(_REMOTE_CKPT_SCHEMES)
+
+
+def _default_checkpoint_cache() -> str:
+    """Pick a download cache dir that exists on the running host.
+
+    On AWS DLAMI GPU boxes the NVMe instance store (~1.5 GB/s) is the right target: the root EBS
+    volume (~42 MB/s) is too slow and torch.load with mmap hangs on it. Off that path (laptops,
+    CI, non-AWS GPUs) the NVMe mount does not exist, so fall back to the system temp dir.
+    """
+    nvme = Path("/opt/dlami/nvme")
+    if nvme.is_dir():
+        return str(nvme / "tessera-checkpoints")
+    return str(Path(tempfile.gettempdir()) / "tessera-checkpoints")
+
+
+def download_checkpoint(remote_path: str, local_dir: str | None = None) -> str:
+    """Download a model checkpoint from a remote URI to local storage.
+
+    Handles any fsspec-supported remote scheme — ``s3://``, ``https://`` (e.g. a HuggingFace
+    ``resolve/main`` URL), ``gs://``. The file is staged locally because torch.load wants a real
+    path and reads it twice.
+
+    Args:
+        remote_path: Remote URI (e.g. ``"s3://bucket/path/model.pt"`` or
+            ``"https://huggingface.co/.../tessera_v1_1_aws_encoder.pt"``).
+        local_dir: Local directory for downloads. Defaults to the NVMe instance store on AWS
+            DLAMI hosts, else a system temp dir.
+
+    Returns:
+        Local file path.
+
+    Concurrency: many actors on one host may call this with the same ``remote_path`` and shared
+    cache dir at once (cold cache, hundreds of actors). The download writes to a unique temp file
+    and is published with an atomic rename, so a concurrent reader never sees a partially-written
+    checkpoint and concurrent writers cannot corrupt each other — the last rename wins and every
+    byte is identical.
+    """
+    filename = remote_path.rsplit("/", 1)[-1]
+
+    local = Path(local_dir or _default_checkpoint_cache())
+    local.mkdir(parents=True, exist_ok=True)
+    local_path = local / filename
+
+    if local_path.exists():
+        logger.info("Checkpoint already cached: %s", local_path)
+        return str(local_path)
+
+    logger.info("Downloading checkpoint: %s → %s", remote_path, local_path)
+    # Checkpoints are ~200 MB, so reading the whole file into memory is fine.
+    with fsspec.open(remote_path, "rb") as remote:
+        data = remote.read()
+    # Staged into a unique temp file in the SAME dir, so the rename stays on one filesystem and is atomic: concurrent
+    # actors publishing the same checkpoint cannot see a half-written file.
+    with tempfile.NamedTemporaryFile(dir=local, prefix=f"{filename}.", suffix=".part", delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(local_path)
+
+    downloaded_size = local_path.stat().st_size
+    logger.info("Download complete: %s (%.1f MB)", local_path, downloaded_size / 1024 / 1024)
+
+    return str(local_path)

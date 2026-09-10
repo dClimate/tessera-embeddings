@@ -1,21 +1,21 @@
 """Bulk object-store prefix deletion, shared by staging + mosaic cleanup.
 
-:func:`delete_prefix` removes a prefix with ``s5cmd rm`` (the production path — s5cmd
-parallelizes far past fsspec's serial per-key DELETEs), falling back to fsspec's
-recursive ``rm`` if s5cmd is unavailable.
+On a versioned S3 bucket a plain delete only writes delete markers, so old object versions
+accumulate and keep costing storage. :func:`delete_prefix` removes a prefix with ``s5cmd rm``
+(the production path -- s5cmd parallelizes far past fsspec's serial per-key DELETEs), falling
+back to fsspec's recursive ``rm`` if s5cmd is unavailable.
 
-``--all-versions`` is OPT-IN, not the default. On a versioned bucket a plain delete only
-writes delete markers, so old versions accumulate and keep costing storage — that is what
-the flag is for. But the campaign's buckets are UNVERSIONED, and there the flag is not a
-free precaution: it raises the required permission to ``s3:DeleteObjectVersion`` and
-enumerates through ``ListObjectVersions``. Callers on a versioned bucket pass it
-explicitly. The fsspec fallback cannot remove non-current versions at all, so a warning is
-logged when it is used with the flag on.
+``--all-versions`` is **ON by default**, because the default has to be the safe one for a caller
+whose bucket it does not know: getting it wrong on a versioned bucket is a false success, not a
+cost mistake (see :func:`delete_prefix`). It is not free, though, so a caller that KNOWS its
+bucket is unversioned opts out at the call site -- the flag buys nothing there, it raises the
+required permission to ``s3:DeleteObjectVersion``, and it makes s5cmd enumerate through
+``ListObjectVersions``. The fsspec fallback cannot remove non-current versions at all, so a
+warning is logged when it is used with the flag on.
 
-**The delete is verified, not reported.** A tool's count of what it removed says
-nothing about what is left, and a prefix that keeps some of its objects is worse
-than one that keeps all of them: chunks with no store read as a corrupted mosaic
-to whatever next tries to write there.
+**The delete is verified, not reported.** A tool's count of what it removed says nothing about
+what is left, and a prefix that keeps some of its objects is worse than one that keeps all of
+them: chunks with no store read as a corrupted mosaic to whatever next tries to write there.
 
 Subprocess + fsspec only (no boto3), so this stays outside ``providers/aws``.
 """
@@ -34,7 +34,7 @@ _Log = logging.Logger | logging.LoggerAdapter
 
 
 def _s5cmd_rm(uri: str, log: _Log, *, all_versions: bool) -> None:
-    """Delete everything under *uri* with ``s5cmd rm`` (``--all-versions`` opt-in).
+    """Delete everything under *uri* with ``s5cmd rm``, adding ``--all-versions`` when asked.
 
     Raises:
         FileNotFoundError: If the s5cmd binary is not on PATH.
@@ -57,54 +57,49 @@ def _s5cmd_rm(uri: str, log: _Log, *, all_versions: bool) -> None:
     log.info("s5cmd deleted %d object(s) from %s", n, uri)
 
 
-#: How many times a prefix is re-deleted before its survivors are reported. A delete that
-#: reports success can still leave objects behind, so one extra pass is worth taking; more
-#: than a couple means something other than a lost listing page is keeping them alive, and
-#: repeating will not find it.
+#: How many times a prefix is re-deleted before its survivors are reported. A delete that reports
+#: success can still leave objects behind, so one extra pass is worth taking; more than a couple
+#: means something other than a lost listing page is keeping them alive.
 _DELETE_PASSES = 3
 
-#: Seconds to wait before a retry, multiplied by the attempt number. Both failure modes here
-#: are rate pressure — S3 answered `SlowDown` outright on one prefix and silently dropped
-#: objects from another — and rate pressure wants time rather than another immediate attempt.
+#: Seconds to wait before a retry, multiplied by the attempt number. Both failure modes here are
+#: rate pressure — S3 answered `SlowDown` outright on one prefix and silently dropped objects from
+#: another — and rate pressure wants time rather than another immediate attempt.
 _DELETE_BACKOFF_S = 5.0
 
 
 class DeleteUnverifiedError(RuntimeError):
     """The delete ran, and whether it worked could not be established.
 
-    Distinct from :class:`PrefixNotEmptyError`, which asserts a fact: objects ARE still
-    there. This one asserts the absence of a fact, and the two want different responses —
-    survivors mean the work did not take, an unverifiable prefix means we do not know.
-    Only ``strict`` callers see it, because only they have said they cannot proceed on
-    an unverified prefix.
+    Distinct from :class:`PrefixNotEmptyError`, which asserts that objects ARE still there. This
+    asserts the absence of a fact, and the two want different responses. Only ``strict`` callers
+    see it, because only they have said they cannot proceed on an unverified prefix.
     """
 
 
 class PrefixNotEmptyError(RuntimeError):
     """A delete ran to completion and objects are still there.
 
-    Distinct from the s5cmd failures beside it because it needs the opposite response: those
-    mean the tool could not run and fsspec should try instead, this means the work was done
-    and did not take. Retrying it another way finds the same survivors.
+    Distinct from the s5cmd failures beside it because it needs the opposite response: those mean
+    the tool could not run and fsspec should try instead, this means the work was done and did not
+    take, so retrying it another way finds the same survivors.
     """
 
 
 def _survivors(uri: str, log: _Log) -> list[str] | None:
     """Objects still under *uri*, or None if the prefix could not be listed.
 
-    ``None`` is not "empty": a listing that failed proves nothing, and reporting it as a
-    clean prefix is how an unverified delete comes to look verified.
+    ``None`` is not "empty": a listing that failed proves nothing, and reporting it as a clean
+    prefix is how an unverified delete comes to look verified.
 
-    THE LIMIT OF THIS CHECK. `fs.find` lists CURRENT keys only. On a versioned bucket it
-    cannot see non-current versions or delete markers, so an `--all-versions` delete that
-    exited zero while leaving history behind would read back as verified-empty — and the
-    caller would report reclaimed storage that is still billed. Measured 2026-08-18: every
-    bucket this runs against (`arbol-tessera-{embeddings,inputs}` and their `-dev` pair)
-    answers `get-bucket-versioning` with no Status, i.e. versioning has never been enabled,
-    and the CDK construct creates buckets with it off because Icechunk carries its own
-    versioning. So the gap is unreachable today. It becomes reachable the moment versioning
-    is turned on anywhere, and nothing here would notice: enable it and this must move to a
-    version-aware listing (`list_object_versions`) first.
+    THE LIMIT OF THIS CHECK. `fs.find` lists CURRENT keys only. On a versioned bucket it cannot see
+    non-current versions or delete markers, so an `--all-versions` delete that exited zero while
+    leaving history behind would read back as verified-empty, and the caller would report reclaimed
+    storage that is still billed. Measured 2026-08-18: every bucket this runs against
+    (`arbol-tessera-{embeddings,inputs}` and their `-dev` pair) answers `get-bucket-versioning` with
+    no Status, i.e. versioning has never been enabled, and the CDK construct creates buckets with it
+    off because Icechunk carries its own versioning. Turning versioning on anywhere makes the gap
+    reachable and nothing here would notice: this must move to `list_object_versions` first.
     """
     try:
         fs = fsspec.filesystem(fsspec.utils.get_protocol(uri))
@@ -119,9 +114,8 @@ def _s5cmd_rm_verified(uri: str, log: _Log, *, all_versions: bool) -> None:
     """``s5cmd rm`` the prefix, then READ IT BACK, retrying while objects survive.
 
     s5cmd reported deleting 145,195 objects from one cell's mosaics and exited zero, and 807 of
-    them were still there — hours older than the delete, so not a race with a writer. A count of
-    what a tool says it removed is not a statement about what is left, and the residue is not
-    inert: the next ingest of that cell finds a prefix holding chunks and no store, which is
+    them were still there — hours older than the delete, so not a race with a writer. The residue
+    is not inert: the next ingest of that cell finds a prefix holding chunks and no store, which is
     indistinguishable from a corrupted mosaic.
 
     Raises:
@@ -137,10 +131,9 @@ def _s5cmd_rm_verified(uri: str, log: _Log, *, all_versions: bool) -> None:
         except RuntimeError as exc:
             # The expected failure at this scale, and the one that produced the residue:
             # `SlowDown: Please reduce your request rate` on a quarter-million-object prefix,
-            # observed live on 48S/2022. A throttle is transient by definition, so it earns the
-            # same retry budget as a pass that left survivors — the previous version fell
-            # straight through to the serial fsspec sweep, which faces the same rate limit with
-            # none of s5cmd's parallelism.
+            # observed live on 48S/2022. A throttle is transient, so it earns the same retry budget
+            # as a pass that left survivors rather than falling straight through to the serial
+            # fsspec sweep, which faces the same rate limit with none of s5cmd's parallelism.
             #
             # NOT FileNotFoundError: a missing binary will still be missing next time, and the
             # fallback is the whole answer for it.
@@ -152,11 +145,9 @@ def _s5cmd_rm_verified(uri: str, log: _Log, *, all_versions: bool) -> None:
         if left == []:
             return  # verified empty — the only outcome that is a success
         if left is None:
-            # The listing failed, so the prefix is UNKNOWN rather than clean. Retrying the
-            # delete would not help (the delete is not what failed) and would manufacture an
-            # endless loop, so stop here and let the caller's own bar decide: best-effort
-            # returns, strict raises. Reporting it as clean is what `_survivors` documents as
-            # the way an unverified delete comes to look verified.
+            # The listing failed, so the prefix is UNKNOWN rather than clean. Retrying the delete
+            # would not help (the delete is not what failed) and would manufacture an endless loop,
+            # so stop here and let the caller's own bar decide: best-effort returns, strict raises.
             raise DeleteUnverifiedError(uri)
         log.warning(
             "%d object(s) survived pass %d of the delete of %s (e.g. %s)",
@@ -165,15 +156,16 @@ def _s5cmd_rm_verified(uri: str, log: _Log, *, all_versions: bool) -> None:
             uri,
             left[0],
         )
-    # Only reachable when the LAST pass ran and left objects — a last pass that raised
-    # re-raised inside the loop, so the fsspec fallback still gets its turn.
+    # Only reachable when the LAST pass ran and left objects — a last pass that raised re-raised
+    # inside the loop, so the fsspec fallback still gets its turn.
     raise PrefixNotEmptyError(uri)
 
 
 def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = True, strict: bool = False) -> None:
     """Delete every object under *uri* (a directory-like prefix).
 
-    S3 uses ``s5cmd`` with an fsspec fallback; other schemes use fsspec directly.
+    S3 uses ``s5cmd`` (all versions by default) with an fsspec fallback; other schemes use fsspec
+    directly.
 
     Args:
         uri: Prefix to remove (e.g. ``s3://bucket/mosaics/33N/2025``).
@@ -237,12 +229,11 @@ def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = Tru
         except (FileNotFoundError, RuntimeError) as exc:
             if strict and all_versions:
                 # fsspec's rm removes CURRENT objects; on a versioned bucket it leaves every
-                # non-current version in place (and adds a delete marker). So the fallback
-                # cannot honour `all_versions`, and returning success from it tells a strict
-                # caller a prefix is reclaimed when terabytes of old versions are still billed
-                # — `_InputRetention.cleanup` then releases the cell's storage-budget slot and
-                # admits another ingest. Best-effort callers still get the fallback; a caller
-                # that said it cannot proceed on an unclean prefix gets told.
+                # non-current version in place (and adds a delete marker). So the fallback cannot
+                # honour `all_versions`, and returning success from it tells a strict caller a
+                # prefix is reclaimed when terabytes of old versions are still billed —
+                # `_InputRetention.cleanup` then releases the cell's storage-budget slot and admits
+                # another ingest. Best-effort callers still get the fallback.
                 msg = (
                     f"s5cmd could not delete {uri} ({exc}) and the fsspec fallback cannot remove "
                     "non-current versions, so an all-versions delete cannot be honoured here. "

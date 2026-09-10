@@ -1,8 +1,8 @@
 """The per-shard record: what a shard contained, and what it refused, in one row.
 
-One inference chunk is one 2048-px shard, so this is per-shard accounting even though it is computed
-per chunk. It exists because a minimum-depth rule makes "what is not here" a thing the product has to
-be able to explain: a refused pixel and an ocean pixel are the same bytes in the store, and only a
+One inference chunk is one 2048-px shard, so this is per-shard accounting even though it is
+computed per chunk. A minimum-depth rule makes "what is not here" something the product must be
+able to explain: a refused pixel and an ocean pixel are the same bytes in the store, and only a
 record separates them.
 
 **Everything here is a count, never a percentage.** A stored percentage is a second copy of a truth
@@ -10,20 +10,20 @@ that can drift from its numerator, and correcting one place and not the others i
 repository has already had. Formulas belong in the reader.
 
 **Three categories, never two.** Live shards include the land mask's sea buffer, so a coastal shard
-can be majority ocean. "Percent skipped" against the full 2048² is meaningless, and ``n_eligible_px``
-— pixels the mask calls land — is the only honest denominator. The parts must satisfy
+can be majority ocean; "percent skipped" against the full 2048² is meaningless, and
+``n_eligible_px`` — pixels the mask calls land — is the only honest denominator. The parts satisfy
 
     n_embedded_px + n_refused_thin_px + n_refused_no_optical_px + n_refused_no_radar_px == n_eligible_px
 
 and :func:`build` checks it rather than trusting the caller, because the three refusal reasons are
-computed in a different module from the eligibility mask and nothing else would notice them drifting
-apart.
+computed in a different module from the eligibility mask and nothing else would notice them
+drifting apart.
 
 **The histogram is for the top-up, not for reporting.** Refused pixels are expected to be revisited
 once more imagery is published, and that pass has to choose where to spend without scanning a
 petabyte. How CLOSE a shard's refusals were to the line is what makes that choosable, and a mean
-cannot express it: a shard whose refusals sit just under the line is rescued by a small backfill,
-one whose refusals sit near zero is not.
+cannot express it: refusals sitting just under the line are rescued by a small backfill, refusals
+near zero are not.
 """
 
 from __future__ import annotations
@@ -76,8 +76,8 @@ class ShardRecord:
         """A flat dict for the registry parquet, with the bitmask as a signed-safe string.
 
         The mask is 64 bits and parquet's integer types are signed, so a shard with its top chunk
-        refused would round-trip as a negative number. Written as a fixed-width hex string, which
-        is unambiguous and still sorts.
+        refused would round-trip as a negative number. A fixed-width hex string is unambiguous and
+        still sorts.
         """
         row = dataclasses.asdict(self)
         row["refused_depth_hist"] = list(self.refused_depth_hist)
@@ -105,15 +105,15 @@ def depth_histogram(depths: np.ndarray, edges: tuple[int, ...] = DEPTH_BIN_EDGES
 def eligible_from_chunk_liveness(chunk_live: np.ndarray, side: int = SHARD_PX) -> np.ndarray:
     """Expand a shard's 8x8 chunk-liveness grid into the per-pixel eligibility mask.
 
-    **This is what "eligible" can mean, and it is coarser than the name suggests.** The land mask
-    holds liveness per 2048-px tile and per 256-px inner chunk, and nothing finer exists anywhere in
-    the system — so a pixel is eligible when the mask calls its CHUNK live, not when the mask calls
-    that pixel land. A live chunk on a coastline is part water, so the denominator over-counts there
-    and a coastal shard's refusal share is a lower bound. Stated here because the alternative is a
-    reader dividing by it and believing the answer is exact.
+    **"Eligible" is coarser than the name suggests.** The land mask holds liveness per 2048-px tile
+    and per 256-px inner chunk, and nothing finer exists anywhere in the system, so a pixel is
+    eligible when the mask calls its CHUNK live, not when the mask calls that pixel land. A live
+    chunk on a coastline is part water, so the denominator over-counts there and a coastal shard's
+    refusal share is a lower bound — stated here because the alternative is a reader dividing by it
+    and believing the answer exact.
 
-    Defined as a function rather than left to each caller because the record, the validator and the
-    registry all need the same denominator, and three expansions of one grid is three chances to
+    A function rather than each caller's own expansion because the record, the validator and the
+    registry need the same denominator, and three expansions of one grid is three chances to
     disagree about what a shard contained.
     """
     if chunk_live.shape != (CHUNKS_PER_EDGE, CHUNKS_PER_EDGE):
@@ -168,15 +168,13 @@ def build(
 ) -> ShardRecord:
     """Assemble one shard's record from masks that all describe the same footprint.
 
-    Every mask is boolean over the shard. ``eligible`` is the land mask; the other four partition it,
-    and that is checked here rather than assumed — the refusal masks come from the inference dataset
-    and the eligibility mask from the land mask, so nothing else in the system would notice them
-    disagreeing.
+    Every mask is boolean over the shard. ``eligible`` is the land mask; the other four partition
+    it, checked here rather than assumed — the refusal masks come from the inference dataset and
+    the eligibility mask from the land mask, so nothing else would notice them disagreeing.
 
-    Depth statistics are over ELIGIBLE pixels, not embedded ones. Over embedded pixels they would
-    describe only the pixels that passed, which is the one population whose depth is already known
-    to clear the line — and the question the record exists to answer is what the refused ones looked
-    like.
+    Depth statistics are over ELIGIBLE pixels, not embedded ones: over embedded pixels they would
+    describe only the population whose depth is already known to clear the line, and the question
+    the record exists to answer is what the refused pixels looked like.
     """
     shapes = {a.shape for a in (eligible, embedded, s2_obs, refused_thin, refused_no_optical, refused_no_radar)}
     if len(shapes) != 1:
@@ -249,9 +247,8 @@ def build_from_counts(
     :func:`build` is the reference: it takes the whole shard's masks and is what the standalone
     rebuild reads out of the store. The actor cannot use it — it processes a shard in strips and
     never holds the whole thing — so this takes the totals instead, plus the two 8x8 grids the
-    bitmask needs. **A test asserts the two agree on the same data**, which is the only thing that
-    keeps a fast path and a reference implementation from drifting into two different answers about
-    what a shard contained.
+    bitmask needs. **A test asserts the two agree on the same data**, which is the only thing
+    keeping a fast path and a reference implementation from drifting into two different answers.
 
     ``depth_sum`` is a sum over ELIGIBLE pixels and is divided here, so the caller accumulates one
     number per strip rather than carrying an array.

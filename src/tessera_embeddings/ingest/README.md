@@ -83,13 +83,10 @@ from-date and a to-date. A **worklist** is a to-do list of jobs, one job per dat
 turns out to be impossible it is crossed off and two shorter jobs are written in its place.
 
 The problem this shape exists for: Earth Search refuses **a request whose answer would be bigger
-than about 6 MB** — AWS Lambda's synchronous response limit. Item sizes vary, so whether a given
-hundred scenes clears the cap depends on which hundred the bookmark and date window select, which is
-why one request out of hundreds is refused every time while all the others are served. It is not
-overloaded — the refusal comes back in 1.3 seconds, as fast as a success — and it is not the
-bookmark's fault: the identical bookmark is answered when the date window is shorter, and answered
-when only ninety results are asked for instead of a hundred. So the remedy is to ask for a *smaller
-answer*, never the same one again.
+than about 6 MB** — AWS Lambda's synchronous response limit. The refusal comes back in 1.3 seconds,
+as fast as a success, so nothing is overloaded and repeating the request cannot help. The remedy is
+always to ask for a *smaller answer*. The diagram below is the whole mechanism; everything after it
+is detail.
 
 ```text
 WHY A REQUEST GETS REFUSED -- the whole mechanism, in one line
@@ -232,40 +229,25 @@ to 250 and set to 100 for Earth Search. This applies only to providers queried t
 CMR-STAC search entirely and queries the native CMR Granule API. See
 [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md) for the full rationale.
 
-**Why 100 for Earth Search, and what to watch.** It is not a throughput choice — it is the
-response cap. Earth Search refuses any request whose response would exceed roughly **6 MB**,
-AWS Lambda's synchronous response limit, and 250 items of `sentinel-2-l2a` is always over it.
-A hundred items averages 4.6 MB, but the biggest page ever **served** was **5.73 MB — 96% of the
-cap** — and the refused one works out to 5.96 MB. So the gap between fine and refused is about a
-quarter of a megabyte, and the average is the wrong number to reason from.
+**Why 100 for Earth Search, and what to watch.** Not throughput — the response cap above. 250
+items of `sentinel-2-l2a` is always over it. A hundred averages 4.6 MB, but the biggest page ever
+**served** was **5.73 MB, 96% of the cap**, and the refused one works out to 5.96 MB: the gap
+between fine and refused is about a quarter of a megabyte, so the average is the wrong number to
+reason from. Outside the heavy band above, a hundred items is about 2.2 MB.
 
-What makes an item heavy is the shape of the ground it covers rather than the files attached to
-it, and the heavy items are confined to a few months of 2018 and 2019 — see *The months where the
-catalogue entries are heavy* above. Outside that band a hundred items is about 2.2 MB, a third of
-the cap.
+Lowering it further is not the answer — six months of a ten-year archive is a concentrated
+problem, and the page-size fallback below handles it where it happens rather than taxing every
+query in every year. The cap tracks **bytes, not the `limit` value**: measured directly, 130 items
+are served at 5.99 MB and 150 refused, while 150 are served at 4.77 MB once unneeded assets are
+excluded server-side. If first pages ever start returning 502, this margin is the first thing to
+check — a first-page refusal is the one case no date-window re-cut can route around.
 
-Lowering this number is therefore not the answer — see the campaign record for the measurements.
-Six months of a ten-year archive is a concentrated problem, and the page-size fallback below handles
-it where it happens rather than taxing every query in every year. The cap tracks **bytes, not the `limit` value**: measured directly, 130
-items are served at 5.99 MB and 150 refused, while 150 are served at 4.77 MB once unneeded
-assets are excluded server-side. If first pages ever start returning 502, this margin is the
-first thing to check and lowering this number is the lever — a first-page refusal is the one
-case no date-window re-cut can route around.
-
-**A page request deep in a walk is refused by the SAME ~6 MB response cap, and there are two
-levers for it.** Some individual page requests are refused with a 502 while
-the rest of the same walk is served, which looks like a separate defect and is not: item sizes
-vary, so whether a given hundred items clears the cap depends on which hundred the cursor and
-date window select. That is why the refusal is deterministic in the *request* — cursor and date
-window together — rather than in how deep the walk has got, and why it has been seen at page 289
-of one window and page 14 of a shorter one sharing its late bound. Re-sending the byte-identical
-cursor and window at `limit=90` is served, returning 5.60 MB where the hundred would have been
-about 6.2 MB. So waiting cannot absorb
-it — which is why 502 is kept out of the retry ladder above. **It is the same cap
-`max_page_size` was lowered for**, reached from the other direction: that one refuses a first
-page because 250 items are always too many, this one refuses a later page because those
-particular hundred items happen to be. A smaller page from the refused cursor IS served, and
-is the most direct remedy; it is not used here only because `pystac_client` bakes the limit
+**The same cap also refuses pages deep in a walk**, which looks like a separate defect and is not.
+Because item sizes vary, the refusal is deterministic in the *request* — cursor and date window
+together — rather than in how deep the walk has got: it has been seen at page 289 of one window
+and page 14 of a shorter one sharing its late bound. Re-sending the byte-identical cursor and
+window at `limit=90` is served, returning 5.60 MB where the hundred would have been about 6.2 MB.
+That is the most direct remedy and is not used here only because `pystac_client` bakes the limit
 into a search and cannot resume from a cursor at a different size.
 
 What clears it is either a smaller response or a regrouping that produces one. `stac.py` tries
@@ -322,12 +304,11 @@ deduped by `id` across every search a query runs, which absorbs the boundary ins
 antimeridian overlap alike.
 
 **Item order.** The re-partition does change the order items are *walked* in — one walk returns
-the window newest-first, the worklist returns window by window in date order — and that matters
-because `query_stac_items` sorts with `solar_day_sort_key`, which orders a solar day's items
-clearest-first and settles equal-cloud ties on `id` — so the sequence is a function of the items
-rather than of the order the walk produced, and the loader's fuser keeps the first valid source of
-each group. Verified against an unsplit walk at several part counts; see
-[the ingest campaign record](../../../context_docs/design/ingest_optimization_campaign_2026_07.md),
+the window newest-first, the worklist returns window by window in date order. That is safe only
+because `query_stac_items` re-sorts with `solar_day_sort_key`, making the final sequence a function
+of the items rather than of the order the walk produced (see *Cloud cover* below for what that sort
+decides). Verified against an unsplit walk at several part counts; see
+[the ingest campaign record](../../../context_docs/ingest/ingest-performance.md),
 which also records the measurements and the two optimisations that are closed (a larger page,
 and server-side field selection).
 
@@ -410,7 +391,7 @@ deadline plus one final attempt. And failing the cell this way is not surrender:
 returns to the campaign's work list, and a later dispatch RESUMES from the dates already
 committed (Icechunk commits a date's time slot atomically with its pixels), so the bound
 costs latency, never work. The default's derivation against measured leg durations is in
-`context_docs/design/ingest_read_failure_causes_2026_08.md` (cause 3).
+`context_docs/ingest/source-read-failures.md` (cause 3).
 
 **Two things stop that bound refusing an attempt a leg had the budget for.**
 
@@ -443,6 +424,8 @@ the plain deadline and its reads along with it.
 `source_coverage.py`'s preflight probe deliberately does **not** use any of this. Every
 failure of that probe is already INCONCLUSIVE by design, which is the right answer for both
 refusals at once, and the module sits outside the mosaic-content fingerprint closure.
+
+#### Cloud cover decides which scene wins a pixel
 
 Cloud cover is intentionally **not** used as a filter at the STAC query stage — pixel-level
 cloud classification is handled later (SCL for S2, ML model for inference). For S2, items
@@ -1127,7 +1110,7 @@ landing every zone in 2–5 windows. Sparse ROIs group *harder* in relative term
 point: a large fraction of a tiny area is still a tiny area.
 
 Calibration of the price, the campaign-wide table, and the cap sweep are in
-`context_docs/design/ingest-live-tile-cropping.md`.
+`context_docs/ingest/ingest-performance.md`.
 
 - **Windows** come from `live_windows.py`, from the boolean ROI mask that both
   `rasterize_roi_zarr` and `export_zone_roi` write. The mask is coarsened to the ingest chunk
@@ -1686,7 +1669,7 @@ sits at the top of the range where that was *measured* to hold, not at an estima
 widening it means measuring an ROI in between. Being denominated in covered window area also couples
 it to the merge exchange rate above: a finer merge covers less area, so ROIs drift below the
 threshold and more of them batch. Recalibrate against runs, never an offline sweep at a different
-merge cost. Figures in `context_docs/design/ingest_optimization_campaign_2026_07.md` §3.16.
+merge cost. Figures in `context_docs/ingest/ingest-performance.md` §3.16.
 
 When it is on, k consecutive PASSING dates compute as ONE graph: their work packs the fleet
 together, one date's straggling reads backfill with another's writes, and the drain tail and commit
@@ -2285,7 +2268,7 @@ every `/vsis3/` open) then hands the refreshed `AWSSession`'s frozen credentials
 no `gdal.SetConfigOption` or `VSICurlClearCache` is needed. This reaches into private
 `odc.loader` internals (`_OdcThreadSession`, `_local`) and is a version-sensitive hook — if odc
 renames those symbols, the import fails loudly and the regression tests in
-`tests/unit/test_auth.py` catch the break in CI before it hits a 1hr cloud run.
+`tests/unit/ingest/test_auth.py` catch the break in CI before it hits a 1hr cloud run.
 
 This was empirically verified on a us-west-2 EC2 box (2026-05-20): a four-month S1 ingest
 run at `cred_refresh_interval_sec=60` over a persistent local Dask cluster forced multiple

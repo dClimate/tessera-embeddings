@@ -1,23 +1,21 @@
 """Fingerprinting the source that decides a stored artifact's CONTENT.
 
-Two pipeline stages need the same answer to the same question: *was the data already
-in this store produced by the code running now?* Inference asks it of a staging prefix
-before resuming into it; ingest asks it of an interrupted mosaic before appending to it.
-Both have the same failure if they guess wrong — one artifact holding output from two
-code versions, published under a single completion mark, with nothing recording that it
-happened.
+Two pipeline stages ask the same question — *was the data already in this store produced
+by the code running now?* Inference asks it of a staging prefix before resuming into it;
+ingest asks it of an interrupted mosaic before appending. Guessing wrong gives both the
+same failure: one artifact holding output from two code versions, published under a
+single completion mark, with nothing recording that it happened.
 
-A **source hash over an import closure** is the answer both use, rather than a build
-identity (an AMI id, an image digest). A build identity is correct but far too wide:
-it moves on every re-bake and every hotfix anywhere in the repo, so it abandons work
-that is perfectly reusable. Hashing only the code that determines the artifact's
-content keeps a hotfix cheap while still catching the changes that matter.
+Both answer with a **source hash over an import closure** rather than a build identity
+(an AMI id, an image digest). A build identity is correct but far too wide — it moves on
+every re-bake and every hotfix anywhere in the repo, so it abandons perfectly reusable
+work. Hashing only the code that determines the artifact's content keeps a hotfix cheap
+while still catching the changes that matter.
 
-**What this deliberately does not cover: dependency drift.** A source hash is blind to
-a new library under the same source. Callers bound that gap their own way — the fill
-pins one AMI for a whole campaign, so a single run cannot straddle two images — and a
-deliberate mid-campaign upgrade wants an explicit force-new token rather than a silent
-reuse.
+**It cannot see dependency drift:** a new library under unchanged source. Callers bound
+that gap themselves — the fill pins one AMI for a whole campaign, so a single run cannot
+straddle two images — and a deliberate mid-campaign upgrade wants an explicit force-new
+token rather than a silent reuse.
 """
 
 from __future__ import annotations
@@ -32,40 +30,68 @@ _PACKAGE = __name__.split(".")[0]
 def first_party_import_closure(seed: list[Path], root: Path) -> set[Path]:
     """Every in-package module reachable from *seed*, following imports transitively.
 
-    The seed names the code that OBVIOUSLY produces the artifact; this finds the code it
-    delegates to. Without it the identity misses exactly the dependencies that matter
-    most — inference's ``data_loading`` calls ``compute_doy`` from ``storage.zarr_store``
-    to build a model input, and reads ``TimeWindow`` from ``config.time_windows`` to
-    choose which observations are used. A change to either alters the output while
-    leaving a hand-listed identity unmoved.
-
-    A closure rather than a longer list, because a list only covers the dependencies
-    someone remembered: it goes stale the first time an import is added, and it goes
-    stale silently, in the direction that loses data.
+    The seed names the code that OBVIOUSLY produces the artifact; the closure finds what it
+    delegates to. Without it the identity misses exactly the dependencies that matter most:
+    inference's ``data_loading`` calls ``compute_doy`` from ``storage.zarr_store`` to build a
+    model input and reads ``TimeWindow`` from ``config.time_windows`` to choose which
+    observations are used, and a change to either alters the output while leaving a
+    hand-listed identity unmoved. A hand-list also goes stale the first time an import is
+    added, silently, in the direction that loses data.
 
     Parses rather than imports — this runs on a flow runner that has no torch, and
     importing to inspect would execute module bodies for a hash. ``from x import y``
     contributes both ``x`` and ``x.y`` as candidates, since either may name the module.
-    Non-package imports and names that resolve to no file are skipped.
+    Non-package imports and names that resolve to no file are skipped — where *resolve*
+    means a case-exact match against a real directory listing, not ``Path.exists()``; see
+    :func:`resolve_case_exactly`.
     """
+    listings: dict[Path, frozenset[str]] = {}
+
+    def names_in(directory: Path) -> frozenset[str]:
+        """The exact filenames *directory* holds. Cached per closure computation."""
+        if directory not in listings:
+            try:
+                listings[directory] = frozenset(entry.name for entry in directory.iterdir())
+            except OSError:  # not a directory, or unreadable
+                listings[directory] = frozenset()
+        return listings[directory]
+
+    def resolve_case_exactly(relative: str) -> Path | None:
+        """*relative* under ``root``, requiring every component to match case EXACTLY.
+
+        ``Path.exists()`` is not enough, and the difference is not cosmetic. On a
+        case-insensitive filesystem — macOS, which is where this is developed —
+        ``config/PROVIDERS.py`` "exists" because it resolves to ``providers.py``. A
+        ``from .providers import PROVIDERS`` therefore contributes a *candidate module* whose
+        name is the imported constant, and the closure gains an entry for a file that is not
+        in the repository. Since :func:`source_identity` hashes each path STRING as well as
+        its bytes, that phantom moves the digest, and the same source yields a different
+        identity on macOS than on Linux — so a mosaic begun on a laptop is refused by the
+        fleet as built by different code.
+
+        Checking against a real directory listing is what makes the answer independent of
+        the filesystem's case behaviour. Do not simplify this back to ``exists()``.
+        """
+        current = root
+        for part in relative.split("/"):
+            if part not in names_in(current):
+                return None
+            current = current / part
+        return current
 
     def module_file(dotted: str) -> Path | None:
         rel = dotted.removeprefix(_PACKAGE + ".").replace(".", "/")
-        for candidate in (root / f"{rel}.py", root / rel / "__init__.py"):
-            if candidate.exists():
-                return candidate
-        return None
+        return resolve_case_exactly(f"{rel}.py") or resolve_case_exactly(f"{rel}/__init__.py")
 
     def absolute_module(node: ast.ImportFrom, path: Path) -> str | None:
         """The dotted name ``node`` imports from, resolved against ``path`` if relative.
 
         A relative import's ``node.module`` is the tail alone — ``"providers"`` for
-        ``from .providers import PROVIDERS`` — so a first-party filter on the package
-        prefix rejects it. That mattered: package ``__init__`` files re-export with
-        relative imports, so the closure stopped at every one of them. ``config`` was
-        reached and ``config/providers.py`` was not, leaving the STAC collections, band
-        lists, resolutions and baseline settings outside the fingerprint of the code
-        that ingests with them.
+        ``from .providers import PROVIDERS`` — so a first-party filter on the package prefix
+        rejects it. That mattered: package ``__init__`` files re-export with relative
+        imports, so the closure stopped at every one of them, reaching ``config`` but not
+        ``config/providers.py`` and leaving the STAC collections, band lists, resolutions
+        and baseline settings outside the fingerprint of the code that ingests with them.
         """
         if not node.level:
             return node.module if node.module and node.module.startswith(_PACKAGE) else None
@@ -105,13 +131,11 @@ def first_party_import_closure(seed: list[Path], root: Path) -> set[Path]:
 def source_identity(sources: tuple[str, ...], prefix: str) -> str:
     """A ``<prefix>-<digest>`` fingerprint of *sources* and everything they import.
 
-    ``sources`` are package-relative paths — a directory contributes every ``.py`` under
-    it, a file contributes itself — and each is required to exist. A moved or renamed
-    module must fail loudly here rather than silently fingerprint fewer files, because
-    fingerprinting fewer files is how two code versions come to share one artifact.
-
-    Contents are hashed with their package-relative paths, sorted, so the digest is
-    stable across machines and checkouts.
+    ``sources`` are package-relative paths — a directory contributes every ``.py`` under it,
+    a file contributes itself — and each is required to exist, because fingerprinting fewer
+    files is how two code versions come to share one artifact. Contents are hashed with
+    their package-relative paths, sorted, so the digest is stable across machines and
+    checkouts.
     """
     root = Path(__file__).resolve().parent.parent
     seed: list[Path] = []

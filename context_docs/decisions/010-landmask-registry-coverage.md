@@ -2,7 +2,7 @@
 
 **Status:** **Accepted (2026-07-15).** Implemented in
 `src/tessera_embeddings/ingest/land_mask.py` (builder), the
-`build-land-mask-coverage` Prefect flow, and `scripts/build_landmask_coverage.py`.
+`build-land-mask-coverage` Prefect flow, and `scripts/build/build_landmask_coverage.py`.
 Consumed by the zone-fill runner (ADR-008 W5). Verified end-to-end against the
 full delivery registry (120 zones, 112 with cells, 1,593,479 cells, 360,953 live
 tiles; build ~5 s, validate ~1 s on a laptop).

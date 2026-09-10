@@ -1,12 +1,9 @@
 """Dask cluster sizing for the ingest phase.
 
-Ingest keeps Dask for compute (STAC reads, mosaicking); these caps size its
-cluster and the master pipeline's Ray pool. Assembly no longer runs on Dask —
-its process-pool sizing lives in :mod:`tessera_embeddings.config.assembly`.
-
-The reference repo also defines a ``CoarsenConfig`` for an embedding
-coarsening flow; that flow is out of scope for the open-source release
-and is not ported here.
+Ingest keeps Dask for compute (STAC reads, mosaicking); these caps size its cluster and
+the master pipeline's Ray pool. Assembly does not run on Dask — its process-pool sizing
+lives in :mod:`tessera_embeddings.config.assembly`. The reference repo's ``CoarsenConfig``
+belongs to an embedding-coarsening flow that is out of scope here and is not ported.
 """
 
 from __future__ import annotations
@@ -37,18 +34,14 @@ def compute_pipeline_cluster_sizing(
 ) -> tuple[int, int, int]:
     """Derive worker / actor counts from ROI chunk count when not explicitly set.
 
-    Defaults used when the corresponding argument is ``None``:
+    Defaults for a ``None`` argument: ``ingest_min_workers`` 1 per chunk, capped at
+    :data:`INGEST_MIN_WORKERS_CAP` and floored at :data:`INGEST_MIN_WORKERS_FLOOR`;
+    ``ingest_max_workers`` ``ratio * n_chunks`` floored, capped at
+    :data:`INGEST_MAX_WORKERS_CAP`; ``num_actors`` 1 per chunk, capped at
+    :data:`NUM_ACTORS_CAP`.
 
-    * ``ingest_min_workers``: 1 per chunk, capped at
-      :data:`INGEST_MIN_WORKERS_CAP`, floored at
-      :data:`INGEST_MIN_WORKERS_FLOOR`.
-    * ``ingest_max_workers``: ``ratio * n_chunks`` (floored), capped at
-      :data:`INGEST_MAX_WORKERS_CAP`.
-    * ``num_actors``: 1 per chunk, capped at :data:`NUM_ACTORS_CAP`.
-
-    When ``n_chunks < INGEST_MIN_WORKERS_FLOOR`` the floor kicks in and
-    the ratio between min and max workers does not hold (max is clamped
-    up to min instead).
+    Below :data:`INGEST_MIN_WORKERS_FLOOR` chunks the floor wins and the min/max ratio no
+    longer holds — max is clamped up to min instead.
     """
     import math
 

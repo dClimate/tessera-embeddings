@@ -42,7 +42,7 @@ select = [
 
 # A miscounted %-placeholder raises inside logging, which swallows it and drops the line —
 # on a Dask worker, where the dropped line was the only record that the task ran. This was
-# checked by a hand-rolled AST walk in tests/unit/test_source_read_resilience.py that read
+# checked by a hand-rolled AST walk in tests/unit/ingest/test_source_read_resilience.py that read
 # ONE module (ingest/s1_roi.py); these rules make the same check over ALL OF src/ AND tests/,
 # which is strictly wider. Verified equivalent before that test was removed: a too-many and a
 # too-few mutant in s1_roi.py each fail these rules exactly as they failed the test.
@@ -86,4 +86,6 @@ convention = "google"
 # clusters. Printing IS its output contract, same as the tools above — it lives
 # in tests/ rather than profiling/ because it drives the real partitioner, which
 # is inside the Prefect layer and so cannot be imported from the package.
-"tests/unit/test_cluster_balance.py" = ["T201"]
+# Matched by basename: keyed to a full path, this silently stopped applying when
+# the file moved into a subject directory, and the print calls became lint errors.
+"**/test_cluster_balance.py" = ["T201"]
