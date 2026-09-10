@@ -700,6 +700,13 @@ class ActorPool:
         right now" for a few seconds, and cancelling on that first answer would throw a batch
         away mid-boot and re-request it moments later.
 
+        **That clock measures a CONTINUOUS drought, which is why the caller resets it.** This
+        method only runs while there is no work, so it cannot observe the drought ending; a
+        timestamp left from an earlier one would keep counting through all the work in between,
+        and the next brief zone boundary would then cancel a booting slot on the first answer —
+        the exact churn the grace exists to prevent. The caller calls
+        :meth:`reset_unplaced_grace` when the drought lifts.
+
         Args:
             outstanding_work: len(pending) + len(chunk_queue) + reservations at call time.
             floor: READY actors the caller keeps whatever happens, as in :meth:`retire_idle`.
@@ -719,6 +726,17 @@ class ActorPool:
                 actor_idx,
                 instance_id,
             )
+
+    def reset_unplaced_grace(self) -> None:
+        """Forget how long slots have been unplaced, because there is work again.
+
+        The counterpart to :meth:`retire_initializing`, called when the drought lifts. Without
+        it the grace stops being a grace: the timestamps survive the working period, so the next
+        momentary gap finds them already past the threshold and cancels a slot that has had no
+        grace at all. :meth:`retire_idle` needs no equivalent because dispatch restamps an
+        actor's idle clock every time it hands out work.
+        """
+        self._unplaced_since.clear()
 
     def _retire_slot(self, actor_idx: int) -> str:
         """Kill one slot's actor and mark the slot retired; return the instance ID it was on.
@@ -1663,5 +1681,9 @@ def _process_chunks_work_stealing(
             # `retire_idle` cannot see them, yet they are what the autoscaler is still being
             # asked for. See `retire_initializing`.
             pool.retire_initializing(outstanding, floor=floor)
+        elif retire_idle_actors:
+            # The drought has lifted. The unplaced clock must not keep counting through a period
+            # when there WAS work, or the next zone boundary cancels a booting slot instantly.
+            pool.reset_unplaced_grace()
 
     return results

@@ -720,6 +720,28 @@ class TestRetireInitializing:
             pool.actor_instance_ids[idx] = "pending-init"
         return pool
 
+    def test_the_grace_is_forgotten_once_there_is_work_again(self) -> None:
+        """The clock measures a CONTINUOUS drought, so a working period must not count toward it.
+
+        `retire_initializing` only runs while there is no work, so it cannot see the drought end.
+        Left alone, a timestamp from an earlier drought keeps counting through all the work in
+        between and the next momentary gap cancels a booting slot with no grace at all.
+        """
+        pool = self._pool_with_unplaced(1)
+        pool.retire_initializing(outstanding_work=0)  # first drought: stamps the clock
+        assert pool._unplaced_since, "the first call should have stamped the clock"
+        # Wind the stamp past the grace, as an hour of real work between two droughts would.
+        # Without the reset this is what makes the next gap cancel instantly.
+        pool._unplaced_since[1] = time.monotonic() - 3600
+
+        pool.reset_unplaced_grace()  # work resumed
+
+        # A later gap, long after the first drought began, must still serve a full grace.
+        with patch.object(_sched_mod.ray, "kill") as mock_kill:
+            pool.retire_initializing(outstanding_work=0)
+        mock_kill.assert_not_called()
+        assert 1 not in pool._retired
+
     def test_unplaced_slots_are_cancelled_once_no_work_is_outstanding(self) -> None:
         """THE POINT. Through an ingest drought these keep asking AWS for machines the run has
         no work for, and if the capacity arrives they boot, load the checkpoint and bill a whole

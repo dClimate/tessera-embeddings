@@ -132,6 +132,22 @@ Two things had to be true, and one was not.
 No hysteresis. Retirement requires an actor to have been seen idle on a *previous* call and then
 to exceed the 120 s idle grace, so a cell that becomes ready inside two minutes retires nothing.
 
+### The unplaced grace measures a continuous drought
+
+Slots still waiting on placement are retired separately, because `retire_idle` cannot see them —
+dispatch skips an initializing slot, so it is never observed idle — while the autoscaler is still
+being asked for their machines. They get the same 120 s grace, on their own clock, so a zone
+boundary answering "nothing right now" for a few seconds does not throw a batch away mid-boot.
+
+**The clock has to be reset when the drought lifts, and only the caller can do it.**
+`retire_initializing` runs only inside the wind-down branch, which is entered only when there is
+no work, so it never observes work resuming. A timestamp left from an earlier drought therefore
+keeps counting through everything in between, and the next momentary gap finds it long past the
+threshold and cancels a booting slot with no grace at all — the precise churn the grace exists to
+prevent. The dispatch loop calls `reset_unplaced_grace` on the other arm of that branch. The idle
+wind-down needs no equivalent, because dispatch restamps an actor's idle clock every time it hands
+out work.
+
 ### Retiring a slot is not terminating its machine
 
 `_retire_slot` fires the EC2 terminator only when the slot it just killed was the last live one on
