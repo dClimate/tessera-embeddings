@@ -38,7 +38,7 @@ dependency, and the modules the campaign's own monitoring depends on, weeks befo
 |---|---:|---|
 | `embedding_validation_rules.py` | 1,201 | **none** — `dataclasses`, `math`, `numpy` only |
 | `embedding_validation.py` | 2,075 | four *tessera* modules; privately, only its own rules file |
-| `tests/unit/embedding_validation/` | 1,303 | paired |
+| `yield-embeddings/tests/unit/embedding_validation/` | 1,303 | paired |
 
 **Essentially nothing to untangle.** The rules module is pure logic and the audit module's sole
 private dependency travels with it. It violates none of the enforced architecture rules — the
@@ -87,4 +87,4 @@ for its own store; it is not a per-validation-run argument.
 
 - [ADR 018](018-refuse-pixels-below-minimum-optical-depth.md) — the rule these two statements
   contradict
-- [`design/minimum-optical-depth-plan.md`](../design/minimum-optical-depth-plan.md)
+- [`../inference/minimum-optical-depth.md`](../inference/minimum-optical-depth.md)

@@ -2,14 +2,13 @@
 
 The partner delivers the global land mask as ~1.59M per-0.1°-cell GeoTIFFs
 (``grid_{lon}_{lat}.tiff``) plus a ``registry.txt`` and ``SHA256SUM`` under
-``s3://tessera-embeddings/v1.1/global_0.1_degree_tiff_all/``. **v1.1 semantics
-(from the partner): every registry-listed tile is all-1s** — v1 followed the
-coastline per-pixel but cropped land, so v1.1 dropped per-pixel masking, and
-coverage additionally extends ~1 cell (~11 km) into the sea. The consequence is
-decisive: *tile presence / the registry listing IS the mask*. No TIFF pixel
-needs to be read to build our runtime artifact — only the registry file and
-geometry. (Empirically confirmed on the delivery sample: registry membership
-tracks all-1s exactly; v1-era all-zero tiles are absent from the registry.)
+``s3://tessera-embeddings/v1.1/global_0.1_degree_tiff_all/``. **v1.1 semantics (from the
+partner): every registry-listed tile is all-1s** — v1.1 dropped v1's per-pixel coastline
+masking (which cropped land), and coverage extends ~1 cell (~11 km) into the sea, so the
+mask is GENEROUS versus a real coastline. The consequence is decisive: *tile presence /
+the registry listing IS the mask*. No TIFF pixel needs to be read to build our runtime
+artifact — only the registry file and geometry. (Confirmed on the delivery sample:
+registry membership tracks all-1s exactly; v1-era all-zero tiles are absent from it.)
 
 So the runtime artifact is **per-zone coverage bitmaps**, not a pixel mask:
 
@@ -22,19 +21,19 @@ So the runtime artifact is **per-zone coverage bitmaps**, not a pixel mask:
 
 All 120 UTM zone groups live in one Icechunk repo (``BucketPaths.land_mask_store()``),
 mirroring the global store's layout so the consumer read is exactly
-``open_store_as_zarr_group(path, group=zone)`` — the same helper, timeout/retry
-hardening, and credential path the rest of the campaign uses. The all-ocean
-zones (8 of 120) get empty bitmaps, so the runner always finds a coverage group
-and its ``mark_zone_year_empty`` path fires naturally.
+``open_store_as_zarr_group(path, group=zone)`` — same helper, timeout/retry hardening and
+credential path as the rest of the campaign. The all-ocean zones (8 of 120) get empty
+bitmaps, so the runner always finds a coverage group and its ``mark_zone_year_empty`` path
+fires naturally.
 
-Building is pure geometry over the registry (sub-minute, no data-plane reads):
-stream ``registry.txt`` → assign each cell to its NOMINAL 6° UTM band by
-filename math → per zone, vectorized pyproj projection of each cell's footprint
-→ snap to our zone-grid pixel indices → OR the covered tile/chunk rectangles
-into the bitmaps → one atomic commit carrying the registry sha256.
+Building is pure geometry over the registry (sub-minute, no data-plane reads): stream
+``registry.txt`` → assign each cell to its NOMINAL 6° UTM band by filename math → per zone,
+vectorized pyproj projection of each cell's footprint → snap to our zone-grid pixel indices
+→ OR the covered tile/chunk rectangles into the bitmaps → one atomic commit carrying the
+registry sha256.
 
-Domain-layer rules apply: stdlib logging only (no orchestrator imports), storage
-via fsspec / the icechunk helpers (no boto3).
+Domain-layer rules apply: stdlib logging only (no orchestrator imports), storage via fsspec
+/ the icechunk helpers (no boto3).
 """
 
 from __future__ import annotations
@@ -81,11 +80,11 @@ REGISTRY_NAME = "registry.txt"
 CELL_DEG = 0.1
 HALF_DEG = CELL_DEG / 2.0
 
-#: Number of WGS84 sample points per cell (3x3: corners, edge midpoints,
-#: centre) whose projected bbox bounds the cell's footprint in the zone CRS.
-#: A 0.1° cell projects to a near-rectangle, but the sea buffer lives at zone
-#: edges where meridian curvature bows the top/bottom edges, so the midpoints
-#: are cheap insurance against under-covering an edge tile.
+#: WGS84 sample offsets per cell (3x3: corners, edge midpoints, centre) whose projected
+#: bbox bounds the cell's footprint in the zone CRS. A 0.1° cell projects to a
+#: near-rectangle, but the sea buffer lives at zone edges where meridian curvature bows the
+#: top/bottom edges, so the midpoints are cheap insurance against under-covering an edge
+#: tile.
 _SAMPLE_OFFSETS = np.array([-HALF_DEG, 0.0, HALF_DEG])
 
 
@@ -124,9 +123,9 @@ class BuildResult:
 def parse_cell_name(name: str) -> tuple[float, float]:
     """``grid_{lon}_{lat}.tiff`` → ``(lon_center, lat_center)`` in degrees.
 
-    The lon/lat are the cell CENTERS (e.g. ``grid_-0.05_10.05.tiff`` →
-    ``(-0.05, 10.05)``). Raises ``ValueError`` on anything not of that form —
-    a malformed registry line must fail loudly, never be silently skipped.
+    The lon/lat are the cell CENTERS (e.g. ``grid_-0.05_10.05.tiff`` → ``(-0.05, 10.05)``).
+    Raises ``ValueError`` on anything else — a malformed registry line must fail loudly,
+    never be silently skipped.
     """
     if not (name.startswith("grid_") and name.endswith(".tiff")):
         raise ValueError(f"Registry entry {name!r} is not of the form 'grid_<lon>_<lat>.tiff'")
@@ -142,10 +141,10 @@ def parse_cell_name(name: str) -> tuple[float, float]:
 def _validate_cell_center(name: str, lon: float, lat: float) -> None:
     """Reject non-finite, out-of-range, or off-lattice registry cell centres.
 
-    Centres sit on the 0.1° lattice at ±(0.05 + 0.1·k)°, so ``value * 20`` is an
-    odd integer. A typo (``NaN``, ``|lon| > 180``, or a centre off the lattice)
-    would otherwise be assigned to the wrong zone or produce shifted/clamped
-    coverage — the registry is load-bearing, so fail loudly here.
+    Centres sit on the 0.1° lattice at ±(0.05 + 0.1·k)°, so ``value * 20`` is an odd
+    integer. A typo (``NaN``, ``|lon| > 180``, or an off-lattice centre) would otherwise be
+    assigned to the wrong zone or produce shifted/clamped coverage — the registry is
+    load-bearing, so fail loudly here.
     """
     for axis, value, limit in (("lon", lon, 180.0), ("lat", lat, 90.0)):
         if not math.isfinite(value):
@@ -167,11 +166,10 @@ def _transformer(epsg: int) -> Transformer:
 def zone_for_cell(lon: float, lat: float) -> str:
     """Cell centre → the UTM common name of its zone (e.g. ``"30N"``, ``"19S"``).
 
-    Uses the NOMINAL 6° UTM band (``utm_6deg_nominal``, ADR-008) — filename
-    math only, never the MGRS exceptions in :func:`ingest.roi.determine_utm_zone`.
-    Cells never straddle a 6° band edge (a 6° band is exactly 60 0.1° cells and
-    centres are offset 0.05° from every boundary), so the ``floor`` is exact.
-    Hemisphere is the sign of the centre latitude (never exactly 0).
+    Uses the NOMINAL 6° UTM band (``utm_6deg_nominal``, ADR-008) — filename math only, never
+    the MGRS exceptions in :func:`ingest.roi.determine_utm_zone`. Cells never straddle a 6°
+    band edge (a band is exactly 60 0.1° cells and centres sit 0.05° off every boundary), so
+    the ``floor`` is exact. Hemisphere is the sign of the centre latitude (never exactly 0).
     """
     band = math.floor((lon + 180.0) / 6.0) + 1
     band = min(max(band, 1), 60)
@@ -183,11 +181,10 @@ def project_cells_to_pixel_boxes(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Vectorized: cell centres → half-open pixel boxes ``(r0, r1, c0, c1)``.
 
-    Projects each cell's 3x3 sample grid into ``spec``'s CRS, takes the
-    projected bbox, and snaps it (floor low / ceil high) to integer pixel
-    indices on the zone grid, clamped to ``[0, height] x [0, width]``. Rows are
-    measured from the top (north): the northing axis descends, so the *max*
-    projected northing maps to the *min* row. Clamping absorbs the ~1-cell sea
+    Projects each cell's 3x3 sample grid into ``spec``'s CRS, takes the projected bbox, and
+    snaps it (floor low / ceil high) to integer pixel indices on the zone grid, clamped to
+    ``[0, height] x [0, width]``. Rows run from the top (north): the northing axis descends,
+    so the *max* projected northing maps to the *min* row. Clamping absorbs the ~1-cell sea
     buffer that projects beyond a zone's fixed extent.
     """
     transformer = _transformer(int(spec.epsg))
@@ -210,12 +207,11 @@ def project_cells_to_pixel_boxes(
 def build_zone_coverage(zone: str, lons: np.ndarray, lats: np.ndarray) -> ZoneCoverage:
     """Build one zone's coverage bitmaps by OR-ing every cell's footprint.
 
-    ``lons``/``lats`` are the centres of the registry cells assigned to ``zone``
-    (empty for an all-ocean zone). The zone-grid dimensions are exact multiples
-    of :data:`SHARD_PX` and :data:`INNER_PX`, so tile/chunk ranges never spill a
-    partial edge. The tile bitmap is derived from the same clamped pixel box as
-    the chunk bitmap via the identity ``ceil(ceil(x/256)/8) == ceil(x/2048)``,
-    which is what makes ``tile_live == 8x8-block-any(chunk_live)`` hold globally.
+    ``lons``/``lats`` are the centres of the registry cells assigned to ``zone`` (empty for
+    an all-ocean zone). Zone-grid dimensions are exact multiples of :data:`SHARD_PX` and
+    :data:`INNER_PX`, so tile/chunk ranges never spill a partial edge. Both bitmaps come
+    from the same clamped pixel box via ``ceil(ceil(x/256)/8) == ceil(x/2048)``, which is
+    what makes ``tile_live == 8x8-block-any(chunk_live)`` hold globally.
     """
     spec = zone_grid.zone(zone)
     tile_live = np.zeros((spec.height // SHARD_PX, spec.width // SHARD_PX), dtype=bool)
@@ -226,18 +222,16 @@ def build_zone_coverage(zone: str, lons: np.ndarray, lats: np.ndarray) -> ZoneCo
         r0, r1, c0, c1 = project_cells_to_pixel_boxes(lons, lats, spec)
         for i in range(n_cells):
             if r1[i] <= r0[i] or c1[i] <= c0[i]:
-                # Footprint fell WHOLLY outside the zone extent — e.g. a cell
-                # centre beyond UTM's usable range (>84°N / <80°S) whose zone
-                # grid can't represent it. It set no coverage bit; count it so
-                # build_all can surface the loss loudly rather than dropping it
-                # silently. (The v1.1 registry is 59.45S to 83.65N, so this is 0.)
+                # Footprint fell WHOLLY outside the zone extent — e.g. a centre beyond
+                # UTM's usable range (>84°N / <80°S). It set no coverage bit; counted so
+                # build_all surfaces the loss loudly. (The v1.1 registry runs 59.45S to
+                # 83.65N, so this is 0.)
                 #
-                # Antarctica is therefore absent from the product BY DECISION, not by
-                # accident of this guard: the registry never offers an Antarctic cell, and
-                # UTM could not place one if it did. See ADR-017 — "global" here means the
-                # registry's extent, 59.45S to 83.65N, and that bound is published rather
-                # than implied. This counter stays because it is what would report a FUTURE
-                # registry quietly reaching past what UTM can represent.
+                # Antarctica is absent from the product BY DECISION, not by accident of
+                # this guard: the registry never offers an Antarctic cell and UTM could not
+                # place one. See ADR-017 — "global" means the registry's extent, 59.45S to
+                # 83.65N, published rather than implied. The counter stays because it is
+                # what would report a FUTURE registry reaching past what UTM can represent.
                 n_clipped += 1
                 continue
             tile_live[
@@ -254,8 +248,8 @@ def build_zone_coverage(zone: str, lons: np.ndarray, lats: np.ndarray) -> ZoneCo
 def _ceil_div(a: int, b: int) -> int:
     """``ceil(a / b)`` for non-negative ints (the exclusive end of a pixel range).
 
-    ``a`` arrives as a NumPy scalar from the projected pixel arrays; integer
-    floor-division keeps it exact, and NumPy ints index zarr slices fine.
+    ``a`` arrives as a NumPy scalar from the projected pixel arrays; integer floor-division
+    keeps it exact, and NumPy ints index zarr slices fine.
     """
     return -(-a // b)
 
@@ -266,8 +260,8 @@ def _ceil_div(a: int, b: int) -> int:
 def read_registry(registry_uri: str) -> tuple[list[str], str]:
     """Read the whole registry file → (tile names, sha256 of the raw bytes).
 
-    Reads in one shot (the file is ~120 MB) so the sha256 covers the exact
-    bytes we built from — recorded in every zone's attrs as build provenance.
+    Reads in one shot (the file is ~120 MB) so the sha256 covers the exact bytes we built
+    from — recorded in every zone's attrs as build provenance.
     """
     with fsspec.open(registry_uri, "rb") as fh:
         data = fh.read()
@@ -297,8 +291,8 @@ def group_cells_by_zone(names: list[str]) -> dict[str, tuple[np.ndarray, np.ndar
 def _write_coverage_arrays(node: zarr.Group, cov: ZoneCoverage) -> None:
     """Create the two bool bitmaps as single-chunk arrays on a group node.
 
-    ``overwrite=True`` so a re-delivery rebuilds cleanly into the same repo (a
-    new commit replacing the arrays; the old coverage stays in history).
+    ``overwrite=True`` so a re-delivery rebuilds cleanly into the same repo: a new commit
+    replaces the arrays and the old coverage stays in history.
     """
     node.create_array(
         "tile_live_2048",
@@ -332,16 +326,13 @@ def build_all(
         dest: URI of the coverage Icechunk repo (``BucketPaths.land_mask_store()``).
         registry_uri: Registry file URI; defaults to ``{delivery_uri}/registry.txt``.
         delivery_uri: Partner delivery prefix (recorded in attrs as ``source``).
-        zones: Restrict to these zone COMMON NAMES — ``"33N"``, ``"07S"`` — the
-            keys ``zone_grid.zone`` is registered under, not EPSG codes
-            (default: all 120). A restricted build still commits; unlisted
-            zones simply aren't touched.
+        zones: Restrict to these zone COMMON NAMES — ``"33N"``, ``"07S"`` — the keys
+            ``zone_grid.zone`` is registered under, not EPSG codes (default: all 120). A
+            restricted build still commits; unlisted zones simply aren't touched.
         get_credentials: Optional Icechunk credential callback.
-        s3_region: Region of the coverage repo, when it is not Icechunk's default.
-            Every reader in this module already takes one, and so does every
-            campaign/seed/fill/export flow — without it here, a deployment whose
-            bucket lives elsewhere can seed and fill the global store but cannot
-            build the mask those steps require.
+        s3_region: Region of the coverage repo, when not Icechunk's default. Without it a
+            deployment whose bucket lives elsewhere could seed and fill the global store
+            but not build the mask those steps require.
         log: Optional logger.
 
     Returns:
@@ -481,10 +472,10 @@ def validate_coverage(
     _check_geo_points(root, set(target_zones), log)
 
 
-#: (lon, lat, expected_live, label) sanity points, all on exact 0.1° cell
-#: centres. Land points are in the registry (so must be live); the ocean point
-#: is a deep-Pacific gyre far from any buffered coast (so must be dead) — a
-#: coarse guard against an inverted or mis-snapped build, not a coastline test.
+#: (lon, lat, expected_live, label) sanity points, all on exact 0.1° cell centres. Land
+#: points are in the registry (must be live); the ocean point is a deep-Pacific gyre far
+#: from any buffered coast (must be dead). A coarse guard against an inverted or
+#: mis-snapped build, not a coastline test — the mask is ~1 cell generous at every coast.
 _GEO_CHECKS: tuple[tuple[float, float, bool, str], ...] = (
     (2.35, 48.85, True, "Paris"),
     (-47.85, -15.75, True, "Brasília"),
@@ -497,8 +488,8 @@ def _check_geo_points(
 ) -> None:
     """Assert each in-scope :data:`_GEO_CHECKS` point's tile matches expectation.
 
-    Points whose zone was not validated (a restricted ``--zones`` run) are
-    skipped, so subset validation never touches an unbuilt group.
+    Points whose zone was not validated (a restricted ``--zones`` run) are skipped, so
+    subset validation never touches an unbuilt group.
     """
     for lon, lat, expected, label in _GEO_CHECKS:
         zone = zone_for_cell(lon, lat)
@@ -539,15 +530,12 @@ def spot_check_delivery(
 ) -> SpotCheckResult:
     """Sample ``n`` registry TIFFs from the bucket and verify the v1.1 contract.
 
-    This is the ONLY place a delivery pixel is read, and it exists solely to
-    guard the assumption the whole design rests on. For each sampled tile it
-    asserts: pixels are all-1s; the file CRS equals the filename-derived zone;
-    and the raster bounds match our projected cell bbox within ``bounds_tol_px``
-    pixels. Any violation raises ``ValueError`` — the all-1s assumption is not
-    something to discover a wrong answer from later.
+    The ONLY place a delivery pixel is read, and it exists solely to guard the all-1s
+    assumption the whole design rests on. Per sampled tile it asserts: pixels are all-1s;
+    the file CRS equals the filename-derived zone; the raster bounds match our projected
+    cell bbox within ``bounds_tol_px`` pixels. Any violation raises ``ValueError``.
 
-    Sampling is a deterministic stride over the registry (reproducible across
-    runs), not random.
+    Sampling is a deterministic stride over the registry (reproducible), not random.
     """
     log = log or logger
     if not names:
@@ -573,8 +561,8 @@ def spot_check_delivery(
             crs_ok += 1
             west, south, east, north = _expected_cell_bounds(lon, lat, spec)
             b = ds.bounds
-            # Check ALL four edges: a wrong width/height (shifted right/bottom)
-            # must not pass the load-bearing georeferencing check.
+            # ALL four edges: a wrong width/height (shifted right/bottom) must not pass the
+            # load-bearing georeferencing check.
             if max(abs(b.left - west), abs(b.bottom - south), abs(b.right - east), abs(b.top - north)) > tol_m:
                 raise ValueError(
                     f"{name}: bounds {tuple(round(x, 1) for x in b)} off expected "
@@ -604,11 +592,11 @@ def reconcile_with_bucket(
 ) -> tuple[int, int, int]:
     """List the delivery prefix and reconcile it against the registry.
 
-    Returns ``(n_registry, n_bucket_tiffs, n_extras)``. The registry is the
-    authority (presence-based), so ``registry ⊆ bucket`` must hold; ``n_extras``
-    are bucket TIFFs absent from the registry (expected: v1-era leftovers,
-    including all-zero tiles). Raises if any registry entry is missing from the
-    bucket. Lists ~1.7M objects — a manual ``verify`` step, not a hot path.
+    Returns ``(n_registry, n_bucket_tiffs, n_extras)``. The registry is the authority
+    (presence-based), so ``registry ⊆ bucket`` must hold; ``n_extras`` are bucket TIFFs
+    absent from the registry (expected: v1-era leftovers, including all-zero tiles). Raises
+    if any registry entry is missing. Lists ~1.7M objects — a manual ``verify`` step, never
+    a hot path.
     """
     log = log or logger
     fs, _ = fsspec.core.url_to_fs(delivery_uri)
@@ -637,9 +625,9 @@ def _join(base: str, name: str) -> str:
 def _tile_range_bbox_wgs84(spec: ZoneSpec, r0: int, r1: int, c0: int, c1: int) -> tuple[float, float, float, float]:
     """WGS84 ``(minx, miny, maxx, maxy)`` covering tile rows ``[r0, r1)`` x cols ``[c0, c1)``.
 
-    Delegates to :func:`~tessera_embeddings.storage.zone_grid.tile_range_bbox_wgs84`, which is
-    where the densified-perimeter containment guarantee and the antimeridian convention now live —
-    the published registry needs the same box per tile, and two implementations of a grid
+    Delegates to :func:`~tessera_embeddings.storage.zone_grid.tile_range_bbox_wgs84`, which
+    owns the densified-perimeter containment guarantee and the antimeridian convention: the
+    published registry needs the same box per tile, and two implementations of a grid
     convention is how one of them quietly stops describing the grid in use. Kept as a
     module-private alias so this file's callers and their tests read unchanged.
     """
@@ -649,9 +637,9 @@ def _tile_range_bbox_wgs84(spec: ZoneSpec, r0: int, r1: int, c0: int, c1: int) -
 def _live_tile_bbox_wgs84(spec: ZoneSpec, tile_live: np.ndarray) -> tuple[float, float, float, float]:
     """WGS84 ``(minx, miny, maxx, maxy)`` bounding the zone's LIVE tiles.
 
-    Tight to the live-tile envelope (not the full zone extent) so the STAC/CMR
-    query never scans ocean-only latitudes. This is the box the ingest itself
-    queries the catalogue with (via the ROI's ``bbox_wgs84`` attr).
+    Tight to the live-tile envelope (not the full zone extent) so the STAC/CMR query never
+    scans ocean-only latitudes. This is the box the ingest queries the catalogue with, via
+    the ROI's ``bbox_wgs84`` attr.
     """
     rows = np.where(tile_live.any(axis=1))[0]
     cols = np.where(tile_live.any(axis=0))[0]
@@ -663,18 +651,15 @@ def live_tile_block_bboxes_wgs84(
 ) -> list[tuple[tuple[float, float, float, float], int]]:
     """Per-block WGS84 boxes covering the zone's live tiles, with each block's live count.
 
-    The tile grid is cut into ``block_tiles`` x ``block_tiles`` blocks and each
-    block containing at least one live tile yields ``(bbox, live_count)``, the
-    bbox tight to that block's live rows/cols. Together the boxes cover every
-    live tile, and each box contains the live tiles it reports — so a catalogue
-    miss against EVERY box is a miss against all of the zone's live land, while
-    the union envelope alone cannot say that (a sparse zone's envelope is mostly
-    water and land the zone does not own, so an envelope hit may be nothing the
-    zone can use).
+    The tile grid is cut into ``block_tiles`` x ``block_tiles`` blocks; each block with at
+    least one live tile yields ``(bbox, live_count)``, the bbox tight to that block's live
+    rows/cols. Together the boxes cover every live tile and each box contains the live tiles
+    it reports, so a catalogue miss against EVERY box is a miss against all of the zone's
+    live land. The union envelope alone cannot say that: a sparse zone's envelope is mostly
+    water and land the zone does not own, so an envelope hit may be nothing it can use.
 
-    The count is a proxy for land carried, letting callers probe the densest
-    block first: where the source publishes anything at all, the densest block
-    is where it shows up soonest.
+    The count is a proxy for land carried, letting callers probe the densest block first —
+    where the source publishes anything, that is where it shows up soonest.
     """
     if block_tiles < 1:
         raise ValueError(f"block_tiles must be >= 1, got {block_tiles}")
@@ -701,8 +686,8 @@ def _zone_roi_transform(spec: ZoneSpec) -> list[float]:
     """The ROI mask's 6-coeff affine for ``spec``: north-up, top-left origin.
 
     ``[pixel_w, 0, easting_min, 0, -pixel_h, northing_max]`` — the form
-    :func:`~tessera_embeddings.ingest.roi.read_roi_metadata` reconstructs into a
-    GeoBox. Shared by the writer and the validator so the two cannot drift.
+    :func:`~tessera_embeddings.ingest.roi.read_roi_metadata` reconstructs into a GeoBox.
+    Shared by the writer and the validator so the two cannot drift.
     """
     return [PIXEL_M, 0.0, spec.easting[0], 0.0, -PIXEL_M, spec.northing[1]]
 
@@ -710,14 +695,13 @@ def _zone_roi_transform(spec: ZoneSpec) -> list[float]:
 def _remove_superseded_roi(dest_path: str, storage_options: dict | None) -> None:
     """Remove an ROI a PREVIOUS coverage delivery left for a zone that is now all-ocean.
 
-    The ROI is a plain zarr at a path derived from the zone name, so direct ingest callers
-    find it by name rather than by being handed it. Returning "all-ocean" while one is still
-    sitting there lets a superseded delivery's land go on being ingested while the current
-    coverage bitmap declares there is none — the stale file wins simply by existing.
+    The ROI is a plain zarr at a path derived from the zone name, so ingest callers find it
+    by name rather than by being handed it. Returning "all-ocean" while one still sits there
+    lets a superseded delivery's land go on being ingested against coverage that declares
+    none — the stale file wins simply by existing.
 
     Raises rather than warning when a mask is present and cannot be removed: that is exactly
-    the state this exists to prevent, and reporting the zone as cleanly all-ocean with the old
-    mask still readable would be the misleading half of both outcomes.
+    the state this exists to prevent.
     """
     fs, path = fsspec.core.url_to_fs(dest_path, **(storage_options or {}))
     if not fs.exists(path):
@@ -746,11 +730,10 @@ def _roi_is_current(
 ) -> bool:
     """Whether an ROI zarr already exists at ``dest_path`` for the current coverage.
 
-    Idempotency probe. Shape/CRS/transform are invariant across registry
-    deliveries, so they alone can't detect changed coverage — the coverage
-    group's ``registry_sha256`` is the discriminator: a new delivery (different
-    ``tile_live_2048``) changes the sha and forces a rebuild. Any open failure
-    (missing store) means "rebuild".
+    Idempotency probe. Shape/CRS/transform are invariant across registry deliveries, so they
+    alone cannot detect changed coverage — the coverage group's ``registry_sha256`` is the
+    discriminator: a new delivery (different ``tile_live_2048``) changes the sha and forces
+    a rebuild. Any open failure (missing store) means "rebuild".
     """
     try:
         existing = zarr.open(dest_path, mode="r", storage_options=storage_options)
@@ -776,24 +759,23 @@ def export_zone_roi(
 ) -> str | None:
     """Synthesize the ingest ROI mask for one zone from its coverage bitmap.
 
-    Reads the zone's ``tile_live_2048`` bitmap from the coverage repo (ADR-010),
-    upsamples it by :data:`SHARD_PX` onto the zone pixel grid, and writes the
-    exact ROI-mask artifact the ROI ingest flows consume
-    (:func:`tessera_embeddings.ingest.roi.read_roi_metadata`): a chunked boolean
-    zarr on the FIXED zone grid — origin/shape from :class:`ZoneSpec`, never
-    ``compute_grid``'s bbox-fit — with a tight WGS84 bbox drawn from the live
-    tiles. The fill embeds whole live 2048-px tiles, so the mask is tile-granular
-    (a live coastal tile's ocean pixels are included by design); masked ocean is
-    zeroed at ingest and its all-fill chunks are elided.
+    Reads the zone's ``tile_live_2048`` bitmap from the coverage repo (ADR-010), upsamples
+    it by :data:`SHARD_PX` onto the zone pixel grid, and writes the exact ROI-mask artifact
+    the ROI ingest flows consume (:func:`tessera_embeddings.ingest.roi.read_roi_metadata`):
+    a chunked boolean zarr on the FIXED zone grid — origin/shape from :class:`ZoneSpec`,
+    never ``compute_grid``'s bbox-fit — with a tight WGS84 bbox from the live tiles. The
+    fill embeds whole live 2048-px tiles, so the mask is tile-granular (a live coastal
+    tile's ocean pixels are included by design); masked ocean is zeroed at ingest and its
+    all-fill chunks are elided.
 
     Args:
         zone: UTM common name (e.g. ``"33N"``).
         land_mask_path: Coverage Icechunk repo (``BucketPaths.land_mask_store``).
         dest_path: Output ROI zarr URI (e.g. ``{inputs}/rois/zarrs/zone_33N.zarr``).
-        get_credentials: Icechunk credential callback. Used for the coverage-repo read
-            AND, converted to fsspec options, for the ROI zarr's own currency probe and
-            write — the ROI is a plain zarr, so it does not travel on this callback by
-            itself, and a callback-only deployment could not export a mask at all.
+        get_credentials: Icechunk credential callback. Used for the coverage-repo read AND,
+            converted to fsspec options, for the ROI zarr's own currency probe and write —
+            the ROI is a plain zarr and does not travel on this callback by itself, so a
+            callback-only deployment could otherwise not export a mask at all.
         s3_region: Region for the coverage-repo read, if not the default.
 
     Returns:
@@ -805,9 +787,9 @@ def export_zone_roi(
     tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
     coverage_sha = cast("str | None", cov.attrs.get("registry_sha256"))
     if not tile_live.any():
-        # Clear any ROI an EARLIER delivery left here before reporting the zone all-ocean —
-        # this delivery is the authority on where land is, and a stale mask at a
-        # name-derived path is discoverable by ingest callers that never see this return.
+        # Clear any ROI an EARLIER delivery left here before reporting the zone all-ocean:
+        # this delivery is the authority on where land is, and a stale mask at a name-derived
+        # path is discoverable by ingest callers that never see this return.
         _remove_superseded_roi(dest_path, plain_zarr_storage_options(dest_path, get_credentials, s3_region))
         logger.info("Zone %s is all-ocean — no ROI to export", zone)
         return None
@@ -836,8 +818,8 @@ def export_zone_roi(
     z.attrs["_manifest"] = RoiManifest(resolution=PIXEL_M, chunk_size=INGEST_CHUNK_SIZE, crs=spec.crs).to_dict()
 
     # Upsample tile-liveness onto pixels one chunk-aligned block at a time (each
-    # INGEST_CHUNK_SIZE block = tiles_per_chunk² tiles). Whole-store upsampling
-    # would be tens of GB; empty blocks are skipped so ocean stays fill (elided).
+    # INGEST_CHUNK_SIZE block = tiles_per_chunk² tiles): whole-store upsampling would be
+    # tens of GB. Empty blocks are skipped so ocean stays fill (elided).
     tiles_per_chunk = INGEST_CHUNK_SIZE // SHARD_PX
     for ty0 in range(0, tile_live.shape[0], tiles_per_chunk):
         for tx0 in range(0, tile_live.shape[1], tiles_per_chunk):
@@ -848,10 +830,9 @@ def export_zone_roi(
             y0, x0 = ty0 * SHARD_PX, tx0 * SHARD_PX
             z[y0 : y0 + pixels.shape[0], x0 : x0 + pixels.shape[1]] = pixels
 
-    # Stamp the coverage sha LAST — it is the idempotency discriminator
-    # (_roi_is_current keys off it), so it must land only after every pixel is
-    # written. A crash mid-upsample then leaves an ROI without this attr, forcing
-    # the retry to rebuild rather than trusting a partially-written array.
+    # Stamp the coverage sha LAST: it is the idempotency discriminator (_roi_is_current keys
+    # off it), so a crash mid-upsample leaves an ROI without this attr and the retry rebuilds
+    # rather than trusting a partially-written array.
     z.attrs["coverage_sha256"] = coverage_sha  # ties the ROI to the coverage delivery it was built from
 
     logger.info(
@@ -869,11 +850,11 @@ def expected_live_chunk_grid(
 ) -> np.ndarray:
     """Boolean grid of the live ingest chunks in ``zone`` (a KB read of the bitmap).
 
-    Marks exactly the blocks :func:`export_zone_roi` writes — same
-    ``INGEST_CHUNK_SIZE`` blocking of ``tile_live_2048``, same skip-if-not-``any``
-    rule — so it is the authority on both HOW MANY chunks a correct mask stores
-    and WHERE they sit. :func:`validate_zone_roi` compares positions against it;
-    :func:`live_chunk_count` is its sum.
+    Marks exactly the blocks :func:`export_zone_roi` writes — same ``INGEST_CHUNK_SIZE``
+    blocking of ``tile_live_2048``, same skip-if-not-``any`` rule — so it is the authority
+    on both HOW MANY chunks a correct mask stores and WHERE they sit.
+    :func:`validate_zone_roi` compares positions against it; :func:`live_chunk_count` is its
+    sum.
     """
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
     tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
@@ -909,30 +890,27 @@ def validate_zone_roi(
 ) -> list[str]:
     """Check a written zone ROI mask against its contract. Empty list means valid.
 
-    A mask that exists is not a mask that is right, and a wrong one is expensive:
-    the ingest pins its grid from this artifact and the fill validates the mosaic
-    against the same :class:`~tessera_embeddings.storage.zone_grid.ZoneSpec`, so a
-    bad transform surfaces hours later as a grid mismatch — or, worse, as data
-    written to the wrong ground position. Asserted here:
+    A mask that exists is not a mask that is right, and a wrong one is expensive: the ingest
+    pins its grid from this artifact and the fill validates the mosaic against the same
+    :class:`~tessera_embeddings.storage.zone_grid.ZoneSpec`, so a bad transform surfaces
+    hours later as a grid mismatch — or worse, as data written to the wrong ground position.
+    Asserted here:
 
-    * **Grid identity** — shape, CRS, and affine equal the zone's ``ZoneSpec``
-      (via :func:`_zone_roi_transform`, the writer's own source), plus a WGS84
-      bbox in range. ``west > east`` is accepted: zones 01/60 straddle the
-      antimeridian and the bbox is deliberately written in the GeoJSON crossing
-      convention.
+    * **Grid identity** — shape, CRS and affine equal the zone's ``ZoneSpec`` (via
+      :func:`_zone_roi_transform`, the writer's own source), plus a WGS84 bbox in range.
+      ``west > east`` is accepted: zones 01/60 straddle the antimeridian and the bbox is
+      deliberately written in the GeoJSON crossing convention.
     * **Completion** — ``coverage_sha256`` matches the coverage group's
-      ``registry_sha256``. The writer stamps it last, so its presence is the only
-      evidence every pixel landed, and its value is what makes the mask current
-      for *this* land-mask delivery rather than a superseded one.
-    * **Placement** — the count of stored chunk objects equals
-      :func:`live_chunk_count`. Because an all-ocean chunk is never written, this
-      is a whole-zone assertion that the mask marks land where the coverage
-      bitmap says land is, and nowhere else, at the cost of one listing.
-    * **Croppable layout** — the chunk grid is recoverable from the keys at all.
-      The ingest's live-window cropping prefers that listing over a per-position
-      read; a mask this returns ``None`` for still ingests correctly but falls
-      back to the scan, which is worth knowing before a campaign rather than
-      after.
+      ``registry_sha256``. The writer stamps it last, so its presence is the only evidence
+      every pixel landed, and its value is what makes the mask current for *this* delivery
+      rather than a superseded one.
+    * **Placement** — the stored chunk objects equal :func:`live_chunk_count`. Since an
+      all-ocean chunk is never written, this is a whole-zone assertion that the mask marks
+      land where the coverage bitmap says land is and nowhere else, for one listing.
+    * **Croppable layout** — the chunk grid is recoverable from the keys at all. The
+      ingest's live-window cropping prefers that listing over a per-position read; a mask
+      this returns ``None`` for still ingests correctly but falls back to the scan, worth
+      knowing before a campaign rather than after.
 
     Returns:
         One human-readable string per failed check, in check order; empty when
@@ -965,8 +943,8 @@ def validate_zone_roi(
         problems.append(f"bbox_wgs84 {bbox!r} is not four finite numbers")
     else:
         west, south, east, north = (float(v) for v in bbox)
-        # west > east is legal (antimeridian crossing), so bound each edge rather
-        # than asserting an ordering that zones 01/60 correctly violate.
+        # west > east is legal (antimeridian crossing), so bound each edge rather than
+        # asserting an ordering that zones 01/60 correctly violate.
         if not (-180.0 <= west <= 180.0 and -180.0 <= east <= 180.0):
             problems.append(f"bbox_wgs84 longitudes out of range: {west}, {east}")
         if not (-90.0 <= south < north <= 90.0):
@@ -980,20 +958,19 @@ def validate_zone_roi(
     if tuple(z.chunks) != (INGEST_CHUNK_SIZE, INGEST_CHUNK_SIZE):
         problems.append(f"chunks {tuple(z.chunks)} != ({INGEST_CHUNK_SIZE}, {INGEST_CHUNK_SIZE})")
     else:
-        # The SAME options the array was opened with above. Listing the mask's chunk
-        # keys is a second, independent trip to the store, so a callback-only or
-        # non-default-region ROI opens fine here and then fails validation on a
-        # listing that carried no credentials.
+        # The SAME options the array was opened with above: listing the mask's chunk keys is
+        # a second, independent trip to the store, so a callback-only or non-default-region
+        # ROI opens fine here and then fails validation on an uncredentialed listing.
         grid = live_chunk_grid_from_keys(
             roi_path, z, storage_options=plain_zarr_storage_options(roi_path, get_credentials, s3_region)
         )
         if grid is None:
             problems.append("live chunk grid not recoverable from the mask's keys (ingest would fall back to scanning)")
         else:
-            # POSITIONS, not just the count. This is the pre-campaign placement gate,
-            # and equal sums are exactly what a placement error preserves: one chunk
-            # missing where land is and one present where it isn't cancels out, and a
-            # count check calls a mask with land in the wrong part of the zone valid.
+            # POSITIONS, not just the count. Equal sums are exactly what a placement error
+            # preserves: one chunk missing where land is and one present where it isn't
+            # cancel out, so a count check calls a mask with land in the wrong part of the
+            # zone valid.
             expected_grid = expected_live_chunk_grid(
                 zone, land_mask_path=land_mask_path, get_credentials=get_credentials, s3_region=s3_region
             )

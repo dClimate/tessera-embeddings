@@ -13,18 +13,17 @@ def _month_add(year: int, month: int, delta: int) -> tuple[int, int]:
 class TimeWindow:
     """A resolved 12-month observation window for inference.
 
-    Always contains exactly 12 chronologically sorted ``(year, month)`` pairs.
-    Created via :func:`parse_time_window` from a single end-month string.
+    Exactly 12 chronologically sorted ``(year, month)`` pairs, built by
+    :func:`parse_time_window` from a single end-month string.
 
     Attributes:
         window_start: First ``(year, month)`` of the window.
         window_end: Last ``(year, month)`` of the window.
         months: All 12 ``(year, month)`` tuples in chronological order.
-        window_end_label: ISO date string (``"YYYY-MM-DD"``) using first-of-month
-            convention (e.g. ``"2025-06-01"`` represents the full month of
-            June 2025).  Used as the output Zarr time coordinate label.
-            Data filtering is by ``(year, month)`` membership, so **all**
-            observations within each month are included regardless of day.
+        window_end_label: The output Zarr time coordinate label — an ISO date on the
+            first-of-month convention, so ``"2025-06-01"`` means all of June 2025.
+            Filtering is by ``(year, month)`` membership, so every observation in a
+            month is included regardless of day.
     """
 
     window_start: tuple[int, int]
@@ -33,11 +32,7 @@ class TimeWindow:
     window_end_label: str
 
     def to_date_range(self) -> tuple[str, str]:
-        """Return ``(start_date, end_date)`` as ``YYYY-MM-DD`` strings.
-
-        ``start_date`` is the first day of :attr:`window_start` month;
-        ``end_date`` is the last day of :attr:`window_end` month.
-        """
+        """Return ``(start_date, end_date)``: first day of the start month to last day of the end month."""
         sy, sm = self.window_start
         ey, em = self.window_end
         start = f"{sy}-{sm:02d}-01"
@@ -46,10 +41,7 @@ class TimeWindow:
 
 
 def _parse_month_year(s: str) -> tuple[int, int]:
-    """Parse a single ``"Month Year"`` string into a ``(year, month)`` tuple.
-
-    Args:
-        s: A string like ``"June 2025"``.
+    """Parse a ``"Month Year"`` string (e.g. ``"June 2025"``) into a ``(year, month)`` tuple.
 
     Raises:
         ValueError: If the string cannot be parsed.
@@ -63,16 +55,13 @@ def _parse_month_year(s: str) -> tuple[int, int]:
 
 
 def parse_time_window(date: str) -> TimeWindow:
-    """Parse a single end-month into a 12-month rolling ``TimeWindow``.
-
-    The window always contains exactly 12 months ending at *date*, in
-    chronological order.
+    """Parse a single end-month into the 12-month rolling ``TimeWindow`` ending at it.
 
     Args:
         date: End month as ``"Month Year"`` (e.g. ``"June 2025"``).
 
     Returns:
-        A ``TimeWindow`` spanning the 12 months ending at *date*.
+        A ``TimeWindow`` of the 12 months ending at *date*, in chronological order.
 
     Raises:
         ValueError: If the string cannot be parsed.

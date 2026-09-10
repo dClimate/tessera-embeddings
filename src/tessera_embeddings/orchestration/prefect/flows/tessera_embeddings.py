@@ -14,10 +14,9 @@ Architecture::
       ├── Run assemble_embeddings_task on the flow runner (worker processes)
       └── Tear down the Ray cluster; on-cancellation hook covers partials
 
-The ``BucketPaths`` parameter is the deployment-supplied storage
-contract — there is no ``dev: bool`` toggle. Callers (typically a
-Prefect deployment with parameters) construct paths once at flow
-boundary and the rest of the code is path-agnostic.
+The ``BucketPaths`` parameter is the deployment-supplied storage contract — there is no
+``dev: bool`` toggle. Callers (typically a Prefect deployment with parameters) construct
+paths once at the flow boundary and the rest of the code is path-agnostic.
 """
 
 from __future__ import annotations
@@ -56,12 +55,10 @@ from tessera_embeddings.orchestration.prefect.tasks.inference import (
 )
 from tessera_embeddings.storage.zarr_store import plain_zarr_storage_options
 
-# Fresh runs with allow_s2_only=True carry this run_id prefix. The run_id
-# namespaces the staging directory, so the prefix records the per-pixel S1
-# mode that produced a run's staged chunks — letting a resume detect (and
-# refuse) a mode flip that would otherwise mix S1-gated and S2-only chunks in
-# one assembled output. Default runs keep the historical bare-uuid run_id, so
-# the single-ROI path is byte-for-byte unchanged when the flag is off.
+# Fresh runs with allow_s2_only=True carry this run_id prefix. The run_id namespaces the
+# staging directory, so the prefix records the per-pixel S1 mode that produced a run's
+# staged chunks, letting a resume detect and refuse a mode flip that would otherwise mix
+# S1-gated and S2-only chunks in one assembled output. Default runs keep a bare uuid.
 S2_ONLY_RUN_PREFIX = "s2only-"
 
 
@@ -78,33 +75,29 @@ class EmbeddingsDevParams(BaseModel):
     skip_coverage_check: bool = False
     cleanup_staging: bool = True
     output_name_suffix: str = ""
-    # Dev-iteration escape hatch. When set (requires code_bucket), the provider
-    # tars this local dir and uploads it to s3://{code_bucket}/code/... *before*
-    # ``ray up``, so workers run your working-tree code without a CI round-trip.
-    # None (default) = no upload: workers use AMI-baked source, or a tarball a
-    # CI workflow already put in code_bucket. See providers/aws/gotchas.md.
+    # Dev-iteration escape hatch. When set (requires code_bucket), the provider tars this
+    # local dir to s3://{code_bucket}/code/... *before* ``ray up``, so workers run
+    # working-tree code without a CI round-trip. None (default) = no upload: workers use
+    # AMI-baked source or a tarball CI already put in code_bucket (providers/aws/gotchas.md).
     sync_source_path: str | None = None
 
 
 def _resolve_run_id(previous_run_id: str | None, *, allow_s2_only: bool, assembly_only: bool) -> str:
     """Derive the staging run_id, encoding the S2-only mode via S2_ONLY_RUN_PREFIX.
 
-    ``run_inference()`` reuses staged ``.zarr``/``.skipped`` artifacts by run_id
-    alone. If a resume flipped ``allow_s2_only``, old skip markers (S2-valid /
-    zero-S1 pixels the flag now embeds) would be kept for already-staged chunks
-    while only the not-yet-staged chunks were recomputed under the new gate, and
-    assembly would publish a mix of S1-gated and S2-only tiles. Encoding the mode
-    in the run_id — which namespaces the staging directory — lets a resume detect
-    and refuse a mode flip. Fresh default-mode runs keep the historical bare-uuid
-    run_id, so the single-ROI path is unchanged when the flag is off.
+    ``run_inference()`` reuses staged ``.zarr``/``.skipped`` artifacts by run_id alone. A
+    resume that flipped ``allow_s2_only`` would keep old skip markers (S2-valid / zero-S1
+    pixels the flag now embeds) for already-staged chunks while recomputing only the rest
+    under the new gate, and assembly would publish a mix of S1-gated and S2-only tiles.
+    Encoding the mode in the run_id — which namespaces the staging directory — lets a resume
+    detect and refuse the flip.
 
-    Assembly-only resumes never run the per-pixel gate, so the requested flag cannot
-    change WHICH pixels they publish — but it still reaches the ``EmbeddingManifest``
-    they write, so exempting them outright let a staged S2-only run be published as
-    flag-off, after which a later flag-off append mixes incompatible slices into one
-    store. :func:`staged_s2_only_mode` is what the caller uses instead: the prefix is the
-    record of what the staged pixels ARE, so the mode is read off it rather than trusted
-    from a parameter nobody had to set.
+    Assembly-only resumes never run the per-pixel gate, so the requested flag cannot change
+    WHICH pixels they publish — but it still reaches the ``EmbeddingManifest`` they write,
+    so an outright exemption publishes a staged S2-only run as flag-off and a later flag-off
+    append then mixes incompatible slices into one store. Callers use
+    :func:`staged_s2_only_mode` instead: the prefix records what the staged pixels ARE,
+    rather than trusting a parameter nobody had to set.
     """
     if previous_run_id:
         resumed_s2_only = previous_run_id.startswith(S2_ONLY_RUN_PREFIX)
@@ -122,22 +115,20 @@ def _resolve_run_id(previous_run_id: str | None, *, allow_s2_only: bool, assembl
 def _assert_resume_mode_matches(previous_run_id: str | None, *, allow_s2_only: bool, assembly_only: bool) -> None:
     """The half of the mode-mixing refusal that the REQUEST alone can settle.
 
-    :func:`_resolve_run_id` has to run LATE, because the flag it must encode is the
-    config's effective one and that is not known until the orbit has been resolved
-    against the mosaic. This is the part that can be decided before any store is opened,
-    and it is deliberately only HALF the check.
+    :func:`_resolve_run_id` has to run LATE: the flag it encodes is the config's EFFECTIVE
+    one, unknown until the orbit is resolved against the mosaic. This is the part decidable
+    before any store is opened, and it is deliberately only HALF the check.
 
     **Only the request-is-True direction.** The effective flag is forced ON — never off —
     when the orbit resolves to ``"none"`` (:class:`InferenceConfig`), so a request of
-    ``False`` may still become ``True`` and legitimately match an S2-only staged run.
-    Refusing that here rejected exactly the resume it should allow: a radar-free ROI
-    staged under the forced flag, resumed with ``require_s1=False`` and the flag left at
-    its default. The opposite direction has no such escape — nothing forces the flag off,
-    so a request of ``True`` against a bare staged run contradicts whatever the orbit
-    resolves to, and is refused now rather than after a store probe.
+    ``False`` may still become ``True`` and legitimately match an S2-only staged run;
+    refusing that rejects exactly the resume it should allow (a radar-free ROI staged under
+    the forced flag, resumed with ``require_s1=False`` and the flag left at its default).
+    The opposite direction has no such escape — nothing forces the flag off, so a request of
+    ``True`` against a bare staged run contradicts whatever the orbit resolves to.
 
-    The full comparison still happens, against ``config.allow_s2_only``, once the orbit
-    is known. This check narrows what reaches it; it does not replace it.
+    The full comparison against ``config.allow_s2_only`` still happens once the orbit is
+    known. This narrows what reaches it; it does not replace it.
     """
     if allow_s2_only and not assembly_only and previous_run_id and not staged_s2_only_mode(previous_run_id):
         _resolve_run_id(previous_run_id, allow_s2_only=allow_s2_only, assembly_only=assembly_only)
@@ -146,11 +137,11 @@ def _assert_resume_mode_matches(previous_run_id: str | None, *, allow_s2_only: b
 def staged_s2_only_mode(previous_run_id: str | None) -> bool:
     """Whether a staged run's chunks were produced under the S2-only pixel gate.
 
-    The run_id prefix is the durable record of that, and on an ASSEMBLY-ONLY resume it is
-    the only one: nothing recomputes the pixels, so the flow parameter says nothing about
-    what is in the staging directory. Publishing on the parameter alone wrote a manifest
-    claiming S1-gated pixels over S2-only ones, and a later flag-off append then mixed
-    two policies into one store with nothing objecting.
+    The run_id prefix is the durable record, and on an ASSEMBLY-ONLY resume it is the only
+    one: nothing recomputes the pixels, so the flow parameter says nothing about what is in
+    the staging directory. Publishing on the parameter alone writes a manifest claiming
+    S1-gated pixels over S2-only ones, and a later flag-off append then mixes two policies
+    into one store with nothing objecting.
     """
     return bool(previous_run_id and previous_run_id.startswith(S2_ONLY_RUN_PREFIX))
 
@@ -191,46 +182,36 @@ def tessera_embeddings(
             :class:`BucketPaths`). Replaces the reference repo's
             ``dev: bool`` toggle.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
-        ssm_prefix: SSM Parameter Store prefix under which the Ray
-            cluster resource IDs (security group, instance profile,
-            subnets, key pair) are published by the deployment's infra.
-            Defaults to the OSS ``/tessera/ray/``; deployments that
-            publish under a different prefix must override this.
-        cloudwatch_log_group: CloudWatch log group the Ray workers write
-            agent logs to. Must match the group the deployment's infra
-            creates and grants the worker role access to.
-        code_bucket: S3 bucket (no ``s3://`` prefix) workers pull the
-            source tarball from, at
-            ``s3://{code_bucket}/code/src{code_suffix}.tar.gz``. Setting
-            this only *points* workers at the tarball — it does not
-            upload one; an external/CI workflow is expected to have put
-            it there (the general production path when source ships as an
-            S3 artifact). Leave ``None`` for AMI-baked source. See
-            ``dev_params.sync_source_path`` to also upload from the local
-            tree. See ``providers/aws/gotchas.md`` for the three modes.
-        code_suffix: Filename suffix for the source tarball (e.g.
-            ``"-mybranch"``, letting branches coexist in one bucket).
-            Empty for production tarballs.
+        ssm_prefix: SSM Parameter Store prefix under which the deployment's infra publishes
+            the Ray cluster resource IDs (security group, instance profile, subnets, key
+            pair). Deployments publishing under a different prefix must override this.
+        cloudwatch_log_group: CloudWatch log group the Ray workers write agent logs to. Must
+            match the group the deployment's infra creates and grants the worker role.
+        code_bucket: S3 bucket (no ``s3://`` prefix) workers pull the source tarball from,
+            at ``s3://{code_bucket}/code/src{code_suffix}.tar.gz``. This only *points*
+            workers at the tarball; an external/CI workflow is expected to have put it there
+            (the production path when source ships as an S3 artifact). ``None`` for
+            AMI-baked source; ``dev_params.sync_source_path`` also uploads from the local
+            tree. ``providers/aws/gotchas.md`` covers the three modes.
+        code_suffix: Filename suffix for the source tarball (e.g. ``"-mybranch"``, letting
+            branches coexist in one bucket). Empty for production tarballs.
         num_actors: Number of GPU actors to create.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
         require_s1: Demand radar rather than request it, and **True by default here**
             because this flow fills ONE cell: an operator naming a single zone-year over
-            terrain that should be imaged wants to be told when its radar is missing, not
-            to receive optical-only embeddings quietly. Set False for a cell that is
-            genuinely radar-free — parts of the globe have no dual-pol coverage at all, and
-            the ingest's per-orbit item count is what distinguishes that from a lost orbit.
-            The global campaign passes False for the same reason.
-        s3_region: Optional S3 region for the mosaic/store opens — threaded, like the
-            IAM credential callback, through orbit resolution, chunk enumeration, the
-            coverage gate, and the assembly task. ``None`` uses the default Icechunk
-            region; set it for a store outside the default region.
-        allow_s2_only: Embed S2-valid pixels that have ZERO S1 observations
-            (sub-zone SAR coverage gaps) via the upstream v1.1 missing-S1
-            convention (all-zeros normalized S1 input) instead of skipping
-            them. Default False (historical behavior). Affected pixels are
-            identifiable afterwards via ``s1_asc_obs_count +
-            s1_desc_obs_count == 0``; quality is unvalidated — see the
-            optional-S1 ADR.
+            terrain that should be imaged wants to be told when its radar is missing, not to
+            receive optical-only embeddings quietly. Set False for a genuinely radar-free
+            cell — parts of the globe have no dual-pol coverage at all, and the ingest's
+            per-orbit item count is what distinguishes that from a lost orbit. The global
+            campaign passes False for the same reason.
+        s3_region: Optional S3 region for the mosaic/store opens — threaded, like the IAM
+            credential callback, through orbit resolution, chunk enumeration, the coverage
+            gate and the assembly task. ``None`` uses the default Icechunk region.
+        allow_s2_only: Embed S2-valid pixels with ZERO S1 observations (sub-zone SAR
+            coverage gaps) via the upstream v1.1 missing-S1 convention (all-zeros normalized
+            S1 input) instead of skipping them. Default False. Affected pixels are
+            identifiable afterwards via ``s1_asc_obs_count + s1_desc_obs_count == 0``;
+            quality is unvalidated — see the optional-S1 ADR.
         dev_params: See :class:`EmbeddingsDevParams`.
 
     Returns:
@@ -252,9 +233,8 @@ def tessera_embeddings(
     if not dev_params.assembly_only and num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
 
-    # Refuse a contradicted resume before anything is opened. The run_id itself is minted
-    # much later, from the config's EFFECTIVE flag (see below), but this half of the check
-    # needs only the request and must not wait behind a store probe.
+    # Refuse a contradicted resume before anything is opened. The run_id is minted much
+    # later, from the config's EFFECTIVE flag, but this half needs only the request.
     _assert_resume_mode_matches(
         dev_params.previous_run_id, allow_s2_only=allow_s2_only, assembly_only=dev_params.assembly_only
     )
@@ -275,8 +255,8 @@ def tessera_embeddings(
 
     mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
 
-    # Probe the SAR stores with the same credential callback + region the assemble
-    # step uses, so orbit resolution doesn't fall back to the default Icechunk chain.
+    # Same credential callback + region the assemble step uses, so orbit resolution doesn't
+    # fall back to the default Icechunk chain.
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 
     resolved_s1_orbit = resolve_s1_orbit(
@@ -296,20 +276,20 @@ def tessera_embeddings(
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,
         # An assembly-only resume republishes staged pixels without recomputing them, so
-        # what they ARE is recorded in the run_id prefix and nowhere in this call's
-        # parameters. The prefix is therefore the ONLY source, not one of two: OR-ing the
-        # requested flag in let `allow_s2_only=True` over a bare staged run publish an
-        # S2-only manifest for S1-gated tiles, which is the same mislabelling in the other
-        # direction — and the direction that makes a later honest flag-off append fail.
+        # what they ARE lives in the run_id prefix and nowhere in this call's parameters.
+        # The prefix is the ONLY source, not one of two: OR-ing the requested flag in lets
+        # `allow_s2_only=True` over a bare staged run publish an S2-only manifest for
+        # S1-gated tiles — the same mislabelling in the direction that makes a later honest
+        # flag-off append fail.
         allow_s2_only=(staged_s2_only_mode(dev_params.previous_run_id) if dev_params.assembly_only else allow_s2_only),
     )
 
-    # AFTER the config, and from the config's own flag. `InferenceConfig` FORCES
-    # allow_s2_only when the orbit resolves to none — every pixel there has zero S1
-    # observations, so the default gate would skip all of them — and minting the run_id
-    # from the requested flag missed that: S2-only chunks landed under an unprefixed
-    # staging prefix, where an explicit S2-only resume is then refused and the same bare
-    # id can be reused under the S1-gated mode the prefix exists to separate.
+    # AFTER the config, and from the config's OWN flag. `InferenceConfig` FORCES
+    # allow_s2_only when the orbit resolves to none (every pixel there has zero S1
+    # observations, so the default gate would skip all of them). Minting from the REQUESTED
+    # flag instead lands S2-only chunks under an unprefixed staging prefix, where an
+    # explicit S2-only resume is refused and the bare id can be reused under the S1-gated
+    # mode the prefix exists to separate.
     run_id = _resolve_run_id(
         dev_params.previous_run_id,
         allow_s2_only=config.allow_s2_only,
@@ -325,8 +305,7 @@ def tessera_embeddings(
 
     staging_base = f"{output_bucket.rstrip('/')}/staging"
 
-    # Detect staged chunk size from prior runs — chunk_size may differ
-    # between a resumed run and the current config.
+    # A resumed run's staged chunk_size may differ from the current config's.
     chunk_size = config.chunk_size
     if dev_params.previous_run_id:
         try:
@@ -355,10 +334,10 @@ def tessera_embeddings(
     live_chunks = filter_chunks_by_roi_mask(
         chunks,
         roi_zarr_path,
-        # The SAME options assembly uses. This filter and assembly's must derive the
-        # identical live set from the identical mask; opening one on the ambient chain
-        # and the other on the run's credentials can fail here before Ray, or — worse —
-        # succeed against a different mask than the one the output is assembled from.
+        # The SAME options assembly uses: this filter and assembly's must derive an
+        # identical live set from an identical mask. Opening one on the ambient chain and
+        # the other on the run's credentials fails here before Ray, or — worse — succeeds
+        # against a different mask than the output is assembled from.
         storage_options=plain_zarr_storage_options(roi_zarr_path, iam_icechunk_credentials, s3_region),
     )
     log.info(
@@ -377,16 +356,14 @@ def tessera_embeddings(
         s3_region=s3_region,
     )
 
-    # Same structural check `assemble` makes before extending an existing store —
-    # model, sampler checkpoints, upstream ingest identity — run HERE, on metadata
-    # only, so an append that can never be accepted is rejected before a GPU fleet
-    # is provisioned rather than after the whole inference is paid for.
+    # The same structural check `assemble` makes before extending an existing store (model,
+    # sampler checkpoints, upstream ingest identity), run HERE on metadata only, so an
+    # append that can never be accepted is rejected before a GPU fleet is paid for.
     #
-    # Only on runs that will actually append. `assembly_only` reaches assemble
-    # immediately, which validates for itself; `inference_only` returns after
-    # staging and never touches the output store, so gating it would block a
-    # legitimate dev run — staging a new checkpoint against an ROI whose published
-    # store was written by a different one — over an append it is not making.
+    # Only on runs that will actually append. `assembly_only` reaches assemble immediately
+    # and validates for itself; `inference_only` never touches the output store, so gating
+    # it would block a legitimate dev run — staging a new checkpoint against an ROI whose
+    # published store was written by a different one — over an append it is not making.
     if not (dev_params.assembly_only or dev_params.inference_only):
         assert_output_store_accepts(
             output_bucket=output_bucket,
@@ -399,10 +376,8 @@ def tessera_embeddings(
             s3_region=s3_region,
         )
 
-    # Lazily import the AWS Ray provider so the embeddings flow file
-    # can be inspected (for arch tests) on machines without ray
-    # installed. The provider is only needed when the flow actually
-    # runs.
+    # Lazy import so the flow file can be inspected (arch tests) on machines without ray
+    # installed; the provider is only needed when the flow actually runs.
     from tessera_embeddings.providers.aws.ray import (
         cluster_name_for_flow_run,
         make_instance_terminator,
@@ -426,8 +401,8 @@ def tessera_embeddings(
         "time_window": time_window,
         "cleanup_staging": dev_params.cleanup_staging,
         "output_name_suffix": dev_params.output_name_suffix,
-        # Same credential callback + region the orbit probe uses — so the assembly
-        # task's manifest read + writer.assemble open the stores with them, not the
+        # Same credential callback + region the orbit probe uses, so the assembly task's
+        # manifest read and writer.assemble open the stores with them rather than the
         # default Icechunk chain (callback-only / non-default-region deployments).
         "get_credentials": iam_icechunk_credentials,
         "s3_region": s3_region,
@@ -467,23 +442,21 @@ def tessera_embeddings(
                 t0=t0,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
-                # Terminate the EC2 instance behind each retired idle actor at once,
-                # rather than holding idle GPU nodes to the end of the run on the Ray
-                # autoscaler's idle timeout, which is unreliable after ray.kill()
-                # (providers/aws/gotchas.md). Actors go idle at the tail, while the
-                # last chunks finish, so this is where a run stops paying for GPUs it
-                # is done with. The callback runs driver-side; its boto3 client never
+                # Terminate each retired idle actor's EC2 instance at once rather than
+                # holding idle GPU nodes to the end of the run on the Ray autoscaler's idle
+                # timeout, unreliable after ray.kill() (providers/aws/gotchas.md). Actors go
+                # idle at the tail while the last chunks finish, so this is where a run
+                # stops paying for GPUs it is done with. Driver-side; its boto3 client never
                 # ships to a worker. Matches fill_zone_year.
                 on_actor_retire=make_instance_terminator(log=log),
             )
     finally:
         # Clear the hook state on the EXCEPTION path too. Cleared only on success, a run
-        # whose inference raised inside the Ray context left `_ray_lifecycle`'s
-        # process-wide cluster name pointing at it — and Prefect reuses worker processes,
-        # so a LATER run's cancellation hook would prefer that stale name over its own
-        # flow-run fallback, tear down a cluster already gone, and leak the live fleet it
-        # was called to reclaim. Matches fill_zone_year and fill_zones_sequential, which
-        # both already do this.
+        # whose inference raised inside the Ray context leaves `_ray_lifecycle`'s
+        # process-wide cluster name pointing at it — and Prefect reuses worker processes, so
+        # a LATER run's cancellation hook prefers that stale name over its own flow-run
+        # fallback, tears down a cluster already gone, and leaks the live fleet it was called
+        # to reclaim. Matches fill_zone_year and fill_zones_sequential.
         deactivate()
 
     succeeded = [r for r in results if r["status"] == "success"]
@@ -533,10 +506,9 @@ def _run_assembly(
 ) -> dict[str, Any]:
     """Run the assembly task on the flow runner with a local worker-process pool.
 
-    No cluster to provision: the raw-zarr engine forks worker processes on this
-    host (see ``inference.assembly``), so the task runs directly under the
-    flow's default runner. ``AssemblyConfig`` sizes the pool from the live
-    chunk count within its RAM/S3 budget.
+    No cluster to provision: the raw-zarr engine forks worker processes on this host (see
+    ``inference.assembly``), so the task runs directly under the flow's default runner.
+    ``AssemblyConfig`` sizes the pool from the live chunk count within its RAM/S3 budget.
     """
     n_workers = AssemblyConfig().compute_n_workers(assemble_kwargs["n_live_chunks"])
     log.info("Assembling on the flow runner with %d worker process(es)", n_workers)

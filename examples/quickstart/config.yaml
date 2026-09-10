@@ -5,7 +5,7 @@
 #         examples/quickstart/config.yaml --skip-inference
 #
 # Drop --skip-inference to run the full pipeline (CPU inference).
-# Expect ~30+ minutes end-to-end on a developer laptop.
+# ~3.5 minutes end-to-end on a developer laptop, most of it ingest.
 #
 # All paths use file:// for portability. Replace with s3:// (or any
 # fsspec-supported scheme) for cloud deployments.

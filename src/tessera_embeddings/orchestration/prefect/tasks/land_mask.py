@@ -1,13 +1,12 @@
 """Prefect task shells for the land-mask coverage domain functions.
 
-Thin wrappers (ADR-002 shape-C): pull the run logger from Prefect context,
-delegate to the :mod:`tessera_embeddings.ingest.land_mask` domain functions, and
-convert the dataclass result to a dict at the boundary. No Dask client is pulled
-— the coverage build is pure geometry over the registry and runs entirely on the
-flow runner (no cluster), like :mod:`generate_roi`.
+Thin wrappers (ADR-002 shape-C): pull the run logger from Prefect context, delegate to the
+:mod:`tessera_embeddings.ingest.land_mask` domain functions, and convert the dataclass
+result to a dict at the boundary. No Dask client is pulled — the coverage build is pure
+geometry over the registry and runs entirely on the flow runner, like :mod:`generate_roi`.
 
-This file is one of the few places in the package that imports from
-:mod:`prefect`. Domain modules under ``ingest/`` never do.
+This file is one of the few places in the package that imports from :mod:`prefect`. Domain
+modules under ``ingest/`` never do.
 """
 
 from __future__ import annotations

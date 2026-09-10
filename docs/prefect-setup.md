@@ -176,8 +176,10 @@ Cause: chunk size too small → graph too big. See
 [`README.md`](../README.md) §"Why chunk size dominates everything".
 Only *ingest* uses Dask (`INGEST_CHUNK_SIZE = 4096` storage chunks);
 assembly runs as local worker processes on the flow runner — size that
-container for **~24 GB** of assembly headroom (`AssemblyConfig` caps **16**
-workers × ~1–1.5 GB staged-tile slices; 20 GB measured peak) plus the commit. Don't reach for
+container for the **full 64 GiB** (`AssemblyConfig` caps **16** workers, and a
+16-worker pool was measured peaking near 40 GiB) plus the coordinator and the
+commit. Anything smaller risks an OOM in the shard-write
+tail rather than a clean failure. Don't reach for
 `INFERENCE_CHUNK_SIZE` here: it drives GPU read-tiling, not Dask, and
 must stay equal to the 2048-px shard pitch for the global store (D3).
 

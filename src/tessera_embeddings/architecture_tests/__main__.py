@@ -1,13 +1,8 @@
 """CLI entry point for ``tessera_embeddings.architecture_tests``.
 
-Invoke via ``python -m tessera_embeddings.architecture_tests
---source path/to/src [--allowlist file.toml]``.
-
-Exit codes:
-
-* ``0`` — no violations.
-* ``1`` — at least one violation. Violations are written to stderr
-  (one per line) before exiting.
+Invoke via ``python -m tessera_embeddings.architecture_tests --source path/to/src
+[--allowlist file.toml]``. Exits ``0`` with no violations, or ``1`` after writing each
+violation to stderr on its own line.
 """
 
 from __future__ import annotations

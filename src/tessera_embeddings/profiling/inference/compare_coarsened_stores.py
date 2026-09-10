@@ -1,24 +1,19 @@
 """Bit-identity check for two coarsened (500 m) embedding icechunk stores.
 
-Sibling to :mod:`compare_outputs` (which gates the *full-resolution, int8 +
-scales, per-chunk staged* runs against the ADR-012 validated-equivalence
-thresholds). This script targets the **coarsened** aggregate stores instead:
-a single icechunk store per run whose ``embeddings`` variable is already
-float32 / pre-dequantized (no ``scales`` variable) and whose obs-count layers
-are uint32. See ``scripts/plot_corn_sample_500m_regions.py`` for that format.
+Sibling to :mod:`compare_outputs`, which gates the full-resolution int8 + scales runs
+against the ADR-012 validated-equivalence thresholds. This script targets the **coarsened**
+aggregate stores: one icechunk store per run whose ``embeddings`` is already float32 /
+pre-dequantized (no ``scales`` variable) and whose obs-count layers are uint32. See
+``scripts/plot_corn_sample_500m_regions.py`` for that format.
 
-The question here is stricter and simpler than ADR-012: are the two stores
-**bit-identical**? "Bit-identical" means every array — coordinates and data —
-matches its counterpart byte-for-byte (floats compared on their raw bit
-pattern, so a ``-0.0`` vs ``0.0`` or a differing NaN payload counts as a
-mismatch). Because the inference speed-up campaign only guarantees *validated
-equivalence* for the int8 outputs (batch-size changes move cuBLAS kernel
-selection, so the 10 m int8 values differ by <=1 level on a small fraction of
-pixels), the dequantized-then-mean-pooled 500 m floats are unlikely to be
-bit-identical. So when they are not, the script still reports HOW they diverge
-(max/mean abs diff, exactness fractions, per-pixel cosine, NaN-mask agreement)
-so the divergence can be judged as either "quantization shimmer" or a real
-defect.
+The question is stricter than ADR-012: are the two stores **bit-identical** — every
+coordinate and data array matching byte-for-byte, floats compared on their raw bit pattern
+so ``-0.0`` vs ``0.0`` or a differing NaN payload counts as a mismatch? Usually not: the
+inference speed-up campaign only guarantees validated equivalence for the int8 outputs
+(batch-size changes move cuBLAS kernel selection, so 10 m int8 values differ by <=1 level on
+a small fraction of pixels), which the dequantized-then-mean-pooled 500 m floats inherit. So
+when they differ the script reports HOW — max/mean abs diff, exactness fractions, per-pixel
+cosine, NaN-mask agreement — to tell quantization shimmer from a real defect.
 
 Usage::
 
@@ -26,10 +21,9 @@ Usage::
         s3://<bucket>/embeddings/<roi>-reference_500m.zarr \
         s3://<bucket>/embeddings/<roi>-candidate_500m.zarr
 
-Exit code 0 = fully bit-identical, 1 = any difference (structural, coordinate,
-or array). Data volume is small (~0.4 GB/store for Iowa), so the full arrays
-are compared by default; ``--sample-rows N`` compares an evenly-strided subset
-of northing rows if pointed at a much larger store.
+Exit code 0 = fully bit-identical, 1 = any difference (structural, coordinate, or array).
+Data volume is small (~0.4 GB/store for Iowa) so full arrays are compared by default;
+``--sample-rows N`` compares an evenly-strided subset of northing rows on a larger store.
 """
 
 from __future__ import annotations
@@ -43,30 +37,26 @@ import xarray as xr
 
 from tessera_embeddings.storage.zarr_store import open_store
 
-# Stream the (northing, easting, band) arrays in row slabs to bound peak
-# memory. Sized to the stores' 384-row northing chunk so each on-disk chunk is
-# downloaded exactly once (a smaller, unaligned slab re-reads a straddled chunk
-# on the next slab, ~doubling the S3 transfer). One 384-row embeddings slab is
-# ~384 * 1066 * 128 * 4 B ~= 210 MB per store; two stores + uint bit-views stay
-# comfortably under ~0.6 GB.
+# Row-slab size for streaming the (northing, easting, band) arrays, bounding peak memory.
+# Matched to the stores' 384-row northing chunk so each on-disk chunk downloads exactly once
+# — a smaller, unaligned slab re-reads a straddled chunk on the next slab, ~doubling S3
+# transfer. One 384-row embeddings slab is ~384 * 1066 * 128 * 4 B ~= 210 MB per store; two
+# stores plus uint bit-views stay under ~0.6 GB.
 ROW_BLOCK = 384
 
-# Obs-count / provenance layers are keyed by name so a variable present in one
-# store but absent in the other is caught rather than silently skipped.
+# Keyed by name so a variable present in one store but absent in the other is caught rather
+# than silently skipped.
 OBS_VARS = ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count")
 
-# The coarsened-store format contract: these variables must be present in BOTH
-# stores — two identically-malformed stores (e.g. both missing `embeddings`)
-# must fail, not vacuously pass. `scales` must be ABSENT: its presence means a
-# full-resolution int8 store (compare those with compare_outputs.py), not a
-# pre-dequantized coarsened one.
+# Format contract. Required vars must be present in BOTH stores, so two identically-
+# malformed stores (both missing `embeddings`) fail rather than vacuously pass. `scales`
+# must be ABSENT: it marks a full-resolution int8 store, which compare_outputs.py handles.
 REQUIRED_VARS = ("embeddings", *OBS_VARS)
 FORBIDDEN_VARS = ("scales",)
 
-# The format's expected dtypes. Pinning them (not just checking the two stores
-# agree) means two identically-malformed stores — e.g. both with int16
-# embeddings, or uint16 obs counts that would overflow at 50x50 coarsening
-# (up to ~315k obs/px ≫ 65535) — fail rather than certify each other.
+# Dtypes are PINNED, not merely checked for agreement, so two identically-wrong stores —
+# int16 embeddings, or uint16 obs counts that overflow at 50x50 coarsening (~315k obs/px
+# >> 65535) — fail instead of certifying each other.
 EXPECTED_DTYPES = {
     "embeddings": "float32",
     "s2_obs_count": "uint32",
@@ -74,10 +64,9 @@ EXPECTED_DTYPES = {
     "s1_desc_obs_count": "uint32",
 }
 
-# ...and the format's expected dimension layout, again pinned in both stores:
-# a wrong-but-agreeing axis order (e.g. embeddings as (time, northing, band,
-# easting)) would pass a dtype-and-agreement check yet break the northing-slab
-# reader. All required vars carry (northing, easting), optionally led by time;
+# Dim layout, likewise pinned in both stores: a wrong-but-agreeing axis order (embeddings as
+# (time, northing, band, easting)) passes a dtype-and-agreement check yet breaks the
+# northing-slab reader. All required vars carry (northing, easting), optionally led by time;
 # embeddings additionally trails band.
 EXPECTED_DIMS = {
     "embeddings": ("northing", "easting", "band"),
@@ -86,11 +75,9 @@ EXPECTED_DIMS = {
     "s1_desc_obs_count": ("northing", "easting"),
 }
 
-# Root attrs that legitimately differ between two runs of the same ROI — pure
-# run provenance, not data or format. `run_id` plus anything run-scoped
-# (``run_*``, e.g. run_started_at/run_completed_at timestamps) is reported but
-# never fails the gate; every other attr difference (format, version, grid)
-# still does.
+# Root attrs that legitimately differ between two runs of the same ROI: `run_id` plus
+# anything run-scoped (``run_*``, e.g. run_started_at) is reported but never fails the gate.
+# Every other attr difference (format, version, grid) still does.
 BENIGN_ATTR_DIFFS = frozenset({"run_id"})
 
 
@@ -178,9 +165,8 @@ def compare_coords(ref: xr.Dataset, test: xr.Dataset) -> list[str]:
     problems: list[str] = []
     if dict(ref.sizes) != dict(test.sizes):
         problems.append(f"dims differ: {dict(ref.sizes)} vs {dict(test.sizes)}")
-    # str() because xarray types its keys as Hashable, which is neither sortable
-    # nor usable as a name in the messages below; every key in these stores is a
-    # string.
+    # str() because xarray types its keys as Hashable, which is neither sortable nor usable
+    # as a name in the messages below; every key in these stores is a string.
     ref_coords, test_coords = {str(c) for c in ref.coords}, {str(c) for c in test.coords}
     if ref_coords != test_coords:
         problems.append(f"coord set differs: only-ref={ref_coords - test_coords} only-test={test_coords - ref_coords}")
@@ -214,11 +200,10 @@ def compare_attrs(ref: xr.Dataset, test: xr.Dataset) -> tuple[list[str], list[st
 def compare_var_structure(ref: xr.Dataset, test: xr.Dataset) -> list[str]:
     """Per-variable dims/shape/dtype mismatches between the two stores.
 
-    Must run before any bit comparison: ``_bit_equal`` views each side through
-    an unsigned integer of *its own* width, so a dtype change that preserves
-    small values (uint16 vs uint32 counts, or all-zero float32 vs float64)
-    would otherwise compare "equal" and falsely certify non-identical stores;
-    a shape/dims change would crash mid-read instead of reporting cleanly.
+    Must run before any bit comparison: ``_bit_equal`` views each side through an unsigned
+    integer of *its own* width, so a dtype change preserving small values (uint16 vs uint32
+    counts, all-zero float32 vs float64) would compare "equal" and falsely certify
+    non-identical stores; a shape/dims change would crash mid-read rather than report.
     """
     problems: list[str] = []
     # str(): see compare_coords — xarray keys are typed Hashable, ours are strings.
@@ -235,12 +220,11 @@ def compare_var_structure(ref: xr.Dataset, test: xr.Dataset) -> list[str]:
 
 def _accumulate_float(cmp: VarComparison, a: np.ndarray, b: np.ndarray) -> None:
     """Fold one float slab into the running numeric-divergence metrics."""
-    # "not comparable" = either side is non-finite (NaN OR ±inf). The mask must
-    # exclude inf too: inf - inf = NaN would poison max/mean/CDF on a store that
-    # carries infinities. The NaN mask-agreement counter still keys on isnan
-    # (NaN is the invalid-pixel fill); an inf is neither valid data nor the fill,
-    # so a one-sided inf shows up as a non-finite (dropped) element and, if it
-    # differs bitwise, in n_bit_equal — it can't masquerade as agreement.
+    # "Not comparable" = either side non-finite (NaN OR ±inf). inf must be excluded too:
+    # inf - inf = NaN would poison max/mean/CDF on a store carrying infinities. The NaN
+    # mask-agreement counter still keys on isnan (NaN is the invalid-pixel fill); a one-sided
+    # inf drops out as non-finite and, if it differs bitwise, shows in n_bit_equal, so it
+    # cannot masquerade as agreement.
     fin_a, fin_b = np.isfinite(a), np.isfinite(b)
     nan_a, nan_b = np.isnan(a), np.isnan(b)
     cmp.nan_mask_mismatches += int((nan_a != nan_b).sum())
@@ -282,19 +266,17 @@ def compare_variable(
 ) -> VarComparison:
     """Stream-compare one data variable across the given northing row slabs.
 
-    Each entry is ``(slab, selection)``: the slab is read whole (one backing
-    zarr chunk's worth of rows), then ``selection`` — when sampling — picks
-    the sampled rows out of it in memory. ``None`` compares the whole slab.
+    Each entry is ``(slab, selection)``: the slab is read whole (one backing zarr chunk's
+    worth of rows), then ``selection`` picks the sampled rows out of it in memory. ``None``
+    compares the whole slab.
     """
     da_ref, da_test = ref[name], test[name]
     cmp = VarComparison(name=name, dtype=str(da_ref.dtype))
     is_float = da_ref.dtype.kind == "f"
 
-    # A variable without a `northing` dim (a scalar or non-spatial auxiliary
-    # var an unexpected store might carry) can't be row-slabbed — read it whole
-    # in one shot rather than crashing on isel(northing=...). The known format
-    # vars (embeddings, obs counts) all have northing and take the streaming
-    # path below.
+    # A variable without a `northing` dim (a scalar or non-spatial auxiliary an unexpected
+    # store might carry) can't be row-slabbed — read it whole rather than crashing on
+    # isel(northing=...). The known format vars all have northing and stream below.
     if "northing" not in da_ref.dims:
         a, b = da_ref.values, da_test.values
         cmp.n += a.size
@@ -306,11 +288,9 @@ def compare_variable(
         sub_ref = da_ref.isel(northing=rows_slice)
         sub_test = da_test.isel(northing=rows_slice)
         if sel is not None:
-            # Select the sampled rows by DIM NAME, not a positional numpy index:
-            # northing's axis position depends on whether a `time` dim is present
-            # ((time, northing, easting, band) vs (northing, easting, band)), so
-            # positional indexing would silently select easting on a time-less
-            # store. `sel` are slab-relative northing offsets.
+            # Select by DIM NAME, not a positional numpy index: northing's axis position
+            # depends on whether a `time` dim is present, so positional indexing would
+            # silently select easting on a time-less store. `sel` are slab-relative offsets.
             sub_ref = sub_ref.isel(northing=sel)
             sub_test = sub_test.isel(northing=sel)
         a = sub_ref.values
@@ -327,12 +307,10 @@ def compare_variable(
 def _row_slabs(height: int, sample_rows: int | None) -> list[tuple[slice, list[int] | None]]:
     """Row slabs covering [0, height), or a chunk-aligned sampled subset.
 
-    Sampling groups the sampled row indices by their containing
-    ``ROW_BLOCK``-aligned slab (= the stores' northing chunk), so each backing
-    zarr chunk downloads and decompresses ONCE; the sampled rows are then
-    selected from the slab in memory. Per-row slices would re-read the whole
-    containing chunk for every sampled row — far slower than a full scan once
-    several samples land in one chunk.
+    Sampling groups the row indices by their containing ``ROW_BLOCK``-aligned slab (= the
+    stores' northing chunk) so each backing zarr chunk downloads and decompresses ONCE, then
+    selects the sampled rows in memory. Per-row slices would re-read the whole containing
+    chunk per sampled row — slower than a full scan once several samples share a chunk.
     """
     if sample_rows and sample_rows < height:
         idx = np.linspace(0, height - 1, sample_rows, dtype=int)
@@ -390,9 +368,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    # Format contract: both stores must carry the coarsened layout. Without
-    # this, two identically-malformed stores (both missing `embeddings`, say)
-    # would vacuously "pass" on whatever variables remain in common.
+    # Format contract: without it, two identically-malformed stores (both missing
+    # `embeddings`, say) would vacuously "pass" on whatever variables remain in common.
     missing = [v for v in REQUIRED_VARS if v not in ref_vars]
     if missing:
         print(f"\nVERDICT: INVALID coarsened store(s) — required variable(s) absent from both: {missing}")
@@ -405,9 +382,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    # Pin the required variables to the format's expected dtypes in BOTH stores
-    # (compare_var_structure only checks the two AGREE — two identically-wrong
-    # stores would agree and pass).
+    # Pin dtypes in BOTH stores; compare_var_structure only checks the two AGREE, and two
+    # identically-wrong stores agree.
     dtype_problems = [
         f"{tag} '{v}' is {ds[v].dtype} (expected {EXPECTED_DTYPES[v]})"
         for v in REQUIRED_VARS
@@ -420,9 +396,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {p}")
         return 1
 
-    # ...and the dims layout (again in both stores): a wrong-but-agreeing axis
-    # order passes the dtype + agreement checks yet breaks the slab reader / the
-    # format's meaning. A leading `time` axis is allowed and ignored.
+    # Same for the dims layout: a wrong-but-agreeing axis order passes the dtype and
+    # agreement checks yet breaks the slab reader. A leading `time` axis is allowed.
     dim_problems = [
         f"{tag} '{v}' dims {tuple(ds[v].dims)} (expected {EXPECTED_DIMS[v]}, optionally led by time)"
         for v in REQUIRED_VARS

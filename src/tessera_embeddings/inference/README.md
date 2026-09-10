@@ -28,7 +28,7 @@ loop, valid-pixel-aware striping, and a RAM-bounded cross-chunk starter prefetch
 phase-by-phase below, then synthesized into a decision tree with relative impact in
 [**How Our Performance Optimizations Fit Together**](#how-our-performance-optimizations-fit-together); full profiling and
 gotchas are in
-[`context_docs/design/inference_gpu_saturation_profile_2026_07.md`](../../../context_docs/design/inference_gpu_saturation_profile_2026_07.md).
+[`context_docs/inference/inference-on-gpus.md`](../../../context_docs/inference/inference-on-gpus.md).
 
 ---
 
@@ -321,7 +321,7 @@ the strip / cross-chunk-starter prefetch loads — is bounded by `_BACKGROUND_IO
 (600 s, matching the scheduler's `flush_writes()` RPC timeout). A wedged S3/zarr client
 with no socket timeout would otherwise hang `process_chunk` itself, where the scheduler's
 tail-flush recovery can never reach it (Ray serialises actor calls, and a 1–2-actor run
-never hits the ≥3-stall abort). A **timeout** always fails the chunk so the scheduler
+never hits the systemic-stall abort). A **timeout** always fails the chunk so the scheduler
 replaces the actor (reaping the wedged worker) and requeues — critically because the
 writer and prefetch pools are single, *persistent* workers, so a stuck task would poison
 every later write/prefetch. Only a background strip's pool is per-chunk and managed
@@ -708,7 +708,10 @@ assignment the worker cannot see into), so there is no separate compress or uplo
 record says so in-band via `fused_compress_put`. The record also carries the per-worker
 stats (band order / partition order), requested-vs-effective worker counts, the per-fork
 S3 request cap in force, and object/byte counts, so throughput rates derive from the
-record alone. Field-by-field meaning lives on `assembly._assembly_summary_line`; keep the
+record alone — noting that `bytes` is **logical, uncompressed write volume** (the blocks
+handed to zarr) and is neither object-store ingress, since a cleared position's block is
+built locally without a staged read, nor egress, since `fused_compress_put` writes go over
+the wire compressed. Field-by-field meaning lives on `assembly._assembly_summary_line`; keep the
 keys stable or update the parsers in the same change.
 
 A global fill also carries **`catch_ups`**, a tally of what
@@ -726,7 +729,16 @@ so a *single* same-zone commit early in a fill makes every remaining tick report
 too. Read a run of them as "one or more same-zone writers, from the first blocked tick
 onward", not as a count of collisions — and note that the fill is then back to today's
 behaviour and exposed to the stall that
-`context_docs/design/keeping-the-assembly-session-current-2026_08.md` describes.
+`context_docs/storage/writing-to-the-global-store.md` describes.
+
+**The fork phase is watched — the assembly's ONE backstop.** A daemon thread in
+`shard_writer.run_forked` watches the shard counters the workers update in shared memory; if they
+stop for `FORK_STALL_TIMEOUT_S` (thirty minutes) it dumps every thread's stack with `faulthandler`,
+terminates the pool, and the fill fails normally with its cell re-dispatched. Alert on `ASSEMBLY
+FORK PHASE STALLED`. It cannot unwind a coordinator parked inside icechunk; the dump still fires.
+Not a fix for 2026-09-04 — that cause is removed at the source — but the net under the next unknown
+one, and the only way to get a stack where `CAP_SYS_PTRACE` is denied
+(`context_docs/assembly/assembly-wedges-during-fork-phase-2026-09-04.md`).
 
 The **campaign land mask** is not a pixel ROI but a per-zone *coverage bitmap*
 (`tile_live_2048`) built from the partner's delivery registry by
@@ -765,10 +777,10 @@ The commit row is the manifest-splitting story: an Icechunk manifest maps
 chunks → objects, one per array by default, so unsplit commits are O(store).
 See the README's "Manifest splitting" diagram for the visual.
 
-**S3 concurrency.** The coordinator opens the repo with `max_concurrent_requests =
-TARGET_AGGREGATE_S3_CONCURRENCY // n_workers`; forks inherit it through pickling (no
-`save_config` round-trip needed), so fleet-wide PUT concurrency stays under S3's
-per-prefix ceiling regardless of worker count.
+**S3 concurrency.** None is imposed: the repo opens at icechunk's default (256) and the forks
+inherit it through pickling. A per-fork cap used to be divided out of a fleet PUT budget and floored
+at 1 on every campaign fill — the value at which icechunk deadlocks
+(`context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md`).
 
 **Manifest splitting.** `assemble` opens the repo under `manifest_split({"time": 1})`. By
 default icechunk keeps one manifest object per array, so every commit rewrites the entire
@@ -1028,8 +1040,11 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | Actor dies (OOM, instance loss) | `ActorPool.replace()` spawns a replacement; instance ID of the new node resolved lazily so the main loop isn't stalled |
 | >50% of actor slots dead | `ActorPool.replace()` escalates log severity to ERROR / CRITICAL |
 | Replacement actor still initialising | `dispatch_idle()` queues work to it anyway — Ray buffers the call until `__init__` completes |
-| Idle actor after work drains | `ActorPool.retire_idle()` kills actors idle past `idle_grace_sec` (default 120s), freeing GPU nodes; never drops below remaining work count |
-| Chunk stalls (no batch update for 5 min) | `ProgressTracker` detects per-chunk staleness; `_poll_tracker()` aborts if ≥3 chunks stall simultaneously |
+| Idle actor after work drains | `ActorPool.retire_idle()` kills actors idle past `idle_grace_sec` (default 120s), freeing GPU nodes; never drops below the remaining work count, nor below the caller's `floor` |
+| Idle fleet while a chained source waits | A source answering `[]` has nothing DELIVERABLE right now, so the fleet WINDS DOWN through the wait — all but one ready actor, the liveness floor — and re-grows through the batch machinery when work arrives, the session staying alive throughout. Deliverable, not merely present: a landed cell the single feeder cannot hand over while it is inside any `CellInputs` call does not hold the fleet. Only where the pool can grow back: the mid-run wind-down is skipped when actor batching is off (`actor_request_batch_size = 0`), since nothing would recreate the retired slots. See `context_docs/inference/the-fleet-and-the-work-source.md` |
+| Slots still waiting on placement when work runs out | `ActorPool.retire_initializing()` cancels them after the same idle grace, so the run stops asking AWS for machines it has no work for — never below one READY actor, which is the only thing that can run arriving work |
+| Several actors packed on one instance (`num_gpus < 1`) | Retirement kills the actor but terminates the INSTANCE only when no live slot is left on it, so retiring one actor cannot kill a busy sibling or the retained floor actor |
+| Chunk stalls (no batch update for 5 min) | `ProgressTracker` detects per-chunk staleness; `_poll_tracker()` aborts once `ActorPool.systemic_stall_threshold` chunks stall simultaneously — a tenth of `fleet_size`, floor 3 |
 | Flow cancelled in Prefect UI | `on_cancellation` hook runs `ray down` |
 
 ---

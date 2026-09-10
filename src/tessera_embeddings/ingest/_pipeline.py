@@ -5,23 +5,18 @@ background thread. Exists so a consumer that must run serially (e.g. a writer ho
 exclusive resource) can still hide the preparation cost of what comes next inside its own
 runtime.
 
-``depth`` is how many prepared results may be buffered ahead, and it exists because the
-consumer's unit is not always one item. Depth 1 is right when the consumer consumes items
-one at a time: preparation is a small fraction of consumption, so a deeper buffer would hold
-results in memory to hide nothing. When the consumer instead BATCHES k items before acting
-(the S2 date loop under ``batch_dates``), depth 1 hides only one item's preparation per
-batch — the look-ahead has to reach k for the next batch to be ready when the current one
-finishes.
+``depth`` is how many prepared results may be buffered ahead. Depth 1 suits a consumer that
+takes items one at a time; when it instead BATCHES k items before acting (the S2 date loop
+under ``batch_dates``), the look-ahead has to reach k for the next batch to be ready when the
+current one finishes.
 
 Preparation stays SINGLE-THREADED at any depth: one worker, items prepared in order. Depth
-buys buffering, never concurrency, so ``prepare`` still sees the same one-at-a-time
-world and the side-effect-free contract below is unchanged.
+buys buffering, never concurrency.
 
-An exception raised by ``prepare`` surfaces on the consuming thread at the point its result
-would have been used, so failure ordering matches the serial loop's — with depth > 1 that
-means later items may already have been prepared when an earlier one raises, which is
-harmless precisely because preparation has no side effects. ``prepare`` must not mutate
-shared state; the consumer owns all side effects.
+An exception raised by ``prepare`` surfaces on the consuming thread where its result would
+have been used, so failure ordering matches the serial loop's. ``prepare`` must not mutate
+shared state — the consumer owns all side effects — which is also what makes it harmless for
+later items to be prepared already when an earlier one raises.
 """
 
 from __future__ import annotations
@@ -45,18 +40,12 @@ def pipelined[T, P](items: Iterable[T], prepare: Callable[[T], P], *, depth: int
     # A sentinel rather than None: an item may legitimately BE None, and exhausting on
     # it would silently truncate the run.
     done = object()
-    # Exited WITHOUT joining on the abnormal path. A `with` block calls
-    # `shutdown(wait=True)`, so if the consumer raises or breaks mid-loop, generator
-    # finalisation blocks until the in-flight preparation returns — and preparation is a
-    # read against the very Dask cluster the failing flow is trying to tear down. A read
-    # that has stalled there holds the unwind for as long as it stalls, with the whole
-    # billed fleet still up, which is the opposite of what the failure path needs.
-    #
-    # `cancel_futures=True` drops the ones not yet started; the one already running cannot
-    # be interrupted (nothing in Python can interrupt it), so what changes is that cleanup
-    # no longer WAITS for it. The thread is still non-daemon and still joined at
-    # interpreter exit, so this abandons no work silently — it only stops the teardown
-    # queueing behind a read that may never finish.
+    # Exited WITHOUT joining (see the `shutdown(wait=False, cancel_futures=True)` below, which
+    # is why this is not a `with` block). Preparation is a read against the very Dask cluster a
+    # failing flow is tearing down; waiting for a stalled one holds the unwind with the whole
+    # billed fleet still up. Cancelling drops the not-yet-started futures; the running one cannot
+    # be interrupted, but the thread is non-daemon and still joined at interpreter exit, so no
+    # work is abandoned silently.
     pool = ThreadPoolExecutor(max_workers=1)
     try:
         # Exactly `depth` in flight, so depth=1 keeps the original one-ahead behaviour:

@@ -23,7 +23,7 @@ EPSG registry (via ``pyproj``), then snapped outward to the 2048-px shard pitch
 (:data:`SHARD_PX` x :data:`PIXEL_M` = 20 480 m). Because every 6° band has the
 same geometry in its own CRS, all northern zones share one extent template and
 all southern zones another — but :func:`derive_extent` and the pinning test
-(``tests/unit/test_zone_grid.py``) re-derive per zone from pyproj so an
+(``tests/unit/storage/test_zone_grid.py``) re-derive per zone from pyproj so an
 EPSG-database change can't silently move the grid.
 """
 
@@ -44,8 +44,6 @@ PIXEL_M: float = 10.0
 #: Shard pitch in metres — extents snap to this so the grid is shard-aligned.
 PITCH_M: float = SHARD_PX * PIXEL_M  # 20 480 m
 
-#: The campaign's annual timesteps (2025 filled first, then backwards).
-CAMPAIGN_YEARS: tuple[int, ...] = tuple(range(2017, 2026))
 
 #: Machine-readable marker of the boundary policy, for dataset attrs.
 ZONE_SCHEME: str = "utm_6deg_nominal"
@@ -188,8 +186,8 @@ def tile_range_bbox_wgs84(spec: ZoneSpec, r0: int, r1: int, c0: int, c1: int) ->
     lets callers treat a catalogue miss against the box as a miss against everything inside it.
 
     Lives here, with the northing convention and ``PITCH_M`` it depends on, because two callers
-    now need it — the ingest's catalogue preflight and the published registry's per-tile box —
-    and a second copy is how one of them silently stops describing the grid the other uses.
+    need it — the ingest's catalogue preflight and the published registry's per-tile box — and a
+    second copy is how one of them silently stops describing the grid the other uses.
     """
     tile_m = PITCH_M
     e_lo = spec.easting[0] + c0 * tile_m
@@ -197,11 +195,11 @@ def tile_range_bbox_wgs84(spec: ZoneSpec, r0: int, r1: int, c0: int, c1: int) ->
     n_hi = spec.northing[1] - r0 * tile_m  # top (max northing)
     n_lo = spec.northing[1] - r1 * tile_m  # bottom (min northing)
 
-    # 64 samples per edge, chosen by measurement rather than by feel. The docstring's
-    # containment guarantee is what callers rely on — `preflight_optical_source` treats a
-    # catalogue miss against this box as a miss against everything inside it — and a sampled
-    # perimeter only contains the true envelope if no extremum hides between two samples.
-    # Measured worst-case under-coverage across zone edges and latitudes:
+    # 64 samples per edge, chosen by measurement. Callers rely on the docstring's containment
+    # guarantee — `preflight_optical_source` treats a catalogue miss against this box as a miss
+    # against everything inside it — and a sampled perimeter only contains the true envelope if no
+    # extremum hides between two samples. Measured worst-case under-coverage across zone edges and
+    # latitudes:
     #
     #     16 -> 325 m     32 -> 63 m     64 -> 9.8 m     128 -> 0.61 m
     #
@@ -240,27 +238,12 @@ def tile_row_latitudes(spec: ZoneSpec, n_rows: int) -> np.ndarray:
 
     Deliberately arithmetic rather than a pyproj transform. A degree of latitude is
     ~111.32 km everywhere to within 0.3%, three orders of magnitude finer than the
-    20-degree bands this feeds, and it keeps the caller free of a projection
-    round-trip per tile row. Southern zones carry UTM's 10,000,000 m false northing,
-    so their northings are shifted first; both hemispheres' extents confirm the
-    convention (north tops out at 83.9 degrees, south bottoms at -79.9).
+    20-degree bands this feeds, and it spares the caller a projection round-trip per
+    tile row. Southern zones carry UTM's 10,000,000 m false northing, so their
+    northings are shifted first; both hemispheres' extents confirm the convention
+    (north tops out at 83.9 degrees, south bottoms at -79.9).
     """
     northing = spec.northing[1] - (np.arange(n_rows, dtype="float64") + 0.5) * PITCH_M
     if spec.hemisphere == "S":
         northing = northing - 10_000_000.0
     return northing / 111_320.0
-
-
-def year_timestamp(year: int) -> np.datetime64:
-    """The Q2 calendar-year convention, encoded once: ``year`` → ``YYYY-01-01`` ns."""
-    return np.datetime64(f"{year}-01-01", "ns")
-
-
-def year_of(value: np.datetime64 | np.ndarray) -> int:
-    """Inverse of :func:`year_timestamp`: a (scalar) timestamp's calendar year."""
-    return int(np.asarray(value).astype("datetime64[Y]").astype(int)) + 1970
-
-
-def calendar_year_times(years: tuple[int, ...] = CAMPAIGN_YEARS) -> np.ndarray:
-    """Return one ``datetime64[ns]`` per year at ``YYYY-01-01`` (Q2 convention)."""
-    return np.array([year_timestamp(y) for y in years])

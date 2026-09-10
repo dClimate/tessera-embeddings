@@ -6,21 +6,18 @@ subtracts it from its own COGs; ESA's originals carry it. Which of those served 
 property of **where that band's object lives**, so the question is asked of a single asset rather
 than of an item, a date, or a collection.
 
-**One atom.** :func:`source_decision` is the only place the question is answered. Its production
-caller is the load path's metadata parser, which stamps the answer onto each source as odc opens
-it; duplicate selection reaches the same evidence through :mod:`asset_locations` when it ranks a
-candidate copy. The answer used to be derived separately at item level in more than one place, and
-those derivations drifted: a spare that the correction path would refuse was offered to the
-fallback ladder, which recovers from a read failure and not from a refusal, so a single unreadable
-object aborted a whole ingest. Keeping the atom here — and keeping it free of any notion of *item*
-— is what makes that class of drift unrepresentable rather than merely tested for.
+**One atom.** :func:`source_decision` is the only place the question is answered, and it knows
+nothing of *items*. Its production caller is the load path's metadata parser, which stamps the
+answer onto each source as odc opens it; duplicate selection reaches the same evidence through
+:mod:`asset_locations` when it ranks a candidate copy. Two item-level derivations of this drifted
+once and offered the fallback ladder a spare the correction path then refused — the ladder recovers
+from a read failure but not from a refusal, so a single unreadable object aborted a whole ingest.
 
-Deliberately imports no odc. The GDAL environment has to be configured before ``odc.stac`` is
+Deliberately imports no odc: the GDAL environment must be configured before ``odc.stac`` is
 imported (see :mod:`tessera_embeddings.config.environment` and the import ordering in
-:mod:`tessera_embeddings.ingest.stac`), so the module holding the decision must not be the module
-that pulls odc in. Callers hand in a bucket and a baseline; resolving an asset key to a bucket is
-:mod:`tessera_embeddings.ingest.asset_locations`' job and resolving a band name to an asset is
-odc's.
+:mod:`tessera_embeddings.ingest.stac`). Callers hand in a bucket and a baseline; resolving an asset
+key to a bucket is :mod:`tessera_embeddings.ingest.asset_locations`' job and resolving a band name
+to an asset is odc's.
 """
 
 from __future__ import annotations
@@ -38,10 +35,9 @@ from tessera_embeddings.ingest.asset_locations import (
 class OffsetDecision(enum.Enum):
     """What is owed to one reflectance source.
 
-    Three states rather than a boolean, because "we cannot tell" needs a response that neither
-    answer gives. Correcting already-harmonised pixels and leaving raw ones alone are both wrong
-    by exactly the offset and both silent, so a source nobody can classify must not be handled as
-    though it had been classified.
+    Three states rather than a boolean: correcting already-harmonised pixels and leaving raw ones
+    alone are both wrong by exactly the offset and both silent, so a source nobody can classify
+    must not be handled as though it had been.
     """
 
     #: The offset is present and must be removed.
@@ -61,9 +57,8 @@ def source_decision(
     """What is owed to the source served from ``bucket`` by an item declaring ``baseline``.
 
     Asked per ASSET, which is what lets an item whose bands straddle two producers be corrected
-    band by band. Asked of the whole item instead, such a copy has no single correct answer and
-    refuses — and because the correction used to be decided per solar day, that refusal took every
-    other tile of the day with it.
+    band by band. Asked of the whole item, such a copy has no single correct answer and refuses —
+    and a refusal decided per solar day takes every other tile of that day with it.
 
     Args:
         bucket: the S3 bucket serving this source, from
@@ -86,10 +81,9 @@ def source_decision(
     Returns:
         The decision for this one source.
     """
-    # The collection's answer replaces the asset's rather than supplementing it. Where a provider
-    # serves its bands under native asset keys, the bucket is unclassifiable by construction, so
-    # consulting it would turn a collection the configuration fully describes into one that refuses
-    # every date.
+    # The collection's answer REPLACES the asset's rather than supplementing it: where a provider
+    # serves bands under native asset keys the bucket is unclassifiable by construction, so
+    # consulting it would make a fully-described collection refuse every date.
     if known_harmonisation is not None:
         producer: Harmonisation | None = known_harmonisation
     elif bucket in HARMONISED_ASSET_BUCKETS:
@@ -108,10 +102,9 @@ def source_decision(
     if producer is Harmonisation.HARMONISED:
         return OffsetDecision.EXEMPT
 
-    # Below the threshold no producer changes a pixel, so an unclassified bucket is harmless there.
-    # This gate is why an unrecognised mirror of PRE-04.00 data costs nothing: the correction is
-    # not owed either way, and refusing would lose real imagery for an ambiguity with no
-    # consequence.
+    # Below the threshold no producer changes a pixel, so an unclassified bucket is harmless: this
+    # gate is why an unrecognised mirror of PRE-04.00 data costs nothing, where refusing would lose
+    # real imagery over an ambiguity with no consequence.
     if baseline is not None and baseline < threshold:
         return OffsetDecision.EXEMPT
 
@@ -121,13 +114,13 @@ def source_decision(
         return OffsetDecision.UNDECIDABLE
 
     # Unharmonised, and the baseline is what says whether the offset was ever added. A missing or
-    # malformed value parses as nothing rather than as zero: reading it as zero exempts a date
-    # whose pixels may carry the offset, and correcting it takes the offset off pre-04.00 pixels
-    # that never had it. Both are wrong by the same amount in opposite directions, and both silent.
+    # malformed value parses as nothing rather than as zero: read as zero it exempts a date whose
+    # pixels may carry the offset; corrected anyway it strips the offset from pre-04.00 pixels that
+    # never had it. Both are wrong by the same amount in opposite directions, and both silent.
     if baseline is None:
         return OffsetDecision.UNDECIDABLE
 
     # Unharmonised and at or above the threshold: the offset is there and comes off. Nothing else
-    # can reach this line — a harmonised producer returned above, an unclassified one refused, and
-    # `SettledProducer` is what stops an answer naming no producer from arriving at all.
+    # reaches this line — a harmonised producer returned above, an unclassified one refused, and
+    # `SettledProducer` stops an answer naming no producer from arriving at all.
     return OffsetDecision.OWED

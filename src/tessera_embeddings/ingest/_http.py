@@ -52,20 +52,18 @@ def json_or_raise(resp: requests.Response, *, log_body: bool) -> Any:  # noqa: A
 def make_logging_retry(label: str, **kwargs: object) -> Retry:
     """Build a urllib3 Retry that logs a warning on every retry attempt.
 
-    Catalog/granule endpoints (CMR, STAC) intermittently time out or
-    return 5xx under load. urllib3 retries these silently inside the
-    ``HTTPAdapter``; without logging, a stalled query that is quietly
-    retrying looks indistinguishable from a hang. This wrapper surfaces
-    each attempt — including the final exhausted one — at WARNING.
+    Catalog/granule endpoints (CMR, STAC) intermittently time out or return 5xx under load, and
+    urllib3 retries these silently inside the ``HTTPAdapter`` — so without logging, a stalled
+    query that is quietly retrying is indistinguishable from a hang. This surfaces each attempt,
+    including the final exhausted one, at WARNING.
 
     Args:
         label: Short prefix identifying the endpoint (e.g. ``"CMR"``, ``"STAC"``).
         **kwargs: Passed through to :class:`urllib3.util.retry.Retry`.
 
     Returns:
-        A ``Retry`` instance whose ``increment`` logs before delegating.
-        ``label`` is captured by closure, so it survives the internal
-        ``Retry.new()`` copies urllib3 makes on each attempt.
+        A ``Retry`` whose ``increment`` logs before delegating. ``label`` is captured by closure,
+        so it survives the internal ``Retry.new()`` copies urllib3 makes on each attempt.
     """
 
     class _LoggingRetry(Retry):
@@ -97,22 +95,20 @@ def make_logging_retry(label: str, **kwargs: object) -> Retry:
 def spawn_abandonable[A, T](fn: Callable[[A], T], arg: A) -> Callable[..., T]:
     """Start ``fn(arg)`` on a DAEMON thread; return a waiter that may give up on it.
 
-    For catalogue calls that must be bounded by a deadline the caller owns. Two things about
-    ``ThreadPoolExecutor`` make it the wrong tool here, and both are silent:
+    For catalogue calls that must be bounded by a deadline the caller owns. ``ThreadPoolExecutor``
+    is the wrong tool, silently: ``shutdown(wait=False)`` abandons nothing, because its workers are
+    NON-DAEMON and joined by an ``atexit`` hook — a stalled HTTP read then holds the interpreter,
+    and on the Prefect path the whole ECS task, open for the rest of that call's timeout-and-retry
+    budget, long after the code that wanted the answer stopped waiting. ``cancel_futures=True``
+    only drops futures that have not STARTED.
 
-    ``shutdown(wait=False)`` returns without abandoning anything. The executor's workers are
-    NON-DAEMON and joined by an ``atexit`` hook, so a stalled HTTP read holds the interpreter — and on
-    the Prefect path the whole ECS task — open for the rest of that call's timeout-and-retry budget,
-    long after the code that wanted the answer stopped waiting. ``cancel_futures=True`` does not help
-    either: it only drops futures that have not STARTED.
-
-    A daemon thread does not hold the process open, so abandonment costs nothing beyond a socket the
-    OS reclaims. There is no cancel — an in-flight ``requests`` call is not interruptible from
+    A daemon thread does not hold the process open, so abandonment costs nothing beyond a socket
+    the OS reclaims. There is no cancel — an in-flight ``requests`` call is not interruptible from
     outside — so abandonment is the only mechanism available, and it is enough.
 
-    The waiter takes an optional ``timeout`` and raises :class:`TimeoutError` when it expires, leaving
-    the thread running. Exceptions from ``fn`` are re-raised in the CALLER's thread, where a
-    ``future.result()`` would have raised them.
+    The waiter takes an optional ``timeout`` and raises :class:`TimeoutError` when it expires,
+    leaving the thread running. Exceptions from ``fn`` are re-raised in the CALLER's thread, where
+    a ``future.result()`` would have raised them.
     """
     out: list[T] = []
     err: list[BaseException] = []

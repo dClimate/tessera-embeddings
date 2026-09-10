@@ -15,10 +15,9 @@ are no hardcoded AWS account IDs in source control.
 
 A "Ray provider" is duck-typed: a `ray_cluster` context manager that
 yields *something* (a head address, a YAML path, `None`, …) and tears
-the cluster down on exit. There is intentionally no abstract base
-class — providers vary too much across clouds for a useful interface.
-Adding a new cloud means writing a new sibling directory whose
-`ray_cluster` accepts whatever inputs that cloud needs.
+the cluster down on exit. Adding a new cloud means a new sibling
+directory whose `ray_cluster` takes whatever inputs that cloud needs.
+Why there is no base class: [`../README.md`](../README.md#why-no-abstraction).
 
 The AWS implementation owns five concerns:
 
@@ -120,19 +119,16 @@ expects the worker AMI to have:
   (`torch`, `ray`, `tessera_embeddings`)
 - `aws` CLI for the optional source-tarball pull
 
-The reference repo uses Packer to build this AMI in CI, then publishes
-the AMI ID to SSM so the cluster YAML resolves it at runtime. Any
-other AMI-baking tool works — what matters is that workers boot ready
-to run, with no `pip install` step at provisioning time.
+**Bake rather than install on boot:** at 100–500 workers, `pip install`
+of `torch` + `ray` and their transitives dominates provisioning at ~5 min
+per worker; baking moves that to one CI job and nodes boot ready in ~1
+minute. The reference repo builds the AMI with Packer in CI and publishes
+its ID to SSM, so the cluster YAML resolves it at runtime — any baking
+tool works.
 
-Why bake instead of `pip install` on every boot? At 100–500 workers,
-pip install of `torch` + `ray` + their transitives is the dominant
-cost (~5 min per worker). Baking moves it to a single CI job; nodes
-boot ready in ~1 minute.
-
-If you ship a different layout (different venv path, different
-package install location), edit the `head_start_ray_commands` /
-`worker_start_ray_commands` and the `setup_commands` accordingly.
+For a different layout (venv path, install location), edit
+`head_start_ray_commands` / `worker_start_ray_commands` and
+`setup_commands`.
 
 ---
 

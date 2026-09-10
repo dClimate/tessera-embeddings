@@ -40,12 +40,12 @@ def _slab_array_from_zarr(
     that whole layer reachable under the slice, so the shell each region item
     backfills drags the master's entire chunk layer and any cull/optimize over it
     is ``O(total store chunks)`` — the scaling that OOM'd the scheduler as the
-    master's time axis grew (independent of how many dates a batch writes).
+    master's time axis grew, independent of how many dates a batch writes.
 
     Instead we enumerate, in closed form, only the chunk blocks the ``slices``
-    touch and emit one read task per block. The resulting graph is
-    ``O(slab chunks)``, independent of store size, and sits on a fresh HLG with
-    no parent dependency — there is no whole-store layer left to cull.
+    touch and emit one read task per block: ``O(slab chunks)``, independent of
+    store size, on a fresh HLG with no parent dependency, so there is no
+    whole-store layer left to cull.
 
     ``band_single_chunk`` collapses the band axis (innermost, for a 4-D store)
     into one chunk. The reflectance region path is 3-D, so callers pass ``False``
@@ -116,10 +116,10 @@ def _assert_zarr_layout_matches_dims(zarr_arr: zarr.Array, var: xr.DataArray, na
     only line up if the array's physical axis order and per-axis chunk grid match
     the xarray view's dim order and chunking. They do for stores written through
     this package (xarray records ``_ARRAY_DIMENSIONS`` in dim order, ``open_zarr``
-    preserves it, and both views share one snapshot) — but nothing enforces it, so
-    a transposed write, a per-var dim permutation, or a chunk grid sourced from
-    config instead of the store would silently slice the wrong axes and corrupt the
-    backfill. Fail loudly here instead.
+    preserves it, both views share one snapshot) but nothing enforces it, so a
+    transposed write, a per-var dim permutation, or a chunk grid sourced from
+    config instead of the store would silently slice the wrong axes and corrupt
+    the backfill. Fail loudly here instead.
     """
     dims = tuple(str(d) for d in var.dims)
     if zarr_arr.ndim != len(dims):
@@ -204,17 +204,17 @@ def _pad_region_to_chunks(
     :func:`_slab_array_from_zarr`: one read task per overlapping chunk block, on a
     fresh graph with no whole-store parent layer. ``existing.isel(widened)`` would
     instead carry the master's *entire* time-chunk layer into every shell — a
-    graph sized ``O(master time * spatial)``, independent of how many dates the
-    batch writes — which is what OOM'd the scheduler as the master grew. A
+    graph sized ``O(master time * spatial)`` regardless of how many dates the
+    batch writes, which is what OOM'd the scheduler as the master grew. A
     positional ``setitem`` then overlays the incoming data on the grid-chunked
     shell.
 
-    Note this keeps every overlapped chunk — including interior chunks fully
-    covered by the region — dependent on the store read, so a large unaligned
-    write fetches the whole widened slab, not just its edge chunks. That extra IO
-    is bounded by the padding (at most one chunk per region face) and is
-    acceptable at current tile sizes; reading only the boundary chunks would need
-    an edge-concatenation rebuild and is deferred.
+    Note this keeps every overlapped chunk — interior chunks fully covered by the
+    region included — dependent on the store read, so a large unaligned write
+    fetches the whole widened slab, not just its edge chunks. That extra IO is
+    bounded by the padding (at most one chunk per region face) and acceptable at
+    current tile sizes; reading only the boundary chunks would need an
+    edge-concatenation rebuild and is deferred.
     """
     # Normalize region slices up front: resolve open bounds (slice(None)) to
     # concrete indices, reject non-unit steps, and reject empty slices, so the
@@ -228,12 +228,11 @@ def _pad_region_to_chunks(
             raise ValueError(f"Region slice for {dim!r} is empty: {sl!r}.")
         normalized[dim] = slice(start, stop)
 
-    # Assert every written variable covers exactly the region before any write.
-    # Done for both the aligned and padded paths: on the aligned path
-    # ``to_icechunk`` would otherwise reject (or, for a missing axis, broadcast)
-    # a wrongly shaped array deep inside its writer with a cryptic error; here we
-    # fail early with a clear message. Returns data matched to the store's dim
-    # order (a transposed input would otherwise overlay onto the wrong axes).
+    # Assert every written variable covers exactly the region, on both the aligned
+    # and padded paths: on the aligned path `to_icechunk` would otherwise reject
+    # (or, for a missing axis, broadcast) a wrongly shaped array deep inside its
+    # writer with a cryptic error. Returns data matched to the store's dim order,
+    # since a transposed input would otherwise overlay onto the wrong axes.
     matched = _match_region_shapes(existing, data, normalized, region)
 
     chunk_sizes = _store_chunk_sizes(existing, tuple(normalized))
@@ -259,22 +258,14 @@ def _pad_region_to_chunks(
         # group[name] is a data-var array; zarr v3 stubs widen __getitem__ to
         # Array | Group, so narrow it for the slab builder.
         zarr_arr = cast("zarr.Array", group[name])
-        # The shell is built by indexing the raw zarr array POSITIONALLY by axis,
-        # but slab_slices/widened/chunk grid are all keyed by xarray's named dims.
-        # That crossing is only safe if the named-dim order and per-axis chunk grid
-        # match the raw array's physical layout. They do today (xarray writes
-        # _ARRAY_DIMENSIONS in dim order and open_zarr preserves it; both views come
-        # from the same snapshot), but it's an unasserted invariant — a transposed
-        # write, mixed per-var dim orders, or sourcing chunk sizes from config would
-        # silently slice the wrong axes / mis-align the backfill. Assert it so that
-        # failure mode is loud, not silent.
+        # The shell indexes the raw zarr array POSITIONALLY while slab_slices, widened
+        # and the chunk grid are keyed by xarray's named dims; that crossing is only
+        # safe if the two layouts agree, and nothing enforces it (see the assertion's
+        # own docstring for what goes wrong silently).
         _assert_zarr_layout_matches_dims(zarr_arr, existing[name], name)
         # Per-axis slices for the widened region in store dim order; a dim absent
         # from the region spans its full axis.
         slab_slices = tuple(widened[d] if d in widened else slice(None) for d in dims)
-        # Shell read straight from zarr: one task per overlapping chunk block on a
-        # fresh graph, sized by the widened slab — NOT existing.isel(widened),
-        # which would carry the master's whole time-chunk layer into every item.
         shell = _slab_array_from_zarr(
             zarr_arr, slab_slices, f"shell-{name}-{tokenize(zarr_arr, slab_slices)}", band_single_chunk=False
         )
@@ -287,12 +278,11 @@ def _pad_region_to_chunks(
         shell[idx] = incoming.data  # positional overlay; incoming wins
         padded_vars[name] = (dims, shell)
 
-    # Coords come from the lazy store view (authoritative). They're 1-D and dropped
-    # before the region write anyway, but carrying them keeps the dataset
-    # well-formed. Slice only the coordinate variables: ``existing.isel(widened)``
-    # would index every data var too — building (and immediately discarding) a
-    # per-region dask slice of the master's whole chunk layer for each one. Slicing
-    # the coords-only dataset never touches the heavy data-var graph.
+    # Coords come from the lazy store view (authoritative). They are 1-D and dropped
+    # before the region write anyway, but carrying them keeps the dataset well-formed.
+    # Slice only the coordinate variables: `existing.isel(widened)` would index every
+    # data var too, building and immediately discarding a per-region dask slice of the
+    # master's whole chunk layer for each one.
     coords = existing.coords.to_dataset().isel(widened).coords
     padded = xr.Dataset(padded_vars, coords=coords)
     return padded, widened

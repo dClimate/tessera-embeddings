@@ -12,9 +12,9 @@ authors = [
 keywords = ["satellite", "remote-sensing", "embeddings", "tessera", "sentinel"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    # Versions must match the CI matrix in .github/workflows/unit.yml.
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
@@ -53,10 +53,10 @@ dependencies = [
     # class, and `rasterio._base.__file__` as the extension to `dlsym` GDAL out of. The wording
     # is load-bearing rather than cosmetic — the classifier corroborates that a line came from
     # the source READER by its `CPLE_` prefix, so a renamed map entry silences the sensor rather
-    # than breaking it. `tests/unit/test_loader_failure_attribution.py` drives a real `CPLError`
+    # than breaking it. `tests/unit/ingest/test_loader_failure_attribution.py` drives a real `CPLError`
     # through the real map and asserts the whole line, so drift fails CI; the bound is what keeps
     # a fresh resolution from walking into it unasked. See
-    # context_docs/design/ingest_read_failure_causes_2026_08.md.
+    # context_docs/ingest/source-read-failures.md.
     "rasterio>=1.5.0,<1.6",
     "rioxarray",
     "pystac",
