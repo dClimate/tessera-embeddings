@@ -12,6 +12,7 @@ import datetime
 import itertools
 import json
 import logging
+import multiprocessing
 from importlib.metadata import version as _dist_version
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,66 +39,23 @@ from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
     OBS_COUNT_VARS,
     STAGED_READ_CONFIG_KWARGS,
-    TARGET_AGGREGATE_S3_CONCURRENCY,
     AllChunksSkippedError,
     IncompleteStageError,
     SpatialCoords,
     ZarrWriter,
+    _fill_band_worker,
     _layout_matching_store,
     _partition_bands,
-    _s3_budget_split,
     _staged_storage_options,
     _write_granularity,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.quantization import quantize_embeddings
+from tessera_embeddings.storage import shard_writer
 from tessera_embeddings.storage.conventions import ENCODER_VERSION
 from tessera_embeddings.storage.global_store import create_global_repo, create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.time_axis import TIME_ENCODING
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store, plain_zarr_storage_options
-
-
-@pytest.mark.parametrize(
-    ("s3_concurrency", "n_workers"),
-    [(100, 8), (5, 8), (3, 8), (1, 8), (None, 8), (50, 4), (100, 200), (5, 16)],
-)
-def test_s3_budget_split_keeps_every_requested_worker(s3_concurrency, n_workers):
-    """REPLACES ``test_s3_budget_split_never_exceeds_target``, which asserted
-    ``workers * cap <= budget`` and so pinned the clamp that cost the campaign
-    two thirds of its assembly width.
-
-    The per-fork cap floors at 1, so that product CANNOT be held below the budget
-    once the requested worker count exceeds it — the only way to satisfy it is to
-    drop forks, which is what used to happen on every assembly. The invariant is
-    now the weaker, honest one: the fleet ceiling holds where it can, and where it
-    cannot, the overshoot is exactly the requested worker count.
-    """
-    budget = s3_concurrency if s3_concurrency is not None else TARGET_AGGREGATE_S3_CONCURRENCY
-    workers, cap = _s3_budget_split(s3_concurrency, n_workers)
-    assert workers >= 1 and cap >= 1
-    assert workers == n_workers, "the S3 budget must never shrink the fork pool"
-    assert workers * cap <= max(budget, n_workers)
-
-
-def test_the_campaigns_own_parameters_no_longer_shrink_the_pool():
-    """The exact arithmetic that bound in production: TARGET_AGGREGATE_S3_CONCURRENCY
-    (100) // (2 * n_clusters) at ten clusters is 5, against AssemblyConfig's 16 workers.
-
-    Pinned with the campaign's real numbers rather than a synthetic pair, because
-    the clamp was invisible precisely where it bound — the requested count stayed
-    16 everywhere it was configured, and only the emitted `workers_used` disagreed.
-    The measured cost is in `context_docs/storage/writing-to-the-global-store.md`.
-    """
-    assert _s3_budget_split(5, 16) == (16, 1)
-
-
-def test_a_budget_above_the_worker_count_still_divides():
-    """The half that was never broken: when the budget genuinely exceeds the pool,
-    each fork gets its share and the fleet ceiling holds exactly.
-    """
-    workers, cap = _s3_budget_split(100, 8)
-    assert (workers, cap) == (8, 12)
-    assert workers * cap <= 100
 
 
 def _dummy_scales(h: int, w: int) -> np.ndarray:
@@ -716,7 +674,6 @@ class TestAssembly:
         assert rec["run"] == "run1"
         assert rec["tiles_staged"] == 2 and rec["tiles_cleared"] == 0
         assert rec["workers_requested"] == 1 and rec["workers_used"] == 1
-        assert rec["per_worker_s3_cap"] == TARGET_AGGREGATE_S3_CONCURRENCY
         assert rec["tiles"] == 2
         assert rec["writes"] == 4  # 2 tiles x (embeddings + scales)
         # Uncompressed bytes handed to zarr: 5x5 px per tile, int8 emb + f32 scales.
@@ -2260,11 +2217,9 @@ class TestAssembleGlobal:
     def test_emits_one_assembly_summary_record(self, tmp_path, caplog):
         """The record states what actually ran, not what was asked for.
 
-        Requested workers, effective forks, and the per-fork S3 cap can all
-        differ (the budget split and the work partition each cap the count), and
-        the totals are sums over workers — the figures that decide whether a
-        slow assembly is blocked on staged reads, on compression, or on the
-        object store.
+        Requested workers and effective forks can differ (the work partition caps the
+        count), and the totals are sums over workers — the figures that decide whether a
+        slow assembly is blocked on staged reads, on compression, or on the object store.
         """
         dim = 8
         ny = nx = 2 * self.TILE
@@ -2280,7 +2235,6 @@ class TestAssembleGlobal:
                 year=2025,
                 run_id="runT",
                 n_workers=4,
-                s3_concurrency=12,
                 staged_labels=["chunk_0_0", "chunk_0_1"],
                 skipped_labels=["chunk_1_0"],
             )
@@ -2291,7 +2245,6 @@ class TestAssembleGlobal:
         # cleared), so only 3 forks actually ran.
         assert rec["workers_requested"] == 4
         assert rec["workers_used"] == 3 == len(rec["workers"])
-        assert rec["per_worker_s3_cap"] == 3  # budget 12 split across the 4 requested workers
         # Totals are SUMS across workers: 3 tile loads (cleared included — its
         # fill block is written like any other), 2 vars each.
         assert rec["tiles"] == 3
@@ -2302,14 +2255,13 @@ class TestAssembleGlobal:
         for key in ("read_s", "write_s", "fill_wall_s", "merge_s", "commit_s", "attrs_commit_s", "total_s"):
             assert rec[key] >= 0
 
-    def test_a_budget_below_the_worker_count_no_longer_drops_forks(self, tmp_path, caplog):
-        """The campaign's real shape, through the real call path: a per-fill S3 budget
-        well BELOW the requested worker count.
+    def test_every_requested_worker_forks(self, tmp_path, caplog):
+        """Nothing between the requested worker count and the forks that run but the work
+        partition.
 
-        This is the end-to-end companion to the ``_s3_budget_split`` unit tests. The
-        clamp used to run ``min(n_workers, budget)`` forks — 2 of 4 here, and 5 of 16
-        in production — and the only place it showed was this record's ``workers_used``.
-        The budget now sets the per-fork request cap alone.
+        An S3-request budget used to sit here and clamp the pool to ``min(n_workers,
+        budget)`` — 2 of 4 here, 5 of 16 in production — and the only place it showed was
+        this record's ``workers_used``. Both the clamp and the budget are gone.
         """
         dim = 8
         ny = nx = 2 * self.TILE
@@ -2328,15 +2280,11 @@ class TestAssembleGlobal:
                 year=2025,
                 run_id="runB",
                 n_workers=4,
-                s3_concurrency=2,
                 staged_labels=labels,
             )
         (rec,) = _assembly_summary_records(caplog)
         assert rec["workers_requested"] == 4
-        assert rec["workers_used"] == 4 == len(rec["workers"]), "the S3 budget must not drop forks"
-        # Floors at 1, so this fill's aggregate concurrency is its worker count. That
-        # is the ceiling this change gives up, deliberately — see _s3_budget_split.
-        assert rec["per_worker_s3_cap"] == 1
+        assert rec["workers_used"] == 4 == len(rec["workers"]), "a requested fork went missing"
 
     def _year_record(self, store_path):
         """The landed year's provenance entry (2025 is index 1 on the seeded axis)."""
@@ -2878,3 +2826,48 @@ def test_radar_coverage_counts_fully_free_tiles_from_a_generator():
     assert from_list is not None and from_generator is not None
     assert from_list["tiles_fully_s1_free"] == 2, "two of the three tiles are entirely radar-free"
     assert from_generator == from_list, "a one-shot iterable must give the same answer as a list"
+
+
+class TestTheFillBandWorkerReportsProgress:
+    """`run_forked`'s contract: a worker MUST advance the shared shard counters, since the stall
+    watchdog reads only those. `_fill_band_worker` reported nothing, which made every standalone
+    `assemble` longer than FORK_STALL_TIMEOUT_S kill its own healthy workers.
+    """
+
+    @staticmethod
+    def _fork_over_a_tiny_store(tmp_path):
+        """A fork of a single-ROI-shaped store: `embeddings` and `scales` at the ROOT."""
+        repo, _ = open_or_create_repo(str(tmp_path / "out.zarr"))
+        session = repo.writable_session("main")
+        root = zarr.open_group(session.store, mode="a")
+        root.create_array("embeddings", shape=(1, 4, 4, 2), chunks=(1, 2, 2, 2), dtype="int8", fill_value=0)
+        root.create_array("scales", shape=(1, 4, 4), chunks=(1, 2, 2), dtype="float32", fill_value=0.0)
+        session.commit("schema")
+        return repo.writable_session("main").fork()
+
+    def test_the_denominator_comes_first_then_one_report_per_tile(self, tmp_path):
+        """Denominator first because the coordinator withholds its figure until every worker has
+        reported one; then per tile, so the counter moves while the worker is still working.
+        """
+        slots = multiprocessing.get_context("spawn").Array("l", 4, lock=False)
+        shard_writer._init_fork_worker(slots)
+        seen: list[tuple] = []
+        real = shard_writer.report_shard_progress
+        try:
+            _assembly_mod.report_shard_progress = lambda *a: (seen.append(a), real(*a))[1]
+            _fill_band_worker(
+                {
+                    "fork": self._fork_over_a_tiny_store(tmp_path),
+                    "time_index": 0,
+                    "band": (0, 4),
+                    "variables": ["embeddings", "scales"],
+                    "clear": [ChunkSpec(0, 0, 0, 2, 0, 4), ChunkSpec(1, 0, 2, 4, 0, 4)],
+                    "tiles": [],
+                    "worker_index": 1,
+                }
+            )
+        finally:
+            _assembly_mod.report_shard_progress = real
+            shard_writer._PROGRESS_SLOTS = None
+        assert seen == [(1, 0, 2), (1, 1, 2), (1, 2, 2)], f"wrong report sequence: {seen}"
+        assert list(slots) == [0, 0, 2, 2], "reported under the wrong worker index, or not at all"

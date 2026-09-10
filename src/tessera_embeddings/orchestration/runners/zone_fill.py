@@ -332,7 +332,6 @@ def fill_zone_year(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     run_id: str | None = None,
     n_assembly_workers: int | None = None,
-    s3_concurrency: int | None = None,
     cleanup_staging: bool = True,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
@@ -367,8 +366,6 @@ def fill_zone_year(
             resume it (staged tiles are skipped, the year index overwritten idempotently).
         n_assembly_workers: Assembly worker-process count; defaults to ``AssemblyConfig``
             sizing from the live-tile count.
-        s3_concurrency: This fill's slice of the fleet S3-PUT budget, forwarded to
-            ``assemble_global``; ``None`` uses the full aggregate target (a lone fill).
         cleanup_staging: Delete staged tiles after a successful fill.
         get_credentials: Optional icechunk credential callback (actors + store).
         s3_region: Optional S3 region override for the global store.
@@ -412,7 +409,6 @@ def fill_zone_year(
         optical_min_obs=config.optical_min_obs,
         log=log,
         n_assembly_workers=n_assembly_workers,
-        s3_concurrency=s3_concurrency,
         cleanup_staging=cleanup_staging,
         get_credentials=get_credentials,
         s3_region=s3_region,
@@ -893,7 +889,6 @@ def assemble_zone_year(
     optical_min_obs: int | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     n_assembly_workers: int | None = None,
-    s3_concurrency: int | None = None,
     cleanup_staging: bool = True,
     # How to run the staging delete. None runs it INLINE, which on the trailing-assembly thread
     # makes the next cell's assembly wait out a multi-terabyte delete — measured at ~2 h per
@@ -976,7 +971,6 @@ def assemble_zone_year(
                 # account of which tiles were thin, unimaged or radar-free.
                 registry_root=registry_root,
                 optical_min_obs=optical_min_obs,
-                s3_concurrency=s3_concurrency,
                 empty=True,
                 # The STORE's credential: assemble_global uses it only to open the global store and
                 # to write the registry part beside it — both live in the store's own bucket.
@@ -1066,7 +1060,6 @@ def assemble_zone_year(
         n_workers=n_workers,
         staged_labels=staged_labels,
         skipped_labels=skipped_labels,
-        s3_concurrency=s3_concurrency,
         radar_coverage=radar_coverage,
         # The STORE's credential: assemble_global uses it only to open the global store and to
         # write the registry part beside it — both live in the store's own bucket.

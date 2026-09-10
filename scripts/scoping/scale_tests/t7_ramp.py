@@ -1,7 +1,7 @@
 """T7 — fresh-bucket PUT ramp (T7, optional).
 
 Deliberately provokes S3 ``503 SlowDown`` on a cold bucket to calibrate the
-campaign warm-up and confirm/adjust ``TARGET_AGGREGATE_S3_CONCURRENCY``. Raw
+campaign warm-up and locate the request rate at which a single prefix throttles. Raw
 boto3 PUTs of fixed-size objects at ramped concurrency; no icechunk involved.
 
 **S3 only** — a no-op on ``--backend local``. Run it LAST (or against a second

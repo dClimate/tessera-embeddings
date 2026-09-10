@@ -60,7 +60,6 @@ from prefect.states import StateType
 from tessera_embeddings.config.inference import checkpoint_filename, inference_code_identity
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
-from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
 from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.orchestration.prefect.flows._child_runs import (
     CANCELLATION_CONFIRM_S,
@@ -148,6 +147,13 @@ _QUIESCENT_TERMINAL_STATES = frozenset({StateType.FAILED, StateType.COMPLETED})
 #: and cannot make a lingering child stop. This delay is what lets the two mechanisms that do
 #: act — the teardown that waits for children, and the orphan sweep — finish.
 _SETTLE_DELAY_S = CANCELLATION_CONFIRM_S
+
+#: Assembly workers the CHAINED fill is asked for, overriding ``AssemblyConfig``'s default of 16.
+#: A fact about a host, not about assembly: ~48 GB peak needs the 32 vCPU / 244 GiB
+#: ``assembly_large`` family this deployment runs on, and every other caller of the default would
+#: be oversubscribed. Worth spending because assembly is the campaign's tail — one trailing thread
+#: per cluster. ``context_docs/storage/writing-to-the-global-store.md``.
+ASSEMBLY_WORKERS_ON_THE_LARGE_RUNNER = 32
 
 
 def _still_running(live: dict[asyncio.Task[Any], int | None]) -> bool:
@@ -1199,14 +1205,9 @@ async def run_global_campaign(
             # forwarding the override it rejects the same store after its ingest has been
             # paid for. The campaign-level flag has to reach the gate that fires.
             "allow_model_mismatch": allow_model_mismatch,
-            # Divide the fleet S3-PUT budget across concurrent fills so K shard-write phases
-            # don't burst K times the target PUTs (the ~800-req SlowDown). D6 gates
-            # committers; this bounds the ungated upload phase.
-            "s3_concurrency": max(1, TARGET_AGGREGATE_S3_CONCURRENCY // max_parallel_clusters),
-            # The same idea one layer down: a fleet-wide rate the concurrent fills share,
-            # here the account's RunInstances quota. Unlike the S3 budget there is no share
-            # to divide — each autoscaler runs the limiter client-side — so the campaign
-            # passes only whether to run it at all.
+            # A fleet-wide rate the concurrent fills share: the account's RunInstances quota.
+            # There is no share to divide — each autoscaler runs the limiter client-side — so the
+            # campaign passes only whether to run it at all.
             "launch_pacing": launch_pacing,
             "gpu_fallback_instance_types": gpu_fallback_instance_types,
             "gpu_fallback_vcpu_budget": gpu_fallback_vcpu_budget,
@@ -1436,7 +1437,6 @@ async def run_global_campaign(
                 # last iteration left behind if a call ever outlived its iteration.
                 def _chained_params(
                     cells: list[list[Any]],
-                    n_clusters: int,
                     cell_look_ahead: int,
                     snapshot: CampaignStatus = status,
                 ) -> dict[str, Any]:
@@ -1485,11 +1485,11 @@ async def run_global_campaign(
                         # the direct ingest/fill refs above are already branch-resolved.
                         "branch": branch,
                         # This cluster's OWN zone count, so its admission gates never limit
-                        # fleet fill (see the dispatch comment above). The staging+assembly
-                        # slice below keeps the fleet-wide S3-PUT rate at the aggregate
-                        # target.
+                        # fleet fill (see the dispatch comment above).
                         "look_ahead": cell_look_ahead,
-                        "s3_concurrency": max(1, TARGET_AGGREGATE_S3_CONCURRENCY // (2 * n_clusters)),
+                        # THE CHAINED FILL ONLY: `_fill_params` dispatches `fill-zone-year` on
+                        # the 64 GiB inference family, which must keep the library default.
+                        "n_assembly_workers": ASSEMBLY_WORKERS_ON_THE_LARGE_RUNNER,
                         # As in _fill_params: the account's RunInstances quota is the
                         # fleet-wide rate these clusters share, and each autoscaler enforces
                         # its own share client-side rather than being handed a divided count.
@@ -1536,7 +1536,6 @@ async def run_global_campaign(
                     zones: list[str],
                     outcome: Any,  # noqa: ANN401 — Prefect FlowRun or the exception that replaced it
                     years: tuple[int, ...] = tuple(batch_years),
-                    n_clusters: int = len(clusters),
                     cell_look_ahead: int = look_ahead,
                 ) -> tuple[dict[str, Any], list[str], list[int]] | None:
                     """A ready-to-dispatch replacement for a settled fill, or ``None`` to decline.
@@ -1634,13 +1633,11 @@ async def run_global_campaign(
                         missing = _missing(fresh)
                         if not missing:
                             return None
-                        # The cluster count is the ROUND'S: the replacement takes the vacated
-                        # slot, so its ingest share and S3 concurrency slice are the ones the
-                        # round sized. Inside the guard because its land-mask and SSM probes
-                        # must decline a refill, not end a campaign.
+                        # Inside the guard because the land-mask and SSM probes must decline a
+                        # refill, not end a campaign.
                         cells = [[z, y] for z, y in missing]
                         return (
-                            _chained_params(cells, n_clusters, cell_look_ahead, fresh),
+                            _chained_params(cells, cell_look_ahead, fresh),
                             sorted({str(z) for z, _y in missing}),
                             sorted({y for _z, y in missing}),
                         )
@@ -1669,7 +1666,7 @@ async def run_global_campaign(
                 # an ordinary FAILED state does not fire the child-cancel hook, so those runs
                 # would be orphaned with their fleets billing. And every task is created INSIDE
                 # the try, so no task can exist outside the cancellation path.
-                params_by_slot = [_chained_params(cells_for[id(cl)], len(clusters), look_ahead) for cl in clusters]
+                params_by_slot = [_chained_params(cells_for[id(cl)], look_ahead) for cl in clusters]
                 #: The round's fills, and any replacement dispatched into a vacated slot. This
                 #: is what "the round is still open" means and the only thing the liveness
                 #: gate consults — a planner that has decided nothing yet is not a reason to

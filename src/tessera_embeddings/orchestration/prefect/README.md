@@ -122,7 +122,11 @@ today:
    returned or raised has, by then, joined the trailing assembly thread that does its
    committing, cancelled its child ingests and waited for them to confirm terminal, and
    torn down its fleet — all inside `finally` blocks that complete before the state is
-   set. A **crash** carries none of that (the process that would run the `finally` is the
+   set. The one case where that thread CANNOT be joined — a trailing assembly wedged inside
+   icechunk, which `drain_trailing_assemblies` gives up on after `TRAILING_ASSEMBLY_CEILING_S`
+   (2026-09-04) — is deliberately never allowed to become `FAILED`: the flow tears down and
+   then ends its own process (`_end_process_after_wedged_drain`), so it surfaces as a crash
+   and its cells wait for the round like any other crash's. A **crash** carries none of that (the process that would run the `finally` is the
    process that died, and the verdict can be reached from missed heartbeats while the run
    is still writing), and a **cancellation** is a request rather than a fact. Both wait.
 2. **Enough time has passed for its descendants to have stopped.** Condition 1 covers the

@@ -556,7 +556,7 @@ def _manifest_splitting_config(split_sizes: dict[str, int]) -> icechunk.Manifest
     )
 
 
-def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk.RepositoryConfig:
+def _default_repo_config() -> icechunk.RepositoryConfig:
     """Build the RepositoryConfig overrides applied to every repo open.
 
     Chunk cache is left at icechunk's (small) default — see
@@ -566,10 +566,9 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     default). When active it bounds a commit's manifest rewrite to the shards it touched, the
     dominant region-write cost on large continental stores.
 
-    ``max_concurrent_requests`` caps per-repo HTTP concurrency (icechunk's default is 256).
-    Assembly at cornbelt scale fans out thousands of concurrent PUTs to one zarr prefix,
-    blowing past S3's ~3.5K/s per-prefix limit and triggering 503 SlowDown, so callers
-    fanning out across many workers should set it lower (e.g. 64).
+    **Request concurrency is icechunk's default (256) and is never overridden**, because at 1 —
+    what assembly's old per-fork budget produced — icechunk deadlocks ``commit`` and
+    ``rebase``/``diff``. ``context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md``.
 
     **Storage timeouts + retries** are always applied, because icechunk defaults to unbounded
     per-attempt timeouts and a single try, so a wedged socket (diagnosed in production: a
@@ -583,8 +582,6 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     config = icechunk.RepositoryConfig.default()
     if _manifest_split_sizes:
         config.manifest = icechunk.ManifestConfig(splitting=_manifest_splitting_config(_manifest_split_sizes))
-    if max_concurrent_requests is not None:
-        config.max_concurrent_requests = max_concurrent_requests
     # Mutate the existing StorageSettings in place (RepositoryConfig.default() may leave
     # storage=None) so any fields icechunk seeded survive.
     storage = config.storage or icechunk.StorageSettings()
@@ -611,7 +608,7 @@ _GLOBAL_PRELOAD_MAX_ARRAYS = 2400
 _GLOBAL_PRELOAD_MAX_REFS = 1_000_000
 
 
-def global_store_config(max_concurrent_requests: int | None = None) -> icechunk.RepositoryConfig:
+def global_store_config() -> icechunk.RepositoryConfig:
     """RepositoryConfig for the 120-group global store (ADR-008 D4/D5).
 
     Layers on :func:`_default_repo_config` (timeouts + retries): manifest split **time@1**,
@@ -619,7 +616,7 @@ def global_store_config(max_concurrent_requests: int | None = None) -> icechunk.
     tuning so coordinate manifests across all 120 groups are preloaded. Persist with
     ``repo.save_config()`` on create so re-opens and forked workers inherit it.
     """
-    config = _default_repo_config(max_concurrent_requests)
+    config = _default_repo_config()
     config.manifest = icechunk.ManifestConfig(
         splitting=_manifest_splitting_config({"time": 1}),
         preload=icechunk.ManifestPreloadConfig(
@@ -648,7 +645,6 @@ def is_missing_repo(exc: icechunk.IcechunkError) -> bool:
 
 def open_repo(
     store_path: str,
-    max_concurrent_requests: int | None = None,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
     scatter_initial_credentials: bool = False,
@@ -667,13 +663,12 @@ def open_repo(
             region=region,
             scatter_initial_credentials=scatter_initial_credentials,
         ),
-        config=_default_repo_config(max_concurrent_requests),
+        config=_default_repo_config(),
     )
 
 
 def _create_repo(
     store_path: str,
-    max_concurrent_requests: int | None = None,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
     scatter_initial_credentials: bool = False,
@@ -687,7 +682,7 @@ def _create_repo(
                 region=region,
                 scatter_initial_credentials=scatter_initial_credentials,
             ),
-            config=_default_repo_config(max_concurrent_requests),
+            config=_default_repo_config(),
         )
     except icechunk.IcechunkError as e:
         if "repositories can only be created in clean prefixes" in str(e):
@@ -706,7 +701,6 @@ def _create_repo(
 
 def open_or_create_repo(
     store_path: str,
-    max_concurrent_requests: int | None = None,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
     scatter_initial_credentials: bool = False,
@@ -715,7 +709,6 @@ def open_or_create_repo(
 
     Args:
         store_path: Local path or S3 URI.
-        max_concurrent_requests: Optional cap on concurrent S3 requests per repo.
         get_credentials: Optional credential callback (see :func:`_create_storage`).
         region: Optional S3 region override.
         scatter_initial_credentials: With a distributed writer, cache the initial credentials
@@ -737,7 +730,6 @@ def open_or_create_repo(
     try:
         return open_repo(
             store_path,
-            max_concurrent_requests,
             get_credentials=get_credentials,
             region=region,
             scatter_initial_credentials=scatter_initial_credentials,
@@ -753,7 +745,6 @@ def open_or_create_repo(
     # this function's own handlers and re-attributed.
     return _create_repo(
         store_path,
-        max_concurrent_requests,
         get_credentials=get_credentials,
         region=region,
         scatter_initial_credentials=scatter_initial_credentials,
@@ -1072,7 +1063,6 @@ def open_store(
 
 def open_store_as_zarr_group(
     store_path: str,
-    max_concurrent_requests: int | None = None,
     group: str | None = None,
     *,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
@@ -1085,17 +1075,13 @@ def open_store_as_zarr_group(
     ``.values`` call on the xarray path would build and execute a fresh dask graph per
     variable and hold scheduler state until the dataset handle dies.
 
-    ``max_concurrent_requests`` caps per-repo HTTP concurrency (icechunk default 256); pass
-    it when many processes read one S3 prefix at once — the region merge's worker forks all
-    reading one feature store — so the aggregate GET rate stays under S3's per-prefix
-    ceiling. ``group`` selects one Zarr group (the global store's per-zone layout); ``None``
+    ``group`` selects one Zarr group (the global store's per-zone layout); ``None``
     returns the root. ``get_credentials``/``region`` are forwarded so a store outside the
     default S3 region, or reachable only via an explicit credential callback, can be read
     with the same options as the writer used.
     """
     return open_store_group_and_tip(
         store_path,
-        max_concurrent_requests=max_concurrent_requests,
         group=group,
         get_credentials=get_credentials,
         region=region,
@@ -1104,7 +1090,6 @@ def open_store_as_zarr_group(
 
 def open_store_group_and_tip(
     store_path: str,
-    max_concurrent_requests: int | None = None,
     group: str | None = None,
     *,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
@@ -1124,9 +1109,7 @@ def open_store_group_and_tip(
     snapshot labelled with the OLD id — fresh data under a stale identity, precisely the
     confusion the snapshot is here to prevent.
     """
-    repo = open_repo(
-        store_path, max_concurrent_requests=max_concurrent_requests, get_credentials=get_credentials, region=region
-    )
+    repo = open_repo(store_path, get_credentials=get_credentials, region=region)
     tip = repo.lookup_branch(branch)
     session = repo.readonly_session(snapshot_id=tip)
     root = zarr.open_group(session.store, mode="r")

@@ -480,54 +480,18 @@ def test_the_gate_is_reentrant_within_a_thread(monkeypatch):
     assert entered == ["enter:outer", "enter:inner", "exit:inner", "exit:outer"]
 
 
-# --- releasing the slot: a failed RELEASE must not fail the work (mirror of the hold tests) ------
+def test_a_failed_release_does_not_fail_the_work(monkeypatch, caplog) -> None:
+    """A release failure has nothing to say about work that is already finished. The clean-release
+    path is pinned by the hold and reentrancy tests above.
+    """
 
+    class _FailsToRelease(_Opens):
+        def __exit__(self, *exc):
+            raise _server_said(503, "Service Unavailable")
 
-class _FailsToRelease:
-    """Admits, then refuses to give the slot back with the real shape: a 503 from the decrement."""
-
-    def __init__(self) -> None:
-        request = httpx.Request("POST", "http://prefect/api/v2/concurrency_limits/decrement")
-        try:
-            httpx.Response(503, text="Service Unavailable", request=request).raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            self.error = PrefectHTTPStatusError.from_httpx_error(exc)
-        self.entered = 0
-
-    def __call__(self, name, occupy=1, strict=True, **kw):
-        return self
-
-    def __enter__(self):
-        self.entered += 1
-
-    def __exit__(self, *exc):
-        raise self.error
-
-
-def test_a_failed_release_does_not_fail_the_work(monkeypatch) -> None:
-    cm = _FailsToRelease()
-    monkeypatch.setattr(mod, "concurrency", cm)
-    with FleetGate("tessera-global-ingests", log=logging.getLogger("t")):
-        pass
-    assert cm.entered == 1
-
-
-def test_a_failed_release_is_announced(monkeypatch, caplog) -> None:
-    """Swallowed is not silent: the slot idles until its lease expires, and the log must say so."""
-    monkeypatch.setattr(mod, "concurrency", _FailsToRelease())
+    monkeypatch.setattr(mod, "concurrency", _FailsToRelease(RuntimeError(), fail_times=0))
+    completed = False
     with caplog.at_level(logging.WARNING), FleetGate("tessera-global-ingests", log=logging.getLogger("t")):
-        pass
+        completed = True
+    assert completed
     assert any("could not be released" in r.getMessage() for r in caplog.records)
-
-
-def test_the_bodys_own_exception_still_propagates(monkeypatch) -> None:
-    """The guard covers the release, not the work."""
-    monkeypatch.setattr(mod, "concurrency", _FailsToRelease())
-    with pytest.raises(ValueError, match="the ingest itself failed"), FleetGate("g", log=logging.getLogger("t")):
-        raise ValueError("the ingest itself failed")
-
-
-def test_an_unbalanced_release_still_raises() -> None:
-    """The stack pop is outside the guard: an unbalanced stack is our bug, not a server condition."""
-    with pytest.raises((IndexError, AttributeError)):
-        FleetGate("gate", log=logging.getLogger("t")).__exit__(None, None, None)

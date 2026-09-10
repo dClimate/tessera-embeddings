@@ -59,7 +59,7 @@ class CatchUpAbortedTheWaitError(RuntimeError):
 
     Raised only to END THE WAIT; the real cause is the tick's own exception, which
     :func:`ticking` re-raises when its block exits. This one stops an assembly spending another
-    three hours and sixteen workers on a fill that can no longer commit.
+    three hours and thirty-two workers on a fill that can no longer commit.
     """
 
 
@@ -71,6 +71,9 @@ class CatchUpDidNotStopError(RuntimeError):
     session a hung rebase still holds either blocks on that lock — one stuck call becomes a stuck
     fill — or, if the catch-up later returns, moves the base AFTER the write was merged, which is
     the expensive replay this module exists to avoid.
+
+    Nothing recovers from it: it fails the fill, whose cell is unmarked and re-dispatched. Its
+    job is to make a hung catch-up a crash rather than an indefinite park.
     """
 
 
@@ -241,72 +244,6 @@ def catch_up_best_effort(
 CATCH_UP_INTERVAL_S = 5.0
 
 
-def rehome_after_a_wedged_catch_up(
-    repo: icechunk.Repository,
-    group: str,
-    *,
-    base: str,
-    branch: str = "main",
-    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
-) -> icechunk.Session:
-    """Open a fresh session for finished forks whose own session is no longer safe to touch.
-
-    **Why a fresh session rather than a stopped thread.** A wedged catch-up cannot be stopped: it
-    is blocked inside a pyo3 call into Rust where no Python mechanism reaches it — not a timeout,
-    not a signal, not ``PyThreadState_SetAsyncExc`` — and on 2026-08-31 the two that wedged never
-    returned. The session it holds can never be declared free, so the only move left is to stop
-    sharing state with it.
-
-    **Why the finished work survives that.** :func:`~...shard_writer.run_forked` raises from the
-    timer's exit, which runs after its body, so every worker's fork is already in hand and
-    undamaged. And a fork is not bound to the session that produced it: the normal path already
-    merges forks made at one base into a session that has since rebased to the tip, which eight
-    published cells did on 2026-08-31 across one to seven rebases. Verified against icechunk 2.1.1
-    on a real repository — a fork merged into a session opened later commits, its data lands, and
-    the commits it skipped keep both their chunks and their attrs.
-
-    **What this must check, and why it is not optional.** Abandoning the old session also abandons
-    the conflict detection its commit would have done over ``base..tip``. A fresh session's own
-    rebase only covers what lands after it opens, so this walks the skipped range itself and
-    refuses if anything in it touched ``group`` — the same rule, and reason, as
-    :func:`catch_up_to_branch`. The walk is a read-only diff, which stayed at 0.1-0.4 s throughout
-    every stall yet observed, so it is not on the path that wedges.
-
-    Args:
-        repo: The repository.
-        group: The group being written, whose collisions must still be detectable.
-        base: The abandoned session's base, captured BEFORE the fork phase — never read off
-            the poisoned session, which another thread is inside.
-        branch: Branch to open the fresh session on.
-        log: Where to say that this happened; it should never pass unremarked.
-
-    Returns:
-        A fresh writable session at the branch tip, safe to merge the finished forks into.
-
-    Raises:
-        CaughtUpPastAConflictError: A commit in the skipped range touched ``group``, so
-            re-homing would put a same-group collision beyond conflict detection. The cell
-            fails, which is the cheap outcome.
-    """
-    fresh = repo.writable_session(branch)
-    landed = fresh.snapshot_id
-    if base != landed and _diff_touches(repo.diff(from_snapshot_id=base, to_snapshot_id=landed), group):
-        raise CaughtUpPastAConflictError(
-            f"cannot re-home {group} onto a fresh session: a commit between the abandoned base "
-            f"{base} and the tip {landed} touched {group}, so the re-homed commit could not "
-            f"detect a collision with it"
-        )
-    (log or _log).warning(
-        "Re-homing %s onto a fresh session at %s: its catch-up wedged and cannot be stopped, so "
-        "the finished forks are merged onto a session no other thread holds. The abandoned "
-        "session was based at %s.",
-        group,
-        landed,
-        base,
-    )
-    return fresh
-
-
 @contextmanager
 def ticking(
     interval_s: float,
@@ -327,14 +264,11 @@ def ticking(
 
     ``abort`` is set the moment a tick fails, so a caller waiting on hours of work can stop early
     instead of finishing a fill already known to be uncommittable. Without it the failure surfaces
-    only when this block exits — for an assembly, up to three hours and sixteen workers' worth of
+    only when this block exits — for an assembly, up to three hours and thirty-two workers' worth of
     object-store writes later.
 
-    **Only a caller that can act on it will.** ``run_forked`` always passes one, but its
-    single-payload branch runs the worker inline and never looks at it. That branch is a one-shard
-    cell or ``n_workers=1``, a short write by construction, so the abort would arrive at a fill
-    about to end anyway; interrupting it would need a second cancellation mechanism that is not
-    worth carrying for that case.
+    ``run_forked`` always passes one, and since every payload count now goes through the worker
+    pool there is no branch that ignores it.
     """
     if tick is None:
         yield

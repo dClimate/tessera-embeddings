@@ -48,7 +48,7 @@ from prefect.deployments import run_deployment
 from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import Cancelling
 
-from tessera_embeddings.config.fault_injection import WITHHOLD_WORK, FaultInjection
+from tessera_embeddings.config.fault_injection import WITHHOLD_WORK, FaultInjection, hard_exit_after_flush
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
@@ -90,6 +90,7 @@ from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import (
 from tessera_embeddings.orchestration.runners.sequential_fill import (
     PreparedCell,
     SequentialCell,
+    TrailingAssemblyWedgedError,
     fill_zones_sequential,
 )
 from tessera_embeddings.orchestration.runners.zone_fill import (
@@ -566,6 +567,37 @@ class _DeploymentCellInputs:
 _INGEST_TAG_PREFIX = "chained-ingest"
 
 
+#: ``EX_TEMPFAIL``: the work is retryable — the abandoned cells are unmarked and re-dispatch.
+WEDGED_DRAIN_EXIT_STATUS = 75
+
+
+def _end_process_after_wedged_drain(
+    exc: TrailingAssemblyWedgedError, log: logging.Logger | logging.LoggerAdapter[logging.Logger]
+) -> None:
+    """End the process rather than report ``FAILED``, because a writer thread may still be alive.
+
+    The README's replacement-admission rule rests on "a fill that returned or raised has, by
+    then, joined the trailing assembly thread that does its committing". A drain that gave up has
+    not joined it, so ``FAILED`` would make that premise false and open the outcome the campaign
+    exists to prevent: two writers on one zone. Crashing is the honest state — the thread dies
+    with the process, and Prefect's CRASHED is what the driver already treats conservatively.
+
+    Called from the flow's ``finally`` AFTER the fleet is down and the ingests cancelled, so the
+    exit can never orphan either.
+    """
+    hard_exit_after_flush(
+        WEDGED_DRAIN_EXIT_STATUS,
+        log=log,
+        message=(
+            "Ending this process: %d trailing assembly/assemblies were abandoned behind a wedged one whose "
+            "thread cannot be stopped. Reporting FAILED would tell the campaign this fill has stopped "
+            "writing, which is not known to be true; exiting makes it true. The run surfaces as CRASHED "
+            "and its cells are re-dispatched next round from their staged tiles."
+        ),
+        args=(exc.abandoned,),
+    )
+
+
 def _ingest_child_tag(flow_run_id: object) -> str | None:
     """Deterministic tag for this run's child ingest deployments."""
     return child_run_tag(_INGEST_TAG_PREFIX, flow_run_id)
@@ -609,7 +641,6 @@ def fill_zones_sequential_flow(
     allow_s2_only: bool = False,
     allow_model_mismatch: bool = False,
     allow_ingest_code_mismatch: bool = False,
-    s3_concurrency: int | None = None,
     launch_pacing: bool = False,
     gpu_fallback_instance_types: list[str] | None = None,
     gpu_fallback_vcpu_budget: int | None = None,
@@ -683,14 +714,11 @@ def fill_zones_sequential_flow(
         allow_model_mismatch: Fill even when the seeded store advertises a different
             encoder/checkpoint than this build (default rejects).
         allow_ingest_code_mismatch: Resume a store built by different ingest code (off by default).
-        s3_concurrency: Each trailing assembly's slice of the fleet S3-PUT budget. ``None`` =
-            the aggregate target halved, leaving headroom for the live cell's concurrent
-            staging writes.
         launch_pacing: Pace this cluster's EC2 launch requests against the account's shared
-            RunInstances quota — the same shape as ``s3_concurrency``, a budget concurrent
-            clusters share, except this one is a request RATE whose enforcement lives in the
-            client rather than in a count we divide. Default ``False`` keeps today's launch
-            behaviour; the campaign turns it on when it runs more than one cluster.
+            RunInstances quota — a budget concurrent clusters share, except it is a request RATE
+            whose enforcement lives in the client rather than in a count we divide. Default
+            ``False`` keeps today's launch behaviour; the campaign turns it on when it runs more
+            than one cluster.
         gpu_fallback_instance_types: EC2 instance types this fill may fall back to when the
             production rung has no capacity (e.g. ``["g5.2xlarge"]``). Opens the card's rung AND
             installs the capacity-aware autoscaler scorer -- see
@@ -1141,14 +1169,6 @@ def fill_zones_sequential_flow(
             input_coverage=coverage,
         )
 
-    # One assembly at a time trails the live cell's staging writes, so split the fleet PUT
-    # budget between them rather than letting the pair burst ~2x the target (the parallel
-    # driver divides by max_parallel_zones for the same reason).
-    if s3_concurrency is None:
-        from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
-
-        s3_concurrency = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // 2)
-
     # on_actor_retire fires only from idle retirement, which the scheduler suppresses while the
     # zone stream is unexhausted — so this terminator is inert mid-stream and only drains the
     # fleet early during the true cluster tail. A dead actor's abandoned instance is reclaimed
@@ -1251,7 +1271,6 @@ def fill_zones_sequential_flow(
                 optical_min_obs=_store_optical_min_obs(),
                 input_coverage=prep.input_coverage,
                 log=log,
-                s3_concurrency=s3_concurrency,
                 cleanup_staging=cleanup_staging,
                 # OFF the assembly thread: measured at ~2 h per cell inline, during which the
                 # next cell's assembly could not start even with its tiles fully staged.
@@ -1279,6 +1298,7 @@ def fill_zones_sequential_flow(
     # above the `try` let any failure in between — a raising `start`, an unexpected error in the
     # wait — return without cancelling them, leaving children writing mosaic prefixes that a
     # prompt retry of this flow would then race.
+    wedged: TrailingAssemblyWedgedError | None = None
     try:
         if inputs is not None:
             # EVERY live cell, not a look-ahead window: the driver's `max_parallel` is what
@@ -1336,24 +1356,34 @@ def fill_zones_sequential_flow(
             # handed. `_session` closes over the name and is called below, so assigning here
             # reaches every session this cluster runs.
             publish_fleet_mix = publisher_for_resolved_yaml(resolved_yaml, gpu_fallback_vcpu_budget, log)
-            seq = fill_zones_sequential(
-                cells=live,
-                prepare=_prepare,
-                plan=_plan,
-                session=_session,
-                assemble=_assemble,
-                housekeeping=housekeeping,
-                session_s1_orbit=s1_orbit,
-                log=log,
-                inputs=inputs,
-                look_ahead=look_ahead,
-                max_retained_failures=max_retained_failures,
-                attempts_per_cell_in_cluster=attempts_per_cell_in_cluster,
-                fault=fault,
-                # Built here rather than in the runner: the runner is Prefect-free, so "is
-                # inference paused" reaches it as a plain callable.
-                paused=(pause_signal(inference_pause_gate, log=log) if inference_pause_gate else None),
-            )
+            try:
+                seq = fill_zones_sequential(
+                    cells=live,
+                    prepare=_prepare,
+                    plan=_plan,
+                    session=_session,
+                    assemble=_assemble,
+                    housekeeping=housekeeping,
+                    session_s1_orbit=s1_orbit,
+                    log=log,
+                    inputs=inputs,
+                    look_ahead=look_ahead,
+                    max_retained_failures=max_retained_failures,
+                    attempts_per_cell_in_cluster=attempts_per_cell_in_cluster,
+                    fault=fault,
+                    # Built here rather than in the runner: the runner is Prefect-free, so "is
+                    # inference paused" reaches it as a plain callable.
+                    paused=(pause_signal(inference_pause_gate, log=log) if inference_pause_gate else None),
+                )
+            except TrailingAssemblyWedgedError as exc:
+                # LATCHED AT THE POINT OF DETECTION, inside the Ray context. The crash-not-fail
+                # invariant must not depend on this exception surviving the unwinding: leaving the
+                # `with` runs `ray_cluster`'s teardown (`ray.shutdown`, `ray down`, tag
+                # termination), and an exception THERE replaces this one, after which the outer
+                # `finally` would see no wedge and report FAILED with the assembly thread alive.
+                # Every layer between detection and action is a place the signal can be dropped.
+                wedged = exc
+                raise
     finally:
         # Joined HERE because this `finally` is the only place covering every way the runner can
         # exit — the normal return, its partial-failure RuntimeError (a normal exit path, per
@@ -1365,11 +1395,24 @@ def fill_zones_sequential_flow(
         # retry. Nothing about the join needs ingest alive, so the urgent stop goes first.
         if inputs is not None:
             inputs.shutdown()
-        housekeeping.shutdown(wait=True)
+        if wedged is None:
+            housekeeping.shutdown(wait=True)
+        else:
+            # ON THE WEDGED PATH THERE IS NO JOIN. This join has THREE unbounded legs — the
+            # `s5cmd` subprocess, the `fsspec` recursive `rm` it falls back to, and the
+            # read-back that lists objects — so waiting here is waiting forever, and the exit
+            # below is the one thing that must happen. Abandoning an in-flight delete can leak
+            # a storage prefix: recoverable, and it costs storage. Failing to exit leaves a
+            # cluster the campaign driver may read as quiescent and dispatch a second writer
+            # onto, which is the outcome the exit exists to prevent. Dying wins.
+            housekeeping.shutdown(wait=False, cancel_futures=True)
         # The context manager has already torn the cluster down (or the hook will, on
         # cancellation) — clear the hook state even when the runner raises (its partial-failure
         # RuntimeError is a NORMAL exit path).
         deactivate()
+        if wedged is not None:
+            # LAST, after the fleet is down and the ingests are cancelled: this does not return.
+            _end_process_after_wedged_drain(wedged, log)
 
     log.info(
         "Year %d sequential fill: %d/%d live cells landed (plus %d retagged, %d empty)",

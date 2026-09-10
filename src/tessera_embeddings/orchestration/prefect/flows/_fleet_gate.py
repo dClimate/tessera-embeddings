@@ -207,13 +207,8 @@ class FleetGate(AbstractContextManager):
     ) -> None:
         """Release the slot; a failure to release never fails the work the slot guarded.
 
-        The work is finished by the time this runs. Raising here recorded six completed cells as
-        ingest failures on 2026-09-09 (a Prefect 503 on the decrement) and sent them to the
-        fleet-rebuilding retry pass. Swallowing is safe because a slot is leased: renewal stops on
-        exit and the server reclaims it one lease later (measured on dev at 1.22 lease periods), so
-        the cost is one idle slot for ~15 min on the 900 s ingest lease, not a cumulative leak. A
-        clean release is unchanged. The ``pop`` stays outside the guard: an unbalanced stack is our
-        bug, not a server condition.
+        The work is already done, and the slot is LEASED so the server reclaims it. The ``pop``
+        stays outside the guard: an unbalanced stack is our own bug, not a server condition.
         """
         cm = self._local.stack.pop()
         try:
@@ -221,8 +216,7 @@ class FleetGate(AbstractContextManager):
         except Exception as release_exc:
             if self._log is not None:
                 self._log.warning(
-                    "Gate %r could not be released (%s: %s); continuing — the slot is leased and "
-                    "the server reclaims it, and the guarded work is already done.",
+                    "Gate %r could not be released (%s: %s); continuing — the work is done and the slot is leased.",
                     self._name,
                     type(release_exc).__name__,
                     release_exc,
