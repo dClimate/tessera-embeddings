@@ -20,7 +20,7 @@ rather than buried.
 |---|---|
 | Ingest (Fargate) | $115,000 – $126,000 — **under review, see §4: measured velocity is 2.7–4.0× slower than the basis, which would treble this** |
 | **Inference (GPU, on-demand)** | **$472,000 – $713,000**, plan on **$573,000** — re-based 2026-08-07 on one token unit (§6b), re-measured the same day on a COMPLETED dense cell, then re-weighted onto campaign land (§6c). Was $452,000 – $573,000 / $527,000 |
-| Assembly | ~$1,300 — measured (§6c) |
+| Assembly | ~$1,300 — measured (§6c). **Superseded: not separable from the container fleet; inside §12's $187,120** |
 | S3 requests | ~$1,600 — almost all of it ingest (§7) |
 | Mosaic storage (transient) | ~$3,000 |
 | Ray cluster ramp | ~$1,200 — 10 boots, one per cluster. A year-serial campaign would pay one per cluster-year instead, ~$11,000 (§4) |
@@ -48,7 +48,7 @@ review **upward** by up to 3x (§4).
 **Costed in tokens, with both sides of the division measured in ONE unit.** The campaign is
 **2.36 × 10¹⁵ combined S2+S1 tokens** — 1.363 × 10¹³ pixels at a measured, land-weighted
 **173 tokens per pixel** — run at a measured **2.127 M combined tok/sec** per worker, which is
-**307,854 GPU-hours** (§6b, §6c). The pair this replaces — 1.98 × 10¹⁵ tokens at ≈1.9 M
+**307,854 GPU-hours** (§6b, §6c) — **measured 354,742, +15.2% (§12)**. The pair this replaces — 1.98 × 10¹⁵ tokens at ≈1.9 M
 tok/sec — divided an S2+S1 census by an **optical-only** rate; both terms were wrong by a
 similar factor in opposite directions, so the line itself moved little and the
 capacity-planning rate is **12,294 px/s** equivalent against the prior 13,103, a change of
@@ -410,6 +410,24 @@ than the aggregate, and the aggregate basis hides both:
 
 ## 5. Inference — the cost is fixed; the waste is not
 
+> **SUPERSEDED BY §12 FOR EVERY DURATION AND FLEET SIZE BELOW. The campaign has run; read §12
+> first.** This section is the pre-campaign plan, kept because its arithmetic turned out sound and
+> its inputs did not.
+>
+> **What ran:** 25 clusters of 100 actors, peaking at a 1,307-card daily average and averaging 961
+> cards over the run, consuming **354,742 graphics-card hours** — 15.2% more than the 307,854
+> modelled here — and taking **15.4 days** of publication against the ~5.1 days below.
+>
+> **The 3× duration gap is not an arithmetic error, and decomposing it is the useful part.** This
+> section's figure assumed **2,500 actors at 100% of single-card basis**. Feed it the measured work
+> and the measured per-card rate and it gives 5.91 days at 2,500 cards — close to what it says. The
+> campaign simply never ran 2,500 cards; it averaged 961. Duration is GPU-hours over average fleet
+> size, so a fleet 2.6× smaller and 15% more work than modelled is the whole of the 3×.
+>
+> **So the lesson is not to distrust this arithmetic but to plan on a fleet you will actually
+> hold.** Every table below reads as "if the fleet is this wide"; none of them predicts how wide it
+> will be, and that is the term that decided the schedule. §12 records what the fleet actually was.
+
 GPU-hours follow from pixels and throughput alone:
 
 ```
@@ -454,6 +472,11 @@ same rate either way. What the ingest configuration decides is whether the fleet
 > The spread is observation depth and it straddles the reference rather than sitting on it, so the
 > matched-fleet arithmetic below is right in form and needs a per-zone cost to be right in value.
 
+> **The 289.2 is a single average, and the note above this subsection records that per-chunk cost
+> varies 2.2× by zone — so every fleet size derived from it is right in form and approximate in
+> value. Measured, a published cell cost 358.3 graphics-card hours (§12), 24% more.** Sizing a
+> fleet to the zone mix rather than the average was never done and would need per-zone costs.
+
 A zone-year costs **289.2 GPU-hours** at the planning basis. The *matched* fleet — the size
 at which the fleet exactly consumes what ingest produces — is `supply × 289.2`. Running at
 the matched size is the wrong target for two reasons: it leaves no absorber when supply dips,
@@ -492,6 +515,10 @@ year and the cell count stops helping at ~45. Without the barrier the makespan i
 **Past ~52 cells the campaign is flat at ~5.1 days**, because the 2,500-actor fleet consumes at
 a fixed rate no matter how fast mosaics arrive: `307,854 GPU-hours ÷ 2,500 = 123 h`.
 
+> **SUPERSEDED (§12): the ~5.1 d in this table and the one above it assume 2,500 actors, and the
+> campaign averaged 961.** The measured work was 354,742 graphics-card hours and publication took
+> **15.4 days**. Divide the measured work by the fleet you will actually hold, not by the quota.
+
 > **Re-based on §6c (was ~4.8 d).** The rows above divided the OLD 283,200 GPU-hours by 2,500
 > actors. The land-weighted census raised the work to 307,854 GPU-hours — +8.7% — and the campaign
 > with it, from ~4.8 to ~5.1 days. Fleet SIZING is untouched, because that is set by ingest supply
@@ -503,6 +530,11 @@ schedule at all. This is the easiest wrong quota request to make from this docum
 Fargate when the binding resource is GPU.
 
 **To buy schedule, buy actors.** Cells shown are what keeps 85% provisioning:
+
+> **The `≤275 each` column rests on the assembly-concurrency ceiling withdrawn later in this
+> document, and the campaign did not use this shape.** It ran **25 clusters of 100**, so neither
+> the 275 cap nor the 250-per-cluster rows below were ever tested. Read the *actor totals* as the
+> planning basis they are; ignore the cluster split. §12 has what the fleet did.
 
 | actors | clusters at ≤275 each | **campaign** | vs 2,500 |
 |---|---|---|---|
@@ -824,7 +856,10 @@ run in a different zone.
 **Assembly, measured for the first time — to completion.** A 16 vCPU / 64 GiB Fargate task moves
 **4.97 TB of logical, uncompressed volume across 2.34 M objects** for a dense zone-year — staged
 tiles are stored **uncompressed**, at 570.4 MB each — at $0.93/hour plus about $1 of S3 requests. Scaling by tile
-count over 9 years of 112 zones gives **~$1,150**, superseding the ~$200 in §1. Utilisation was
+count over 9 years of 112 zones gives **~$1,150**, superseding the ~$200 in §1. **SUPERSEDED
+2026-09-10:** assembly is not separable in the billing records, because it runs on the same
+Fargate task family as the fill that owns it. It is inside §12's measured $187,120 container line,
+which is 1.47× the top of the modelled ingest-plus-assembly range. Utilisation was
 57–79% of CPU, ~1.0 GB/s of combined network and 52% of memory, so nothing was saturated.
 
 | | measured |
@@ -865,7 +900,7 @@ question is whether assembly finishes before the next cell's inference does:
 > 891 tiles resolved as skips are still written, as fill, over the whole live footprint. An
 > estimate built on the staged count is short by however many were skipped — 10% here.
 >
-> **The 1.10× margin cannot be read off the table below any more.** Both of its terms moved and
+> **The 1.10× margin cannot be read off the table above any more.** Both of its terms moved and
 > not by the same factor. Measured on the same cell: assembly 5.78 h against inference of 9.3 h at
 > ~245 actors, so the margin was ~1.6× — wider than documented, but arrived at from two numbers
 > that are each ~1.7-2.6× the modelled ones. Re-derive it from a matched pair before quoting it.
@@ -996,11 +1031,34 @@ will want when they plan for it.
 
 ## 8. Scenario summary
 
+> **THIS IS THE PLAN, NOT THE CAMPAIGN. It ran; §12 is the record.** Kept because the comparison
+> below is the most useful thing in this document for sizing the next one — and because every row
+> of it was quotable, which is exactly why it needs the outturn beside it.
+>
+> | | planned | **measured** |
+> |---|---|---|
+> | Fargate vCPU | 22,692 | peaked at an **18,166** daily average |
+> | GPU fleet | 2,500 — the quota | peaked at **1,307**, averaged **961** |
+> | clusters × actors | 10 × 250 | **25 × 100** |
+> | Inference | $573,000 | **$528,172** |
+> | Ingest | $121,000 | inside the **$187,120** container line |
+> | Assembly + S3 + mosaics | $5,900 | **$100,138** — 17× |
+> | Cluster ramp | ~$1,200 | **$1,471** |
+> | **Total** | **~$700,000** | **$816,901** — 17% over |
+> | **Campaign wall clock** | **~5.1 d** | **15.4 d** |
+> | Idle burn | $0 | **not zero** — see below |
+>
+> **"Idle burn $0" was the one row that was structurally wrong rather than numerically off.** The
+> 85%-provisioning policy makes idle burn zero *only while ingest keeps the queue full*, and the
+> campaign paid about **$9,650** for three abandoned clusters in a single cancellation (§12) before
+> any lull is counted. Idleness is not separable from the bill, but it is inside §12's 86.6%-of-basis
+> figure, which divides delivered work by every card that was billed.
+
 The campaign runs **all years in one batch**: 61 cells at 60 workers, 10 clusters of 250 actors.
 Ingest at its cost midpoint, inference at §6c's measured combined basis, fleet provisioned at 85% of
 matched so idle burn is zero (§5).
 
-| | **THE CAMPAIGN** |
+| | **THE CAMPAIGN (as planned)** |
 |---|---|
 | Fargate vCPU | 22,692 |
 | GPU fleet | 2,500 — the quota |
@@ -1070,7 +1128,13 @@ uncertainty list that carries its own retired entries is one nobody reads to the
    (`s1_asc_obs_count + s1_desc_obs_count == 0`), so the work is describing them, not finding
    them (§6).
 
-3. **Provision 2,500 GPU actors as 10 clusters of 250.** Sizing under what ingest can feed
+3. ~~**Provision 2,500 GPU actors as 10 clusters of 250.**~~ **NOT WHAT RAN, and the reasoning
+   below is withdrawn.** The campaign ran **25 clusters of 100** and never held more than a
+   1,307-card daily average. The ten-rather-than-eight conclusion came from the assembly-ceiling
+   figure withdrawn in §6c, so the cluster split had no supported basis either way. Kept for
+   provenance; §12 records the fleet that ran and what it delivered. The original text follows.
+
+   **Provision 2,500 GPU actors as 10 clusters of 250.** Sizing under what ingest can feed
    makes idle burn structurally zero and leaves headroom for an ingest cell to fail and restart
    without starving the fleet (§5). The campaign sits at 81% of supply, which the 2,500-actor
    quota chose rather than the policy — 85% would want 2,611. The split into ten clusters rather

@@ -142,6 +142,13 @@ are different questions, and a percentage that does not say which is not yet a f
   property of the campaign.
   ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
 
+- **"Per-chunk cost varies 7× by zone."** The 7× included a 0.029 reading that the very next
+  sentence rejected as a partial-resumption artefact — resumed tiles cost nothing and drag a leg's
+  average down. The uncontaminated spread is **2.2×**. Sizing a spread with a figure you have just
+  declared invalid overstates sustainable variation, and it weakened the fleet-sizing conclusion it
+  was meant to support.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §5)
+
 **A partial run's whole-cell summary is biased, not merely imprecise** — the chunks that
 have finished are not a random sample of the cell, because scheduling order correlates with
 geography. The profile document now refuses to carry figures from a run still in flight,
@@ -191,6 +198,14 @@ one stratification flipped the sign of the conclusion.
   non-linear. A second salvage attempt, "use the larger ratio as an upper bound", was withdrawn
   as well: nothing measured bounds a third pool size.
   ([`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md))
+
+- **The assembly-concurrency margin of 1.10×, and the 275-actor ceiling and ten-cluster split
+  derived from it.** A ratio of two modelled values on one cell, used to locate a crossover and
+  then to choose a fleet shape. Both terms were later re-measured at 1.7–2.6× their modelled
+  values — the same cell's assembly took **5.78 h** against the 3.28 h the ratio assumed — so the
+  crossover had no supported location. The campaign then ran **25 clusters of 100**, testing
+  neither the cap nor the split.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c, §10)
 
 **The cure:** a two-parameter model needs a third point before it is a model, and a curve
 needs enough points to show it is monotonic before one of them becomes a recommendation.
@@ -262,6 +277,19 @@ one most likely to recur, because it is invisible to whoever makes it.
   invalidates standing in the same file."*
 - The ingest record notes the same failure independently: *"it has been violated twice by
   leaving an old number in one section while correcting it in another."*
+
+- **The 1.10× withdrawal was struck in one paragraph and left running the document.** Review of
+  the correcting change found the withdrawn crossover still sizing clusters at "≤275 each" in §5's
+  active table and still choosing "10 clusters of 250" in §10's action list, and the invalidated
+  per-zone cost still multiplying every fleet size by a single 289.2 GPU-hour average. Three
+  reviewers raised it across two rounds before it was swept. **The strike-through is not the
+  withdrawal; the grep is.**
+- **A related one, found only by the campaign finishing: §5's durations assumed a fleet nobody had
+  committed to.** Every table read "if the fleet is 2,500 actors at full basis", and none said how
+  wide the fleet would actually be. It averaged 961. The arithmetic was sound — fed the measured
+  work and rate it reproduces its own answer — so the miss was an unstated input, not a wrong
+  calculation, which is the hardest kind to grep for.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §5, §12)
 
 **The cure is a grep, and it is the cheapest item in this file:** when a figure is
 withdrawn, search every document for the number and for the phrase, not just for the
