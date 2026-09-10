@@ -321,7 +321,7 @@ the strip / cross-chunk-starter prefetch loads — is bounded by `_BACKGROUND_IO
 (600 s, matching the scheduler's `flush_writes()` RPC timeout). A wedged S3/zarr client
 with no socket timeout would otherwise hang `process_chunk` itself, where the scheduler's
 tail-flush recovery can never reach it (Ray serialises actor calls, and a 1–2-actor run
-never hits the ≥3-stall abort). A **timeout** always fails the chunk so the scheduler
+never hits the systemic-stall abort). A **timeout** always fails the chunk so the scheduler
 replaces the actor (reaping the wedged worker) and requeues — critically because the
 writer and prefetch pools are single, *persistent* workers, so a stuck task would poison
 every later write/prefetch. Only a background strip's pool is per-chunk and managed
@@ -1037,8 +1037,11 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | Actor dies (OOM, instance loss) | `ActorPool.replace()` spawns a replacement; instance ID of the new node resolved lazily so the main loop isn't stalled |
 | >50% of actor slots dead | `ActorPool.replace()` escalates log severity to ERROR / CRITICAL |
 | Replacement actor still initialising | `dispatch_idle()` queues work to it anyway — Ray buffers the call until `__init__` completes |
-| Idle actor after work drains | `ActorPool.retire_idle()` kills actors idle past `idle_grace_sec` (default 120s), freeing GPU nodes; never drops below remaining work count |
-| Chunk stalls (no batch update for 5 min) | `ProgressTracker` detects per-chunk staleness; `_poll_tracker()` aborts if ≥3 chunks stall simultaneously |
+| Idle actor after work drains | `ActorPool.retire_idle()` kills actors idle past `idle_grace_sec` (default 120s), freeing GPU nodes; never drops below the remaining work count, nor below the caller's `floor` |
+| Idle fleet while a chained source waits | A source answering `[]` has nothing DELIVERABLE right now, so the fleet WINDS DOWN through the wait — all but one ready actor, the liveness floor — and re-grows through the batch machinery when work arrives, the session staying alive throughout. Deliverable, not merely present: a landed cell the single feeder cannot hand over while it is inside any `CellInputs` call does not hold the fleet. Only where the pool can grow back: the mid-run wind-down is skipped when actor batching is off (`actor_request_batch_size = 0`), since nothing would recreate the retired slots. See `context_docs/inference/the-fleet-and-the-work-source.md` |
+| Slots still waiting on placement when work runs out | `ActorPool.retire_initializing()` cancels them after the same idle grace, so the run stops asking AWS for machines it has no work for — never below one READY actor, which is the only thing that can run arriving work |
+| Several actors packed on one instance (`num_gpus < 1`) | Retirement kills the actor but terminates the INSTANCE only when no live slot is left on it, so retiring one actor cannot kill a busy sibling or the retained floor actor |
+| Chunk stalls (no batch update for 5 min) | `ProgressTracker` detects per-chunk staleness; `_poll_tracker()` aborts once `ActorPool.systemic_stall_threshold` chunks stall simultaneously — a tenth of `fleet_size`, floor 3 |
 | Flow cancelled in Prefect UI | `on_cancellation` hook runs `ray down` |
 
 ---

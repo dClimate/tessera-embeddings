@@ -54,6 +54,11 @@ class ZoneContext:
     run_id: str
     time_window: TimeWindow | None = None
     s1_orbit: str | None = None
+    #: Which attempt at this cell these items belong to. NOT part of the staging identity — the
+    #: ``run_id`` is, and it must stay stable so a retry resumes the tiles the failed attempt
+    #: staged. This exists only so the scheduler's retry budget can tell one attempt from the
+    #: next; see :attr:`WorkItem.retry_key`.
+    attempt: int = 1
 
 
 @dataclass(frozen=True)
@@ -73,6 +78,23 @@ class WorkItem:
     def uid(self) -> str:
         """Scheduler-unique key for this item (labels alone collide across zones)."""
         return chunk_uid(self.ctx.run_id, self.chunk.label)
+
+    @property
+    def retry_key(self) -> str:
+        """Key for the per-chunk RETRY BUDGET, qualified by the cell's attempt.
+
+        Deliberately not :attr:`uid`. A re-admitted cell reuses its ``run_id`` (staging resume
+        depends on that) and its chunk labels, so every uid is unchanged and the exhausted
+        counts from the failed attempt would still be there — the first transient failure of the
+        new attempt would be declared permanent at once, where a fresh session used to hand out
+        a fresh budget. The identity that matters for a budget is "this attempt of this chunk".
+
+        Separate from ``uid`` rather than replacing it, because ``uid`` is also the progress
+        tracker's key and the ACTOR builds that key itself from the run id it is passed; moving
+        the attempt into ``uid`` would make the actor's ``report`` and the scheduler's ``remove``
+        drift, which is the aliasing failure :func:`chunk_uid` exists to prevent.
+        """
+        return f"a{self.ctx.attempt}:{self.uid}"
 
 
 def _as_item(work: WorkItem | ChunkSpec, ctx: ZoneContext) -> WorkItem:
@@ -170,6 +192,7 @@ class ActorPool:
         on_retire: Callable[[str], None] | None = None,
         get_credentials: Callable[[], Any] | None = None,
         s3_region: str | None = None,
+        fleet_target: int | None = None,
     ) -> None:
         """Initialise the pool from already-ready actor handles.
 
@@ -189,6 +212,10 @@ class ActorPool:
                 replacements) so a non-default-region fill's reads — and the
                 retries after a chunk failure/OOM — open the mosaic in the right
                 region. See :class:`InferenceActor`.
+            fleet_target: Total actors the run intends to hold. It is what the
+                systemic-failure thresholds are judged against — see
+                :attr:`fleet_size`. ``None`` (a caller that supplies its whole
+                fleet up front) falls back to the slot count.
         """
         self.actors = actors
         self.actor_instance_ids = actor_instance_ids
@@ -198,6 +225,7 @@ class ActorPool:
         self._on_retire = on_retire
         self._get_credentials = get_credentials
         self._s3_region = s3_region
+        self._fleet_target = fleet_target
 
         self.actor_deaths: int = 0
 
@@ -221,6 +249,10 @@ class ActorPool:
         self._initializing: set[int] = set()
         self._retired: set[int] = set()
         self._idle_since: dict[int, float] = {}
+        # When each still-initializing slot became cancellable — its own clock, because an
+        # unplaced slot is never "idle" and so never enters `_idle_since`. See
+        # `retire_initializing`.
+        self._unplaced_since: dict[int, float] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -240,6 +272,29 @@ class ActorPool:
         """
         return len(self.actors) - len(self._retired)
 
+    @property
+    def ready_count(self) -> int:
+        """Non-retired slots that can actually be DISPATCHED to — live minus initializing.
+
+        The floor in :meth:`retire_idle` is on this rather than on ``live_count``, because an
+        initializing slot is skipped by dispatch and may never place: a floor satisfied by
+        unplaced slots retires the last usable actor and, if capacity never arrives, leaves a
+        session with a live source and nothing able to run its work.
+        """
+        return len(self.actors) - len(self._retired | self._initializing)
+
+    @property
+    def requested(self) -> int:
+        """Actors this run has asked for and still intends to use — the ONE definition.
+
+        Read by both the batch calculation and the fleet-demand publisher, so they cannot
+        diverge. Retired slots are excluded: they stay in ``actors`` forever (the indices are
+        the pool's identity, shared by ``pending``, ``reserved``, ``_initializing`` and
+        ``actor_instance_ids``, so the list cannot be compacted), and counting them both froze a
+        wound-down pool's requests and advertised GPUs the run no longer wanted.
+        """
+        return self.live_count
+
     def outstanding_work(self, queued: int) -> int:
         """In-flight + queued + reserved chunks — the true remaining-work count.
 
@@ -252,13 +307,47 @@ class ActorPool:
         return len(self.pending) + queued + len(self.reserved)
 
     @property
-    def max_actor_deaths(self) -> int:
-        """Death count that signals a systemic failure.
+    def fleet_size(self) -> int:
+        """The fleet SIZE the systemic-failure thresholds are judged against.
 
-        Tracks the CURRENT pool size so the threshold scales as later batches are added; a fixed
-        batch-1 count trips the alarm far too early on a fleet built up incrementally.
+        The run's TARGET where the caller gave one, because it is the only fleet quantity that
+        is stable over a session's lifetime. Neither count the pool itself holds is:
+
+        * ``len(self.actors)`` is CUMULATIVE. Retired slots stay in it forever (the indices are
+          the pool's identity), so a session that winds down through an ingest drought and
+          regrows counts every generation — a 40-actor fleet reads 79 after one drought and 118
+          after two, and a threshold derived from it desensitises without bound.
+        * ``live_count`` collapses to the wind-down floor, which would make the FIRST death
+          after a drought read as "the whole fleet has died".
+
+        Falls back to the slot count when no target was given: such a caller supplies its whole
+        fleet up front and never regrows, so the two agree.
         """
-        return len(self.actors)
+        return self._fleet_target or len(self.actors)
+
+    @property
+    def max_actor_deaths(self) -> int:
+        """Death count that signals a systemic failure — as many deaths as the fleet has slots.
+
+        Judged against :attr:`fleet_size`, so it scales with the fleet the run is building
+        towards and does not drift as a wound-down pool regrows. LOG-ONLY: it decides the level
+        :meth:`replace` reports a death at and nothing else. Compare
+        :attr:`systemic_stall_threshold`, which aborts.
+        """
+        return self.fleet_size
+
+    @property
+    def systemic_stall_threshold(self) -> int:
+        """Simultaneously-stalled chunks that mean the FLEET is wedged, not one chunk.
+
+        A tenth of :attr:`fleet_size`, floor three, so it scales with the EVENTUAL fleet and
+        not the batch the caller was handed — a threshold frozen at batch-1/10 aborts a large
+        run after a handful of stalls once later batches join. Beside :attr:`max_actor_deaths`
+        because they are the same judgement about the same fleet, and this is the half that
+        ABORTS: read off the cumulative slot list it climbed with every wind-down cycle, which
+        made the guard less sensitive the longer a session ran.
+        """
+        return max(3, self.fleet_size // 10)
 
     # ------------------------------------------------------------------
     # Instance-ID resolution
@@ -382,7 +471,7 @@ class ActorPool:
             s1_orbit=item.ctx.s1_orbit,
         )
         self.pending[ref] = (item, actor_idx)
-        self.chunk_attempts[item.uid] = self.chunk_attempts.get(item.uid, 0) + 1
+        self.chunk_attempts[item.retry_key] = self.chunk_attempts.get(item.retry_key, 0) + 1
 
     def take_reserved(self, actor_idx: int) -> WorkItem | None:
         """Pop and return the item reserved for this actor, if any."""
@@ -470,6 +559,10 @@ class ActorPool:
         self._pending_iid_refs[actor_idx] = self.actors[actor_idx].get_instance_id.remote()  # type: ignore[union-attr]
         self.actor_instance_ids[actor_idx] = placeholder_iid
         self._initializing.add(actor_idx)
+        # Every ENTRY into the initializing state starts the cancellation clock over. `replace`
+        # re-marks a slot the pool has used before, and a clock left from that slot's previous
+        # initialization would make the replacement cancellable the moment it was created.
+        self._unplaced_since.pop(actor_idx, None)
 
     def add_actors(self, new_actors: list[ray.actor.ActorHandle]) -> None:
         """Append a freshly-requested batch of actors to the pool.
@@ -506,17 +599,18 @@ class ActorPool:
         self.actor_deaths += 1
         if self.actor_deaths >= self.max_actor_deaths:
             self.log.critical(
-                "!!! %d actor deaths — every actor slot has died at least once. "
+                "!!! %d actor deaths — as many as the fleet has slots (%d). "
                 "This is systemic (bad checkpoint? memory leak? instance type too small?). "
                 "KILL THIS FLOW and investigate before burning more GPU spend.",
                 self.actor_deaths,
+                self.fleet_size,
             )
         elif self.actor_deaths >= self.max_actor_deaths // 2:
             self.log.error(
-                "!!! %d / %d actor slots have died — possible systemic issue. "
+                "!!! %d deaths against a fleet of %d slots — possible systemic issue. "
                 "Monitor closely or consider killing this flow.",
                 self.actor_deaths,
-                len(self.actors),
+                self.fleet_size,
             )
         else:
             self.log.warning(
@@ -537,18 +631,24 @@ class ActorPool:
         self.actors[actor_idx] = new_actor
         self.mark_initializing(actor_idx, placeholder_iid=f"pending-replacement-of-{instance_id}")
 
-    def retire_idle(self, outstanding_work: int) -> None:
+    def retire_idle(self, outstanding_work: int, floor: int = 0) -> None:
         """Kill actors that have been idle past the grace period.
 
-        Never kills an actor if it would leave fewer live actors than there
-        is outstanding work (floor check).
+        Never kills an actor if it would leave fewer live actors than there is outstanding work,
+        or fewer READY (dispatchable) actors than ``floor``.
 
         Args:
             outstanding_work: len(pending) + len(chunk_queue) at call time.
+            floor: READY actors to keep whatever happens; the chained session passes ``1`` while
+                its work source is unexhausted. A liveness floor: with a dispatchable slot live,
+                arriving work goes out at once and the batch machinery grows the fleet from
+                there, and `live_count > 0` keeps the dispatch loop from ending the session —
+                turning the wind-down into the teardown it exists to avoid.
         """
         busy = self.busy_actors
         now = time.monotonic()
         live = self.live_count
+        ready = self.ready_count
 
         # The grace period avoids churn from momentary idleness between chunks, and keeps spare
         # capacity available when an in-flight chunk fails and is re-queued.
@@ -569,21 +669,130 @@ class ActorPool:
             if now - self._idle_since.get(actor_idx, now) < grace:
                 continue
 
-            # Don't kill if it would leave fewer live actors than remaining work
-            if live - 1 < outstanding_work:
+            # Don't kill if it would leave fewer live actors than remaining work, or fewer
+            # DISPATCHABLE actors than the caller's liveness floor. Two quantities, because an
+            # initializing slot counts as live but cannot run anything.
+            if live - 1 < outstanding_work or ready - 1 < floor:
                 continue
 
-            self.resolve_iid(actor_idx)  # pick up lazily-resolved EC2 instance ID
-            instance_id = self.actor_instance_ids[actor_idx] if actor_idx < len(self.actor_instance_ids) else "unknown"
-            with contextlib.suppress(Exception):
-                ray.kill(self.actors[actor_idx])
-            self._retired.add(actor_idx)
-            self._idle_since.pop(actor_idx, None)
+            instance_id = self._retire_slot(actor_idx)
             live -= 1
+            ready -= 1
             self.log.info("Killed idle actor %d (instance %s) — releasing GPU node", actor_idx, instance_id)
-            if self._on_retire is not None and instance_id.startswith("i-"):
-                with contextlib.suppress(Exception):
-                    self._on_retire(instance_id)
+
+    def retire_initializing(self, outstanding_work: int, floor: int = 0) -> None:
+        """Cancel slots that have not placed yet, once there is no work left for them to run.
+
+        An initializing slot is invisible to :meth:`retire_idle` — dispatch skips it, so it is
+        never seen idle — but it is not free. A Ray actor waiting on placement holds a GPU
+        resource request the autoscaler forwards to AWS, and it counts in :attr:`requested`,
+        which is what the fleet publisher advertises. Through an ingest drought that keeps asking
+        for machines the run has no work for, and if the capacity does arrive the instances boot,
+        load the checkpoint and bill a full idle grace before the wind-down can reach them.
+
+        REFUSED WHILE ANY WORK IS OUTSTANDING (it needs the capacity), and refused unless a
+        READY actor is already standing: an unplaced slot is otherwise the session's only route
+        to a live actor, and cancelling it would leave a live work source with nothing that can
+        ever run its chunks — the teardown the wind-down's floor exists to avoid. Retiring these
+        never lowers :attr:`ready_count`, so the floor cannot be crossed from here.
+
+        The SAME GRACE as the idle wind-down, on its own clock: a zone boundary answers "nothing
+        right now" for a few seconds, and cancelling on that first answer would throw a batch
+        away mid-boot and re-request it moments later.
+
+        **That clock measures a CONTINUOUS drought, which is why the caller resets it.** This
+        method only runs while there is no work, so it cannot observe the drought ending; a
+        timestamp left from an earlier one would keep counting through all the work in between,
+        and the next brief zone boundary would then cancel a booting slot on the first answer —
+        the exact churn the grace exists to prevent. The caller calls
+        :meth:`reset_unplaced_grace` when the drought lifts.
+
+        Args:
+            outstanding_work: len(pending) + len(chunk_queue) + reservations at call time.
+            floor: READY actors the caller keeps whatever happens, as in :meth:`retire_idle`.
+        """
+        if outstanding_work > 0 or self.ready_count < max(floor, 1):
+            return
+        now = time.monotonic()
+        for actor_idx in sorted(self._initializing):
+            if actor_idx not in self._unplaced_since:
+                self._unplaced_since[actor_idx] = now
+                continue
+            if now - self._unplaced_since[actor_idx] < self.idle_grace_sec:
+                continue
+            instance_id = self._retire_slot(actor_idx)
+            self.log.info(
+                "Cancelled unplaced actor %d (was %s) — no outstanding work, so it is no longer advertising GPU demand",
+                actor_idx,
+                instance_id,
+            )
+
+    def reset_unplaced_grace(self) -> None:
+        """Forget how long slots have been unplaced, because there is work again.
+
+        The counterpart to :meth:`retire_initializing`, called when the drought lifts. Without
+        it the grace stops being a grace: the timestamps survive the working period, so the next
+        momentary gap finds them already past the threshold and cancels a slot that has had no
+        grace at all. :meth:`retire_idle` needs no equivalent because dispatch restamps an
+        actor's idle clock every time it hands out work.
+        """
+        self._unplaced_since.clear()
+
+    def _retire_slot(self, actor_idx: int) -> str:
+        """Kill one slot's actor and mark the slot retired; return the instance ID it was on.
+
+        The one retirement primitive, shared by the idle wind-down and by the cancellation of
+        unplaced slots so both leave the same state behind — and so both honour the packing rule:
+
+        THE INSTANCE IS TERMINATED ONLY WHEN THIS SLOT WAS THE LAST LIVE ONE ON IT. Under
+        ``config.num_gpus < 1`` several actors share one GPU instance, and firing the terminator
+        per retired actor then kills a machine still hosting a busy sibling — or the one actor
+        the liveness floor just kept, leaving the session believing it has a live slot whose
+        handle is dead. Whole-GPU actors (the default, and what the campaign runs) are alone on
+        their instance, so the check passes on the first retirement and nothing changes for them;
+        on a packed instance the LAST retirement terminates it, which is the same outcome one
+        step later.
+
+        **Co-residency is decided by instance ID, so a sibling that has none yet cannot be seen.**
+        An initializing actor carries the ``pending-init`` placeholder until its constructor and
+        ``get_instance_id`` round-trip finish, and a placeholder never equals an ``i-`` ID — so on
+        a packed instance the comparison alone would read a booting sibling's machine as empty and
+        terminate it. Under packing the pending IDs are therefore resolved first, and any slot
+        still unresolved defers termination: co-residency cannot be *disproved*, and the costs are
+        not symmetric. Deferring leaves an instance up until the fleet's own teardown reclaims it;
+        terminating kills a live actor mid-boot. The default whole-GPU path skips all of this,
+        where one actor per instance makes a sibling impossible.
+        """
+        self.resolve_iid(actor_idx)  # pick up lazily-resolved EC2 instance ID
+        instance_id = self.actor_instance_ids[actor_idx] if actor_idx < len(self.actor_instance_ids) else "unknown"
+        with contextlib.suppress(Exception):
+            ray.kill(self.actors[actor_idx])
+        self._retired.add(actor_idx)
+        self._initializing.discard(actor_idx)
+        self._pending_iid_refs.pop(actor_idx, None)
+        self._idle_since.pop(actor_idx, None)
+        self._unplaced_since.pop(actor_idx, None)
+        packed = self.config.num_gpus < 1
+        if packed:
+            for idx in list(self._pending_iid_refs):
+                self.resolve_iid(idx)  # non-blocking; a sibling mid-``__init__`` stays unresolved
+        still_hosted = any(
+            iid == instance_id and idx not in self._retired for idx, iid in enumerate(self.actor_instance_ids)
+        )
+        unplaced_sibling = packed and any(
+            idx not in self._retired and not iid.startswith("i-") for idx, iid in enumerate(self.actor_instance_ids)
+        )
+        if unplaced_sibling and not still_hosted:
+            self.log.info(
+                "Not terminating %s after retiring actor %d — a packed fleet has a slot whose "
+                "instance is not yet known, so this machine cannot be shown to be empty",
+                instance_id,
+                actor_idx,
+            )
+        if self._on_retire is not None and instance_id.startswith("i-") and not still_hosted and not unplaced_sibling:
+            with contextlib.suppress(Exception):
+                self._on_retire(instance_id)
+        return instance_id
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +1052,7 @@ def _batch_actors_to_request(
     Full derivation: ``context_docs/inference/gpu-fleet-launch-throttling.md``.
 
     Args:
-        requested: Actors requested so far (``len(pool.actors)``).
+        requested: Actors requested so far and still wanted (``pool.requested``).
         target: Total actors the run should eventually reach.
         outstanding: In-flight + queued chunks. Caps requests so we do not provision more
             actors than there is work left.
@@ -914,6 +1123,7 @@ def _process_chunks_work_stealing(
     placement_timeout_sec: float = 300.0,
     retire_idle_actors: bool = True,
     more_work: Callable[[], list[WorkItem] | None] | None = None,
+    source_has_work: Callable[[], bool] | None = None,
     on_item_done: Callable[[WorkItem, dict], None] | None = None,
 ) -> list[dict]:
     """Process chunks with dynamic work-stealing across actors.
@@ -953,21 +1163,33 @@ def _process_chunks_work_stealing(
             the first, later ones are requested here. ``None`` disables batching — the caller's
             ``actors`` list is the whole fleet.
         total_actors_target: Total actors the run should eventually reach; requesting stops
-            once ``len(pool.actors)`` reaches it. Ignored when ``actor_factory`` is None.
+            once ``pool.requested`` reaches it. Also the fleet the systemic-failure thresholds
+            are judged against (:attr:`ActorPool.fleet_size`). Ignored when ``actor_factory``
+            is None.
         placement_timeout_sec: Max seconds to wait for a batch's instances to be placed before
             requesting the next anyway (capacity-shortfall escape hatch).
-        retire_idle_actors: Kill actors idle past the grace period as the run's tail drains
-            (the default). A chained multi-zone fill leaves this True and relies on the
-            ``more_work`` gate below; a caller managing zones as separate calls passes False
-            for every zone but its last, since the "surplus" workers are the NEXT zone's fleet
-            and retiring them idle-drains the shared cluster's instances at every zone tail
-            (see ``orchestration.runners.sequential_fill``).
+        retire_idle_actors: Kill actors idle past the grace period (the default). A chained
+            multi-zone fill leaves this True and relies on the ``more_work`` gate below; a
+            caller managing zones as separate calls passes False for every zone but its last,
+            since the "surplus" workers are the NEXT zone's fleet and retiring them idle-drains
+            the shared cluster's instances at every zone tail (see
+            ``orchestration.runners.sequential_fill``).
         more_work: Optional pull source for a chained multi-zone session. Polled (non-blocking)
             whenever the queue is at or below the live actor count: a list extends the queue
             (its items carry their own :class:`ZoneContext`), ``[]`` means nothing ready YET
             (the loop stays alive and keeps polling), ``None`` means exhausted forever. While
-            unexhausted, idle retirement is suppressed — apparently-idle actors are the next
-            zone's fleet — and the loop does not exit on an empty queue.
+            unexhausted the loop does not exit on an empty queue.
+
+            **``[]`` is not ``None``, and the difference drives retirement.** A list means work
+            is arriving, so nothing is retired; ``None`` retires freely. ``[]`` means nothing
+            right now, so — unless ``source_has_work`` says otherwise — the fleet WINDS DOWN to
+            one actor (:meth:`ActorPool.retire_idle`'s floor) while the session stays alive and
+            the pool re-grows here when work returns.
+        source_has_work: Optional predicate asked whenever ``more_work`` answers ``[]``: is there
+            INFERENCE work available right now that this poll simply did not hand over? A source
+            can withhold work it holds (the operator pause does exactly that), and withheld work
+            is not an absence of work — the fleet is kept for it. Cheap and non-blocking by
+            contract. ``None`` means ``[]`` is taken at face value.
         on_item_done: Optional callback fired exactly once per work item at its FINAL outcome —
             success (after any deferred write confirms) or permanent failure — with the item
             and its result dict. A chained session uses it for per-zone completion accounting;
@@ -988,6 +1210,7 @@ def _process_chunks_work_stealing(
         on_retire=on_actor_retire,
         get_credentials=get_credentials,
         s3_region=s3_region,
+        fleet_target=total_actors_target,
     )
 
     # Mark actors that haven't finished __init__ yet. seed() skips them; they receive work via
@@ -1009,14 +1232,6 @@ def _process_chunks_work_stealing(
     #: slowest whole chunk yet observed took ~480 s in total and the wedge this exists for sat
     #: 14,396 s. The choice is between minutes and forever, so anywhere in that range works.
     stall_recovery_sec = 4 * stall_threshold_sec
-
-    # Scales with the EVENTUAL fleet size, not just the first batch: with batching, ``actors``
-    # holds only the initial subset, so a threshold frozen at batch-1/10 would abort a large run
-    # after a handful of stalls once later batches join. Recomputed each iteration against the
-    # larger of the current pool and the target.
-    def _stall_threshold() -> int:
-        fleet = max(len(pool.actors), total_actors_target or 0)
-        return max(3, fleet // 10)
 
     # --- Actor-batch requesting ---
     # The caller supplies only the first batch; the loop requests the rest here, pacing the
@@ -1044,7 +1259,7 @@ def _process_chunks_work_stealing(
             fleet.send(
                 target=total_actors_target,
                 outstanding=pool.outstanding_work(len(chunk_queue)),
-                requested=len(pool.actors),
+                requested=pool.requested,
             )
 
     def _maybe_request_next_batch() -> None:
@@ -1056,7 +1271,7 @@ def _process_chunks_work_stealing(
         last_joined_gpus = _joined_gpu_count(last_joined_gpus, config.num_gpus)
         placed_actor_slots = _placed_actor_slots(last_joined_gpus, config.num_gpus)
         n, timed_out = _batch_actors_to_request(
-            requested=len(pool.actors),
+            requested=pool.requested,
             target=total_actors_target,
             outstanding=pool.outstanding_work(len(chunk_queue)),
             placed_actor_slots=placed_actor_slots,
@@ -1077,7 +1292,7 @@ def _process_chunks_work_stealing(
         log.info(
             "Requested actor batch: +%d (%d/%d total, %d actor slots placed)%s",
             n,
-            len(pool.actors),
+            pool.requested,
             total_actors_target,
             placed_actor_slots,
             " — placement timed out, requesting anyway" if timed_out else "",
@@ -1117,7 +1332,7 @@ def _process_chunks_work_stealing(
             )
         pool.resolve_iid(actor_idx)
         instance_id = pool.actor_instance_ids[actor_idx]
-        attempts = pool.chunk_attempts.get(item.uid, 1)
+        attempts = pool.chunk_attempts.get(item.retry_key, 1)
         # attempts starts at 1 on first submission, so max_chunk_retries=2 means first try + 2
         # re-queues = 3 total attempts.
         if attempts <= max_chunk_retries:
@@ -1171,7 +1386,7 @@ def _process_chunks_work_stealing(
         """Requeue a deferred chunk whose write failed or is of unknown state."""
         item, deferred = entry
         label = str(deferred["chunk"])
-        attempts = pool.chunk_attempts.get(item.uid, 1)
+        attempts = pool.chunk_attempts.get(item.retry_key, 1)
         if attempts <= max_chunk_retries:
             log.warning(
                 "Chunk %s staging write unconfirmed (%s, attempt %d/%d) — re-queuing",
@@ -1255,14 +1470,23 @@ def _process_chunks_work_stealing(
     # starts at zero right here. ``t0`` keeps its other uses (run summaries, provenance).
     inference_t0 = last_tick
     # A chained session's work source: while unexhausted the loop must stay alive through
-    # empty-queue gaps (the next zone may still be ingesting) and must not retire "idle" actors
-    # (they are the next zone's fleet).
+    # empty-queue gaps (the next zone may still be ingesting).
     source_active = more_work is not None
+    # ...but "unexhausted" is not "has work": a source answering `[]` has nothing RIGHT NOW, and
+    # holding a full fleet against that is the most expensive way to wait for anything here.
+    # Stale while the queue is deep (the poll is conditional), which is harmless — `retire_idle`
+    # will not retire below the outstanding work count either way.
+    source_idle = False
     # Stay alive while any work remains: in-flight chunks, deferred writes awaiting confirmation,
     # queued chunks with a live actor to run them, or an unexhausted work source. The queue clause
     # must NOT be gated on _initializing alone — a failed tail flush (_flush_idle_writes, after
     # dispatch) requeues its chunk when no actor is initializing, and that retry would be dropped.
     # `live_count > 0` prevents a busy-spin when every actor has died.
+    #
+    # UNCHANGED by the wind-down: retirement keeps a floor of one live actor while the source is
+    # unexhausted (`retire_idle`'s `floor`), so this holds without knowing about the wind-down.
+    # Degating it on `source_active` instead lets a pool wound down to zero poll a source it
+    # cannot serve.
     while pool.pending or pending_write or ((chunk_queue or source_active) and pool.live_count > 0):
         # Top up from the work source BEFORE waiting so freshly-ready zones dispatch this
         # iteration. Polled only when the queue is at or below the live actor count. For zones at
@@ -1273,17 +1497,24 @@ def _process_chunks_work_stealing(
             fetched = more_work()  # type: ignore[misc]  # source_active implies more_work is not None
             if fetched is None:
                 source_active = False
+                source_idle = False
                 log.info(
                     "Work source exhausted — %d queued + %d in-flight chunk(s) remain",
                     len(chunk_queue),
                     len(pool.pending),
                 )
             elif fetched:
+                source_idle = False
                 chunk_queue.extend(fetched)
                 n_total += len(fetched)
                 log.info(
                     "Work source added %d chunk(s) (queue now %d, total %d)", len(fetched), len(chunk_queue), n_total
                 )
+            else:
+                # `[]` alone does not mean idle: a source may be WITHHOLDING work it holds (the
+                # operator pause), and work withheld is not work absent. Only a source with no
+                # inference work available right now lets the fleet go.
+                source_idle = source_has_work is None or not source_has_work()
         if pool.pending:
             # Block for any one chunk to finish. At a zone boundary — source still active and the
             # queue drained to the poll trigger — the next zone may become ready momentarily, so
@@ -1324,7 +1555,7 @@ def _process_chunks_work_stealing(
                 len(results),
                 n_total,
                 stall_threshold_sec,
-                _stall_threshold(),
+                pool.systemic_stall_threshold,
                 log,
                 elapsed_min=(time.monotonic() - inference_t0) / 60,
                 gpu_hours=gpu_seconds / 3600,
@@ -1431,9 +1662,28 @@ def _process_chunks_work_stealing(
         # its zone-tail writes confirmed before that zone's assembly can verify staged
         # completeness.
         _flush_idle_writes()
-        # Retirement additionally waits for source exhaustion: while more zones may arrive, an
-        # idle actor is the next zone's fleet and retiring it idle-drains the shared cluster.
-        if retire_idle_actors and not source_active:
-            pool.retire_idle(pool.outstanding_work(len(chunk_queue)))
+        # Retire when there is no inference work to be had — exhausted, or nothing to give right
+        # now. NOT merely "unexhausted": a cluster waiting on an ingest held a full idle fleet
+        # for the whole wait. The session stays alive, so ingest and the assembly backlog carry
+        # on and the pool re-grows through the batch machinery when work arrives.
+        # A MID-RUN wind-down is only safe where the pool can grow back, and `batching_enabled`
+        # is the whole of what recreates a retired slot. `actor_request_batch_size = 0` (request
+        # the fleet all at once) turns it off, as does a caller that hands over its whole fleet
+        # with no target — and then a single ingest gap would cut the fleet to the liveness floor
+        # for the rest of the run, with every later cell inferred on one actor. The TAIL
+        # wind-down is unaffected: the source is exhausted, so there is nothing to grow back for.
+        if retire_idle_actors and (not source_active or (source_idle and batching_enabled)):
+            # One actor is kept while more work may still arrive — see `retire_idle`'s `floor`.
+            floor = 1 if source_active else 0
+            outstanding = pool.outstanding_work(len(chunk_queue))
+            pool.retire_idle(outstanding, floor=floor)
+            # Slots still waiting on placement are retired too, and they need saying separately:
+            # `retire_idle` cannot see them, yet they are what the autoscaler is still being
+            # asked for. See `retire_initializing`.
+            pool.retire_initializing(outstanding, floor=floor)
+        elif retire_idle_actors:
+            # The drought has lifted. The unplaced clock must not keep counting through a period
+            # when there WAS work, or the next zone boundary cancels a booting slot instantly.
+            pool.reset_unplaced_grace()
 
     return results

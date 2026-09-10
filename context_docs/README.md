@@ -67,8 +67,12 @@ context_docs/
 │   │                                              campaign path itself measured
 │   ├── minimum-optical-depth.md                the one data-quality rule: refuse a pixel below
 │   │                                              15 observations. Four measurement campaigns
-│   └── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once
-│                                                  throttle each other, and the two bounds
+│   ├── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once
+│   │                                              throttle each other, and the two bounds
+│   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
+│                                                  retry through a second call rebuilt one; the
+│                                                  wind-down, and why the fleet is not held
+│                                                  through the assembly backlog drain
 │
 ├── assembly/                      WHEN AN ASSEMBLY STOPS
 │   ├── assembly-wedges-during-fork-phase-2026-09-04.md   five fills froze in the shard-write tail

@@ -36,6 +36,21 @@ def _server_said(status: int, detail: str) -> PrefectHTTPStatusError:
     raise AssertionError(f"{status} did not raise")  # pragma: no cover
 
 
+def _request_was_rejected(*fields: str) -> PrefectHTTPStatusError:
+    """The OTHER 422: FastAPI's own rejection, whose ``detail`` is a LIST of objects with ``loc``."""
+    request = httpx.Request("POST", "http://prefect/api/v2/concurrency_limits/increment-with-lease")
+    detail = [
+        {"type": "greater_than", "loc": ["body", field], "msg": f"Input should be greater than 0 for {field}"}
+        for field in fields
+    ]
+    response = httpx.Response(422, json={"detail": detail}, request=request)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return PrefectHTTPStatusError.from_httpx_error(exc)
+    raise AssertionError("422 did not raise")  # pragma: no cover
+
+
 def _wrapped(inner: BaseException) -> Exception:
     """The shape Prefect delivers: its own error with the HTTP error as the cause."""
     exc = RuntimeError("Unable to acquire concurrency slots on ['tessera-global-ingests']")
@@ -83,6 +98,23 @@ def test_a_422_from_the_server_is_a_hold() -> None:
     """
     exc = _wrapped(_server_said(422, "Slots requested is greater than the limit"))
     assert gate_is_holding(exc)
+
+
+@pytest.mark.parametrize("field", ["lease_duration", "slots"])
+def test_a_request_the_server_refuses_is_not_a_hold(field: str) -> None:
+    """A malformed call is permanent, so holding on it parks the gate forever."""
+    assert not gate_is_holding(_wrapped(_request_was_rejected(field)))
+
+
+def test_a_422_whose_body_cannot_be_read_still_holds() -> None:
+    """The doubt goes towards holding: a wrong hold is recoverable, a wrong propagation is not."""
+    request = httpx.Request("POST", "http://prefect/api/v2/concurrency_limits/increment-with-lease")
+    response = httpx.Response(422, content=b"<html>gateway</html>", request=request)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        inner = PrefectHTTPStatusError.from_httpx_error(exc)
+    assert gate_is_holding(_wrapped(inner))
 
 
 def test_a_missing_limit_is_not_a_hold() -> None:

@@ -37,7 +37,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
 from functools import cache, partial
 from typing import TYPE_CHECKING, Any
@@ -98,7 +98,6 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     assemble_zone_year,
     assert_calendar_year_window,
     fill_zone_year,
-    infer_zone_year,
     plan_zone_inference,
     zone_live_tile_count,
     zone_year_complete,
@@ -461,20 +460,26 @@ class _DeploymentCellInputs:
             f"mosaic prefix — those commits do not rebase, so the loser's failure is terminal."
         )
 
-    def cancel_unstarted(self) -> int:
+    def cancel_unstarted(self, cells: Iterable[tuple[str, int]] | None = None) -> int:
         """Cancel queued ingests that have not begun, and forget them. Returns how many.
 
         ``Future.cancel()`` succeeds only for a task still sitting in the pool's queue, so a
         running or finished ingest is untouched — this drops work, never interrupts it.
 
-        Called before the in-child retry pass: every pending cell's ingest is submitted up
-        front, so a retry's fresh ``start`` would otherwise sit behind most of a cluster in this
-        FIFO queue and block for hours on a still-billing cluster. Those cells are unattempted
-        either way and stay pending for the next campaign pass.
+        ``cells`` restricts it to those keys; ``None`` means every cell. Both callers exist
+        because every live cell's ingest is submitted up front: the crashed-session unwind takes
+        the whole queue, since nothing is left to serve, while the retained-failure cap names
+        only the cells it refused and must leave a retry's queued re-ingest alone.
+
+        Forgetting a cancelled cell restores ``start``'s meaning — the cell has no attempt in
+        flight — so a later ``start`` (a retry) submits a real one rather than joining a
+        cancelled future.
         """
+        keys = list(self._futures) if cells is None else list(cells)
         cancelled = 0
-        for key, fut in list(self._futures.items()):
-            if fut.cancel():
+        for key in keys:
+            fut = self._futures.get(key)
+            if fut is not None and fut.cancel():
                 self._futures.pop(key, None)
                 cancelled += 1
         if cancelled:
@@ -1223,29 +1228,12 @@ def fill_zones_sequential_flow(
             s3_region=s3_region,
             retire_idle_actors=True,  # the scheduler holds off until the source is exhausted
             more_work=more_work,
+            # The runner publishes its availability predicate on the source callable (see
+            # `sequential_fill`), so the session contract stays two-argument. Without it a `[]`
+            # poll is taken at face value and an operator pause holding real work would let the
+            # fleet go.
+            source_has_work=getattr(more_work, "has_work", None),
             on_item_done=on_item_done,
-        )
-
-    def _infer_single(cell: SequentialCell, prep: PreparedCell, final: bool) -> ZoneFillHandoff:
-        # A per-cell session with the cell's own config, on the still-provisioned cluster, for
-        # the cells the shared stream did not finish — a crashed session's survivors, and the
-        # retry pass.
-        return infer_zone_year(
-            store_path=store_path,
-            zone=cell.zone,
-            year=cell.year,
-            land_mask_path=land_mask_path,
-            mosaic_base=prep.mosaic_base,
-            staging_base=prep.staging_base,
-            config=prep.config,
-            num_actors=cell.num_actors,
-            log=log,
-            run_id=prep.run_id,
-            get_credentials=iam_icechunk_credentials,
-            s3_region=s3_region,
-            on_actor_retire=terminator,
-            on_fleet_demand=publish_fleet_mix,
-            retire_idle_actors=final,
         )
 
     #: Where a landed cell's deletes go. Owned here rather than by the runner because the
@@ -1376,7 +1364,6 @@ def fill_zones_sequential_flow(
                     session=_session,
                     assemble=_assemble,
                     housekeeping=housekeeping,
-                    infer_single=_infer_single,
                     session_s1_orbit=s1_orbit,
                     log=log,
                     inputs=inputs,
