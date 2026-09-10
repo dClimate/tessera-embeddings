@@ -76,9 +76,9 @@ context_docs/
 │   │                                                      removed, and the two bounds kept
 │   ├── icechunk-max-concurrent-requests-1-deadlock.md    the upstream fault behind it: a request
 │   │                                                      cap of 1 deadlocks commit and rebase
-│   └── what-bounds-assembly-2026-09-09.md                measured at 16 AND 32 workers: 2.9 GiB
-│                                                          per worker, linear, and the processor
-│                                                          saturates on whatever box it is given
+│   └── what-bounds-assembly-2026-09-09.md                measured PER TASK at 16 and 32 workers:
+│                                                          40 and 94 GiB peaks, and why a family
+│                                                          metric cannot measure one task
 │
 └── storage/                       WRITING AND KEEPING THE RESULT
     ├── writing-to-the-global-store.md          assembly's fork pool, the session catch-up, the

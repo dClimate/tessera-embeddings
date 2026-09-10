@@ -1,74 +1,90 @@
-# What actually bounds assembly, measured 2026-09-09/10
+# What bounds assembly, measured per task 2026-09-09/10
 
 Assembly runs inside the campaign fill's own Fargate task as a pool of forked worker processes.
 This records what that box is actually limited by, because the pool size had been reasoned about
-from an estimate rather than a measurement, and the estimate was wrong by roughly half.
+from an estimate rather than a measurement, and the estimate was low by roughly half.
 
 Read this before changing `AssemblyConfig.max_workers` or moving a fill to a different runner.
 
+## How it was measured, and why the first two attempts did not count
+
+**Per task, from the Container Insights performance log**
+(`/aws/ecs/containerinsights/global-tessera-prod/performance`), where every record carries a
+`TaskId`. Rows are grouped by task, and each figure below comes with the other metrics *from the
+same record* — one task, one minute.
+
+That matters, because the obvious route gives a wrong answer. The CloudWatch **metric**
+`MemoryUtilized` is published only under `{ClusterName, TaskDefinitionFamily}`, and each statistic
+is aggregated across tasks independently. So a minute's memory `Maximum` and its CPU `Maximum` can
+belong to **different tasks**, and filtering minutes by CPU does not restrict the memory figures to
+the tasks that were assembling. Two earlier rounds of figures were built that way and both were
+wrong in the same direction; they are recorded at the end so nobody repeats them.
+
+**The performance log retains 24 hours** (confirmed: earliest record 2026-09-09 19:11Z, latest
+2026-09-10 19:09Z). Anything older can only be reached through the metric route, with the caveat
+above.
+
 ## The measurement
 
-Container Insights at one-minute resolution over the 2026-09-09/10 global campaign, on both
-runners the campaign actually used. Figures are **per-task peaks** — the `Maximum` statistic, which
-is the worst single task in that minute — restricted to the minutes when the pool was assembling
-(peak task CPU above half the reservation). A flow runner's lifetime also covers ingest
-coordination and inference dispatch, which are near CPU-idle, so a lifetime mean would mix in
-phases where no worker process exists at all.
+Highest-memory minutes of the worst task in each family, every column from that one record:
 
 | | 16 workers, 16 vCPU / 64 GiB | 32 workers, 32 vCPU / 244 GiB |
 |---|---|---|
-| assembling minutes sampled | 642 | 1,097 |
-| memory, median minute | 37.5 GiB | 86.5 GiB |
-| **memory, worst minute** | **46.7 GiB — 73% of the box** | **93.5 GiB — 38% of the box** |
-| memory per worker at that peak | **2.92 GiB** | **2.92 GiB** |
-| CPU, median minute | 85% | 77% |
-| **CPU, worst minute** | **96.8%** | **99.7%** |
-| network rx, median / worst | 692 / 1,006 MB/s | 965 / 1,251 MB/s |
-| network tx, median / worst | 413 / 520 MB/s | 651 / 877 MB/s |
+| tasks in the population | 20 | 25 |
+| **peak task memory** | **40.1 GiB — 63% of the box** | **93.5 GiB — 38% of the box** |
+| CPU in that same minute | 64% | 33% |
+| network rx / tx, same minute | 463 / 311 MB/s | 650 / 601 MB/s |
+| **highest CPU any task reached** | **96.8%** | **87.8%** |
+| memory ÷ workers at the peak | 2.50 GiB | 2.92 GiB |
 
 ## What it says
 
-**Per worker: 2.92 GiB, and the pool is linear in worker count.** The two sizes agree to three
-significant figures on a quantity neither was fitted to, which is the strongest evidence here:
-fixed per-task overhead is small enough to ignore, so `workers × 2.9 GiB` is a usable sizing rule.
-The superseded estimate of 1 to 1.5 GB per worker was low by a factor of two.
+**A 16-worker pool peaks near 40 GiB and a 32-worker pool near 94 GiB.** Both attributable to a
+single task in a single minute. This is the part the sizing decision rests on, and it is solid.
 
-**Assembly saturates the processor of whatever box it is given.** 96.8% of 16 vCPU and 99.7% of 32.
-This is no longer an inference from utilisation on one size: doubling the pool on a doubled box
-raised the ceiling and the pool climbed straight back to it, which is what a compute-bound pool
-does and what an I/O-bound one cannot. A third instrument agrees — the `ASSEMBLY_SUMMARY` records
-put each worker at 0.75-0.83 of a core from its own CPU and wall-clock fields.
+**94 GiB does not fit the 64 GiB inference flow-runner family.** So `AssemblyConfig.max_workers`
+stays 16, and only the campaign's chained fill — the sole deployment on the 244 GiB
+`assembly_large` family — asks for 32. Measured now, not projected.
 
-**Network rose but did not cap, and it is not the binding constraint.** Doubling the workers moved
-peak receive by 1.24x and peak transmit by 1.69x, well short of double, while the processor went to
-the wall. Fargate publishes no per-task network allowance, so there is still no headroom figure —
-but the earlier worry that something unmeasured sat near a limit is answered: the constraint that
-bound first was the processor, on both sizes. This also disposes of the tight 504-546 MB/s band
-observed across twelve cells of very different sizes, which had looked like a hidden ceiling.
+**16 workers has less headroom than it looks.** 63% of the 64 GiB box on the per-task figure, and
+the metric route saw 73% during the earlier run on 09-09 (46.7 GiB, outside the log's retention and
+so not attributable to a task). Either way, about 17-24 GiB is left for the coordinator, the Ray
+head and the commit, so a 16-worker pool wants the full 64 GiB.
 
-**32 workers does not fit the 64 GiB family**, by measurement now rather than projection: 93.5 GiB
-against 64. So `AssemblyConfig.max_workers` stays 16 and only the campaign's chained fill, which is
-the sole deployment on the 244 GiB `assembly_large` family, asks for 32.
+**Per worker is 2.5 GiB at 16 and 2.9 GiB at 32 — so the pool is NOT linear in worker count, and
+these are whole-task ratios rather than per-worker footprints.** They include the coordinator, the
+Ray head and the runtime. Fitting a line to the two points gives 3.34 GiB per worker and a
+*negative* fixed overhead of −13 GiB, which is nonsense: two points from different runner families
+running different cells cannot separate overhead from per-worker cost. **For sizing, use the larger
+ratio, ~2.9 GiB per worker, as an upper bound** — it predicts the 94 GiB actually observed at 32 and
+is conservative at 16.
 
-**16 workers has less headroom than it looks.** The worst minute reached 73% of the 64 GiB box,
-leaving about 17 GiB for the coordinator, the Ray head and the commit. Sizing a custom runner below
-64 GiB for a 16-worker pool is not safe.
+**Assembly is compute-heavy, but the processor is NOT established as the binding constraint.**
+A 16-worker task reached 96.8% of its 16 vCPU, so that pool very nearly saturates its box. A
+32-worker task reached only 87.8% of its 32 vCPU, and its peak-memory minutes ran at 25-33%, so
+doubling the pool left processor headroom rather than pinning it. Assembly's own instrumentation
+agrees that the work is computational — the `ASSEMBLY_SUMMARY` records put each worker at 0.75-0.83
+of a core from its CPU and wall-clock fields — and the campaign's outcome is consistent with a
+real win from a wider pool. But Fargate publishes no per-task network allowance, so with rx of
+650-922 MB/s at 32 workers the headroom there is unknown, and **which resource binds at 32 workers
+is an open question.** Settling it needs a controlled run, not more of this data.
 
 ## What this supersedes
 
-Two rounds of figures, both understated:
+Three rounds, each understated or misattributed, all reaching the same decision:
 
 1. **The `AssemblyConfig` docstring's estimate** — 1 to 1.5 GB per worker, a pool peaking around
    24 GB, 32 workers around 48 GB. Never measured at 16; low by about half.
 2. **A first measurement round, 2026-09-09** — "~38 GiB mean, 41.1 GiB peak; 79% CPU mean, 94%
-   peak; 650/410 MB/s". Those came from forty one-minute samples on a single task, and they land on
-   the **median** column above, not the peak: what was published as a peak was a typical minute.
-   The per-worker figure derived from it, ~2.4 GiB, was correspondingly low, and the 32-worker
-   projection of ~75 GiB understated the measured 93.5 GiB. Read a peak from the whole population
-   of tasks over the whole run, not from a window that happens to be quiet.
-
-The conclusion both rounds supported was right throughout — `max_workers` stays 16, and 32 belongs
-only to the large runner — but each made the margin look more comfortable than it is.
+   peak". Forty one-minute samples on a single task. The memory figure was close to right by luck;
+   the arithmetic in the published percentages did not match the figures beside it.
+3. **A second round from the CloudWatch metric route, 2026-09-10** — "46.7 GiB and 93.5 GiB peaks,
+   2.92 GiB per worker at both sizes, linear, CPU saturating at 96.8% and 99.7%". The 32-worker
+   memory peak survives; everything else does not. The equal per-worker quotients were a
+   coincidence between two independently mis-derived numbers, the linearity claim rested on that
+   coincidence, and the 99.7% CPU was a cross-task artefact of independent aggregation — no single
+   task exceeded 87.8%. **The lesson is the one at the top: a per-metric `Maximum` over a family is
+   not a measurement of any task.**
 
 ## Care with the throughput figures
 

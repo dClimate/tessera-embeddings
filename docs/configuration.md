@@ -162,13 +162,15 @@ cfg = AssemblyConfig()                                # chunks_per_worker=10, ma
 n_workers = cfg.compute_n_workers(25)                 # → 3
 ```
 
-The default cap of 16 puts the pool at a **measured ~47 GiB peak** — one
-staged-tile slice in flight per worker, ~2.9 GiB at a 2048-px full-band tile.
-That fits the flow runner's 64 GiB, but at 73% of it, so **size a custom
+The default cap of 16 was **measured peaking near 40 GiB** on the task as a
+whole, about two thirds of the flow runner's 64 GiB. So **size a custom
 flow-runner container at the full 64 GiB for a 16-worker pool**: assembly is
-where the peak is, and the remaining ~17 GiB is what the coordinator, the Ray
-head and the commit have to share. The footprint is linear in worker count, so
-a pool of 32 needs ~94 GiB and does not fit a 64 GiB host at all. Override
+where the peak is, and what is left over is what the coordinator, the Ray head
+and the commit have to share. Budget roughly **2.9 GiB per worker** for a
+different pool size — an upper bound taken from the largest ratio observed, not
+a linear law, since the 32-worker measurement came out higher per worker than
+the 16-worker one. A pool of 32 was measured near 94 GiB and does not fit a
+64 GiB host at all. Override
 `chunks_per_worker` if your workload profile differs; raise `max_workers` only
 with the RAM and S3 budgets in view, and see
 [`context_docs/assembly/what-bounds-assembly-2026-09-09.md`](../context_docs/assembly/what-bounds-assembly-2026-09-09.md)
