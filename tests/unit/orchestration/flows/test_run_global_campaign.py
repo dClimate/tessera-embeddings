@@ -851,7 +851,7 @@ def test_ingest_disabled_skips_ingest_and_cleanup(wired):
 
 def test_the_per_cell_fill_is_never_given_the_large_runners_worker_count(wired):
     """`fill-zone-year` runs on the 16 vCPU / 64 GiB inference family, where a 32-process
-    assembly pool does not fit at all: measured at ~2.4 GiB per worker it peaks near 75 GiB. Only
+    assembly pool does not fit at all: measured at ~2.9 GiB per worker it peaks near 94 GiB. Only
     the chained fill's deployment is the 244 GiB `assembly_large` family, so only it is told 32.
     """
     _per_cell()

@@ -708,7 +708,10 @@ assignment the worker cannot see into), so there is no separate compress or uplo
 record says so in-band via `fused_compress_put`. The record also carries the per-worker
 stats (band order / partition order), requested-vs-effective worker counts, the per-fork
 S3 request cap in force, and object/byte counts, so throughput rates derive from the
-record alone. Field-by-field meaning lives on `assembly._assembly_summary_line`; keep the
+record alone — noting that `bytes` is **logical, uncompressed write volume** (the blocks
+handed to zarr) and is neither object-store ingress, since a cleared position's block is
+built locally without a staged read, nor egress, since `fused_compress_put` writes go over
+the wire compressed. Field-by-field meaning lives on `assembly._assembly_summary_line`; keep the
 keys stable or update the parsers in the same change.
 
 A global fill also carries **`catch_ups`**, a tally of what

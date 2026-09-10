@@ -128,10 +128,13 @@ was actually seen.
 
 - **No assembly was run with the change**; the expected 2.5–3× speedup is arithmetic over recorded
   processor and wall-clock fractions, not a measurement of the changed code.
-- **Resident memory at 16 workers has never been observed.** Each worker holds at most one staged-tile
-  slice, about 1–1.5 GB, so 16 workers is *estimated* at roughly 24 GB against a 16 vCPU / 64 GiB
-  runner sized explicitly for `n_workers=16` at about 19 GiB. The only *measured* figure is 20 GiB at
-  a pool of 8.
+- **Resident memory at 16 workers had never been observed** when this was written. **CORRECTED
+  2026-09-10:** it has been, and the estimate below was low by a factor of two. Measured 2.9 GiB per
+  worker, a ~47 GiB peak at 16 and ~94 GiB at 32 — see
+  [`../assembly/what-bounds-assembly-2026-09-09.md`](../assembly/what-bounds-assembly-2026-09-09.md).
+  The superseded reasoning: each worker holds at most one staged-tile slice, about 1–1.5 GB, so 16
+  workers was *estimated* at roughly 24 GB against a 16 vCPU / 64 GiB runner sized explicitly for
+  `n_workers=16` at about 19 GiB, with the only *measured* figure 20 GiB at a pool of 8.
 - **The `2 *` factor in the campaign's budget divisor is left alone.** Whether the staging and
   published buckets carry independent request budgets was not established.
 - **The 800-PUT `SlowDown` figure is the repo's own code comment** and was not traced to a primary

@@ -20,12 +20,13 @@ class AssemblyConfig:
     Worker count is derived from *live* (ROI-intersecting) chunks, not the full grid:
     only live chunks have staged data to read and write.
 
-    ``max_workers`` defaults to 16: each worker holds one staged-tile slice, and the pool peaks at
-    roughly 40 GiB — inside the 64 GiB inference flow-runner family, the smallest host any caller
-    of this default runs on.
+    ``max_workers`` defaults to 16: each worker holds one staged-tile slice, measured at ~2.9 GiB,
+    so the pool peaks near 47 GiB — inside the 64 GiB inference flow-runner family, the smallest
+    host any caller of this default runs on, though at 73% of it rather than comfortably.
 
-    **A bigger pool belongs to the runner that can hold it, not to this default.** 32 workers peak
-    near 75 GiB, which does NOT fit that 64 GiB family, so the campaign passes
+    **A bigger pool belongs to the runner that can hold it, not to this default.** The footprint is
+    linear in worker count, so 32 workers peak near 94 GiB, which does NOT fit that 64 GiB family
+    at all, and the campaign therefore passes
     ``n_assembly_workers=32`` in its chained-fill dispatch
     (``run_global_campaign.ASSEMBLY_WORKERS_ON_THE_LARGE_RUNNER``), which is the only deployment on
     the 244 GiB ``assembly_large`` family. Sizing this default up would break every other caller.
