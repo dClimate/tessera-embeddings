@@ -78,8 +78,11 @@ context_docs/
 │   ├── assembly-wedges-during-fork-phase-2026-09-04.md   five fills froze in the shard-write tail
 │   │                                                      for four days; the root cause, what was
 │   │                                                      removed, and the two bounds kept
-│   └── icechunk-max-concurrent-requests-1-deadlock.md    the upstream fault behind it: a request
-│                                                          cap of 1 deadlocks commit and rebase
+│   ├── icechunk-max-concurrent-requests-1-deadlock.md    the upstream fault behind it: a request
+│   │                                                      cap of 1 deadlocks commit and rebase
+│   └── what-bounds-assembly-2026-09-09.md                measured PER TASK at 16 and 32 workers:
+│                                                          40 and 94 GiB peaks, and why a family
+│                                                          metric cannot measure one task
 │
 └── storage/                       WRITING AND KEEPING THE RESULT
     ├── writing-to-the-global-store.md          assembly's fork pool, the session catch-up, the

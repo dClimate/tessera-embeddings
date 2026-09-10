@@ -2,7 +2,10 @@
 
 **Assembly is the campaign's last stage and its longest.** It reads a cell's staged inference tiles
 out of S3 and writes them into the published Icechunk store as whole shards, then marks the cell
-complete. On a dense zone-year that is **4.97 TB across 2.34 M objects**, about three and a half
+complete. On a dense zone-year that is **4.97 TB of logical, uncompressed volume across 2.34 M
+objects** — the blocks handed to zarr, which is neither S3 ingress nor egress; see
+[`../assembly/what-bounds-assembly-2026-09-09.md`](../assembly/what-bounds-assembly-2026-09-09.md)
+§"Care with the throughput figures" — about three and a half
 hours, thirty-two worker processes (sixteen until 2026-09-08), and — at fleet width — up to ten
 coordinators doing it at once into **one repository on one branch**.
 
@@ -45,7 +48,13 @@ process boundaries; a fork can be merged into a session it was not created from,
 | shard-write phase | **195.9 min** (3.27 h) |
 | merge + commit | **37 s — 0.32% of assembly** |
 | total | **196.6 min** (3.28 h) |
-| effective read rate | **423 MB/s** |
+| effective logical rate | **423 MB/s** |
+
+The rate is **logical volume over wall-clock, not measured S3 traffic.** It comes from
+`ASSEMBLY_SUMMARY.bytes`, which counts uncompressed blocks handed to zarr: a cell with cleared
+tiles includes blocks built locally with no staged read, and the outbound side crosses the wire
+compressed. It is the right basis for how long a cell takes and the wrong one for sizing object-store
+bandwidth.
 
 **For planning, assembly IS the shard write**, with no second phase to model. That also means the
 commit is negligible, which is the fact §5 turns on.
@@ -128,10 +137,13 @@ was actually seen.
 
 - **No assembly was run with the change**; the expected 2.5–3× speedup is arithmetic over recorded
   processor and wall-clock fractions, not a measurement of the changed code.
-- **Resident memory at 16 workers has never been observed.** Each worker holds at most one staged-tile
-  slice, about 1–1.5 GB, so 16 workers is *estimated* at roughly 24 GB against a 16 vCPU / 64 GiB
-  runner sized explicitly for `n_workers=16` at about 19 GiB. The only *measured* figure is 20 GiB at
-  a pool of 8.
+- **Resident memory at 16 workers had never been observed** when this was written. **CORRECTED
+  2026-09-10:** it has been, and the estimate below was low by a factor of two. Measured per task,
+  a ~40 GiB peak at 16 workers and ~94 GiB at 32 — see
+  [`../assembly/what-bounds-assembly-2026-09-09.md`](../assembly/what-bounds-assembly-2026-09-09.md).
+  The superseded reasoning: each worker holds at most one staged-tile slice, about 1–1.5 GB, so 16
+  workers was *estimated* at roughly 24 GB against a 16 vCPU / 64 GiB runner sized explicitly for
+  `n_workers=16` at about 19 GiB, with the only *measured* figure 20 GiB at a pool of 8.
 - **The `2 *` factor in the campaign's budget divisor is left alone.** Whether the staging and
   published buckets carry independent request budgets was not established.
 - **The 800-PUT `SlowDown` figure is the repo's own code comment** and was not traced to a primary

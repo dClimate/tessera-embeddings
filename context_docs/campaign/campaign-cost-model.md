@@ -793,9 +793,9 @@ rate, so **fleet width and geography are perfectly confounded** in the cell tabl
 like an actor-count penalty and must not be read as one. Separating them needs a second wide
 run in a different zone.
 
-**Assembly, measured for the first time — to completion.** A 16 vCPU / 64 GiB Fargate task
-reads **4.97 TB across 2.34 M objects** for a dense zone-year — staged tiles are stored
-**uncompressed**, at 570.4 MB each — at $0.93/hour plus about $1 of S3 requests. Scaling by tile
+**Assembly, measured for the first time — to completion.** A 16 vCPU / 64 GiB Fargate task moves
+**4.97 TB of logical, uncompressed volume across 2.34 M objects** for a dense zone-year — staged
+tiles are stored **uncompressed**, at 570.4 MB each — at $0.93/hour plus about $1 of S3 requests. Scaling by tile
 count over 9 years of 112 zones gives **~$1,150**, superseding the ~$200 in §1. Utilisation was
 57–79% of CPU, ~1.0 GB/s of combined network and 52% of memory, so nothing was saturated.
 
@@ -804,11 +804,17 @@ count over 9 years of 112 zones gives **~$1,150**, superseding the ~$200 in §1.
 | shard-write phase | **195.9 min** (3.27 h) |
 | merge + commit | **37 s — 0.32% of assembly** |
 | total | **196.6 min** (3.28 h) |
-| effective read rate | **423 MB/s** |
+| effective logical rate | **423 MB/s** |
+
+**The 423 MB/s is logical volume over wall-clock, not S3 traffic.** `ASSEMBLY_SUMMARY.bytes`
+counts uncompressed blocks handed to zarr, so a cell with cleared tiles includes blocks built
+locally with no staged read, and writes cross the wire compressed. Use it to plan how long a cell
+takes; do not use it to size object-store bandwidth. See
+[`../assembly/what-bounds-assembly-2026-09-09.md`](../assembly/what-bounds-assembly-2026-09-09.md).
 
 **Two corrections and one free result.** An in-flight estimate of 2.2–3.1 hours, extrapolated
 from a ~550 MB/s instantaneous network sample, was optimistic: sustained over the run the
-effective rate is **423 MB/s**, so a spot network reading is not a throughput basis. And **the
+effective logical rate is **423 MB/s**, so a spot network reading is not a throughput basis. And **the
 commit is negligible** — 37 seconds of 196 minutes, because the forked workers have already
 written every chunk and the merge is metadata only. That is the phase split `ASSEMBLY_SUMMARY`
 was added to obtain, available from two log timestamps: for planning, **assembly IS the shard

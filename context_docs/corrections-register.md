@@ -53,6 +53,24 @@ that was entirely an artefact.
   own. (`ingest/ingest-performance.md` §5)
 - Plus, by that investigation's own count, three more of its six corrections: zone in one,
   keep threshold in another, generalising a single zone in a third.
+- **The assembly pool's "2.92 GiB per worker at both sizes", and the peaks it was built from.**
+  Read from the CloudWatch metric `Maximum` over `{ClusterName, TaskDefinitionFamily}`, where
+  **each statistic is aggregated across tasks independently** — so the unlisted condition was
+  *which task*, and a minute's memory maximum and its CPU maximum could belong to different ones.
+  They do: per task the peak-memory and peak-CPU minutes are different tasks in both families, so
+  filtering minutes by CPU never restricted the memory figures to the tasks that were assembling.
+  **What the route could not do was ESTABLISH a figure, which is not the same as getting one
+  wrong** — of the four it produced, 93.5 GiB and 99.7% CPU are confirmed per task, while 46.7 GiB
+  and 96.8% are not reproducible (40.1 GiB and 95.8% are the highest attributable) and belong to a
+  run outside the log's retention. The per-worker claim is withdrawn outright: the two ratios are
+  2.51 and 2.92, and their apparent agreement was a coincidence between one confirmed number and
+  one that could not be checked. See
+  [`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md).
+- **The same pool's "41.1 GiB peak", one round earlier.** The largest of forty one-minute samples
+  on a **single task**, published as the pool's peak. Note what cannot be said about it: that run
+  is outside the performance log's 24-hour retention, so where the figure fell in its own run's
+  distribution is unrecoverable — it is neither confirmed nor shown to be typical, only shown to
+  be ungeneralisable. The generalising half of this is mechanism 6.
 
 **The cure is written down already and it is mechanical:** before comparing two figures,
 write down the conditions of each side and diff them. The July record carries a
@@ -146,11 +164,41 @@ one stratification flipped the sign of the conclusion.
   survived in two other documents for weeks after it was superseded**, which is mechanism 8 below
   and is the clearest single argument for merging them.
 
+- **"The assembly pool is linear in worker count at 2.92 GiB per worker."** Two points, from
+  **different runner families running different cells**, whose per-worker quotients happened to
+  agree to three significant figures — and only one of the two was ever confirmed (mechanism 1
+  above), so the agreement was a coincidence between a real number and one that could not be
+  checked. Per task the ratios are 2.51 GiB at 16 workers and 2.92 at 32; a line through them
+  implies a **negative** fixed overhead of −13 GiB, which is the arithmetic saying the two points
+  cannot separate overhead from per-worker cost. **The correction is symmetric, and the first
+  attempt at it was not:** whole-task peaks from different families and cells cannot establish
+  non-linearity either, so the finding is that linearity is *unestablished*, not that the pool is
+  non-linear. A second salvage attempt, "use the larger ratio as an upper bound", was withdrawn
+  as well: nothing measured bounds a third pool size.
+  ([`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md))
+
 **The cure:** a two-parameter model needs a third point before it is a model, and a curve
 needs enough points to show it is monotonic before one of them becomes a recommendation.
+**Two points agreeing is not evidence when both come from the same broken instrument.**
 
 ### 7. A mechanism asserted to explain a result, before being measured
 
+- **The assembly pool's "1 to 1.5 GB per worker", and the 24 GB and 48 GB pool figures built on
+  it.** Published in the `AssemblyConfig` docstring and in two **public** documents as sizing
+  guidance, having never been measured at any pool size; a 16-worker pool measures near 40 GiB, so
+  the figure was low by more than half and an operator following it would have under-provisioned a
+  runner into an OOM. Filed here because an unmeasured estimate presented as a measurement is the
+  same failure as an unmeasured mechanism presented as a cause. Its *propagation* is mechanism 8:
+  the estimate reached `docs/configuration.md`, `docs/prefect-setup.md`, the storage record and two
+  test docstrings, and the public guidance was the last of them to be corrected.
+  ([`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md))
+- **"Assembly is CPU-bound."** Asserted from utilisation, which shows the processor is busy at
+  moments, not that it is the constraint that binds the rate of work — while Fargate publishes no
+  per-task network allowance, so the competing candidate was never measurable from outside. The
+  *utilisation* survives and is now attributable: 95.8% of 16 vCPU and 99.7% of 32, each one task
+  in one minute. The *inference* from it does not, and the question is now stated as open, needing
+  a controlled run.
+  ([`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md))
 - **"Most of the dead area is not geometric — it is cloud."** Backwards: geometric dead is
   55–66% of live chunks and radiometric 10–21%. *"The claim was made to explain the null
   result and was not measured before being asserted."*
