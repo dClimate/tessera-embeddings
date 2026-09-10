@@ -85,10 +85,14 @@ it, and so is whatever the task was doing at its peak. There is simply less slac
 24 GB guidance implied, which is why a 16-worker pool wants the full 64 GiB rather than a
 cut-down runner.
 
-**Per worker is 2.51 GiB at 16 and 2.92 GiB at 32 — so the pool is NOT linear in worker count.**
-Fitting a line to the two points gives 3.34 GiB per worker and a *negative* fixed overhead of
-−13 GiB, which is the arithmetic saying two points from different runner families running
-different cells cannot separate overhead from per-worker cost.
+**Per worker is 2.51 GiB at 16 and 2.92 GiB at 32, and what follows from that is only that
+linearity is UNESTABLISHED — not that the pool is non-linear.** The two figures are whole-task
+peaks from different runner families running different cells, and they include the fill's
+coordinator and the Python runtime, so unequal ratios are equally consistent with a linear pool
+sitting on different overheads. The confound that stops the numbers proving linearity stops them
+disproving it too. Fitting a line to the two points gives 3.34 GiB per worker and a *negative*
+fixed overhead of −13 GiB, which is the arithmetic saying the same thing: two points like these
+cannot separate overhead from per-worker cost in either direction.
 
 **So there is no per-worker sizing rule here, and the larger ratio is not an upper bound either.**
 Taking 2.9 GiB per worker as a bound was tried and withdrawn: nothing measured stops a third pool

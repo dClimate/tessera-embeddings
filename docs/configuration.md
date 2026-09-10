@@ -168,10 +168,13 @@ flow-runner container at the full 64 GiB for a 16-worker pool**: assembly is
 where the peak is, the figure is whole-task (so the coordinator and the runtime
 are already inside it), and what is left over is unused reservation rather than
 a second allocation — there is simply less slack than it looks. A pool of 32 was
-measured near 94 GiB and does not fit a 64 GiB host at all. **Only those two sizes have been measured, and the two do not imply a
-per-worker rule** — the 32-worker pool used more per worker than the 16-worker
-one, so any other pool size needs its own measurement rather than an
-extrapolation. Override
+measured near 94 GiB and does not fit a 64 GiB host at all.
+
+**Only those two sizes have been measured, and they do not give a per-worker
+rule**: the 32-worker pool used 2.92 GiB per worker against the 16-worker pool's
+2.51 GiB, and because both are whole-task figures from different runner families
+there is no way to tell overhead from per-worker cost. Any other pool size needs
+its own measurement rather than an extrapolation. Override
 `chunks_per_worker` if your workload profile differs; raise `max_workers` only
 with the RAM and S3 budgets in view, and see
 [`context_docs/assembly/what-bounds-assembly-2026-09-09.md`](../context_docs/assembly/what-bounds-assembly-2026-09-09.md)

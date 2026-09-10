@@ -166,12 +166,15 @@ one stratification flipped the sign of the conclusion.
 
 - **"The assembly pool is linear in worker count at 2.92 GiB per worker."** Two points, from
   **different runner families running different cells**, whose per-worker quotients happened to
-  agree to three significant figures — and both were mis-derived (mechanism 1 above), so the
-  agreement was a coincidence between two wrong numbers. Per task the ratios are 2.50 GiB at 16
-  workers and 2.92 at 32; a line through them implies a **negative** fixed overhead of −13 GiB,
-  which is the arithmetic saying the two points cannot separate overhead from per-worker cost.
-  A first attempt to salvage it as "use the larger ratio as an upper bound" was withdrawn too:
-  nothing measured bounds a third pool size.
+  agree to three significant figures — and only one of the two was ever confirmed (mechanism 1
+  above), so the agreement was a coincidence between a real number and one that could not be
+  checked. Per task the ratios are 2.51 GiB at 16 workers and 2.92 at 32; a line through them
+  implies a **negative** fixed overhead of −13 GiB, which is the arithmetic saying the two points
+  cannot separate overhead from per-worker cost. **The correction is symmetric, and the first
+  attempt at it was not:** whole-task peaks from different families and cells cannot establish
+  non-linearity either, so the finding is that linearity is *unestablished*, not that the pool is
+  non-linear. A second salvage attempt, "use the larger ratio as an upper bound", was withdrawn
+  as well: nothing measured bounds a third pool size.
   ([`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md))
 
 **The cure:** a two-parameter model needs a third point before it is a model, and a curve
