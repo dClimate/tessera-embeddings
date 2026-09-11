@@ -53,6 +53,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import icechunk
 import numpy as np
 import zarr
 
@@ -149,24 +150,67 @@ def _percentiles(samples: list[float]) -> dict[str, float]:
 # ── the worker: one phase, one process ───────────────────────────────────────
 
 
+#: Open-path variants. Each answers a question a reader would otherwise have to guess at, and the
+#: three are measured in one sweep so they are comparable to each other rather than across runs.
+#:
+#: * ``open`` — what a reader gets by following the documented recipe.
+#: * ``open_no_preload`` — the same, with manifest preloading switched off. The store SAVES the
+#:   writer's repository configuration, so a reader inherits preload settings chosen to help a
+#:   fill, and this is what those settings cost somebody who only wants to read.
+#: * ``open_zone_direct`` — opening one zone group by path instead of the root and indexing in.
+#:   Worth measuring because the natural guess is that the root open enumerates all 120 groups;
+#:   if the two are the same, the cost is somewhere else.
+OPEN_PHASES = ("open", "open_no_preload", "open_zone_direct")
+
+
+def _no_preload_config() -> icechunk.RepositoryConfig:
+    """The saved repository config with manifest preloading switched off, and nothing else changed."""
+    return icechunk.RepositoryConfig(
+        manifest=icechunk.ManifestConfig(
+            preload=icechunk.ManifestPreloadConfig(max_total_refs=0, max_arrays_to_scan=0),
+        )
+    )
+
+
 def _open_zone(payload: dict[str, Any]) -> tuple[zarr.Group, dict[str, float]]:
     """Open the store to one zone group at the payload's concurrency, timing each step."""
     zarr.config.set({"async.concurrency": payload["concurrency"]})
+    phase = payload["phase"]
     timings: dict[str, float] = {}
     started = time.monotonic()
-    repo = open_global_repo(payload["uri"], region=payload["region"], anonymous=payload["anonymous"])
+    if phase == "open_no_preload":
+        repo = icechunk.Repository.open(_storage_for(payload), config=_no_preload_config())
+    else:
+        repo = open_global_repo(payload["uri"], region=payload["region"], anonymous=payload["anonymous"])
     timings["repository_open_s"] = round(time.monotonic() - started, 3)
     started = time.monotonic()
     session = repo.readonly_session(branch="main")
     timings["readonly_session_s"] = round(time.monotonic() - started, 3)
     started = time.monotonic()
-    root = zarr.open_group(session.store, mode="r")
-    timings["root_group_open_s"] = round(time.monotonic() - started, 3)
-    started = time.monotonic()
-    group = root[payload["zone"]]
+    if phase == "open_zone_direct":
+        # Straight to the group, never touching the root node.
+        timings["root_group_open_s"] = 0.0
+        group = zarr.open_group(session.store, path=payload["zone"], mode="r")
+    else:
+        root = zarr.open_group(session.store, mode="r")
+        timings["root_group_open_s"] = round(time.monotonic() - started, 3)
+        started = time.monotonic()
+        group = root[payload["zone"]]
     _ = group["embeddings"].shape  # force the array metadata, which is what a reader needs
     timings["zone_group_open_s"] = round(time.monotonic() - started, 3)
     return group, timings
+
+
+def _storage_for(payload: dict[str, Any]) -> icechunk.Storage:
+    """Icechunk storage for the payload's URI, for the one phase that needs its own config."""
+    bucket, _, prefix = payload["uri"].removeprefix("s3://").partition("/")
+    return icechunk.s3_storage(
+        bucket=bucket,
+        prefix=prefix,
+        region=payload["region"],
+        anonymous=True if payload["anonymous"] else None,
+        from_env=None if payload["anonymous"] else True,
+    )
 
 
 def _net_bytes_received() -> int | None:
@@ -190,7 +234,7 @@ def run_phase(payload: dict[str, Any]) -> dict[str, Any]:
     # nearly free, because opening the root already fetched the snapshot that describes every group.
     timings["total_open_s"] = round(sum(timings.values()), 3)
     result: dict[str, Any] = {"phase": payload["phase"], "concurrency": payload["concurrency"], **timings}
-    if payload["phase"] == "open":
+    if payload["phase"] in OPEN_PHASES:
         return result
 
     embeddings = group["embeddings"]
@@ -343,7 +387,7 @@ def main(argv: list[str] | None = None) -> int:
         "points": points,
         "region_origin": region_origin,
     }
-    phases = ["open", "point", *wanted]
+    phases = [*OPEN_PHASES, "point", *wanted]
 
     results: list[dict[str, Any]] = []
     for concurrency in CONCURRENCIES:
@@ -359,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 warm = {"phase": phase, "concurrency": concurrency, "cache": "warm", "error": str(exc)}
             results += [cold, warm]
-            print(f"  c={concurrency:<4} {phase:<12} cold={_one_line(cold)}  warm={_one_line(warm)}")
+            print(f"  c={concurrency:<4} {phase:<17} cold={_one_line(cold)}  warm={_one_line(warm)}")
 
     print()
     _print_table(results)
@@ -389,7 +433,7 @@ def _one_line(result: dict[str, Any]) -> str:
     """One phase's headline figure, for the progress line."""
     if "error" in result:
         return f"FAILED {result['error'][:60]}"
-    if result["phase"] == "open":
+    if result["phase"] in OPEN_PHASES:
         return (
             f"{result['total_open_s'] * 1e3:.0f} ms to first read"
             f" (repo {result['repository_open_s'] * 1e3:.0f}"
@@ -406,16 +450,16 @@ def _one_line(result: dict[str, Any]) -> str:
 def _print_table(results: list[dict[str, Any]]) -> None:
     """The whole sweep as one table, cold and warm side by side."""
     print(
-        f"{'phase':<12} {'conc':>5} {'cache':<5} {'p50 ms':>8} {'p95 ms':>8} {'MB/s':>8} {'MB/point':>9} {'open ms':>8}"
+        f"{'phase':<17} {'conc':>5} {'cache':<5} {'p50 ms':>8} {'p95 ms':>8} {'MB/s':>8} {'MB/point':>9} {'open ms':>8}"
     )
     for result in results:
         if "error" in result:
-            head = f"{result['phase']:<12} {result['concurrency']:>5} {result['cache']:<5}"
+            head = f"{result['phase']:<17} {result['concurrency']:>5} {result['cache']:<5}"
             print(f"{head}   FAILED: {result['error'][:60]}")
             continue
         wire = result.get("wire_bytes_per_point")
         print(
-            f"{result['phase']:<12} {result['concurrency']:>5} {result['cache']:<5} "
+            f"{result['phase']:<17} {result['concurrency']:>5} {result['cache']:<5} "
             f"{result.get('p50_ms', ''):>8} {result.get('p95_ms', ''):>8} "
             f"{result.get('throughput_mbps', ''):>8} "
             f"{(round(wire / 1e6, 2) if wire else ''):>9} "
