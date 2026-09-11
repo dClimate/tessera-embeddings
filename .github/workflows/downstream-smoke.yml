@@ -22,6 +22,18 @@ name: Downstream smoke test
 # This workflow MUST NEVER be a required status check. A project that the people
 # reviewing a pull request here cannot see should not be able to veto a release. The
 # `continue-on-error: true` below makes a failure surface as a warning, not a block.
+#
+# SECURITY, and read this before enabling the trigger. This job runs the pull request's
+# own code while holding a token for another repository, which is the shape of a
+# credential-exfiltration bug. Two things keep it safe and both are load-bearing:
+#
+#   * `persist-credentials: false` on both checkouts, so the token is never written to
+#     disk where the tested code could read it.
+#   * `pull_request`, NEVER `pull_request_target`. On `pull_request` a fork's build gets
+#     no secrets and a read-only token, so untrusted code cannot reach either. Switching
+#     to `pull_request_target` to "make forks work" hands your secrets to code the fork
+#     author controls. If you need fork coverage, require a maintainer to dispatch it by
+#     hand instead.
 on:
   # pull_request:
   #   branches: [main]
@@ -42,10 +54,16 @@ jobs:
           # Falls back to the run's own token: checkout REQUIRES a non-empty value, so an
           # omitted secret would fail the checkout rather than read a public project.
           token: ${{ secrets.DOWNSTREAM_READ_TOKEN || github.token }}
+          # REQUIRED, not optional. checkout writes the token into .git/config by default and
+          # leaves it there until post-job cleanup, and the pytest step below runs code from
+          # the pull request. Persisted, a token with access to a private downstream project
+          # would be readable -- and exfiltratable -- by that code.
+          persist-credentials: false
           path: downstream
       - name: Check out this pull request
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false  # same reason; nothing here pushes
           path: tessera_embeddings
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
