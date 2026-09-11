@@ -201,8 +201,7 @@ workers:     g6e.xlarge          (4 vCPU, 32 GB,    1 InferenceActor each
 ```
 
 The L40S carries **45,776 MiB — 44.7 GiB, or 48.0 GB decimal**. All three numbers
-name the same card; quote the unit, because dropping it has already put the figure
-in our docs two different ways. 250 GB NVMe is fast enough for `torch.load` of the
+name the same card, so quote the unit. 250 GB NVMe is fast enough for `torch.load` of the
 checkpoint without EBS stalls, and the NIC is rated "up to 20 Gbps" — a burst
 credit, not a sustained floor — for the S3-heavy load phase. ~$1.86/hr on-demand
 at us-west-2; spot varies (~$0.5–0.9/hr).
@@ -226,13 +225,12 @@ and neither works without the other:
    *reachable*; it does not make the autoscaler use it. Ray picks node types with a
    greedy loop and stops choosing a type only when that type's own `max_workers` is
    exhausted — so while demand stays under the production rung's ceiling, an open
-   fallback is **never asked for at all**, however long the primary has been refusing.
-   Measured on dev on 2026-08-28: 18 consecutive launch attempts, every one for the
-   L40S, every one refused, and not one attempt at the A10G sitting open at a ceiling
-   of 25. What breaks that is `providers/aws/fleet_mix.py`, which states how many of
-   each card the fleet should hold through `request_resources`. Autoscaler v2 satisfies
-   that request in the **same scheduling pass** as ordinary actor demand, so both pools
-   are asked for at once.
+   fallback is **never asked for at all**, however long the primary has been refusing —
+   measured as eighteen consecutive launch attempts for a refusing L40S rung with an open
+   A10G rung untouched beside it. What breaks that is `providers/aws/fleet_mix.py`, which
+   states how many of each card the fleet should hold through `request_resources`.
+   Autoscaler v2 satisfies that request in the **same scheduling pass** as ordinary actor
+   demand, so both pools are asked for at once.
 
 **There is no capacity-aware scorer any more, and there was never a working one in
 production.** The `RAY_AUTOSCALER_UTILIZATION_SCORER` hook belongs to autoscaler **v1**,
@@ -264,8 +262,8 @@ machines held by a standing request are exempt from the idle timeout, which is w
 ask is recomputed every round and allowed to fall.
 
 **An ask is a floor, not a delivery.** Ray launches with `MinCount=1`, so AWS fills what
-it can and reports success: one measured call asked for six A10G and got one, with a
-launch-failure count of zero throughout. **The fallback pool is supply-constrained too**
+it can and reports success — an ask for six A10G has returned one, with a launch-failure
+count of zero throughout. **The fallback pool is supply-constrained too**
 — opening it buys a second pool, not an unlimited one — and anything monitoring this
 must compare asked against live, because a failure count cannot see partial fulfilment.
 
@@ -294,8 +292,8 @@ it. An explicit probe-and-drain would be a feature, and is not here.
 clears in seconds, and a quota refusal (`InstanceLimitExceeded`) only gets worse on a
 rung that spends more quota — so neither demotes.
 
-**The configuration the campaign runs.** As of 2026-08-28, with the L40S in short
-supply:
+**Setting the ceilings is arithmetic against the vCPU quota, and you have to do it
+yourself.** A configuration looks like this:
 
 ```
 gpu_fallback_instance_types = ["g5.2xlarge"]
@@ -303,16 +301,14 @@ gpu_fallback_vcpu_budget    = 840
 gpu-worker-ladder (SSM)     = g6e.xlarge:101
 ```
 
-That yields ceilings of **101 L40S and 105 A10G** per cluster. The L40S ceiling sits
-well above the ~39 AWS is currently supplying, which costs nothing unclaimed and
-converts straight into more actors per vCPU if supply recovers — an L40S actor is half
-the quota of an A10G one. The A10G ceiling is what actually decides the bill while the
-L40S trickles: `39x4 + 105x8 = 996` vCPU per cluster, **9,960 across ten, inside the
-10,000 account quota by design** rather than by AWS refusing the last launches.
-
-Both rungs full would be 1,244 vCPU per cluster and over quota. That is the accepted
-limitation — Ray's ceilings count nodes and cannot be jointly weighted — and AWS
-enforces the real line by refusing. `TestTheCampaignRestartConfiguration` pins all of it.
+which yields ceilings of 101 L40S and 105 A10G per cluster. Size the pair against the
+supply you are actually getting, not against both ceilings: a primary ceiling well above
+what AWS is supplying costs nothing unclaimed and converts straight into more actors per
+vCPU if supply recovers, while the fallback ceiling is what decides the bill in the
+meantime. **Both rungs full would exceed the quota** — Ray's ceilings count nodes and
+cannot be jointly weighted, so the real line is enforced by AWS refusing the launches.
+That is an accepted limitation rather than an oversight.
+`TestTheCampaignRestartConfiguration` pins the configuration the library ships with.
 
 **The vCPU-matched sizes are deliberately not offered.** `g5.xlarge` and `g6.xlarge` are
 4 vCPU per GPU like the production rung, but carry 16 GiB of host RAM against a measured
@@ -320,12 +316,12 @@ enforces the real line by refusing. `TestTheCampaignRestartConfiguration` pins a
 16 GB g5-class workers.
 
 The L4 is half the L40S's VRAM. What makes it arguable at all is the per-chunk
-peak-VRAM telemetry on the `CHUNK_SUMMARY` line: `max_memory_allocated` measured
-**4.6–7.5 GiB** at optical depths of 54–113 timesteps, against the ~43 GiB the
-earlier `nvidia-smi` reading implied. That reading was the caching allocator's
-*reserved* pool, which runs ~3× the live requirement and sizes itself to the card
-it is given. Read `vram_peak_gib` against `t_kept` before trusting any card-fit
-argument: the requirement grows with optical depth.
+peak-VRAM telemetry on the `CHUNK_SUMMARY` line: `max_memory_allocated` measures
+**4.6–7.5 GiB** at optical depths of 54–113 timesteps, far below what an `nvidia-smi`
+reading suggests. `nvidia-smi` reports the caching allocator's *reserved* pool, which
+runs around three times the live requirement and sizes itself to whatever card it is
+given, so it cannot answer a card-fit question. Read `vram_peak_gib` against `t_kept`
+instead, and remember the requirement grows with optical depth.
 
 ## Region
 
@@ -363,6 +359,12 @@ Total                                     ~$8-15
 
 These are budgetary; profile your specific AOI before scaling
 billing assumptions.
+
+**Do not extrapolate them to a global run.** A campaign's bill is not a per-area figure
+multiplied up: storage, S3 requests and the container fleet together came to more than a
+third of the real total, and none of them scales the way the lines above do. The measured
+outturn of the global campaign — every line, with the usage it was derived from — is
+[`context_docs/campaign/campaign-cost-model.md`](../../context_docs/campaign/campaign-cost-model.md) §12.
 
 ## See also
 
