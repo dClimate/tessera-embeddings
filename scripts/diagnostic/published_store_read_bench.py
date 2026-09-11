@@ -157,13 +157,35 @@ def _percentiles(samples: list[float]) -> dict[str, float]:
 OPEN_PHASES = ("open", "open_zone_direct")
 
 
-def _no_preload_config() -> icechunk.RepositoryConfig:
-    """The saved repository config with manifest preloading switched off, and nothing else changed."""
-    return icechunk.RepositoryConfig(
-        manifest=icechunk.ManifestConfig(
+def _reader_config(payload: dict[str, Any]) -> icechunk.RepositoryConfig | None:
+    """The store's SAVED config with only the payload's overrides applied, or None to change nothing.
+
+    **Starts from what the store saved, never from a fresh config.** A `RepositoryConfig` passed to
+    `Repository.open` replaces the saved one wholesale rather than layering on it, so asking for a
+    chunk cache with a fresh config also silently reverts the manifest preload the writer chose —
+    which was measured here at 2.4 s of the open path, and would have moved between two arms that
+    were supposed to differ only in their cache. Fetching the saved config first and mutating one
+    field keeps each arm a one-variable change.
+    """
+    if not (payload.get("no_preload") or payload.get("chunk_cache_mb")):
+        return None
+    config = icechunk.Repository.fetch_config(_storage_for(payload))
+    if config is None:
+        raise RuntimeError("the store saved no repository config; an override here would not be a one-variable change")
+    if payload.get("no_preload"):
+        config.manifest = icechunk.ManifestConfig(
             preload=icechunk.ManifestPreloadConfig(max_total_refs=0, max_arrays_to_scan=0),
+            splitting=config.manifest.splitting if config.manifest else None,
         )
-    )
+    if payload.get("chunk_cache_mb"):
+        # The saved config sets no caching, so a reader gets icechunk's own default chunk cache. A
+        # working set larger than that cache is evicted before it can be revisited, which is the
+        # difference between a repeated read of one inner chunk costing a request and costing
+        # nothing.
+        config.caching = icechunk.CachingConfig(
+            num_bytes_chunks=int(payload["chunk_cache_mb"]) * 1024 * 1024,
+        )
+    return config
 
 
 def _open_zone(payload: dict[str, Any]) -> tuple[zarr.Group, dict[str, float]]:
@@ -172,8 +194,9 @@ def _open_zone(payload: dict[str, Any]) -> tuple[zarr.Group, dict[str, float]]:
     phase = payload["phase"]
     timings: dict[str, float] = {}
     started = time.monotonic()
-    if payload["no_preload"]:
-        repo = icechunk.Repository.open(_storage_for(payload), config=_no_preload_config())
+    config = _reader_config(payload)
+    if config is not None:
+        repo = icechunk.Repository.open(_storage_for(payload), config=config)
     else:
         repo = open_global_repo(payload["uri"], region=payload["region"], anonymous=payload["anonymous"])
     timings["repository_open_s"] = round(time.monotonic() - started, 3)
@@ -317,6 +340,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--chunk-cache-mb",
+        type=int,
+        default=0,
+        help=(
+            "override the chunk cache size in MiB. The store saves no caching setting, so a reader "
+            "gets icechunk's own default; raising it above the working set is what turns a repeated "
+            "read of one inner chunk from a request into a cache hit."
+        ),
+    )
+    parser.add_argument(
         "--no-preload",
         action="store_true",
         help=(
@@ -342,6 +375,8 @@ def main(argv: list[str] | None = None) -> int:
     host = _host_facts()
     print(f"host:  {host}")
     preload_note = "manifest preload DISABLED" if args.no_preload else "manifest preload as saved in the store"
+    if args.chunk_cache_mb:
+        preload_note += f", chunk cache {args.chunk_cache_mb} MiB"
     print(f"store: {args.uri} ({args.region})  zone {args.zone} year {args.year}  [{preload_note}]")
 
     repo = open_global_repo(args.uri, region=args.region, anonymous=args.anonymous)
@@ -388,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
         "region": args.region,
         "anonymous": args.anonymous,
         "no_preload": args.no_preload,
+        "chunk_cache_mb": args.chunk_cache_mb,
         "zone": args.zone,
         "time_index": time_index,
         "points": points,
@@ -421,6 +457,7 @@ def main(argv: list[str] | None = None) -> int:
                     "host": host,
                     "store": {"uri": args.uri, "region": args.region, "zone": args.zone, "year": args.year},
                     "no_preload": args.no_preload,
+                    "chunk_cache_mb": args.chunk_cache_mb,
                     "snapshot_id": session.snapshot_id,
                     "live_shards": len(shards),
                     "probe_pixels": len(points),
