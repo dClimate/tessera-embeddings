@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from datetime import datetime
@@ -112,14 +113,17 @@ def _schema_audit(fs: pyarrow.fs.FileSystem, parts: list[dict[str, Any]]) -> dic
     """
     import pyarrow.parquet as pq
 
-    declared = {field.name: str(field.type) for field in registry_schema()}
+    # Type AND nullability. `str(field.type)` alone accepts a part that declares `tile`, `run_id`,
+    # `assembled_at` or `embedded` as nullable — and a null identity there breaks the latest-wins
+    # selection or groups unrelated rows under a null tile.
+    declared = {field.name: (str(field.type), field.nullable) for field in registry_schema()}
     missing: dict[str, list[str]] = {}
     extra: dict[str, list[str]] = {}
     retyped: dict[str, list[str]] = {}
     without_identity: list[str] = []
     for part in parts:
         schema = pq.read_schema(part["path"], filesystem=fs)
-        present = {field.name: str(field.type) for field in schema}
+        present = {field.name: (str(field.type), field.nullable) for field in schema}
         if absent := sorted(set(declared) - set(present)):
             missing[part["path"]] = absent
         if surplus := sorted(set(present) - set(declared)):
@@ -201,6 +205,23 @@ def _aoi_query(
     }
 
 
+#: Registry tile labels are ``chunk_<shard_y>_<shard_x>`` — the same shard-grid coordinates
+#: :func:`~tessera_embeddings.storage.published_store.live_shards` returns, which is what makes the
+#: two directly comparable rather than only countable.
+_TILE_LABEL = re.compile(r"^chunk_(\d+)_(\d+)$")
+
+
+def _tile_coordinate(label: str) -> tuple[int, int] | None:
+    """The ``(shard_y, shard_x)`` a tile label names, or None if it does not parse.
+
+    Returns None rather than raising so an unrecognised label is REPORTED as a finding instead of
+    aborting the audit — a renamed label scheme is exactly the sort of drift this exists to notice,
+    and crashing on it would hide every other cell's verdict.
+    """
+    match = _TILE_LABEL.match(str(label))
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
 def _latest_per_tile(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Keep one row per tile — the one with the latest ``assembled_at``.
 
@@ -266,6 +287,15 @@ def _verify_against_store(
             # holds one shard each, reporting a correct cell as a disagreement. `assembled_at` is
             # the clock the registry provides for exactly this decision; a run id is not one.
             registry_rows = list(_latest_per_tile(all_rows).values())
+            # The COORDINATES, not the count. One embedded tile missing and one wrongly marked
+            # embedded leaves the cardinalities equal, and a registry whose whole job is to say
+            # WHERE coverage is would then be pointing consumers at the wrong tiles while this
+            # audit said "agrees". `live_shards` already has the exact pairs.
+            registry_tiles = {
+                _tile_coordinate(r["tile"]) for r in registry_rows if r["embedded"] and _tile_coordinate(r["tile"])
+            }
+            store_tiles = coverage.get(time_index, frozenset()) if time_index is not None else frozenset()
+            unparsed_tiles = sorted({r["tile"] for r in registry_rows if not _tile_coordinate(r["tile"])})
             findings.append(
                 {
                     "zone": zone,
@@ -277,7 +307,11 @@ def _verify_against_store(
                     "runs_present": sorted({r["run_id"] for r in all_rows}),
                     "registry_embedded": sum(1 for r in registry_rows if r["embedded"]),
                     "registry_not_embedded": sum(1 for r in registry_rows if not r["embedded"]),
-                    "store_live_shards": len(coverage.get(time_index, ())) if time_index is not None else 0,
+                    "store_live_shards": len(store_tiles),
+                    "in_registry_only": sorted(registry_tiles - store_tiles)[:20],
+                    "in_store_only": sorted(store_tiles - registry_tiles)[:20],
+                    "tiles_disagreeing": len(registry_tiles ^ store_tiles),
+                    "unparsable_tile_labels": unparsed_tiles[:10],
                 }
             )
     return findings
@@ -397,7 +431,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\ncross-check against the store ({len(zones)} zone(s)):")
         print(f"  {'cell':<12} {'complete':>8} {'rows':>6} {'embedded':>9} {'shards':>7}  verdict")
         for finding in findings:
-            counts_agree = finding["registry_embedded"] == finding["store_live_shards"]
+            # Coordinate equality, which implies count equality and catches what it cannot.
+            counts_agree = finding["tiles_disagreeing"] == 0 and not finding["unparsable_tile_labels"]
             # A cell holding data and NOT marked complete is the half-published state this audit
             # records `marked_complete` to catch: a fill that wrote its shards and its registry
             # part, then died before adding the year to `years_complete`. Its counts agree, so

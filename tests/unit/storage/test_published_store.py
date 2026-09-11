@@ -246,3 +246,70 @@ class TestLayoutDimensionNames:
             overwrite=True,
         )
         assert any("no dimension names" in d for d in published_store.layout_departures(group))
+
+
+class TestLayoutFillAndAttributes:
+    """Fill value, declared attributes, and extents — the checks geometry alone cannot make."""
+
+    def test_a_finite_fill_on_scales_is_reported(self, seeded):
+        # The one that matters most: every coverage question in this module reads a finite `scales`
+        # value as written data, so a finite fill makes never-written pixels indistinguishable from
+        # real ones while the array keeps the right dtype, chunks and shards.
+        _, group = _writable_group(seeded, "01N")
+        group.create_array(
+            "scales",
+            shape=group["scales"].shape,
+            dtype="float32",
+            chunks=(1, 256, 256),
+            shards=(1, 2048, 2048),
+            dimension_names=("time", "northing", "easting"),
+            fill_value=0.0,
+            overwrite=True,
+        )
+        departures = published_store.layout_departures(group)
+        assert any("scales" in d and "fill value" in d for d in departures)
+        assert not any("chunks" in d or "shards" in d or "dimension names" in d for d in departures)
+
+    def test_nan_fill_is_not_reported_as_a_departure(self, seeded):
+        # float("nan") != float("nan"), and zarr returns a numpy scalar rather than a Python float,
+        # so a naive comparison calls every conforming store broken.
+        group = zarr_store.open_store_as_zarr_group(seeded, group="01N")
+        assert not any("fill value" in d for d in published_store.layout_departures(group))
+
+    def test_a_missing_declared_attribute_is_reported(self, seeded):
+        # `dtype="bool"` on an int8 array is how xarray presents booleans; without it a labelled
+        # reader silently gets 0 and 1 instead.
+        _, group = _writable_group(seeded, "01N")
+        covered = group["s2_month_covered"]
+        group.create_array(
+            "s2_month_covered",
+            shape=covered.shape,
+            dtype="int8",
+            chunks=covered.chunks,
+            shards=covered.shards,
+            dimension_names=("time", "northing", "easting", "month"),
+            fill_value=covered.fill_value,
+            overwrite=True,
+        )
+        departures = published_store.layout_departures(group)
+        assert any("s2_month_covered" in d and "dtype" in d and "bool" in d for d in departures)
+
+    def test_an_array_shorter_than_its_coordinate_is_reported(self, seeded):
+        # Expectations are derived from the array's own shape, so truncating it by a whole shard
+        # keeps the nominal chunk and shard sizes and passes every geometry check. The coordinate
+        # arrays are the independent oracle.
+        _, group = _writable_group(seeded, "01N")
+        scales = group["scales"]
+        short = (scales.shape[0], scales.shape[1] - SHARD_PX, scales.shape[2])
+        group.create_array(
+            "scales",
+            shape=short,
+            dtype="float32",
+            chunks=(1, 256, 256),
+            shards=(1, 2048, 2048),
+            dimension_names=("time", "northing", "easting"),
+            fill_value=float("nan"),
+            overwrite=True,
+        )
+        departures = published_store.layout_departures(group)
+        assert any("northing" in d and "coordinate array" in d for d in departures)

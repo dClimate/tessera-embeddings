@@ -229,8 +229,17 @@ def _open_zone(payload: dict[str, Any]) -> tuple[zarr.Group, dict[str, float]]:
 
 
 def _storage_for(payload: dict[str, Any]) -> icechunk.Storage:
-    """Icechunk storage for the payload's URI, for the one phase that needs its own config."""
-    bucket, _, prefix = payload["uri"].removeprefix("s3://").partition("/")
+    """Icechunk storage for the payload's URI, built without a repository config.
+
+    Handles a LOCAL path as well as an S3 URI. Every arm of this benchmark opens through here, so
+    forcing a filesystem path into ``s3_storage`` would have made `--no-preload` and
+    `--chunk-cache-mb` fail on exactly the local or synthetic store somebody would rehearse them
+    against, while the same store opened fine without those flags.
+    """
+    uri = payload["uri"]
+    if not uri.startswith("s3://"):
+        return icechunk.local_filesystem_storage(uri.removeprefix("file://"))
+    bucket, _, prefix = uri.removeprefix("s3://").partition("/")
     return icechunk.s3_storage(
         bucket=bucket,
         prefix=prefix,

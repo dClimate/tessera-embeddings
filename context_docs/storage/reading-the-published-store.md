@@ -409,13 +409,19 @@ declared types; every part's own key-value metadata agrees with the zone and yea
 part's path fails to parse; and no cell has more than one part, which means nothing was filled
 twice.
 
-**It agrees with the store.** Per cell, the count of rows with `embedded` true equals the count of
-shards holding embeddings — checked over 16S (17 tiles in each of nine years) and 33N (8,593 tiles
-in each of nine years, of which 7,982 are embedded in 2017 and all 8,593 in every later year). The
-2017 shortfall is 611 tiles that were evaluated and produced nothing, and the store and the
-registry put the same number on it from opposite directions. That is the strongest evidence
-available that the registry is a faithful convenience layer rather than a second, drifting source
-of truth.
+**It agrees with the store, tile for tile.** A registry tile label is `chunk_<shard_y>_<shard_x>`,
+which is the same shard-grid coordinate Icechunk's chunk index returns, so the two can be compared
+as sets rather than as counts — and they must be, because one tile missing and one wrongly marked
+embedded leaves the counts equal while the registry points a consumer at the wrong ground. Checked
+over 16S (17 tiles in each of nine years) and 33N (8,593 tiles in each of nine years): every
+embedded tile in the registry is a live shard in the store and every live shard is an embedded
+tile, with no exceptions in either direction.
+
+That includes 33N/2017, where only 7,982 of the 8,593 evaluated tiles are embedded. The 611-tile
+shortfall is land that was imaged and then wholly refused by the depth rule, and the store and the
+registry put the same 7,982 coordinates on it from opposite directions. It is the strongest
+evidence available that the registry is a faithful convenience layer rather than a second,
+drifting source of truth.
 
 **Row counts differ between the two, and both are right.** 3,247,410 registry rows against
 3,229,545 shards holding embeddings: the difference, 17,865, is tiles that were evaluated and

@@ -62,6 +62,25 @@ CAMPAIGN_YEARS = tuple(range(2017, 2026))
 EXPECTED_ZONES = tuple(f"{n:02d}{hemisphere}" for n in range(1, 61) for hemisphere in ("N", "S"))
 
 
+def _storage_for(args: argparse.Namespace) -> icechunk.Storage:
+    """Storage for the audited URI, with no repository config attached.
+
+    Needed only so the config the store SAVED can be fetched separately from the handle the audit
+    reads through. Handles a local path as well as an S3 URI, so the census can be rehearsed
+    against a synthetic store.
+    """
+    if not args.uri.startswith("s3://"):
+        return icechunk.local_filesystem_storage(args.uri.removeprefix("file://"))
+    bucket, _, prefix = args.uri.removeprefix("s3://").partition("/")
+    return icechunk.s3_storage(
+        bucket=bucket,
+        prefix=prefix,
+        region=args.region,
+        anonymous=True if args.anonymous else None,
+        from_env=None if args.anonymous else True,
+    )
+
+
 def _cell_tags(repo: icechunk.Repository) -> set[tuple[str, int]]:
     """Every ``(zone, year)`` the store carries a completion tag for.
 
@@ -76,17 +95,25 @@ def _cell_tags(repo: icechunk.Repository) -> set[tuple[str, int]]:
     return cells
 
 
-def _describe_config(repo: icechunk.Repository) -> dict[str, Any]:
-    """The parts of the persisted repository config a reader's performance depends on."""
-    manifest = repo.config.manifest
+def _describe_config(config: icechunk.RepositoryConfig | None) -> dict[str, Any]:
+    """The parts of a repository config a reader's performance depends on.
+
+    **Takes the config the STORE saved, never `repo.config`.** `open_global_repo` supplies
+    `global_store_config()`, and an explicit config replaces the persisted one rather than layering
+    onto it — so reading it back off the handle echoes what the library just passed in and would
+    report healthy tuning for a store that had lost its saved config entirely.
+    """
+    if config is None:
+        return {"saved_config": None}
+    manifest = config.manifest
     preload = getattr(manifest, "preload", None)
     splitting = getattr(manifest, "splitting", None)
     return {
         "manifest_preload_max_total_refs": getattr(preload, "max_total_refs", None),
         "manifest_preload_max_arrays_to_scan": getattr(preload, "max_arrays_to_scan", None),
         "manifest_splitting_configured": splitting is not None,
-        "caching": repr(repo.config.caching),
-        "storage_concurrency": repr(getattr(repo.config.storage, "concurrency", None)),
+        "caching": repr(config.caching),
+        "storage_concurrency": repr(getattr(config.storage, "concurrency", None)),
     }
 
 
@@ -176,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     repo = open_global_repo(args.uri, region=args.region, anonymous=args.anonymous)
     timings["repository_open_s"] = round(time.monotonic() - started, 3)
+    saved_config = icechunk.Repository.fetch_config(_storage_for(args))
 
     started = time.monotonic()
     session = repo.readonly_session(branch="main")
@@ -194,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"store:     {args.uri} ({args.region})")
     print(f"snapshot:  {session.snapshot_id}")
     print(f"opens:     {timings}")
-    print(f"config:    {json.dumps(_describe_config(repo), indent=13)[1:-1].strip()}")
+    print(f"config:    {json.dumps(_describe_config(saved_config), indent=13)[1:-1].strip()}")
     print(f"root keys: {sorted(root.attrs)}")
     print(f"groups:    {len(present)} of {len(EXPECTED_ZONES)} expected (auditing {len(zones)})")
     if missing_groups:
@@ -255,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
                     "region": args.region,
                     "snapshot_id": session.snapshot_id,
                     "timings": timings,
-                    "config": _describe_config(repo),
+                    "config": _describe_config(saved_config),
                     "root_attrs": {k: root.attrs[k] for k in sorted(root.attrs)},
                     "zones": zone_reports,
                     "reconciliation": {

@@ -93,13 +93,50 @@ def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[s
             out.append(f"{var}: dimension names are {tuple(names)}, the layout declares {tuple(expected.dims)}")
         if array.dtype != np.dtype(expected.dtype):
             out.append(f"{var}: dtype is {array.dtype}, the {layout.name} layout declares {expected.dtype}")
+        if not _fill_values_match(array.fill_value, expected.fill_value):
+            # Load-bearing rather than cosmetic. `sample_live_pixels` and every coverage question in
+            # this module read a finite `scales` value as "written", so a finite fill would make
+            # never-written pixels indistinguishable from data — and the array would still have the
+            # right dtype, chunks and shards.
+            out.append(f"{var}: fill value is {array.fill_value!r}, the layout declares {expected.fill_value!r}")
+        for name, value in expected.attrs:
+            # Part of the array's TYPE, not decoration: `dtype="bool"` on an int8 array is how
+            # xarray knows to present booleans, and without it a labelled reader gets 0 and 1.
+            if array.attrs.get(name) != value:
+                out.append(f"{var}: attribute {name}={array.attrs.get(name)!r}, the layout declares {value!r}")
         chunks, shards = clamp_chunks_and_shards(tuple(array.shape), expected.chunks, expected.shards)
         if tuple(array.chunks) != chunks:
             out.append(f"{var}: inner chunks are {tuple(array.chunks)}, the layout declares {chunks}")
         actual_shards = tuple(array.shards) if array.shards else None
         if actual_shards != shards:
             out.append(f"{var}: shards are {actual_shards}, the layout declares {shards}")
+        # Extents against the COORDINATE arrays, because the expectations above are derived from this
+        # array's own shape and so cannot see it being short. An array truncated by a whole shard
+        # keeps the nominal chunk and shard sizes and passes every check above, while a labelled
+        # reader gets conflicting dimension lengths — or silently loses the coverage off the end.
+        for axis, dim in enumerate(expected.dims):
+            coord = present.get(dim)
+            if coord is not None and coord.ndim == 1 and coord.shape[0] != array.shape[axis]:
+                out.append(f"{var}: dimension {dim} is {array.shape[axis]}, its coordinate array is {coord.shape[0]}")
     return out
+
+
+def _fill_values_match(actual: object, expected: object) -> bool:
+    """Whether two fill values agree, treating NaN as equal to NaN.
+
+    Two traps in one line of arithmetic. ``float("nan") != float("nan")``, and NaN is exactly the
+    fill ``scales`` relies on — so the obvious comparison reports every conforming store as broken.
+    And zarr hands back a NUMPY scalar (``np.float32("nan")``), not a Python float, so an
+    ``isinstance(..., float)`` guard misses it and the NaN case never fires.
+    """
+    try:
+        left = np.asarray(actual, dtype="float64")
+        right = np.asarray(expected, dtype="float64")
+    except (TypeError, ValueError):
+        return bool(actual == expected)
+    if bool(np.isnan(left)) and bool(np.isnan(right)):
+        return True
+    return bool(left == right)
 
 
 def live_shards(session: icechunk.Session, zone: str, var: str = COVERAGE_VAR) -> dict[int, frozenset[tuple[int, int]]]:
