@@ -41,6 +41,7 @@ import icechunk
 import numpy as np
 import zarr
 
+from tessera_embeddings.config.inference import EMBEDDING_DIM
 from tessera_embeddings.storage import published_store, zone_grid
 from tessera_embeddings.storage.global_store import open_global_repo
 
@@ -60,6 +61,55 @@ CAMPAIGN_YEARS = tuple(range(2017, 2026))
 #: reconciliation is filtered to the groups that were audited too, so a store that lost an entire
 #: zone would reconcile perfectly against its own smaller self and exit 0.
 EXPECTED_ZONES = tuple(f"{n:02d}{hemisphere}" for n in range(1, 61) for hemisphere in ("N", "S"))
+
+
+#: Root attributes a consumer needs in order to interpret the product at all, with the values this
+#: pipeline fixes. In the ``utm_zones`` layout the encoder and quantization provenance is stated
+#: ONCE at the root, so a zone group cannot make up for a root that lost it.
+_REQUIRED_ROOT_VALUES = {
+    "geoemb:type": "pixel",
+    "geoemb:dimensions": EMBEDDING_DIM,
+    "geoemb:data_type": "int8",
+    "geoemb:spatial_layout": "utm_zones",
+}
+#: Present-and-non-empty is all that can be asked of these: the model URL and build version depend
+#: on the run, so a value check here would only pin whatever the last run happened to write.
+_REQUIRED_ROOT_KEYS = ("geoemb:model", "geoemb:build_version", "geoemb:source_data", "geoemb:quantization")
+
+
+def _root_departures(attrs: dict[str, Any]) -> list[str]:
+    """Every way the root's provenance falls short of what a consumer needs to interpret the data.
+
+    Printed AND counted. Without the quantization block a consumer cannot turn int8 back into
+    reflectance-space values, and without the convention declaration they have no way to look up
+    what any of these keys mean — so a store missing them is one nobody can reliably read, however
+    complete its arrays are.
+    """
+    out: list[str] = []
+    for key, expected in _REQUIRED_ROOT_VALUES.items():
+        if attrs.get(key) != expected:
+            out.append(f"root: {key}={attrs.get(key)!r}, expected {expected!r}")
+    for key in _REQUIRED_ROOT_KEYS:
+        if not attrs.get(key):
+            out.append(f"root: {key} is missing or empty")
+    quantization = attrs.get("geoemb:quantization")
+    if isinstance(quantization, dict):
+        # The dequantization recipe itself: which array holds the per-pixel factors, and what a
+        # missing factor looks like there. A consumer that cannot resolve these two cannot use the
+        # embeddings, only read them.
+        scale = quantization.get("scale")
+        if quantization.get("method") != "per_pixel_scale":
+            out.append(f"root: quantization method is {quantization.get('method')!r}, expected 'per_pixel_scale'")
+        if not isinstance(scale, dict) or scale.get("array_name") != "scales":
+            out.append(f"root: quantization scale does not name the `scales` array: {scale!r}")
+        elif str(scale.get("nodata")).lower() != "nan":
+            out.append(f"root: quantization scale nodata is {scale.get('nodata')!r}, expected NaN")
+    elif quantization is not None:
+        out.append(f"root: geoemb:quantization is {type(quantization).__name__}, expected a mapping")
+    declared = {c.get("name") for c in attrs.get("zarr_conventions", []) if isinstance(c, dict)}
+    if "geoemb:" not in declared:
+        out.append(f"root: zarr_conventions does not declare the geoemb: convention (declares {sorted(declared)})")
+    return out
 
 
 def _storage_for(args: argparse.Namespace) -> icechunk.Storage:
@@ -230,7 +280,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"snapshot:  {session.snapshot_id}")
     print(f"opens:     {timings}")
     print(f"config:    {json.dumps(_describe_config(saved_config), indent=13)[1:-1].strip()}")
+    root_departures = _root_departures(dict(root.attrs))
     print(f"root keys: {sorted(root.attrs)}")
+    for departure in root_departures:
+        print(f"           {departure}")
     print(f"groups:    {len(present)} of {len(EXPECTED_ZONES)} expected (auditing {len(zones)})")
     if missing_groups:
         print(f"           MISSING GROUPS: {missing_groups}")
@@ -279,6 +332,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"has provenance, unmarked: {len(unmarked_provenance)} {unmarked_provenance[:6]}")
     print(f"groups missing/unexpected:{len(missing_groups)} / {len(unexpected_groups)}")
     print(f"years outside the campaign:{len(unexpected_years)} {unexpected_years[:6]}")
+    print(f"root provenance departures: {len(root_departures)}")
     if args.shards:
         print(f"shards in unmarked years:  {len(unmarked_shards)} {list(unmarked_shards.items())[:4]}")
 
@@ -301,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
                         "missing_groups": missing_groups,
                         "unexpected_groups": unexpected_groups,
                         "years_outside_the_campaign": unexpected_years,
+                        "root_departures": root_departures,
                         "live_shards_in_unmarked_years": unmarked_shards,
                     },
                 },
@@ -321,6 +376,7 @@ def main(argv: list[str] | None = None) -> int:
             or unexpected_groups
             or unexpected_years
             or unmarked_shards
+            or root_departures
         )
         else 0
     )

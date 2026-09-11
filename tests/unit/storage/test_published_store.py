@@ -313,3 +313,65 @@ class TestLayoutFillAndAttributes:
         )
         departures = published_store.layout_departures(group)
         assert any("northing" in d and "coordinate array" in d for d in departures)
+
+
+class TestLayoutCoordinatesAndCodec:
+    """Two more departures the geometry checks cannot see: a lost coordinate, and a wrong codec."""
+
+    def test_a_missing_coordinate_array_is_reported(self, seeded):
+        # Without this, losing `northing` only causes the extent check for that dimension to be
+        # skipped — so the audit reports nothing while every geospatial read of the zone is
+        # incomplete.
+        _, group = _writable_group(seeded, "01N")
+        del group["northing"]
+        assert any("northing" in d and "does not have it" in d for d in published_store.layout_departures(group))
+
+    def test_a_missing_month_coordinate_is_reported(self, seeded):
+        # `month` and `time_bnds` are the two easiest to leave out of a "required coordinates" set,
+        # which is why the layout audit asks the seeder's own definition instead of its own list.
+        _, group = _writable_group(seeded, "01N")
+        del group["month"]
+        assert any("month" in d and "does not have it" in d for d in published_store.layout_departures(group))
+
+    def test_scales_without_its_declared_codec_is_reported(self, seeded):
+        _, group = _writable_group(seeded, "01N")
+        group.create_array(
+            "scales",
+            shape=group["scales"].shape,
+            dtype="float32",
+            chunks=(1, 256, 256),
+            shards=(1, 2048, 2048),
+            dimension_names=("time", "northing", "easting"),
+            fill_value=float("nan"),
+            compressors=None,
+            serializer="auto",
+            overwrite=True,
+        )
+        departures = published_store.layout_departures(group)
+        assert any("scales" in d and "codec" in d for d in departures)
+
+
+class TestAnonymousWithAnOverride:
+    """`anonymous` must not be quietly satisfied by an installed S3 override."""
+
+    def test_an_installed_override_refuses_an_anonymous_read(self, monkeypatch):
+        # The override carries credentials and an endpoint, so honouring it would send credentials
+        # for a caller that asked to send none — which would make an anonymous-access check pass
+        # while authenticating, the one thing that check exists to rule out.
+        class _Override:
+            def make_storage(self, prefix_override=None):
+                raise AssertionError("the override must not be consulted for an anonymous read")
+
+        monkeypatch.setattr(zarr_store, "_s3_config_override", _Override())
+        with pytest.raises(ValueError, match="anonymous"):
+            zarr_store._create_storage("s3://bucket/prefix", anonymous=True)
+
+    def test_an_installed_override_still_serves_a_credentialed_read(self, monkeypatch):
+        sentinel = object()
+
+        class _Override:
+            def make_storage(self, prefix_override=None):
+                return sentinel
+
+        monkeypatch.setattr(zarr_store, "_s3_config_override", _Override())
+        assert zarr_store._create_storage("s3://bucket/prefix") is sentinel

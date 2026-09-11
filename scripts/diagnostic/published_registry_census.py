@@ -38,7 +38,7 @@ import json
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -131,7 +131,14 @@ def _schema_audit(fs: pyarrow.fs.FileSystem, parts: list[dict[str, Any]]) -> dic
         if wrong := sorted(n for n in set(declared) & set(present) if declared[n] != present[n]):
             retyped[part["path"]] = wrong
         metadata = {k.decode(): v.decode() for k, v in (schema.metadata or {}).items() if k != b"pandas"}
-        if metadata.get("zone") != part["zone"] or metadata.get("year") != str(part["year"]):
+        # Run id as well as zone and year. Parts are keyed BY RUN — that is what makes a refill add
+        # a part instead of overwriting one — so a footer whose run id contradicts its own filename
+        # has two provenances, and the latest-wins selection has no way to tell which is the row's.
+        if (
+            metadata.get("zone") != part["zone"]
+            or metadata.get("year") != str(part["year"])
+            or metadata.get("run_id") != part["run_id"]
+        ):
             without_identity.append(part["path"])
     return {
         "parts_missing_declared_columns": missing,
@@ -243,12 +250,34 @@ def _latest_per_tile(rows: list[dict[str, Any]]) -> dict[tuple[str, str], dict[s
     """
     latest: dict[tuple[str, str], tuple[datetime, dict[str, Any]]] = {}
     for row in rows:
-        stamp = datetime.fromisoformat(str(row["assembled_at"]))
         key = (str(row.get("zone", "")), str(row["tile"]))
+        stamp = _parse_stamp(row["assembled_at"])
+        if stamp is None:
+            # RECORDED, not raised. A malformed or offset-naive timestamp makes the parse or the
+            # comparison below throw, and it would do so in the middle of the audit — aborting
+            # before any cell verdict or the JSON report, exactly when malformed registry data is
+            # what somebody is trying to diagnose. The row is kept, flagged, and ordered last.
+            row["assembled_at_unparsable"] = True
+            latest.setdefault(key, (datetime.min.replace(tzinfo=UTC), row))
+            continue
         held = latest.get(key)
         if held is None or stamp > held[0]:
             latest[key] = (stamp, row)
     return {key: row for key, (_, row) in latest.items()}
+
+
+def _parse_stamp(value: object) -> datetime | None:
+    """``assembled_at`` as an aware datetime, or None when it will not parse or compare.
+
+    Offset-NAIVE is treated as unparsable rather than assumed to be UTC: comparing a naive against
+    an aware datetime raises, and guessing a zone would silently reorder runs. Current writers emit
+    an offset, so a naive value is itself the finding.
+    """
+    try:
+        stamp = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp.tzinfo is not None else None
 
 
 def _verify_against_store(
@@ -303,6 +332,7 @@ def _verify_against_store(
             }
             store_tiles = coverage.get(time_index, frozenset()) if time_index is not None else frozenset()
             unparsed_tiles = sorted({r["tile"] for r in registry_rows if not _tile_coordinate(r["tile"])})
+            bad_stamps = sorted({str(r["tile"]) for r in registry_rows if r.get("assembled_at_unparsable")})
             findings.append(
                 {
                     "zone": zone,
@@ -319,6 +349,7 @@ def _verify_against_store(
                     "in_store_only": sorted(store_tiles - registry_tiles)[:20],
                     "tiles_disagreeing": len(registry_tiles ^ store_tiles),
                     "unparsable_tile_labels": unparsed_tiles[:10],
+                    "unparsable_assembled_at": bad_stamps[:10],
                 }
             )
     return findings
@@ -439,7 +470,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {'cell':<12} {'complete':>8} {'rows':>6} {'embedded':>9} {'shards':>7}  verdict")
         for finding in findings:
             # Coordinate equality, which implies count equality and catches what it cannot.
-            counts_agree = finding["tiles_disagreeing"] == 0 and not finding["unparsable_tile_labels"]
+            counts_agree = (
+                finding["tiles_disagreeing"] == 0
+                and not finding["unparsable_tile_labels"]
+                and not finding["unparsable_assembled_at"]
+            )
             # A cell holding data and NOT marked complete is the half-published state this audit
             # records `marked_complete` to catch: a fill that wrote its shards and its registry
             # part, then died before adding the year to `years_complete`. Its counts agree, so

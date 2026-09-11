@@ -435,6 +435,17 @@ def _create_storage(
     if store_path.startswith("s3://"):
         bucket, prefix = _parse_s3_url(store_path)
         if _s3_config_override:
+            # REFUSED rather than honoured either way. The override carries its own credentials and
+            # endpoint, so returning it would send credentials for a caller that asked to send
+            # none — making an anonymous-access check pass while authenticating, which is the one
+            # thing that check exists to rule out. Silently dropping the override instead would
+            # point the read at the wrong endpoint.
+            if anonymous:
+                raise ValueError(
+                    "anonymous=True with an installed S3 config override: the override carries "
+                    "credentials and an endpoint, so it cannot serve an anonymous read. Clear the "
+                    "override, or drop anonymous."
+                )
             return _s3_config_override.make_storage(prefix_override=prefix)
         # Fall back to the globally-registered provider when the caller passed none. This is
         # how the S1 ingest path keeps icechunk on IAM-role creds: set_s3_credentials

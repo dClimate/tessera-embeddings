@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 
 from tessera_embeddings.config.store_layout import GLOBAL, SHARD_PX, StoreLayout, clamp_chunks_and_shards
+from tessera_embeddings.storage.global_store import _codec_id, missing_seeded_arrays
 
 if TYPE_CHECKING:
     import icechunk
@@ -67,6 +68,12 @@ def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[s
     """
     present = dict(group.arrays())
     out: list[str] = []
+    # The COORDINATE arrays too, from the same definition the seeder uses. A zone that lost
+    # `northing`, `month` or `time_bnds` would otherwise only cause the extent check below to be
+    # skipped for whichever dimension it names — so an audit reports nothing while a labelled or
+    # geospatial read of that zone is incomplete.
+    for name in sorted(missing_seeded_arrays(group, layout)):
+        out.append(f"{name}: a seed of the {layout.name} layout writes it and the group does not have it")
     for var in layout.arrays:
         array = present.get(var)
         if array is None:
@@ -104,6 +111,14 @@ def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[s
             # xarray knows to present booleans, and without it a labelled reader gets 0 and 1.
             if array.attrs.get(name) != value:
                 out.append(f"{var}: attribute {name}={array.attrs.get(name)!r}, the layout declares {value!r}")
+        # The codec is part of the declared layout and decides both the store's size and its read
+        # performance, so `scales` created without its PCodec serializer is a real departure even
+        # with the right dtype, fill and geometry. `_codec_id` is the write side's own mapping from
+        # an existing array back to a layout codec key, reused rather than reimplemented because a
+        # second copy of that three-case rule is how the two drift apart.
+        actual_codec = _codec_id(array)
+        if actual_codec != expected.codec:
+            out.append(f"{var}: codec is {actual_codec!r}, the layout declares {expected.codec!r}")
         chunks, shards = clamp_chunks_and_shards(tuple(array.shape), expected.chunks, expected.shards)
         if tuple(array.chunks) != chunks:
             out.append(f"{var}: inner chunks are {tuple(array.chunks)}, the layout declares {chunks}")
