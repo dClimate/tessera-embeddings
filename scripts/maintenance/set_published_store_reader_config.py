@@ -61,6 +61,14 @@ DEFAULT_REGION = "us-west-2"
 PREFERRED_SPOT_CHECK_ZONE = "16S"
 
 
+def _open_for_read(uri: str, region: str) -> icechunk.Repository:
+    """Open for reading with no configuration, anonymously if the store allows it."""
+    try:
+        return icechunk.Repository.open(_create_storage(uri, anonymous=True, region=region))
+    except icechunk.IcechunkError:
+        return icechunk.Repository.open(_create_storage(uri, region=region))
+
+
 def read_state(uri: str, region: str) -> dict[str, Any]:
     """The state a configuration write must not disturb, read with no configuration supplied.
 
@@ -68,13 +76,14 @@ def read_state(uri: str, region: str) -> dict[str, Any]:
     process handed it — which is the whole point, since `open_global_repo` supplies
     `global_store_config()` and would mask a store that had lost its own.
 
-    Reads on the AMBIENT credential chain, not anonymously. Forcing anonymous worked against the
-    published store, whose bucket policy grants public reads, and made this script impossible to
-    rehearse anywhere else: pointed at a throwaway store it failed with `AccessDenied` before
-    reaching the write it was meant to be testing. Credentials are orthogonal to the thing that
-    matters here, which is passing no configuration.
+    Tries anonymously first and falls back to the ambient credential chain, because each mode alone
+    breaks a case that matters. Forcing anonymous made the script impossible to rehearse anywhere
+    but the published store — a throwaway failed with `AccessDenied` before reaching the write it
+    was meant to be testing. Forcing the ambient chain then broke the published store for an
+    operator with no credentials loaded, which is how its own dry run is most naturally invoked.
+    Credentials are orthogonal to what this function is for, which is passing no CONFIGURATION.
     """
-    repo = icechunk.Repository.open(_create_storage(uri, region=region))
+    repo = _open_for_read(uri, region)
     tags = sorted(repo.list_tags())
     return {
         "spec_version": str(repo.spec_version),
@@ -218,9 +227,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # One real read, because a store whose metadata reconciles can still have broken references.
     try:
-        session = icechunk.Repository.open(_create_storage(args.uri, region=args.region)).readonly_session(
-            branch="main"
-        )
+        session = _open_for_read(args.uri, args.region).readonly_session(branch="main")
         root = zarr.open_group(session.store, mode="r")
         present = sorted(name for name, _ in root.groups())
         zone = PREFERRED_SPOT_CHECK_ZONE if PREFERRED_SPOT_CHECK_ZONE in present else (present or [None])[0]
