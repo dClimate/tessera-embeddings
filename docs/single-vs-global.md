@@ -103,10 +103,20 @@ a single-area run applies no optical-depth floor and there is currently no way t
 campaign's fifteen. Wiring it through would be a small change to the library, not a configuration
 choice.
 
-The global store does record which line was used: it stamps `optical_min_obs` when it is seeded, so
-a consumer can read what a cell was measured against rather than assuming. All three settings are
-per-run, so **if you need to match a published cell exactly, read what is recorded on it rather
-than trusting any default written down here.**
+**What the published store lets you check, and what it does not.** Only one of the three is
+recorded, and it is on the store's ROOT attributes rather than on a zone:
+
+```python
+ds_root = xr.open_zarr(session.store, consolidated=False)   # no group=
+ds_root.attrs["optical_min_obs"]     # 15 — the line every cell was measured against
+ds_root.attrs["checkpoint_id"]       # which model produced it, plus the geoemb: provenance
+```
+
+`allow_s2_only` and `min_valid_coverage` are **not** published. The coverage threshold is kept in
+the private ingest manifest and never copied into the store, so a consumer cannot recover it from
+the data. **Exact reproduction of a published cell therefore needs the run's own parameters, not
+just the store** — ask whoever produced it. What the store does answer is the question that matters
+most often: which optical-depth line a cell was held to, and which model wrote it.
 
 ## What actually differs
 
