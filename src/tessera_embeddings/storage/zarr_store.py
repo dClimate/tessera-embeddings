@@ -420,12 +420,10 @@ def _create_storage(
             once and caches the result, so pickled copies of the storage (shipped to Ray
             actors or Dask workers during ``to_icechunk``) do not all stampede the provider
             on deserialisation. True for distributed assembly.
-        anonymous: Read with no credentials at all, for a bucket whose policy grants public
-            reads — which is how the published global store is served, so a consumer with no
-            AWS account can open it. Mutually exclusive with ``get_credentials``: passing both
-            asks for two different identities and the honest answer is to refuse rather than
-            silently prefer one. Read-only by construction; a write through anonymous storage
-            fails at the object store.
+        anonymous: Read with no credentials, for a bucket whose policy grants public reads —
+            how the published global store is served. Mutually exclusive with
+            ``get_credentials``: passing both asks for two identities, and refusing beats
+            silently preferring one.
 
     Raises:
         ValueError: If ``anonymous`` is set alongside ``get_credentials``.
@@ -435,11 +433,10 @@ def _create_storage(
     if store_path.startswith("s3://"):
         bucket, prefix = _parse_s3_url(store_path)
         if _s3_config_override:
-            # REFUSED rather than honoured either way. The override carries its own credentials and
-            # endpoint, so returning it would send credentials for a caller that asked to send
-            # none — making an anonymous-access check pass while authenticating, which is the one
-            # thing that check exists to rule out. Silently dropping the override instead would
-            # point the read at the wrong endpoint.
+            # REFUSED, not honoured either way. The override carries its own credentials and
+            # endpoint, so returning it would make an anonymous-access check pass while
+            # authenticating — the one thing that check rules out — while silently dropping it
+            # would point the read at the wrong endpoint.
             if anonymous:
                 raise ValueError(
                     "anonymous=True with an installed S3 config override: the override carries "
@@ -641,9 +638,9 @@ def global_store_config() -> icechunk.RepositoryConfig:
     coordinate manifests across all 120 groups are preloaded.
 
     **Written once, at create, and then saved into the store.** Every later open inherits it from
-    there rather than being handed it again, which is what makes
-    :func:`~tessera_embeddings.storage.global_store.set_saved_manifest_preload` able to change the
-    preload for every reader at once.
+    there rather than being handed it again, which is what lets
+    :func:`~tessera_embeddings.storage.global_store.set_saved_manifest_preload` change the preload
+    for every reader at once.
     """
     config = _default_repo_config()
     config.manifest = icechunk.ManifestConfig(

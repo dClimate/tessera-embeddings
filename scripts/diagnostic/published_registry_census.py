@@ -1,26 +1,19 @@
 """Audit the published registry: is it written as designed, and can a consumer navigate it?
 
 The registry is the Parquet dataset beside the store that answers "is my area covered, and how
-well" without opening a petabyte. This script checks the three ways that promise can fail.
+well" without opening a petabyte. Three ways that promise can fail:
 
-**Is it shaped as designed?** Parts should land at ``parts/zone=<ZONE>/year=<YEAR>/<run>.parquet``,
-one per cell, keyed by run so a refill adds a part instead of overwriting one. A cell with two
-parts is therefore expected and reported rather than flagged, but a cell with none, or a part where
-no cell is complete, is a real disagreement with the store.
+**Shape.** Parts land at ``parts/zone=<ZONE>/year=<YEAR>/<run>.parquet``, keyed by run so a refill
+adds a part instead of overwriting one — two parts for a cell is expected and reported, none is a
+real disagreement with the store.
 
-**Can the whole dataset be read?** A campaign crossing code versions leaves older parts missing a
-column newer ones have, and ``pyarrow`` infers a dataset's schema from the first file it finds in
-sorted path order — so a column added mid-campaign is silently dropped from every whole-dataset
-read if zone 01N was written before the change. The only safe read states the schema explicitly.
-This script reads both ways and reports whether the answers differ, which is the difference between
-a consumer who follows the documentation and one who does not.
+**Whole-dataset reads.** ``pyarrow`` infers a dataset's schema from the first file in sorted path
+order, so a column added mid-campaign is silently dropped if zone 01N was written before the
+change. Only a read that states the schema is safe; this reads both ways and reports the difference.
 
-**Does it agree with the store?** Every column is derivable from the store, so the registry is a
-convenience layer and never a second source of truth — which is only true if it actually agrees.
-``--verify-zones`` reads live shards for the named zones and checks, per cell, that the count of
-rows with ``embedded`` true equals the number of shards holding embeddings. A mismatch means one of
-the two is wrong about published coverage, and that is worth knowing before a consumer trusts
-either.
+**Agreement with the store.** Every column is derivable from the store, so the registry is a
+convenience layer and never a second source of truth — which is only true if it agrees.
+``--verify-zones`` compares, per cell, the registry's embedded tiles against the store's shards.
 
 Run from the REPOSITORY ROOT::
 
@@ -42,7 +35,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
 import zarr
 
 if TYPE_CHECKING:
@@ -56,13 +48,34 @@ DEFAULT_STORE = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
 DEFAULT_REGION = "us-west-2"
 
+#: The campaign's preallocated time axis. A partition key outside it names a cell the store has no
+#: slot for, however well-formed the part under it is.
+CAMPAIGN_YEARS = tuple(range(2017, 2026))
+
+#: The three refusal reasons `refused_px` is the sum of. Mirrored from the registry module so this
+#: check and the writer name the same three.
+_REFUSAL_REASONS = ("refused_no_optical_px", "refused_thin_px", "refused_no_radar_px")
+
+#: Printed per category and, together, the schema half of the exit status.
+_SCHEMA_FINDINGS = (
+    "parts_missing_declared_columns",
+    "parts_with_undeclared_columns",
+    "parts_with_wrong_column_types",
+    "parts_whose_metadata_disagrees_with_its_path",
+)
+#: The area-of-interest half of the exit status.
+_AOI_FINDINGS = (
+    "rows_with_unparsable_assembled_at",
+    "rows_with_a_null_bounding_box",
+    "rows_whose_refusal_reasons_do_not_sum",
+)
+
 
 def _filesystem(region: str, *, anonymous: bool = False) -> pyarrow.fs.FileSystem:
     """An S3 filesystem for the registry — anonymous, or on the ambient credential chain.
 
-    ``anonymous`` matters for more than convenience: the registry sits in a bucket whose policy
-    grants public reads, so a consumer without an AWS account reads it that way, and a diagnostic
-    that only ever signs its requests cannot tell whether that consumer's path works.
+    The bucket grants public reads, so a consumer without an AWS account reads it anonymously, and
+    a diagnostic that always signs its requests cannot tell whether that path works.
     """
     from pyarrow.fs import S3FileSystem
 
@@ -72,9 +85,8 @@ def _filesystem(region: str, *, anonymous: bool = False) -> pyarrow.fs.FileSyste
 def _parts(fs: pyarrow.fs.FileSystem, root: str) -> list[dict[str, Any]]:
     """Every Parquet part with its parsed partition keys, from one listing of the dataset.
 
-    Parsed from the PATH because the path is the authority — ``zone`` and ``year`` are hive
-    partition keys and deliberately not columns, so a part opened alone learns what it describes
-    from where it sits (and from its own key-value metadata, which this script checks separately).
+    From the PATH, which is the authority: ``zone`` and ``year`` are hive partition keys and
+    deliberately not columns, so a part opened alone learns what it describes from where it sits.
     """
     from pyarrow.fs import FileSelector
 
@@ -98,20 +110,26 @@ def _parts(fs: pyarrow.fs.FileSystem, root: str) -> list[dict[str, Any]]:
     return out
 
 
-#: The campaign's preallocated time axis. A partition key outside it names a cell the store has no
-#: slot for, however well-formed the part under it is.
-CAMPAIGN_YEARS = tuple(range(2017, 2026))
+def _names_a_real_cell(part: dict[str, Any]) -> bool:
+    """Whether a part's path names a zone the store can hold and a year the campaign preallocated.
 
-#: The three refusal reasons `refused_px` is the sum of. Mirrored from the registry module so this
-#: check and the writer name the same three.
-_REFUSAL_REASONS = ("refused_no_optical_px", "refused_thin_px", "refused_no_radar_px")
+    ``zone=61N`` is syntactically fine and passes the schema audit while advertising coverage the
+    store cannot hold, so a key that parses but names no real cell is as much a defect as one that
+    does not. Checked against the zone grid, the authority the store's group names come from.
+    """
+    return (
+        part["zone"] is not None
+        and part["year"] is not None
+        and part["zone"] in zone_grid.ZONES
+        and part["year"] in CAMPAIGN_YEARS
+    )
 
 
 def _refusals_add_up(row: dict[str, Any]) -> bool:
     """Whether ``refused_px`` equals the sum of its three reason columns.
 
-    True when any of the four is null, because null means "not measured" and a comparison against
-    an unmeasured total asserts something nobody recorded. Only rows carrying all four are checked.
+    True when any of the four is null: null means "not measured", and comparing against an
+    unmeasured total asserts something nobody recorded.
     """
     total = row.get("refused_px")
     parts = [row.get(reason) for reason in _REFUSAL_REASONS]
@@ -142,15 +160,14 @@ def _siblings(fs: pyarrow.fs.FileSystem, root: str) -> list[str]:
 
 
 def _schema_audit(fs: pyarrow.fs.FileSystem, parts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Whether every part carries the declared columns, and what each part's own metadata says.
+    """Whether every part carries the declared columns, and what its own metadata says.
 
-    Reads footers only — no row groups — so the cost is one small range request per part.
+    Footers only, so the cost is one small range request per part.
     """
     import pyarrow.parquet as pq
 
-    # Type AND nullability. `str(field.type)` alone accepts a part that declares `tile`, `run_id`,
-    # `assembled_at` or `embedded` as nullable — and a null identity there breaks the latest-wins
-    # selection or groups unrelated rows under a null tile.
+    # Type AND nullability: the type alone accepts a part declaring `tile`, `run_id`,
+    # `assembled_at` or `embedded` as nullable, and a null identity there breaks latest-wins.
     declared = {field.name: (str(field.type), field.nullable) for field in registry_schema()}
     missing: dict[str, list[str]] = {}
     extra: dict[str, list[str]] = {}
@@ -166,9 +183,9 @@ def _schema_audit(fs: pyarrow.fs.FileSystem, parts: list[dict[str, Any]]) -> dic
         if wrong := sorted(n for n in set(declared) & set(present) if declared[n] != present[n]):
             retyped[part["path"]] = wrong
         metadata = {k.decode(): v.decode() for k, v in (schema.metadata or {}).items() if k != b"pandas"}
-        # Run id as well as zone and year. Parts are keyed BY RUN — that is what makes a refill add
-        # a part instead of overwriting one — so a footer whose run id contradicts its own filename
-        # has two provenances, and the latest-wins selection has no way to tell which is the row's.
+        # Run id as well as zone and year. Parts are keyed BY RUN, so a footer whose run id
+        # contradicts its own filename carries two provenances and latest-wins cannot tell which
+        # is the row's.
         if (
             metadata.get("zone") != part["zone"]
             or metadata.get("year") != str(part["year"])
@@ -207,11 +224,9 @@ def _aoi_query(
 ) -> dict[str, Any]:
     """Time the question the registry exists to answer: is this box covered in this year?
 
-    Filters on the row bounding boxes with a plain overlap test rather than the containment test a
-    reader might reach for first — a tile overlapping the area of interest is part of the answer
-    even when it is not inside it. The antimeridian is left out on purpose: rows in zones 01 and 60
-    have ``bbox_west > bbox_east``, so an overlap test written this way drops them, and the
-    honest thing for a diagnostic is to say so rather than to appear to handle it.
+    Overlap, not containment: a tile overlapping the area of interest is part of the answer even
+    when it is not inside it. The antimeridian is left out on purpose — zones 01 and 60 have
+    ``bbox_west > bbox_east``, so this test drops them, and saying so beats appearing to handle it.
     """
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
@@ -227,36 +242,38 @@ def _aoi_query(
         & (pc.field("bbox_south") <= north)
         & (pc.field("bbox_north") >= south),
         columns=[
+            # Everything read downstream, not only what the report prints: an unprojected column
+            # is simply absent from the returned rows, so the per-cell grouping and `_newest_run`
+            # raise on `year` and `run_id` rather than falling back to anything.
             "zone",
+            "year",
             "tile",
             "embedded",
             "refused_px",
             *_REFUSAL_REASONS,
             "eligible_px",
             "median_obs_where_thin",
+            "run_id",
             "assembled_at",
         ],
     )
-    # LATEST RUN PER TILE, for the same reason the store cross-check needs it: a refill leaves the
-    # original part in place, so a tile filled twice would be counted twice here and its refused
-    # pixels added together — inflating the very answer a consumer came for.
     raw = table.to_pylist()
-    # Per (zone, year), because an area of interest can span both — and within each, the newest
-    # RUN as a whole for the reason in `_newest_run`.
+    # Per (zone, year), because an area of interest can span both, and within each the newest RUN:
+    # a refill leaves the original part in place, so a tile filled twice would be counted twice
+    # here and its refused pixels added together, inflating the answer a consumer came for.
     by_cell: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for row in raw:
         by_cell.setdefault((str(row["zone"]), int(row["year"] or year)), []).append(row)
     rows = [r for cell_rows in by_cell.values() for r in _newest_run(cell_rows)]
     embedded = [r["embedded"] for r in rows]
     refused = [r["refused_px"] for r in rows if r["refused_px"] is not None]
-    # Malformed timestamps have to reach the REPORT, not just the run selection. `_newest_run`
-    # cannot order a run whose timestamps will not parse, so it never selects it — and an AOI-only
-    # run would otherwise print a plausible answer built on the older rows and exit 0.
+    # Malformed timestamps have to reach the REPORT, not just the run selection: `_newest_run` can
+    # never select a run it cannot order, so an AOI-only run would otherwise print a plausible
+    # answer built on the older rows and exit 0.
     bad_stamps = unparsable_stamps(raw)
     # A null bounding box makes every Arrow comparison in the filter above evaluate to null, so the
-    # row is dropped from EVERY area query — silently undercounting the coverage this dataset
-    # exists to report. The schema permits null, which is why it has to be checked rather than
-    # assumed.
+    # row is dropped from EVERY area query — silently undercounting the coverage this dataset exists
+    # to report. The schema permits null, so it has to be checked rather than assumed.
     null_bbox = _rows_with_null_bbox(fs, prefix, year)
     # `refused_px` is defined as the sum of the three reason columns, and nothing else checks it.
     inconsistent = [r["tile"] for r in rows if not _refusals_add_up(r)]
@@ -286,9 +303,7 @@ _TILE_LABEL = re.compile(r"^chunk_(\d+)_(\d+)$")
 def _tile_coordinate(label: str) -> tuple[int, int] | None:
     """The ``(shard_y, shard_x)`` a tile label names, or None if it does not parse.
 
-    Returns None rather than raising so an unrecognised label is REPORTED as a finding instead of
-    aborting the audit — a renamed label scheme is exactly the sort of drift this exists to notice,
-    and crashing on it would hide every other cell's verdict.
+    None rather than raising, so a renamed label scheme is REPORTED rather than aborting the audit.
     """
     match = _TILE_LABEL.match(str(label))
     return (int(match.group(1)), int(match.group(2))) if match else None
@@ -297,10 +312,9 @@ def _tile_coordinate(label: str) -> tuple[int, int] | None:
 def unparsable_stamps(rows: list[dict[str, Any]]) -> list[str]:
     """Tiles among ``rows`` whose ``assembled_at`` will not parse or compare.
 
-    **Collected BEFORE deduplication**, over every row rather than the survivors. A malformed row
-    is ordered last, so a tile that also has a valid older row loses the malformed one entirely —
-    and asking the deduplicated set afterwards would report nothing while the stale coverage it
-    silently selected is exactly the problem.
+    **Collected BEFORE deduplication**, over every row: a malformed row is ordered last, so a tile
+    with a valid older row loses the malformed one entirely, and asking the deduplicated set would
+    report nothing while the stale coverage it silently selected is the problem.
     """
     return sorted({f"{row.get('zone', '')}/{row['tile']}" for row in rows if _parse_stamp(row["assembled_at"]) is None})
 
@@ -308,9 +322,8 @@ def unparsable_stamps(rows: list[dict[str, Any]]) -> list[str]:
 def _parse_stamp(value: object) -> datetime | None:
     """``assembled_at`` as an aware datetime, or None when it will not parse or compare.
 
-    Offset-NAIVE is treated as unparsable rather than assumed to be UTC: comparing a naive against
-    an aware datetime raises, and guessing a zone would silently reorder runs. Current writers emit
-    an offset, so a naive value is itself the finding.
+    Offset-NAIVE counts as unparsable rather than assumed UTC: comparing naive against aware
+    raises, and guessing a zone would silently reorder runs.
     """
     try:
         stamp = datetime.fromisoformat(str(value))
@@ -322,13 +335,9 @@ def _parse_stamp(value: object) -> datetime | None:
 def _optical_skip_labels(group: zarr.Group, year: int) -> list[str]:
     """Tile labels the year's provenance records as skipped for want of usable optical imagery.
 
-    The third oracle, and the only one that can see a refusal NEITHER array witnesses: a tile with
-    no usable optical observations has no ``scales`` shard and no ``s2_obs_count`` shard either, so
-    comparing those two cannot tell a missing registry row from a tile that was never land.
-    ``runs[<year>].optical_skips.labels`` is the store's own list of them.
-
-    Returns an empty list when the year has no provenance or records no labels — absence here is
-    not evidence of a problem, because a cell that refused nothing legitimately records none.
+    The only oracle for a refusal NEITHER array witnesses: a tile with no usable optical
+    observations has no ``scales`` shard and no ``s2_obs_count`` shard, so those two cannot tell a
+    missing registry row from a tile that was never land. Empty is not evidence of a problem.
     """
     runs = group.attrs.get("runs", {})
     entry = runs.get(str(year)) if isinstance(runs, dict) else None
@@ -342,13 +351,10 @@ def _optical_skip_labels(group: zarr.Group, year: int) -> list[str]:
 def _newest_run(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Only the rows of the most recently assembled run among ``rows``.
 
-    A registry part is one complete run of one cell, so "latest wins" is a choice between RUNS,
-    not between rows. Picking per tile would build a union of runs — newer rows for the tiles a
-    refill touched, older rows for any it dropped — which no run produced and which the store
-    therefore cannot match.
-
-    A run whose timestamps will not parse cannot be ordered, so it is never selected as the newest;
-    :func:`unparsable_stamps` reports those separately, over every row rather than the survivors.
+    A part is one complete run of one cell, so "latest wins" chooses between RUNS, not rows:
+    picking per tile would build a union no run produced, which the store cannot match.
+    ``assembled_at`` is the clock the registry provides for this; a run id is not one. A run whose
+    timestamps will not parse cannot be ordered, so it is never selected.
     """
     newest: tuple[datetime, str] | None = None
     for row in rows:
@@ -372,7 +378,7 @@ def _verify_against_store(
     *,
     anonymous: bool = False,
 ) -> list[dict[str, Any]]:
-    """Per cell, compare the registry's embedded-tile count with the store's live shard count."""
+    """Per cell, compare the registry's embedded tiles with the store's live shards."""
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
 
@@ -385,14 +391,11 @@ def _verify_against_store(
     for zone in zones:
         group = root_group[zone]
         years = [int(y) for y in group.attrs.get("years_complete", [])]
-        stamps = group["time"][:]
-        calendar = _calendar_years(stamps)
+        calendar = published_store.calendar_years(group)
         coverage = published_store.live_shards(session, zone)
-        # Shards holding OBSERVATION COUNTS, which is a different question from shards holding
-        # embeddings. A tile that was imaged and then wholly refused has counts and no embeddings,
-        # so this is the only independent record of the refused half of the registry — without it,
-        # deleting every `embedded=False` row would leave the embedded-tile comparison unchanged
-        # and the audit would still say "agrees".
+        # Shards holding OBSERVATION COUNTS: a tile imaged and then wholly refused has counts and
+        # no embeddings, so this is the only independent record of the refused half — without it,
+        # deleting every `embedded=False` row would leave the audit still saying "agrees".
         observed = published_store.live_shards(session, zone, "s2_obs_count")
         table = dataset.to_table(
             filter=pc.field("zone") == zone,
@@ -407,36 +410,24 @@ def _verify_against_store(
             ],
         )
         rows = table.to_pylist()
-        # The UNION of the store's calendar and the registry's own years. Iterating only the store's
-        # would load a part for a year the store has no slot for — `year=2026`, say — and never look
-        # at it, so a registry advertising a cell that cannot exist would pass every check.
+        # The UNION of the store's calendar and the registry's own years, or a part for a year the
+        # store has no slot for — `year=2026`, say — would never be looked at.
         registry_years = {int(r["year"]) for r in rows if r["year"] is not None}
         for year in sorted(set(calendar) | registry_years):
             time_index = calendar.index(year) if year in calendar else None
             all_rows = [r for r in rows if r["year"] == year]
-            # LATEST RUN PER TILE, not every row. A refill deliberately writes a NEW part rather
-            # than overwriting the original, so the registry holds one complete tile set per run —
-            # and summing them all would count a two-run cell's tiles twice against a store that
-            # holds one shard each, reporting a correct cell as a disagreement. `assembled_at` is
-            # the clock the registry provides for exactly this decision; a run id is not one.
             # Duplicates WITHIN one run, before latest-wins hides them. Cross-run duplication is
-            # by design; the same `(run_id, tile)` twice is not, and a consumer reading the Parquet
-            # directly gets both rows and doubles that tile's coverage and refusal counts.
+            # by design; the same `(run_id, tile)` twice doubles that tile's counts for anyone
+            # reading the Parquet directly.
             within_run: dict[tuple[str, str], int] = {}
             for row in all_rows:
                 key = (str(row["run_id"]), str(row["tile"]))
                 within_run[key] = within_run.get(key, 0) + 1
             duplicated = sorted(f"{run}/{tile}" for (run, tile), n in within_run.items() if n > 1)
-            # The newest RUN as a whole, not the newest row per tile. A part is a complete run of
-            # a cell, so taking newer rows for some tiles and older rows for others would
-            # synthesise a union no run ever produced — and if a refill legitimately dropped a tile
-            # the earlier fill had, the stale row would survive and be compared against a store
-            # that no longer holds it.
             registry_rows = _newest_run(all_rows)
-            # The COORDINATES, not the count. One embedded tile missing and one wrongly marked
-            # embedded leaves the cardinalities equal, and a registry whose whole job is to say
-            # WHERE coverage is would then be pointing consumers at the wrong tiles while this
-            # audit said "agrees". `live_shards` already has the exact pairs.
+            # The COORDINATES, not the count: one tile missing and one wrongly marked embedded
+            # leaves the cardinalities equal while the registry points consumers at the wrong
+            # ground and this audit says "agrees".
             registry_tiles = {
                 _tile_coordinate(r["tile"]) for r in registry_rows if r["embedded"] and _tile_coordinate(r["tile"])
             }
@@ -445,11 +436,9 @@ def _verify_against_store(
             refused_tiles = {
                 _tile_coordinate(r["tile"]) for r in registry_rows if not r["embedded"] and _tile_coordinate(r["tile"])
             }
-            # A tile with observation counts and no embeddings was evaluated and refused, so the
-            # registry must carry a not-embedded row for it. The converse does NOT hold: a tile
-            # refused for having NO imagery at all has no counts either — neither array witnesses
-            # it, so a missing row for that case would be invisible here. The store records those
-            # separately, in the year's own provenance, and they are folded in below.
+            # A tile with counts and no embeddings was evaluated and refused, so the registry must
+            # carry a not-embedded row. The converse does NOT hold — a tile refused for having no
+            # imagery has no counts either, so it comes from the year's provenance instead.
             skipped = {
                 coord for label in _optical_skip_labels(group, year) if (coord := _tile_coordinate(label)) is not None
             }
@@ -482,15 +471,6 @@ def _verify_against_store(
     return findings
 
 
-def _calendar_years(stamps: np.ndarray) -> list[int]:
-    """Calendar years from an int64-nanosecond time coordinate; see the read bench on the cast."""
-    decoded = np.asarray(stamps).astype("datetime64[ns]").astype("datetime64[Y]").astype(int) + 1970
-    years = [int(y) for y in decoded]
-    if not all(1970 <= y <= 2200 for y in years):
-        raise ValueError(f"time coordinate did not decode to plausible years: {years[:4]}")
-    return years
-
-
 def main(argv: list[str] | None = None) -> int:
     """Audit the registry; return 0 when nothing disagrees and 1 when something does."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -514,31 +494,14 @@ def main(argv: list[str] | None = None) -> int:
     parts = _parts(fs, args.registry)
     listing_s = round(time.monotonic() - started, 2)
 
-    # Unparsable paths are separated BEFORE the cell map is built. A key of `(None, None)` sorted
-    # alongside `("01N", 2017)` raises TypeError in Python 3, so the diagnostic would crash on
-    # exactly the malformed paths it exists to report, before reporting them.
-    # A zone key that parses but names no real zone is as much a defect as one that does not parse:
-    # `zone=61N` is syntactically fine, passes the schema audit, and advertises coverage in a zone
-    # the published store cannot contain. Checked against the zone grid, the same authority the
-    # store's own group names come from.
-    unparsed = [
-        part["path"]
-        for part in parts
-        if part["zone"] is None
-        or part["year"] is None
-        or part["zone"] not in zone_grid.ZONES
-        or part["year"] not in CAMPAIGN_YEARS
-    ]
+    # Separated BEFORE the cell map is built: a key of `(None, None)` sorted alongside
+    # `("01N", 2017)` raises TypeError, so the diagnostic would crash on exactly the malformed paths
+    # it exists to report.
+    unparsed = [part["path"] for part in parts if not _names_a_real_cell(part)]
     cells: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for part in parts:
-        if (
-            part["zone"] is None
-            or part["year"] is None
-            or part["zone"] not in zone_grid.ZONES
-            or part["year"] not in CAMPAIGN_YEARS
-        ):
-            continue
-        cells.setdefault((part["zone"], part["year"]), []).append(part)
+        if _names_a_real_cell(part):
+            cells.setdefault((part["zone"], part["year"]), []).append(part)
     refilled = {f"{z}/{y}": len(v) for (z, y), v in sorted(cells.items()) if len(v) > 1}
 
     print(f"registry:      {args.registry} ({args.region})")
@@ -548,9 +511,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"parts whose path does not parse or names no real zone: {len(unparsed)} {unparsed[:4]}")
 
     # A compacted master and a dataset-level `_common_metadata` are what a consumer WITHOUT this
-    # package needs: the first so one schema covers the whole read, the second so a reader can take
-    # the schema from the dataset instead of from a part it has to know is current. Their absence is
-    # a finding about who can read this dataset, not a defect in it.
+    # package needs, so one schema covers the whole read and comes from the dataset rather than
+    # from a part they must know is current. Absence is a finding about who can read this.
     siblings = _siblings(fs, args.registry)
     print(f"siblings beside parts/: {[s for s in siblings if s != 'parts'] or 'none'}")
 
@@ -572,17 +534,12 @@ def main(argv: list[str] | None = None) -> int:
         report["schema_audit"]["wall_s"] = round(time.monotonic() - started, 2)
         audit = report["schema_audit"]
         print(f"\nschema audit ({audit['wall_s']}s over {len(parts)} footers):")
-        for key in (
-            "parts_missing_declared_columns",
-            "parts_with_undeclared_columns",
-            "parts_with_wrong_column_types",
-            "parts_whose_metadata_disagrees_with_its_path",
-        ):
+        for key in _SCHEMA_FINDINGS:
             print(f"  {key}: {len(audit[key])}")
 
-    # Run BOTH ways to see which columns an inferring reader loses. The two wall times are NOT a
-    # comparison of the two methods: the first read warms the object store's and the host's caches
-    # for the second, and swapping the order swaps which one looks fast.
+    # BOTH ways, to see which columns an inferring reader loses. The two wall times are NOT a
+    # comparison of the methods: the first read warms the object store's and the host's caches for
+    # the second, and swapping the order swaps which one looks fast.
     print("\nwhole-dataset reads (wall times are sequential, so not comparable to each other):")
     for with_schema in (True, False):
         result = _read_dataset(fs, args.registry, with_schema=with_schema)
@@ -619,27 +576,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {'cell':<12} {'complete':>8} {'rows':>6} {'embedded':>9} {'shards':>7}  verdict")
         for finding in findings:
             # Coordinate equality, which implies count equality and catches what it cannot.
-            counts_agree = (
-                finding["tiles_disagreeing"] == 0
-                and not finding["unparsable_tile_labels"]
-                and not finding["unparsable_assembled_at"]
-                and not finding["duplicated_within_a_run"]
-                and not finding["refusal_reasons_do_not_sum"]
-                and not finding["refused_tiles_the_registry_omits"]
+            counts_agree = not any(
+                (
+                    finding["tiles_disagreeing"],
+                    finding["unparsable_tile_labels"],
+                    finding["unparsable_assembled_at"],
+                    finding["duplicated_within_a_run"],
+                    finding["refusal_reasons_do_not_sum"],
+                    finding["refused_tiles_the_registry_omits"],
+                )
             )
-            # A cell holding data and NOT marked complete is the half-published state this audit
-            # records `marked_complete` to catch: a fill that wrote its shards and its registry
-            # part, then died before adding the year to `years_complete`. Its counts agree, so
-            # counting alone would call it healthy.
-            # ANY registry row counts as populated, not only an embedded one. A cell whose part
-            # holds nothing but refused tiles has zero embedded rows and zero shards, so counting
-            # those alone calls it empty — while the registry is still advertising a record for a
-            # cell nothing marks complete.
+            # Data present and NOT marked complete is the half-published state: a fill that wrote
+            # its shards and its part, then died before adding the year to `years_complete`. Its
+            # counts agree, so counting alone calls it healthy. ANY row counts as populated — a
+            # part holding only refused tiles has zero embedded rows and zero shards.
             populated = bool(finding["registry_rows"] or finding["store_live_shards"])
             unmarked = populated and not finding["marked_complete"]
-            outside = not finding["in_store_time_axis"]
             verdict = "agrees"
-            if outside:
+            if not finding["in_store_time_axis"]:
                 verdict = "NOT IN THE STORE'S TIME AXIS"
             elif unmarked:
                 verdict = "UNMARKED"
@@ -658,29 +612,13 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.json_out).write_text(json.dumps(report, indent=2, default=str))
         print(f"\nwrote {args.json_out}")
 
-    # EVERY category the schema audit collects, not the two that looked most serious. A part whose
-    # own metadata contradicts its partition path carries two conflicting identities, and a part
-    # holding a column the schema does not declare means the writer and this checker disagree about
-    # the schema — automation exiting 0 on either has accepted a registry it should not have.
+    # EVERY category, not the two that look most serious: a part whose metadata contradicts its
+    # path carries two identities, and an undeclared column means the writer and this checker
+    # disagree about the schema. Automation exiting 0 on either has accepted a bad registry.
     aoi = report.get("aoi_query", {})
-    aoi_broken = any(
-        aoi.get(key)
-        for key in (
-            "rows_with_unparsable_assembled_at",
-            "rows_with_a_null_bounding_box",
-            "rows_whose_refusal_reasons_do_not_sum",
-        )
-    )
+    aoi_broken = any(aoi.get(key) for key in _AOI_FINDINGS)
     audit = report.get("schema_audit", {})
-    broken = any(
-        audit.get(key)
-        for key in (
-            "parts_missing_declared_columns",
-            "parts_with_undeclared_columns",
-            "parts_with_wrong_column_types",
-            "parts_whose_metadata_disagrees_with_its_path",
-        )
-    )
+    broken = any(audit.get(key) for key in _SCHEMA_FINDINGS)
     return 1 if (unparsed or broken or disagreements or aoi_broken) else 0
 
 

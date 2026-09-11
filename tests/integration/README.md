@@ -27,15 +27,15 @@ Marked `@pytest.mark.integration`. Skipped by default; opt in via
 ## The one live-service exception, and why it is one
 
 `test_published_store_access.py` reads the real published store over the network. The
-cassette rule is right for a third-party API, where what we care about is that our
-parsing still works and a recording proves it. It is the wrong tool here, because the
-subject under test **is** the live artifact: the claim is "somebody with no AWS account
-can open the published store and get data out of it", and a replayed recording of our
-own request stays green through every way that claim can break — a tightened bucket
-policy, a reset branch, a reorganisation that moves the zone groups.
+cassette rule is right for a third-party API, where what matters is that our parsing
+still works and a recording proves it. Here the subject under test **is** the live
+artifact: the claim is "somebody with no AWS account can open the published store and
+get data out of it", and a replayed recording of our own request stays green through
+every way that claim can break — a tightened bucket policy, a reset branch, a
+reorganisation that moves the zone groups.
 
-It needs no credentials and clears every AWS variable before opening anything, so
-passing with a profile in the environment and failing without one would be a finding
-rather than a flaw. It is opt-in twice — the `integration` marker plus
-`TESSERA_TEST_PUBLISHED_STORE=1` — because a marker alone has previously been enough
-for a test to run where nobody wanted it. Nothing in CI sets the variable.
+It needs no credentials and clears every AWS variable first, so passing with a profile
+in the environment and failing without one would be a finding rather than a flaw. It is
+opt-in twice — the `integration` marker plus `TESSERA_TEST_PUBLISHED_STORE=1`, which
+nothing in CI sets — because a marker alone has previously been enough for a test to run
+where nobody wanted it.

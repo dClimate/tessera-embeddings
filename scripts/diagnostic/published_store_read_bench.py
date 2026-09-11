@@ -1,22 +1,19 @@
 """Measure read performance against the published store, comparably to the scoping runs.
 
-The chunk and shard geometry was chosen on a synthetic benchmark
-(``scripts/scoping/scale_tests/``, recorded in ADR 008). This asks the same questions of the store
-that was built, so those read claims can be checked rather than inherited. The workloads, their
-extents and the concurrency sweep are copied from that harness on purpose: a different point count
-would produce figures that look comparable and are not.
+The chunk and shard geometry was chosen on a synthetic benchmark (``scripts/scoping/scale_tests/``,
+recorded in ADR 008). This asks the same questions of the store that was built, so the workloads,
+their extents and the concurrency sweep are copied from that harness: a different point count would
+produce figures that look comparable and are not.
 
-Three things it does because the obvious version misleads:
+Three definitions, because the obvious version of each misleads:
 
 * **Probes land only on pixels that hold data.** A read of an absent chunk is answered from the
-  manifest without a request, so a probe on elided ocean is nearly free, and a sample mixing those
-  with real reads reports the mixture as latency.
-* **Cold means a fresh process; warm means a second pass through the same open.** Every cold phase
-  runs in a subprocess that exits afterwards.
-* **The throughput column is decompressed elements per second**, which is what the scoping harness
-  reported. On this store that is within a few percent of the wire rate, because the quantized
-  embeddings barely compress. ``band_subset`` counts only the bands asked for while the reader
-  fetches all 128, so it understates by sixteenfold — kept for comparability.
+  manifest without a request, so a sample mixing elided ocean with real reads reports the mixture.
+* **Cold is a fresh process; warm is a second pass through the same open.**
+* **Throughput is decompressed elements per second**, the scoping harness's definition — within a
+  few percent of the wire rate here, because the quantized embeddings barely compress.
+  ``band_subset`` counts only the bands asked for while all 128 are fetched, so it understates by
+  sixteenfold; kept for comparability.
 
 Run from the REPOSITORY ROOT::
 
@@ -48,14 +45,13 @@ from tessera_embeddings.storage.global_store import open_global_repo
 DEFAULT_URI = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGION = "us-west-2"
 
-#: Concurrency sweep, from the scoping harness (`t1_read_bench.CONCURRENCIES_BENCH`). The scoping
-#: figures published in ADR 008 are medians ACROSS this sweep, so reproducing the sweep is what
-#: makes a median comparable to a median.
+#: From the scoping harness (`t1_read_bench.CONCURRENCIES_BENCH`). Its published figures are medians
+#: ACROSS this sweep, so reproducing the sweep is what makes a median comparable to a median.
 CONCURRENCIES = (10, 64, 128)
 
-#: Region workloads as ``(label, northing extent, easting extent, bands)`` — the extents from
-#: `t1_read_bench.WORKLOADS`. `bulk` at 4096 px spans a 2x2 block of 2048-px shards, which is why
-#: the benchmark needs a contiguous live block rather than any live shard.
+#: ``(label, northing extent, easting extent, bands)``, extents from `t1_read_bench.WORKLOADS`.
+#: `bulk` at 4096 px spans a 2x2 block of 2048-px shards, which is why the benchmark needs a
+#: contiguous live block rather than any live shard.
 WORKLOADS = (
     ("patch", 100, 100, 128),
     ("tile", 1000, 1000, 128),
@@ -67,9 +63,8 @@ WORKLOADS = (
 def _host_facts() -> dict[str, Any]:
     """Where this ran: EC2 identity when there is one, the machine's own name otherwise.
 
-    Asked of the instance metadata service with a short timeout and IMDSv2's token handshake. A
-    benchmark whose report cannot say which region it ran in is not evidence about either region,
-    so this is recorded rather than passed in by the operator — an argument can be wrong.
+    Recorded rather than passed in, because an argument can be wrong and a benchmark that cannot
+    say which region it ran in is not evidence about either region.
     """
     facts: dict[str, Any] = {
         "platform": platform.platform(),
@@ -101,22 +96,6 @@ def _host_facts() -> dict[str, Any]:
         instance_id=identity.get("instanceId"),
     )
     return facts
-
-
-def _calendar_years(group: zarr.Group) -> list[int]:
-    """The calendar year of each time slot, from the group's own ``time`` coordinate.
-
-    The coordinate is int64 nanoseconds since the epoch, so it has to be VIEWED as
-    ``datetime64[ns]`` before being truncated to years — casting the raw integers straight to
-    ``datetime64[Y]`` reads each nanosecond count as a year offset and yields years in the
-    billions, which then silently fails to match any year a caller asks for. The range check
-    turns a future change of units into a loud failure rather than a wrong time index.
-    """
-    stamps = np.asarray(group["time"][:]).astype("datetime64[ns]")
-    years = [int(y) for y in stamps.astype("datetime64[Y]").astype(int) + 1970]
-    if not all(1970 <= y <= 2200 for y in years):
-        raise ValueError(f"time coordinate did not decode to plausible years: {years[:4]}")
-    return years
 
 
 def _percentiles(samples: list[float]) -> dict[str, float]:
@@ -167,20 +146,15 @@ def _net_bytes_received() -> int | None:
 def run_phase(payload: dict[str, Any], repeats: int = 1) -> list[dict[str, Any]]:
     """Open the store once, run one phase ``repeats`` times on that open, and return each result.
 
-    **The repeats share one opened group, and that is the whole point.** An earlier version called
-    this function twice for the warm arm, which re-opened the storage, repository, session and
-    group each time — so the "warm" figure was a second cold reader, and every cache this
-    benchmark is meant to observe was thrown away between the two. A reader who keeps their handle
-    is the case worth measuring, and it is the case the scoping harness measured.
+    **The repeats share one opened group, and that is the whole point.** Calling this twice for the
+    warm arm re-opens everything, so the "warm" figure becomes a second cold reader and every cache
+    the benchmark exists to observe is thrown away between the two.
 
-    The open phases ignore ``repeats``: their measurement IS the open, and a second one on an
-    already-open group has nothing to time. That the open is paid once per handle rather than once
-    per read is the useful fact about it.
+    The open phases ignore ``repeats``: their measurement IS the open, paid once per handle.
     """
     group, timings = _open_zone(payload)
-    # The sum, not the steps, is what a consumer waits for before their first read. The steps are
-    # kept beside it because they say WHERE the wait is — and on this store the zone-group step is
-    # nearly free, because opening the root already fetched the snapshot that describes every group.
+    # The sum, not the steps, is what a consumer waits for before their first read; the steps stay
+    # beside it because they say WHERE the wait is.
     timings["total_open_s"] = round(sum(timings.values()), 3)
     base: dict[str, Any] = {"phase": payload["phase"], "concurrency": payload["concurrency"], **timings}
     if payload["phase"] == "open":
@@ -216,18 +190,15 @@ def _measure(group: zarr.Group, payload: dict[str, Any]) -> dict[str, Any]:
     after = _net_bytes_received()
     if before is not None and after is not None:
         result["wire_bytes"] = after - before
-    # A live shard only means at least one of its inner chunks is initialized, so a contiguous
-    # block of live shards can still be mostly elided ocean — and a read of elided chunks issues no
-    # requests, which would report as high throughput for having done less work. This fraction is
-    # the guard, it is carried into the table rather than buried in the JSON, and the driver refuses
-    # a window that is mostly fill.
+    # A read of elided chunks issues no requests, so a partly-elided window reports as high
+    # throughput for having done less work. This fraction is the guard; it goes into the table
+    # rather than the JSON, and the driver refuses a window that is mostly fill.
     nonfill = float(np.count_nonzero(block) / block.size)
     result.update(
         workload=label,
         wall_s=round(wall, 3),
         elements=int(block.size),
-        # The scoping harness's definition: decompressed elements per second. See the module
-        # docstring on why this is not a wire rate.
+        # The scoping harness's definition: decompressed elements per second, not a wire rate.
         throughput_mbps=round((block.size / 1e6) / wall, 1) if wall > 0 else 0.0,
         # NOT a coverage figure: int8 zero is both the fill value and a legitimate band value, so a
         # fully written block lands a little under 1.0 rather than exactly at it.
@@ -239,16 +210,12 @@ def _measure(group: zarr.Group, payload: dict[str, Any]) -> dict[str, Any]:
 # ── the parent: choose the addresses, then drive cold and warm arms ──────────
 
 
-#: A region window must be FULLY non-fill to be measured, at one probe per inner chunk. A read of
-#: elided chunks issues no requests, so any fill in the window reports as throughput for having
-#: done less work.
-#:
-#: **One, not a threshold, because every workload reads from the same origin.** A window that is
-#: 90% live overall can still have its north-west corner elided — and `patch` reads 100 px of that
-#: corner, `band_subset` 512 and `tile` 1000, so a partial threshold would leave the small
-#: workloads measuring fill while the large one looked fine. Requiring the whole window removes the
-#: question rather than answering it per workload, and it costs nothing: of 40 candidate blocks
-#: examined in 33N/2025, all 40 qualified.
+#: A region window must be FULLY non-fill: a read of elided chunks issues no requests, and so
+#: reports as throughput for having done less work. **One, not a threshold, because every workload
+#: reads from the same origin** — a 90%-live window can have its north-west corner elided, and
+#: `patch` reads 100 px of that corner while `tile` reads 1000, so a partial threshold leaves the
+#: small workloads measuring fill. It costs nothing: of 40 candidate blocks in 33N/2025, all 40
+#: qualified.
 MIN_NONFILL = 1.0
 
 
@@ -257,14 +224,11 @@ def _contiguous_live_block(
 ) -> tuple[tuple[int, int], float] | None:
     """Origin of a ``span x span`` block of live shards that is actually full, plus its fill fraction.
 
-    **A live shard is not a full shard.** `live_shards` reports a shard with at least one
-    initialized inner chunk, and along a coastline most of such a shard can be elided ocean — so a
-    contiguous block of live shard coordinates is a necessary condition and not a sufficient one.
-    Each candidate block is therefore sampled before it is accepted: a strided read of `scales`
-    over the window, cheap because `scales` is a thirty-second of `embeddings` and strided to one
-    value per inner chunk, and the block is taken only if :data:`MIN_NONFILL` of those values are
-    finite. Returns None when no candidate qualifies, which is a real answer for a zone that has no
-    solid block of that size.
+    **A live shard is not a full shard**: `live_shards` reports one initialized inner chunk, and
+    along a coastline the rest can be elided ocean — so contiguous live coordinates are necessary
+    and not sufficient. Each candidate is sampled first, one strided `scales` value per inner chunk.
+    None means no candidate reached :data:`MIN_NONFILL`, a real answer for a zone with no solid
+    block of that size.
     """
     needed = span // SHARD_PX + (1 if span % SHARD_PX else 0)
     scales = cast("zarr.Array", group["scales"])
@@ -275,8 +239,6 @@ def _contiguous_live_block(
         y0, x0 = shard_y * SHARD_PX, shard_x * SHARD_PX
         if y0 + span > scales.shape[1] or x0 + span > scales.shape[2]:
             continue
-        # One sample per inner chunk: enough to tell a solid window from a coastal one, and it reads
-        # kilobytes rather than the gigabytes the window itself holds.
         probe = np.asarray(scales[time_index, y0 : y0 + span : INNER_PX, x0 : x0 + span : INNER_PX])
         fraction = float(np.isfinite(probe).mean())
         if fraction >= MIN_NONFILL:
@@ -350,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
     repo = open_global_repo(args.uri, region=args.region, anonymous=args.anonymous)
     session = repo.readonly_session(branch="main")
     group = zarr.open_group(session.store, mode="r")[args.zone]
-    years = _calendar_years(group)
+    years = published_store.calendar_years(group)
     if args.year not in years:
         parser.error(f"{args.zone} has no {args.year} slot; its time axis is {years}")
     time_index = years.index(args.year)
@@ -362,12 +324,10 @@ def main(argv: list[str] | None = None) -> int:
     if not shards:
         parser.error(f"{args.zone}/{args.year} has no live shards; nothing to benchmark")
 
-    # ESCALATING oversample until the requested count is met. `sample_live_pixels` keeps only the
-    # candidates that provably hold data, and on a sparse coastal zone-year most do not — so a
-    # fixed factor returns however many it happens to find. Raising `--points` does not help,
-    # because the candidate pool scales with it and the success ratio does not: the count comes out
-    # short either way, and percentiles from a handful of probes would then be printed beside a
-    # scoping figure taken over a thousand.
+    # ESCALATING oversample until the count is met. On a sparse coastal zone-year most candidates
+    # hold no data, and raising `--points` does not help because the pool scales with it while the
+    # success ratio does not — so percentiles from a handful would sit beside a scoping figure
+    # taken over a thousand.
     points: list[tuple[int, int]] = []
     for factor in (4, 16, 64):
         points = published_store.sample_live_pixels(
@@ -393,13 +353,12 @@ def main(argv: list[str] | None = None) -> int:
         if unknown := sorted(set(wanted) - {w[0] for w in WORKLOADS}):
             parser.error(f"unknown workload(s) {unknown}; available: {[w[0] for w in WORKLOADS]}")
 
-    # Sized for the LARGEST requested workload, so a run that skips `bulk` is not refused for want
-    # of a block only `bulk` needs.
     region_origin: tuple[int, int] | None = None
     block_nonfill: float | None = None
     if wanted:
-        # Both extents, not just the northing one: a workload that is wider than it is tall would
-        # otherwise be handed a block big enough on one axis only.
+        # Sized for the LARGEST requested workload, so a run that skips `bulk` is not refused for
+        # want of a block only `bulk` needs — and over BOTH extents, so a workload wider than it is
+        # tall is not handed a block big enough on one axis only.
         span = max(max(w[1], w[2]) for w in WORKLOADS if w[0] in wanted)
         found = _contiguous_live_block(group, time_index, shards, span)
         if found is None:
@@ -427,8 +386,7 @@ def main(argv: list[str] | None = None) -> int:
             cold = {**_run_cold(payload), "cache": "cold"}
             arms = [cold]
             # Warm: a SECOND pass through the same opened group, inside one call, so whatever the
-            # first pass cached is still there. The open phases have no second pass to take —
-            # their measurement IS the open, which a reader pays once per handle.
+            # first pass cached is still there. The open phases have no second pass to take.
             if phase != "open":
                 try:
                     passes = run_phase(payload, repeats=2)
@@ -484,8 +442,11 @@ def _one_line(result: dict[str, Any]) -> str:
 
 def _print_table(results: list[dict[str, Any]]) -> None:
     """The whole sweep as one table, cold and warm side by side."""
+    # The `nonfill` column was printed per row with no header, so the region rows' guard fraction
+    # landed under a blank heading.
     print(
-        f"{'phase':<17} {'conc':>5} {'cache':<5} {'p50 ms':>8} {'p95 ms':>8} {'MB/s':>8} {'MB/point':>9} {'open ms':>8}"
+        f"{'phase':<17} {'conc':>5} {'cache':<5} {'p50 ms':>8} {'p95 ms':>8} {'MB/s':>8} "
+        f"{'MB/point':>9} {'open ms':>8} {'nonfill':>8}"
     )
     for result in results:
         if "error" in result:

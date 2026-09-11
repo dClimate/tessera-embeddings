@@ -1,28 +1,19 @@
 """Audit the published global store from a consumer's seat: does it open, and is it as planned?
 
-Answers four questions a consumer or an operator asks about a finished campaign, in the order
-they matter:
+Checks four things and exits non-zero on any disagreement:
 
-1. **Does it open, and what does a reader inherit?** The tuned repository configuration is saved
-   into the store, so a consumer who opens it with no configuration of their own still gets the
-   manifest splitting and preload settings the writer chose. This prints what came back, because
-   "the reader inherits the tuning" is a claim that should be checked rather than assumed.
-2. **Is every zone group shaped the way the architecture promised?** Per-array dtype, inner chunks
-   and shards, compared against the declared global layout
-   (:data:`~tessera_embeddings.config.store_layout.GLOBAL`) by
-   :func:`~tessera_embeddings.storage.published_store.layout_departures`.
-3. **Which zone-years are complete?** Each group's ``years_complete`` is the authority — slots for
-   all nine years are preallocated at seed, so an unfilled year opens without error and reads back
-   as fill. A year deliberately left empty because the zone has no qualifying land IS in the list;
-   a year that never landed is absent from it. The two are indistinguishable from the data.
-4. **Does the tag record agree?** Every completed cell is tagged ``zone-<ZONE>-<YEAR>``, written in
-   a different operation from the attribute. Reconciling the two is the cheapest check that no cell
-   was half-recorded, and the script exits non-zero if they disagree.
+1. **What a reader inherits.** The repository configuration is saved into the store, so a consumer
+   who passes none of their own gets what the writer left. Printed rather than assumed.
+2. **Layout.** Per-array dtype, inner chunks and shards against
+   :data:`~tessera_embeddings.config.store_layout.GLOBAL`, plus the CRS and the spatial grid.
+3. **Completion.** Each group's ``years_complete`` is the authority — all nine slots are
+   preallocated at seed, so an unfilled year opens without error and reads back as fill. A year
+   deliberately left empty IS in the list; a year that never landed is absent from it.
+4. **The tag record.** Cells are tagged ``zone-<ZONE>-<YEAR>`` in a different operation from the
+   attribute, so reconciling the two is the cheapest check that no cell was half-recorded.
 
-``--shards`` adds per-zone-year shard coverage, which costs one manifest enumeration per zone and
-is the only part of this script that is not effectively instant.
-
-Run from the REPOSITORY ROOT::
+``--shards`` adds per-zone-year shard coverage, one manifest enumeration per zone and the only part
+that is not effectively instant. Run from the REPOSITORY ROOT::
 
     uv run python scripts/diagnostic/published_store_census.py --zones 16S,33N
     uv run python scripts/diagnostic/published_store_census.py --shards --json census.json
@@ -38,15 +29,13 @@ from pathlib import Path
 from typing import Any
 
 import icechunk
-import numpy as np
 import zarr
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM
 from tessera_embeddings.storage import published_store, zone_grid
 from tessera_embeddings.storage.global_store import open_global_repo
 
-#: The published store and the region its bucket lives in. Both overridable so the script can be
-#: pointed at a staging copy, which is the only way to rehearse it without reading the real thing.
+#: Overridable so the script can be pointed at a staging copy, which is the only way to rehearse it.
 DEFAULT_URI = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGION = "us-west-2"
 
@@ -54,18 +43,14 @@ DEFAULT_REGION = "us-west-2"
 #: missing; the store's own `time` coordinate is the authority for what the slots mean.
 CAMPAIGN_YEARS = tuple(range(2017, 2026))
 
-#: Every group the store should hold: 60 six-degree UTM zones, north and south.
-#:
-#: Checked as a SET rather than a count, and checked before any zone is audited. An audit that
-#: iterates whatever groups it finds cannot report a missing one — and with `--zones all` the tag
-#: reconciliation is filtered to the groups that were audited too, so a store that lost an entire
-#: zone would reconcile perfectly against its own smaller self and exit 0.
+#: Checked as a SET and before any zone is audited: an audit that iterates whatever groups it finds
+#: cannot report a missing one, and with `--zones all` the tag reconciliation is filtered to the
+#: audited groups too — so a store that lost a whole zone would reconcile against its smaller self.
 EXPECTED_ZONES = tuple(f"{n:02d}{hemisphere}" for n in range(1, 61) for hemisphere in ("N", "S"))
 
-
-#: Root attributes a consumer needs in order to interpret the product at all, with the values this
-#: pipeline fixes. In the ``utm_zones`` layout the encoder and quantization provenance is stated
-#: ONCE at the root, so a zone group cannot make up for a root that lost it.
+#: Root attributes a consumer needs to interpret the product at all. In the ``utm_zones`` layout the
+#: encoder and quantization provenance is stated ONCE at the root, so a zone group cannot make up
+#: for a root that lost it.
 _REQUIRED_ROOT_VALUES = {
     "geoemb:type": "pixel",
     "geoemb:dimensions": EMBEDDING_DIM,
@@ -73,17 +58,15 @@ _REQUIRED_ROOT_VALUES = {
     "geoemb:spatial_layout": "utm_zones",
 }
 #: Present-and-non-empty is all that can be asked of these: the model URL and build version depend
-#: on the run, so a value check here would only pin whatever the last run happened to write.
+#: on the run, so a value check would only pin whatever the last run happened to write.
 _REQUIRED_ROOT_KEYS = ("geoemb:model", "geoemb:build_version", "geoemb:source_data", "geoemb:quantization")
 
 
 def _root_departures(attrs: dict[str, Any]) -> list[str]:
     """Every way the root's provenance falls short of what a consumer needs to interpret the data.
 
-    Printed AND counted. Without the quantization block a consumer cannot turn int8 back into
-    reflectance-space values, and without the convention declaration they have no way to look up
-    what any of these keys mean — so a store missing them is one nobody can reliably read, however
-    complete its arrays are.
+    Printed AND counted: without the quantization block nobody can turn int8 back into
+    reflectance-space values, so a store missing it is unreadable however complete its arrays are.
     """
     out: list[str] = []
     for key, expected in _REQUIRED_ROOT_VALUES.items():
@@ -94,9 +77,8 @@ def _root_departures(attrs: dict[str, Any]) -> list[str]:
             out.append(f"root: {key} is missing or empty")
     quantization = attrs.get("geoemb:quantization")
     if isinstance(quantization, dict):
-        # The dequantization recipe itself: which array holds the per-pixel factors, and what a
-        # missing factor looks like there. A consumer that cannot resolve these two cannot use the
-        # embeddings, only read them.
+        # The dequantization recipe: which array holds the per-pixel factors, and what a missing
+        # factor looks like there. Without both, the embeddings can be read but not used.
         scale = quantization.get("scale")
         if quantization.get("method") != "per_pixel_scale":
             out.append(f"root: quantization method is {quantization.get('method')!r}, expected 'per_pixel_scale'")
@@ -115,9 +97,9 @@ def _root_departures(attrs: dict[str, Any]) -> list[str]:
 def _storage_for(args: argparse.Namespace) -> icechunk.Storage:
     """Storage for the audited URI, with no repository config attached.
 
-    Needed only so the config the store SAVED can be fetched separately from the handle the audit
-    reads through. Handles a local path as well as an S3 URI, so the census can be rehearsed
-    against a synthetic store.
+    So the config the store SAVED is fetched independently of the handle the audit reads through: a
+    config handed to ``Repository.open`` replaces the saved one, and anything read back off such a
+    handle is only an echo of what was passed in. Takes a local path too, for rehearsals.
     """
     if not args.uri.startswith("s3://"):
         return icechunk.local_filesystem_storage(args.uri.removeprefix("file://"))
@@ -134,8 +116,8 @@ def _storage_for(args: argparse.Namespace) -> icechunk.Storage:
 def _cell_tags(repo: icechunk.Repository) -> set[tuple[str, int]]:
     """Every ``(zone, year)`` the store carries a completion tag for.
 
-    Tag names that do not parse as ``zone-<ZONE>-<YEAR>`` are ignored rather than guessed at: the
-    store also carries ``year-<YEAR>-complete`` tags, and a future scheme may add more.
+    Names that do not parse as ``zone-<ZONE>-<YEAR>`` are ignored rather than guessed at: the store
+    also carries ``year-<YEAR>-complete`` tags, and a future scheme may add more.
     """
     cells: set[tuple[str, int]] = set()
     for tag in repo.list_tags():
@@ -146,13 +128,7 @@ def _cell_tags(repo: icechunk.Repository) -> set[tuple[str, int]]:
 
 
 def _describe_config(config: icechunk.RepositoryConfig | None) -> dict[str, Any]:
-    """The parts of a repository config a reader's performance depends on.
-
-    **Takes the config the STORE saved, never `repo.config`.** `open_global_repo` supplies
-    `global_store_config()`, and an explicit config replaces the persisted one rather than layering
-    onto it — so reading it back off the handle echoes what the library just passed in and would
-    report healthy tuning for a store that had lost its saved config entirely.
-    """
+    """The parts of a repository config a reader's performance depends on."""
     if config is None:
         return {"saved_config": None}
     manifest = config.manifest
@@ -167,21 +143,6 @@ def _describe_config(config: icechunk.RepositoryConfig | None) -> dict[str, Any]
     }
 
 
-def _calendar_years(group: zarr.Group) -> list[int]:
-    """The calendar year of each time slot, from the group's own ``time`` coordinate.
-
-    The coordinate is int64 nanoseconds since the epoch, so it must be VIEWED as ``datetime64[ns]``
-    before being truncated to years; casting the raw integers straight to ``datetime64[Y]`` reads
-    each nanosecond count as a year offset. The range check turns a future change of units into a
-    loud failure rather than a silently wrong mapping from time index to year.
-    """
-    stamps = np.asarray(group["time"][:]).astype("datetime64[ns]")
-    years = [int(y) for y in stamps.astype("datetime64[Y]").astype(int) + 1970]
-    if not all(1970 <= y <= 2200 for y in years):
-        raise ValueError(f"time coordinate did not decode to plausible years: {years[:4]}")
-    return years
-
-
 def _zone_report(root: zarr.Group, zone: str, *, with_shards: bool, session: icechunk.Session) -> dict[str, Any]:
     """Everything this audit records about one zone group."""
     opened = time.monotonic()
@@ -189,10 +150,9 @@ def _zone_report(root: zarr.Group, zone: str, *, with_shards: bool, session: ice
     attrs = dict(group.attrs)
     years = [int(y) for y in attrs.get("years_complete", [])]
     departures = published_store.layout_departures(group)
-    # The CRS is CHECKED, not just reported. A zone declaring another zone's EPSG code, or none at
-    # all, georeferences every array in it wrongly — and a consumer has no way to notice, because
-    # the arrays are the right shape and the attribute is present and plausible. The expected value
-    # comes from `zone_grid` so this and the seeder cannot disagree about it.
+    # The CRS is CHECKED, not just reported: another zone's EPSG code georeferences every array
+    # wrongly while the shapes stay right and the attribute stays plausible. Expected value from
+    # `zone_grid`, so this and the seeder cannot disagree.
     spec = zone_grid.zone(zone) if zone in zone_grid.ZONES else None
     if spec is None:
         departures.append(f"{zone}: not a known UTM zone, so neither its CRS nor its grid can be checked")
@@ -201,20 +161,18 @@ def _zone_report(root: zarr.Group, zone: str, *, with_shards: bool, session: ice
             departures.append(f"{zone}: declares crs {attrs.get('crs')!r}, the zone grid says {spec.crs!r}")
         departures += [f"{zone}: {d}" for d in published_store.coordinate_departures(group, spec)]
     expected_crs = spec.crs if spec else None
-    # A year marked complete that the campaign never preallocated is a completion record pointing at
-    # no time slot. Unchecked it also makes the "never filled" arithmetic wrong, and can turn it
-    # negative.
+    # A completion record pointing at no time slot. Unchecked it also makes the "never filled"
+    # arithmetic wrong, and can turn it negative.
     unexpected_years = [y for y in years if y not in CAMPAIGN_YEARS]
-    # Sorted and unique, which is how the writer persists it and what every count below assumes. A
-    # duplicate survives into `from_attrs` as one element, so the set-based reconciliation that
-    # follows cannot see it and the reported cell counts quietly stop adding up.
+    # Sorted and unique is how the writer persists it and what every count below assumes: a
+    # duplicate survives into `from_attrs` as one element, so the set-based reconciliation cannot
+    # see it and the reported cell counts quietly stop adding up.
     if years != sorted(set(years)):
         departures.append(f"{zone}: years_complete is {years}, not a sorted unique list")
-    # The group's OWN time axis, decoded and compared — not just the completion attribute against a
-    # constant. A shifted or duplicated axis passes every attribute and tag check while a labelled
-    # reader asking for 2021 gets another year's data, and nothing above would notice, because
-    # `years_complete` is a list of integers with no link to the coordinate it is describing.
-    calendar = _calendar_years(group)
+    # The group's OWN time axis, decoded — not just the attribute against a constant. A shifted or
+    # duplicated axis passes every attribute and tag check while a labelled reader asking for 2021
+    # gets another year, because `years_complete` has no link to the coordinate it describes.
+    calendar = published_store.calendar_years(group)
     if tuple(calendar) != CAMPAIGN_YEARS:
         departures.append(f"{zone}: time coordinate decodes to {calendar}, the campaign axis is {list(CAMPAIGN_YEARS)}")
     report: dict[str, Any] = {
@@ -227,8 +185,8 @@ def _zone_report(root: zarr.Group, zone: str, *, with_shards: bool, session: ice
         "time_axis": calendar,
         "layout_departures": departures,
         "open_s": round(time.monotonic() - opened, 3),
-        # A year in `runs` but not in `years_complete` would mean a fill that wrote data and never
-        # marked itself, which is the one inconsistency the two-commit write model could leave.
+        # A year in `runs` but not in `years_complete` means a fill that wrote data and never marked
+        # itself — the one inconsistency the two-commit write model can leave.
         "years_with_provenance": sorted(int(y) for y in attrs.get("runs", {})),
     }
     if with_shards:
@@ -237,10 +195,9 @@ def _zone_report(root: zarr.Group, zone: str, *, with_shards: bool, session: ice
         report["live_shards_by_time_index"] = {str(k): len(v) for k, v in coverage.items()}
         report["live_shards_total"] = sum(len(v) for v in coverage.values())
         report["shard_enumeration_s"] = round(time.monotonic() - started, 2)
-        # THE half-published state the write model can produce. Shards are committed before the
-        # year's attributes, so a crash between the two commits leaves real data in a year nothing
-        # records as complete — and a reader asking `years_complete` will never look at it. Only
-        # reachable with `--shards`, because it needs the per-year coverage.
+        # THE half-published state the write model can produce: shards are committed before the
+        # year's attributes, so a crash between the two leaves real data in a year nothing records
+        # as complete — and a reader trusting `years_complete` will never look at it.
         report["live_shards_in_incomplete_years"] = {
             str(calendar[index]): len(shards)
             for index, shards in sorted(coverage.items())
@@ -281,11 +238,10 @@ def main(argv: list[str] | None = None) -> int:
     present = sorted(k for k, _ in root.groups())
     missing_groups = sorted(set(EXPECTED_ZONES) - set(present))
     unexpected_groups = sorted(set(present) - set(EXPECTED_ZONES))
-    # A full audit walks the EXPECTED zones that are present, not everything the root holds. An
-    # auxiliary or corrupt extra group has no `time` array, so sending it through `_zone_report`
-    # raises while decoding the calendar — and the census then never prints its reconciliation,
-    # never writes its JSON, and never returns the non-zero status the extra group had earned. The
-    # extras are already reported as `unexpected_groups`.
+    # A full audit walks the EXPECTED zones that are present: an auxiliary or corrupt extra group
+    # has no `time` array, so `_zone_report` would raise while decoding the calendar and the census
+    # would never print its reconciliation, write its JSON or return the non-zero status that group
+    # had earned. Extras are reported as `unexpected_groups`.
     zones = [z for z in present if z in set(EXPECTED_ZONES)] if args.zones == "all" else args.zones.split(",")
     if absent := sorted(set(zones) - set(present)):
         parser.error(f"the store has no group(s) {absent}; it holds {len(present)}")
@@ -313,22 +269,20 @@ def main(argv: list[str] | None = None) -> int:
         complete = len(report["years_complete"])
         print(f"{report['zone']:<6} {report['crs'] or '?':<12} {complete:>8} {missing:<30} {departures}")
 
-    # Reconciliation. Only meaningful over the zones actually audited, so a `--zones` run compares
-    # the tag record for those zones and nothing else.
     audited = {r["zone"] for r in zone_reports}
     from_attrs = {(r["zone"], y) for r in zone_reports for y in r["years_complete"]}
-    # A FULL audit compares every parsed tag; a subset audit compares only the zones asked for.
-    # Filtering unconditionally is how an orphan tag — `zone-61N-2025`, or one left behind by a
-    # deleted group — disappears from the comparison and lets the census exit 0 on it.
+    # A FULL audit compares every parsed tag; a subset audit only the zones asked for. Filtering
+    # unconditionally is how an orphan tag — `zone-61N-2025`, or one left by a deleted group —
+    # disappears from the comparison and lets the census exit 0 on it.
     from_tags = tags if args.zones == "all" else {(z, y) for z, y in tags if z in audited}
     only_attrs = sorted(from_attrs - from_tags)
     only_tags = sorted(from_tags - from_attrs)
     unmarked_provenance = sorted(
         (r["zone"], y) for r in zone_reports for y in r["years_with_provenance"] if y not in r["years_complete"]
     )
-    # And the other direction. A year marked complete with no `runs` entry is a published cell whose
-    # run id and input coverage nobody can look up — the reader contract says each completed year
-    # carries them, and a one-sided check certifies exactly the half that is missing.
+    # And the other direction: a year marked complete with no `runs` entry is a published cell whose
+    # run id and input coverage nobody can look up, and a one-sided check certifies exactly the half
+    # that is missing.
     provenance_missing = sorted(
         (r["zone"], y) for r in zone_reports for y in r["years_complete"] if y not in r["years_with_provenance"]
     )
@@ -386,22 +340,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         print(f"\nwrote {args.json_out}")
 
-    return (
-        1
-        if (
-            only_attrs
-            or only_tags
-            or unmarked_provenance
-            or departures
-            or missing_groups
-            or unexpected_groups
-            or unexpected_years
-            or unmarked_shards
-            or root_departures
-            or provenance_missing
-        )
-        else 0
-    )
+    problems = (only_attrs, only_tags, unmarked_provenance, provenance_missing, departures)
+    groups_and_years = (missing_groups, unexpected_groups, unexpected_years, unmarked_shards, root_departures)
+    return 1 if any(problems) or any(groups_and_years) else 0
 
 
 if __name__ == "__main__":

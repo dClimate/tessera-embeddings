@@ -1,22 +1,17 @@
 """The published store is readable by an outside consumer — checked against the live store.
 
-**Why this test reaches a live service when the tier says cassettes always.** The rule exists so
-the suite stays deterministic and fast, and it is the right rule for a third-party API: what we
-care about there is that our parsing still works, and a recording proves that. Here the subject
-under test IS the live artifact. The claim is "somebody with no AWS account can open the published
-store and get data out of it", and a cassette of our own recording cannot fail in the way that
-claim can — the bucket policy could be tightened, the branch could be reset, a future
-reorganisation could move the zone groups, and every one of those would leave a replayed cassette
-green.
+Reaches a live service where the tier says cassettes always, because here the subject under test IS
+the live artifact: the claim is "somebody with no AWS account can open the published store and get
+data out of it", and a replayed recording of our own request stays green through every way that
+claim can break. See `tests/integration/README.md` for the full reasoning.
 
-So it is opt-in TWICE: the ``integration`` marker the default invocation deselects, and an
-environment variable on top, because a marker alone has previously been enough for a test to end
-up running where it was not wanted. Nothing in CI sets it::
+Opt-in twice — the ``integration`` marker plus ``TESSERA_TEST_PUBLISHED_STORE=1``, which nothing in
+CI sets::
 
     TESSERA_TEST_PUBLISHED_STORE=1 uv run pytest -m integration tests/integration/test_published_store_access.py
 
-It reads no credentials, on purpose. If it passes with an AWS profile in the environment but fails
-without one, that is the finding, not a flaw in the test — so it clears every AWS variable first.
+It reads no credentials on purpose, and clears every AWS variable first: passing with a profile in
+the environment but failing without one would be the finding, not a flaw in the test.
 """
 
 from __future__ import annotations
@@ -30,7 +25,6 @@ import zarr
 
 from tessera_embeddings.storage import published_store
 from tessera_embeddings.storage.global_store import open_global_repo
-from tessera_embeddings.storage.zarr_store import global_store_config
 
 PUBLISHED_URI = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 PUBLISHED_REGION = "us-west-2"
@@ -50,10 +44,9 @@ pytestmark = [
 ]
 
 #: Every way botocore can find a credential, not just the ones a laptop uses. On an EC2 or ECS host
-#: — where this test is most likely to be run against the real store — instance metadata and the
-#: container credential endpoint answer even with every key and profile variable cleared, and a
-#: web-identity pair answers in CI. Clearing only the profile and static-key variables would leave
-#: the fixture's own assertion failing on those hosts, turning a correct environment into a red test.
+#: — where this is most likely to be run — instance metadata and the container credential endpoint
+#: answer even with every key and profile variable cleared, and a web-identity pair answers in CI,
+#: so clearing only the profile and static-key variables would turn a correct environment red.
 _AWS_ENV = (
     "AWS_PROFILE",
     "AWS_DEFAULT_PROFILE",
@@ -77,8 +70,8 @@ def anonymous_root(tmp_path_factory):
     snapshot; a per-test open would also make the suite's runtime a function of its test count.
     """
     saved = {name: os.environ.pop(name, None) for name in _AWS_ENV}
-    # Point the shared-credentials and config files at an empty directory as well, so a profile in
-    # ~/.aws cannot answer for the anonymous path and make this test pass for the wrong reason.
+    # The shared-credentials and config files too, so a profile in ~/.aws cannot answer for the
+    # anonymous path and make this pass for the wrong reason.
     empty = tmp_path_factory.mktemp("no-aws")
     for name in ("AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE", "AWS_EC2_METADATA_DISABLED"):
         saved[name] = os.environ.get(name)
@@ -87,9 +80,8 @@ def anonymous_root(tmp_path_factory):
     # Instance metadata is reachable on any EC2 host and is not an environment variable to unset.
     os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
     try:
-        # Prove the scrubbing worked before trusting anything this fixture yields. Without this,
-        # an ambient profile would make every test below pass while saying nothing about the
-        # anonymous path — the exact failure the environment clearing exists to prevent.
+        # Prove the scrubbing worked before trusting anything this fixture yields: an ambient
+        # profile would make every test below pass while saying nothing about the anonymous path.
         import botocore.session
 
         assert botocore.session.get_session().get_credentials() is None, (
@@ -97,10 +89,8 @@ def anonymous_root(tmp_path_factory):
         )
         repo = open_global_repo(PUBLISHED_URI, region=PUBLISHED_REGION, anonymous=True)
         session = repo.readonly_session(branch="main")
-        # The config SAVED IN THE STORE, fetched separately. `open_global_repo` always passes
-        # `global_store_config()`, and an explicit config replaces the persisted one rather than
-        # layering onto it — so `repo.config` echoes back what the library just supplied and would
-        # look healthy even if the store had lost its saved config entirely.
+        # The config SAVED IN THE STORE, fetched separately, so the tests below can compare it
+        # against the handle rather than reading the handle and calling that the store's state.
         saved_config = icechunk.Repository.fetch_config(
             icechunk.s3_storage(
                 bucket=PUBLISHED_URI.removeprefix("s3://").split("/", 1)[0],
@@ -128,25 +118,24 @@ class TestAnonymousAccess:
         assert groups[0] == "01N"
         assert groups[-1] == "60S"
 
-    def test_the_store_carries_the_writers_manifest_tuning(self, anonymous_root):
-        # Read from the STORE, not from the repository handle. `save_config` persisted it, so a
-        # consumer who passes no configuration of their own reads with the splitting and preload
-        # the writer chose; if this is ever None, such readers are silently on icechunk's defaults
-        # and the figures in context_docs/storage/reading-the-published-store.md no longer apply.
+    def test_the_store_is_tuned_for_readers_rather_than_for_the_fill(self, anonymous_root):
+        # The campaign's last step switches the saved manifest preload off. A re-enabled preload
+        # costs every consumer about 2.5 s per open and buys them nothing, and the figures in
+        # context_docs/storage/reading-the-published-store.md would stop applying. Splitting must
+        # survive that switch, because it describes the manifests already on disk.
         _, _, _, saved_config = anonymous_root
         assert saved_config is not None, "the store has no saved repository config"
         manifest = saved_config.manifest
         assert manifest is not None
         assert manifest.splitting is not None
         assert manifest.preload is not None
-        assert manifest.preload.max_total_refs > 0
+        assert manifest.preload.max_total_refs == 0
 
-    def test_the_library_config_still_matches_what_the_store_saved(self, anonymous_root):
-        # They are byte-identical today, which is why reading through `open_global_repo` costs a
-        # reader the same as reading with no config at all. If they diverge, the published figures
-        # describe one path and the library takes the other.
-        _, _, _, saved_config = anonymous_root
-        assert repr(saved_config) == repr(global_store_config())
+    def test_opening_inherits_the_saved_config_rather_than_replacing_it(self, anonymous_root):
+        # A config handed to `Repository.open` REPLACES the saved one, which is how readers used to
+        # get the writer's preload back through this package — 2,245 ms against 852 inheriting.
+        repo, _, _, saved_config = anonymous_root
+        assert repr(repo.config) == repr(saved_config)
 
     def test_a_zone_group_conforms_to_the_declared_layout(self, anonymous_root):
         _, _, root, _ = anonymous_root
@@ -160,9 +149,7 @@ class TestAnonymousAccess:
 
     def test_the_time_axis_is_the_nine_preallocated_calendar_years(self, anonymous_root):
         _, _, root, _ = anonymous_root
-        stamps = np.asarray(root[SAMPLE_ZONE]["time"][:]).astype("datetime64[ns]")
-        years = tuple(int(y) for y in stamps.astype("datetime64[Y]").astype(int) + 1970)
-        assert years == EXPECTED_YEARS
+        assert tuple(published_store.calendar_years(root[SAMPLE_ZONE])) == EXPECTED_YEARS
 
     def test_reading_a_live_pixel_returns_embeddings_rather_than_fill(self, anonymous_root):
         _, session, root, _ = anonymous_root
@@ -176,13 +163,13 @@ class TestAnonymousAccess:
         vector = np.asarray(group["embeddings"][last_year_index, y, x, :])
         assert vector.shape == (128,)
         assert vector.dtype == np.dtype("int8")
-        # int8 fill is 0 and a real embedding is not all-zero, which is exactly why `scales` and
-        # its NaN fill is what `sample_live_pixels` filters on rather than this array.
+        # int8 fill is 0 and a real embedding is not all-zero, which is why `sample_live_pixels`
+        # filters on `scales` and its NaN fill rather than on this array.
         assert np.any(vector != 0)
 
     def test_every_zone_year_marked_complete_is_also_tagged(self, anonymous_root):
-        # The two are written in separate commits, so they can disagree. Checked over the whole
-        # store because a single zone would not exercise the reconciliation at all.
+        # The two are written in separate commits, so they can disagree. Over the whole store,
+        # because a single zone would not exercise the reconciliation at all.
         repo, _, root, _ = anonymous_root
         tagged = {
             (parts[1], int(parts[2]))

@@ -52,8 +52,7 @@ class TestLayoutDepartures:
         assert published_store.layout_departures(group) == []
 
     def test_every_declared_array_is_actually_checked(self, seeded):
-        # Guards the audit against silently passing because it looked at nothing: the group must
-        # hold each array the layout declares, or a conforming verdict means only "found none".
+        # Or a conforming verdict means only "found none".
         group = zarr_store.open_store_as_zarr_group(seeded, group="01N")
         assert set(GLOBAL.arrays) <= set(dict(group.arrays()))
 
@@ -73,8 +72,8 @@ class TestLayoutDepartures:
         assert any("s2_obs_count" in d and "absent" in d for d in published_store.layout_departures(group))
 
     def test_coordinate_arrays_are_not_departures(self, seeded):
-        # `time`, `band`, `northing`, `easting`, `time_bnds`, `month` are in the group and in no
-        # layout. Reporting them would bury real findings under six per zone.
+        # The six coordinate arrays are in the group and in no layout; reporting them would bury
+        # real findings under six per zone.
         group = zarr_store.open_store_as_zarr_group(seeded, group="01N")
         assert "time" in dict(group.arrays())
         assert published_store.layout_departures(group) == []
@@ -96,8 +95,8 @@ class TestLiveShards:
         assert coverage == {0: frozenset({(1, 0), (2, 1)}), 1: frozenset({(1, 0)})}
 
     def test_the_coordinates_are_shard_grid_not_inner_chunk_grid(self, seeded):
-        # The distinction this module rests on. One 2048-px shard holds 64 inner chunks, so an
-        # inner-chunk enumeration would return 64 coordinates with indices up to (8*sy + 7).
+        # One 2048-px shard holds 64 inner chunks, so an inner-chunk enumeration would return 64
+        # coordinates with indices up to (8*sy + 7).
         _fill_shard(seeded, "01N", 0, (3, 1))
         repo = global_store.open_global_repo(seeded)
         coverage = published_store.live_shards(repo.readonly_session(branch="main"), "01N")
@@ -155,9 +154,8 @@ class TestSampleLivePixels:
             assert 1 * SHARD_PX <= x < 2 * SHARD_PX
 
     def test_fill_inside_a_live_shard_is_filtered_out(self, seeded):
-        # THE reason this function exists. A shard half at fill would otherwise contribute
-        # candidates whose read never leaves the process, and a latency benchmark built on them
-        # reports the elided reads as if they were real ones.
+        # THE reason this function exists: a candidate on fill is read without leaving the
+        # process, so a latency benchmark built on them reports free reads as real ones.
         _fill_shard(seeded, "01N", 0, (1, 1), live_fraction=0.5)
         group = zarr_store.open_store_as_zarr_group(seeded, group="01N")
         pixels = published_store.sample_live_pixels(group, 0, [(1, 1)], 12, seed=11, oversample=8)
@@ -180,8 +178,7 @@ class TestAnonymousStorage:
         monkeypatch.setattr(zarr_store.icechunk, "s3_storage", lambda **kw: captured.update(kw))
         zarr_store._create_storage("s3://bucket/prefix", anonymous=True)
         assert captured["anonymous"] is True
-        # The credential callback must be ABSENT, not merely unused: passing both leaves which one
-        # icechunk honours up to icechunk.
+        # ABSENT, not merely unused: passing both leaves the choice up to icechunk.
         assert "get_credentials" not in captured
 
     def test_the_default_path_forwards_the_registered_provider_and_never_asks_for_anonymous(self, monkeypatch):
@@ -194,8 +191,7 @@ class TestAnonymousStorage:
         assert "anonymous" not in captured
 
     def test_with_no_registered_provider_icechunks_own_chain_is_left_to_answer(self, monkeypatch):
-        # Neither key is set, so icechunk falls back to the standard AWS chain. This is the shape
-        # a bare test process sees, and it must not be mistaken for the anonymous path.
+        # The shape a bare test process sees, and it must not be mistaken for the anonymous path.
         captured: dict[str, object] = {}
         monkeypatch.setattr(zarr_store.icechunk, "s3_storage", lambda **kw: captured.update(kw))
         monkeypatch.setattr(zarr_store, "_default_credentials_provider", None)
@@ -217,8 +213,8 @@ class TestLayoutDimensionNames:
     """Dimension names are part of the contract, and the one departure the geometry checks miss."""
 
     def test_transposed_spatial_axes_are_reported(self, seeded):
-        # The case that motivates checking names at all: `easting, northing` has the right rank,
-        # the right dtype and — since both spatial chunk sizes are 256 — the right chunk geometry.
+        # Why names are checked at all: `easting, northing` has the right rank, the right dtype
+        # and — both spatial chunk sizes being 256 — the right chunk geometry.
         _, group = _writable_group(seeded, "01N")
         shape = group["scales"].shape
         group.create_array(
@@ -253,9 +249,8 @@ class TestLayoutFillAndAttributes:
     """Fill value, declared attributes, and extents — the checks geometry alone cannot make."""
 
     def test_a_finite_fill_on_scales_is_reported(self, seeded):
-        # The one that matters most: every coverage question in this module reads a finite `scales`
-        # value as written data, so a finite fill makes never-written pixels indistinguishable from
-        # real ones while the array keeps the right dtype, chunks and shards.
+        # Every coverage question reads a finite `scales` value as written data, so a finite fill
+        # hides never-written pixels behind the right dtype, chunks and shards.
         _, group = _writable_group(seeded, "01N")
         group.create_array(
             "scales",
@@ -279,7 +274,7 @@ class TestLayoutFillAndAttributes:
 
     def test_a_missing_declared_attribute_is_reported(self, seeded):
         # `dtype="bool"` on an int8 array is how xarray presents booleans; without it a labelled
-        # reader silently gets 0 and 1 instead.
+        # reader gets 0 and 1.
         _, group = _writable_group(seeded, "01N")
         covered = group["s2_month_covered"]
         group.create_array(
@@ -296,9 +291,8 @@ class TestLayoutFillAndAttributes:
         assert any("s2_month_covered" in d and "dtype" in d and "bool" in d for d in departures)
 
     def test_an_array_shorter_than_its_coordinate_is_reported(self, seeded):
-        # Expectations are derived from the array's own shape, so truncating it by a whole shard
-        # keeps the nominal chunk and shard sizes and passes every geometry check. The coordinate
-        # arrays are the independent oracle.
+        # Expectations come from the array's own shape, so truncating it by a whole shard passes
+        # every geometry check; the coordinate arrays are the independent oracle.
         _, group = _writable_group(seeded, "01N")
         scales = group["scales"]
         short = (scales.shape[0], scales.shape[1] - SHARD_PX, scales.shape[2])
@@ -320,16 +314,15 @@ class TestLayoutCoordinatesAndCodec:
     """Two more departures the geometry checks cannot see: a lost coordinate, and a wrong codec."""
 
     def test_a_missing_coordinate_array_is_reported(self, seeded):
-        # Without this, losing `northing` only causes the extent check for that dimension to be
-        # skipped — so the audit reports nothing while every geospatial read of the zone is
-        # incomplete.
+        # Otherwise losing `northing` only skips that dimension's extent check, so the audit
+        # reports nothing while every geospatial read of the zone is incomplete.
         _, group = _writable_group(seeded, "01N")
         del group["northing"]
         assert any("northing" in d and "does not have it" in d for d in published_store.layout_departures(group))
 
     def test_a_missing_month_coordinate_is_reported(self, seeded):
-        # `month` and `time_bnds` are the two easiest to leave out of a "required coordinates" set,
-        # which is why the layout audit asks the seeder's own definition instead of its own list.
+        # The two easiest to leave out of a hand-written "required coordinates" set, which is why
+        # the audit asks the seeder's own definition.
         _, group = _writable_group(seeded, "01N")
         del group["month"]
         assert any("month" in d and "does not have it" in d for d in published_store.layout_departures(group))
@@ -356,9 +349,8 @@ class TestAnonymousWithAnOverride:
     """`anonymous` must not be quietly satisfied by an installed S3 override."""
 
     def test_an_installed_override_refuses_an_anonymous_read(self, monkeypatch):
-        # The override carries credentials and an endpoint, so honouring it would send credentials
-        # for a caller that asked to send none — which would make an anonymous-access check pass
-        # while authenticating, the one thing that check exists to rule out.
+        # The override carries credentials and an endpoint, so honouring it would make an
+        # anonymous-access check pass while authenticating — the one thing it rules out.
         class _Override:
             def make_storage(self, prefix_override=None):
                 raise AssertionError("the override must not be consulted for an anonymous read")
@@ -386,8 +378,8 @@ class TestCoordinateDepartures:
         assert published_store.coordinate_departures(group, _ZONE) == []
 
     def test_a_reversed_northing_axis_is_reported(self, seeded):
-        # The northing axis descends — row 0 is the top. Ascending is the same values, the same
-        # length and the same spacing, and every pixel in the zone is then in the wrong place.
+        # Northing descends; ascending is the same values, length and spacing with every pixel in
+        # the wrong place.
         _, group = _writable_group(seeded, "01N")
         northing = np.asarray(group["northing"][:])
         group["northing"][:] = northing[::-1]
@@ -451,8 +443,8 @@ class TestSavedManifestPreload:
         assert global_store.open_global_repo(seeded).config.manifest.preload.max_total_refs == expected
 
     def test_manifest_splitting_and_storage_settings_survive_the_switch(self, seeded):
-        # Splitting describes the manifests already on disk, and the timeouts and retries are the
-        # writer's. Building a fresh config to change the preload is how they get dropped.
+        # Splitting describes the manifests already on disk; building a fresh config to change the
+        # preload is how it gets dropped.
         before = global_store.open_global_repo(seeded).config
         global_store.set_saved_manifest_preload(seeded, enabled=False)
         after = global_store.open_global_repo(seeded).config
@@ -460,7 +452,7 @@ class TestSavedManifestPreload:
         assert repr(after.storage) == repr(before.storage)
 
     def test_tags_and_the_branch_tip_survive_the_switch(self, seeded):
-        # The write rebuilds the object that holds them, so this is the thing that must not move.
+        # The write rebuilds the object that holds them, so this is what must not move.
         repo = global_store.open_global_repo(seeded)
         session = repo.writable_session("main")
         zarr.open_group(session.store, mode="r+")["01N"].attrs["years_complete"] = [2025]

@@ -81,10 +81,9 @@ def open_global_repo(
 ) -> icechunk.Repository:
     """Open the global store, inheriting the configuration it was created with.
 
-    **Passes no config**, so the manifest splitting, timeouts, retries and preload all come from
-    what :func:`create_global_repo` saved into the store. Handing Icechunk a config here would
-    REPLACE the saved one, which is how the published store's own readers ended up preloading
-    manifests they had no use for — measured at 2,245 ms against 852 ms inheriting.
+    **Passes no config.** Handing Icechunk one here would REPLACE what
+    :func:`create_global_repo` saved, which is how the published store's readers ended up
+    preloading manifests they had no use for — 2,245 ms against 852 ms inheriting.
 
     ``anonymous`` reads with no credentials, which is how the published store is served.
     ``scatter_initial_credentials`` is the caller's call: set it where the session is shipped to
@@ -110,21 +109,19 @@ def set_saved_manifest_preload(
 ) -> None:
     """Switch the store's SAVED manifest preload on or off, for every reader at once.
 
-    Preloading manifests helps a fill, which is about to touch them anyway, and costs a reader
-    seconds per open for nothing. So it belongs on for a campaign and off afterwards — turn it off
-    as the last step of a campaign or a year's update, the way any other database maintenance runs.
+    Preloading helps a fill, which is about to touch those manifests anyway, and costs a reader
+    seconds per open for nothing — so it goes off as the last step of a campaign or a year's update.
 
     **This rewrites the store's ``repo`` object**, which holds the branch pointers, every tag and
-    every snapshot record; Icechunk rebuilds it from its parts. That is safe — the previous object
-    is copied to ``overwritten/`` first and both that copy and the put are conditional on the
-    version read, so a concurrent writer is detected and retried rather than clobbered — and it was
-    verified against a clone of the published store's own reference state before first use. No
-    snapshot is created, so the change is invisible to ``ancestry()`` and is undone by calling this
-    again rather than by ``reset_branch``.
+    every snapshot record; Icechunk rebuilds it from its parts. Safe because the previous object is
+    copied to ``overwritten/`` first and both the copy and the put are conditional on the version
+    read, so a concurrent writer is detected and retried rather than clobbered; verified against a
+    clone of the published store's reference state before first use. No snapshot is created, so the
+    change is invisible to ``ancestry()`` and is undone by calling this again, not ``reset_branch``.
 
     Raises:
         RuntimeError: If the preload did not change, or if any tag or branch moved. Either means
-            stop and look rather than continue: the backup in ``overwritten/`` is the way back.
+            stop and look: the backup in ``overwritten/`` is the way back.
     """
 
     def state(repo: icechunk.Repository) -> tuple[dict[str, str], dict[str, str]]:

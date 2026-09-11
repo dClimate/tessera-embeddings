@@ -24,9 +24,9 @@ no longer exists. The fifth is the index published beside the store, which the s
 | 6 | the per-tile registry published beside the store | 2026-08-19 |
 
 **The reader's side is a separate document.** What a consumer needs to open the finished store (as
-it turns out, no credentials at all), whether what was published conforms to what was designed, what
-it costs to read from inside and outside its region, and the one inherited setting that dominates
-open latency: [`reading-the-published-store.md`](reading-the-published-store.md).
+it turns out, no credentials at all), whether what was published conforms to what was designed, and
+what it costs to read from inside and outside its region:
+[`reading-the-published-store.md`](reading-the-published-store.md).
 
 ---
 

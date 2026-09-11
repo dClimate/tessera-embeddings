@@ -28,14 +28,13 @@ Produces artifacts the campaign depends on.
 
 ## `maintenance/` — supported tooling that MUTATES something already in service
 
-One script today, and the directory exists to keep it away from the read-only tools. Anything here
-changes something consumers are already using, which is why the bar is higher than for a
-diagnostic: it should dry-run by default, refuse rather than adapt when it finds state its
-evidence was not gathered against, and be able to undo itself.
+Kept apart from the read-only tools because anything here changes something consumers are already
+using. The bar is higher than for a diagnostic: dry-run by default, refuse rather than adapt when
+the state was not what the evidence was gathered against, and be able to undo itself.
 
 | script | what it does |
 |---|---|
-| `set_published_store_reader_config.py` | Switches the published store's SAVED manifest preload off, so consumers stop inheriting a setting sized for writing that costs them ~2.5 s of every open and returns nothing. On spec version 2 that rewrites the one object holding every tag and the branch pointers, which was verified non-destructive against a clone of the real store's reference state before this script was written. Dry run unless `--apply`; `--rollback` undoes it. |
+| `set_published_store_reader_config.py` | Switches the published store's SAVED manifest preload off, so consumers stop inheriting a setting sized for writing that costs them ~2.5 s of every open and returns nothing. On spec version 2 that rewrites the one object holding every tag and the branch pointers, verified non-destructive against a clone of the real store's reference state first. Dry run unless `--apply`; `--rollback` undoes it. |
 
 ## `diagnostic/` — supported tooling
 
