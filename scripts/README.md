@@ -34,6 +34,9 @@ Answers "why is this environment behaving that way?" and is expected to work on 
 |---|---|
 | `check_env.py` | Prints the installed torch variant and CUDA availability — which lock file this environment was actually built from. |
 | `probe_edl_bearer.py` | Whether a Bearer Earthdata token survives the full ASF redirect chain. Written for a specific auth failure and kept because that failure recurs. |
+| `published_store_census.py` | Whether the published global store opens, conforms to the declared layout in all 120 zone groups, and agrees with its own completion tags about which cells are done. Exits non-zero on any disagreement. |
+| `published_store_read_bench.py` | Read performance of the published store — open latency, point-vector percentiles, region throughput, bytes on the wire — using the same workloads and concurrency sweep as `scoping/scale_tests/t1_read_bench.py`, so the built store can be compared against the scoped one. |
+| `published_registry_census.py` | Whether the published Parquet registry is shaped as designed, whether a whole-dataset read loses columns, how fast an area-of-interest coverage query answers, and whether the registry's coverage agrees with the store's. |
 
 ## `scoping/` — kept-for-reference instruments
 
