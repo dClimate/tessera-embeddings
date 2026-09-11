@@ -942,11 +942,13 @@ CAMPAIGN_GPU_H_PER_TILE_YEAR = CAMPAIGN_GPU_HOURS / CAMPAIGN_TILE_YEARS
 #: Blended card price the campaign actually paid, against the $1.861 single-card figure the model
 #: divides by: the fleet was 57.3% of the cheaper A10G by hours.
 #:
-#: **This is why the model's cost line is a FLOOR rather than a central estimate.** It divides by
-#: the g6e (L40S) rate and prices at the g6e rate throughout, which is only reachable if the fleet
-#: places entirely on g6e -- and g6e capacity is scarce, so a real fleet falls back to the g5
-#: (A10G), which is cheaper per hour AND slower. Both effects are real and they partly cancel:
-#: the campaign needed 15% more card-hours than the model and bought them 20% cheaper.
+#: **A MIXED FLEET HAS NO STABLE CARD-HOUR FIGURE, which is why both cases are recorded rather
+#: than one.** The two card types differ in speed and in price, so the hours a campaign needs
+#: depend on what it places. The model divides by the L40S rate throughout, so its hours are the
+#: L40S-only case: a minimum on HOURS, and so on schedule, but not on spend. On these figures the
+#: L40S costs 1.54x the A10G per hour and delivers about 1.31x the throughput, so the premium is
+#: not covered and the A10G is the better value per token -- a claim resting on an inference the
+#: engine cannot confirm, so it is reported and not planned on. `campaign-cost-model.md` §12.
 CAMPAIGN_BLENDED_GPU_HOUR_USD = CAMPAIGN_GPU_COST_USD / CAMPAIGN_GPU_HOURS
 
 
@@ -1141,18 +1143,28 @@ def test_the_model_reconciles_against_the_campaign_outturn() -> None:
     assert pytest.approx(1.489, rel=0.02) == CAMPAIGN_BLENDED_GPU_HOUR_USD
     assert pytest.approx(predicted_gpu_hours * GPU_HOUR_USD * 0.92, rel=0.03) == CAMPAIGN_GPU_COST_USD
 
-    # THE MODEL'S COST LINE IS A FLOOR, and this is the assertion that says so. It prices every
-    # hour at the g6e rate, which is only reachable if the fleet places entirely on g6e — and g6e
-    # capacity is scarce, so a real fleet falls back to the slower, cheaper g5. Had the campaign
-    # held g6e for the hours it actually needed, the cards would have cost about $660,000, well
-    # over the modelled $573,000. The fallback is what brought it in under.
-    floor = predicted_gpu_hours * GPU_HOUR_USD
-    all_fast_at_measured_hours = CAMPAIGN_GPU_HOURS * GPU_HOUR_USD
-    assert all_fast_at_measured_hours > floor, (
-        "the modelled line is no longer a floor — it can only be one while the measured hours exceed the modelled hours"
+    # THE MODEL'S HOURS ARE THE L40S-ONLY CASE: a minimum on card-hours, and so on schedule, but
+    # NOT a minimum on spend. Pinned because the intuition runs the other way — the faster card
+    # needs fewer hours, so it looks cheaper, and on these figures it is not.
+    hours_all_fast = CAMPAIGN_GPU_HOURS * 0.866  # the same work at the full L40S rate
+    assert hours_all_fast < CAMPAIGN_GPU_HOURS, "the L40S-only case must need FEWER hours"
+    assert pytest.approx(307_207, rel=0.01) == hours_all_fast
+    assert pytest.approx(571_711, rel=0.01) == hours_all_fast * GPU_HOUR_USD
+
+    # The A10G speed, solved for from the blend and the hour split rather than measured. Weak, and
+    # asserted only so the SIGN of the conclusion cannot drift unnoticed: the price premium is
+    # 1.54x against a speed premium of about 1.31x, so the premium is not covered.
+    a10g_price = 1.2120
+    a10g_speed = (0.866 * CAMPAIGN_GPU_HOURS - 151_347.5) / 203_394.5
+    assert pytest.approx(0.766, rel=0.02) == a10g_speed
+    assert GPU_HOUR_USD / a10g_price > 1 / a10g_speed, (
+        "the L40S price premium is now covered by its speed premium — the per-token value "
+        "comparison has flipped and §12's wording needs re-deriving"
     )
-    assert pytest.approx(660_000, rel=0.02) == all_fast_at_measured_hours
-    assert CAMPAIGN_GPU_COST_USD < floor < all_fast_at_measured_hours
+    # The outturn sits between the two single-card cases, which is the shape of a mixed fleet.
+    all_slow = hours_all_fast / a10g_speed * a10g_price
+    all_fast = hours_all_fast * GPU_HOUR_USD
+    assert all_slow < CAMPAIGN_GPU_COST_USD < all_fast
 
     # The roster is the one input that reproduced exactly, so it is welded rather than approximated.
     assert live_tiles * CAMPAIGN_YEARS == 3_248_577

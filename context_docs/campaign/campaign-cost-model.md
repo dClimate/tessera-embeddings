@@ -1374,23 +1374,37 @@ is §1's headline table against measurement.
 | EBS volumes | no line | $3,150 | missing from the model |
 | **Campaign total** | **$594,000–$846,000, plan $700,000** | **$816,901** | **inside the range, 16.7% over plan** |
 
-**The modelled inference line is a FLOOR, not a central estimate, and that is why it looks so
-accurate.** It divides by the L40S single-card rate and prices every hour at the L40S rate,
-which is reachable only if the fleet places entirely on `g6e.xlarge`. That capacity is scarce, so
-a real fleet falls back to the `g5.2xlarge` A10G — **cheaper per hour and slower**, and both
-effects are real:
+**There is no stable graphics-card-hour figure for a mixed fleet, and this section stops
+pretending otherwise.** The two card types differ in both speed and price, so the hours a campaign
+needs depend on what it places. What can be reported honestly is two things: what was spent, and
+what the same work would have taken on the faster card alone.
 
-| | |
-|---|---|
-| modelled: 307,854 hours, all L40S at $1.861 | **$573,000** — the floor |
-| the hours actually needed, had they all been L40S | **$660,000** |
-| what ran: 354,742 hours at a blended $1.489 | **$528,172** |
+| | card-hours | cost |
+|---|---|---|
+| **what ran** — 57.3% A10G, 42.7% L40S by hours | **354,742** | **$528,172** |
+| the same work on `g6e.xlarge` (L40S) alone | **307,207** | $571,711 |
+| the same work on `g5.2xlarge` (A10G) alone | 400,901 | $485,893 |
 
-The fallback cost 15% more card-hours and bought them 20% cheaper, which is what brought the
-line in *under* a floor it could not otherwise have met. **The +15.2% in hours is not a second
+**The L40S-only row is the minimum CARD-HOURS, and so the shortest schedule — but not the
+minimum spend.** That is the part worth stating carefully, because the intuition runs the other
+way. The L40S costs **1.54×** the A10G per hour and, on these figures, delivers only **1.31×** the
+throughput, so the premium is not covered: per token the A10G comes out about **18% better
+value**. The campaign's fallback onto scarce L40S capacity therefore cost it schedule and saved it
+money, which is why the outturn sits between the two rows.
+
+**That comparison rests on an inference, and it is the weakest number in this section.** The A10G
+rate is not measured. It is solved for — from the one blended figure of 86.6% of L40S basis and the
+57.3/42.7 hour split — which assumes card type is the only systematic difference between those
+hours. It is not: the A10G was the *fallback*, acquired under capacity pressure, so its hours
+plausibly carry more ramp and more idleness than the L40S hours do, and that alone would understate
+its speed. Per-card throughput accounting is what would settle it, and the engine does not emit it.
+**Do not re-plan a fleet mix on this until it does** — the defensible statements are the two
+measured rows above and the fact that the L40S is the faster card.
+
+Read the model's $573,000 accordingly: it is the L40S-only case, so it is a floor on hours and a
+near-miss on cost by coincidence rather than by accuracy. **The +15.2% in hours is not a second
 error — it IS the 86.6%-of-basis shortfall**: 307,854 divided by 0.866 is 355,490 against the
-354,742 measured. So a planner should read $573,000 as "the best case if every card is the fast
-one" and budget the mix explicitly.
+354,742 measured.
 
 **The range held; the plan did not; and the lines were wrong in offsetting directions.** That is
 the honest summary. The graphics-card line — the one the go/no-go decision rested on, and the one
