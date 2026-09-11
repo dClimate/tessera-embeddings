@@ -82,7 +82,11 @@ def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[s
         # `easting, northing` instead of `northing, easting` has the right rank, the right dtype
         # and — because both spatial chunk sizes are 256 — the right chunk geometry, so every other
         # check here passes while every labelled read of it comes back transposed.
-        names = array.metadata.dimension_names
+        # `getattr` rather than an attribute access: Zarr v2 metadata has no dimension names at
+        # all, and an array here carrying v2 metadata could hold neither names nor shards — so the
+        # "no dimension names" verdict below is the right answer for that case too, and reporting
+        # it beats raising on a store shaped in a way this audit exists to notice.
+        names = getattr(array.metadata, "dimension_names", None)
         if names is None:
             out.append(f"{var}: has no dimension names, the layout declares {expected.dims}")
         elif tuple(names) != tuple(expected.dims):
