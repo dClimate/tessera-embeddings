@@ -4,7 +4,7 @@ Source: ``ucam-eo/tessera``, ``tessera_infer_v2/student/infer.py`` (``_pad_patte
 2026-08-21. Copied rather than paraphrased ON PURPOSE, and it must stay copied: a
 reimplementation "in our style" would drift toward our own v1.1 habits, which is precisely the
 divergence this reference exists to detect. If it looks un-idiomatic, that is the point — do
-not tidy it. See ``tests/unit/test_sampling_v2_parity.py``.
+not tidy it. See ``tests/unit/inference/test_sampling_v2_parity.py``.
 
 Two details survive verbatim because they change the answer: ``np.linspace(..., dtype=np.int64)``
 TRUNCATES rather than rounds, and the ``remain <= n`` branch takes group medians while the other

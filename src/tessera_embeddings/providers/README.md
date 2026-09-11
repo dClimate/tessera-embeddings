@@ -119,21 +119,14 @@ worth skimming before you start.
 
 ## Why no abstraction?
 
-Three concrete reasons:
+Cloud APIs are too different to share a useful base class — AWS uses
+SSM + EC2 + ECS Fargate where GCP would use Secret Manager + GCE and
+on-prem might use Slurm — so anything fitting all three is too thin to
+help or too thick to evolve. Parameter surfaces make it worse: an
+`ami_ssm_name` kwarg is meaningless on GCP, and a shared signature
+would carry dead parameters and surprise `NotImplementedError`s.
+Forking is cheap by comparison: a provider is ~500 LOC and shares
+essentially nothing cloud-specific with its siblings.
 
-1. **Cloud APIs are too different** to share a useful base class.
-   AWS uses SSM + EC2 + ECS Fargate; GCP would use Secret Manager +
-   GCE; on-prem might use Slurm or k8s. An abstraction that fits all
-   three is either too thin to help or too thick to evolve.
-2. **Parameter surfaces drift quickly.** A `provider.ray_cluster(...)`
-   that takes an `ami_ssm_name` makes no sense on GCP. Forcing every
-   provider through a shared kwarg list creates dead parameters and
-   surprise NotImplementedErrors.
-3. **Forking is cheap.** Each provider is ~500 LOC. Two providers
-   share maybe 50 LOC of stdlib utilities and 0 LOC of cloud-specific
-   helpers. A copy-modify is faster than designing an inheritance
-   tree, and the resulting code reads top-to-bottom without
-   indirection.
-
-For the longer version, see
+Full argument in
 [`context_docs/decisions/004-duck-typed-providers.md`](../../../context_docs/decisions/004-duck-typed-providers.md).

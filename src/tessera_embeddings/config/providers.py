@@ -1,8 +1,4 @@
-"""STAC provider and collection configuration.
-
-This module defines the dataclasses and provider registry for querying
-satellite data from various STAC catalogs.
-"""
+"""Dataclasses and the provider registry for querying satellite data from STAC catalogs."""
 
 from dataclasses import dataclass, field
 
@@ -32,6 +28,10 @@ class CollectionConfig:
         tile_id_property: STAC property containing tile/grid ID
         tile_id_prefix: Prefix for tile ID in queries (e.g., "MGRS-")
         has_scl: whether this collection provides an SCL layer to use for cloudmask
+        harmonisation_varies_by_item: whether items here can disagree about whether the BOA
+            offset was already subtracted, forcing a per-item decision from asset locations
+        band_names_are_asset_keys: whether the names in ``bands`` are the item's asset keys
+            rather than common names the loader resolves through an alias table
     """
 
     collection_id: str
@@ -42,6 +42,14 @@ class CollectionConfig:
     tile_id_property: str | None = "grid:code"
     tile_id_prefix: str = ""
     has_scl: bool = False
+    #: Off by default: a collection served by one producer has one answer. On, the producer
+    #: decision reads each item's asset LOCATIONS, which requires `band_names_are_asset_keys`.
+    harmonisation_varies_by_item: bool = False
+    #: Earth Search keys its assets by the names in `bands`; Planetary Computer serves the same
+    #: imagery under native keys (`B02`, `SCL`). Any check that looks an asset up BY NAME —
+    #: producer classification, read-set completeness, locality — is uninformative where this is
+    #: False, and reports every copy as incomplete and remote.
+    band_names_are_asset_keys: bool = False
 
     @property
     def requires_baseline_correction(self) -> bool:
@@ -57,20 +65,29 @@ class STACProvider:
         name: Human-readable provider name
         catalog_url: STAC API endpoint URL
         collections: Mapping of collection aliases to configurations
+        refuses_oversized_pages: True where an over-large response comes back as a 5xx rather
+            than a smaller answer. The query layer then re-asks a DIFFERENT request (shorter
+            date window, fewer items) instead of retrying in place, which buys nothing and
+            costs the whole backoff. Set only where measured: elsewhere a 502 is transient and
+            the retries are wanted.
+        throttles_with_forbidden: True where a 403 means "not right now" rather than "never",
+            so waiting is the remedy and the query layer applies its 429 backoff ladder. Set
+            only for a public, unauthenticated catalogue measured to behave this way: elsewhere
+            a 403 is a verdict about who is asking, which patience cannot change.
     """
 
     name: str
     catalog_url: str
     collections: dict[str, CollectionConfig] = field(default_factory=dict)
+    #: STAC search page size (the ``limit`` per page request), used only by providers queried
+    #: through ``client.search()`` (Earth Search, Planetary Computer). The OPERA ``cmr-asf`` path
+    #: bypasses CMR-STAC search for the native CMR granule API
+    #: (``opera_query.make_s1_item_provider``), so it does not apply there; raising it for
+    #: CMR-STAC made the
+    #: 500s worse — context_docs/decisions/009-native-cmr-granule-query.md.
     max_page_size: int = 250
-    """STAC search page size (the ``limit`` per page request).
-
-    Used only by providers queried through ``client.search()`` (Earth Search,
-    Planetary Computer). The OPERA ``cmr-asf`` path bypasses CMR-STAC search
-    entirely and queries the native CMR granule API instead (see
-    ``opera_query.make_s1_item_provider``), so this value does not apply there.
-    Raising it for CMR-STAC made the 500s worse, not better — see
-    context_docs/decisions/009-native-cmr-granule-query.md."""
+    refuses_oversized_pages: bool = False
+    throttles_with_forbidden: bool = False
 
 
 # =============================================================================
@@ -82,18 +99,24 @@ PROVIDERS: dict[str, STACProvider] = {
         name="Earth Search (Element 84)",
         catalog_url="https://earth-search.aws.element84.com/v1",
         collections={
-            # Earth Search v1 already applies the BOA offset correction
-            # (subtracts 1000 from post-baseline 4.00 data) in its COGs.
-            # The raster:bands offset=-0.1 and earthsearch:boa_offset_applied
-            # metadata are unreliable (see sertit/eoreader#120), but the
-            # pixel values are consistently harmonized. No correction needed.
+            # Earth Search harmonises the BOA offset (subtracts 1000 post-baseline 04.00) in its
+            # OWN COGs, but this collection also indexes items pointing at ESA originals, which
+            # still carry it — hence the threshold plus `harmonisation_varies_by_item`, which
+            # decides per ASSET from where that asset lives. Unsetting the threshold exempts the
+            # whole collection and is correct only if every item is a harmonised COG. The
+            # raster:bands offset=-0.1 and earthsearch:boa_offset_applied metadata are unreliable
+            # (sertit/eoreader#120), so asset location is the signal. ADR 021.
             "sentinel-2-l2a": CollectionConfig(
                 collection_id="sentinel-2-l2a",
                 bands=S2_L2A_BANDS,
                 resolution=10,
+                baseline_threshold=S2_BASELINE_THRESHOLD,
+                baseline_offset=S2_BASELINE_OFFSET,
                 tile_id_property="grid:code",
                 tile_id_prefix="MGRS-",
                 has_scl=True,
+                harmonisation_varies_by_item=True,
+                band_names_are_asset_keys=True,
             ),
             "sentinel-2-l1c": CollectionConfig(
                 collection_id="sentinel-2-l1c",
@@ -119,17 +142,27 @@ PROVIDERS: dict[str, STACProvider] = {
                 tile_id_prefix="",
             ),
         },
-        # BELOW the class default, and measured rather than guessed. This catalogue's search
-        # returns 502 for some (area, date-window) pairs at 250 items per page while
-        # answering the SAME query at 100 in under two seconds, and answering an adjacent
-        # year at 250 without trouble — so it is a page-size sensitivity in the service, not
-        # our load and not missing data. It also defeats the nine attempts of backoff
-        # underneath us, so the retry ladder cannot absorb it and only a smaller page can.
-        # Roughly twice the page requests for a query that answers at all is a good trade:
-        # search calls are a rounding error against the per-scene COG reads that dominate an
-        # ingest. Set per provider rather than on the class default, because nothing implicates
-        # the other catalogues. Reproduction: `scripts/e84_search_502_probe.py` (yield-embeddings).
+        # BELOW the class default: this catalogue refuses a response over ~6 MB (AWS Lambda's
+        # synchronous response limit) and 250 `sentinel-2-l2a` items exceeds it. Per provider,
+        # since nothing implicates the other catalogues. The cap tracks RESPONSE BYTES, and item
+        # size is driven by footprint shape — items tracing a twelve-detector sawtooth run to
+        # 98 KB against 0.2 KB for a rectangle, confined to roughly Nov 2018 - Mar 2019. So a
+        # given hundred may or may not clear 6 MB depending on which hundred the cursor and date
+        # window select, which is why one page deep in a walk is refused while the rest serve;
+        # `ingest/stac.py` re-cuts the date window to regroup them.
+        #
+        # Headroom at 100 is only ~4% — largest page SERVED was 5.73 MB against a 4.6 MB average,
+        # so do not reason from the average. Lowering further is deliberately NOT the answer: it
+        # taxes every query in every year for six months of a ten-year archive, and
+        # `ingest/stac.py` already re-asks a refused page at half the size. Measurements:
+        # context_docs/ingest/ingest-performance.md §7c.
         max_page_size=100,
+        refuses_oversized_pages=True,
+        # Public and unauthenticated — we send no credential — so a 403 here cannot be about who
+        # is asking; it is the aggregate request rate, i.e. a 429, and is waited out as one. Per
+        # provider, because a 403 from a catalogue that DOES authorize is permanent and must keep
+        # failing the leg on the first refusal.
+        throttles_with_forbidden=True,
     ),
     "cmr-asf": STACProvider(
         name="NASA CMR-STAC (ASF)",
@@ -148,6 +181,10 @@ PROVIDERS: dict[str, STACProvider] = {
         name="Microsoft Planetary Computer",
         catalog_url="https://planetarycomputer.microsoft.com/api/stac/v1",
         collections={
+            # Planetary Computer serves ESA's values unharmonised and serves them ALL that way,
+            # so the answer is the collection's and `harmonisation_varies_by_item` stays off. It
+            # also keys assets natively (`B02`, `SCL`), relying on the loader to resolve the
+            # common names in `bands`, so a per-item read of asset locations would find nothing.
             "sentinel-2-l2a": CollectionConfig(
                 collection_id="sentinel-2-l2a",
                 bands=S2_L2A_BANDS,

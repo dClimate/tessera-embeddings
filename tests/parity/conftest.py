@@ -105,6 +105,25 @@ def vcr_config() -> dict:
     The cassette captures only the STAC HTTP we care about
     (Earth Search, CMR-STAC, CMR Granule Search). Everything else
     flows through normally.
+
+    **Do not add ``allow_playback_repeats``.** It looks like the fix when a
+    cassette runs out of recordings, and it silently breaks pagination
+    instead. VCR's default matchers cover method, scheme, host, port, path
+    and query but NOT the request body, so every ``POST /v1/search`` in a
+    cassette is indistinguishable from every other. Replaying them once
+    each, in file order, is what makes page two follow page one; allow
+    repeats and every page request gets the first recording back, whose
+    ``next`` link points at page two forever. Measured: 16,227 replays and
+    3.9 GB of resident memory before it was killed, on a query that should
+    make four requests.
+
+    If a query ever does split into concurrent date windows here, a second
+    worker thread will open its own client and ask for the catalogue root
+    again — one root fetch per thread, see ``_PerThreadClient``. The answer
+    then is a cassette carrying a second recorded root, not looser replay.
+    A body matcher is not an alternative either: the recordings were made at
+    a page size of 10 and the code now asks for more, so matching on the
+    body would need the cassette re-recorded.
     """
     return {
         "filter_headers": [

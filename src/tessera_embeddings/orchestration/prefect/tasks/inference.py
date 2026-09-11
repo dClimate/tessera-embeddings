@@ -1,18 +1,14 @@
 """Prefect task shells for inference domain functions.
 
-Two shells:
+* :func:`run_inference_task` wraps
+  :func:`tessera_embeddings.inference.runner.run_inference`. Runs on the Prefect flow
+  runner (no GPU); the runner connects to the Ray cluster the flow has already entered.
+* :func:`assemble_embeddings_task` wraps
+  :class:`tessera_embeddings.inference.assembly.ZarrWriter` ``.assemble``. Also on the
+  flow runner; the raw-zarr engine forks its own worker processes there (no Dask).
 
-* :func:`run_inference_task` — wraps
-  :func:`tessera_embeddings.inference.runner.run_inference`. Runs on
-  the Prefect flow runner (no GPU); the runner connects to the Ray
-  cluster the flow has already entered.
-* :func:`assemble_embeddings_task` — wraps
-  :class:`tessera_embeddings.inference.assembly.ZarrWriter` ``.assemble``.
-  Runs on the Prefect flow runner; the raw-zarr engine forks its own
-  worker processes on that host (no Dask cluster).
-
-Cluster lifecycle (Ray) is the *flow's* concern, not the task's.
-That keeps each task shell thin enough to be obviously correct.
+Ray cluster lifecycle is the *flow's* concern, not the task's, which keeps each shell
+thin enough to be obviously correct.
 """
 
 from __future__ import annotations
@@ -52,9 +48,8 @@ def run_inference_task(
 ) -> list[dict]:
     """Prefect task: create Ray actors, run work-stealing inference.
 
-    Caller must already be inside a Ray context (the flow's
-    ``ray_cluster`` ctx manager). This task shell pulls the Prefect
-    logger and delegates to :func:`run_inference`.
+    Caller must already be inside a Ray context (the flow's ``ray_cluster`` context
+    manager). Pulls the Prefect logger and delegates to :func:`run_inference`.
     """
     return run_inference(
         num_actors=num_actors,
@@ -97,20 +92,18 @@ def assemble_embeddings_task(
 ) -> dict:
     """Prefect task: assemble staged chunks into the final Icechunk store.
 
-    The raw-zarr engine forks ``n_workers`` worker processes on this host;
-    the same count divides the fleet-wide S3 concurrency budget into the
-    per-fork request cap. No cluster is provisioned.
+    The raw-zarr engine forks ``n_workers`` worker processes on this host; the same count
+    divides the fleet-wide S3 concurrency budget into the per-fork request cap. No cluster
+    is provisioned.
 
-    The full chunk grid is reconstructed in-task from ``total_y``,
-    ``total_x``, and ``chunk_size`` via :func:`enumerate_chunks` rather
-    than passed in. The grid is purely a function of those three scalars,
-    and shipping the materialized ``list[ChunkSpec]`` across the inner
-    flow's parameter boundary blows Prefect's 524,288-byte flow-run
-    parameter limit for large ROIs.
+    The full chunk grid is re-enumerated in-task from ``total_y``/``total_x``/``chunk_size``
+    rather than passed in: it is purely a function of those three scalars, and shipping the
+    materialized ``list[ChunkSpec]`` across the inner flow's parameter boundary blows
+    Prefect's 524,288-byte flow-run parameter limit for large ROIs.
 
     Args:
-        chunk_size: Square chunk edge length in pixels; the grid is
-            re-enumerated from this plus the mosaic dimensions.
+        chunk_size: Square chunk edge length in pixels; the grid is re-enumerated from
+            this plus the mosaic dimensions.
         n_live_chunks: Number of chunks intersecting the ROI mask.
         total_y: Mosaic height in pixels.
         total_x: Mosaic width in pixels.
@@ -123,21 +116,17 @@ def assemble_embeddings_task(
         t0: Flow start time for elapsed logging.
         n_workers: Worker-process count for this assembly run.
         run_started_at: Flow trigger time for the time coordinate.
-        results: Inference result dicts; ``None`` in assemble-only mode.
-        mosaic_base: Base path for input mosaic stores. Used to copy
-            projected coordinates and CRS from the reflectance store.
-        time_window: 12-month inference window. Falls back to
-            ``config.time_window``.
-        result_stats: Pre-aggregated inference outcome counts
-            (``succeeded``, ``skipped``, ``failed``, ``total_valid_pixels``);
-            ``None`` in assemble-only mode. Aggregated in the calling flow
-            so the per-chunk result dicts never cross the inner flow's
-            parameter boundary (the 524,288-byte limit).
-        cleanup_staging: If True, delete staged chunk zarrs after
-            successful assembly. Disable for resumable dev runs.
-        output_name_suffix: Optional suffix appended to the output
-            filename (before ``.zarr``). Use to avoid clobbering when
-            iterating on dev runs.
+        mosaic_base: Base path for input mosaic stores. Used to copy projected
+            coordinates and CRS from the reflectance store.
+        time_window: 12-month inference window. Falls back to ``config.time_window``.
+        result_stats: Pre-aggregated inference outcome counts (``succeeded``,
+            ``skipped``, ``failed``, ``total_valid_pixels``); ``None`` in assemble-only
+            mode. Aggregated in the calling flow so the per-chunk result dicts never
+            cross the inner flow's 524,288-byte parameter boundary.
+        cleanup_staging: If True, delete staged chunk zarrs after successful assembly.
+            Disable for resumable dev runs.
+        output_name_suffix: Optional suffix appended to the output filename (before
+            ``.zarr``), to avoid clobbering when iterating on dev runs.
         get_credentials: Optional Icechunk credential callback (see
             :func:`tessera_embeddings.storage.zarr_store._create_storage`).
         s3_region: Optional S3 region override.

@@ -18,7 +18,7 @@ upstream of the model (loading, sampling, bucketing) is version-agnostic.
 | `builder.py` | `tessera_infer/src/models/builder.py` | Type hints, ruff formatting. Added FSDP prefix stripping in `load_v11_checkpoint()`, plus the v2 build/load path (`_build_v2_inference_model`, `load_v2_checkpoint`, `_verify_v2_args`). |
 
 `tests/fixtures/upstream/v2_student_reference.py` is a **verbatim** copy of
-upstream's v2 `model.py`; `tests/unit/test_student_v2_golden.py` runs it beside
+upstream's v2 `model.py`; `tests/unit/inference/test_student_v2_golden.py` runs it beside
 our port on the real checkpoint and asserts identical outputs (observed:
 bit-identical). Re-fetch instructions are in that file's header.
 

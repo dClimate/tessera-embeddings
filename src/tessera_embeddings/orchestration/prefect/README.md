@@ -8,21 +8,34 @@ enforce that rule.
 ```
 orchestration/prefect/
 ├── flows/                  Layer 3: @flow definitions
+│   │
+│   │  single-ROI path
 │   ├── generate_roi.py
 │   ├── ingest_s2_roi_reflectance.py
 │   ├── ingest_s1_roi_sar.py
-│   ├── tessera_embeddings.py        # single-ROI: ROI → mosaic → inference → assembly
+│   ├── tessera_embeddings.py        # single-ROI: ROI -> mosaic -> inference -> assembly
 │   ├── tessera_full_pipeline.py     # single-ROI master: chains the four above via run_deployment
-│   ├── build_land_mask.py           # global campaign: registry → per-zone coverage bitmaps (no cluster)
-│   ├── seed_global_store.py         # global campaign: seed the 120 UTM-zone groups (no cluster)
-│   ├── fill_zone_year.py            # global campaign: one (zone, year) via Ray → assembly → tag
-│   ├── _cell_validation.py          # internal helper: hand a tagged cell to its validator, don't wait
-│   └── run_global_campaign.py       # global campaign driver: dispatch every pending (zone, year)
-├── tasks/                  Layer 2: thin @task wrappers (~20 LOC each)
-│   ├── ingest.py                    # process_roi_reflectance, process_roi_sar
-│   ├── inference.py                 # run_inference_task, assemble_embeddings_task
-│   └── land_mask.py                 # build / verify / validate coverage (no-cluster steps)
-└── _dask_runner.py         internal helper: prefect_dask DaskTaskRunner factory
+│   │
+│   │  global campaign (ADR-008)
+│   ├── build_land_mask.py           # registry -> per-zone coverage bitmaps (no cluster)
+│   ├── export_zone_rois.py          # per-zone ROI Zarrs from the coverage bitmaps
+│   ├── seed_global_store.py         # seed the 120 UTM-zone groups (metadata only, no cluster)
+│   ├── ingest_zone_year.py          # one (zone, year) mosaic build
+│   ├── fill_zone_year.py            # one (zone, year) via Ray -> assembly -> tag
+│   ├── fill_zones_sequential.py     # many cells on one long-lived Ray cluster
+│   ├── run_global_campaign.py       # driver: dispatch every pending (zone, year)
+│   │
+│   │  shared private helpers (underscore = not a public import surface)
+│   ├── _cell_validation.py          # hand a tagged cell to its validator, don't wait
+│   ├── _child_runs.py               # child deployment runs: cancel sweeps, terminal-state check
+│   ├── _dask_lifecycle.py           # Dask/ECS teardown hook + the DaskTaskRunner factory
+│   ├── _ray_lifecycle.py            # Ray teardown hook (the Ray analogue of the above)
+│   ├── _fleet_gate.py               # hold dispatch while the GPU fleet is saturated
+│   └── _overrides.py                # per-run flow option overrides
+└── tasks/                  Layer 2: thin @task wrappers (~20 LOC each, ADR-002)
+    ├── ingest.py                    # process_roi_reflectance, process_roi_sar
+    ├── inference.py                 # run_inference_task, assemble_embeddings_task
+    └── land_mask.py                 # build / verify / validate coverage (no-cluster steps)
 ```
 
 ## Global campaign (120 UTM zones)
@@ -50,8 +63,12 @@ loop), under one of two strategies:
   bringup (minutes of billed GPU idle each), the per-worker model-load cold
   start, and the EC2 capacity roll across the whole cluster instead of per zone
   (`max_parallel_clusters=1` = a single cluster for the whole year). Zones whose
-  mosaics resolve a different S1 orbit than the session run per-cell after
-  the stream. The shared fleet is kept busy at the seams by **ingest look-ahead**
+  mosaics resolve a different S1 orbit stream anyway, under their own orbit. **A
+  failed cell is retried on that same fleet**, from the back of the feeder's queue
+  rather than through a second inference session; when the source has nothing ready
+  the fleet **winds down** to one actor and re-grows when work arrives
+  (`context_docs/inference/the-fleet-and-the-work-source.md`).
+  The shared fleet is kept busy at the seams by **ingest look-ahead**
   (the next zones' mosaics ingest while the current one infers) and **trailing
   assembly** (a zone's shard write runs on a background thread — assembly is
   ~10-15% of a zone's inference wall — while the next zone's inference keeps the
@@ -86,6 +103,85 @@ deterministic failure looks like from the driver: a coverage gate, a fingerprint
 mismatch, an unseeded group. Those want a human, not another GPU fleet, so the
 campaign logs them at ERROR and moves on rather than burning a cluster per attempt.
 
+#### Not waiting for the round: `immediate_refill`
+
+A dispatch round is a **barrier**: it collects every cluster's outcome before re-reading
+the store. Since a cluster owns a roster of zones, one dying early costs that whole
+roster the wait for the round's slowest sibling. `immediate_refill` (default **off**,
+and off is byte-for-byte the behaviour above) re-dispatches a settled cluster's
+still-missing cells into the slot it just vacated — so the replacement inherits its
+ingest share, its committer share and its place under `max_parallel_clusters`, and the
+fleet's width and cost do not change.
+
+**Nothing locks a zone; the zone partition IS the guarantee that a zone's years never
+land on two clusters.** So a replacement is admitted only when both of these hold, and
+declining is always safe because the cells then wait for the round exactly as they do
+today:
+
+1. **The predecessor reached a state that proves it stopped writing.** A fill that
+   returned or raised has, by then, joined the trailing assembly thread that does its
+   committing, cancelled its child ingests and waited for them to confirm terminal, and
+   torn down its fleet — all inside `finally` blocks that complete before the state is
+   set. The one case where that thread CANNOT be joined — a trailing assembly wedged inside
+   icechunk, which `drain_trailing_assemblies` gives up on after `TRAILING_ASSEMBLY_CEILING_S`
+   (2026-09-04) — is deliberately never allowed to become `FAILED`: the flow tears down and
+   then ends its own process (`_end_process_after_wedged_drain`), so it surfaces as a crash
+   and its cells wait for the round like any other crash's. A **crash** carries none of that (the process that would run the `finally` is the
+   process that died, and the verdict can be reached from missed heartbeats while the run
+   is still writing), and a **cancellation** is a request rather than a fact. Both wait.
+2. **Enough time has passed for its descendants to have stopped.** Condition 1 covers the
+   fill's own writers, and — because its teardown cancels its children and waits on them
+   before the state is set — most of its direct children too. **That wait is best effort:**
+   it gives up after its budget and logs whatever it could not confirm. And *their*
+   grandchildren are only ever asked, by a hook that does not block. So condition 1 is not a
+   guarantee about descendants, and the delay is not a belt on a working brace — it is the
+   time those two unconfirmed levels actually need. The delay is that same confirmation budget again, for that level, derived from
+   it rather than chosen. Counted from the cancellation request, the two together come to
+   the interval the crash-recovery record already recommends between a run's death and
+   re-dispatching its cells.
+
+**Why a wait and not a check of who is writing.** A census of live runs was built and then
+removed. It can only report what was true a moment ago, and it cannot make a lingering child
+stop — the wrong instrument for settling an asynchronous cancellation. Two mechanisms already
+*act* rather than observe, and the delay is simply what lets them finish: the fill's own
+teardown, which waits for its children; and the orphan sweep, which independently finds and
+stops whatever outlived a teardown, on its own schedule.
+
+**It reserves nothing**, and should not be read as doing so. A dispatcher outside the campaign
+could still start a writer. That is not introduced here — the round's own re-dispatch has
+always worked this way — and closing it means fencing at the write, the same prerequisite the
+crashed and cancelled cases are waiting on. The store keeps the residual affordable rather
+than silent: mosaic commits do not rebase, so a second writer fails loudly.
+
+Bounded per **cell**, for the life of the campaign rather than of a round: a cell that has
+had its replacement is not eligible for another on a later round, a replacement is not
+itself eligible for one, and none is issued unless a sibling is still running. A cell
+therefore gains at most one attempt beyond `max_dispatch_rounds` in total.
+
+Every read the decision makes declines on failure rather than propagating — the store's tip
+and tags, and the replacement's own land-mask and SSM probes. Declining
+costs a round's wait; an exception escaping mid-round would fail the campaign while sibling
+fills were still writing, and an ordinary `FAILED` state does not fire the child-cancel hook
+that would sweep them.
+
+What it deliberately does not address: crashed and cancelled fills, which need fencing at
+the write rather than an inference about who has stopped; the barrier itself, which still
+closes the round for everything the immediate path declined; and the lifetime coupling
+between a fill and its ingest children, which is load-bearing — see below.
+
+#### A dying fill's ingest bytes are not lost
+
+Worth stating plainly, because the opposite is the natural assumption. A failing fill
+cancels its in-flight ingests and waits for them to stop, and that wait is deliberate: a
+retry is a NEW parent run, deriving its child tag from its own run id, so it can neither
+find an orphaned ingest nor be told about it — and mosaic commits do not rebase, so two
+writers on one prefix is a failure nothing downstream detects. What is cancelled is the
+*process*, not the work: a failed cell's mosaic is retained (cleanup runs only for a cell
+that landed, and the orphan-mosaic sweep only touches cells that are complete AND tagged),
+and an interrupted mosaic is resumed rather than rebuilt. So a fill's death costs the wall
+clock of the wait, not the bytes — which is why shortening the wait is the whole fix, and
+why loosening any teardown rule would be the wrong one.
+
 At the very end — after every year has had its attempts — the campaign raises with
 the complete list of unfilled cells. It fails loudly, but only once it has done
 everything it could, and a re-run resumes from exactly there.
@@ -104,7 +200,7 @@ are running. With `max_parallel_clusters` at 8 that is 5 zones per cluster.
 
 Because the clusters are separate Prefect flow runs on separate machines, no
 in-process semaphore can see across them, so the cap is a **Prefect global
-concurrency limit** — the same mechanism as the commit gate. Each zone's ingest
+concurrency limit**. Each zone's ingest
 holds one slot for its whole duration. The campaign upserts the limit to
 `max_parallel_ingest` at start, so the parameter is the only place the number is
 written and it cannot drift from the server's. Each cluster also takes an even
@@ -168,9 +264,18 @@ Two subtleties worth knowing:
 
 How this plays out on the real world — 112 live UTM zones, 360,953 land tiles —
 and what happens if you move off 8 clusters is measured in
-[`context_docs/design/campaign-cluster-sizing.md`](../../../../context_docs/design/campaign-cluster-sizing.md).
-Short version: 8 splits the year to within 0.0%, 16 costs 0.6% and roughly halves
-wall clock, and past ~20 the largest zones start to dominate.
+[`context_docs/campaign/campaign-cost-model.md`](../../../../context_docs/campaign/campaign-cost-model.md)
+§5b.
+
+**Read the short version below as the SUPERSEDED area-only diagnostic**: 8 splits
+the year to within 0.0%, 16 costs 0.6%, and past ~20 the largest zones start to
+dominate. Those figures balance on raw live-tile count, which is balancing on
+AREA. The shipped partition weights each zone's tiles by its latitude band's
+observation count — proportional to GPU-hours — and by the years it still carries,
+and on that basis the campaign's **10** clusters spread by **0.009%** where the
+tile-count split would give **21.8%**. Do not quote the row above for a cluster
+count; run `scripts/scoping/cluster_work_spread.py --mask … --clusters …`, which reads the
+current mask through the campaign's own partitioner.
 
 > **Size the fleets to match.** These caps count *clusters* and *zones*, not
 > machines. Eight inference clusters at the default `num_actors` plus forty
@@ -182,10 +287,10 @@ Zone-parallelism (either flavor) is safe because inference is independent
 across zones and only *same-zone* fills conflict (shared group attrs →
 `RebaseFailedError`) — the year-serial loop guarantees a zone never fills two
 years at once, and within a sequential run the depth-1 trailing assembly can
-never overlap a commit for the same zone group. The fleet-wide **committer
-bound is a Prefect global concurrency limit** (`commit_limit_name`, ADR-008 D6),
-passed to every fill so commits stay under the storm threshold while GPU
-inference runs unbounded. `build_land_mask` and `seed_global_store` are
+never overlap a commit for the same zone group. **Commits are otherwise ungated.**
+They contend on the branch-tip CAS, since all 120 zone groups share one repo, but
+run 1 measured that as 2.2 s at 16 committers and 15 s at 120 with zero
+unresolvable conflicts. See `context_docs/storage/writing-to-the-global-store.md`. `build_land_mask` and `seed_global_store` are
 cluster-less (they run on the flow runner like `generate_roi`); only
 `fill_zone_year` / `fill_zones_sequential` provision Ray.
 
@@ -217,7 +322,7 @@ override.
 | `tessera_full_pipeline.py` | Async master flow chaining the four above via `arun_deployment`. |
 | `build_land_mask.py` | Global campaign: build per-zone coverage bitmaps from the partner delivery registry (ADR-010). Optional pre-build delivery verification + post-build validation. No cluster. |
 | `seed_global_store.py` | Global campaign: create the global-store repo and seed every unseeded UTM-zone group (metadata-only, ADR-008 D1). Idempotent. No cluster. |
-| `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commit gate = a Prefect global concurrency limit. |
+| `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commits are ungated. |
 | `fill_zones_sequential.py` | Global campaign: fill one cluster's zones sequentially on a SINGLE shared Ray cluster (densest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Waits for its densest zone's mosaic before requesting GPUs. Pre-cluster triage settles retag/all-ocean cells. |
 | `ingest_zone_year.py` | Global campaign: build one cell's S1/S2 mosaics on the fixed zone grid by dispatching the ROI ingest deployments onto a synthesised zone-shaped ROI. Marker-gated and crash-safe: a stale or half-written mosaic is cleared and rebuilt, never appended onto. |
 | `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="cluster-per-zone"`), or size-balanced `fill-zones-sequential` runs on long-lived clusters (`"chained-clusters"`). |

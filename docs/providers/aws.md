@@ -73,6 +73,44 @@ Plus an AMI parameter at the path you pass via `ami_ssm_name`,
 e.g. `/tessera/ray/ami-id`. The AMI ID points at the GPU AMI you've
 baked (see `gotchas.md` for the AMI-bake pattern).
 
+### Optional SSM key: `gpu-worker-ladder`
+
+| Key | Type | Purpose |
+|---|---|---|
+| `gpu-worker-ladder` | String | Per-instance-type GPU worker ceilings, e.g. `g6e.xlarge:101,g5.2xlarge:105` |
+
+**Absent is the default, and it means the cluster template's node types stand
+exactly as shipped.** Set it and `_resolve_ray_config` rewrites the `max_workers`
+of each on-demand GPU rung from the value, letting you change which EC2 instance
+types a fleet may buy — and how many of each — without a release, a deployment
+re-registration, or an AMI re-bake. It does still require provisioning a cluster
+after the edit; see the first bullet below. Every `g6e` size is the same L40S on x86_64,
+so one AMI serves all of them.
+
+Four properties worth knowing before you set it:
+
+- **It is read ONCE, when a cluster's config is resolved before `ray up`.** The
+  running autoscaler never re-reads it, so editing the parameter does nothing to a
+  fleet that is already up: it keeps requesting the rung it launched with, however
+  long the capacity refusal lasts. **Failover therefore requires a new cluster**,
+  not a parameter edit — set the value first, then provision. Treat this as the
+  operational cost of the mechanism: it is a pre-launch knob, not a live one.
+- **It is authoritative, not additive.** A rung the value does not name is set to
+  `0`. So `g6e.2xlarge:150` alone also closes `g6e.xlarge`; name every rung you
+  want the fleet to use.
+- **It refuses rather than warns.** A malformed entry, a repeated instance type,
+  or an instance type no shipped rung offers fails the cluster launch. A ladder
+  that part-applied would grow a fleet nobody asked for.
+- **`max_workers` is the only mechanism that moves Ray's choice.** Ray's
+  autoscaler scores node types purely from their resources; its scorer takes a
+  `node_availability_summary` and never reads it, so an `InsufficientInstanceCapacity`
+  has *no* influence on which type it asks for next. Two consequences:
+  `max_workers: 0` makes a rung genuinely unreachable, and **opening a second rung
+  beside an unrestricted first one buys nothing** — you must lower the first rung's
+  count to push demand onto the second. See `TestRayNodeTypePreference`.
+
+Spot rungs are outside the ladder's domain and are never touched by it.
+
 Populate these with whatever IaC you use:
 
 ```
@@ -158,17 +196,136 @@ Default node config:
 ```
 head:        m5.2xlarge          (8 vCPU, 32 GB)   GCS + autoscaler
 workers:     g6e.xlarge          (4 vCPU, 32 GB,    1 InferenceActor each
-                                  1× L40S 48 GB,
+                                  1× L40S 45,776 MiB,
                                   250 GB NVMe)
 ```
 
-`g6e.xlarge` gives 48 GB VRAM (the Tessera model + working set fit
-with lots of headroom), 250 GB NVMe (fast enough for `torch.load` of
-the checkpoint without EBS stalls), and up to 20 Gbps network for the
-S3-heavy load phase. ~$1.86/hr on-demand at us-west-2; spot varies
-(~$0.5–0.9/hr). Scaling is horizontal — one GPU/actor per worker —
-so bigger instances don't help; note the 4 vCPUs make host-side data
-loading the tight resource per worker.
+The L40S carries **45,776 MiB — 44.7 GiB, or 48.0 GB decimal**. All three numbers
+name the same card; quote the unit, because dropping it has already put the figure
+in our docs two different ways. 250 GB NVMe is fast enough for `torch.load` of the
+checkpoint without EBS stalls, and the NIC is rated "up to 20 Gbps" — a burst
+credit, not a sustained floor — for the S3-heavy load phase. ~$1.86/hr on-demand
+at us-west-2; spot varies (~$0.5–0.9/hr).
+
+Scaling is horizontal: one GPU, one `InferenceActor`. The 4 vCPUs make host-side
+data loading the tight resource per worker, and the template ships two
+**capacity-fallback** rungs, both at `max_workers: 0`:
+
+| rung | card | vCPU/GPU | host GiB | throughput vs L40S |
+|---|---|---:|---:|---:|
+| `g5.2xlarge` | A10G | 8 | 32 | **0.46** |
+| `g6.2xlarge` | L4 | 8 | 32 | 0.32 |
+
+**Opening one is a campaign parameter, not a release.** Pass
+`gpu_fallback_instance_types=["g5.2xlarge"]` to `run-global-campaign`. That does two things per fill,
+and neither works without the other:
+
+1. **Opens the card's rung** at the same ceiling as the production rung, so either card
+   can carry the whole fleet.
+2. **Starts publishing a per-rung fleet request.** Opening a rung only makes it
+   *reachable*; it does not make the autoscaler use it. Ray picks node types with a
+   greedy loop and stops choosing a type only when that type's own `max_workers` is
+   exhausted — so while demand stays under the production rung's ceiling, an open
+   fallback is **never asked for at all**, however long the primary has been refusing.
+   Measured on dev on 2026-08-28: 18 consecutive launch attempts, every one for the
+   L40S, every one refused, and not one attempt at the A10G sitting open at a ceiling
+   of 25. What breaks that is `providers/aws/fleet_mix.py`, which states how many of
+   each card the fleet should hold through `request_resources`. Autoscaler v2 satisfies
+   that request in the **same scheduling pass** as ordinary actor demand, so both pools
+   are asked for at once.
+
+**There is no capacity-aware scorer any more, and there was never a working one in
+production.** The `RAY_AUTOSCALER_UTILIZATION_SCORER` hook belongs to autoscaler **v1**,
+and `ray up` has started **v2** by default since Ray 2.50 — which every one of our
+clusters runs. v2 has no plugin point for a scoring function at all, so that module was
+dead code and has been deleted. v2's own capacity signal is unreachable twice over: it
+is only the tiebreak *after* the utilisation score, which our rungs never tie on
+(`g6e.xlarge` at 4 vCPU packs a one-CPU one-GPU actor more tightly than any 8 vCPU
+fallback), and it is only populated on `ALLOCATION_TIMEOUT` while our refusals arrive as
+`ALLOCATION_FAILED`. The mix is therefore **stated rather than inferred**.
+
+**Still one fallback at a time.** Stating the mix removes Ray's node-name tie for the
+machines the request covers, but the request is a floor — ordinary actor demand above it
+is scored by Ray as before, and the supported fallbacks are identical to that scorer.
+Both `run-global-campaign` and `_apply_gpu_fallback` refuse a second one; the registry
+and the allocation policy are n-ary and ready for the day that lifts.
+
+**How the ask is sized.** Rungs are ranked by throughput per vCPU, because the quota is
+counted in vCPU and the cards are not equally priced in it (0.250, 0.0575 and 0.040 of
+an L40S-equivalent per vCPU). Each rung in turn takes what the remaining demand and
+budget afford, bounded by its ceiling. The **best** rung is asked for what it currently
+holds plus a small probe rather than for its ceiling: a ceiling-sized ask would reserve
+budget for machines AWS is refusing, and a live-sized ask would never grow.
+
+**Two behaviours to know, both measured rather than assumed.** An ask above a rung's
+ceiling provisions **nothing at all** — a partially infeasible constraint is discarded
+whole rather than filled as far as it goes, so the ceiling clamp is load-bearing. And
+machines held by a standing request are exempt from the idle timeout, which is why the
+ask is recomputed every round and allowed to fall.
+
+**An ask is a floor, not a delivery.** Ray launches with `MinCount=1`, so AWS fills what
+it can and reports success: one measured call asked for six A10G and got one, with a
+launch-failure count of zero throughout. **The fallback pool is supply-constrained too**
+— opening it buys a second pool, not an unlimited one — and anything monitoring this
+must compare asked against live, because a failure count cannot see partial fulfilment.
+
+Three things to know before you turn it on.
+
+**It costs double the quota per GPU.** The G-and-VT quota is counted in vCPU. These
+sizes are 8 vCPU per GPU against `g6e.xlarge`'s 4, so the applied 10,000 vCPU buys
+either 2,500 L40S or 1,250 A10G. A fleet fully on fallback is half the card count
+*before* the 0.46 throughput factor.
+
+**Recovery applies to new demand, not to running nodes.** When L40S supply returns the
+published ask shifts back toward it, and fallback machines above the new ask lose their
+constraint protection and drain on the idle timeout — but nothing evicts a *busy* A10G
+to make room for an L40S. Under the chained-cluster strategy actors are long-lived, so a
+cluster that filled with fallback early holds that composition until those actors go
+idle.
+
+That is deliberate rather than an oversight: draining healthy workers mid-chunk to trade
+cards would discard the work in flight. But it is a real operational cost, and the
+practical remedy is that **the next cluster starts fresh** — ceilings and preference are
+resolved per provision. If a long-running cluster is stuck on the fallback while L40S
+capacity has visibly returned, the lever is to let that fill finish rather than to fight
+it. An explicit probe-and-drain would be a feature, and is not here.
+
+**Only genuine capacity refusals move the fleet.** A throttle (`RequestLimitExceeded`)
+clears in seconds, and a quota refusal (`InstanceLimitExceeded`) only gets worse on a
+rung that spends more quota — so neither demotes.
+
+**The configuration the campaign runs.** As of 2026-08-28, with the L40S in short
+supply:
+
+```
+gpu_fallback_instance_types = ["g5.2xlarge"]
+gpu_fallback_vcpu_budget    = 840
+gpu-worker-ladder (SSM)     = g6e.xlarge:101
+```
+
+That yields ceilings of **101 L40S and 105 A10G** per cluster. The L40S ceiling sits
+well above the ~39 AWS is currently supplying, which costs nothing unclaimed and
+converts straight into more actors per vCPU if supply recovers — an L40S actor is half
+the quota of an A10G one. The A10G ceiling is what actually decides the bill while the
+L40S trickles: `39x4 + 105x8 = 996` vCPU per cluster, **9,960 across ten, inside the
+10,000 account quota by design** rather than by AWS refusing the last launches.
+
+Both rungs full would be 1,244 vCPU per cluster and over quota. That is the accepted
+limitation — Ray's ceilings count nodes and cannot be jointly weighted — and AWS
+enforces the real line by refusing. `TestTheCampaignRestartConfiguration` pins all of it.
+
+**The vCPU-matched sizes are deliberately not offered.** `g5.xlarge` and `g6.xlarge` are
+4 vCPU per GPU like the production rung, but carry 16 GiB of host RAM against a measured
+~17.7 GB per-actor requirement — the exact shape that OOMed the loader on the earlier
+16 GB g5-class workers.
+
+The L4 is half the L40S's VRAM. What makes it arguable at all is the per-chunk
+peak-VRAM telemetry on the `CHUNK_SUMMARY` line: `max_memory_allocated` measured
+**4.6–7.5 GiB** at optical depths of 54–113 timesteps, against the ~43 GiB the
+earlier `nvidia-smi` reading implied. That reading was the caching allocator's
+*reserved* pool, which runs ~3× the live requirement and sizes itself to the card
+it is given. Read `vram_peak_gib` against `t_kept` before trusting any card-fit
+argument: the requirement grows with optical depth.
 
 ## Region
 

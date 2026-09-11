@@ -11,11 +11,9 @@ Two invariants:
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 import tessera_embeddings
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests._paths import REPO_ROOT
 
 
 def test_all_contains_no_private_names() -> None:

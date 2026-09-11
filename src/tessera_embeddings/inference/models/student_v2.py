@@ -26,7 +26,7 @@ The parameter names here match the upstream v2 ``PixelStudent`` exactly
 :class:`~tessera_embeddings.inference.models.ssl_model.MultimodalBTInferenceModel`
 uses — so the runtime graph is assembled from that wrapper (it adds the
 dual-CUDA-stream backbone execution) and the checkpoint loads ``strict=True``.
-``tests/unit/test_student_v2_golden.py`` pins our output against the vendored
+``tests/unit/inference/test_student_v2_golden.py`` pins our output against the vendored
 upstream reference on the real checkpoint.
 
 Ported from ``geotessera/TESSERA-V-2.0-2B-L`` (Hugging Face), ``model.py``

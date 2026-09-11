@@ -1,13 +1,10 @@
-"""Configuration module for satellite data pipeline.
+"""Configuration for the satellite data pipeline.
 
-Re-exports all configuration constants, dataclasses, and provider registries
-for convenient importing throughout the codebase.
+Re-exports the configuration constants, dataclasses and provider registries, so either of these
+works::
 
-Usage:
     from tessera_embeddings.config import S2_L2A_BANDS, CollectionConfig, PROVIDERS
-    # or
     from tessera_embeddings.config.satellites import S2_BASELINE_THRESHOLD
-    from tessera_embeddings.config.providers import STACProvider
 """
 
 from .providers import (

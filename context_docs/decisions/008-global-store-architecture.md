@@ -2,7 +2,7 @@
 
 **Status:** **Accepted — scoping concluded (2026-07-14).** All decisions
 D1–D9 are FIRM, each backed by S3-bench evidence from runs `run1`, `d3`, and
-`d3v2` (test program in `context_docs/design/global-store-test-plan.md`). One
+`d3v2` (test program: `scripts/scoping/scale_tests/`). One
 operational measurement is explicitly *deferred, not blocking* — GC duration at
 10⁸-object scale (D7) — to be taken against a large repo before/while the
 campaign runs. The next work is **implementation** of the group-aware, sharded,
@@ -78,7 +78,7 @@ coordinate arrays at creation. Fill 2025 first, then backfill older years as
 end-appends.
 
 Why: unwritten chunks cost zero storage and zero manifest refs (verified in
-`tests/unit/test_empty_store.py`: `nchunks_initialized == 0`), so
+`tests/unit/storage/test_empty_store.py`: `nchunks_initialized == 0`), so
 pre-allocation is free. Physical prepends are possible since icechunk 2.0
 (`shift_array` / `reindex_array`, metadata-only chunk remapping) but the
 feature is ~3 months old, `reindex_array` has a documented stale-data gotcha
@@ -289,14 +289,34 @@ held: zero unresolvable conflicts at every N.
 > the same gate and so concurrent committers can exceed the cluster count. Kept for those
 > reasons, not for throughput.
 
-**Enforced in code since 2026-07-28.** The cap is a Prefect global concurrency
-limit (`commit_limit_name`) held around each commit, and `run_global_campaign`
-upserts its VALUE at preflight to
+> **REMOVED 2026-08-27. The cap no longer exists in code**, and the paragraph below describes
+> what it did until then.
+>
+> The curve below is NOT retracted — it is the reason the removal is safe rather than an argument
+> against it. What it measures is LATENCY: `N=16` is where a commit reaches **2.2 s** against ~1 s
+> serial, and `N=120` where it reaches **15 s**. "Cross-group conflict-freedom held: zero
+> unresolvable conflicts at every N", including 120 — six times this campaign's `2N=20` ceiling at
+> `max_parallel_clusters=10`. So the gate bounded a slowdown measured in seconds, not a failure.
+>
+> **Two corrections to my own reasoning, recorded because both were load-bearing.** The removal was
+> first argued from a claim that the campaign writes per-ROI stores; it does not, and that premise
+> is withdrawn — `global_store()` returns one repo holding all 120 zone groups, and commits share a
+> branch tip. And this note first said N≥16 was "twice the cluster count this campaign runs", as
+> reassurance; it is the reverse — the fleet's ceiling is 2N, so 10 clusters reach 20.
+>
+> Reopen criterion is now **N ≥ 120**, detected by the `COMMIT <secs>` line in
+> `commit_with_rebase`, which is the only site every commit passes through. See
+> [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md).
+
+**Enforced in code from 2026-07-28 until 2026-08-27.** The cap was a Prefect global
+concurrency limit (`commit_limit_name`) held around each commit, and `run_global_campaign`
+upserted its VALUE at preflight to
 `min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS=8)`. Previously only the
 limit's *name* was threaded through and the number lived on the server, where it
-could silently drift from this constraint. Duty-cycle measurements showing how
-much headroom this leaves are in
-[`design/campaign-cluster-sizing.md`](../design/campaign-cluster-sizing.md).
+could silently drift from this constraint. The simultaneous-committer timings, the
+queueing this actually bound, and the threshold that would reopen it are in
+[`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §5 —
+**which also records that this limit is now REMOVED**, so read it before restoring one.
 
 ### D7 — Snapshot hygiene: tags + expiry policy (FIRM policy; cadence PENDING T6)
 
@@ -464,5 +484,5 @@ zarr PR #3004 (partial-shard-read); it only improves the sharded read path.
 
 **Next:** implement this write path in `tessera_embeddings.storage` (group-aware
 seeding, sharded land-masked writer, commit-concurrency cap, GC/expiry helpers).
-The scale-test scripts (`scripts/scale_tests/`) remain as regression harness and
+The scale-test scripts (`scripts/scoping/scale_tests/`) remain as regression harness and
 for the deferred GC-at-scale measurement.

@@ -1,9 +1,8 @@
 """Performance profiling utilities for the inference pipeline.
 
-Provides GPU diagnostics, autocast dtype probing, and per-layer timing
-via a profiling flag on model modules. Designed to stay in production —
-profiling runs once per inference call on a single designated batch,
-adding negligible overhead to the overall run.
+GPU diagnostics, autocast dtype probing, and per-layer timing via a profiling
+flag on model modules. Designed to stay in production: profiling runs once per
+inference call on a single designated batch, so the overhead is negligible.
 """
 
 from __future__ import annotations
@@ -54,14 +53,12 @@ def log_cuda_diagnostics(device: torch.device) -> None:
 def log_autocast_dtype_probe(device: torch.device, dtype: torch.dtype | None = None) -> None:
     """Probe which dtypes autocast actually uses for key operations.
 
-    Creates small test tensors and runs them through matmul, Linear, GRU,
-    LayerNorm, and TransformerEncoderLayer under autocast. Logs the output
-    dtype of each — this reveals whether tensor cores can engage or whether
-    autocast is silently keeping ops in FP32.
-
-    Critical for understanding GRU behavior: PyTorch autocast may force RNNs
-    to FP32 for numerical stability, which would explain FP32-like throughput
-    despite reduced-precision model weights.
+    Runs small test tensors through matmul, Linear, GRU, LayerNorm, and
+    TransformerEncoderLayer under autocast and logs each output dtype, which
+    reveals whether tensor cores can engage or autocast is silently keeping ops
+    in FP32. The GRU is the one to watch: PyTorch autocast may force RNNs to FP32
+    for numerical stability, which would explain FP32-like throughput despite
+    reduced-precision model weights.
 
     Args:
         device: Target device. No-op on CPU.
@@ -173,12 +170,11 @@ def transformer_flops(
 ) -> int:
     """Transformer-layer FLOPs for one dual-backbone forward pass.
 
-    Same accounting as :func:`log_effective_tflops` (attention projections,
-    score/context matmuls, FFN — each matmul (M,K)x(K,N) = 2MKN FLOPs), but with
-    each backbone charged at its own sequence length instead of assuming both
-    run at the S2 length. GRU, embedding MLP, positional encoding, and the
-    dim_reducer are excluded (< ~15% of total); treat results as a consistent
-    lower bound for cross-run comparison, not an exact FLOP count.
+    Counts attention projections, score/context matmuls and FFN — each matmul
+    (M,K)x(K,N) = 2MKN FLOPs — charging each backbone at its OWN sequence length
+    rather than assuming both run at the S2 length. GRU, embedding MLP, positional
+    encoding and the dim_reducer are excluded (< ~15% of total), so treat the result
+    as a consistent lower bound for cross-run comparison, not an exact FLOP count.
     """
     total = 0
     for seq_len in (s2_seq_len, s1_seq_len):
@@ -201,9 +197,9 @@ def log_effective_tflops(
 
     Compares against GPU theoretical peaks to determine hardware utilization.
     Reference hardware: L40S (g6e.xlarge production workers) — BF16 tensor
-    181 TFLOPS dense, memory bandwidth 864 GB/s.
-    Historical: A10G BF16 ~35 realistic (GA10x runs FP32-accumulate at half the
-    advertised 70 dense), T4 BF16=65 peak, L4 BF16=121 peak.
+    181 TFLOPS dense, memory bandwidth 864 GB/s. Other cards, for reading an older
+    run: A10G BF16 ~35 realistic (GA10x runs FP32-accumulate at half the advertised
+    70 dense), T4 BF16=65 peak, L4 BF16=121 peak.
 
     Only counts transformer layer FLOPs (attention + FFN) via
     :func:`transformer_flops`. ``seq_len`` is the S2 backbone's sequence length;

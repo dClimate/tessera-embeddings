@@ -7,20 +7,30 @@ reference are intentionally omitted — tessera-embeddings has no cloudmask modu
 
 from __future__ import annotations
 
-import boto3
-import icechunk
-import numpy as np
-import pytest
-import xarray as xr
-from moto.server import ThreadedMotoServer
+import os
 
-# -----------------------------------------------------------------------------
-# Warning Suppression
-# -----------------------------------------------------------------------------
+# Suppress Icechunk's Rust-level warning about local filesystem concurrency: valid for
+# production, irrelevant here (moto S3 or single-threaded local).
+#
+# Set as the ENVIRONMENT variable, before icechunk is imported, rather than only by calling
+# `set_logs_filter` afterwards. The filter is process-global and write-only, so a directive
+# installed by a direct call is invisible to `storage.icechunk_logging`, which has to restore
+# it after a commit's tracing scope. Seeding both from one variable makes them agree by
+# construction. Importing that module here instead would pull in the package's config tree
+# and its logging setup, which breaks unrelated log-capture tests.
+_ICECHUNK_LOG = "icechunk::storage::object_store=error"
+os.environ.setdefault("ICECHUNK_LOG", _ICECHUNK_LOG)
 
-# Suppress Icechunk's Rust-level warning about local filesystem concurrency.
-# Valid for production but irrelevant for tests (moto S3 or single-threaded local).
-icechunk.set_logs_filter("icechunk::storage::object_store=error")
+import boto3  # noqa: E402
+import icechunk  # noqa: E402
+import numpy as np  # noqa: E402
+import pytest  # noqa: E402
+import xarray as xr  # noqa: E402
+from moto.server import ThreadedMotoServer  # noqa: E402
+
+# Belt and braces: if anything imported icechunk before this file was loaded, it has already
+# read the variable and missed it. Applying it directly costs nothing and the value is the same.
+icechunk.set_logs_filter(os.environ["ICECHUNK_LOG"])
 
 # -----------------------------------------------------------------------------
 # AWS Mock Fixtures
@@ -107,32 +117,6 @@ def sample_reflectance_data():
     return _make_data
 
 
-@pytest.fixture
-def sample_sar_data():
-    """Factory returning xarray Dataset with VV/VH bands (SAR-style)."""
-
-    def _make(
-        dates: list[str],
-        height: int = 20,
-        width: int = 20,
-        seed: int = 42,
-    ) -> xr.Dataset:
-        rng = np.random.default_rng(seed)
-        n_times = len(dates)
-        data_vars = {}
-        for band in ["VV", "VH"]:
-            data = rng.uniform(-25.0, 5.0, size=(n_times, height, width)).astype(np.float32)
-            data_vars[band] = (["time", "northing", "easting"], data)
-        coords = {
-            "time": [np.datetime64(d, "ns") for d in dates],
-            "northing": np.arange(height),
-            "easting": np.arange(width),
-        }
-        return xr.Dataset(data_vars, coords=coords)
-
-    return _make
-
-
 # -----------------------------------------------------------------------------
 # STAC Mock Fixtures
 # -----------------------------------------------------------------------------
@@ -151,9 +135,12 @@ def mock_stac_item():
         baseline: str = "04.00",
         cloud_cover: float = 15.0,
         tile_id: str = "33UUP",
+        host_root: str = "s3://sentinel-s2-l2a/tiles/33/U/UP/2024/1",
     ):
         from datetime import datetime
         from unittest.mock import Mock
+
+        from tessera_embeddings.ingest.asset_locations import READ_ASSET_KEYS
 
         item = Mock()
         item.datetime = datetime.fromisoformat(date)
@@ -161,7 +148,25 @@ def mock_stac_item():
             "s2:processing_baseline": baseline,
             "eo:cloud_cover": cloud_cover,
             "grid:code": f"MGRS-{tile_id}",
+            # The ACQUISITION instant, which is where a real item keeps it and the only surviving
+            # record of it once normalize_to_solar_day has stamped `.datetime` with noon. Duplicate
+            # selection reads this to tell distinct same-day passes from reprocessings of one, so a
+            # fixture without it makes every scene of a day look like one acquisition.
+            # Timezone-aware, as every real STAC item's is. A naive stamp now reads as
+            # UNREADABLE, because one naive value among aware ones makes the acquisition sort
+            # raise and abort duplicate selection for a whole query.
+            "datetime": date if date.endswith("Z") or "+" in date else f"{date}Z",
         }
+        # REAL asset hrefs, because whether the BOA offset is corrected is decided from where
+        # the assets live. A bare Mock auto-creates `assets`, so an href read off it is a Mock
+        # rather than a string, and the item then classifies as "producer unknown" — which means
+        # REFUSE, not "correct it": at or above the threshold the load raises
+        # `HeterogeneousProducerError` before a pixel is read, and duplicate selection withholds
+        # such a copy from the fallback ladder. Either way the test stops measuring what it meant
+        # to. Defaults to ESA's originals at 04.00, which ARE owed the offset, so a test about
+        # baseline parsing sees its baseline flow through. Pass `host_root` pointing at
+        # sentinel-cogs to model Element 84's harmonised COGs instead.
+        item.assets = {key: {"href": f"{host_root}/{key}"} for key in READ_ASSET_KEYS}
         return item
 
     return _make_item
@@ -178,99 +183,6 @@ def local_zarr_path(tmp_path):
     zarr_dir = tmp_path / "zarr_stores"
     zarr_dir.mkdir()
     return zarr_dir
-
-
-# -----------------------------------------------------------------------------
-# Icechunk S3 Fixtures
-# -----------------------------------------------------------------------------
-
-
-@pytest.fixture
-def icechunk_s3_config(moto_server, test_bucket):
-    """Provide Icechunk S3 configuration for moto-backed tests.
-
-    Returns a dict with parameters for icechunk.s3_storage().
-    """
-    return {
-        "bucket": test_bucket,
-        "endpoint_url": moto_server,
-        "allow_http": True,
-        "access_key_id": "testing",
-        "secret_access_key": "testing",
-        "region": "us-east-1",
-    }
-
-
-@pytest.fixture
-def icechunk_s3_store_path(test_bucket):
-    """Return a factory that generates S3 store paths for Icechunk.
-
-    Usage:
-        path = icechunk_s3_store_path("my-store")
-        # Returns: "s3://test-tessera-embeddings/my-store"
-    """
-
-    def _make_path(store_name: str) -> str:
-        return f"s3://{test_bucket}/{store_name}"
-
-    return _make_path
-
-
-# -----------------------------------------------------------------------------
-# ROI Test Fixtures
-# -----------------------------------------------------------------------------
-
-
-@pytest.fixture
-def mock_roi_metadata():
-    """Factory returning ROIMetadata with configurable size/CRS.
-
-    Builds ROIMetadata dataclass instances without touching the filesystem.
-    """
-    from unittest.mock import Mock
-
-    from tessera_embeddings.ingest.roi import ROIMetadata
-
-    def _make(
-        height: int = 20,
-        width: int = 20,
-        crs: str = "EPSG:32615",
-        bbox_wgs84: tuple[float, float, float, float] = (-90.5, 44.0, -90.0, 44.5),
-    ) -> ROIMetadata:
-        geobox = Mock()
-        geobox.shape = Mock(y=height, x=width)
-        return ROIMetadata(
-            bbox_wgs84=bbox_wgs84,
-            native_crs=crs,
-            geobox=geobox,
-            width=width,
-            height=height,
-        )
-
-    return _make
-
-
-@pytest.fixture
-def roi_mask_array():
-    """Factory returning boolean numpy array with configurable coverage.
-
-    Args via factory call:
-        height, width: spatial dimensions (default 20x20)
-        coverage: fraction of True pixels (default 0.8)
-        seed: RNG seed for reproducibility
-    """
-
-    def _make(
-        height: int = 20,
-        width: int = 20,
-        coverage: float = 0.8,
-        seed: int = 42,
-    ) -> np.ndarray:
-        rng = np.random.default_rng(seed)
-        mask = rng.random((height, width)) < coverage
-        return mask
-
-    return _make
 
 
 # -----------------------------------------------------------------------------

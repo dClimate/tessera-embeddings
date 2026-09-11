@@ -12,9 +12,9 @@ authors = [
 keywords = ["satellite", "remote-sensing", "embeddings", "tessera", "sentinel"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    # Versions must match the CI matrix in .github/workflows/unit.yml.
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
@@ -33,9 +33,31 @@ dependencies = [
     "zarr",
     "icechunk>=2.1.1",
     "fsspec",
-    "odc-stac",
+    # Bounded because `ingest/stac.py` subclasses `odc.stac._mdtools.StacMDParser` and
+    # `odc.loader.RioReader` to remove the Sentinel-2 BOA offset per image as it is read.
+    # The first is private and the second's `read` contract is what the subclass overrides,
+    # so a minor bump can move either without a deprecation. See
+    # context_docs/decisions/021-correct-the-boa-offset-per-image.md.
+    "odc-stac>=0.5.2,<0.6",
+    # Bounded SEPARATELY, because the line above bounds nothing here: `odc-stac` 0.5.2 requires
+    # only `odc-loader>=0.6.4`, so a fresh resolution can satisfy it with a breaking 0.7.
+    # `RioReader` and the `read` contract the subclass overrides are public — both are in
+    # `odc.loader.__all__`, and `read` matches the documented `RasterReader` protocol — but the
+    # subclass reaches `self._src` for the offset stamped onto the source, and that attribute is
+    # on no protocol. At 0.x the minor version is where breaking changes land either way.
+    "odc-loader>=0.6.4,<0.7",
     "odc-geo",
-    "rasterio",
+    # Bounded because `ingest/loader_failures.py` reaches into three private rasterio names to
+    # forward the GDAL messages no per-thread handler is installed for: `rasterio._env.code_map`
+    # and `level_map` for the wording and level, `rasterio._err.CPLE_BaseError` for the cause
+    # class, and `rasterio._base.__file__` as the extension to `dlsym` GDAL out of. The wording
+    # is load-bearing rather than cosmetic — the classifier corroborates that a line came from
+    # the source READER by its `CPLE_` prefix, so a renamed map entry silences the sensor rather
+    # than breaking it. `tests/unit/ingest/test_loader_failure_attribution.py` drives a real `CPLError`
+    # through the real map and asserts the whole line, so drift fails CI; the bound is what keeps
+    # a fresh resolution from walking into it unasked. See
+    # context_docs/ingest/source-read-failures.md.
+    "rasterio>=1.5.0,<1.6",
     "rioxarray",
     "pystac",
     "pystac-client",

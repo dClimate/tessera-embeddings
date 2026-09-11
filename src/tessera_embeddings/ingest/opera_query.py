@@ -1,9 +1,8 @@
 """OPERA RTC-S1 query utilities: MGRS bbox, orbit filtering, UTM EPSG.
 
-OPERA RTC-S1 items on CMR-STAC lack MGRS tile IDs, orbit direction,
-and projection metadata. This module provides helpers to query by
-spatial extent, filter by orbit via the native CMR Granule Search API,
-derive the CRS, and prepare items for loading.
+OPERA RTC-S1 items on CMR-STAC carry no MGRS tile ID, orbit direction or projection metadata, so
+these helpers query by spatial extent, filter orbit via the native CMR Granule Search API, derive
+the CRS, and prepare items for loading.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ import time
 import warnings
 from collections import Counter
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import mgrs
 import requests
@@ -23,43 +22,41 @@ from pystac.utils import str_to_datetime
 from requests.adapters import HTTPAdapter
 
 from tessera_embeddings.config import S1_OPERA_BANDS
-from tessera_embeddings.ingest._http import make_logging_retry
+from tessera_embeddings.ingest._http import NonJsonResponseError, json_or_raise, make_logging_retry
 from tessera_embeddings.ingest.auth import get_edl_session, resolve_item_assets, rewrite_assets_to_s3
 from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 
 logger = logging.getLogger(__name__)
 
-# CMR Granule Search API — queried directly instead of CMR-STAC search.
-# CMR-STAC's cursor-based pagination intermittently 500s on CONUS-scale
-# queries (nasa/cmr-stac#408) and pages internally at ~100 items regardless
-# of the requested limit (#411); the native granule API pages cleanly at
-# 2000 against the same host. It also supports ``attribute[]`` filtering,
-# which CMR-STAC silently ignores — so orbit direction is filtered
-# server-side here rather than by intersecting a separate STAC result.
+# CMR Granule Search API, queried directly instead of CMR-STAC search: CMR-STAC's cursor
+# pagination intermittently 500s at zone scale (nasa/cmr-stac#408) and pages internally at ~100
+# items whatever limit is asked (#411), while the native API pages cleanly at 2000 on the same
+# host and honours ``attribute[]`` filtering, which CMR-STAC silently ignores — so orbit direction
+# is filtered server-side rather than by intersecting a separate STAC result.
 _CMR_GRANULE_URL = "https://cmr.earthdata.nasa.gov/search/granules.json"
 _CMR_OPERA_SHORT_NAME = "OPERA_L2_RTC-S1_V1"
 _CMR_PROVIDER = "ASF"
 _CMR_PAGE_SIZE = 2000
 
-#: Polarisation required of every granule, filtered server-side.
+#: Polarisations required of every granule, filtered server-side. BOTH of them.
 #:
-#: Co-pol only: CMR matches a multi-valued attribute if ANY value matches, so requiring VV
-#: admits every VV+VH granule while excluding the HH/HV ones outright. Requiring VH as well
-#: would be redundant, and requiring it INSTEAD would admit nothing that VV does not.
-_REQUIRED_POLARIZATION = "VV"
+#: CMR matches a multi-valued attribute if ANY of its values matches, and ANDs repeated
+#: ``attribute[]`` entries on the same attribute name. Naming VV alone is therefore NOT equivalent
+#: to requiring the pair — the archive holds genuinely single-polarisation VV-only granules, which
+#: contain VV and so pass, and ingest cannot use half a pair. Naming both is EXACT rather than
+#: merely tighter: it admits no single-pol granule and drops no dual-pol one, and it costs nothing
+#: to page granules the client would reject anyway.
+_REQUIRED_POLARIZATIONS = ("VV", "VH")
 
-# Granule data links carry the per-band COG download URLs. The ``rel`` ends
-# in ``/data#`` and the HTTPS href ends in ``_<BAND>.tif``. HH/HV are matched
-# for RECOGNITION ONLY (EW-mode polar granules carry them instead of VV/VH) so
-# the skip log can say what a rejected granule actually had — the pipeline
-# still ingests exclusively dual-pol VV+VH (``S1_OPERA_BANDS``).
+# Granule data links carry the per-band COG download URLs: ``rel`` ends in ``/data#`` and the
+# HTTPS href in ``_<BAND>.tif``. HH/HV are matched for RECOGNITION ONLY, so the skip log can say
+# what a rejected granule had; ingest takes dual-pol VV+VH (``S1_OPERA_BANDS``) exclusively.
 _CMR_DATA_REL_SUFFIX = "/data#"
 _BAND_HREF_RE = re.compile(r"_(VV|VH|HH|HV|mask)\.tif$")
 
 
-# CMR intermittently times out or returns 5xx under load. urllib3's Retry
-# retries read timeouts (``read`` defaults to ``total``) as well as the
-# listed statuses, with exponential backoff honoring Retry-After.
+# CMR intermittently times out or 5xxes under load. urllib3's Retry covers read timeouts (``read``
+# defaults to ``total``) as well as the listed statuses, backing off and honouring Retry-After.
 _CMR_RETRY = make_logging_retry(
     "CMR",
     total=6,
@@ -68,6 +65,13 @@ _CMR_RETRY = make_logging_retry(
     allowed_methods=frozenset(["GET"]),
     respect_retry_after_header=True,
 )
+
+
+#: Attempts at ONE page whose body did not parse, and the seconds between them (times the
+#: attempt number). Scoped to that case alone: it is the single failure ``_CMR_RETRY``
+#: cannot see, since its ladder keys on status and this response's status is fine.
+_NON_JSON_PAGE_ATTEMPTS = 4
+_NON_JSON_PAGE_BACKOFF_S = 5.0
 
 
 def _cmr_session() -> requests.Session:
@@ -133,20 +137,16 @@ def mgrs_tile_to_utm_epsg(tile_id: str) -> str:
 def normalize_opera_timestamps(items: list[Any], *, mid_longitude: float | None = None) -> list[Any]:
     """Stamp OPERA burst granules with noon UTC of the **solar day** they belong to.
 
-    A thin wrapper over
-    :func:`~tessera_embeddings.ingest.solar_days.normalize_to_solar_day`, kept because the
-    OPERA reason for normalising is its own: a single bbox query returns ~10 burst granules
-    per pass, each with a slightly different sub-second timestamp, and ``odc.stac.load``
-    would make every burst its own time step instead of mosaicking them. Sharing one
-    timestamp is what merges them.
+    A thin wrapper over :func:`~tessera_embeddings.ingest.solar_days.normalize_to_solar_day`, kept
+    because the OPERA reason for normalising is its own: one bbox query returns ~10 burst granules
+    per pass with slightly different sub-second timestamps, and ``odc.stac.load`` would make each
+    burst its own time step instead of mosaicking them. Sharing one timestamp merges them.
 
-    **This grouped by UTC DATE until 2026-07-30, and that made the whole solar-day
-    apparatus on the S1 path inert.** Everything downstream — ownership, footprint
-    derivation, the written label — derived its "solar day" from a timestamp that had
-    already been flattened to noon of the UTC date, so it recovered the UTC date and
-    nothing else. Radar was therefore labelled in UTC while optical was labelled in solar
-    days, and in a high-offset zone the same calendar label in the two stores meant
-    different 24-hour windows that inference then paired per pixel.
+    It must be the SOLAR day, not the UTC date. Everything downstream — ownership, footprint
+    derivation, the written label — recovers its day from this timestamp, so flattening to the UTC
+    date here labels radar in UTC while optical is labelled in solar days; in a high-offset zone
+    the same calendar label then means two different 24-hour windows, which inference pairs per
+    pixel. See ADR-014 (``solar-offset-applied-only-in-solar-days``).
     """
     return normalize_to_solar_day(items, mid_longitude=mid_longitude)
 
@@ -154,18 +154,17 @@ def normalize_opera_timestamps(items: list[Any], *, mid_longitude: float | None 
 def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = None) -> Item | None:
     """Build a pystac ``Item`` from one CMR granule search entry.
 
-    Maps the granule's data download links onto the ``S1_OPERA_BANDS`` asset
-    keys (``0_VV``, ``0_VH``) so the constructed item is shape-compatible with
-    the CMR-STAC items the rest of the pipeline expects. odc.stac.load reads
-    dtype, nodata, and CRS from the COGs themselves (we pass an explicit
-    geobox), so only the band hrefs, id, datetime, geometry, and bbox matter.
+    Maps the granule's data download links onto the ``S1_OPERA_BANDS`` asset keys (``0_VV``,
+    ``0_VH``) so the item is shape-compatible with the CMR-STAC items the rest of the pipeline
+    expects. odc.stac.load reads dtype, nodata and CRS from the COGs themselves (we pass an
+    explicit geobox), so only band hrefs, id, datetime, geometry and bbox matter.
 
-    Only dual-pol VV+VH granules are accepted — a partial-pol granule would
-    otherwise ingest a fabricated all-nodata band that the encoder reads as a
-    confident physical signal (see the optional-S1 ADR). The skip log names
-    what WAS found (``VV-only``, EW-mode ``HH/HV``, …) so regional data loss
-    is quantifiable; ``skip_counts`` (optional) accumulates the same
-    categories for a per-query summary.
+    Only dual-pol VV+VH granules are accepted: a partial-pol granule would ingest a fabricated
+    all-nodata band that the encoder reads as a confident physical signal (see the optional-S1
+    ADR). The query already requires both polarisations server-side, so this is the safety net —
+    it catches a granule whose metadata claims the pair and whose data links do not carry it. The
+    skip log names what WAS found (``VV-only``, cross-pol ``HH/HV``, …); ``skip_counts``
+    accumulates the same categories for a per-query summary.
 
     Args:
         entry: One element of ``feed.entry`` from the CMR granule search JSON.
@@ -196,11 +195,9 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
     if len(assets) < len(S1_OPERA_BANDS):
         pols = sorted(k for k in band_hrefs if k != "mask")
         if {"HH", "HV"} & set(pols):
-            # NOT "EW-mode": this said so speculatively for a while and cost real
-            # investigation time. Checked against CMR, the Greenland granules carrying HH/HV
-            # report BEAM_MODE=IW, and a BEAM_MODE=EW query over that region returns nothing.
-            # Cross-pol is a choice of polarisation, not of swath mode — so name only what
-            # was observed.
+            # Name only the polarisations observed, never a swath mode: the Greenland granules
+            # carrying HH/HV report BEAM_MODE=IW in CMR, and a BEAM_MODE=EW query over that
+            # region returns nothing. Cross-pol is a choice of polarisation, not of swath mode.
             category = f"{'/'.join(pols)} (cross-pol, no VV+VH)"
         elif pols:
             category = f"{'/'.join(pols)}-only"
@@ -208,17 +205,17 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
             category = "no data links"
         if skip_counts is not None:
             skip_counts[category] += 1
-        # A SAFETY NET now, not the primary filter: the query already excludes granules whose
-        # POLARIZATION lacks VV, so reaching here means one advertised VV in its metadata and
-        # then did not publish the band pair. That is a catalogue inconsistency worth seeing,
-        # which is why it stays at WARNING — but it should now be rare, and a burst of these
-        # means something changed upstream rather than that this region is cross-pol.
+        # A SAFETY NET, not the primary filter: the query requires POLARIZATION to name BOTH
+        # polarisations, so reaching here means a granule whose metadata claims the pair and whose
+        # data links do not carry it — a rare catalogue inconsistency worth seeing, hence WARNING.
+        # The granule response carries no polarisation field at all, so this names what the QUERY
+        # required and must not claim to quote the catalogue. See ADR-009.
         logger.warning(
-            "Skipping granule %s: CMR reported %s but the published bands are %s — needs "
-            "both VV and VH, so this granule is inconsistent with its own metadata",
+            "Skipping granule %s: published bands are %s, but it matched a query requiring "
+            "POLARIZATION to include %s — its metadata and its data links disagree",
             entry.get("title", "<unknown>"),
-            _REQUIRED_POLARIZATION,
             pols or "none",
+            "+".join(_REQUIRED_POLARIZATIONS),
         )
         return None
 
@@ -265,12 +262,11 @@ def _query_cmr_granules(
 ) -> list[Item]:
     """Query the CMR Granule Search API for OPERA items in a bbox/date/orbit.
 
-    CMR's ``bounding_box`` is lower-left/upper-right (west,south,east,north) and
-    does NOT read a west>east box as antimeridian-crossing — it would match
-    nothing. An ROI whose live-tile envelope crosses ±180° (zones 01*/60*) is
-    stored with a GeoJSON-style west>east bbox (see ``land_mask.export_zone_roi``),
-    so here we split it at the antimeridian into two CMR-valid boxes and merge
-    (dedup by granule id). A normal box queries once.
+    CMR's ``bounding_box`` is lower-left/upper-right (west,south,east,north) and does NOT read a
+    west>east box as antimeridian-crossing — it would match nothing. An ROI whose live-tile
+    envelope crosses ±180° (zones 01*/60*) is stored with a GeoJSON-style west>east bbox (see
+    ``land_mask.export_zone_roi``), so it is split at the antimeridian into two CMR-valid boxes
+    and merged, deduped by granule id. A normal box queries once.
 
     Args:
         bbox: (west, south, east, north) in WGS84 degrees; west>east = crosses ±180°.
@@ -299,6 +295,42 @@ def _query_cmr_granules(
     return _query_cmr_granules_one(bbox, start_date, end_date, orbit_direction)
 
 
+def _fetch_granule_page(
+    session: requests.Session,
+    params: dict[str, str | int | list[str]],
+    headers: dict[str, str],
+    page: int,
+) -> tuple[dict[str, Any], str | None]:
+    """Fetch ONE page of granules, re-asking when the body is not JSON.
+
+    Returns the decoded body and the cursor to carry into the next page.
+
+    Retried here because the session's ladder keys on status and an unparseable body arrives
+    under a success status that ``raise_for_status`` passes. Unretried, one such page ends a leg
+    holding a zone-year of already-written batches. Safe to repeat: a GET whose cursor the archive
+    itself issued names the identical page.
+    """
+    for attempt in range(1, _NON_JSON_PAGE_ATTEMPTS + 1):
+        resp = session.get(_CMR_GRANULE_URL, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+        try:
+            body = cast(dict[str, Any], json_or_raise(resp, log_body=True))
+        except NonJsonResponseError:
+            if attempt == _NON_JSON_PAGE_ATTEMPTS:
+                raise
+            logger.warning(
+                "CMR page %d unparseable (attempt %d/%d), re-asking in %.0fs",
+                page,
+                attempt,
+                _NON_JSON_PAGE_ATTEMPTS,
+                _NON_JSON_PAGE_BACKOFF_S * attempt,
+            )
+            time.sleep(_NON_JSON_PAGE_BACKOFF_S * attempt)
+            continue
+        return body, resp.headers.get("CMR-Search-After")
+    raise AssertionError("unreachable: the loop either returns or raises")  # pragma: no cover
+
+
 def _query_cmr_granules_one(
     bbox: tuple[float, float, float, float],
     start_date: str,
@@ -311,13 +343,10 @@ def _query_cmr_granules_one(
     using the ``CMR-Search-After`` header for pagination and ``attribute[]``
     for server-side orbit-direction filtering.
     """
-    # BOTH filters server-side. The polarisation one is what stops us paying to page
-    # granules we will always reject: ingest needs dual-pol VV+VH, so a granule whose
-    # POLARIZATION does not include VV can never qualify, and asking CMR to exclude them
-    # discards nothing reachable. Measured on zone 23N, whose land is all Greenland: 138,276
-    # granules paged over ~160 s per orbit-year, every one rejected client-side, become 0
-    # returned immediately. A list value is how requests encodes a repeated query parameter —
-    # a dict cannot hold two "attribute[]" keys.
+    # BOTH filters server-side; the polarisation one stops us paying to page granules ingest can
+    # never use, and excludes nothing reachable. The list value is how requests encodes a repeated
+    # query parameter (a dict cannot hold two "attribute[]" keys), and repeating the polarisation
+    # name is what makes CMR require both rather than either.
     params: dict[str, str | int | list[str]] = {
         "short_name": _CMR_OPERA_SHORT_NAME,
         "provider": _CMR_PROVIDER,
@@ -326,7 +355,7 @@ def _query_cmr_granules_one(
         "page_size": _CMR_PAGE_SIZE,
         "attribute[]": [
             f"string,ASCENDING_DESCENDING,{orbit_direction.upper()}",
-            f"string,POLARIZATION,{_REQUIRED_POLARIZATION}",
+            *(f"string,POLARIZATION,{pol}" for pol in _REQUIRED_POLARIZATIONS),
         ],
     }
 
@@ -340,9 +369,7 @@ def _query_cmr_granules_one(
     page = 0
     while True:
         page += 1
-        resp = session.get(_CMR_GRANULE_URL, params=params, headers=headers, timeout=30)
-        resp.raise_for_status()
-        body = resp.json()
+        body, search_after = _fetch_granule_page(session, params, headers, page)
 
         entries = body.get("feed", {}).get("entry", [])
         if not entries:
@@ -354,7 +381,6 @@ def _query_cmr_granules_one(
             f"({len(items)} items so far, {time.monotonic() - t0:.1f}s)"
         )
 
-        search_after = resp.headers.get("CMR-Search-After")
         if search_after and len(entries) == params["page_size"]:
             headers["CMR-Search-After"] = search_after
         else:
@@ -365,16 +391,15 @@ def _query_cmr_granules_one(
         f"in {time.monotonic() - t0:.1f}s"
     )
     if skip_counts:
-        # These SURVIVED the server-side VV filter and were still unusable, so the count is no
-        # longer a measure of how cross-pol a region is — it is a measure of catalogue
-        # inconsistency. Before the filter this line routinely reported six figures over polar
-        # land and read as normal; a non-trivial count here now is a genuine anomaly.
+        # These SURVIVED the server-side polarisation filter and were still unusable, so the
+        # count measures catalogue inconsistency, not how cross-pol a region is. Single-pol
+        # granules are excluded at the server, so a non-trivial count here is a genuine anomaly.
         logger.warning(
             "CMR granule query (%s): %d granule(s) passed the %s filter but published no "
             "VV+VH pair: %s — inconsistent metadata upstream, not a regional coverage fact",
             orbit_direction,
             sum(skip_counts.values()),
-            _REQUIRED_POLARIZATION,
+            "+".join(_REQUIRED_POLARIZATIONS),
             dict(sorted(skip_counts.items())),
         )
     return items
@@ -391,22 +416,16 @@ def make_s1_item_provider(
 ) -> Callable[[], list[Item]]:
     """Create an item_provider_fn that builds OPERA items from the native CMR granule API.
 
-    The returned callable replaces CMR-STAC ``client.search()`` for the
-    ``cmr-asf`` provider — bypassing CMR-STAC's 500-prone cursor pagination
-    (nasa/cmr-stac#408) and its 28x latency penalty (#411). It:
+    Replaces CMR-STAC ``client.search()`` for the ``cmr-asf`` provider, bypassing its 500-prone
+    cursor pagination (nasa/cmr-stac#408) and 28x latency penalty (#411). It:
 
-    1. **Queries the native CMR Granule Search API**, which filters orbit
-       direction server-side via ``attribute[]`` and pages cleanly at 2000.
-       Items are built directly from the granule data links — no STAC search
-       and no local granule-ID intersection (both were needed only because
-       CMR-STAC could not orbit-filter).
-    2. **Rewrites asset URLs** — OPERA RTC-S1 asset URLs point to ASF's
-       datapool HTTPS endpoints. For in-region access these are rewritten to
-       S3 URIs; for out-of-region access they are resolved through ASF's OAuth
-       redirect chain to obtain CloudFront signed URLs.
-    3. **Normalizes timestamps** — OPERA bursts on the same date have slightly
-       different timestamps. These are normalized to noon UTC so that
-       odc.stac.load groups them into a single time slice for mosaicking.
+    1. **Queries the native CMR Granule Search API**, which filters orbit direction server-side
+       via ``attribute[]`` and pages cleanly at 2000. Items are built straight from the granule
+       data links — no STAC search, no local granule-ID intersection.
+    2. **Rewrites asset URLs** from ASF's datapool HTTPS endpoints: to S3 URIs for in-region
+       access, or through ASF's OAuth redirect chain to CloudFront signed URLs otherwise.
+    3. **Normalizes timestamps** so same-day bursts share one, and odc.stac.load groups them into
+       a single time slice for mosaicking.
 
     Args:
         orbit_direction: "ascending" or "descending".
@@ -425,13 +444,10 @@ def make_s1_item_provider(
         Zero-argument callable that returns a list of ready-to-load pystac Items.
 
     Note:
-        The returned callable issues a fresh CMR granule query on **every**
-        invocation — it does not cache at construction time. The current S1
-        flow builds one provider per batch and invokes it once (a single
-        ``query_stac_items`` call), so this is fine. If a future caller feeds
-        the same provider to both ``has_new_stac_dates`` and
-        ``query_stac_items``, it will run two full CONUS-scale CMR queries per
-        batch; build a separate provider per call site instead.
+        The returned callable issues a fresh CMR granule query on **every** invocation; it does
+        not cache at construction. The S1 flow builds one provider per batch and invokes it once.
+        Feeding one provider to both ``has_new_stac_dates`` and ``query_stac_items`` would run two
+        full zone-scale CMR queries per batch — build a separate provider per call site.
     """
     if orbit_direction not in ("ascending", "descending"):
         raise ValueError(f"orbit_direction must be 'ascending' or 'descending', got '{orbit_direction}'")

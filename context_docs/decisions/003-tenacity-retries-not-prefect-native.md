@@ -68,7 +68,8 @@ runner is less robust than the Prefect path — both bad outcomes.
 
 ## Related
 
-- [`appendix/prefect_flow_handling.md` §3.3](../../open_sourcing_planning/appendix/prefect_flow_handling.md)
-  (in the planning archive) — the longer-form analysis.
+- `appendix/prefect_flow_handling.md` §3.3 — the longer-form analysis. **It is in the
+  open-sourcing planning archive, which is gitignored and therefore not in the repository**, so
+  this is a pointer for whoever holds that archive rather than a link a reader can follow.
 - [`docs/prefect-setup.md`](../../docs/prefect-setup.md) §"Common
   gotchas" — what users should know.

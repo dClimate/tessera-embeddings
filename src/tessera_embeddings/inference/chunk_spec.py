@@ -86,8 +86,7 @@ def enumerate_chunks(
         chunk_size: Size of each chunk in pixels (square).
 
     Returns:
-        List of ChunkSpec objects covering the entire mosaic.
-        Edge chunks may be smaller than chunk_size.
+        ChunkSpecs covering the whole mosaic; edge chunks may be smaller than *chunk_size*.
     """
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
@@ -121,15 +120,7 @@ def enumerate_chunks_from_dataset(
     ds: xr.Dataset,
     chunk_size: int = INFERENCE_CHUNK_SIZE,
 ) -> list[ChunkSpec]:
-    """Enumerate chunks from an xarray Dataset's spatial dimensions.
-
-    Args:
-        ds: Dataset with 'y' and 'x' dimensions.
-        chunk_size: Size of each chunk in pixels.
-
-    Returns:
-        List of ChunkSpec objects.
-    """
+    """Enumerate chunks from a Dataset's ``northing``/``easting`` sizes."""
     return enumerate_chunks(ds.sizes["northing"], ds.sizes["easting"], chunk_size)
 
 
@@ -141,20 +132,18 @@ def filter_chunks_by_roi_mask(
 ) -> list[ChunkSpec]:
     """Return only the chunks whose spatial extent intersects the ROI mask.
 
-    The ROI mask is a boolean zarr array of shape (H, W) with pixels set to
-    True where inference is wanted. Chunks with no True pixels in their
-    (y_start:y_stop, x_start:x_stop) slice are dropped — there is no reason
-    to burn a GPU actor on them, and assembly fills missing chunks with
-    zero / NaN downstream.
+    The ROI mask is a boolean zarr of shape (H, W), True where inference is wanted. A chunk
+    with no True pixel in its slice is dropped — no reason to burn a GPU actor on it, and
+    assembly fills missing chunks with zero / NaN downstream.
 
     Args:
         chunks: Full chunk grid from :func:`enumerate_chunks_from_dataset`.
         roi_zarr_path: S3 URI or local path to the ROI boolean zarr.
         storage_options: fsspec options for the open — the credential and region a
-            deployment needs to read its own ROI. The mask is a PLAIN zarr, not an
-            Icechunk store, so it does not travel on the Icechunk callback its callers
-            thread everywhere else, and without this it opened on the ambient chain: in
-            a callback-only or non-default-region deployment, the wrong credentials or
+            deployment needs to read its own ROI. The mask is a PLAIN zarr, not an Icechunk
+            store, so it does not travel on the Icechunk callback its callers thread
+            everywhere else; without this it opens on the ambient chain, which in a
+            callback-only or non-default-region deployment means the wrong credentials or
             none at all, on the one read that decides which chunks exist.
 
     Returns:
@@ -165,10 +154,8 @@ def filter_chunks_by_roi_mask(
     def intersects(chunk: ChunkSpec) -> bool:
         return bool(mask[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop].any())  # type: ignore[index]
 
-    # One window read per chunk dominated by S3 latency + decompression; fan
-    # the reads out across a thread pool (the GIL is released during both) so
-    # wall time scales with the slowest reads rather than their sum. Order is
-    # preserved so the live subset keeps the input's row-major chunk ordering.
+    # Fanned out so wall time scales with the slowest read rather than their sum. `pool.map`
+    # preserves order, so the live subset keeps the input's row-major chunk ordering.
     with ThreadPoolExecutor(max_workers=_ROI_PROBE_WORKERS) as pool:
         hits = pool.map(intersects, chunks)
     live = [chunk for chunk, hit in zip(chunks, hits, strict=True) if hit]

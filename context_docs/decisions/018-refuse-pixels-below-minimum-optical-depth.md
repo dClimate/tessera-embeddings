@@ -86,6 +86,6 @@ on adjacent readable pairs, and is not a prerequisite for this line.
 
 ## Related
 
-- [`design/minimum-optical-depth-plan.md`](../design/minimum-optical-depth-plan.md) — the evidence
+- [`../inference/minimum-optical-depth.md`](../inference/minimum-optical-depth.md) — the evidence
   and the build record
 - [ADR 008](008-global-store-architecture.md) — the write-once root identity this rule joins

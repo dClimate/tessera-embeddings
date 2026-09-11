@@ -5,7 +5,7 @@
 # Verbatim copy of `model.py` from the Hugging Face model repository
 # `geotessera/TESSERA-V-2.0-2B-L` (identical to `ucam-eo/tessera`'s
 # `tessera_infer_v2/student/model.py`). It exists so
-# `tests/unit/test_student_v2_golden.py` can pin our port
+# `tests/unit/inference/test_student_v2_golden.py` can pin our port
 # (`inference/models/student_v2.py`) against upstream's own forward pass on the
 # real checkpoint. Re-fetch with:
 #
