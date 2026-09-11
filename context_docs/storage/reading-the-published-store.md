@@ -43,6 +43,10 @@ print(zone.attrs["years_complete"])          # which years this zone holds
 vector = zone["embeddings"][8, 500_000, 30_000, :]   # one pixel, all 128 bands, 2025
 ```
 
+That works, and it is not the fastest way. **Add one line to turn a 2.6-second open into a
+0.15-second one** — §4.3 has the measurement and the four lines of code. Everything else about the
+recipe above is right.
+
 Two details carry the rest of the document.
 
 **The store is Icechunk, not plain Zarr.** `xr.open_zarr("s3://.../dclimate.icechunk")` does not
@@ -140,8 +144,9 @@ data volume will overstate it by whatever fraction of each shard is ocean.
 
 ## 4. Measured read performance
 
-See §4.1 for the table. Three things about the method first, because each of them is a way to get a
-wrong number that looks right.
+§4.1 is the read path in both regions, §4.2 the metadata and coverage questions, §4.3 the one
+inherited setting that dominates the open, and §4.4 the comparison against what scoping predicted.
+Three things about the method first, because each is a way to get a wrong number that looks right.
 
 **Probes must land in pixels that hold embeddings.** Icechunk answers a read of an absent chunk from
 the manifest without issuing a request, so a probe on elided ocean is nearly free — and a latency
@@ -154,34 +159,194 @@ a second read in the same process measures the cache. Every cold phase runs in a
 then exits. The parent picks the probe pixels once and passes them down, so the cold arm, the warm
 arm and both regions read the same addresses.
 
-**The throughput column is not a wire rate.** It is decompressed elements per second, which is what
-the scoping harness reported (`elements / wall`); for the int8 `embeddings` one element is one byte,
-so it is a logical MB/s and can exceed the host's network bandwidth, because zstd means fewer bytes
-cross the wire than reach the array. The `band_subset` workload counts only the bands asked for
-while the reader must fetch and decode all 128 in the chunk, so its figure understates the work by
-design — kept because changing it would break comparability with the scoping run, not because it is
-a bandwidth claim.
+**The throughput column is decompressed elements per second**, which is what the scoping harness
+reported (`elements / wall`). For the int8 `embeddings` one element is one byte, so it reads as a
+logical MB/s. In general that can exceed a host's network bandwidth, because compression means
+fewer bytes cross the wire than reach the array — but **on this store it does not**, because the
+quantized embeddings turn out to be effectively incompressible (§4.4: 8.0 MB on the wire for an
+8.39 MB inner chunk). So here the logical rate and the wire rate are within a few percent of each
+other, and the distinction matters for how the figure is defined rather than for how it reads.
 
-### 4.1 The numbers
+The one exception is `band_subset`, which counts only the 8 bands asked for while the reader must
+fetch and decode all 128 in the chunk — so its figure understates the work by a factor of sixteen.
+Kept as it is because changing the definition would break comparability with the scoping run, not
+because it is a bandwidth claim.
 
-*(inserted below)*
+### 4.1 The read path, in both regions
 
-### 4.2 Against what scoping predicted
+One `r7i.4xlarge` per region — the scoping host's instance type — reading zone 33N's 2025 slot
+through 1,000 probe pixels, every figure a median across the 10/64/128 concurrency sweep. The
+bucket is in us-west-2, so us-east-1 is the cross-region case and its S3 traffic necessarily
+crosses the public internet: a gateway endpoint is region-local, so there is no configuration that
+makes a remote region's reads local, and the asymmetry is part of what cross-region costs rather
+than a flaw in the arrangement.
+
+| | us-west-2 (in-region) | us-east-1 (cross-region) | |
+|---|---|---|---|
+| open, to first read | 2,638 ms cold / 2,571 warm | 3,198 / 3,183 | 1.2× |
+| one pixel's 128-band vector, p50 / p95 | **302 / 463 ms** | **463 / 779 ms** | 1.5× |
+| …bytes on the wire, per pixel | 8.04 MB | 8.15 MB | — |
+| patch, 100×100×128 | 4 MB/s (0.4 s) | 1 MB/s (1.2 s) | 3.3× |
+| tile, 1000×1000×128 | 280 MB/s (0.5 s) | 83 MB/s (1.5 s) | 3.4× |
+| band subset, 512×512×8 | 9 MB/s (0.2 s) | 1 MB/s (1.4 s) | 6.7× |
+| bulk, 4096×4096×128 | **763 MB/s (2.8 s)** | **194 MB/s (11.0 s)** | 3.9× |
+
+Concurrency barely moves any of it: in-region bulk throughput is 741–781 MB/s across all three
+settings and both cache states, and the open path is 2.5–2.7 s at every setting. The non-fill
+fraction of every region read was 0.99, which is how these rows are known to have landed on data
+rather than on ocean.
+
+**Cross-region costs between 1.2× and 6.7×, and which end you land on depends on the shape of the
+read, not its size.** Bulk pays 3.9× because it is bandwidth-bound and the bandwidth is what
+distance takes away. The open path pays only 1.2×, because most of it is neither bandwidth nor
+distance (§4.3). A single pixel pays 1.5×.
+
+### 4.2 Metadata and coverage navigation
+
+| | us-west-2 | us-east-1 |
+|---|---|---|
+| repository open | 0.21 s | 0.61 s |
+| root group open | 2.58 s | 2.65 s |
+| a zone group, after the root is open (median of 120) | 14 ms | 14 ms |
+| shard enumeration, one zone, all nine years (median of 120) | 0.51 s | 0.89 s |
+| shard enumeration, **all 120 zones** | **60 s** | 104 s |
+| registry: list all 994 parts | 0.16 s | 0.62 s |
+| registry: read all 994 schema footers | 73 s | 191 s |
+| registry: whole dataset, 3,247,410 rows | 14.9 s | 51.5 s |
+| registry: **"is my area covered", one box, one year** | **0.74 s** | 2.58 s |
+
+Two of these are the answers somebody will actually want. **A complete shard-level coverage map of
+the whole globe takes a minute in-region** and under two cross-region, which makes "what exists"
+a question to ask rather than a table to maintain. And **the registry answers a coverage question
+about an area of interest in under a second in-region**, which is the whole reason it exists.
+
+Both regions independently found 3,229,545 live shards and 3,247,410 registry rows. That the two
+hosts agree is the check that neither run was partial.
+
+### 4.3 The one inherited setting that dominates the open path
+
+The store saves the repository configuration the campaign wrote with, so a reader who passes none
+of their own inherits the writer's manifest preload — a budget of 1,000,000 refs across up to 2,400
+arrays. Measured on one host, 33N/2025, 150 probes, two alternated rounds, six samples per cell:
+
+| us-west-2 | preload as saved | preload disabled |
+|---|---|---|
+| open, to first read (cold) | 2,706 ms | **158 ms** |
+| one pixel, p50 | 286 ms | 278 ms |
+| one pixel, p95 | 426 ms | 392 ms |
+| one pixel, bytes on the wire | 8.02 MB | 8.02 MB |
+| bulk | 755 MB/s | 754 MB/s |
+| tile (cold) | 255 MB/s | 293 MB/s |
+
+**It costs 2.5 seconds of every open and buys the reader nothing measurable.** Not point latency,
+not bytes on the wire, not region throughput — every read column is the same or marginally better
+without it. That is not a criticism of the setting: it was chosen so a *fill* did not re-fetch
+manifests it was about to write into, and there it earns its keep. It is simply the wrong default
+to inherit as a reader, and inheriting it is automatic.
+
+Confirmed in both regions, three samples each:
+
+| open, to first read | us-west-2 | us-east-1 |
+|---|---|---|
+| following the documented recipe | 2,490 ms | 3,592 ms |
+| with preload disabled | **143 ms** | **932 ms** |
+| opening the zone group by path instead of the root | 2,484 ms | 3,411 ms |
+
+**Opening the zone group by path does not avoid it**, which is the natural guess and wrong: the cost
+simply moves out of the root-group step and into the zone-group step. It is not the 120 groups being
+enumerated; it is the preload, and the only thing that avoids it is asking for a different config.
+
+Note also what the preload-free numbers say about distance: 143 ms in-region against 932 ms
+cross-region is **6.5×**, against the 1.2× the full open path shows. The preload is largely
+region-independent work, so leaving it in place hides most of the cross-region penalty behind
+something slower than the penalty.
+
+**For a reader, then:** fetch the saved config, turn preload off, and keep everything else.
+
+```python
+import icechunk
+
+storage = icechunk.s3_storage(
+    bucket="tessera-embeddings", prefix="v1.1/dclimate.icechunk",
+    region="us-west-2", anonymous=True,
+)
+config = icechunk.Repository.fetch_config(storage)
+config.manifest = icechunk.ManifestConfig(
+    preload=icechunk.ManifestPreloadConfig(max_total_refs=0, max_arrays_to_scan=0),
+    splitting=config.manifest.splitting,
+)
+repo = icechunk.Repository.open(storage, config=config)
+```
+
+**Start from the saved config, never from a fresh one.** A `RepositoryConfig` handed to
+`Repository.open` replaces what the store saved rather than layering onto it, so building one to
+change a single setting silently reverts every other. This document made that mistake once while
+being written: an arm meant to differ only in its chunk cache also reverted the preload, and the
+open time moved for the wrong reason.
+
+### 4.4 Against what scoping predicted
 
 [ADR 008](../decisions/008-global-store-architecture.md) settled the chunk and shard geometry on a
-synthetic store: one timestep, one group, 70% land, random int8, on an `r7i.4xlarge` in us-west-2.
-The figures it published for the adopted `c256_sharded` variant, as medians across a 10/64/128
-concurrency sweep, were a cold point-vector p50 of **29 ms** and p95 of **204 ms**, a zone open of
-**128 ms**, bulk throughput peaking at **2,014 MB/s**, and — from the `d3`/`d3v2` runs — **1.23 MB
-on the wire per point read**.
+synthetic store: one timestep, one group, 70% land, random int8, on an `r7i.4xlarge` in us-west-2 —
+the same instance type this benchmark used, which is the only thing about the two hosts that is
+known to match.
 
-**The store built is not the store scoped**, in three ways that all push the same direction, and a
-comparison that ignores them is not a comparison. The published store has 120 groups rather than
-one and nine years rather than one, so its snapshot and manifests are far larger; its data is real
-quantized embeddings rather than random bytes, so it compresses differently; and the benchmark
-reads it from a machine matched to the scoping host in instance type but not in anything else.
-The like-for-like part is the workload definitions, their extents and the concurrency sweep, which
-were copied deliberately.
+**The store built is not the store scoped.** The published store has 120 groups rather than one and
+nine years rather than one, so its snapshot and manifests are far larger; its data is real
+quantized embeddings rather than random int8. The like-for-like part is the workload definitions,
+their extents and the concurrency sweep, copied deliberately so that at least the questions match.
+
+| scoping said | measured | verdict |
+|---|---|---|
+| zone open **128 ms** | 2,638 ms as documented, **143 ms** with preload off | **reconciled** — see below |
+| bulk throughput, 13–2,014 MB/s across 24 samples, median **202** | 763 MB/s bulk, 280 tile, 9 band-subset, 4 patch | **consistent** — inside the range, comparable median |
+| point p50 **29 ms**, p95 **204 ms** | p50 **302 ms**, p95 **463 ms** | **not reconciled** |
+| **1.23 MB** on the wire per point read | **8.04 MB** | **not reconciled** |
+
+**The open time reconciles, and the explanation is the preload.** Scoping's store was one group and
+one year, so a 1,000,000-ref preload budget had almost nothing to fetch and cost almost nothing;
+against a 120-group, nine-year repository the same budget is 2.5 s of work. With preload disabled
+the published store opens to first read in 143 ms in-region, against the 128 ms scoping published.
+The geometry is behaving as scoped; what changed is what the inherited configuration has to do.
+
+**The throughput figures are consistent, and cannot be compared more sharply than that.** Scoping
+retained only the distribution over its 24 `c256_sharded` throughput samples — four workloads × three
+concurrencies × two cache states — not the per-workload breakdown, and the raw run data is gone. So
+"2,014 MB/s" is the maximum over that whole set and not a bulk-read figure, and quoting it against
+our bulk read would be comparing a maximum with a median. What can honestly be said is that our
+four workloads span 4–763 MB/s with a median in the low hundreds, which sits inside scoping's
+13–2,014 range around a comparable median.
+
+**Two figures do not reconcile, and this is what was established before giving up on them.**
+
+Measured, and stable: **8.0–8.3 MB crosses the wire per isolated point-vector read**, which is one
+uncompressed 256×256×128 int8 inner chunk. So the embeddings are effectively incompressible, and a
+point read fetches exactly one whole inner chunk. 8 MB at in-region single-stream S3 rates is a few
+hundred milliseconds, so the 302 ms p50 and the 8.04 MB are the same fact told twice, and any
+explanation has to account for both.
+
+The obvious candidate was **probe locality**: if scoping's probes repeatedly hit the same inner
+chunks, its per-point average would be diluted by cache hits and would describe something other
+than the cost of one read. That was tested directly and **does not hold on the published store** —
+1,000 probes over 16S's 1,088 inner chunks cost 7.96 MB/point, statistically the same as 25 probes
+over 33N's 549,952 at 8.28 MB/point. Repeat reads of an inner chunk re-fetch it here.
+
+Two other candidates were eliminated by reading the scoping harness rather than guessing.
+Compressibility is not the answer: `synth.py` generates random int8, deliberately worst-case, so
+scoping's data was as incompressible as ours. Nor is a codec difference between the variants:
+`variants.py` fixes only chunk and shard geometry per variant and takes dtype, serializer and
+compressor from the library, so `c256_full` at 8.69 MB/point and `c256_sharded` at 1.23 MB/point
+were the same bytes through the same zstd — and 8.69 MB is one whole inner chunk, exactly what we
+measure, while 1.23 MB is a seventh of one.
+
+**So: scoping's own two numbers disagree with each other on identical geometry and codec, and the
+records needed to settle which is right were not kept.** The ADR read the gap as sharding doing
+lean partial reads; a point read has to decompress a whole inner chunk to return a pixel, so that
+reading cannot be right as stated. The remaining untested candidate is a chunk cache large enough
+to hold the scale-test store's small working set — and the published store saves no caching
+setting, so its readers get icechunk's own default, which nothing here sized. **This is registered
+as unreconciled rather than explained**, and the practical consequence is in §6: point access costs
+one inner chunk per pixel, and a consumer should read regions.
 
 ## 5. The registry beside the store
 
@@ -239,10 +404,17 @@ whatever `pyarrow` infers. Fine while every part agrees; a trap the first time t
 they are in `context_docs/campaign/campaign-plan.md`, not in the published product.
 
 **Point access is expensive, and the store is not built for it.** One pixel's 128-band vector costs
-a whole 256×256×128 inner chunk on the wire. That is the geometry working as intended — it is what
-makes block reads fast and object counts manageable — but a consumer whose access pattern is
-scattered single pixels will find it slow, and the fix is to read a region and index into it, not
-to tune the client.
+a whole 256×256×128 inner chunk on the wire — measured at 8.0 MB and 302 ms in-region, and it does
+not get cheaper when probes revisit the same chunk (§4.4). That is the geometry working as intended:
+it is what makes block reads fast and object counts manageable. But a consumer whose access pattern
+is scattered single pixels will find it slow, and the fix is to read a region and index into it, not
+to tune the client. Reading a 1000×1000 tile delivers 280 MB/s; reading its million pixels one at a
+time would take three days.
+
+**A reader inherits the writer's manifest preload, which costs 2.5 s of every open and returns
+nothing** (§4.3). Nothing warns about it, opening a zone group directly does not avoid it, and the
+only fix is to pass a configuration — starting from the saved one, or every other setting silently
+reverts too.
 
 **Five of the nine years have no roll-up completion tag** (§2).
 

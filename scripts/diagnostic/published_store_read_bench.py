@@ -282,6 +282,10 @@ def run_phase(payload: dict[str, Any]) -> dict[str, Any]:
         # The scoping harness's definition: decompressed elements per second. See the module
         # docstring on why this is not a wire rate.
         throughput_mbps=round((block.size / 1e6) / wall, 1) if wall > 0 else 0.0,
+        # A sanity indicator that the region held data rather than fill, NOT a coverage figure:
+        # int8 zero is both the fill value and a legitimate band value, so a fully written block
+        # lands a little under 1.0 rather than exactly at it. It is here to make a read that
+        # silently landed on ocean obvious, which would show as a fraction near zero.
         nonfill_fraction=round(float(np.count_nonzero(block) / block.size), 4),
     )
     return result
@@ -412,7 +416,9 @@ def main(argv: list[str] | None = None) -> int:
     # of a block only `bulk` needs.
     region_origin = None
     if wanted:
-        span = max(w[1] for w in WORKLOADS if w[0] in wanted)
+        # Both extents, not just the northing one: a workload that is wider than it is tall would
+        # otherwise be handed a block big enough on one axis only.
+        span = max(max(w[1], w[2]) for w in WORKLOADS if w[0] in wanted)
         region_origin = _contiguous_live_block(shards, span)
         if region_origin is None:
             print(f"no contiguous live block of {span} px in {args.zone}/{args.year}; skipping region workloads")
