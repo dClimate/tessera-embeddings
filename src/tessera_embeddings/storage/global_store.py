@@ -75,6 +75,7 @@ def open_global_repo(
     region: str | None = None,
     scatter_initial_credentials: bool = False,
     anonymous: bool = False,
+    preload_manifests: bool = True,
 ) -> icechunk.Repository:
     """Open the global-store repo with the global config layered on.
 
@@ -83,8 +84,17 @@ def open_global_repo(
     sites, which never pickle and would gain nothing for a live secret in a pickle.
 
     ``anonymous`` reads with no credentials, which is how the published store is served to
-    consumers. The config passed here is layered on top of whatever the store has SAVED, so a
-    reader inherits the writer's manifest splitting and preload tuning either way.
+    consumers.
+
+    **``preload_manifests=False`` is the one thing a reader should change.** The manifest preload
+    is sized for a fill and costs a reader about 2.5 s of every open for nothing measurable — see
+    :func:`~tessera_embeddings.storage.zarr_store.global_store_config`. The whole consumer recipe
+    is then::
+
+        repo = open_global_repo(uri, region="us-west-2", anonymous=True, preload_manifests=False)
+        session = repo.readonly_session(branch="main")
+
+    Anything that writes must leave the preload on.
     """
     return icechunk.Repository.open(
         _create_storage(
@@ -94,7 +104,7 @@ def open_global_repo(
             scatter_initial_credentials=scatter_initial_credentials,
             anonymous=anonymous,
         ),
-        config=global_store_config(),
+        config=global_store_config(preload_manifests=preload_manifests),
     )
 
 

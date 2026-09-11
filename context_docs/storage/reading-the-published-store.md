@@ -43,9 +43,9 @@ print(zone.attrs["years_complete"])          # which years this zone holds
 vector = zone["embeddings"][8, 500_000, 30_000, :]   # one pixel, all 128 bands, 2025
 ```
 
-That works, and it is not the fastest way. **Add one line to turn a 2.7-second open into a
-fifth of a second** — §4.3 has the measurement and the four lines of code. Everything else about the
-recipe above is right.
+That works, and it is not the fastest way. **Pass `preload_manifests=False` and a 2.7-second open
+becomes about a fifth of a second** — §4.3 has the measurement and the reasoning. Everything else
+about the recipe above is right.
 
 Two details carry the rest of the document.
 
@@ -282,7 +282,22 @@ preload-free path is 224 → 1,403 ms, about **6×**, against the 1.3× the full
 preload is largely region-independent work, so leaving it in place hides most of the distance
 penalty behind something slower than the penalty.
 
-**For a reader, then:** fetch the saved config, turn preload off, keep everything else.
+**For a reader using this package, it is one keyword:**
+
+```python
+repo = open_global_repo(
+    "s3://tessera-embeddings/v1.1/dclimate.icechunk",
+    region="us-west-2", anonymous=True, preload_manifests=False,
+)
+session = repo.readonly_session(branch="main")
+```
+
+`preload_manifests=False` zeroes the preload budget and changes nothing else — manifest splitting,
+timeouts and retries all stay as the writer set them. Anything that WRITES must leave it on, which
+is why it is a reader's opt-out rather than a new default: the preload exists so a fill does not
+re-fetch manifests it is about to write into, and there it earns its keep.
+
+**For a consumer not using this package**, the same thing by hand:
 
 ```python
 import icechunk
@@ -291,10 +306,10 @@ storage = icechunk.s3_storage(
     bucket="tessera-embeddings", prefix="v1.1/dclimate.icechunk",
     region="us-west-2", anonymous=True,
 )
-config = icechunk.Repository.fetch_config(storage)
+config = icechunk.Repository.fetch_config(storage)      # start from what the STORE saved
 config.manifest = icechunk.ManifestConfig(
     preload=icechunk.ManifestPreloadConfig(max_total_refs=0, max_arrays_to_scan=0),
-    splitting=config.manifest.splitting,
+    splitting=config.manifest.splitting,                 # keep the rest
 )
 repo = icechunk.Repository.open(storage, config=config)
 ```
@@ -303,7 +318,8 @@ repo = icechunk.Repository.open(storage, config=config)
 `Repository.open` replaces what the store saved rather than layering onto it, so building one to
 change a single setting silently reverts every other. This document made that mistake once while
 being written: an arm meant to differ only in its chunk cache also reverted the preload, and the
-open time moved for the wrong reason.
+open time moved for the wrong reason. The one-keyword form above avoids the trap by construction —
+it builds the whole config from the same function the writer used, with one field changed.
 
 ### 4.4 Against what scoping predicted
 

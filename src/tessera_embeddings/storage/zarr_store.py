@@ -633,20 +633,37 @@ _GLOBAL_PRELOAD_MAX_ARRAYS = 2400
 _GLOBAL_PRELOAD_MAX_REFS = 1_000_000
 
 
-def global_store_config() -> icechunk.RepositoryConfig:
+def global_store_config(*, preload_manifests: bool = True) -> icechunk.RepositoryConfig:
     """RepositoryConfig for the 120-group global store (ADR-008 D4/D5).
 
     Layers on :func:`_default_repo_config` (timeouts + retries): manifest split **time@1**,
     one manifest per year per array so a year fill rewrites only that year's, plus preload
     tuning so coordinate manifests across all 120 groups are preloaded. Persist with
     ``repo.save_config()`` on create so re-opens and forked workers inherit it.
+
+    **``preload_manifests=False`` is for READERS, and it is the difference between a 2.7-second
+    open and a 0.2-second one.** The preload exists so a FILL does not re-fetch manifests it is
+    about to write into; against a 120-group, nine-year repository it is seconds of work that a
+    reader pays on every open and gets nothing back for — point latency, region throughput and
+    bytes on the wire are all unchanged without it. Measured both in-region and cross-region in
+    ``context_docs/storage/reading-the-published-store.md`` §4.3. Anything that writes should leave
+    it on.
+
+    Manifest SPLITTING is kept in both cases: it describes how the manifests already on disk are
+    laid out, so it is not a reader's to switch off.
     """
     config = _default_repo_config()
     config.manifest = icechunk.ManifestConfig(
         splitting=_manifest_splitting_config({"time": 1}),
-        preload=icechunk.ManifestPreloadConfig(
-            max_arrays_to_scan=_GLOBAL_PRELOAD_MAX_ARRAYS,
-            max_total_refs=_GLOBAL_PRELOAD_MAX_REFS,
+        preload=(
+            icechunk.ManifestPreloadConfig(
+                max_arrays_to_scan=_GLOBAL_PRELOAD_MAX_ARRAYS,
+                max_total_refs=_GLOBAL_PRELOAD_MAX_REFS,
+            )
+            if preload_manifests
+            # Zeroed rather than None: None means "use icechunk's own default", which preloads
+            # something, and the point here is to preload nothing.
+            else icechunk.ManifestPreloadConfig(max_arrays_to_scan=0, max_total_refs=0)
         ),
     )
     return config

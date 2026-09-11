@@ -427,3 +427,54 @@ class TestMonthCoordinate:
     def test_the_seeded_month_axis_is_not_a_departure(self, seeded):
         group = zarr_store.open_store_as_zarr_group(seeded, group="01N")
         assert not any("month" in d for d in published_store.coordinate_departures(group, _ZONE))
+
+
+class TestPreloadManifestsFlag:
+    """The one keyword a reader should change, and the writer's default it must not disturb."""
+
+    def test_the_default_keeps_the_writers_preload(self):
+        preload = zarr_store.global_store_config().manifest.preload
+        assert preload is not None
+        assert preload.max_arrays_to_scan > 0
+        assert preload.max_total_refs > 0
+
+    def test_disabling_it_zeroes_the_budget_rather_than_unsetting_it(self):
+        # Zeroed, not None: None means "use icechunk's own default", which preloads something, and
+        # the whole point is to preload nothing.
+        preload = zarr_store.global_store_config(preload_manifests=False).manifest.preload
+        assert preload is not None
+        assert preload.max_arrays_to_scan == 0
+        assert preload.max_total_refs == 0
+
+    def test_manifest_splitting_survives_either_way(self):
+        # Splitting describes how the manifests already on disk are laid out, so it is not a
+        # reader's to switch off — and building a fresh config to change the preload is exactly how
+        # it would get dropped by accident.
+        on = zarr_store.global_store_config().manifest.splitting
+        off = zarr_store.global_store_config(preload_manifests=False).manifest.splitting
+        assert on is not None
+        assert repr(off) == repr(on)
+
+    def test_the_timeouts_and_retries_survive_either_way(self):
+        on = zarr_store.global_store_config()
+        off = zarr_store.global_store_config(preload_manifests=False)
+        assert repr(off.storage) == repr(on.storage)
+
+    def test_open_global_repo_forwards_the_flag(self, monkeypatch):
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            global_store.icechunk.Repository,
+            "open",
+            staticmethod(lambda storage, config=None: captured.update(config=config) or object()),
+        )
+        monkeypatch.setattr(global_store, "_create_storage", lambda *a, **k: object())
+        global_store.open_global_repo("s3://bucket/prefix", preload_manifests=False)
+        preload = captured["config"].manifest.preload
+        assert preload.max_arrays_to_scan == 0
+
+    def test_creating_a_store_is_unaffected_by_the_reader_flag(self, tmp_path):
+        # `create_global_repo` must keep the writer's preload whatever a reader asks for — it takes
+        # no such argument, and this pins that the two call sites did not get wired together.
+        repo = global_store.create_global_repo(str(tmp_path / "w.icechunk"))
+        preload = repo.config.manifest.preload
+        assert preload.max_arrays_to_scan > 0
