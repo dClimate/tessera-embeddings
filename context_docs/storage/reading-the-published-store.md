@@ -419,9 +419,15 @@ tile, with no exceptions in either direction.
 
 That includes 33N/2017, where only 7,982 of the 8,593 evaluated tiles are embedded. The 611-tile
 shortfall is land that was imaged and then wholly refused by the depth rule, and the store and the
-registry put the same 7,982 coordinates on it from opposite directions. It is the strongest
-evidence available that the registry is a faithful convenience layer rather than a second,
-drifting source of truth.
+registry put the same 7,982 coordinates on it from opposite directions.
+
+**The refused half is checked too, against a different array.** A tile that was imaged and then
+wholly refused holds observation counts and no embeddings, so `s2_obs_count`'s shard set is an
+independent record of it — and every tile in 33N/2017 that has counts without embeddings appears
+in the registry as a not-embedded row. Without that, deleting every `embedded=False` row would
+leave the embedded comparison untouched and the audit would still say the two agree. Together the
+two directions are the strongest evidence available that the registry is a faithful convenience
+layer rather than a second, drifting source of truth.
 
 **Row counts differ between the two, and both are right.** 3,247,410 registry rows against
 3,229,545 shards holding embeddings: the difference, 17,865, is tiles that were evaluated and

@@ -281,7 +281,12 @@ def main(argv: list[str] | None = None) -> int:
     present = sorted(k for k, _ in root.groups())
     missing_groups = sorted(set(EXPECTED_ZONES) - set(present))
     unexpected_groups = sorted(set(present) - set(EXPECTED_ZONES))
-    zones = present if args.zones == "all" else args.zones.split(",")
+    # A full audit walks the EXPECTED zones that are present, not everything the root holds. An
+    # auxiliary or corrupt extra group has no `time` array, so sending it through `_zone_report`
+    # raises while decoding the calendar — and the census then never prints its reconciliation,
+    # never writes its JSON, and never returns the non-zero status the extra group had earned. The
+    # extras are already reported as `unexpected_groups`.
+    zones = [z for z in present if z in set(EXPECTED_ZONES)] if args.zones == "all" else args.zones.split(",")
     if absent := sorted(set(zones) - set(present)):
         parser.error(f"the store has no group(s) {absent}; it holds {len(present)}")
     print(f"store:     {args.uri} ({args.region})")

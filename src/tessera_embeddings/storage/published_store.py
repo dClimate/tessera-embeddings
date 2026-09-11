@@ -133,7 +133,14 @@ def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[s
         # reader gets conflicting dimension lengths — or silently loses the coverage off the end.
         for axis, dim in enumerate(expected.dims):
             coord = present.get(dim)
-            if coord is not None and coord.ndim == 1 and coord.shape[0] != array.shape[axis]:
+            if coord is None:
+                continue  # already reported above, from `missing_seeded_arrays`
+            if coord.ndim != 1:
+                # A coordinate of the wrong rank cannot index ANY dimension. Skipping the check
+                # here is how it would otherwise satisfy every audit — the name exists, so
+                # `missing_seeded_arrays` is happy — while no labelled reader can use it.
+                out.append(f"{var}: coordinate {dim} has {coord.ndim} dimensions, a coordinate must have one")
+            elif coord.shape[0] != array.shape[axis]:
                 out.append(f"{var}: dimension {dim} is {array.shape[axis]}, its coordinate array is {coord.shape[0]}")
     return out
 
@@ -182,6 +189,9 @@ def coordinate_departures(group: zarr.Group, spec: ZoneSpec) -> list[str]:
             out.append(f"{name}: absent, so its grid cannot be checked")
             continue
         actual = cast("zarr.Array", array)
+        if actual.ndim != 1:
+            out.append(f"{name}: has {actual.ndim} dimensions, a coordinate axis must have one")
+            continue
         if actual.shape[0] != expected.size:
             out.append(f"{name}: has {actual.shape[0]} values, the zone grid defines {expected.size}")
             continue

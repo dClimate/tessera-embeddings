@@ -98,6 +98,41 @@ def _parts(fs: pyarrow.fs.FileSystem, root: str) -> list[dict[str, Any]]:
     return out
 
 
+#: The campaign's preallocated time axis. A partition key outside it names a cell the store has no
+#: slot for, however well-formed the part under it is.
+CAMPAIGN_YEARS = tuple(range(2017, 2026))
+
+#: The three refusal reasons `refused_px` is the sum of. Mirrored from the registry module so this
+#: check and the writer name the same three.
+_REFUSAL_REASONS = ("refused_no_optical_px", "refused_thin_px", "refused_no_radar_px")
+
+
+def _refusals_add_up(row: dict[str, Any]) -> bool:
+    """Whether ``refused_px`` equals the sum of its three reason columns.
+
+    True when any of the four is null, because null means "not measured" and a comparison against
+    an unmeasured total asserts something nobody recorded. Only rows carrying all four are checked.
+    """
+    total = row.get("refused_px")
+    parts = [row.get(reason) for reason in _REFUSAL_REASONS]
+    if total is None or any(part is None for part in parts):
+        return True
+    return int(total) == sum(int(part) for part in parts)
+
+
+def _rows_with_null_bbox(fs: pyarrow.fs.FileSystem, prefix: str, year: int) -> list[str]:
+    """Tiles in ``year`` whose bounding box has a null component, so no area query can find them."""
+    import pyarrow.compute as pc
+    import pyarrow.dataset as ds
+
+    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=dataset_schema())
+    missing = pc.field("bbox_west").is_null()
+    for field in ("bbox_south", "bbox_east", "bbox_north"):
+        missing = missing | pc.field(field).is_null()
+    table = dataset.to_table(filter=(pc.field("year") == year) & missing, columns=["zone", "tile"])
+    return sorted(f"{r['zone']}/{r['tile']}" for r in table.to_pylist())
+
+
 def _siblings(fs: pyarrow.fs.FileSystem, root: str) -> list[str]:
     """Names of everything sitting directly under the registry root, ``parts`` included."""
     from pyarrow.fs import FileSelector
@@ -196,9 +231,21 @@ def _aoi_query(
     # LATEST RUN PER TILE, for the same reason the store cross-check needs it: a refill leaves the
     # original part in place, so a tile filled twice would be counted twice here and its refused
     # pixels added together — inflating the very answer a consumer came for.
-    rows = list(_latest_per_tile(table.to_pylist()).values())
+    raw = table.to_pylist()
+    rows = list(_latest_per_tile(raw).values())
     embedded = [r["embedded"] for r in rows]
     refused = [r["refused_px"] for r in rows if r["refused_px"] is not None]
+    # Malformed timestamps have to reach the REPORT, not just the dedupe. `_latest_per_tile` orders
+    # such a row last, so a malformed newer refill loses to its stale predecessor — and an
+    # AOI-only run would otherwise print a plausible answer built on the wrong rows and exit 0.
+    bad_stamps = sorted({str(r["tile"]) for r in rows if r.get("assembled_at_unparsable")})
+    # A null bounding box makes every Arrow comparison in the filter above evaluate to null, so the
+    # row is dropped from EVERY area query — silently undercounting the coverage this dataset
+    # exists to report. The schema permits null, which is why it has to be checked rather than
+    # assumed.
+    null_bbox = _rows_with_null_bbox(fs, prefix, year)
+    # `refused_px` is defined as the sum of the three reason columns, and nothing else checks it.
+    inconsistent = [r["tile"] for r in rows if not _refusals_add_up(r)]
     return {
         "aoi": list(aoi),
         "year": year,
@@ -209,6 +256,9 @@ def _aoi_query(
         "tiles_embedded": sum(1 for v in embedded if v),
         "tiles_not_embedded": sum(1 for v in embedded if not v),
         "refused_px_total": sum(refused),
+        "rows_with_unparsable_assembled_at": bad_stamps[:10],
+        "rows_with_a_null_bounding_box": null_bbox[:10],
+        "rows_whose_refusal_reasons_do_not_sum": inconsistent[:10],
         "note": "antimeridian zones 01/60 are not handled by this overlap test",
     }
 
@@ -305,6 +355,12 @@ def _verify_against_store(
         stamps = group["time"][:]
         calendar = _calendar_years(stamps)
         coverage = published_store.live_shards(session, zone)
+        # Shards holding OBSERVATION COUNTS, which is a different question from shards holding
+        # embeddings. A tile that was imaged and then wholly refused has counts and no embeddings,
+        # so this is the only independent record of the refused half of the registry — without it,
+        # deleting every `embedded=False` row would leave the embedded-tile comparison unchanged
+        # and the audit would still say "agrees".
+        observed = published_store.live_shards(session, zone, "s2_obs_count")
         table = dataset.to_table(
             filter=pc.field("zone") == zone,
             columns=["year", "embedded", "tile", "refused_px", "run_id", "assembled_at"],
@@ -322,6 +378,14 @@ def _verify_against_store(
             # and summing them all would count a two-run cell's tiles twice against a store that
             # holds one shard each, reporting a correct cell as a disagreement. `assembled_at` is
             # the clock the registry provides for exactly this decision; a run id is not one.
+            # Duplicates WITHIN one run, before latest-wins hides them. Cross-run duplication is
+            # by design; the same `(run_id, tile)` twice is not, and a consumer reading the Parquet
+            # directly gets both rows and doubles that tile's coverage and refusal counts.
+            within_run: dict[tuple[str, str], int] = {}
+            for row in all_rows:
+                key = (str(row["run_id"]), str(row["tile"]))
+                within_run[key] = within_run.get(key, 0) + 1
+            duplicated = sorted(f"{run}/{tile}" for (run, tile), n in within_run.items() if n > 1)
             registry_rows = list(_latest_per_tile(all_rows).values())
             # The COORDINATES, not the count. One embedded tile missing and one wrongly marked
             # embedded leaves the cardinalities equal, and a registry whose whole job is to say
@@ -331,6 +395,15 @@ def _verify_against_store(
                 _tile_coordinate(r["tile"]) for r in registry_rows if r["embedded"] and _tile_coordinate(r["tile"])
             }
             store_tiles = coverage.get(time_index, frozenset()) if time_index is not None else frozenset()
+            observed_tiles = observed.get(time_index, frozenset()) if time_index is not None else frozenset()
+            refused_tiles = {
+                _tile_coordinate(r["tile"]) for r in registry_rows if not r["embedded"] and _tile_coordinate(r["tile"])
+            }
+            # A tile with observation counts and no embeddings was evaluated and refused, so the
+            # registry must carry a not-embedded row for it. The converse does NOT hold: a tile
+            # refused for having no imagery at all has no counts either, which is why this is a
+            # subset test and not an equality.
+            unrecorded_refusals = sorted((observed_tiles - store_tiles) - refused_tiles)
             unparsed_tiles = sorted({r["tile"] for r in registry_rows if not _tile_coordinate(r["tile"])})
             bad_stamps = sorted({str(r["tile"]) for r in registry_rows if r.get("assembled_at_unparsable")})
             findings.append(
@@ -348,8 +421,11 @@ def _verify_against_store(
                     "in_registry_only": sorted(registry_tiles - store_tiles)[:20],
                     "in_store_only": sorted(store_tiles - registry_tiles)[:20],
                     "tiles_disagreeing": len(registry_tiles ^ store_tiles),
+                    "refused_tiles_the_registry_omits": unrecorded_refusals[:20],
                     "unparsable_tile_labels": unparsed_tiles[:10],
                     "unparsable_assembled_at": bad_stamps[:10],
+                    "duplicated_within_a_run": duplicated[:10],
+                    "refusal_reasons_do_not_sum": [r["tile"] for r in registry_rows if not _refusals_add_up(r)][:10],
                 }
             )
     return findings
@@ -397,11 +473,19 @@ def main(argv: list[str] | None = None) -> int:
     unparsed = [
         part["path"]
         for part in parts
-        if part["zone"] is None or part["year"] is None or part["zone"] not in zone_grid.ZONES
+        if part["zone"] is None
+        or part["year"] is None
+        or part["zone"] not in zone_grid.ZONES
+        or part["year"] not in CAMPAIGN_YEARS
     ]
     cells: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for part in parts:
-        if part["zone"] is None or part["year"] is None or part["zone"] not in zone_grid.ZONES:
+        if (
+            part["zone"] is None
+            or part["year"] is None
+            or part["zone"] not in zone_grid.ZONES
+            or part["year"] not in CAMPAIGN_YEARS
+        ):
             continue
         cells.setdefault((part["zone"], part["year"]), []).append(part)
     refilled = {f"{z}/{y}": len(v) for (z, y), v in sorted(cells.items()) if len(v) > 1}
@@ -465,8 +549,14 @@ def main(argv: list[str] | None = None) -> int:
         query = report["aoi_query"]
         print(f"\narea-of-interest query ({args.aoi}, {args.aoi_year}): {query['wall_s']}s")
         print(
-            f"  tiles overlapping {query['tiles_overlapping']}, embedded {query['tiles_embedded']}, "
-            f"not embedded {query['tiles_not_embedded']}, refused px {query['refused_px_total']:,}"
+            f"  tiles overlapping {query['tiles_overlapping']} in zones {query['zones_overlapping']}, "
+            f"embedded {query['tiles_embedded']}, not embedded {query['tiles_not_embedded']}, "
+            f"refused px {query['refused_px_total']:,}"
+        )
+        print(
+            f"  rows with an unparsable timestamp {len(query['rows_with_unparsable_assembled_at'])}, "
+            f"a null bounding box {len(query['rows_with_a_null_bounding_box'])}, "
+            f"refusal reasons that do not sum {len(query['rows_whose_refusal_reasons_do_not_sum'])}"
         )
 
     disagreements: list[dict[str, Any]] = []
@@ -482,6 +572,9 @@ def main(argv: list[str] | None = None) -> int:
                 finding["tiles_disagreeing"] == 0
                 and not finding["unparsable_tile_labels"]
                 and not finding["unparsable_assembled_at"]
+                and not finding["duplicated_within_a_run"]
+                and not finding["refusal_reasons_do_not_sum"]
+                and not finding["refused_tiles_the_registry_omits"]
             )
             # A cell holding data and NOT marked complete is the half-published state this audit
             # records `marked_complete` to catch: a fill that wrote its shards and its registry
@@ -518,6 +611,15 @@ def main(argv: list[str] | None = None) -> int:
     # own metadata contradicts its partition path carries two conflicting identities, and a part
     # holding a column the schema does not declare means the writer and this checker disagree about
     # the schema — automation exiting 0 on either has accepted a registry it should not have.
+    aoi = report.get("aoi_query", {})
+    aoi_broken = any(
+        aoi.get(key)
+        for key in (
+            "rows_with_unparsable_assembled_at",
+            "rows_with_a_null_bounding_box",
+            "rows_whose_refusal_reasons_do_not_sum",
+        )
+    )
     audit = report.get("schema_audit", {})
     broken = any(
         audit.get(key)
@@ -528,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
             "parts_whose_metadata_disagrees_with_its_path",
         )
     )
-    return 1 if (unparsed or broken or disagreements) else 0
+    return 1 if (unparsed or broken or disagreements or aoi_broken) else 0
 
 
 if __name__ == "__main__":
