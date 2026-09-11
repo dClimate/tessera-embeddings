@@ -126,7 +126,7 @@ most often: which optical-depth line a cell was held to, and which model wrote i
 | how you say where | a boolean grid you make, at pixel resolution | a prepared coverage store, at 2048-pixel tile resolution |
 | time period | **any 12 months**, ending in the month you choose | **calendar years only**, January to December |
 | output | one store per area, one entry per window | one store for the world, one entry per zone per year |
-| scale | one machine, one GPU or a few | dozens of machines, hundreds of GPUs, days of running |
+| scale | one machine, one GPU or a few | **around 2,500 single-GPU machines**, days of running |
 | you run it | yourself, when you want | as a campaign, with restart and recovery machinery |
 
 \* A **UTM zone** is one of 60 north–south strips the world is divided into for mapping, each six
@@ -279,10 +279,10 @@ free and instant compared with computing anything.
 >
 > The authority is each zone group's `years_complete` attribute. Note that the store is an
 > Icechunk repository, so you open it through a session rather than by handing the URI straight to
-> xarray:
+> Zarr or xarray:
 >
 > ```python
-> import xarray as xr
+> import zarr
 > from tessera_embeddings.storage.global_store import open_global_repo
 >
 > repo = open_global_repo(
@@ -290,9 +290,15 @@ free and instant compared with computing anything.
 >     region="us-west-2", anonymous=True, preload_manifests=False,
 > )
 > session = repo.readonly_session(branch="main")
-> ds = xr.open_zarr(session.store, group="33N", consolidated=False, decode_coords="all")
-> print(ds.attrs["years_complete"])      # the years you can read
+> zone = zarr.open_group(session.store, mode="r")["33N"]
+> print(zone.attrs["years_complete"])      # the years you can read
 > ```
+>
+> **Ask Zarr for this rather than xarray.** You want one line of metadata, not data, and
+> `xr.open_zarr` insists on describing every array in the zone before it will show you an
+> attribute — millions of pieces for a zone this size, four times the wait and eight times the
+> memory. Use xarray when you actually want the embeddings, as the
+> [README example](../README.md#reading-a-zone-group-xarray) does.
 >
 > **You do not need an AWS account to run this.** The bucket's policy grants anyone read access,
 > and `anonymous=True` is what makes the library send an unsigned request, so the whole example
@@ -316,12 +322,14 @@ not have, and you have the infrastructure for it. It is a large, long, expensive
 operational machinery; [`context_docs/campaign/campaign-plan.md`](../context_docs/campaign/campaign-plan.md)
 describes what that involves and
 [`context_docs/campaign/campaign-cost-model.md`](../context_docs/campaign/campaign-cost-model.md)
-records what the last one cost.
+estimates what one costs. Read that as a planning model rather than a bill: it was written before
+the campaign ran, and what the completed run actually cost is still being written up.
 
 ## Where to go next
 
 - [`quickstart.md`](quickstart.md) — the single-area path, end to end, on a laptop
-- [`configuration.md`](configuration.md) — every setting, including the mask and window parameters
+- [`configuration.md`](configuration.md) — the configuration objects and what each field does,
+  including the time window
 - [top-level README](../README.md#the-global-embeddings-store) — how the global store is laid out
 - [`context_docs/decisions/008-global-store-architecture.md`](../context_docs/decisions/008-global-store-architecture.md)
   — why the global store is shaped the way it is

@@ -499,8 +499,16 @@ from tessera_embeddings.storage.global_store import open_global_repo
 
 repo = open_global_repo("s3://<bucket>/global/tessera.icechunk")
 session = repo.readonly_session(branch="main")
-ds = xr.open_zarr(session.store, group="33N", consolidated=False, decode_coords="all")
+ds = xr.open_zarr(session.store, group="33N", consolidated=False, decode_coords="all",
+                  chunks=None)
 ```
+
+`chunks=None` matters on a global zone. Without it xarray hands back Dask-backed
+arrays, and a zone is large enough that the graph describing one runs to millions
+of chunks — reading a single pixel through it costs seconds and gigabytes, against
+a fifth of a second and no measurable memory with `chunks=None`. The same advice,
+and why, is in
+[`inference/README.md`](src/tessera_embeddings/inference/README.md#write-units-vs-read-units-per-layout).
 
 ```
 <xarray.Dataset>

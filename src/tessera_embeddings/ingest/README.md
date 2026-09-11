@@ -15,7 +15,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 - [When a read fails](#when-a-read-fails)
 - [Where a resumed run starts](#where-a-resumed-run-starts)
 - [Performance Optimizations](#performance-optimizations)
-- [Authentication (EDL / OPERA data)](#authentication-edl-opera-data)
+- [Authentication (EDL / OPERA data)](#authentication-edl--opera-data)
 - [OPERA-Specific Query Quirks](#opera-specific-query-quirks)
 - [Accessing the Dask Dashboard](#accessing-the-dask-dashboard)
 
@@ -36,15 +36,15 @@ behind these choices — what was measured, and what was tried and abandoned —
 | `asset_locations.py` | Where an item's assets live, keeping two questions apart: whether the read is cheap (the bucket's REGION) and whether the offset is already removed (the PRODUCER). `AssetSources` reports the keys it could not resolve instead of dropping them. |
 | `duplicates.py` | Chooses between duplicate catalogue items for one tile-date, which Element 84 publishes whenever a granule is reprocessed. Rejected copies are kept as a fallback. [§ Choosing between duplicate copies of a tile-date](#choosing-between-duplicate-copies-of-a-tile-date) |
 | `loader_failures.py` | Keeps what a failed load knows — which object, and why — neither of which reaches the caller on its own. One `install_capture_everywhere` call covers every current and future worker. [§ When a source object will not read](#when-a-source-object-will-not-read) |
-| `auth.py` | Earthdata Login for ASF-hosted OPERA data: S3 direct access on roughly hourly credentials, plus legacy signed URLs. Renewal is timer-driven, because the credentials expire on their own clock. [§ Authentication (EDL / OPERA data)](#authentication-edl-opera-data) |
+| `auth.py` | Earthdata Login for ASF-hosted OPERA data: S3 direct access on roughly hourly credentials, plus legacy signed URLs. Renewal is timer-driven, because the credentials expire on their own clock. [§ Authentication (EDL / OPERA data)](#authentication-edl--opera-data) |
 | `transforms.py` | Post-load lazy Dask transforms. Currently `amplitude_to_db`. [§ OPERA RTC-S1 Amplitude-to-dB Conversion](#opera-rtc-s1-amplitude-to-db-conversion) |
 | `roi.py` | ROI utilities: read an existing Zarr ROI store, rasterise a GeoJSON polygon to a boolean mask on a UTM grid, load Sentinel-2 tile footprints. [§ Generating an ROI](#generating-an-roi) |
 | `roi_processing.py` | Higher-level ROI helpers used by the `generate_roi` flow. |
-| `source_coverage.py` | Optical preflight: does the catalogue publish anything reaching a zone's live land in this window, answered before any cluster is provisioned. Three-valued — only a positive finding of absence refuses. [§ Zone ingestion (the global campaign) — ADR-011](#zone-ingestion-the-global-campaign-adr-011) |
+| `source_coverage.py` | Optical preflight: does the catalogue publish anything reaching a zone's live land in this window, answered before any cluster is provisioned. Three-valued — only a positive finding of absence refuses. [§ Zone ingestion (the global campaign) — ADR-011](#zone-ingestion-the-global-campaign--adr-011) |
 | `catalogue_refusal.py` | Tells a catalogue that is BUSY apart from one that cannot serve this REQUEST, and names the request either way. [§ When the catalogue refuses: naming the request, and telling the two refusals apart](#when-the-catalogue-refuses-naming-the-request-and-telling-the-two-refusals-apart) |
 | `live_windows.py` | Derives the chunk-aligned live windows every ingest loads and writes, and narrows them per date to the land that date's imagery reaches. [§ Cropping to live windows (unconditional)](#cropping-to-live-windows-unconditional) |
 | `_http.py` | Shared HTTP helpers for catalogue and granule queries: retries that log each attempt, calls the caller can abandon, and a guard for replies that claim success but are not JSON. |
-| `_pipeline.py` | A prepare/consume pipeline with a look-ahead depth, so the next item is prepared while the current one is consumed. Buys buffering, never concurrency. [§ Pipelining a date's preparation (`pipeline_dates`)](#pipelining-a-dates-preparation-pipelinedates) |
+| `_pipeline.py` | A prepare/consume pipeline with a look-ahead depth, so the next item is prepared while the current one is consumed. Buys buffering, never concurrency. [§ Pipelining a date's preparation (`pipeline_dates`)](#pipelining-a-dates-preparation-pipeline_dates) |
 
 ---
 

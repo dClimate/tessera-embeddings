@@ -221,7 +221,7 @@ import icechunk, xarray as xr
 
 repo    = icechunk.Repository.open(icechunk.s3_storage(bucket=..., prefix=...))
 session = repo.readonly_session(branch="main")          # or snapshot_id=<a tag's snapshot>
-ds      = xr.open_zarr(session.store, group="33N", consolidated=False)
+ds      = xr.open_zarr(session.store, group="33N", consolidated=False, chunks=None)
 
 # One pixel's 128-d vector, dequantized. Two small reads, one chunk each.
 px = ds.isel(time=8, northing=500_000, easting=30_000)
