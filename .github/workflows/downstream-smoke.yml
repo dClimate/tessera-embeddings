@@ -52,14 +52,27 @@ jobs:
       - name: Install the dependent project against this pull request's tessera_embeddings
         run: |
           cd downstream
-          # --system: setup-uv installs only uv, so there is no virtual environment here and
-          # `uv pip` refuses to touch the interpreter without being told to.
-          uv pip install --system -r dev.lock
-          # Override the pinned tessera_embeddings with the checkout above. This must come
-          # AFTER the lock file, or the lock reinstalls the pinned release over it and the
-          # suite tests the last release instead of this pull request.
-          uv pip install --system ../tessera_embeddings
+          # An EXPLICIT virtual environment, and every later command aimed at it by path.
+          # `setup-uv` installs only uv, so without this there is no environment for
+          # `uv pip` to target; and `uv run` would discover the downstream project and
+          # sync an environment of its own, which would quietly reinstall the PINNED
+          # tessera_embeddings over the checkout below. The suite would then pass while
+          # testing the last release, which is the one outcome this workflow must not have.
+          uv venv .venv
+          uv pip install --python .venv/bin/python -r dev.lock
+          # AFTER the lock file: the lock pins tessera_embeddings, so installing the
+          # checkout first would let the lock overwrite it.
+          uv pip install --python .venv/bin/python ../tessera_embeddings
+          # Prove the override took. A silent fallback to the pinned release is the whole
+          # risk here, so fail loudly now rather than report a meaningless pass later.
+          # `direct_url.json` (PEP 610) is the oracle: pip and uv write it for a path
+          # install and not for one resolved from an index, so it distinguishes the
+          # checkout from the pinned release. The module's __file__ cannot — a
+          # non-editable install copies into site-packages either way.
+          .venv/bin/python -c "import importlib.metadata as m, sys; r = m.distribution('tessera_embeddings').read_text('direct_url.json'); print('tessera_embeddings installed from:', r); sys.exit(0 if r and 'file://' in r else 'NOT the checkout - the lock pinned release won')"
       - name: Run the dependent project's fast suite
         run: |
           cd downstream
-          uv run pytest tests/unit tests/architecture -n auto --tb=short
+          # `.venv/bin/python -m pytest`, not `uv run`: no project discovery, no sync, so
+          # this is certainly the environment the step above built.
+          .venv/bin/python -m pytest tests/unit tests/architecture -n auto --tb=short
