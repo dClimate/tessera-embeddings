@@ -9,6 +9,25 @@ Generate per-pixel (10m^2) TESSERA satellite embeddings at any scale. Ports the 
 cloud-native, distributed architecture that runs on any major cloud —
 or on a laptop (slowly).
 
+## Contents
+
+- [What this is](#what-this-is)
+- [One area, or the whole world](#one-area-or-the-whole-world)
+- [What this isn't](#what-this-isnt)
+- [Installation](#installation)
+- [Quickstart](#quickstart)
+- [Running at scale](#running-at-scale)
+- [Architecture](#architecture)
+- [The global embeddings store](#the-global-embeddings-store)
+- [The test that proves decoupling](#the-test-that-proves-decoupling)
+- [What's in here](#whats-in-here)
+- [Documentation](#documentation)
+- [Downstream consumers](#downstream-consumers)
+- [Contributing](#contributing)
+- [License](#license)
+- [Acknowledgments](#acknowledgments)
+
+---
 ## What this is
 
 A Python library for:

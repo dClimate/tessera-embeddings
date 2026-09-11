@@ -38,6 +38,18 @@ orchestration/prefect/
     └── land_mask.py                 # build / verify / validate coverage (no-cluster steps)
 ```
 
+## Contents
+
+- [Global campaign (120 UTM zones)](#global-campaign-120-utm-zones)
+- [Master pipeline](#master-pipeline)
+- [Individual flows](#individual-flows)
+- [Deliberate fault injection (supervised drills only)](#deliberate-fault-injection-supervised-drills-only)
+- [The two-flow pattern](#the-two-flow-pattern)
+- [Task shells](#task-shells)
+- [Provider selection](#provider-selection)
+- [Running](#running)
+
+---
 ## Global campaign (120 UTM zones)
 
 The global 10 m embeddings campaign (ADR-008) has its own four flows, distinct
@@ -377,7 +389,7 @@ hooks then clean up after.
 > assembly) lives in the domain modules. See
 > [`ingest/README.md`](../../ingest/README.md#background-how-dask-task-graphs-consume-scheduler-ram)
 > for the scheduler-RAM cost model that drives those choices, and
-> [`inference/README.md`](../../inference/README.md#three-layer-chunk-anatomy)
+> [`inference/README.md`](../../inference/README.md#1-chunk-enumeration-and-roi-pre-filter)
 > for the assembly-side equivalent.
 
 ## Deliberate fault injection (supervised drills only)
