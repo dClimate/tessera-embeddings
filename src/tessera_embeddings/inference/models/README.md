@@ -34,9 +34,11 @@ bit-identical). Re-fetch instructions are in that file's header.
 | Output normalisation | none | trailing non-affine `LayerNorm` → per-pixel mean 0 / std 1 |
 | Checkpoint payload | `{"model_state"/"model_state_dict": …}` + FSDP/compile prefixes + training heads → `strict=False` | `{"model": state_dict, "args": {...}}`, clean → `strict=True` |
 | Band stats | MPC/AWS split (`norm_source`) | one fixed set; `norm_source` rejected |
+| Resampling rule | `build_resample_indices` | `build_resample_indices_v2` (upstream `_pad_pattern`) — the bucket SCHEDULE is shared, the index selection is not |
+| Fusion | `concat` or `sum` | `concat` only, refused at config time |
 | Checkpoint artifact | `tessera_v1_1_{aws,mpc}_encoder.pt` | `student_large.pt` from `geotessera/TESSERA-V-2.0-2B-L` (`ckpt/student_large.pt`, 175 MB) |
 
-Both versions share the same input contract (S2 = 10 bands in upstream order,
+Both versions share the same input *contract* (S2 = 10 bands in upstream order,
 S1 = VV/VH merged with per-orbit normalisation, raw integer DOY 1–365, the
 {8,16,…,256} bucket schedule) and the same runtime wrapper,
 `MultimodalBTInferenceModel` — its parameter names (`s2_backbone`,
@@ -45,6 +47,13 @@ upstream v2's `PixelStudent.encode`, so a v2 checkpoint loads into it
 `strict=True` and it is not duplicated in `student_v2.py`. Reusing it also keeps
 the dual-CUDA-stream backbone execution and the profiling hooks for both
 versions.
+
+The shared bucket schedule is a shared *contract*, not shared preprocessing: a
+pixel with `k` valid observations lands in the same bucket under either version,
+but the indices chosen to fill that bucket come from the version's own rule (see
+the table above and `../README.md` §4c). Anything comparing two models' outputs
+has to treat the selection as model-specific — the boundary is drawn in
+`context_docs/inference/validating-a-model-change.md` §2.
 
 `builder._fuse_custom_gru` is a v1.1-only optimisation and is skipped for v2:
 there is no GRU in the v2 graph (so also none of the reset-gate approximation

@@ -47,11 +47,12 @@ def build_resample_indices_v2(valid_len: int, target_size: int) -> np.ndarray:
     **A different algorithm from v1.1's, not a refinement of it.** It reproduces upstream v2's
     ``_pad_pattern`` (``tessera_infer_v2/student/infer.py``), which is the padding the v2 student
     was trained under, and it disagrees with :func:`build_resample_indices` on almost every
-    inexact count — 1,163 of the 1,188 (count, bucket) pairs across this pipeline's 32 bucket
-    sizes. For ``n=5, B=8`` v1.1 appends ``[1, 2, 3]`` and v2 appends ``[1, 3, 4]``; downsampling
-    differs everywhere. Feeding v2 the v1.1 pattern gives the model an observation sequence its
-    training contract never produced, and nothing downstream can detect it — the tensor is the
-    right shape and dtype either way.
+    inexact count: for ``n=5, B=8`` v1.1 appends ``[1, 2, 3]`` and v2 appends ``[1, 3, 4]``, and
+    downsampling differs everywhere. Feeding v2 the v1.1 pattern gives the model an observation
+    sequence its training contract never produced, and nothing downstream can detect it — the
+    tensor is the right shape and dtype either way. How far apart the two rules are is counted in
+    ``context_docs/inference/validating-a-model-change.md`` §2, which is also where the
+    consequence for cross-model validation is drawn.
 
     Three details are load-bearing and reproduce upstream exactly rather than approximately:
 

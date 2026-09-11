@@ -69,8 +69,23 @@ def assert_run_id_matches_model(run_id: str | None, model_version: ModelVersion)
 
     Enforced at every boundary that reuses staging rather than only where the run_id is minted:
     the flow's guard protects the flow's callers, and this protects everyone else.
+
+    ``None`` means "nothing staged yet" and is permitted; an id that was SUPPLIED but is empty or
+    blank is refused. The distinction used to be a truthiness test, which read ``""`` as absent and
+    waved it through — while ``"   "``, meaning exactly the same thing, was refused as unprefixed.
+    An empty id is the one value that cannot record an encoder while still naming a staging
+    namespace, so it is the one value that must not be mistaken for "no id".
     """
-    if run_id and staged_by_v2(run_id) != (model_version != "v1.1"):
+    if run_id is None:
+        return
+    if not run_id.strip():
+        raise ValueError(
+            f"run_id={run_id!r} is empty, so it records no encoder and namespaces no staging: every "
+            f"run passing one stages into the same place, and a later run of the OTHER model reads "
+            f"those tiles as its own already-staged work. Mint it as "
+            f"run_id_prefix({model_version!r}) + <uuid>."
+        )
+    if staged_by_v2(run_id) != (model_version != "v1.1"):
         staged = "v2" if staged_by_v2(run_id) else "v1.1"
         # Both causes are named because they cannot be told apart from here, and that is the
         # whole reason the prefix exists: an id carries the encoder or nothing does. Saying only
@@ -388,6 +403,20 @@ S1_ORBIT_NONE = "none"
 # Embedding output dimension saved to the store. v1.1 produces 192-D reps and we
 # save the first 128; v2 Large produces 128-D natively (Matryoshka-ordered), so
 # the slice is a no-op there.
+#: How the two backbone representations are combined, as implemented by
+#: :meth:`~tessera_embeddings.inference.models.ssl_model.MultimodalBTInferenceModel.forward`.
+#: Listed here because ``InferenceConfig`` is where the value is SET, and the forward pass is
+#: inside a Ray actor: left unchecked at construction, an unknown method survived config
+#: validation, sized the dim-reducer for one backbone instead of two, loaded a checkpoint, and
+#: only then raised — once per batch, on a provisioned fleet.
+FUSION_METHODS: frozenset[str] = frozenset({"concat", "sum"})
+
+#: The only fusion the v2 students were distilled with. Their published ``dim_reducer`` takes the
+#: concatenated pair, so "sum" is not a slower variant of the same model — it is a different graph
+#: that the checkpoint cannot load into.
+V2_FUSION_METHOD = "concat"
+
+
 EMBEDDING_DIM = 128
 
 # Internal model representation dimension (before the 128-D slice) — v1.1.
@@ -629,7 +658,10 @@ class InferenceConfig:
             num_encoder_layers: Transformer encoder layer count.
             dim_feedforward: Transformer FFN hidden dim.
             dropout: Dropout rate (zeroed at inference, kept for arch compat).
-            fusion_method: "concat" or "sum" for combining S2/S1 representations.
+            fusion_method: How the S2/S1 representations are combined — one of
+                :data:`FUSION_METHODS`. ``"v2-large"`` accepts only
+                :data:`V2_FUSION_METHOD`; the published student's reducer is shaped
+                for the concatenated pair, so nothing else loads.
             num_obs_checkpoints: Sorted bucket sizes for the all-obs sampler.
 
         Inference:
@@ -837,6 +869,23 @@ class InferenceConfig:
             raise ValueError(
                 f"norm_source={self.norm_source!r} does not apply to model_version={self.model_version!r}: "
                 "v2 students hard-code a single set of band statistics. Leave norm_source unset."
+            )
+
+        # HERE, not at model construction. Both of these are decided by this object alone — no
+        # checkpoint, no cluster, nothing a worker discovers — and model construction happens
+        # inside a Ray actor, so enforcing them there charges a deterministic config error the
+        # full price of provisioning a fleet and downloading a checkpoint first. The unknown-method
+        # case was worse than late: it raised in the FORWARD pass, per batch, after a reducer had
+        # already been sized for the wrong number of backbones.
+        if self.fusion_method not in FUSION_METHODS:
+            valid = ", ".join(repr(k) for k in sorted(FUSION_METHODS))
+            raise ValueError(f"Invalid fusion_method: {self.fusion_method!r}. Must be one of {valid}.")
+        if self.model_version != "v1.1" and self.fusion_method != V2_FUSION_METHOD:
+            raise ValueError(
+                f"fusion_method={self.fusion_method!r} does not apply to "
+                f"model_version={self.model_version!r}: the v2 students were distilled with "
+                f"{V2_FUSION_METHOD!r} fusion and their published dim_reducer is shaped for the "
+                f"concatenated pair, so the checkpoint would not load. Leave fusion_method unset."
             )
 
         self._apply_arch_defaults()

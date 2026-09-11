@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 import fsspec
 import torch
 
-from tessera_embeddings.config.inference import MODEL_ARCHS
+from tessera_embeddings.config.inference import MODEL_ARCHS, V2_FUSION_METHOD
 
 from .modules import CustomGRU, TemporalAwarePooling, V11TransformerEncoder
 from .ssl_model import MultimodalBTInferenceModel, build_dim_reducer
@@ -155,8 +155,17 @@ def _build_v2_inference_model(config: InferenceConfig, device: torch.device) -> 
             enable_qk_norm=enable_qk_norm,
         )
 
-    if config.fusion_method != "concat":
-        msg = f"v2 students are trained with concat fusion; got fusion_method={config.fusion_method!r}"
+    # Second gate, not the first. `InferenceConfig.__post_init__` refuses this at construction,
+    # which is where a deterministic config error belongs — this one runs inside a Ray actor, so
+    # reaching it means a fleet was already paid for. It is kept because the config is a MUTABLE
+    # dataclass: a caller that reassigns `config.fusion_method` after construction bypasses the
+    # first gate entirely, and the failure it would otherwise cause is a reducer sized for one
+    # backbone loading a checkpoint shaped for two.
+    if config.fusion_method != V2_FUSION_METHOD:
+        msg = (
+            f"v2 students are distilled with {V2_FUSION_METHOD!r} fusion; got "
+            f"fusion_method={config.fusion_method!r} (set after InferenceConfig validation?)"
+        )
         raise ValueError(msg)
 
     return MultimodalBTInferenceModel(

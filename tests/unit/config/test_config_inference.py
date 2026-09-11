@@ -179,6 +179,61 @@ def test_allow_s2_only_defaults_off() -> None:
     assert _minimal_config(allow_s2_only=True).allow_s2_only is True
 
 
+# ── validated where it is SET, because where it is USED is inside a Ray actor ──
+
+
+def test_an_unknown_fusion_method_is_refused_at_construction() -> None:
+    """It used to reach the FORWARD pass. Config accepted any string, `_build_inference_model`
+    read `== "concat"` to decide how many backbones the dim-reducer spans — so an unknown method
+    silently sized it for one — the checkpoint then loaded, and `MultimodalBTInferenceModel.forward`
+    raised "Unknown fusion method" once per batch, on a provisioned fleet.
+
+    The cost of being late is the whole point: this is decided by the config object alone, with no
+    checkpoint and no cluster consulted, so there is nothing to learn by waiting.
+    """
+    with pytest.raises(ValueError, match="Invalid fusion_method"):
+        _minimal_config(fusion_method="bogus")
+    assert _minimal_config(fusion_method="concat").fusion_method == "concat"
+    assert _minimal_config(fusion_method="sum").fusion_method == "sum", "v1.1 still accepts both"
+
+
+def test_v2_refuses_a_fusion_it_was_not_distilled_with() -> None:
+    """v2 supports only concat, and that was enforced only in `_build_v2_inference_model` — which
+    runs remotely. A public `run_inference` caller therefore paid for Ray actors and a checkpoint
+    download before a deterministic configuration error surfaced as an actor-init failure.
+    """
+    with pytest.raises(ValueError, match="does not apply to model_version"):
+        _minimal_config(model_version="v2-large", fusion_method="sum")
+    # The supported combination still builds, and v1.1 is untouched either way.
+    assert _minimal_config(model_version="v2-large").fusion_method == "concat"
+    assert _minimal_config(model_version="v2-large", fusion_method="concat").fusion_method == "concat"
+
+
+def test_every_per_model_table_covers_every_model_version() -> None:
+    """`model_version` is validated against MODEL_ARCHS alone, so a version added there and
+    forgotten in one of the sibling tables passes config validation and fails later — a
+    KeyError inside an actor, or a wrong figure, depending on which table was missed.
+
+    Asserted as one set comparison rather than per table: the defect is a version that is in
+    some of them, and the tables are only meaningful together.
+    """
+    from tessera_embeddings.config.inference import (
+        MODEL_ARCHS,
+        MODEL_ENCODER_URLS,
+        MODEL_EST_PX_PER_SEC,
+    )
+    from tessera_embeddings.inference.sampling import _CACHED_RESAMPLERS, _RESAMPLERS
+
+    versions = set(MODEL_ARCHS)
+    for name, table in (
+        ("MODEL_ENCODER_URLS", MODEL_ENCODER_URLS),
+        ("MODEL_EST_PX_PER_SEC", MODEL_EST_PX_PER_SEC),
+        ("sampling._RESAMPLERS", _RESAMPLERS),
+        ("sampling._CACHED_RESAMPLERS", _CACHED_RESAMPLERS),
+    ):
+        assert set(table) == versions, f"{name} does not cover the same versions as MODEL_ARCHS"
+
+
 def test_an_explicitly_empty_norm_source_is_refused_not_defaulted() -> None:
     """`or "aws"` accepted every falsy value and silently selected AWS statistics.
 

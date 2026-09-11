@@ -398,9 +398,22 @@ concatenation (in both versions) so that the model sees per-orbit statistics, no
 > both orbits correct and preferred, in contrast to v1 where the two orbits shared
 > normalisation statistics.
 
-`build_resample_indices` handles under-sampled pixels (fewer valid timesteps than the
-bucket target) via deterministic repeat-padding — last valid timestep is duplicated until
-target is reached. Over-sampled pixels are uniformly sub-sampled.
+**The padding/subsampling rule is per-model, and only the bucket schedule is shared.** Which
+bucket a pixel lands in is the same under both versions (`num_obs_checkpoints`); which
+observations fill it is not. `resampler_for(model_version)` selects the rule:
+
+- **v1.1** — `build_resample_indices`. Under-sampled pixels (fewer valid timesteps than the
+  bucket target) get deterministic repeat-padding; over-sampled pixels are uniformly
+  sub-sampled.
+- **v2-large** — `build_resample_indices_v2`, which reproduces upstream v2's `_pad_pattern`.
+  It disagrees with v1.1's indices on almost every inexact count, so it is a different
+  algorithm rather than a variant of the same one.
+
+`MosaicChunkInferenceDataset` takes `model_version` and threads it through, because the two
+rules produce tensors of identical shape and dtype — a dataset left on the default would feed
+v2 a sequence it was never trained on with nothing downstream able to object. The disagreement
+is measured in `context_docs/inference/validating-a-model-change.md` §2, which also draws the
+consequence for validating a store across a model change.
 
 #### 4d. GPU Forward Pass (`inference.py`)
 

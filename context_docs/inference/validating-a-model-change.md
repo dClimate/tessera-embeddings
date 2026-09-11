@@ -34,19 +34,41 @@ The invariant that survives a model swap is that **only the model changed**. So 
 model-independent must match the reference exactly, while the values must not match at all. The gate
 asserts both halves, then judges the values on structure rather than on agreement.
 
-**Where that boundary actually falls.** It is not "the encoder" — it sits one stage earlier, at band
-standardisation. Selection, geometry and sampling are shared: the mosaic reads, the SCL validity
-mask and per-pixel validity gate, the observation counts, the band order, the `{8,16,…,256}` bucket
-schedule, and the raw integer DOY are identical code driven by identical config for both models
-(`MODEL_ARCHS["v2-large"]` overrides only the architecture fields — it does not touch
-`num_obs_checkpoints`). Standardisation is *deliberately* model-specific: `band_stats(model_version,
-norm_source)` returns v2's single hard-coded set for v2 and the AWS/MPC set for v1.1. So the
-normalised tensors the encoder consumes differ between the two models even for byte-identical input
-pixels, and requiring them to match would assert something false.
+**Where that boundary actually falls, and it is earlier than "the encoder".** Two stages before it
+are model-specific, not one, and an earlier draft of this document got that wrong — it called
+sampling shared, which would send a reader chasing a preprocessing difference through the encoder or
+the normalisation, where it is not.
 
-Hence the exact-match half of the gate is scoped to the shared stages above — which is precisely why
-applying the wrong statistics is a *blind spot* the structural checks have to cover, not something
-the exact-match half catches.
+*Shared, and so exact-match testable:* the mosaic reads, the SCL validity mask and per-pixel
+validity gate, the observation counts, the band order, the raw integer DOY, and the `{8,16,…,256}`
+bucket **schedule** — a pixel with `k` valid observations lands in the same bucket under either
+model, because `MODEL_ARCHS["v2-large"]` overrides only the architecture fields and does not touch
+`num_obs_checkpoints`.
+
+*Model-specific, and so NOT:*
+
+* **Which observations fill that bucket.** The schedule is shared; the index selection is not.
+  `MosaicChunkInferenceDataset` passes `model_version` into the resamplers, and v2 dispatches to
+  `build_resample_indices_v2` — a different algorithm from v1.1's, not a refinement of it. Over
+  the reachable population (`compute_bin_keys` clips a count to the smallest checkpoint at or
+  above it, so the pairs a bucket can actually receive are counts 1..B for each of the 32
+  buckets: 4,224 pairs) the two rules select **different indices for 4,128 of them — 97.7%**,
+  agreeing on only 96. So two runs over byte-identical pixels hand their encoders different
+  observation sequences, at the same shape and dtype.
+
+  > *Withdrawn:* `build_resample_indices_v2`'s docstring claimed "1,163 of the 1,188 (count,
+  > bucket) pairs". That figure reproduces under no enumeration of this pipeline's buckets —
+  > counts 1..B give 4,224 pairs, the parity test's wider 1..2B sweep gives 8,448 — so it was
+  > removed from the docstring rather than carried forward. The 4,128/4,224 above was measured
+  > by enumerating both resamplers directly.
+* **Band standardisation.** `band_stats(model_version, norm_source)` returns v2's single
+  hard-coded set for v2 and the AWS/MPC pair for v1.1, so the normalised tensors differ too.
+
+Requiring either of those to match would assert something false. Hence the exact-match half of the
+gate is scoped to the shared list above and stops at the bucket schedule — which is precisely why
+**both** of the model-specific stages are *blind spots* the structural checks have to cover. A wrong
+padding rule and a wrong statistic set are the same shape of mistake: a correctly-shaped tensor the
+encoder accepts, carrying a sequence its training contract never produced.
 
 ### The blind spot that motivates the structural checks
 
@@ -54,10 +76,10 @@ v2's `dim_reducer` ends in a **non-affine LayerNorm**. That layer forces every o
 0 / unit standard deviation *regardless of what it is fed*.
 
 So "the vectors are well formed" proves nothing about the encoder's input. The most plausible
-v2-specific mistake — applying v1.1's band statistics instead of v2's hard-coded set, or permuting
-band order — would produce vectors that pass every numeric check while carrying no information.
-Checks 4 through 7 in the script exist solely to close that gap, and they test structure, which
-survives the two models occupying unrelated coordinate spaces.
+v2-specific mistake — applying v1.1's band statistics instead of v2's hard-coded set, resampling
+with v1.1's padding rule, or permuting band order — would produce vectors that pass every numeric
+check while carrying no information. Checks 4 through 7 in the script exist solely to close that
+gap, and they test structure, which survives the two models occupying unrelated coordinate spaces.
 
 ## 3. Calibration — the ceiling
 
