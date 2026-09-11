@@ -1533,7 +1533,8 @@ land cells published.
    **10.21 PiB** at the end of 08-30 and **9.63 PiB** at the end of 08-31, and a daily average
    belongs between a falling day's endpoints, which 10.02 is. (Inputs alone peak at **9.97 PiB**,
    staging at 0.466 PiB.) Mosaics are deleted per cell after publication, so peak resident badly
-   understates total volume moved.
+   understates total volume moved: the campaign wrote **14.04 PB** of mosaics in all — 12.47 PiB,
+   1.25× the 9.97 PiB it ever held at once. §12c measures it.
 
    > **CORRECTED 2026-09-11, and it was two errors compounding.** This read "about 9.33 PiB
    > resident — within 6% of the 9.97 PiB peak". The 9.33 converted AWS's storage "GB" as 10⁹
@@ -1645,6 +1646,92 @@ chunks rather than the 96-hour window §6b sampled, or a per-pixel token basis t
 processed figure by. Neither is in this PR. **Until one exists, quote 173 only as the number the
 model divides by, never as a measured property of the imagery.**
 
+### 12c. Total volume ingested — 14.04 PB of mosaics, counted object by object
+
+Peak resident storage answers *what did we hold*, which is the storage bill. It does not answer
+*what did we move*, which is what ingest and inference actually did. The two differ by a factor of
+1.25 here — 12.47 PiB written against a 9.97 PiB peak — because a cell's mosaic is deleted as soon
+as inference has consumed it. Compare the two only in the same unit: 14.04 PB against 9.97 PiB
+looks like 1.4×, and that is the decimal-versus-binary trap this document has already fallen into
+once (§12, item 2).
+
+**The campaign wrote 14,039,127,147,659,618 bytes of mosaics — 14.04 PB, or 12.47 PiB — as
+1,235,101,063 objects averaging 11.4 MB.** The delivered store is 1.60 PB, so the campaign
+**ingested 8.8 bytes of imagery for every byte of embedding it published.**
+
+The read side is not separately measured — that bucket had no S3 request metrics configured — but
+992 of the 994 ingested cells published with data, and a mosaic exists only for tiles that get
+embedded, so the fleet read back essentially all of it. Treat the input bucket as having carried
+about 28 PB in and out, and treat the second half of that as inferred.
+
+| array | objects | volume | cells | per cell |
+|---|---|---|---|---|
+| `reflectance.zarr` (optical) | 1,103,006,328 | **11.50 PB** | 994 | 11.57 TB |
+| `sar_descending.zarr` | 69,759,305 | 1.35 PB | 865 | 1.56 TB |
+| `sar_ascending.zarr` | 62,335,430 | 1.19 PB | 817 | 1.46 TB |
+| **all mosaics** | **1,235,101,063** | **14.04 PB** | **994** | **14.12 TB** |
+
+Radar is missing from 129 and 177 cells respectively. That is §6's coverage story rather than a
+loss — `allow_s2_only` embeds optical-only land.
+
+**994 cells were ingested and 992 published with data, so there was almost no re-ingestion**
+despite two relaunches. A relaunch reused staged inference instead of rebuilding mosaics, which is
+exactly what pinning `staging_code_identity` was for.
+
+**Rates.** The first mosaic byte landed 2026-08-06 23:12Z and the last 2026-09-10 01:02Z, but 97%
+of the volume moved in the twelve days from 08-21 to 09-01.
+
+| window | volume | rate |
+|---|---|---|
+| bulk span, 08-21 → 09-01 | 13.60 PB | 1.13 PB/day = 13.1 GB/s |
+| peak day, 08-27 | 2.55 PB | 29.6 GB/s |
+| peak hour, 08-21 21:00Z | 159 TB | 44.2 GB/s |
+
+**Ingest finished well before publication did.** 99.96% of the mosaic volume had landed by
+2026-09-03 and the last cell published on 2026-09-11, so this campaign's tail was inference and
+assembly, never input. §5 reaches the same conclusion from card hours; this reaches it from
+bytes, and the two share no instrument.
+
+**Against the plan, 2.5× low.** [`campaign-plan.md`](campaign-plan.md) §1 budgeted 5.6 PB of
+mosaics across 1,008 zone-years, about 5.6 TB a cell, against a measured 14.12 TB. The plan does
+not record how its figure was derived, so the gap cannot be attributed to any single assumption.
+It is, however, the mechanism behind transient storage coming in 24× over model, and the largest
+unflagged miss in the whole document.
+
+#### How it was measured
+
+S3 Inventory ran daily on both buckets from 2026-08-06 with `Size` and `LastModifiedDate`, in
+Parquet — and **the inputs bucket held 232 MB until 2026-08-06**, of which 231 MB is the model
+checkpoint and the rest coverage manifests, code and two region outlines. None of it is under
+`mosaics/`, so those snapshots cover the entire life of the mosaic data. The script checks that
+rather than assuming it, and checks it as a share of the measured total rather than against zero —
+232 MB is 0.0000017% of what followed. [`scripts/diagnostic/campaign_volume_audit.py`](../../scripts/diagnostic/campaign_volume_audit.py)
+builds an Athena table over the 36 snapshots and counts each object once.
+
+Three things make this a measurement rather than an estimate.
+
+- **Two methods agree to the byte.** Deduplicating on `(key, last_modified_date)` across every
+  snapshot gives 14,039,127,147,659,618 bytes. Taking, for each clock hour, the most that any one
+  snapshot ever saw written in that hour gives the identical total. The first is exact and
+  expensive, the second cheap and robust to inventory lag, and they fail in different directions.
+- **It reconciles with CloudWatch.** Summing a snapshot's sizes reproduces `BucketSizeBytes` for
+  the matching day to within 0.002%: 11,229.347 TB from the 08-31 snapshot against 9.974 PiB at the
+  end of 08-30.
+- **The arithmetic closes.** The three array totals sum to the whole-bucket total, and nothing
+  outside `mosaics/` accounts for more than a rounding error.
+
+**What it can miss, and by how little.** An object written and deleted entirely between two 01:00Z
+snapshots is invisible to all of this. Mosaic residency was days rather than hours — the bucket
+climbed to 10 PiB and took nine days to drain — so the window is narrow, and the naive
+per-day-window query that is vulnerable to it returned 13.94 PB against the dedupe's 14.04 PB,
+which bounds the effect at 0.7%.
+
+**Staging is NOT measured here.** The outputs bucket's inventory was filtered to a prefix the
+staged tiles did not use, and its request metrics recorded nothing, so the only instruments left
+are its daily size series — whose positive increments floor staged writes at 0.72 PB — and the fact
+that everything staged was assembled into the 1.60 PB store. Treat staging as 1 to 1.6 PB and do
+not quote it as measured.
+
 ### Method, and what these figures are not
 
 **These are list prices applied to measured usage. They are not a bill.** Cost Explorer's cost
@@ -1706,10 +1793,11 @@ separately; it is recorded here because the campaign paid for it.
 - **It does not extrapolate to a larger fleet.** Everything here is measured at a peak of 1,307
   cards. Whether 2,500 cards would hold 85.4% of basis is untested, and §5's headline of 5.1 days
   assumes 2,500 cards at 100% of basis, which nothing has ever observed.
-- **It cannot split storage between the mosaics and the staged tiles.** The $73,180 covers both,
-  and per-bucket cost allocation is not enabled. Bucket-size metrics say the mosaics dominate — a
-  9.97 PiB peak on 2026-08-30 against 0.466 PiB of staging on 09-08 — so the line is overwhelmingly
-  the cost of holding input imagery, but the split is inferred rather than billed.
+- **It cannot split storage COST between the mosaics and the staged tiles.** The $73,180 covers
+  both, and per-bucket cost allocation is not enabled. The volumes are now known — 14.04 PB of
+  mosaics written, against a staging total that can only be bounded at 1 to 1.6 PB (§12c) — and the
+  peaks are 9.97 PiB of mosaics against 0.466 PiB of staging, so the line is overwhelmingly the
+  cost of holding input imagery. The dollar split remains inferred rather than billed.
 - **It does not price the restarts separately.** The campaign was relaunched twice, on 2026-08-31
   and 2026-09-09. Their cost is inside every total above; what a clean single-pass run would have
   cost is not measurable from here.

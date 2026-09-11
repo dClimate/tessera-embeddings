@@ -13,7 +13,7 @@ just a number in a document. Lifting figures out of the context that qualified t
 several of the entries below happened in the first place.
 
 What this file adds is the thing proximity cannot give: **the pattern.** Individually each
-withdrawal reads as bad luck. Grouped, eight mechanisms account for all of them, most
+withdrawal reads as bad luck. Grouped, nine mechanisms account for all of them, most
 recur across documents that never cite each other, and one document caught itself
 repeating a single mistake three times without noticing the same mistake in its
 neighbours.
@@ -347,11 +347,33 @@ withdrawn, search every document for the number and for the phrase, not just for
 section you were editing. Both instances above would have been caught by searching for the
 figure itself.
 
+### 9. A figure published without its derivation, which nothing could then check
+
+Newest class, and the only one whose entries can survive a whole programme. A number with its
+working attached can be re-derived and argued with; a bare number can only be believed or
+measured, and if nothing measures it, it is believed.
+
+- **"5.6 PB of mosaics, ~5.6 TB a zone-year."** The transient input volume the campaign was
+  designed around, and the basis of its ~$3,000 storage line. Measured object by object from S3
+  Inventory once the campaign closed: **14.04 PB, 14.12 TB a cell — 2.5× the estimate**, and the
+  mechanism behind storage costing 24× its modelled line. Because the plan never recorded how
+  5.6 TB was reached, the gap cannot be attributed to any single assumption, which is the whole
+  cost of the omission: the figure cannot even be debugged. Withdrawn in
+  [`campaign/campaign-plan.md`](campaign/campaign-plan.md) §1; measured in
+  [`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12c.
+- **An OPEN instance: the 4.6 GiB low end of the inference VRAM range.** It appears with no
+  measurement behind it and no note of where it came from. It has not been withdrawn, because
+  nobody can yet say whether it is right.
+
+**The cure is one line of provenance, not a longer derivation** — the input geometry, the run it
+came from, or the words "estimated, unmeasured". The last of those would have been enough here:
+an estimate that announces itself gets checked, and this one was not checked for three months.
+
 ---
 
 ## Before publishing a figure
 
-Distilled from the eight above. Each line exists because skipping it cost a withdrawal.
+Distilled from the nine above. Each line exists because skipping it cost a withdrawal.
 
 1. **Name the conditions** — zone, width, dates, season, fleet state. If you are comparing,
    diff both sides' conditions first.
@@ -364,6 +386,9 @@ Distilled from the eight above. Each line exists because skipping it cost a with
 5. **How many points?** Two cannot fit two parameters, and one region is not a curve.
 6. **Is the mechanism measured or assumed?** "Unexplained" is an acceptable answer.
 7. **Where else does this number appear?** Grep for it before you finish.
+8. **Can a reader re-derive it?** Give the working, the run it came from, or the word
+   "estimated". A bare number cannot be checked, and an unchecked estimate survives until
+   something expensive disagrees with it.
 
 ## Why the withdrawals stay in place
 

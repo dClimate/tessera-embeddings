@@ -80,6 +80,14 @@ once is `cells in flight × ~5.6 TB` rather than the whole 5.6 PB (5.6 PB over 1
 zone-years). Run sequentially, that full volume is held at once and storage alone becomes about
 **$128,000 a month** instead of ~$3,000.
 
+> **WITHDRAWN 2026-09-11: the mosaic volume was 2.5× this.** The campaign wrote **14.04 PB** of
+> mosaics, 14.12 TB a cell, counted object by object from S3 Inventory — see
+> [`campaign-cost-model.md`](campaign-cost-model.md) §12c. The design argument above survives
+> unchanged and in fact strengthens, since staging the two phases avoided holding 14 PB rather
+> than 5.6 PB; only the figure is wrong. This plan does not record how 5.6 TB a cell was derived,
+> so the gap is not attributable to any one assumption. It is the mechanism behind transient
+> storage costing 24× its modelled line.
+
 > **The three stages are also UNGATED with respect to each other, and that was a measured
 > correction** (PR #149, 2026-08-26). The campaign asked for 60 concurrent ingests and **ran 7**,
 > with the configuration correct all along: the fleet-wide Prefect gate never engaged, because two
