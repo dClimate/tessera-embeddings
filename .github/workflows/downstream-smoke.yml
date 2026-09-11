@@ -50,9 +50,11 @@ jobs:
       - name: Install the dependent project against this pull request's tessera_embeddings
         run: |
           cd downstream
-          # Replace the pinned tessera_embeddings with the checkout above.
-          uv pip install ../tessera_embeddings
           uv pip install -r dev.lock
+          # Override the pinned tessera_embeddings with the checkout above. This must come
+          # AFTER the lock file, or the lock reinstalls the pinned release over it and the
+          # suite tests the last release instead of this pull request.
+          uv pip install ../tessera_embeddings
       - name: Run the dependent project's fast suite
         run: |
           cd downstream
