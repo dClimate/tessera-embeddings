@@ -53,6 +53,19 @@ that was entirely an artefact.
   own. (`ingest/ingest-performance.md` §5)
 - Plus, by that investigation's own count, three more of its six corrections: zone in one,
   keep threshold in another, generalising a single zone in a third.
+- **The assembly crossover "near 158 actors at 16 workers, near 383 at 32."** Published as the
+  replacement for the withdrawn 275-actor ceiling, in the same section that had just written *"re-
+  derive it from a matched pair before quoting it."* It divides **37N**'s inference rate by
+  **48N**'s assembly rate — the two cells are 2.5× apart on inference. On 48N's own inference the
+  16-worker crossover is near **394**. The campaign's 250-actor shape sits between 158 and 394, so
+  **nothing measured places it on either side of the line**, and a docstring had gone on to offer a
+  505-cell publication day as evidence that it sat above one. What survives is the part that holds
+  on every basis: 100 actors is under every crossover, and widening the pool raises every
+  crossover — the latter mechanically rather than measurably, since the two assembly rates the
+  ratio uses are themselves from different cells. **The correction for an unmatched comparison is not a different unmatched
+  comparison.**
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c,
+  `tests/unit/inference/test_gpu_starvation.py`)
 - **The assembly pool's "2.92 GiB per worker at both sizes", and the peaks it was built from.**
   Read from the CloudWatch metric `Maximum` over `{ClusterName, TaskDefinitionFamily}`, where
   **each statistic is aggregated across tasks independently** — so the unlisted condition was
@@ -87,6 +100,15 @@ Consulting it would have caught the season error in one minute. It was not consu
 - **"`t_kept` 145 remains a defensible planning figure."** 145 is a combined census figure
   and `t_kept` is optical, so "inside the observed 57–158 range" compared quantities in
   different units. (`inference/inference-on-gpus.md`, correction 4)
+- **"About 9.33 PiB resident — within 6% of the 9.97 PiB peak measured independently."** Two unit
+  errors in one reconciliation. The 9.33 converted AWS's storage "GB" as 10⁹ bytes, where for S3
+  storage AWS means 2³⁰ — the figure is **10.02 PiB**, 7.4% higher. And it compared a billing
+  *daily average* against a bucket-metric *maximum*, on a different day, over one of the two
+  buckets billing covers. The offered explanation for the 6% gap, "billing covers every bucket",
+  pointed the wrong way: adding the second bucket raises the independent figure and widens the gap
+  it was meant to close. Corrected, the two instruments agree to **1.0%** — which is the result the
+  reconciliation existed to produce, and which the wrong units hid.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
 - **Pixels per second versus tokens per second.** The cluster-sizing note's wall-clock and
   GPU-hour columns rested on a px/s figure measured over one region; inference cost scales with
   tokens, and px/s is a property of the pipeline *and the geography it ran over*. Those columns are
@@ -99,6 +121,23 @@ instrument self-check — the same optical quantity computed two ways. Radar is 
 census's 143 tokens, so had `t_kept` included radar the two could not have agreed at all.
 **They agreed *because* both were optical.** An agreement that a hypothesis predicts should
 be impossible is evidence against the hypothesis, not for it.
+
+- **"The token estimate of 2.36 × 10¹⁵ came in at 2.353 × 10¹⁵, within 0.3% — the census work
+  behind §6 was sound."** The same false reassurance, in the same document, from the opposite
+  direction: here the two sides agreed because they *are* the same arithmetic. The model's estimate
+  is roster pixels × 173 tokens per pixel; the "measured" figure is delivered pixels × the same
+  173. Their ratio is the completion rate and nothing else — on the final census, 99.96%, so the
+  two now agree to 0.04%. **Nothing in the campaign measured token depth**, because no instrument
+  counts tokens; every per-card figure in §12 divides a modelled numerator by a measured
+  denominator, which is useful for planning and is not a throughput measurement. The store carries
+  the per-cell observation counts that would settle it, and they have not been read.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
+
+- **"62% of the fleet is the cheaper card."** A share by *instantaneous count*, quoted where the
+  cost argument needs a share by *card-hours*; by hours it is **57.2%**. The two are different
+  measurements of a fleet whose composition changes hour to hour, and only one of them multiplies
+  against a price.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
 
 ### 3. Presence counted where coverage was meant
 
@@ -126,6 +165,33 @@ are different questions, and a percentage that does not say which is not yet a f
   and **0.1–32.1°** complete, and its radar depth 146.8 partial against **89.9** complete.
   ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c; originally recorded in
   a since-deleted working note, in git history)
+
+- **Three of the campaign cost model's §12 figures, all taken on 2026-09-02 while the campaign
+  was a third done.** "The whole campaign will cost **$555,000**" became **$828,364** measured;
+  "the ingest containers use 964 of 25,000 vCPU, **under 4%**" became a **73% peak** on 08-27,
+  because the reading was taken after the heavy ingest had finished; and "**83%** of single-card
+  basis" became **85.4%**, because it multiplied a snapshot fleet count by an elapsed period
+  instead of using the billed hours. The pattern is one reading, taken mid-campaign, phrased as a
+  property of the campaign.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
+
+- **And then the replacement for those figures was itself taken too early — a second time, on the
+  same document, eight days later.** §12's outturn was measured on 2026-09-10 at 22:50Z, with the
+  campaign essentially finished, and published as final. It was not: Cost Explorer trails real
+  time, and had reported only about **60% of that day's graphics-card hours**. The campaign total
+  **$816,901** is really **$828,364**; card-hours 354,742 are really 360,282; "86.6% of basis" is
+  **85.4%**. The section had *named* the trailing day as a risk and then sized it as "well under
+  1%" without measuring it — it was 1.4%, which at fleet width is a whole shift of 1,300 cards.
+  **A campaign being over is not the same as its instrument having finished reporting.** Close a
+  cost window on a day the instrument has settled, never on the current one.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
+
+- **"Per-chunk cost varies 7× by zone."** The 7× included a 0.029 reading that the very next
+  sentence rejected as a partial-resumption artefact — resumed tiles cost nothing and drag a leg's
+  average down. The uncontaminated spread is **2.2×**. Sizing a spread with a figure you have just
+  declared invalid overstates sustainable variation, and it weakened the fleet-sizing conclusion it
+  was meant to support.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §5)
 
 **A partial run's whole-cell summary is biased, not merely imprecise** — the chunks that
 have finished are not a random sample of the cell, because scheduling order correlates with
@@ -177,6 +243,14 @@ one stratification flipped the sign of the conclusion.
   as well: nothing measured bounds a third pool size.
   ([`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md))
 
+- **The assembly-concurrency margin of 1.10×, and the 275-actor ceiling and ten-cluster split
+  derived from it.** A ratio of two modelled values on one cell, used to locate a crossover and
+  then to choose a fleet shape. Both terms were later re-measured at 1.7–2.6× their modelled
+  values — the same cell's assembly took **5.78 h** against the 3.28 h the ratio assumed — so the
+  crossover had no supported location. The campaign then ran **25 clusters of 100**, testing
+  neither the cap nor the split.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c, §10)
+
 **The cure:** a two-parameter model needs a third point before it is a model, and a curve
 needs enough points to show it is monotonic before one of them becomes a recommendation.
 **Two points agreeing is not evidence when both come from the same broken instrument.**
@@ -192,6 +266,19 @@ needs enough points to show it is monotonic before one of them becomes a recomme
   the estimate reached `docs/configuration.md`, `docs/prefect-setup.md`, the storage record and two
   test docstrings, and the public guidance was the last of them to be corrected.
   ([`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md))
+- **The campaign cost model's two smallest lines, "S3 requests ~$1,600" and "transient mosaic
+  storage ~$3,000."** Neither was ever measured; the outturns are **$26,311** and **$73,180**, 16×
+  and 24× low, and together $95,000. The storage estimate even names the sensitivity that broke it
+  — "if inference lags, it grows linearly with the backlog" — and then does not size it. An
+  estimate small enough to skip re-deriving is exactly the one nobody checks.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §7, §12)
+- **"$17,576 for an icechunk reproduction box."** A real line of spend — 1,545 `c8gn.48xlarge`
+  hours — attributed to the only large non-campaign activity anyone remembered, without asking the
+  instances what they were. They are the isolated VPC's three NAT instances; the reproduction work
+  ran on a different instance type, of which the account records no usage in the window. The
+  *quantity* survives and the *cause* did not. **An expensive line deserves the API call that
+  identifies it.**
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
 - **"Assembly is CPU-bound."** Asserted from utilisation, which shows the processor is busy at
   moments, not that it is the constraint that binds the rate of work — while Fargate publishes no
   per-task network allowance, so the competing candidate was never measurable from outside. The
@@ -242,6 +329,19 @@ one most likely to recur, because it is invisible to whoever makes it.
 - The ingest record notes the same failure independently: *"it has been violated twice by
   leaving an old number in one section while correcting it in another."*
 
+- **The 1.10× withdrawal was struck in one paragraph and left running the document.** Review of
+  the correcting change found the withdrawn crossover still sizing clusters at "≤275 each" in §5's
+  active table and still choosing "10 clusters of 250" in §10's action list, and the invalidated
+  per-zone cost still multiplying every fleet size by a single 289.2 GPU-hour average. Three
+  reviewers raised it across two rounds before it was swept. **The strike-through is not the
+  withdrawal; the grep is.**
+- **A related one, found only by the campaign finishing: §5's durations assumed a fleet nobody had
+  committed to.** Every table read "if the fleet is 2,500 actors at full basis", and none said how
+  wide the fleet would actually be. It averaged 961. The arithmetic was sound — fed the measured
+  work and rate it reproduces its own answer — so the miss was an unstated input, not a wrong
+  calculation, which is the hardest kind to grep for.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §5, §12)
+
 **The cure is a grep, and it is the cheapest item in this file:** when a figure is
 withdrawn, search every document for the number and for the phrase, not just for the
 section you were editing. Both instances above would have been caught by searching for the
@@ -257,7 +357,9 @@ Distilled from the eight above. Each line exists because skipping it cost a with
    diff both sides' conditions first.
 2. **Name the unit** — optical or combined tokens; per pixel or per zone; pixels or tokens
    per second.
-3. **Is the run finished?** If not, do not report a whole-cell figure from it at all.
+3. **Is the run finished — and has the instrument finished reporting it?** Those are two
+   questions. Do not report a whole-cell figure from a live run at all, and do not close a billing
+   window on a day the billing system is still filling in.
 4. **What else moves with this variable?** Stratify before reporting a correlation.
 5. **How many points?** Two cannot fit two parameters, and one region is not a curve.
 6. **Is the mechanism measured or assumed?** "Unexplained" is an acceptable answer.
