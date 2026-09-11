@@ -23,10 +23,14 @@ FOUR ASSUMPTIONS THAT WOULD SILENTLY CORRUPT THE ANSWER, each guarded below:
   against its own tiers. A campaign this size priced at the first tier is overstated.
 * The most recent day or two is incomplete, because Cost Explorer trails real time. The last
   day in the data is reported so it is not read as a fall in activity.
-* Anything with no price entry is EXCLUDED and printed, so a reader sees what the total omits
-  rather than assuming it is everything.
+* Anything with no price entry is EXCLUDED and printed IN FULL, with no quantity threshold.
+  A threshold cannot be set here, because quantities are not comparable across billing units:
+  900 hours of a large instance is five figures and 900 S3 requests is nothing. Unpriced EC2
+  instance-hours are called out separately, since those are the ones that are large money at
+  small quantity -- which is how three NAT instances at ``c8gn.48xlarge`` cost $18,500 without
+  appearing anywhere anyone looked.
 
-Re-run this at the end of a campaign, and widen ``PRICE`` if the fleet gains an instance type;
+Re-run this at the end of a campaign, and widen ``EC2_TYPES`` if the fleet gains an instance type;
 an unpriced type shows up in the excluded list rather than vanishing.
 """
 
@@ -65,15 +69,22 @@ FLAT_TYPES = {
 STORAGE_TYPE = "USW2-TimedStorage-ByteHrs"
 STORAGE_TIERS = ((51_200, 0.023), (512_000, 0.022), (float("inf"), 0.021))
 
-#: How the lines are reported. Order is presentation order.
+#: How the lines are reported: (label, usage types, is_campaign_work). Order is presentation order.
+#:
+#: The third field exists because the account carries spend that is not the campaign, and a script
+#: whose only total silently includes it invites that total to be quoted as the campaign's cost.
+#: Both subtotals are printed; only the campaign one is comparable with the cost model.
 GROUPS = (
-    ("graphics cards", ("USW2-BoxUsage:g5.2xlarge", "USW2-BoxUsage:g6e.xlarge")),
-    ("Fargate containers", ("USW2-Fargate-vCPU-Hours:perCPU", "USW2-Fargate-GB-Hours")),
-    ("S3 storage", (STORAGE_TYPE,)),
-    ("S3 requests", ("USW2-Requests-Tier1", "USW2-Requests-Tier2", "USW2-Inventory-ObjectsListed")),
-    ("EBS volumes", ("USW2-EBS:VolumeUsage.gp3",)),
-    ("Ray head nodes", ("USW2-BoxUsage:m5.2xlarge",)),
-    ("reproduction box", ("USW2-BoxUsage:c8gn.48xlarge",)),
+    ("graphics cards", ("USW2-BoxUsage:g5.2xlarge", "USW2-BoxUsage:g6e.xlarge"), True),
+    ("Fargate containers", ("USW2-Fargate-vCPU-Hours:perCPU", "USW2-Fargate-GB-Hours"), True),
+    ("S3 storage", (STORAGE_TYPE,), True),
+    ("S3 requests", ("USW2-Requests-Tier1", "USW2-Requests-Tier2", "USW2-Inventory-ObjectsListed"), True),
+    ("EBS volumes", ("USW2-EBS:VolumeUsage.gp3",), True),
+    ("Ray head nodes", ("USW2-BoxUsage:m5.2xlarge",), True),
+    # The isolated VPC's three fck-nat NAT instances, whose launch templates carried
+    # `c8gn.48xlarge` instead of `t4g.micro` from 2026-08-20 to 2026-09-11. Real spend, not
+    # campaign work, and kept as its own line so it can neither be hidden nor double-counted.
+    ("NAT instances (mis-sized)", ("USW2-BoxUsage:c8gn.48xlarge",), False),
 )
 
 
@@ -234,28 +245,43 @@ def main(argv: list[str] | None = None) -> int:
     if gpu_days:
         print(f"\ngraphics-card days: {gpu_days[0]} .. {gpu_days[-1]} ({len(gpu_days)} days)")
 
-    print(f"\n{'line':<22} {'quantity':>34} {'$ at list':>13}")
-    grand = 0.0
-    for label, uts in GROUPS:
+    print(f"\n{'line':<26} {'quantity':>34} {'$ at list':>13}")
+    campaign, other = 0.0, 0.0
+    for label, uts, is_campaign in GROUPS:
         if label == "S3 storage":
-            print(f"{label:<22} {quantity[STORAGE_TYPE]:>28,.0f} GB-Mo {stor_total:>13,.0f}")
-            grand += stor_total
-            continue
-        cost = sum(quantity[u] * price[u] for u in uts)
-        qty = " + ".join(f"{quantity[u]:,.0f}" for u in uts)
-        print(f"{label:<22} {qty:>34} {cost:>13,.0f}")
-        grand += cost
-    print(f"{'TOTAL':<22} {'':>34} {grand:>13,.0f}")
+            cost, qty = stor_total, f"{quantity[STORAGE_TYPE]:,.0f} GB-Mo"
+        else:
+            cost = sum(quantity[u] * price[u] for u in uts)
+            qty = " + ".join(f"{quantity[u]:,.0f}" for u in uts)
+        print(f"{label:<26} {qty:>34} {cost:>13,.0f}")
+        # Summed as PRINTED, to the dollar, so the table adds up for whoever checks it by hand and
+        # so a figure quoted from here matches a figure quoted from the printed lines.
+        if is_campaign:
+            campaign += round(cost)
+        else:
+            other += round(cost)
+    print(f"{'CAMPAIGN TOTAL':<26} {'':>34} {campaign:>13,.0f}")
+    if other:
+        print(f"{'GRAND TOTAL — incl. non-campaign':<26} {'':>34} {campaign + other:>13,.0f}")
 
     print("\n  S3 storage by month (GB-months -> $):")
     for month, (gb, cost) in stor_detail.items():
         print(f"    {month}  {gb:>14,.0f}  ${cost:>12,.0f}")
 
-    print("\nEXCLUDED — usage with no price entry here (quantities over 1,000):")
+    # Printed in full and unfiltered. A quantity threshold here would be a comparison across
+    # billing units -- hours against requests against gigabyte-months -- and the expensive omission
+    # is precisely the small-quantity, high-price one a threshold hides.
     priced = set(price) | {STORAGE_TYPE}
-    for ut, q in sorted(quantity.items(), key=lambda kv: -kv[1]):
-        if ut not in priced and q >= 1000:
-            print(f"  {ut:<44} {q:>18,.0f} {units[ut]}")
+    unpriced = [(ut, q) for ut, q in sorted(quantity.items(), key=lambda kv: -kv[1]) if ut not in priced]
+    print(f"\nEXCLUDED — every usage type with no price entry here ({len(unpriced)}):")
+    for ut, q in unpriced:
+        print(f"  {ut:<44} {q:>18,.2f} {units[ut]}")
+    boxes = [(ut, q) for ut, q in unpriced if ":" in ut and "BoxUsage" in ut]
+    if boxes:
+        print("\n  *** UNPRICED EC2 INSTANCE-HOURS — these are the ones that are large money at")
+        print("      small quantity. Add each to EC2_TYPES, or satisfy yourself it is not ours:")
+        for ut, q in boxes:
+            print(f"        {ut:<42} {q:>14,.0f} h")
 
     print(f"\nlast day in the data: {days[-1]} — INCOMPLETE, Cost Explorer trails real time")
     print("These are LIST PRICES on measured usage, not a bill. See this module's docstring.")

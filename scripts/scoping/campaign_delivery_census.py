@@ -26,6 +26,11 @@ THREE DISTINCTIONS THAT DECIDE WHETHER THE PERCENTAGE MEANS ANYTHING:
   compute could sustain; a single mean over the whole span hides that and reads as throughput.
   Section 12 records a day that published 505 cells for exactly this reason.
 
+**It prints the snapshot ID of each store it read**, because a census of a live store is an
+as-of and the reader needs to know which as-of. Both stores keep committing after a campaign
+ends, so a later re-run reporting a higher percentage is a NEWER answer rather than a
+contradiction -- and the snapshot IDs are what let someone tell those two apart.
+
 Read-only. Needs credentials for the mask bucket and read access to the published store.
 """
 
@@ -39,7 +44,7 @@ import sys
 from pathlib import Path
 
 from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
-from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
+from tessera_embeddings.storage.zarr_store import open_store_group_and_tip
 
 MASK_URI = "s3://global-tessera-inputs/masks/global.icechunk"
 STORE_URI = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
@@ -47,15 +52,32 @@ YEARS = tuple(range(2017, 2026))
 REGION = "us-west-2"
 
 
-def read_mask() -> dict[str, int]:
-    """Per-zone live-tile counts from the mask's own stored attribute."""
-    mask = open_store_as_zarr_group(MASK_URI, get_credentials=iam_icechunk_credentials, region=REGION)
-    return {z: int(dict(mask[z].attrs).get("n_live_tiles") or 0) for z in mask.group_keys()}
+def read_mask() -> tuple[dict[str, int], str]:
+    """(per-zone live-tile counts, mask snapshot ID), from the mask's own stored attribute.
+
+    A missing or unreadable ``n_live_tiles`` RAISES rather than reading as zero. Zero is a
+    meaningful value here -- it means an ocean-only zone, whose nine cells are then expected to
+    publish as empty -- so treating an absent attribute as zero would silently drop that zone's
+    tiles from the denominator *and* reclassify its cells as landless, which the roster
+    reconciliation cannot catch because both sides move together. The percentage this script
+    exists to produce would come out too high, and nothing would say so.
+    """
+    mask, snapshot = open_store_group_and_tip(MASK_URI, get_credentials=iam_icechunk_credentials, region=REGION)
+    land: dict[str, int] = {}
+    for zone in mask.group_keys():
+        raw = dict(mask[zone].attrs).get("n_live_tiles")
+        if raw is None:
+            raise SystemExit(f"mask zone {zone} has no n_live_tiles attribute — the roster cannot be derived")
+        n = int(raw)
+        if n < 0:
+            raise SystemExit(f"mask zone {zone} has n_live_tiles={raw!r} — not a tile count")
+        land[zone] = n
+    return land, snapshot
 
 
-def read_store(land: dict[str, int]) -> tuple[dict, dict]:
-    """(published_with_data, published_empty), each keyed ``zone|year``."""
-    store = open_store_as_zarr_group(STORE_URI, get_credentials=iam_icechunk_credentials, region=REGION)
+def read_store(land: dict[str, int]) -> tuple[dict, dict, str]:
+    """(published_with_data, published_empty, store snapshot ID), each keyed ``zone|year``."""
+    store, snapshot = open_store_group_and_tip(STORE_URI, get_credentials=iam_icechunk_credentials, region=REGION)
     published: dict[str, dict] = {}
     empty: dict[str, dict] = {}
     for zone in store.group_keys():
@@ -65,7 +87,7 @@ def read_store(land: dict[str, int]) -> tuple[dict, dict]:
             run = runs.get(str(year)) or {}
             record = {"assembled_at": run.get("assembled_at"), "tiles": land.get(zone, 0)}
             (empty if run.get("empty") else published)[f"{zone}|{year}"] = record
-    return published, empty
+    return published, empty, snapshot
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -75,14 +97,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", dest="json_path", help="write the raw census to this path")
     args = ap.parse_args(argv)
 
-    land = read_mask()
+    land, mask_snapshot = read_mask()
     with_land = {z: n for z, n in land.items() if n > 0}
     per_year = sum(with_land.values())
     roster_tiles = per_year * len(YEARS)
     print(f"mask: {len(land)} zones, {len(with_land)} with land, {per_year:,} live tiles per year")
     print(f"roster: {per_year:,} x {len(YEARS)} years = {roster_tiles:,} tile-years")
 
-    published, empty = read_store(land)
+    published, empty, store_snapshot = read_store(land)
     delivered = sum(v["tiles"] for v in published.values())
 
     roster_land = {f"{z}|{y}" for z in with_land for y in YEARS}
@@ -146,9 +168,24 @@ def main(argv: list[str] | None = None) -> int:
             for day in sorted(tiles_by_day):
                 print(f"{day!s:<12} {tiles_by_day[day]:>12,} {cells_by_day[day]:>6} {tiles_by_day[day] / 24:>9,.0f}")
 
+    # Last, so it is the line nearest the figures a reader copies out.
+    print(f"\nread at mask snapshot {mask_snapshot}, store snapshot {store_snapshot}")
+    print("Both stores keep committing. Quote the snapshot with the percentage, or the percentage")
+    print("dates silently.")
+
     if args.json_path:
         with Path(args.json_path).open("w") as fh:
-            json.dump({"land": land, "published": published, "empty": empty, "roster": roster_tiles}, fh)
+            json.dump(
+                {
+                    "land": land,
+                    "published": published,
+                    "empty": empty,
+                    "roster": roster_tiles,
+                    "mask_snapshot": mask_snapshot,
+                    "store_snapshot": store_snapshot,
+                },
+                fh,
+            )
         print(f"\nwrote {args.json_path}")
     return 0
 

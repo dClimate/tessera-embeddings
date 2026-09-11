@@ -306,24 +306,30 @@ is in this table because it is the most consequential value in it.
 > actors** — and the 2026-09-09 relaunch passed **25 clusters of 100**. Both are supported and
 > the choice is free.
 >
-> **It does not change the cost.** The bill is total card-hours times price, and splitting a
-> given actor total across more or fewer clusters moves neither term. §12's figures are
-> shape-independent for that reason.
+> **It barely changes the cost.** The bill is dominated by total card-hours times price, and
+> splitting a given actor total across more or fewer clusters moves neither term. The one term it
+> does move is the Ray head node each cluster carries: fifteen extra `m5.2xlarge` at $0.384 an hour
+> over a campaign this long is on the order of **$2,000 against $828,364**, about 0.2%. §12's
+> figures are shape-independent at that tolerance, and not exactly.
 >
 > **It does change the assembly crossover**, which is per cluster: a cluster's single assembly
-> thread does not speed up as its actor count rises. The "~275-actor ceiling" cited below came
-> from an assembly rate since re-measured 1.7× slower, and there is no single ceiling — the
-> crossover is a function of the assembly POOL WIDTH, near 158 actors at the shipped 16 workers
-> and near 383 at 32. So 250 actors is over the line on a 16-worker pool and under it on a
-> 32-worker one, while 100 is under both. The relaunch widened the pool and narrowed the clusters
-> together. Arithmetic in `campaign-cost-model.md` §6c and
+> thread does not speed up as its actor count rises. The "~275-actor ceiling" cited below came from
+> an assembly rate since re-measured 1.7× slower, and there is no single ceiling. **Nor is there a
+> single replacement.** The crossover is a function of the assembly POOL WIDTH *and* of which
+> cell's inference rate the assembly rate is divided by, and the two available inference figures
+> are 2.5× apart — so at the shipped 16 workers it lands anywhere from **158 to 394 actors**.
+> **250 sits inside that range, so nothing measured says which side of the line the campaign's
+> wide shape ran on**; the only matched pair of measurements, both from 48N-2017, puts it on the
+> safe side. **100 actors is under every crossover on every basis**, which is the one statement
+> that needs no argument, and widening the pool raises the crossover on every basis. The relaunch
+> did both at once. Arithmetic in `campaign-cost-model.md` §6c and
 > `tests/unit/inference/test_gpu_starvation.py`; outturn in §12.
 
 | parameter | value | why |
 |---|---|---|
 | **published store** | **`s3://tessera-embeddings/v1.1/dclimate.icechunk`** | the AWS Open Data bucket, not ours — it carries the storage cost and serves the dataset publicly. Set as `BucketPaths.global_store_uri` on the PROD account's paths, so it is a property of the account rather than a parameter an operator can get wrong. Every producer and consumer of the store reads it from that one method, and no dev or branch deployment carries it, so nothing but production can reach the public bucket |
 | `fill_strategy` | `"chained-clusters"` | one cluster per zone-set, not per zone-year |
-| **`max_parallel_clusters`** | **10** ★ — **also run at 25** | 10 x 250 actors reaches the full 2,500-actor quota while keeping each cluster's assembly thread under its ~275-actor ceiling (§6). Balance holds to ~16, and each cluster still opens on one of the 10 densest zones. **The ~275 ceiling is withdrawn — see the note above the table. 25 clusters was also run, chosen so a cluster that finishes early releases quota the survivors climb into; it costs the same** |
+| **`max_parallel_clusters`** | **10** ★ — **also run at 25** | 10 x 250 actors reaches the full 2,500-actor quota while keeping each cluster's assembly thread under its ~275-actor ceiling (§6). Balance holds to ~16, and each cluster still opens on one of the 10 densest zones. **The ~275 ceiling is withdrawn — see the note above the table. 25 clusters was also run, chosen so a cluster that finishes early releases quota the survivors climb into; it costs the same to within about 0.2%, the difference being one Ray head node per cluster** |
 | **`max_parallel_ingest`** | **60** ★ | fleet-wide cap on simultaneous zone-ingests. With every year in one batch the ingest knee is gone, so this is set by quota and by what the GPU fleet can absorb (§6). **60, not the 61 this table asked for until 2026-08-19, and the reason is division:** each cluster's share is this cap over the cluster count ROUNDED UP, so 61 over 10 aims every cluster at 7 and the fleet at 70 against its own gate of 61 — the gate holds the ceiling, so it oversubscribes rather than breaches, but the clusters queue on it and the log reports a width the fleet never runs at. 60 over 10 is exactly 6. Now the flow DEFAULT, so it needs no passing |
 | `max_dispatch_rounds` | 2 | **The outer recovery.** How many times the campaign re-dispatches whatever is still missing — rounds, not a per-zone budget. It is the only thing that recovers a child run that DIED, since a killed or cancelled run takes its own retry counter with it (§8) |
 | `immediate_refill` | `false` | **Off for the run in flight; turn it on at the next restart.** A dispatch round is a barrier — it collects every cluster's outcome before re-reading the store — so a cluster that dies early makes its whole roster wait for the round's slowest sibling. On, a settled cluster's still-missing cells go straight back out into the slot it vacated, inheriting its ingest and committer shares so fleet width and cost do not move. Admitted only when the predecessor's terminal state shows its own writers stopped AND a settling delay has passed, so the asynchronous cancellation of its descendants has had time to take effect; the delay is derived from the confirmation budget the fill's own teardown already spends. A crash or a cancellation waits, because neither carries that proof and re-dispatching them automatically is what §8's write-fencing note is about. It admits, it does not RESERVE: nothing locks a cell, so a writer dispatched from outside the campaign is not excluded — the same residual the round's own re-dispatch has always carried, bounded by mosaic commits refusing a second writer rather than merging. Off is byte-for-byte the old path, which is what makes it safe to merge mid-campaign (§8) |
