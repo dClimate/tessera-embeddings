@@ -505,9 +505,11 @@ ds = xr.open_zarr(session.store, group="33N", consolidated=False, decode_coords=
 
 `chunks=None` matters on a global zone. Without it xarray hands back Dask-backed
 arrays, and a zone is large enough that the graph describing one runs to millions
-of chunks — reading a single pixel through it costs seconds and gigabytes, against
-a fifth of a second and no measurable memory with `chunks=None`. The same advice,
-and why, is in
+of chunks: reading a single pixel through it took about three seconds and peaked
+near two gigabytes, against a fifth of a second and under 200 MB with
+`chunks=None`. Neither is free — xarray still builds the zone's variables and
+materialises a 933,888-element `northing` coordinate either way — but one of them
+scales with the zone and the other does not. The same advice, and why, is in
 [`inference/README.md`](src/tessera_embeddings/inference/README.md#write-units-vs-read-units-per-layout).
 
 ```
