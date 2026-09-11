@@ -26,6 +26,16 @@ Produces artifacts the campaign depends on.
 | `build_landmask_coverage.py` | Builds, verifies and validates the campaign land-mask coverage store from the partner TIFF delivery ([ADR 010](../context_docs/decisions/010-landmask-registry-coverage.md)). The mask is the campaign's work list. |
 | `record_stac_cassettes.py` | Re-records the VCR cassettes the integration and parity tests replay. Hits the STAC endpoints only, never COG bodies. Needs Earthdata credentials. |
 
+## `publish/` — supported tooling that MUTATES a published artifact
+
+One script, and the directory exists to keep it away from the read-only tools. Anything here
+changes something consumers are already using, so it dry-runs by default and refuses to write a
+store whose state is not the one its safety evidence was gathered against.
+
+| script | what it does |
+|---|---|
+| `set_published_store_reader_config.py` | Switches the published store's SAVED manifest preload off, so consumers stop inheriting a setting sized for writing that costs them ~2.5 s of every open and returns nothing. On spec version 2 that rewrites the one object holding every tag and the branch pointers, so run `diagnostic/repo_config_write_safety.py` first and read its evidence. Dry run unless `--apply`; `--rollback` undoes it. |
+
 ## `diagnostic/` — supported tooling
 
 Answers "why is this environment behaving that way?" and is expected to work on demand.
