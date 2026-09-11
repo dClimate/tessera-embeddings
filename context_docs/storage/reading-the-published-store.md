@@ -154,10 +154,15 @@ sample that mixes those with real reads reports the mixture. The benchmark takes
 the chunk index, samples candidate pixels inside them, and keeps only those whose `scales` value is
 finite.
 
-**Cold means a fresh process.** Icechunk caches manifests and the HTTP client pools connections, so
-a second read in the same process measures the cache. Every cold phase runs in a subprocess that
-then exits. The parent picks the probe pixels once and passes them down, so the cold arm, the warm
-arm and both regions read the same addresses.
+**Cold means a fresh process; warm means a second pass through the same open.** Icechunk caches
+manifests and pools connections, so every cold phase runs in a subprocess that then exits. The warm
+arm is a second pass over the group the first pass opened. An earlier version of the benchmark
+re-opened everything for the warm arm, which made it a second cold reader and discarded the caches
+the arm exists to observe — found in review, and the reason the warm and cold columns of an earlier
+draft of this document agreed everywhere. The open phases have no warm figure at all, because their
+measurement *is* the open, and a reader pays it once per handle rather than once per read. The
+parent picks the probe pixels once and passes them down, so both arms and both regions read exactly
+the same addresses.
 
 **The throughput column is decompressed elements per second**, which is what the scoping harness
 reported (`elements / wall`). For the int8 `embeddings` one element is one byte, so it reads as a
@@ -423,12 +428,19 @@ whatever `pyarrow` infers. Fine while every part agrees; a trap the first time t
 they are in `context_docs/campaign/campaign-plan.md`, not in the published product.
 
 **Point access is expensive, and the store is not built for it.** One pixel's 128-band vector costs
-a whole 256×256×128 inner chunk on the wire — measured at 8.0 MB and 302 ms in-region, and it does
-not get cheaper when probes revisit the same chunk (§4.4). That is the geometry working as intended:
-it is what makes block reads fast and object counts manageable. But a consumer whose access pattern
-is scattered single pixels will find it slow, and the fix is to read a region and index into it, not
-to tune the client. Reading a 1000×1000 tile delivers 280 MB/s; reading its million pixels one at a
+a whole 256×256×128 inner chunk on the wire — 8.39 MB, measured at 8.0 MB and 302 ms in-region,
+because the quantized embeddings barely compress. That is the geometry working as intended: it is
+what makes block reads fast and object counts manageable. But a consumer whose access pattern is
+scattered single pixels will find it slow, and the fix is to read a region and index into it, not to
+tune the client. Reading a 1000×1000 tile delivers 280 MB/s; reading its million pixels one at a
 time would take three days.
+
+**If reads do revisit the same neighbourhood, size the chunk cache to the working set.** The store
+saves no caching setting, so a reader gets icechunk's own default, which is small against an
+8.39 MB chunk. A 16 GiB cache on a workload whose 1,000 probes land in 1,088 inner chunks cut bytes
+on the wire per read from 7.97 MB to 5.14 MB and p50 from 209 ms to 142 ms — almost exactly the
+saving the repeat fraction predicts (§4.4). No cache helps a working set that never repeats, which
+is why this is a separate recommendation from the one above rather than a replacement for it.
 
 **A reader inherits the writer's manifest preload, which costs 2.5 s of every open and returns
 nothing** (§4.3). Nothing warns about it, opening a zone group directly does not avoid it, and the
