@@ -221,7 +221,7 @@ import icechunk, xarray as xr
 
 repo    = icechunk.Repository.open(icechunk.s3_storage(bucket=..., prefix=...))
 session = repo.readonly_session(branch="main")          # or snapshot_id=<a tag's snapshot>
-ds      = xr.open_zarr(session.store, group="33N", consolidated=False)
+ds      = xr.open_zarr(session.store, group="33N", consolidated=False, chunks=None)
 
 # One pixel's 128-d vector, dequantized. Two small reads, one chunk each.
 px = ds.isel(time=8, northing=500_000, easting=30_000)
@@ -616,8 +616,19 @@ answer — cost-model §4.
 **Prod's state:** the coverage mask is built, all 112 land-zone ROIs are exported, the campaign
 deployment set is registered in its branch-scoped form, the crash-recovery automations are armed, the
 Slack alerts are registered, the monitoring round's read permissions are deployed (§9), and the
-Prefect server is sized correctly. **The published store is not
-seeded, and cannot be until write access to the Open Data bucket exists** (item 4b). The store that
+Prefect server is sized correctly. ~~**The published store is not
+seeded, and cannot be until write access to the Open Data bucket exists** (item 4b).~~
+
+> **SUPERSEDED 2026-09-10: the store is seeded, written and readable.** Write access was granted,
+> the campaign ran to completion, and the published store now holds 120 zone groups with 992 cells
+> filled. Verified by reading it: `years_complete` on `33N` lists all nine years. The unfilled
+> cells are early years over tiny or remote land. **No tile-year total is quoted here on purpose:
+> the closing census belongs to `campaign-cost-model.md` (PR 148), and the figures this paragraph
+> carried until 2026-09-11 were read off a live store mid-drain, so they undercounted.** Until 148
+> lands, this paragraph and `corrections-register.md` are the record of the fact; 148 is the record
+> of the numbers. **This paragraph is kept struck rather
+> than deleted because it was quoted, in review of another change, as evidence that the dataset
+> should not be advertised as readable.** The store that
 had been seeded in prod's own bucket before the publish target changed was deleted on 2026-08-13
 (847 objects, all metadata), so the only global store prod will ever hold is the published one.
 

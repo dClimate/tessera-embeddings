@@ -32,6 +32,23 @@ gotchas are in
 
 ---
 
+## Contents
+
+- [Architecture at a Glance](#architecture-at-a-glance)
+- [Pipeline Phases](#pipeline-phases)
+- [How Our Performance Optimizations Fit Together](#how-our-performance-optimizations-fit-together)
+- [Fault Tolerance](#fault-tolerance)
+- [Key Configuration (`config.py`)](#key-configuration-configpy)
+- [Model Architecture Constraint](#model-architecture-constraint)
+- [Provenance](#provenance)
+- [Accessing the Dask Dashboard](#accessing-the-dask-dashboard)
+- [Accessing the Ray Dashboard](#accessing-the-ray-dashboard)
+
+This file is reference for the current code path. The rationale behind these choices — what was
+measured, and what was tried and abandoned — lives in `context_docs/`.
+
+---
+
 ## Architecture at a Glance
 
 ```

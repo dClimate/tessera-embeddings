@@ -11,6 +11,22 @@ are no hardcoded AWS account IDs in source control.
 
 ---
 
+## Contents
+
+- [The provisioning contract](#the-provisioning-contract)
+- [The cluster YAML template](#the-cluster-yaml-template)
+- [Subnet / AZ placement — multi-AZ with capacity failover](#subnet--az-placement--multi-az-with-capacity-failover)
+- [AMI baking pattern](#ami-baking-pattern)
+- [Code sync (`sync_source_path`)](#code-sync-sync_source_path)
+- [CloudWatch logging](#cloudwatch-logging)
+- [Teardown — three layers of defence](#teardown--three-layers-of-defence)
+- [Launch throttling — the account quota nobody owns](#launch-throttling--the-account-quota-nobody-owns)
+- [Connection modes](#connection-modes)
+- [Adding a new cloud provider](#adding-a-new-cloud-provider)
+- [Kubernetes](#kubernetes)
+
+---
+
 ## The provisioning contract
 
 A "Ray provider" is duck-typed: a `ray_cluster` context manager that

@@ -6,26 +6,45 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 
 ---
 
+## Contents
+
+- [Module Overview](#module-overview)
+- [Basic Ingestion Process](#basic-ingestion-process)
+- [ROI Workflow](#roi-workflow)
+- [Data Transformations](#data-transformations)
+- [When a read fails](#when-a-read-fails)
+- [Where a resumed run starts](#where-a-resumed-run-starts)
+- [Performance Optimizations](#performance-optimizations)
+- [Authentication (EDL / OPERA data)](#authentication-edl--opera-data)
+- [OPERA-Specific Query Quirks](#opera-specific-query-quirks)
+- [Accessing the Dask Dashboard](#accessing-the-dask-dashboard)
+
+This file is long and is meant to be searched rather than read through. The rationale
+behind these choices — what was measured, and what was tried and abandoned — is in
+[`context_docs/ingest/`](../../../context_docs/ingest/), not here.
+
+---
+
 ## Module Overview
 
-| Module | Purpose |
+| Module | What it does |
 |---|---|
-| `stac.py` | STAC-based data loading via `odc.stac.load`. Handles multiple providers (Earth Search, Planetary Computer), date filtering, and the load-time machinery that applies the BOA offset: `BoaOffsetParser` stamps each source with its decision and `_BoaCorrectingReader` applies it inside the read. |
-| `opera_query.py` | OPERA RTC-S1 query utilities: spatial bbox construction, item construction from the native CMR Granule Search API (bypasses CMR-STAC search; orbit-direction filtered server-side), UTM EPSG derivation, and asset preparation. |
-| `boa_offset.py` | The ONE place the BOA offset question is answered. `source_decision` takes a bucket and a declared baseline and returns owed, exempt, or undecidable. Asked per ASSET, which is what lets an item whose bands straddle two producers be corrected band by band instead of refused. Imports no odc on purpose: the GDAL environment has to be configured before `odc.stac` is imported, so the module holding the decision must not be the one that pulls odc in. |
-| `item_baselines.py` | The ONE reader of `s2:processing_baseline`. Reports an integer hundredth (`04.00` -> `400`), the same scale `S2_BASELINE_THRESHOLD` is expressed in, and `None` for every kind of unreadable. Exists because there were two readers on two scales with two notions of unreadable, so each numeric edge case had to be fixed twice — and they had drifted before anyone noticed. |
-| `asset_locations.py` | Answers the two questions asked of where an item's assets live, and keeps them apart: **is the read cheap** (a property of the bucket's REGION) and **has the reflectance offset already been removed** (a property of the PRODUCER). They have the same answer today and would not the first time anyone mirrors unharmonised data in region, so two bucket lists make that impossible to conflate. Also holds `AssetSources`, which reports the keys it could NOT resolve rather than dropping them — the primitive that generated the same defect three times when it returned only what it found. Its item-level harmonisation answer feeds duplicate RANKING; the correction itself is decided per asset in `boa_offset.py`. |
-| `duplicates.py` | Chooses between DUPLICATE catalogue items for one tile-date — Element 84 publishes more than one whenever a granule is reprocessed, distinguished by `s2:sequence`. Usable first, then the newest baseline, then the copy owing no offset correction; the rejected copies are retained as a fallback the write steps down when a source object will never read. Reducing to one copy before the loader is what makes a fallback possible at all, since `odc.stac.load` FUSES a solar-day group — and it is also what makes the recorded baseline match the pixels written. |
-| `loader_failures.py` | Keeps what a failed load knows — WHICH object, and WHY — since neither reaches the caller on its own and both need code running on the reader before the read fails. One `install_capture_everywhere` call per ingest installs both on every current and future worker. Names the source object a failed load could not read. `odc.stac.load` reports it in its OWN log record and raises an exception that does not carry it, so a logging handler on every reader process records each aborted href, and the caller collects them after a failure and maps them back to tile-dates. That name is what lets the duplicate ladder step down ONE copy instead of every duplicated tile in the date. Attribution is best effort by design: an empty answer means "attribute nothing", never "nothing was at fault", and the recovery it sharpens still works without it. |
-| `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary AWS credentials minted by ASF, ~1 hour) and legacy CloudFront signed URL resolution. Those credentials expire on their OWN clock, unrelated to any unit of work, so renewal must be driven by a timer and by the advertised expiry — never by the work loop, which can only renew between units and so cannot renew inside one that outlives the margin. |
-| `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
-| `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
-| `source_coverage.py` | Optical-source preflight: whether the catalogue publishes ANYTHING reaching a zone's live land in a window, answered by limit-1 existence probes over live-tile block envelopes (window padded per the solar-day convention) before any cluster is provisioned. The verdict is three-valued — only a positive finding of absence refuses; inconclusive and provisional-present both pass the cell through, because a wrong refusal loses campaign coverage while a pass-through only costs the late failure it would have hit anyway. Deliberately OUTSIDE the mosaic-content fingerprint closure (its probe is built here, not in `stac.py`), so shipping preflight changes never invalidates in-flight mosaics. Called by the chained fill driver's pre-cluster triage. |
-| `catalogue_refusal.py` | Tells a catalogue that is BUSY apart from one that cannot serve a given REQUEST, and names the request either way. The client stack discards the search body when it wraps a transport failure, so a refusal arrives identifying the host and the endpoint path and nothing about what was asked. Both refusals are one exception type from one endpoint and need opposite responses: waiting is the entire remedy for a stated overload and pure waste against a request that is refused every time. The status separates them but does not settle it — what settles it is an identical REPEAT, which only the layer holding the attempt budget can observe, so this module classifies and that layer supplies the repeat. |
-| `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
-| `_http.py` | Shared HTTP helpers for catalogue and granule queries: `make_logging_retry` (retries a failed request, logging each attempt — the library retries silently otherwise, and a query quietly retrying looks exactly like one that has hung), `spawn_abandonable` (waits for a call the caller wants to be able to give up on), and `json_or_raise` (catches a reply that claims success but is not JSON — see below). |
-| `_pipeline.py` | A prepare/consume pipeline with a configurable look-ahead `depth`: overlaps the preparation of the next item with the consumption of the current one on one background thread, and reports the preparation time the consumer had to wait for. Used by the S2 date loop (`pipeline_dates`), with `depth` sized to `batch_dates` so a batch's whole preparation can hide behind the previous batch's write. Depth buys BUFFERING, never concurrency — preparation stays on one thread in order, so the side-effect-free contract holds at any depth. |
-| `live_windows.py` | (Merge exchange rate is caller-owned: pass `WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows share one graph, the higher `WINDOW_COST_IN_CHUNKS` when each is a blocking write. Both S2 and S1 select it from how the run writes, so the rate cannot drift from the write strategy it prices.) Derives the chunk-aligned live windows every ingest loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
+| `stac.py` | STAC loading through `odc.stac.load` — providers, date filtering, and the load-time machinery that applies the Sentinel-2 reflectance offset. [§ Sentinel-2 Baseline Correction (load-time)](#sentinel-2-baseline-correction-load-time) |
+| `opera_query.py` | OPERA RTC-S1 queries: bounding boxes, items built from CMR's native Granule Search with orbit direction filtered server-side, UTM EPSG derivation, asset preparation. [§ OPERA-Specific Query Quirks](#opera-specific-query-quirks) |
+| `boa_offset.py` | The one place the reflectance-offset question is answered. Asked per ASSET, so an item whose bands come from two producers is corrected band by band rather than refused. [§ Sentinel-2 Baseline Correction (load-time)](#sentinel-2-baseline-correction-load-time) |
+| `item_baselines.py` | The one reader of `s2:processing_baseline`. Reports integer hundredths (`04.00` -> `400`) and `None` for every kind of unreadable. |
+| `asset_locations.py` | Where an item's assets live, keeping two questions apart: whether the read is cheap (the bucket's REGION) and whether the offset is already removed (the PRODUCER). `AssetSources` reports the keys it could not resolve instead of dropping them. |
+| `duplicates.py` | Chooses between duplicate catalogue items for one tile-date, which Element 84 publishes whenever a granule is reprocessed. Rejected copies are kept as a fallback. [§ Choosing between duplicate copies of a tile-date](#choosing-between-duplicate-copies-of-a-tile-date) |
+| `loader_failures.py` | Keeps what a failed load knows — which object, and why — neither of which reaches the caller on its own. One `install_capture_everywhere` call covers every current and future worker. [§ When a source object will not read](#when-a-source-object-will-not-read) |
+| `auth.py` | Earthdata Login for ASF-hosted OPERA data: S3 direct access on roughly hourly credentials, plus legacy signed URLs. Renewal is timer-driven, because the credentials expire on their own clock. [§ Authentication (EDL / OPERA data)](#authentication-edl--opera-data) |
+| `transforms.py` | Post-load lazy Dask transforms. Currently `amplitude_to_db`. [§ OPERA RTC-S1 Amplitude-to-dB Conversion](#opera-rtc-s1-amplitude-to-db-conversion) |
+| `roi.py` | ROI utilities: read an existing Zarr ROI store, rasterise a GeoJSON polygon to a boolean mask on a UTM grid, load Sentinel-2 tile footprints. [§ Generating an ROI](#generating-an-roi) |
+| `roi_processing.py` | Higher-level ROI helpers used by the `generate_roi` flow. |
+| `source_coverage.py` | Optical preflight: does the catalogue publish anything reaching a zone's live land in this window, answered before any cluster is provisioned. Three-valued — only a positive finding of absence refuses. [§ Zone ingestion (the global campaign) — ADR-011](#zone-ingestion-the-global-campaign--adr-011) |
+| `catalogue_refusal.py` | Tells a catalogue that is BUSY apart from one that cannot serve this REQUEST, and names the request either way. [§ When the catalogue refuses: naming the request, and telling the two refusals apart](#when-the-catalogue-refuses-naming-the-request-and-telling-the-two-refusals-apart) |
+| `live_windows.py` | Derives the chunk-aligned live windows every ingest loads and writes, and narrows them per date to the land that date's imagery reaches. [§ Cropping to live windows (unconditional)](#cropping-to-live-windows-unconditional) |
+| `_http.py` | Shared HTTP helpers for catalogue and granule queries: retries that log each attempt, calls the caller can abandon, and a guard for replies that claim success but are not JSON. |
+| `_pipeline.py` | A prepare/consume pipeline with a look-ahead depth, so the next item is prepared while the current one is consumed. Buys buffering, never concurrency. [§ Pipelining a date's preparation (`pipeline_dates`)](#pipelining-a-dates-preparation-pipeline_dates) |
 
 ---
 
@@ -1320,7 +1339,7 @@ decoupled.
 The two flows keep task count bounded via different mechanisms — per-date iteration for S2,
 time-windowed batching for S1 — described in the sections below. The same scheduler-RAM
 discipline reappears in inference assembly; see
-[`inference/README.md`](../inference/README.md#three-layer-chunk-anatomy) for the
+[`inference/README.md`](../inference/README.md#1-chunk-enumeration-and-roi-pre-filter) for the
 ChunkSpec-vs-sub-chunk decoupling that makes assembly survive on the same budget.
 
 ### S2: per-date iteration (task graph management)
