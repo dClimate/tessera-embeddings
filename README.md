@@ -76,7 +76,8 @@ as fill values rather than as an error.
 **The model and the ingest are the same code in both**, and assembly is shared up to the point of
 writing. What differs is scale, how you say which ground you want, the store's conventions — most
 importantly that the global store holds calendar years only, while a single area can use any
-twelve-month window — and the campaign's stricter pixel-selection settings, which mean the same
+twelve-month window — and the campaign's different pixel-selection settings — two of them looser than the
+library defaults and one stricter — which mean the same
 area and year can give different results on the two paths.
 
 **→ [`docs/single-vs-global.md`](docs/single-vs-global.md)** explains the differences that are

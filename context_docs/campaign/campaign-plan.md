@@ -595,10 +595,12 @@ seeded, and cannot be until write access to the Open Data bucket exists** (item 
 
 > **SUPERSEDED 2026-09-10: the store is seeded, written and readable.** Write access was granted,
 > the campaign ran to completion, and the published store now holds 120 zone groups with 992 cells
-> filled — 3,243,043 tile-years, 99.83% of the roster. Verified by reading it: `years_complete` on
-> `33N` lists all nine years. Fourteen cells are unfilled, all of them early years over tiny or
-> remote land. The measured outturn is being written up in `campaign-cost-model.md` (PR 148);
-> until that lands, this paragraph and `corrections-register.md` are the record. **This paragraph is kept struck rather
+> filled. Verified by reading it: `years_complete` on `33N` lists all nine years. The unfilled
+> cells are early years over tiny or remote land. **No tile-year total is quoted here on purpose:
+> the closing census belongs to `campaign-cost-model.md` (PR 148), and the figures this paragraph
+> carried until 2026-09-11 were read off a live store mid-drain, so they undercounted.** Until 148
+> lands, this paragraph and `corrections-register.md` are the record of the fact; 148 is the record
+> of the numbers. **This paragraph is kept struck rather
 > than deleted because it was quoted, in review of another change, as evidence that the dataset
 > should not be advertised as readable.** The store that
 had been seeded in prod's own bucket before the publish target changed was deleted on 2026-08-13

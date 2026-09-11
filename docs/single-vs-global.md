@@ -191,9 +191,12 @@ that is what that campaign is for. Yours can be a city, a catchment, a set of fa
 protected area, a coastline, a study plot, or a lake — anything you can draw. The code only ever
 asks "is this pixel wanted?"
 
-**What the mask does not free you from is radar.** The single-area path resolves a Sentinel-1 orbit
-for the run and will not accept "none", so an area with no Sentinel-1 store behind it cannot
-complete — ingest both sensors, even if your interest is optical.
+**What the mask does not free you from is radar, unless you ask.** Both single-area entry points
+resolve a Sentinel-1 orbit for the run, and by default neither accepts "none" — so an area with no
+Sentinel-1 store behind it will not complete, and you should ingest both sensors even if your
+interest is optical. The Prefect flow does have a way out: pass `require_s1=False` and it will
+finish optical-only where there is genuinely no radar. The plain runner has no such switch; it
+demands an orbit, and that is not configurable.
 
 Two supported ways to make one, both a single flow run:
 
