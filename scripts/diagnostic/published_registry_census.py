@@ -238,7 +238,7 @@ def _aoi_query(
     # Malformed timestamps have to reach the REPORT, not just the dedupe. `_latest_per_tile` orders
     # such a row last, so a malformed newer refill loses to its stale predecessor — and an
     # AOI-only run would otherwise print a plausible answer built on the wrong rows and exit 0.
-    bad_stamps = sorted({str(r["tile"]) for r in rows if r.get("assembled_at_unparsable")})
+    bad_stamps = unparsable_stamps(raw)
     # A null bounding box makes every Arrow comparison in the filter above evaluate to null, so the
     # row is dropped from EVERY area query — silently undercounting the coverage this dataset
     # exists to report. The schema permits null, which is why it has to be checked rather than
@@ -306,14 +306,26 @@ def _latest_per_tile(rows: list[dict[str, Any]]) -> dict[tuple[str, str], dict[s
             # RECORDED, not raised. A malformed or offset-naive timestamp makes the parse or the
             # comparison below throw, and it would do so in the middle of the audit — aborting
             # before any cell verdict or the JSON report, exactly when malformed registry data is
-            # what somebody is trying to diagnose. The row is kept, flagged, and ordered last.
-            row["assembled_at_unparsable"] = True
+            # what somebody is trying to diagnose. The row is kept and ordered last, so a valid
+            # predecessor wins; callers learn about it from `unparsable_stamps`, which is collected
+            # over EVERY row rather than only the surviving ones.
             latest.setdefault(key, (datetime.min.replace(tzinfo=UTC), row))
             continue
         held = latest.get(key)
         if held is None or stamp > held[0]:
             latest[key] = (stamp, row)
     return {key: row for key, (_, row) in latest.items()}
+
+
+def unparsable_stamps(rows: list[dict[str, Any]]) -> list[str]:
+    """Tiles among ``rows`` whose ``assembled_at`` will not parse or compare.
+
+    **Collected BEFORE deduplication**, over every row rather than the survivors. A malformed row
+    is ordered last, so a tile that also has a valid older row loses the malformed one entirely —
+    and asking the deduplicated set afterwards would report nothing while the stale coverage it
+    silently selected is exactly the problem.
+    """
+    return sorted({f"{row.get('zone', '')}/{row['tile']}" for row in rows if _parse_stamp(row["assembled_at"]) is None})
 
 
 def _parse_stamp(value: object) -> datetime | None:
@@ -405,7 +417,7 @@ def _verify_against_store(
             # subset test and not an equality.
             unrecorded_refusals = sorted((observed_tiles - store_tiles) - refused_tiles)
             unparsed_tiles = sorted({r["tile"] for r in registry_rows if not _tile_coordinate(r["tile"])})
-            bad_stamps = sorted({str(r["tile"]) for r in registry_rows if r.get("assembled_at_unparsable")})
+            bad_stamps = unparsable_stamps(all_rows)
             findings.append(
                 {
                     "zone": zone,

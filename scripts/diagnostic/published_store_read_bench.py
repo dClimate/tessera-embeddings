@@ -333,10 +333,17 @@ def _measure(group: zarr.Group, payload: dict[str, Any]) -> dict[str, Any]:
 # ── the parent: choose the addresses, then drive cold and warm arms ──────────
 
 
-#: A region window must be at least this fraction non-fill to be measured. A read of elided chunks
-#: issues no requests, so a fill-heavy window reports high throughput for having done less work —
-#: the figure is then a statement about the window, not about the store.
-MIN_NONFILL = 0.9
+#: A region window must be FULLY non-fill to be measured, at one probe per inner chunk. A read of
+#: elided chunks issues no requests, so any fill in the window reports as throughput for having
+#: done less work.
+#:
+#: **One, not a threshold, because every workload reads from the same origin.** A window that is
+#: 90% live overall can still have its north-west corner elided — and `patch` reads 100 px of that
+#: corner, `band_subset` 512 and `tile` 1000, so a partial threshold would leave the small
+#: workloads measuring fill while the large one looked fine. Requiring the whole window removes the
+#: question rather than answering it per workload, and it costs nothing: of 40 candidate blocks
+#: examined in 33N/2025, all 40 qualified.
+MIN_NONFILL = 1.0
 
 
 def _contiguous_live_block(
@@ -349,9 +356,9 @@ def _contiguous_live_block(
     contiguous block of live shard coordinates is a necessary condition and not a sufficient one.
     Each candidate block is therefore sampled before it is accepted: a strided read of `scales`
     over the window, cheap because `scales` is a thirty-second of `embeddings` and strided to one
-    value per inner chunk, and the block is taken only if at least :data:`MIN_NONFILL` of those
-    values are finite. Returns None when no candidate qualifies, which is a real answer for a zone
-    that has no solid block of that size.
+    value per inner chunk, and the block is taken only if :data:`MIN_NONFILL` of those values are
+    finite. Returns None when no candidate qualifies, which is a real answer for a zone that has no
+    solid block of that size.
     """
     needed = span // SHARD_PX + (1 if span % SHARD_PX else 0)
     scales = cast("zarr.Array", group["scales"])
