@@ -285,16 +285,24 @@ free and instant compared with computing anything.
 > import xarray as xr
 > from tessera_embeddings.storage.global_store import open_global_repo
 >
-> repo = open_global_repo("s3://tessera-embeddings/v1.1/dclimate.icechunk")
+> repo = open_global_repo(
+>     "s3://tessera-embeddings/v1.1/dclimate.icechunk",
+>     region="us-west-2", anonymous=True, preload_manifests=False,
+> )
 > session = repo.readonly_session(branch="main")
 > ds = xr.open_zarr(session.store, group="33N", consolidated=False, decode_coords="all")
 > print(ds.attrs["years_complete"])      # the years you can read
 > ```
 >
-> **This needs AWS credentials resolvable on your machine**, even though the bucket is public: the
-> library has no unsigned-read path today, so with nothing in the environment or an instance
-> profile it fails before it reaches the attribute. Any valid credentials will do — they are used
-> to sign the request, not to authorise it.
+> **You do not need an AWS account to run this.** The bucket's policy grants anyone read access,
+> and `anonymous=True` is what makes the library send an unsigned request, so the whole example
+> works with nothing set in your environment. `preload_manifests=False` is worth passing as well:
+> the store carries a saved setting, sized for the job of writing it, that costs a reader about two
+> and a half seconds on every open and buys nothing back — the measurement is in
+> `context_docs/storage/reading-the-published-store.md` §4.3. Both of those arguments arrive with
+> the change that opened the store to anonymous readers, so on an older copy of the library they
+> will not be accepted: drop them and supply any AWS credentials instead, which is all the previous
+> version needed.
 >
 > **Read that list carefully, because it distinguishes two different things from a third.** A year
 > *in* the list either holds data or was deliberately marked as having none — an all-ocean zone, or
