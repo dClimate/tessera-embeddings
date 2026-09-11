@@ -150,17 +150,11 @@ def _percentiles(samples: list[float]) -> dict[str, float]:
 # ── the worker: one phase, one process ───────────────────────────────────────
 
 
-#: Open-path variants. Each answers a question a reader would otherwise have to guess at, and the
-#: three are measured in one sweep so they are comparable to each other rather than across runs.
-#:
-#: * ``open`` — what a reader gets by following the documented recipe.
-#: * ``open_no_preload`` — the same, with manifest preloading switched off. The store SAVES the
-#:   writer's repository configuration, so a reader inherits preload settings chosen to help a
-#:   fill, and this is what those settings cost somebody who only wants to read.
-#: * ``open_zone_direct`` — opening one zone group by path instead of the root and indexing in.
-#:   Worth measuring because the natural guess is that the root open enumerates all 120 groups;
-#:   if the two are the same, the cost is somewhere else.
-OPEN_PHASES = ("open", "open_no_preload", "open_zone_direct")
+#: Open-path phases, measured in one sweep so they are comparable to each other rather than across
+#: runs. ``open`` is the documented recipe; ``open_zone_direct`` opens one zone group by path
+#: instead of going through the root, which is worth measuring because the natural guess — that the
+#: root open is slow because it enumerates 120 groups — is testable and wrong.
+OPEN_PHASES = ("open", "open_zone_direct")
 
 
 def _no_preload_config() -> icechunk.RepositoryConfig:
@@ -178,7 +172,7 @@ def _open_zone(payload: dict[str, Any]) -> tuple[zarr.Group, dict[str, float]]:
     phase = payload["phase"]
     timings: dict[str, float] = {}
     started = time.monotonic()
-    if phase == "open_no_preload":
+    if payload["no_preload"]:
         repo = icechunk.Repository.open(_storage_for(payload), config=_no_preload_config())
     else:
         repo = open_global_repo(payload["uri"], region=payload["region"], anonymous=payload["anonymous"])
@@ -323,6 +317,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--no-preload",
+        action="store_true",
+        help=(
+            "open with manifest preloading switched off instead of inheriting the writer's saved "
+            "setting. Applies to EVERY phase, so a run with and a run without it compare the whole "
+            "read path rather than only its first step — which is what says whether the open time "
+            "the preload buys back is paid for later in the reads."
+        ),
+    )
+    parser.add_argument(
         "--anonymous",
         action="store_true",
         help="read with no credentials (the published bucket grants public reads)",
@@ -337,7 +341,8 @@ def main(argv: list[str] | None = None) -> int:
 
     host = _host_facts()
     print(f"host:  {host}")
-    print(f"store: {args.uri} ({args.region})  zone {args.zone} year {args.year}")
+    preload_note = "manifest preload DISABLED" if args.no_preload else "manifest preload as saved in the store"
+    print(f"store: {args.uri} ({args.region})  zone {args.zone} year {args.year}  [{preload_note}]")
 
     repo = open_global_repo(args.uri, region=args.region, anonymous=args.anonymous)
     session = repo.readonly_session(branch="main")
@@ -382,6 +387,7 @@ def main(argv: list[str] | None = None) -> int:
         "uri": args.uri,
         "region": args.region,
         "anonymous": args.anonymous,
+        "no_preload": args.no_preload,
         "zone": args.zone,
         "time_index": time_index,
         "points": points,
@@ -414,6 +420,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "host": host,
                     "store": {"uri": args.uri, "region": args.region, "zone": args.zone, "year": args.year},
+                    "no_preload": args.no_preload,
                     "snapshot_id": session.snapshot_id,
                     "live_shards": len(shards),
                     "probe_pixels": len(points),
