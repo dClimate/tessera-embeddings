@@ -169,3 +169,44 @@ class TestSampleLivePixels:
         first = published_store.sample_live_pixels(group, 0, [(1, 0)], 5, seed=7)
         second = published_store.sample_live_pixels(group, 0, [(1, 0)], 5, seed=7)
         assert first == second
+
+
+class TestAnonymousStorage:
+    """Opening an S3 store with no credentials — the path an outside consumer reads on."""
+
+    def test_anonymous_asks_icechunk_for_anonymous_credentials(self, monkeypatch):
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(zarr_store.icechunk, "s3_storage", lambda **kw: captured.update(kw))
+        zarr_store._create_storage("s3://bucket/prefix", anonymous=True)
+        assert captured["anonymous"] is True
+        # The credential callback must be ABSENT, not merely unused: passing both leaves which one
+        # icechunk honours up to icechunk.
+        assert "get_credentials" not in captured
+
+    def test_the_default_path_forwards_the_registered_provider_and_never_asks_for_anonymous(self, monkeypatch):
+        captured: dict[str, object] = {}
+        provider = object()
+        monkeypatch.setattr(zarr_store.icechunk, "s3_storage", lambda **kw: captured.update(kw))
+        monkeypatch.setattr(zarr_store, "_default_credentials_provider", provider)
+        zarr_store._create_storage("s3://bucket/prefix")
+        assert captured.get("get_credentials") is provider
+        assert "anonymous" not in captured
+
+    def test_with_no_registered_provider_icechunks_own_chain_is_left_to_answer(self, monkeypatch):
+        # Neither key is set, so icechunk falls back to the standard AWS chain. This is the shape
+        # a bare test process sees, and it must not be mistaken for the anonymous path.
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(zarr_store.icechunk, "s3_storage", lambda **kw: captured.update(kw))
+        monkeypatch.setattr(zarr_store, "_default_credentials_provider", None)
+        zarr_store._create_storage("s3://bucket/prefix")
+        assert "get_credentials" not in captured
+        assert "anonymous" not in captured
+
+    def test_anonymous_with_a_credential_callback_is_refused(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            zarr_store._create_storage("s3://bucket/prefix", get_credentials=lambda: None, anonymous=True)
+
+    def test_a_local_path_ignores_anonymous(self, tmp_path):
+        # `anonymous` is an S3 concept; a local store must not be refused or altered by it.
+        storage = zarr_store._create_storage(str(tmp_path / "local.icechunk"), anonymous=True)
+        assert storage is not None
