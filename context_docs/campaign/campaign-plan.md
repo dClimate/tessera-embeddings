@@ -301,27 +301,36 @@ row is the exception and carries no star deliberately: the published store is no
 it is a property of the production account's paths, so it cannot be passed, mistyped or omitted. It
 is in this table because it is the most consequential value in it.
 
-> **WHAT ACTUALLY RAN DIFFERED IN TWO STARRED ROWS, and one of the reasons below was withdrawn.**
-> The campaign ran **25 clusters of 100 actors**, not 10 of 250, and its chained fill passed **32
-> assembly workers** rather than the default 16. The "~275-actor assembly ceiling" that justified
-> the 10 × 250 shape came from an assembly rate since re-measured 1.7× slower, and there is no
-> single ceiling: the crossover is a function of the assembly pool width — near 158 actors at 16
-> workers and near 383 at 32 (`campaign-cost-model.md` §6c and
-> `tests/unit/inference/test_gpu_starvation.py`). At 100 actors the campaign sat under it either
-> way. The outturn is `campaign-cost-model.md` §12; this table is the plan.
+> **THE CAMPAIGN RAN BOTH FLEET SHAPES, and the reason given below for choosing one is
+> withdrawn.** Every dispatch up to 2026-09-08 took these defaults — **10 clusters of 250
+> actors** — and the 2026-09-09 relaunch passed **25 clusters of 100**. Both are supported and
+> the choice is free.
+>
+> **It does not change the cost.** The bill is total card-hours times price, and splitting a
+> given actor total across more or fewer clusters moves neither term. §12's figures are
+> shape-independent for that reason.
+>
+> **It does change the assembly crossover**, which is per cluster: a cluster's single assembly
+> thread does not speed up as its actor count rises. The "~275-actor ceiling" cited below came
+> from an assembly rate since re-measured 1.7× slower, and there is no single ceiling — the
+> crossover is a function of the assembly POOL WIDTH, near 158 actors at the shipped 16 workers
+> and near 383 at 32. So 250 actors is over the line on a 16-worker pool and under it on a
+> 32-worker one, while 100 is under both. The relaunch widened the pool and narrowed the clusters
+> together. Arithmetic in `campaign-cost-model.md` §6c and
+> `tests/unit/inference/test_gpu_starvation.py`; outturn in §12.
 
 | parameter | value | why |
 |---|---|---|
 | **published store** | **`s3://tessera-embeddings/v1.1/dclimate.icechunk`** | the AWS Open Data bucket, not ours — it carries the storage cost and serves the dataset publicly. Set as `BucketPaths.global_store_uri` on the PROD account's paths, so it is a property of the account rather than a parameter an operator can get wrong. Every producer and consumer of the store reads it from that one method, and no dev or branch deployment carries it, so nothing but production can reach the public bucket |
 | `fill_strategy` | `"chained-clusters"` | one cluster per zone-set, not per zone-year |
-| **`max_parallel_clusters`** | **10** ★ — **ran at 25** | 10 x 250 actors reaches the full 2,500-actor quota while keeping each cluster's assembly thread under its ~275-actor ceiling (§6). Balance holds to ~16, and each cluster still opens on one of the 10 densest zones. **The ~275 ceiling is withdrawn — see the note above the table — and the campaign ran 25 clusters, chosen so a cluster that finishes early releases quota the survivors climb into** |
+| **`max_parallel_clusters`** | **10** ★ — **also run at 25** | 10 x 250 actors reaches the full 2,500-actor quota while keeping each cluster's assembly thread under its ~275-actor ceiling (§6). Balance holds to ~16, and each cluster still opens on one of the 10 densest zones. **The ~275 ceiling is withdrawn — see the note above the table. 25 clusters was also run, chosen so a cluster that finishes early releases quota the survivors climb into; it costs the same** |
 | **`max_parallel_ingest`** | **60** ★ | fleet-wide cap on simultaneous zone-ingests. With every year in one batch the ingest knee is gone, so this is set by quota and by what the GPU fleet can absorb (§6). **60, not the 61 this table asked for until 2026-08-19, and the reason is division:** each cluster's share is this cap over the cluster count ROUNDED UP, so 61 over 10 aims every cluster at 7 and the fleet at 70 against its own gate of 61 — the gate holds the ceiling, so it oversubscribes rather than breaches, but the clusters queue on it and the log reports a width the fleet never runs at. 60 over 10 is exactly 6. Now the flow DEFAULT, so it needs no passing |
 | `max_dispatch_rounds` | 2 | **The outer recovery.** How many times the campaign re-dispatches whatever is still missing — rounds, not a per-zone budget. It is the only thing that recovers a child run that DIED, since a killed or cancelled run takes its own retry counter with it (§8) |
 | `immediate_refill` | `false` | **Off for the run in flight; turn it on at the next restart.** A dispatch round is a barrier — it collects every cluster's outcome before re-reading the store — so a cluster that dies early makes its whole roster wait for the round's slowest sibling. On, a settled cluster's still-missing cells go straight back out into the slot it vacated, inheriting its ingest and committer shares so fleet width and cost do not move. Admitted only when the predecessor's terminal state shows its own writers stopped AND a settling delay has passed, so the asynchronous cancellation of its descendants has had time to take effect; the delay is derived from the confirmation budget the fill's own teardown already spends. A crash or a cancellation waits, because neither carries that proof and re-dispatching them automatically is what §8's write-fencing note is about. It admits, it does not RESERVE: nothing locks a cell, so a writer dispatched from outside the campaign is not excluded — the same residual the round's own re-dispatch has always carried, bounded by mosaic commits refusing a second writer rather than merging. Off is byte-for-byte the old path, which is what makes it safe to merge mid-campaign (§8) |
 | `ingest_settings.max_workers` | 60 | S2 fleet width. Shortens each cell, and so the tail of the cluster holding the densest zone (§6) |
 | `ingest_settings.s1_worker_fraction` | 0.22 | → 13 workers per S1 orbit at the recommended 60w, sized to finish inside S2 |
 | `ingest_settings.batch_days` | 30 | S1 batch length |
-| **`num_actors`** | **250** ★ — **ran at 100** | GPU actors per cluster. 10 clusters x 250 = the 2,500-actor quota, which is ~82% of what 60 cells of ingest can feed — under it by policy, so the fleet never idles (§6). **The campaign ran 100 per cluster as a CEILING rather than a request: each cluster holds only ~4,300 tiles of inference, and placement settled around a 1,307-card peak against an 2,500-card ask** |
+| **`num_actors`** | **250** ★ — **also run at 100** | GPU actors per cluster. 10 clusters x 250 = the 2,500-actor quota, which is ~82% of what 60 cells of ingest can feed — under it by policy, so the fleet never idles (§6). **Either way this is a CEILING rather than a request: placement settled at a 1,307-card peak against a 2,500-card ask. At 100 per cluster the assembly crossover is not a constraint at either pool width; at 250 it is, on the shipped 16-worker pool** |
 | `s1_orbit` | `"both"` | downgrades per zone when an orbit has no imagery. `"none"` is a *resolved* value, not a request: passing it in is refused, since it would defeat `require_s1` and publish optical-only embeddings that report success |
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |

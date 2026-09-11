@@ -414,9 +414,12 @@ than the aggregate, and the aggregate basis hides both:
 > first.** This section is the pre-campaign plan, kept because its arithmetic turned out sound and
 > its inputs did not.
 >
-> **What ran:** 25 clusters of 100 actors, peaking at a 1,307-card daily average and averaging 961
-> cards over the run, consuming **354,742 graphics-card hours** — 15.2% more than the 307,854
-> modelled here — and taking **15.4 days** of publication against the ~5.1 days below.
+> **What ran:** both fleet shapes — **10 clusters of 250 actors** up to 2026-09-08, then **25 of
+> 100** after the relaunch — peaking at a 1,307-card daily average and averaging 961 cards,
+> consuming **354,742 graphics-card hours**, 15.2% more than the 307,854 modelled here, and
+> taking **15.4 days** of publication against the ~5.1 days below. **The shape is a free choice
+> and does not affect cost**, which is total card-hours times price; it affects the per-cluster
+> assembly crossover, and nothing else here.
 >
 > **The 3× duration gap is not an arithmetic error, and decomposing it is the useful part.** This
 > section's figure assumed **2,500 actors at 100% of single-card basis**. Feed it the measured work
@@ -532,9 +535,11 @@ Fargate when the binding resource is GPU.
 **To buy schedule, buy actors.** Cells shown are what keeps 85% provisioning:
 
 > **The `≤275 each` column rests on the assembly-concurrency ceiling withdrawn later in this
-> document, and the campaign did not use this shape.** It ran **25 clusters of 100**, so neither
-> the 275 cap nor the 250-per-cluster rows below were ever tested. Read the *actor totals* as the
-> planning basis they are; ignore the cluster split. §12 has what the fleet did.
+> document.** There is no single ceiling: the crossover is set by the assembly POOL WIDTH, near
+> 158 actors per cluster at the shipped 16 workers and near 383 at 32. The campaign ran 250 per
+> cluster against a 16-worker pool for most of its life — above that line — and 100 against a
+> 32-worker pool after the relaunch. Read the *actor totals* as the planning basis they are, and
+> take the cluster split from §12 rather than from the `≤275` column.
 
 | actors | clusters at ≤275 each | **campaign** | vs 2,500 |
 |---|---|---|---|
@@ -1039,7 +1044,7 @@ will want when they plan for it.
 > |---|---|---|
 > | Fargate vCPU | 22,692 | peaked at an **18,166** daily average |
 > | GPU fleet | 2,500 — the quota | peaked at **1,307**, averaged **961** |
-> | clusters × actors | 10 × 250 | **25 × 100** |
+> | clusters × actors | 10 × 250 | **both run** — 10 × 250, then 25 × 100; same cost |
 > | Inference | $573,000 | **$528,172** |
 > | Ingest | $121,000 | inside the **$187,120** container line |
 > | Assembly + S3 + mosaics | $5,900 | **$100,138** — 17× |
@@ -1128,11 +1133,12 @@ uncertainty list that carries its own retired entries is one nobody reads to the
    (`s1_asc_obs_count + s1_desc_obs_count == 0`), so the work is describing them, not finding
    them (§6).
 
-3. ~~**Provision 2,500 GPU actors as 10 clusters of 250.**~~ **NOT WHAT RAN, and the reasoning
-   below is withdrawn.** The campaign ran **25 clusters of 100** and never held more than a
-   1,307-card daily average. The ten-rather-than-eight conclusion came from the assembly-ceiling
-   figure withdrawn in §6c, so the cluster split had no supported basis either way. Kept for
-   provenance; §12 records the fleet that ran and what it delivered. The original text follows.
+3. **Provision 2,500 GPU actors — but the cluster split below is withdrawn as a *reason*.** The
+   campaign ran this shape up to 2026-09-08 and 25 clusters of 100 after, and never held more than
+   a 1,307-card daily average against either ask. **Both shapes cost the same**: the bill is total
+   card-hours times price. The ten-rather-than-eight conclusion came from the assembly-ceiling
+   figure withdrawn in §6c, so it is the *justification* that fails, not the setting. What
+   actually constrains a cluster's actor count is its assembly pool width — §12. Original text:
 
    **Provision 2,500 GPU actors as 10 clusters of 250.** Sizing under what ingest can feed
    makes idle burn structurally zero and leaves headroom for an ingest cell to fail and restart
@@ -1367,6 +1373,24 @@ is §1's headline table against measurement.
 | Ray cluster ramp | ~$1,200 | $1,471 head nodes | close |
 | EBS volumes | no line | $3,150 | missing from the model |
 | **Campaign total** | **$594,000–$846,000, plan $700,000** | **$816,901** | **inside the range, 16.7% over plan** |
+
+**The modelled inference line is a FLOOR, not a central estimate, and that is why it looks so
+accurate.** It divides by the L40S single-card rate and prices every hour at the L40S rate,
+which is reachable only if the fleet places entirely on `g6e.xlarge`. That capacity is scarce, so
+a real fleet falls back to the `g5.2xlarge` A10G — **cheaper per hour and slower**, and both
+effects are real:
+
+| | |
+|---|---|
+| modelled: 307,854 hours, all L40S at $1.861 | **$573,000** — the floor |
+| the hours actually needed, had they all been L40S | **$660,000** |
+| what ran: 354,742 hours at a blended $1.489 | **$528,172** |
+
+The fallback cost 15% more card-hours and bought them 20% cheaper, which is what brought the
+line in *under* a floor it could not otherwise have met. **The +15.2% in hours is not a second
+error — it IS the 86.6%-of-basis shortfall**: 307,854 divided by 0.866 is 355,490 against the
+354,742 measured. So a planner should read $573,000 as "the best case if every card is the fast
+one" and budget the mix explicitly.
 
 **The range held; the plan did not; and the lines were wrong in offsetting directions.** That is
 the honest summary. The graphics-card line — the one the go/no-go decision rested on, and the one
