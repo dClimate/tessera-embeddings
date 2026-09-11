@@ -6,11 +6,18 @@ across the 14 documents that carried them.** That count is a dated measurement, 
 one — a grep for "withdrawn" now also finds the prose in this file and in the two places that
 link to it.
 
-**This does not replace the withdrawals themselves.** Those stay next to the claims they
-correct, and they have to: a withdrawn number a reader can still see, with the correction
-attached, cannot be quoted by accident — the same number in a register nobody opened is
-just a number in a document. Lifting figures out of the context that qualified them is how
-several of the entries below happened in the first place.
+**For most documents this does not replace the withdrawals themselves.** They stay next to the
+claims they correct, because a withdrawn number a reader can still see, with the correction
+attached, cannot be quoted by accident.
+
+**For the two campaign documents it does.** `campaign/campaign-plan.md` and
+`campaign/campaign-cost-model.md` state only current figures, and this file is the sole record of
+what they used to say. Both are read operationally — someone sizing a fleet or a budget wants the
+number, not its history — and between them they had accumulated 87 such passages. The cost of that
+choice is real and worth naming: a figure lifted out of the context that qualified it is how
+several of the entries below happened in the first place, so **a number quoted from either of those
+documents carries no visible warning that an earlier version of it is still in circulation.**
+Check this file before quoting one.
 
 What this file adds is the thing proximity cannot give: **the pattern.** Individually each
 withdrawal reads as bad luck. Grouped, nine mechanisms account for all of them, most
@@ -421,21 +428,26 @@ Distilled from the nine above. Each line exists because skipping it cost a withd
    "estimated". A bare number cannot be checked, and an unchecked estimate survives until
    something expensive disagrees with it.
 
-## Why the withdrawals stay in place
+## Where the withdrawals live
 
-Recorded here so this file is not mistaken for a proposal to consolidate them.
+Two rules, because the documents are read differently.
 
-The withdrawals live next to the claims they correct because that is where they do their
-work — a reader reaching for a figure has to read past the retraction to reach it. They are
-also a small share of the text they sit in: across the documents that carry them they are
-**under a tenth** of the lines, and the remainder is the derivation those documents exist
-for. Extracting them would shorten nothing meaningfully and would retire no document, while
-moving each correction one lookup away from the number it corrects.
+**The measurement records keep theirs in place.** `ingest/ingest-performance.md`,
+`inference/inference-on-gpus.md`, the assembly records and the decision records all carry their
+withdrawn claims beside the corrected ones. A reader reaching for one of those figures has to read
+past the retraction to reach it, which is the point, and the retractions are under a tenth of the
+lines in documents that exist for their derivations. The decision records go further by being
+append-only: a superseded record stays and a new one supersedes it. For these, this file is an
+index over that material rather than a replacement for it.
 
-[`campaign/campaign-plan.md`](campaign/campaign-plan.md) §11 states the underlying rule: the
-stage records *"carry their own withdrawn claims beside the corrected ones, on purpose — a
-reviewer who sees only the final number learns nothing about how it went wrong"*. The decision
-records follow the same principle by being append-only — a superseded record stays and a new one
-supersedes it.
+**The two campaign documents keep none.** `campaign/campaign-plan.md` and
+`campaign/campaign-cost-model.md` state the current position and nothing else, and for them this
+file is the record. That was a deliberate change on 2026-09-11, on the grounds that both are
+operational documents whose readers want a figure rather than its provenance.
 
-This register is the index over that material, not a replacement for it.
+What survived that change in those two documents is worth knowing, because it is the distinction to
+apply when writing them: **an operating rule learned from a mistake stays as a rule, and the
+anecdote goes.** "Do not close a cost window on the current day" is live instruction; the story of
+the day it cost $11,000 is not. A live qualification on a current figure also stays — the staged
+volume that can only be bounded between 1 and 1.6 PB is a limitation, not a retraction. The test is
+tense: does the sentence say what is true now, or what somebody used to believe?

@@ -62,7 +62,7 @@ when one fails.
 
 ```
    a naive run             ingest then inference     ~12 days     14 PB of mosaics at once
-   the campaign             ingest alongside it       ~5.1 days    ~850 TB at once
+   the campaign             ingest alongside it       ~5.1 days    ~850 TB at once (ran at 9.97 PiB)
 ```
 
 **~5.1 days is the campaign's wall clock.** It is ~60 cells of ingest feeding 2,500 GPU actors
@@ -81,6 +81,14 @@ writes — counted object by object from S3 Inventory,
 [`campaign-cost-model.md`](campaign-cost-model.md) §12c. Run sequentially, that full volume is held
 at once and storage alone becomes a six-figure monthly bill instead of the transient line measured
 at **$73,180** for the whole campaign (cost-model §12).
+
+**The design property held; the number this paragraph predicts did not.** At 60 cells in flight the
+arithmetic above gives ~850 TB resident, and the campaign peaked at **9.97 PiB — 13× that, or 795
+cells' worth of mosaic resident at once** out of 1,008. Mosaics are deleted after *assembly*, not
+after inference, and assembly is what this campaign was short of, so they accumulated instead of
+draining. Staging still earned its keep — 9.97 PiB is well under the 14.04 PB a sequential run
+would have held, and that gap is the whole benefit — but **this arithmetic sizes the floor, not the
+exposure.** Size storage on how fast the *deletions* land, not on how many ingests are admitted.
 
 > **The three stages are also UNGATED with respect to each other, and that was a measured
 > correction** (PR #149, 2026-08-26). The campaign asked for 60 concurrent ingests and **ran 7**,
@@ -1058,9 +1066,11 @@ pointer, never a derivation.
 
 **Those documents carry their own withdrawn claims beside the corrected ones, on purpose** — a
 reviewer who sees only the final number learns nothing about how it went wrong, and
-[`../corrections-register.md`](../corrections-register.md) indexes them by mechanism.
+[`../corrections-register.md`](../corrections-register.md) indexes them by mechanism. **The
+exception is [`campaign-cost-model.md`](campaign-cost-model.md)**, which states only current
+figures; its withdrawals live in the register alone.
 
-**This file carries none of them.** It states the current position; how that position was reached
+**This file carries none of them either.** It states the current position; how that position was reached
 lives in the document that owns the measurement. A finding that changed a decision here is folded
 into the section it changed, and history appears only where it explains a decision that would
 otherwise look arbitrary.

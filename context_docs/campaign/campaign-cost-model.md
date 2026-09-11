@@ -1575,10 +1575,18 @@ of the volume moved in the twelve days from 08-21 to 09-01.
 assembly, never input. §5 reaches the same conclusion from card hours; this reaches it from
 bytes, and the two share no instrument.
 
-**This volume is the mechanism behind transient storage coming in 24× over its modelled line**
-(§7, §12). **State how a volume figure was derived** — the input geometry, the run it came from, or
-the words "estimated, unmeasured". A bare per-cell volume cannot be debugged when a measurement
-disagrees with it by a factor of two and a half.
+**This volume is part of the mechanism behind transient storage coming in 24× over its modelled
+line, and the smaller part.** Volume was 2.5× the estimate; peak resident volume was **13× what the
+plan's own arithmetic predicted** — 9.97 PiB against ~850 TB for 60 cells in flight — because
+mosaics are deleted after assembly rather than after inference, and assembly was the scarce stage,
+so they accumulated. The two factors over-explain the 24× on the bill, so a clean split is not
+recoverable from a peak figure; what is clear is that **residency dominates volume**. §7 names the
+same mechanism from the estimate's side. **Size storage on how fast deletions land, not on how many
+ingests are admitted.**
+
+**State how a volume figure was derived** — the input geometry, the run it came from, or the words
+"estimated, unmeasured". A bare per-cell volume cannot be debugged when a measurement disagrees
+with it by a factor of two and a half.
 
 #### How it was measured
 
