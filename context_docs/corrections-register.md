@@ -61,7 +61,8 @@ that was entirely an artefact.
   **nothing measured places it on either side of the line**, and a docstring had gone on to offer a
   505-cell publication day as evidence that it sat above one. What survives is the part that holds
   on every basis: 100 actors is under every crossover, and widening the pool raises every
-  crossover. **The correction for an unmatched comparison is not a different unmatched
+  crossover — the latter mechanically rather than measurably, since the two assembly rates the
+  ratio uses are themselves from different cells. **The correction for an unmatched comparison is not a different unmatched
   comparison.**
   ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c,
   `tests/unit/inference/test_gpu_starvation.py`)
@@ -99,6 +100,15 @@ Consulting it would have caught the season error in one minute. It was not consu
 - **"`t_kept` 145 remains a defensible planning figure."** 145 is a combined census figure
   and `t_kept` is optical, so "inside the observed 57–158 range" compared quantities in
   different units. (`inference/inference-on-gpus.md`, correction 4)
+- **"About 9.33 PiB resident — within 6% of the 9.97 PiB peak measured independently."** Two unit
+  errors in one reconciliation. The 9.33 converted AWS's storage "GB" as 10⁹ bytes, where for S3
+  storage AWS means 2³⁰ — the figure is **10.02 PiB**, 7.4% higher. And it compared a billing
+  *daily average* against a bucket-metric *maximum*, on a different day, over one of the two
+  buckets billing covers. The offered explanation for the 6% gap, "billing covers every bucket",
+  pointed the wrong way: adding the second bucket raises the independent figure and widens the gap
+  it was meant to close. Corrected, the two instruments agree to **1.0%** — which is the result the
+  reconciliation existed to produce, and which the wrong units hid.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
 - **Pixels per second versus tokens per second.** The cluster-sizing note's wall-clock and
   GPU-hour columns rested on a px/s figure measured over one region; inference cost scales with
   tokens, and px/s is a property of the pipeline *and the geography it ran over*. Those columns are
@@ -262,15 +272,12 @@ needs enough points to show it is monotonic before one of them becomes a recomme
   — "if inference lags, it grows linearly with the backlog" — and then does not size it. An
   estimate small enough to skip re-deriving is exactly the one nobody checks.
   ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §7, §12)
-- **"$17,576 for an icechunk reproduction box nobody switched off", and "tear down debugging
-  infrastructure."** A real and large line of spend — 1,545 `c8gn.48xlarge` hours — attributed to
-  the only large non-campaign activity anyone remembered, without asking the instance what it was.
-  It is the **isolated VPC's three NAT instances**, whose CloudFormation launch templates carried
-  `c8gn.48xlarge` where they should have carried `t4g.micro`; the icechunk reproduction ran on a
-  different instance type entirely. The cost of the wrong cause was the *recommendation it
-  produced*: someone told to tear down a debugging box would have found none and left $819 a day
-  running. The instance type, image name, autoscaling group and stack were each one API call away.
-  **An expensive line deserves the call that identifies it.**
+- **"$17,576 for an icechunk reproduction box."** A real line of spend — 1,545 `c8gn.48xlarge`
+  hours — attributed to the only large non-campaign activity anyone remembered, without asking the
+  instances what they were. They are the isolated VPC's three NAT instances; the reproduction work
+  ran on a different instance type, of which the account records no usage in the window. The
+  *quantity* survives and the *cause* did not. **An expensive line deserves the API call that
+  identifies it.**
   ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
 - **"Assembly is CPU-bound."** Asserted from utilisation, which shows the processor is busy at
   moments, not that it is the constraint that binds the rate of work — while Fargate publishes no

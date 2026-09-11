@@ -14,6 +14,12 @@ taken from a document.
 
 THREE DISTINCTIONS THAT DECIDE WHETHER THE PERCENTAGE MEANS ANYTHING:
 
+* **A tile published as FILL is not a tile carrying data**, and the two are reported separately.
+  Each run records ``optical_skips.tiles_skipped``: tiles whose every date the optical preflight
+  refused, which assembly still writes over the cell's whole live footprint so the array carries no
+  holes. Crediting a published cell's entire land footprint as delivered counts those, and they are
+  a real fraction -- 4.2% of 2017. So the roster percentage and the *tile-years carrying embeddings*
+  are two different numbers, and a token or throughput figure wants the second.
 * **A cell published as ``empty`` is counted separately, never folded in.** It is a genuine
   completion of the roster carrying no land, so counting it as delivered inflates the cell
   count while contributing no tiles, and dropping it silently makes the roster look unfinished.
@@ -45,6 +51,7 @@ from pathlib import Path
 
 from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 from tessera_embeddings.storage.zarr_store import open_store_group_and_tip
+from tessera_embeddings.storage.zone_grid import ZONES
 
 MASK_URI = "s3://global-tessera-inputs/masks/global.icechunk"
 STORE_URI = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
@@ -63,6 +70,14 @@ def read_mask() -> tuple[dict[str, int], str]:
     exists to produce would come out too high, and nothing would say so.
     """
     mask, snapshot = open_store_group_and_tip(MASK_URI, get_credentials=iam_icechunk_credentials, region=REGION)
+    # The zone roster is checked against the grid definition rather than taken from whatever the
+    # mask happens to hold. A zone absent from the mask would otherwise drop out of the denominator
+    # while the reconciliation still passed, because both sides of that check are built from this
+    # same dictionary -- the identical failure shape as a missing ``n_live_tiles``, one level up.
+    present = set(mask.group_keys())
+    if present != set(ZONES):
+        missing, extra = sorted(set(ZONES) - present), sorted(present - set(ZONES))
+        raise SystemExit(f"mask zone roster does not match the grid: missing={missing} extra={extra}")
     land: dict[str, int] = {}
     for zone in mask.group_keys():
         raw = dict(mask[zone].attrs).get("n_live_tiles")
@@ -76,7 +91,13 @@ def read_mask() -> tuple[dict[str, int], str]:
 
 
 def read_store(land: dict[str, int]) -> tuple[dict, dict, str]:
-    """(published_with_data, published_empty, store snapshot ID), each keyed ``zone|year``."""
+    """(published_with_data, published_empty, store snapshot ID), each keyed ``zone|year``.
+
+    Each published record carries both tile counts: the cell's live footprint, and how much of it
+    the optical preflight refused so assembly wrote it as fill. ``tiles_live`` comes from the run's
+    own record rather than from the mask, which makes it an independent check ON the mask -- and
+    the two agree exactly, to the tile, in all nine years.
+    """
     store, snapshot = open_store_group_and_tip(STORE_URI, get_credentials=iam_icechunk_credentials, region=REGION)
     published: dict[str, dict] = {}
     empty: dict[str, dict] = {}
@@ -85,7 +106,13 @@ def read_store(land: dict[str, int]) -> tuple[dict, dict, str]:
         runs = attrs.get("runs") or {}
         for year in attrs.get("years_complete") or []:
             run = runs.get(str(year)) or {}
-            record = {"assembled_at": run.get("assembled_at"), "tiles": land.get(zone, 0)}
+            skips = run.get("optical_skips") or {}
+            record = {
+                "assembled_at": run.get("assembled_at"),
+                "tiles": land.get(zone, 0),
+                "tiles_live_recorded": skips.get("tiles_live"),
+                "skipped": int(skips.get("tiles_skipped") or 0),
+            }
             (empty if run.get("empty") else published)[f"{zone}|{year}"] = record
     return published, empty, snapshot
 
@@ -106,6 +133,21 @@ def main(argv: list[str] | None = None) -> int:
 
     published, empty, store_snapshot = read_store(land)
     delivered = sum(v["tiles"] for v in published.values())
+    skipped = sum(v["skipped"] for v in published.values())
+    with_data = delivered - skipped
+
+    # The run's own live-tile count against the mask's. Two instruments, no shared code: if they
+    # disagree, one of the two footprints is wrong and the roster percentage means nothing.
+    disagree = {
+        k: (v["tiles"], v["tiles_live_recorded"])
+        for k, v in published.items()
+        if v["tiles_live_recorded"] is not None and int(v["tiles_live_recorded"]) != v["tiles"]
+    }
+    if disagree:
+        print(f"\nMASK AND RUN RECORDS DISAGREE on the live footprint of {len(disagree)} cells:", file=sys.stderr)
+        for k, (m, r) in sorted(disagree.items())[:10]:
+            print(f"  {k}: mask {m:,} vs run record {r:,}", file=sys.stderr)
+        return 1
 
     roster_land = {f"{z}|{y}" for z in with_land for y in YEARS}
     roster_none = {f"{z}|{y}" for z, n in land.items() if n == 0 for y in YEARS}
@@ -115,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     missing_none = roster_none - set(published) - set(empty)
 
     print(f"\n{'bucket':<44} {'cells':>6} {'tile-years':>13}")
-    print(f"{'published with data':<44} {len(published):>6} {delivered:>13,}")
+    print(f"{'published, cell carries data':<44} {len(published):>6} {delivered:>13,}")
     print(f"{'published empty — landless zone':<44} {len(empty_none):>6} {0:>13}")
     print(
         f"{'published empty — land, every tile refused':<44} {len(empty_land):>6} "
@@ -137,7 +179,24 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  published but not in the roster: {sorted(stray)[:10]}", file=sys.stderr)
         return 1
     print(f"\nreconciled: every one of {roster_cells} roster cells in exactly one bucket")
-    print(f"delivered {delivered:,} of {roster_tiles:,} tile-years = {delivered / roster_tiles * 100:.2f}%")
+    print(f"roster completion {delivered:,} of {roster_tiles:,} tile-years = {delivered / roster_tiles * 100:.2f}%")
+    # The second number, and the one a token or throughput figure needs. The first says the cell
+    # published; this says the tile holds an embedding.
+    print(
+        f"of which {skipped:,} tiles were published as FILL (optical preflight refused every date), "
+        f"so\ntile-years CARRYING EMBEDDINGS {with_data:,} = {with_data / roster_tiles * 100:.2f}% of the roster"
+    )
+    by_year_skip: collections.Counter = collections.Counter()
+    by_year_live: collections.Counter = collections.Counter()
+    for k, v in published.items():
+        by_year_skip[int(k.split("|")[1])] += v["skipped"]
+        by_year_live[int(k.split("|")[1])] += v["tiles"]
+    print(
+        "  fill by year: "
+        + "  ".join(
+            f"{y}:{by_year_skip[y]:,}({by_year_skip[y] / by_year_live[y] * 100:.2f}%)" for y in sorted(by_year_live)
+        )
+    )
 
     if missing:
         by_zone = collections.Counter(k.split("|")[0] for k in missing)
@@ -181,6 +240,9 @@ def main(argv: list[str] | None = None) -> int:
                     "published": published,
                     "empty": empty,
                     "roster": roster_tiles,
+                    "delivered": delivered,
+                    "skipped": skipped,
+                    "with_data": with_data,
                     "mask_snapshot": mask_snapshot,
                     "store_snapshot": store_snapshot,
                 },

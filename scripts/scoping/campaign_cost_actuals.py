@@ -4,7 +4,12 @@ Produces the cost half of ``context_docs/campaign/campaign-cost-model.md`` secti
 instance-hours, container-hours, storage and request volumes over the campaign window, each
 multiplied by the published list price for its exact billing usage type.
 
-    python scripts/scoping/campaign_cost_actuals.py --start 2026-07-01 --end 2026-09-12
+    python scripts/scoping/campaign_cost_actuals.py --start 2026-07-01 --end 2026-09-11
+
+``--end`` IS EXCLUSIVE, which is Cost Explorer's convention and the single easiest thing to get
+wrong here: the command above closes the window on 2026-09-10, which is what §12 publishes. An
+``--end`` of 2026-09-12 would pull in a day of usage that is not campaign work and a day Cost
+Explorer had not finished reporting.
 
 WHAT IT PRODUCES IS NOT A BILL, and the distinction is the reason this script exists rather
 than a console screenshot. Cost Explorer's *cost* metrics read as zero in this member account
@@ -21,14 +26,17 @@ FOUR ASSUMPTIONS THAT WOULD SILENTLY CORRUPT THE ANSWER, each guarded below:
   string, and the unit is asserted before the quantity is used.
 * S3 storage steps down in price at 50 TB and 500 TB, so it is priced per calendar month
   against its own tiers. A campaign this size priced at the first tier is overstated.
-* The most recent day or two is incomplete, because Cost Explorer trails real time. The last
-  day in the data is reported so it is not read as a fall in activity.
+* The most recent day or two is incomplete, because Cost Explorer trails real time -- which
+  understated this campaign by $11,000 once (§12). The last day in the data is reported so it is
+  not read as a fall in activity, and Cost Explorer's own ``Estimated`` flag is surfaced per
+  period. Note what that flag does and does not mean: it marks the whole of a month AWS has not
+  closed for billing, not a day whose usage is still arriving. It is therefore a statement about
+  finality and not about completeness, and both matter.
 * Anything with no price entry is EXCLUDED and printed IN FULL, with no quantity threshold.
   A threshold cannot be set here, because quantities are not comparable across billing units:
   900 hours of a large instance is five figures and 900 S3 requests is nothing. Unpriced EC2
   instance-hours are called out separately, since those are the ones that are large money at
-  small quantity -- which is how three NAT instances at ``c8gn.48xlarge`` cost $18,500 without
-  appearing anywhere anyone looked.
+  small quantity.
 
 Re-run this at the end of a campaign, and widen ``EC2_TYPES`` if the fleet gains an instance type;
 an unpriced type shows up in the excluded list rather than vanishing.
@@ -65,9 +73,11 @@ FLAT_TYPES = {
     "USW2-Inventory-ObjectsListed": ("AmazonS3", "Objects"),
     "USW2-EBS:VolumeUsage.gp3": ("AmazonEC2", "GB-Mo"),
 }
-#: Priced per calendar month against its own tier boundaries.
+#: Priced per calendar month against its own tier boundaries, which are FETCHED and not pinned --
+#: see :func:`storage_tiers`. A campaign this size sits in the third tier, so hard-coding the first
+#: rate overstates it, and hard-coding all three would go stale silently against every other line
+#: on this page being live.
 STORAGE_TYPE = "USW2-TimedStorage-ByteHrs"
-STORAGE_TIERS = ((51_200, 0.023), (512_000, 0.022), (float("inf"), 0.021))
 
 #: How the lines are reported: (label, usage types, is_campaign_work). Order is presentation order.
 #:
@@ -81,10 +91,9 @@ GROUPS = (
     ("S3 requests", ("USW2-Requests-Tier1", "USW2-Requests-Tier2", "USW2-Inventory-ObjectsListed"), True),
     ("EBS volumes", ("USW2-EBS:VolumeUsage.gp3",), True),
     ("Ray head nodes", ("USW2-BoxUsage:m5.2xlarge",), True),
-    # The isolated VPC's three fck-nat NAT instances, whose launch templates carried
-    # `c8gn.48xlarge` instead of `t4g.micro` from 2026-08-20 to 2026-09-11. Real spend, not
-    # campaign work, and kept as its own line so it can neither be hidden nor double-counted.
-    ("NAT instances (mis-sized)", ("USW2-BoxUsage:c8gn.48xlarge",), False),
+    # The isolated VPC's three NAT instances, 2026-08-20 to 2026-09-11. Real spend, not campaign
+    # production, and kept as its own line so it can neither be hidden nor double-counted.
+    ("isolated-VPC NAT instances", ("USW2-BoxUsage:c8gn.48xlarge",), False),
 )
 
 
@@ -148,14 +157,48 @@ def flat_price(pricing: Any, service: str, usage_type: str) -> float:  # noqa: A
     return min(prices)
 
 
-def fetch_usage(ce: Any, start: str, end: str) -> tuple[dict, dict]:  # noqa: ANN401 — botocore client, untyped
-    """(usage[day][usage_type], unit[usage_type]) over every page.
+def storage_tiers(pricing: Any) -> tuple[tuple[float, float], ...]:  # noqa: ANN401 — botocore client, untyped
+    """S3 Standard storage price tiers as ``((upper_gb_month, rate), ...)``, ascending.
+
+    Fetched rather than pinned. The Pricing API returns one price dimension per tier carrying its
+    own ``beginRange``/``endRange``, so the boundaries are published data like every other rate on
+    this page; pinning them would leave one line of the table frozen while the rest moved.
+    """
+    resp = pricing.get_products(
+        ServiceCode="AmazonS3",
+        Filters=[{"Type": "TERM_MATCH", "Field": "usagetype", "Value": STORAGE_TYPE}],
+        MaxResults=100,
+    )
+    tiers: list[tuple[float, float]] = []
+    for blob in resp["PriceList"]:
+        for term in json.loads(blob)["terms"].get("OnDemand", {}).values():
+            for dim in term["priceDimensions"].values():
+                if dim["unit"] != "GB-Mo":
+                    continue
+                upper = dim.get("endRange") or "Inf"
+                tiers.append(
+                    (float("inf") if upper in ("Inf", "") else float(upper), float(dim["pricePerUnit"]["USD"]))
+                )
+    if not tiers:
+        raise SystemExit(f"no storage tiers for {STORAGE_TYPE} — refusing to guess them")
+    return tuple(sorted(tiers))
+
+
+def fetch_usage(ce: Any, start: str, end: str) -> tuple[dict, dict, list[str]]:  # noqa: ANN401 — botocore client, untyped
+    """(usage[day][usage_type], unit[usage_type], periods AWS still calls estimated).
 
     Paginated deliberately: a single page is not the whole window, and a truncated fetch is
     indistinguishable from a quiet campaign.
+
+    The ``Estimated`` flag is carried out rather than dropped. It does not mean what the trailing-day
+    problem needs it to mean -- AWS sets it for every day of an unclosed month, not for a day whose
+    usage is still landing -- so it cannot be the guard against closing a window too early. It is
+    still the only statement the API makes about whether a figure is final, and a caller quoting a
+    total deserves to know which part of it AWS has not closed.
     """
     usage: dict[str, dict[str, float]] = collections.defaultdict(dict)
     units: dict[str, str] = {}
+    estimated: list[str] = []
     token, pages = None, 0
     while True:
         kw: dict[str, Any] = {
@@ -170,6 +213,8 @@ def fetch_usage(ce: Any, start: str, end: str) -> tuple[dict, dict]:  # noqa: AN
         pages += 1
         for period in resp["ResultsByTime"]:
             day = period["TimePeriod"]["Start"]
+            if period.get("Estimated") and day not in estimated:
+                estimated.append(day)
             for group in period["Groups"]:
                 ut = group["Keys"][0]
                 metric = group["Metrics"]["UsageQuantity"]
@@ -179,10 +224,10 @@ def fetch_usage(ce: Any, start: str, end: str) -> tuple[dict, dict]:  # noqa: AN
         if not token:
             break
     print(f"fetched {pages} page(s): {len(usage)} days, {len(units)} usage types")
-    return usage, units
+    return usage, units, sorted(estimated)
 
 
-def storage_cost(usage: dict) -> tuple[float, dict[str, tuple[float, float]]]:
+def storage_cost(usage: dict, tiers: tuple[tuple[float, float], ...]) -> tuple[float, dict[str, tuple[float, float]]]:
     """S3 storage priced per calendar month against its tier boundaries."""
     by_month: collections.Counter = collections.Counter()
     for day, day_usage in usage.items():
@@ -191,7 +236,7 @@ def storage_cost(usage: dict) -> tuple[float, dict[str, tuple[float, float]]]:
     total, detail = 0.0, {}
     for month, gb_months in sorted(by_month.items()):
         remaining, cost, floor = gb_months, 0.0, 0.0
-        for bound, rate in STORAGE_TIERS:
+        for bound, rate in tiers:
             take = min(remaining, bound - floor)
             if take <= 0:
                 break
@@ -208,19 +253,37 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--start", required=True, help="inclusive, YYYY-MM-DD")
     ap.add_argument("--end", required=True, help="EXCLUSIVE, YYYY-MM-DD (the Cost Explorer convention)")
+    ap.add_argument(
+        "--require-final",
+        action="store_true",
+        help="refuse if AWS still calls any period in the window estimated (i.e. an unclosed month)",
+    )
     args = ap.parse_args(argv)
 
     session = boto3.Session()
     ce = session.client("ce", region_name=CE_REGION)
     pricing = session.client("pricing", region_name=PRICING_REGION)
 
-    usage, units = fetch_usage(ce, args.start, args.end)
+    usage, units, estimated = fetch_usage(ce, args.start, args.end)
     if not usage:
         print("no usage in that window", file=sys.stderr)
         return 1
+    if estimated:
+        print(
+            f"\nAWS still calls {len(estimated)} period(s) ESTIMATED: {estimated[0]} .. {estimated[-1]}."
+            "\n  That flag marks an unclosed BILLING month, not a day whose usage is still arriving,"
+            "\n  so it is a statement about finality rather than completeness. Quantities in an"
+            "\n  unclosed month can still move.",
+            file=sys.stderr,
+        )
+        if args.require_final:
+            print("REFUSING: --require-final was passed. Move --end back to a closed month.", file=sys.stderr)
+            return 1
 
     price = {ut: ec2_price(pricing, it) for ut, it in EC2_TYPES.items()}
     price.update({ut: flat_price(pricing, svc, ut) for ut, (svc, _) in FLAT_TYPES.items()})
+    tiers = storage_tiers(pricing)
+    print("\nS3 storage tiers (fetched): " + ", ".join(f"<={b:,.0f} GB-Mo ${r}" for b, r in tiers))
     print("\nunit prices (on-demand list, fetched now):")
     for ut, p in sorted(price.items()):
         print(f"  {ut:<40} ${p:.6f} per {units.get(ut, '?')}")
@@ -237,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  REFUSING {ut}: unexpected unit {units.get(ut)!r}", file=sys.stderr)
             return 1
 
-    stor_total, stor_detail = storage_cost(usage)
+    stor_total, stor_detail = storage_cost(usage, tiers)
 
     days = sorted(usage)
     gpu_uts = GROUPS[0][1]

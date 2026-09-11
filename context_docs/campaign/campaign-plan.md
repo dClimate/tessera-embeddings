@@ -321,7 +321,9 @@ is in this table because it is the most consequential value in it.
 > **250 sits inside that range, so nothing measured says which side of the line the campaign's
 > wide shape ran on**; the only matched pair of measurements, both from 48N-2017, puts it on the
 > safe side. **100 actors is under every crossover on every basis**, which is the one statement
-> that needs no argument, and widening the pool raises the crossover on every basis. The relaunch
+> that needs no argument, and widening the pool raises the crossover on every basis — that one
+> mechanically, since more workers cannot slow a fixed cell down, but NOT by a measured factor:
+> the 16- and 32-worker assembly rates are themselves from different cells. The relaunch
 > did both at once. Arithmetic in `campaign-cost-model.md` §6c and
 > `tests/unit/inference/test_gpu_starvation.py`; outturn in §12.
 
@@ -336,7 +338,7 @@ is in this table because it is the most consequential value in it.
 | `ingest_settings.max_workers` | 60 | S2 fleet width. Shortens each cell, and so the tail of the cluster holding the densest zone (§6) |
 | `ingest_settings.s1_worker_fraction` | 0.22 | → 13 workers per S1 orbit at the recommended 60w, sized to finish inside S2 |
 | `ingest_settings.batch_days` | 30 | S1 batch length |
-| **`num_actors`** | **250** ★ — **also run at 100** | GPU actors per cluster. 10 clusters x 250 = the 2,500-actor quota, which is ~82% of what 60 cells of ingest can feed — under it by policy, so the fleet never idles (§6). **Either way this is a CEILING rather than a request: placement settled at a 1,307-card peak against a 2,500-card ask. At 100 per cluster the assembly crossover is not a constraint at either pool width; at 250 it is, on the shipped 16-worker pool** |
+| **`num_actors`** | **250** ★ — **also run at 100** | GPU actors per cluster. 10 clusters x 250 = the 2,500-actor quota, which is ~82% of what 60 cells of ingest can feed — under it by policy, so the fleet never idles (§6). **Either way this is a CEILING rather than a request: placement settled at a 1,307-card peak against a 2,500-card ask. At 100 per cluster the assembly crossover is not a constraint at either pool width. At 250 it is UNDETERMINED — see the note above the table: the shipped-width crossover lies between 158 and 394 actors depending on which cell's inference rate it is derived from, and 250 is inside that range** |
 | `s1_orbit` | `"both"` | downgrades per zone when an orbit has no imagery. `"none"` is a *resolved* value, not a request: passing it in is refused, since it would defeat `require_s1` and publish optical-only embeddings that report success |
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |

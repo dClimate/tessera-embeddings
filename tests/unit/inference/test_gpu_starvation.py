@@ -957,7 +957,12 @@ CAMPAIGN_ASSEMBLY_WORKERS_LATE = 32
 #: over a window closed on 2026-09-10 -- the last day any card ran, and a day Cost Explorer had
 #: fully reported by the time it was read.
 CAMPAIGN_GPU_HOURS = 360_282
-#: Tile-years published with data -- 992 cells, 99.96% of the 3,248,577 roster.
+#: Tile-years in the 992 completed cells -- 99.96% of the 3,248,577 roster.
+#:
+#: The COMPLETED footprint, not the footprint carrying data: 17,855 of these were refused by the
+#: optical preflight and written as fill, so 3,229,545 hold embeddings (§12). This constant is the
+#: former because every cost and rate figure in §12 is divided by it; a per-tile figure about
+#: delivered WORK wants the latter.
 CAMPAIGN_TILE_YEARS = 3_247_400
 #: Graphics cards at on-demand list. NOT a bill: this account's cost metrics read as zero, so the
 #: figure is measured usage times published list price. See the cost script's docstring.
@@ -1102,8 +1107,10 @@ def test_the_assembly_crossover_depends_on_the_pool_width() -> None:
     cell — puts it on the safe side.
 
     What survives unconditionally is narrower and still useful: **100 actors per cluster is under
-    every crossover on every basis**, and widening the assembly pool raises the crossover on every
-    basis. The relaunch did both at once.
+    every crossover on every basis**. Widening the assembly pool raises the crossover too, but
+    mechanically rather than measurably -- more workers cannot slow a fixed cell down, while the
+    two measured rates come from different cells, so nothing here sizes the effect. The relaunch
+    moved both at once.
 
     **The 505-cell day is therefore NOT evidence for a starved assembly thread**, and an earlier
     version of this docstring offered it as such. Assemblies also stalled on an upstream Icechunk
@@ -1123,9 +1130,17 @@ def test_the_assembly_crossover_depends_on_the_pool_width() -> None:
     be32 = break_even(a32)
     matched16 = break_even(a16, MATCHED_INFERENCE_GPU_H_PER_TILE)
 
-    # Widening the pool moves the crossover, which is the whole claim, and it holds on either basis.
-    assert be32 > 2 * be16 / 1.5, "doubling the assembly pool no longer buys actor headroom"
-    assert break_even(a32, MATCHED_INFERENCE_GPU_H_PER_TILE) > 2 * matched16 / 1.5
+    # THE POOL-WIDTH EFFECT IS MECHANICAL, NOT MEASURED, and this test no longer pretends
+    # otherwise. More workers cannot make a fixed cell's assembly slower, so a wider pool raises
+    # the crossover by construction. But the two entries of ASSEMBLY_S_PER_TILE_BY_WORKERS come
+    # from DIFFERENT CELLS -- 48N at 16 workers, 51S at 32 -- so their 2.4x ratio is pool width
+    # confounded with geography and cannot size the effect. Asserted: only the ordering, and only
+    # as a statement about these two measurements.
+    assert a32 < a16, (
+        "the 32-worker cell no longer measures faster per tile than the 16-worker one — the pair "
+        "of measurements this module keys on has changed, whatever the cause"
+    )
+    # A same-cell pair at two widths is what would turn that into a scaling law. There is none.
 
     # The two ends of the range, and the fact that they ARE two ends: same assembly rate, inference
     # from two different cells, 2.5x apart. Pinned so that neither can be quoted as "the" crossover.
