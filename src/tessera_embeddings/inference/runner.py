@@ -20,7 +20,7 @@ from typing import Any
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.inference import InferenceConfig, assert_run_id_matches_model
 from tessera_embeddings.inference.actors import InferenceActor
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -77,6 +77,8 @@ def run_inference(
         mosaic_base: Base path for input mosaic stores (any fsspec URI).
         staging_base: Base path for staged output stores.
         run_id: Unique run identifier, for resume detection and staging-path namespacing.
+            Must be non-empty and carry the prefix for ``config.model_version`` (see
+            :func:`~tessera_embeddings.config.inference.run_id_prefix`).
         t0: **Accepted and ignored.** For a chained session the run's start is the top of
             the whole stream, so this counted the ingest look-ahead, ``ray up``, EC2 bringup
             and model load, and read as though inference had been running that long; it also
@@ -118,12 +120,33 @@ def run_inference(
         ``"resumed": True`` on entries already staged by a prior run.
 
     Raises:
-        ValueError: If ``num_actors < 1``.
+        ValueError: If ``num_actors < 1``, if ``run_id`` is empty, or if ``run_id``'s encoder
+            prefix contradicts ``config.model_version``.
         RuntimeError: If too few actors initialize within the timeout (see
             :func:`tessera_embeddings.inference.runner.wait_for_actors`).
     """
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors}")
+
+    # A staging NAMESPACE, which is why this is checked for both models and separately from the
+    # encoder rule below. `run_id` is interpolated straight into `staging_base/<run_id>/<label>`,
+    # so an empty one resolves to `staging_base//<label>` — a single prefix that every run passing
+    # an empty id shares. The resume scan then reports one run's tiles as another's already-staged
+    # work, and on a local filesystem the `//` collapses so they land loose in `staging_base`
+    # beside the per-run directories.
+    if not run_id or not run_id.strip():
+        raise ValueError(
+            f"run_id={run_id!r} is empty. It namespaces the staging prefix, so an empty one makes "
+            f"every run share one directory and resume over each other's tiles. Mint it as "
+            f"run_id_prefix(config.model_version) + <uuid>."
+        )
+
+    # BEFORE anything is reused. This is a public entry point, so a caller can arrive here
+    # with a run_id and a config that disagree about the encoder without ever passing through
+    # the Prefect flow's guard — and the artifacts themselves cannot settle it, being the same
+    # shape and dtype under either student. Checked even when `chunks` is empty: a chained
+    # session reuses the same run_id for the work that arrives later.
+    assert_run_id_matches_model(run_id, config.model_version)
 
     # --- Resume check: skip chunks already staged from a prior run ---
     # Gated on a non-empty chunk list: a chained session starts empty (work

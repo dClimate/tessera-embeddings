@@ -57,9 +57,24 @@ CI verifies that the names listed here match `tessera_embeddings.__all__`.
 
 ## Inference (domain)
 
+- `run_id_prefix(model_version) -> str` — the prefix a staging `run_id`
+  must carry for `model_version`, empty for `v1.1`. **Mint every `run_id`
+  through this**, including fresh ones: `run_inference` reads an
+  unprefixed id as v1.1 and refuses a v2 config, because staged chunks
+  record neither which student wrote them (they are `(H, W, 128)` int8
+  either way) nor anything else that could settle it. A bare UUID is
+  therefore not a valid id for a v2 run — not an arbitrary rule, but the
+  only place the encoder is written down.
+
+  ```python
+  run_id = run_id_prefix(config.model_version) + uuid.uuid4().hex[:12]
+  ```
+
 - `run_inference(*, num_actors, config, chunks, mosaic_base,
   staging_base, run_id, t0, log, on_actor_retire=None) -> list[dict]`
-  — pure-domain Ray-based inference run. Caller is responsible for
+  — pure-domain Ray-based inference run. **`run_id` must carry the
+  prefix for `config.model_version`** (see `run_id_prefix` above); it is
+  refused otherwise, including for a brand-new run. Caller is responsible for
   having connected to Ray (`ray.init` or attached to a cluster).
   `t0` is **accepted and ignored**. The progress line it fed now times
   inference from the dispatch loop's own start, because a run's start

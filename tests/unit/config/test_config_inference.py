@@ -13,6 +13,7 @@ from tessera_embeddings.config.inference import (
     TUNED_GPU_GIB,
     InferenceConfig,
     _normalize_obs_checkpoints,
+    band_stats,
     batch_size_for_gpu,
     checkpoint_filename,
 )
@@ -38,6 +39,15 @@ def test_checkpoint_filename_default_is_aws() -> None:
 def test_checkpoint_filename_invalid_raises() -> None:
     with pytest.raises(ValueError, match="Unknown norm_source"):
         checkpoint_filename("bogus")
+
+
+def test_checkpoint_filename_v2_large() -> None:
+    assert checkpoint_filename(model_version="v2-large") == "student_large.pt"
+
+
+def test_checkpoint_filename_v2_ignores_norm_source() -> None:
+    """v2 ships one checkpoint per student size — no norm_source split."""
+    assert checkpoint_filename("mpc", model_version="v2-large") == checkpoint_filename(model_version="v2-large")
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +129,16 @@ def test_inference_config_empty_num_obs_checkpoints_raises() -> None:
         _minimal_config(num_obs_checkpoints=())
 
 
+def test_inference_config_default_model_version_is_v11() -> None:
+    cfg = _minimal_config()
+    assert cfg.model_version == "v1.1"
+
+
+def test_inference_config_invalid_model_version_raises() -> None:
+    with pytest.raises(ValueError, match="Invalid model_version"):
+        _minimal_config(model_version="v3")
+
+
 def test_inference_config_compute_std_forced_false() -> None:
     cfg = _minimal_config(compute_std=True)  # type: ignore[call-arg]
     assert cfg.compute_std is False
@@ -132,10 +152,12 @@ def test_the_newest_field_is_the_last_field() -> None:
 
     Moving this assertion is the expected cost of adding a field, and it is worth paying: the
     tripwire fires on an insertion and on an append alike, so whoever moves it has to look at
-    where their field landed. It named allow_s2_only until 2026-08-13, when optical_min_obs was
-    appended after it, and actor_request_headroom appended after that.
+    where their field landed. It named allow_s2_only until 2026-08-13, then optical_min_obs, then
+    actor_request_headroom, and now model_version — which arrived on the v2-large branch INSERTED
+    second, before this rule existed on that branch, and was moved to the end during the merge
+    rather than left to rebind every positional argument after ``time_window``.
     """
-    assert fields(InferenceConfig)[-1].name == "actor_request_headroom"
+    assert fields(InferenceConfig)[-1].name == "model_version"
 
 
 def test_the_minimum_depth_rule_defaults_to_no_rule() -> None:
@@ -155,6 +177,88 @@ def test_a_rule_that_refuses_nothing_is_refused_by_the_config() -> None:
 def test_allow_s2_only_defaults_off() -> None:
     assert _minimal_config().allow_s2_only is False
     assert _minimal_config(allow_s2_only=True).allow_s2_only is True
+
+
+# ── validated where it is SET, because where it is USED is inside a Ray actor ──
+
+
+def test_an_unknown_fusion_method_is_refused_at_construction() -> None:
+    """It used to reach the FORWARD pass. Config accepted any string, `_build_inference_model`
+    read `== "concat"` to decide how many backbones the dim-reducer spans — so an unknown method
+    silently sized it for one — the checkpoint then loaded, and `MultimodalBTInferenceModel.forward`
+    raised "Unknown fusion method" once per batch, on a provisioned fleet.
+
+    The cost of being late is the whole point: this is decided by the config object alone, with no
+    checkpoint and no cluster consulted, so there is nothing to learn by waiting.
+    """
+    with pytest.raises(ValueError, match="Invalid fusion_method"):
+        _minimal_config(fusion_method="bogus")
+    assert _minimal_config(fusion_method="concat").fusion_method == "concat"
+    assert _minimal_config(fusion_method="sum").fusion_method == "sum", "v1.1 still accepts both"
+
+
+def test_v2_refuses_a_fusion_it_was_not_distilled_with() -> None:
+    """v2 supports only concat, and that was enforced only in `_build_v2_inference_model` — which
+    runs remotely. A public `run_inference` caller therefore paid for Ray actors and a checkpoint
+    download before a deterministic configuration error surfaced as an actor-init failure.
+    """
+    with pytest.raises(ValueError, match="does not apply to model_version"):
+        _minimal_config(model_version="v2-large", fusion_method="sum")
+    # The supported combination still builds, and v1.1 is untouched either way.
+    assert _minimal_config(model_version="v2-large").fusion_method == "concat"
+    assert _minimal_config(model_version="v2-large", fusion_method="concat").fusion_method == "concat"
+
+
+def test_every_per_model_table_covers_every_model_version() -> None:
+    """`model_version` is validated against MODEL_ARCHS alone, so a version added there and
+    forgotten in one of the sibling tables passes config validation and fails later — a
+    KeyError inside an actor, or a wrong figure, depending on which table was missed.
+
+    Asserted as one set comparison rather than per table: the defect is a version that is in
+    some of them, and the tables are only meaningful together.
+    """
+    from tessera_embeddings.config.inference import (
+        MODEL_ARCHS,
+        MODEL_ENCODER_URLS,
+        MODEL_EST_PX_PER_SEC,
+    )
+    from tessera_embeddings.inference.sampling import _CACHED_RESAMPLERS, _RESAMPLERS
+
+    versions = set(MODEL_ARCHS)
+    for name, table in (
+        ("MODEL_ENCODER_URLS", MODEL_ENCODER_URLS),
+        ("MODEL_EST_PX_PER_SEC", MODEL_EST_PX_PER_SEC),
+        ("sampling._RESAMPLERS", _RESAMPLERS),
+        ("sampling._CACHED_RESAMPLERS", _CACHED_RESAMPLERS),
+    ):
+        assert set(table) == versions, f"{name} does not cover the same versions as MODEL_ARCHS"
+
+
+def test_an_explicitly_empty_norm_source_is_refused_not_defaulted() -> None:
+    """`or "aws"` accepted every falsy value and silently selected AWS statistics.
+
+    Pairing a checkpoint with the wrong band statistics produces embeddings that are wrong and
+    perfectly well-formed — no shape error, no NaN, nothing downstream to object. Only the UNSET
+    case may default; anything supplied goes through validation.
+    """
+    with pytest.raises(ValueError, match="Invalid norm_source"):
+        _minimal_config(norm_source="")  # type: ignore[arg-type]
+    assert _minimal_config(norm_source=None).norm_source == "aws", "unset still defaults"
+    assert _minimal_config(norm_source="mpc").norm_source == "mpc"
+
+
+def test_band_stats_refuses_an_empty_norm_source_too() -> None:
+    """The SAME defaulting trap, at a second site — and the validation just below it cannot
+    catch this one, because `""` has already become `"aws"` by the time the check runs.
+
+    Worth its own test rather than folding into the config test above: `band_stats` is called
+    directly by the actor with whatever the config resolved, so it is reachable independently.
+    """
+    with pytest.raises(ValueError, match="Invalid norm_source"):
+        band_stats("v1.1", norm_source="")
+    assert band_stats("v1.1", norm_source=None) == band_stats("v1.1", norm_source="aws")
+    # v2 hard-codes one set and ignores the argument entirely.
+    assert band_stats("v2-large", norm_source="") == band_stats("v2-large")
 
 
 class TestActorRequestPolicy:

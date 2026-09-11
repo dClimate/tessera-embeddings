@@ -33,7 +33,14 @@ from prefect.runtime import flow_run as flow_run_ctx
 from pydantic import BaseModel
 
 from tessera_embeddings.config.assembly import AssemblyConfig
-from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
+from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
+    INFERENCE_CHUNK_SIZE,
+    V2_RUN_PREFIX,
+    ModelVersion,
+    checkpoint_filename,
+    run_id_prefix,
+)
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import AllChunksSkippedError, ZarrWriter
@@ -62,6 +69,10 @@ from tessera_embeddings.storage.zarr_store import plain_zarr_storage_options
 S2_ONLY_RUN_PREFIX = "s2only-"
 
 
+#: Staging-run prefix marking chunks produced by a v2 student. v1.1 keeps the
+#: historical bare-uuid run_id, so nothing about the existing path changes.
+
+
 class EmbeddingsDevParams(BaseModel):
     """Development-mode toggles for the embeddings flow.
 
@@ -82,37 +93,83 @@ class EmbeddingsDevParams(BaseModel):
     sync_source_path: str | None = None
 
 
-def _resolve_run_id(previous_run_id: str | None, *, allow_s2_only: bool, assembly_only: bool) -> str:
-    """Derive the staging run_id, encoding the S2-only mode via S2_ONLY_RUN_PREFIX.
+def _run_modes(run_id: str) -> tuple[bool, bool]:
+    """``(staged_by_v2, staged_s2_only)``, read off a staging run_id's prefixes.
 
-    ``run_inference()`` reuses staged ``.zarr``/``.skipped`` artifacts by run_id alone. A
-    resume that flipped ``allow_s2_only`` would keep old skip markers (S2-valid / zero-S1
-    pixels the flag now embeds) for already-staged chunks while recomputing only the rest
-    under the new gate, and assembly would publish a mix of S1-gated and S2-only tiles.
-    Encoding the mode in the run_id — which namespaces the staging directory — lets a resume
-    detect and refuse the flip.
+    The two markers COMPOSE, in this order, so one run can carry both. They are read
+    positionally rather than with two independent ``startswith`` calls, because the S2-only
+    marker stops being at the front the moment a model prefix precedes it — and a
+    ``v2-s2only-`` run read with a bare ``startswith`` reports as S1-gated, which is the
+    mislabelling both prefixes exist to prevent.
+    """
+    rest = run_id
+    staged_v2 = rest.startswith(V2_RUN_PREFIX)
+    if staged_v2:
+        rest = rest[len(V2_RUN_PREFIX) :]
+    return staged_v2, rest.startswith(S2_ONLY_RUN_PREFIX)
 
-    Assembly-only resumes never run the per-pixel gate, so the requested flag cannot change
-    WHICH pixels they publish — but it still reaches the ``EmbeddingManifest`` they write,
-    so an outright exemption publishes a staged S2-only run as flag-off and a later flag-off
-    append then mixes incompatible slices into one store. Callers use
-    :func:`staged_s2_only_mode` instead: the prefix records what the staged pixels ARE,
-    rather than trusting a parameter nobody had to set.
+
+def _resolve_run_id(
+    previous_run_id: str | None,
+    *,
+    model_version: ModelVersion,
+    allow_s2_only: bool,
+    assembly_only: bool,
+) -> str:
+    """Derive the staging run_id, encoding BOTH the encoder and the S2-only pixel gate.
+
+    ``run_inference()`` reuses staged ``.zarr``/``.skipped`` artifacts by run_id alone, and the
+    artifacts themselves record neither fact: a staged chunk is (H, W, 128) int8 whichever
+    student wrote it — v1.1 saves the first 128 of its 192-d representation, v2 emits 128
+    natively — and an S2-only tile is shaped exactly like an S1-gated one. So the run_id
+    namespace is the only place a resume can detect that it is about to mix two kinds of work,
+    and it has to carry both marks rather than either.
+
+    **The two refusals are not symmetric about assembly-only, and that asymmetry is the point
+    of keeping them in one function where it is visible.**
+
+    * The ENCODER check is never exempt. Assembly is what writes the provenance attrs, so an
+      assembly-only pass under the wrong version is precisely the case that stamps a store
+      ``geoemb:model`` = 1.1 over v2 pixels.
+    * The S2-ONLY check IS exempt, because assembly recomputes nothing: the prefix is then the
+      only record of what the staged pixels are, and the caller reads it back with
+      :func:`staged_s2_only_mode` instead of trusting a flow parameter.
+
+    Fresh default runs (v1.1, S1-gated) keep the historical bare-uuid form, so neither prefix
+    appears until something actually diverges from it.
     """
     if previous_run_id:
-        resumed_s2_only = previous_run_id.startswith(S2_ONLY_RUN_PREFIX)
-        if not assembly_only and resumed_s2_only != allow_s2_only:
+        staged_v2, staged_s2_only = _run_modes(previous_run_id)
+        wants_v2 = model_version != "v1.1"
+        if staged_v2 != wants_v2:
+            staged = "v2" if staged_v2 else "v1.1"
             raise ValueError(
-                f"Cannot resume run {previous_run_id!r} (allow_s2_only={resumed_s2_only}) with "
+                f"Cannot resume run {previous_run_id!r} (staged by {staged}) with "
+                f"model_version={model_version!r}: its staged chunks came from the other "
+                f"encoder, and continuing would publish a mix of both and stamp the store "
+                f"with one of them. Resume with the {staged} model, or start a fresh run."
+            )
+        if not assembly_only and staged_s2_only != allow_s2_only:
+            raise ValueError(
+                f"Cannot resume run {previous_run_id!r} (allow_s2_only={staged_s2_only}) with "
                 f"allow_s2_only={allow_s2_only}: its staged chunks were produced under the other "
                 f"per-pixel S1 mode, so continuing would publish a mix of S1-gated and S2-only "
-                f"tiles. Resume with allow_s2_only={resumed_s2_only}, or start a fresh run."
+                f"tiles. Resume with allow_s2_only={staged_s2_only}, or start a fresh run."
             )
         return previous_run_id
-    return (S2_ONLY_RUN_PREFIX if allow_s2_only else "") + uuid.uuid4().hex[:12]
+    # The encoder half comes from the shared helper every other minting site uses; the
+    # S2-only half is this layer's own and composes after it.
+    prefix = run_id_prefix(model_version) + (S2_ONLY_RUN_PREFIX if allow_s2_only else "")
+    return prefix + uuid.uuid4().hex[:12]
 
 
-def _assert_resume_mode_matches(previous_run_id: str | None, *, allow_s2_only: bool, assembly_only: bool) -> None:
+def _assert_resume_mode_matches(
+    previous_run_id: str | None,
+    *,
+    model_version: ModelVersion,
+    allow_s2_only: bool,
+    assembly_only: bool,
+) -> None:
     """The half of the mode-mixing refusal that the REQUEST alone can settle.
 
     :func:`_resolve_run_id` has to run LATE: the flag it encodes is the config's EFFECTIVE
@@ -131,7 +188,12 @@ def _assert_resume_mode_matches(previous_run_id: str | None, *, allow_s2_only: b
     known. This narrows what reaches it; it does not replace it.
     """
     if allow_s2_only and not assembly_only and previous_run_id and not staged_s2_only_mode(previous_run_id):
-        _resolve_run_id(previous_run_id, allow_s2_only=allow_s2_only, assembly_only=assembly_only)
+        _resolve_run_id(
+            previous_run_id,
+            model_version=model_version,
+            allow_s2_only=allow_s2_only,
+            assembly_only=assembly_only,
+        )
 
 
 def staged_s2_only_mode(previous_run_id: str | None) -> bool:
@@ -143,7 +205,7 @@ def staged_s2_only_mode(previous_run_id: str | None) -> bool:
     S1-gated pixels over S2-only ones, and a later flag-off append then mixes two policies
     into one store with nothing objecting.
     """
-    return bool(previous_run_id and previous_run_id.startswith(S2_ONLY_RUN_PREFIX))
+    return bool(previous_run_id) and _run_modes(previous_run_id or "")[1]
 
 
 @flow(
@@ -166,6 +228,7 @@ def tessera_embeddings(
     code_suffix: str = "",
     num_actors: int = 20,
     s1_orbit: str = "both",
+    model_version: ModelVersion = DEFAULT_MODEL_VERSION,
     require_s1: bool = True,
     s3_region: str | None = None,
     allow_s2_only: bool = False,
@@ -197,6 +260,9 @@ def tessera_embeddings(
             branches coexist in one bucket). Empty for production tarballs.
         num_actors: Number of GPU actors to create.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
+        model_version: Which Tessera model to run — ``"v1.1"`` (default) or
+            ``"v2-large"``. Also selects the checkpoint filename expected under
+            ``{inputs}/models/``.
         require_s1: Demand radar rather than request it, and **True by default here**
             because this flow fills ONE cell: an operator naming a single zone-year over
             terrain that should be imaged wants to be told when its radar is missing, not to
@@ -236,7 +302,10 @@ def tessera_embeddings(
     # Refuse a contradicted resume before anything is opened. The run_id is minted much
     # later, from the config's EFFECTIVE flag, but this half needs only the request.
     _assert_resume_mode_matches(
-        dev_params.previous_run_id, allow_s2_only=allow_s2_only, assembly_only=dev_params.assembly_only
+        dev_params.previous_run_id,
+        model_version=model_version,
+        allow_s2_only=allow_s2_only,
+        assembly_only=dev_params.assembly_only,
     )
     run_started_at = datetime.datetime.now(datetime.UTC)
     t0 = time.monotonic()
@@ -251,7 +320,7 @@ def tessera_embeddings(
         time_window.window_end_label,
     )
 
-    checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename()}"
+    checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename(model_version=model_version)}"
 
     mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
 
@@ -275,6 +344,7 @@ def tessera_embeddings(
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,
+        model_version=model_version,
         # An assembly-only resume republishes staged pixels without recomputing them, so
         # what they ARE lives in the run_id prefix and nowhere in this call's parameters.
         # The prefix is the ONLY source, not one of two: OR-ing the requested flag in lets
@@ -290,16 +360,21 @@ def tessera_embeddings(
     # flag instead lands S2-only chunks under an unprefixed staging prefix, where an
     # explicit S2-only resume is refused and the bare id can be reused under the S1-gated
     # mode the prefix exists to separate.
+    #
+    # The model version is a direct request rather than a derived one, so it could have been
+    # settled earlier; it is passed here so ONE function owns the whole run_id.
     run_id = _resolve_run_id(
         dev_params.previous_run_id,
+        model_version=model_version,
         allow_s2_only=config.allow_s2_only,
         assembly_only=dev_params.assembly_only,
     )
     log.info(
-        "Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s, allow_s2_only=%s",
+        "Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s, model_version=%s, allow_s2_only=%s",
         roi_name,
         mosaic_base,
         run_id,
+        model_version,
         config.allow_s2_only,
     )
 

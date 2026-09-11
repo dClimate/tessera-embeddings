@@ -15,6 +15,10 @@ exclude = [
     "dist",
     "*.egg-info",
     "open_sourcing_planning",
+    # Verbatim upstream sources vendored as golden references for port tests.
+    # They must stay byte-comparable to the files they were copied from, so
+    # neither the linter nor the formatter may touch them.
+    "tests/fixtures/upstream",
 ]
 
 [format]

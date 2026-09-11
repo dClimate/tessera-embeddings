@@ -196,6 +196,7 @@ class TestStagingLifecycle:
             patch(f"{_MOD}.build_inference_config", return_value=_inference_config()),
             patch(f"{_MOD}.enumerate_mosaic_chunks", return_value=([MagicMock()], 2048, 2048)),
             patch(f"{_MOD}.filter_chunks_by_roi_mask", return_value=[MagicMock()]),
+            patch(f"{_MOD}.assert_output_store_accepts"),
             patch(f"{_MOD}.ray_cluster"),
             patch(f"{_MOD}.run_inference", return_value=inference_results),
             patch(f"{_MOD}.checkpoint_to_version", return_value="v1.1"),
@@ -216,6 +217,7 @@ class TestStagingLifecycle:
             s1_orbit="ascending",
             checkpoint_dir=None,
             checkpoint_url="/models/ckpt.pt",
+            model_version="v1.1",
             num_gpus=0,
             log=logging.getLogger("test"),
         )

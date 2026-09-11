@@ -7,6 +7,7 @@ fixed by the checkpoints rather than chosen.
 import logging
 import math
 import time
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -161,7 +162,7 @@ class TemporalEncoding(nn.Module):
 
     Learnable frequency parameters and a linear projection, unlike the fixed sinusoidal
     ``TemporalPositionalEncoder``. Kept from tessera alpha_1.0 for forward-compatibility; NOT
-    wired into ``TransformerEncoder``.
+    wired into ``V11TransformerEncoder``.
     """
 
     def __init__(self, d_model: int, num_freqs: int = 64) -> None:
@@ -202,32 +203,59 @@ class TemporalPositionalEncoder(nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
         self.d_model = d_model
-        # div_term depends only on d_model, so it is a buffer rather than a per-forward compute
-        # (~18 ms per backbone). persistent=False keeps it out of state_dict so checkpoint
-        # loading still works, while it still follows .to(device) / .bfloat16(). Held in FP32 for
-        # sin/cos precision; the output is cast to the model dtype.
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * -(math.log(10000.0) / d_model))
-        self.register_buffer("div_term", div_term, persistent=False)
+        # div_term depends only on d_model, so it is not a per-forward compute (~18 ms per
+        # backbone). It is cached per device rather than held as a registered buffer *on purpose*:
+        # a buffer is swept by ``nn.Module.bfloat16()``, which would round these frequencies to 8
+        # mantissa bits and shift sin/cos arguments by up to ~0.70 rad at DOY 365 (measured over
+        # d_model=640; ~0.65 for v1.1's 768) — a silent divergence from the FP32 path the models
+        # were trained and golden-tested on. A plain fp32 cache cannot be downcast by a
+        # module-level dtype conversion.
+        self._div_term_cache: dict[torch.device, torch.Tensor] = {}
 
-    def forward(self, doy: torch.Tensor) -> torch.Tensor:
+    def _div_term(self, device: torch.device) -> torch.Tensor:
+        """FP32 sinusoidal frequencies for *device*, computed once per device.
+
+        Filled on whichever CUDA stream runs the first forward (a backbone side stream under the
+        pipelined loop) and read from that same stream on every later call, since each backbone
+        owns its own encoder. It is never freed — the cache holds the only reference for the
+        module's life — so it needs no ``record_stream``, and the profile batch's default-stream
+        read is ordered behind the pipeline drain that precedes it.
+        """
+        cached = self._div_term_cache.get(device)
+        if cached is None:
+            cached = torch.exp(
+                torch.arange(0, self.d_model, 2, dtype=torch.float32, device=device)
+                * -(math.log(10000.0) / self.d_model)
+            )
+            self._div_term_cache[device] = cached
+        return cached
+
+    def forward(self, doy: torch.Tensor, out_dtype: torch.dtype | None = None) -> torch.Tensor:
         """Compute positional encoding from day-of-year.
 
         Args:
-            doy: DOY values of shape (B, T).
+            doy: DOY values of shape (B, T). Must be FP32 — see the dtype note
+                below; BF16 cannot represent DOY above 256 to one-day resolution.
+            out_dtype: dtype of the returned encoding. Defaults to ``doy.dtype``.
 
         Returns:
             Positional encoding of shape (B, T, d_model).
         """
-        # FP32 for precision, then cast the OUTPUT back to the caller's dtype (BF16 under
+        # FP32 for precision, then cast the OUTPUT to the compute dtype (BF16 under
         # model.bfloat16()). Without that cast PyTorch's dtype promotion (BF16 + FP32 = FP32)
         # spreads FP32 through the whole transformer and GRU: 7 TFLOPS instead of 20-30 on T4
         # tensor cores.
         #
+        # *doy itself must arrive in FP32.* BF16 carries 8 mantissa bits, so it represents integers
+        # exactly only up to 256: DOY 257 would land on 256, and .float() here cannot recover what
+        # the cast already discarded. The callers therefore keep the DOY channel FP32 and cast only
+        # the bands — see V11TransformerEncoder.forward / StudentTransformerEncoder.forward.
+        #
         # torch.empty, not zeros: every element is written because 0::2 and 1::2 partition the
         # even d_model, so the multi-GB zero-fill is dead work and the values are identical. The
         # strided writes also avoid holding sin and cos live beside an interleaved output.
-        position = doy.unsqueeze(-1).float()
-        angles = position * self.div_term.float()  # (B, T, d_model/2)
+        position = doy.float().unsqueeze(-1)
+        angles = position * self._div_term(doy.device)  # (B, T, d_model/2)
         pe = torch.empty(doy.shape[0], doy.shape[1], self.d_model, device=doy.device)
         pe[:, :, 0::2] = torch.sin(angles)
         pe[:, :, 1::2] = torch.cos(angles)
@@ -235,10 +263,10 @@ class TemporalPositionalEncoder(nn.Module):
         # from here, so holding it through pe.to() co-resides it with the fp32 pe and the bf16
         # output — peak VRAM the concurrent s2/s1 backbones cannot spare.
         del angles
-        return pe.to(doy.dtype)
+        return pe.to(out_dtype or doy.dtype)
 
 
-class TransformerEncoder(nn.Module):
+class V11TransformerEncoder(nn.Module):
     """Transformer encoder for satellite time series.
 
     Embeds bands via MLP, adds sinusoidal positional encoding from DOY, runs the transformer
@@ -283,7 +311,11 @@ class TransformerEncoder(nn.Module):
         """Forward pass.
 
         Args:
-            x: Input of shape (B, seq_len, band_num + 1) where the last column is DOY.
+            x: Input of shape (B, seq_len, band_num + 1) where the last column is
+                DOY. Pass FP32 even under reduced-precision inference: the bands
+                are cast to the compute dtype here, while the DOY column stays
+                FP32 so integer days above 256 survive (see
+                :class:`TemporalPositionalEncoder`).
 
         Returns:
             Pooled representation of shape (B, latent_dim * 4).
@@ -292,18 +324,23 @@ class TransformerEncoder(nn.Module):
 
         bands = x[:, :, :-1]
         doy = x[:, :, -1]
+        # The compute dtype is whatever the weights carry (BF16/FP16 after
+        # model.bfloat16()/.half(), FP32 otherwise). Casting per-channel here
+        # instead of casting the whole input upstream is what keeps DOY exact;
+        # when x already matches, both .to() calls are no-ops.
+        compute_dtype = cast("nn.Linear", self.embedding[0]).weight.dtype
 
         if profile and x.is_cuda:
             torch.cuda.synchronize()
             t0 = time.monotonic()
 
-        bands_embedded = self.embedding(bands)
+        bands_embedded = self.embedding(bands.to(compute_dtype))
 
         if profile and x.is_cuda:
             torch.cuda.synchronize()
             t1 = time.monotonic()
 
-        temporal_encoding = self.temporal_encoder(doy)
+        temporal_encoding = self.temporal_encoder(doy, out_dtype=compute_dtype)
 
         if profile and x.is_cuda:
             torch.cuda.synchronize()
@@ -330,7 +367,7 @@ class TransformerEncoder(nn.Module):
             t5 = time.monotonic()
             band_num = bands.shape[-1]
             logger.debug(
-                "  PROFILE TransformerEncoder (band_num=%d, input shape=%s): "
+                "  PROFILE V11TransformerEncoder (band_num=%d, input shape=%s): "
                 "embedding=%.1fms (out dtype=%s)  "
                 "pos_encoding=%.1fms (out dtype=%s)  "
                 "add=%.1fms (out dtype=%s)  "
