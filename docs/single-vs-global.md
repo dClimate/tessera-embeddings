@@ -302,7 +302,7 @@ Coordinates:
   * northing     (northing) float64 ...
   * easting      (easting) float64 ...
   * band         (band) int64 0 1 ... 127
-    time_bnds    (time, bnds) datetime64[ns] ...     ← [Jan 1, Dec 31] per slot
+    time_bnds    (time, bnds) datetime64[ns] ...     ← [Jan 1, Jan 1 next year) per slot
 Data variables:
     embeddings   (time, northing, easting, band) int8 ...
     scales       (time, northing, easting) float32 ...
@@ -331,7 +331,8 @@ start of the exact January-to-December window that slot holds**
 (`time_convention="calendar_year"`, and the fill runner rejects any other window, so the label
 always matches the data). The companion `time_bnds` variable, shape `(time, 2)` and linked from
 `time.attrs["bounds"]` as CF requires, states each slot's interval outright:
-`[YYYY-01-01, YYYY-12-31]`. Rolling twelve-month windows are never written here; they belong in a
+`[YYYY-01-01, (YYYY+1)-01-01)` — half-open, so the upper bound is the following 1 January and
+the whole of 31 December is inside the interval. Rolling twelve-month windows are never written here; they belong in a
 single-area store, whose convention is one entry per window, labelled by the month it ended.
 
 **How many observations fed each pixel.** Three count layers record it —

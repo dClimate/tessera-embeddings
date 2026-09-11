@@ -54,7 +54,7 @@ without further explanation.
 | **strip** | A horizontal slice of a tile — its full easting (east–west) width, and a range of its northing (north–south) rows. A tile too large to hold in memory is loaded one strip at a time. |
 | **SCL** | Sentinel-2's Scene Classification Layer: the per-pixel mask saying which pixels on which dates are usable, and which are cloud, shadow, snow or no data. Most decisions in this pipeline start from it. |
 | **optical depth** | How many usable optical observations a pixel has in its year. It varies by an order of magnitude with geography, and it drives both cost and quality. |
-| **bucket** | A group of pixels that have the *same* number of observations. Grouping them lets the model run over one rectangular tensor with no padding and no masking, which is much faster than variable-length input. Pixels are binned to the nearest count on a fixed schedule (`num_obs_checkpoints`). |
+| **bucket** | A group of pixels sharing the same `(s2_bin, s1_bin)` target pair. Grouping them lets the model run over one rectangular tensor with no padding and no masking, which is much faster than variable-length input. The optical and radar counts are binned *independently*, each UP to the smallest checkpoint that is greater than or equal to it (`num_obs_checkpoints`) — so pixels in one bucket share a target shape, not an observation count. |
 | **prefetch** | Starting a read before the thing that needs it asks for it. While the GPU works on the data it has, a background thread fetches what it will want next — so the read happens *during* compute instead of in front of it. |
 | **staging** | Each finished tile is written to a scratch prefix on S3 first, and copied into the real store afterwards. Actors never write to the output store directly. |
 | **shard** | One object in the output store: a 2048-pixel square holding an 8 × 8 grid of independently compressed 256-pixel **inner chunks**, plus an index of where each one sits inside it. A reader fetches the index, then only the inner chunks it needs. |
@@ -475,8 +475,9 @@ they are concatenated, so the model sees per-orbit statistics rather than blende
 This is the part every other section exists to serve. The arrangement below is what keeps
 the card from ever waiting.
 
-**One bucket at a time, biggest first.** `iter_buckets(largest_first=True)` hands over the
-largest group of pixels first. The GPU memory that bucket needs is allocated once, and
+**One bucket at a time, biggest sequence first.** `iter_buckets(largest_first=True)` sorts by
+`s2_target × s1_target` descending, so the first bucket has the largest sequence shape — which
+may hold very few pixels. The GPU memory that bucket needs is allocated once, and
 every smaller bucket afterwards reuses it, so the run does not grow its memory footprint
 after the first bucket.
 
@@ -492,9 +493,13 @@ smaller and larger were both tried.
 GPU before the GPU can compute it, and a card cannot compute during a copy it is waiting
 on. So batches are staged in **pinned** host memory — memory the operating system promises
 not to move, which is what lets the copy proceed without the CPU shepherding it — and the
-copy is issued on its own CUDA stream. While batch *i* computes, batch *i+1* is already
-being copied in and batch *i−1*'s results are being copied out; the host thread runs one
-batch behind, collecting results.
+copies are issued non-blocking, so the host thread does not wait on them. **There is no
+separate copy stream**: every operation goes on the current stream, in the serial loop's order.
+What the pipeline buys is host-side queueing — while the GPU works through batch *i*, the host
+has already enqueued batch *i+1*'s copy and forward and is draining batch *i−1*'s results, so
+the card never waits for the host to catch up. It does **not** overlap a transfer with a
+forward pass; same-stream work still runs in order. That distinction matters when you are
+deciding whether transfer bandwidth or host-side queueing is the constraint.
 
 ```
  serial loop:     [H2D][═ fwd i ═][D2H][scatter][H2D][═ fwd i+1 ═][D2H][scatter]
@@ -937,13 +942,14 @@ They come in two families:
   makes each GEMM larger, so the tensor cores idle less.
 - **batch / sub-batch** — pixels are inferred in groups, not one at a time. A chunk's
   pixels are split into fixed-size **sub-batches**, each of which is one GPU forward pass.
-- **the transfer "bubble" / copy stream / double-buffering** — a batch must be copied
-  from CPU to GPU ("host→device") before the GPU can compute it; done naively the copy
-  and the compute alternate, so the GPU stalls during every copy — a **bubble**. Staging
-  batches in **pinned** (page-locked) host memory and issuing the copy on a separate CUDA
-  **copy stream** lets the *next* batch transfer while the current one computes; holding
-  two batches in flight at once (**double-buffering**, "two-deep") hides the copy behind
-  compute. (**D2H** = device→host, copying results back.)
+- **the transfer "bubble" / double-buffering** — a batch must be copied from CPU to GPU
+  ("host→device") before the GPU can compute it; done naively the host waits for each copy
+  and each forward pass in turn, so the card stalls whenever the host is the slow one — a
+  **bubble**. Staging batches in **pinned** (page-locked) host memory and issuing the copies
+  non-blocking lets the host run ahead and keep two batches in flight at once
+  (**double-buffering**, "two-deep"), so the queue is never empty. Note this pipeline uses a
+  single CUDA stream: it removes host-side stalls, not transfer time. (**D2H** =
+  device→host, copying results back.)
 - **SCL mask** — Sentinel-2's per-pixel Scene Classification Layer; here, the
   cloud/validity mask that records which pixels and which dates hold usable data. Every
   per-chunk decision below starts from it.
@@ -992,9 +998,8 @@ MID-FORWARD; the write hides the POST-FORWARD idle (see the three windows above)
   ● vectorised temporal resampling   batch prep 600–650 ms → ~130 ms/sub-batch
                                       (was SLOWER than the GPU forward → prep
                                        gated the GPU; now it doesn't)          [§6]
-  ◐ async two-deep GPU pipeline      pinned double-buffers + copy stream so the
-                                      next batch transfers while this one runs
-                                      → no per-batch bubble                    [§7]
+  ◐ async two-deep GPU pipeline      pinned double-buffers, one stream, host runs
+                                      a batch ahead → no host-side bubble      [§7]
   ◐ batch size 7168 (BF16)           bigger GEMMs use the tensor cores more
                                       fully (the one non-bit-identical change) [§7]
   ○ background staging write         the ~7.5 s S3 upload runs on a writer

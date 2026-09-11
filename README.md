@@ -210,8 +210,8 @@ and together they are why this is the bar we hold ourselves to:
 - `plain.py` is the worked reference for anyone porting to Airflow, Dagster or Flyte:
   everything it does is the non-Prefect wiring they would have to reproduce.
 
-For CI, `plain.py --skip-inference` is the fast pull-request check. **The end-to-end run
-on the quickstart ROI is not automated at all** — it is verified by running it by hand
+**Neither variant runs in CI.** `plain.py --skip-inference` is the fast check to run by hand,
+and the end-to-end run on the quickstart region of interest is verified by hand too
 ([ADR 023](context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)).
 Pull-request checks also apply the AST-based architecture rules described under
 [Architecture](#architecture), which catch Prefect leaks at the import level without
@@ -384,7 +384,8 @@ src/tessera_embeddings/
       flows/             @flow-decorated orchestration (Layer 3)
       tasks/             thin @task wrappers (Layer 2)
     runners/             non-Prefect entry points: plain.py (one area),
-                         zone_fill.py and sequential_fill.py (one campaign cell)
+                         zone_fill.py (one campaign cell),
+                         sequential_fill.py (many cells, one Ray session)
   providers/             concrete cloud-provisioning glue
     aws/                 ray.py, dask.py, credentials.py, fleet_mix.py,
                          cluster.yaml.template, gotchas.md
