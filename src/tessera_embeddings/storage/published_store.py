@@ -46,6 +46,8 @@ if TYPE_CHECKING:
     import icechunk
     import zarr
 
+    from tessera_embeddings.storage.zone_grid import ZoneSpec
+
 #: The array whose initialized chunks define a zone-year's shard coverage. See the module
 #: docstring: NaN fill makes absence unambiguous, and it is the cheapest array to then read.
 COVERAGE_VAR = "scales"
@@ -152,6 +154,47 @@ def _fill_values_match(actual: object, expected: object) -> bool:
     if bool(np.isnan(left)) and bool(np.isnan(right)):
         return True
     return bool(left == right)
+
+
+def coordinate_departures(group: zarr.Group, spec: ZoneSpec) -> list[str]:
+    """Every way the group's spatial coordinates depart from the grid its zone spec defines.
+
+    Separate from :func:`layout_departures` because the subject is different: that one asks whether
+    an array has the declared geometry, this one asks whether the grid it is laid on puts pixels
+    where the CRS says they are. A zone can pass the layout audit completely and still be
+    geolocated wrongly — `northing` reversed, shifted by a pixel, or written at the wrong spacing —
+    and no attribute recovers the true positions, so a labelled reader silently associates every
+    value with the wrong ground.
+
+    **Checks the origin, the step and the far end rather than every value.** Those three pin a shift,
+    a reversal and a wrong spacing, which are the ways an affine axis can be wrong; reading both
+    full axes of all 120 zones to also rule out a non-uniform interior would move about a gigabyte
+    to guard against something the writer — which builds them with :func:`numpy.arange` — cannot
+    produce. Compared against ``zone_grid``'s own builders, so the convention has one definition.
+    """
+    from tessera_embeddings.storage.zone_grid import easting_coords, northing_coords
+
+    out: list[str] = []
+    present = dict(group.arrays())
+    for name, expected in (("northing", northing_coords(spec)), ("easting", easting_coords(spec))):
+        array = present.get(name)
+        if array is None:
+            out.append(f"{name}: absent, so its grid cannot be checked")
+            continue
+        actual = cast("zarr.Array", array)
+        if actual.shape[0] != expected.size:
+            out.append(f"{name}: has {actual.shape[0]} values, the zone grid defines {expected.size}")
+            continue
+        if expected.size < 2:
+            continue
+        got = np.asarray(actual[[0, 1, -1]], dtype="float64")
+        want = expected[[0, 1, -1]]
+        if not np.allclose(got, want, rtol=0.0, atol=1e-6):
+            out.append(
+                f"{name}: starts {got[0]}, steps {got[1] - got[0]}, ends {got[2]}; "
+                f"the zone grid says starts {want[0]}, steps {want[1] - want[0]}, ends {want[2]}"
+            )
+    return out
 
 
 def live_shards(session: icechunk.Session, zone: str, var: str = COVERAGE_VAR) -> dict[int, frozenset[tuple[int, int]]]:

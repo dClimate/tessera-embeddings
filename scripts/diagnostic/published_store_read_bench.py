@@ -472,10 +472,27 @@ def main(argv: list[str] | None = None) -> int:
     if not shards:
         parser.error(f"{args.zone}/{args.year} has no live shards; nothing to benchmark")
 
-    points = published_store.sample_live_pixels(group, time_index, shards, args.points, seed=args.seed)
+    # ESCALATING oversample until the requested count is met. `sample_live_pixels` keeps only the
+    # candidates that provably hold data, and on a sparse coastal zone-year most do not — so a
+    # fixed factor returns however many it happens to find. Raising `--points` does not help,
+    # because the candidate pool scales with it and the success ratio does not: the count comes out
+    # short either way, and percentiles from a handful of probes would then be printed beside a
+    # scoping figure taken over a thousand.
+    points: list[tuple[int, int]] = []
+    for factor in (4, 16, 64):
+        points = published_store.sample_live_pixels(
+            group, time_index, shards, args.points, seed=args.seed, oversample=factor
+        )
+        if len(points) >= args.points:
+            break
+        print(f"  {len(points)} of {args.points} probes held data at oversample {factor}; escalating")
     print(f"probe pixels confirmed to hold embeddings: {len(points)} of {args.points} requested")
-    if not points:
-        parser.error("no candidate pixel held data; raise --points or pick another zone-year")
+    if len(points) < args.points:
+        parser.error(
+            f"only {len(points)} of {args.points} probes landed on data in {args.zone}/{args.year} even at "
+            "64x oversampling — its live shards are mostly elided. Lower --points, or pick a denser "
+            "zone-year; a short sample would not be comparable to the scoping workload."
+        )
 
     if args.workloads == "all":
         wanted = [w[0] for w in WORKLOADS]

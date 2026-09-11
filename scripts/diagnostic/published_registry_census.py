@@ -48,7 +48,7 @@ import zarr
 if TYPE_CHECKING:
     import pyarrow.fs
 
-from tessera_embeddings.storage import published_store
+from tessera_embeddings.storage import published_store, zone_grid
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.registry import dataset_schema, registry_schema
 
@@ -390,10 +390,18 @@ def main(argv: list[str] | None = None) -> int:
     # Unparsable paths are separated BEFORE the cell map is built. A key of `(None, None)` sorted
     # alongside `("01N", 2017)` raises TypeError in Python 3, so the diagnostic would crash on
     # exactly the malformed paths it exists to report, before reporting them.
-    unparsed = [part["path"] for part in parts if part["zone"] is None or part["year"] is None]
+    # A zone key that parses but names no real zone is as much a defect as one that does not parse:
+    # `zone=61N` is syntactically fine, passes the schema audit, and advertises coverage in a zone
+    # the published store cannot contain. Checked against the zone grid, the same authority the
+    # store's own group names come from.
+    unparsed = [
+        part["path"]
+        for part in parts
+        if part["zone"] is None or part["year"] is None or part["zone"] not in zone_grid.ZONES
+    ]
     cells: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for part in parts:
-        if part["zone"] is None or part["year"] is None:
+        if part["zone"] is None or part["year"] is None or part["zone"] not in zone_grid.ZONES:
             continue
         cells.setdefault((part["zone"], part["year"]), []).append(part)
     refilled = {f"{z}/{y}": len(v) for (z, y), v in sorted(cells.items()) if len(v) > 1}
@@ -402,7 +410,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"parts:         {len(parts)} in {listing_s}s, {sum(p['size'] for p in parts) / 1e6:.1f} MB")
     print(f"cells covered: {len(cells)}")
     print(f"cells with more than one part (a refill): {len(refilled)} {list(refilled)[:8]}")
-    print(f"parts whose path does not parse:          {len(unparsed)} {unparsed[:4]}")
+    print(f"parts whose path does not parse or names no real zone: {len(unparsed)} {unparsed[:4]}")
 
     # A compacted master and a dataset-level `_common_metadata` are what a consumer WITHOUT this
     # package needs: the first so one schema covers the whole read, the second so a reader can take

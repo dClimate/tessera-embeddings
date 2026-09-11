@@ -193,15 +193,23 @@ def _zone_report(root: zarr.Group, zone: str, *, with_shards: bool, session: ice
     # all, georeferences every array in it wrongly — and a consumer has no way to notice, because
     # the arrays are the right shape and the attribute is present and plausible. The expected value
     # comes from `zone_grid` so this and the seeder cannot disagree about it.
-    expected_crs = zone_grid.zone(zone).crs if zone in zone_grid.ZONES else None
-    if expected_crs is None:
-        departures.append(f"{zone}: not a known UTM zone, so no expected CRS to check against")
-    elif attrs.get("crs") != expected_crs:
-        departures.append(f"{zone}: declares crs {attrs.get('crs')!r}, the zone grid says {expected_crs!r}")
+    spec = zone_grid.zone(zone) if zone in zone_grid.ZONES else None
+    if spec is None:
+        departures.append(f"{zone}: not a known UTM zone, so neither its CRS nor its grid can be checked")
+    else:
+        if attrs.get("crs") != spec.crs:
+            departures.append(f"{zone}: declares crs {attrs.get('crs')!r}, the zone grid says {spec.crs!r}")
+        departures += [f"{zone}: {d}" for d in published_store.coordinate_departures(group, spec)]
+    expected_crs = spec.crs if spec else None
     # A year marked complete that the campaign never preallocated is a completion record pointing at
     # no time slot. Unchecked it also makes the "never filled" arithmetic wrong, and can turn it
     # negative.
     unexpected_years = [y for y in years if y not in CAMPAIGN_YEARS]
+    # Sorted and unique, which is how the writer persists it and what every count below assumes. A
+    # duplicate survives into `from_attrs` as one element, so the set-based reconciliation that
+    # follows cannot see it and the reported cell counts quietly stop adding up.
+    if years != sorted(set(years)):
+        departures.append(f"{zone}: years_complete is {years}, not a sorted unique list")
     # The group's OWN time axis, decoded and compared — not just the completion attribute against a
     # constant. A shifted or duplicated axis passes every attribute and tag check while a labelled
     # reader asking for 2021 gets another year's data, and nothing above would notice, because
@@ -313,6 +321,12 @@ def main(argv: list[str] | None = None) -> int:
     unmarked_provenance = sorted(
         (r["zone"], y) for r in zone_reports for y in r["years_with_provenance"] if y not in r["years_complete"]
     )
+    # And the other direction. A year marked complete with no `runs` entry is a published cell whose
+    # run id and input coverage nobody can look up — the reader contract says each completed year
+    # carries them, and a one-sided check certifies exactly the half that is missing.
+    provenance_missing = sorted(
+        (r["zone"], y) for r in zone_reports for y in r["years_complete"] if y not in r["years_with_provenance"]
+    )
     departures = {r["zone"]: r["layout_departures"] for r in zone_reports if r["layout_departures"]}
     unexpected_years = sorted((r["zone"], y) for r in zone_reports for y in r["years_unexpected"])
     unmarked_shards = {
@@ -330,6 +344,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"marked complete, untagged:{len(only_attrs)} {only_attrs[:6]}")
     print(f"tagged, not marked:       {len(only_tags)} {only_tags[:6]}")
     print(f"has provenance, unmarked: {len(unmarked_provenance)} {unmarked_provenance[:6]}")
+    print(f"complete, no provenance:  {len(provenance_missing)} {provenance_missing[:6]}")
     print(f"groups missing/unexpected:{len(missing_groups)} / {len(unexpected_groups)}")
     print(f"years outside the campaign:{len(unexpected_years)} {unexpected_years[:6]}")
     print(f"root provenance departures: {len(root_departures)}")
@@ -351,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
                         "marked_complete_untagged": only_attrs,
                         "tagged_not_marked": only_tags,
                         "has_provenance_unmarked": unmarked_provenance,
+                        "complete_without_provenance": provenance_missing,
                         "layout_departures": departures,
                         "missing_groups": missing_groups,
                         "unexpected_groups": unexpected_groups,
@@ -377,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
             or unexpected_years
             or unmarked_shards
             or root_departures
+            or provenance_missing
         )
         else 0
     )

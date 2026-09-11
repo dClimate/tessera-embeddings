@@ -375,3 +375,36 @@ class TestAnonymousWithAnOverride:
 
         monkeypatch.setattr(zarr_store, "_s3_config_override", _Override())
         assert zarr_store._create_storage("s3://bucket/prefix") is sentinel
+
+
+class TestCoordinateDepartures:
+    """Whether the grid a zone is laid on puts its pixels where the CRS says they are."""
+
+    def test_a_seeded_zone_matches_its_zone_grid(self, seeded):
+        group = zarr_store.open_store_as_zarr_group(seeded, group="01N")
+        assert published_store.coordinate_departures(group, _ZONE) == []
+
+    def test_a_reversed_northing_axis_is_reported(self, seeded):
+        # The northing axis descends — row 0 is the top. Ascending is the same values, the same
+        # length and the same spacing, and every pixel in the zone is then in the wrong place.
+        _, group = _writable_group(seeded, "01N")
+        northing = np.asarray(group["northing"][:])
+        group["northing"][:] = northing[::-1]
+        departures = published_store.coordinate_departures(group, _ZONE)
+        assert any("northing" in d for d in departures)
+
+    def test_an_easting_shifted_by_one_pixel_is_reported(self, seeded):
+        _, group = _writable_group(seeded, "01N")
+        group["easting"][:] = np.asarray(group["easting"][:]) + 10.0
+        assert any("easting" in d for d in published_store.coordinate_departures(group, _ZONE))
+
+    def test_a_wrong_pixel_spacing_is_reported(self, seeded):
+        _, group = _writable_group(seeded, "01N")
+        easting = np.asarray(group["easting"][:])
+        group["easting"][:] = easting[0] + (np.arange(easting.size) + 0.5) * 20.0
+        assert any("easting" in d for d in published_store.coordinate_departures(group, _ZONE))
+
+    def test_a_missing_axis_is_reported_rather_than_raising(self, seeded):
+        _, group = _writable_group(seeded, "01N")
+        del group["easting"]
+        assert any("easting" in d and "absent" in d for d in published_store.coordinate_departures(group, _ZONE))
