@@ -1,44 +1,26 @@
-"""Measure read performance against the published global store, comparably to the scoping runs.
+"""Measure read performance against the published store, comparably to the scoping runs.
 
-The sizing decisions behind this store were taken on a synthetic benchmark
-(``scripts/scoping/scale_tests/t1_read_bench.py`` and ``t8_sharding.py``, recorded in
-[ADR 008](../../context_docs/decisions/008-global-store-architecture.md)). This script asks the
-same questions of the store that was actually built, so the architecture's read claims can be
-checked rather than inherited. The workloads, their extents and the concurrency sweep are copied
-from that harness deliberately — a different point count or a different region size would produce
-numbers that look comparable and are not.
+The chunk and shard geometry was chosen on a synthetic benchmark
+(``scripts/scoping/scale_tests/``, recorded in ADR 008). This asks the same questions of the store
+that was built, so those read claims can be checked rather than inherited. The workloads, their
+extents and the concurrency sweep are copied from that harness on purpose: a different point count
+would produce figures that look comparable and are not.
 
-**Four things this script does because the naive version is wrong:**
+Three things it does because the obvious version misleads:
 
-* **Probes are placed in pixels that provably hold embeddings.** A read of an absent chunk is
-  answered from the manifest without a request, so probes that land on fill are nearly free — and
-  a sample mixing those with real reads reports the mixture as latency. Live shards come from the
-  store's own chunk enumeration and each candidate pixel is then confirmed against ``scales``
-  (:func:`~tessera_embeddings.storage.published_store.sample_live_pixels`).
-
-* **Cold means a fresh process; warm means a second pass through the SAME open.** Icechunk caches
-  manifests and pools connections, so every cold phase runs in a subprocess that exits afterwards.
-  The warm arm is a second pass inside one `run_phase` call, on the group the first pass opened —
-  an earlier version called `run_phase` twice, which re-opened everything and made "warm" a second
-  cold reader, throwing away the caches this benchmark exists to observe. The parent chooses the
-  pixels once and passes them down, so both arms and both regions read exactly the same addresses.
-
-* **Throughput is reported the way the scoping harness reported it**, as decompressed elements per
-  second (``elements / wall``). For the int8 ``embeddings`` one element is one byte, so the figure
-  is a logical MB/s and can exceed the host's network bandwidth, because zstd means fewer bytes
-  cross the wire than reach the array. It is a decompressed-delivery rate, not a wire rate. The
-  band-subset workload counts only the bands asked for, while the reader must fetch and decode the
-  whole 128-band inner chunk, so its number understates the work by design — kept for
-  comparability, not as a bandwidth claim.
-
-* **Bytes on the wire come from the interface counters**, as in the scoping run, which means any
-  other traffic on the host is counted too. Trustworthy on a dedicated instance; noise on a
-  laptop. The report says which host it ran on so a reader can judge.
+* **Probes land only on pixels that hold data.** A read of an absent chunk is answered from the
+  manifest without a request, so a probe on elided ocean is nearly free, and a sample mixing those
+  with real reads reports the mixture as latency.
+* **Cold means a fresh process; warm means a second pass through the same open.** Every cold phase
+  runs in a subprocess that exits afterwards.
+* **The throughput column is decompressed elements per second**, which is what the scoping harness
+  reported. On this store that is within a few percent of the wire rate, because the quantized
+  embeddings barely compress. ``band_subset`` counts only the bands asked for while the reader
+  fetches all 128, so it understates by sixteenfold — kept for comparability.
 
 Run from the REPOSITORY ROOT::
 
     uv run python scripts/diagnostic/published_store_read_bench.py --zone 33N --year 2025
-    uv run python scripts/diagnostic/published_store_read_bench.py --points 200 --json bench.json
 """
 
 from __future__ import annotations
@@ -56,7 +38,6 @@ import urllib.request
 from pathlib import Path
 from typing import Any, cast
 
-import icechunk
 import numpy as np
 import zarr
 
@@ -153,100 +134,25 @@ def _percentiles(samples: list[float]) -> dict[str, float]:
 # ── the worker: one phase, one process ───────────────────────────────────────
 
 
-#: Open-path phases, measured in one sweep so they are comparable to each other rather than across
-#: runs. ``open`` is the documented recipe; ``open_zone_direct`` opens one zone group by path
-#: instead of going through the root, which is worth measuring because the natural guess — that the
-#: root open is slow because it enumerates 120 groups — is testable and wrong.
-OPEN_PHASES = ("open", "open_zone_direct")
-
-
-def _reader_config(payload: dict[str, Any]) -> icechunk.RepositoryConfig | None:
-    """The store's SAVED config with only the payload's overrides applied, or None to change nothing.
-
-    **Starts from what the store saved, never from a fresh config.** A `RepositoryConfig` passed to
-    `Repository.open` replaces the saved one wholesale rather than layering on it, so asking for a
-    chunk cache with a fresh config also silently reverts the manifest preload the writer chose —
-    which was measured here at 2.4 s of the open path, and would have moved between two arms that
-    were supposed to differ only in their cache. Fetching the saved config first and mutating one
-    field keeps each arm a one-variable change.
-    """
-    if not (payload.get("no_preload") or payload.get("chunk_cache_mb")):
-        return None
-    config = icechunk.Repository.fetch_config(_storage_for(payload))
-    if config is None:
-        raise RuntimeError("the store saved no repository config; an override here would not be a one-variable change")
-    if payload.get("no_preload"):
-        config.manifest = icechunk.ManifestConfig(
-            preload=icechunk.ManifestPreloadConfig(max_total_refs=0, max_arrays_to_scan=0),
-            splitting=config.manifest.splitting if config.manifest else None,
-        )
-    if payload.get("chunk_cache_mb"):
-        # The saved config sets no caching, so a reader gets icechunk's own default chunk cache. A
-        # working set larger than that cache is evicted before it can be revisited, which is the
-        # difference between a repeated read of one inner chunk costing a request and costing
-        # nothing.
-        config.caching = icechunk.CachingConfig(
-            num_bytes_chunks=int(payload["chunk_cache_mb"]) * 1024 * 1024,
-        )
-    return config
-
-
 def _open_zone(payload: dict[str, Any]) -> tuple[zarr.Group, dict[str, float]]:
     """Open the store to one zone group at the payload's concurrency, timing each step."""
     zarr.config.set({"async.concurrency": payload["concurrency"]})
-    phase = payload["phase"]
     timings: dict[str, float] = {}
     started = time.monotonic()
-    # Both arms open the SAME storage, and the baseline passes no config at all so it gets exactly
-    # what the store saved. Going through `open_global_repo` here instead would supply
-    # `global_store_config()` — byte-identical to the saved config today, so the figures would not
-    # move, but it makes the baseline and the override arms differ in where their config came from,
-    # and a `--uri` pointing at another store or any later drift would silently reintroduce a
-    # second variable.
-    config = _reader_config(payload)
-    repo = (
-        icechunk.Repository.open(_storage_for(payload), config=config)
-        if config
-        else icechunk.Repository.open(_storage_for(payload))
-    )
+    # Opens the way a consumer does, inheriting whatever config the store holds.
+    repo = open_global_repo(payload["uri"], region=payload["region"], anonymous=payload["anonymous"])
     timings["repository_open_s"] = round(time.monotonic() - started, 3)
     started = time.monotonic()
     session = repo.readonly_session(branch="main")
     timings["readonly_session_s"] = round(time.monotonic() - started, 3)
     started = time.monotonic()
-    if phase == "open_zone_direct":
-        # Straight to the group, never touching the root node.
-        timings["root_group_open_s"] = 0.0
-        group = zarr.open_group(session.store, path=payload["zone"], mode="r")
-    else:
-        root = zarr.open_group(session.store, mode="r")
-        timings["root_group_open_s"] = round(time.monotonic() - started, 3)
-        started = time.monotonic()
-        group = root[payload["zone"]]
+    root = zarr.open_group(session.store, mode="r")
+    timings["root_group_open_s"] = round(time.monotonic() - started, 3)
+    started = time.monotonic()
+    group = root[payload["zone"]]
     _ = group["embeddings"].shape  # force the array metadata, which is what a reader needs
     timings["zone_group_open_s"] = round(time.monotonic() - started, 3)
     return group, timings
-
-
-def _storage_for(payload: dict[str, Any]) -> icechunk.Storage:
-    """Icechunk storage for the payload's URI, built without a repository config.
-
-    Handles a LOCAL path as well as an S3 URI. Every arm of this benchmark opens through here, so
-    forcing a filesystem path into ``s3_storage`` would have made `--no-preload` and
-    `--chunk-cache-mb` fail on exactly the local or synthetic store somebody would rehearse them
-    against, while the same store opened fine without those flags.
-    """
-    uri = payload["uri"]
-    if not uri.startswith("s3://"):
-        return icechunk.local_filesystem_storage(uri.removeprefix("file://"))
-    bucket, _, prefix = uri.removeprefix("s3://").partition("/")
-    return icechunk.s3_storage(
-        bucket=bucket,
-        prefix=prefix,
-        region=payload["region"],
-        anonymous=True if payload["anonymous"] else None,
-        from_env=None if payload["anonymous"] else True,
-    )
 
 
 def _net_bytes_received() -> int | None:
@@ -277,7 +183,7 @@ def run_phase(payload: dict[str, Any], repeats: int = 1) -> list[dict[str, Any]]
     # nearly free, because opening the root already fetched the snapshot that describes every group.
     timings["total_open_s"] = round(sum(timings.values()), 3)
     base: dict[str, Any] = {"phase": payload["phase"], "concurrency": payload["concurrency"], **timings}
-    if payload["phase"] in OPEN_PHASES:
+    if payload["phase"] == "open":
         return [base]
     return [{**base, "pass": n + 1, **_measure(group, payload)} for n in range(max(1, repeats))]
 
@@ -424,26 +330,6 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--chunk-cache-mb",
-        type=int,
-        default=0,
-        help=(
-            "override the chunk cache size in MiB. The store saves no caching setting, so a reader "
-            "gets icechunk's own default; raising it above the working set is what turns a repeated "
-            "read of one inner chunk from a request into a cache hit."
-        ),
-    )
-    parser.add_argument(
-        "--no-preload",
-        action="store_true",
-        help=(
-            "open with manifest preloading switched off instead of inheriting the writer's saved "
-            "setting. Applies to EVERY phase, so a run with and a run without it compare the whole "
-            "read path rather than only its first step — which is what says whether the open time "
-            "the preload buys back is paid for later in the reads."
-        ),
-    )
-    parser.add_argument(
         "--anonymous",
         action="store_true",
         help="read with no credentials (the published bucket grants public reads)",
@@ -459,10 +345,7 @@ def main(argv: list[str] | None = None) -> int:
 
     host = _host_facts()
     print(f"host:  {host}")
-    preload_note = "manifest preload DISABLED" if args.no_preload else "manifest preload as saved in the store"
-    if args.chunk_cache_mb:
-        preload_note += f", chunk cache {args.chunk_cache_mb} MiB"
-    print(f"store: {args.uri} ({args.region})  zone {args.zone} year {args.year}  [{preload_note}]")
+    print(f"store: {args.uri} ({args.region})  zone {args.zone} year {args.year}")
 
     repo = open_global_repo(args.uri, region=args.region, anonymous=args.anonymous)
     session = repo.readonly_session(branch="main")
@@ -530,14 +413,12 @@ def main(argv: list[str] | None = None) -> int:
         "uri": args.uri,
         "region": args.region,
         "anonymous": args.anonymous,
-        "no_preload": args.no_preload,
-        "chunk_cache_mb": args.chunk_cache_mb,
         "zone": args.zone,
         "time_index": time_index,
         "points": points,
         "region_origin": region_origin,
     }
-    phases = [*OPEN_PHASES, "point", *wanted]
+    phases = ["open", "point", *wanted]
 
     results: list[dict[str, Any]] = []
     for concurrency in CONCURRENCIES:
@@ -548,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
             # Warm: a SECOND pass through the same opened group, inside one call, so whatever the
             # first pass cached is still there. The open phases have no second pass to take —
             # their measurement IS the open, which a reader pays once per handle.
-            if phase not in OPEN_PHASES:
+            if phase != "open":
                 try:
                     passes = run_phase(payload, repeats=2)
                     arms.append({**passes[-1], "cache": "warm"})
@@ -567,8 +448,6 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "host": host,
                     "store": {"uri": args.uri, "region": args.region, "zone": args.zone, "year": args.year},
-                    "no_preload": args.no_preload,
-                    "chunk_cache_mb": args.chunk_cache_mb,
                     "snapshot_id": session.snapshot_id,
                     "live_shards": len(shards),
                     "probe_pixels": len(points),
@@ -589,7 +468,7 @@ def _one_line(result: dict[str, Any]) -> str:
     """One phase's headline figure, for the progress line."""
     if "error" in result:
         return f"FAILED {result['error'][:60]}"
-    if result["phase"] in OPEN_PHASES:
+    if result["phase"] == "open":
         return (
             f"{result['total_open_s'] * 1e3:.0f} ms to first read"
             f" (repo {result['repository_open_s'] * 1e3:.0f}"

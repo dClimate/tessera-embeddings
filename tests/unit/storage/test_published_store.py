@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import icechunk
 import numpy as np
 import pytest
 import zarr
@@ -429,52 +430,58 @@ class TestMonthCoordinate:
         assert not any("month" in d for d in published_store.coordinate_departures(group, _ZONE))
 
 
-class TestPreloadManifestsFlag:
-    """The one keyword a reader should change, and the writer's default it must not disturb."""
+class TestSavedManifestPreload:
+    """The switch writers use: it changes the store, so every reader inherits the change."""
 
-    def test_the_default_keeps_the_writers_preload(self):
-        preload = zarr_store.global_store_config().manifest.preload
-        assert preload is not None
-        assert preload.max_arrays_to_scan > 0
-        assert preload.max_total_refs > 0
+    def test_a_new_store_is_created_with_preloading_on(self, seeded):
+        # On for a fill, which is about to touch those manifests anyway.
+        repo = global_store.open_global_repo(seeded)
+        assert repo.config.manifest.preload.max_total_refs > 0
 
-    def test_disabling_it_zeroes_the_budget_rather_than_unsetting_it(self):
-        # Zeroed, not None: None means "use icechunk's own default", which preloads something, and
-        # the whole point is to preload nothing.
-        preload = zarr_store.global_store_config(preload_manifests=False).manifest.preload
-        assert preload is not None
-        assert preload.max_arrays_to_scan == 0
+    def test_switching_it_off_is_visible_to_a_reader_that_passes_no_config(self, seeded):
+        global_store.set_saved_manifest_preload(seeded, enabled=False)
+        preload = icechunk.Repository.open(zarr_store._create_storage(seeded)).config.manifest.preload
         assert preload.max_total_refs == 0
-
-    def test_manifest_splitting_survives_either_way(self):
-        # Splitting describes how the manifests already on disk are laid out, so it is not a
-        # reader's to switch off — and building a fresh config to change the preload is exactly how
-        # it would get dropped by accident.
-        on = zarr_store.global_store_config().manifest.splitting
-        off = zarr_store.global_store_config(preload_manifests=False).manifest.splitting
-        assert on is not None
-        assert repr(off) == repr(on)
-
-    def test_the_timeouts_and_retries_survive_either_way(self):
-        on = zarr_store.global_store_config()
-        off = zarr_store.global_store_config(preload_manifests=False)
-        assert repr(off.storage) == repr(on.storage)
-
-    def test_open_global_repo_forwards_the_flag(self, monkeypatch):
-        captured: dict[str, object] = {}
-        monkeypatch.setattr(
-            global_store.icechunk.Repository,
-            "open",
-            staticmethod(lambda storage, config=None: captured.update(config=config) or object()),
-        )
-        monkeypatch.setattr(global_store, "_create_storage", lambda *a, **k: object())
-        global_store.open_global_repo("s3://bucket/prefix", preload_manifests=False)
-        preload = captured["config"].manifest.preload
         assert preload.max_arrays_to_scan == 0
 
-    def test_creating_a_store_is_unaffected_by_the_reader_flag(self, tmp_path):
-        # `create_global_repo` must keep the writer's preload whatever a reader asks for — it takes
-        # no such argument, and this pins that the two call sites did not get wired together.
-        repo = global_store.create_global_repo(str(tmp_path / "w.icechunk"))
-        preload = repo.config.manifest.preload
-        assert preload.max_arrays_to_scan > 0
+    def test_switching_it_back_on_restores_the_writers_budget(self, seeded):
+        global_store.set_saved_manifest_preload(seeded, enabled=False)
+        global_store.set_saved_manifest_preload(seeded, enabled=True)
+        expected = zarr_store.global_store_config().manifest.preload.max_total_refs
+        assert global_store.open_global_repo(seeded).config.manifest.preload.max_total_refs == expected
+
+    def test_manifest_splitting_and_storage_settings_survive_the_switch(self, seeded):
+        # Splitting describes the manifests already on disk, and the timeouts and retries are the
+        # writer's. Building a fresh config to change the preload is how they get dropped.
+        before = global_store.open_global_repo(seeded).config
+        global_store.set_saved_manifest_preload(seeded, enabled=False)
+        after = global_store.open_global_repo(seeded).config
+        assert repr(after.manifest.splitting) == repr(before.manifest.splitting)
+        assert repr(after.storage) == repr(before.storage)
+
+    def test_tags_and_the_branch_tip_survive_the_switch(self, seeded):
+        # The write rebuilds the object that holds them, so this is the thing that must not move.
+        repo = global_store.open_global_repo(seeded)
+        session = repo.writable_session("main")
+        zarr.open_group(session.store, mode="r+")["01N"].attrs["years_complete"] = [2025]
+        snapshot = session.commit("mark 01N year 2025 complete")
+        repo.create_tag("zone-01N-2025", snapshot)
+        before = ({t: str(repo.lookup_tag(t)) for t in repo.list_tags()}, str(repo.lookup_branch("main")))
+        global_store.set_saved_manifest_preload(seeded, enabled=False)
+        after_repo = global_store.open_global_repo(seeded)
+        assert {t: str(after_repo.lookup_tag(t)) for t in after_repo.list_tags()} == before[0]
+        assert str(after_repo.lookup_branch("main")) == before[1]
+
+    def test_it_raises_rather_than_returning_quietly_if_the_switch_does_not_take(self, seeded, monkeypatch):
+        monkeypatch.setattr(icechunk.Repository, "save_config", lambda self: None)
+        with pytest.raises(RuntimeError, match="preload did not change"):
+            global_store.set_saved_manifest_preload(seeded, enabled=False)
+
+
+class TestOpenInheritsTheStoredConfig:
+    """`open_global_repo` passes no config, which is what makes the switch above reach everyone."""
+
+    def test_opening_does_not_override_what_the_store_saved(self, seeded):
+        global_store.set_saved_manifest_preload(seeded, enabled=False)
+        # If this handed Icechunk `global_store_config()`, the preload would read back on.
+        assert global_store.open_global_repo(seeded).config.manifest.preload.max_total_refs == 0
