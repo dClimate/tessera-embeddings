@@ -19,9 +19,9 @@ Both paths run the same three stages in the same order, with the same code:
    ingest    →    inference    →    assembly    →   (validation)
    ------         ---------         --------          ----------
    fetch and      run the model     write the         global path
-   mosaic the     on a GPU          results into      only: check
-   imagery                          a store you       what landed
-                                    can read
+   mosaic the     on a GPU, or on   results into      only, and
+   imagery        CPU for small     a store you       only if
+                  runs              can read          configured
 ```
 
 The global campaign can add a fourth step the single-area path does not have: once a zone-year is
@@ -71,19 +71,27 @@ uses a better model, or has a different definition of an embedding — it does n
 
 ### But it is not configured the same, and that part does change the answer
 
-The shared code is run with **different settings**, and two of them decide which pixels get an
-embedding at all. The same area and the same year can therefore come out differently depending on
-which path produced it:
+The shared code is run with **different settings**, and three of them change what comes out. The
+same area and the same year can therefore differ depending on which path produced it:
 
-| setting | library default (single area) | the global campaign |
+| setting | single area | the global campaign |
 |---|---|---|
 | `allow_s2_only` | `false` — a pixel with no radar observation produces nothing | **`true`** — optical-only pixels are embedded |
 | `optical_min_obs` | unset — no minimum | **15** — a pixel with fewer than fifteen clear optical observations in the year is left empty |
+| `min_valid_coverage` | **5%** of the area's pixels must be cloud-free for a date to be kept | **0.1%** |
 
-Those are the only two quality rules in the system, and both were deliberate choices for a global
-run: about a fifth of the land has no radar for 2022–24, so without `allow_s2_only` those pixels
-would be holes; and fifteen observations is the line below which an embedding was judged not
-trustworthy.
+The first two are the only quality rules applied per pixel, and both were deliberate choices for a
+global run: about a fifth of the land has no radar for 2022–24, so without `allow_s2_only` those
+pixels would be holes, and fifteen observations is the line below which an embedding was judged
+untrustworthy.
+
+**The third is easy to miss and matters as much**, because it throws away whole dates before
+inference ever sees them. A zone-sized area is mostly ocean and edge, so the single-area default of
+5% would discard nearly every date over a zone — hence 0.1% for the campaign. Run a small, compact
+area at 0.1% and you keep dates the 5% default would have dropped, and the embeddings differ
+accordingly. **Note the trap:** the two values live in two constants that share the name
+`DEFAULT_MIN_VALID_COVERAGE`, in `config/ingest.py` (0.1) and `ingest/roi_processing.py` (5.0), so
+reading one of them tells you nothing about which applies to your run.
 
 **What this means in practice.** If you compare your own single-area output against the published
 global store and the pixels disagree, check these settings before looking for a bug.
@@ -96,10 +104,9 @@ campaign's fifteen. Wiring it through would be a small change to the library, no
 choice.
 
 The global store does record which line was used: it stamps `optical_min_obs` when it is seeded, so
-a consumer can read what a cell was measured against rather than assuming. Ingest thresholds are
-per-run in the same way — `min_valid_coverage`, the percentage of valid pixels a date needs to be
-kept at all, defaults to 5% and can be overridden per run — so if you need to match a published
-cell exactly, read the settings recorded on it rather than trusting any default written here.
+a consumer can read what a cell was measured against rather than assuming. All three settings are
+per-run, so **if you need to match a published cell exactly, read what is recorded on it rather
+than trusting any default written down here.**
 
 ## What actually differs
 
