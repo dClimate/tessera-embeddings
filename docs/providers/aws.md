@@ -210,10 +210,14 @@ Scaling is horizontal: one GPU, one `InferenceActor`. The 4 vCPUs make host-side
 data loading the tight resource per worker, and the template ships two
 **capacity-fallback** rungs, both at `max_workers: 0`:
 
-| rung | card | vCPU/GPU | host GiB | throughput vs L40S |
-|---|---|---:|---:|---:|
-| `g5.2xlarge` | A10G | 8 | 32 | **0.46** |
-| `g6.2xlarge` | L4 | 8 | 32 | 0.32 |
+| rung | card | vCPU/GPU | host GiB |
+|---|---|---:|---:|
+| `g5.2xlarge` | A10G | 8 | 32 |
+| `g6.2xlarge` | L4 | 8 | 32 |
+
+Neither card is as fast as the L40S, and the A10G is the faster of the two. All three were
+measured on the same work in the same minute; the ratios, the cost per unit of work, and the
+DCGM counters behind them are in [`context_docs/inference/inference-on-gpus.md`](../../context_docs/inference/inference-on-gpus.md#4-which-gpu-and-whether-a-different-one-is-worth-its-availability) §4.
 
 **Opening one is a campaign parameter, not a release.** Pass
 `gpu_fallback_instance_types=["g5.2xlarge"]` to `run-global-campaign`. That does two things per fill,
@@ -249,8 +253,8 @@ Both `run-global-campaign` and `_apply_gpu_fallback` refuse a second one; the re
 and the allocation policy are n-ary and ready for the day that lifts.
 
 **How the ask is sized.** Rungs are ranked by throughput per vCPU, because the quota is
-counted in vCPU and the cards are not equally priced in it (0.250, 0.0575 and 0.040 of
-an L40S-equivalent per vCPU). Each rung in turn takes what the remaining demand and
+counted in vCPU and the cards are not equally priced in it — `GPU_RUNGS` carries that
+order, derived from the measured ratios in [`context_docs/inference/inference-on-gpus.md`](../../context_docs/inference/inference-on-gpus.md#4-which-gpu-and-whether-a-different-one-is-worth-its-availability) §4. Each rung in turn takes what the remaining demand and
 budget afford, bounded by its ceiling. The **best** rung is asked for what it currently
 holds plus a small probe rather than for its ceiling: a ceiling-sized ask would reserve
 budget for machines AWS is refusing, and a live-sized ask would never grow.
@@ -270,9 +274,9 @@ must compare asked against live, because a failure count cannot see partial fulf
 Three things to know before you turn it on.
 
 **It costs double the quota per GPU.** The G-and-VT quota is counted in vCPU. These
-sizes are 8 vCPU per GPU against `g6e.xlarge`'s 4, so the applied 10,000 vCPU buys
-either 2,500 L40S or 1,250 A10G. A fleet fully on fallback is half the card count
-*before* the 0.46 throughput factor.
+sizes are 8 vCPU per GPU against `g6e.xlarge`'s 4, so a 10,000 vCPU quota buys either
+2,500 L40S or 1,250 A10G. A fleet fully on fallback is therefore half the card count —
+and then each of those cards is slower as well, by the measured ratio in [`context_docs/inference/inference-on-gpus.md`](../../context_docs/inference/inference-on-gpus.md#4-which-gpu-and-whether-a-different-one-is-worth-its-availability) §4.
 
 **Recovery applies to new demand, not to running nodes.** When L40S supply returns the
 published ask shifts back toward it, and fallback machines above the new ask lose their
@@ -311,17 +315,18 @@ That is an accepted limitation rather than an oversight.
 `TestTheCampaignRestartConfiguration` pins the configuration the library ships with.
 
 **The vCPU-matched sizes are deliberately not offered.** `g5.xlarge` and `g6.xlarge` are
-4 vCPU per GPU like the production rung, but carry 16 GiB of host RAM against a measured
-~17.7 GB per-actor requirement — the exact shape that OOMed the loader on the earlier
-16 GB g5-class workers.
+4 vCPU per GPU like the production rung, but carry only 16 GiB of host RAM in total, and
+measurement puts about that much in one actor's working set on its own — so the machine has
+nothing left for anything else. These are the cheapest sizes per GPU-hour in either family,
+which is why the exclusion is worth stating rather than leaving to be discovered. The
+measurement is in [`context_docs/inference/inference-on-gpus.md`](../../context_docs/inference/inference-on-gpus.md#4-which-gpu-and-whether-a-different-one-is-worth-its-availability) §4.
 
-The L4 is half the L40S's VRAM. What makes it arguable at all is the per-chunk
-peak-VRAM telemetry on the `CHUNK_SUMMARY` line: `max_memory_allocated` measures
-**4.6–7.5 GiB** at optical depths of 54–113 timesteps, far below what an `nvidia-smi`
-reading suggests. `nvidia-smi` reports the caching allocator's *reserved* pool, which
-runs around three times the live requirement and sizes itself to whatever card it is
-given, so it cannot answer a card-fit question. Read `vram_peak_gib` against `t_kept`
-instead, and remember the requirement grows with optical depth.
+**The L4 has half the L40S's VRAM**, which is the one hard fact about it. Whether that is
+enough is a question about how much VRAM this model needs at a given optical depth, and an
+`nvidia-smi` reading cannot answer it: that number is the caching allocator's *reserved*
+pool, which sizes itself to whatever card it is given rather than to the work. Read
+`vram_peak_gib` against `t_kept` on the `CHUNK_SUMMARY` line instead. The measured
+allocations, on both fallback cards, are in [`context_docs/inference/inference-on-gpus.md`](../../context_docs/inference/inference-on-gpus.md#4-which-gpu-and-whether-a-different-one-is-worth-its-availability) §4.
 
 ## Region
 
@@ -352,13 +357,16 @@ Total                                     ~$0.85
 
 Inference, 100 km × 100 km ROI:
 ─────────────────────────────────────────────────
-~10× the chunks → ~10× the time on each step.
 Ingest scales linearly; inference uses ~10–20 spot GPUs (~$2-4/run)
 Total                                     ~$8-15
 ```
 
 These are budgetary; profile your specific AOI before scaling
-billing assumptions.
+billing assumptions. **What drives the figure is the area you keep, not the box you
+draw** — both ingest and inference skip whole chunks that fall outside your mask, so a
+compact area costs close to its own extent while a scattered one pays for every tile it
+lands on. The mechanism, and the measured saving, are in
+[the ingest README](../../src/tessera_embeddings/ingest/README.md#cropping-to-live-windows-unconditional).
 
 **Do not extrapolate them to a global run.** A campaign's bill is not a per-area figure
 multiplied up: storage, S3 requests and the container fleet together came to more than a
