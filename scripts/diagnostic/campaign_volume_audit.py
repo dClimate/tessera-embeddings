@@ -138,9 +138,12 @@ def main() -> int:
             print(f"lifetime    UNKNOWN - no bucket metrics before {cutoff:%Y-%m-%d}")
         else:
             share = before / written
-            print(f"lifetime    {before:,.0f} B resident before {cutoff:%Y-%m-%d} = {share:.2%} of the total")
-            if share > 0.001:
-                print("            material pre-existing data: this is a floor, not a lifetime total")
+            verdict = (
+                "negligible, so the figure above is a lifetime total"
+                if share <= 0.001
+                else f"{share:.1%} of the total, so the figure above is a FLOOR"
+            )
+            print(f"lifetime    {before:,.0f} B resident before {cutoff:%Y-%m-%d} - {verdict}")
 
     # The cross-check. Reading, for each clock hour, the most any one snapshot ever saw
     # written in that hour is cheap and cannot be fooled by inventory reporting lag; the
