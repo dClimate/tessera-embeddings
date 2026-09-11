@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import platform
 import subprocess
@@ -53,13 +54,13 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import icechunk
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.store_layout import SHARD_PX
+from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX
 from tessera_embeddings.storage import published_store
 from tessera_embeddings.storage.global_store import open_global_repo
 
@@ -196,11 +197,18 @@ def _open_zone(payload: dict[str, Any]) -> tuple[zarr.Group, dict[str, float]]:
     phase = payload["phase"]
     timings: dict[str, float] = {}
     started = time.monotonic()
+    # Both arms open the SAME storage, and the baseline passes no config at all so it gets exactly
+    # what the store saved. Going through `open_global_repo` here instead would supply
+    # `global_store_config()` — byte-identical to the saved config today, so the figures would not
+    # move, but it makes the baseline and the override arms differ in where their config came from,
+    # and a `--uri` pointing at another store or any later drift would silently reintroduce a
+    # second variable.
     config = _reader_config(payload)
-    if config is not None:
-        repo = icechunk.Repository.open(_storage_for(payload), config=config)
-    else:
-        repo = open_global_repo(payload["uri"], region=payload["region"], anonymous=payload["anonymous"])
+    repo = (
+        icechunk.Repository.open(_storage_for(payload), config=config)
+        if config
+        else icechunk.Repository.open(_storage_for(payload))
+    )
     timings["repository_open_s"] = round(time.monotonic() - started, 3)
     started = time.monotonic()
     session = repo.readonly_session(branch="main")
@@ -293,6 +301,12 @@ def _measure(group: zarr.Group, payload: dict[str, Any]) -> dict[str, Any]:
     after = _net_bytes_received()
     if before is not None and after is not None:
         result["wire_bytes"] = after - before
+    # A live shard only means at least one of its inner chunks is initialized, so a contiguous
+    # block of live shards can still be mostly elided ocean — and a read of elided chunks issues no
+    # requests, which would report as high throughput for having done less work. This fraction is
+    # the guard, it is carried into the table rather than buried in the JSON, and the driver refuses
+    # a window that is mostly fill.
+    nonfill = float(np.count_nonzero(block) / block.size)
     result.update(
         workload=label,
         wall_s=round(wall, 3),
@@ -300,11 +314,9 @@ def _measure(group: zarr.Group, payload: dict[str, Any]) -> dict[str, Any]:
         # The scoping harness's definition: decompressed elements per second. See the module
         # docstring on why this is not a wire rate.
         throughput_mbps=round((block.size / 1e6) / wall, 1) if wall > 0 else 0.0,
-        # A sanity indicator that the region held data rather than fill, NOT a coverage figure:
-        # int8 zero is both the fill value and a legitimate band value, so a fully written block
-        # lands a little under 1.0 rather than exactly at it. It is here to make a read that
-        # silently landed on ocean obvious, which would show as a fraction near zero.
-        nonfill_fraction=round(float(np.count_nonzero(block) / block.size), 4),
+        # NOT a coverage figure: int8 zero is both the fill value and a legitimate band value, so a
+        # fully written block lands a little under 1.0 rather than exactly at it.
+        nonfill_fraction=round(nonfill, 4),
     )
     return result
 
@@ -312,17 +324,51 @@ def _measure(group: zarr.Group, payload: dict[str, Any]) -> dict[str, Any]:
 # ── the parent: choose the addresses, then drive cold and warm arms ──────────
 
 
-def _contiguous_live_block(shards: frozenset[tuple[int, int]], span: int) -> tuple[int, int] | None:
-    """Pixel origin of a ``span x span`` shard block whose every shard is live, or None.
+#: A region window must be at least this fraction non-fill to be measured. A read of elided chunks
+#: issues no requests, so a fill-heavy window reports high throughput for having done less work —
+#: the figure is then a statement about the window, not about the store.
+MIN_NONFILL = 0.9
 
-    The region workloads must sit inside written data or they measure fill. `bulk` at 4096 px
-    needs 2x2 shards, and a zone's live shards follow its coastline, so a block of the right size
-    has to be searched for rather than assumed.
+
+def _contiguous_live_block(
+    group: zarr.Group, time_index: int, shards: frozenset[tuple[int, int]], span: int
+) -> tuple[tuple[int, int], float] | None:
+    """Origin of a ``span x span`` block of live shards that is actually full, plus its fill fraction.
+
+    **A live shard is not a full shard.** `live_shards` reports a shard with at least one
+    initialized inner chunk, and along a coastline most of such a shard can be elided ocean — so a
+    contiguous block of live shard coordinates is a necessary condition and not a sufficient one.
+    Each candidate block is therefore sampled before it is accepted: a strided read of `scales`
+    over the window, cheap because `scales` is a thirty-second of `embeddings` and strided to one
+    value per inner chunk, and the block is taken only if at least :data:`MIN_NONFILL` of those
+    values are finite. Returns None when no candidate qualifies, which is a real answer for a zone
+    that has no solid block of that size.
     """
     needed = span // SHARD_PX + (1 if span % SHARD_PX else 0)
+    scales = cast("zarr.Array", group["scales"])
+    best: tuple[tuple[int, int], float] | None = None
     for shard_y, shard_x in sorted(shards):
-        if all((shard_y + dy, shard_x + dx) in shards for dy in range(needed) for dx in range(needed)):
-            return shard_y * SHARD_PX, shard_x * SHARD_PX
+        if not all((shard_y + dy, shard_x + dx) in shards for dy in range(needed) for dx in range(needed)):
+            continue
+        y0, x0 = shard_y * SHARD_PX, shard_x * SHARD_PX
+        if y0 + span > scales.shape[1] or x0 + span > scales.shape[2]:
+            continue
+        # One sample per inner chunk: enough to tell a solid window from a coastal one, and it reads
+        # kilobytes rather than the gigabytes the window itself holds.
+        probe = np.asarray(scales[time_index, y0 : y0 + span : INNER_PX, x0 : x0 + span : INNER_PX])
+        fraction = float(np.isfinite(probe).mean())
+        if fraction >= MIN_NONFILL:
+            return (y0, x0), fraction
+        if best is None or fraction > best[1]:
+            best = ((y0, x0), fraction)
+    if best is not None:
+        logging.getLogger(__name__).warning(
+            "no %d px block reached %.0f%% non-fill; the fullest found was %.0f%% at %s",
+            span,
+            MIN_NONFILL * 100,
+            best[1] * 100,
+            best[0],
+        )
     return None
 
 
@@ -433,15 +479,19 @@ def main(argv: list[str] | None = None) -> int:
 
     # Sized for the LARGEST requested workload, so a run that skips `bulk` is not refused for want
     # of a block only `bulk` needs.
-    region_origin = None
+    region_origin: tuple[int, int] | None = None
+    block_nonfill: float | None = None
     if wanted:
         # Both extents, not just the northing one: a workload that is wider than it is tall would
         # otherwise be handed a block big enough on one axis only.
         span = max(max(w[1], w[2]) for w in WORKLOADS if w[0] in wanted)
-        region_origin = _contiguous_live_block(shards, span)
-        if region_origin is None:
-            print(f"no contiguous live block of {span} px in {args.zone}/{args.year}; skipping region workloads")
+        found = _contiguous_live_block(group, time_index, shards, span)
+        if found is None:
+            print(f"no {span} px block in {args.zone}/{args.year} is {MIN_NONFILL:.0%} non-fill; skipping region reads")
             wanted = []
+        else:
+            region_origin, block_nonfill = found
+            print(f"region window {region_origin}, {block_nonfill:.1%} of its inner chunks hold data")
 
     base = {
         "uri": args.uri,
@@ -490,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
                     "live_shards": len(shards),
                     "probe_pixels": len(points),
                     "region_origin": region_origin,
+                    "region_window_nonfill": block_nonfill,
                     "concurrencies": list(CONCURRENCIES),
                     "results": results,
                 },
@@ -535,7 +586,8 @@ def _print_table(results: list[dict[str, Any]]) -> None:
             f"{result.get('p50_ms', ''):>8} {result.get('p95_ms', ''):>8} "
             f"{result.get('throughput_mbps', ''):>8} "
             f"{(round(wire / 1e6, 2) if wire else ''):>9} "
-            f"{round(result['total_open_s'] * 1e3):>8}"
+            f"{round(result['total_open_s'] * 1e3):>8} "
+            f"{result.get('nonfill_fraction', ''):>8}"
         )
 
 

@@ -38,9 +38,10 @@ from pathlib import Path
 from typing import Any
 
 import icechunk
+import numpy as np
 import zarr
 
-from tessera_embeddings.storage import published_store
+from tessera_embeddings.storage import published_store, zone_grid
 from tessera_embeddings.storage.global_store import open_global_repo
 
 #: The published store and the region its bucket lives in. Both overridable so the script can be
@@ -89,18 +90,49 @@ def _describe_config(repo: icechunk.Repository) -> dict[str, Any]:
     }
 
 
+def _calendar_years(group: zarr.Group) -> list[int]:
+    """The calendar year of each time slot, from the group's own ``time`` coordinate.
+
+    The coordinate is int64 nanoseconds since the epoch, so it must be VIEWED as ``datetime64[ns]``
+    before being truncated to years; casting the raw integers straight to ``datetime64[Y]`` reads
+    each nanosecond count as a year offset. The range check turns a future change of units into a
+    loud failure rather than a silently wrong mapping from time index to year.
+    """
+    stamps = np.asarray(group["time"][:]).astype("datetime64[ns]")
+    years = [int(y) for y in stamps.astype("datetime64[Y]").astype(int) + 1970]
+    if not all(1970 <= y <= 2200 for y in years):
+        raise ValueError(f"time coordinate did not decode to plausible years: {years[:4]}")
+    return years
+
+
 def _zone_report(root: zarr.Group, zone: str, *, with_shards: bool, session: icechunk.Session) -> dict[str, Any]:
     """Everything this audit records about one zone group."""
     opened = time.monotonic()
     group = root[zone]
     attrs = dict(group.attrs)
     years = [int(y) for y in attrs.get("years_complete", [])]
+    departures = published_store.layout_departures(group)
+    # The CRS is CHECKED, not just reported. A zone declaring another zone's EPSG code, or none at
+    # all, georeferences every array in it wrongly — and a consumer has no way to notice, because
+    # the arrays are the right shape and the attribute is present and plausible. The expected value
+    # comes from `zone_grid` so this and the seeder cannot disagree about it.
+    expected_crs = zone_grid.zone(zone).crs if zone in zone_grid.ZONES else None
+    if expected_crs is None:
+        departures.append(f"{zone}: not a known UTM zone, so no expected CRS to check against")
+    elif attrs.get("crs") != expected_crs:
+        departures.append(f"{zone}: declares crs {attrs.get('crs')!r}, the zone grid says {expected_crs!r}")
+    # A year marked complete that the campaign never preallocated is a completion record pointing at
+    # no time slot. Unchecked it also makes the "never filled" arithmetic wrong, and can turn it
+    # negative.
+    unexpected_years = [y for y in years if y not in CAMPAIGN_YEARS]
     report: dict[str, Any] = {
         "zone": zone,
         "crs": attrs.get("crs"),
+        "expected_crs": expected_crs,
         "years_complete": years,
         "years_missing": [y for y in CAMPAIGN_YEARS if y not in years],
-        "layout_departures": published_store.layout_departures(group),
+        "years_unexpected": unexpected_years,
+        "layout_departures": departures,
         "open_s": round(time.monotonic() - opened, 3),
         # A year in `runs` but not in `years_complete` would mean a fill that wrote data and never
         # marked itself, which is the one inconsistency the two-commit write model could leave.
@@ -112,6 +144,16 @@ def _zone_report(root: zarr.Group, zone: str, *, with_shards: bool, session: ice
         report["live_shards_by_time_index"] = {str(k): len(v) for k, v in coverage.items()}
         report["live_shards_total"] = sum(len(v) for v in coverage.values())
         report["shard_enumeration_s"] = round(time.monotonic() - started, 2)
+        # THE half-published state the write model can produce. Shards are committed before the
+        # year's attributes, so a crash between the two commits leaves real data in a year nothing
+        # records as complete — and a reader asking `years_complete` will never look at it. Only
+        # reachable with `--shards`, because it needs the per-year coverage.
+        calendar = _calendar_years(group)
+        report["live_shards_in_incomplete_years"] = {
+            str(calendar[index]): len(shards)
+            for index, shards in sorted(coverage.items())
+            if index < len(calendar) and calendar[index] not in years and shards
+        }
     return report
 
 
@@ -174,13 +216,22 @@ def main(argv: list[str] | None = None) -> int:
     # the tag record for those zones and nothing else.
     audited = {r["zone"] for r in zone_reports}
     from_attrs = {(r["zone"], y) for r in zone_reports for y in r["years_complete"]}
-    from_tags = {(z, y) for z, y in tags if z in audited}
+    # A FULL audit compares every parsed tag; a subset audit compares only the zones asked for.
+    # Filtering unconditionally is how an orphan tag — `zone-61N-2025`, or one left behind by a
+    # deleted group — disappears from the comparison and lets the census exit 0 on it.
+    from_tags = tags if args.zones == "all" else {(z, y) for z, y in tags if z in audited}
     only_attrs = sorted(from_attrs - from_tags)
     only_tags = sorted(from_tags - from_attrs)
     unmarked_provenance = sorted(
         (r["zone"], y) for r in zone_reports for y in r["years_with_provenance"] if y not in r["years_complete"]
     )
     departures = {r["zone"]: r["layout_departures"] for r in zone_reports if r["layout_departures"]}
+    unexpected_years = sorted((r["zone"], y) for r in zone_reports for y in r["years_unexpected"])
+    unmarked_shards = {
+        f"{r['zone']}/{year}": count
+        for r in zone_reports
+        for year, count in r.get("live_shards_in_incomplete_years", {}).items()
+    }
 
     print(f"\ncells complete (attrs):   {len(from_attrs)}")
     print(f"cells tagged:             {len(from_tags)}")
@@ -192,6 +243,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"tagged, not marked:       {len(only_tags)} {only_tags[:6]}")
     print(f"has provenance, unmarked: {len(unmarked_provenance)} {unmarked_provenance[:6]}")
     print(f"groups missing/unexpected:{len(missing_groups)} / {len(unexpected_groups)}")
+    print(f"years outside the campaign:{len(unexpected_years)} {unexpected_years[:6]}")
+    if args.shards:
+        print(f"shards in unmarked years:  {len(unmarked_shards)} {list(unmarked_shards.items())[:4]}")
 
     if args.json_out:
         with Path(args.json_out).open("w") as handle:
@@ -211,6 +265,8 @@ def main(argv: list[str] | None = None) -> int:
                         "layout_departures": departures,
                         "missing_groups": missing_groups,
                         "unexpected_groups": unexpected_groups,
+                        "years_outside_the_campaign": unexpected_years,
+                        "live_shards_in_unmarked_years": unmarked_shards,
                     },
                 },
                 handle,
@@ -221,7 +277,16 @@ def main(argv: list[str] | None = None) -> int:
 
     return (
         1
-        if (only_attrs or only_tags or unmarked_provenance or departures or missing_groups or unexpected_groups)
+        if (
+            only_attrs
+            or only_tags
+            or unmarked_provenance
+            or departures
+            or missing_groups
+            or unexpected_groups
+            or unexpected_years
+            or unmarked_shards
+        )
         else 0
     )
 

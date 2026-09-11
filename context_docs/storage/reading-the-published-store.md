@@ -354,9 +354,17 @@ reads within an inner chunk** cannot be it, because a pixel cannot be returned w
 decompressing the whole chunk that holds it — which is what makes ADR 008's reading of the gap,
 that sharding does lean partial reads, not tenable as stated.
 
-What remained was **cache reuse**, and it is measurable. If probes revisit inner chunks and the
-cache holds them, the average bytes per read falls to `distinct chunks touched / probes` × 8.39 MB.
-Measured in us-west-2 on 16S/2025, where 1,000 probes land in 1,088 inner chunks:
+What remained was **cache reuse — and reuse alone is not enough, which is why a first attempt at
+this explanation appeared to fail.** Asking whether probes revisit inner chunks, with the store's
+own configuration, showed nothing: 1,000 probes over 16S's 1,088 inner chunks cost 7.96 MB each,
+statistically identical to 25 probes over 33N's 549,952 at 8.28 MB. The reuse was there and the
+saving was not, because the store **saves no caching setting** and icechunk's default cache is
+small against an 8.39 MB chunk — every revisit had been evicted before it came round again. Reuse
+only shows when the cache can hold the working set.
+
+With that, the arithmetic is simple: if probes revisit inner chunks and the cache holds them, the
+average bytes per read falls to `distinct chunks touched / probes` × 8.39 MB. Measured in
+us-west-2 on 16S/2025, where 1,000 probes land in 1,088 inner chunks:
 
 | | p50 | bytes on the wire per point |
 |---|---|---|

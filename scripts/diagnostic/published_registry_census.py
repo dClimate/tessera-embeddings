@@ -180,15 +180,20 @@ def _aoi_query(
         & (pc.field("bbox_east") >= west)
         & (pc.field("bbox_south") <= north)
         & (pc.field("bbox_north") >= south),
-        columns=["tile", "embedded", "refused_px", "eligible_px", "median_obs_where_thin"],
+        columns=["tile", "embedded", "refused_px", "eligible_px", "median_obs_where_thin", "assembled_at"],
     )
-    embedded = table.column("embedded").to_pylist()
-    refused = [v for v in table.column("refused_px").to_pylist() if v is not None]
+    # LATEST RUN PER TILE, for the same reason the store cross-check needs it: a refill leaves the
+    # original part in place, so a tile filled twice would be counted twice here and its refused
+    # pixels added together — inflating the very answer a consumer came for.
+    rows = list(_latest_per_tile(table.to_pylist()).values())
+    embedded = [r["embedded"] for r in rows]
+    refused = [r["refused_px"] for r in rows if r["refused_px"] is not None]
     return {
         "aoi": list(aoi),
         "year": year,
         "wall_s": round(time.monotonic() - started, 2),
-        "tiles_overlapping": table.num_rows,
+        "tiles_overlapping": len(rows),
+        "rows_before_dedup": table.num_rows,
         "tiles_embedded": sum(1 for v in embedded if v),
         "tiles_not_embedded": sum(1 for v in embedded if not v),
         "refused_px_total": sum(refused),
@@ -248,8 +253,12 @@ def _verify_against_store(
             columns=["year", "embedded", "tile", "refused_px", "run_id", "assembled_at"],
         )
         rows = table.to_pylist()
-        for year in sorted(set(calendar)):
-            time_index = calendar.index(year)
+        # The UNION of the store's calendar and the registry's own years. Iterating only the store's
+        # would load a part for a year the store has no slot for — `year=2026`, say — and never look
+        # at it, so a registry advertising a cell that cannot exist would pass every check.
+        registry_years = {int(r["year"]) for r in rows if r["year"] is not None}
+        for year in sorted(set(calendar) | registry_years):
+            time_index = calendar.index(year) if year in calendar else None
             all_rows = [r for r in rows if r["year"] == year]
             # LATEST RUN PER TILE, not every row. A refill deliberately writes a NEW part rather
             # than overwriting the original, so the registry holds one complete tile set per run —
@@ -261,13 +270,14 @@ def _verify_against_store(
                 {
                     "zone": zone,
                     "year": year,
+                    "in_store_time_axis": time_index is not None,
                     "marked_complete": year in years,
                     "registry_rows": len(registry_rows),
                     "registry_rows_before_dedup": len(all_rows),
                     "runs_present": sorted({r["run_id"] for r in all_rows}),
                     "registry_embedded": sum(1 for r in registry_rows if r["embedded"]),
                     "registry_not_embedded": sum(1 for r in registry_rows if not r["embedded"]),
-                    "store_live_shards": len(coverage.get(time_index, ())),
+                    "store_live_shards": len(coverage.get(time_index, ())) if time_index is not None else 0,
                 }
             )
     return findings
@@ -392,10 +402,21 @@ def main(argv: list[str] | None = None) -> int:
             # records `marked_complete` to catch: a fill that wrote its shards and its registry
             # part, then died before adding the year to `years_complete`. Its counts agree, so
             # counting alone would call it healthy.
-            populated = bool(finding["registry_embedded"] or finding["store_live_shards"])
+            # ANY registry row counts as populated, not only an embedded one. A cell whose part
+            # holds nothing but refused tiles has zero embedded rows and zero shards, so counting
+            # those alone calls it empty — while the registry is still advertising a record for a
+            # cell nothing marks complete.
+            populated = bool(finding["registry_rows"] or finding["store_live_shards"])
             unmarked = populated and not finding["marked_complete"]
-            verdict = "agrees" if counts_agree and not unmarked else ("UNMARKED" if unmarked else "DISAGREES")
-            if not counts_agree or unmarked:
+            outside = not finding["in_store_time_axis"]
+            verdict = "agrees"
+            if outside:
+                verdict = "NOT IN THE STORE'S TIME AXIS"
+            elif unmarked:
+                verdict = "UNMARKED"
+            elif not counts_agree:
+                verdict = "DISAGREES"
+            if verdict != "agrees":
                 disagreements.append({**finding, "verdict": verdict})
             print(
                 f"  {finding['zone']}/{finding['year']:<7} {finding['marked_complete']!s:>8} "
