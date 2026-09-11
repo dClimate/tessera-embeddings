@@ -43,7 +43,7 @@ A Python library for:
   validated pipelines.
 - **Generating 128-dimensional Tessera embeddings** via distributed
   GPU inference with Ray.
-- **Coarsening and assembling** the output into analysis-ready stores
+- **Assembling** the output into analysis-ready stores
   at configurable resolution.
 
 Output stores are self-describing via GeoZarr conventions: every embedding
@@ -63,30 +63,44 @@ Alongside the library we ship **reference orchestration**: opinionated
 Prefect flows and AWS provisioning helpers that demonstrate how we
 run this at production scale. They are examples, not requirements.
 
-## One area, or the whole world
+## Embeddings generation pathway
 
-There are two ways to run this, and they are more alike than they look.
+This repository supports two pathways, referred to in the code base as SINGLE and GLOBAL.
 
-**One area.** You supply an area of interest — a polygon, a set of Sentinel-2 tiles, or any mask
-you can draw — and get embeddings for it over any twelve-month window you choose. This runs on one
-machine; the [quickstart](docs/quickstart.md) does it on a laptop in a few minutes.
+**One region of interest (ROI).** You supply an area of interest — a polygon, a set of Sentinel-2 tiles, or any mask
+you can draw — and get embeddings for it over any twelve-month window you choose. This runs on a cloud cluster
+or equally on one machine; the [quickstart](docs/quickstart.md) does it on a laptop in a few minutes.
+
+Our assumption is that the vast majority of users of this repository will follow the single ROI 
+path for their custom workflows.
 
 **The whole world.** The same pipeline, run as a campaign over the world's land between
-**59.45°S and 83.65°N** (Antarctica is excluded by decision — see below), one UTM zone and one
-calendar year at a time. The result is published as **global TESSERA v1.1** at
-`s3://tessera-embeddings/v1.1/dclimate.icechunk/`, so in most cases you can read it rather than
-compute anything — checking each zone's `years_complete` first, because unfilled cells read back
-as fill values rather than as an error.
+**59.45°S and 83.65°N** (Antarctica is excluded), one UTM zone and one calendar year at a time.
+The result is published as **global TESSERA v1.1** at `s3://tessera-embeddings/v1.1/dclimate.icechunk/`,
+so in most cases you can read it rather than compute anything — checking each zone's `years_complete`
+first, because unfilled cells read back as fill values rather than as an error. Note that each UTM
+zone corresponds to one zarr group and the data within is projected to the corresponding UTM-specific EPSG.
+
+The global campaign is complex, long, and extremely expensive (see ['context_docs/campaign/campaign-cost-model.md'](context_docs/campaign/campaign-cost-model.md)). When done it creates a more complex Icechunk Zarr with
+Zarr Groups that require a very slightly more complex access pattern. We have primarily exposed
+it here as a matter of transparency. However, if you wish to run a campaign yourself and have a 
+spare ~1 million dollars, by all means go ahead, the code as written will do so efficiently with
+minor modifications to your use case.
+
+Note that the global store's time intervals were fixed at Jan 1 - December 31st calendar years,
+but with minimal intervention the inference code will absolutely support custom time intervals,
+as it already does robustly for the single ROI use case. This was hard-coded purely as a matter
+of convenience.
 
 **The model and the ingest are the same code in both**, and assembly is shared up to the point of
-writing. What differs is scale, how you say which ground you want, the store's conventions — most
-importantly that the global store holds calendar years only, while a single area can use any
-twelve-month window — and the campaign's different pixel-selection settings — two of them looser than the
-library defaults and one stricter — which mean the same
+writing. What differs is scale, how you include/exclude oceans and other unwanted areas,
+the store's conventions — most importantly that the global store holds calendar years only, while
+a single area can use any twelve-month window — and the campaign's different pixel-selection settings
+— two of them looser than the library defaults and one stricter — which mean the same
 area and year can give different results on the two paths.
 
-**→ [`docs/single-vs-global.md`](docs/single-vs-global.md)** explains the differences that are
-real, including how to supply your own mask (it does not have to be land) and why the global store
+**→ [`docs/single-vs-global.md`](docs/single-vs-global.md)** explains in greater detail the differences between
+the two pathways, how to supply your own mask (it does not have to be land) and why the global store
 insists on calendar years.
 
 ## What this isn't

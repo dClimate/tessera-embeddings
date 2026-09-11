@@ -7,9 +7,7 @@ single-area path the pixel size is a parameter you can change.
 
 There are two ways to run it. You can point it at **one area you care about**, or you can run the
 **global campaign** that covers the world's land between 59.45°S and 83.65°N — Antarctica is
-excluded by decision, not omitted by accident. This page explains how they relate, because
-the honest answer is that they are far more alike than different, and knowing which differences
-are real will save you guessing.
+excluded by decision. This page explains their points of similarity (many) and difference (few).
 
 ## The short version
 
@@ -18,7 +16,7 @@ Both paths run the same three stages in the same order, with the same code:
 ```
    ingest    →    inference    →    assembly    →   (validation)
    ------         ---------         --------          ----------
-   fetch and      run the model     write the         global path
+   fetch and      run the model     write the         currently global path
    mosaic the     on a GPU, or on   results into      only, and
    imagery        CPU for small     a store you       only if
                   runs              can read          configured
@@ -26,14 +24,14 @@ Both paths run the same three stages in the same order, with the same code:
 
 The global campaign can add a fourth step the single-area path does not have: once a zone-year is
 written and tagged, it dispatches a validation run that produces figures and a machine-readable
-verdict on the published cell. That is how bad published data gets noticed in a job too large to
+verdict on the published cell. That unearths bad data in a job too large to
 inspect by hand — but it is **configured, not automatic**. The validation deployment defaults to
 unset, and with nothing set the dispatch does nothing, so a campaign you run yourself gets no
 validation unless you supply one.
 
-The **model is identical** and the **ingest is identical**. Assembly shares its code up to the
+Otherwise, the **model, ingest, and inference are identical**. Assembly shares its code up to the
 point of writing, and then the two write differently — the global path lays down whole 2048-pixel
-tiles into slots that were set aside in advance, which is what lets many machines add to one
+tiles into slots that were set aside in advance,in order to let many machines add to one
 dataset at once; the single-area path creates or extends a store of its own. That difference
 reaches the data in one place, and it is worth knowing before you compare the two: where a tile
 was looked at and refused — no pixel in it passed the quality rules — the global path still writes
@@ -44,11 +42,10 @@ asymmetry is deliberate, and the reason is in a comment at the write site. What 
 is how much you run at once, how you say which ground you want, and what the output store looks
 like when it lands.
 
-If you are choosing: use the single-area path unless you actually need global coverage. It is
-simpler and more flexible about time periods, and it can run entirely on one machine — the
-quickstart does. (The full Prefect pipeline flow provisions a Dask cluster for the ingest stage and
-auto-sizes it from the area, so "one machine" describes the plain runner rather than every
-single-area entry point.)
+If you are uncertain, you almost certainly should use the single-area path. If you need global coverage,
+first check if the published multi-year global dataset at s3://tessera-embeddings/v1.1/dclimate.icechunk
+works for you. The single path is simpler and more flexible about time periods, can be flexibly run
+on different cluster sizes or single machines, and is vastly more cost-effective for small area analysis.
 
 ## What is genuinely the same
 
@@ -72,13 +69,10 @@ own extent (one sparse island zone drops from 3,706 chunks per band-date to 4), 
 is small but *scattered* — a thousand separate field boundaries across a region — can touch many
 tiles and cost accordingly. If your area is sparse, its cost is set by how many tiles it lands on.
 
-So: if you are wondering whether the global campaign does something cleverer to the imagery, or
-uses a better model, or has a different definition of an embedding — it does not.
-
 ### But it is not configured the same, and that part does change the answer
 
-The shared code is run with **different settings**, and three of them change what comes out. The
-same area and the same year can therefore differ depending on which path produced it:
+The shared code is run with **different default settings**, and three of them change what comes out.
+The same area and the same year can therefore differ depending on which path produced it:
 
 | setting | single area | the global campaign |
 |---|---|---|
@@ -106,8 +100,7 @@ global store and the pixels disagree, check these settings before looking for a 
 before trying.** `allow_s2_only` is a parameter you can pass. `optical_min_obs` is **not exposed**
 on either documented single-area path — neither the plain runner nor the Prefect flow reads it — so
 a single-area run applies no optical-depth floor and there is currently no way to ask it for the
-campaign's fifteen. Wiring it through would be a small change to the library, not a configuration
-choice.
+campaign's fifteen. Wiring it through would be a small change to the library and is on the roadmap.
 
 **What the published store lets you check, and what it does not.** Only one of the three is
 recorded, and it is on the store's ROOT attributes rather than on a zone:
@@ -132,11 +125,12 @@ most often: which optical-depth line a cell was held to, and which model wrote i
 | how you say where | a boolean grid you make, at pixel resolution | a prepared coverage store, at 2048-pixel tile resolution |
 | time period | **any 12 months**, ending in the month you choose | **calendar years only**, January to December |
 | output | one store per area, one entry per window | one store for the world, one entry per zone per year |
-| scale | one machine, one GPU or a few | **over a thousand single-GPU machines at once**, for weeks |
+| scale | one machine, one GPU or a few | **a peak of 1,307 single-GPU machines**, plus a large container fleet, for about two weeks |
 | you run it | yourself, when you want | as a campaign, with restart and recovery machinery |
 
-\* A **UTM zone** is one of 60 north–south strips the world is divided into for mapping, each six
-degrees of longitude wide. Each is split at the equator into a northern and a southern half with
+\* A **UTM zone** is a common convention in geography. The UTM system divides the world into 
+60 northern and southern strips for mapping, each six degrees of longitude wide. 
+Each is split at the equator into a northern and a southern half with
 its own flat coordinate system, which gives the **120** groups this store has, named like `33N` and
 `33S` — the same longitude band, opposite hemispheres. The campaign works a zone at a time because
 that flat coordinate system is what lets imagery be processed without distortion. You do not need
@@ -164,12 +158,15 @@ between two events rarely lines up with January.
 **The global store takes calendar years only.** Ask the global path for anything but January to
 December and it refuses before it spends any money on GPUs.
 
-**The reason is the store, not the model.** The model computes a twelve-month window either way.
-The global store's time axis has one slot per calendar year, and each slot carries a label saying
+**The reason is the store's convention, not the model.** The model computes a twelve-month window either way.
+The global store's time axis has one slot per calendar year, and by each slot carries a label saying
 it covers 1 January to 31 December. If a non-calendar window were written into a slot labelled
 that way, anyone reading the store later would be told something untrue about what they were
-looking at. So the refusal protects readers of a dataset published for other people to use, and it
-is checked once, early, rather than discovered late.
+looking at.
+
+Global stores that support non-calendar year time windows are technically entirely possible
+and we are comfortable making the required code changes if a genuine use case
+(and corresponding budget) are expressed to us.
 
 Single-area stores use a different and equally explicit convention: one entry per window, labelled
 by the month the window ended. Nothing is lost — the two stores just make different promises.
@@ -178,7 +175,7 @@ by the month the window ended. Nothing is lost — the two stores just make diff
 store labels and lays out time, not a change to the model or the pipeline, which is why the
 single-area path can already do it.
 
-## Saying which ground you want
+## Selecting which areas you do, and don't, want
 
 ### For one area: a boolean grid, and it does not have to be land
 
@@ -210,8 +207,8 @@ Two supported ways to make one, both a single flow run:
    tiling-grid GeoJSON there first. Without it the run fails on a missing file before anything is
    rasterised. The polygon route has no such prerequisite.
 
-Either way the result is a small **Zarr** file — a directory-shaped array format that stores big
-grids in chunks so a reader can fetch only the part it needs.
+Either way the result is a small **Zarr** file. Using Zarr lets us store our big boolean
+grids in chunks so a reader can fetch only the part it needs and apply them.
 
 You can write one yourself, but the pipeline needs more than the array. It reads three attributes
 off it and fails without them:
@@ -494,21 +491,15 @@ finished tile from an interrupted one, is in the
 
 ## Which should I use?
 
-**Use the single-area path if** you have a study area, you want a time window that is not a
-calendar year, you want to iterate quickly, or you are evaluating whether these embeddings help
-you at all. It runs on one machine and the quickstart finishes on a laptop in a few minutes.
+**Use the single-area path if** you have a study area, you want one or several time windows that are
+not a calendar year, you want to iterate quickly, or you are evaluating whether these embeddings help
+you at all.
 
 **Use the global dataset if** the area you want is already filled. Reading a published store is
 free and instant compared with computing anything.
 
-> **Check before you trust it, and do not infer coverage from latitude and year.** Every
-> zone-and-year slot in the store is created in advance, before any imagery is processed. That
-> means a cell that was never filled **opens perfectly happily and hands back fill values** — you
-> will not get an error, you will get plausible-looking nothing.
->
-> The authority is each zone group's `years_complete` attribute. Note that the store is an
-> Icechunk repository, so you open it through a session rather than by handing the URI straight to
-> Zarr or xarray:
+> Note that the store is an Icechunk repository, so you open it through a session rather than by 
+> handing the URI straight to Zarr or xarray:
 >
 > ```python
 > import zarr
@@ -520,7 +511,7 @@ free and instant compared with computing anything.
 > )
 > session = repo.readonly_session(branch="main")
 > zone = zarr.open_group(session.store, mode="r")["33N"]
-> print(zone.attrs["years_complete"])      # the years you can read
+> print(zone.attrs)      # check all the attrs for a zone
 > ```
 >
 > **Ask Zarr for this rather than xarray.** You want one line of metadata, not data, and
@@ -533,11 +524,10 @@ free and instant compared with computing anything.
 > and `anonymous=True` is what makes the library send an unsigned request, so the whole example
 > works with nothing set in your environment. **Nothing else needs passing.** The published store
 > is configured for readers, so opening it does no extra work on your behalf and there is no
-> performance argument to tune. `anonymous=True` itself arrives with the change that opened the
-> store to anonymous readers, so on an older copy of the library it will not be accepted: drop it
-> and supply any AWS credentials instead, which is all the previous version needed.
+> performance argument to tune.
 >
-> **Read that list carefully, because it distinguishes two different things from a third.** A year
+> **Read the zone.attrs["year_complete"] list carefully,**
+> **because it distinguishes two different things from a third.** A year
 > *in* the list either holds data or was deliberately marked as having none — an all-ocean zone, or
 > land where the campaign looked and found nothing usable. Either way the question has been
 > answered. A year *missing* from the list is different: that cell never landed, which is a gap in

@@ -21,6 +21,7 @@ their CRS and grid differ by zone.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable, Mapping
 from typing import cast
 
@@ -48,6 +49,8 @@ from tessera_embeddings.storage.time_axis import (
 from tessera_embeddings.storage.zarr_store import _create_storage, global_store_config
 from tessera_embeddings.storage.zone_grid import PIXEL_M, ZONE_SCHEME, ZoneSpec, easting_coords, northing_coords
 
+logger = logging.getLogger(__name__)
+
 
 def create_global_repo(
     store_path: str,
@@ -74,12 +77,17 @@ def open_global_repo(
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     region: str | None = None,
     scatter_initial_credentials: bool = False,
+    anonymous: bool = False,
 ) -> icechunk.Repository:
-    """Open the global-store repo with the global config layered on.
+    """Open the global store, inheriting the configuration it was created with.
 
-    ``scatter_initial_credentials`` is the caller's call: only it knows whether it will pickle
-    this repo. Set it where the session is shipped to workers; leave it off on the read/commit
-    sites, which never pickle and would gain nothing for a live secret in a pickle.
+    **Passes no config.** Handing Icechunk one here would REPLACE what
+    :func:`create_global_repo` saved, which is how the published store's readers ended up
+    preloading manifests they had no use for — 2,245 ms against 852 ms inheriting.
+
+    ``anonymous`` reads with no credentials, which is how the published store is served.
+    ``scatter_initial_credentials`` is the caller's call: set it where the session is shipped to
+    workers, leave it off on read and commit sites, which never pickle.
     """
     return icechunk.Repository.open(
         _create_storage(
@@ -87,9 +95,68 @@ def open_global_repo(
             get_credentials=get_credentials,
             region=region,
             scatter_initial_credentials=scatter_initial_credentials,
-        ),
-        config=global_store_config(),
+            anonymous=anonymous,
+        )
     )
+
+
+def set_saved_manifest_preload(
+    store_path: str,
+    *,
+    enabled: bool,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    region: str | None = None,
+) -> None:
+    """Switch the store's SAVED manifest preload on or off, for every reader at once.
+
+    Preloading helps a fill, which is about to touch those manifests anyway, and costs a reader
+    seconds per open for nothing — so it goes off as the last step of a campaign or a year's update.
+
+    **This rewrites the store's ``repo`` object**, which holds the branch pointers, every tag and
+    every snapshot record; Icechunk rebuilds it from its parts. Safe because the previous object is
+    copied to ``overwritten/`` first and both the copy and the put are conditional on the version
+    read, so a concurrent writer is detected and retried rather than clobbered; verified against a
+    clone of the published store's reference state before first use. No snapshot is created, so the
+    change is invisible to ``ancestry()`` and is undone by calling this again, not ``reset_branch``.
+
+    Raises:
+        RuntimeError: If the preload did not change, or if any tag or branch moved. Either means
+            stop and look: the backup in ``overwritten/`` is the way back.
+    """
+
+    def state(repo: icechunk.Repository) -> tuple[dict[str, str], dict[str, str]]:
+        return (
+            {t: str(repo.lookup_tag(t)) for t in repo.list_tags()},
+            {b: str(repo.lookup_branch(b)) for b in repo.list_branches()},
+        )
+
+    before = state(open_global_repo(store_path, get_credentials=get_credentials, region=region))
+    config = global_store_config()
+    manifest = config.manifest
+    if not enabled and manifest is not None:
+        # Zeroed, not unset: `None` means "use Icechunk's own default", which preloads something.
+        config.manifest = icechunk.ManifestConfig(
+            splitting=manifest.splitting,
+            preload=icechunk.ManifestPreloadConfig(max_arrays_to_scan=0, max_total_refs=0),
+        )
+    repo = icechunk.Repository.open(
+        _create_storage(store_path, get_credentials=get_credentials, region=region), config=config
+    )
+    repo.save_config()
+
+    after_repo = open_global_repo(store_path, get_credentials=get_credentials, region=region)
+    preload = after_repo.config.manifest.preload if after_repo.config.manifest else None
+    refs = preload.max_total_refs if preload else None
+    if bool(refs) != enabled:
+        raise RuntimeError(f"manifest preload did not change: refs {refs}, wanted enabled={enabled}")
+    after = state(after_repo)
+    if after != before:
+        raise RuntimeError(
+            f"tags or branches moved while saving the config — {len(before[0])} tags and "
+            f"{len(before[1])} branch(es) before, {len(after[0])} and {len(after[1])} after; "
+            "restore from the newest object under overwritten/"
+        )
+    logger.info("saved manifest preload %s for %s", "enabled" if enabled else "disabled", store_path)
 
 
 def create_layout_arrays(

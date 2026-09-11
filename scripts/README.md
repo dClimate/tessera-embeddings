@@ -26,6 +26,16 @@ Produces artifacts the campaign depends on.
 | `build_landmask_coverage.py` | Builds, verifies and validates the campaign land-mask coverage store from the partner TIFF delivery ([ADR 010](../context_docs/decisions/010-landmask-registry-coverage.md)). The mask is the campaign's work list. |
 | `record_stac_cassettes.py` | Re-records the VCR cassettes the integration and parity tests replay. Hits the STAC endpoints only, never COG bodies. Needs Earthdata credentials. |
 
+## `maintenance/` — supported tooling that MUTATES something already in service
+
+Kept apart from the read-only tools because anything here changes something consumers are already
+using. The bar is higher than for a diagnostic: dry-run by default, refuse rather than adapt when
+the state was not what the evidence was gathered against, and be able to undo itself.
+
+| script | what it does |
+|---|---|
+| `set_published_store_reader_config.py` | Switches the published store's SAVED manifest preload off, so consumers stop inheriting a setting sized for writing that costs them ~2.5 s of every open and returns nothing. On spec version 2 that rewrites the one object holding every tag and the branch pointers, verified non-destructive against a clone of the real store's reference state first. Dry run unless `--apply`; `--rollback` undoes it. |
+
 ## `diagnostic/` — supported tooling
 
 Answers "why is this environment behaving that way?" and is expected to work on demand.
@@ -34,6 +44,9 @@ Answers "why is this environment behaving that way?" and is expected to work on 
 |---|---|
 | `check_env.py` | Prints the installed torch variant and CUDA availability — which lock file this environment was actually built from. |
 | `probe_edl_bearer.py` | Whether a Bearer Earthdata token survives the full ASF redirect chain. Written for a specific auth failure and kept because that failure recurs. |
+| `published_store_census.py` | Whether the published global store opens, conforms to the declared layout in all 120 zone groups, and agrees with its own completion tags about which cells are done. Exits non-zero on any disagreement. |
+| `published_store_read_bench.py` | Read performance of the published store — open latency, point-vector percentiles, region throughput, bytes on the wire — using the same workloads and concurrency sweep as `scoping/scale_tests/t1_read_bench.py`, so the built store can be compared against the scoped one. |
+| `published_registry_census.py` | Whether the published Parquet registry is shaped as designed, whether a whole-dataset read loses columns, how fast an area-of-interest coverage query answers, and whether the registry's coverage agrees with the store's. |
 
 ## `scoping/` — kept-for-reference instruments
 
@@ -46,6 +59,9 @@ changed upstream may need repair first, and that is a decision, not a defect.
 | `census_s1_coverage.py` | Global OPERA radar coverage on an equal-area land grid | `context_docs/campaign/campaign-cost-model.md` §6 |
 | `census_s2_coverage.py` | Global Sentinel-2 usable-observation counts on the same grid | `context_docs/inference/minimum-optical-depth.md` |
 | `cluster_work_spread.py` | How evenly N Ray clusters divide the work, from the real mask — the campaign ends when the LAST cluster does | `context_docs/campaign/campaign-plan.md` §10, cost model §5b |
+| `campaign_cost_actuals.py` | What a finished campaign cost: measured usage from Cost Explorer priced at list rates from the Pricing API. Not a bill — see its docstring for why this account cannot produce one | `context_docs/campaign/campaign-cost-model.md` §12 |
+| `campaign_delivery_census.py` | What a finished campaign delivered: cells and tile-years published against the roster, reconciled, separating tiles carrying embeddings from tiles written as fill, with the per-day delivery curve | `context_docs/campaign/campaign-cost-model.md` §12 |
+| `census_published_token_depth.py` | How deep the delivered embeddings actually are: per-pixel observation counts sampled from the published store, by year and by latitude band — the only depth measurement in this programme that is independent of the cost model. Public store, no credentials | `context_docs/campaign/campaign-cost-model.md` §12b |
 | `scale_tests/` | Whether Icechunk holds up at campaign scale: read, write, prealloc, group count, contention, GC, ramp, sharding | [ADR 008](../context_docs/decisions/008-global-store-architecture.md), `context_docs/storage/icechunk-api-ledger.md`, and its own `README.md` |
 
 `cluster_work_spread.py` is the exception worth knowing: it is the **only** thing that

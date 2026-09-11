@@ -401,6 +401,7 @@ def _create_storage(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
     scatter_initial_credentials: bool = False,
+    anonymous: bool = False,
 ) -> icechunk.Storage:
     """Create Icechunk storage for local or S3 paths.
 
@@ -419,24 +420,45 @@ def _create_storage(
             once and caches the result, so pickled copies of the storage (shipped to Ray
             actors or Dask workers during ``to_icechunk``) do not all stampede the provider
             on deserialisation. True for distributed assembly.
+        anonymous: Read with no credentials, for a bucket whose policy grants public reads —
+            how the published global store is served. Mutually exclusive with
+            ``get_credentials``: passing both asks for two identities, and refusing beats
+            silently preferring one.
+
+    Raises:
+        ValueError: If ``anonymous`` is set alongside ``get_credentials``.
     """
+    if anonymous and get_credentials is not None:
+        raise ValueError("anonymous=True and get_credentials are mutually exclusive; pass one or the other")
     if store_path.startswith("s3://"):
         bucket, prefix = _parse_s3_url(store_path)
         if _s3_config_override:
+            # REFUSED, not honoured either way. The override carries its own credentials and
+            # endpoint, so returning it would make an anonymous-access check pass while
+            # authenticating — the one thing that check rules out — while silently dropping it
+            # would point the read at the wrong endpoint.
+            if anonymous:
+                raise ValueError(
+                    "anonymous=True with an installed S3 config override: the override carries "
+                    "credentials and an endpoint, so it cannot serve an anonymous read. Clear the "
+                    "override, or drop anonymous."
+                )
             return _s3_config_override.make_storage(prefix_override=prefix)
         # Fall back to the globally-registered provider when the caller passed none. This is
         # how the S1 ingest path keeps icechunk on IAM-role creds: set_s3_credentials
         # overwrites the AWS_* env vars with OPERA-scoped STS tokens for GDAL reads, and
         # icechunk's default AWS chain would otherwise pick those up and get AccessDenied
         # writing our own store. See tessera_embeddings.providers.aws.credentials.
-        if get_credentials is None:
+        if get_credentials is None and not anonymous:
             get_credentials = _default_credentials_provider
         s3_kwargs: dict = {
             "bucket": bucket,
             "prefix": prefix,
             "region": region if region is not None else _DEFAULT_S3_REGION,
         }
-        if get_credentials is not None:
+        if anonymous:
+            s3_kwargs["anonymous"] = True
+        elif get_credentials is not None:
             s3_kwargs["get_credentials"] = get_credentials
             s3_kwargs["scatter_initial_credentials"] = scatter_initial_credentials
         return icechunk.s3_storage(**s3_kwargs)
@@ -611,10 +633,14 @@ _GLOBAL_PRELOAD_MAX_REFS = 1_000_000
 def global_store_config() -> icechunk.RepositoryConfig:
     """RepositoryConfig for the 120-group global store (ADR-008 D4/D5).
 
-    Layers on :func:`_default_repo_config` (timeouts + retries): manifest split **time@1**,
-    one manifest per year per array so a year fill rewrites only that year's, plus preload
-    tuning so coordinate manifests across all 120 groups are preloaded. Persist with
-    ``repo.save_config()`` on create so re-opens and forked workers inherit it.
+    Layers on :func:`_default_repo_config` (timeouts + retries): manifest split **time@1**, one
+    manifest per year per array so a year fill rewrites only that year's, plus preload tuning so
+    coordinate manifests across all 120 groups are preloaded.
+
+    **Written once, at create, and then saved into the store.** Every later open inherits it from
+    there rather than being handed it again, which is what lets
+    :func:`~tessera_embeddings.storage.global_store.set_saved_manifest_preload` change the preload
+    for every reader at once.
     """
     config = _default_repo_config()
     config.manifest = icechunk.ManifestConfig(

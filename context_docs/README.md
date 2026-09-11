@@ -88,6 +88,9 @@ context_docs/
     ├── writing-to-the-global-store.md          assembly's fork pool, the session catch-up, the
     │                                              credential incident, why commits are ungated,
     │                                              and the registry published beside the store
+    ├── reading-the-published-store.md          the reader's side: no credentials needed, what
+    │                                              conforms, measured speeds in two regions, and
+    │                                              what would surprise a consumer
     ├── staging-identity-and-resume.md          what a run id identifies, and what resumes
     └── icechunk-api-ledger.md                  signatures and gotchas the scale tests earned
 ```
