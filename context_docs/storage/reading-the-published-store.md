@@ -300,8 +300,8 @@ their extents and the concurrency sweep, copied deliberately so that at least th
 |---|---|---|
 | zone open **128 ms** | 2,638 ms as documented, **143 ms** with preload off | **reconciled** — see below |
 | bulk throughput, 13–2,014 MB/s across 24 samples, median **202** | 763 MB/s bulk, 280 tile, 9 band-subset, 4 patch | **consistent** — inside the range, comparable median |
-| point p50 **29 ms**, p95 **204 ms** | p50 **302 ms**, p95 **463 ms** | **not reconciled** |
-| **1.23 MB** on the wire per point read | **8.04 MB** | **not reconciled** |
+| point p50 **29 ms**, p95 **204 ms** | p50 **302 ms**, p95 **463 ms** | **reconciled** — see below |
+| **1.23 MB** on the wire per point read | **8.04 MB** | **reconciled** — see below |
 
 **The open time reconciles, and the explanation is the preload.** Scoping's store was one group and
 one year, so a 1,000,000-ref preload budget had almost nothing to fetch and cost almost nothing;
@@ -310,43 +310,62 @@ the published store opens to first read in 143 ms in-region, against the 128 ms 
 The geometry is behaving as scoped; what changed is what the inherited configuration has to do.
 
 **The throughput figures are consistent, and cannot be compared more sharply than that.** Scoping
-retained only the distribution over its 24 `c256_sharded` throughput samples — four workloads × three
-concurrencies × two cache states — not the per-workload breakdown, and the raw run data is gone. So
-"2,014 MB/s" is the maximum over that whole set and not a bulk-read figure, and quoting it against
-our bulk read would be comparing a maximum with a median. What can honestly be said is that our
-four workloads span 4–763 MB/s with a median in the low hundreds, which sits inside scoping's
-13–2,014 range around a comparable median.
+retained only the distribution over its 24 `c256_sharded` throughput samples — four workloads ×
+three concurrencies × two cache states — not the per-workload breakdown, and the raw run data is
+gone. So "2,014 MB/s" is the maximum over that whole set and not a bulk-read figure; quoting it
+against our bulk read would compare a maximum with a median. What can honestly be said is that our
+four workloads span 4–763 MB/s with a median in the low hundreds, inside scoping's 13–2,014 range
+around a comparable median.
 
-**Two figures do not reconcile, and this is what was established before giving up on them.**
+**The point figures reconcile too, and the mechanism is the chunk cache against the working set.**
 
-Measured, and stable: **8.0–8.3 MB crosses the wire per isolated point-vector read**, which is one
-uncompressed 256×256×128 int8 inner chunk. So the embeddings are effectively incompressible, and a
-point read fetches exactly one whole inner chunk. 8 MB at in-region single-stream S3 rates is a few
-hundred milliseconds, so the 302 ms p50 and the 8.04 MB are the same fact told twice, and any
-explanation has to account for both.
+Start from what is solid. A point-vector read fetches **one whole 256×256×128 int8 inner chunk**,
+which is 8.39 MB, and the quantized embeddings are effectively incompressible, so 8.39 MB is also
+what crosses the wire. At in-region single-stream S3 rates that is a few hundred milliseconds. So
+the measured 8.04 MB and 302 ms are one fact told twice, and any explanation has to fit both.
 
-The obvious candidate was **probe locality**: if scoping's probes repeatedly hit the same inner
-chunks, its per-point average would be diluted by cache hits and would describe something other
-than the cost of one read. That was tested directly and **does not hold on the published store** —
-1,000 probes over 16S's 1,088 inner chunks cost 7.96 MB/point, statistically the same as 25 probes
-over 33N's 549,952 at 8.28 MB/point. Repeat reads of an inner chunk re-fetch it here.
+Three candidate explanations were eliminated first. **Compressibility** is not it: `synth.py`
+generates random int8, deliberately worst-case, so scoping's data was as incompressible as ours.
+**A codec difference between variants** is not it either: `variants.py` fixes only chunk and shard
+geometry per variant and takes dtype, serializer and compressor from the library. And **partial
+reads within an inner chunk** cannot be it, because a pixel cannot be returned without
+decompressing the whole chunk that holds it — which is what makes ADR 008's reading of the gap,
+that sharding does lean partial reads, not tenable as stated.
 
-Two other candidates were eliminated by reading the scoping harness rather than guessing.
-Compressibility is not the answer: `synth.py` generates random int8, deliberately worst-case, so
-scoping's data was as incompressible as ours. Nor is a codec difference between the variants:
-`variants.py` fixes only chunk and shard geometry per variant and takes dtype, serializer and
-compressor from the library, so `c256_full` at 8.69 MB/point and `c256_sharded` at 1.23 MB/point
-were the same bytes through the same zstd — and 8.69 MB is one whole inner chunk, exactly what we
-measure, while 1.23 MB is a seventh of one.
+What remained was **cache reuse**, and it is measurable. If probes revisit inner chunks and the
+cache holds them, the average bytes per read falls to `distinct chunks touched / probes` × 8.39 MB.
+Measured in us-west-2 on 16S/2025, where 1,000 probes land in 1,088 inner chunks:
 
-**So: scoping's own two numbers disagree with each other on identical geometry and codec, and the
-records needed to settle which is right were not kept.** The ADR read the gap as sharding doing
-lean partial reads; a point read has to decompress a whole inner chunk to return a pixel, so that
-reading cannot be right as stated. The remaining untested candidate is a chunk cache large enough
-to hold the scale-test store's small working set — and the published store saves no caching
-setting, so its readers get icechunk's own default, which nothing here sized. **This is registered
-as unreconciled rather than explained**, and the practical consequence is in §6: point access costs
-one inner chunk per pixel, and a consumer should read regions.
+| | p50 | bytes on the wire per point |
+|---|---|---|
+| icechunk's default chunk cache | 209 ms | 7.97 MB |
+| a 16 GiB chunk cache | **142 ms** | **5.14 MB** |
+
+And the predicted figure: 1,000 uniform draws over 1,088 chunks touch
+`1088 × (1 − e^(−1000/1088)) = 654` distinct ones, so a cache large enough to hold them all gives
+`654 / 1000 × 8.39 = 5.49 MB` per point. **Measured 5.14 MB** — slightly better than the uniform
+prediction, as it should be, since probes are drawn shard by shard and therefore cluster a little.
+The arithmetic predicts the measurement.
+
+Run the same arithmetic backwards on scoping's number: 1.23 MB/point implies a distinct-chunk
+ratio of `1.23 / 8.39 = 0.147`, which for 1,000 probes means roughly **150 distinct inner chunks**.
+That is what a small synthetic store gives when 1,000 probes are sampled clustered rather than
+scattered — which is exactly what `t8_sharding.py` does for that measurement (`scattered=False`;
+the scattered case is a different experiment). **So scoping's 1.23 MB/point is the average cost of
+a read on a working set small enough to cache, and our 8.04 MB is the cost of a read that misses.
+Both are right, and neither is the other's answer.**
+
+**The practical consequence is the useful part.** A consumer whose reads revisit the same
+neighbourhood should size the chunk cache to the working set, because icechunk's default is small
+against an 8.39 MB chunk and a miss costs a whole chunk. And a consumer reading scattered pixels
+should stop and read regions instead (§6) — no cache helps a working set that never repeats.
+
+**Two things this leaves open.** ADR 008's own two variant figures — 8.69 MB/point unsharded
+against 1.23 sharded, on identical geometry and codec — are still not explained by anything here,
+since cache reuse should have applied equally to both; the raw run data is gone, so this is
+recorded rather than chased. And the 16 GiB arm was measured within a single pass, not across a
+genuinely warm second pass, so it shows reuse *within* a workload and not what a second traversal
+would cost.
 
 ## 5. The registry beside the store
 
