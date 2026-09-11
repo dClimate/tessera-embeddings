@@ -61,8 +61,13 @@ jobs:
           # testing the last release, which is the one outcome this workflow must not have.
           uv venv .venv
           uv pip install --python .venv/bin/python -r dev.lock
-          # AFTER the lock file: the lock pins tessera_embeddings, so installing the
-          # checkout first would let the lock overwrite it.
+          # The downstream package ITSELF. `-r dev.lock` installs its dependencies, not the
+          # project, and `uv run` used to install the discovered project implicitly -- running
+          # pytest directly does not, so a src-layout project would not be importable.
+          # --no-deps because the lock above already resolved them.
+          uv pip install --python .venv/bin/python --no-deps .
+          # LAST, so it wins: the lock pins tessera_embeddings, and installing the checkout
+          # any earlier would let the lock reinstall the pinned release over it.
           uv pip install --python .venv/bin/python ../tessera_embeddings
           # Prove the override took. A silent fallback to the pinned release is the whole
           # risk here, so fail loudly now rather than report a meaningless pass later.

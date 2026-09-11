@@ -49,7 +49,7 @@ without further explanation.
 | term | what it means |
 |---|---|
 | **mosaic** | The input. Per-date Sentinel-2 reflectance and Sentinel-1 radar, already fetched and written to Zarr stores by the ingest stage. Inference never queries a satellite catalogue. |
-| **tile** (`chunk` in the code) | The unit of work: a 2048 × 2048-pixel square of ground, one year deep. One tile becomes exactly one object in the output store. |
+| **tile** (`chunk` in the code) | The unit of work: a 2048 × 2048-pixel square of ground, one year deep. One tile becomes one shard **per output array** — the global layout has eight (`embeddings`, `scales`, three observation counts, three month masks), each written independently — so a tile is eight objects, not one. Count objects per array when sizing anything. |
 | **actor** | A Ray worker process pinned to one GPU. It holds the model in VRAM and processes whole tiles, one after another. |
 | **strip** | A horizontal slice of a tile — its full easting (east–west) width, and a range of its northing (north–south) rows. A tile too large to hold in memory is loaded one strip at a time. |
 | **SCL** | Sentinel-2's Scene Classification Layer: the per-pixel mask saying which pixels on which dates are usable, and which are cloud, shadow, snow or no data. Most decisions in this pipeline start from it. |
@@ -453,9 +453,13 @@ Each bucket needs a fixed-length sequence per pixel. For a bucket `(s2_bin, s1_b
 - **`resample_s1_bucket`** loads the ascending and descending observations and returns
   `(B, s1_bin, 3)`: the normalised VV/VH pair plus a day-of-year feature.
 
-`build_resample_indices` handles pixels that have too few observations for their bucket's
-target by repeating the last valid date until the target is reached, deterministically;
-pixels with too many are sub-sampled uniformly.
+`build_resample_indices` is deterministic in both directions. Too **few** observations for the
+bucket target: every original index is kept, and the shortfall is filled with duplicate indices
+placed at evenly spaced positions across the whole observation range — `linspace` over
+`[0, valid_len - 1]`, rounded — so the duplicates are spread through the year rather than piled on
+the last date. Too **many**: each of `target` evenly split chunks contributes its median index.
+A reimplementation that repeated the final date instead would feed the model a different sequence
+and get different embeddings.
 
 **Each radar orbit is normalised on its own statistics.** Ascending and descending
 observations are standardised with their own mean and standard deviation —
