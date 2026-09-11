@@ -92,7 +92,15 @@ which was the second half of the sharding decision and the easier half to get wr
 | zone-years never filled | **14** |
 | shards holding embeddings, whole store | **3,229,545** |
 | completion tags (`zone-<ZONE>-<YEAR>`) | 1,066 |
+| year-milestone tags (`year-<YEAR>-complete`) | 4 — 2022, 2023, 2024, 2025 |
+| tags in total | 1,070 |
 | cells marked complete but untagged, or tagged but unmarked | 0 |
+
+**Only 2022–2025 cover all 120 zones.** Complete zone-years per calendar year are 114, 117, 119,
+118, 118, 120, 120, 120, 120 for 2017 through 2025 — the earlier years are short because the
+optical archive over a few zones could not meet the depth rule, and the shortfalls sum to the 14
+above. A milestone tag exists exactly for the four years that reached 120, which is an independent
+confirmation that the milestone logic fires on the condition it claims.
 
 The attribute and the tag are written in separate commits, so they *can* disagree; they do not. The
 14 unfilled cells are 03S 2017/2018/2020/2021, 08S 2017/2018, 09S 2017, 24N 2017, 26S 2017,
@@ -310,7 +318,7 @@ end of the next year's update.
 On a spec-version-2 repository `save_config` rewrites the single `repo` object rather than writing a
 config file off to one side — and that object holds the branch pointers, every tag, the deleted-tag
 list, every snapshot record, the metadata, the feature flags and the status, all rebuilt from its
-parts. Here it is 181 KB carrying the `main` pointer and 1,070 completion tags. The current object
+parts. Here it is 181 KB carrying the `main` pointer and all 1,070 tags. The current object
 is copied to `overwritten/repo.<timestamp>.<id>` first, both the copy and the put are conditional on
 the version the caller read, a lost race raises `RepoInfoUpdated` and retries, and a single object
 PUT is atomic. `force_write_repo_info`, which bypasses all of that, is not on this path.

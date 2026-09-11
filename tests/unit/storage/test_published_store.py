@@ -36,6 +36,15 @@ def writable_zone(seeded):
     yield zarr.open_group(session.store, mode="r+")["01N"]
 
 
+def _write_obs_count_shard(path: str, zone: str, time_index: int, shard: tuple[int, int]) -> None:
+    """Write one shard of `s2_obs_count` and nothing else, so its coverage differs from `scales`."""
+    session = global_store.open_global_repo(path).writable_session("main")
+    array = zarr.open_group(session.store, mode="r+")[zone]["s2_obs_count"]
+    y0, y1, x0, x1 = published_store.shard_pixel_window(shard, array.shape)
+    array[time_index, y0:y1, x0:x1] = 3
+    session.commit(f"obs count {zone} t{time_index} shard {shard}")
+
+
 def _fill_shard(path: str, zone: str, time_index: int, shard: tuple[int, int], *, live_fraction: float = 1.0) -> None:
     """Write one shard of `scales` and `embeddings`, leaving `1 - live_fraction` of it at fill."""
     session = global_store.open_global_repo(path).writable_session("main")
@@ -121,6 +130,20 @@ class TestLayoutDepartures:
         assert any("northing" in d and "coordinate array" in d for d in departures), departures
 
 
+class TestCalendarYears:
+    """Decoding the time coordinate to calendar years."""
+
+    def test_the_seeded_years_decode_from_the_time_coordinate(self, seeded):
+        # The one assertion that separates a correct decode from an off-by-any-amount one. The
+        # coordinate is int64 nanoseconds: casting it straight to datetime64[Y] reads each
+        # nanosecond count as a year offset, which the range guard below would not catch for a
+        # small offset. Three diagnostic scripts map a time index to a year through this.
+        group = zarr.open_group(global_store.open_global_repo(seeded).readonly_session(branch="main").store, mode="r")[
+            "01N"
+        ]
+        assert published_store.calendar_years(group) == list(_YEARS)
+
+
 class TestLiveShards:
     """Enumerating which shards of a zone-year hold data."""
 
@@ -137,6 +160,17 @@ class TestLiveShards:
         repo = global_store.open_global_repo(seeded)
         coverage = published_store.live_shards(repo.readonly_session(branch="main"), "01N")
         assert coverage == {0: frozenset({(1, 0), (2, 1)}), 1: frozenset({(1, 0)})}
+
+    def test_the_var_argument_selects_which_array_is_enumerated(self, seeded):
+        # `published_registry_census.py` asks for `scales` and for `s2_obs_count` and compares the
+        # two. An implementation that ignored `var` would answer both with the same call, so the
+        # comparison would agree unconditionally and the census would report success regardless.
+        # A test that asks for two arrays with the SAME coverage cannot catch that; these differ.
+        _fill_shard(seeded, "01N", 0, (1, 0))
+        _write_obs_count_shard(seeded, "01N", 0, (2, 1))
+        session = global_store.open_global_repo(seeded).readonly_session(branch="main")
+        assert published_store.live_shards(session, "01N") == {0: frozenset({(1, 0)})}
+        assert published_store.live_shards(session, "01N", "s2_obs_count") == {0: frozenset({(2, 1)})}
 
 
 class TestShardPixelWindow:
