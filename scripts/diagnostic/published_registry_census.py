@@ -37,6 +37,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -201,13 +202,20 @@ def _latest_per_tile(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     The registry's latest-wins rule, applied rather than assumed away. A tie keeps the row already
     held: arbitrary but stable, and a tie means two runs stamped the same instant, which nothing in
     the data can order.
+
+    **Compared as strings, which is only valid while every part writes the same timestamp format.**
+    ``assembled_at`` is a column of strings, and the writer fills it from ``datetime.isoformat()``
+    with a ``+00:00`` offset, so lexical order is chronological order. A future writer emitting
+    ``Z`` instead, or a local offset, would sort wrongly and silently — so this parses rather than
+    trusting the ordering, and says so if a value does not match the expected shape.
     """
-    latest: dict[str, dict[str, Any]] = {}
+    latest: dict[str, tuple[datetime, dict[str, Any]]] = {}
     for row in rows:
+        stamp = datetime.fromisoformat(str(row["assembled_at"]))
         held = latest.get(row["tile"])
-        if held is None or str(row["assembled_at"]) > str(held["assembled_at"]):
-            latest[row["tile"]] = row
-    return latest
+        if held is None or stamp > held[0]:
+            latest[row["tile"]] = (stamp, row)
+    return {tile: row for tile, (_, row) in latest.items()}
 
 
 def _verify_against_store(
