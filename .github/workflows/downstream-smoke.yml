@@ -1,19 +1,27 @@
-name: Downstream smoke test (yield_modeling)
+name: Downstream smoke test
 
-# INITIALLY DISABLED — the downstream consumer (yield_modeling) is a
-# private repo that does not yet have a stable v0.1.0 of its own. To
-# activate post yield_modeling first release:
+# DISABLED BY DEFAULT. This is a starting point for running a dependent project's fast
+# test suite against a pull request here, so a breaking change is caught at the point of
+# change rather than after a release.
 #
-#   1. Uncomment the `pull_request` trigger below.
-#   2. Add a repo secret `YIELD_MODELING_READ_TOKEN` (read-only PAT
-#      scoped to the closed repo).
-#   3. Verify yield_modeling/main has a stable green
-#      `pytest tests/unit tests/architecture` run.
+# To adopt it:
 #
-# This workflow MUST NEVER be a required status check. The whole point
-# is that a private downstream cannot veto an OSS release. The
-# `continue-on-error: true` step below makes failure surface as a PR
-# warning, not a block.
+#   1. Set a repository variable `DOWNSTREAM_REPO` to the project to test, as
+#      `owner/name`. It is a variable rather than a literal so that a fork can point
+#      this at its own project without editing the workflow.
+#   2. Add a repository secret `DOWNSTREAM_READ_TOKEN` — a read-only token with access
+#      to that project. Omit it if the project is public.
+#   3. Adjust the lock-file name and the test command in the last two steps to whatever
+#      that project uses. The ones below assume a `dev.lock` and a
+#      `tests/unit tests/architecture` split, which is this repository's own convention.
+#   4. Uncomment the `pull_request` trigger.
+#
+# Confirm the other project's default branch has a reliably green run of that command
+# before enabling the trigger: a suite that is already red reports nothing useful.
+#
+# This workflow MUST NEVER be a required status check. A project that the people
+# reviewing a pull request here cannot see should not be able to veto a release. The
+# `continue-on-error: true` below makes a failure surface as a warning, not a block.
 on:
   # pull_request:
   #   branches: [main]
@@ -25,27 +33,27 @@ jobs:
     timeout-minutes: 15
     continue-on-error: true  # informational only
     steps:
-      - name: Check out yield_modeling at known-good ref
+      - name: Check out the dependent project
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: arbol/yield_modeling
+          repository: ${{ vars.DOWNSTREAM_REPO }}
           ref: main
-          token: ${{ secrets.YIELD_MODELING_READ_TOKEN }}
-          path: yield_modeling
-      - name: Check out this OSS PR
+          token: ${{ secrets.DOWNSTREAM_READ_TOKEN }}
+          path: downstream
+      - name: Check out this pull request
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: tessera_embeddings
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          cache-dependency-glob: "yield_modeling/dev.lock"
-      - name: Install yield_modeling against this PR's tessera_embeddings
+          cache-dependency-glob: "downstream/dev.lock"
+      - name: Install the dependent project against this pull request's tessera_embeddings
         run: |
-          cd yield_modeling
-          # Replace the pinned tessera_embeddings with the PR checkout.
+          cd downstream
+          # Replace the pinned tessera_embeddings with the checkout above.
           uv pip install ../tessera_embeddings
           uv pip install -r dev.lock
-      - name: Run yield_modeling fast suite
+      - name: Run the dependent project's fast suite
         run: |
-          cd yield_modeling
+          cd downstream
           uv run pytest tests/unit tests/architecture -n auto --tb=short
