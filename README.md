@@ -341,58 +341,12 @@ the dispatch chain, the cancellation sweep and the per-branch deployment routing
 **→ [`docs/single-vs-global.md`](docs/single-vs-global.md#the-published-global-dataset)**
 is the reader's and writer's guide to this store: how to open a zone group, what its time
 axis promises, what the per-pixel observation counts record, how shards and manifests are
-laid out and why, and — before you trust any of it — how to check that the cell you want
-was actually filled. The architecture is settled in
+laid out, why the chunk sizes are what they are — get that wrong and a scheduler drowns in
+tasks or a worker runs out of memory — and, before you trust any of it, how to check that
+the cell you want was actually filled. The architecture is settled in
 [ADR-008](context_docs/decisions/008-global-store-architecture.md); the operational plan
 for running a campaign is
 [`context_docs/campaign/campaign-plan.md`](context_docs/campaign/campaign-plan.md).
-
-### Why chunk size dominates everything
-
-A subtle reality of distributed array workloads: **the task graph your scheduler has to
-plan grows quadratically with how finely you chunk the data.** Chunk too small and the
-scheduler spends more time managing tasks than the tasks spend doing work — on a
-20 km × 20 km area of interest, 200-pixel chunks build a graph of ten thousand nodes,
-which costs tens of seconds and about a gigabyte of scheduler memory before any data is
-read, and leaves overhead as most of the wall clock. Chunk too large and a worker cannot
-fit one chunk in memory at all.
-
-Storage and read granularity are tuned separately. Ingest writes `INGEST_CHUNK_SIZE =
-4096` storage chunks to keep the satellite-ingest Dask graph small (a quarter of the
-spatial tasks), while inference reads a smaller sub-tile out of them — small enough to
-keep peak GPU-node RAM in check. Zarr's `oindex` reads a sub-tile out of a 4096 chunk with
-no alignment requirement, so the two sizes are independent.
-
-The read tile divides the output chunking, and both paths use the same one:
-`INFERENCE_CHUNK_SIZE = 2048`, so one inference tile is exactly one 2048-pixel shard
-(ADR-008 D3). The global campaign also passes it explicitly, since that path requires the
-identity rather than merely matching it. Go smaller on the ingest chunk and the
-satellite-ingest scheduler drowns in tasks; go larger on the read tile and you exhaust the
-memory of a single-GPU worker. If you change either, profile.
-
-The powers of two are not cosmetic — they align every stage of the pipeline on one grid,
-so no stage rechunks its input:
-
-```
-ingest chunk    4096 px  = 2×2 inference tiles
-inference tile  2048 px  = 1 output shard
-shard           2048 px  = 8×8 inner chunks
-inner chunk      256 px  = the unit downstream readers decode
-
-one ingest store chunk (4096²) — what one satellite read/write touches
-┌─ inference tile (2048²) ─┬─ inference tile (2048²) ─┐
-│ ░░░░░░░░░░░░░░░░░░░░░░░░ │                          │
-│ ░ 8×8 grid of 256²     ░ │   each tile is read out  │
-│ ░ inner chunks — the   ░ │   of the ingest chunk by │
-│ ░ same grid the output ░ │   one GPU actor, staged  │
-│ ░ shard will store     ░ │   as one file, and lands │
-│ ░░░░░░░░░░░░░░░░░░░░░░░░ │   as ONE shard object    │
-├──────────────────────────┼──────────────────────────┤
-│                          │                          │
-│    inference tile        │    inference tile        │
-│                          │                          │
-└──────────────────────────┴──────────────────────────┘
-```
 
 ## Repo structure
 
@@ -434,8 +388,9 @@ tests/                   unit, architecture, integration, parity and GPU tiers
   you want.
 - [`docs/single-vs-global.md`](docs/single-vs-global.md) — running for
   one area versus the global campaign: what is shared, what differs,
-  how to supply your own mask, and why the global store takes calendar
-  years only.
+  how to supply your own mask, why the global store takes calendar
+  years only, and how to read the published store — its layout, its
+  chunk sizes, and how to check a cell was filled.
 - [`docs/quickstart.md`](docs/quickstart.md) — laptop demo
   end-to-end, including GPU inference.
 - [`docs/environment-setup.md`](docs/environment-setup.md) — lock

@@ -291,7 +291,7 @@ from tessera_embeddings.storage.global_store import open_global_repo
 
 repo = open_global_repo(
     "s3://tessera-embeddings/v1.1/dclimate.icechunk",
-    region="us-west-2", anonymous=True, preload_manifests=False,
+    region="us-west-2", anonymous=True,
 )
 session = repo.readonly_session(branch="main")
 ds = xr.open_zarr(session.store, group="33N", consolidated=False, decode_coords="all",
@@ -312,9 +312,10 @@ Data variables:
     s2_obs_count (time, northing, easting) uint16 ...
 ```
 
-The two anonymous-read arguments are the ones described in
-[Which should I use?](#which-should-i-use); if your copy of the library does not accept them,
-drop them and supply any AWS credentials instead.
+`anonymous=True` is what sends an unsigned request, which is why this needs no AWS credentials
+at all. There is nothing else to pass: the published store is already configured for readers.
+See [Which should I use?](#which-should-i-use) if your copy of the library does not accept the
+argument.
 
 **`chunks=None` matters on a zone this size.** Without it xarray hands back Dask-backed arrays,
 and a zone is large enough that the graph describing one runs to millions of chunks: reading a
@@ -350,6 +351,58 @@ Reference docs:
 [xarray weather & climate (CF) guide](https://docs.xarray.dev/en/stable/user-guide/weather-climate.html) ·
 [CF conventions §7.1 Cell Boundaries](https://cfconventions.org/cf-conventions/cf-conventions.html#cell-boundaries) ·
 [cf-xarray bounds handling](https://cf-xarray.readthedocs.io/en/latest/bounds.html)
+
+### Why chunk size dominates everything
+
+Both paths use the same grid, so none of this is specific to the global store — but the
+global store is where getting it wrong is most expensive, and it is the reason the shard
+sizes above are the numbers they are.
+
+A subtle reality of distributed array workloads: **the task graph your scheduler has to
+plan grows quadratically with how finely you chunk the data.** Chunk too small and the
+scheduler spends more time managing tasks than the tasks spend doing work — on a
+20 km × 20 km area of interest, 200-pixel chunks build a graph of ten thousand nodes,
+which costs tens of seconds and about a gigabyte of scheduler memory before any data is
+read, and leaves overhead as most of the wall clock. Chunk too large and a worker cannot
+fit one chunk in memory at all.
+
+Storage and read granularity are tuned separately. Ingest writes `INGEST_CHUNK_SIZE =
+4096` storage chunks to keep the satellite-ingest Dask graph small (a quarter of the
+spatial tasks), while inference reads a smaller sub-tile out of them — small enough to
+keep peak GPU-node RAM in check. Zarr's `oindex` reads a sub-tile out of a 4096 chunk with
+no alignment requirement, so the two sizes are independent.
+
+The read tile divides the output chunking, and both paths use the same one:
+`INFERENCE_CHUNK_SIZE = 2048`, so one inference tile is exactly one 2048-pixel shard
+([ADR-008](../context_docs/decisions/008-global-store-architecture.md) D3). The global
+campaign also passes it explicitly, since that path requires the identity rather than
+merely matching it. Go smaller on the ingest chunk and the
+satellite-ingest scheduler drowns in tasks; go larger on the read tile and you exhaust the
+memory of a single-GPU worker. If you change either, profile.
+
+The powers of two are not cosmetic — they align every stage of the pipeline on one grid,
+so no stage rechunks its input:
+
+```
+ingest chunk    4096 px  = 2×2 inference tiles
+inference tile  2048 px  = 1 output shard
+shard           2048 px  = 8×8 inner chunks
+inner chunk      256 px  = the unit downstream readers decode
+
+one ingest store chunk (4096²) — what one satellite read/write touches
+┌─ inference tile (2048²) ─┬─ inference tile (2048²) ─┐
+│ ░░░░░░░░░░░░░░░░░░░░░░░░ │                          │
+│ ░ 8×8 grid of 256²     ░ │   each tile is read out  │
+│ ░ inner chunks — the   ░ │   of the ingest chunk by │
+│ ░ same grid the output ░ │   one GPU actor, staged  │
+│ ░ shard will store     ░ │   as one file, and lands │
+│ ░░░░░░░░░░░░░░░░░░░░░░░░ │   as ONE shard object    │
+├──────────────────────────┼──────────────────────────┤
+│                          │                          │
+│    inference tile        │    inference tile        │
+│                          │                          │
+└──────────────────────────┴──────────────────────────┘
+```
 
 ### How the store is laid out
 
@@ -463,7 +516,7 @@ free and instant compared with computing anything.
 >
 > repo = open_global_repo(
 >     "s3://tessera-embeddings/v1.1/dclimate.icechunk",
->     region="us-west-2", anonymous=True, preload_manifests=False,
+>     region="us-west-2", anonymous=True,
 > )
 > session = repo.readonly_session(branch="main")
 > zone = zarr.open_group(session.store, mode="r")["33N"]
@@ -478,13 +531,11 @@ free and instant compared with computing anything.
 >
 > **You do not need an AWS account to run this.** The bucket's policy grants anyone read access,
 > and `anonymous=True` is what makes the library send an unsigned request, so the whole example
-> works with nothing set in your environment. `preload_manifests=False` is worth passing as well:
-> the store carries a saved setting, sized for the job of writing it, that costs a reader about two
-> and a half seconds on every open and buys nothing back — the measurement is in
-> `context_docs/storage/reading-the-published-store.md` §4.3. Both of those arguments arrive with
-> the change that opened the store to anonymous readers, so on an older copy of the library they
-> will not be accepted: drop them and supply any AWS credentials instead, which is all the previous
-> version needed.
+> works with nothing set in your environment. **Nothing else needs passing.** The published store
+> is configured for readers, so opening it does no extra work on your behalf and there is no
+> performance argument to tune. `anonymous=True` itself arrives with the change that opened the
+> store to anonymous readers, so on an older copy of the library it will not be accepted: drop it
+> and supply any AWS credentials instead, which is all the previous version needed.
 >
 > **Read that list carefully, because it distinguishes two different things from a third.** A year
 > *in* the list either holds data or was deliberately marked as having none — an all-ocean zone, or

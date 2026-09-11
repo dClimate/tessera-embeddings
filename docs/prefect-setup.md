@@ -173,7 +173,8 @@ Symptom: flow logs hundreds of warnings about heartbeat timeouts
 while "Building Dask graph"; eventually fails.
 
 Cause: chunk size too small → graph too big. See
-[`README.md`](../README.md) §"Why chunk size dominates everything".
+[`single-vs-global.md`](single-vs-global.md#why-chunk-size-dominates-everything)
+on why chunk size dominates everything.
 Only *ingest* uses Dask (`INGEST_CHUNK_SIZE = 4096` storage chunks);
 assembly runs as local worker processes on the flow runner — size that
 container for the **full 64 GiB** (`AssemblyConfig` caps **16** workers, and a

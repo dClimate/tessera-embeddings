@@ -133,8 +133,9 @@ paths** (`INFERENCE_CHUNK_SIZE`, equal to `SHARD_PX`); edge tiles may be smaller
 size balances peak memory during inference against scheduling overhead, and makes one tile
 exactly one output shard (ADR-008 D3), so assembly writes whole objects instead of
 read-modify-writing a partial one at every tile boundary. The whole chain of sizes divides
-evenly, so no stage rechunks another stage's output — the
-[top-level README](../../../README.md#why-chunk-size-dominates-everything) has the grid.
+evenly, so no stage rechunks another stage's output —
+[`docs/single-vs-global.md`](../../../docs/single-vs-global.md#why-chunk-size-dominates-everything)
+has the grid and why it matters.
 
 `filter_chunks_by_roi_mask` then drops every tile whose footprint does not intersect the
 area of interest. Only the survivors — the **live tiles** — are dispatched, and the cluster

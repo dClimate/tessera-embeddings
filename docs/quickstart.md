@@ -204,8 +204,9 @@ Denver, CO — one inference chunk at 10 m resolution. To use your own AOI:
 - **`ModuleNotFoundError: ray`** during the inference step → re-run
   `uv sync --all-extras`.
 - **The runner hangs on "Building Dask graph…"** → check chunk size
-  in your config. See [`README.md`](../README.md) §"Why chunk size
-  dominates everything".
+  in your config. See
+  [`single-vs-global.md`](single-vs-global.md#why-chunk-size-dominates-everything)
+  on why chunk size dominates everything.
 - **Empty embedding output** → check coverage. The runner skips
   dates with insufficient valid (non-cloud) S2 pixels. The
   `min_valid_coverage` threshold defaults to 5% of the ROI;
