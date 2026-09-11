@@ -40,6 +40,7 @@ DATETIME = "2024-07-01/2024-07-31"
 START_DATE = "2024-07-01"
 END_DATE = "2024-07-31"
 
+
 def _repo_root() -> Path:
     """The directory holding ``pyproject.toml``, found by walking up from this file.
 
