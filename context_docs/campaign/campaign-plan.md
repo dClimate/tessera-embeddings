@@ -590,8 +590,16 @@ answer — cost-model §4.
 **Prod's state:** the coverage mask is built, all 112 land-zone ROIs are exported, the campaign
 deployment set is registered in its branch-scoped form, the crash-recovery automations are armed, the
 Slack alerts are registered, the monitoring round's read permissions are deployed (§9), and the
-Prefect server is sized correctly. **The published store is not
-seeded, and cannot be until write access to the Open Data bucket exists** (item 4b). The store that
+Prefect server is sized correctly. ~~**The published store is not
+seeded, and cannot be until write access to the Open Data bucket exists** (item 4b).~~
+
+> **SUPERSEDED 2026-09-10: the store is seeded, written and readable.** Write access was granted,
+> the campaign ran to completion, and the published store now holds 120 zone groups with 992 cells
+> filled — 3,243,043 tile-years, 99.83% of the roster. Verified by reading it: `years_complete` on
+> `33N` lists all nine years. Fourteen cells are unfilled, all of them early years over tiny or
+> remote land. The outturn is `campaign-cost-model.md` §12. **This paragraph is kept struck rather
+> than deleted because it was quoted, in review of another change, as evidence that the dataset
+> should not be advertised as readable.** The store that
 had been seeded in prod's own bucket before the publish target changed was deleted on 2026-08-13
 (847 objects, all metadata), so the only global store prod will ever hold is the published one.
 

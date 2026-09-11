@@ -47,14 +47,18 @@ There are two ways to run this, and they are more alike than they look.
 you can draw — and get embeddings for it over any twelve-month window you choose. This runs on one
 machine; the [quickstart](docs/quickstart.md) does it on a laptop in a few minutes.
 
-**The whole world.** The same pipeline, run as a campaign over all the world's land, one UTM zone
-and one calendar year at a time. The result is published as
-**global TESSERA v1.1** at `s3://tessera-embeddings/v1.1/dclimate.icechunk/`, so in most cases you
-can read it rather than compute anything.
+**The whole world.** The same pipeline, run as a campaign over the world's land between
+**59.45°S and 83.65°N** (Antarctica is excluded by decision — see below), one UTM zone and one
+calendar year at a time. The result is published as **global TESSERA v1.1** at
+`s3://tessera-embeddings/v1.1/dclimate.icechunk/`, so in most cases you can read it rather than
+compute anything — checking each zone's `years_complete` first, because unfilled cells read back
+as fill values rather than as an error.
 
-**The model, the ingest and the assembly are the same code in both.** What differs is scale, how
-you say which ground you want, and two conventions in the output store — most importantly that the
-global store holds calendar years only, while a single area can use any twelve-month window.
+**The model and the ingest are the same code in both**, and assembly is shared up to the point of
+writing. What differs is scale, how you say which ground you want, the store's conventions — most
+importantly that the global store holds calendar years only, while a single area can use any
+twelve-month window — and the campaign's stricter pixel-selection settings, which mean the same
+area and year can give different results on the two paths.
 
 **→ [`docs/single-vs-global.md`](docs/single-vs-global.md)** explains the differences that are
 real, including how to supply your own mask (it does not have to be land) and why the global store

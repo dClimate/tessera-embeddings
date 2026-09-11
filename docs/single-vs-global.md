@@ -14,12 +14,18 @@ are real will save you guessing.
 Both paths run the same three stages in the same order, with the same code:
 
 ```
-   ingest    →    inference    →    assembly
-   ------         ---------         --------
-   fetch and      run the model     write the results
-   mosaic the     on a GPU          into a store you
-   imagery                          can read
+   ingest    →    inference    →    assembly    →   (validation)
+   ------         ---------         --------          ----------
+   fetch and      run the model     write the         global path
+   mosaic the     on a GPU          results into      only: check
+   imagery                          a store you       what landed
+                                    can read
 ```
+
+The global campaign adds a fourth step the single-area path does not have: once a zone-year is
+written and tagged, it dispatches a validation run that produces figures and a machine-readable
+verdict on the published cell. That is how bad published data gets noticed in a job too large to
+inspect by hand.
 
 The **model is identical** and the **ingest is identical**. Assembly shares its code up to the
 point of writing, and then the two write differently — the global path lays down whole 2048-pixel
@@ -54,6 +60,28 @@ tiles and cost accordingly. If your area is sparse, its cost is set by how many 
 So: if you are wondering whether the global campaign does something cleverer to the imagery, or
 uses a better model, or has a different definition of an embedding — it does not.
 
+### But it is not configured the same, and that part does change the answer
+
+The shared code is run with **different settings**, and two of them decide which pixels get an
+embedding at all. The same area and the same year can therefore come out differently depending on
+which path produced it:
+
+| setting | library default (single area) | the global campaign |
+|---|---|---|
+| `allow_s2_only` | `false` — a pixel with no radar observation produces nothing | **`true`** — optical-only pixels are embedded |
+| `optical_min_obs` | unset — no minimum | **15** — a pixel with fewer than fifteen clear optical observations in the year is left empty |
+
+Those are the only two quality rules in the system, and both were deliberate choices for a global
+run: about a fifth of the land has no radar for 2022–24, so without `allow_s2_only` those pixels
+would be holes; and fifteen observations is the line below which an embedding was judged not
+trustworthy.
+
+**What this means in practice.** If you compare your own single-area output against the published
+global store and the pixels disagree, check these two settings before looking for a bug. If you
+want your own run to match the published dataset, set both to the campaign's values. And because
+they are per-run settings, the global store stamps `optical_min_obs` when it is seeded, so a
+consumer can read which line a cell was actually measured against rather than assuming.
+
 ## What actually differs
 
 | | one area | the whole world |
@@ -65,11 +93,13 @@ uses a better model, or has a different definition of an embedding — it does n
 | scale | one machine, one GPU or a few | dozens of machines, hundreds of GPUs, days of running |
 | you run it | yourself, when you want | as a campaign, with restart and recovery machinery |
 
-\* A **UTM zone** is one of 120 north–south strips the world is divided into for mapping, each six
-degrees of longitude wide and named like `33N` or `07S`. The global campaign uses them as its unit
-of work because each one has its own flat coordinate system, which is what lets imagery be
-processed without distortion. You do not need to care about this for the single-area path — it
-works out the right coordinate system from your area.
+\* A **UTM zone** is one of 60 north–south strips the world is divided into for mapping, each six
+degrees of longitude wide. Each is split at the equator into a northern and a southern half with
+its own flat coordinate system, which gives the **120** groups this store has, named like `33N` and
+`33S` — the same longitude band, opposite hemispheres. The campaign works a zone at a time because
+that flat coordinate system is what lets imagery be processed without distortion. You do not need
+to care about any of this for the single-area path: it works out the right coordinate system from
+your area.
 
 Everything in that table is about *packaging and scale*. None of it is about how an embedding is
 computed.
@@ -117,17 +147,37 @@ Two supported ways to make one, both a single flow run:
    This is the usual route, and the one the quickstart uses for its square kilometre over Denver.
 2. **From Sentinel-2 tile names.** Name one or more Sentinel-2 tiles — the roughly 110 km squares
    the mission publishes its imagery in, with codes like `13TDE` — and their footprints become your
-   area. Useful when you want your outputs to line up exactly with someone else's tiling.
+   area. Useful when you want your outputs to line up with someone else's tiling exactly.
+   **This route needs a tile index the repository does not ship:** it reads
+   `sentinel2_tiles.geojson` from the root of your ROI bucket, so you have to put a Sentinel-2
+   tiling-grid GeoJSON there first. Without it the run fails on a missing file before anything is
+   rasterised. The polygon route has no such prerequisite.
 
 Either way the result is a small **Zarr** file — a directory-shaped array format that stores big
-grids in chunks so a reader can fetch only the part it needs. You can also write one yourself if
-you already have a mask: it is an ordinary chunked boolean array with the grid's origin and shape
-recorded alongside it.
+grids in chunks so a reader can fetch only the part it needs.
+
+You can write one yourself, but the pipeline needs more than the array. It reads three attributes
+off it and fails without them:
+
+| attribute | what it is |
+|---|---|
+| `crs` | the coordinate reference system the grid is in, as a string |
+| `transform` | the six affine coefficients mapping array indices to projected coordinates |
+| `bbox_wgs84` | the bounding box in ordinary longitude and latitude, used to query the catalogues |
+
+The array itself is a chunked boolean of shape `(height, width)`. If your mask is in another form,
+the least error-prone route is still to hand the pipeline a GeoJSON outline and let it rasterise —
+it produces all of this for you, on the right grid.
 
 **Two things to get right.** The mask must sit on the same coordinate system and grid as the
-imagery you are ingesting — the flow handles this when it rasterises for you. And a mask that
-selects nothing is treated as an error rather than as a run with no work, so you find out
-immediately.
+imagery you are ingesting — the flow handles this when it rasterises for you if you supply a
+polygon.
+
+And **a mask that selects nothing does not fail.** The rasteriser reports how many pixels it
+selected and carries on, and a run over an empty mask completes having produced nothing of
+substance. So read the valid-pixel count in the log of your mask-building run before you spend
+anything on GPUs — a polygon in the wrong coordinate system, or one that misses the imagery's
+extent, looks exactly like this.
 
 ### For the whole world: a prepared coverage store
 
@@ -138,8 +188,11 @@ from a global delivery of small per-cell files, and the campaign reads it to dec
 Two consequences worth knowing:
 
 - **It is tile-granular, not pixel-granular.** A coastal tile with any land in it is included
-  whole, so some ocean pixels come along. That is deliberate: it keeps the unit of work a whole
-  tile, and the ocean pixels are cheap because masked water is dropped during ingest.
+  whole, so the ocean pixels inside that tile come along — and they are **embedded, not dropped**.
+  Water is a valid surface class as far as the cloud mask is concerned, so a sea pixel in a live
+  tile gets an embedding like any other. That is deliberate: it keeps the unit of work a whole
+  tile. What gets skipped is whole tiles and chunks *outside* the coverage mask, which is where
+  nearly all the saving comes from.
 - **Coverage extends a little way offshore** — roughly 11 km — because the upstream mask was built
   with a generous margin for other users. So "land" here is slightly more than land.
 
