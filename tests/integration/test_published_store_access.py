@@ -119,17 +119,16 @@ class TestAnonymousAccess:
         assert groups[-1] == "60S"
 
     def test_the_store_is_tuned_for_readers_rather_than_for_the_fill(self, anonymous_root):
-        # The campaign's last step switches the saved manifest preload off. A re-enabled preload
-        # costs every consumer about 2.5 s per open and buys them nothing, and the figures in
+        # The campaign's last step switches the saved manifest preload off — BOTH counters, which
+        # is what `set_saved_manifest_preload` writes. A re-enabled preload costs every consumer
+        # about 2.5 s per open and buys them nothing, and the figures in
         # context_docs/storage/reading-the-published-store.md would stop applying. Splitting must
         # survive that switch, because it describes the manifests already on disk.
         _, _, _, saved_config = anonymous_root
         assert saved_config is not None, "the store has no saved repository config"
         manifest = saved_config.manifest
-        assert manifest is not None
-        assert manifest.splitting is not None
-        assert manifest.preload is not None
-        assert manifest.preload.max_total_refs == 0
+        assert manifest.splitting is not None, "the manifest splitting configuration was dropped"
+        assert (manifest.preload.max_total_refs, manifest.preload.max_arrays_to_scan) == (0, 0)
 
     def test_opening_inherits_the_saved_config_rather_than_replacing_it(self, anonymous_root):
         # A config handed to `Repository.open` REPLACES the saved one, which is how readers used to
