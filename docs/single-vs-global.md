@@ -132,7 +132,7 @@ most often: which optical-depth line a cell was held to, and which model wrote i
 | how you say where | a boolean grid you make, at pixel resolution | a prepared coverage store, at 2048-pixel tile resolution |
 | time period | **any 12 months**, ending in the month you choose | **calendar years only**, January to December |
 | output | one store per area, one entry per window | one store for the world, one entry per zone per year |
-| scale | one machine, one GPU or a few | **around 2,500 single-GPU machines**, days of running |
+| scale | one machine, one GPU or a few | **over a thousand single-GPU machines at once**, for weeks |
 | you run it | yourself, when you want | as a campaign, with restart and recovery machinery |
 
 \* A **UTM zone** is one of 60 north–south strips the world is divided into for mapping, each six
@@ -496,10 +496,16 @@ free and instant compared with computing anything.
 **Run the global campaign yourself only if** you need coverage or years the published store does
 not have, and you have the infrastructure for it. It is a large, long, expensive job with its own
 operational machinery; [`context_docs/campaign/campaign-plan.md`](../context_docs/campaign/campaign-plan.md)
-describes what that involves and
+describes what that involves.
+
+**What one costs is now measured rather than estimated.** The completed campaign published
+992 cells — 3,247,400 tile-years, 99.96% of what it set out to cover — for about **$828,000**
+at on-demand list prices, using 360,282 graphics-card hours over 36 days of billed compute.
+Graphics cards were only about two thirds of that; storage, object-store requests and the
+container fleet made up most of the rest.
 [`context_docs/campaign/campaign-cost-model.md`](../context_docs/campaign/campaign-cost-model.md)
-estimates what one costs. Read that as a planning model rather than a bill: it was written before
-the campaign ran, and what the completed run actually cost is still being written up.
+§12 is the record, with every line and the usage it was derived from, and it is the figure to
+quote rather than any of the planning estimates earlier in that document.
 
 ## Where to go next
 
