@@ -235,18 +235,28 @@ free and instant compared with computing anything.
 > **Check before you trust it, and do not infer coverage from latitude and year.** Every
 > zone-and-year slot in the store is created in advance, before any imagery is processed. That
 > means a cell that was never filled **opens perfectly happily and hands back fill values** — you
-> will not get an error, you will get plausible-looking nothing. The authority is each zone
-> group's `years_complete` attribute, which lists only the years that actually landed:
+> will not get an error, you will get plausible-looking nothing.
+>
+> The authority is each zone group's `years_complete` attribute. Note that the store is an
+> Icechunk repository, so you open it through a session rather than by handing the URI straight to
+> xarray:
 >
 > ```python
 > import xarray as xr
-> zone = xr.open_zarr("s3://tessera-embeddings/v1.1/dclimate.icechunk/", group="33N")
-> print(zone.attrs["years_complete"])      # the years you can trust
+> from tessera_embeddings.storage.global_store import open_global_repo
+>
+> repo = open_global_repo("s3://tessera-embeddings/v1.1/dclimate.icechunk")
+> session = repo.readonly_session(branch="main")
+> ds = xr.open_zarr(session.store, group="33N", consolidated=False, decode_coords="all")
+> print(ds.attrs["years_complete"])      # the years you can read
 > ```
 >
-> A small number of cells are legitimately unfilled — mostly tiny or remote land in the earliest
-> years, where the satellite archive holds nothing to work from — so an absent year is usually a
-> fact about the imagery rather than a gap waiting to be closed.
+> **Read that list carefully, because it distinguishes two different things from a third.** A year
+> *in* the list either holds data or was deliberately marked as having none — an all-ocean zone, or
+> land where the campaign looked and found nothing usable. Either way the question has been
+> answered. A year *missing* from the list is different: that cell never landed, which is a gap in
+> the publication rather than a statement about the imagery. **Investigate a missing year; do not
+> read it as "there was nothing there".**
 
 **Run the global campaign yourself only if** you need coverage or years the published store does
 not have, and you have the infrastructure for it. It is a large, long, expensive job with its own
