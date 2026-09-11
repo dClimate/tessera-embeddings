@@ -21,9 +21,12 @@ Both paths run the same three stages in the same order, with the same code:
    imagery                          can read
 ```
 
-The **model is identical**. The **ingest is identical**. The **assembly is identical**. What
-changes is how much you run at once, how you say which ground you want, and what the output store
-looks like when it lands.
+The **model is identical** and the **ingest is identical**. Assembly shares its code up to the
+point of writing, and then the two write differently — the global path lays down whole 2048-pixel
+tiles into slots that were set aside in advance, which is what lets many machines add to one
+dataset at once; the single-area path creates or extends a store of its own. What changes overall
+is how much you run at once, how you say which ground you want, and what the output store looks
+like when it lands.
 
 If you are choosing: use the single-area path unless you actually need global coverage. It is
 simpler, it runs on one machine, and it is more flexible about time periods.
@@ -40,9 +43,13 @@ single-area path in another — but before ingest runs, the global path *convert
 exactly the artefact the single-area path uses: a plain boolean grid saying where you want
 embeddings. From that point on, the two are indistinguishable to the ingest code.
 
-**Cost scales with the area you keep, not the box you draw.** Both paths skip work on any part of
-the grid your area does not touch, with no flag to set. A sparse island costs about what the
-island costs, not what its bounding box costs.
+**Cost follows the area you keep far more closely than the box you draw**, in both paths and with
+no flag to set. Be precise about the unit, though: work is skipped a **chunk at a time**, not a
+pixel at a time — ingest works in 4096-pixel windows and inference in 2048-pixel tiles, and any
+window your mask touches at all is processed whole. So a compact area is close to free beyond its
+own extent (one sparse island zone drops from 3,706 chunks per band-date to 4), while an area that
+is small but *scattered* — a thousand separate field boundaries across a region — can touch many
+tiles and cost accordingly. If your area is sparse, its cost is set by how many tiles it lands on.
 
 So: if you are wondering whether the global campaign does something cleverer to the imagery, or
 uses a better model, or has a different definition of an embedding — it does not.
@@ -169,9 +176,24 @@ project that produced it.
 calendar year, you want to iterate quickly, or you are evaluating whether these embeddings help
 you at all. It runs on one machine and the quickstart finishes on a laptop in a few minutes.
 
-**Use the global dataset if** the area you want is already covered — and check first, because if
-it is land between those latitudes and one of the years 2017 to 2025, it probably is. Reading a
-published store is free and instant compared with computing anything.
+**Use the global dataset if** the area you want is already filled. Reading a published store is
+free and instant compared with computing anything.
+
+> **Check before you trust it, and do not infer coverage from latitude and year.** Every
+> zone-and-year slot in the store is created in advance, before any imagery is processed. That
+> means a cell that was never filled **opens perfectly happily and hands back fill values** — you
+> will not get an error, you will get plausible-looking nothing. The authority is each zone
+> group's `years_complete` attribute, which lists only the years that actually landed:
+>
+> ```python
+> import xarray as xr
+> zone = xr.open_zarr("s3://tessera-embeddings/v1.1/dclimate.icechunk/", group="33N")
+> print(zone.attrs["years_complete"])      # the years you can trust
+> ```
+>
+> A small number of cells are legitimately unfilled — mostly tiny or remote land in the earliest
+> years, where the satellite archive holds nothing to work from — so an absent year is usually a
+> fact about the imagery rather than a gap waiting to be closed.
 
 **Run the global campaign yourself only if** you need coverage or years the published store does
 not have, and you have the infrastructure for it. It is a large, long, expensive job with its own
