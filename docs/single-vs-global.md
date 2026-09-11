@@ -473,8 +473,10 @@ The global store splits manifests at `time@1`:
                                                  the arrays/years read
 ```
 
-Single-area stores use the same idea spatially: a 32-chunk-per-axis two-dimensional split, so
-rewriting a region rewrites only the manifest tiles it touches (`zarr_store.manifest_split`).
+Manifest splitting is **opt-in**, via `zarr_store.manifest_split`, and no path takes its
+default. The default it offers is 4 chunks per northing and easting axis; what assembly
+actually opens under is `manifest_split({"time": 1})` — one manifest per time slot — so
+writing a year rewrites only that year's manifest.
 
 **Four write paths, all committing atomically.** The first three are in
 `storage/zarr_store.py`, the fourth in `inference/assembly.py` and

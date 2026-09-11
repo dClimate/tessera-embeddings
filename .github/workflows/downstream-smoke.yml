@@ -32,8 +32,11 @@ name: Downstream smoke test
 #   * `pull_request`, NEVER `pull_request_target`. On `pull_request` a fork's build gets
 #     no secrets and a read-only token, so untrusted code cannot reach either. Switching
 #     to `pull_request_target` to "make forks work" hands your secrets to code the fork
-#     author controls. If you need fork coverage, require a maintainer to dispatch it by
-#     hand instead.
+#     author controls. There is NO safe shortcut here: dispatching by hand does not help
+#     either, because `workflow_dispatch` checks out a ref of THIS repository and nothing
+#     below selects a fork's head, so it would test the base branch and report a pass that
+#     means nothing. Fork coverage needs an explicit, validated head repository and ref
+#     input, which this template deliberately does not have.
 on:
   # pull_request:
   #   branches: [main]

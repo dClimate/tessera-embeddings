@@ -581,9 +581,10 @@ reconstructed:
 reconstructed = quantized.astype(float32) * scale[..., np.newaxis]
 ```
 
-The round-trip error is bounded by `scale / 127` per channel — typically under 1% of the
-original magnitude. Non-finite values are rejected with a `ValueError` before quantization
-rather than being silently encoded.
+The round-trip error is bounded by **`scale / 2`** per channel — nearest-integer rounding, so
+half a quantisation step. Since `scale` is the row's own `max|value| / 127`, that is
+`max|value| / 254`, or under 0.4% of the row's largest channel. Non-finite values are rejected
+with a `ValueError` before quantization rather than being silently encoded.
 
 **It happens per bucket, not per tile.** Because each pixel's scale comes only from its own
 128 channels, quantization is per-pixel independent, so `run_inference` compresses each
@@ -813,24 +814,32 @@ windowed reads `filter_chunks_by_roi_mask` performs for the single-area flows.
 The write path and the read path deliberately work at different granularities: what a
 writer emits in one go is much larger than what a reader has to fetch.
 
+**The two layouts now share one geometry**, so what differs is the writer and the manifest
+split, not the objects. Both use `(1, 256, 256, 128)` inner chunks — full band depth, so the
+band axis is never split — inside `(1, 2048, 2048, 128)` shards.
+
 ```text
                   SINGLE (one area)               GLOBAL (zone group)
 ─────────────────────────────────────────────────────────────────────────────
-S3 object       = one 500×500×4 chunk (~a few   = one 2048² shard (≤ ~0.5 GB:
-                  hundred KB)                     8×8 inner chunks + index)
+S3 object       one 2048² shard, the SAME for both: 8×8 inner chunks of
+                256 px at full 128-band depth, plus an index
 
 writer emits    band worker streams tile        shard worker emits whole
                 y-slices; partial edge chunks    shard objects, exactly once
                 read-modify-write in-fork        (never read-modify-write)
 
-reader fetches  whole chunk objects under       shard index (one small GET),
-                the window (~KBs per point,      then ranged-GETs of only the
-                ×32 band chunks for full         overlapped inner chunks
-                depth)                           (~8.4 MB per point, full band)
+reader fetches  the shard index (one small GET), then ranged-GETs of only
+                the overlapped inner chunks — identical either way, and
+                ~8.4 MB for one point at full band depth
 
-commit rewrites manifest tiles the write        that year's manifests only
-                touched (32-chunk 2D split)      (time@1 split)
+commit rewrites that timestep's manifests only  that year's manifests only
+                (assemble opens under            (the same time@1 split,
+                 manifest_split time@1)          baked into the repo config)
 ```
+
+A point read costs the same in both, and it costs 8.4 MB because the smallest fetchable unit
+is one full-depth inner chunk. That is the number to design around, not the 128 bytes a
+single pixel's vector occupies.
 
 **Manifest splitting** is the last row. `assemble` opens the repo under
 `manifest_split({"time": 1})` — one manifest shard per timestep, so a one-timestep write
@@ -865,10 +874,11 @@ ds = open_store(store_path, chunks=None)   # or xr.open_zarr(session.store, cons
 ds.isel(time=0).sel(northing=slice(...), easting=slice(...)).embeddings.values
 ```
 
-The default chunking builds one Dask task per on-disk chunk. With 500×500×4 sub-chunks the
-band axis alone is 32 chunks, so the graph is `n_time × n_y × n_x × 32` tasks — large enough
-at CONUS extent that even a *lazy* `isel` or `sel` runs out of memory while manipulating the
-graph, before any data is read. `chunks=None` opens the store zarr-lazy with no graph at
+The default chunking builds one Dask task per on-disk chunk. Inner chunks are
+`(1, 256, 256, 128)` — full depth, so the band axis is a single chunk — which puts 64 of them
+in each 2048-pixel shard and makes the graph `n_time × n_y × n_x` tasks over the 256-pixel
+grid. At CONUS extent that is large enough that even a *lazy* `isel` or `sel` runs out of
+memory while manipulating the graph, before any data is read. `chunks=None` opens the store zarr-lazy with no graph at
 all: slicing is pure metadata, and chunks load only when `.values` is pulled. This is
 unrelated to manifest splitting, which bounds commit cost rather than graph size.
 
