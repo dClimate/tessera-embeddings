@@ -6,11 +6,18 @@ across the 14 documents that carried them.** That count is a dated measurement, 
 one — a grep for "withdrawn" now also finds the prose in this file and in the two places that
 link to it.
 
-**This does not replace the withdrawals themselves.** Those stay next to the claims they
-correct, and they have to: a withdrawn number a reader can still see, with the correction
-attached, cannot be quoted by accident — the same number in a register nobody opened is
-just a number in a document. Lifting figures out of the context that qualified them is how
-several of the entries below happened in the first place.
+**For most documents this does not replace the withdrawals themselves.** They stay next to the
+claims they correct, because a withdrawn number a reader can still see, with the correction
+attached, cannot be quoted by accident.
+
+**For the two campaign documents it does.** `campaign/campaign-plan.md` and
+`campaign/campaign-cost-model.md` state only current figures, and this file is the sole record of
+what they used to say. Both are read operationally — someone sizing a fleet or a budget wants the
+number, not its history — and between them they had accumulated 87 such passages. The cost of that
+choice is real and worth naming: a figure lifted out of the context that qualified it is how
+several of the entries below happened in the first place, so **a number quoted from either of those
+documents carries no visible warning that an earlier version of it is still in circulation.**
+Check this file before quoting one.
 
 What this file adds is the thing proximity cannot give: **the pattern.** Individually each
 withdrawal reads as bad luck. Grouped, nine mechanisms account for all of them, most
@@ -248,8 +255,18 @@ one stratification flipped the sign of the conclusion.
   then to choose a fleet shape. Both terms were later re-measured at 1.7–2.6× their modelled
   values — the same cell's assembly took **5.78 h** against the 3.28 h the ratio assumed — so the
   crossover had no supported location. The campaign then ran **25 clusters of 100**, testing
-  neither the cap nor the split.
-  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c, §10)
+  neither the cap nor the split. This register is the record of the withdrawal itself;
+  [`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c and §10 now carry only
+  the replacement — a 158-to-394 crossover range, and a cluster split that costs the same either
+  way.
+
+- **"The deepest radar measured anywhere is 30–35°."** The maximum of one section's own sample,
+  published as the maximum over campaign land, and used to argue that a sample-weighted radar
+  depth under-represents the deep latitudes. Read from the published store the deepest band is
+  **40–45°** (81.1 observations per written pixel against 68.8), and 30–35° is indistinguishable
+  from 35–40° and 45–50°. The *direction* of the land-weighting argument survives and the
+  superlative does not; the claim is now scoped to the sample it came from.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c, §12b)
 
 **The cure:** a two-parameter model needs a third point before it is a model, and a curve
 needs enough points to show it is monotonic before one of them becomes a recommendation.
@@ -286,6 +303,17 @@ needs enough points to show it is monotonic before one of them becomes a recomme
   in one minute. The *inference* from it does not, and the question is now stated as open, needing
   a controlled run.
   ([`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md))
+- **"Only 61% of the fleet's cards are working"** — 712 busy against 1,163 switched on — **"and
+  the machine-provisioning loop is outrunning the software that places work on them."** Both
+  halves were wrong, and the explanation was invented before the number was taken apart. 379 of
+  the 451 supposedly-idle machines were **three compute clusters abandoned by cancelled fill
+  runs**, holding no work because the process that would have given them work was dead: a
+  shutdown failure, not a provisioning one. Fleet throughput did not fall when they were switched
+  off — 5,583 tile-years an hour before, 6,230 after — and on the live fleet 766 of 784 cards held
+  work, **98%**. The real finding was the shutdown gap: the sweeper meant to catch abandoned
+  clusters inventories **container tasks**, and these were **virtual machines**. The quantity it
+  cost survives — $590 an hour, about **$9,650**.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
 - **"Most of the dead area is not geometric — it is cloud."** Backwards: geometric dead is
   55–66% of live chunks and radiometric 10–21%. *"The claim was made to explain the null
   result and was not measured before being asserted."*
@@ -342,9 +370,18 @@ one most likely to recur, because it is invisible to whoever makes it.
   calculation, which is the hardest kind to grep for.
   ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §5, §12)
 
+- **"71 cells and a 23,000 vCPU Fargate quota, on a 4.5-day ingest wall clock."** The wall clock
+  was `total work ÷ cells`, which assumes work can be spread across the year boundary.
+  `run_global_campaign` barriers on years, so a year cannot finish faster than its single longest
+  zone and the cell count stops buying schedule at **45**. Past that the quota bought nothing at
+  all — not schedule, not supply, not usable GPU fleet — and 45 cells at 60 workers reaches 5.6
+  days on *less* quota than the 71-cell plan asked for. Same shape as the bullet above: sound
+  arithmetic, an unstated input.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §4, §10)
+
 **The cure is a grep, and it is the cheapest item in this file:** when a figure is
 withdrawn, search every document for the number and for the phrase, not just for the
-section you were editing. Both instances above would have been caught by searching for the
+section you were editing. The instances above would each have been caught by searching for the
 figure itself.
 
 ### 9. A figure published without its derivation, which nothing could then check
@@ -358,8 +395,9 @@ measured, and if nothing measures it, it is believed.
   Inventory once the campaign closed: **14.04 PB, 14.12 TB a cell — 2.5× the estimate**, and the
   mechanism behind storage costing 24× its modelled line. Because the plan never recorded how
   5.6 TB was reached, the gap cannot be attributed to any single assumption, which is the whole
-  cost of the omission: the figure cannot even be debugged. Withdrawn in
-  [`campaign/campaign-plan.md`](campaign/campaign-plan.md) §1; measured in
+  cost of the omission: the figure cannot even be debugged. The estimate stood in
+  [`campaign/campaign-plan.md`](campaign/campaign-plan.md) §1, which now states the measured
+  figure instead; the measurement is in
   [`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12c.
 - **An OPEN instance: the 4.6 GiB low end of the inference VRAM range.** It appears with no
   measurement behind it and no note of where it came from. It has not been withdrawn, because
@@ -390,21 +428,26 @@ Distilled from the nine above. Each line exists because skipping it cost a withd
    "estimated". A bare number cannot be checked, and an unchecked estimate survives until
    something expensive disagrees with it.
 
-## Why the withdrawals stay in place
+## Where the withdrawals live
 
-Recorded here so this file is not mistaken for a proposal to consolidate them.
+Two rules, because the documents are read differently.
 
-The withdrawals live next to the claims they correct because that is where they do their
-work — a reader reaching for a figure has to read past the retraction to reach it. They are
-also a small share of the text they sit in: across the documents that carry them they are
-**under a tenth** of the lines, and the remainder is the derivation those documents exist
-for. Extracting them would shorten nothing meaningfully and would retire no document, while
-moving each correction one lookup away from the number it corrects.
+**The measurement records keep theirs in place.** `ingest/ingest-performance.md`,
+`inference/inference-on-gpus.md`, the assembly records and the decision records all carry their
+withdrawn claims beside the corrected ones. A reader reaching for one of those figures has to read
+past the retraction to reach it, which is the point, and the retractions are under a tenth of the
+lines in documents that exist for their derivations. The decision records go further by being
+append-only: a superseded record stays and a new one supersedes it. For these, this file is an
+index over that material rather than a replacement for it.
 
-[`campaign/campaign-plan.md`](campaign/campaign-plan.md) §11 states the underlying rule: the
-stage records *"carry their own withdrawn claims beside the corrected ones, on purpose — a
-reviewer who sees only the final number learns nothing about how it went wrong"*. The decision
-records follow the same principle by being append-only — a superseded record stays and a new one
-supersedes it.
+**The two campaign documents keep none.** `campaign/campaign-plan.md` and
+`campaign/campaign-cost-model.md` state the current position and nothing else, and for them this
+file is the record. That was a deliberate change on 2026-09-11, on the grounds that both are
+operational documents whose readers want a figure rather than its provenance.
 
-This register is the index over that material, not a replacement for it.
+What survived that change in those two documents is worth knowing, because it is the distinction to
+apply when writing them: **an operating rule learned from a mistake stays as a rule, and the
+anecdote goes.** "Do not close a cost window on the current day" is live instruction; the story of
+the day it cost $11,000 is not. A live qualification on a current figure also stays — the staged
+volume that can only be bounded between 1 and 1.6 PB is a limitation, not a retraction. The test is
+tense: does the sentence say what is true now, or what somebody used to believe?
