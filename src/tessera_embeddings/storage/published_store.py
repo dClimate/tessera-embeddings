@@ -78,6 +78,15 @@ def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[s
             # departure worth reporting for this array — the rest would compare unrelated axes.
             out.append(f"{var}: has {array.ndim} dimensions, the layout declares {len(expected.dims)} {expected.dims}")
             continue
+        # The NAMES, not just how many there are. An array whose spatial axes are labelled
+        # `easting, northing` instead of `northing, easting` has the right rank, the right dtype
+        # and — because both spatial chunk sizes are 256 — the right chunk geometry, so every other
+        # check here passes while every labelled read of it comes back transposed.
+        names = array.metadata.dimension_names
+        if names is None:
+            out.append(f"{var}: has no dimension names, the layout declares {expected.dims}")
+        elif tuple(names) != tuple(expected.dims):
+            out.append(f"{var}: dimension names are {tuple(names)}, the layout declares {tuple(expected.dims)}")
         if array.dtype != np.dtype(expected.dtype):
             out.append(f"{var}: dtype is {array.dtype}, the {layout.name} layout declares {expected.dtype}")
         chunks, shards = clamp_chunks_and_shards(tuple(array.shape), expected.chunks, expected.shards)

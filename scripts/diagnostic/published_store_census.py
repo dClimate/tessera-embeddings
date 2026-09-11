@@ -52,6 +52,14 @@ DEFAULT_REGION = "us-west-2"
 #: missing; the store's own `time` coordinate is the authority for what the slots mean.
 CAMPAIGN_YEARS = tuple(range(2017, 2026))
 
+#: Every group the store should hold: 60 six-degree UTM zones, north and south.
+#:
+#: Checked as a SET rather than a count, and checked before any zone is audited. An audit that
+#: iterates whatever groups it finds cannot report a missing one — and with `--zones all` the tag
+#: reconciliation is filtered to the groups that were audited too, so a store that lost an entire
+#: zone would reconcile perfectly against its own smaller self and exit 0.
+EXPECTED_ZONES = tuple(f"{n:02d}{hemisphere}" for n in range(1, 61) for hemisphere in ("N", "S"))
+
 
 def _cell_tags(repo: icechunk.Repository) -> set[tuple[str, int]]:
     """Every ``(zone, year)`` the store carries a completion tag for.
@@ -135,13 +143,22 @@ def main(argv: list[str] | None = None) -> int:
     root = zarr.open_group(session.store, mode="r")
     timings["root_group_open_s"] = round(time.monotonic() - started, 3)
 
-    zones = sorted(k for k, _ in root.groups()) if args.zones == "all" else args.zones.split(",")
+    present = sorted(k for k, _ in root.groups())
+    missing_groups = sorted(set(EXPECTED_ZONES) - set(present))
+    unexpected_groups = sorted(set(present) - set(EXPECTED_ZONES))
+    zones = present if args.zones == "all" else args.zones.split(",")
+    if absent := sorted(set(zones) - set(present)):
+        parser.error(f"the store has no group(s) {absent}; it holds {len(present)}")
     print(f"store:     {args.uri} ({args.region})")
     print(f"snapshot:  {session.snapshot_id}")
     print(f"opens:     {timings}")
     print(f"config:    {json.dumps(_describe_config(repo), indent=13)[1:-1].strip()}")
     print(f"root keys: {sorted(root.attrs)}")
-    print(f"groups:    {len(list(root.groups()))} (auditing {len(zones)})")
+    print(f"groups:    {len(present)} of {len(EXPECTED_ZONES)} expected (auditing {len(zones)})")
+    if missing_groups:
+        print(f"           MISSING GROUPS: {missing_groups}")
+    if unexpected_groups:
+        print(f"           UNEXPECTED GROUPS: {unexpected_groups}")
 
     tags = _cell_tags(repo)
     zone_reports = [_zone_report(root, z, with_shards=args.shards, session=session) for z in zones]
@@ -174,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"marked complete, untagged:{len(only_attrs)} {only_attrs[:6]}")
     print(f"tagged, not marked:       {len(only_tags)} {only_tags[:6]}")
     print(f"has provenance, unmarked: {len(unmarked_provenance)} {unmarked_provenance[:6]}")
+    print(f"groups missing/unexpected:{len(missing_groups)} / {len(unexpected_groups)}")
 
     if args.json_out:
         with Path(args.json_out).open("w") as handle:
@@ -191,6 +209,8 @@ def main(argv: list[str] | None = None) -> int:
                         "tagged_not_marked": only_tags,
                         "has_provenance_unmarked": unmarked_provenance,
                         "layout_departures": departures,
+                        "missing_groups": missing_groups,
+                        "unexpected_groups": unexpected_groups,
                     },
                 },
                 handle,
@@ -199,7 +219,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         print(f"\nwrote {args.json_out}")
 
-    return 1 if (only_attrs or only_tags or unmarked_provenance or departures) else 0
+    return (
+        1
+        if (only_attrs or only_tags or unmarked_provenance or departures or missing_groups or unexpected_groups)
+        else 0
+    )
 
 
 if __name__ == "__main__":

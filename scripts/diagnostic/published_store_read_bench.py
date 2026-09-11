@@ -16,10 +16,12 @@ numbers that look comparable and are not.
   store's own chunk enumeration and each candidate pixel is then confirmed against ``scales``
   (:func:`~tessera_embeddings.storage.published_store.sample_live_pixels`).
 
-* **Cold means a fresh process, not a fresh variable.** Icechunk caches manifests and the HTTP
-  client pools connections, so a second read in one process measures the cache. Every cold phase
-  runs in a subprocess that exits afterwards. The parent chooses the pixels once and passes them
-  down, so the cold and warm arms — and two regions — read exactly the same addresses.
+* **Cold means a fresh process; warm means a second pass through the SAME open.** Icechunk caches
+  manifests and pools connections, so every cold phase runs in a subprocess that exits afterwards.
+  The warm arm is a second pass inside one `run_phase` call, on the group the first pass opened —
+  an earlier version called `run_phase` twice, which re-opened everything and made "warm" a second
+  cold reader, throwing away the caches this benchmark exists to observe. The parent chooses the
+  pixels once and passes them down, so both arms and both regions read exactly the same addresses.
 
 * **Throughput is reported the way the scoping harness reported it**, as decompressed elements per
   second (``elements / wall``). For the int8 ``embeddings`` one element is one byte, so the figure
@@ -239,21 +241,33 @@ def _net_bytes_received() -> int | None:
     return int(psutil.net_io_counters().bytes_recv)
 
 
-def run_phase(payload: dict[str, Any]) -> dict[str, Any]:
-    """Run one benchmark phase in this process and return its metrics.
+def run_phase(payload: dict[str, Any], repeats: int = 1) -> list[dict[str, Any]]:
+    """Open the store once, run one phase ``repeats`` times on that open, and return each result.
 
-    The single place a phase is defined, so the cold arm (a fresh subprocess) and the warm arm
-    (a second call in the parent) cannot drift into measuring different things.
+    **The repeats share one opened group, and that is the whole point.** An earlier version called
+    this function twice for the warm arm, which re-opened the storage, repository, session and
+    group each time — so the "warm" figure was a second cold reader, and every cache this
+    benchmark is meant to observe was thrown away between the two. A reader who keeps their handle
+    is the case worth measuring, and it is the case the scoping harness measured.
+
+    The open phases ignore ``repeats``: their measurement IS the open, and a second one on an
+    already-open group has nothing to time. That the open is paid once per handle rather than once
+    per read is the useful fact about it.
     """
     group, timings = _open_zone(payload)
     # The sum, not the steps, is what a consumer waits for before their first read. The steps are
     # kept beside it because they say WHERE the wait is — and on this store the zone-group step is
     # nearly free, because opening the root already fetched the snapshot that describes every group.
     timings["total_open_s"] = round(sum(timings.values()), 3)
-    result: dict[str, Any] = {"phase": payload["phase"], "concurrency": payload["concurrency"], **timings}
+    base: dict[str, Any] = {"phase": payload["phase"], "concurrency": payload["concurrency"], **timings}
     if payload["phase"] in OPEN_PHASES:
-        return result
+        return [base]
+    return [{**base, "pass": n + 1, **_measure(group, payload)} for n in range(max(1, repeats))]
 
+
+def _measure(group: zarr.Group, payload: dict[str, Any]) -> dict[str, Any]:
+    """One pass of a read workload on an already-open group."""
+    result: dict[str, Any] = {}
     embeddings = group["embeddings"]
     time_index = payload["time_index"]
 
@@ -272,9 +286,13 @@ def run_phase(payload: dict[str, Any]) -> dict[str, Any]:
 
     label, dy, dx, bands = next(w for w in WORKLOADS if w[0] == payload["phase"])
     y0, x0 = payload["region_origin"]
+    before = _net_bytes_received()
     started = time.monotonic()
     block = embeddings[time_index, y0 : y0 + dy, x0 : x0 + dx, 0:bands]
     wall = time.monotonic() - started
+    after = _net_bytes_received()
+    if before is not None and after is not None:
+        result["wire_bytes"] = after - before
     result.update(
         workload=label,
         wall_s=round(wall, 3),
@@ -312,7 +330,7 @@ def _run_cold(payload: dict[str, Any]) -> dict[str, Any]:
     """Run one phase in a fresh interpreter so no cache or connection pool is warm."""
     completed = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), "--worker"],
-        input=json.dumps(payload),
+        input=json.dumps({**payload, "repeats": 1}),
         capture_output=True,
         text=True,
         check=False,
@@ -323,7 +341,7 @@ def _run_cold(payload: dict[str, Any]) -> dict[str, Any]:
             "concurrency": payload["concurrency"],
             "error": (completed.stderr or "").strip()[-800:],
         }
-    return json.loads(completed.stdout)
+    return json.loads(completed.stdout)[0]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -373,7 +391,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.worker:
-        print(json.dumps(run_phase(json.loads(sys.stdin.read()))))
+        request = json.loads(sys.stdin.read())
+        print(json.dumps(run_phase(request, repeats=int(request.get("repeats", 1)))))
         return 0
 
     host = _host_facts()
@@ -442,16 +461,19 @@ def main(argv: list[str] | None = None) -> int:
         for phase in phases:
             payload = {**base, "phase": phase, "concurrency": concurrency}
             cold = {**_run_cold(payload), "cache": "cold"}
-            # Warm: the same phase again in THIS process, where the cold subprocess left nothing
-            # behind. Run it twice and keep the second, so the warm figure describes a primed
-            # cache rather than the priming.
-            try:
-                run_phase(payload)
-                warm = {**run_phase(payload), "cache": "warm"}
-            except Exception as exc:
-                warm = {"phase": phase, "concurrency": concurrency, "cache": "warm", "error": str(exc)}
-            results += [cold, warm]
-            print(f"  c={concurrency:<4} {phase:<17} cold={_one_line(cold)}  warm={_one_line(warm)}")
+            arms = [cold]
+            # Warm: a SECOND pass through the same opened group, inside one call, so whatever the
+            # first pass cached is still there. The open phases have no second pass to take —
+            # their measurement IS the open, which a reader pays once per handle.
+            if phase not in OPEN_PHASES:
+                try:
+                    passes = run_phase(payload, repeats=2)
+                    arms.append({**passes[-1], "cache": "warm"})
+                except Exception as exc:
+                    arms.append({"phase": phase, "concurrency": concurrency, "cache": "warm", "error": str(exc)})
+            results += arms
+            warm_note = f"  warm={_one_line(arms[-1])}" if len(arms) > 1 else ""
+            print(f"  c={concurrency:<4} {phase:<17} cold={_one_line(cold)}{warm_note}")
 
     print()
     _print_table(results)

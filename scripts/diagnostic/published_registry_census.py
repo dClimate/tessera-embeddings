@@ -195,6 +195,21 @@ def _aoi_query(
     }
 
 
+def _latest_per_tile(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Keep one row per tile — the one with the latest ``assembled_at``.
+
+    The registry's latest-wins rule, applied rather than assumed away. A tie keeps the row already
+    held: arbitrary but stable, and a tie means two runs stamped the same instant, which nothing in
+    the data can order.
+    """
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        held = latest.get(row["tile"])
+        if held is None or str(row["assembled_at"]) > str(held["assembled_at"]):
+            latest[row["tile"]] = row
+    return latest
+
+
 def _verify_against_store(
     fs: pyarrow.fs.FileSystem,
     root: str,
@@ -220,17 +235,28 @@ def _verify_against_store(
         stamps = group["time"][:]
         calendar = _calendar_years(stamps)
         coverage = published_store.live_shards(session, zone)
-        table = dataset.to_table(filter=pc.field("zone") == zone, columns=["year", "embedded", "tile", "refused_px"])
+        table = dataset.to_table(
+            filter=pc.field("zone") == zone,
+            columns=["year", "embedded", "tile", "refused_px", "run_id", "assembled_at"],
+        )
         rows = table.to_pylist()
         for year in sorted(set(calendar)):
             time_index = calendar.index(year)
-            registry_rows = [r for r in rows if r["year"] == year]
+            all_rows = [r for r in rows if r["year"] == year]
+            # LATEST RUN PER TILE, not every row. A refill deliberately writes a NEW part rather
+            # than overwriting the original, so the registry holds one complete tile set per run —
+            # and summing them all would count a two-run cell's tiles twice against a store that
+            # holds one shard each, reporting a correct cell as a disagreement. `assembled_at` is
+            # the clock the registry provides for exactly this decision; a run id is not one.
+            registry_rows = list(_latest_per_tile(all_rows).values())
             findings.append(
                 {
                     "zone": zone,
                     "year": year,
                     "marked_complete": year in years,
                     "registry_rows": len(registry_rows),
+                    "registry_rows_before_dedup": len(all_rows),
+                    "runs_present": sorted({r["run_id"] for r in all_rows}),
                     "registry_embedded": sum(1 for r in registry_rows if r["embedded"]),
                     "registry_not_embedded": sum(1 for r in registry_rows if not r["embedded"]),
                     "store_live_shards": len(coverage.get(time_index, ())),
@@ -271,11 +297,16 @@ def main(argv: list[str] | None = None) -> int:
     parts = _parts(fs, args.registry)
     listing_s = round(time.monotonic() - started, 2)
 
-    cells: dict[tuple[str | None, int | None], list[dict[str, Any]]] = {}
+    # Unparsable paths are separated BEFORE the cell map is built. A key of `(None, None)` sorted
+    # alongside `("01N", 2017)` raises TypeError in Python 3, so the diagnostic would crash on
+    # exactly the malformed paths it exists to report, before reporting them.
+    unparsed = [part["path"] for part in parts if part["zone"] is None or part["year"] is None]
+    cells: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for part in parts:
+        if part["zone"] is None or part["year"] is None:
+            continue
         cells.setdefault((part["zone"], part["year"]), []).append(part)
     refilled = {f"{z}/{y}": len(v) for (z, y), v in sorted(cells.items()) if len(v) > 1}
-    unparsed = [p["path"] for p in parts if p["zone"] is None or p["year"] is None]
 
     print(f"registry:      {args.registry} ({args.region})")
     print(f"parts:         {len(parts)} in {listing_s}s, {sum(p['size'] for p in parts) / 1e6:.1f} MB")
@@ -348,13 +379,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\ncross-check against the store ({len(zones)} zone(s)):")
         print(f"  {'cell':<12} {'complete':>8} {'rows':>6} {'embedded':>9} {'shards':>7}  verdict")
         for finding in findings:
-            agrees = finding["registry_embedded"] == finding["store_live_shards"]
-            if not agrees:
-                disagreements.append(finding)
+            counts_agree = finding["registry_embedded"] == finding["store_live_shards"]
+            # A cell holding data and NOT marked complete is the half-published state this audit
+            # records `marked_complete` to catch: a fill that wrote its shards and its registry
+            # part, then died before adding the year to `years_complete`. Its counts agree, so
+            # counting alone would call it healthy.
+            populated = bool(finding["registry_embedded"] or finding["store_live_shards"])
+            unmarked = populated and not finding["marked_complete"]
+            verdict = "agrees" if counts_agree and not unmarked else ("UNMARKED" if unmarked else "DISAGREES")
+            if not counts_agree or unmarked:
+                disagreements.append({**finding, "verdict": verdict})
             print(
                 f"  {finding['zone']}/{finding['year']:<7} {finding['marked_complete']!s:>8} "
                 f"{finding['registry_rows']:>6} {finding['registry_embedded']:>9} "
-                f"{finding['store_live_shards']:>7}  {'agrees' if agrees else 'DISAGREES'}"
+                f"{finding['store_live_shards']:>7}  {verdict}"
             )
         report["disagreements"] = disagreements
 
@@ -362,8 +400,20 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.json_out).write_text(json.dumps(report, indent=2, default=str))
         print(f"\nwrote {args.json_out}")
 
+    # EVERY category the schema audit collects, not the two that looked most serious. A part whose
+    # own metadata contradicts its partition path carries two conflicting identities, and a part
+    # holding a column the schema does not declare means the writer and this checker disagree about
+    # the schema — automation exiting 0 on either has accepted a registry it should not have.
     audit = report.get("schema_audit", {})
-    broken = any(audit.get(k) for k in ("parts_missing_declared_columns", "parts_with_wrong_column_types"))
+    broken = any(
+        audit.get(key)
+        for key in (
+            "parts_missing_declared_columns",
+            "parts_with_undeclared_columns",
+            "parts_with_wrong_column_types",
+            "parts_whose_metadata_disagrees_with_its_path",
+        )
+    )
     return 1 if (unparsed or broken or disagreements) else 0
 
 

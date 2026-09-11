@@ -210,3 +210,39 @@ class TestAnonymousStorage:
         # `anonymous` is an S3 concept; a local store must not be refused or altered by it.
         storage = zarr_store._create_storage(str(tmp_path / "local.icechunk"), anonymous=True)
         assert storage is not None
+
+
+class TestLayoutDimensionNames:
+    """Dimension names are part of the contract, and the one departure the geometry checks miss."""
+
+    def test_transposed_spatial_axes_are_reported(self, seeded):
+        # The case that motivates checking names at all: `easting, northing` has the right rank,
+        # the right dtype and — since both spatial chunk sizes are 256 — the right chunk geometry.
+        _, group = _writable_group(seeded, "01N")
+        shape = group["scales"].shape
+        group.create_array(
+            "scales",
+            shape=shape,
+            dtype="float32",
+            chunks=(1, 256, 256),
+            shards=(1, 2048, 2048),
+            dimension_names=("time", "easting", "northing"),
+            overwrite=True,
+        )
+        departures = published_store.layout_departures(group)
+        assert any("scales" in d and "dimension names" in d for d in departures)
+        assert not any("chunks" in d or "shards" in d or "dtype" in d for d in departures), (
+            "the point of this test is that only the NAMES are wrong"
+        )
+
+    def test_unnamed_dimensions_are_reported(self, seeded):
+        _, group = _writable_group(seeded, "01N")
+        group.create_array(
+            "scales",
+            shape=group["scales"].shape,
+            dtype="float32",
+            chunks=(1, 256, 256),
+            shards=(1, 2048, 2048),
+            overwrite=True,
+        )
+        assert any("no dimension names" in d for d in published_store.layout_departures(group))
