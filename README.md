@@ -317,7 +317,7 @@ without an AWS account.
 
 It currently holds **about 1.6 PB** of embeddings — 1.42 PiB, the same measurement in the
 other unit, so say which one you mean — and it grows whenever a year is added.
-`Repository.total_chunks_storage()` on the store reports the exact figure.
+`Repository.chunk_storage_stats().native_bytes` on the store reports the exact figure.
 
 **What "global" means here: land between 59.45°S and 83.65°N**, the extent of the coverage
 registry the campaign is built from. **Antarctica is excluded by decision**, not omitted by

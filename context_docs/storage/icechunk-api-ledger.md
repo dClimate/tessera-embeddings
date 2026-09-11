@@ -113,7 +113,8 @@ Repository.garbage_collect(delete_object_older_than: datetime, *, dry_run=False,
                            max_concurrent_manifest_fetches=500) -> GCSummary
 Repository.reset_branch(branch, snapshot_id, *, from_snapshot_id=None)
 Repository.rewrite_manifests(message, *, branch, …)   # repo-wide only
-Repository.total_chunks_storage(...) -> int
+Repository.chunk_storage_stats(...) -> ChunkStorageStats   # .native_bytes for native chunks only
+Repository.total_chunks_storage(...) -> int               # DEPRECATED in 2.1.1; use the above
 ```
 
 Tags (`repo.create_tag(name, snapshot_id=…)`) protect snapshots from expiry. **Tags are write-once
