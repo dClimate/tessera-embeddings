@@ -38,7 +38,7 @@ import json
 import re
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -226,18 +226,32 @@ def _aoi_query(
         & (pc.field("bbox_east") >= west)
         & (pc.field("bbox_south") <= north)
         & (pc.field("bbox_north") >= south),
-        columns=["zone", "tile", "embedded", "refused_px", "eligible_px", "median_obs_where_thin", "assembled_at"],
+        columns=[
+            "zone",
+            "tile",
+            "embedded",
+            "refused_px",
+            *_REFUSAL_REASONS,
+            "eligible_px",
+            "median_obs_where_thin",
+            "assembled_at",
+        ],
     )
     # LATEST RUN PER TILE, for the same reason the store cross-check needs it: a refill leaves the
     # original part in place, so a tile filled twice would be counted twice here and its refused
     # pixels added together — inflating the very answer a consumer came for.
     raw = table.to_pylist()
-    rows = list(_latest_per_tile(raw).values())
+    # Per (zone, year), because an area of interest can span both — and within each, the newest
+    # RUN as a whole for the reason in `_newest_run`.
+    by_cell: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for row in raw:
+        by_cell.setdefault((str(row["zone"]), int(row["year"] or year)), []).append(row)
+    rows = [r for cell_rows in by_cell.values() for r in _newest_run(cell_rows)]
     embedded = [r["embedded"] for r in rows]
     refused = [r["refused_px"] for r in rows if r["refused_px"] is not None]
-    # Malformed timestamps have to reach the REPORT, not just the dedupe. `_latest_per_tile` orders
-    # such a row last, so a malformed newer refill loses to its stale predecessor — and an
-    # AOI-only run would otherwise print a plausible answer built on the wrong rows and exit 0.
+    # Malformed timestamps have to reach the REPORT, not just the run selection. `_newest_run`
+    # cannot order a run whose timestamps will not parse, so it never selects it — and an AOI-only
+    # run would otherwise print a plausible answer built on the older rows and exit 0.
     bad_stamps = unparsable_stamps(raw)
     # A null bounding box makes every Arrow comparison in the filter above evaluate to null, so the
     # row is dropped from EVERY area query — silently undercounting the coverage this dataset
@@ -280,43 +294,6 @@ def _tile_coordinate(label: str) -> tuple[int, int] | None:
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 
-def _latest_per_tile(rows: list[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
-    """Keep one row per ``(zone, tile)`` — the one with the latest ``assembled_at``.
-
-    **Keyed on the zone as well as the label**, because a label is only ``chunk_<row>_<col>`` and
-    every zone has a ``chunk_3_2``. An area of interest can straddle two UTM zones, so keying on
-    the label alone would collapse unrelated tiles into one and UNDERCOUNT the coverage a consumer
-    asked about. Rows from a per-zone query carry the same zone throughout, where this is a no-op.
-
-    The registry's latest-wins rule, applied rather than assumed away. A tie keeps the row already
-    held: arbitrary but stable, and a tie means two runs stamped the same instant, which nothing in
-    the data can order.
-
-    **Compared as strings, which is only valid while every part writes the same timestamp format.**
-    ``assembled_at`` is a column of strings, and the writer fills it from ``datetime.isoformat()``
-    with a ``+00:00`` offset, so lexical order is chronological order. A future writer emitting
-    ``Z`` instead, or a local offset, would sort wrongly and silently — so this parses rather than
-    trusting the ordering, and says so if a value does not match the expected shape.
-    """
-    latest: dict[tuple[str, str], tuple[datetime, dict[str, Any]]] = {}
-    for row in rows:
-        key = (str(row.get("zone", "")), str(row["tile"]))
-        stamp = _parse_stamp(row["assembled_at"])
-        if stamp is None:
-            # RECORDED, not raised. A malformed or offset-naive timestamp makes the parse or the
-            # comparison below throw, and it would do so in the middle of the audit — aborting
-            # before any cell verdict or the JSON report, exactly when malformed registry data is
-            # what somebody is trying to diagnose. The row is kept and ordered last, so a valid
-            # predecessor wins; callers learn about it from `unparsable_stamps`, which is collected
-            # over EVERY row rather than only the surviving ones.
-            latest.setdefault(key, (datetime.min.replace(tzinfo=UTC), row))
-            continue
-        held = latest.get(key)
-        if held is None or stamp > held[0]:
-            latest[key] = (stamp, row)
-    return {key: row for key, (_, row) in latest.items()}
-
-
 def unparsable_stamps(rows: list[dict[str, Any]]) -> list[str]:
     """Tiles among ``rows`` whose ``assembled_at`` will not parse or compare.
 
@@ -340,6 +317,50 @@ def _parse_stamp(value: object) -> datetime | None:
     except (TypeError, ValueError):
         return None
     return stamp if stamp.tzinfo is not None else None
+
+
+def _optical_skip_labels(group: zarr.Group, year: int) -> list[str]:
+    """Tile labels the year's provenance records as skipped for want of usable optical imagery.
+
+    The third oracle, and the only one that can see a refusal NEITHER array witnesses: a tile with
+    no usable optical observations has no ``scales`` shard and no ``s2_obs_count`` shard either, so
+    comparing those two cannot tell a missing registry row from a tile that was never land.
+    ``runs[<year>].optical_skips.labels`` is the store's own list of them.
+
+    Returns an empty list when the year has no provenance or records no labels — absence here is
+    not evidence of a problem, because a cell that refused nothing legitimately records none.
+    """
+    runs = group.attrs.get("runs", {})
+    entry = runs.get(str(year)) if isinstance(runs, dict) else None
+    if not isinstance(entry, dict):
+        return []
+    skips = entry.get("optical_skips")
+    labels = skips.get("labels") if isinstance(skips, dict) else None
+    return [str(label) for label in labels] if isinstance(labels, list) else []
+
+
+def _newest_run(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Only the rows of the most recently assembled run among ``rows``.
+
+    A registry part is one complete run of one cell, so "latest wins" is a choice between RUNS,
+    not between rows. Picking per tile would build a union of runs — newer rows for the tiles a
+    refill touched, older rows for any it dropped — which no run produced and which the store
+    therefore cannot match.
+
+    A run whose timestamps will not parse cannot be ordered, so it is never selected as the newest;
+    :func:`unparsable_stamps` reports those separately, over every row rather than the survivors.
+    """
+    newest: tuple[datetime, str] | None = None
+    for row in rows:
+        stamp = _parse_stamp(row["assembled_at"])
+        if stamp is None:
+            continue
+        candidate = (stamp, str(row["run_id"]))
+        if newest is None or candidate > newest:
+            newest = candidate
+    if newest is None:
+        return list(rows)
+    return [r for r in rows if str(r["run_id"]) == newest[1]]
 
 
 def _verify_against_store(
@@ -375,7 +396,15 @@ def _verify_against_store(
         observed = published_store.live_shards(session, zone, "s2_obs_count")
         table = dataset.to_table(
             filter=pc.field("zone") == zone,
-            columns=["year", "embedded", "tile", "refused_px", "run_id", "assembled_at"],
+            columns=[
+                "year",
+                "embedded",
+                "tile",
+                "refused_px",
+                *_REFUSAL_REASONS,
+                "run_id",
+                "assembled_at",
+            ],
         )
         rows = table.to_pylist()
         # The UNION of the store's calendar and the registry's own years. Iterating only the store's
@@ -398,7 +427,12 @@ def _verify_against_store(
                 key = (str(row["run_id"]), str(row["tile"]))
                 within_run[key] = within_run.get(key, 0) + 1
             duplicated = sorted(f"{run}/{tile}" for (run, tile), n in within_run.items() if n > 1)
-            registry_rows = list(_latest_per_tile(all_rows).values())
+            # The newest RUN as a whole, not the newest row per tile. A part is a complete run of
+            # a cell, so taking newer rows for some tiles and older rows for others would
+            # synthesise a union no run ever produced — and if a refill legitimately dropped a tile
+            # the earlier fill had, the stale row would survive and be compared against a store
+            # that no longer holds it.
+            registry_rows = _newest_run(all_rows)
             # The COORDINATES, not the count. One embedded tile missing and one wrongly marked
             # embedded leaves the cardinalities equal, and a registry whose whole job is to say
             # WHERE coverage is would then be pointing consumers at the wrong tiles while this
@@ -413,9 +447,14 @@ def _verify_against_store(
             }
             # A tile with observation counts and no embeddings was evaluated and refused, so the
             # registry must carry a not-embedded row for it. The converse does NOT hold: a tile
-            # refused for having no imagery at all has no counts either, which is why this is a
-            # subset test and not an equality.
-            unrecorded_refusals = sorted((observed_tiles - store_tiles) - refused_tiles)
+            # refused for having NO imagery at all has no counts either — neither array witnesses
+            # it, so a missing row for that case would be invisible here. The store records those
+            # separately, in the year's own provenance, and they are folded in below.
+            skipped = {
+                coord for label in _optical_skip_labels(group, year) if (coord := _tile_coordinate(label)) is not None
+            }
+            must_be_refused = ((observed_tiles - store_tiles) | skipped) - store_tiles
+            unrecorded_refusals = sorted(must_be_refused - refused_tiles)
             unparsed_tiles = sorted({r["tile"] for r in registry_rows if not _tile_coordinate(r["tile"])})
             bad_stamps = unparsable_stamps(all_rows)
             findings.append(

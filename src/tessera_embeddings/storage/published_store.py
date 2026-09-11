@@ -179,10 +179,20 @@ def coordinate_departures(group: zarr.Group, spec: ZoneSpec) -> list[str]:
     to guard against something the writer — which builds them with :func:`numpy.arange` — cannot
     produce. Compared against ``zone_grid``'s own builders, so the convention has one definition.
     """
+    from tessera_embeddings.config.store_layout import MONTH_COORD
     from tessera_embeddings.storage.zone_grid import easting_coords, northing_coords
 
     out: list[str] = []
     present = dict(group.arrays())
+    # `month` is compared by VALUE, not just length. The writer seeds 1..12, and a coordinate
+    # holding 0..11, a reordered sequence or a duplicate has the right rank and extent while
+    # `sel(month=7)` then selects the wrong plane of `*_month_covered`. It is small enough to read
+    # whole, unlike the spatial axes.
+    month = present.get("month")
+    if month is not None and month.ndim == 1:
+        months = [int(v) for v in np.asarray(month[:])]
+        if months != list(MONTH_COORD):
+            out.append(f"month: holds {months}, the writer seeds {list(MONTH_COORD)}")
     for name, expected in (("northing", northing_coords(spec)), ("easting", easting_coords(spec))):
         array = present.get(name)
         if array is None:

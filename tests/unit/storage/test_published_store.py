@@ -408,3 +408,22 @@ class TestCoordinateDepartures:
         _, group = _writable_group(seeded, "01N")
         del group["easting"]
         assert any("easting" in d and "absent" in d for d in published_store.coordinate_departures(group, _ZONE))
+
+
+class TestMonthCoordinate:
+    """The `month` axis is compared by value: `sel(month=7)` has to mean July."""
+
+    def test_a_zero_based_month_axis_is_reported(self, seeded):
+        _, group = _writable_group(seeded, "01N")
+        group["month"][:] = np.arange(12, dtype="int16")
+        assert any("month" in d for d in published_store.coordinate_departures(group, _ZONE))
+
+    def test_a_reordered_month_axis_is_reported(self, seeded):
+        _, group = _writable_group(seeded, "01N")
+        months = np.asarray(group["month"][:])
+        group["month"][:] = months[::-1]
+        assert any("month" in d for d in published_store.coordinate_departures(group, _ZONE))
+
+    def test_the_seeded_month_axis_is_not_a_departure(self, seeded):
+        group = zarr_store.open_store_as_zarr_group(seeded, group="01N")
+        assert not any("month" in d for d in published_store.coordinate_departures(group, _ZONE))
