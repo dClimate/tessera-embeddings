@@ -114,12 +114,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--region", default=DEFAULT_REGION, help="bucket region")
     parser.add_argument("--zones", default="all", help="comma-separated zone list, or 'all'")
     parser.add_argument("--shards", action="store_true", help="also enumerate live shards per zone-year")
+    parser.add_argument(
+        "--anonymous",
+        action="store_true",
+        help="read with no credentials (the published bucket grants public reads)",
+    )
     parser.add_argument("--json", dest="json_out", help="write the full report to this path")
     args = parser.parse_args(argv)
 
     timings: dict[str, float] = {}
     started = time.monotonic()
-    repo = open_global_repo(args.uri, region=args.region)
+    repo = open_global_repo(args.uri, region=args.region, anonymous=args.anonymous)
     timings["repository_open_s"] = round(time.monotonic() - started, 3)
 
     started = time.monotonic()

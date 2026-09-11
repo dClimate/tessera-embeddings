@@ -154,7 +154,7 @@ def _open_zone(payload: dict[str, Any]) -> tuple[zarr.Group, dict[str, float]]:
     zarr.config.set({"async.concurrency": payload["concurrency"]})
     timings: dict[str, float] = {}
     started = time.monotonic()
-    repo = open_global_repo(payload["uri"], region=payload["region"])
+    repo = open_global_repo(payload["uri"], region=payload["region"], anonymous=payload["anonymous"])
     timings["repository_open_s"] = round(time.monotonic() - started, 3)
     started = time.monotonic()
     session = repo.readonly_session(branch="main")
@@ -278,6 +278,11 @@ def main(argv: list[str] | None = None) -> int:
             f"Available: {','.join(w[0] for w in WORKLOADS)}. The open and point phases always run."
         ),
     )
+    parser.add_argument(
+        "--anonymous",
+        action="store_true",
+        help="read with no credentials (the published bucket grants public reads)",
+    )
     parser.add_argument("--json", dest="json_out", help="write the full report here")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -290,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"host:  {host}")
     print(f"store: {args.uri} ({args.region})  zone {args.zone} year {args.year}")
 
-    repo = open_global_repo(args.uri, region=args.region)
+    repo = open_global_repo(args.uri, region=args.region, anonymous=args.anonymous)
     session = repo.readonly_session(branch="main")
     group = zarr.open_group(session.store, mode="r")[args.zone]
     years = _calendar_years(group)
@@ -332,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
     base = {
         "uri": args.uri,
         "region": args.region,
+        "anonymous": args.anonymous,
         "zone": args.zone,
         "time_index": time_index,
         "points": points,

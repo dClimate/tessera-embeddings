@@ -74,12 +74,17 @@ def open_global_repo(
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     region: str | None = None,
     scatter_initial_credentials: bool = False,
+    anonymous: bool = False,
 ) -> icechunk.Repository:
     """Open the global-store repo with the global config layered on.
 
     ``scatter_initial_credentials`` is the caller's call: only it knows whether it will pickle
     this repo. Set it where the session is shipped to workers; leave it off on the read/commit
     sites, which never pickle and would gain nothing for a live secret in a pickle.
+
+    ``anonymous`` reads with no credentials, which is how the published store is served to
+    consumers. The config passed here is layered on top of whatever the store has SAVED, so a
+    reader inherits the writer's manifest splitting and preload tuning either way.
     """
     return icechunk.Repository.open(
         _create_storage(
@@ -87,6 +92,7 @@ def open_global_repo(
             get_credentials=get_credentials,
             region=region,
             scatter_initial_credentials=scatter_initial_credentials,
+            anonymous=anonymous,
         ),
         config=global_store_config(),
     )

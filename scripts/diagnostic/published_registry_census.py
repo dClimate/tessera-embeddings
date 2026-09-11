@@ -55,11 +55,16 @@ DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
 DEFAULT_REGION = "us-west-2"
 
 
-def _filesystem(region: str) -> pyarrow.fs.FileSystem:
-    """An S3 filesystem for the registry, using the ambient credential chain."""
+def _filesystem(region: str, *, anonymous: bool = False) -> pyarrow.fs.FileSystem:
+    """An S3 filesystem for the registry — anonymous, or on the ambient credential chain.
+
+    ``anonymous`` matters for more than convenience: the registry sits in a bucket whose policy
+    grants public reads, so a consumer without an AWS account reads it that way, and a diagnostic
+    that only ever signs its requests cannot tell whether that consumer's path works.
+    """
     from pyarrow.fs import S3FileSystem
 
-    return S3FileSystem(region=region)
+    return S3FileSystem(region=region, anonymous=anonymous)
 
 
 def _parts(fs: pyarrow.fs.FileSystem, root: str) -> list[dict[str, Any]]:
@@ -191,7 +196,13 @@ def _aoi_query(
 
 
 def _verify_against_store(
-    fs: pyarrow.fs.FileSystem, root: str, store_uri: str, region: str, zones: list[str]
+    fs: pyarrow.fs.FileSystem,
+    root: str,
+    store_uri: str,
+    region: str,
+    zones: list[str],
+    *,
+    anonymous: bool = False,
 ) -> list[dict[str, Any]]:
     """Per cell, compare the registry's embedded-tile count with the store's live shard count."""
     import pyarrow.compute as pc
@@ -199,7 +210,7 @@ def _verify_against_store(
 
     prefix = root.removeprefix("s3://").rstrip("/") + "/parts"
     dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=dataset_schema())
-    session = open_global_repo(store_uri, region=region).readonly_session(branch="main")
+    session = open_global_repo(store_uri, region=region, anonymous=anonymous).readonly_session(branch="main")
     root_group = zarr.open_group(session.store, mode="r")
 
     findings: list[dict[str, Any]] = []
@@ -247,10 +258,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--aoi", default="", help="west,south,east,north in WGS84 degrees, to time a coverage query")
     parser.add_argument("--aoi-year", type=int, default=2025)
     parser.add_argument("--skip-schema-audit", action="store_true", help="skip the per-part footer read")
+    parser.add_argument(
+        "--anonymous",
+        action="store_true",
+        help="read with no credentials (the published bucket grants public reads)",
+    )
     parser.add_argument("--json", dest="json_out")
     args = parser.parse_args(argv)
 
-    fs = _filesystem(args.region)
+    fs = _filesystem(args.region, anonymous=args.anonymous)
     started = time.monotonic()
     parts = _parts(fs, args.registry)
     listing_s = round(time.monotonic() - started, 2)
@@ -327,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     disagreements: list[dict[str, Any]] = []
     if args.verify_zones:
         zones = args.verify_zones.split(",")
-        findings = _verify_against_store(fs, args.registry, args.store, args.region, zones)
+        findings = _verify_against_store(fs, args.registry, args.store, args.region, zones, anonymous=args.anonymous)
         report["store_cross_check"] = findings
         print(f"\ncross-check against the store ({len(zones)} zone(s)):")
         print(f"  {'cell':<12} {'complete':>8} {'rows':>6} {'embedded':>9} {'shards':>7}  verdict")
