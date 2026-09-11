@@ -1,11 +1,13 @@
 # One area, or the whole world
 
 This library does one thing: it turns satellite imagery into **embeddings** — a compact numerical
-summary of what each 10-metre patch of ground looked like over a year, which you can then feed to
-a downstream model instead of the raw imagery.
+summary of what each patch of ground looked like over a year, which you can then feed to a
+downstream model instead of the raw imagery. A patch is 10 metres square by default, and on the
+single-area path the pixel size is a parameter you can change.
 
 There are two ways to run it. You can point it at **one area you care about**, or you can run the
-**global campaign** that covers all the world's land. This page explains how they relate, because
+**global campaign** that covers the world's land between 59.45°S and 83.65°N — Antarctica is
+excluded by decision, not omitted by accident. This page explains how they relate, because
 the honest answer is that they are far more alike than different, and knowing which differences
 are real will save you guessing.
 
@@ -22,10 +24,12 @@ Both paths run the same three stages in the same order, with the same code:
                                     can read
 ```
 
-The global campaign adds a fourth step the single-area path does not have: once a zone-year is
+The global campaign can add a fourth step the single-area path does not have: once a zone-year is
 written and tagged, it dispatches a validation run that produces figures and a machine-readable
 verdict on the published cell. That is how bad published data gets noticed in a job too large to
-inspect by hand.
+inspect by hand — but it is **configured, not automatic**. The validation deployment defaults to
+unset, and with nothing set the dispatch does nothing, so a campaign you run yourself gets no
+validation unless you supply one.
 
 The **model is identical** and the **ingest is identical**. Assembly shares its code up to the
 point of writing, and then the two write differently — the global path lays down whole 2048-pixel
@@ -35,13 +39,18 @@ is how much you run at once, how you say which ground you want, and what the out
 like when it lands.
 
 If you are choosing: use the single-area path unless you actually need global coverage. It is
-simpler, it runs on one machine, and it is more flexible about time periods.
+simpler and more flexible about time periods, and it can run entirely on one machine — the
+quickstart does. (The full Prefect pipeline flow provisions a Dask cluster for the ingest stage and
+auto-sizes it from the area, so "one machine" describes the plain runner rather than every
+single-area entry point.)
 
 ## What is genuinely the same
 
 **The same inference code runs in both.** The single-area flow and the global campaign both call
-the same `run_inference` function, on the same model checkpoint, producing the same
-128-dimensional embedding per pixel. There is no "global model" and no "small model".
+the same `run_inference` function, producing the same 128-dimensional embedding per pixel. There is
+no "global model" and no "small model" — by default they run the same checkpoint too, though the
+single-area path lets you point at another one with `checkpoint_url`, in which case the outputs are
+of course no longer comparable.
 
 **The same ingest code runs in both, and it sees the same kind of input.** This is the part that
 surprises people. The global campaign holds its coverage information in one format and the
@@ -77,10 +86,20 @@ would be holes; and fifteen observations is the line below which an embedding wa
 trustworthy.
 
 **What this means in practice.** If you compare your own single-area output against the published
-global store and the pixels disagree, check these two settings before looking for a bug. If you
-want your own run to match the published dataset, set both to the campaign's values. And because
-they are per-run settings, the global store stamps `optical_min_obs` when it is seeded, so a
-consumer can read which line a cell was actually measured against rather than assuming.
+global store and the pixels disagree, check these settings before looking for a bug.
+
+**Exact parity is not reachable from the single-area entry points today, and you should know that
+before trying.** `allow_s2_only` is a parameter you can pass. `optical_min_obs` is **not exposed**
+on either documented single-area path — neither the plain runner nor the Prefect flow reads it — so
+a single-area run applies no optical-depth floor and there is currently no way to ask it for the
+campaign's fifteen. Wiring it through would be a small change to the library, not a configuration
+choice.
+
+The global store does record which line was used: it stamps `optical_min_obs` when it is seeded, so
+a consumer can read what a cell was measured against rather than assuming. Ingest thresholds are
+per-run in the same way — `min_valid_coverage`, the percentage of valid pixels a date needs to be
+kept at all, defaults to 5% and can be overridden per run — so if you need to match a published
+cell exactly, read the settings recorded on it rather than trusting any default written here.
 
 ## What actually differs
 
@@ -140,6 +159,10 @@ turn into that grid will work.
 that is what that campaign is for. Yours can be a city, a catchment, a set of farm boundaries, a
 protected area, a coastline, a study plot, or a lake — anything you can draw. The code only ever
 asks "is this pixel wanted?"
+
+**What the mask does not free you from is radar.** The single-area path resolves a Sentinel-1 orbit
+for the run and will not accept "none", so an area with no Sentinel-1 store behind it cannot
+complete — ingest both sensors, even if your interest is optical.
 
 Two supported ways to make one, both a single flow run:
 
@@ -250,6 +273,11 @@ free and instant compared with computing anything.
 > ds = xr.open_zarr(session.store, group="33N", consolidated=False, decode_coords="all")
 > print(ds.attrs["years_complete"])      # the years you can read
 > ```
+>
+> **This needs AWS credentials resolvable on your machine**, even though the bucket is public: the
+> library has no unsigned-read path today, so with nothing in the environment or an instance
+> profile it fails before it reaches the attribute. Any valid credentials will do — they are used
+> to sign the request, not to authorise it.
 >
 > **Read that list carefully, because it distinguishes two different things from a third.** A year
 > *in* the list either holds data or was deliberately marked as having none — an all-ocean zone, or

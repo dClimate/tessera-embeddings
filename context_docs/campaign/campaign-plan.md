@@ -597,7 +597,8 @@ seeded, and cannot be until write access to the Open Data bucket exists** (item 
 > the campaign ran to completion, and the published store now holds 120 zone groups with 992 cells
 > filled — 3,243,043 tile-years, 99.83% of the roster. Verified by reading it: `years_complete` on
 > `33N` lists all nine years. Fourteen cells are unfilled, all of them early years over tiny or
-> remote land. The outturn is `campaign-cost-model.md` §12. **This paragraph is kept struck rather
+> remote land. The measured outturn is being written up in `campaign-cost-model.md` (PR 148);
+> until that lands, this paragraph and `corrections-register.md` are the record. **This paragraph is kept struck rather
 > than deleted because it was quoted, in review of another change, as evidence that the dataset
 > should not be advertised as readable.** The store that
 had been seeded in prod's own bucket before the publish target changed was deleted on 2026-08-13
