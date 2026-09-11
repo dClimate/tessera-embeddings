@@ -26,11 +26,12 @@ Produces artifacts the campaign depends on.
 | `build_landmask_coverage.py` | Builds, verifies and validates the campaign land-mask coverage store from the partner TIFF delivery ([ADR 010](../context_docs/decisions/010-landmask-registry-coverage.md)). The mask is the campaign's work list. |
 | `record_stac_cassettes.py` | Re-records the VCR cassettes the integration and parity tests replay. Hits the STAC endpoints only, never COG bodies. Needs Earthdata credentials. |
 
-## `publish/` — supported tooling that MUTATES a published artifact
+## `maintenance/` — supported tooling that MUTATES something already in service
 
-One script, and the directory exists to keep it away from the read-only tools. Anything here
-changes something consumers are already using, so it dry-runs by default and refuses to write a
-store whose state is not the one its safety evidence was gathered against.
+One script today, and the directory exists to keep it away from the read-only tools. Anything here
+changes something consumers are already using, which is why the bar is higher than for a
+diagnostic: it should dry-run by default, refuse rather than adapt when it finds state its
+evidence was not gathered against, and be able to undo itself.
 
 | script | what it does |
 |---|---|

@@ -31,11 +31,11 @@ immediately re-reads the store and verifies that nothing but the configuration m
 else did, it says so and names the backup object to restore from. ``--rollback`` puts the writer's
 configuration back.
 
-    uv run python scripts/build/set_published_store_reader_config.py                  # dry run
+    uv run python scripts/maintenance/set_published_store_reader_config.py                  # dry run
     PUBLISHED_STORE_WRITER_ROLE_ARN=arn:aws:iam::601791338954:role/... \
-        uv run python scripts/build/set_published_store_reader_config.py --apply
+        uv run python scripts/maintenance/set_published_store_reader_config.py --apply
     PUBLISHED_STORE_WRITER_ROLE_ARN=... \
-        uv run python scripts/build/set_published_store_reader_config.py --rollback
+        uv run python scripts/maintenance/set_published_store_reader_config.py --rollback
 """
 
 from __future__ import annotations
@@ -54,19 +54,27 @@ from tessera_embeddings.storage.zarr_store import _create_storage, global_store_
 DEFAULT_URI = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGION = "us-west-2"
 
-#: A zone read back after the write, as a cheap end-to-end check that the store still works. Small,
-#: so it costs a second; any zone would do.
-SPOT_CHECK_ZONE = "16S"
+#: Preferred zone for the post-write read-back, because it is small and so costs about a second.
+#: NOT required to exist: naming a zone only the published store has made this script report a
+#: failure against every other store, which is the same defect as hard-coding anonymous reads — a
+#: check that can only run against production cannot be rehearsed before production.
+PREFERRED_SPOT_CHECK_ZONE = "16S"
 
 
 def read_state(uri: str, region: str) -> dict[str, Any]:
     """The state a configuration write must not disturb, read with no configuration supplied.
 
-    Opened anonymously and with no config, so what comes back is what the STORE holds rather than
-    anything this process handed it — which is the whole point, since `open_global_repo` would
-    supply `global_store_config()` and mask a store that had lost its own.
+    **Opened with no config**, so what comes back is what the STORE holds rather than anything this
+    process handed it — which is the whole point, since `open_global_repo` supplies
+    `global_store_config()` and would mask a store that had lost its own.
+
+    Reads on the AMBIENT credential chain, not anonymously. Forcing anonymous worked against the
+    published store, whose bucket policy grants public reads, and made this script impossible to
+    rehearse anywhere else: pointed at a throwaway store it failed with `AccessDenied` before
+    reaching the write it was meant to be testing. Credentials are orthogonal to the thing that
+    matters here, which is passing no configuration.
     """
-    repo = icechunk.Repository.open(_create_storage(uri, anonymous=True, region=region))
+    repo = icechunk.Repository.open(_create_storage(uri, region=region))
     tags = sorted(repo.list_tags())
     return {
         "spec_version": str(repo.spec_version),
@@ -193,8 +201,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  tags {after['tag_count']}, branch tip {after['branch_tips'].get('main')}")
 
     ok = True
-    if after["preload_refs"] != (before["preload_refs"] if want_preload else 0):
-        print("  PROBLEM: the configuration did not take")
+    # Compared against what this package WRITES for the requested direction, not against the value
+    # the store happened to hold before. The earlier form asked whether the new value equalled the
+    # OLD one whenever restoring, which is false exactly when a rollback succeeds — a spurious
+    # failure at the one moment somebody is undoing something and least wants to doubt the tool.
+    expected_refs = global_store_config(preload_manifests=want_preload).manifest.preload.max_total_refs
+    if after["preload_refs"] != expected_refs:
+        print(f"  PROBLEM: the configuration did not take — refs {after['preload_refs']}, wanted {expected_refs}")
         ok = False
     if moved:
         print(f"  PROBLEM: something other than the configuration changed: {moved}")
@@ -205,14 +218,19 @@ def main(argv: list[str] | None = None) -> int:
 
     # One real read, because a store whose metadata reconciles can still have broken references.
     try:
-        session = icechunk.Repository.open(
-            _create_storage(args.uri, anonymous=True, region=args.region)
-        ).readonly_session(branch="main")
-        group = zarr.open_group(session.store, mode="r")[SPOT_CHECK_ZONE]
-        years = list(group.attrs["years_complete"])
-        print(f"  spot check: {SPOT_CHECK_ZONE} still opens and reports {len(years)} complete years")
+        session = icechunk.Repository.open(_create_storage(args.uri, region=args.region)).readonly_session(
+            branch="main"
+        )
+        root = zarr.open_group(session.store, mode="r")
+        present = sorted(name for name, _ in root.groups())
+        zone = PREFERRED_SPOT_CHECK_ZONE if PREFERRED_SPOT_CHECK_ZONE in present else (present or [None])[0]
+        if zone is None:
+            print("  spot check: the store holds no zone groups, so there is nothing to read back")
+        else:
+            years = list(root[zone].attrs["years_complete"])
+            print(f"  spot check: {zone} still opens and reports {len(years)} complete years")
     except Exception as exc:
-        print(f"  PROBLEM: {SPOT_CHECK_ZONE} no longer reads: {type(exc).__name__}: {exc}")
+        print(f"  PROBLEM: the store no longer reads: {type(exc).__name__}: {exc}")
         ok = False
 
     if not ok:
