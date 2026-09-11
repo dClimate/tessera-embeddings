@@ -61,8 +61,8 @@ when one fails.
 
 
 ```
-   a naive run             ingest then inference     ~12 days     5.6 PB of mosaics at once
-   the campaign             ingest alongside it       ~5.1 days    ~340 TB at once
+   a naive run             ingest then inference     ~12 days     14 PB of mosaics at once
+   the campaign             ingest alongside it       ~5.1 days    ~850 TB at once
 ```
 
 **~5.1 days is the campaign's wall clock.** It is ~60 cells of ingest feeding 2,500 GPU actors
@@ -76,17 +76,11 @@ Two design properties get it there, and neither is an optimisation the campaign 
 **Ingest and inference are staged, not sequential.** Ingest builds a zone-year's mosaic on
 Fargate; inference consumes it on GPU and the mosaic is deleted. They use different resource
 pools, so overlapping them costs neither side. And because mosaics are transient, what is held at
-once is `cells in flight × ~5.6 TB` rather than the whole 5.6 PB (5.6 PB over 1,008
-zone-years). Run sequentially, that full volume is held at once and storage alone becomes about
-**$128,000 a month** instead of ~$3,000.
-
-> **WITHDRAWN 2026-09-11: the mosaic volume was 2.5× this.** The campaign wrote **14.04 PB** of
-> mosaics, 14.12 TB a cell, counted object by object from S3 Inventory — see
-> [`campaign-cost-model.md`](campaign-cost-model.md) §12c. The design argument above survives
-> unchanged and in fact strengthens, since staging the two phases avoided holding 14 PB rather
-> than 5.6 PB; only the figure is wrong. This plan does not record how 5.6 TB a cell was derived,
-> so the gap is not attributable to any one assumption. It is the mechanism behind transient
-> storage costing 24× its modelled line.
+once is `cells in flight × 14.12 TB` rather than the whole **14.04 PB** of mosaics the campaign
+writes — counted object by object from S3 Inventory,
+[`campaign-cost-model.md`](campaign-cost-model.md) §12c. Run sequentially, that full volume is held
+at once and storage alone becomes a six-figure monthly bill instead of the transient line measured
+at **$73,180** for the whole campaign (cost-model §12).
 
 > **The three stages are also UNGATED with respect to each other, and that was a measured
 > correction** (PR #149, 2026-08-26). The campaign asked for 60 concurrent ingests and **ran 7**,
@@ -309,10 +303,9 @@ row is the exception and carries no star deliberately: the published store is no
 it is a property of the production account's paths, so it cannot be passed, mistyped or omitted. It
 is in this table because it is the most consequential value in it.
 
-> **THE CAMPAIGN RAN BOTH FLEET SHAPES, and the reason given below for choosing one is
-> withdrawn.** Every dispatch up to 2026-09-08 took these defaults — **10 clusters of 250
-> actors** — and the 2026-09-09 relaunch passed **25 clusters of 100**. Both are supported and
-> the choice is free.
+> **BOTH FLEET SHAPES ARE SUPPORTED AND THE CHOICE IS FREE.** These defaults are **10 clusters
+> of 250 actors**; **25 clusters of 100** is equally valid, and the campaign ran both — the
+> dispatches up to 2026-09-08 on the first and the 2026-09-09 relaunch on the second.
 >
 > **It barely changes the cost.** The bill is dominated by total card-hours times price, and
 > splitting a given actor total across more or fewer clusters moves neither term. The one term it
@@ -321,26 +314,24 @@ is in this table because it is the most consequential value in it.
 > figures are shape-independent at that tolerance, and not exactly.
 >
 > **It does change the assembly crossover**, which is per cluster: a cluster's single assembly
-> thread does not speed up as its actor count rises. The "~275-actor ceiling" cited below came from
-> an assembly rate since re-measured 1.7× slower, and there is no single ceiling. **Nor is there a
-> single replacement.** The crossover is a function of the assembly POOL WIDTH *and* of which
-> cell's inference rate the assembly rate is divided by, and the two available inference figures
-> are 2.5× apart — so at the shipped 16 workers it lands anywhere from **158 to 394 actors**.
-> **250 sits inside that range, so nothing measured says which side of the line the campaign's
-> wide shape ran on**; the only matched pair of measurements, both from 48N-2017, puts it on the
-> safe side. **100 actors is under every crossover on every basis**, which is the one statement
-> that needs no argument, and widening the pool raises the crossover on every basis — that one
-> mechanically, since more workers cannot slow a fixed cell down, but NOT by a measured factor:
-> the 16- and 32-worker assembly rates are themselves from different cells. The relaunch
-> did both at once. Arithmetic in `campaign-cost-model.md` §6c and
+> thread does not speed up as its actor count rises. **There is no single ceiling.** The crossover
+> is a function of the assembly POOL WIDTH *and* of which cell's inference rate the assembly rate
+> is divided by, and the two available inference figures are 2.5× apart — so at the shipped 16
+> workers it lands anywhere from **158 to 394 actors**. **250 sits inside that range, so nothing
+> measured says which side of the line a 250-actor cluster runs on**; the only matched pair of
+> measurements, both from 48N-2017, puts it on the safe side. **100 actors is under every
+> crossover on every basis**, which is the one statement that needs no argument, and widening the
+> pool raises the crossover on every basis — that one mechanically, since more workers cannot slow
+> a fixed cell down, but NOT by a measured factor: the 16- and 32-worker assembly rates are
+> themselves from different cells. Arithmetic in `campaign-cost-model.md` §6c and
 > `tests/unit/inference/test_gpu_starvation.py`; outturn in §12.
 
 | parameter | value | why |
 |---|---|---|
 | **published store** | **`s3://tessera-embeddings/v1.1/dclimate.icechunk`** | the AWS Open Data bucket, not ours — it carries the storage cost and serves the dataset publicly. Set as `BucketPaths.global_store_uri` on the PROD account's paths, so it is a property of the account rather than a parameter an operator can get wrong. Every producer and consumer of the store reads it from that one method, and no dev or branch deployment carries it, so nothing but production can reach the public bucket |
 | `fill_strategy` | `"chained-clusters"` | one cluster per zone-set, not per zone-year |
-| **`max_parallel_clusters`** | **10** ★ — **also run at 25** | 10 x 250 actors reaches the full 2,500-actor quota while keeping each cluster's assembly thread under its ~275-actor ceiling (§6). Balance holds to ~16, and each cluster still opens on one of the 10 densest zones. **The ~275 ceiling is withdrawn — see the note above the table. 25 clusters was also run, chosen so a cluster that finishes early releases quota the survivors climb into; it costs the same to within about 0.2%, the difference being one Ray head node per cluster** |
-| **`max_parallel_ingest`** | **60** ★ | fleet-wide cap on simultaneous zone-ingests. With every year in one batch the ingest knee is gone, so this is set by quota and by what the GPU fleet can absorb (§6). **60, not the 61 this table asked for until 2026-08-19, and the reason is division:** each cluster's share is this cap over the cluster count ROUNDED UP, so 61 over 10 aims every cluster at 7 and the fleet at 70 against its own gate of 61 — the gate holds the ceiling, so it oversubscribes rather than breaches, but the clusters queue on it and the log reports a width the fleet never runs at. 60 over 10 is exactly 6. Now the flow DEFAULT, so it needs no passing |
+| **`max_parallel_clusters`** | **10** ★ — **also run at 25** | 10 x 250 actors reaches the full 2,500-actor quota, and each cluster opens on one of the 10 densest zones; balance holds to ~16. **There is no single assembly ceiling — see the note above the table. 25 clusters is the other supported shape, chosen so a cluster that finishes early releases quota the survivors climb into; it costs the same to within about 0.2%, the difference being one Ray head node per cluster** |
+| **`max_parallel_ingest`** | **60** ★ | fleet-wide cap on simultaneous zone-ingests. With every year in one batch the ingest knee is gone, so this is set by quota and by what the GPU fleet can absorb (§6). **60 rather than 61, and the reason is division:** each cluster's share is this cap over the cluster count ROUNDED UP, so 61 over 10 aims every cluster at 7 and the fleet at 70 against its own gate of 61 — the gate holds the ceiling, so it oversubscribes rather than breaches, but the clusters queue on it and the log reports a width the fleet never runs at. 60 over 10 is exactly 6. Now the flow DEFAULT, so it needs no passing |
 | `max_dispatch_rounds` | 2 | **The outer recovery.** How many times the campaign re-dispatches whatever is still missing — rounds, not a per-zone budget. It is the only thing that recovers a child run that DIED, since a killed or cancelled run takes its own retry counter with it (§8) |
 | `immediate_refill` | `false` | **Off for the run in flight; turn it on at the next restart.** A dispatch round is a barrier — it collects every cluster's outcome before re-reading the store — so a cluster that dies early makes its whole roster wait for the round's slowest sibling. On, a settled cluster's still-missing cells go straight back out into the slot it vacated, inheriting its ingest and committer shares so fleet width and cost do not move. Admitted only when the predecessor's terminal state shows its own writers stopped AND a settling delay has passed, so the asynchronous cancellation of its descendants has had time to take effect; the delay is derived from the confirmation budget the fill's own teardown already spends. A crash or a cancellation waits, because neither carries that proof and re-dispatching them automatically is what §8's write-fencing note is about. It admits, it does not RESERVE: nothing locks a cell, so a writer dispatched from outside the campaign is not excluded — the same residual the round's own re-dispatch has always carried, bounded by mosaic commits refusing a second writer rather than merging. Off is byte-for-byte the old path, which is what makes it safe to merge mid-campaign (§8) |
 | `ingest_settings.max_workers` | 60 | S2 fleet width. Shortens each cell, and so the tail of the cluster holding the densest zone (§6) |
@@ -354,7 +345,7 @@ is in this table because it is the most consequential value in it.
 | `require_s1` | `false` | Also registered on the campaign's deployments. A global run never refuses a cell for having no radar; that option exists for an operator filling one named zone-year who wants to be told (§8) |
 | **`optical_min_obs`** | **15** | **The one data-quality line, and the only reason a pixel is refused.** Fewer than fifteen clear optical observations in the year and the pixel is left empty; exactly fifteen is kept. Stamped on the store when it is seeded, so every cell is measured against the same line and a consumer can read what it was. Nothing about radar enters this decision |
 | **`overlap_years`** | **`true`** ★ | every requested year dispatched as one batch, so a zone's later years overlap the inference of its earlier ones and the campaign boots 8 clusters rather than 72. Certified on six cells that each carry both radar orbits, including a same-zone year rollover inside one cluster |
-| `attempts_per_cell_in_cluster` | 2 | **The cheap retry.** One more go at a failed cell on the GPU fleet that is still standing — the cell re-enters the live work stream, reusing its kept mosaic and staged tiles. Covers "the work failed but the machine is fine"; a dead run is `max_dispatch_rounds`' job (§8). **Corrected in place:** until 2026-09-09 this retry ran after the stream, through a per-cell path that called `run_inference` again, so every retried cell rebuilt a fleet — `context_docs/inference/the-fleet-and-the-work-source.md` |
+| `attempts_per_cell_in_cluster` | 2 | **The cheap retry.** One more go at a failed cell on the GPU fleet that is still standing — the cell re-enters the live work stream, reusing its kept mosaic and staged tiles. Covers "the work failed but the machine is fine"; a dead run is `max_dispatch_rounds`' job (§8). The retry happens inside the live work stream precisely so that a retried cell does not rebuild a GPU fleet — `context_docs/inference/the-fleet-and-the-work-source.md` |
 | `force_staging_reuse` | `false` | Escape hatch, and it cannot reach staging created without it: setting it changes the prefix, so it only preserves reuse between runs that both set it. To RESTART onto an earlier campaign's staged tiles, pass `staging_code_identity` (§8) |
 | `staging_code_identity` | `""` | The restart lever. States the fingerprint's code component outright instead of deriving it, which is the only form that reaches an existing prefix. Copy the value from the driver's log of the campaign being resumed. Mutually exclusive with both rows around it (§8) |
 | `force_staging_restage` | `""` | Any new token forces a fresh staging prefix, for a change the source hash cannot see (a dependency upgrade). Abandoning stale staged work is always safe, so unlike the row above this one is usable in production |
@@ -366,10 +357,10 @@ is in this table because it is the most consequential value in it.
 The remaining gates are **Prefect global concurrency limits**, because clusters are separate flow
 runs on separate machines and only a server-side gate can bound them together.
 
-**There used to be a third, `tessera-global-commits`, and it is gone** — see
+**There is no commits gate** — see
 [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §5, which
-carries the measurement, the committer-count threshold that would reopen it, and the detector that
-would say so. Nothing bounds committers now, and no pre-launch provisioning step is needed for one.
+carries the measurement, the committer-count threshold that would open one, and the detector that
+would say so. Nothing bounds committers, and no pre-launch provisioning step is needed for one.
 
 | gate | who creates it | if it is absent |
 |---|---|---|
@@ -495,8 +486,8 @@ zone: [`campaign-validation-and-monitoring.md`](campaign-validation-and-monitori
 
 **Figures here are results, not derivations.** [`campaign-cost-model.md`](campaign-cost-model.md) is
 the source of truth for every number and the arithmetic behind it; where the two disagree, the cost
-model is right. This section says what to run and what it costs, and nothing more — the derivations
-that used to be restated here are one click away and were a second copy of numbers that move.
+model is right. This section says what to run and what it costs, and nothing more; the derivations
+are one click away.
 
 | | |
 |---|---|
@@ -532,9 +523,9 @@ answer — cost-model §4.
    cells provisions all 2,500 actors, so the two are matched exactly, with no slack.
    Read the applied value in the account before relying on either; the request history lags
    amendments to an open case.
-2. *(Removed.)* The commit gate used to be provisioned here. Commits are ungated now
+2. **No gate to provision.** Commits are ungated
    ([`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §5),
-   and the ingest gate was never a pre-launch item: the
+   and the ingest gate is not a pre-launch item either: the
    campaign upserts it from `max_parallel_ingest` at start (§3).
 3. **Coverage/land mask built** for all 120 zones, and its `registry_sha256` frozen. A
    mask rebuild mid-campaign invalidates every completed zone-year's fingerprint.
@@ -789,13 +780,12 @@ billed. Pausing buys time to decide without losing work; it is not a way to sit 
 work it was throttling runs unthrottled — the opposite of the intent, and silent. That is true of
 the inference gate too: it reads an inactive gate as running, so deactivating it un-pauses.
 
-**The gates hold, they do not fail.** A limit at zero used to fail the next cell that reached it,
-because the server refuses a request for more slots than the limit holds and that refusal is not
-retried. The two capacity gates now wait on that state and log it, which is what makes zero a
-pause rather than a way to lose cells. A gate that does not *exist* still fails immediately, and
-must. The inference gate works differently by design — it is **read** rather than acquired, so it
-holds no slot and needs no lease, and a read that fails answers "not paused" so that a wobbly API
-can never stop the campaign working.
+**The gates hold, they do not fail.** The server refuses a request for more slots than a limit
+holds, and that refusal is not retried — so the two capacity gates wait on a zero limit and log
+it, which is what makes zero a pause rather than a way to lose cells. A gate that does not
+*exist* fails immediately, and must. The inference gate works differently by design — it is
+**read** rather than acquired, so it holds no slot and needs no lease, and a read that fails
+answers "not paused" so that a wobbly API can never stop the campaign working.
 
 ### The three retry scopes, and why they are three
 
@@ -812,12 +802,11 @@ and each retries on its own when a source misbehaves. The 6-hour budget caps how
 keep retrying, so a single stuck source cannot hold the cell, or the Dask fleet it is paying for,
 indefinitely.
 
-**Independently means the legs do not wait for each other**, and that is worth stating because it
-used to be the other way round. A failed leg was once held until all three had settled before being
-re-run, which put the wait for the slowest leg onto the cell's own critical path: one radar leg
-failed a minute in and was not re-run for an hour, because it was waiting on an optical leg with an
-hour still to go. Since a cell cannot begin inference until all three have landed, that hour was
-added for nothing. Each leg now re-runs on its own clock, after the short pause in §3.
+**Independently means the legs do not wait for each other.** Each leg re-runs on its own clock,
+after the short pause in §3. Holding a failed leg until all three had settled would put the wait
+for the slowest leg onto the cell's own critical path — a radar leg that fails a minute in would
+sit idle behind an optical leg with an hour still to go — and since a cell cannot begin inference
+until all three have landed, that wait buys nothing.
 
 **A failure no re-run can fix stops at once**, rather than spending the budget proving it. The clearest
 case is a leftover location that a fresh store cannot be created in: its contents decide the error,
@@ -901,9 +890,9 @@ commits rather than a deadlock, and there is no manual release procedure.
 > inference source or the code tarball moves it cannot be recomputed). To resume one specific
 > prefix for one cell, `fill-zone-year`'s explicit `run_id` still does that.
 >
-> This paragraph used to call `run_id` the only reliable lever, which was true per cell and left a
-> campaign with nothing: a driver derives its children's run ids, so there was no way to restart one
-> onto its own staged work. The distinction is DERIVED versus STATED — both `force_staging_*` knobs
+> **`run_id` is a per-cell lever and does not restart a campaign**: a driver derives its
+> children's run ids, so there is no way to point one at its own staged work with `run_id` alone.
+> The distinction is DERIVED versus STATED — both `force_staging_*` knobs
 > compute the identity from the code in front of them, and no computation over changed code
 > reproduces the identity that changed code replaced. The three are mutually exclusive and a run
 > passing more than one is refused at preflight. None of them relaxes a gate on the published store.
@@ -1030,7 +1019,7 @@ if a cell of opportunity lands in that band, reading its observation counts refi
 **Radar observation depth is regional, not latitudinal — do not model it against latitude.**
 Across five measured latitude bands radar depth spans 66–147 tokens per pixel with a correlation
 against latitude of **+0.009**, while optical depth over the same bands gives **+0.912**. The
-deepest radar measured anywhere is the Middle East and the shallowest the Arctic, which points at
+deepest radar in that sample is the Middle East and the shallowest the Arctic, which points at
 the Sentinel-1 observation plan rather than at geometry. Radar's *share* of a sequence does fall
 with latitude, but only because the optical denominator rises. Planning form: a constant **90
 tokens/px, range 66–147** (cost model §6b).
@@ -1077,7 +1066,7 @@ into the section it changed, and history appears only where it explains a decisi
 otherwise look arbitrary.
 
 The register groups them by the mechanism that produced them rather than by file. The mechanism is the part
-that keeps repeating: eight mechanisms cover every one, and most recur across documents that
+that keeps repeating: nine mechanisms cover every one, and most recur across documents that
 do not cite each other. **Read it before publishing a figure or reusing one.**
 
 - [`campaign-cost-model.md`](campaign-cost-model.md) — costs, GPU fleet sizing, the idle-burn

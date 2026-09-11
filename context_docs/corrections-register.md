@@ -248,8 +248,18 @@ one stratification flipped the sign of the conclusion.
   then to choose a fleet shape. Both terms were later re-measured at 1.7–2.6× their modelled
   values — the same cell's assembly took **5.78 h** against the 3.28 h the ratio assumed — so the
   crossover had no supported location. The campaign then ran **25 clusters of 100**, testing
-  neither the cap nor the split.
-  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c, §10)
+  neither the cap nor the split. This register is the record of the withdrawal itself;
+  [`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c and §10 now carry only
+  the replacement — a 158-to-394 crossover range, and a cluster split that costs the same either
+  way.
+
+- **"The deepest radar measured anywhere is 30–35°."** The maximum of one section's own sample,
+  published as the maximum over campaign land, and used to argue that a sample-weighted radar
+  depth under-represents the deep latitudes. Read from the published store the deepest band is
+  **40–45°** (81.1 observations per written pixel against 68.8), and 30–35° is indistinguishable
+  from 35–40° and 45–50°. The *direction* of the land-weighting argument survives and the
+  superlative does not; the claim is now scoped to the sample it came from.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c, §12b)
 
 **The cure:** a two-parameter model needs a third point before it is a model, and a curve
 needs enough points to show it is monotonic before one of them becomes a recommendation.
@@ -286,6 +296,17 @@ needs enough points to show it is monotonic before one of them becomes a recomme
   in one minute. The *inference* from it does not, and the question is now stated as open, needing
   a controlled run.
   ([`assembly/what-bounds-assembly-2026-09-09.md`](assembly/what-bounds-assembly-2026-09-09.md))
+- **"Only 61% of the fleet's cards are working"** — 712 busy against 1,163 switched on — **"and
+  the machine-provisioning loop is outrunning the software that places work on them."** Both
+  halves were wrong, and the explanation was invented before the number was taken apart. 379 of
+  the 451 supposedly-idle machines were **three compute clusters abandoned by cancelled fill
+  runs**, holding no work because the process that would have given them work was dead: a
+  shutdown failure, not a provisioning one. Fleet throughput did not fall when they were switched
+  off — 5,583 tile-years an hour before, 6,230 after — and on the live fleet 766 of 784 cards held
+  work, **98%**. The real finding was the shutdown gap: the sweeper meant to catch abandoned
+  clusters inventories **container tasks**, and these were **virtual machines**. The quantity it
+  cost survives — $590 an hour, about **$9,650**.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12)
 - **"Most of the dead area is not geometric — it is cloud."** Backwards: geometric dead is
   55–66% of live chunks and radiometric 10–21%. *"The claim was made to explain the null
   result and was not measured before being asserted."*
@@ -342,9 +363,18 @@ one most likely to recur, because it is invisible to whoever makes it.
   calculation, which is the hardest kind to grep for.
   ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §5, §12)
 
+- **"71 cells and a 23,000 vCPU Fargate quota, on a 4.5-day ingest wall clock."** The wall clock
+  was `total work ÷ cells`, which assumes work can be spread across the year boundary.
+  `run_global_campaign` barriers on years, so a year cannot finish faster than its single longest
+  zone and the cell count stops buying schedule at **45**. Past that the quota bought nothing at
+  all — not schedule, not supply, not usable GPU fleet — and 45 cells at 60 workers reaches 5.6
+  days on *less* quota than the 71-cell plan asked for. Same shape as the bullet above: sound
+  arithmetic, an unstated input.
+  ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §4, §10)
+
 **The cure is a grep, and it is the cheapest item in this file:** when a figure is
 withdrawn, search every document for the number and for the phrase, not just for the
-section you were editing. Both instances above would have been caught by searching for the
+section you were editing. The instances above would each have been caught by searching for the
 figure itself.
 
 ### 9. A figure published without its derivation, which nothing could then check
@@ -358,8 +388,9 @@ measured, and if nothing measures it, it is believed.
   Inventory once the campaign closed: **14.04 PB, 14.12 TB a cell — 2.5× the estimate**, and the
   mechanism behind storage costing 24× its modelled line. Because the plan never recorded how
   5.6 TB was reached, the gap cannot be attributed to any single assumption, which is the whole
-  cost of the omission: the figure cannot even be debugged. Withdrawn in
-  [`campaign/campaign-plan.md`](campaign/campaign-plan.md) §1; measured in
+  cost of the omission: the figure cannot even be debugged. The estimate stood in
+  [`campaign/campaign-plan.md`](campaign/campaign-plan.md) §1, which now states the measured
+  figure instead; the measurement is in
   [`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §12c.
 - **An OPEN instance: the 4.6 GiB low end of the inference VRAM range.** It appears with no
   measurement behind it and no note of where it came from. It has not been withdrawn, because
