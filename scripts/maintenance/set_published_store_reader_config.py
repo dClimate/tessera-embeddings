@@ -14,11 +14,13 @@ every snapshot record, the metadata, the feature flags and the status. Icechunk 
 and puts it back. On the published store that is the ``main`` pointer and 1,070 completion tags —
 the record of what the campaign delivered.
 
-That write was verified safe before this script was written, not assumed:
-``scripts/diagnostic/repo_config_write_safety.py``, run against a throwaway clone of this store's
-own reference state, showed all 1,070 tags, the branch pointer, the spec version, the manifest
-splitting and the storage settings surviving a rewrite and a rollback unchanged, with the previous
-object copied to ``overwritten/`` first and nothing deleted. Read that before running this.
+That write was verified safe before this script was written, not assumed. A battery run against a
+throwaway clone of this store's own reference state — the real ``repo`` object, all 1,070 tags —
+showed every tag, the branch pointer, the spec version, the manifest splitting and the storage
+settings surviving a rewrite and a rollback unchanged, with the previous object copied to
+``overwritten/`` first and nothing deleted. The evidence is recorded in
+``context_docs/storage/reading-the-published-store.md``; the one-off battery that produced it was
+removed once the question was settled.
 
 **Nothing in our own code is affected either way.** Both places the package opens Icechunk pass a
 configuration explicitly, which replaces the saved one, and forked assembly workers are handed the

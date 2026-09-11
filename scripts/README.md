@@ -35,7 +35,7 @@ evidence was not gathered against, and be able to undo itself.
 
 | script | what it does |
 |---|---|
-| `set_published_store_reader_config.py` | Switches the published store's SAVED manifest preload off, so consumers stop inheriting a setting sized for writing that costs them ~2.5 s of every open and returns nothing. On spec version 2 that rewrites the one object holding every tag and the branch pointers, so run `diagnostic/repo_config_write_safety.py` first and read its evidence. Dry run unless `--apply`; `--rollback` undoes it. |
+| `set_published_store_reader_config.py` | Switches the published store's SAVED manifest preload off, so consumers stop inheriting a setting sized for writing that costs them ~2.5 s of every open and returns nothing. On spec version 2 that rewrites the one object holding every tag and the branch pointers, which was verified non-destructive against a clone of the real store's reference state before this script was written. Dry run unless `--apply`; `--rollback` undoes it. |
 
 ## `diagnostic/` — supported tooling
 
@@ -48,7 +48,6 @@ Answers "why is this environment behaving that way?" and is expected to work on 
 | `published_store_census.py` | Whether the published global store opens, conforms to the declared layout in all 120 zone groups, and agrees with its own completion tags about which cells are done. Exits non-zero on any disagreement. |
 | `published_store_read_bench.py` | Read performance of the published store — open latency, point-vector percentiles, region throughput, bytes on the wire — using the same workloads and concurrency sweep as `scoping/scale_tests/t1_read_bench.py`, so the built store can be compared against the scoped one. |
 | `published_registry_census.py` | Whether the published Parquet registry is shaped as designed, whether a whole-dataset read loses columns, how fast an area-of-interest coverage query answers, and whether the registry's coverage agrees with the store's. |
-| `repo_config_write_safety.py` | Whether rewriting a store's saved configuration can lose anything. On spec version 2 that write rebuilds the one object holding every tag, the branch pointers and every snapshot record, so this proves — against a throwaway store, and optionally against a clone of a real store's reference state — that the tags, the branch tip, the data and the other settings survive it. Run it before changing configuration on anything published. |
 
 ## `scoping/` — kept-for-reference instruments
 

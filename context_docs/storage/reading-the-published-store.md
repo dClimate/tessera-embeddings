@@ -321,6 +321,35 @@ being written: an arm meant to differ only in its chunk cache also reverted the 
 open time moved for the wrong reason. The one-keyword form above avoids the trap by construction —
 it builds the whole config from the same function the writer used, with one field changed.
 
+### 4.3a Changing that setting in the store is safe, and here is why
+
+Since the preload is saved *in* the store, the tidiest fix is to change it there so consumers stop
+inheriting it. That write is bigger than it sounds and was verified before being made.
+
+On a spec-version-2 repository `save_config` does not write a config file off to one side: it
+rewrites the single `repo` object, and that object holds the branch pointers, every tag, the
+deleted-tag list, every snapshot record, the metadata, the feature flags and the status. Icechunk
+rebuilds all of it from its parts and puts it back. Here that is 181 KB carrying the `main` pointer
+and 1,070 completion tags — the record of what the campaign delivered.
+
+The implementation is careful with it: the current object is copied to
+`overwritten/repo.<timestamp>.<id>` first, both the copy and the put are conditional on the version
+the caller read, a lost race raises `RepoInfoUpdated` and retries, and a single object PUT is atomic
+so there is no torn state to observe. `force_write_repo_info`, which bypasses all of that, is marked
+unsafe in the source and is not on this path.
+
+**Measured, not reasoned.** A battery run against a throwaway copy of this store's own `repo`
+object — the real reference state, all 1,070 tags — rewrote the configuration and rolled it back:
+every tag, the branch pointer, the spec version, the manifest splitting and the storage settings
+came through unchanged, the configuration restored byte-identically, a backup object appeared, and
+nothing was deleted. At object level only the `repo` object and its backup were touched, and no
+snapshot was created, so the change does not appear in `ancestry()` and cannot be undone with
+`reset_branch` — it is undone by writing the configuration back, or by restoring the backup.
+
+`scripts/maintenance/set_published_store_reader_config.py` makes the change. It dry-runs by default
+and refuses rather than adapting if the store is not in the state this evidence was gathered
+against.
+
 ### 4.4 Against what scoping predicted
 
 [ADR 008](../decisions/008-global-store-architecture.md) settled the chunk and shard geometry on a
