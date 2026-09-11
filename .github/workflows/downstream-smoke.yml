@@ -37,7 +37,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ vars.DOWNSTREAM_REPO }}
-          ref: main
+          # No `ref`: checkout then resolves that repository's own default branch, which is
+          # not necessarily called `main`. Pinning one would fail before the tests ran.
           # Falls back to the run's own token: checkout REQUIRES a non-empty value, so an
           # omitted secret would fail the checkout rather than read a public project.
           token: ${{ secrets.DOWNSTREAM_READ_TOKEN || github.token }}

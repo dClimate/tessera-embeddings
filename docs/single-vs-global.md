@@ -340,9 +340,13 @@ single-area store, whose convention is one entry per window, labelled by the mon
 By default every embedded pixel has at least one radar observation. Where a fill ran with
 `allow_s2_only=True`, as the global campaign does, optical-only pixels are embedded too, and they
 are exactly those with a finite `scales` value and
-`s1_asc_obs_count + s1_desc_obs_count == 0`. The quality of an optical-only embedding has not been
-validated against a radar-informed one — see
-[ADR-013](../context_docs/decisions/013-optional-s1-s2-only-pixels.md).
+`s1_asc_obs_count + s1_desc_obs_count == 0`. **Embedding them is a deliberate decision, not a
+gap**: about a fifth of the land has no radar at all for 2022–2024, so for those pixel-years the
+choice was radar-free embeddings or none. What does not exist is a *published* comparison of an
+optical-only embedding against a radar-informed one, so if that distinction matters for your use,
+read the two radar counts and decide per pixel rather than assuming the two are interchangeable.
+[ADR-013](../context_docs/decisions/013-optional-s1-s2-only-pixels.md) records the decision and
+what is still owed.
 
 Reference docs:
 [`xarray.open_zarr` / `decode_coords`](https://docs.xarray.dev/en/stable/generated/xarray.open_zarr.html) ·
