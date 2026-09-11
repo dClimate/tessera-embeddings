@@ -152,6 +152,13 @@ def _zone_report(root: zarr.Group, zone: str, *, with_shards: bool, session: ice
     # no time slot. Unchecked it also makes the "never filled" arithmetic wrong, and can turn it
     # negative.
     unexpected_years = [y for y in years if y not in CAMPAIGN_YEARS]
+    # The group's OWN time axis, decoded and compared — not just the completion attribute against a
+    # constant. A shifted or duplicated axis passes every attribute and tag check while a labelled
+    # reader asking for 2021 gets another year's data, and nothing above would notice, because
+    # `years_complete` is a list of integers with no link to the coordinate it is describing.
+    calendar = _calendar_years(group)
+    if tuple(calendar) != CAMPAIGN_YEARS:
+        departures.append(f"{zone}: time coordinate decodes to {calendar}, the campaign axis is {list(CAMPAIGN_YEARS)}")
     report: dict[str, Any] = {
         "zone": zone,
         "crs": attrs.get("crs"),
@@ -159,6 +166,7 @@ def _zone_report(root: zarr.Group, zone: str, *, with_shards: bool, session: ice
         "years_complete": years,
         "years_missing": [y for y in CAMPAIGN_YEARS if y not in years],
         "years_unexpected": unexpected_years,
+        "time_axis": calendar,
         "layout_departures": departures,
         "open_s": round(time.monotonic() - opened, 3),
         # A year in `runs` but not in `years_complete` would mean a fill that wrote data and never
@@ -175,7 +183,6 @@ def _zone_report(root: zarr.Group, zone: str, *, with_shards: bool, session: ice
         # year's attributes, so a crash between the two commits leaves real data in a year nothing
         # records as complete — and a reader asking `years_complete` will never look at it. Only
         # reachable with `--shards`, because it needs the per-year coverage.
-        calendar = _calendar_years(group)
         report["live_shards_in_incomplete_years"] = {
             str(calendar[index]): len(shards)
             for index, shards in sorted(coverage.items())

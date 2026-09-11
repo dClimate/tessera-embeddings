@@ -184,7 +184,7 @@ def _aoi_query(
         & (pc.field("bbox_east") >= west)
         & (pc.field("bbox_south") <= north)
         & (pc.field("bbox_north") >= south),
-        columns=["tile", "embedded", "refused_px", "eligible_px", "median_obs_where_thin", "assembled_at"],
+        columns=["zone", "tile", "embedded", "refused_px", "eligible_px", "median_obs_where_thin", "assembled_at"],
     )
     # LATEST RUN PER TILE, for the same reason the store cross-check needs it: a refill leaves the
     # original part in place, so a tile filled twice would be counted twice here and its refused
@@ -198,6 +198,7 @@ def _aoi_query(
         "wall_s": round(time.monotonic() - started, 2),
         "tiles_overlapping": len(rows),
         "rows_before_dedup": table.num_rows,
+        "zones_overlapping": sorted({str(r["zone"]) for r in rows}),
         "tiles_embedded": sum(1 for v in embedded if v),
         "tiles_not_embedded": sum(1 for v in embedded if not v),
         "refused_px_total": sum(refused),
@@ -222,8 +223,13 @@ def _tile_coordinate(label: str) -> tuple[int, int] | None:
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 
-def _latest_per_tile(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Keep one row per tile — the one with the latest ``assembled_at``.
+def _latest_per_tile(rows: list[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
+    """Keep one row per ``(zone, tile)`` — the one with the latest ``assembled_at``.
+
+    **Keyed on the zone as well as the label**, because a label is only ``chunk_<row>_<col>`` and
+    every zone has a ``chunk_3_2``. An area of interest can straddle two UTM zones, so keying on
+    the label alone would collapse unrelated tiles into one and UNDERCOUNT the coverage a consumer
+    asked about. Rows from a per-zone query carry the same zone throughout, where this is a no-op.
 
     The registry's latest-wins rule, applied rather than assumed away. A tie keeps the row already
     held: arbitrary but stable, and a tie means two runs stamped the same instant, which nothing in
@@ -235,13 +241,14 @@ def _latest_per_tile(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     ``Z`` instead, or a local offset, would sort wrongly and silently — so this parses rather than
     trusting the ordering, and says so if a value does not match the expected shape.
     """
-    latest: dict[str, tuple[datetime, dict[str, Any]]] = {}
+    latest: dict[tuple[str, str], tuple[datetime, dict[str, Any]]] = {}
     for row in rows:
         stamp = datetime.fromisoformat(str(row["assembled_at"]))
-        held = latest.get(row["tile"])
+        key = (str(row.get("zone", "")), str(row["tile"]))
+        held = latest.get(key)
         if held is None or stamp > held[0]:
-            latest[row["tile"]] = (stamp, row)
-    return {tile: row for tile, (_, row) in latest.items()}
+            latest[key] = (stamp, row)
+    return {key: row for key, (_, row) in latest.items()}
 
 
 def _verify_against_store(
