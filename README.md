@@ -39,6 +39,27 @@ Alongside the library we ship **reference orchestration**: opinionated
 Prefect flows and AWS provisioning helpers that demonstrate how we
 run this at production scale. They are examples, not requirements.
 
+## One area, or the whole world
+
+There are two ways to run this, and they are more alike than they look.
+
+**One area.** You supply an area of interest — a polygon, a set of Sentinel-2 tiles, or any mask
+you can draw — and get embeddings for it over any twelve-month window you choose. This runs on one
+machine; the [quickstart](docs/quickstart.md) does it on a laptop in a few minutes.
+
+**The whole world.** The same pipeline, run as a campaign over all the world's land, one UTM zone
+and one calendar year at a time. The result is published as
+**global TESSERA v1.1** at `s3://tessera-embeddings/v1.1/dclimate.icechunk/`, so in most cases you
+can read it rather than compute anything.
+
+**The model, the ingest and the assembly are the same code in both.** What differs is scale, how
+you say which ground you want, and two conventions in the output store — most importantly that the
+global store holds calendar years only, while a single area can use any twelve-month window.
+
+**→ [`docs/single-vs-global.md`](docs/single-vs-global.md)** explains the differences that are
+real, including how to supply your own mask (it does not have to be land) and why the global store
+insists on calendar years.
+
 ## What this isn't
 
 - **Not a universal orchestration framework.** Prefect is the
@@ -560,6 +581,13 @@ src/tessera_embeddings/
 
 ## Documentation
 
+- [`docs/README.md`](docs/README.md) — what is in `docs/` and how it
+  differs from `context_docs/`. Start here if you are not sure which
+  you want.
+- [`docs/single-vs-global.md`](docs/single-vs-global.md) — running for
+  one area versus the global campaign: what is shared, what differs,
+  how to supply your own mask, and why the global store takes calendar
+  years only.
 - [`docs/quickstart.md`](docs/quickstart.md) — laptop demo
   end-to-end, including GPU inference.
 - [`docs/environment-setup.md`](docs/environment-setup.md) — lock
