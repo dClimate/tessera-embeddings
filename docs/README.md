@@ -11,7 +11,7 @@ what was tried and abandoned — you want [`context_docs/`](../context_docs/) in
 | you want to… | go to |
 |---|---|
 | run the pipeline for the first time | [`quickstart.md`](quickstart.md) |
-| know what you can set, and what it does | [`configuration.md`](configuration.md) |
+| know what the configuration objects hold, and what each field does | [`configuration.md`](configuration.md) |
 | get a working Python environment | [`environment-setup.md`](environment-setup.md) |
 | stand up the reference orchestrator | [`prefect-setup.md`](prefect-setup.md) |
 | run it on AWS | [`providers/aws.md`](providers/aws.md) |

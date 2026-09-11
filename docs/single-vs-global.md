@@ -34,7 +34,13 @@ validation unless you supply one.
 The **model is identical** and the **ingest is identical**. Assembly shares its code up to the
 point of writing, and then the two write differently — the global path lays down whole 2048-pixel
 tiles into slots that were set aside in advance, which is what lets many machines add to one
-dataset at once; the single-area path creates or extends a store of its own. What changes overall
+dataset at once; the single-area path creates or extends a store of its own. That difference
+reaches the data in one place, and it is worth knowing before you compare the two: where a tile
+was looked at and refused — no pixel in it passed the quality rules — the global path still writes
+the observation counts it measured there, while the single-area path leaves them at fill. So a
+refused footprint reads as zero observations in a single-area output and as the real count in the
+global store. The embeddings are fill either way; it is the counts beside them that disagree. The
+asymmetry is deliberate, and the reason is in a comment at the write site. What changes otherwise
 is how much you run at once, how you say which ground you want, and what the output store looks
 like when it lands.
 
@@ -146,6 +152,14 @@ computed.
 twelve months up to and including it. Ask for `"June 2025"` and you get July 2024 through June
 2025. This is genuinely useful: a growing season, a monsoon year, or a window chosen to sit
 between two events rarely lines up with January.
+
+> **You set the window and the imagery range separately, and on the plain runner nothing checks
+> they agree.** A config carries both a `time_window_end`, which is the label the output is written
+> under, and a `time_range`, which is the span actually ingested. The Prefect flow refuses a window
+> its inputs do not cover; the plain runner does not check at all, so it will happily label one
+> month of imagery as a twelve-month embedding — the shipped quickstart config does exactly that,
+> deliberately, to keep a laptop run short. **If you intend a real twelve-month embedding, set
+> `time_range` to span those twelve months yourself.**
 
 **The global store takes calendar years only.** Ask the global path for anything but January to
 December and it refuses before it spends any money on GPUs.
