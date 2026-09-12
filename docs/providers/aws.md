@@ -330,10 +330,24 @@ much of the enforcing, not the configuration.
 
 Ray's ceilings count nodes and cannot be jointly weighted, so there is nowhere to express the
 combined limit. That is an accepted limitation rather than an oversight, but size it yourself
-before assuming the ceilings bind. Per cluster take `min(206, num_actors)` GPUs, multiply by
-the vCPU of whichever rung actually fills them — 4 for `g6e.xlarge`, 8 for `g5.2xlarge`, so
-the mix moves the answer twofold — then multiply by the cluster count and compare against your
-own quota.
+before assuming the ceilings bind — **and count the two rungs separately**, because they have
+independent ceilings and different vCPU costs. Per cluster:
+
+```
+primary_nodes  = min(primary_ceiling,  num_actors)
+fallback_nodes = min(fallback_ceiling, num_actors - primary_nodes)
+vCPU           = 4 * primary_nodes + 8 * fallback_nodes    # g6e.xlarge, g5.2xlarge
+```
+
+then multiply by the cluster count. Collapsing that to a single rung understates a mixed
+fleet: at 150 actors it is 101 primary plus 49 fallback, **796 vCPU**, where multiplying 150
+by 4 would say 600.
+
+**For quota planning take the fallback-heavy case rather than that one.** The order above
+assumes the primary rung fills first, which is what happens when supply allows. When it does
+not — the situation the fallback exists for — the fallback fills first, and the same 150
+actors become 45 primary plus 105 fallback, **1,020 vCPU**. The quota you need is set by the
+arrangement you get on a bad day, not a good one.
 `TestTheCampaignRestartConfiguration` pins the configuration the library ships with.
 
 **The vCPU-matched sizes are deliberately not offered.** `g5.xlarge` and `g6.xlarge` are
