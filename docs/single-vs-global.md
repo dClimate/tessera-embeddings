@@ -550,7 +550,7 @@ free and instant compared with computing anything.
 > is configured for readers, so opening it does no extra work on your behalf and there is no
 > performance argument to tune.
 >
-> **Read the zone.attrs["year_complete"] list carefully,**
+> **Read the zone.attrs["years_complete"] list carefully,**
 > **because it distinguishes two different things from a third.** A year
 > *in* the list either holds data or was deliberately marked as having none — an all-ocean zone, or
 > land where the campaign looked and found nothing usable. Either way the question has been

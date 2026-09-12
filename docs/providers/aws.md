@@ -311,17 +311,29 @@ what AWS is supplying costs nothing unclaimed and converts straight into more ac
 vCPU if supply recovers, while the fallback ceiling is what decides the bill in the
 meantime.
 
-**Both rungs full exceeds the quota, but only once you multiply by the cluster count** — and
-that multiplier is the part worth writing down. One cluster at both ceilings is
-`101 × 4 + 840 = 1,244` vCPU, comfortably inside a 10,000 vCPU quota. The breach starts at
-**nine concurrent clusters** (11,196 vCPU); eight fit, at 9,952. The global campaign ran both
-shapes — 10 clusters of 250 actors until 2026-09-08, then 25 of 100 — which is 12,440 and
-31,100 vCPU of ceiling against 10,000 of quota. So in practice AWS refusing launches did most
-of the enforcing, not the configuration. Ray's ceilings count nodes and cannot
-be jointly weighted, so there is nowhere to express the combined limit. That is an accepted
-limitation rather than an oversight, but size it yourself before assuming the ceilings bind:
-the number to check is `clusters × (primary_ceiling × vCPU_per_primary + fallback_vcpu_budget)`
-against your own quota.
+**Two caps sit on each cluster, and the smaller one binds.** The rung ceilings cap *nodes* —
+101 primary plus 105 fallback, so 206 GPUs — while `num_actors` caps how many of those a
+cluster can ever occupy, because a production actor reserves a whole GPU. Establish which is
+binding before doing any vCPU arithmetic: the campaign's two shapes were governed by
+different ones.
+
+| shape | nodes allowed | actors allowed | binds | vCPU over all clusters |
+|---|---|---|---|---|
+| 10 × 250, to 2026-09-08 | 206 | 250 | the rung ceilings | 12,440 (`10 × 1,244`) |
+| 25 × 100, after | 206 | 100 | **the actor cap** | 10,000 all-L40S, 20,000 all-A10G |
+
+One cluster at both node ceilings is `101 × 4 + 840 = 1,244` vCPU, well inside a 10,000 vCPU
+quota; on that shape the breach starts at **nine concurrent clusters**, at 11,196, and eight
+fit at 9,952. Both campaign shapes overrun the quota, with one exception worth noticing: 25 ×
+100 running entirely on the primary rung lands exactly on 10,000. So AWS refusing launches did
+much of the enforcing, not the configuration.
+
+Ray's ceilings count nodes and cannot be jointly weighted, so there is nowhere to express the
+combined limit. That is an accepted limitation rather than an oversight, but size it yourself
+before assuming the ceilings bind. Per cluster take `min(206, num_actors)` GPUs, multiply by
+the vCPU of whichever rung actually fills them — 4 for `g6e.xlarge`, 8 for `g5.2xlarge`, so
+the mix moves the answer twofold — then multiply by the cluster count and compare against your
+own quota.
 `TestTheCampaignRestartConfiguration` pins the configuration the library ships with.
 
 **The vCPU-matched sizes are deliberately not offered.** `g5.xlarge` and `g6.xlarge` are
