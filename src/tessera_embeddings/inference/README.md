@@ -147,10 +147,16 @@ tens of seconds just to open the store, read the SCL mask and discover that a ti
 nothing in it. On a GPU-priced machine that is pure waste, so the emptiness is established
 once, cheaply, before any machine is asked for.
 
-A tile that was never dispatched has nothing staged on S3. Assembly re-runs the same
-filter and simply never writes that footprint, so it reads back as the store's fill value
-— `0` for the `int8` embeddings and `uint16` counts, `NaN` for the `float32` scales. There
-are no placeholder files and no placeholder chunks.
+A tile that was never dispatched has nothing staged on S3. On a fresh store or an append,
+assembly re-runs the same filter and simply never writes that footprint, so it reads back as
+the store's fill value — `0` for the `int8` embeddings and `uint16` counts, `NaN` for the
+`float32` scales. There are no placeholder files and no placeholder chunks.
+
+**Overwriting an existing timestep is different, and the difference is a stale-data
+guarantee.** When `overwrite` is set, assembly builds `clear_chunks` from every tile that is
+*not* live this run and explicitly assigns fill across it. So if a region of interest shrinks
+or moves, the previous run's embeddings cannot survive underneath the new one. Not writing
+would leave them readable; clearing is what makes a re-run's output mean what it says.
 
 ### 2. Starting the GPU cluster
 
@@ -768,9 +774,12 @@ dragged out the whole assembly.
                    └── main only advances once the timestep's data is fully written ──┘
 ```
 
-Within a band, tile boundaries in easting still cut output chunks mid-chunk; those partial
-chunks are read-modify-written *sequentially inside one fork*, and icechunk sessions read
-their own writes, so the merged result is exact.
+Within a band, interior tile boundaries in easting **do not** cut output chunks:
+`enumerate_chunks` steps by `INFERENCE_CHUNK_SIZE` from zero, and the layout's shards are the
+same 2048 wide, so every interior boundary lands exactly on a shard edge. Only a **ragged tile
+at the array's own edge** is partial — a 5000-pixel axis gives boundaries at 0, 2048, 4096 and
+then 5000. Those edge chunks are read-modify-written *sequentially inside one fork*, and
+icechunk sessions read their own writes, so the merged result is exact.
 
 #### The steps
 
