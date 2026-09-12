@@ -125,7 +125,7 @@ most often: which optical-depth line a cell was held to, and which model wrote i
 | how you say where | a boolean grid you make, at pixel resolution | a prepared coverage store, at 2048-pixel tile resolution |
 | time period | **any 12 months**, ending in the month you choose | **calendar years only**, January to December |
 | output | one store per area, one entry per window | one store for the world, one entry per zone per year |
-| scale | one machine, one GPU or a few | **up to a 1,307-card daily average** (964 across the campaign), plus a large container fleet, for about two weeks |
+| scale | one machine, one GPU or a few | **up to a 1,307-card daily average** (964 across the campaign), plus a large container fleet; 15.6 days of publication inside **36 days of billed compute** |
 | you run it | yourself, when you want | as a campaign, with restart and recovery machinery |
 
 \* A **UTM zone** is a common convention in geography. The UTM system divides the world into 
@@ -568,7 +568,9 @@ operational machinery; [`context_docs/campaign/campaign-plan.md`](../context_doc
 describes what that involves.
 
 **What one costs is now measured rather than estimated.** The completed campaign published
-992 cells — 3,247,400 tile-years, 99.96% of what it set out to cover — for about **$828,000**
+**1,066 of 1,080 cells** — 992 carrying data, for 3,247,400 tile-years and 99.96% of the
+roster, plus 74 published as deliberately empty (72 landless zones and 2 where every tile was
+refused). Only 14 never landed. That cost about **$828,000**
 at on-demand list prices, using 360,282 graphics-card hours over 36 days of billed compute.
 Graphics cards were only about two thirds of that; storage, object-store requests and the
 container fleet made up most of the rest.

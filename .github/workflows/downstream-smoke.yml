@@ -32,6 +32,15 @@ name: Downstream smoke test
 #
 #   * `persist-credentials: false` on both checkouts, so the token is never written to
 #     disk where the tested code could read it.
+#   * A TRUST GATE, which you have to supply and this template cannot. The token protects
+#     itself; the downstream's SOURCE is a different matter. On a same-repository pull
+#     request the secret IS available, the private checkout succeeds, and that project's
+#     code then sits on the same runner as the pull request's own code while the suite runs
+#     it. Anyone who can open a pull request here could read it. That is an escalation from
+#     write access on THIS repository to read access on a private OTHER one, and the two
+#     permissions are not the same set of people. Before enabling the trigger, either
+#     satisfy yourself that every pull-request author may already read the downstream, or
+#     do not place its source beside code they control.
 #   * `pull_request`, NEVER `pull_request_target`. On `pull_request` a fork's build gets
 #     no secrets and a read-only token, so untrusted code cannot reach either. Switching
 #     to `pull_request_target` to "make forks work" hands your secrets to code the fork
