@@ -292,8 +292,8 @@ Six hard rules enforced in CI:
 
 1. No `import prefect` outside the flow layer.
 2. Stdlib `logging` in the domain layer, not `get_run_logger()`.
-3. Config is pydantic, not a Prefect Block (Blocks load into pydantic
-   at flow entry).
+3. Config is plain config objects, not Prefect Blocks (a Block's
+   values load into them at flow entry).
 4. Storage is fsspec, not orchestrator-specific filesystem
    abstractions.
 5. Secrets enter at flow entry and travel as plain values.
@@ -370,8 +370,9 @@ for running a campaign is
 
 ```
 src/tessera_embeddings/
-  config/                pydantic config models — ingest, inference, assembly,
-                         store layout, paths, time windows
+  config/                config objects, MIXED by design: plain dataclasses for
+                         inference, assembly, store layout and time windows;
+                         pydantic for ingest settings and bucket paths
   ingest/                STAC search and ingestion (Sentinel-2, Sentinel-1/OPERA),
                          ROI rasterization, the campaign land mask, auth
   inference/             GPU inference: Ray actors, work-stealing scheduler,
@@ -414,8 +415,8 @@ tests/                   unit, architecture, integration, parity and GPU tiers
   end-to-end, including GPU inference.
 - [`docs/environment-setup.md`](docs/environment-setup.md) — lock
   files, CUDA variants, uv setup.
-- [`docs/configuration.md`](docs/configuration.md) — the pydantic
-  config tree.
+- [`docs/configuration.md`](docs/configuration.md) — the config
+  tree.
 - [`docs/prefect-setup.md`](docs/prefect-setup.md) — standing up your
   own Prefect server: work pool shape, Blocks used, deployment
   examples, common gotchas. We don't ship IaC for the server itself;

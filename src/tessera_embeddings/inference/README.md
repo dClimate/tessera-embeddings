@@ -489,8 +489,13 @@ may hold very few pixels. The GPU memory that bucket needs is allocated once, an
 every smaller bucket afterwards reuses it, so the run does not grow its memory footprint
 after the first bucket.
 
-**Pixels go through in sub-batches of 7,168.** A bucket can hold millions of pixels, so
-they are run in fixed-size groups. The size is not arbitrary. The model's arithmetic is
+**Pixels go through in sub-batches of up to 7,168.** A bucket can hold millions of pixels, so
+they are run in fixed-size groups. 7,168 is the L40S-tuned default and a **ceiling, not the
+runtime size**: every actor calls `batch_size_for_gpu` at start-up, which scales it down for
+the card's VRAM, the actor's share of that card, and the deepest sequence its buckets can
+reach. On the A10G and L4 fallback paths, and for any fractional-GPU actor, the real batch is
+smaller — so read a throughput or memory figure against the batch that actor actually chose.
+The size is not arbitrary. The model's arithmetic is
 dominated by large matrix multiplications, and GPUs run those on dedicated hardware
 (tensor cores) that is only efficient when the matrices are big — a larger batch makes each
 multiplication bigger, so less of that hardware sits unused. 7,168 was measured as the
@@ -536,10 +541,14 @@ is validated for finiteness after it has been copied back
 (`raise_on_nonfinite_scales`). Checking it on the GPU instead forces the card to finish and
 report before the host can read the answer, which stalls the pipeline once per sub-batch.
 
-**The arithmetic runs in BF16** (`_prepare_gpu`) — a 16-bit float with the same exponent
-range as a 32-bit one, so the model's values cannot overflow, at half the bytes. On cards
-older than Ampere, which have no BF16, FP16 is a best-effort fallback; that format *does*
-overflow, above 65,504.
+**The arithmetic runs in BF16** (`_prepare_gpu`) — a 16-bit float carrying the same eight-bit
+exponent as a 32-bit one, so it spans roughly FP32's range at half the bytes, and overflow
+stops being the practical concern it is in FP16. It is **not impossible**: a custom checkpoint
+or an unstable activation can still exceed the finite range, and when it does the symptom is
+the non-finite scale described above. So if you are chasing non-finite outputs, do not rule
+out overflow on the grounds that the arithmetic is BF16. On cards older than Ampere, which
+have no BF16, FP16 is a best-effort fallback, and there overflow is a routine hazard rather
+than a remote one — anything above 65,504.
 
 **Four things are deliberately off or replaced**, each because it was measured and made
 things worse:
