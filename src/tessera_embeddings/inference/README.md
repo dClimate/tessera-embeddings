@@ -1,7 +1,9 @@
 # Tessera Inference Pipeline
 
 Distributed GPU inference that turns mosaicked Sentinel-2 reflectance and Sentinel-1 radar
-into **128-dimensional embeddings, one per 10 m pixel**.
+into **128-dimensional embeddings, one per pixel** — at 10 m for the global store and by
+default, though a single-area run sets its own `resolution` and gets one embedding per pixel
+at whatever it chose.
 
 Two entry points run the same domain code:
 

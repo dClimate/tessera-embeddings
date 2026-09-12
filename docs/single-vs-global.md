@@ -125,7 +125,7 @@ most often: which optical-depth line a cell was held to, and which model wrote i
 | how you say where | a boolean grid you make, at pixel resolution | a prepared coverage store, at 2048-pixel tile resolution |
 | time period | **any 12 months**, ending in the month you choose | **calendar years only**, January to December |
 | output | one store per area, one entry per window | one store for the world, one entry per zone per year |
-| scale | one machine, one GPU or a few | **a peak of 1,307 single-GPU machines**, plus a large container fleet, for about two weeks |
+| scale | one machine, one GPU or a few | **up to a 1,307-card daily average** (964 across the campaign), plus a large container fleet, for about two weeks |
 | you run it | yourself, when you want | as a campaign, with restart and recovery machinery |
 
 \* A **UTM zone** is a common convention in geography. The UTM system divides the world into 
@@ -443,8 +443,12 @@ zone group "33N" ▸ embeddings ▸ year 2025 ▸ one shard
 └──────────────────────────────────────────────────────────────────────┘
 
 WRITE  one staged inference tile (2048²) is exactly one shard: the assembly worker
-       emits the whole object once — no read-modify-write — and an all-ocean tile
-       costs nothing, because it is never staged and never written.
+       emits the whole object once — no read-modify-write — and on the GLOBAL path
+       an all-ocean tile costs nothing: the campaign land mask marks only tiles
+       containing land as live, so it is never dispatched, staged or written.
+       That is a property of THAT mask, not of water — water pixels pass the
+       optical validity test, so a coastal tile embeds its ocean, and a
+       single-area run whose own mask covers open water will stage and write it.
 READ   a point or window read fetches the shard index, then asks for only the byte
        ranges of the inner chunks it overlaps — about 8.65 MB for a usable point
        (embeddings + scales), not 0.5 GB.

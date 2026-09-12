@@ -12,8 +12,11 @@ name: Downstream smoke test
 #   2. Add a repository secret `DOWNSTREAM_READ_TOKEN` — a read-only token with access
 #      to that project. Omit it if the project is public.
 #   3. Adjust the lock-file name and the test command in the last two steps to whatever
-#      that project uses. The ones below assume a `dev.lock` and a
-#      `tests/unit tests/architecture` split, which is this repository's own convention.
+#      that project uses. Both below are PLACEHOLDERS, not this repository's own setup:
+#      `dev.lock` is a requirements-style file the `uv pip install -r` command expects,
+#      and this repository ships a `uv.lock`, which is a uv project lock and is NOT
+#      interchangeable with it. The `tests/unit tests/architecture` split is this
+#      repository's, and a downstream's may differ.
 #   4. Uncomment the `pull_request` trigger.
 #
 # Confirm the other project's default branch has a reliably green run of that command
