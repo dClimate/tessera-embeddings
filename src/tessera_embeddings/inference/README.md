@@ -50,7 +50,7 @@ without further explanation.
 |---|---|
 | **mosaic** | The input. Per-date Sentinel-2 reflectance and Sentinel-1 radar, already fetched and written to Zarr stores by the ingest stage. Inference never queries a satellite catalogue. |
 | **tile** (`chunk` in the code) | The unit of work: a 2048 × 2048-pixel square of ground, one year deep. One tile becomes one shard **per output array** — the global layout has eight (`embeddings`, `scales`, three observation counts, three month masks), each written independently — so a tile is eight objects, not one. Count objects per array when sizing anything. |
-| **actor** | A Ray worker process pinned to one GPU. It holds the model in VRAM and processes whole tiles, one after another. |
+| **actor** | A Ray worker process that reserves `config.num_gpus` of a card and processes whole tiles, one after another, holding the model in VRAM. **One whole GPU is the production default, not a rule**: `num_gpus` is a float, so a fractional value packs several actors onto one card (and shrinks each one's batch — see §7), and the laptop path sets it to `0` and runs on CPU. |
 | **strip** | A horizontal slice of a tile — its full easting (east–west) width, and a range of its northing (north–south) rows. A tile too large to hold in memory is loaded one strip at a time. |
 | **SCL** | Sentinel-2's Scene Classification Layer: the per-pixel mask saying which pixels on which dates are usable, and which are cloud, shadow, snow or no data. Most decisions in this pipeline start from it. |
 | **optical depth** | How many usable optical observations a pixel has in its year. It varies by an order of magnitude with geography, and it drives both cost and quality. |

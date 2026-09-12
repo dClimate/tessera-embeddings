@@ -309,9 +309,19 @@ which yields ceilings of 101 L40S and 105 A10G per cluster. Size the pair agains
 supply you are actually getting, not against both ceilings: a primary ceiling well above
 what AWS is supplying costs nothing unclaimed and converts straight into more actors per
 vCPU if supply recovers, while the fallback ceiling is what decides the bill in the
-meantime. **Both rungs full would exceed the quota** — Ray's ceilings count nodes and
-cannot be jointly weighted, so the real line is enforced by AWS refusing the launches.
-That is an accepted limitation rather than an oversight.
+meantime.
+
+**Both rungs full exceeds the quota, but only once you multiply by the cluster count** — and
+that multiplier is the part worth writing down. One cluster at both ceilings is
+`101 × 4 + 840 = 1,244` vCPU, comfortably inside a 10,000 vCPU quota. The breach starts at
+**nine concurrent clusters** (11,196 vCPU); eight fit, at 9,952. The global campaign ran both
+shapes — 10 clusters of 250 actors until 2026-09-08, then 25 of 100 — which is 12,440 and
+31,100 vCPU of ceiling against 10,000 of quota. So in practice AWS refusing launches did most
+of the enforcing, not the configuration. Ray's ceilings count nodes and cannot
+be jointly weighted, so there is nowhere to express the combined limit. That is an accepted
+limitation rather than an oversight, but size it yourself before assuming the ceilings bind:
+the number to check is `clusters × (primary_ceiling × vCPU_per_primary + fallback_vcpu_budget)`
+against your own quota.
 `TestTheCampaignRestartConfiguration` pins the configuration the library ships with.
 
 **The vCPU-matched sizes are deliberately not offered.** `g5.xlarge` and `g6.xlarge` are
