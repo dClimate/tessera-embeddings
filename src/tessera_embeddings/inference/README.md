@@ -426,10 +426,13 @@ buckets.
    `ucam-eo/tessera`'s `_sample_s1_merged` returns for the same case. Nothing in the
    encoder requires a radar observation to exist. Radar-informed pixels are unaffected by
    the flag. Downstream, an optical-only pixel is exactly one with a finite `scales` value
-   and `s1_asc_obs_count + s1_desc_obs_count == 0`. **Their quality has not been
-   validated against radar-informed embeddings** — read
-   [ADR-013](../../../context_docs/decisions/013-optional-s1-s2-only-pixels.md) before
-   enabling this in production.
+   and `s1_asc_obs_count + s1_desc_obs_count == 0`. **The production gate on this is recorded
+   as cleared** — [ADR-013](../../../context_docs/decisions/013-optional-s1-s2-only-pixels.md)
+   §Quality caveat, and the global campaign runs with the flag on, because about a fifth of
+   the land has no radar for 2022–24 and the choice there is radar-free embeddings or none.
+   Two caveats that clearance does not remove: the study behind it is **not yet cited** in
+   that ADR, and no *published* comparison of optical-only against radar-informed embeddings
+   exists. If that distinction matters to you, read the two radar counts and decide per pixel.
 
 2. **Which bucket each pixel goes in.** `compute_bin_keys` maps a pixel's
    `(optical count, radar count)` to the nearest entry in `num_obs_checkpoints`. Pixels
