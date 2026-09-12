@@ -928,8 +928,12 @@ volume**, so it is neither object-store ingress nor egress. Field-by-field meani
 `assembly._assembly_summary_line`; keep the keys stable or update the parsers in the same
 change.
 
-A global fill also carries **`catch_ups`**, a tally of what `shard_writer.catch_up_to_branch`
-did while the forks were writing. It is reported because a healthy commit looks identical
+A global fill also carries **`catch_ups`**, a tally of what
+`storage.session_catch_up.catch_up_best_effort` did while the forks were writing — that is the
+wrapper `shard_writer` actually calls, and the distinction matters when you are reading the
+tally: it returns whatever the inner `catch_up_to_branch` returned **or `failed`**, an outcome
+the inner function cannot produce on its own. Trace a `failed` tick to the wrapper, which is
+where a catch-up that broke is turned into a lost optimisation rather than a lost fill. It is reported because a healthy commit looks identical
 whether the session was kept up to date or simply got lucky, so the tally is the only
 evidence the mechanism ran. Read a run of `blocked` ticks as "one or more writers touched
 this zone, from the first blocked tick onward" rather than as a count of collisions: the
