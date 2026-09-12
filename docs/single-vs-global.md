@@ -125,7 +125,7 @@ most often: which optical-depth line a cell was held to, and which model wrote i
 | how you say where | a boolean grid you make, at pixel resolution | a prepared coverage store, at 2048-pixel tile resolution |
 | time period | **any 12 months**, ending in the month you choose | **calendar years only**, January to December |
 | output | one store per area, one entry per window | one store for the world, one entry per zone per year |
-| scale | modest clusters of Fargate + GPU machines | **up to 5,100 Fargate and 2,500 single-GPU machines**, days of running |
+| scale | one machine, one GPU or a few | **up to a 1,307-card daily average** (964 across the campaign), plus a large container fleet; 15.6 days of publication inside **36 days of billed compute** |
 | you run it | yourself, when you want | as a campaign, with restart and recovery machinery |
 
 \* A **UTM zone** is a common convention in geography. The UTM system divides the world into 
@@ -270,12 +270,256 @@ annual time axis for **2017 to 2025** and holds embeddings as 8-bit integers wit
 pixel, stored in 2048-pixel tiles, alongside the scale factors needed to interpret them and
 per-pixel counts of how many observations fed each result.
 
-Reading one zone is an ordinary `xarray` open — the top-level
-[README](../README.md#reading-a-zone-group-xarray) has a worked example, including which options
-you need for the time bounds and coordinate reference to come through correctly.
-
 The store is hosted by AWS Open Data, which sponsors its storage, so reading it does not bill the
 project that produced it.
+
+**Check that the cell you want was filled before you read it** — see
+[Which should I use?](#which-should-i-use) below. A cell that was never filled opens without
+complaint and hands back fill values rather than an error.
+
+### Reading a zone group
+
+Open a zone group through a read-only Icechunk session, and ask xarray to decode the variables
+that CF conventions link to a coordinate:
+
+```python
+import xarray as xr
+from tessera_embeddings.storage.global_store import open_global_repo
+
+repo = open_global_repo(
+    "s3://tessera-embeddings/v1.1/dclimate.icechunk",
+    region="us-west-2", anonymous=True,
+)
+session = repo.readonly_session(branch="main")
+ds = xr.open_zarr(session.store, group="33N", consolidated=False, decode_coords="all",
+                  chunks=None)
+```
+
+```
+<xarray.Dataset>
+Coordinates:
+  * time         (time) datetime64[ns] 2017-01-01 2018-01-01 ... 2025-01-01
+  * northing     (northing) float64 ...
+  * easting      (easting) float64 ...
+  * band         (band) int64 0 1 ... 127
+    time_bnds    (time, bnds) datetime64[ns] ...     ← [Jan 1, Jan 1 next year) per slot
+Data variables:
+    embeddings   (time, northing, easting, band) int8 ...
+    scales       (time, northing, easting) float32 ...
+    s2_obs_count (time, northing, easting) uint16 ...
+```
+
+`anonymous=True` is what sends an unsigned request, which is why this needs no AWS credentials
+at all. There is nothing else to pass: the published store is already configured for readers.
+See [Which should I use?](#which-should-i-use) if your copy of the library does not accept the
+argument.
+
+**`chunks=None` matters on a zone this size.** Without it xarray hands back Dask-backed arrays,
+and a zone is large enough that the graph describing one runs to millions of chunks: reading a
+single pixel through it took about three seconds and peaked near two gigabytes, against a fifth of
+a second and under 200 MB with `chunks=None`. Neither is free — xarray still builds the zone's
+variables and materialises a 933,888-element `northing` coordinate either way — but one of them
+scales with the zone and the other does not. The same advice, and the same reason, is in the
+[inference README](../src/tessera_embeddings/inference/README.md#write-units-vs-read-units-per-layout).
+
+**`decode_coords="all"`** is what promotes `time_bnds` from a data variable to a coordinate:
+xarray treats variables referenced by a `bounds` or `grid_mapping` attribute as coordinates.
+Without it the dataset holds exactly the same numbers; `time_bnds` just lists lower down.
+
+**What each `time` point means, guaranteed.** Each one is **January 1 of its calendar year — the
+start of the exact January-to-December window that slot holds**
+(`time_convention="calendar_year"`, and the fill runner rejects any other window, so the label
+always matches the data). The companion `time_bnds` variable, shape `(time, 2)` and linked from
+`time.attrs["bounds"]` as CF requires, states each slot's interval outright:
+`[YYYY-01-01, (YYYY+1)-01-01)` — half-open, so the upper bound is the following 1 January and
+the whole of 31 December is inside the interval. Rolling twelve-month windows are never written here; they belong in a
+single-area store, whose convention is one entry per window, labelled by the month it ended.
+
+**How many observations fed each pixel.** Three count layers record it —
+`s2_obs_count`, `s1_asc_obs_count`, `s1_desc_obs_count` — always written, with `0` meaning none.
+By default every embedded pixel has at least one radar observation. Where a fill ran with
+`allow_s2_only=True`, as the global campaign does, optical-only pixels are embedded too, and they
+are exactly those with a finite `scales` value and
+`s1_asc_obs_count + s1_desc_obs_count == 0`. **Embedding them is a deliberate decision, not a
+gap**: about a fifth of the land has no radar at all for 2022–2024, so for those pixel-years the
+choice was radar-free embeddings or none. What does not exist is a *published* comparison of an
+optical-only embedding against a radar-informed one, so if that distinction matters for your use,
+read the two radar counts and decide per pixel rather than assuming the two are interchangeable.
+[ADR-013](../context_docs/decisions/013-optional-s1-s2-only-pixels.md) records the decision and
+what is still owed.
+
+Reference docs:
+[`xarray.open_zarr` / `decode_coords`](https://docs.xarray.dev/en/stable/generated/xarray.open_zarr.html) ·
+[xarray weather & climate (CF) guide](https://docs.xarray.dev/en/stable/user-guide/weather-climate.html) ·
+[CF conventions §7.1 Cell Boundaries](https://cfconventions.org/cf-conventions/cf-conventions.html#cell-boundaries) ·
+[cf-xarray bounds handling](https://cf-xarray.readthedocs.io/en/latest/bounds.html)
+
+### Why chunk size dominates everything
+
+Both paths use the same grid, so none of this is specific to the global store — but the
+global store is where getting it wrong is most expensive, and it is the reason the shard
+sizes above are the numbers they are.
+
+A subtle reality of distributed array workloads: **the task graph your scheduler has to
+plan grows quadratically with how finely you chunk the data.** Chunk too small and the
+scheduler spends more time managing tasks than the tasks spend doing work — on a
+20 km × 20 km area of interest, 200-pixel chunks build a graph of ten thousand nodes,
+which costs tens of seconds and about a gigabyte of scheduler memory before any data is
+read, and leaves overhead as most of the wall clock. Chunk too large and a worker cannot
+fit one chunk in memory at all.
+
+Storage and read granularity are tuned separately. Ingest writes `INGEST_CHUNK_SIZE =
+4096` storage chunks to keep the satellite-ingest Dask graph small (a quarter of the
+spatial tasks), while inference reads a smaller sub-tile out of them — small enough to
+keep peak GPU-node RAM in check. Zarr's `oindex` reads a sub-tile out of a 4096 chunk with
+no alignment requirement, so the two sizes are independent.
+
+The read tile divides the output chunking, and both paths use the same one:
+`INFERENCE_CHUNK_SIZE = 2048`, so one inference tile is exactly one 2048-pixel shard
+([ADR-008](../context_docs/decisions/008-global-store-architecture.md) D3). The global
+campaign also passes it explicitly, since that path requires the identity rather than
+merely matching it. Go smaller on the ingest chunk and the
+satellite-ingest scheduler drowns in tasks; go larger on the read tile and you exhaust the
+memory of a single-GPU worker. If you change either, profile.
+
+The powers of two are not cosmetic — they align every stage of the pipeline on one grid,
+so no stage rechunks its input:
+
+```
+ingest chunk    4096 px  = 2×2 inference tiles
+inference tile  2048 px  = 1 output shard
+shard           2048 px  = 8×8 inner chunks
+inner chunk      256 px  = the unit downstream readers decode
+
+one ingest store chunk (4096²) — what one satellite read/write touches
+┌─ inference tile (2048²) ─┬─ inference tile (2048²) ─┐
+│ ░░░░░░░░░░░░░░░░░░░░░░░░ │                          │
+│ ░ 8×8 grid of 256²     ░ │   each tile is read out  │
+│ ░ inner chunks — the   ░ │   of the ingest chunk by │
+│ ░ same grid the output ░ │   one GPU actor, staged  │
+│ ░ shard will store     ░ │   as one file, and lands │
+│ ░░░░░░░░░░░░░░░░░░░░░░░░ │   as ONE shard object    │
+├──────────────────────────┼──────────────────────────┤
+│                          │                          │
+│    inference tile        │    inference tile        │
+│                          │                          │
+└──────────────────────────┴──────────────────────────┘
+```
+
+### How the store is laid out
+
+You do not need any of this to read the store. It is here because the layout is what makes a
+job this size possible at all, and because two of the choices are visible to a consumer.
+
+**Zones are named, not numbered.** Zone groups, mosaic paths and campaign tags all use the UTM
+**common name** — `canonicalize_zone` parses `"33n"` or `" 7s "` into `"33N"` and `"07S"`. This is
+a deliberate deviation from the geoembeddings `utm_zones` specification, whose `utm{NN}` group
+name cannot say which hemisphere it means. The EPSG code (326xx north, 327xx south) is kept, but
+only as the coordinate reference system.
+
+**Zones are pure six-degree longitude bands.** Every pixel centre falls in exactly one zone, and
+the per-zone pixel grids come from the EPSG registry (`storage/zone_grid.py`), snapped to the
+20,480 m shard pitch. The Norway and Svalbard width exceptions that MGRS makes (32V, and 31X–37X)
+are deliberately **not** honoured: they exist for navigation, not for data grids. **If you work
+near those zones, do not assume MGRS behaviour** — the dataset says so in each group's
+`zone_scheme: "utm_6deg_nominal"` attribute.
+
+**A shard is one S3 object holding an 8×8 grid of smaller chunks.** That is the geometry that
+makes a point read cheap without making a write expensive:
+
+```
+zone group "33N" ▸ embeddings ▸ year 2025 ▸ one shard
+┌─ shard object (2048² px × 128 bands ≈ 0.5 GB max on S3) ────────────┐
+│   8×8 inner chunks, 256² px × 128 bands (8.39 MB each, ~8.0 on the │
+│                                          wire — int8 barely zips)   │
+│   ┌────┬────┬────┬────┬────┬────┬────┬────┐                         │
+│   │▓▓▓▓│▓▓▓▓│▓▓▓▓│    │    │▓▓▓▓│▓▓▓▓│▓▓▓▓│   ▓ = data: encoded    │
+│   ├────┼────┼────┼────┼────┼────┼────┼────┤       bytes + an index  │
+│   │▓▓▓▓│▓▓▓▓│    │    │    │    │▓▓▓▓│▓▓▓▓│       entry             │
+│   ├────┼────┼────┼────┼────┼────┼────┼────┤   blank = all-fill (no  │
+│   │▓▓▓▓│    │    │    │    │    │    │▓▓▓▓│     valid observations):│
+│   └────┴────┴────┴────┴────┴────┴────┴────┘       zero bytes stored │
+│   + shard index: inner chunk → (offset, length)    — a "lean" shard │
+└──────────────────────────────────────────────────────────────────────┘
+
+WRITE  one staged inference tile (2048²) is exactly one shard: the assembly worker
+       emits the whole object once — no read-modify-write. A tile costs nothing
+       only when nothing selects it. On the GLOBAL path selection is BUFFERED
+       coverage, not land: a tile is live if any registry cell's footprint
+       intersects it, and that footprint reaches ~11 km (about one cell) out to
+       sea (ADR-010). So open ocean is skipped, but a tile within that buffer is
+       embedded and written even holding no land at all — deliberately, so
+       coastal pixels are not clipped, which is why the cost model budgets
+       buffered coverage rather than land area. Water is not the criterion in
+       either direction: water pixels pass the optical validity test, so a
+       single-area run whose own mask covers open water will stage and write it.
+READ   a point or window read fetches the shard index, then asks for only the byte
+       ranges of the inner chunks it overlaps — about 8.65 MB for a usable point
+       (embeddings + scales), not 0.5 GB.
+```
+
+**Those figures are the `embeddings` array. The other seven are far smaller**, and the sizes
+above do not carry over to them:
+
+| array | inner chunk | whole shard |
+|---|---|---|
+| `embeddings` (int8, 128 bands) | 8.39 MB | 537 MB |
+| `s2_month_covered` and the two radar equivalents (int8, 12 months) | 0.79 MB | 50 MB |
+| `scales` (float32) | 0.26 MB | 17 MB |
+| the three `*_obs_count` arrays (uint16) | 0.13 MB | 8 MB |
+
+**So the real floor for one pixel is about 8.65 MB across two objects, not 8.39 across one**:
+the embeddings are int8 and meaningless without `scales`, so any read that returns usable
+numbers pulls an inner chunk from both arrays. Add the observation counts if you need
+provenance, and you are at roughly 9 MB.
+
+Single-area stores use the same geometry; the two presets are one definition under two names.
+
+**Manifests are split by year, so a commit costs one year rather than the whole store.** An
+Icechunk **manifest** is the index that maps every chunk to the object holding it. By default
+there is one per array, so every commit rewrites the entire index no matter how little changed.
+The global store splits manifests at `time@1`:
+
+```
+    unsplit (default)                     split time@1 (global store)
+    one manifest per array                one manifest per (array, year)
+
+    MANIFEST: all 9 years                 M2017 M2018 ⋯ M2024 M2025
+    ┌────────────────────────┐            ┌────┐┌────┐  ┌────┐┌────┐
+    │ every (year, y, x)     │            │ ρρ ││ ρρ │  │ ρρ ││ ρρ │
+    │ chunk → object ref     │            └────┘└────┘  └────┘└─▲──┘
+    └───────────▲────────────┘                                  │
+                │                         WRITE  filling 2025 rewrites
+    WRITE  ANY commit rewrites                   only M2025 — commit
+           the whole thing:                      cost stays O(one year)
+           O(entire store)                       for all nine years
+                                          READ   opening a group loads
+                                                 only the manifests of
+                                                 the arrays/years read
+```
+
+Manifest splitting is **opt-in**, via `zarr_store.manifest_split`, and no path takes its
+default. The default it offers is 4 chunks per northing and easting axis; what assembly
+actually opens under is `manifest_split({"time": 1})` — one manifest per time slot — so
+writing a year rewrites only that year's manifest.
+
+**Four write paths, all committing atomically.** The first three are in
+`storage/zarr_store.py`, the fourth in `inference/assembly.py` and
+`storage/shard_writer.py`:
+
+1. **create** — `write_dataset` on a fresh store. It adopts a repository an interrupted attempt
+   left behind, rather than failing forever on a dirty prefix.
+2. **append** — extend the time axis of an existing store.
+3. **region overwrite** — rewrite a slice, in time or space, in place.
+4. **shard-assemble** — staged inference tiles written as whole, lean 2048-pixel shards into a
+   pre-allocated zone group, one fork-and-merge commit per (zone, year). These commits are
+   ungated: they contend on the repository's single branch tip, which costs seconds and never a
+   conflict. The mechanics are in
+   [`context_docs/storage/writing-to-the-global-store.md`](../context_docs/storage/writing-to-the-global-store.md).
+
+The full write-path reference, including what a fork worker does and how a resume tells a
+finished tile from an interrupted one, is in the
+[inference README](../src/tessera_embeddings/inference/README.md).
 
 ## Which should I use?
 
@@ -295,7 +539,7 @@ free and instant compared with computing anything.
 >
 > repo = open_global_repo(
 >     "s3://tessera-embeddings/v1.1/dclimate.icechunk",
->     region="us-west-2", anonymous=True, preload_manifests=False,
+>     region="us-west-2", anonymous=True,
 > )
 > session = repo.readonly_session(branch="main")
 > zone = zarr.open_group(session.store, mode="r")["33N"]
@@ -306,13 +550,15 @@ free and instant compared with computing anything.
 > `xr.open_zarr` insists on describing every array in the zone before it will show you an
 > attribute — millions of pieces for a zone this size, four times the wait and eight times the
 > memory. Use xarray when you actually want the embeddings, as the
-> [README example](../README.md#reading-a-zone-group-xarray) does.
+> [example above](#reading-a-zone-group) does.
 >
 > **You do not need an AWS account to run this.** The bucket's policy grants anyone read access,
 > and `anonymous=True` is what makes the library send an unsigned request, so the whole example
-> works with nothing set in your environment.
+> works with nothing set in your environment. **Nothing else needs passing.** The published store
+> is configured for readers, so opening it does no extra work on your behalf and there is no
+> performance argument to tune.
 >
-> **Read the zone.attrs["year_complete"] list carefully,**
+> **Read the zone.attrs["years_complete"] list carefully,**
 > **because it distinguishes two different things from a third.** A year
 > *in* the list either holds data or was deliberately marked as having none — an all-ocean zone, or
 > land where the campaign looked and found nothing usable. Either way the question has been
@@ -323,17 +569,26 @@ free and instant compared with computing anything.
 **Run the global campaign yourself only if** you need coverage or years the published store does
 not have, and you have the infrastructure for it. It is a large, long, expensive job with its own
 operational machinery; [`context_docs/campaign/campaign-plan.md`](../context_docs/campaign/campaign-plan.md)
-describes what that involves and
+describes what that involves.
+
+**What one costs is now measured rather than estimated.** The completed campaign published
+**1,066 of 1,080 cells** — 992 carrying data, for 3,247,400 tile-years and 99.96% of the
+roster, plus 74 published as deliberately empty (72 landless zones and 2 where every tile was
+refused). Only 14 never landed. That cost about **$828,000**
+at on-demand list prices, using 360,282 graphics-card hours over 36 days of billed compute.
+Graphics cards were only about two thirds of that; storage, object-store requests and the
+container fleet made up most of the rest.
 [`context_docs/campaign/campaign-cost-model.md`](../context_docs/campaign/campaign-cost-model.md)
-estimates what one costs. These are estimates because GPU availability and how quickly you can
-clear out interim storage impact costs at the margin.
+§12 is the record, with every line and the usage it was derived from, and it is the figure to
+quote rather than any of the planning estimates earlier in that document.
 
 ## Where to go next
 
 - [`quickstart.md`](quickstart.md) — the single-area path, end to end, on a laptop
 - [`configuration.md`](configuration.md) — the configuration objects and what each field does,
   including the time window
-- [top-level README](../README.md#the-global-embeddings-store) — how the global store is laid out
+- [top-level README](../README.md#the-global-embeddings-store) — the overview of the store and the
+  code that fills it
 - [`context_docs/decisions/008-global-store-architecture.md`](../context_docs/decisions/008-global-store-architecture.md)
   — why the global store is shaped the way it is
 - [`context_docs/decisions/010-landmask-registry-coverage.md`](../context_docs/decisions/010-landmask-registry-coverage.md)

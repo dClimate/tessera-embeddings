@@ -9,6 +9,12 @@ Generate per-pixel (10m^2) TESSERA satellite embeddings at any scale. Ports the 
 cloud-native, distributed architecture that runs on any major cloud —
 or on a laptop (slowly).
 
+**This repository is currently set up for TESSERA v1.1.** The model architecture, the
+band statistics, the temporal sampling and the published global store are all v1.1, and a
+run you start today is a v1.1 run. Support for a **v2 Large student model is in flight**
+([PR #98](https://github.com/dClimate/tessera-embeddings/pull/98)) — not merged, and with
+no release date to quote.
+
 ## Contents
 
 - [What this is](#what-this-is)
@@ -19,10 +25,9 @@ or on a laptop (slowly).
 - [Running at scale](#running-at-scale)
 - [Architecture](#architecture)
 - [The global embeddings store](#the-global-embeddings-store)
-- [The test that proves decoupling](#the-test-that-proves-decoupling)
-- [What's in here](#whats-in-here)
+- [Repo structure](#repo-structure)
 - [Documentation](#documentation)
-- [Downstream consumers](#downstream-consumers)
+- [Using this for your own project](#using-this-for-your-own-project)
 - [Contributing](#contributing)
 - [License](#license)
 - [Acknowledgments](#acknowledgments)
@@ -173,22 +178,52 @@ source .venv/bin/activate   # REQUIRED — and use plain `python`, never `uv run
                             # docs/quickstart.md has the detail.
 
 # End-to-end pipeline on the bundled Denver, CO quickstart ROI.
-# Ingest → cloud mask → CPU inference → assemble. ~3-4 minutes on a laptop,
-# most of it ingest; CPU inference of the single chunk takes about a minute.
+# Ingest → cloud mask → CPU inference → assemble. About three and a half minutes on a
+# laptop, most of it ingest; CPU inference of the single chunk takes about a minute.
 python -m tessera_embeddings.orchestration.runners.plain examples/quickstart/config.yaml
 
-# Skip inference for fast ingest-only sanity checks (~5 min).
+# Ingest only — shorter, because it stops before inference. For contributors
+# iterating on ingest changes without waiting for CPU torch.
 python -m tessera_embeddings.orchestration.runners.plain \
     examples/quickstart/config.yaml --skip-inference
 ```
 
-The default mode runs the full chain — inference and assembly are
-coupled, so end-to-end is the primary demo. `--skip-inference` is the
-fast path for contributors iterating on ingest changes without waiting
-for CPU torch. Production inference always runs on GPU. See
+The default mode runs the full chain, and that is the primary demo: inference and
+assembly are coupled, so ingest-only is a convenience rather than a full-stack run.
+Production inference always runs on GPU. See
 [`docs/quickstart.md`](docs/quickstart.md) for prerequisites
 (Earthdata Login credentials for OPERA; the model checkpoint is
 pulled from HuggingFace automatically).
+
+**The quickstart is also this project's decoupling test — but only when it actually runs on a
+CPU.** The bundled `examples/quickstart/config.yaml` sets `device: auto`, which probes
+`torch.cuda.is_available()` at run time, so on a machine with a working CUDA setup the
+quickstart runs on the GPU and proves nothing about CPU decoupling. **To run it as the
+architectural check, set `device: cpu` in the config**, or run it on a machine without CUDA.
+`auto` is the right default for the quickstart's actual job — one config that works on a
+laptop and a dev box alike — so the flag is deliberate and it is the claim that needs the
+qualification.
+
+The runner behind it,
+[`src/tessera_embeddings/orchestration/runners/plain.py`](src/tessera_embeddings/orchestration/runners/plain.py),
+is an orchestrator-free sequencer: it calls the same domain functions as the Prefect
+flows, without Prefect, through Ray's local mode. With torch pinned to CPU, three things
+follow, and together they are why this is the bar we hold ourselves to:
+
+- If CPU torch works without modification, no GPU-specific coupling has leaked into the
+  domain layer. That is the strongest architectural separation check available without
+  deploying to several cloud targets.
+- Assembly has nothing to assemble without embeddings, so the ingest-only path cannot
+  stand in for it.
+- `plain.py` is the worked reference for anyone porting to Airflow, Dagster or Flyte:
+  everything it does is the non-Prefect wiring they would have to reproduce.
+
+**Neither variant runs in CI.** `plain.py --skip-inference` is the fast check to run by hand,
+and the end-to-end run on the quickstart region of interest is verified by hand too
+([ADR 023](context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)).
+Pull-request checks also apply the AST-based architecture rules described under
+[Architecture](#architecture), which catch Prefect leaks at the import level without
+running the pipeline.
 
 ## Running at scale
 
@@ -265,8 +300,8 @@ Six hard rules enforced in CI:
 
 1. No `import prefect` outside the flow layer.
 2. Stdlib `logging` in the domain layer, not `get_run_logger()`.
-3. Config is pydantic, not a Prefect Block (Blocks load into pydantic
-   at flow entry).
+3. Config is plain config objects, not Prefect Blocks (a Block's
+   values load into them at flow entry).
 4. Storage is fsspec, not orchestrator-specific filesystem
    abstractions.
 5. Secrets enter at flow entry and travel as plain values.
@@ -276,74 +311,10 @@ Six hard rules enforced in CI:
 If those rules hold, you can rewrite the flow layer for any
 orchestrator without touching the domain.
 
-### Why chunk size dominates everything
-
-A subtle reality of distributed array workloads: **the task graph
-your scheduler has to plan grows quadratically with how finely you
-chunk the data.** Chunks too small means the scheduler spends more
-time managing tasks than tasks spend doing work. Chunks too large
-means workers can't fit a chunk in memory.
-
-```
-ROI: 20 km × 20 km, S2 reflectance, 10 m resolution, 12 dates:
-
-chunks=200×200 (10× too small)        chunks=2048×2048 (the right size)
-─────────────────────────────         ───────────────────────────────
-□□□□□□□□□□  □□□□□□□□□□  □□□□□           ┌────────┐
-□□□□□□□□□□  □□□□□□□□□□  □□□□□           │        │
-□□□□□□□□□□  □□□□□□□□□□  □□□□□           │  ████  │  ← 1 chunk
-□□□□□□□□□□  □□□□□□□□□□  □□□□□           │  ████  │
-…  10 000 graph nodes  …                └────────┘
-                                          12 nodes
-graph build:    ~30 s                   graph build:   <1 s
-scheduler RAM:  ~1 GB                   scheduler RAM: <50 MB
-overhead:       95% of wall-clock       overhead:      <5%
-```
-
-Storage and read granularity are tuned separately. Ingest writes
-`INGEST_CHUNK_SIZE = 4096` storage chunks to keep the satellite-ingest
-Dask graph small (¼ the spatial tasks), while inference reads a smaller
-sub-tile out of them — small enough to keep peak GPU-node RAM in check.
-Zarr's `oindex` reads a sub-tile out of a 4096 chunk with no alignment
-requirement, so the two sizes are independent.
-
-The read tile divides the OUTPUT chunking, and both paths use the same
-one: `INFERENCE_CHUNK_SIZE = 2048`, so one inference tile is exactly one
-2048-px shard (ADR-008 D3). The global campaign also passes it explicitly,
-since that path requires the identity rather than merely matching it. Go
-smaller on the ingest chunk and the satellite-ingest Dask scheduler drowns
-in tasks; go larger on the read tile and you OOM on a g6e.xlarge. If you
-change either, profile.
-
-The powers of two are not cosmetic — they align every stage of the
-pipeline on one grid, so no stage rechunks its input:
-
-```
-ingest chunk    4096 px  = 2×2 inference tiles
-inference tile  2048 px  = 1 output shard
-shard           2048 px  = 8×8 inner chunks
-inner chunk      256 px  = the unit downstream readers decode
-
-one ingest store chunk (4096²) — what one satellite read/write touches
-┌─ inference tile (2048²) ─┬─ inference tile (2048²) ─┐
-│ ░░░░░░░░░░░░░░░░░░░░░░░░ │                          │
-│ ░ 8×8 grid of 256²     ░ │   each tile is read out  │
-│ ░ inner chunks — the   ░ │   of the ingest chunk by │
-│ ░ same grid the output ░ │   one GPU actor, staged  │
-│ ░ shard will store     ░ │   as one file, and lands │
-│ ░░░░░░░░░░░░░░░░░░░░░░░░ │   as ONE shard object    │
-├──────────────────────────┼──────────────────────────┤
-│                          │                          │
-│    inference tile        │    inference tile        │
-│                          │                          │
-└──────────────────────────┴──────────────────────────┘
-```
-
 ### Using these architecture checks in your own repo
 
-The hard-rule checks ship as a reusable module so downstream consumers
-(closed-source forks, community adapter contributors) can apply the
-same contract to their own code:
+The hard-rule checks ship as a reusable module, so a fork or an adapter can hold its own
+code to the same contract:
 
 ```bash
 # Run against any source tree
@@ -352,41 +323,29 @@ uv run python -m tessera_embeddings.architecture_tests \
     --allowlist your-arch-allowlist.toml
 ```
 
-The allowlist file (TOML) documents intentional deviations (e.g.
-"Prefect imports in my own `orchestration/prefect/` are expected").
-See
+The allowlist file (TOML) documents intentional deviations — for example, "Prefect
+imports in my own `orchestration/prefect/` are expected". See
 [`src/tessera_embeddings/architecture_tests/`](src/tessera_embeddings/architecture_tests/)
-for the rule definitions, allowlist schema, and worked examples.
-
-### Public API surface
-
-This library follows semver for the documented public API surface.
-Anything outside it — underscore-prefixed names, modules whose names
-start with `_`, anything under `tessera_embeddings.orchestration.prefect.*` —
-is implementation detail and may change between minor releases. The
-full public-API surface is listed in
-[`docs/public-api.md`](docs/public-api.md). External code should
-depend only on items listed there.
+for the rule definitions, the allowlist schema, and worked examples.
 
 ## The global embeddings store
 
-Beyond single-ROI stores, the library ships the storage layout and write
-path for a **global 10 m campaign**: one Icechunk repo holding 120 Zarr
-groups — one per UTM zone, named by its **common name** (`01N`–`60N`,
-`01S`–`60S`; the EPSG:326xx/327xx code is retained only as the CRS) — each
-pre-allocated with a 2017–2025 annual time axis and filled one
-(zone, year) at a time. The architecture is settled in
-[ADR-008](context_docs/decisions/008-global-store-architecture.md), and the
-operational plan for running the campaign is
-[`context_docs/campaign/campaign-plan.md`](context_docs/campaign/campaign-plan.md).
+Alongside per-area stores, the library ships the storage layout and the write path for a
+**global 10 m store**: one Icechunk repository holding 120 Zarr groups — one per UTM zone,
+named by its common name (`01N`–`60N`, `01S`–`60S`) — each pre-allocated with a 2017–2025
+annual time axis and filled one (zone, year) at a time. The published result is **global
+TESSERA v1.1** at `s3://tessera-embeddings/v1.1/dclimate.icechunk/`, and it is readable
+without an AWS account.
 
-**What "global" means here: land between 59.45°S and 83.65°N**, which is the
-extent of the coverage registry the campaign is built from.
-**Antarctica is excluded by decision**, not omitted by accident — the registry
-offers no Antarctic land cell, and the UTM grid could not place one if it did
-(UTM's usable range stops at 80°S). Reaching further south would need a
-different projection, a different coverage source and a different zone scheme;
-see [ADR-017](context_docs/decisions/017-no-antarctic-coverage.md).
+It currently holds **about 1.6 PB** of embeddings (1.42 PiB, the same figure in binary
+units), and it grows whenever a year is added.
+`Repository.chunk_storage_stats().native_bytes` reports the exact size.
+
+**What "global" means here: land between 59.45°S and 83.65°N**, the extent of the coverage
+registry the campaign is built from. **Antarctica is excluded by decision**, not omitted by
+accident — the registry offers no Antarctic land cell, and the UTM grid could not place one
+if it did (UTM's usable range stops at 80°S). See
+[ADR-017](context_docs/decisions/017-no-antarctic-coverage.md).
 
 ```
 one Icechunk repo (BucketPaths.global_store())
@@ -398,233 +357,56 @@ one Icechunk repo (BucketPaths.global_store())
 └── 60S/    attrs: crs, zone_scheme, years_complete, runs, conventions
 ```
 
-Zone groups, mosaic paths, and tags all use the UTM **common name**
-(`canonicalize_zone` parses `"33n"`/`" 7s "` → `"33N"`/`"07S"`) — a
-deliberate deviation from the geoembeddings `utm_zones` spec, whose
-`utm{NN}` group name can't express the hemisphere.
+`run_global_campaign` drives the fill year-serial with bounded zone parallelism and
+triggers its own ingestion (ADR-011); `orchestration/runners/zone_fill.py` is the
+end-to-end (zone, year) callable, and `storage/campaign.py` holds the per-cell tags,
+snapshot expiry and the zone×year progress reader. The
+[Prefect flow README](src/tessera_embeddings/orchestration/prefect/README.md) documents
+the dispatch chain, the cancellation sweep and the per-branch deployment routing.
 
-Four write paths, all committing atomically (`storage/zarr_store.py` has
-the first three; `inference/assembly.py` + `storage/shard_writer.py` the
-fourth):
+**→ [`docs/single-vs-global.md`](docs/single-vs-global.md#the-published-global-dataset)**
+is the reader's and writer's guide to this store: how to open a zone group, what its time
+axis promises, what the per-pixel observation counts record, how shards and manifests are
+laid out, why the chunk sizes are what they are — get that wrong and a scheduler drowns in
+tasks or a worker runs out of memory — and, before you trust any of it, how to check that
+the cell you want was actually filled. The architecture is settled in
+[ADR-008](context_docs/decisions/008-global-store-architecture.md); the operational plan
+for running a campaign is
+[`context_docs/campaign/campaign-plan.md`](context_docs/campaign/campaign-plan.md).
 
-1. **create** — `write_dataset` on a fresh store; it adopts a repo an
-   interrupted attempt left behind rather than failing forever on a dirty
-   prefix;
-2. **append** — extend the time axis of an existing store;
-3. **region overwrite** — rewrite a temporal/spatial slice in place;
-4. **shard-assemble** — staged inference tiles written as whole, lean
-   2048-px shards into a pre-allocated zone group, one fork/merge commit
-   per (zone, year). Commits are ungated: they contend on the repo's single
-   branch tip, but that costs seconds and never a conflict — see
-   `context_docs/storage/writing-to-the-global-store.md`.
-
-### Anatomy of a shard: what a write emits, what a read fetches
-
-A shard is one S3 object wrapping an 8×8 grid of independently
-compressed **inner chunks**, plus a tiny index mapping each inner chunk
-to its byte range inside the object:
-
-```
-zone group "32601" ▸ embeddings ▸ year 2025 ▸ one shard
-┌─ shard object (2048² px × 128 bands ≈ 0.5 GB max on S3) ────────────┐
-│   8×8 inner chunks, 256² px × 128 bands (~8.4 MB int8+zstd each)    │
-│   ┌────┬────┬────┬────┬────┬────┬────┬────┐                         │
-│   │▓▓▓▓│▓▓▓▓│▓▓▓▓│    │    │▓▓▓▓│▓▓▓▓│▓▓▓▓│   ▓ = data: encoded    │
-│   ├────┼────┼────┼────┼────┼────┼────┼────┤       bytes + an index  │
-│   │▓▓▓▓│▓▓▓▓│    │    │    │    │▓▓▓▓│▓▓▓▓│       entry             │
-│   ├────┼────┼────┼────┼────┼────┼────┼────┤   blank = all-fill (no  │
-│   │▓▓▓▓│    │    │    │    │    │    │▓▓▓▓│     valid observations):│
-│   └────┴────┴────┴────┴────┴────┴────┴────┘       zero bytes stored │
-│   + shard index: inner chunk → (offset, length)    — a "lean" shard │
-└──────────────────────────────────────────────────────────────────────┘
-
-WRITE  1 staged inference tile (2048²) == 1 shard: the assembly worker
-       emits the whole object exactly once — no read-modify-write, and
-       an all-ocean tile costs nothing (never staged, never written).
-READ   a point/window read GETs the shard index, then ranged-GETs only
-       the inner chunks it overlaps — ~8 MB per point, not 0.5 GB.
-       (Single-ROI stores use this same geometry — one preset, two names.)
-```
-
-### Manifest splitting: why a commit costs one year, not the store
-
-An Icechunk **manifest** is the index mapping every chunk to its object.
-By default there is one per array — so every commit rewrites the whole
-index, O(store), regardless of how little changed. The global store
-splits manifests at `time@1`:
-
-```
-    unsplit (default)                     split time@1 (global store)
-    one manifest per array                one manifest per (array, year)
-
-    MANIFEST: all 9 years                 M2017 M2018 ⋯ M2024 M2025
-    ┌────────────────────────┐            ┌────┐┌────┐  ┌────┐┌────┐
-    │ every (year, y, x)     │            │ ρρ ││ ρρ │  │ ρρ ││ ρρ │
-    │ chunk → object ref     │            └────┘└────┘  └────┘└─▲──┘
-    └───────────▲────────────┘                                  │
-                │                         WRITE  filling 2025 rewrites
-    WRITE  ANY commit rewrites                   only M2025 — commit
-           the whole thing:                      cost stays O(one year)
-           O(entire store)                       for all nine years
-                                          READ   opening a group loads
-                                                 only the manifests of
-                                                 the arrays/years read
-```
-
-Single-ROI stores use the same idea spatially: a 32-chunk-per-axis 2D
-split so a region overwrite rewrites only the manifest tiles it touches
-(see `zarr_store.manifest_split`).
-
-The per-zone pixel grids are derived from the EPSG registry
-(`storage/zone_grid.py`), snapped to the 20,480 m shard pitch.
-**Zone-boundary policy:** zones are pure nominal 6° longitude bands —
-disjoint, every pixel-center in exactly one zone. The Norway/Svalbard
-MGRS width exceptions (32V, 31X–37X) are deliberately **not** honored:
-they exist for navigation, not data grids. Consumers must not assume
-MGRS behavior near those zones; the dataset advertises this via the
-`zone_scheme: "utm_6deg_nominal"` group attribute.
-
-Campaign operations — per-cell tags, snapshot expiry + GC, and a
-zone×year progress reader — live in `storage/campaign.py`; the
-end-to-end (zone, year) fill callable is
-`orchestration/runners/zone_fill.py`.
-
-`run_global_campaign` drives the whole thing year-serial with bounded
-zone parallelism, and **triggers its own ingestion** (ADR-011): per
-pending cell it dispatches `ingest-zone-year` (synthesize a zone-shaped
-ROI from the coverage bitmap → run the S1/S2 ROI ingest flows onto
-`mosaics/{zone}/{year}`) → `fill-zone-year` (a pre-Ray coverage gate,
-then inference → shard-assemble → tag) → delete the transient mosaic
-(`s5cmd --all-versions`). A `zones=["33N", "15S"]` filter restricts the
-run; the default (all 120) skips already-finished cells, and `ingest=False`
-bypasses ingestion when mosaics already exist upstream. A `branch` slug routes
-every dispatched deployment — the fill, the ingest, and the S1/S2 grandchildren
-`ingest-zone-year` dispatches — to its `-<branch>` variant, so a downstream that
-registers dev-branch deployments can exercise the whole chain (including
-ingestion) off prod; `branch=None` (default) is the unsuffixed production path.
-
-### Reading a zone group (xarray)
-
-Open a zone group through an Icechunk readonly session and ask xarray to
-decode CF-linked variables as coordinates:
-
-```python
-import xarray as xr
-from tessera_embeddings.storage.global_store import open_global_repo
-
-repo = open_global_repo("s3://<bucket>/global/tessera.icechunk")
-session = repo.readonly_session(branch="main")
-ds = xr.open_zarr(session.store, group="33N", consolidated=False, decode_coords="all",
-                  chunks=None)
-```
-
-`chunks=None` matters on a global zone. Without it xarray hands back Dask-backed
-arrays, and a zone is large enough that the graph describing one runs to millions
-of chunks: reading a single pixel through it took about three seconds and peaked
-near two gigabytes, against a fifth of a second and under 200 MB with
-`chunks=None`. Neither is free — xarray still builds the zone's variables and
-materialises a 933,888-element `northing` coordinate either way — but one of them
-scales with the zone and the other does not. The same advice, and why, is in
-[`inference/README.md`](src/tessera_embeddings/inference/README.md#write-units-vs-read-units-per-layout).
-
-```
-<xarray.Dataset>
-Coordinates:
-  * time         (time) datetime64[ns] 2017-01-01 2018-01-01 ... 2025-01-01
-  * northing     (northing) float64 ...
-  * easting      (easting) float64 ...
-  * band         (band) int64 0 1 ... 127
-    time_bnds    (time, bnds) datetime64[ns] ...     ← [Jan 1, Dec 31] per slot
-Data variables:
-    embeddings   (time, northing, easting, band) int8 ...
-    scales       (time, northing, easting) float32 ...
-    s2_obs_count (time, northing, easting) uint16 ...
-```
-
-**Time semantics (guaranteed).** Each `time` point is **January 1 of its
-calendar year — the start of the exact Jan–Dec window that slot holds**
-(`time_convention="calendar_year"`; the fill runner rejects any other
-window, so the label always matches the data). The companion `time_bnds`
-variable (shape `(time, 2)`, linked via `time.attrs["bounds"]` per CF)
-states each slot's covered interval explicitly: `[YYYY-01-01, YYYY-12-31]`.
-
-`decode_coords="all"` is what promotes `time_bnds` from *Data variables*
-to *Coordinates* — xarray sets variables referenced by `bounds` (and
-`grid_mapping`) attributes as coordinates. Without it the dataset is
-identical; `time_bnds` just lists under data variables. Non-calendar
-12-month windows are **not** written to this store — the single-ROI
-output stores (`time_convention="12mo_window_end"`, one time entry per
-window-end label) are the home for rolling windows.
-
-**Per-pixel input provenance.** The obs-count layers record how many
-observations fed each pixel's embedding: `s2_obs_count`,
-`s1_asc_obs_count`, `s1_desc_obs_count` (always written; `0` = none).
-By default every embedded pixel has ≥1 S1 observation; when a fill ran
-with `allow_s2_only=True` (opt-in — embeds S2-valid pixels inside S1
-coverage gaps using the upstream v1.1 missing-S1 convention), the
-**S2-only pixels are exactly those with a finite `scales` value and
-`s1_asc_obs_count + s1_desc_obs_count == 0`**. S2-only embedding quality
-is unvalidated against S1-informed embeddings — see
-[ADR-013](context_docs/decisions/013-optional-s1-s2-only-pixels.md).
-
-Reference docs:
-[`xarray.open_zarr` / `decode_coords`](https://docs.xarray.dev/en/stable/generated/xarray.open_zarr.html) ·
-[xarray weather & climate (CF) guide](https://docs.xarray.dev/en/stable/user-guide/weather-climate.html) ·
-[CF conventions §7.1 Cell Boundaries](https://cfconventions.org/cf-conventions/cf-conventions.html#cell-boundaries) ·
-[cf-xarray bounds handling](https://cf-xarray.readthedocs.io/en/latest/bounds.html)
-
-## The test that proves decoupling
-
-[`src/tessera_embeddings/orchestration/runners/plain.py`](src/tessera_embeddings/orchestration/runners/plain.py)
-is an orchestrator-free sequencer that calls the same domain
-functions as the Prefect flows, without Prefect. By default it runs
-the full end-to-end pipeline (ingest → cloud mask → inference →
-assembly) on a laptop with torch on CPU via Ray's local mode. Slow on
-real workloads, practical on the Denver quickstart ROI we ship for
-exactly this purpose.
-
-A `--skip-inference` flag runs only ingest for fast sanity checks;
-assembly is skipped because it has nothing to assemble without
-embeddings.
-
-Why end-to-end on CPU is the credibility bar we chose:
-
-- Assembly depends on inference outputs — "ingest-only" is a
-  convenience path for contributors, not a meaningful full-stack demo.
-- If CPU torch works without modification, no GPU-specific coupling
-  has leaked into the domain layer. That's the strongest
-  architectural separation check we can make without deploying to
-  multiple cloud targets.
-- `plain.py` is the reference for users porting to
-  Airflow/Dagster/Flyte: everything it does is the non-Prefect wiring
-  they'll need to reproduce.
-
-For CI: `plain.py --skip-inference` is the fast PR check (minutes).
-**The end-to-end run on the quickstart ROI is not automated at all** — it
-is verified by running it by hand, which takes about three and a half
-minutes on a laptop
-([ADR 023](context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)). Fast PR checks also use
-AST-based architecture rules (§Architecture) to catch Prefect leaks
-at the import level without running the pipeline.
-
-## What's in here
+## Repo structure
 
 ```
 src/tessera_embeddings/
-  config/                pydantic config models
-  ingest/                STAC ingestion, ROI rasterization, auth
-  inference/             GPU inference (Ray actors, work-stealing scheduler)
-  storage/               Zarr stores, manifests, empty-store seeding
+  config/                config objects, MIXED by design: plain dataclasses for
+                         inference, assembly, store layout and time windows;
+                         pydantic for ingest settings and bucket paths
+  ingest/                STAC search and ingestion (Sentinel-2, Sentinel-1/OPERA),
+                         ROI rasterization, the campaign land mask, auth
+  inference/             GPU inference: Ray actors, work-stealing scheduler,
+                         per-tile loading, quantization, staging and assembly
+  storage/               Zarr and Icechunk stores, manifests, zone grids,
+                         empty-store seeding, shard writer, campaign tags
   orchestration/
-    concurrency.py       sliding_window_submit — shared by flows + runners
+    concurrency.py       sliding_window_submit — shared by flows and runners
     prefect/             Prefect — 100% quarantined here
       flows/             @flow-decorated orchestration (Layer 3)
       tasks/             thin @task wrappers (Layer 2)
-    runners/             non-Prefect entry points (plain.py)
+    runners/             non-Prefect entry points: plain.py (one area),
+                         zone_fill.py (one campaign cell),
+                         sequential_fill.py (many cells, one Ray session)
   providers/             concrete cloud-provisioning glue
-    aws/                 ray.py, dask.py, gotchas.md
-    local/               ray.py, dask.py
+    aws/                 ray.py, dask.py, credentials.py, fleet_mix.py,
+                         cluster.yaml.template, gotchas.md
+    local/               ray.py, dask.py — demo and tests
+  profiling/             AWS-specific harnesses for watching a live run
   architecture_tests/    reusable layer-rule checker (CLI + Python API)
+
+docs/                    how to run, configure and port it  (docs/README.md)
+context_docs/            why it is shaped this way, and what was measured
+examples/quickstart/     the bundled Denver, CO area of interest and its config
+scripts/                 scoping and analysis scripts, not part of the library
+tests/                   unit, architecture, integration, parity and GPU tiers
 ```
 
 ## Documentation
@@ -634,14 +416,15 @@ src/tessera_embeddings/
   you want.
 - [`docs/single-vs-global.md`](docs/single-vs-global.md) — running for
   one area versus the global campaign: what is shared, what differs,
-  how to supply your own mask, and why the global store takes calendar
-  years only.
+  how to supply your own mask, why the global store takes calendar
+  years only, and how to read the published store — its layout, its
+  chunk sizes, and how to check a cell was filled.
 - [`docs/quickstart.md`](docs/quickstart.md) — laptop demo
   end-to-end, including GPU inference.
 - [`docs/environment-setup.md`](docs/environment-setup.md) — lock
   files, CUDA variants, uv setup.
-- [`docs/configuration.md`](docs/configuration.md) — the pydantic
-  config tree.
+- [`docs/configuration.md`](docs/configuration.md) — the config
+  tree.
 - [`docs/prefect-setup.md`](docs/prefect-setup.md) — standing up your
   own Prefect server: work pool shape, Blocks used, deployment
   examples, common gotchas. We don't ship IaC for the server itself;
@@ -660,35 +443,36 @@ src/tessera_embeddings/
 - [`context_docs/`](context_docs/) — design decisions, framing,
   rationale.
 
-## Downstream consumers
+## Using this for your own project
 
-This library has a known production downstream consumer:
-`yield_modeling`, a private repo that imports this library, supplies
-AWS infrastructure, and runs production workloads. We've wired the
-OSS CI to run a fast smoke test against `yield_modeling` on every
-PR — catches accidental breaking changes at the point of change
-instead of in production.
+The domain layer is a library, not a framework: there is nothing to inherit and nothing
+to register. You import the functions you want and call them. Four things are worth
+knowing before you build on it.
 
-The smoke-test workflow lives at
-`.github/workflows/downstream-smoke.yml`. It is **initially disabled**
-(only `workflow_dispatch` enabled, no `pull_request` trigger).
-Activation criteria:
+**Depend only on the documented public API.** This library follows semver for the surface
+listed in [`docs/public-api.md`](docs/public-api.md). Anything outside it —
+underscore-prefixed names, and everything under
+`tessera_embeddings.orchestration.prefect.*` — is implementation detail and may change
+between minor releases.
 
-1. `yield_modeling` has its first internal release.
-2. A read-only GitHub token (`YIELD_MODELING_READ_TOKEN`) is
-   configured as a repo secret.
-3. `yield_modeling/main` reliably has a green test suite.
+**Keep your own orchestration and cloud glue separate.** The Prefect flows and the AWS
+provider are reference implementations you are meant to replace, not extend.
+[`docs/orchestrator-swap.md`](docs/orchestrator-swap.md) walks through running without
+Prefect, and [`docs/providers/adding-your-own.md`](docs/providers/adding-your-own.md)
+through targeting another cloud.
 
-Once active, the smoke test runs `yield_modeling`'s
-`pytest tests/unit tests/architecture` against the OSS PR's SHA.
-**Failure is informational, not blocking** — it gives the OSS PR
-author a heads-up about downstream impact. We never make this a
-required status check; that would give a private repo veto power
-over public releases.
+**Apply the same layering rules to your own code.** The hard rules in
+[Architecture](#architecture) ship as a reusable checker you can point at any source
+tree, with a TOML allowlist for the deviations you intend — see
+[Using these architecture checks in your own repo](#using-these-architecture-checks-in-your-own-repo).
 
-Other downstreams (community adapters, external production users)
-can wire up the same pattern against their own forks. See the
-smoke-test workflow file for the template.
+**Wire a smoke test against your own project.** `.github/workflows/downstream-smoke.yml`
+is a starting point for running a dependent project's fast test suite against a pull
+request here, so a breaking change is caught at the point of change rather than after a
+release. It ships disabled (`workflow_dispatch` only) and needs a repository to point at,
+a read-only token for it, and the test command you want run. Keep it **informational
+rather than blocking**: a project nobody outside your team can see should not be able to
+veto a release here.
 
 ## Contributing
 

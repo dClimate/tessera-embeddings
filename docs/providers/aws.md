@@ -201,8 +201,7 @@ workers:     g6e.xlarge          (4 vCPU, 32 GB,    1 InferenceActor each
 ```
 
 The L40S carries **45,776 MiB — 44.7 GiB, or 48.0 GB decimal**. All three numbers
-name the same card; quote the unit, because dropping it has already put the figure
-in our docs two different ways. 250 GB NVMe is fast enough for `torch.load` of the
+name the same card, so quote the unit. 250 GB NVMe is fast enough for `torch.load` of the
 checkpoint without EBS stalls, and the NIC is rated "up to 20 Gbps" — a burst
 credit, not a sustained floor — for the S3-heavy load phase. ~$1.86/hr on-demand
 at us-west-2; spot varies (~$0.5–0.9/hr).
@@ -211,10 +210,14 @@ Scaling is horizontal: one GPU, one `InferenceActor`. The 4 vCPUs make host-side
 data loading the tight resource per worker, and the template ships two
 **capacity-fallback** rungs, both at `max_workers: 0`:
 
-| rung | card | vCPU/GPU | host GiB | throughput vs L40S |
-|---|---|---:|---:|---:|
-| `g5.2xlarge` | A10G | 8 | 32 | **0.46** |
-| `g6.2xlarge` | L4 | 8 | 32 | 0.32 |
+| rung | card | vCPU/GPU | host GiB |
+|---|---|---:|---:|
+| `g5.2xlarge` | A10G | 8 | 32 |
+| `g6.2xlarge` | L4 | 8 | 32 |
+
+Neither card is as fast as the L40S, and the A10G is the faster of the two. All three were
+measured on the same work in the same minute; the ratios, the cost per unit of work, and the
+DCGM counters behind them are in [`context_docs/inference/inference-on-gpus.md`](../../context_docs/inference/inference-on-gpus.md#4-which-gpu-and-whether-a-different-one-is-worth-its-availability) §4.
 
 **Opening one is a campaign parameter, not a release.** Pass
 `gpu_fallback_instance_types=["g5.2xlarge"]` to `run-global-campaign`. That does two things per fill,
@@ -226,13 +229,12 @@ and neither works without the other:
    *reachable*; it does not make the autoscaler use it. Ray picks node types with a
    greedy loop and stops choosing a type only when that type's own `max_workers` is
    exhausted — so while demand stays under the production rung's ceiling, an open
-   fallback is **never asked for at all**, however long the primary has been refusing.
-   Measured on dev on 2026-08-28: 18 consecutive launch attempts, every one for the
-   L40S, every one refused, and not one attempt at the A10G sitting open at a ceiling
-   of 25. What breaks that is `providers/aws/fleet_mix.py`, which states how many of
-   each card the fleet should hold through `request_resources`. Autoscaler v2 satisfies
-   that request in the **same scheduling pass** as ordinary actor demand, so both pools
-   are asked for at once.
+   fallback is **never asked for at all**, however long the primary has been refusing —
+   measured as eighteen consecutive launch attempts for a refusing L40S rung with an open
+   A10G rung untouched beside it. What breaks that is `providers/aws/fleet_mix.py`, which
+   states how many of each card the fleet should hold through `request_resources`.
+   Autoscaler v2 satisfies that request in the **same scheduling pass** as ordinary actor
+   demand, so both pools are asked for at once.
 
 **There is no capacity-aware scorer any more, and there was never a working one in
 production.** The `RAY_AUTOSCALER_UTILIZATION_SCORER` hook belongs to autoscaler **v1**,
@@ -251,8 +253,8 @@ Both `run-global-campaign` and `_apply_gpu_fallback` refuse a second one; the re
 and the allocation policy are n-ary and ready for the day that lifts.
 
 **How the ask is sized.** Rungs are ranked by throughput per vCPU, because the quota is
-counted in vCPU and the cards are not equally priced in it (0.250, 0.0575 and 0.040 of
-an L40S-equivalent per vCPU). Each rung in turn takes what the remaining demand and
+counted in vCPU and the cards are not equally priced in it — `GPU_RUNGS` carries that
+order, derived from the measured ratios in [`context_docs/inference/inference-on-gpus.md`](../../context_docs/inference/inference-on-gpus.md#4-which-gpu-and-whether-a-different-one-is-worth-its-availability) §4. Each rung in turn takes what the remaining demand and
 budget afford, bounded by its ceiling. The **best** rung is asked for what it currently
 holds plus a small probe rather than for its ceiling: a ceiling-sized ask would reserve
 budget for machines AWS is refusing, and a live-sized ask would never grow.
@@ -264,17 +266,17 @@ machines held by a standing request are exempt from the idle timeout, which is w
 ask is recomputed every round and allowed to fall.
 
 **An ask is a floor, not a delivery.** Ray launches with `MinCount=1`, so AWS fills what
-it can and reports success: one measured call asked for six A10G and got one, with a
-launch-failure count of zero throughout. **The fallback pool is supply-constrained too**
+it can and reports success — an ask for six A10G has returned one, with a launch-failure
+count of zero throughout. **The fallback pool is supply-constrained too**
 — opening it buys a second pool, not an unlimited one — and anything monitoring this
 must compare asked against live, because a failure count cannot see partial fulfilment.
 
 Three things to know before you turn it on.
 
 **It costs double the quota per GPU.** The G-and-VT quota is counted in vCPU. These
-sizes are 8 vCPU per GPU against `g6e.xlarge`'s 4, so the applied 10,000 vCPU buys
-either 2,500 L40S or 1,250 A10G. A fleet fully on fallback is half the card count
-*before* the 0.46 throughput factor.
+sizes are 8 vCPU per GPU against `g6e.xlarge`'s 4, so a 10,000 vCPU quota buys either
+2,500 L40S or 1,250 A10G. A fleet fully on fallback is therefore half the card count —
+and then each of those cards is slower as well, by the measured ratio in [`context_docs/inference/inference-on-gpus.md`](../../context_docs/inference/inference-on-gpus.md#4-which-gpu-and-whether-a-different-one-is-worth-its-availability) §4.
 
 **Recovery applies to new demand, not to running nodes.** When L40S supply returns the
 published ask shifts back toward it, and fallback machines above the new ask lose their
@@ -294,8 +296,8 @@ it. An explicit probe-and-drain would be a feature, and is not here.
 clears in seconds, and a quota refusal (`InstanceLimitExceeded`) only gets worse on a
 rung that spends more quota — so neither demotes.
 
-**The configuration the campaign runs.** As of 2026-08-28, with the L40S in short
-supply:
+**Setting the ceilings is arithmetic against the vCPU quota, and you have to do it
+yourself.** A configuration looks like this:
 
 ```
 gpu_fallback_instance_types = ["g5.2xlarge"]
@@ -303,29 +305,64 @@ gpu_fallback_vcpu_budget    = 840
 gpu-worker-ladder (SSM)     = g6e.xlarge:101
 ```
 
-That yields ceilings of **101 L40S and 105 A10G** per cluster. The L40S ceiling sits
-well above the ~39 AWS is currently supplying, which costs nothing unclaimed and
-converts straight into more actors per vCPU if supply recovers — an L40S actor is half
-the quota of an A10G one. The A10G ceiling is what actually decides the bill while the
-L40S trickles: `39x4 + 105x8 = 996` vCPU per cluster, **9,960 across ten, inside the
-10,000 account quota by design** rather than by AWS refusing the last launches.
+which yields ceilings of 101 L40S and 105 A10G per cluster. Size the pair against the
+supply you are actually getting, not against both ceilings: a primary ceiling well above
+what AWS is supplying costs nothing unclaimed and converts straight into more actors per
+vCPU if supply recovers, while the fallback ceiling is what decides the bill in the
+meantime.
 
-Both rungs full would be 1,244 vCPU per cluster and over quota. That is the accepted
-limitation — Ray's ceilings count nodes and cannot be jointly weighted — and AWS
-enforces the real line by refusing. `TestTheCampaignRestartConfiguration` pins all of it.
+**Two caps sit on each cluster, and the smaller one binds.** The rung ceilings cap *nodes* —
+101 primary plus 105 fallback, so 206 GPUs — while `num_actors` caps how many of those a
+cluster can ever occupy, because a production actor reserves a whole GPU. Establish which is
+binding before doing any vCPU arithmetic: the campaign's two shapes were governed by
+different ones.
+
+| shape | nodes allowed | actors allowed | binds | vCPU over all clusters |
+|---|---|---|---|---|
+| 10 × 250, to 2026-09-08 | 206 | 250 | the rung ceilings | 12,440 (`10 × 1,244`) |
+| 25 × 100, after | 206 | 100 | **the actor cap** | 10,000 all-L40S, 20,000 all-A10G |
+
+One cluster at both node ceilings is `101 × 4 + 840 = 1,244` vCPU, well inside a 10,000 vCPU
+quota; on that shape the breach starts at **nine concurrent clusters**, at 11,196, and eight
+fit at 9,952. Both campaign shapes overrun the quota, with one exception worth noticing: 25 ×
+100 running entirely on the primary rung lands exactly on 10,000. So AWS refusing launches did
+much of the enforcing, not the configuration.
+
+Ray's ceilings count nodes and cannot be jointly weighted, so there is nowhere to express the
+combined limit. That is an accepted limitation rather than an oversight, but size it yourself
+before assuming the ceilings bind — **and count the two rungs separately**, because they have
+independent ceilings and different vCPU costs. Per cluster:
+
+```
+primary_nodes  = min(primary_ceiling,  num_actors)
+fallback_nodes = min(fallback_ceiling, num_actors - primary_nodes)
+vCPU           = 4 * primary_nodes + 8 * fallback_nodes    # g6e.xlarge, g5.2xlarge
+```
+
+then multiply by the cluster count. Collapsing that to a single rung understates a mixed
+fleet: at 150 actors it is 101 primary plus 49 fallback, **796 vCPU**, where multiplying 150
+by 4 would say 600.
+
+**For quota planning take the fallback-heavy case rather than that one.** The order above
+assumes the primary rung fills first, which is what happens when supply allows. When it does
+not — the situation the fallback exists for — the fallback fills first, and the same 150
+actors become 45 primary plus 105 fallback, **1,020 vCPU**. The quota you need is set by the
+arrangement you get on a bad day, not a good one.
+`TestTheCampaignRestartConfiguration` pins the configuration the library ships with.
 
 **The vCPU-matched sizes are deliberately not offered.** `g5.xlarge` and `g6.xlarge` are
-4 vCPU per GPU like the production rung, but carry 16 GiB of host RAM against a measured
-~17.7 GB per-actor requirement — the exact shape that OOMed the loader on the earlier
-16 GB g5-class workers.
+4 vCPU per GPU like the production rung, but carry only 16 GiB of host RAM in total, and
+measurement puts about that much in one actor's working set on its own — so the machine has
+nothing left for anything else. These are the cheapest sizes per GPU-hour in either family,
+which is why the exclusion is worth stating rather than leaving to be discovered. The
+measurement is in [`context_docs/inference/inference-on-gpus.md`](../../context_docs/inference/inference-on-gpus.md#4-which-gpu-and-whether-a-different-one-is-worth-its-availability) §4.
 
-The L4 is half the L40S's VRAM. What makes it arguable at all is the per-chunk
-peak-VRAM telemetry on the `CHUNK_SUMMARY` line: `max_memory_allocated` measured
-**4.6–7.5 GiB** at optical depths of 54–113 timesteps, against the ~43 GiB the
-earlier `nvidia-smi` reading implied. That reading was the caching allocator's
-*reserved* pool, which runs ~3× the live requirement and sizes itself to the card
-it is given. Read `vram_peak_gib` against `t_kept` before trusting any card-fit
-argument: the requirement grows with optical depth.
+**The L4 has half the L40S's VRAM**, which is the one hard fact about it. Whether that is
+enough is a question about how much VRAM this model needs at a given optical depth, and an
+`nvidia-smi` reading cannot answer it: that number is the caching allocator's *reserved*
+pool, which sizes itself to whatever card it is given rather than to the work. Read
+`vram_peak_gib` against `t_kept` on the `CHUNK_SUMMARY` line instead. The measured
+allocations, on both fallback cards, are in [`context_docs/inference/inference-on-gpus.md`](../../context_docs/inference/inference-on-gpus.md#4-which-gpu-and-whether-a-different-one-is-worth-its-availability) §4.
 
 ## Region
 
@@ -356,13 +393,22 @@ Total                                     ~$0.85
 
 Inference, 100 km × 100 km ROI:
 ─────────────────────────────────────────────────
-~10× the chunks → ~10× the time on each step.
 Ingest scales linearly; inference uses ~10–20 spot GPUs (~$2-4/run)
 Total                                     ~$8-15
 ```
 
 These are budgetary; profile your specific AOI before scaling
-billing assumptions.
+billing assumptions. **What drives the figure is the area you keep, not the box you
+draw** — both ingest and inference skip whole chunks that fall outside your mask, so a
+compact area costs close to its own extent while a scattered one pays for every tile it
+lands on. The mechanism, and the measured saving, are in
+[the ingest README](../../src/tessera_embeddings/ingest/README.md#cropping-to-live-windows-unconditional).
+
+**Do not extrapolate them to a global run.** A campaign's bill is not a per-area figure
+multiplied up: storage, S3 requests and the container fleet together came to more than a
+third of the real total, and none of them scales the way the lines above do. The measured
+outturn of the global campaign — every line, with the usage it was derived from — is
+[`context_docs/campaign/campaign-cost-model.md`](../../context_docs/campaign/campaign-cost-model.md) §12.
 
 ## See also
 

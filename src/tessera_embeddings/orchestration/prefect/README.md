@@ -389,7 +389,7 @@ hooks then clean up after.
 > assembly) lives in the domain modules. See
 > [`ingest/README.md`](../../ingest/README.md#background-how-dask-task-graphs-consume-scheduler-ram)
 > for the scheduler-RAM cost model that drives those choices, and
-> [`inference/README.md`](../../inference/README.md#1-chunk-enumeration-and-roi-pre-filter)
+> [`inference/README.md`](../../inference/README.md#1-deciding-which-tiles-to-run)
 > for the assembly-side equivalent.
 
 ## Deliberate fault injection (supervised drills only)

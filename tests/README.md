@@ -18,8 +18,9 @@ Default `pytest` invocation only runs unit + architecture, per
 `pyproject.toml`. CI workflows opt in to the heavier markers explicitly.
 
 One workflow exists but is deliberately dormant, with the reason and the re-enable steps in a
-comment at the top of the file: `downstream-smoke.yml`, waiting on a stable release of the private
-downstream consumer. (`nightly.yml` is **deleted** — its only selector matched a stub for a test
+comment at the top of the file: `downstream-smoke.yml`, which runs a dependent project's fast suite
+against a pull request here. It needs a repository to point at, a read token for it, and a reliably
+green suite on that side before it is worth enabling. (`nightly.yml` is **deleted** — its only selector matched a stub for a test
 that will not be written; see ADR 023.)
 
 ## Where a new unit test goes

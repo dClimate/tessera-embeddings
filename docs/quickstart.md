@@ -5,8 +5,10 @@ real-world AOI: ~1 km² over Denver, Colorado, picked because it sits
 under both ascending and descending OPERA RTC-S1 tracks, so the
 quickstart exercises `s1_orbit: both`.
 
-Read time: 5 minutes. Run time: ~2.5 min for ingest only, ~3.5 min for
-full end-to-end CPU inference.
+Read time: 5 minutes. Run time: about three and a half minutes end to
+end, of which roughly a minute is CPU inference — so the ingest-only run
+below is the shorter of the two, not the faster-to-type version of a
+longer one.
 
 ## Prerequisites
 
@@ -73,7 +75,7 @@ Two one-time steps:
    `src/tessera_embeddings/ingest/auth.py::get_edl_session` for
    the precedence rules.
 
-## Ingest only (5 minutes)
+## Ingest only
 
 Sets up the env, ingests one month of S2 + S1 over the quickstart
 ROI, and stops before inference. Useful for confirming the install
@@ -108,8 +110,8 @@ What happens:
 ```
 1. Rasterise GeoJSON → ROI Zarr        (~1 s, no cluster)
 2. Local Dask cluster (2 workers)
-3. S2 L2A ingest from Earth Search     (~2 min, ~12 dates)
-4. S1 OPERA RTC ingest from CMR-STAC   (~3 min, ~6 dates)
+3. S2 L2A ingest from Earth Search     (~12 dates)
+4. S1 OPERA RTC ingest from CMR-STAC   (~6 dates)
 5. Stop. No inference. No assembly.
 ```
 
@@ -202,8 +204,9 @@ Denver, CO — one inference chunk at 10 m resolution. To use your own AOI:
 - **`ModuleNotFoundError: ray`** during the inference step → re-run
   `uv sync --all-extras`.
 - **The runner hangs on "Building Dask graph…"** → check chunk size
-  in your config. See [`README.md`](../README.md) §"Why chunk size
-  dominates everything".
+  in your config. See
+  [`single-vs-global.md`](single-vs-global.md#why-chunk-size-dominates-everything)
+  on why chunk size dominates everything.
 - **Empty embedding output** → check coverage. The runner skips
   dates with insufficient valid (non-cloud) S2 pixels. The
   `min_valid_coverage` threshold defaults to 5% of the ROI;

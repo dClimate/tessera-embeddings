@@ -1,19 +1,54 @@
-name: Downstream smoke test (yield_modeling)
+name: Downstream smoke test
 
-# INITIALLY DISABLED — the downstream consumer (yield_modeling) is a
-# private repo that does not yet have a stable v0.1.0 of its own. To
-# activate post yield_modeling first release:
+# DISABLED BY DEFAULT. This is a starting point for running a dependent project's fast
+# test suite against a pull request here, so a breaking change is caught at the point of
+# change rather than after a release.
 #
-#   1. Uncomment the `pull_request` trigger below.
-#   2. Add a repo secret `YIELD_MODELING_READ_TOKEN` (read-only PAT
-#      scoped to the closed repo).
-#   3. Verify yield_modeling/main has a stable green
-#      `pytest tests/unit tests/architecture` run.
+# To adopt it:
 #
-# This workflow MUST NEVER be a required status check. The whole point
-# is that a private downstream cannot veto an OSS release. The
-# `continue-on-error: true` step below makes failure surface as a PR
-# warning, not a block.
+#   1. Set a repository variable `DOWNSTREAM_REPO` to the project to test, as
+#      `owner/name`. It is a variable rather than a literal so that a fork can point
+#      this at its own project without editing the workflow.
+#   2. Add a repository secret `DOWNSTREAM_READ_TOKEN` — a read-only token with access
+#      to that project. Omit it if the project is public.
+#   3. Adjust the lock-file name and the test command in the last two steps to whatever
+#      that project uses. Both below are PLACEHOLDERS, not this repository's own setup:
+#      `dev.lock` is a requirements-style file the `uv pip install -r` command expects,
+#      and this repository ships a `uv.lock`, which is a uv project lock and is NOT
+#      interchangeable with it. The `tests/unit tests/architecture` split is this
+#      repository's, and a downstream's may differ.
+#   4. Uncomment the `pull_request` trigger.
+#
+# Confirm the other project's default branch has a reliably green run of that command
+# before enabling the trigger: a suite that is already red reports nothing useful.
+#
+# This workflow MUST NEVER be a required status check. A project that the people
+# reviewing a pull request here cannot see should not be able to veto a release. The
+# `continue-on-error: true` below makes a failure surface as a warning, not a block.
+#
+# SECURITY, and read this before enabling the trigger. This job runs the pull request's
+# own code while holding a token for another repository, which is the shape of a
+# credential-exfiltration bug. Two things keep it safe and both are load-bearing:
+#
+#   * `persist-credentials: false` on both checkouts, so the token is never written to
+#     disk where the tested code could read it.
+#   * A TRUST GATE, which you have to supply and this template cannot. The token protects
+#     itself; the downstream's SOURCE is a different matter. On a same-repository pull
+#     request the secret IS available, the private checkout succeeds, and that project's
+#     code then sits on the same runner as the pull request's own code while the suite runs
+#     it. Anyone who can open a pull request here could read it. That is an escalation from
+#     write access on THIS repository to read access on a private OTHER one, and the two
+#     permissions are not the same set of people. Before enabling the trigger, either
+#     satisfy yourself that every pull-request author may already read the downstream, or
+#     do not place its source beside code they control.
+#   * `pull_request`, NEVER `pull_request_target`. On `pull_request` a fork's build gets
+#     no secrets and a read-only token, so untrusted code cannot reach either. Switching
+#     to `pull_request_target` to "make forks work" hands your secrets to code the fork
+#     author controls. There is NO safe shortcut here: dispatching by hand does not help
+#     either, because `workflow_dispatch` checks out a ref of THIS repository and nothing
+#     below selects a fork's head, so it would test the base branch and report a pass that
+#     means nothing. Fork coverage needs an explicit, validated head repository and ref
+#     input, which this template deliberately does not have.
 on:
   # pull_request:
   #   branches: [main]
@@ -25,27 +60,58 @@ jobs:
     timeout-minutes: 15
     continue-on-error: true  # informational only
     steps:
-      - name: Check out yield_modeling at known-good ref
+      - name: Check out the dependent project
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: arbol/yield_modeling
-          ref: main
-          token: ${{ secrets.YIELD_MODELING_READ_TOKEN }}
-          path: yield_modeling
-      - name: Check out this OSS PR
+          repository: ${{ vars.DOWNSTREAM_REPO }}
+          # No `ref`: checkout then resolves that repository's own default branch, which is
+          # not necessarily called `main`. Pinning one would fail before the tests ran.
+          # Falls back to the run's own token: checkout REQUIRES a non-empty value, so an
+          # omitted secret would fail the checkout rather than read a public project.
+          token: ${{ secrets.DOWNSTREAM_READ_TOKEN || github.token }}
+          # REQUIRED, not optional. checkout writes the token into .git/config by default and
+          # leaves it there until post-job cleanup, and the pytest step below runs code from
+          # the pull request. Persisted, a token with access to a private downstream project
+          # would be readable -- and exfiltratable -- by that code.
+          persist-credentials: false
+          path: downstream
+      - name: Check out this pull request
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false  # same reason; nothing here pushes
           path: tessera_embeddings
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          cache-dependency-glob: "yield_modeling/dev.lock"
-      - name: Install yield_modeling against this PR's tessera_embeddings
+          cache-dependency-glob: "downstream/dev.lock"
+      - name: Install the dependent project against this pull request's tessera_embeddings
         run: |
-          cd yield_modeling
-          # Replace the pinned tessera_embeddings with the PR checkout.
-          uv pip install ../tessera_embeddings
-          uv pip install -r dev.lock
-      - name: Run yield_modeling fast suite
+          cd downstream
+          # An EXPLICIT virtual environment, and every later command aimed at it by path.
+          # `setup-uv` installs only uv, so without this there is no environment for
+          # `uv pip` to target; and `uv run` would discover the downstream project and
+          # sync an environment of its own, which would quietly reinstall the PINNED
+          # tessera_embeddings over the checkout below. The suite would then pass while
+          # testing the last release, which is the one outcome this workflow must not have.
+          uv venv .venv
+          uv pip install --python .venv/bin/python -r dev.lock
+          # The downstream package ITSELF. `-r dev.lock` installs its dependencies, not the
+          # project, and `uv run` used to install the discovered project implicitly -- running
+          # pytest directly does not, so a src-layout project would not be importable.
+          # --no-deps because the lock above already resolved them.
+          uv pip install --python .venv/bin/python --no-deps .
+          # LAST, so it wins: the lock pins tessera_embeddings, and installing the checkout
+          # any earlier would let the lock reinstall the pinned release over it.
+          uv pip install --python .venv/bin/python ../tessera_embeddings
+          # Prove the override took. A silent fallback to the pinned release is the whole
+          # risk here, so fail loudly now rather than report a meaningless pass later.
+          # `direct_url.json` (PEP 610) is the oracle: pip and uv write it for a path
+          # install and not for one resolved from an index, so it distinguishes the
+          # checkout from the pinned release. The module's __file__ cannot — a
+          # non-editable install copies into site-packages either way.
+          .venv/bin/python -c "import importlib.metadata as m, sys; r = m.distribution('tessera_embeddings').read_text('direct_url.json'); print('tessera_embeddings installed from:', r); sys.exit(0 if r and 'file://' in r else 'NOT the checkout - the lock pinned release won')"
+      - name: Run the dependent project's fast suite
         run: |
-          cd yield_modeling
-          uv run pytest tests/unit tests/architecture -n auto --tb=short
+          cd downstream
+          # `.venv/bin/python -m pytest`, not `uv run`: no project discovery, no sync, so
+          # this is certainly the environment the step above built.
+          .venv/bin/python -m pytest tests/unit tests/architecture -n auto --tb=short

@@ -1339,7 +1339,7 @@ decoupled.
 The two flows keep task count bounded via different mechanisms — per-date iteration for S2,
 time-windowed batching for S1 — described in the sections below. The same scheduler-RAM
 discipline reappears in inference assembly; see
-[`inference/README.md`](../inference/README.md#1-chunk-enumeration-and-roi-pre-filter) for the
+[`inference/README.md`](../inference/README.md#1-deciding-which-tiles-to-run) for the
 ChunkSpec-vs-sub-chunk decoupling that makes assembly survive on the same budget.
 
 ### S2: per-date iteration (task graph management)

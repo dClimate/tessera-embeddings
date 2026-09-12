@@ -104,6 +104,17 @@ rather than re-exported from the top-level package:
   change rather than a re-export: it belongs with the other time-axis symbols, and a
   second import path for one name is the sprawl this move exists to remove.
 
+  **`global_store` and `published_store` are public, because the published dataset's
+  own read recipe depends on them.** `global_store.open_global_repo` is the documented
+  way to open TESSERA v1.1 — including `anonymous=True`, the unsigned read that needs no
+  AWS account — so it cannot sit outside the surface this document promises to keep
+  stable. Public with it: `create_global_repo`, `seed_zone_groups`,
+  `set_saved_manifest_preload` (end-of-campaign maintenance) and the identity checks
+  `stamp_root_identity` / `check_root_identity` / `check_destination_types`. From
+  `published_store`, the reader-side audit helpers: `layout_departures`,
+  `coordinate_departures`, `live_shards` / `live_shards_async`, `shard_pixel_window`,
+  `sample_live_pixels`, `calendar_years`, `missing_seeded_arrays`.
+
 ## Privacy conventions
 
 - `_`-prefixed module names → fully private (e.g.

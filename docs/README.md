@@ -18,7 +18,7 @@ what was tried and abandoned — you want [`context_docs/`](../context_docs/) in
 | run it on something other than AWS | [`providers/adding-your-own.md`](providers/adding-your-own.md) |
 | use a different orchestrator than Prefect | [`orchestrator-swap.md`](orchestrator-swap.md) |
 | know which names are stable to import | [`public-api.md`](public-api.md) |
-| choose between one area and the whole globe | [`single-vs-global.md`](single-vs-global.md) |
+| choose between one area and the whole globe, or read the published global store | [`single-vs-global.md`](single-vs-global.md) |
 | understand *why* a design is the way it is | [`../context_docs/`](../context_docs/) |
 | understand what the code *is* | the [top-level README](../README.md) |
 
