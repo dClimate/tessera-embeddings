@@ -195,12 +195,20 @@ Production inference always runs on GPU. See
 (Earthdata Login credentials for OPERA; the model checkpoint is
 pulled from HuggingFace automatically).
 
-**The quickstart is also this project's decoupling test, which is why it runs end to end
-on a CPU.** The runner behind it,
+**The quickstart is also this project's decoupling test — but only when it actually runs on a
+CPU.** The bundled `examples/quickstart/config.yaml` sets `device: auto`, which probes
+`torch.cuda.is_available()` at run time, so on a machine with a working CUDA setup the
+quickstart runs on the GPU and proves nothing about CPU decoupling. **To run it as the
+architectural check, set `device: cpu` in the config**, or run it on a machine without CUDA.
+`auto` is the right default for the quickstart's actual job — one config that works on a
+laptop and a dev box alike — so the flag is deliberate and it is the claim that needs the
+qualification.
+
+The runner behind it,
 [`src/tessera_embeddings/orchestration/runners/plain.py`](src/tessera_embeddings/orchestration/runners/plain.py),
 is an orchestrator-free sequencer: it calls the same domain functions as the Prefect
-flows, without Prefect, with torch on CPU through Ray's local mode. Three things follow,
-and together they are why this is the bar we hold ourselves to:
+flows, without Prefect, through Ray's local mode. With torch pinned to CPU, three things
+follow, and together they are why this is the bar we hold ourselves to:
 
 - If CPU torch works without modification, no GPU-specific coupling has leaked into the
   domain layer. That is the strongest architectural separation check available without
