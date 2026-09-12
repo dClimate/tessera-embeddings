@@ -157,7 +157,11 @@ are no placeholder files and no placeholder chunks.
 `_start_ray_cluster()` resolves the cluster YAML at runtime from SSM parameters (security
 group, subnets, instance profile, AMI, SSH key), writes the resolved file to a tempfile and
 runs `ray up`. The flow connects over Ray Client (`ray://head-ip:10001`), and the cluster
-lives inside a context manager so it is always torn down when assembly finishes.
+lives inside a context manager that encloses **inference only** — `run_inference_task` is
+inside the `with`, and `_run_assembly` is called after it exits. So the GPU fleet is released
+once the tiles are inferred and staged, and **assembly runs with no graphics cards rented at
+all.** That is the right way round for billing: assembly is the long, cheap tail, and paying
+L40S rates through it would be the single easiest way to waste money on this pipeline.
 
 - **Head:** m5.2xlarge — Ray's own bookkeeping and the autoscaler, no inference work.
 - **Workers:** g6e.xlarge (one L40S, 4 vCPU, 32 GB RAM), on demand, across several
@@ -830,16 +834,19 @@ writer emits    band worker streams tile        shard worker emits whole
 
 reader fetches  the shard index (one small GET), then ranged-GETs of only
                 the overlapped inner chunks — identical either way, and
-                ~8.4 MB for one point at full band depth
+                ~8.65 MB for one usable point: an 8.39 MB embeddings chunk
+                plus the 0.26 MB scales chunk needed to dequantise it
 
 commit rewrites that timestep's manifests only  that year's manifests only
                 (assemble opens under            (the same time@1 split,
                  manifest_split time@1)          baked into the repo config)
 ```
 
-A point read costs the same in both, and it costs 8.4 MB because the smallest fetchable unit
-is one full-depth inner chunk. That is the number to design around, not the 128 bytes a
-single pixel's vector occupies.
+A point read costs the same in both, and the floor is **8.65 MB across two objects**: one
+full-depth `embeddings` inner chunk at 8.39 MB, plus the matching `scales` inner chunk at
+0.26 MB, because the embeddings are int8 and cannot be dequantised without their scale. That
+is the number to design around, not the 128 bytes a single pixel's vector occupies. Reading
+raw quantised values and never dequantising them is the only case that costs 8.39 alone.
 
 **Manifest splitting** is the last row. `assemble` opens the repo under
 `manifest_split({"time": 1})` — one manifest shard per timestep, so a one-timestep write

@@ -446,7 +446,8 @@ WRITE  one staged inference tile (2048²) is exactly one shard: the assembly wor
        emits the whole object once — no read-modify-write — and an all-ocean tile
        costs nothing, because it is never staged and never written.
 READ   a point or window read fetches the shard index, then asks for only the byte
-       ranges of the inner chunks it overlaps — about 8 MB for a point, not 0.5 GB.
+       ranges of the inner chunks it overlaps — about 8.65 MB for a usable point
+       (embeddings + scales), not 0.5 GB.
 ```
 
 **Those figures are the `embeddings` array. The other seven are far smaller**, and the sizes
