@@ -443,11 +443,15 @@ zone group "33N" ▸ embeddings ▸ year 2025 ▸ one shard
 └──────────────────────────────────────────────────────────────────────┘
 
 WRITE  one staged inference tile (2048²) is exactly one shard: the assembly worker
-       emits the whole object once — no read-modify-write — and on the GLOBAL path
-       an all-ocean tile costs nothing: the campaign land mask marks only tiles
-       containing land as live, so it is never dispatched, staged or written.
-       That is a property of THAT mask, not of water — water pixels pass the
-       optical validity test, so a coastal tile embeds its ocean, and a
+       emits the whole object once — no read-modify-write. A tile costs nothing
+       only when nothing selects it. On the GLOBAL path selection is BUFFERED
+       coverage, not land: a tile is live if any registry cell's footprint
+       intersects it, and that footprint reaches ~11 km (about one cell) out to
+       sea (ADR-010). So open ocean is skipped, but a tile within that buffer is
+       embedded and written even holding no land at all — deliberately, so
+       coastal pixels are not clipped, which is why the cost model budgets
+       buffered coverage rather than land area. Water is not the criterion in
+       either direction: water pixels pass the optical validity test, so a
        single-area run whose own mask covers open water will stage and write it.
 READ   a point or window read fetches the shard index, then asks for only the byte
        ranges of the inner chunks it overlaps — about 8.65 MB for a usable point
