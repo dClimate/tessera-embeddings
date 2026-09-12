@@ -57,7 +57,7 @@ without further explanation.
 | **bucket** | A group of pixels sharing the same `(s2_bin, s1_bin)` target pair. Grouping them lets the model run over one rectangular tensor with no padding and no masking, which is much faster than variable-length input. The optical and radar counts are binned *independently*, each UP to the smallest checkpoint that is greater than or equal to it (`num_obs_checkpoints`) — so pixels in one bucket share a target shape, not an observation count. |
 | **prefetch** | Starting a read before the thing that needs it asks for it. While the GPU works on the data it has, a background thread fetches what it will want next — so the read happens *during* compute instead of in front of it. |
 | **staging** | Each finished tile is written to a scratch prefix on S3 first, and copied into the real store afterwards. Actors never write to the output store directly. |
-| **shard** | One object in the output store: a 2048-pixel square holding an 8 × 8 grid of independently compressed 256-pixel **inner chunks**, plus an index of where each one sits inside it. A reader fetches the index, then only the inner chunks it needs. |
+| **shard** | One object in the output store: a 2048-pixel square holding an 8 × 8 grid of independently compressed 256-pixel **inner chunks**, plus an index of where each one sits inside it. A reader fetches the index, then only the inner chunks it needs. Size depends on the array — 537 MB for `embeddings`, 8 to 50 MB for the rest — so quote the array whenever you quote a shard size. |
 
 ## Contents
 

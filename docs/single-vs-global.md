@@ -430,7 +430,8 @@ makes a point read cheap without making a write expensive:
 ```
 zone group "33N" ▸ embeddings ▸ year 2025 ▸ one shard
 ┌─ shard object (2048² px × 128 bands ≈ 0.5 GB max on S3) ────────────┐
-│   8×8 inner chunks, 256² px × 128 bands (~8.4 MB int8+zstd each)    │
+│   8×8 inner chunks, 256² px × 128 bands (8.39 MB each, ~8.0 on the │
+│                                          wire — int8 barely zips)   │
 │   ┌────┬────┬────┬────┬────┬────┬────┬────┐                         │
 │   │▓▓▓▓│▓▓▓▓│▓▓▓▓│    │    │▓▓▓▓│▓▓▓▓│▓▓▓▓│   ▓ = data: encoded    │
 │   ├────┼────┼────┼────┼────┼────┼────┼────┤       bytes + an index  │
@@ -447,6 +448,21 @@ WRITE  one staged inference tile (2048²) is exactly one shard: the assembly wor
 READ   a point or window read fetches the shard index, then asks for only the byte
        ranges of the inner chunks it overlaps — about 8 MB for a point, not 0.5 GB.
 ```
+
+**Those figures are the `embeddings` array. The other seven are far smaller**, and the sizes
+above do not carry over to them:
+
+| array | inner chunk | whole shard |
+|---|---|---|
+| `embeddings` (int8, 128 bands) | 8.39 MB | 537 MB |
+| `s2_month_covered` and the two radar equivalents (int8, 12 months) | 0.79 MB | 50 MB |
+| `scales` (float32) | 0.26 MB | 17 MB |
+| the three `*_obs_count` arrays (uint16) | 0.13 MB | 8 MB |
+
+**So the real floor for one pixel is about 8.65 MB across two objects, not 8.39 across one**:
+the embeddings are int8 and meaningless without `scales`, so any read that returns usable
+numbers pulls an inner chunk from both arrays. Add the observation counts if you need
+provenance, and you are at roughly 9 MB.
 
 Single-area stores use the same geometry; the two presets are one definition under two names.
 
