@@ -17,11 +17,11 @@ Default `pytest` invocation only runs unit + architecture, per
 `addopts = "-m 'not integration and not parity and not slow and not gpu'"` in
 `pyproject.toml`. CI workflows opt in to the heavier markers explicitly.
 
-One workflow exists but is deliberately dormant, with the reason and the re-enable steps in a
-comment at the top of the file: `downstream-smoke.yml`, which runs a dependent project's fast suite
-against a pull request here. It needs a repository to point at, a read token for it, and a reliably
-green suite on that side before it is worth enabling. (`nightly.yml` is **deleted** — its only selector matched a stub for a test
-that will not be written; see ADR 023.)
+Two workflows have been **deleted** rather than kept dormant. `nightly.yml` — its only selector
+matched a stub for a test that will not be written; see ADR 023. `downstream-smoke.yml` — it ran a
+dependent project's fast suite against a pull request here, but it could never be exercised from
+this repository, so every defect in it surfaced in review rather than in a run. The README's
+adopter notes describe the approach in prose instead.
 
 ## Where a new unit test goes
 

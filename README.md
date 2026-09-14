@@ -466,13 +466,14 @@ through targeting another cloud.
 tree, with a TOML allowlist for the deviations you intend — see
 [Using these architecture checks in your own repo](#using-these-architecture-checks-in-your-own-repo).
 
-**Wire a smoke test against your own project.** `.github/workflows/downstream-smoke.yml`
-is a starting point for running a dependent project's fast test suite against a pull
-request here, so a breaking change is caught at the point of change rather than after a
-release. It ships disabled (`workflow_dispatch` only) and needs a repository to point at,
-a read-only token for it, and the test command you want run. Keep it **informational
-rather than blocking**: a project nobody outside your team can see should not be able to
-veto a release here.
+**Consider a smoke test against your own project**, so a breaking change here is caught at
+the point of change rather than after a release. Check the dependent project out beside this
+one, install it against *this checkout* rather than the release its lock file pins — order
+matters, since installing the lock afterwards puts the pinned version back — and run its fast
+suite. Two things to hold to. Keep it **informational rather than blocking**: a project nobody
+outside your team can see should not be able to veto a release here. And note that such a job
+runs a pull request's code beside another repository's source, so only enable it where every
+pull-request author may already read that project.
 
 ## Contributing
 
