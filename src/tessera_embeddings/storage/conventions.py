@@ -52,17 +52,25 @@ def _is_metre_crs(epsg_code: str | None) -> bool:
 
 
 # Convention registration metadata (UUID + schema URLs)
+#
+# Every URL here is pinned to a tag that EXISTS and is dereferenceable. Neither convention has
+# cut a `v1`, so the four URLs that once pointed at `refs/tags/v1` all 404'd — a registration
+# nobody can follow is worse than none, because it reads as a version claim. `v0.1` is the tag
+# both repositories actually carry, and its text is identical to `main` on the two rules this
+# store depends on (the corner origin and pixel registration). `proj:` also moved organisation:
+# `zarr-experimental/geo-proj` still redirects, but the home is `zarr-conventions`.
+# Re-pin to `refs/tags/v1` once upstream tags it, in the same change that re-checks the spec.
 _PROJ_CONVENTION = {
-    "schema_url": "https://raw.githubusercontent.com/zarr-experimental/geo-proj/refs/tags/v1/schema.json",
-    "spec_url": "https://github.com/zarr-experimental/geo-proj/blob/v1/README.md",
+    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/geo-proj/refs/tags/v0.1/schema.json",
+    "spec_url": "https://github.com/zarr-conventions/geo-proj/blob/v0.1/README.md",
     "uuid": "f17cb550-5864-4468-aeb7-f3180cfb622f",
     "name": "proj:",
     "description": "Coordinate reference system information for geospatial data",
 }
 
 _SPATIAL_CONVENTION = {
-    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/spatial/refs/tags/v1/schema.json",
-    "spec_url": "https://github.com/zarr-conventions/spatial/blob/v1/README.md",
+    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/spatial/refs/tags/v0.1/schema.json",
+    "spec_url": "https://github.com/zarr-conventions/spatial/blob/v0.1/README.md",
     "uuid": "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4",
     "name": "spatial:",
     "description": "Spatial coordinate information",
@@ -162,11 +170,25 @@ def _crs_fields_from_epsg(epsg_code: str) -> dict[str, str | dict]:
 
 
 def _compute_affine_transform(y_coords: np.ndarray, x_coords: np.ndarray) -> list[float]:
-    """Compute a 6-element affine transform from coordinate arrays.
+    """Compute a 6-element affine transform from PIXEL-CENTRE coordinate arrays.
 
     For axis-aligned grids the transform is::
 
         [scale_x, 0, origin_x, 0, scale_y, origin_y]
+
+    **The origin is the OUTER CORNER of the first pixel, not its centre.** The ``spatial:``
+    convention defines the transform over array indices where ``(0, 0)`` is the top-left
+    corner of the top-left pixel and the first pixel's centre is at ``(0.5, 0.5)``, so ``c``
+    is the western-most coordinate of the X axis and ``f`` the northern-most of the Y axis —
+    the same rule as a GDAL geotransform or a rasterio ``Affine``. Our coordinate arrays are
+    pixel CENTRES on both paths that reach here (``zone_grid`` builds them as
+    ``edge + (i + 0.5) * pitch``, and ``odc`` writes centres into every mosaic), so half a
+    pixel is stepped back off each axis to reach the corner the convention asks for.
+
+    Emitting the centre instead is not a harmless convention difference: it displaces every
+    pixel half a cell diagonally for any consumer that reads the transform, and it
+    contradicts :func:`_compute_bbox`, which is already edge-based. The two must agree —
+    ``c`` is ``bbox[0]`` and ``f`` is ``bbox[3]`` for a north-up grid — and a test pins that.
 
     The scale is the **median** spacing between consecutive coordinates, not
     ``coords[1] - coords[0]``: in non-UTM projections the float representation of
@@ -201,8 +223,12 @@ def _compute_affine_transform(y_coords: np.ndarray, x_coords: np.ndarray) -> lis
                 res_y,
             )
 
-    origin_x = float(x_coords[0])
-    origin_y = float(y_coords[0])
+    # Half a pixel back from the first CENTRE, along each axis's own sign: for a north-up
+    # grid res_y is negative, so this moves the Y origin UP to the northern edge and the X
+    # origin LEFT to the western edge. Signed rather than `abs()`, so a south-up or
+    # west-negative grid lands on its own leading edge instead of a pixel inside the grid.
+    origin_x = float(x_coords[0]) - res_x / 2
+    origin_y = float(y_coords[0]) - res_y / 2
     return [res_x, 0.0, origin_x, 0.0, res_y, origin_y]
 
 
