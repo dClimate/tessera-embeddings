@@ -52,19 +52,35 @@ def _is_metre_crs(epsg_code: str | None) -> bool:
 
 
 # Convention registration metadata (UUID + schema URLs)
+#
+# **Each entry is the registration object its own schema REQUIRES, field for field.** The `v0.1`
+# schemas pin every field with `const` and set `additionalProperties: false`, so a registration that
+# differs anywhere does not validate against the schema it advertises. Pinning `refs/tags/v1` — a
+# tag neither convention has cut — additionally 404'd all four URLs, and a registration nobody can
+# follow is worse than none because it reads as a version claim.
+#
+# **The three conventions genuinely disagree about `name`, and that is not a typo here.** The proj
+# and spatial schemas require the BARE name (`"proj"`, `"spatial"`); the geoembeddings schema
+# requires the key prefix WITH its colon (`"geoemb:"`). Each was read from the schema it pins.
+# Anything matching these by name must therefore not assume a uniform shape — match on `uuid`,
+# which is the field all three describe as permanently identifying the convention.
+#
+# `proj:` also moved organisation twice: `zarr-experimental/geo-proj` and `zarr-conventions/geo-proj`
+# both still redirect, but the repository its own schema names is `zarr-conventions/proj`.
+# Re-pin to a later tag only in a change that re-reads these schemas, since the URLs are `const`.
 _PROJ_CONVENTION = {
-    "schema_url": "https://raw.githubusercontent.com/zarr-experimental/geo-proj/refs/tags/v1/schema.json",
-    "spec_url": "https://github.com/zarr-experimental/geo-proj/blob/v1/README.md",
+    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/proj/refs/tags/v0.1/schema.json",
+    "spec_url": "https://github.com/zarr-conventions/proj/blob/v0.1/README.md",
     "uuid": "f17cb550-5864-4468-aeb7-f3180cfb622f",
-    "name": "proj:",
+    "name": "proj",
     "description": "Coordinate reference system information for geospatial data",
 }
 
 _SPATIAL_CONVENTION = {
-    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/spatial/refs/tags/v1/schema.json",
-    "spec_url": "https://github.com/zarr-conventions/spatial/blob/v1/README.md",
+    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/spatial/refs/tags/v0.1/schema.json",
+    "spec_url": "https://github.com/zarr-conventions/spatial/blob/v0.1/README.md",
     "uuid": "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4",
-    "name": "spatial:",
+    "name": "spatial",
     "description": "Spatial coordinate information",
 }
 
@@ -162,11 +178,25 @@ def _crs_fields_from_epsg(epsg_code: str) -> dict[str, str | dict]:
 
 
 def _compute_affine_transform(y_coords: np.ndarray, x_coords: np.ndarray) -> list[float]:
-    """Compute a 6-element affine transform from coordinate arrays.
+    """Compute a 6-element affine transform from PIXEL-CENTRE coordinate arrays.
 
     For axis-aligned grids the transform is::
 
         [scale_x, 0, origin_x, 0, scale_y, origin_y]
+
+    **The origin is the OUTER CORNER of the first pixel, not its centre.** The ``spatial:``
+    convention defines the transform over array indices where ``(0, 0)`` is the top-left
+    corner of the top-left pixel and the first pixel's centre is at ``(0.5, 0.5)``, so ``c``
+    is the western-most coordinate of the X axis and ``f`` the northern-most of the Y axis —
+    the same rule as a GDAL geotransform or a rasterio ``Affine``. Our coordinate arrays are
+    pixel CENTRES on both paths that reach here (``zone_grid`` builds them as
+    ``edge + (i + 0.5) * pitch``, and ``odc`` writes centres into every mosaic), so half a
+    pixel is stepped back off each axis to reach the corner the convention asks for.
+
+    Emitting the centre instead is not a harmless convention difference: it displaces every
+    pixel half a cell diagonally for any consumer that reads the transform, and it
+    contradicts :func:`_compute_bbox`, which is already edge-based. The two must agree —
+    ``c`` is ``bbox[0]`` and ``f`` is ``bbox[3]`` for a north-up grid — and a test pins that.
 
     The scale is the **median** spacing between consecutive coordinates, not
     ``coords[1] - coords[0]``: in non-UTM projections the float representation of
@@ -201,8 +231,12 @@ def _compute_affine_transform(y_coords: np.ndarray, x_coords: np.ndarray) -> lis
                 res_y,
             )
 
-    origin_x = float(x_coords[0])
-    origin_y = float(y_coords[0])
+    # Half a pixel back from the first CENTRE, along each axis's own sign: for a north-up
+    # grid res_y is negative, so this moves the Y origin UP to the northern edge and the X
+    # origin LEFT to the western edge. Signed rather than `abs()`, so a south-up or
+    # west-negative grid lands on its own leading edge instead of a pixel inside the grid.
+    origin_x = float(x_coords[0]) - res_x / 2
+    origin_y = float(y_coords[0]) - res_y / 2
     return [res_x, 0.0, origin_x, 0.0, res_y, origin_y]
 
 

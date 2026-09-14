@@ -35,6 +35,7 @@ the state was not what the evidence was gathered against, and be able to undo it
 | script | what it does |
 |---|---|
 | `set_published_store_reader_config.py` | Switches the published store's SAVED manifest preload off, so consumers stop inheriting a setting sized for writing that costs them ~2.5 s of every open and returns nothing. On spec version 2 that rewrites the one object holding every tag and the branch pointers, verified non-destructive against a clone of the real store's reference state first. Dry run unless `--apply`; `--rollback` undoes it. |
+| `fix_published_store_spatial_transform.py` | Moves each zone group's `spatial:transform` origin from the first pixel's centre to its outer corner, which is where the `spatial:` convention puts it, and re-pins the `proj:`/`spatial:` registration URLs to a tag that exists. Metadata only, one commit, 120 groups. Each corrected origin is derived from that group's own coordinate arrays and cross-checked against its own `spatial:bbox`; anything unrecognised is refused and nothing outside those two attrs may change. Idempotent, and dry run unless `--apply`. See [ADR 024](../context_docs/decisions/024-spatial-transform-origin-is-the-pixel-corner.md). |
 
 ## `diagnostic/` — supported tooling
 
