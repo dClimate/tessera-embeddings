@@ -76,8 +76,8 @@ class TestBuildConventionAttrs:
         # zarr_conventions should contain all three
         conventions = attrs["zarr_conventions"]
         names = [c["name"] for c in conventions]
-        assert "proj:" in names
-        assert "spatial:" in names
+        assert "proj" in names
+        assert "spatial" in names
         assert "geoemb:" in names
         # Each convention has a UUID
         for conv in conventions:
@@ -133,8 +133,8 @@ class TestBuildConventionAttrs:
         assert attrs["geoemb:type"] == "pixel"
         assert attrs["geoemb:dimensions"] == 128
         names = [c["name"] for c in attrs["zarr_conventions"]]
-        assert "proj:" not in names
-        assert "spatial:" not in names
+        assert "proj" not in names
+        assert "spatial" not in names
         assert "geoemb:" in names
 
     def test_non_mgrs_tile_id_omits_proj(self) -> None:
@@ -151,9 +151,9 @@ class TestBuildConventionAttrs:
         )
         assert "proj:code" not in attrs
         names = [c["name"] for c in attrs["zarr_conventions"]]
-        assert "proj:" not in names
+        assert "proj" not in names
         # spatial: still present since coords are provided
-        assert "spatial:" in names
+        assert "spatial" in names
 
     def test_model_is_public_ref_build_is_package_checkpoint_is_provenance(self) -> None:
         """geoemb:model is the PUBLIC encoder reference (ENCODER_VERSION), NOT the
@@ -247,7 +247,7 @@ class TestBuildConventionAttrs:
         assert "proj:wkt2" in attrs
         assert "proj:projjson" in attrs
         names = [c["name"] for c in attrs["zarr_conventions"]]
-        assert "proj:" in names
+        assert "proj" in names
 
     def test_single_pixel_coords_skips_spatial(self) -> None:
         """spatial: requires at least 2 coordinate values to derive a transform."""
@@ -367,7 +367,7 @@ class TestConventionRegistration:
             x_coords=np.arange(500000.0, 500100.0, 10.0),
         )
         registered = {c["name"]: c for c in attrs["zarr_conventions"]}
-        for name in ("proj:", "spatial:"):
+        for name in ("proj", "spatial"):
             for url_field in ("schema_url", "spec_url"):
                 url = registered[name][url_field]
                 assert "/v0.1/" in url, f"{name} {url_field} must pin the tag upstream actually cut"
@@ -393,7 +393,7 @@ class TestMultiGroupPlacement:
         assert "geoemb:type" not in attrs
         names = [c["name"] for c in attrs["zarr_conventions"]]
         assert "geoemb:" not in names
-        assert {"proj:", "spatial:"} <= set(names)
+        assert {"proj", "spatial"} <= set(names)
         assert attrs["proj:code"] == "EPSG:32633"
 
     def test_root_attrs_are_geoemb_only(self) -> None:

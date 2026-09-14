@@ -8,9 +8,12 @@ half a pixel (5 m) to the south-east. The same groups' ``spatial:bbox`` was alre
 edge-based, so the store also contradicted itself. This walks the zone groups and moves the origin
 half a pixel back along each axis, leaving every other attribute untouched.
 
-It also re-pins the ``proj:`` and ``spatial:`` entries in ``zarr_conventions``. Both pointed at
+It also replaces the ``proj``/``spatial`` entries in ``zarr_conventions`` with the exact
+registration objects those conventions' ``v0.1`` schemas require. The published ones pointed at
 ``refs/tags/v1``, a tag neither convention has cut, so all four URLs a consumer might follow
-returned 404. ``v0.1`` is the tag both repositories carry.
+returned 404; they also carried ``proj:``/``spatial:`` as the ``name`` where both schemas pin the
+bare word, and one named a repository that has since moved. Entries are matched by ``uuid``,
+because the repair changes the name.
 
 **Nothing is recomputed from a table.** Each group's corrected origin is derived from that group's
 OWN coordinate arrays, then cross-checked against that group's OWN ``spatial:bbox`` — an attribute
@@ -56,12 +59,35 @@ DEFAULT_REGION = "us-west-2"
 EXPECTED_GROUPS = 120
 EXPECTED_TAGS = 1070
 
-#: The registration entries as the fixed source now emits them, keyed by convention name. Imported
-#: from `conventions` rather than restated, so the store and the code that writes new stores cannot
-#: drift apart: correcting one here without the other is exactly the failure being repaired.
+#: The registration entries as the fixed source now emits them, keyed by **UUID**. Imported from
+#: `conventions` rather than restated, so the store and the code that writes new stores cannot drift
+#: apart: correcting one here without the other is exactly the failure being repaired.
+#:
+#: Keyed by uuid and not by `name` because the repair CHANGES the name — the `v0.1` schemas require
+#: the bare `"proj"`/`"spatial"` where the store holds `"proj:"`/`"spatial:"` — so a name key would
+#: fail to match the very entries being migrated. The uuid is the one field all three conventions
+#: describe as permanently identifying them.
 WANTED_CONVENTIONS: dict[str, dict] = {
-    _PROJ_CONVENTION["name"]: _PROJ_CONVENTION,
-    _SPATIAL_CONVENTION["name"]: _SPATIAL_CONVENTION,
+    _PROJ_CONVENTION["uuid"]: _PROJ_CONVENTION,
+    _SPATIAL_CONVENTION["uuid"]: _SPATIAL_CONVENTION,
+}
+
+#: The exact registration objects the published store SHIPPED with, which are the only stale state
+#: this script knows how to replace. A third shape — an extra field, a different uuid, a later
+#: version — is somebody else's change, and overwriting it wholesale would silently delete metadata
+#: this script never examined. Recognise, then replace; never "differs, therefore mine now".
+SHIPPED_CONVENTIONS: dict[str, dict] = {
+    entry["uuid"]: {
+        "schema_url": f"https://raw.githubusercontent.com/{repo}/refs/tags/v1/schema.json",
+        "spec_url": f"https://github.com/{repo}/blob/v1/README.md",
+        "uuid": entry["uuid"],
+        "name": f"{entry['name']}:",
+        "description": entry["description"],
+    }
+    for entry, repo in (
+        (_PROJ_CONVENTION, "zarr-experimental/geo-proj"),
+        (_SPATIAL_CONVENTION, "zarr-conventions/spatial"),
+    )
 }
 
 #: How far two coordinates may differ and still count as the same place, in CRS units (metres
@@ -76,6 +102,18 @@ WRITABLE_KEYS = frozenset({"spatial:transform", "zarr_conventions"})
 
 class RefusedError(Exception):
     """A precondition failed. Raised, not returned, so no caller can proceed past one."""
+
+
+def _require_finite(name: str, **values: np.ndarray | list[float]) -> None:
+    """Refuse *name* if any of *values* holds a NaN or an infinity.
+
+    Separate and called early because every other guard here is a tolerance comparison, and those
+    are silently satisfied by NaN: ``abs(nan - x) > TOL`` is False, so a non-finite value passes
+    each check by failing to be comparable at all.
+    """
+    for label, value in values.items():
+        if not np.all(np.isfinite(np.asarray(value, dtype="float64"))):
+            raise RefusedError(f"{name}: {label} holds a non-finite value, which no tolerance check can judge")
 
 
 def _corner_origin(centres: np.ndarray) -> tuple[float, float]:
@@ -118,6 +156,12 @@ def _inspect(group: zarr.Group, name: str) -> dict[str, Any]:
     if north.size < 2 or east.size < 2:
         raise RefusedError(f"{name}: needs at least two coordinates per axis to derive a resolution")
 
+    # Before ANY tolerance comparison. `abs(x - y) > TOL` is False when either side is NaN, so a
+    # single non-finite coordinate would sail through every guard below, be written as a NaN origin,
+    # and pass the post-write verification for the same reason — the one failure mode where these
+    # checks report success precisely because they cannot see.
+    _require_finite(name, transform=transform, northing=north, easting=east)
+
     res_x, edge_x = _corner_origin(east)
     res_y, edge_y = _corner_origin(north)
     if abs(res_x - a) > TOL_M or abs(res_y - e) > TOL_M:
@@ -134,6 +178,7 @@ def _inspect(group: zarr.Group, name: str) -> dict[str, Any]:
     bbox = [float(v) for v in attrs.get("spatial:bbox") or []]
     if len(bbox) != 4:
         raise RefusedError(f"{name}: spatial:bbox has {len(bbox)} elements, expected 4")
+    _require_finite(name, bbox=bbox)
     want_x = bbox[0] if res_x > 0 else bbox[2]
     want_y = bbox[3] if res_y < 0 else bbox[1]
     if abs(edge_x - want_x) > TOL_M or abs(edge_y - want_y) > TOL_M:
@@ -154,8 +199,7 @@ def _inspect(group: zarr.Group, name: str) -> dict[str, Any]:
                 f"nor the corner ({edge_x}, {edge_y}) — refusing to overwrite an unknown value"
             )
 
-    registered = {entry.get("name"): entry for entry in attrs.get("zarr_conventions", []) if isinstance(entry, dict)}
-    urls_stale = any(registered.get(n) != want for n, want in WANTED_CONVENTIONS.items() if n in registered)
+    urls_stale = _registration_state(attrs.get("zarr_conventions", []), name)
 
     return {
         "zone": name,
@@ -168,16 +212,52 @@ def _inspect(group: zarr.Group, name: str) -> dict[str, Any]:
     }
 
 
+def _registration_state(entries: list, name: str) -> bool:
+    """Whether the ``proj``/``spatial`` registrations need replacing. Refuses any third state.
+
+    Three demands, and a missing registration fails the first of them:
+
+    * **Both must be present.** Absent, the group promises a consumer no way to look up what its
+      attributes mean, which is an unrecognised store state rather than "already correct" — and
+      treating it as correct is how a group would be reported clean and silently skipped.
+    * **Each must equal EITHER the shipped object or the wanted one.** Recognise, then replace.
+      Anything else — an added field, a changed uuid, a later version somebody pinned deliberately —
+      is a change this script never examined, and replacing it wholesale would delete it silently.
+    * **They must agree with each other**, so a half-migrated group is repaired rather than reported
+      clean on the strength of whichever entry happens to be current.
+    """
+    found = {entry.get("uuid"): entry for entry in entries if isinstance(entry, dict)}
+    states = set()
+    for uuid, wanted in WANTED_CONVENTIONS.items():
+        entry = found.get(uuid)
+        if entry is None:
+            raise RefusedError(f"{name}: zarr_conventions has no entry for {wanted['name']} ({uuid})")
+        if entry == wanted:
+            states.add(False)
+        elif entry == SHIPPED_CONVENTIONS[uuid]:
+            states.add(True)
+        else:
+            raise RefusedError(
+                f"{name}: the {wanted['name']} registration is neither the one published nor the one "
+                f"wanted — refusing to overwrite metadata this has not examined: {entry}"
+            )
+    if len(states) != 1:
+        raise RefusedError(f"{name}: one registration is repaired and the other is not — refusing a half-migration")
+    return states.pop()
+
+
 def _repaired_conventions(entries: list) -> list:
-    """*entries* with the ``proj:``/``spatial:`` registrations re-pinned, order preserved.
+    """*entries* with the ``proj``/``spatial`` registrations replaced, order preserved.
 
     Rebuilt positionally rather than filtered and re-appended: the list is what a consumer reads to
-    find the spec, and reordering it would be a second, gratuitous change to diff against.
+    find the spec, and reordering it would be a second, gratuitous change to diff against. Safe to
+    replace whole entries because :func:`_registration_state` has already established that each is
+    byte-for-byte the object we published, so nothing unexamined can be lost.
     """
     out = []
     for entry in entries:
-        name = entry.get("name") if isinstance(entry, dict) else None
-        out.append(dict(WANTED_CONVENTIONS[name]) if name in WANTED_CONVENTIONS else entry)
+        uuid = entry.get("uuid") if isinstance(entry, dict) else None
+        out.append(dict(WANTED_CONVENTIONS[uuid]) if uuid in WANTED_CONVENTIONS else entry)
     return out
 
 
@@ -189,6 +269,14 @@ def _apply_to_group(group: zarr.Group, plan: dict[str, Any]) -> None:
     unexpected key means the blast radius is checked rather than assumed.
     """
     before = dict(group.attrs)
+    # The plan was made against a read-only snapshot; this runs against the writable session. The
+    # branch tip is compared once in `main`, and this re-checks the one value being overwritten, so
+    # a group that moved underneath the plan is refused rather than written from stale evidence.
+    if [float(v) for v in before.get("spatial:transform") or []] != [float(v) for v in plan["before"]]:
+        raise RefusedError(
+            f"{plan['zone']}: its transform changed between inspection and the write "
+            f"({plan['before']} -> {before.get('spatial:transform')}) — re-run the inspection"
+        )
     after = dict(before)
     if plan["transform_stale"]:
         after["spatial:transform"] = plan["after"]
@@ -212,14 +300,34 @@ def _verify(group: zarr.Group, name: str) -> None:
     attrs = dict(group.attrs)
     transform = [float(v) for v in attrs["spatial:transform"]]
     bbox = [float(v) for v in attrs["spatial:bbox"]]
+    # Ahead of the comparison, for the same reason `_inspect` checks it: a NaN origin would satisfy
+    # every tolerance test below by being incomparable, so the verification would confirm a wreck.
+    _require_finite(name, transform=transform, bbox=bbox)
     want_x = bbox[0] if transform[0] > 0 else bbox[2]
     want_y = bbox[3] if transform[4] < 0 else bbox[1]
     if abs(transform[2] - want_x) > TOL_M or abs(transform[5] - want_y) > TOL_M:
         raise RefusedError(f"{name}: after the write the origin still disagrees with the bbox")
-    registered = {e.get("name"): e for e in attrs.get("zarr_conventions", []) if isinstance(e, dict)}
-    for conv_name, want in WANTED_CONVENTIONS.items():
-        if conv_name in registered and registered[conv_name] != want:
-            raise RefusedError(f"{name}: {conv_name} registration was not re-pinned")
+    # Required to be PRESENT and exactly right, not merely "not wrong if present" — a verification
+    # that skips what it cannot find confirms nothing about the group that lost its registration.
+    registered = {e.get("uuid"): e for e in attrs.get("zarr_conventions", []) if isinstance(e, dict)}
+    for uuid, want in WANTED_CONVENTIONS.items():
+        if registered.get(uuid) != want:
+            raise RefusedError(f"{name}: the {want['name']} registration is missing or was not re-pinned")
+
+
+def _rollback_hint(before: object, repair: object) -> str:
+    """The undo command, as a compare-and-swap that refuses once someone else has built on it.
+
+    ``from_snapshot_id`` is the point: a bare ``reset_branch`` would also discard any commit that
+    landed after this repair, so an undo run a week later would silently take real work with it.
+    Pinned to the repair's own snapshot, the reset succeeds only while it is still the tip.
+    """
+    return f"roll back if needed with repo.reset_branch('main', '{before}', from_snapshot_id='{repair}')"
+
+
+def _tag_targets(repo: icechunk.Repository) -> dict[str, str]:
+    """Every tag and the snapshot it points at, as the sibling reader-config repair records them."""
+    return {tag: str(repo.lookup_tag(tag)) for tag in repo.list_tags()}
 
 
 def _open_for_read(uri: str, region: str) -> icechunk.Repository:
@@ -248,6 +356,9 @@ def main(argv: list[str] | None = None) -> int:
 
     repo = _open_for_read(args.uri, args.region)
     tags, branches = sorted(repo.list_tags()), sorted(repo.list_branches())
+    # Where each tag POINTS, not how many there are. A count survives a tag being deleted and
+    # another added, or any tag being retargeted, so it cannot support the claim the run makes.
+    before_tags = _tag_targets(repo)
     before_snapshot = repo.lookup_branch("main")
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
     groups = sorted(name for name, _ in root.groups())
@@ -310,6 +421,14 @@ def main(argv: list[str] | None = None) -> int:
 
     writable = open_global_repo(args.uri, get_credentials=icechunk_credentials_for(args.uri), region=args.region)
     session = writable.writable_session("main")
+    # The plans describe `before_snapshot`. If `main` moved between the inspection and here, this
+    # session is based on newer content the plans never saw, and Icechunk will not conflict on it
+    # because the write is a valid edit of whatever it finds. Refusing is the only safe answer —
+    # and it must be checked on the SESSION's base, which is what the write will actually build on.
+    if str(session.snapshot_id) != str(before_snapshot):
+        print(f"\nREFUSING: main moved from {before_snapshot} to {session.snapshot_id} since the inspection.")
+        print("Nothing written. Re-run: the plans describe a snapshot that is no longer the tip.")
+        return 1
     node = zarr.open_group(session.store, mode="a")
     try:
         for plan in todo:
@@ -330,14 +449,15 @@ def main(argv: list[str] | None = None) -> int:
             _verify(after_root[name], name)
     except RefusedError as refusal:
         print(f"VERIFICATION FAILED: {refusal}")
-        print(f"roll back with repo.reset_branch('main', '{before_snapshot}')")
+        print(_rollback_hint(before_snapshot, snapshot))
         return 1
-    surviving, branches_after = sorted(after.list_tags()), sorted(after.list_branches())
-    if len(surviving) != len(tags) or branches_after != branches:
-        print(f"VERIFICATION FAILED: refs changed — {len(surviving)} tags, branches {branches_after}")
+    after_tags, branches_after = _tag_targets(after), sorted(after.list_branches())
+    if after_tags != before_tags or branches_after != branches:
+        moved = sorted(set(after_tags.items()) ^ set(before_tags.items()))
+        print(f"VERIFICATION FAILED: refs changed — branches {branches_after}, tags differing: {moved[:5]}")
         return 1
-    print(f"verified {len(targets)} group(s); {len(surviving)} tags and branches {branches_after} intact")
-    print(f"roll back if needed with repo.reset_branch('main', '{before_snapshot}')")
+    print(f"verified {len(targets)} group(s); {len(after_tags)} tags all on their original snapshots")
+    print(_rollback_hint(before_snapshot, snapshot))
     return 0
 
 

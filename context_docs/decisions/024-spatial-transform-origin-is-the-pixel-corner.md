@@ -71,14 +71,26 @@ write down.
 origin *up* to the northern edge; an ascending Y axis moves *down* to its own leading edge. Using
 `abs()` would land half a pixel inside the data on one of the two.
 
-### The dead registration URLs, fixed in the same change
+### The registration entries, fixed in the same change
 
-Separately found while reading the same attributes: the `zarr_conventions` entries for `proj:` and
-`spatial:` pinned `refs/tags/v1`, a tag neither convention has cut, so all four URLs a consumer
-might follow returned 404. The code had already hit this for `geoemb:` and worked around it by
-pinning a commit, but left the other two. Both repositories carry `v0.1`; that is what they now
-pin, and a test asserts it. `proj:` also moved organisation — `zarr-experimental/geo-proj` still
-redirects, but `zarr-conventions` is the home.
+Separately found while reading the same attributes, and then sharpened by review: the
+`zarr_conventions` entries for `proj` and `spatial` did not conform to the schemas they advertise.
+
+The `v0.1` schemas pin **every** field with `const` and set `"additionalProperties": false`, so a
+registration differing anywhere fails validation. Ours differed three ways. It pinned
+`refs/tags/v1`, a tag neither convention has cut, so all four URLs a consumer might follow returned
+404. It gave `name` as `"proj:"`/`"spatial:"` where both schemas require the bare word. And the proj
+URLs named `zarr-conventions/geo-proj`, where that schema's own `const` names `zarr-conventions/proj`
+(the older `zarr-experimental/geo-proj` and `zarr-conventions/geo-proj` both still redirect, which is
+why following the link was not enough to catch it). Each entry is now the exact object its schema
+requires, read from the schema rather than assumed, with a test pinning it.
+
+**The three conventions genuinely disagree about `name`, which is why a uniform rule was wrong.**
+The proj and spatial schemas require `"proj"` and `"spatial"`; the geoembeddings schema requires
+`"geoemb:"`, colon included, describing it as "key-prefixed". So `geoemb:` was right all along and
+is untouched. Anything matching these entries must therefore key on `uuid` — the one field all three
+describe as permanently identifying the convention, and the only key that still matches an entry
+whose name is being migrated.
 
 ## 4. Why the store is repaired rather than reissued or documented
 

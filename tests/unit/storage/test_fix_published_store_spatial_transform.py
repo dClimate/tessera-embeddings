@@ -63,8 +63,7 @@ def _regress_to_published_state(path: str, *, zones: tuple[str, ...], urls: bool
         attrs["spatial:transform"] = [a, b, c + a / 2, d, e, f + e / 2]
         if urls:
             attrs["zarr_conventions"] = [
-                {**entry, "schema_url": _STALE_SPATIAL_URL} if entry.get("name") == "spatial:" else entry
-                for entry in attrs["zarr_conventions"]
+                script.SHIPPED_CONVENTIONS.get(entry.get("uuid"), entry) for entry in attrs["zarr_conventions"]
             ]
         root[zone].attrs.update(attrs)
     session.commit("regress to the published store's shipped state")
@@ -129,9 +128,9 @@ class TestTheRepair:
     def test_the_registration_urls_are_repinned(self, broken: str) -> None:
         assert _run(broken, "--apply") == 0
         registered = {c["name"]: c for c in _attrs_of(broken, "01N")["zarr_conventions"]}
-        assert registered["spatial:"]["schema_url"] != _STALE_SPATIAL_URL
-        assert "/v0.1/" in registered["spatial:"]["schema_url"]
-        assert "/v0.1/" in registered["proj:"]["spec_url"]
+        assert registered["spatial"]["schema_url"] != _STALE_SPATIAL_URL
+        assert "/v0.1/" in registered["spatial"]["schema_url"]
+        assert "/v0.1/" in registered["proj"]["spec_url"]
 
     def test_nothing_but_the_two_attrs_changes(self, broken: str) -> None:
         """The guarantee the store depends on: provenance, run records and the depth rule survive.
@@ -229,3 +228,55 @@ class TestRefusals:
 
     def test_an_unknown_zone_is_refused(self, broken: str) -> None:
         assert _run(broken, "--apply", "--zone", "99N") == 1
+
+    def test_a_non_finite_coordinate_is_refused(self, broken: str) -> None:
+        """NaN satisfies every tolerance guard by being incomparable, so it is caught up front.
+
+        Injected into the coordinate ARRAY, which is the only route it can arrive by: Icechunk
+        rejects a NaN in a JSON attribute outright, so the attrs cannot carry one.
+        """
+        session = global_store.open_global_repo(broken).writable_session("main")
+        group = zarr.open_group(session.store, mode="a")["01N"]
+        group["easting"][3] = float("nan")
+        session.commit("inject a non-finite coordinate")
+        assert _run(broken, "--apply") == 1
+
+    def test_a_missing_registration_is_refused_not_called_clean(self, broken: str) -> None:
+        """Absent is an unrecognised state, not "already correct" — it must not be skipped."""
+        kept = [c for c in _attrs_of(broken, "01N")["zarr_conventions"] if c.get("name") != "proj:"]
+        self._corrupt(broken, "01N", **{"zarr_conventions": kept})
+        assert _run(broken, "--apply") == 1
+
+    def test_a_registration_carrying_unexamined_metadata_is_refused(self, broken: str) -> None:
+        """Neither the object published nor the one wanted: replacing it wholesale would delete it."""
+        entries = [
+            {**c, "extra_field": "somebody else's"} if c.get("name") == "spatial:" else c
+            for c in _attrs_of(broken, "01N")["zarr_conventions"]
+        ]
+        self._corrupt(broken, "01N", **{"zarr_conventions": entries})
+        assert _run(broken, "--apply") == 1
+
+    def test_a_half_migrated_group_is_refused(self, broken: str) -> None:
+        """One entry repaired and the other not must not read as clean on the strength of the first."""
+        entries = [
+            script.WANTED_CONVENTIONS.get(c.get("uuid"), c) if c.get("name") == "proj:" else c
+            for c in _attrs_of(broken, "01N")["zarr_conventions"]
+        ]
+        self._corrupt(broken, "01N", **{"zarr_conventions": entries})
+        assert _run(broken, "--apply") == 1
+
+    def test_a_group_that_moved_after_inspection_is_not_written_from_stale_evidence(self, broken: str) -> None:
+        """`_apply_to_group` re-checks the value it is about to overwrite against its plan."""
+        plan = script._inspect(
+            zarr.open_group(global_store.open_global_repo(broken).readonly_session(branch="main").store, mode="r")[
+                "01N"
+            ],
+            "01N",
+        )
+        session = global_store.open_global_repo(broken).writable_session("main")
+        node = zarr.open_group(session.store, mode="a")
+        moved = list(plan["before"])
+        moved[2] += 1000.0
+        node["01N"].attrs.update({**dict(node["01N"].attrs), "spatial:transform": moved})
+        with pytest.raises(script.RefusedError, match="changed between inspection and the write"):
+            script._apply_to_group(node["01N"], plan)

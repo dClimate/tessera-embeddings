@@ -53,18 +53,26 @@ def _is_metre_crs(epsg_code: str | None) -> bool:
 
 # Convention registration metadata (UUID + schema URLs)
 #
-# Every URL here is pinned to a tag that EXISTS and is dereferenceable. Neither convention has
-# cut a `v1`, so the four URLs that once pointed at `refs/tags/v1` all 404'd — a registration
-# nobody can follow is worse than none, because it reads as a version claim. `v0.1` is the tag
-# both repositories actually carry, and its text is identical to `main` on the two rules this
-# store depends on (the corner origin and pixel registration). `proj:` also moved organisation:
-# `zarr-experimental/geo-proj` still redirects, but the home is `zarr-conventions`.
-# Re-pin to `refs/tags/v1` once upstream tags it, in the same change that re-checks the spec.
+# **Each entry is the registration object its own schema REQUIRES, field for field.** The `v0.1`
+# schemas pin every field with `const` and set `additionalProperties: false`, so a registration that
+# differs anywhere does not validate against the schema it advertises. Pinning `refs/tags/v1` — a
+# tag neither convention has cut — additionally 404'd all four URLs, and a registration nobody can
+# follow is worse than none because it reads as a version claim.
+#
+# **The three conventions genuinely disagree about `name`, and that is not a typo here.** The proj
+# and spatial schemas require the BARE name (`"proj"`, `"spatial"`); the geoembeddings schema
+# requires the key prefix WITH its colon (`"geoemb:"`). Each was read from the schema it pins.
+# Anything matching these by name must therefore not assume a uniform shape — match on `uuid`,
+# which is the field all three describe as permanently identifying the convention.
+#
+# `proj:` also moved organisation twice: `zarr-experimental/geo-proj` and `zarr-conventions/geo-proj`
+# both still redirect, but the repository its own schema names is `zarr-conventions/proj`.
+# Re-pin to a later tag only in a change that re-reads these schemas, since the URLs are `const`.
 _PROJ_CONVENTION = {
-    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/geo-proj/refs/tags/v0.1/schema.json",
-    "spec_url": "https://github.com/zarr-conventions/geo-proj/blob/v0.1/README.md",
+    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/proj/refs/tags/v0.1/schema.json",
+    "spec_url": "https://github.com/zarr-conventions/proj/blob/v0.1/README.md",
     "uuid": "f17cb550-5864-4468-aeb7-f3180cfb622f",
-    "name": "proj:",
+    "name": "proj",
     "description": "Coordinate reference system information for geospatial data",
 }
 
@@ -72,7 +80,7 @@ _SPATIAL_CONVENTION = {
     "schema_url": "https://raw.githubusercontent.com/zarr-conventions/spatial/refs/tags/v0.1/schema.json",
     "spec_url": "https://github.com/zarr-conventions/spatial/blob/v0.1/README.md",
     "uuid": "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4",
-    "name": "spatial:",
+    "name": "spatial",
     "description": "Spatial coordinate information",
 }
 

@@ -1613,7 +1613,7 @@ class TestAssemblyValidation:
         # Convention registration
         assert "zarr_conventions" in attrs
         names = [c["name"] for c in attrs["zarr_conventions"]]
-        assert "proj:" in names
+        assert "proj" in names
         assert "geoemb:" in names
 
         # proj:
