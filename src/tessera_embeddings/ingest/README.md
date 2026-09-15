@@ -347,11 +347,10 @@ The rest of this section is the mechanism behind that picture.
 #### The months where the catalogue entries are heavy
 
 Catalogue entries from roughly **November 2018 to March 2019** are about 100× larger than
-normal. An entry usually carries the tile's bounding rectangle, a couple of hundred bytes;
-these carry the outline of where the imagery actually falls, and since Sentinel-2 builds an
-image from twelve detectors that edge is a fine sawtooth — 2,497 points and 98 KB in one
-measured entry, against 0.2 KB. The asset list is ~18 KB either way, so the outline is what
-makes them heavy.
+normal. An entry usually carries the tile's bounding rectangle, a couple of hundred bytes; these
+carry the outline of where the imagery actually falls, and since Sentinel-2 builds an image from
+twelve detectors that edge is a fine sawtooth — 98 KB in one measured entry against 0.2 KB. The
+asset list is ~18 KB either way, so the outline is what makes them heavy.
 
 The band is a reprocessing gap: ESA reprocessed most of the archive to a version carrying the
 simple rectangle, and those months are the stretch where only the original 02.11 is on offer.
@@ -367,117 +366,106 @@ Sampling one day a month across the boundary:
 | Jun 2023 | 5 | 0 of 50 | 05.09 |
 
 It cannot spread, since no current processing version produces these outlines, and it could
-disappear if that stretch is ever reprocessed.
+disappear if that stretch is ever reprocessed. Two consequences in this code: a hundred entries
+is ~2.2 MB outside the band and at or over the ~6 MB response ceiling inside it, so page refusals
+are a 2019 phenomenon; and a month of these entries holds an order of magnitude more bytes than
+the same month in 2024, which is part of why the query streams month by month. Any per-item
+figure — page size, retained bytes, query timing — reads differently here than anywhere else in
+the archive.
 
-Two consequences in this code. A hundred entries is ~2.2 MB outside the band and at or over
-the ~6 MB response ceiling inside it, so page refusals are a 2019 phenomenon. And a
-month of these entries holds an order of magnitude more bytes than the same month in 2024,
-which is part of why the query streams month by month.
-
-Any per-item figure — page size, retained bytes, query timing — reads differently in these
-months than anywhere else in the archive.
-
-`_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry`
-built by `make_logging_retry()` (`_http.py`, shared with the CMR Granule query) and passed
-into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 503, 504)`).
-The subclass logs each retry attempt at WARNING — urllib3 otherwise retries silently inside
-the `HTTPAdapter`, making a slow query indistinguishable from a hang. Because
-`search.items()` paginates lazily, each page fetch is a separate HTTP call — configuring
-retries on the underlying `HTTPAdapter` means a transient 5xx on page N is retried in
-place, instead of throwing away prior pages and restarting the whole query.
+`_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry` built by
+`make_logging_retry()` (`_http.py`, shared with the CMR Granule query) and passed into
+`StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 503, 504)`). The subclass
+logs each attempt at WARNING — urllib3 otherwise retries silently inside the `HTTPAdapter`,
+making a slow query indistinguishable from a hang. Because `search.items()` paginates lazily each
+page fetch is a separate HTTP call, so retrying at the adapter recovers a transient 5xx on page N
+in place instead of throwing away prior pages and restarting the whole query.
 
 **502 is deliberately absent from that force-list**, so an Earth Search page refusal arrives
 unretried and the date-window re-cut below starts immediately rather than after the ladder's
-backoff. A transient 502 is absorbed by the attempt budget owning the leg. The CMR Granule
-query keeps its own ladder (`opera_query._CMR_RETRY`), 502 included. Note that `StacApiIO`'s
-default `max_retries=5` passes a bare int to urllib3, whose empty `status_forcelist` means
-5xx is **not** retried — the explicit `Retry` object is required.
+backoff; a transient 502 is absorbed by the attempt budget owning the leg. The CMR Granule query
+keeps its own ladder (`opera_query._CMR_RETRY`), 502 included. Note that `StacApiIO`'s default
+`max_retries=5` passes a bare int to urllib3, whose empty `status_forcelist` means 5xx is **not**
+retried — the explicit `Retry` object is required.
 
-The page size is `STACProvider.max_page_size` (the `limit` per page request), defaulting
-to 250 and set to 100 for Earth Search. This applies only to providers queried through
-`client.search()` (Earth Search, Planetary Computer) — the OPERA `cmr-asf` path bypasses
-CMR-STAC search entirely and queries the native CMR Granule API. See
-[ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md) for the full rationale.
+The page size is `STACProvider.max_page_size` (the `limit` per page request), defaulting to 250
+and set to 100 for Earth Search. It applies only to providers queried through `client.search()`
+(Earth Search, Planetary Computer); the OPERA `cmr-asf` path queries the native CMR Granule API
+instead — see [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
 
-**Why 100 for Earth Search, and what to watch.** Not throughput — the response cap above. 250
-items of `sentinel-2-l2a` is always over it. A hundred averages 4.6 MB, but the biggest page ever
-**served** was **5.73 MB, 96% of the cap**, and the refused one works out to 5.96 MB: the gap
-between fine and refused is about a quarter of a megabyte, so the average is the wrong number to
-reason from. Outside the heavy band above, a hundred items is about 2.2 MB.
+**Why 100 for Earth Search, and what to watch.** Not throughput but the response cap: 250 items
+of `sentinel-2-l2a` is always over it. A hundred averages 4.6 MB, yet the largest page ever
+served was 96% of the cap, so the margin between fine and refused is about a quarter of a
+megabyte and the average is the wrong number to reason from. Lowering it further is not the
+answer — six months of a ten-year archive is a concentrated problem, and the page-size fallback
+below handles it where it happens rather than taxing every query in every year. The cap tracks
+**bytes, not the `limit` value**: 130 items are served at 5.99 MB and 150 refused, while 150 are
+served once unneeded assets are excluded server-side. If first pages ever start returning 502
+this margin is the first thing to check, since a first-page refusal is the one case no
+date-window re-cut can route around.
 
-Lowering it further is not the answer — six months of a ten-year archive is a concentrated
-problem, and the page-size fallback below handles it where it happens rather than taxing every
-query in every year. The cap tracks **bytes, not the `limit` value**: measured directly, 130 items
-are served at 5.99 MB and 150 refused, while 150 are served at 4.77 MB once unneeded assets are
-excluded server-side. If first pages ever start returning 502, this margin is the first thing to
-check — a first-page refusal is the one case no date-window re-cut can route around.
+**The same cap also refuses pages deep in a walk**, which looks like a separate defect and is
+not. Because item sizes vary the refusal is deterministic in the *request* — cursor and date
+window together — rather than in how deep the walk has got: it has been seen at page 289 of one
+window and page 14 of a shorter one sharing its late bound. Re-sending the byte-identical cursor
+and window at a smaller limit is served, and would be the most direct remedy; it is unavailable
+only because `pystac_client` bakes the limit into a search and cannot resume a cursor at a
+different size.
 
-**The same cap also refuses pages deep in a walk**, which looks like a separate defect and is not.
-Because item sizes vary, the refusal is deterministic in the *request* — cursor and date window
-together — rather than in how deep the walk has got: it has been seen at page 289 of one window
-and page 14 of a shorter one sharing its late bound. Re-sending the byte-identical cursor and
-window at `limit=90` is served, returning 5.60 MB where the hundred would have been about 6.2 MB.
-That is the most direct remedy and is not used here only because `pystac_client` bakes the limit
-into a search and cannot resume from a cursor at a different size.
+What clears it is either a smaller response or a regrouping that produces one, and `stac.py`
+tries them in cost order.
 
-What clears it is either a smaller response or a regrouping that produces one. `stac.py` tries
-them in cost order.
-
-**A shorter window first.** Its halves between them walk about as many pages as the parent
-would have, where a smaller page re-walks the whole window at twice the requests. What matters is
-the window's **end** date: the catalogue pages newest-first, so the late bound fixes the whole
-cursor sequence and shortening only the start does not help. `_query_stac_items` re-queries as
-shorter windows on any upstream-error refusal past the first page, recursing until a window
-completes or reaches a single day. Separately, it reads the match count reported beside the first
-page and cuts a window matching more than `_MAX_QUERY_ITEMS` to size — that bounds *cost* rather
-than fixing the defect.
+**A shorter window first.** Its halves between them walk about as many pages as the parent would
+have, where a smaller page re-walks the whole window at twice the requests. What matters is the
+window's **end** date: the catalogue pages newest-first, so the late bound fixes the whole cursor
+sequence and shortening only the start does not help. `_query_stac_items` re-queries as shorter
+windows on any upstream-error refusal past the first page, recursing until a window completes or
+reaches a single day. Separately, it reads the match count reported beside the first page and
+cuts a window matching more than `_MAX_QUERY_ITEMS` to size — that bounds *cost* rather than
+fixing the defect.
 
 **A smaller page as the fallback**, halved down to `_MIN_PAGE_SIZE`, because shortening cannot
 reach two refusals: a **first page**, which a shorter window asks identically, and a **single
-day**, the re-cut's floor. Verified live — a refused 250-item page stepped 250 → 125 → 62,
-interleaving with a window cut, and returned all 2,512 items with post-sort order and extracted
-baselines unchanged.
-
-A stated overload (429, 503) is never answered with a smaller page: that means the provider is
-busy, and more requests is the wrong direction. A refusal neither lever can route around still
-raises the classified `CatalogueQueryError` with its token.
+day**, the re-cut's floor. Verified live, interleaving with a window cut and returning every item
+with post-sort order and extracted baselines unchanged. A stated overload (429, 503) is never
+answered with a smaller page: that means the provider is busy, and more requests is the wrong
+direction. A refusal neither lever can route around still raises the classified
+`CatalogueQueryError` with its token.
 
 **Concurrency.** The windows are independent searches, so `_fill_window_tree` walks up to
 `_QUERY_WINDOW_WORKERS` (6) of them at once. The worklist is driven from the calling thread and
 tasks only ever walk — they never submit and never wait — so deadlock is structurally impossible
-rather than merely unobserved. Each thread gets its own `Client`, because
-`StacApiIO` wraps a `requests.Session` that is not documented thread-safe. Output order comes
-from `_WindowWalk.preorder()` on the finished tree, and the `id` dedupe runs at that assembly step
+rather than merely unobserved. Each thread gets its own `Client`, because `StacApiIO` wraps a
+`requests.Session` that is not documented thread-safe. Output order comes from
+`_WindowWalk.preorder()` on the finished tree, and the `id` dedupe runs at that assembly step
 rather than as pages arrive, so first-occurrence-wins means first in the **walk** and not first
 off the wire.
 
 Six rather than eight, even though eight is faster: the campaign runs tens of cells against this
-one provider at once, so the setting multiplies the concurrent search streams Element 84 sees, and
-per-page latency degrades with width. A failure does not stop the other windows — every window is
-walked, all failures collected, and the depth-first-earliest raised, so which failure surfaces is
-a function of the query rather than of which task finished first.
+one provider at once, so the setting multiplies the concurrent search streams Element 84 sees,
+and per-page latency degrades with width. A failure does not stop the other windows — every
+window is walked, all failures collected, and the depth-first-earliest raised, so which failure
+surfaces is a function of the query rather than of which task finished first.
 
-The re-partition is a pure re-cut of the window, never a narrowing, and it is exact in both
-directions: the outer bounds are the caller's own date strings handed straight back, and every
-interior boundary is a single **instant** (`T00:00:00Z`) shared by the window that ends there
-and the window that starts there. The catalogue's range is inclusive at both ends, so the union
-is the input window with no gap and no overhang, and the only overlap is that one instant.
-
-The boundary is an instant rather than a date because the client expands a bare date end to
-`T23:59:59Z`, so windows abutting on consecutive DATES would leave the last second of each seam's
-earlier day unasked for. Sharing the whole boundary DAY closes that gap too, but makes every seam
-re-fetch a full day for the dedupe to discard — about 13 page requests each at Earth Search. Items
-are deduped by `id` across every search a query runs, which absorbs the boundary instant and the
-antimeridian overlap alike.
+The re-partition is a pure re-cut, never a narrowing, and it is exact in both directions: the
+outer bounds are the caller's own date strings handed straight back, and every interior boundary
+is a single **instant** (`T00:00:00Z`) shared by the window that ends there and the window that
+starts there. The catalogue's range is inclusive at both ends, so the union is the input window
+with no gap and no overhang, and the only overlap is that one instant. An instant rather than a
+date because the client expands a bare date end to `T23:59:59Z`, so windows abutting on
+consecutive DATES would leave the last second of each seam's earlier day unasked for; sharing the
+whole boundary DAY closes that gap too, but makes every seam re-fetch a full day for the dedupe
+to discard. Items are deduped by `id` across every search a query runs, which absorbs the
+boundary instant and the antimeridian overlap alike.
 
 **Item order.** The re-partition does change the order items are *walked* in — one walk returns
 the window newest-first, the worklist returns window by window in date order. That is safe only
-because `query_stac_items` re-sorts with `solar_day_sort_key`, making the final sequence a function
-of the items rather than of the order the walk produced (see *Cloud cover* below for what that sort
-decides). Verified against an unsplit walk at several part counts; see
-[the ingest campaign record](../../../context_docs/ingest/ingest-performance.md),
-which also records the measurements and the two optimisations that are closed (a larger page,
-and server-side field selection).
+because `query_stac_items` re-sorts with `solar_day_sort_key`, making the final sequence a
+function of the items rather than of the order the walk produced (see *Cloud cover* below for
+what that sort decides). Verified against an unsplit walk at several part counts; see
+[the ingest campaign record](../../../context_docs/ingest/ingest-performance.md), which also
+records the measurements and the two optimisations that are closed (a larger page, and
+server-side field selection).
 
 #### Cloud cover decides which scene wins a pixel
 
@@ -735,35 +723,34 @@ The key reads these signals, in this order:
 
 Two properties of that ordering are easy to get wrong and are held by tests:
 
-- **Locality is judged over the read set, not over every asset.** A real Element 84 item
-  carries its COG bands *and* the original JP2s, across two buckets. Requiring all of them
-  disables the preference altogether. It is also judged over the *whole* read set: one local band among many remote
-  ones is not locality, and an item exposing none of them is remote, because absence of
+- **Locality is judged over the read set, not over every asset.** A real Element 84 item carries
+  its COG bands *and* the original JP2s, across two buckets, so requiring every asset disables
+  the preference altogether. It is judged over the *whole* read set: one local band among many
+  remote ones is not locality, and an item exposing none of them is remote, because absence of
   evidence is not evidence of locality.
 - **An unreadable baseline sorts LAST, and makes locality inert for that copy.** A missing
   baseline is an absence of evidence rather than a tie: as a tie it let a copy with no baseline
-  displace a raw copy at 05.00, taking an older reprocessing *and* skipping the correction. Such a
-  copy also refuses its whole date downstream, and the ladder recovers from a read error but not a
-  refusal. An already-harmonised copy is exempt, since no offset decision rests on its baseline
-  and penalising it would hand the tile-date to an older raw reprocessing.
+  displace a raw copy at 05.00, taking an older reprocessing *and* skipping the correction. Such
+  a copy also refuses its whole date downstream, and the ladder recovers from a read error but
+  not a refusal. An already-harmonised copy is exempt, since no offset decision rests on its
+  baseline and penalising it would hand the tile-date to an older raw reprocessing.
 
 **Which copies are the same acquisition is decided by identity, not by a timestamp.** Two
 reprocessings of one granule share a datatake — mission, sensing start and absolute orbit, in
 `s2:datatake_id` — and differ only in the baseline suffix. They do **not** agree on the catalogue
-`datetime`, which is per-copy: on the 2017-12-19 cassette the 02.06 and 05.00 copies of one
-granule are timestamped more than three minutes apart, so a tolerance around that timestamp
-cannot separate "two reprocessings" from "two passes" without getting one wrong. The timestamp
-window survives only as the fallback for a copy naming no datatake. Splitting on a real
-acquisition protects genuine same-day coverage: successive orbits revisit a high-latitude tile
-the same day, and keying on `(tile, solar day)` alone dropped 493 of 2,733 distinct acquisitions
-as duplicates.
+`datetime`, which is per-copy and has been seen to differ by more than three minutes between two
+copies of one granule, so a tolerance around that timestamp cannot separate "two reprocessings"
+from "two passes" without getting one wrong. The timestamp window survives only as the fallback
+for a copy naming no datatake. Splitting on a real acquisition protects genuine same-day
+coverage: successive orbits revisit a high-latitude tile the same day, and keying on `(tile,
+solar day)` alone dropped 493 of 2,733 distinct acquisitions as duplicates.
 
-A copy naming **no** datatake joins an identified acquisition its timestamp places it in, before it
-is allowed to start one, and it is matched against *any* member of that acquisition — members of
-one observation do not agree on the timestamp, which is the whole reason identity is primary, so
-closeness to any of them is the available evidence. Without that, one reprocessing declaring the
-datatake while its sibling omitted it were never compared however close their timestamps, and both
-survived to be fused.
+A copy naming **no** datatake joins an identified acquisition its timestamp places it in, before
+it is allowed to start one, and it is matched against *any* member of that acquisition — members
+of one observation do not agree on the timestamp, which is the whole reason identity is primary,
+so closeness to any of them is the available evidence. Without that, one reprocessing declaring
+the datatake while its sibling omitted it were never compared however close their timestamps, and
+both survived to be fused.
 
 **The tile key is read from whichever property the catalogue populates**, `grid:code` or
 `s2:mgrs_tile`, then the item id — all canonicalised to one form, so two catalogues naming one
@@ -772,30 +759,25 @@ in a field the Element 84 pattern does not match, so without it every item was u
 duplicate selection was a no-op for the whole provider.
 
 **Where the producer cannot be read from an item's assets, the collection supplies it**, through
-`known_harmonisation` on `select_preferred_duplicates` — the same value `stac.collection_harmonisation`
-gives the correction path, so the two cannot disagree. This is load-bearing rather than an
-optimisation, and the two changes above are why: making Planetary Computer items keyable gave that
-provider a fallback ladder for the first time, and deriving the correction from the items made its
-unreadable baselines refuse. A spare judged only on visible assets therefore looked harmless, would
-be offered to the ladder, and would abort the ingest when a read failure stepped down to it, since
-the recovery loop steps down on a read failure and not on a refusal.
+`known_harmonisation` on `select_preferred_duplicates` — the same value
+`stac.collection_harmonisation` gives the correction path, so the two cannot disagree. This is
+load-bearing rather than an optimisation: a spare judged only on visible assets looks harmless,
+is offered to the ladder, and aborts the ingest when a read failure steps down to it, because the
+recovery loop steps down on a read failure and not on a refusal.
 
 The **fallback ladder** — the rejected copies, in the order a read failure steps down them — is
-built by one global sort over the whole tile-date instead, using a key that has no notion of
-"best in my group". Two other constructions were wrong. Ranking the tile-date with the same
-function used for winners let one malformed item's suspension revert every acquisition's ladder
-to sequence order. Ranking each acquisition separately and concatenating them behind their
-sorted heads is wrong further down: with one acquisition holding 05.00 and 01.00 spares and
-another holding 04.00, it yields `[05, 01, 04]`, and the unattributed recovery consumes the head
-on each retry, so the second retry takes 01.00 and never tries the 04.00. In the global order an
-unreadable baseline sorts last rather than suspending anything, which is the same protection by a
-more direct route: a copy whose baseline cannot be read is the one whose correction will silently
-be skipped.
+built by one global sort over the whole tile-date, using a key with no notion of "best in my
+group". Ranking each acquisition separately and concatenating the results is wrong further down
+the ladder: with one acquisition holding 05.00 and 01.00 spares and another holding 04.00 it
+yields `[05, 01, 04]`, and since the unattributed recovery consumes the head on each retry, the
+second retry takes 01.00 and never reaches 04.00. In the global order an unreadable baseline
+simply sorts last, which is the same protection by a more direct route: a copy whose baseline
+cannot be read is the one whose correction will silently be skipped.
 
-Buckets are compared by parsing the href's host and path rather than by substring, so a
-lookalike host cannot be mistaken for a preferred one. The baseline is matched as a version
-string rather than parsed as a number, so `"NaN"`, `"Infinity"` and every other value that is
-numeric without being a version read as unknown — see `item_baselines.py`.
+Buckets are compared by parsing the href's host and path rather than by substring, so a lookalike
+host cannot be mistaken for a preferred one. The baseline is matched as a version string rather
+than parsed as a number, so `"NaN"`, `"Infinity"` and every other value that is numeric without
+being a version read as unknown — see `item_baselines.py`.
 
 ### Data Transformations
 
@@ -836,16 +818,13 @@ These happen before `odc.stac.load` is called:
 ESA changed the S2 L2A processing baseline at version 04.00 (January 2022), adding +1000 to all
 surface reflectance values. Whether that offset has to be subtracted is a property of **who
 served the pixels**, not of the collection: Element 84 harmonises its own COGs and subtracts it
-for you, while ESA's originals carry it.
-
-Leaving `baseline_threshold` unset for Earth Search assumes every item is a harmonised COG, and
-that fails once the collection also indexes items whose assets point at ESA's archive. Reading the
-collection alone exempts or corrects both kinds together, and one of those is always wrong and
-always silent: a skipped correction leaves plausible pixels 1000 too high, a doubled one shifts
+for you, while ESA's originals carry it. Since Earth Search indexes both kinds, reading the
+collection alone exempts or corrects them together — and one of those is always wrong and always
+silent, a skipped correction leaving plausible pixels 1000 too high and a doubled one shifting
 every value by 1000.
 
-So the threshold **is** set for Earth Search, and the decision is made per ASSET from where that
-asset lives (`boa_offset.source_decision`). Three properties of it are worth stating:
+So `baseline_threshold` **is** set for Earth Search, and the decision is made per ASSET from where
+that asset lives (`boa_offset.source_decision`). Three properties of it are worth stating:
 
 - **Judged over the reflectance bands only.** A real Element 84 item carries the original JP2s
   as extra assets beside its COG bands, so judging every asset reports a straddle for an item
@@ -856,11 +835,10 @@ asset lives (`boa_offset.source_decision`). Three properties of it are worth sta
 - **Decided per SOURCE, and applied as each image is read.** `odc.stac.load` fuses a solar day
   into one time slice, so a correction applied to its OUTPUT hits every tile at once, and a day
   whose tiles disagree has no correct answer — 347 days of one region-year were refused that way.
-  The decision is now per reflectance asset (`boa_offset.source_decision`), stamped at parse time
-  (`stac.BoaOffsetParser`) and applied inside the read (`stac._BoaCorrectingReader`) before
-  anything is resampled together. Different tiles occupy different ground, so no pixel is both
-  corrected and uncorrected. Purely additive, since the amount subtracted is a constant: days the
-  pipeline loaded before are bit-identical, and only previously-refused days change. See
+  The decision is stamped per reflectance asset at parse time (`stac.BoaOffsetParser`) and applied
+  inside the read (`stac._BoaCorrectingReader`) before anything is resampled together, so no pixel
+  is both corrected and uncorrected. It is purely additive, the amount being a constant: days the
+  pipeline loaded before are bit-identical and only previously-refused days change. See
   [ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §3.
 - **Thresholded on the item's own declared baseline, and an unreadable one refuses.** An absent
   or malformed `s2:processing_baseline` parses as nothing rather than 0: read as zero it falls
@@ -870,61 +848,42 @@ asset lives (`boa_offset.source_decision`). Three properties of it are worth sta
   property.
 
 **Consulting the assets at all is scoped to the collections that need it**, via
-`CollectionConfig.harmonisation_varies_by_item`. That read looks assets up under the keys named in
-`bands`, the way Earth Search keys its assets and NOT how every provider does: Planetary
-Computer serves the same imagery under native keys (`B02`, `SCL`) and relies on the loader
-resolving the common names, so the read finds nothing there. On Planetary Computer it therefore
-classified every modern item as undeterminable and refused every date at baseline 04.00 or above.
-
-So where the producer cannot vary between items, the **collection's own configuration supplies the
-answer**: a correction threshold on such a collection says every item is unharmonised, which is
-what the threshold is there to correct. `source_decision` takes that as `known_harmonisation` and
-does not consult the bucket at all, letting a provider that serves its bands under native
-asset keys be decided here, and is why every Planetary Computer source is corrected rather than
-refused. One decision then serves both providers, so they cannot disagree about a producer.
+`CollectionConfig.harmonisation_varies_by_item`. Where the producer cannot vary between items the
+**collection's configuration supplies the answer** instead: a correction threshold on such a
+collection says every item is unharmonised, which is what the threshold is there to correct, and
+`source_decision` takes that as `known_harmonisation` without consulting the bucket. That is what
+lets Planetary Computer — which serves the same imagery under native asset keys (`B02`, `SCL`) an
+item-level read would find nothing under — be decided here and corrected rather than refused. One
+decision serves both providers, so they cannot disagree about a producer.
 
 Which assets carry the reflectance bands is resolved through **odc's own alias table**
-(`stac._reflectance_asset_keys`), not from the configured band names: Planetary Computer serves
-`blue` as an asset called `B02`, so deciding against the configured names would match none of its
-assets and correct nothing. `scl` is excluded structurally — it is simply not among the resolved
-keys — rather than by a list the corrector is told to skip.
+(`stac._reflectance_asset_keys`), not from the configured band names, for the same reason. `scl`
+is excluded structurally — it is simply not among the resolved keys — rather than by a list the
+corrector is told to skip.
 
-The correction VALUE is a **constant** — `S2_BASELINE_OFFSET`, `-1000`. The baseline decides only
-*whether* the offset is removed, never how much — that is what makes the move from a per-date to a
-per-source decision produce bit-identical pixels on every day the pipeline already loaded.
-`extract_baselines` remains separate and untouched: it records what each item declared, is what
-reaches the store's `baselines_applied`, and is **not** a correction input — one integer per date is
-provenance, and correcting from it left raw post-04.00 pixels uncorrected whenever it omitted a
-date, carried the zero an unreadable baseline collapses to, or named an arbitrary item's baseline on
-a multi-item date.
+The correction VALUE is a **constant**, `S2_BASELINE_OFFSET` of `-1000`; the baseline decides only
+*whether* the offset is removed, never how much. `extract_baselines` remains separate: it records
+what each item declared and is what reaches the store's `baselines_applied`, but it is **not** a
+correction input. One integer per date is provenance, and correcting from it left raw post-04.00
+pixels uncorrected whenever it omitted a date, carried the zero an unreadable baseline collapses
+to, or named an arbitrary item's baseline on a multi-item date.
 
 Duplicate selection has **two owners**, and neither is the shared query. `query_stac_items`
 deliberately does not prune: `s2_roi` runs its own selection over that output and keeps the
 rejected copies as the ladder `step_down_copies` walks when a source object will not read, so
 pruning upstream would leave it nothing to step down to. `load_stac_items` prunes for everyone
-else — both the documented `query_stac_items` -> `load_stac_items` workflow, which passes through
-neither of the others, and `ingest_tile`, which leaves it to the loader: the loader realigns
-`baselines` in place and that is the same dict `ingest_tile` returns, so the map still describes
-the copy that was kept.
-
-Selecting over an already-selected set is a no-op, so more than one owner is safe.
+else — both the documented `query_stac_items` -> `load_stac_items` workflow and `ingest_tile`,
+which leaves it to the loader: the loader realigns `baselines` in place and that is the same dict
+`ingest_tile` returns, so the map still describes the copy that was kept. Selecting over an
+already-selected set is a no-op, so more than one owner is safe.
 
 **One ambiguous shape survives, and it refuses** (`HeterogeneousProducerError`): a reflectance
 source at or above the threshold whose producer cannot be determined — served from a bucket nobody
-has classified, or belonging to an unharmonised copy that declares no readable baseline. Correcting
-it and exempting it are wrong by the same amount in opposite directions and both are silent, so
-nothing guesses. The refusal is a property of that one source, and it is gated on the threshold:
-below it no producer changes a pixel, so there is nothing to decide.
-
-**No day is decided as a whole any more**, so the shapes that used to cost whole days are gone:
-tiles straddling the threshold, and a raw item fused with an already-harmonised one, are each
-corrected on their own ground. An item whose bands come from two producers is corrected band by
-band. See [ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) and
-`context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md`.
-
-A refusal that does still happen is skipped alone and counted rather than failing the leg, and
-duplicate selection routes around it: a copy that would refuse is ranked last *and* withheld from
-the fallback ladder, since a refusal is not a read failure and nothing retries one. "Alone" is a
+has classified, or belonging to an unharmonised copy that declares no readable baseline. The
+refusal is a property of that one source and is gated on the threshold, since below it no producer
+changes a pixel. It is skipped alone and counted rather than failing the leg, and duplicate
+selection routes around it: a copy that would refuse is ranked last *and* withheld from the
+fallback ladder, since a refusal is not a read failure and nothing retries one. "Alone" is a
 property of `s2_roi`, which loads one solar day per call — a caller pairing `query_stac_items`
 with `load_stac_items` over a multi-day list forfeits every day in it, so pass a day at a time.
 
@@ -939,43 +898,41 @@ Letting one visible harmonised band speak for a hidden native-keyed one would si
 how many reflectance sources it stamped, and how many of those were owed the offset. Reaching
 *none* of them is the one way this can still go wrong quietly — an empty or mistaken
 `reflectance_assets` set corrects nothing and produces plausible pixels 1000 too high — so a zero
-count is a WARNING naming the assets it resolved, and any other count is an INFO line. A warning
+count is a WARNING naming the assets it resolved and any other count is an INFO line. A warning
 rather than an error, because a caller that replaces the loader also reports zero; what makes that
 enough is that every other way of getting this wrong is loud, since an unclassifiable source
 refuses and an unresolvable band name fails the load.
 
-One integer per date is a **lossy** record of a day whose tiles declare different baselines. The
-value is the first item's — the clearest tile, since the query sorts cloud-ascending — and the
+`baselines_applied` is correspondingly **lossy** on a day whose tiles declare different baselines.
+The value is the first item's — the clearest tile, since the query sorts cloud-ascending — and the
 day's other vintages are recorded nowhere. Deliberate: nothing in this package reads the value.
 
-`correct_boa_dn` does the arithmetic, once, on one source's pixels:
-
-**The offset applies to every valid DN, not only to bright ones.** ESA adds it across the whole
-reflectance range precisely so that negative surface reflectance — routine over water and deep
-shadow — is representable in an unsigned type. So the correction is `DN - 1000` for every DN from 1
-upward, floored at the lowest VALID code, which is **1**.
-
-Not zero: zero is the nodata code, so flooring a real dark observation there makes it
-indistinguishable from no observation and every downstream mask drops it. Element 84's harmonised
-COGs floor at 1 for the same reason, and reproducing them exactly is what makes a corrected raw copy
-comparable with a harmonised one. DN 0 itself never reaches the arithmetic — the reader applies the
-result only where the source was valid — so nodata survives as nodata.
+`correct_boa_dn` does the arithmetic, once, on one source's pixels. **The offset applies to every
+valid DN, not only to bright ones**: ESA adds it across the whole reflectance range precisely so
+that negative surface reflectance, routine over water and deep shadow, is representable in an
+unsigned type. So the correction is `DN - 1000` for every DN from 1 upward, floored at the lowest
+VALID code, which is **1**. Not zero, because zero is the nodata code and flooring a real dark
+observation there makes it indistinguishable from no observation, which every downstream mask then
+drops. Element 84's harmonised COGs floor at 1 for the same reason, and reproducing them exactly
+is what makes a corrected raw copy comparable with a harmonised one. DN 0 itself never reaches the
+arithmetic — the reader applies the result only where the source was valid — so nodata survives as
+nodata.
 
 **That the nodata code IS 0 is hard-coded, and that is an unchecked assumption.** `_NODATA = 0`
 is a constant in `stac.py`, and the correction rests on it twice: DN 0 is excluded from the
 arithmetic, and the floor of 1 is what stops a corrected pixel from looking like nodata. The real
 answer belongs to the catalogue, which `odc` derives per band from `raster:bands` and hands the
 reader as `RasterLoadParams`, but the driver is installed on any collection whose config sets
-`requires_baseline_correction`, so nothing ties the constant to what that collection declares. Under a marker of 65535 every gap pixel would
-test as valid — the correction shifts them to 64535, the fuser's `dst == fill_value` test stops
-recognising them as empty, and the mosaic gains data-looking pixels where there was no
-observation. Both Sentinel-2 providers declare 0 today, so this is latent; resolving the marker
-from `cfg` and refusing anything else is owed.
+`requires_baseline_correction`, so nothing ties the constant to what that collection declares.
+Under a marker of 65535 every gap pixel would test as valid — the correction shifts them to 64535,
+the fuser's `dst == fill_value` test stops recognising them as empty, and the mosaic gains
+data-looking pixels where there was no observation. Both Sentinel-2 providers declare 0 today, so
+this is latent; resolving the marker from `cfg` and refusing anything else is owed.
 
-The arithmetic widens to `int32` and casts back to the INPUT dtype, so nothing wraps and the store's
-unsigned arrays are unaffected: the offset is negative and the floor is positive, so an unsigned
-input stays representable. Adding a negative Python int to a `uint16` array raises under numpy 2,
-which the widening exists for.
+The arithmetic widens to `int32` and casts back to the INPUT dtype, so nothing wraps and the
+store's unsigned arrays are unaffected: the offset is negative and the floor is positive, so an
+unsigned input stays representable. Adding a negative Python int to a `uint16` array raises under
+numpy 2, which the widening exists for.
 
 **The floor still acts on resampled values, and that is a recorded limit.** `odc.stac.load`
 reads and resamples in one step, so the wrapped reader sees already-warped pixels, and six of the
@@ -983,7 +940,8 @@ ten configured bands are natively 20 m on a 10 m grid. A pixel whose kernel span
 boundary is floored where Element 84, flooring each source first, would not have been. Fixing it
 means taking over the read-and-warp step and would rewrite pixels in every existing store, so it
 is owed separately — measured in
-[ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §6.
+[ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §6, alongside
+`context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md`.
 
 SCL is never corrected. It is not among the resolved reflectance asset keys, so it carries no
 decision at all — a stronger exclusion than a band list, which could go stale.
@@ -1162,38 +1120,37 @@ credentials, bypassing the env vars. The mechanism:
   reused Dask worker is not left pinned to it, and the previous provider is restored even if the
   body raises. The storage layer ships this as `None` and never imports botocore, per the
   `no-botocore-outside-aws-provider` architecture rule; only the AWS provider supplies it.
-- The `process_roi_sar` Prefect task registers `iam_icechunk_credentials` via that hook when
-  `use_s3_direct=True`. **This must happen in the task shell, not the flow body** — with the
-  Dask task runner the domain function (and its store writes) execute in a *worker* process,
-  so a provider registered in the flow-runner process would never reach them.
+- The `process_roi_sar` Prefect task registers `iam_icechunk_credentials` through that hook when
+  `use_s3_direct=True`. **In the task shell, not the flow body** — under the Dask task runner the
+  domain function and its store writes execute in a *worker* process, so a provider registered in
+  the flow-runner process would never reach them.
 
-The plain-Zarr side needs the same identity, and one property beyond it. An ROI mask is not an
-Icechunk store, so it is read through fsspec, and
-`providers/aws/credentials.py::iam_s3_storage_options` is the fsspec counterpart: the same
-env-stripped chain, returned in the shape fsspec takes as `storage_options`. The ingest is handed
-the **callable**, not its result — and `read_roi_mask` resolves it inside each block read rather
-than once when it builds the graph.
+The plain-Zarr side needs the same identity and one property beyond it. An ROI mask is read
+through fsspec rather than icechunk, and
+`providers/aws/credentials.py::iam_s3_storage_options` is the fsspec counterpart — the same
+env-stripped chain in the shape fsspec takes as `storage_options`. The ingest is handed the
+**callable**, not its result, and `read_roi_mask` resolves it inside each block read rather than
+once at graph build.
 
-That last part matters, because the mask array is LAZY: its block reads happen inside a
-later `write_day_windows` compute, which on the radar path spans a whole 30-day batch. One
-credential resolved at graph-build time would be presented by every one of those reads and, once
-expired, would fail with `ExpiredToken` on a bucket the role can always read — a lifetime problem
-wearing a permissions problem's error message. Opening per block keeps the credential no older
-than the read using it.
+That matters because the mask array is LAZY: its block reads happen inside a later
+`write_day_windows` compute, which on the radar path spans a whole 30-day batch. One credential
+resolved at graph-build time would be presented by every one of those reads and, once expired,
+fail with `ExpiredToken` on a bucket the role can always read — a lifetime problem wearing a
+permissions problem's error message.
 
-Two consequences. Each block read costs its own store open, so its own metadata round trip, where
-the old construction paid one for the whole array; and the returned array is cloudpickle-only,
-because the closure is a nested function. Both are measured in
-`context_docs/decisions/022-resolve-the-roi-mask-credential-at-read-time.md`, and both are reasons
-not to hand this array to a plain-pickle boundary, or to read a whole zone grid you do not need.
+Two consequences: each block read pays its own store open and metadata round trip where the old
+construction paid one for the whole array, and the returned array is cloudpickle-only because the
+closure is nested. Both are measured in
+`context_docs/decisions/022-resolve-the-roi-mask-credential-at-read-time.md`, and both argue
+against handing this array to a plain-pickle boundary or reading a zone grid you do not need.
 
 **IMDS throttling — why `_resolve_iam_credentials` is `lru_cache`d (gotcha).** The credential
 machinery has two distinct TTLs, and conflating them overwhelms the EC2 Instance Metadata
 Service (IMDS):
 
-- `iam_icechunk_credentials` sets `expires_after=15min` on the returned `S3StaticCredentials`.
-  This is how often **icechunk** re-invokes our callback per repo client — it is *not* how
-  often we should touch IMDS.
+- `iam_icechunk_credentials` sets `expires_after=15min` on the returned `S3StaticCredentials`,
+  which is how often **icechunk** re-invokes the callback per repo client — not how often we
+  should touch IMDS.
 - `_resolve_iam_credentials` is `@lru_cache(maxsize=1)`, so the botocore session and the live
   `RefreshableCredentials` it returns are built **once per process**. Those refresh themselves in
   the background, and `get_frozen_credentials()` is a pure expiry check that only re-hits IMDS
