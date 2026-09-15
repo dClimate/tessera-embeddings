@@ -499,14 +499,14 @@ from one known to be fully clouded.
 #### Streaming the query month by month (S2)
 
 `ingest_s2_roi_reflectance` queries **one month at a time** by default
-(`stream_stac_monthly`), prefetching the next month while the current one is being
-ingested. Querying a whole window up front is simpler, but it retains every returned item
-for the run's duration, and a zone-year's worth does not fit alongside the ingest on one
-worker. Streaming bounds retention to the month in hand plus the one being fetched.
+(`stream_stac_monthly`), prefetching the next while the current one is ingested. Querying the
+whole window up front retains every returned item for the run's duration, and a zone-year's worth
+does not fit alongside the ingest on one worker; streaming bounds retention to the month in hand
+plus the one being fetched.
 
-The prefetch runs on a daemon thread rather than a pooled worker: an in-flight catalog
-walk cannot be interrupted from outside, so abandoning it is the only way to stop waiting,
-and a daemon thread does not hold the process open when a run is cancelled mid-query.
+The prefetch runs on a daemon thread rather than a pooled worker: an in-flight catalogue walk
+cannot be interrupted from outside, so abandoning it is the only way to stop waiting, and a
+daemon thread does not hold the process open when a run is cancelled mid-query.
 
 Month ranges **partition** the window — each month owns a half-open slice and items are
 filtered to their owner — so a date cannot be ingested twice or skipped at a boundary.
@@ -1658,13 +1658,8 @@ per passing date (one writable session ── one commit)
   previous exception for details.` — GDAL's actual reason is discarded unless the chain is
   logged. It is also where the reason GDAL never raised is attached; see *When GDAL logs the
   reason instead of raising it*.
-- **Each date narrows further, to the land its own imagery reaches.** A run's windows are the
-  same on every date; a single date is not, since an optical satellite images a fraction of a
-  wide ROI per pass. `windows_for_date` intersects the run's windows with that date's own STAC
-  footprints (reprojected onto the ingest grid, padded one cell so a curved reprojection
-  cannot under-cover), then re-bands and re-groups. This cannot change what a mosaic holds,
-  only remove work whose result was discarded. When the footprint cannot be determined the
-  full window list is returned unchanged, so the conservative path is the fallback.
+- **Each date narrows further, to the land its own imagery reaches**, via `windows_for_date`.
+  See *Narrowing a date's windows, and skipping dates that reach none*.
 
 ```text
    run windows (where the ROI has land)   one date's items      that date writes
@@ -1998,12 +1993,15 @@ from "the footprints are wrong".
 
 ### Narrowing a date's windows, and skipping dates that reach none
 
-A run's live windows describe where the ROI has land, so they are the same on every date. One
-date is not: a satellite images a fraction of a wide ROI per pass, so most of those windows hold
-nothing for a given date. `windows_for_date` removes them. Tasks over them would run, find no
-data and write nothing — an all-fill chunk is never stored — so this cannot change what a mosaic
-contains. Both sensors now do it (`narrow_windows_per_date` on S1, always on S2): six times fewer
-windows per date on the S1 zones measured, worth 7–20% of per-date wall clock.
+A run's live windows are the same on every date; one date is not, since a satellite images a
+fraction of a wide ROI per pass, so most windows hold nothing for it. `windows_for_date`
+intersects the run's windows with that date's own STAC footprints — reprojected onto the ingest
+grid and padded one cell, so a curved reprojection cannot under-cover — then re-bands and
+re-groups. Tasks over the removed windows would run, find nothing and write nothing, so this
+cannot change what a mosaic contains. When a footprint cannot be determined the full window list
+is returned unchanged, so the conservative path is the fallback. Both sensors do it (`narrow_windows_per_date` on S1, always
+on S2): six times fewer windows per date on the S1 zones measured, worth 7–20% of per-date wall
+clock.
 
 **A date whose imagery reaches NO live window is skipped entirely**, on both paths and
 unconditionally. Writing it builds a full graph to store nothing. On S1 this is not a rare case:
