@@ -658,34 +658,24 @@ it and exempting it are wrong by the same amount in opposite directions and both
 nothing guesses. The refusal is a property of that one source, and it is gated on the threshold:
 below it no producer changes a pixel, so there is nothing to decide.
 
-**The shapes that cost whole days are gone**, because a day is no longer decided as a whole. Tiles
-straddling the threshold, and a raw item owed the offset fused with an already-harmonised one, are
-each corrected on their own ground, so no pixel is both corrected and uncorrected — the 347 days a
-2024 region-year lost to that conflict now load. An item whose own bands are served from two
-different producers is likewise corrected band by band. See
-[ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md), and
-`context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md` for the frequency table the
-change was justified against.
+**No day is decided as a whole any more**, so the shapes that used to cost whole days are gone:
+tiles straddling the threshold, and a raw item fused with an already-harmonised one, are each
+corrected on their own ground. An item whose bands come from two producers is corrected band by
+band. See [ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) and
+`context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md`.
 
 A refusal that does still happen is skipped alone and counted rather than failing the leg, and
 duplicate selection routes around it: a copy that would refuse is ranked last *and* withheld from
-the fallback ladder, because a refusal is not a read failure and nothing retries one.
+the fallback ladder, since a refusal is not a read failure and nothing retries one. "Alone" is a
+property of `s2_roi`, which loads one solar day per call — a caller pairing `query_stac_items`
+with `load_stac_items` over a multi-day list forfeits every day in it, so pass a day at a time.
 
-"Alone" is a property of `s2_roi`, which loads ONE solar day per call — not of the refusal, which
-is raised while `odc.stac.load` parses its item list synchronously and so abandons whatever list it
-was given. A caller pairing `query_stac_items` with `load_stac_items` over a multi-day list
-forfeits every day in it, so pass a day at a time wherever one undecidable day should not cost the
-window. Production does not reach this: the only `ingest_tile` caller is the S1 path, whose
-collections have no baseline threshold and therefore no offset decision to refuse.
-
-The surviving case is worth naming, because the safe direction inverts. An item that does not expose
-EVERY reflectance band under the configured names is `UNKNOWN`, not `RAW`. A non-empty subset is not
-enough: nothing in this module can see the alias table that maps a band name to an asset key, so a
-band absent under `blue` may be served under `B02`, and `_prune_item_dict` preserves exactly those
-partially aliased items. Letting one visible harmonised band speak for a hidden native-keyed one
-would subtract 1000 from pixels that may already be harmonised, silently. The live Element 84
-catalogue keys its assets by the configured band names, so this does not arise there today; a
-catalogue that changed its naming would stop the ingest rather than halve a season's reflectance.
+**An item not exposing EVERY reflectance band under the configured names is `UNKNOWN`, not
+`RAW`**, and the safe direction inverts here. A non-empty subset is not enough: nothing in this
+module sees the alias table mapping a band name to an asset key, so a band absent under `blue` may
+be served under `B02`, and `_prune_item_dict` preserves exactly those partially aliased items.
+Letting one visible harmonised band speak for a hidden native-keyed one would silently subtract
+1000 from pixels that may already be harmonised.
 
 **How far the decision reached is reported after every load**, from counters the parser keeps:
 how many reflectance sources it stamped, and how many of those were owed the offset. Reaching
@@ -696,12 +686,9 @@ rather than an error, because a caller that replaces the loader also reports zer
 enough is that every other way of getting this wrong is loud, since an unclassifiable source
 refuses and an unresolvable band name fails the load.
 
-One integer per date is a **lossy** record of a day whose tiles declare different baselines, and
-those days now load — the three-tile day in ADR 021 is exactly that shape. The value is the first
-item's, the clearest tile, because the query sorts a date's items cloud-ascending; the day's other
-vintages are recorded nowhere. Left that way deliberately: the attribute is written and merged
-forward on append, and nothing in this package reads a value from it, so widening its type would
-charge a future reader for a record nobody reads yet.
+One integer per date is a **lossy** record of a day whose tiles declare different baselines. The
+value is the first item's — the clearest tile, since the query sorts cloud-ascending — and the
+day's other vintages are recorded nowhere. Deliberate: nothing in this package reads the value.
 
 `correct_boa_dn` does the arithmetic, once, on one source's pixels:
 
@@ -716,29 +703,28 @@ COGs floor at 1 for the same reason, and reproducing them exactly is what makes 
 comparable with a harmonised one. DN 0 itself never reaches the arithmetic — the reader applies the
 result only where the source was valid — so nodata survives as nodata.
 
-**That the nodata code IS 0 is hard-coded, and that is an unchecked assumption.** `_NODATA = 0` is
-a constant in `stac.py`, and the correction rests on it twice over: DN 0 is the value excluded from
-the arithmetic, and the floor of 1 is what stops a corrected pixel from *looking* like nodata. The
-real answer belongs to the catalogue — `odc` derives it per band from `raster:bands`, and the reader
-has the resolved `RasterLoadParams` in hand when it corrects — but the driver is installed on any
-collection whose config sets `requires_baseline_correction`, so nothing ties the constant to what
-the collection actually declares. Under a marker of, say, 65535 every gap pixel would test as
-valid: the correction shifts them to 64535, the fuser's `dst == fill_value` test stops recognising
-them as empty, and the mosaic gains data-looking pixels 1000 below the nodata code where there was
-no observation. Both Sentinel-2 providers declare 0 today, so this is latent rather than live — the
-fix is to resolve the marker from `cfg` and refuse anything else, and it is owed.
+**That the nodata code IS 0 is hard-coded, and that is an unchecked assumption.** `_NODATA = 0`
+is a constant in `stac.py`, and the correction rests on it twice: DN 0 is excluded from the
+arithmetic, and the floor of 1 is what stops a corrected pixel from looking like nodata. The real
+answer belongs to the catalogue, which `odc` derives per band from `raster:bands` and hands the
+reader as `RasterLoadParams`, but the driver is installed on any collection whose config sets
+`requires_baseline_correction`, so nothing ties the constant to what that collection declares. Under a marker of 65535 every gap pixel would
+test as valid — the correction shifts them to 64535, the fuser's `dst == fill_value` test stops
+recognising them as empty, and the mosaic gains data-looking pixels where there was no
+observation. Both Sentinel-2 providers declare 0 today, so this is latent; resolving the marker
+from `cfg` and refusing anything else is owed.
 
 The arithmetic widens to `int32` and casts back to the INPUT dtype, so nothing wraps and the store's
 unsigned arrays are unaffected: the offset is negative and the floor is positive, so an unsigned
 input stays representable. Adding a negative Python int to a `uint16` array raises under numpy 2,
 which is what the widening is for.
 
-**The floor still acts on resampled values, and that is a recorded limit.** `odc.stac.load` reads
-and resamples in one step, so the wrapped reader sees pixels that have already been warped — and six
-of the ten configured bands are natively 20 m on a 10 m grid. A pixel whose resampling kernel spans
-the DN-1000 boundary is floored where Element 84, flooring each source pixel first, would not have
-been. Fixing it means taking over the read-and-warp step, and unlike the per-source move it would
-**rewrite pixels in every existing store**, so it is owed separately. Measured in
+**The floor still acts on resampled values, and that is a recorded limit.** `odc.stac.load`
+reads and resamples in one step, so the wrapped reader sees already-warped pixels, and six of the
+ten configured bands are natively 20 m on a 10 m grid. A pixel whose kernel spans the DN-1000
+boundary is floored where Element 84, flooring each source first, would not have been. Fixing it
+means taking over the read-and-warp step and would rewrite pixels in every existing store, so it
+is owed separately — measured in
 [ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §6.
 
 SCL is never corrected. It is not among the resolved reflectance asset keys, so it carries no
@@ -1345,66 +1331,55 @@ exactly as it did, and skips exactly as much, which is nothing.
 Everything above reads the exception chain. Some of a read failure's reason never reaches it.
 
 A refused object is not empty: S3 answers the range request with an XML error document, and GDAL
-hands that document to the TIFF decompressor because that is what it asked for. The decompressor
-fails on it — `ZIPDecode: Decoding error at scanline 0`, sometimes `unknown compression method`,
-which is a codec saying the bytes are not compressed data — and that is what gets raised. GDAL
-does state the refusal, as a warning in its OWN log, and raises nothing about it.
+hands it to the TIFF decompressor, which fails on it — `ZIPDecode: Decoding error at scanline 0`,
+sometimes `unknown compression method`. That is what gets raised. GDAL states the refusal as a
+warning in its own log and raises nothing about it.
 
-So the chain says the bytes are bad and the log says the service refused. Those two verdicts are
-opposites: bad bytes means give the date up, refused means wait and give up nothing. Which one a
-failure gets was decided by which GDAL error happened to land last in the retry ladder.
+So the chain says the bytes are bad and the log says the service refused, and those verdicts are
+opposites: bad bytes gives the date up, refused waits and gives up nothing.
 
 `loader_failures` closes it with a second handler on `rasterio._env`, the logger rasterio's CPL
-error handler forwards GDAL's messages to. `carry_logged_refusal` attaches what it collected to
-the failing exception as a note, `_exception_chain_text` reads notes with the rest of the chain,
-and `classify_read_failure` therefore decides from all of it. Both sensors reach this through
-`roi_processing.read_failure_context`, which every per-date read on both paths already passes
-through — so it is one classifier over one set of evidence, not a rule per sensor.
+error handler forwards to. `carry_logged_refusal` attaches what it collected to the failing
+exception as a note, `_exception_chain_text` reads notes with the rest of the chain, and
+`classify_read_failure` decides from all of it. Both sensors reach this through
+`roi_processing.read_failure_context`, so it is one classifier over one set of evidence.
 
-That handler only hears what reaches a logger, and most of it does not. rasterio installs its CPL
-error handler with `CPLPushErrorHandler`, which GDAL keeps **per thread**, so a message reported on
-one of GDAL's own fetch threads falls through to GDAL's process-wide handler and is written to the
-process's stderr — where no `logging.Handler` can reach it. `hear_gdal_from_every_thread` gives that
-process-wide handler somewhere to forward to, in rasterio's own wording, and `install_capture`
-installs it alongside the two log handlers because it is the same sensor: they hear what GDAL says
-to a logger, and it is what makes GDAL say the rest of it to one. It chains to the handler already
-installed rather than replacing it, so GDAL's stderr line still appears and a fatal error still
-aborts through it; and GDAL consults the reporting thread's own handler first, so nothing rasterio
-already forwards is forwarded twice.
+That handler only hears what reaches a logger, and most of it does not: rasterio installs its CPL
+handler with `CPLPushErrorHandler`, which GDAL keeps **per thread**, so a message from one of
+GDAL's own fetch threads goes to the process-wide handler and out to stderr, where no
+`logging.Handler` can reach it. `hear_gdal_from_every_thread` gives that process-wide handler
+somewhere to forward to, and `install_capture` installs it alongside the two log handlers. It
+chains to the existing handler rather than replacing it, so GDAL's stderr line still appears and a
+fatal error still aborts through it, and GDAL consults the reporting thread's own handler first so
+nothing rasterio already forwards is duplicated.
 
 Four properties are what make it safe to add evidence at all:
 
-- **Only refusals are recorded.** A line is kept only if the classifier reads THAT LINE ALONE as
-  `PROVIDER_REFUSED` or `OUR_CREDENTIAL` — the classifier itself is the filter, so there is no
-  second vocabulary to drift. Everything else GDAL says is dropped, and the dropped cases are the
-  point: GDAL probes for sidecars that were never published, and a kept `HTTP response code: 404`
-  is the marker that says a source object is ABSENT, which gives a date up.
+- **Only refusals are recorded.** A line is kept only if the classifier reads that line alone as
+  `PROVIDER_REFUSED` or `OUR_CREDENTIAL`, so there is no second vocabulary to drift. Everything
+  else GDAL says is dropped, which matters because GDAL probes for sidecars that were never
+  published — a kept `HTTP response code: 404` is the marker for an ABSENT source object, and
+  gives a date up.
 - **The direction is bounded.** Refusal is tested before any statement about the bytes, so an
-  attached line can only move a verdict into those two — never into `UNREADABLE` or `ABSENT`.
-  **This capture cannot cost a date.** What a wrong attribution costs is patience: the write
-  spends its refusal budget, the leg fails with its time axis unmoved, and the date is judged
-  alone on the re-dispatch.
-- **Only onto a source read failure.** A store conflict or a duplicate date raised while some
-  other read is being refused is still a store conflict, and answering it with a wait fixes
-  nothing. `is_source_read_failure` gates it on the same `_SOURCE_READER_MARKERS` every other
-  corroboration here uses.
-- **A separate buffer from the aborted hrefs**, read independently. One buffer would mean the
-  caller that classifies destroys the evidence the optical copy ladder attributes from. The href
-  buffer is still drained destructively and its race is unchanged.
+  attached line can only move a verdict into those two, never into `UNREADABLE` or `ABSENT`. A
+  wrong attribution therefore costs patience rather than a date: the write spends its refusal
+  budget, the leg fails with its time axis unmoved, and the date is judged alone on re-dispatch.
+- **Only onto a source read failure**, gated by `is_source_read_failure` on the same
+  `_SOURCE_READER_MARKERS` every other corroboration uses. A store conflict raised while some
+  other read is being refused is still a store conflict, and a wait fixes nothing.
+- **A separate buffer from the aborted hrefs**, read independently, so the caller that classifies
+  cannot destroy the evidence the optical copy ladder attributes from. The href buffer is still
+  drained destructively.
 - **Reading the refusals does not consume them.** Two reads are in flight whenever the optical
-  path pipelines a date — the look-ahead prepares date N+1, whose coverage gate reads, while date
-  N's write is still reading — and each is inside its own `read_failure_context`. A destructive
-  collection let whichever failed first take the other's evidence; the second then saw only the
-  codec's complaint, read as unreadable data, and gave its date up. A line is removed only by
-  eviction past a retention horizon far longer than any single read.
+  path pipelines a date, each inside its own `read_failure_context`; a destructive collection let
+  whichever failed first take the other's evidence. Lines leave only by eviction past a retention
+  horizon far longer than any single read.
 - **What keeps a stale line out is its AGE, not its removal.** A read that logs a refusal and then
-  succeeds on a later attempt drains nothing, so without an age bound its line would be inherited
-  by whatever failed next — and on the optical path a genuinely corrupt object would then read as
-  a refusal and never step down the copy ladder. Each worker reports how old its lines are by its
-  own clock, and the caller applies the cutoff **after** the round trip, against its own. Nothing
-  depends on the fleet's clocks agreeing, and nothing depends on the collection being quick: a
-  cutoff measured before the call excluded the latency the workers' ages already included, and
-  discarded evidence for the very read it was fetching it for.
+  succeeds drains nothing, so without an age bound its line would be inherited by whatever failed
+  next — and a genuinely corrupt object would read as a refusal and never step down the copy
+  ladder. Each worker reports its lines' age by its own clock and the caller applies the cutoff
+  **after** the round trip, against its own, so nothing depends on the fleet's clocks agreeing or
+  on the collection being quick.
 
 The evidence is ATTACHED rather than answered: a caller that classified and discarded would hand
 the next reader of the same exception the opposite verdict, and the radar path has two readers —
@@ -1474,27 +1449,22 @@ for — OPERA publishes one copy of a granule:
 
 1. **Retry**, through the shared `store_write_retrying` policy — and for a provider refusal that
    arrived after a successful read, retry past the attempt limit, because waiting is the only
-   response a refusal has. Radar is the one caller that asks for this: OPERA publishes one copy of
-   a granule, so there is nothing to step down to, and the optical path's answer is the copy ladder
-   instead. A long wait per rung of that ladder would multiply with it.
+   response a refusal has. Radar is the one caller that asks for this, since OPERA publishes one
+   copy of a granule and there is nothing to step down to.
 1. **Fail the leg under a name the cell can act on** if that wait was not enough
-   (`ProviderRefusedReadsError`), so the re-dispatch waits on the long schedule rather than the
-   short one. No date is skipped and the time axis does not move.
-2. **Give up the date** once that retry is exhausted, if and only if the failure is one the
-   source is answerable for AND recomputes. There is one scope, `unreadable`, and one remedy: a
-   reprocessed copy at the provider. A refusal used to be a second, recoverable scope
-   (`provider-refused`); it is not, because giving up a date and then committing a later one puts
-   the earlier one permanently below the append-only maximum, so the re-run meant to recover it is
-   refused instead.
-3. **Name it in the log**, per date and again in an end-of-leg summary, exactly as the optical
-   path does. Nothing durable: the day is below the store's newest date by the time the next
-   date commits, so no record of it changes an outcome.
+   (`ProviderRefusedReadsError`), so the re-dispatch waits on the long schedule. No date is
+   skipped and the time axis does not move.
+2. **Give up the date** once that retry is exhausted, if and only if the failure is one the source
+   is answerable for AND recomputes. One scope, `unreadable`, one remedy: a reprocessed copy at
+   the provider. A refusal is deliberately not a second recoverable scope — giving up a date and
+   then committing a later one puts the earlier one permanently below the append-only maximum, so
+   the re-run meant to recover it is refused instead.
+3. **Name it in the log**, per date and again in an end-of-leg summary. Nothing durable: the day
+   is below the store's newest date by the time the next date commits.
 4. **Stop past `MAX_GIVEN_UP_DATES`**, and stopping is TERMINAL.
-   `TooManyGivenUpDatesError` is IN the leg-retry classifier's non-retryable set, because nothing
-   counted toward the ceiling can clear: a provider refusal re-raises and is retried in order, so
-   every date reaching that counter failed for a cause that recomputes, and a re-dispatch would
-   re-read the same objects, spend the per-read ladder on each, and hold a fleet to reach the
-   identical answer. The remedy is a reprocessed copy, not another attempt.
+   `TooManyGivenUpDatesError` is in the leg-retry classifier's non-retryable set, because nothing
+   counted toward the ceiling can clear: every date reaching that counter failed for a cause that
+   recomputes, so a re-dispatch would re-read the same objects to reach the identical answer.
 
 A date offered by two consecutive batches is given up ONCE. Batch queries are padded a day either
 side, so a boundary solar day comes back from two queries and would otherwise be listed twice and
@@ -1715,29 +1685,21 @@ per passing date (one writable session ── one commit)
   The empty-axis seed matters: the time axis only ever contains dates whose pixels
   committed, which is what keeps `get_existing_dates` (the STAC dedupe),
   `check_time_window_coverage`, and the empty-timestep prunes truthful.
-- **The retry must not retry a second writer** — the one exception to "a failed write
-  commits nothing, so retrying is safe". One store has exactly one writer: these commits
-  pass no `rebase_with`, so a concurrent commit is *refused* rather than merged
-  (`icechunk.ConflictError`), and a date the other writer reached first is refused by the
-  append guard (`DuplicateDateError`). A retry re-opens the session from the tip that
-  writer moved, which turns the refusal into a success and lets two writers interleave
-  dates onto one axis — the outcome the no-rebase choice exists to prevent. Both errors are
-  excluded by type in `storage.zarr_store.store_write_retrying`, the single policy all
-  three write sites use (S1 per-date, S2 per-date, S2 per-batch). It is shared because it
-  was not: each site had built its own `Retrying`, and the exclusion was missing from all
-  three at once.
-- **Polarisation is filtered SERVER-SIDE, and that is a cost fix rather than a correctness
-  one.** Ingest needs dual-pol VV+VH, so a granule whose `POLARIZATION` lacks VV was always
-  rejected client-side — but only after being fetched and parsed. The query now carries
-  `attribute[]=string,POLARIZATION,VV` alongside the orbit filter, which discards nothing
-  reachable (CMR matches a multi-valued attribute if ANY value matches, so VV admits every
-  VV+VH granule) and stops us paying to page the rest. Measured: the all-Greenland zone 23N
-  went from 7.9 s paging 138,276 rejected granules to 0.6 s returning none, and mixed zone 25N
-  from 11.6 s to 2.7 s returning the SAME 2,799 usable items — the unchanged count is what
-  makes it safe. The client-side check is now a safety net, and its warning means a catalogue
-  inconsistency (metadata advertising VV, bands not published) rather than a regional fact.
-  **Cross-pol granules are NOT EW-mode**: that label was a guess and was wrong — the Greenland
-  granules report `BEAM_MODE=IW`, and a `BEAM_MODE=EW` query over that region returns nothing.
+- **The retry must not retry a second writer** — the one exception to "a failed write commits
+  nothing, so retrying is safe". One store has exactly one writer: these commits pass no
+  `rebase_with`, so a concurrent commit is *refused* rather than merged
+  (`icechunk.ConflictError`), and a date the other writer reached first is refused by the append
+  guard (`DuplicateDateError`). Retrying would re-open the session from the tip that writer
+  moved, turning the refusal into a success and letting two writers interleave dates onto one
+  axis. Both errors are excluded by type in `storage.zarr_store.store_write_retrying`, the
+  single policy all three write sites use (S1 per-date, S2 per-date, S2 per-batch).
+- **Polarisation is filtered server-side**, a cost fix rather than a correctness one. Ingest
+  needs dual-pol VV+VH, and the query carries `attribute[]=string,POLARIZATION,VV` alongside the
+  orbit filter. It discards nothing reachable, since CMR matches a multi-valued attribute if ANY
+  value matches, so VV admits every VV+VH granule. The client-side check remains as a safety net,
+  and its warning means a catalogue inconsistency — metadata advertising VV without the bands
+  published — rather than a regional fact. Note that cross-pol granules are **not** EW-mode: the
+  Greenland ones report `BEAM_MODE=IW`, and a `BEAM_MODE=EW` query there returns nothing.
 
 - **A zone can have NO usable radar, and that is a finding rather than a failure.** Over ice
   Sentinel-1 images in Extra Wide swath with HH/HV polarisation, and the OPERA query discards
@@ -2360,52 +2322,35 @@ The key reads these signals, in this order:
 
 1. **Read-set completeness**, judged over the assets *this* load will request — the configured
    bands plus the caller's `extra_bands`, not a fixed list and not the broader pruning set, which
-   keeps `scl` whether or not the call asks for it. First, because a copy missing one of them
-   cannot deliver the tile-date at any baseline, and the generic paths have no recovery for it: a
-   missing band is not one of the read failures the fallback ladder recognises, so an incomplete
-   winner fails the acquisition outright.
-2. **Whether the producer is decidable**, where it would change a pixel. A copy whose producer
-   cannot be identified at all refuses its date at or above the correction threshold — and a
-   refusal is not something the fallback ladder can step down on. A copy whose reflectance bands
-   span a harmonised and a raw producer is *not* among them: each of its sources is decided on its
-   own bucket, so it is corrected band by band rather than refused. Below the threshold the term is
-   inert, because the producer changes no pixel there.
+   keeps `scl` regardless. First, because a copy missing one cannot deliver the tile-date at any
+   baseline, and a missing band is not a failure the fallback ladder recognises.
+2. **Whether the producer is decidable**, where it would change a pixel. An undecidable producer
+   refuses its date at or above the correction threshold, and a refusal is not something the
+   ladder can step down on. A copy spanning a harmonised and a raw producer is not undecidable:
+   each source is decided on its own bucket and corrected band by band. Inert below the threshold.
 3. **Whether the copy demonstrably belongs to the acquisition it is ranked in.** A copy naming
-   neither an observation nor an instant was attached to a cluster arbitrarily, so it must not
-   displace one that says which pass it came from — a known member at an older baseline still
-   represents that pass, while a possibly-unrelated newer one may duplicate another and drop this
-   one's coverage.
-4. **Whether the baseline is readable**, for producers whose correction depends on it, with
-   unknown sorting last. An absent baseline is an absence of evidence, and such a copy refuses its
-   whole date downstream, so an older reprocessing that can be corrected beats a newer one that
-   cannot be processed at all. Above every term below it because a refusal has no recovery. An
-   already-harmonised copy is exempt: its pixels need no correction whatever the baseline says.
-5. **Processing baseline, descending.** The signal that carries data vintage. Ordered by value
-   rather than by "is it the best", so every rung of the fallback ladder stays in descending
-   baseline order. Collapsing the non-best baselines into one tier lets a read failure skip a
-   04.00 copy and hand out a 03.00 one.
+   neither an observation nor an instant was clustered arbitrarily, so it must not displace one
+   that says which pass it came from.
+4. **Whether the baseline is readable**, for producers whose correction depends on it, unknown
+   sorting last. An absent baseline refuses the whole date downstream, so an older reprocessing
+   that can be corrected beats a newer one that cannot be processed. Above every term below it
+   because a refusal has no recovery. Already-harmonised copies are exempt.
+5. **Processing baseline, descending.** Ordered by value rather than "is it best", so every rung
+   of the fallback ladder stays in descending baseline order — a read failure can skip a 04.00
+   copy and hand out a 03.00 one.
 6. **Whether the copy owes an offset correction at all**, where the producer is an item's own
-   property. **Below the baseline**, and there are two reasons to prefer a copy owing nothing —
-   both about the PIXEL rather than about coverage. An already-harmonised copy had its floor
-   applied by its producer *before* any resampling, where one we correct is floored *after*, so on
-   the very dark population the two disagree; and a copy owing nothing cannot be wrong by the
-   offset at all, while one we correct is right only if the bucket lists and the declared baseline
-   are both honest. Those are quality claims, and a quality-versus-quality preference must not buy
-   a better pixel with an older reprocessing — the same rule that keeps locality below the
-   baseline. It outranks locality only because a pixel argument beats a cost one. Inert below the
-   threshold, where no producer changes a pixel — which is most but NOT all ESA-hosted copies: zone
-   01N in 2017 carries 15 at baseline 05.00, so the term does fire on real data. Also inert where
-   the producer is the COLLECTION's answer: every copy then has the same producer, so a term that
-   compares producers would discriminate on the threshold alone, which is the baseline term ranked
-   above it, in the opposite direction.
-7. **Locality, among equal baselines only.** A copy whose read assets all sit in a preferred
-   bucket is cheaper to read, so it wins a baseline tie. Restricting locality to ties is what
-   stops it buying cheaper egress with an older pixel, and it is inert where the baseline is
-   unreadable, so it cannot decide a comparison the baseline could not enter. This is the
-   distinction the two bucket lists exist for: harmonisation is a **pixel** claim and locality is a
-   **cost** claim, so both sit below the baseline, harmonisation above locality. The lists name
-   the same buckets today, but the key sets differ by `scl`, so a copy can be harmonised without
-   being local and the terms are not interchangeable.
+   property. Below the baseline, for two pixel-level reasons: an already-harmonised copy had its
+   floor applied before resampling where one we correct is floored after, so the two disagree on
+   very dark pixels; and a copy owing nothing cannot be wrong by the offset, while a corrected one
+   is right only if the bucket lists and declared baseline are both honest. A quality-versus-
+   quality preference must not buy a better pixel with an older reprocessing. Inert below the
+   threshold — though not universally: zone 01N in 2017 carries 15 at baseline 05.00, so it does
+   fire on real data. Also inert where the producer is the collection's answer.
+7. **Locality, among equal baselines only.** A copy whose read assets sit in a preferred bucket is
+   cheaper to read, so it wins a tie. Restricting it to ties stops it buying cheaper egress with
+   an older pixel. This is why there are two bucket lists: harmonisation is a **pixel** claim,
+   locality a **cost** claim. They name the same buckets today but their key sets differ by `scl`,
+   so a copy can be harmonised without being local.
 8. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of catalogue
    response order, so a rerun cannot silently produce a different mosaic — and it makes the key a
    total order, so no comparison ever falls back to input order.
