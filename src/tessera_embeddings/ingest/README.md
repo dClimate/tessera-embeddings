@@ -137,8 +137,9 @@ Ingestion flows call:
 out-of-ROI pixels to `fill_value` (default 0) across all dataset variables.
 
 `roi_processing.filter_low_coverage_dates` then drops time steps where fewer than
-`min_valid_coverage` percent of ROI pixels are valid (default 5%). Only the per-date valid
-pixel counts are computed eagerly — band arrays remain lazy until the Zarr write.
+`min_valid_coverage` percent of ROI pixels are valid (default 5%). Only the per-date valid pixel
+counts are computed eagerly — one scalar per time step, from SCL for S2 or VV for S1 — so band
+arrays remain lazy and cloud-covered or off-ROI scenes are dropped before any band data is read.
 
 `identify_low_coverage_ds` is the lazy alternative: instead of dropping dates it attaches a
 `valid_coverage` boolean coordinate that downstream tasks can check without reading band data.
@@ -584,6 +585,37 @@ asset keys (`0_VV`, `0_VH`) to build `pystac.Item`s shape-compatible with the re
 pipeline, with `title`, `time_start` and `polygons` supplying id, datetime and geometry.
 Pagination uses the `CMR-Search-After` header, which pages cleanly at 2000. See
 [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
+
+#### Polarisation filtered server-side
+
+A cost fix rather than a correctness one. Ingest needs dual-pol VV+VH, and the query carries
+`attribute[]=string,POLARIZATION,VV` alongside the orbit filter. It discards nothing reachable,
+since CMR matches a multi-valued attribute if ANY value matches, so VV admits every VV+VH granule.
+The client-side check remains as a safety net, and its warning means a catalogue inconsistency —
+metadata advertising VV without the bands published — rather than a regional fact.
+
+#### When a zone has no usable radar
+
+**That is a finding rather than a failure.** Over ice Sentinel-1 images in Extra Wide swath with
+HH/HV polarisation, and the OPERA query discards anything that is not dual-pol VV+VH, so an ROI
+whose land is ice has a catalogue full of granules and not one the ingest can use. Zone 23N
+(Greenland) returns ~183,000 granules for 2021 and **zero** usable items. (They are not EW-mode
+either: the Greenland ones report `BEAM_MODE=IW`, and a `BEAM_MODE=EW` query there returns
+nothing.) Requiring a SAR store there failed the cell permanently, so `"both"` resolves to
+`S1_ORBIT_NONE`, which activates no orbit and leaves the coverage gate checking reflectance alone.
+
+**Permissive by default, refusable on demand.** A global product cannot reject terrain that is
+radar-free as a matter of geography, so `resolve_s1_orbit`'s `allow_none` defaults to True. A
+single run over terrain known to be imaged is the opposite case — there an absent store means
+something upstream broke, and resolving to `none` would embed without radar and hide it — so
+those callers pass the flows' `require_s1`, which reaches the resolver as `allow_none=False`. An
+operator who names one orbit is never downgraded either. Which case it is comes from the ingest's
+per-orbit item count, since it has just queried both orbits: `items_seen=0` means the source
+offers nothing here, which is terrain rather than a gap. A consumer reading a finished mosaic
+cannot distinguish the two, so its warning names the mosaic and points at that count. Accepting a
+radar-free ROI necessarily means embedding S2-only pixels, and `InferenceConfig` derives
+`allow_s2_only` for that case rather than asking the caller, because the alternative is a fill
+that writes nothing and reports success.
 
 #### UTM CRS derivation
 
@@ -1371,6 +1403,12 @@ follow one failure outwards: where the retry sits, how a corrupt object is told 
 provider having a bad hour, what to do when GDAL declines to say which it was, and what the radar
 path does differently because it has no second copy to fall back on.
 
+#### GDAL network tuning
+
+`configure_gdal_environment()` (in [`config/environment.py`](../config/environment.py)) must be
+called before importing `rasterio` or `odc.stac`. It sets GDAL config options for network
+resilience (retry counts, timeouts, connection pooling) that affect all subsequent COG reads.
+
 #### Where the retry sits, and how a failed date is attributed
 
 `roi_processing.source_read_retrying` wraps the point where a date's graph is first *computed*.
@@ -1685,7 +1723,20 @@ summary at the end of the leg. What it does not produce is a record anything lat
 
 ## Performance Optimizations
 
-### Background: how Dask task graphs consume scheduler RAM
+One thing bounds an ingest, and it is not the imagery. The Dask scheduler is a single process
+that expands the whole task graph into memory before a worker reads a byte, and dispatches every
+task through one event loop — so a graph big enough to describe a zone-year exhausts it, and a
+graph small enough to fit can still leave the fleet idle. Every lever below is one of two moves:
+**keep the graph small**, or **keep the fleet busy while it runs**. They pull against each other,
+which is why several of them are priced rather than switched on.
+
+### What bounds the run
+
+Three facts a reader needs before any of the levers make sense: what the scheduler actually
+spends memory on, how the chunk grids line up, and what the write contract is that every lever
+has to preserve.
+
+#### Background: how Dask task graphs consume scheduler RAM
 
 "Dask is lazy" means workers do not read data until `.compute()`; it does not mean the
 scheduler avoids work. Before the first worker task executes, `dask.distributed` expands the full
@@ -1696,8 +1747,10 @@ holding one task's function, arguments and dependency set. The cost:
     scheduler RAM used ≈ n_tasks × 1.5 KB
 ```
 
-This is fully predictable and independent of data size. A graph with 1 million tasks
-consumes ~1.5 GB of scheduler RAM before any worker reads a single byte.
+This is fully predictable and independent of data size. A graph with 1 million tasks consumes
+~1.5 GB of scheduler RAM before any worker reads a single byte. Nothing is read until the Zarr
+write triggers the compute, so a date's whole pipeline — load, correct, mask, write — is one
+graph execution and the scheduler holds all of it at once.
 
 The HLG itself is compact — it stores *layer dicts* rather than expanded objects. The
 expansion to TaskStates happens only when the graph is submitted to the scheduler:
@@ -1717,7 +1770,7 @@ expansion to TaskStates happens only when the graph is submitted to the schedule
   4 compact Python dicts ≈ tens of MB      n_tasks × 1.5 KB of scheduler RAM
 ```
 
-#### How task count multiplies: operations × chunk dimensions
+##### How task count multiplies: operations × chunk dimensions
 
 Each Dask operation (read, transform, write) adds a new layer. Each layer has one task per
 combination of *chunk coordinates* across all chunked dimensions. Ingest writes 4096×4096 px
@@ -1755,7 +1808,120 @@ discipline reappears in inference assembly; see
 [`inference/README.md`](../inference/README.md#1-deciding-which-tiles-to-run) for the
 ChunkSpec-vs-sub-chunk decoupling that makes assembly survive on the same budget.
 
-### Cropping to live windows (unconditional)
+#### Chunk alignment
+
+The ROI Zarr mask is generated with `chunk_size` matching `INGEST_CHUNKS` so that
+`da.from_zarr` reads are zero-copy — each Dask partition maps to exactly one Zarr chunk.
+The same chunk sizes are passed to `odc.stac.load` (after translating `northing`/`easting`
+to `y`/`x`) so band arrays and the mask share the same partition boundaries for aligned
+Dask operations. (Inference reads 2048×2048 sub-tiles out of these 4096×4096 chunks via
+`zarr.Array.oindex`, which needs no such alignment — see
+[`inference/README.md`](../inference/README.md).)
+
+#### Writing a date: one session, one commit
+
+`storage.write_day_windows` owns it. A missing store is seeded all-fill (schema only — creation
+cost independent of extent), then each date appends its time slot atomically WITH its windows in
+**one commit**:
+
+```text
+per passing date (one writable session ── one commit)
+   ├─ append time slot            (metadata-only resize; duplicate date = loud error)
+   ├─ to_icechunk(region=window₁) ┐  pixels flow from the Dask workers that
+   ├─ to_icechunk(region=window₂) │  computed them — never materialised on
+   ├─ ...                         ┘  the flow runner
+   ├─ merge attrs                 (baselines ∪, doy ++, last_appended)
+   └─ commit                      (crash before here ⇒ nothing visible; retry is clean)
+```
+
+The empty-axis seed matters: the time axis only ever contains dates whose pixels
+committed, keeping `get_existing_dates` (the STAC dedupe),
+`check_time_window_coverage`, and the empty-timestep prunes truthful.
+**The retry must not retry a second writer** — the one exception to "a failed write commits
+nothing, so retrying is safe". One store has exactly one writer: these commits pass no
+`rebase_with`, so a concurrent commit is *refused* rather than merged
+(`icechunk.ConflictError`), and a date the other writer reached first is refused by the append
+guard (`DuplicateDateError`). Retrying would re-open the session from the tip that writer
+moved, turning the refusal into a success and letting two writers interleave dates onto one
+axis. Both errors are excluded by type in `storage.zarr_store.store_write_retrying`, the
+single policy all three write sites use (S1 per-date, S2 per-date, S2 per-batch).
+
+### Keeping the graph small
+
+The two flows start from different baselines, and the two cropping steps then cut what either
+of them has to build.
+
+#### S2: per-date iteration
+
+`ingest_s2_roi_reflectance` queries STAC for the full date range upfront, groups items by **local
+solar day** via `group_items_by_date`, then processes one day at a time in a Python loop: each
+iteration builds a single-date Dask graph, calls `odc.stac.load` for that day, filters coverage,
+and writes before moving on.
+
+```text
+Full year (don't build at once):
+┌──────────────────────────── 365 days ────────────────────────────────┐
+│ tiles × dates × bands = O(millions of tasks) → scheduler OOM         │
+└──────────────────────────────────────────────────────────────────────┘
+
+Per-date iteration (what ingest_s2_roi_reflectance actually does):
+ 2024-03-01    2024-03-06    2024-03-11    ...
+┌────────────┐ ┌────────────┐ ┌────────────┐
+│ build      │ │ build      │ │ build      │
+│ SCL check  │ │ SCL check  │ │ SCL check  │
+│ compute    │ │ compute    │ │ compute    │
+│ write      │ │ write      │ │ write      │
+│ discard ◄──┼─┼── graph freed after each date
+└────────────┘ └────────────┘ └────────────┘
+```
+
+Each single-date graph is small: `spatial_chunks × bands` tasks, with no date dimension to
+multiply through, and the per-date overhead of one Python loop iteration and one Zarr append is
+negligible beside the Dask compute for a large spatial ROI.
+
+The grouping key must match the loader's, per *Timestamp handling* above. Grouping
+here by UTC calendar date lets the two disagree, and a group we believe is one day then loads as
+TWO time slices against a cloud mask reduced to one:
+
+```text
+   UTC:      ... 23:00 | 00:00  01:00 ...      ONE UTC date
+   solar:        day N |  day N+1              TWO solar days   (at a +10 h offset)
+                       ^ far-eastern zones image right here
+```
+
+#### S1: time-windowed batching
+
+`ingest_s1_roi_sar` uses a different approach: it splits the full date range into
+`batch_days`-wide windows (default 30) and runs one `build → compute → write → discard`
+cycle per window, which bounds how large any one task graph gets.
+
+```text
+Batched approach (batch_days=30, ingest_s1_roi_sar only):
+ Jan 1–30        Feb 1–28        Mar 1–30       ...
+┌────────────┐  ┌────────────┐  ┌────────────┐
+│ build      │  │ build      │  │ build      │
+│ compute    │  │ compute    │  │ compute    │
+│ write      │  │ write      │  │ write      │
+│ discard ◄──┼──┼── graph freed
+└────────────┘  └────────────┘  └────────────┘
+```
+
+A batch boundary is **not** a credential checkpoint, and treating it as one is unsafe: the STS
+credential's roughly one-hour life is unrelated to how long a batch takes, so a batch that outruns
+it cannot renew at its own boundary. Renewal is owned by a timer — see "Renewal runs on a timer"
+above.
+
+`batch_days` is a parameter on `ingest_s1_roi_sar` and is absent from the S2 flow. The formula
+in the background section above estimates how many tasks a given window width produces; the
+30-day default keeps each batch inside the scheduler's RAM budget at cornbelt scale.
+
+Batch windows are inclusive at both ends and do not overlap: each spans `batch_days` calendar
+days and the loop advances `batch_start` to the day *after* `batch_end`. Since CMR and STAC also
+treat their end date as inclusive, each day is queried by exactly one batch — a boundary landing
+on the next batch's start day would page it twice, wasteful where each day is many pages of
+bursts.
+
+#### Cropping to live windows (unconditional)
 
 Ingest cost scales with the **extent it computes, not the land it keeps**, and a mosaic load
 covers the whole ROI grid even where the mask is entirely ocean or out of footprint. So every
@@ -1849,58 +2015,8 @@ the price, the per-zone table and the cap sweep are in
   `rasterize_roi_zarr` and `export_zone_roi` write. The mask is coarsened to the ingest chunk
   grid — normally from its chunk keys in one listing, else by scanning one chunk block at a
   time (~16 MB peak, no Dask) — then row-banded and grouped as above.
-- **Writes** go through `storage.write_day_windows`: a missing store is seeded all-fill
-  with an **empty** time axis (schema only — creation cost independent of extent), then
-  each date appends its time slot atomically WITH its windows in **one commit**:
-
-```text
-per passing date (one writable session ── one commit)
-   ├─ append time slot            (metadata-only resize; duplicate date = loud error)
-   ├─ to_icechunk(region=window₁) ┐  pixels flow from the Dask workers that
-   ├─ to_icechunk(region=window₂) │  computed them — never materialised on
-   ├─ ...                         ┘  the flow runner
-   ├─ merge attrs                 (baselines ∪, doy ++, last_appended)
-   └─ commit                      (crash before here ⇒ nothing visible; retry is clean)
-```
-
-  The empty-axis seed matters: the time axis only ever contains dates whose pixels
-  committed, keeping `get_existing_dates` (the STAC dedupe),
-  `check_time_window_coverage`, and the empty-timestep prunes truthful.
-- **The retry must not retry a second writer** — the one exception to "a failed write commits
-  nothing, so retrying is safe". One store has exactly one writer: these commits pass no
-  `rebase_with`, so a concurrent commit is *refused* rather than merged
-  (`icechunk.ConflictError`), and a date the other writer reached first is refused by the append
-  guard (`DuplicateDateError`). Retrying would re-open the session from the tip that writer
-  moved, turning the refusal into a success and letting two writers interleave dates onto one
-  axis. Both errors are excluded by type in `storage.zarr_store.store_write_retrying`, the
-  single policy all three write sites use (S1 per-date, S2 per-date, S2 per-batch).
-- **Polarisation is filtered server-side**, a cost fix rather than a correctness one. Ingest
-  needs dual-pol VV+VH, and the query carries `attribute[]=string,POLARIZATION,VV` alongside the
-  orbit filter. It discards nothing reachable, since CMR matches a multi-valued attribute if ANY
-  value matches, so VV admits every VV+VH granule. The client-side check remains as a safety net,
-  and its warning means a catalogue inconsistency — metadata advertising VV without the bands
-  published — rather than a regional fact.
-- **A zone can have NO usable radar, and that is a finding rather than a failure.** Over ice
-  Sentinel-1 images in Extra Wide swath with HH/HV polarisation, and the OPERA query discards
-  anything that is not dual-pol VV+VH, so an ROI whose land is ice has a catalogue full of
-  granules and not one the ingest can use. Zone 23N (Greenland) returns ~183,000 granules for
-  2021 and **zero** usable items. (They are not EW-mode either: the Greenland ones report
-  `BEAM_MODE=IW`, and a `BEAM_MODE=EW` query there returns nothing.) Requiring a SAR store there
-  failed the cell permanently, so `"both"` resolves to `S1_ORBIT_NONE`, which activates no orbit
-  and leaves the coverage gate checking reflectance alone.
-
-  **Permissive by default, refusable on demand.** A global product cannot reject terrain that is
-  radar-free as a matter of geography, so `resolve_s1_orbit`'s `allow_none` defaults to True. A
-  single run over terrain known to be imaged is the opposite case — there an absent store means
-  something upstream broke, and resolving to `none` would embed without radar and hide it — so
-  those callers pass the flows' `require_s1`, which reaches the resolver as `allow_none=False`.
-  An operator who names one orbit is never downgraded either. Which case it is comes from the
-  ingest's per-orbit item count, since it has just queried both orbits: `items_seen=0` means the
-  source offers nothing here, which is terrain rather than a gap. A consumer reading a finished
-  mosaic cannot distinguish the two, so its warning names the mosaic and points at that count.
-  Accepting a radar-free ROI necessarily means embedding S2-only pixels, and `InferenceConfig`
-  derives `allow_s2_only` for that case rather than asking the caller, because the alternative is
-  a fill that writes nothing and reports success.
+- **Writes** go through `storage.write_day_windows`, one commit per date — see
+  *Writing a date: one session, one commit* above.
 - **Reads retry, per date**, and a failed date says which date and which ROI. See
   [§ Where the retry sits, and how a failed date is attributed](#where-the-retry-sits-and-how-a-failed-date-is-attributed).
 - **Each date narrows further, to the land its own imagery reaches**, via `windows_for_date`.
@@ -1919,7 +2035,13 @@ r3    b  b  .  .  .                         .  .  .  .  .    r3   .  .  .  .  .
 ```
 
 - **The declared grid stays full-extent**, so the zone fill's exact-grid validation is
-  unaffected — Zarr/Icechunk arrays are sparse and unwritten chunks read back as fill.
+  unaffected — Zarr/Icechunk arrays are sparse and unwritten chunks read back as fill. That
+  validation checks the declared grid COMPLETELY rather than just its corners, because matching
+  length, CRS and endpoints still admit a reordered or non-affine interior, and inference writes
+  positionally, so such a mosaic would publish real pixels at wrong coordinates silently. Uniform
+  10 m spacing is asserted on both axes. Nothing this ingest produces can fail it, since odc
+  builds every load against the zone geobox, but a fill run with `ingest=False` accepts a mosaic
+  staged by hand.
 - **The SCL coverage phase is cropped too**: its reduce runs over the windows only
   (identical total — the mask is False outside them) and the validity mask stays lazy,
   so no full-extent array is ever persisted.
@@ -1932,14 +2054,7 @@ every branch that tested for it. S1 and S2 share the mechanism, differing only i
 multi-date batches loop per date, since non-contiguous dates cannot share a region write, each
 keeping its own atomic commit and retry scope.
 
-The zone fill's grid validation checks the declared grid COMPLETELY rather than just its corners:
-matching length, CRS and endpoints still admit a reordered or non-affine interior, and inference
-writes positionally, so such a mosaic would publish real pixels at wrong coordinates silently.
-Uniform 10 m spacing is asserted on both axes. Nothing this ingest produces can fail that, since
-odc builds every load against the zone geobox, but a fill run with `ingest=False` accepts a
-mosaic staged by hand.
-
-### Narrowing a date's windows, and skipping dates that reach none
+#### Narrowing a date's windows, and skipping dates that reach none
 
 A run's live windows are the same on every date; one date is not, since a satellite images a
 fraction of a wide ROI per pass, so most windows hold nothing for it. `windows_for_date`
@@ -1967,7 +2082,13 @@ S1's match is on an **exact timestamp** rather than a date string, because odc s
 time coordinate to its group's earliest item timestamp. Keying by solar day instead would
 disagree with the loader wherever the offset crosses UTC midnight.
 
-### Overlapping a date's window writes (`overlap_window_writes`)
+### Keeping the fleet busy
+
+A graph that fits can still under-use the fleet: windows written one after another leave most
+slots idle, and the client-side work between dates is time no worker spends on anything. These
+three fill that, and the last of them is not a straight win.
+
+#### Overlapping a date's window writes (`overlap_window_writes`)
 
 A date is written as several chunk-disjoint windows. Writing them one at a time dominates the
 cost of a date: each window's compute completes before the next begins, so the date costs the
@@ -2006,7 +2127,7 @@ width. Why it is that size is not explained — three accounts were proposed and
 by their own predictions — so rely on the measured range, do not model it, and do not extrapolate
 far outside the widths measured. `context_docs/ingest/ingest-performance.md` §3.11 and §4.9.
 
-### Pipelining a date's preparation (`pipeline_dates`)
+#### Pipelining a date's preparation (`pipeline_dates`)
 
 A date's wall clock splits into **preparation** — building the load graph, running the coverage
 gate, narrowing the footprint, constructing the masks — and the **write**. Preparation is part
@@ -2042,7 +2163,7 @@ Default **off**, and the flag threads from the outer flow through the task shell
 domain function. S1 has no coverage gate and a different batch loop; it is deliberately
 untouched.
 
-### Batching dates into one compute (`batch_dates`)
+#### Batching dates into one compute (`batch_dates`)
 
 **Sized per ROI, and NOT a straight win.** `batch_dates=None` (the default) derives the batch size
 from the ROI's covered window area via `config.ingest.auto_batch_dates`; an explicit integer forces
@@ -2096,112 +2217,14 @@ single-threaded at any depth, so its side-effect-free contract is unchanged; the
 prepared dates buffered while k more are written. `Batch timings` reports
 `prepare`/`hidden`/`stall` per batch, with the same caveat as the per-date line.
 
-### S2: per-date iteration (task graph management)
-
-`ingest_s2_roi_reflectance` queries STAC for the full date range upfront, groups items by **local
-solar day** via `group_items_by_date`, then processes one day at a time in a Python loop: each
-iteration builds a single-date Dask graph, calls `odc.stac.load` for that day, filters coverage,
-and writes before moving on.
-
-```text
-Full year (don't build at once):
-┌──────────────────────────── 365 days ────────────────────────────────┐
-│ tiles × dates × bands = O(millions of tasks) → scheduler OOM         │
-└──────────────────────────────────────────────────────────────────────┘
-
-Per-date iteration (what ingest_s2_roi_reflectance actually does):
- 2024-03-01    2024-03-06    2024-03-11    ...
-┌────────────┐ ┌────────────┐ ┌────────────┐
-│ build      │ │ build      │ │ build      │
-│ SCL check  │ │ SCL check  │ │ SCL check  │
-│ compute    │ │ compute    │ │ compute    │
-│ write      │ │ write      │ │ write      │
-│ discard ◄──┼─┼── graph freed after each date
-└────────────┘ └────────────┘ └────────────┘
-```
-
-Each single-date graph is small: `spatial_chunks × bands` tasks, with no date dimension to
-multiply through, and the per-date overhead of one Python loop iteration and one Zarr append is
-negligible beside the Dask compute for a large spatial ROI.
-
-The grouping key must match the loader's, per *Timestamp handling* above. Grouping
-here by UTC calendar date lets the two disagree, and a group we believe is one day then loads as
-TWO time slices against a cloud mask reduced to one:
-
-```text
-   UTC:      ... 23:00 | 00:00  01:00 ...      ONE UTC date
-   solar:        day N |  day N+1              TWO solar days   (at a +10 h offset)
-                       ^ far-eastern zones image right here
-```
-
-### S1: time-windowed batching (task graph management)
-
-`ingest_s1_roi_sar` uses a different approach: it splits the full date range into
-`batch_days`-wide windows (default 30) and runs one `build → compute → write → discard`
-cycle per window, which bounds how large any one task graph gets.
-
-```text
-Batched approach (batch_days=30, ingest_s1_roi_sar only):
- Jan 1–30        Feb 1–28        Mar 1–30       ...
-┌────────────┐  ┌────────────┐  ┌────────────┐
-│ build      │  │ build      │  │ build      │
-│ compute    │  │ compute    │  │ compute    │
-│ write      │  │ write      │  │ write      │
-│ discard ◄──┼──┼── graph freed
-└────────────┘  └────────────┘  └────────────┘
-```
-
-A batch boundary is **not** a credential checkpoint, and treating it as one is unsafe: the STS
-credential's roughly one-hour life is unrelated to how long a batch takes, so a batch that outruns
-it cannot renew at its own boundary. Renewal is owned by a timer — see "Renewal runs on a timer"
-above.
-
-`batch_days` is a parameter on `ingest_s1_roi_sar` and is absent from the S2 flow. The formula
-in the background section above estimates how many tasks a given window width produces; the
-30-day default keeps each batch inside the scheduler's RAM budget at cornbelt scale.
-
-Batch windows are inclusive at both ends and do not overlap: each spans `batch_days` calendar
-days and the loop advances `batch_start` to the day *after* `batch_end`. Since CMR and STAC also
-treat their end date as inclusive, each day is queried by exactly one batch — a boundary landing
-on the next batch's start day would page it twice, wasteful where each day is many pages of
-bursts.
-
-### Coverage pre-filtering before compute
-
-`filter_low_coverage_dates` eagerly computes only the per-date valid pixel counts — one scalar
-per time step, from SCL for S2 or VV for S1 — to decide which dates to keep. All spectral bands
-stay lazy, so cloud-covered and off-ROI scenes are dropped before any band data is read.
-
-### Lazy evaluation throughout
-
-`odc.stac.load` returns a Dask-backed xarray Dataset with no raster data read yet. The BOA offset
-is applied inside the read itself; the post-load transformations (dB conversion, ROI masking) chain
-further Dask operations without computing. Data is read and written in a single Dask graph
-execution triggered by the Zarr write step.
-
-### Chunk alignment
-
-The ROI Zarr mask is generated with `chunk_size` matching `INGEST_CHUNKS` so that
-`da.from_zarr` reads are zero-copy — each Dask partition maps to exactly one Zarr chunk.
-The same chunk sizes are passed to `odc.stac.load` (after translating `northing`/`easting`
-to `y`/`x`) so band arrays and the mask share the same partition boundaries for aligned
-Dask operations. (Inference reads 2048×2048 sub-tiles out of these 4096×4096 chunks via
-`zarr.Array.oindex`, which needs no such alignment — see
-[`inference/README.md`](../inference/README.md).)
-
-### GDAL network tuning
-
-`configure_gdal_environment()` (in [`config/environment.py`](../config/environment.py)) must be
-called before importing `rasterio` or `odc.stac`. It sets GDAL config options for network
-resilience (retry counts, timeouts, connection pooling) that affect all subsequent COG reads.
-
 ### has_new_stac_dates pre-check
 
-`has_new_stac_dates` is meant to run before provisioning a Dask cluster: it queries the STAC
-catalog and checks for new dates without reading any raster data or starting Fargate tasks,
-so a flow can exit early when nothing is new.
+**Not yet wired into any flow** — this section describes something unbuilt, kept because the
+reasons are worth having written down. `has_new_stac_dates` is meant to run before provisioning a
+Dask cluster: it queries the STAC catalog and checks for new dates without reading any raster data
+or starting Fargate tasks, so a flow could exit early when nothing is new.
 
-**Not yet wired into any flow.** An overlapping date range is no longer a correctness problem:
+An overlapping date range is no longer a correctness problem:
 each ROI ingest begins the day after the newest date its store holds, and a window wholly below
 that line returns a skip without querying (see *Where a resumed run starts*). What the pre-check
 would still buy is avoiding the cluster, since the skip is decided inside the ingest and the
