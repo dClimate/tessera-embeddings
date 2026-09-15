@@ -1082,23 +1082,22 @@ credential's remaining life every `CRED_TICK_INTERVAL_SEC` while batches are bei
 loop's per-batch and per-date checks remain as a fallback. Loop-driven renewal can only fire
 *between* units of work, so a unit outliving its margin cannot renew from inside itself — and that
 coupling is self-reinforcing, since failing reads stop the progress that would trigger renewal.
-
-**What a worker receives is a snapshot.** The plugin freezes the credential at construction, so a
-worker joining N minutes after the last broadcast starts with only the remaining TTL, and past it
-with none. Under adaptive scaling workers join throughout a leg, so the broadcast cadence is a
+What a worker receives is also a **snapshot**: the plugin freezes the credential at construction,
+so a worker joining N minutes after the last broadcast starts with only the remaining TTL and past
+it with none. Under adaptive scaling workers join throughout a leg, so the broadcast cadence is a
 correctness condition and the ticker is what bounds N. Every broadcast logs the advertised expiry
 (`S3 credentials broadcast to workers`).
 
 **Per-thread AWSSession cache**: `odc.loader` caches a boto3 `AWSSession` per thread in
-`threading.local` on first use and ignores subsequent env var updates for that thread's
-lifetime. Dask task pool threads are long-lived, so the initial 1hr STS token was getting
-pinned across refreshes and expiring mid-read. `auth.py` patches `odc.loader._rio.ThreadSession`
-at module import time so each thread self-detects `AWS_ACCESS_KEY_ID` drift and rebuilds its
-cached session from current env vars. `rasterio.env.Env` (entered by `odc.loader.rio_env()` on
-every `/vsis3/` open) then hands the refreshed `AWSSession`'s frozen credentials to GDAL, so no
-`gdal.SetConfigOption` or `VSICurlClearCache` is needed. This reaches into private `odc.loader`
-internals (`_OdcThreadSession`, `_local`) and is version-sensitive: if odc renames those symbols
-the import fails loudly, and `tests/unit/ingest/test_auth.py` catches it in CI.
+`threading.local` on first use and ignores subsequent env var updates for that thread's lifetime.
+Dask task pool threads are long-lived, so the initial 1 h STS token was being pinned across
+refreshes and expiring mid-read. `auth.py` patches `odc.loader._rio.ThreadSession` at module
+import time so each thread self-detects `AWS_ACCESS_KEY_ID` drift and rebuilds its cached session
+from current env vars; `rasterio.env.Env`, entered by `odc.loader.rio_env()` on every `/vsis3/`
+open, then hands GDAL the refreshed session's frozen credentials, so no `gdal.SetConfigOption` or
+`VSICurlClearCache` is needed. This reaches into private `odc.loader` internals
+(`_OdcThreadSession`, `_local`): if odc renames those symbols the import fails loudly, and
+`tests/unit/ingest/test_auth.py` catches it in CI.
 
 OPERA asset STS credentials are intentionally **never cleaned up** from env vars, which avoids
 one Dask task's cleanup removing credentials another still needs. The consequence: once
@@ -1136,11 +1135,9 @@ That matters because the mask array is LAZY: its block reads happen inside a lat
 `write_day_windows` compute, which on the radar path spans a whole 30-day batch. One credential
 resolved at graph-build time would be presented by every one of those reads and, once expired,
 fail with `ExpiredToken` on a bucket the role can always read — a lifetime problem wearing a
-permissions problem's error message.
-
-Two consequences: each block read pays its own store open and metadata round trip where the old
-construction paid one for the whole array, and the returned array is cloudpickle-only because the
-closure is nested. Both are measured in
+permissions problem's error message. Two consequences: each block read pays its own store open
+and metadata round trip where the old construction paid one for the whole array, and the returned
+array is cloudpickle-only because the closure is nested. Both are measured in
 `context_docs/decisions/022-resolve-the-roi-mask-credential-at-read-time.md`, and both argue
 against handing this array to a plain-pickle boundary or reading a zone grid you do not need.
 
@@ -1166,10 +1163,9 @@ once per token lifetime. `lru_cache` does not cache exceptions, so a failed cold
 The same provider is injected into inference workers, where long-lived Ray actors made this the
 dominant failure mode.
 
-S3 direct access also removes a 5-hop OAuth redirect chain per OPERA COG tile: one
-round trip (~0.5 s) buys an hour of STS credentials and GDAL then reads
-`s3://asf-cumulus-prod-opera-products` without per-file HTTPS redirects. At batch scale
-that is the dominant latency reduction.
+S3 direct access also removes a 5-hop OAuth redirect chain per OPERA COG tile: one round trip
+buys an hour of STS credentials and GDAL then reads `s3://asf-cumulus-prod-opera-products`
+without per-file HTTPS redirects, which at batch scale is the dominant latency reduction.
 
 ### URL Rewriting
 
@@ -1417,6 +1413,27 @@ One extra guard: the long wait is only granted after a job has already read some
 wrong — but wrong permissions fail the very first image, while a provider wobble arrives after the
 job has already been served. So the first successful read is what earns the patience.
 
+### Retrying a date's read
+
+`roi_processing.source_read_retrying` wraps the point where a date's graph is first *computed*.
+S1's read happens inside its write's `compute()` and is already covered by the write retry; S2's
+fires earlier, in its coverage gate. Scoped per date deliberately: a task-level retry would re-run
+the whole multi-day loop, so `tasks/ingest.py` refuses `@task(retries=...)`. Unlike the write
+policy it is **not** narrowed by exception type — reads fail through rasterio, GDAL/CPL, botocore
+and bare socket timeouts, a read is idempotent, and enumerating those surfaces risks a new
+transient class becoming fatal.
+
+### Attributing a failed date
+
+Per-date telemetry is emitted *after* a date commits, so the furthest date in a log is the last
+one that WORKED and a failure otherwise leaves no trace. `roi_processing.read_failure_context`
+emits `READ FAILED roi=… date=… items=… first=…` with the traceback on both sensors' per-date
+paths. `roi=` is what makes it attributable: the exception is raised on a Dask worker whose log
+stream is an ECS task id, so without it the same text appears for every zone and belongs to none.
+The traceback recovers rasterio's cause, which reports only `Read failed. See previous exception
+for details.` — GDAL's actual reason is discarded unless the chain is logged. It is also where the
+reason GDAL never raised is attached; see *When GDAL logs the reason instead of raising it*.
+
 ### When a source object will not read
 
 Some published objects are corrupt: a tile of the COG will not inflate, and no retry of any
@@ -1519,10 +1536,9 @@ Everything above reads the exception chain. Some of a read failure's reason neve
 A refused object is not empty: S3 answers the range request with an XML error document, and GDAL
 hands it to the TIFF decompressor, which fails on it — `ZIPDecode: Decoding error at scanline 0`,
 sometimes `unknown compression method`. That is what gets raised. GDAL states the refusal as a
-warning in its own log and raises nothing about it.
-
-So the chain says the bytes are bad and the log says the service refused, and those verdicts are
-opposites: bad bytes gives the date up, refused waits and gives up nothing.
+warning in its own log and raises nothing about it. So the chain says the bytes are bad and the
+log says the service refused, and those verdicts are opposites: bad bytes gives the date up,
+refused waits and gives up nothing.
 
 `loader_failures` closes it with a second handler on `rasterio._env`, the logger rasterio's CPL
 error handler forwards to. `carry_logged_refusal` attaches what it collected to the failing
@@ -1553,19 +1569,15 @@ Four properties are what make it safe to add evidence at all:
 - **Only onto a source read failure**, gated by `is_source_read_failure` on the same
   `_SOURCE_READER_MARKERS` every other corroboration uses. A store conflict raised while some
   other read is being refused is still a store conflict, and a wait fixes nothing.
-- **A separate buffer from the aborted hrefs**, read independently, so the caller that classifies
-  cannot destroy the evidence the optical copy ladder attributes from. The href buffer is still
-  drained destructively.
-- **Reading the refusals does not consume them.** Two reads are in flight whenever the optical
-  path pipelines a date, each inside its own `read_failure_context`; a destructive collection let
-  whichever failed first take the other's evidence. Lines leave only by eviction past a retention
-  horizon far longer than any single read.
-- **What keeps a stale line out is its AGE, not its removal.** A read that logs a refusal and then
-  succeeds drains nothing, so without an age bound its line would be inherited by whatever failed
-  next — and a genuinely corrupt object would read as a refusal and never step down the copy
-  ladder. Each worker reports its lines' age by its own clock and the caller applies the cutoff
-  **after** the round trip, against its own, so nothing depends on the fleet's clocks agreeing or
-  on the collection being quick.
+- **Reading the refusals does not consume them**, and they sit in a separate buffer from the
+  aborted hrefs, which is still drained destructively. Two reads are in flight whenever the
+  optical path pipelines a date, each inside its own `read_failure_context`, and a destructive
+  collection let whichever failed first take the other's evidence. What keeps a stale line out is
+  therefore its AGE: a read that logs a refusal and then succeeds drains nothing, so without an
+  age bound its line would be inherited by whatever failed next and a genuinely corrupt object
+  would read as a refusal and never step down the copy ladder. Each worker reports its lines' age
+  by its own clock and the caller applies the cutoff **after** the round trip against its own, so
+  nothing depends on the fleet's clocks agreeing or on the collection being quick.
 
 The evidence is ATTACHED rather than answered: a caller that classified and discarded would hand
 the next reader of the same exception the opposite verdict, and the radar path has two readers —
@@ -1593,32 +1605,24 @@ unmoved, because its per-date remedy is the copy ladder and a long wait per rung
 with it. The evidence still reaches optical through the same context manager, so a refusal there
 is declined by `is_unreadable_source` and fails the leg rather than stepping copies.
 
-**And only a refusal that arrives AFTER a successful read earns the expensive wait.** An
-authorization verdict on a valid credential is either the provider misbehaving or our permissions
-being genuinely wrong, in the same words. What separates them is not the message but when it
-arrives: a permissions fault is total and deterministic, so it refuses the leg's FIRST date, where
-a provider wobble arrives after the leg has already been served. `s1_roi` keeps one per-leg flag,
-set on the first committed date, and withholds the long wait until it is set — so a leg whose
-access is genuinely wrong fails promptly and releases its fleet instead of idling on it.
+The long wait is also withheld until a leg has read something successfully, per *Waiting: where it
+happens changes what it costs* above: `s1_roi` keeps one per-leg flag, set on the first committed
+date, so a leg whose access is genuinely wrong fails promptly and releases its fleet instead of
+idling on it.
 
-It fails closed three ways, each costing only the ordinary attempt limit. A credential fault on
-THIS side is excluded first, being repairable here. A refusal nothing attributes to the source
+Otherwise it fails closed, each way costing only the ordinary attempt limit. A credential fault
+on THIS side is excluded first, being repairable here. A refusal nothing attributes to the source
 reader is excluded too — `AccessDenied`, `SlowDown` and `InternalError` are S3's words, so they
 count only alongside GDAL's own vocabulary, by the same pairing rule as the not-found markers
-above. And anything unrecognised is excluded — the shape of a failure whose cause was stripped
-crossing the worker boundary: no long wait on suspicion, and not given up either.
+above. And a refusal carrying neither a name nor a status — a transport failure with no code, or a
+cause destroyed crossing the worker boundary — is declined for want of evidence: no long wait on
+suspicion, and not given up either. `cause_was_flattened` says which of those two happened, so a
+leg reading without a decidable cause is visible rather than silent.
 
-The two predicates were once overlapping, and a caller's ORDER of asking decided the verdict.
-They are now disjoint by construction, and by sharing one classification rather than keeping two
-lists in step: both read the same markers and the same HTTP status RANGES, so a status nobody
-enumerated cannot be a refusal to one predicate and bad data to the other. A caller that knows
-only one of them cannot misclassify.
-
-That leaves one honest gap, and it is the fail-closed direction. A refusal carrying neither a
-name nor a status — a transport failure with no code, or a cause destroyed crossing the worker
-boundary — is declined for want of evidence rather than named as a refusal. It draws no long wait
-on suspicion and is not given up either. `cause_was_flattened` is what says which of those two
-happened, so a leg reading without a decidable cause is visible rather than silent.
+The two predicates are disjoint by construction, and stay so by sharing one classification rather
+than keeping two lists in step: both read the same markers and the same HTTP status RANGES, so a
+status nobody enumerated cannot be a refusal to one predicate and bad data to the other, and a
+caller that knows only one of them cannot misclassify.
 
 ### The radar bounded skip (`s1_roi.py`)
 
@@ -1799,15 +1803,12 @@ ChunkSpec-vs-sub-chunk decoupling that makes assembly survive on the same budget
 
 ### Cropping to live windows (unconditional)
 
-Ingest cost scales with the **extent it computes, not the land it keeps**: the mosaic
-loads cover the whole ROI grid even where the mask is entirely ocean/out-of-footprint.
-On a UTM zone that is mostly sea this is the difference between a graph that fits and one
-that does not — the extreme cells hold a few live tiles out of many thousands, and across
-the campaign's land zones roughly three-quarters of the compute would go to ocean.
-
-Every load and write is restricted to the chunk-aligned windows that intersect the ROI
-mask. This is unconditional and has no flag: on a zone where land is 0.238% of the extent,
-uncropped is ~420× the array volume, which exhausts a worker's disk.
+Ingest cost scales with the **extent it computes, not the land it keeps**, and a mosaic load
+covers the whole ROI grid even where the mask is entirely ocean or out of footprint. So every
+load and write is restricted to the chunk-aligned windows that intersect the ROI mask,
+unconditionally and with no flag: on a zone where land is 0.238% of the extent, uncropped is
+~420× the array volume, which exhausts a worker's disk. Across the campaign's land zones roughly
+three-quarters of the compute would otherwise go to ocean.
 
 ```text
 zone / ROI extent (declared grid — UNCHANGED, the fill validates it)
@@ -1872,10 +1873,9 @@ r8    .  .  .  .  .  .       .  .  .  .  .  .          .  .  .  .  .  .
 ```
 
 Group `a` covers r0–r4 at the cost of two dead chunks (`+`), buying four fewer stalls. Whether
-`b` joins it is the same cost question: that union spans `r0–r7 × c0–c4`, adding 16 chunks to save
-one stall — worth it at the production price, so real masks group harder than this illustration
-suggests. Two things stop a group: the price ceasing to justify the area, and
-`MAX_TASKS_PER_WINDOW`, which bounds one window's graph. That cap is expressed in TASKS and
+`b` joins it is the same question, and at the production price it would — real masks group harder
+than this illustration suggests. Two things stop a group: the price ceasing to justify the area,
+and `MAX_TASKS_PER_WINDOW`, which bounds one window's graph. That cap is expressed in TASKS and
 converted to a chunk area through `DEFAULT_TASKS_PER_CHUNK`, because the scheduler dispatches on
 a single-threaded event loop — past its throughput, extra area stops being cheap.
 
@@ -1934,51 +1934,31 @@ per passing date (one writable session ── one commit)
   orbit filter. It discards nothing reachable, since CMR matches a multi-valued attribute if ANY
   value matches, so VV admits every VV+VH granule. The client-side check remains as a safety net,
   and its warning means a catalogue inconsistency — metadata advertising VV without the bands
-  published — rather than a regional fact. Note that cross-pol granules are **not** EW-mode: the
-  Greenland ones report `BEAM_MODE=IW`, and a `BEAM_MODE=EW` query there returns nothing.
-
+  published — rather than a regional fact.
 - **A zone can have NO usable radar, and that is a finding rather than a failure.** Over ice
   Sentinel-1 images in Extra Wide swath with HH/HV polarisation, and the OPERA query discards
-  anything that is not dual-pol VV+VH — so an ROI whose land is ice has a catalogue full of
-  granules and not one the ingest can use. Zone 23N (Greenland) returns ~45,000 ascending and
-  ~138,000 descending granules for 2021 and **zero** usable items. Requiring a SAR store there
+  anything that is not dual-pol VV+VH, so an ROI whose land is ice has a catalogue full of
+  granules and not one the ingest can use. Zone 23N (Greenland) returns ~183,000 granules for
+  2021 and **zero** usable items. (They are not EW-mode either: the Greenland ones report
+  `BEAM_MODE=IW`, and a `BEAM_MODE=EW` query there returns nothing.) Requiring a SAR store there
   failed the cell permanently, so `"both"` resolves to `S1_ORBIT_NONE`, which activates no orbit
   and leaves the coverage gate checking reflectance alone.
 
   **Permissive by default, refusable on demand.** A global product cannot reject terrain that is
-  radar-free as a matter of geography, so `resolve_s1_orbit`'s `allow_none` defaults to True for
-  every caller. A single run over terrain known to be imaged is the opposite case — there an
-  absent store means something upstream broke, and resolving to `none` would embed without radar
-  and hide it — so those callers pass the flows' `require_s1`, which reaches the resolver as
-  `allow_none=False`. An operator who names one orbit is never downgraded either.
-
-  **The ingest's per-orbit item count is the authority on which case it is.** It has just queried
-  both orbits, so `items_seen=0` means the source offers nothing here, which is terrain rather
-  than a gap. A consumer reading a finished mosaic cannot distinguish the two, so its
-  warning names the mosaic and points at that count.
-
-  Accepting a radar-free ROI necessarily means embedding S2-only pixels, since every pixel there
-  has zero S1 observations. `InferenceConfig` derives `allow_s2_only` for that case rather than
-  asking the caller, because the alternative is a fill that writes nothing and reports success.
-
-- **Reads retry, per date.** `roi_processing.source_read_retrying` wraps the point where a
-  date's graph is first *computed*. S1's read happens inside its write's `compute()` and is
-  already covered by the write retry; S2's fires earlier, in its coverage gate. Scoped per
-  date deliberately: a task-level retry would re-run the whole multi-day loop, so
-  `tasks/ingest.py` refuses `@task(retries=...)`. Unlike the write policy it is **not**
-  narrowed by exception type: reads fail through rasterio, GDAL/CPL, botocore and bare socket
-  timeouts, a read is idempotent, and enumerating those surfaces risks a new transient class
-  becoming fatal.
-- **A failed date must say which date, and on which ROI.** Per-date telemetry is emitted
-  *after* a date commits, so the furthest date in a log is the last one that WORKED and a
-  failure otherwise leaves no trace. `roi_processing.read_failure_context` emits
-  `READ FAILED roi=… date=… items=… first=…` with the traceback on both sensors' per-date
-  paths. `roi=` is what makes it attributable: the exception is raised on a Dask worker whose
-  log stream is an ECS task id, so without it the same text appears for every zone and belongs
-  to none. The traceback recovers rasterio's cause, which reports only `Read failed. See
-  previous exception for details.` — GDAL's actual reason is discarded unless the chain is
-  logged. It is also where the reason GDAL never raised is attached; see *When GDAL logs the
-  reason instead of raising it*.
+  radar-free as a matter of geography, so `resolve_s1_orbit`'s `allow_none` defaults to True. A
+  single run over terrain known to be imaged is the opposite case — there an absent store means
+  something upstream broke, and resolving to `none` would embed without radar and hide it — so
+  those callers pass the flows' `require_s1`, which reaches the resolver as `allow_none=False`.
+  An operator who names one orbit is never downgraded either. Which case it is comes from the
+  ingest's per-orbit item count, since it has just queried both orbits: `items_seen=0` means the
+  source offers nothing here, which is terrain rather than a gap. A consumer reading a finished
+  mosaic cannot distinguish the two, so its warning names the mosaic and points at that count.
+  Accepting a radar-free ROI necessarily means embedding S2-only pixels, and `InferenceConfig`
+  derives `allow_s2_only` for that case rather than asking the caller, because the alternative is
+  a fill that writes nothing and reports success.
+- **Reads retry, per date**, and a failed date says which date and which ROI. See
+  *Retrying a date's read* and *Attributing a failed date* under
+  [Error handling](#error-handling).
 - **Each date narrows further, to the land its own imagery reaches**, via `windows_for_date`.
   See *Narrowing a date's windows, and skipping dates that reach none*.
 
