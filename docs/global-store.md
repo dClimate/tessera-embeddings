@@ -148,9 +148,9 @@ A plain Zarr v3 copy is [hosted on Source Coop][sc] and opens with xarray or Zar
 carries the same eight arrays and the same `scales` treatment, so everything above about
 dequantisation and coverage applies.
 
-> **Still being populated, as of 2026-09-15.** Every group and array exists, but almost no
-> chunk data has been written, so most zones currently read back as all-`NaN`. Use the
-> Icechunk store until this note goes away.
+> **Being populated now, expected complete around 2026-09-19.** Every group and array
+> exists, but the chunk data is still landing, so most zones read back as all-`NaN` until
+> then. Use the Icechunk store in the meantime.
 
 ```python
 import xarray as xr
