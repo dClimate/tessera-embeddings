@@ -151,17 +151,17 @@ Omit `group=` and the call still succeeds, but it hands back an empty dataset.
 ## Input data
 
 Each yearly embedding is computed from 10 bands of Sentinel-2 L2A optical imagery and 2 bands of
-Sentinel-1 RTC OPERA radar, using every observation available that year. Coverage is uneven for three
-reasons, and all three show up in the per-pixel counts described below.
+Sentinel-1 RTC OPERA radar, using every observation available that year. Coverage is uneven for
+three reasons, and all three show up in the per-pixel counts described below.
 
-Sentinel-2 L2A arrives partway through 2017, beginning with Europe. Radar coverage becomes spottier over
-much of the world from 2022 to 2024. Sentinel-1B failed in December 2021; its replacement Sentinel-1C
-launched on 5 December 2024 but [opened to users only on 26 March 2025][s1c], with commissioning
-taking priority until that May. About a fifth of the land has no radar for those three years.
-The store shows the gap and the recovery: sampling a live tile in zone 33N gives roughly 24 to
-30 ascending radar observations a year through 2021, exactly zero for 2022, 2023 and 2024,
-then 17.5 in 2025 — around 60% of the earlier rate, for the nine months the satellite was
-publishing.
+Sentinel-2 L2A arrives partway through 2017, beginning with Europe. Radar coverage becomes
+spottier over much of the world from 2022 to 2024. Sentinel-1B failed in December 2021; its
+replacement Sentinel-1C launched on 5 December 2024 but [opened to users only on 26 March
+2025][s1c], with commissioning taking priority until that May. About a fifth of the land has no
+radar for those three years. The store shows the gap and the recovery: sampling a live tile in
+zone 33N gives roughly 24 to 30 ascending radar observations a year through 2021, exactly zero
+for 2022, 2023 and 2024, then 17.5 in 2025 — around 60% of the earlier rate, for the nine months
+the satellite was publishing.
 
 [s1c]: https://dataspace.copernicus.eu/news/2025-3-25-sentinel-1c-user-data-opening-26th-march
 
