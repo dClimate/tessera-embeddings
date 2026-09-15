@@ -20,9 +20,9 @@ regression or change detection, so you can train against them without handling r
 | land mask | GeoTESSERA's, delivered as 0.1° tiles (see below) |
 | model | TESSERA v1.1, the AWS-optimised checkpoint (`tessera_v1_1_aws_encoder.pt`) |
 
-The embeddings are quantised to save space: each pixel-year holds 128 int8 values plus one
-float32 `scales` value, and multiplying the two recovers the original numbers. Where a pixel
-was never embedded the scale is `NaN`, which makes `scales` the array to ask about coverage.
+The embeddings are quantised: each pixel-year holds 128 int8 values plus one float32
+`scales` value, and multiplying the two recovers the original numbers. An unembedded pixel
+has a `NaN` scale, which makes `scales` the array to ask about coverage.
 
 The store records all of this in its root attributes, so you can check it against the data:
 `geoemb:model` (`https://geotessera.org/model/1.1`), `checkpoint_id`, `geoemb:gsd`,
@@ -42,9 +42,8 @@ them. Every listed tile is entirely ones, so the listing itself is the mask and 
 per-pixel land signal to read.
 
 Coverage extends about one cell, roughly 11 km, into the sea, since some users wanted a
-generous ocean margin. A 2048-pixel tile is treated as live when any cell's footprint touches
-it, and at 10 m that tile is 20.5 km across against an 11 km margin, so expect embedded ocean
-near coastlines.
+generous ocean margin. A tile counts as live when any cell's footprint touches it, so expect
+embedded ocean near coastlines.
 
 ## How the data is organised
 
@@ -85,7 +84,7 @@ chunk is 0.26 MB, an observation-count chunk 0.13 MB.
 
 Writing whole 2048-pixel shards keeps the object count manageable across the globe, while the
 256-pixel chunks inside them keep small reads small: a reader fetches the shard's index, then
-only the byte ranges of the chunks it overlaps.
+only the byte ranges it overlaps.
 
 ### What a read costs
 
@@ -129,38 +128,48 @@ ds = xr.open_zarr(session.store, group="33N", consolidated=False,
 Pass no configuration object. The store carries settings already tuned for readers, and
 supplying your own replaces them wholesale.
 
-Multiply by `scales` to get usable numbers. The band dimension broadcasts, so no reshaping
-is needed:
+Multiply by `scales` for usable numbers; the band dimension broadcasts, so no reshaping:
 
 ```python
 window = ds.isel(time=8, northing=slice(661604, 661620), easting=slice(49252, 49268))
 embeddings = window.embeddings * window.scales      # int8 x float32 -> float32
 ```
 
-Pixels that were never embedded carry a `NaN` scale, so they come out of that multiplication
-as `NaN` rather than as a misleading zero.
+Unembedded pixels come out of that as `NaN` rather than a misleading zero.
 
-Note that `chunks=None` skips building a Dask task graph over all 8.67 million chunks in the
-array, which is usually much faster. Slice down to your area of interest with `.sel` or
-`.isel` before reading any values: without Dask the unsliced array has no lazy wrapper, so
-touching it directly attempts the full 66 TiB.
+`chunks=None` skips building a Dask task graph over the array's 8.67 million chunks, which is
+usually much faster. Slice to your area of interest with `.sel` or `.isel` before reading any
+values: without Dask there is no lazy wrapper, so touching the unsliced array attempts the
+full 66 TiB.
 
 ### Without Icechunk
 
-A plain Zarr v3 hierarchy is hosted on Source Coop at <TODO: SOURCE COOP URL> and opens with
-xarray or Zarr alone. Its structure is identical to the Icechunk store, so group names,
-array names, coordinates and the `scales` treatment are all exactly as described above.
+A plain Zarr v3 copy is [hosted on Source Coop][sc] and opens with xarray or Zarr alone. It
+carries the same eight arrays and the same `scales` treatment, so everything above about
+dequantisation and coverage applies.
+
+> **Still being populated, as of 2026-09-15.** Every group and array exists, but almost no
+> chunk data has been written, so most zones currently read back as all-`NaN`. Use the
+> Icechunk store until this note goes away.
 
 ```python
 import xarray as xr
 
 ds = xr.open_zarr(
-    "<TODO: SOURCE COOP URL>", group="33N",
-    storage_options={"anon": True}, consolidated=False, chunks=None,
+    "s3://tessera/tessera/zarr/v1.1-dclimate", group="utm33",
+    storage_options={"anon": True, "endpoint_url": "https://data.source.coop"},
+    consolidated=False, chunks=None,
 )
 ```
 
-Omit `group=` and the call still succeeds, but it hands back an empty dataset.
+Three differences to watch for. Groups are `utm01` to `utm60`, each spanning both
+hemispheres, so there is no `33N`. Spatial coordinates are `x` and `y`. And `embeddings` is
+ordered `(time, band, y, x)`, so while `embeddings * scales` still works — xarray broadcasts
+by name — anything indexing by position needs adjusting. Use the `s3://` form with that
+`endpoint_url` rather than the browser URL: plain HTTPS cannot list a directory, so xarray
+finds no arrays and returns an empty dataset.
+
+[sc]: https://source.coop/tessera/tessera/zarr/v1.1-dclimate
 
 ## Input data
 
