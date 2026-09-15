@@ -75,8 +75,7 @@ slice with `.sel` or `.isel` before reading any values.
 Groups there are `utm01`–`utm60` (each covering both hemispheres) and spatial coordinates are
 `x`/`y`, but the arrays and the `scales` treatment are the same. Use the `s3://` form below
 rather than the browser URL — plain HTTPS cannot list a directory, so xarray returns an empty
-dataset. It is being populated now and expected complete around **2026-09-19**; until then
-most zones read back as `NaN`.
+dataset.
 
 ```python
 import xarray as xr
