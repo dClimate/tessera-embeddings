@@ -351,22 +351,16 @@ The rest of this section is the mechanism behind that picture.
 
 #### The months where the catalogue entries are heavy
 
-Late 2018 and early 2019 are the awkward part of the archive, and it is worth knowing why before
-it surprises you somewhere else.
+Catalogue entries from roughly **November 2018 to March 2019** are about 100× larger than
+normal. An entry usually carries the tile's bounding rectangle, a couple of hundred bytes;
+these carry the outline of where the imagery actually falls, and since Sentinel-2 builds an
+image from twelve detectors that edge is a fine sawtooth — 2,497 points and 98 KB in one
+measured entry, against 0.2 KB. The asset list is ~18 KB either way, so the outline is what
+makes them heavy.
 
-Every scene's catalogue entry includes the shape of the ground it covers. Normally that is a
-rectangle — four corners, a couple of hundred bytes. But entries from roughly **November 2018 to
-March 2019** give the shape of where the imagery *actually* is instead, tracing the edge of the
-data rather than the tile boundary. Sentinel-2 builds each image from twelve separate detectors,
-so that edge is a fine sawtooth, and drawing it takes thousands of points. One entry we measured
-runs to 2,497 points and 98 KB, against 0.2 KB for an ordinary one. The list of files attached to
-the scene is about 18 KB either way, so it is the outline, not the imagery, that makes these
-entries heavy.
-
-The band exists because of a gap in reprocessing rather than anything about that season. ESA
-reprocessed most of the archive to a later version whose entries carry the simple rectangle, and
-the catalogue serves that version when it exists. For those few months it does not exist, so the
-original products are what you get. Sampling one day a month across the boundary:
+The band is a reprocessing gap: ESA reprocessed most of the archive to a version carrying the
+simple rectangle, and those months are the stretch where only the original 02.11 is on offer.
+Sampling one day a month across the boundary:
 
 | month | typical points per entry | heavy entries | versions available |
 |---|---|---|---|
@@ -377,26 +371,16 @@ original products are what you get. Sampling one day a month across the boundary
 | Apr 2019 | 6 | 0 of 50 | 02.11, 05.00 |
 | Jun 2023 | 5 | 0 of 50 | 05.09 |
 
-The heavy months are exactly the ones where version 02.11 is the only one on offer. Why that
-version drew outlines this way when the versions either side did not is an ESA processing decision
-and not something we have chased.
+It cannot spread, since no current processing version produces these outlines, and it could
+disappear if that stretch is ever reprocessed.
 
-Two things follow. It **cannot spread** — no current processing version produces these outlines,
-so no future data brings the problem back. And it **could disappear on its own**, if that stretch
-is ever reprocessed.
+Two consequences in this code. A hundred entries is ~2.2 MB outside the band and at or over
+the ~6 MB response ceiling inside it, which is why page refusals are a 2019 phenomenon. And a
+month of these entries holds an order of magnitude more bytes than the same month in 2024,
+which is part of why the query streams month by month.
 
-What it presses against, in this code:
-
-- **The response cap.** A hundred entries is about 2.2 MB outside the band and at or over the
-  ~6 MB ceiling inside it, which is what makes a page refusal a 2019 phenomenon. See the page-size
-  discussion below.
-- **What a query holds in memory.** A month's worth of these entries is an order of magnitude
-  more bytes than the same month in 2024, which is part of why the query streams month by month
-  rather than fetching a year at once.
-
-Anything that measures per-item cost — page sizes, retained bytes, query timings — will read
-differently in these months than anywhere else in the archive, so a figure taken here is not a
-figure about the campaign generally, and vice versa.
+Any per-item figure — page size, retained bytes, query timing — reads differently in these
+months than anywhere else in the archive.
 
 `_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry`
 built by `make_logging_retry()` (`_http.py`, shared with the CMR Granule query) and passed
@@ -407,15 +391,12 @@ the `HTTPAdapter`, making a slow query indistinguishable from a hang. Because
 retries on the underlying `HTTPAdapter` means a transient 5xx on page N is retried in
 place, instead of throwing away prior pages and restarting the whole query.
 
-**502 is deliberately absent from that force-list**, so an Earth Search page refusal
-arrives unretried and the date-window re-cut below can start immediately instead of after
-the ladder's backoff. A 502 that really was transient is absorbed by the attempt budget
-that owns the leg, which is where a refusal is settled anyway — it takes an identical
-repeat to prove one deterministic. The CMR Granule query keeps its own ladder
-(`opera_query._CMR_RETRY`), 502 included, and is unaffected. Note that
-`StacApiIO`'s default `max_retries=5` passes a bare int to urllib3, which has an empty
-`status_forcelist` and therefore does **not** retry 5xx responses — the explicit `Retry`
-object is required.
+**502 is deliberately absent from that force-list**, so an Earth Search page refusal arrives
+unretried and the date-window re-cut below starts immediately rather than after the ladder's
+backoff. A transient 502 is absorbed by the attempt budget owning the leg. The CMR Granule
+query keeps its own ladder (`opera_query._CMR_RETRY`), 502 included. Note that `StacApiIO`'s
+default `max_retries=5` passes a bare int to urllib3, whose empty `status_forcelist` means
+5xx is **not** retried — the explicit `Retry` object is required.
 
 The page size is `STACProvider.max_page_size` (the `limit` per page request), defaulting
 to 250 and set to 100 for Earth Search. This applies only to providers queried through
@@ -1613,12 +1594,8 @@ that does not — the extreme cells hold a few live tiles out of many thousands,
 the campaign's land zones roughly three-quarters of the compute would go to ocean.
 
 Every load and write is restricted to the chunk-aligned windows that intersect the ROI
-mask. **This is not optional and has no flag.** It was `crop_to_live_windows`, defaulting
-OFF while the path was validated; the validation passed, the default was never flipped, and
-the consequence of running without it is catastrophic rather than merely slower — on a zone
-where land is 0.238% of the extent, uncropped is ~420x the array volume, which exhausts a
-worker's disk and invalidates every measured campaign figure. No caller wanted it off, so
-the parameter is gone rather than defaulted.
+mask. This is unconditional and has no flag: on a zone where land is 0.238% of the extent,
+uncropped is ~420× the array volume, which exhausts a worker's disk.
 
 ```text
 zone / ROI extent (declared grid — UNCHANGED, the fill validates it)
@@ -1786,40 +1763,31 @@ per passing date (one writable session ── one commit)
   has zero S1 observations. `InferenceConfig` derives `allow_s2_only` for that case rather than
   asking the caller, because the alternative is a fill that writes nothing and reports success.
 
-- **Reads retry too, and did not used to.** `roi_processing.source_read_retrying` wraps the
-  point where a date's graph is first *computed*. The two sensors reach that point
-  differently, which is why only one of them needed the fix: S1's read happens inside its
-  write's `compute()`, already covered by the write retry, while S2's fires earlier in its
-  coverage gate and so sat outside every retry. One transient failure reading one granule
-  therefore propagated out of S2's per-date loop and failed the whole zone-year, discarding
-  the months the run had already committed. Scoped per date on purpose — a retry at the task
-  level would re-run the entire multi-day loop, which is why `tasks/ingest.py` refuses
-  `@task(retries=...)`. Unlike the write policy it is **not** narrowed by exception type:
-  reads fail through rasterio, GDAL/CPL, botocore and bare socket timeouts, a read is
-  idempotent, and enumerating those surfaces only risks a new transient class becoming fatal.
+- **Reads retry, per date.** `roi_processing.source_read_retrying` wraps the point where a
+  date's graph is first *computed*. S1's read happens inside its write's `compute()` and is
+  already covered by the write retry; S2's fires earlier, in its coverage gate. Scoped per
+  date deliberately — a task-level retry would re-run the whole multi-day loop, which is why
+  `tasks/ingest.py` refuses `@task(retries=...)`. Unlike the write policy it is **not**
+  narrowed by exception type: reads fail through rasterio, GDAL/CPL, botocore and bare socket
+  timeouts, a read is idempotent, and enumerating those surfaces risks a new transient class
+  becoming fatal.
 - **A failed date must say which date, and on which ROI.** Per-date telemetry is emitted
-  *after* a date commits, so the furthest date in a log is the last one that WORKED — a
-  failure leaves no trace of what was being attempted, and the log reads as progress right up
-  to the point of death. `roi_processing.read_failure_context` closes that on both sensors'
-  per-date paths, emitting `READ FAILED roi=… date=… items=… first=…` with the traceback.
-  The `roi=` field is what makes it attributable: the exception is raised on a Dask worker
-  whose log stream is an ECS task id, so without it the same error text appears for every
-  zone in the fleet and belongs to none of them. The traceback is what recovers rasterio's
-  cause — it reports `Read failed. See previous exception for details.` and that previous
-  exception is GDAL's, discarded unless the chain is logged. It is also where the half of the
-  reason GDAL never raised is collected and attached — see *When GDAL logs the reason instead
-  of raising it* below.
-- **Each date narrows further, to the land its own imagery reaches.** A run's windows
-  say where the ROI has land, and are the same on every date; a single date is not, because
-  an optical satellite images a fraction of a wide ROI per pass. Windows a date does not
-  reach still built tasks that ran, found nothing, and wrote nothing. `windows_for_date`
-  intersects the run's windows with the footprint of that date's own STAC items
-  (reprojected onto the ingest grid, padded outward by one cell so a curved reprojection
-  cannot under-cover), then re-bands and re-groups the remainder. This cannot change what
-  a mosaic holds — it only removes work whose result was already discarded — but it shrinks
-  both the graph and the count of serial region writes. When the footprint cannot be
-  determined the run's full window list is returned unchanged, so the conservative
-  behaviour is the fallback rather than something a caller must opt into.
+  *after* a date commits, so the furthest date in a log is the last one that WORKED and a
+  failure otherwise leaves no trace. `roi_processing.read_failure_context` emits
+  `READ FAILED roi=… date=… items=… first=…` with the traceback on both sensors' per-date
+  paths. `roi=` is what makes it attributable: the exception is raised on a Dask worker whose
+  log stream is an ECS task id, so without it the same text appears for every zone and belongs
+  to none. The traceback recovers rasterio's cause, which reports only `Read failed. See
+  previous exception for details.` — GDAL's actual reason is discarded unless the chain is
+  logged. It is also where the reason GDAL never raised is attached; see *When GDAL logs the
+  reason instead of raising it*.
+- **Each date narrows further, to the land its own imagery reaches.** A run's windows are the
+  same on every date; a single date is not, since an optical satellite images a fraction of a
+  wide ROI per pass. `windows_for_date` intersects the run's windows with that date's own STAC
+  footprints (reprojected onto the ingest grid, padded one cell so a curved reprojection
+  cannot under-cover), then re-bands and re-groups. This cannot change what a mosaic holds,
+  only remove work whose result was discarded. When the footprint cannot be determined the
+  full window list is returned unchanged, so the conservative path is the fallback.
 
 ```text
    run windows (where the ROI has land)   one date's items      that date writes
