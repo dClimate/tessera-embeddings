@@ -71,8 +71,27 @@ carries reader-tuned settings already, and supplying your own replaces them whol
 `chunks=None`, which skips building a Dask graph over the array's 8.67 million chunks, and
 slice with `.sel` or `.isel` before reading any values.
 
+**Prefer plain Zarr?** A Zarr v3 copy is [hosted on Source Coop][sc], no Icechunk needed.
+Groups there are `utm01`–`utm60` (each covering both hemispheres) and spatial coordinates are
+`x`/`y`, but the arrays and the `scales` treatment are the same. Use the `s3://` form below
+rather than the browser URL — plain HTTPS cannot list a directory, so xarray returns an empty
+dataset. It is being populated now and expected complete around **2026-09-19**; until then
+most zones read back as `NaN`.
+
+```python
+import xarray as xr
+
+ds = xr.open_zarr(
+    "s3://tessera/tessera/zarr/v1.1-dclimate", group="utm33",
+    storage_options={"anon": True, "endpoint_url": "https://data.source.coop"},
+    consolidated=False, chunks=None,
+)
+```
+
 [The global embeddings store](#the-global-embeddings-store) below covers the layout, the
 coverage caveats and what a read costs.
+
+[sc]: https://source.coop/tessera/tessera/zarr/v1.1-dclimate
 
 ---
 ## What this is
