@@ -1239,24 +1239,20 @@ reached inside `is_unreadable_source` in `duplicates.py`, which declines them be
 bad-data marker is consulted; there is no separate predicate to ask.
 
 **What a positive verdict buys is TIME, and nothing else.** It is passed to the shared write
-retry as `wait_out`, and the policy then keeps re-attempting that one failure until it has spent
-`WAIT_OUT_BACKOFF_S` of backoff. It may never be spent on giving up a date: a date given up and a
-later date committed puts the earlier one permanently below the store's append-only maximum, so
-the re-run meant to recover it is refused instead. If the wait is not enough, the write fails, the
-leg fails with its time axis unmoved, and the leg's own retry re-offers the date in order.
+retry as `wait_out`, and the policy re-attempts that one failure until it has spent
+`WAIT_OUT_BACKOFF_S` of backoff. It is never spent on giving up a date, for the append-only
+reason given under the radar skip below. If the wait is not enough the write fails, the leg fails
+with its time axis unmoved, and the leg's own retry re-offers the date in order.
 
-**How much time depends on WHERE the waiting happens**, and the two places cost very different
-things. A write waits with its leg's whole Dask fleet held idle behind it, so the in-leg budget is
-minutes. A leg that has FAILED has released its fleet, so waiting before re-dispatching it costs
-latency and nothing else — that budget is `leg_refusal_backoff_s`, and it is tens of minutes. The
-patience goes where it is cheap, and the in-leg wait covers only the ordinary wobble.
+The two waiting budgets are the ones described under *Waiting: where it happens changes what it
+costs* — minutes in-leg, where the fleet sits idle, and tens of minutes between attempts, where
+it does not. The between-attempt budget is `leg_refusal_backoff_s`.
 
-Carrying the verdict from one place to the other takes a type. The leg-retry layer sees a failure
-DETAIL string, and no marker on that string can separate a refused read from a crash — the wrapper
-discarded the cause long before. So a radar write that exhausts its in-leg budget on a refusal
-raises `errors.ProviderRefusedReadsError`, whose name reaches the detail and is what
-`_leg_backoff_s` keys the long delay on. Nothing about the failure changes: it fails the leg
-exactly as it did, and skips exactly as much, which is nothing.
+Carrying the verdict between the two takes a type: the leg-retry layer sees only a failure DETAIL
+string, and no marker on it can separate a refused read from a crash, since the wrapper discarded
+the cause. So a radar write that exhausts its in-leg budget on a refusal raises
+`errors.ProviderRefusedReadsError`, whose name reaches the detail and is what `_leg_backoff_s`
+keys the long delay on. Nothing else about the failure changes.
 
 ### When GDAL logs the reason instead of raising it
 
@@ -1907,11 +1903,9 @@ negligible compared to the Dask compute time for a large spatial ROI.
 
 ### Overlapping a date's window writes (`overlap_window_writes`)
 
-A date is written as several chunk-disjoint windows. The
-obvious implementation writes them one at a time, and that turns out to dominate the cost of
-a date: each window's compute runs to completion before the next begins, so the date costs
-the **sum** of the windows' critical paths while the fleet works on one window and idles
-through the rest of each.
+A date is written as several chunk-disjoint windows. Writing them one at a time dominates the
+cost of a date: each window's compute completes before the next begins, so the date costs the
+**sum** of the windows' critical paths while the fleet idles through most of each.
 
 ```text
 Sequential windows — the fleet sees one window at a time:
@@ -1927,15 +1921,15 @@ Overlapped (overlap_window_writes, the default) — one graph, one commit:
  └── one merge, one commit for the date (contract unchanged) ──┘
 ```
 
-Mechanism: icechunk's dask path already forks a session, stores lazily, and merges
-changesets; writing per window merely runs that whole sequence once per window. Overlapping
-lifts it one level — fork once, collect every window's lazy stored arrays, run one merge
-reduction — so all the windows' loads, masks and chunk writes occupy a single graph.
+Mechanism: icechunk's dask path already forks a session, stores lazily and merges changesets,
+and writing per window runs that sequence once per window. Overlapping lifts it one level — fork
+once, collect every window's lazy stored arrays, run one merge reduction — so every window's
+loads, masks and chunk writes occupy a single graph.
 
-The resulting store is identical either way, and the reason is the windows'
-chunk-disjointness: that is what makes the merged changesets conflict-free, and it is the
-same property that lets a date commit exactly once. Should icechunk's internals move, the
-write falls back to the sequential loop with a warning rather than failing.
+The resulting store is identical either way, because the windows are chunk-disjoint: that is what
+makes the merged changesets conflict-free, and the same property that lets a date commit exactly
+once. Should icechunk's internals move, the write falls back to the sequential loop with a
+warning.
 
 Default **on** for both S2 and S1. `write_day_windows` itself still defaults to the
 sequential path: a storage-layer default should not decide write strategy for its callers,
