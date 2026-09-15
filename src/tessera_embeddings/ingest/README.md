@@ -253,6 +253,7 @@ CMR-STAC there is no tile ID property, so the query falls back to a WGS84 bbox.
 indicates however that Microsoft throttles heavy outbound traffic from Planetary Computer and
 hence it's not an ideal provider. For this reason we jumped through all the OPERA RTC hoops.
 
+---
 ## Detailed Ingestion Process
 
 The happy path in full. Failure modes are collected under
@@ -494,7 +495,54 @@ to reject it — so both query paths split the box at ±180° into two ordinary 
 queries and deduplicate the results by item id. A granule straddling the line is returned
 by both halves and must be loaded once.
 
----
+
+### OPERA-Specific Query Quirks
+
+#### Native granule query (orbit filtering + item construction)
+
+`make_s1_item_provider` builds an `item_provider_fn` that returns ready-to-load OPERA items
+**without calling CMR-STAC `client.search()` at all**. CMR-STAC's cursor pagination
+intermittently 500s on CONUS-scale queries (nasa/cmr-stac#408) and pages internally at ~100
+items regardless of the requested `limit` (#411); it also **silently ignores** the `query`
+extension for CMR additional attributes such as `ASCENDING_DESCENDING`. The native CMR
+Granule Search API has none of these problems.
+
+The provider queries the granule API directly:
+
+```text
+GET https://cmr.earthdata.nasa.gov/search/granules.json
+    ?short_name=OPERA_L2_RTC-S1_V1
+    &attribute[]=string,ASCENDING_DESCENDING,ASCENDING
+    &bounding_box=...
+    &temporal=...
+    &page_size=2000
+```
+
+Orbit direction is filtered **server-side** via `attribute[]`, so the response holds only the
+desired orbit — no separate STAC search and no local granule-ID intersection. Each granule's data
+links (`rel` ending `/data#`, href ending `_VV.tif` / `_VH.tif`) map onto the `S1_OPERA_BANDS`
+asset keys (`0_VV`, `0_VH`) to build `pystac.Item`s shape-compatible with the rest of the
+pipeline, with `title`, `time_start` and `polygons` supplying id, datetime and geometry.
+Pagination uses the `CMR-Search-After` header, which pages cleanly at 2000. See
+[ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
+
+#### Burst Timestamp Normalisation
+
+A single MGRS tile bbox query returns ~10 burst granules per date, each with a slightly
+different sub-second UTC timestamp (reflecting actual acquisition time). If passed to
+`odc.stac.load` as-is, each burst becomes a separate time step instead of being mosaicked
+together.
+
+`normalize_opera_timestamps` delegates to `solar_days.normalize_to_solar_day`, grouping bursts
+by **solar day** and setting every timestamp in a group to noon UTC of that day. `odc.stac.load`
+then treats them as concurrent acquisitions and mosaics them into a single time slice.
+
+#### UTM CRS Derivation
+
+CMR-STAC OPERA items lack the `proj:` extension, so `odc.stac.load` cannot infer the output
+CRS. `mgrs_tile_to_utm_epsg` derives the correct UTM EPSG from the tile's zone number and
+latitude band (C–M = southern hemisphere, N–X = northern hemisphere), e.g. `33UUP` → EPSG:32633.
+
 
 ### Solar days versus UTC queries (`solar_days.py`)
 
@@ -922,7 +970,6 @@ Constants (`S1_DB_SHIFT = 50`, `S1_DB_SCALE = 200`) are ported from
 before `log10` to avoid domain errors; they are written back as 0 (nodata) after conversion.
 This is a fully lazy Dask operation — no data is materialised until the Zarr write.
 
----
 
 ### Recording the window an ingest examined
 
@@ -951,55 +998,7 @@ write the attribute is logged, never raised — the gate simply falls back to re
 month. `assessed_empty_dates` is recorded alongside for observability, separating "sparse region"
 from "the footprints are wrong".
 
-### OPERA-Specific Query Quirks
-
-#### Native granule query (orbit filtering + item construction)
-
-`make_s1_item_provider` builds an `item_provider_fn` that returns ready-to-load OPERA items
-**without calling CMR-STAC `client.search()` at all**. CMR-STAC's cursor pagination
-intermittently 500s on CONUS-scale queries (nasa/cmr-stac#408) and pages internally at ~100
-items regardless of the requested `limit` (#411); it also **silently ignores** the `query`
-extension for CMR additional attributes such as `ASCENDING_DESCENDING`. The native CMR
-Granule Search API has none of these problems.
-
-The provider queries the granule API directly:
-
-```text
-GET https://cmr.earthdata.nasa.gov/search/granules.json
-    ?short_name=OPERA_L2_RTC-S1_V1
-    &attribute[]=string,ASCENDING_DESCENDING,ASCENDING
-    &bounding_box=...
-    &temporal=...
-    &page_size=2000
-```
-
-Orbit direction is filtered **server-side** via `attribute[]`, so the response holds only the
-desired orbit — no separate STAC search and no local granule-ID intersection. Each granule's data
-links (`rel` ending `/data#`, href ending `_VV.tif` / `_VH.tif`) map onto the `S1_OPERA_BANDS`
-asset keys (`0_VV`, `0_VH`) to build `pystac.Item`s shape-compatible with the rest of the
-pipeline, with `title`, `time_start` and `polygons` supplying id, datetime and geometry.
-Pagination uses the `CMR-Search-After` header, which pages cleanly at 2000. See
-[ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
-
-#### Burst Timestamp Normalisation
-
-A single MGRS tile bbox query returns ~10 burst granules per date, each with a slightly
-different sub-second UTC timestamp (reflecting actual acquisition time). If passed to
-`odc.stac.load` as-is, each burst becomes a separate time step instead of being mosaicked
-together.
-
-`normalize_opera_timestamps` delegates to `solar_days.normalize_to_solar_day`, grouping bursts
-by **solar day** and setting every timestamp in a group to noon UTC of that day. `odc.stac.load`
-then treats them as concurrent acquisitions and mosaics them into a single time slice.
-
-#### UTM CRS Derivation
-
-CMR-STAC OPERA items lack the `proj:` extension, so `odc.stac.load` cannot infer the output
-CRS. `mgrs_tile_to_utm_epsg` derives the correct UTM EPSG from the tile's zone number and
-latitude band (C–M = southern hemisphere, N–X = northern hemisphere), e.g. `33UUP` → EPSG:32633.
-
 ---
-
 ## Authentication (EDL / OPERA data)
 
 OPERA RTC-S1 data hosted by ASF requires NASA Earthdata Login (EDL) credentials because ASF
@@ -1672,6 +1671,7 @@ blocking one. `assessed_empty_dates` sits beside it as a count, for observabilit
 A lost day still produces a `DATA LOSS` line naming the date, the cause and the objects, and a
 summary at the end of the leg. What it does not produce is a record anything later reads.
 
+---
 ## Performance Optimizations
 
 ### Background: how Dask task graphs consume scheduler RAM
