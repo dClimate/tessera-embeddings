@@ -817,15 +817,13 @@ These happen before `odc.stac.load` is called:
 
 - **Resampling** — bilinear for primary spectral bands. Extra bands (e.g., S2 SCL) always
   use nearest-neighbour regardless of the primary resampling, enforced via a per-band dict.
-- **Resolution override** — S1 is loaded at 10 m to share a common grid with S2, even though
-  the native OPERA product is 30 m. Resampling to target resolution uses COG overviews and
-  happens during read rather than as a post-processing step.
+- **Resolution override** — S1 loads at 10 m to share a grid with S2 although the native OPERA
+  product is 30 m; resampling uses COG overviews during the read, not as a post-process.
 - **CRS override** — OPERA RTC-S1 items on CMR-STAC lack `proj:` extension metadata; an
   explicit `crs=` (e.g. `EPSG:32633`) must be passed so `odc.stac.load` knows the output
   projection.
-- **GeoBox alignment** — when a `GeoBox` derived from `read_roi_metadata` is supplied, the
-  output grid matches the ROI exactly (same CRS, transform, shape). This overrides bbox,
-  CRS, and resolution.
+- **GeoBox alignment** — a `GeoBox` from `read_roi_metadata` makes the output grid match the ROI
+  exactly in CRS, transform and shape, overriding bbox, CRS and resolution.
 - **groupby** — `"solar_day"` merges items from adjacent MGRS tiles acquired on the same local
   calendar day into one mosaic, which is required for ROI queries crossing tile boundaries. Which
   scene wins a pixel is decided by the sort order; see *Cloud cover decides which scene wins a
@@ -856,22 +854,20 @@ asset lives (`boa_offset.source_decision`). Three properties of it are worth sta
   is a different asset set from the one locality is judged over — see the duplicate selector,
   which uses the full read set including `scl`.
 - **Decided per SOURCE, and applied as each image is read.** `odc.stac.load` fuses a solar day
-  into one time slice, so a correction applied to its OUTPUT is applied to every tile at once —
-  and a day whose tiles disagree then has no correct answer and was refused, at a measured cost of
-  347 days of one region-year. The decision is now made per reflectance asset
-  (`boa_offset.source_decision`), stamped onto each source at parse time (`stac.BoaOffsetParser`)
-  and applied inside the read (`stac._BoaCorrectingReader`), before anything is resampled together.
-  Different tiles occupy different ground, so no pixel is both corrected and uncorrected.
-
-  This is **purely additive**: the amount subtracted is a constant, so a day the pipeline loaded
-  before produces bit-identical pixels, and only previously-refused days change. See
+  into one time slice, so a correction applied to its OUTPUT hits every tile at once, and a day
+  whose tiles disagree has no correct answer — 347 days of one region-year were refused that way.
+  The decision is now per reflectance asset (`boa_offset.source_decision`), stamped at parse time
+  (`stac.BoaOffsetParser`) and applied inside the read (`stac._BoaCorrectingReader`) before
+  anything is resampled together. Different tiles occupy different ground, so no pixel is both
+  corrected and uncorrected. Purely additive, since the amount subtracted is a constant: days the
+  pipeline loaded before are bit-identical, and only previously-refused days change. See
   [ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §3.
-- **Thresholded on the item's own declared baseline, and an unreadable one refuses.**
-  An absent or malformed `s2:processing_baseline` parses as nothing rather than as 0: reading it as
-  zero puts it under the threshold and exempts pixels that may carry the offset, while correcting
-  it takes 1000 off pre-04.00 pixels that never had it. Both are wrong by the same amount in
-  opposite directions and both are silent, so the source refuses. `item_baselines` is the only
-  reader of that property, on one scale, with one notion of unreadable.
+- **Thresholded on the item's own declared baseline, and an unreadable one refuses.** An absent
+  or malformed `s2:processing_baseline` parses as nothing rather than 0: read as zero it falls
+  under the threshold and exempts pixels that may carry the offset, while correcting it takes 1000
+  off pre-04.00 pixels that never had it. Both are wrong by the same amount in opposite directions
+  and both are silent, so the source refuses. `item_baselines` is the only reader of that
+  property.
 
 **Consulting the assets at all is scoped to the collections that need it**, via
 `CollectionConfig.harmonisation_varies_by_item`. That read looks assets up under the keys named in
@@ -1747,13 +1743,11 @@ cannot. So there is no ledger of missed days — it would unlock no action, woul
 step with the store, and would be deleted along with the mosaic it was written on.
 
 **The published product already answers the question a reader actually has.** A mosaic is an
-intermediate: embeddings are computed from it and then it is deleted. What survives is the
-embeddings store, and it carries per-pixel coverage layers alongside the embeddings themselves —
-`s2_obs_count`, `s1_asc_obs_count` and `s1_desc_obs_count` count the usable observations a pixel
-had, and `s2_month_covered`, `s1_asc_month_covered` and `s1_desc_month_covered` give one
-true-or-false per pixel for each month of the year (see `config/store_layout.py`). "Does this
-pixel have data for August" is answered by the published data itself rather than by a note
-attached to something that no longer exists.
+intermediate, deleted once embeddings are computed from it. What survives carries per-pixel
+coverage layers: `s2_obs_count`, `s1_asc_obs_count` and `s1_desc_obs_count` count usable
+observations, and `s2_month_covered`, `s1_asc_month_covered` and `s1_desc_month_covered` give one
+boolean per pixel per month (`config/store_layout.py`). "Does this pixel have data for August" is
+answered by the published data rather than by a note attached to something deleted.
 
 **Downstream, every absence is the same absence.** A day the satellite did not pass over, a day
 too cloudy to keep, a day whose files would not read — none of them put a pixel in the mosaic, and
@@ -2164,14 +2158,12 @@ hides fully, rising toward the whole preparation when the gate is starved behind
 tasks. Serially every date stalls for its full preparation, so the two modes compare from one
 line.
 
-> **`hidden` is not a saving, and reading it as one overstates the benefit several-fold.**
-> When pipelined, `prepare` is wall time on a background thread that spans the whole
-> concurrent write, so it inflates with contention: the same preparation reports a small
-> number serially and a large one pipelined, because it is being *queued behind the write*,
-> not because more of it was avoided. The ceiling on what the overlap can save is what
-> preparation costs when nothing competes with it — i.e. the serial mode's own
-> `prepare` — so any A/B must take its expected saving from the **control** arm and treat
-> `hidden` as a diagnostic of contention only.
+> **`hidden` is not a saving, and reading it as one overstates the benefit several-fold.** When
+> pipelined, `prepare` is wall time on a background thread spanning the whole concurrent write,
+> so it inflates with contention — the same preparation reports small serially and large
+> pipelined because it is queued behind the write, not because more of it was avoided. The
+> ceiling on what the overlap can save is the serial mode's own `prepare`, so take any A/B's
+> expected saving from the **control** arm and treat `hidden` as a contention diagnostic.
 
 Default **off**, and the flag threads from the outer flow through the task shell to the
 domain function. S1 has no coverage gate and a different batch loop; it is deliberately
@@ -2223,16 +2215,13 @@ batched mode the per-date `Stage timings` line is replaced by one `Batch timings
 per batch (build/gate are sums of real per-date values; the write is one shared compute
 and has no per-date decomposition). Default 1 — the one-commit-per-date path — is unchanged.
 
-**Composing with `pipeline_dates`.** The two are complementary and compose: batching removes
-the fleet idleness *within* a date's write, pipelining removes the serial preparation
-*between* writes. Composed, the pipeline's look-ahead is sized to the batch rather than to
-one date — a batch's write is one long consume, so a depth-1 buffer would hide only one
-date's preparation out of k. Preparation stays single-threaded at any depth, so its
-side-effect-free contract is unchanged; the extra cost is that up to k prepared dates are
-buffered while k more are written. `Batch timings` reports `prepare`/`hidden`/`stall` for the
-batch so the two modes are comparable from one log line, with the same caveat as the per-date
-line: `hidden` is bounded by the SERIAL preparation cost, never by a pipelined `prepare`
-figure that contention has inflated.
+**Composing with `pipeline_dates`.** The two are complementary: batching removes fleet idleness
+*within* a date's write, pipelining removes serial preparation *between* writes. Composed, the
+look-ahead is sized to the batch rather than one date, since a batch's write is one long consume
+and a depth-1 buffer would hide one date's preparation out of k. Preparation stays
+single-threaded at any depth, so its side-effect-free contract is unchanged; the cost is up to k
+prepared dates buffered while k more are written. `Batch timings` reports
+`prepare`/`hidden`/`stall` per batch, with the same caveat as the per-date line.
 
 ### S2: per-date iteration (task graph management)
 
@@ -2317,15 +2306,14 @@ resilience (retry counts, timeouts, connection pooling) that affect all subseque
 catalog and checks for new dates without reading any raster data or starting Fargate tasks,
 so a flow can exit early when nothing is new.
 
-**Not yet wired into any flow.** An overlapping date range is no longer a correctness problem for
-the S1/S2 ROI ingests — each of them now begins the day after the newest date its store holds, and
-a window that is wholly below that line returns a skip without querying anything (see *Where a
-resumed run starts*). What the pre-check would still buy is avoiding the cluster: the skip is
-decided inside the ingest, which the caller reaches only after provisioning one. Wiring it into
-the S1/S2 ROI flows is
-tracked in [issue #47](https://github.com/dClimate/tessera-embeddings/issues/47). When doing
-so, avoid sharing one OPERA `item_provider_fn` between the pre-check and the real query — the
-provider re-queries CMR on every call, so reuse would double the query cost.
+**Not yet wired into any flow.** An overlapping date range is no longer a correctness problem:
+each ROI ingest begins the day after the newest date its store holds, and a window wholly below
+that line returns a skip without querying (see *Where a resumed run starts*). What the pre-check
+would still buy is avoiding the cluster, since the skip is decided inside the ingest and the
+caller reaches it only after provisioning one. Tracked in
+[issue #47](https://github.com/dClimate/tessera-embeddings/issues/47); when wiring it, do not
+share one OPERA `item_provider_fn` between the pre-check and the real query, because the provider
+re-queries CMR on every call.
 
 ---
 
