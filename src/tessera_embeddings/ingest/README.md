@@ -1842,21 +1842,12 @@ rule: a heuristic bound on wasted area cannot express "extra area is nearly free
 under-merges precisely on the sparse ROIs where the waste is trivial. Windows stay chunk-aligned
 and mutually chunk-disjoint either way, letting one session write a whole date and commit once.
 
-Effect on the campaign's zones, smallest to largest:
-
-| zone live chunks | stage 1 windows | grouped | writes saved | added area |
-|---|---|---|---|---|
-| 4     | 2   | 1 | 2.0×  | +0%  |
-| 22    | 5   | 1 | 5.0×  | +45% |
-| 26    | 12  | 2 | 6.0×  | +50% |
-| 2,415 | 197 | 3 | 65.7× | +20% |
-
-Summed over all land zones the grouping cuts predicted per-date ingest cost by about **11×**,
-landing every zone in 2–5 windows. Sparse ROIs group *harder* in relative terms, which is the
-point: a large fraction of a tiny area is still a tiny area.
-
-Calibration of the price, the campaign-wide table, and the cap sweep are in
-`context_docs/ingest/ingest-performance.md`.
+Across the campaign's zones this lands every one in 2–5 windows, saving between 2× and 66× of
+the stage-1 write boundaries for between 0% and 50% added area, and cutting predicted per-date
+ingest cost by about **11×** summed over all land zones. Sparse ROIs group *harder* in relative
+terms, which is the point: a large fraction of a tiny area is still a tiny area. Calibration of
+the price, the per-zone table and the cap sweep are in
+`context_docs/ingest/ingest-performance.md` §13.
 
 - **Windows** come from `live_windows.py`, from the boolean ROI mask that both
   `rasterize_roi_zarr` and `export_zone_roi` write. The mask is coarsened to the ingest chunk
@@ -2015,12 +2006,10 @@ Default **on** for both S2 and S1. `write_day_windows` itself still defaults to 
 sequential path: a storage-layer default should not decide write strategy for its callers,
 so each ingest path opts in explicitly.
 
-The gain is **2.4–3.9×** on per-date write time and varies with neither quantity we can vary —
-not window count (23, 9 and 7 windows gave 2.79×, 2.86× and 2.40×) nor fleet width (30 and 60
-workers gave 3.67× and 3.85×, inside the noise floor). **Why it is that size is not explained**:
-three accounts were proposed and all three refuted by their own predictions, each recorded in the
-campaign record's §4.9. Rely on the measured range, do not model it, and do not extrapolate far
-outside the widths measured.
+The gain is **2.4–3.9×** on per-date write time and varies with neither window count nor fleet
+width. Why it is that size is not explained — three accounts were proposed and all three refuted
+by their own predictions — so rely on the measured range, do not model it, and do not extrapolate
+far outside the widths measured. `context_docs/ingest/ingest-performance.md` §3.11 and §4.9.
 
 ### Pipelining a date's preparation (`pipeline_dates`)
 
@@ -2031,10 +2020,9 @@ reads SCL on the workers. Only the client-side part is serial residual a wider f
 shrink.
 
 **The overlap's payoff is therefore not symmetric.** Hiding the client-side part behind the write
-is free; hiding the gate is not, because it is fleet work and on a saturated fleet competes for
-the same slots regardless of scheduling order — task priorities reorder a queue without creating
-capacity. The overlap pays in proportion to the spare capacity the write leaves, making it
-**more** valuable on narrow fleets than wide ones.
+is free; hiding the gate is not, because it is fleet work and on a saturated fleet competes for the
+same slots regardless of scheduling order. So the overlap pays in proportion to the spare capacity
+the write leaves, making it **more** valuable on narrow fleets than wide ones.
 
 `pipeline_dates` prepares date N+1 on one background thread while date N is written
 (`ingest/_pipeline.py`). The write stays serial: icechunk commits are sequential on a branch and
@@ -2051,14 +2039,9 @@ Each written date logs `Pipeline date=…: prepare=… hidden=… stall=…` in 
 the preparation the write could not cover, and is the health metric: near zero when preparation
 hides fully, rising toward the whole preparation when the gate is starved behind the write's own
 tasks. Serially every date stalls for its full preparation, so the two modes compare from one
-line.
-
-> **`hidden` is not a saving, and reading it as one overstates the benefit several-fold.** When
-> pipelined, `prepare` is wall time on a background thread spanning the whole concurrent write,
-> so it inflates with contention — the same preparation reports small serially and large
-> pipelined because it is queued behind the write, not because more of it was avoided. The
-> ceiling on what the overlap can save is the serial mode's own `prepare`, so take any A/B's
-> expected saving from the **control** arm and treat `hidden` as a contention diagnostic.
+line. **`hidden` is not a saving** — pipelined, `prepare` is background-thread wall time spanning
+the whole concurrent write, so it inflates with contention; take any A/B's expected saving from
+the control arm's `prepare` and treat `hidden` as a contention diagnostic.
 
 Default **off**, and the flag threads from the outer flow through the task shell to the
 domain function. S1 has no coverage gate and a different batch loop; it is deliberately
@@ -2086,16 +2069,16 @@ since the fleet is already the constraint, so commit amortisation is its only ga
 wherever the larger write graph crowds out the preparation overlapping it. On a mid-sized ROI,
 preparation at `k=1` already fitted inside the write with zero stall.
 
-So batching pays only where the fleet has idle capacity to fill. The threshold sits at the top of
-the range where that was measured to hold, so widening it means measuring an ROI in between.
+So batching pays only where the fleet has idle capacity to fill, and the threshold sits at the
+top of the range where that was measured to hold — widening it means measuring an ROI in between.
 Denominating it in covered window area also couples it to the merge exchange rate above: a finer
 merge covers less area, so more ROIs drift below the threshold and batch. Recalibrate against
 runs, never an offline sweep at a different merge cost. Figures in
 `context_docs/ingest/ingest-performance.md` §3.16.
 
 When it is on, k consecutive PASSING dates compute as ONE graph: their work packs the fleet
-together, one date's straggling reads backfill with another's writes, and the drain tail and commit
-gap are paid once per batch.
+together, one date's straggling reads backfill with another's writes, and the drain tail and
+commit gap are paid once per batch.
 
 The commit unit becomes the batch, forced rather than chosen: every date's append resizes the
 time axis, so per-date sessions forked from one snapshot would conflict on array metadata even
