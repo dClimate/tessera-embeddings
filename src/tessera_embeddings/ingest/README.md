@@ -537,9 +537,12 @@ chokepoint is that this table has no exceptions:
 | chunk `query_start` / `query_end` | `YYYY-MM-DD` strings | **UTC** — the only thing a catalogue understands |
 
 The two timestamp forms differ (noon in flight, midnight in the store) and never meet as
-numbers: everything that crosses that boundary compares `YYYY-MM-DD` strings. The one row
-that is deliberately UTC is the query bound, because a catalogue has no other vocabulary —
-which is exactly why ownership, not the query bound, decides what gets written.
+numbers: everything crossing that boundary compares `YYYY-MM-DD` strings. The one deliberately
+UTC row is the query bound, because a catalogue has no other vocabulary — which is exactly why
+ownership, not the query bound, decides what gets written. Noon rather than midnight is what
+makes the stamp read as the solar day both directly and after `odc.stac.load` groups on it: noon
+leaves half a day of margin, and no offset the grid produces (±11 h nearest the antimeridian)
+crosses midnight.
 
 **Three things enforce this rather than describing it:**
 
@@ -550,25 +553,18 @@ which is exactly why ownership, not the query bound, decides what gets written.
 - An **architecture rule** (`solar-offset-applied-only-in-solar-days`) fails CI if
   `solar_day_offset_seconds` is called outside this module. One application is the
   invariant; a second is a bug in the opposite direction.
-- Every consumption point **re-normalises defensively** rather than trusting call order,
-  because every supplier (`query_fn`, `item_provider_fn`) is injectable.
-
-Two more properties. `normalize_to_solar_day` is **idempotent**, letting the consumption points
-call it defensively. And the canonical stamp is **noon, not midnight**, so it
-reads as the solar day both directly and after `odc.stac.load` groups on it — noon leaves half a
-day of margin, and no offset the grid produces (±11 h nearest the antimeridian) crosses midnight.
+- Every consumption point **re-normalises defensively** rather than trusting call order, because
+  every supplier (`query_fn`, `item_provider_fn`) is injectable and `normalize_to_solar_day` is
+  idempotent.
 
 A catalogue query is bounded in **UTC**; an ingest window and every chunk of it is a range of
 **solar** days. Where a zone's offset crosses UTC midnight the two do not line up, and both ways
-of ignoring that have been in this codebase:
-
-- **Query the chunk's own range and write what comes back.** A solar day straddling the cut is
-  split: the earlier chunk writes it from its half, the later chunk's half is dropped as an
-  already-written date, and the day lands looking complete while missing acquisitions.
-- **Pad the query, but clamp the pad to the window.** The padding vanishes at the window's own
-  edges, so the first and last solar day of a zone-year lose imagery dated the adjacent UTC day.
-
-Both are silent — `assessed_window` still covers the days and the coverage gate still passes.
+of ignoring that have been in this codebase: querying the chunk's own range and writing what
+comes back splits a straddling solar day, so the earlier chunk writes it from its half, the later
+chunk's half is dropped as an already-written date, and the day lands looking complete while
+missing acquisitions; padding the query but clamping the pad to the window loses the first and
+last solar day of a zone-year, since the padding vanishes at the window's own edges. Both are
+silent — `assessed_window` still covers the days and the coverage gate still passes.
 
 The mechanism is one idea. A chunk **owns** a range of solar days and **queries** a wider range
 of UTC dates:
@@ -604,38 +600,14 @@ nothing else:
 | `whole_window_range` | S2, `stream_stac_monthly=False` | the window in one query |
 
 This rests on our offset arithmetic agreeing exactly with the loader's — both truncate
-longitude over fifteen to whole hours. If they diverged, an image could be filtered out as
-another chunk's while the loader would have grouped it into this one, dropping it from the run
-entirely. `solar_day_offset_seconds` is the single definition, and it is the reason
-`solar_grouping_longitude` prefers the geobox centroid over a bbox midpoint.
-
-That is why `group_items_by_date` takes a `mid_longitude`, and why the pre-sort uses the same key —
-the sort carries the fusion contract (clearest tile FIRST within a group), so sorting on
-a different notion of "day" than the grouping would silently let a cloudier pixel win. Central
-longitudes image far from UTC midnight and are unaffected, which kept it latent.
-Each iteration builds a single-date Dask graph, calls `odc.stac.load` for that day, filters
-coverage, and writes before moving to the next date:
-
-```text
-Full year (don't build at once):
-┌──────────────────────────── 365 days ────────────────────────────────┐
-│ tiles × dates × bands = O(millions of tasks) → scheduler OOM         │
-└──────────────────────────────────────────────────────────────────────┘
-
-Per-date iteration (what ingest_s2_roi_reflectance actually does):
- 2024-03-01    2024-03-06    2024-03-11    ...
-┌────────────┐ ┌────────────┐ ┌────────────┐
-│ build      │ │ build      │ │ build      │
-│ SCL check  │ │ SCL check  │ │ SCL check  │
-│ compute    │ │ compute    │ │ compute    │
-│ write      │ │ write      │ │ write      │
-│ discard ◄──┼─┼── graph freed after each date
-└────────────┘ └────────────┘ └────────────┘
-```
-
-Each single-date graph is small: `spatial_chunks × bands` tasks, with no date dimension to
-multiply through. The per-date overhead (one Python loop iteration, one Zarr append) is
-negligible compared to the Dask compute time for a large spatial ROI.
+longitude over fifteen to whole hours. If they diverged an image could be filtered out as another
+chunk's while the loader would have grouped it into this one, dropping it from the run entirely.
+`solar_day_offset_seconds` is the single definition, and it is why `solar_grouping_longitude`
+prefers the geobox centroid over a bbox midpoint, why `group_items_by_date` takes a
+`mid_longitude`, and why the pre-sort uses the same key: the sort carries the fusion contract
+(clearest tile FIRST within a group), so sorting on a different notion of "day" than the grouping
+would silently let a cloudier pixel win. Central longitudes image far from UTC midnight and are
+unaffected, which kept it latent.
 
 ### Which day a slice is called (and why it is not an item's timestamp)
 
@@ -1248,14 +1220,12 @@ documented fallback for a refusal that crossed a boundary carrying no chain.
 **A status is necessary and not sufficient.** A gateway can fail for minutes and recover, so one
 exhaustion is not proof of a defect. What settles it is a REPEAT — the identical request refused
 the identical way on a later attempt — and that belongs to whoever holds the attempt budget,
-`ingest_zone_year`'s leg loop. This module classifies; the budget holder supplies the repeat.
-
-That split forces the signature's design. The two live in separate deployment runs, so the only
-thing crossing between them is failure text — hence one whitespace-free token under a stable name
-(`CATALOGUE_REFUSAL=`), matched by name and never by position. The signature covers exactly the
-fields that decide the answer (collection, window, area, page) and nothing that varies between
-attempts: a counter or timestamp inside it would make every refusal unique and the repeat check
-dead code.
+`ingest_zone_year`'s leg loop: this module classifies, the budget holder supplies the repeat. The
+two live in separate deployment runs, so the only thing crossing between them is failure text —
+hence one whitespace-free token under a stable name (`CATALOGUE_REFUSAL=`), matched by name and
+never by position, covering exactly the fields that decide the answer (collection, window, area,
+page) and nothing that varies between attempts. A counter or timestamp inside it would make every
+refusal unique and the repeat check dead code.
 
 **Attempts are the only thing those budgets count; elapsed time has exactly one bound.** Each
 page fetch gets 9 HTTP attempts across 364 s of backoff before anything above sees a failure, and
@@ -1269,27 +1239,25 @@ The derivation is in `context_docs/ingest/source-read-failures.md` (cause 3).
 
 **Two things stop that bound refusing an attempt a leg had the budget for.**
 
-The retry ladder DESCENDS rather than ending the retry. The backoff doubles per attempt, so
-the rung an attempt has escalated to can be longer than the deadline has left even while a
-shorter rung fits easily. The rungs beneath are the same policy applied one escalation
-earlier, and the base is the policy's own statement of how long that class of failure is
-worth waiting for — so the loop takes the longest rung that FITS, and only a leg with no
-room for even the base rung is refused. What it deliberately does not do is cap the wait to
-the REMAINDER: waiting exactly what is left makes the next dispatch land on the deadline
-every time, which turns a race into a guarantee of the thing the deadline forbids. The rungs
-themselves are unchanged, and a leg with budget still escalates exactly as before.
+The retry ladder DESCENDS rather than ending the retry. Backoff doubles per attempt, so the rung
+an attempt has escalated to can be longer than the deadline has left even while a shorter rung
+fits easily. The rungs beneath are the same policy applied one escalation earlier, so the loop
+takes the longest rung that FITS and only a leg with no room for even the base rung is refused.
+It does not cap the wait to the REMAINDER: waiting exactly what is left makes the next dispatch
+land on the deadline every time, turning a race into a guarantee of the thing the deadline
+forbids.
 
 A leg that is still COMMITTING DATES earns more deadline, by
-`IngestSettings.leg_progress_extension_s`. Counted from the first dispatch, the plain deadline
-charges a leg for every prior attempt's productive work and so cannot tell a pathological cell
-from one working steadily. Progress is read from the leg's own child store through the same
-`get_existing_dates` the ingest resumes from, so parent and leg cannot disagree; a store that
-cannot be read earns nothing. Two bounds: a grant is a FIXED size, and each must be PAID FOR by
-dates committed since the previous grant. Payment also limits the rate, since every ask sits
-after a failed attempt and the asks within one attempt compete for the same growth, so at most
-one is paid. The ceiling is
-`max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s`; a leg that commits
-nothing never leaves `max_leg_wall_clock_s`, and an extension of 0 restores the plain deadline.
+`IngestSettings.leg_progress_extension_s`, because a deadline counted from the first dispatch
+charges a leg for every prior attempt's productive work and cannot tell a pathological cell from
+one working steadily. Progress is read from the leg's own child store through the same
+`get_existing_dates` the ingest resumes from, so parent and leg cannot disagree, and a store that
+cannot be read earns nothing. A grant is a FIXED size and each must be PAID FOR by dates
+committed since the previous grant, which also limits the rate: every ask sits after a failed
+attempt and the asks within one attempt compete for the same growth, so at most one is paid. The
+ceiling is `max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s`; a leg that
+commits nothing never leaves `max_leg_wall_clock_s`, and an extension of 0 restores the plain
+deadline.
 
 `source_coverage.py`'s preflight probe deliberately does **not** use any of this. Every
 failure of that probe is already INCONCLUSIVE by design, which is the right answer for both
@@ -1301,26 +1269,25 @@ Asking the archive for a page of radar granules normally returns a success code 
 document. Occasionally it returns a success code and a body that is not JSON at all — an error
 page, or a document cut off partway through.
 
-**This slips past every defence we have, and the reason is worth understanding.** Everything that
-decides whether to retry a request looks at the response's status code. Here the status code is
-fine. It says success, and by the only measure those checks apply, it *was* a success. Only the
-body is wrong, and nothing was inspecting the body. So the request sails through the retry logic
-untouched and fails later, when something tries to read it as JSON, with a message that says only:
+**This slips past every defence we have.** Everything that decides whether to retry a request
+looks at the response's status code, and here the status code is fine: it says success, and by the
+only measure those checks apply it *was* a success. Only the body is wrong, and nothing inspects
+the body. So the request sails through the retry logic untouched and fails later, when something
+tries to read it as JSON, with a message that says only:
 
 ```
 Expecting value: line 1 column 1 (char 0)
 ```
 
-That line names no address, no status, and nothing about what actually arrived. It does not even
-say which of the several services we query was the one that broke. In production it ended a radar
-run that had been working for about half an hour, and the whole of what we were told about it was
-that one sentence.
+That line names no address, no status, nothing about what arrived, and not even which of the
+several services we query was the one that broke. In production it ended a radar run that had been
+working for half an hour.
 
 **So the page is simply asked for again**, a small fixed number of times. This is deliberately
 narrow: every other kind of failure is left exactly as it was, and a server error is not re-asked
 here, because the ordinary retry logic has already waited and tried for that one. The re-ask uses
 the position marker the archive itself gave us, so it asks for the same page rather than the next
-one — it cannot accidentally step over granules.
+one and cannot step over granules.
 
 If the retries are used up, the failure now describes itself: which address answered, what status
 it gave, what kind of document it claimed to be sending, and how big it was. A document claiming
@@ -1328,11 +1295,10 @@ to be JSON alongside a body that will not parse means it was cut off; one claimi
 page means an error page was substituted.
 
 **The body that arrived is written to the log, and deliberately kept out of the error message.**
-That distinction matters more than it looks. When a leg fails, the decision about whether to run it
-again is made by searching the failure's text for certain words. The body is text the provider
-chose, not us — so an error page that happened to contain one of those words could flip a leg that
-should have been retried into one treated as permanently dead, costing a whole zone-year. In the
-log it is just as readable and steers nothing.
+Whether to run a failed leg again is decided by searching the failure's text for certain words,
+and the body is text the provider chose rather than us — so an error page containing one of those
+words could flip a leg that should have been retried into one treated as permanently dead, costing
+a whole zone-year. In the log it is just as readable and steers nothing.
 
 **The credential requests never log their body at all.** They use the same helper, because they can
 fail the same way, but with the body capture switched off: a credential document cut off partway
@@ -1450,15 +1416,13 @@ its own log and raises something else entirely, and the section *When GDAL logs 
 of raising it* below is what closes that.
 
 **The chain only exists if something kept it**, and a leg **refuses to start** unless every
-worker confirms it can: a job that cannot explain its own failures can quietly ruin a dataset.
-The read fails on a Dask worker, and rasterio's GDAL error classes cannot be serialised out of it
-by default — Dask substitutes a plain `Exception` holding the wrapper's repr, so what arrives is
-one line with no cause and every predicate here has nothing to read.
-`loader_failures.keep_causes_picklable`, installed on
-every worker by the same plugin as the object capture, is what makes the cause arrive. It is best
-effort, so `cause_was_flattened` recognises a failure that arrived without one and
-`read_failure_context` logs `READ CAUSE LOST` — the signal that a verdict was reached from
-nothing rather than from evidence.
+worker confirms it can: a job that cannot explain its own failures can quietly ruin a dataset. The
+read fails on a Dask worker, and rasterio's GDAL error classes cannot be serialised out of one by
+default — Dask substitutes a plain `Exception` holding the wrapper's repr, so what arrives is one
+line with no cause and every predicate here has nothing to read.
+`loader_failures.keep_causes_picklable`, installed on every worker by the same plugin as the
+object capture, is what makes the cause arrive. It is best effort, so `cause_was_flattened`
+recognises a failure that arrived without one and `read_failure_context` logs `READ CAUSE LOST`.
 
 **An object that was never published counts too, and needs its own markers.** Every
 codec-level signature comes from a BLOCK READ, and a missing object fails at open before any
@@ -1485,20 +1449,18 @@ Past that point the response is a ladder, in `s2_roi.py`'s consume path:
    skipped rather than the leg failed, and a `DATA LOSS` line names the date, the objects and
    the scope. Nothing is written to the store — see *Why nothing records what was missed*.
 
-Two properties are what the attribution step buys, and tests hold them rather than comments:
+Two properties are what the attribution step buys, and tests hold them rather than comments.
+**Blast radius**: with attribution one bad object steps one tile-date, where without it every
+duplicated tile-date steps together, downgrading hundreds of tiles on a wide ROI that read
+perfectly well. **Termination**: a bad object whose tile-date has no alternate is given up
+immediately, where without attribution the ladder first walks every *other* tile's alternates, at
+a full re-read of the date per rung, to reach the same answer.
 
-- **Blast radius.** With attribution, one bad object steps one tile-date; without it, every
-  duplicated tile-date steps together, which on a wide ROI downgrades hundreds of tiles that
-  read perfectly well.
-- **Termination.** A bad object whose tile-date has no alternate is given up immediately.
-  Without attribution the ladder first walks every *other* tile's alternates, at a full re-read
-  of the date per rung, to reach the same answer.
-
-Attribution can fail — a worker that died with the read, a cluster already gone, a loader
-that words its message differently. When it does, the unattributed behaviour above is the
-fallback, and the record says which of the two happened: `scope=attributed` means the named
-objects are the ones that failed, `scope=whole-date` means the failing object was not
-identified and the tiles listed are every tile in the date.
+Attribution can fail — a worker that died with the read, a cluster already gone, a loader that
+words its message differently — and the unattributed behaviour above is then the fallback. The
+record says which happened: `scope=attributed` means the named objects are the ones that failed,
+`scope=whole-date` means the failing object was not identified and the tiles listed are every tile
+in the date.
 
 The batched write path cannot reach the ladder — a batch is one graph and one commit — so it
 isolates first: an unreadable source anywhere in a batch re-runs the batch's dates one at a
@@ -1665,9 +1627,7 @@ that store for good**, whatever the imagery for that day later turns out to be.
 
 Most runs are resumes: a leg dispatched for a calendar year fails part way through and is
 dispatched again, so everything below the line it reached is settled and only the days above it
-are open.
-
-**A run therefore starts the day after the newest date its own store holds**
+are open. **A run therefore starts the day after the newest date its own store holds**
 (`resume_window_start` in `solar_days.py`). Three questions, asked before the catalogue is
 queried and before any date is prepared:
 
@@ -1708,18 +1668,16 @@ intermediate, deleted once embeddings are computed from it. What survives carrie
 coverage layers: `s2_obs_count`, `s1_asc_obs_count` and `s1_desc_obs_count` count usable
 observations, and `s2_month_covered`, `s1_asc_month_covered` and `s1_desc_month_covered` give one
 boolean per pixel per month (`config/store_layout.py`). "Does this pixel have data for August" is
-answered by the published data rather than by a note attached to something deleted.
+answered by the published data rather than by a note attached to something deleted. And downstream
+every absence is the same absence: a day the satellite did not pass over, a day too cloudy to
+keep, and a day whose files would not read all put no pixel in the mosaic, and nothing consuming a
+mosaic tells them apart.
 
-**Downstream, every absence is the same absence.** A day the satellite did not pass over, a day
-too cloudy to keep, a day whose files would not read — none of them put a pixel in the mosaic, and
-nothing that consumes a mosaic tells them apart. The coverage layers say what is there. Why
-something is not there changes nothing about how what *is* there gets used.
-
-There used to be one: `assessed_unreadable_dates` named every day a leg gave up on, and the
-coverage gate subtracted the months holding those days from the months an assessed window
-excuses. It is gone. That subtraction refuses a month that can never be filled — nothing can be
-written below the line — so it deadlocked the cell rather than protecting anything, and the only
-way out was to delete the store, which is a judgement a person makes from an audit.
+There used to be a ledger: `assessed_unreadable_dates` named every day a leg gave up on, and the
+coverage gate subtracted the months holding those days from the months an assessed window excuses.
+That subtraction refuses a month that can never be filled — nothing can be written below the line
+— so it deadlocked the cell rather than protecting anything, and the only way out was to delete
+the store, which is a judgement a person makes from an audit.
 
 What remains on the store is `assessed_window`, which is not a loss record. It says which range a
 leg examined, so a month holding no dates reads as "we looked and there was nothing" rather than
@@ -2162,13 +2120,35 @@ prepared dates buffered while k more are written. `Batch timings` reports
 
 ### S2: per-date iteration (task graph management)
 
-`ingest_s2_roi_reflectance` queries STAC for the full date range upfront, groups items by
-**local solar day** via `group_items_by_date`, then processes one day at a time in a Python loop.
+`ingest_s2_roi_reflectance` queries STAC for the full date range upfront, groups items by **local
+solar day** via `group_items_by_date`, then processes one day at a time in a Python loop: each
+iteration builds a single-date Dask graph, calls `odc.stac.load` for that day, filters coverage,
+and writes before moving on.
 
-The grouping key must match the loader's. `odc.stac.load(groupby="solar_day")`
-shifts every timestamp by ONE longitude — its geobox extent's centroid in WGS84, truncated to whole
-hours — and groups on the result. Grouping here by UTC calendar date instead lets the two disagree,
-and a group we believe is one day then loads as TWO time slices against a cloud mask reduced to one:
+```text
+Full year (don't build at once):
+┌──────────────────────────── 365 days ────────────────────────────────┐
+│ tiles × dates × bands = O(millions of tasks) → scheduler OOM         │
+└──────────────────────────────────────────────────────────────────────┘
+
+Per-date iteration (what ingest_s2_roi_reflectance actually does):
+ 2024-03-01    2024-03-06    2024-03-11    ...
+┌────────────┐ ┌────────────┐ ┌────────────┐
+│ build      │ │ build      │ │ build      │
+│ SCL check  │ │ SCL check  │ │ SCL check  │
+│ compute    │ │ compute    │ │ compute    │
+│ write      │ │ write      │ │ write      │
+│ discard ◄──┼─┼── graph freed after each date
+└────────────┘ └────────────┘ └────────────┘
+```
+
+Each single-date graph is small: `spatial_chunks × bands` tasks, with no date dimension to
+multiply through, and the per-date overhead of one Python loop iteration and one Zarr append is
+negligible beside the Dask compute for a large spatial ROI.
+
+The grouping key must match the loader's, per *Solar days versus UTC queries* above. Grouping
+here by UTC calendar date lets the two disagree, and a group we believe is one day then loads as
+TWO time slices against a cloud mask reduced to one:
 
 ```text
    UTC:      ... 23:00 | 00:00  01:00 ...      ONE UTC date
@@ -2196,7 +2176,7 @@ Batched approach (batch_days=30, ingest_s1_roi_sar only):
 A batch boundary is **not** a credential checkpoint, and treating it as one is unsafe: the STS
 credential's roughly one-hour life is unrelated to how long a batch takes, so a batch that outruns
 it cannot renew at its own boundary. Renewal is owned by a timer — see "Renewal runs on a timer"
-below.
+above.
 
 `batch_days` is a parameter on `ingest_s1_roi_sar` and is absent from the S2 flow. The formula
 in the background section above estimates how many tasks a given window width produces; the
