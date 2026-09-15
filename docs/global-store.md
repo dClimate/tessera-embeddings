@@ -13,12 +13,16 @@ regression or change detection, so you can train against them without handling r
 | | |
 |---|---|
 | resolution | 10 m per pixel |
-| embedding | 128 dimensions |
+| embedding | 128 dimensions, stored as int8 with a per-pixel scale |
 | time steps | 9 — one per calendar year, 2017 to 2025 |
 | each step covers | 1 January to 31 December |
 | extent | land between 59.45°S and 83.65°N, poles and Antarctica excluded |
 | land mask | GeoTESSERA's, delivered as 0.1° tiles (see below) |
 | model | TESSERA v1.1, the AWS-optimised checkpoint (`tessera_v1_1_aws_encoder.pt`) |
+
+The embeddings are quantised to save space: each pixel-year holds 128 int8 values plus one
+float32 `scales` value, and multiplying the two recovers the original numbers. Where a pixel
+was never embedded the scale is `NaN`, which makes `scales` the array to ask about coverage.
 
 The store records all of this in its root attributes, so you can check it against the data:
 `geoemb:model` (`https://geotessera.org/model/1.1`), `checkpoint_id`, `geoemb:gsd`,
@@ -125,6 +129,17 @@ ds = xr.open_zarr(session.store, group="33N", consolidated=False,
 Pass no configuration object. The store carries settings already tuned for readers, and
 supplying your own replaces them wholesale.
 
+Multiply by `scales` to get usable numbers. The band dimension broadcasts, so no reshaping
+is needed:
+
+```python
+window = ds.isel(time=8, northing=slice(661604, 661620), easting=slice(49252, 49268))
+embeddings = window.embeddings * window.scales      # int8 x float32 -> float32
+```
+
+Pixels that were never embedded carry a `NaN` scale, so they come out of that multiplication
+as `NaN` rather than as a misleading zero.
+
 Note that `chunks=None` skips building a Dask task graph over all 8.67 million chunks in the
 array, which is usually much faster. Slice down to your area of interest with `.sel` or
 `.isel` before reading any values: without Dask the unsliced array has no lazy wrapper, so
@@ -132,16 +147,15 @@ touching it directly attempts the full 66 TiB.
 
 ### Without Icechunk
 
-A plain Zarr v3 hierarchy is hosted on Source Coop at
-<insert_source_coop_url_here> and opens with xarray or Zarr alone. It is an identical
-copy of the dataset published above.
-
+A plain Zarr v3 hierarchy is hosted on Source Coop at <TODO: SOURCE COOP URL> and opens with
+xarray or Zarr alone. Its structure is identical to the Icechunk store, so group names,
+array names, coordinates and the `scales` treatment are all exactly as described above.
 
 ```python
 import xarray as xr
 
 ds = xr.open_zarr(
-    "s3://tessera-embeddings/v1.1/cambridge.zarr", group="33N",
+    "<TODO: SOURCE COOP URL>", group="33N",
     storage_options={"anon": True}, consolidated=False, chunks=None,
 )
 ```
