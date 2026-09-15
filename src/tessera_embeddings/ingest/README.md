@@ -268,19 +268,16 @@ property, so queries use a bbox derived from the MGRS tile via `mgrs_tile_to_bbo
 
 #### How one query runs, in plain terms
 
-Four words do all the work in this section. A **page** is one request and the hundred results it
-returns; the catalogue will not hand over more at once. A **cursor** is a bookmark — the catalogue
-returns a slip of paper meaning "you got as far as here", and the next request must carry it. It is
-not a page number: there is no way to ask for the twentieth page directly, and a refused request
-leaves no slip for the one after it, so a walk cannot step over a gap. A **date window** is a
-from-date and a to-date. A **worklist** is a to-do list of jobs, one job per date window; when a job
-turns out to be impossible it is crossed off and two shorter jobs are written in its place.
+Four terms. A **page** is one request and the hundred results it returns. A **cursor** is a
+bookmark the catalogue hands back, which the next request must carry — not a page number, so
+there is no way to ask for the twentieth page directly and a refused request leaves no bookmark
+for the one after it. A **date window** is a from-date and a to-date. A **worklist** holds one job
+per date window; an impossible job is crossed off and replaced by two shorter ones.
 
-The problem this shape exists for: Earth Search refuses **a request whose answer would be bigger
-than about 6 MB** — AWS Lambda's synchronous response limit. The refusal comes back in 1.3 seconds,
-as fast as a success, so nothing is overloaded and repeating the request cannot help. The remedy is
-always to ask for a *smaller answer*. The diagram below is the whole mechanism; everything after it
-is detail.
+The problem this shape exists for: Earth Search refuses **any request whose answer would exceed
+about 6 MB**, AWS Lambda's synchronous response limit. The refusal arrives in 1.3 seconds, as fast
+as a success, so nothing is overloaded and repeating cannot help — the remedy is always to ask for
+a smaller answer. The diagram is the whole mechanism; everything after it is detail.
 
 ```text
 WHY A REQUEST GETS REFUSED -- the whole mechanism, in one line
@@ -841,19 +838,16 @@ boto3 when `odc.loader` builds an `AWSSession`) and resets the cached per-thread
 next `/vsis3/` open picks up the new credentials.
 
 **Renewal runs on a timer, not on the work loop.** `s1_roi.credential_ticker` re-checks the
-credential's remaining life every `CRED_TICK_INTERVAL_SEC` for as long as batches are being
-consumed; the loop's own per-batch and per-date checks remain as a fallback. The timer is what makes
-this correct rather than merely usual: renewal driven only by the loop can fire only *between* units
-of work, so any unit that outlives the remaining margin cannot renew from inside itself. That
-coupling is self-reinforcing — slow work renews less often, an expired credential fails every read,
-failing reads stop progress, and no progress means no further renewal.
+credential's remaining life every `CRED_TICK_INTERVAL_SEC` while batches are being consumed; the
+loop's per-batch and per-date checks remain as a fallback. Loop-driven renewal can only fire
+*between* units of work, so a unit outliving its margin cannot renew from inside itself — and that
+coupling is self-reinforcing, since failing reads stop the progress that would trigger renewal.
 
 **What a worker receives is a snapshot.** The plugin freezes the credential at construction, so a
-worker joining N minutes after the last broadcast starts life with only the remaining TTL, and past
-the TTL starts with none. Under adaptive scaling workers join throughout a leg, which makes the
-broadcast **cadence** a correctness condition rather than a tidiness one — the ticker is what bounds
-N. Every broadcast logs the credential's advertised expiry (`S3 credentials broadcast to workers`),
-so the cadence is auditable from a leg's own log.
+worker joining N minutes after the last broadcast starts with only the remaining TTL, and past it
+with none. Under adaptive scaling workers join throughout a leg, so the broadcast cadence is a
+correctness condition and the ticker is what bounds N. Every broadcast logs the advertised expiry
+(`S3 credentials broadcast to workers`).
 
 **Per-thread AWSSession cache**: `odc.loader` caches a boto3 `AWSSession` per thread in
 `threading.local` on first use and ignores subsequent env var updates for that thread's
@@ -861,25 +855,17 @@ lifetime. Dask task pool threads are long-lived, so the initial 1hr STS token wa
 pinned across refreshes and expiring mid-read. `auth.py` patches `odc.loader._rio.ThreadSession`
 at module import time so each thread self-detects `AWS_ACCESS_KEY_ID` drift and rebuilds its
 cached session from current env vars. `rasterio.env.Env` (entered by `odc.loader.rio_env()` on
-every `/vsis3/` open) then hands the refreshed `AWSSession`'s frozen credentials to GDAL — so
-no `gdal.SetConfigOption` or `VSICurlClearCache` is needed. This reaches into private
-`odc.loader` internals (`_OdcThreadSession`, `_local`) and is a version-sensitive hook — if odc
-renames those symbols, the import fails loudly and the regression tests in
-`tests/unit/ingest/test_auth.py` catch the break in CI before it hits a 1hr cloud run.
+every `/vsis3/` open) then hands the refreshed `AWSSession`'s frozen credentials to GDAL, so no
+`gdal.SetConfigOption` or `VSICurlClearCache` is needed. This reaches into private `odc.loader`
+internals (`_OdcThreadSession`, `_local`) and is version-sensitive: if odc renames those symbols
+the import fails loudly, and `tests/unit/ingest/test_auth.py` catches it in CI.
 
-This was empirically verified on a us-west-2 EC2 box (2026-05-20): a four-month S1 ingest
-run at `cred_refresh_interval_sec=60` over a persistent local Dask cluster forced multiple
-mid-run STS refreshes; every batch's `/vsis3/` reads succeeded, confirming the env-drift
-patch plus orchestrator-side `_local.reset()` are sufficient without explicit GDAL
-credential-cache calls.
-
-OPERA asset STS credentials are intentionally **never cleaned up** from env vars. This avoids
-a race condition where one Dask task's cleanup could remove credentials another task still
-needs. The consequence is subtle: once `set_s3_credentials` runs, the `AWS_*` env vars hold
-OPERA-scoped STS tokens that grant access **only** to `asf-cumulus-prod-opera-products`. Any
-S3 access to the project's *own* bucket that resolves credentials from those env vars — every
-icechunk `Repository.open`/`create` in the S1 write path, not just the initial create — then
-fails with `AccessDenied`.
+OPERA asset STS credentials are intentionally **never cleaned up** from env vars, which avoids
+one Dask task's cleanup removing credentials another still needs. The consequence: once
+`set_s3_credentials` runs, the `AWS_*` env vars hold OPERA-scoped tokens granting access **only**
+to `asf-cumulus-prod-opera-products`, so any S3 access to the project's own bucket resolving from
+those env vars — every icechunk `Repository.open`/`create` in the S1 write path — fails with
+`AccessDenied`.
 
 Icechunk/Zarr operations on the project's own bucket therefore must resolve **IAM-role**
 credentials, bypassing the env vars. The mechanism:
@@ -1016,48 +1002,36 @@ endpoint and need opposite responses:
 | `UPSTREAM_ERROR` | 500, 502, 504 | the upstream failed to PRODUCE an answer | retry once; a repeat settles it as deterministic |
 | `UNKNOWN` | anything else | no readable status | behave as the default does: retry |
 
-The two named sets must jointly cover the ladder's `status_forcelist` — a status the ladder
-retries but the taxonomy does not name falls to `UNKNOWN` and keeps its expansive retry
-forever. A unit test asserts that containment rather than leaving it to care. The converse
-is allowed and deliberate: the taxonomy names 502, which the ladder does **not** retry, and
-a second test pins that exclusion so re-adding it cannot quietly restore the backoff the
-window re-cut exists to avoid.
+The two named sets must jointly cover the ladder's `status_forcelist`, or a status the ladder
+retries but the taxonomy does not name falls to `UNKNOWN` and keeps its expansive retry forever;
+a unit test asserts that containment. The converse is deliberate: the taxonomy names 502, which
+the ladder does **not** retry, and a second test pins that exclusion.
 
 The status is read from the exception **chain**, not the message: `pystac_client` re-raises
-without `from`, so the evidence sits under `__context__` on urllib3's own exception, and the
-top-level text is only a stringification of it. The message is a documented fallback for a
-refusal that crossed a boundary carrying no chain.
+without `from`, so the evidence sits under `__context__` on urllib3's exception. The message is a
+documented fallback for a refusal that crossed a boundary carrying no chain.
 
-**A status is necessary and not sufficient.** A gateway can fail for minutes and recover, so
-one exhaustion is not proof of a defect. What settles it is a REPEAT — the identical request
-refused the identical way on a later attempt — and that observation belongs to whoever holds
-the attempt budget, which is `ingest_zone_year`'s leg loop (see
-[its retry policy](../orchestration/prefect/flows/ingest_zone_year.py)). The two halves are
-deliberately split: this module classifies, the budget holder supplies the repeat, and
-neither is a verdict alone.
+**A status is necessary and not sufficient.** A gateway can fail for minutes and recover, so one
+exhaustion is not proof of a defect. What settles it is a REPEAT — the identical request refused
+the identical way on a later attempt — and that belongs to whoever holds the attempt budget,
+`ingest_zone_year`'s leg loop. This module classifies; the budget holder supplies the repeat.
 
-That split forces the signature's design. The leg that queries and the layer that counts
-attempts are separate deployment runs, so the only thing crossing between them is failure
-text — hence one whitespace-free token under a stable name (`CATALOGUE_REFUSAL=`), matched
-by name and never by position. And the signature covers exactly the fields that decide the
-answer (collection, window, area, page) and nothing that varies between attempts: a counter
-or a timestamp inside it would make every refusal unique and the repeat check dead code that
-always reports "not repeated".
+That split forces the signature's design. The two live in separate deployment runs, so the only
+thing crossing between them is failure text — hence one whitespace-free token under a stable name
+(`CATALOGUE_REFUSAL=`), matched by name and never by position. The signature covers exactly the
+fields that decide the answer (collection, window, area, page) and nothing that varies between
+attempts: a counter or timestamp inside it would make every refusal unique and the repeat check
+dead code.
 
-**Attempts are the only thing those budgets count; elapsed time has exactly one bound.**
-Each page fetch already gets 9 HTTP attempts across 364 s of exponential backoff before
-anything above the ladder sees a failure, and every attempt budget above it — leg, cell,
-zone round — treats the whole layer below as one try. None of them reads a clock, and
-expansive backoff makes the clock the axis that can grow without limit.
-`IngestSettings.max_leg_wall_clock_s` bounds it in the leg loop, at the one place that
-cannot defeat the patience it serves: once the deadline has passed, the loop refuses to
-START another attempt. A leg that is running is never measured against it — a
-slow-but-succeeding leg cannot be why the loop stopped — so the loop's worst case is the
-deadline plus one final attempt. And failing the cell this way is not surrender: the cell
-returns to the campaign's work list, and a later dispatch RESUMES from the dates already
-committed (Icechunk commits a date's time slot atomically with its pixels), so the bound
-costs latency, never work. The default's derivation against measured leg durations is in
-`context_docs/ingest/source-read-failures.md` (cause 3).
+**Attempts are the only thing those budgets count; elapsed time has exactly one bound.** Each
+page fetch gets 9 HTTP attempts across 364 s of backoff before anything above sees a failure, and
+every budget above it — leg, cell, zone round — treats the layer below as one try. None reads a
+clock, and expansive backoff makes the clock the axis that grows without limit.
+`IngestSettings.max_leg_wall_clock_s` bounds it in the leg loop: once the deadline passes, the
+loop refuses to START another attempt. A running leg is never measured against it, so the worst
+case is the deadline plus one final attempt. Failing the cell this way costs latency, not work —
+the cell returns to the work list and a later dispatch resumes from the dates already committed.
+The derivation is in `context_docs/ingest/source-read-failures.md` (cause 3).
 
 **Two things stop that bound refusing an attempt a leg had the budget for.**
 
@@ -1246,25 +1220,19 @@ effort, so `cause_was_flattened` recognises a failure that arrived without one a
 nothing rather than from evidence.
 
 **An object that was never published counts too, and needs its own markers.** Every
-codec-level signature is emitted by a BLOCK READ, and a missing object fails at open, before
-any block is requested — so a catalogue item naming an href the provider never wrote used to
-match nothing and fail the whole leg. `ObjectNotFound`, `NoSuchKey` and `The specified key
-does not exist` cover the three layers that can surface it, and they are matched only
-alongside the source reader's own vocabulary (`RasterioIOError`, `WarpOperationError`, `CPLE_`,
-`HTTP response code:` — the same set the refusal predicate below pairs against). That pairing
-is what makes them mean SOURCE: those strings belong to the S3 layer and every S3 client in
-the process shares it — `icechunk`'s error enum carries two of them verbatim — so unpaired
-they would let a hole in the destination store, or in the ROI mask, be recorded durably as
-provider data loss. GDAL is used here only to read source imagery, so its name beside the
-not-found text is the discriminator. `NoSuchBucket` is deliberately excluded: a vanished
-bucket is systemic and must fail the leg on its first date rather than be skipped date by
-date.
+codec-level signature comes from a BLOCK READ, and a missing object fails at open before any
+block is requested. `ObjectNotFound`, `NoSuchKey` and `The specified key does not exist` cover
+the three layers that surface it, matched only alongside the source reader's own vocabulary
+(`RasterioIOError`, `WarpOperationError`, `CPLE_`, `HTTP response code:`). That pairing is what
+makes them mean SOURCE: those strings belong to the S3 layer that every S3 client in the process
+shares — `icechunk`'s error enum carries two verbatim — so unpaired they would record a hole in
+the destination store as provider data loss. `NoSuchBucket` is deliberately excluded: a vanished
+bucket is systemic and must fail the leg on its first date.
 
-Nothing counts or caps these skips on the OPTICAL path. A source object that will never read
-is rare enough per granule that a ceiling would only ever fire on a fault of some other kind,
-and every date given up is already logged, restated in the end-of-run summary, and written to
-the store. The radar skip below does carry a ceiling, for the different reason given there: it
-answers a provider refusal, which arrives fleet-wide and all at once.
+Nothing counts or caps these skips on the OPTICAL path: they are rare enough per granule that a
+ceiling would only fire on a fault of another kind, and every date given up is logged, restated
+in the end-of-run summary, and written to the store. The radar skip below does carry a ceiling,
+because it answers a provider refusal, which arrives fleet-wide and all at once.
 
 Past that point the response is a ladder, in `s2_roi.py`'s consume path:
 
@@ -1276,16 +1244,14 @@ Past that point the response is a ladder, in `s2_roi.py`'s consume path:
    skipped rather than the leg failed, and a `DATA LOSS` line names the date, the objects and
    the scope. Nothing is written to the store — see *Why nothing records what was missed*.
 
-Two properties are worth stating because they are what the attribution step buys, and they
-are held by tests rather than by comment:
+Two properties are what the attribution step buys, and tests hold them rather than comments:
 
-- **Blast radius.** With attribution, one bad object steps one tile-date. Without it, every
-  duplicated tile-date in the date steps together — which on a wide ROI is most of the date,
-  so a single bad object downgrades the baseline of hundreds of tiles that read perfectly
-  well.
+- **Blast radius.** With attribution, one bad object steps one tile-date; without it, every
+  duplicated tile-date steps together, which on a wide ROI downgrades hundreds of tiles that
+  read perfectly well.
 - **Termination.** A bad object whose tile-date has no alternate is given up immediately.
-  Without attribution the ladder first walks every *other* tile's alternates, at a full
-  re-read of the date per rung, before reaching the same answer.
+  Without attribution the ladder first walks every *other* tile's alternates, at a full re-read
+  of the date per rung, to reach the same answer.
 
 Attribution can fail — a worker that died with the read, a cluster already gone, a loader
 that words its message differently. When it does, the unattributed behaviour above is the
@@ -1582,15 +1548,14 @@ zone / ROI extent (declared grid — UNCHANGED, the fill validates it)
 ```
 
 Windows are derived in **two stages**, and the second is where most of the win is. Each cell
-below is one 4096-px ingest chunk; `#` is live (the mask has land in it), `.` is ocean.
+below is one 4096-px ingest chunk; `#` is live, `.` is ocean.
 
 **Stage 1 — row bands.** One window per live chunk-row, spanning that row's first to last live
 column. A row's interior gaps are included; nothing above or below it is. This is the
 minimum-*area* answer.
 
 **Stage 2 — grouping.** Vertically adjacent bands are unioned into taller windows. That
-computes some dead chunks, and is still a large net win, because the two costs are nothing
-alike:
+computes some dead chunks and is still a large net win, because the two costs differ:
 
 ```text
   chunk area                          a window boundary
@@ -1601,15 +1566,14 @@ alike:
   what the fleet wants.
 ```
 
-So the objective is not "least area" but "least `n_windows × price + area`", where the price is
-one window expressed in the chunk area that costs the same (`WINDOW_COST_IN_CHUNKS`). That
-price is *large*, so grouping pays almost whenever it is geometrically sane.
+So the objective is `least n_windows × price + area`, where the price is one window expressed
+as the chunk area costing the same (`WINDOW_COST_IN_CHUNKS`). That price is large, so grouping
+pays whenever it is geometrically sane.
 
 The merge runs **twice** — once over the run's live grid, once over each date's narrowed grid —
-and both must use the same price. `windows_for_date` takes it as a parameter for that reason:
-priced at the sequential default while the run used the overlapped rate, the per-date re-merge
-would buy dead area back to save boundaries the write path has already made cheap, undoing the
-calibration for every narrowed date.
+and both must use the same price, which is why `windows_for_date` takes it as a parameter. Priced
+at the sequential default while the run used the overlapped rate, the per-date re-merge would buy
+dead area back to save boundaries the write path had already made cheap.
 
 ```text
      live chunk grid        stage 1: row bands        stage 2: grouped
@@ -1632,21 +1596,18 @@ r8    .  .  .  .  .  .       .  .  .  .  .  .          .  .  .  .  .  .
 ```
 
 Group `a` covers r0–r4 at the cost of two dead chunks (`+`), buying four fewer stalls. Whether
-`b` should join it is likewise a cost question, not a shape one: that union would span
-`r0–r7 × c0–c4`, adding 16 chunks to save one stall — worth it at the production price, which
-is why real masks group harder than this small illustration suggests. Two things stop a group:
-the price ceasing to justify the added area, and `MAX_TASKS_PER_WINDOW`, which bounds one
-window's graph so memory and scheduler load stay inside a proven envelope. That cap is
-expressed in TASKS, converted to a chunk area through `DEFAULT_TASKS_PER_CHUNK`, because
-the scheduler dispatches tasks on a single-threaded event loop — past its throughput extra
-area stops being cheap, which is how an unbounded objective over-merges into a saturated
-scheduler and gets slower.
+`b` joins it is the same cost question: that union spans `r0–r7 × c0–c4`, adding 16 chunks to save
+one stall — worth it at the production price, so real masks group harder than this illustration
+suggests. Two things stop a group: the price ceasing to justify the area, and
+`MAX_TASKS_PER_WINDOW`, which bounds one window's graph. That cap is expressed in TASKS and
+converted to a chunk area through `DEFAULT_TASKS_PER_CHUNK`, because the scheduler dispatches on
+a single-threaded event loop — past its throughput, extra area stops being cheap.
 
-Grouping is solved **exactly**, by a dynamic program over consecutive bands rather than a
-greedy rule — a heuristic bound on wasted area cannot express "extra area is nearly free", and
-so under-merges precisely on the sparse ROIs where the absolute waste is trivial. Windows stay
-chunk-aligned and mutually chunk-disjoint either way, which is what lets one session write a
-whole date and commit once.
+Grouping is solved **exactly**, by a dynamic program over consecutive bands rather than a greedy
+rule: a heuristic bound on wasted area cannot express "extra area is nearly free", so it
+under-merges precisely on the sparse ROIs where the waste is trivial. Windows stay chunk-aligned
+and mutually chunk-disjoint either way, which is what lets one session write a whole date and
+commit once.
 
 Effect on the campaign's zones, smallest to largest:
 
@@ -1881,15 +1842,12 @@ and a group we believe is one day then loads as TWO time slices against a cloud 
 its solar day (at noon UTC), and every date derivation downstream is a plain
 `strftime("%Y-%m-%d")` with no offset.**
 
-That rule exists because the alternative was tried and drifted. The offset used to be
-applied independently at six sites, and two of them disagreed with the rest: the
-cloud pre-sort and the baseline map both keyed on the UTC date while the loader grouped by
-solar day. On a day straddling UTC midnight that meant the group was not sorted as intended,
-and half its baseline entries never matched. A seventh
-application would have been one more chance to disagree; applying it once cannot.
+Applied at more than one site the conventions drift: keyed on the UTC date while the loader
+groups by solar day, a group straddling UTC midnight is not sorted as intended and half its
+baseline entries never match.
 
-**Every date modality in the pipeline, and which convention it uses.** The whole point of
-one chokepoint is that this table has no exceptions:
+**Every date modality in the pipeline, and which convention it uses.** The point of one
+chokepoint is that this table has no exceptions:
 
 | where a date lives | form | convention |
 |---|---|---|
@@ -1918,33 +1876,22 @@ which is exactly why ownership, not the query bound, decides what gets written.
 - Every consumption point **re-normalises defensively** rather than trusting call order,
   because every supplier (`query_fn`, `item_provider_fn`) is injectable.
 
-Two consequences worth knowing:
+Two more properties. `normalize_to_solar_day` is **idempotent**, which is what lets the
+consumption points call it defensively. And the canonical stamp is **noon, not midnight**, so it
+reads as the solar day both directly and after `odc.stac.load` groups on it — noon leaves half a
+day of margin, and no offset the grid produces (±11 h nearest the antimeridian) crosses midnight.
 
-- **`normalize_to_solar_day` is idempotent**, so the consumption points (`stream_stac_months`,
-  `has_new_stac_dates`) call it defensively rather than trusting whoever supplied their
-  items — `query_fn` and `item_provider_fn` are both injectable.
-- **Noon, not midnight.** The canonical timestamp has to read as the solar day both directly
-  and after `odc.stac.load` groups on it. Noon has half a day of margin either side, so
-  neither reading crosses midnight for any offset the grid produces (±11 h at the zones
-  nearest the antimeridian).
+A catalogue query is bounded in **UTC**; an ingest window and every chunk of it is a range of
+**solar** days. Where a zone's offset crosses UTC midnight the two do not line up, and both ways
+of ignoring that have been in this codebase:
 
-The same disagreement decides how every query window is bounded, on every path, which is why
-it lives in one module — `ingest/solar_days.py` — instead of being re-derived per sensor.
+- **Query the chunk's own range and write what comes back.** A solar day straddling the cut is
+  split: the earlier chunk writes it from its half, the later chunk's half is dropped as an
+  already-written date, and the day lands looking complete while missing acquisitions.
+- **Pad the query, but clamp the pad to the window.** The padding vanishes at the window's own
+  edges, so the first and last solar day of a zone-year lose imagery dated the adjacent UTC day.
 
-A catalogue query is bounded in **UTC**. An ingest window, and every chunk of it, is a range of
-**solar** days. Wherever a zone's offset crosses UTC midnight the two do not line up, and both
-ways of ignoring that have been in this codebase:
-
-- **Query the chunk's own range and write whatever comes back.** A solar day straddling the cut
-  is split: the earlier chunk writes it from its half, and the later chunk's half is then dropped
-  as an already-written date. The day lands looking complete and is missing acquisitions. The S1
-  batch loop did this at *every* batch boundary.
-- **Pad the query, but clamp the pad to the window.** The padding then vanishes at the window's
-  own two edges, so the first and last solar day of a zone-year lose whatever imagery was dated
-  the adjacent UTC day. The S2 month slicing did this.
-
-Both are silent: `assessed_window` still covers the days, and the month coverage gate still
-passes. Only a comparison against the catalogue would reveal them.
+Both are silent — `assessed_window` still covers the days and the coverage gate still passes.
 
 The mechanism is one idea. A chunk **owns** a range of solar days and **queries** a wider range
 of UTC dates:
