@@ -77,9 +77,9 @@ are the rest.
 
 | Module | What it does |
 |---|---|
-| `stac.py` | STAC loading through `odc.stac.load` — providers, date filtering, and the load-time machinery that applies the Sentinel-2 reflectance offset. [§ Sentinel-2 Baseline Correction (load-time)](#sentinel-2-baseline-correction-load-time) |
+| `stac.py` | STAC loading through `odc.stac.load` — providers, date filtering, and the load-time machinery that applies the Sentinel-2 reflectance offset. [§ Sentinel-2 baseline correction](#sentinel-2-baseline-correction-applied-during-the-read) |
 | `opera_query.py` | OPERA RTC-S1 queries: bounding boxes, items built from CMR's native Granule Search with orbit direction filtered server-side, UTM EPSG derivation, asset preparation. [§ OPERA-Specific Query Quirks](#opera-specific-query-quirks) |
-| `boa_offset.py` | The one place the reflectance-offset question is answered. Asked per ASSET, so an item whose bands come from two producers is corrected band by band rather than refused. [§ Sentinel-2 Baseline Correction (load-time)](#sentinel-2-baseline-correction-load-time) |
+| `boa_offset.py` | The one place the reflectance-offset question is answered. Asked per ASSET, so an item whose bands come from two producers is corrected band by band rather than refused. [§ Sentinel-2 baseline correction](#sentinel-2-baseline-correction-applied-during-the-read) |
 | `item_baselines.py` | The one reader of `s2:processing_baseline`. Reports integer hundredths (`04.00` -> `400`) and `None` for every kind of unreadable. |
 | `asset_locations.py` | Where an item's assets live, keeping two questions apart: whether the read is cheap (the bucket's REGION) and whether the offset is already removed (the PRODUCER). `AssetSources` reports the keys it could not resolve instead of dropping them. |
 | `duplicates.py` | Chooses between duplicate catalogue items for one tile-date, which Element 84 publishes whenever a granule is reprocessed. Rejected copies are kept as a fallback. [§ Choosing between duplicate copies of a tile-date](#choosing-between-duplicate-copies-of-a-tile-date) |
@@ -256,7 +256,7 @@ assets point straight at ESA's archive, and a query returns them mixed. The two 
 on one thing that matters — Element 84 has already subtracted the post-baseline-04.00 reflectance
 offset and ESA has not — so which producer served an asset is decided per asset from where that
 asset lives, never from the collection. That decision is the subject of
-[§ Sentinel-2 Baseline Correction](#sentinel-2-baseline-correction-load-time), and choosing
+[§ Sentinel-2 baseline correction](#sentinel-2-baseline-correction-applied-during-the-read), and choosing
 between an ESA copy and an Element 84 copy of the same tile-date is the subject of
 [§ Choosing between duplicate copies](#choosing-between-duplicate-copies-of-a-tile-date).
 
@@ -275,7 +275,17 @@ was built instead. Treat it as unvalidated configuration.
 The happy path in full. Failure modes are collected under
 [Error handling](#error-handling) instead.
 
-### STAC Query Strategy
+Six things happen between a region and a written mosaic, and they are the order of this section:
+
+1. **Ask the catalogue** what imagery touches the region in this window.
+2. **Settle which day** each image belongs to, since a catalogue speaks UTC and a mosaic is
+   indexed by local solar day.
+3. **Size the request** so the catalogue will actually answer it.
+4. **Filter what came back** — dates already written, and duplicate copies of one acquisition.
+5. **Transform and write** — the reflectance offset during the read, the radar conversion after.
+6. **Record what was examined**, so a month with no imagery reads as a finding and not a gap.
+
+### STAC query strategy
 
 S2 and Landsat are queried by tile ID property (e.g., `grid:code = T33UUP`), which returns
 only items for that specific MGRS tile. OPERA RTC-S1 on CMR-STAC lacks an equivalent
@@ -540,7 +550,12 @@ Everything behind that picture — which months carry the heavy entries, why the
 how a refused window is re-cut, and how the windows are walked concurrently — is in
 [Appendix A: the Earth Search response cap in detail](#appendix-a--the-earth-search-response-cap-in-detail).
 
-### OPERA-Specific Query Quirks
+### OPERA-specific query quirks
+
+OPERA RTC-S1 is queried through NASA's CMR rather than a STAC API, and three things about it have
+no counterpart on the optical path: the query is built against CMR's native granule endpoint, one
+date arrives as ten separate burst granules, and the items carry no projection metadata for the
+loader to read.
 
 #### Native granule query (orbit filtering + item construction)
 
@@ -570,7 +585,7 @@ pipeline, with `title`, `time_start` and `polygons` supplying id, datetime and g
 Pagination uses the `CMR-Search-After` header, which pages cleanly at 2000. See
 [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
 
-#### UTM CRS Derivation
+#### UTM CRS derivation
 
 CMR-STAC OPERA items lack the `proj:` extension, so `odc.stac.load` cannot infer the output
 CRS. `mgrs_tile_to_utm_epsg` derives the correct UTM EPSG from the tile's zone number and
@@ -593,116 +608,13 @@ The filter is an optimisation, not the guarantee. On S1 the queries are built on
 the writes, so the set they filter against is frozen before the run began; the write loop tracks
 what it actually wrote and is the authority.
 
-### Choosing between duplicate copies of a tile-date
+### Data transformations
 
-A catalogue indexes the same tile-date more than once whenever a granule is reprocessed, and
-sometimes from more than one region. `duplicates.py` reduces each tile-date to one copy per
-*acquisition* before the loader sees it, because `odc.stac.load` fuses a solar-day group: two
-copies of one acquisition would be blended into one pixel stack at two different processing
-baselines, and the baseline recorded on the store would match neither.
-
-Preference is **one sort key** (`_preference_key`), and what makes it work is that it is
-**context-free**: no term means "best in my group", so the same tuple orders two copies of one
-acquisition and two copies from different ones. A term relative to the group's own best baseline
-would make cross-acquisition comparison meaningless and force a second key alongside this one. Add
-a signal here and nowhere else.
-
-The key reads these signals, in this order:
-
-1. **Read-set completeness**, judged over the assets *this* load will request — the configured
-   bands plus the caller's `extra_bands`, not a fixed list and not the broader pruning set, which
-   keeps `scl` regardless. First, because a copy missing one cannot deliver the tile-date at any
-   baseline, and a missing band is not a failure the fallback ladder recognises.
-2. **Whether the producer is decidable**, where it would change a pixel. An undecidable producer
-   refuses its date at or above the correction threshold, and a refusal is not something the
-   ladder can step down on. A copy spanning a harmonised and a raw producer is not undecidable:
-   each source is decided on its own bucket and corrected band by band. Inert below the threshold.
-3. **Whether the copy demonstrably belongs to the acquisition it is ranked in.** A copy naming
-   neither an observation nor an instant was clustered arbitrarily, so it must not displace one
-   that says which pass it came from.
-4. **Whether the baseline is readable**, for producers whose correction depends on it, unknown
-   sorting last. An absent baseline refuses the whole date downstream, so an older reprocessing
-   that can be corrected beats a newer one that cannot be processed. Above every term below it
-   because a refusal has no recovery. Already-harmonised copies are exempt.
-5. **Processing baseline, descending.** Ordered by value rather than "is it best", so every rung
-   of the fallback ladder stays in descending baseline order — a read failure can skip a 04.00
-   copy and hand out a 03.00 one.
-6. **Whether the copy owes an offset correction at all**, where the producer is an item's own
-   property. Below the baseline, for two pixel-level reasons: an already-harmonised copy had its
-   floor applied before resampling where one we correct is floored after, so the two disagree on
-   very dark pixels; and a copy owing nothing cannot be wrong by the offset, while a corrected one
-   is right only if the bucket lists and declared baseline are both honest. A quality-versus-
-   quality preference must not buy a better pixel with an older reprocessing. Inert below the
-   threshold — though not universally: zone 01N in 2017 carries 15 at baseline 05.00, so it does
-   fire on real data. Also inert where the producer is the collection's answer.
-7. **Locality, among equal baselines only.** A copy whose read assets sit in a preferred bucket is
-   cheaper to read, so it wins a tie. Restricting it to ties stops it buying cheaper egress with
-   an older pixel. This is why there are two bucket lists: harmonisation is a **pixel** claim,
-   locality a **cost** claim. They name the same buckets today but their key sets differ by `scl`,
-   so a copy can be harmonised without being local.
-8. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of catalogue
-   response order, so a rerun cannot silently produce a different mosaic — and it makes the key a
-   total order, so no comparison ever falls back to input order.
-
-Two properties of that ordering are easy to get wrong and are held by tests:
-
-- **Locality is judged over the read set, not over every asset.** A real Element 84 item carries
-  its COG bands *and* the original JP2s, across two buckets, so requiring every asset disables
-  the preference altogether. It is judged over the *whole* read set: one local band among many
-  remote ones is not locality, and an item exposing none of them is remote, because absence of
-  evidence is not evidence of locality.
-- **An unreadable baseline sorts LAST, and makes locality inert for that copy.** A missing
-  baseline is an absence of evidence rather than a tie: as a tie it let a copy with no baseline
-  displace a raw copy at 05.00, taking an older reprocessing *and* skipping the correction. Such
-  a copy also refuses its whole date downstream, and the ladder recovers from a read error but
-  not a refusal. An already-harmonised copy is exempt, since no offset decision rests on its
-  baseline and penalising it would hand the tile-date to an older raw reprocessing.
-
-**Which copies are the same acquisition is decided by identity, not by a timestamp.** Two
-reprocessings of one granule share a datatake — mission, sensing start and absolute orbit, in
-`s2:datatake_id` — and differ only in the baseline suffix. They do **not** agree on the catalogue
-`datetime`, which is per-copy and has been seen to differ by more than three minutes between two
-copies of one granule, so a tolerance around that timestamp cannot separate "two reprocessings"
-from "two passes" without getting one wrong. The timestamp window survives only as the fallback
-for a copy naming no datatake. Splitting on a real acquisition protects genuine same-day
-coverage: successive orbits revisit a high-latitude tile the same day, and keying on `(tile,
-solar day)` alone dropped 493 of 2,733 distinct acquisitions as duplicates.
-
-A copy naming **no** datatake joins an identified acquisition its timestamp places it in, before
-it is allowed to start one, and it is matched against *any* member of that acquisition — members
-of one observation do not agree on the timestamp, which is the whole reason identity is primary,
-so closeness to any of them is the available evidence. Without that, one reprocessing declaring
-the datatake while its sibling omitted it were never compared however close their timestamps, and
-both survived to be fused.
-
-**The tile key is read from whichever property the catalogue populates**, `grid:code` or
-`s2:mgrs_tile`, then the item id — all canonicalised to one form, so two catalogues naming one
-tile produce one grouping key. Reading only Earth Search's property would leave every item from a
-catalogue naming the tile elsewhere unkeyable, which makes duplicate selection a silent no-op for
-that whole provider rather than an error.
-
-**Where the producer cannot be read from an item's assets, the collection supplies it**, through
-`known_harmonisation` on `select_preferred_duplicates` — the same value
-`stac.collection_harmonisation` gives the correction path, so the two cannot disagree. This is
-load-bearing rather than an optimisation: a spare judged only on visible assets looks harmless,
-is offered to the ladder, and aborts the ingest when a read failure steps down to it, because the
-recovery loop steps down on a read failure and not on a refusal.
-
-The **fallback ladder** — the rejected copies, in the order a read failure steps down them — is
-built by one global sort over the whole tile-date, using a key with no notion of "best in my
-group". Ranking each acquisition separately and concatenating the results is wrong further down
-the ladder: with one acquisition holding 05.00 and 01.00 spares and another holding 04.00 it
-yields `[05, 01, 04]`, and since the unattributed recovery consumes the head on each retry, the
-second retry takes 01.00 and never reaches 04.00. In the global order an unreadable baseline
-simply sorts last, which is the same protection by a more direct route: a copy whose baseline
-cannot be read is the one whose correction will silently be skipped.
-
-Buckets are compared by parsing the href's host and path rather than by substring, so a lookalike
-host cannot be mistaken for a preferred one. The baseline is matched as a version string rather
-than parsed as a number, so `"NaN"`, `"Infinity"` and every other value that is numeric without
-being a version read as unknown — see `item_baselines.py`.
-
-### Data Transformations
+What happens to the data between a catalogue item and a written pixel, in the order it happens:
+items are rewritten before the load, the load itself is configured to produce the grid and the
+groups we want, then the radar amplitude conversion runs after it. The one correction that does
+not fit that sequence is the Sentinel-2 reflectance offset, which happens *inside* the read and
+is large enough to have its own section below.
 
 #### Pre-load (STAC items)
 
@@ -735,8 +647,31 @@ These happen before `odc.stac.load` is called:
   pixel*.
 - **Dimension rename** — `normalize_odc_dims` maps `odc.stac.load`'s `y`/`x` output
   dimensions to the project-wide `northing`/`easting` convention and drops `spatial_ref`.
+- **The Sentinel-2 reflectance offset** is applied inside this read, per source — see
+  [§ Sentinel-2 baseline correction](#sentinel-2-baseline-correction-applied-during-the-read)
+  next.
 
-#### Sentinel-2 Baseline Correction (load-time)
+#### Post-load
+
+These happen after `odc.stac.load` returns:
+
+##### OPERA RTC-S1 amplitude-to-dB conversion
+
+OPERA products store linear amplitude (float32). `transforms.amplitude_to_db` converts to a
+compact scaled uint16 suitable for storage and model inference:
+
+```text
+dB = 20 × log10(amplitude) + 50
+scaled = dB × 200
+result = clip(scaled, 0, 32767).astype(uint16)
+```
+
+Constants (`S1_DB_SHIFT = 50`, `S1_DB_SCALE = 200`) are ported from
+`tessera_preprocessing/s1_fast_processor.py`. Zero/negative amplitudes are masked to `1e-10`
+before `log10` to avoid domain errors; they are written back as 0 (nodata) after conversion.
+This is a fully lazy Dask operation — no data is materialised until the Zarr write.
+
+### Sentinel-2 baseline correction (applied during the read)
 
 ESA changed the S2 L2A processing baseline at version 04.00 (January 2022), adding +1000 to all
 surface reflectance values. Whether that offset has to be subtracted is a property of **who
@@ -867,28 +802,137 @@ is owed separately — measured in
 [ADR 021](../../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §6, alongside
 `context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md`.
 
-SCL is never corrected. It is not among the resolved reflectance asset keys, so it carries no
-decision at all — a stronger exclusion than a band list, which could go stale.
+### Choosing between duplicate copies of a tile-date
 
-#### Post-load
+A catalogue indexes the same tile-date more than once whenever a granule is reprocessed, and
+sometimes from more than one region. An **acquisition** is one real pass of the satellite over
+the tile — a high-latitude tile can have two in a day, and each can be published several times as
+ESA reprocesses it — so the job is to reduce each tile-date to one copy per acquisition, keeping
+every distinct pass. `duplicates.py` does that before the loader sees it, because `odc.stac.load`
+fuses a solar-day group: two copies of one acquisition would be blended into one pixel stack at
+two different processing baselines, and the baseline recorded on the store would match neither.
 
-These happen after `odc.stac.load` returns:
+The copies it rejects are not discarded. They become the **fallback ladder**: if the chosen
+copy's object will not read, the recovery steps down to the next rung rather than losing the
+date. That is why several terms below rank for "can this copy be processed at all" ahead of
+"is this copy the best", and it is described in full at the end of this section.
 
-##### OPERA RTC-S1 Amplitude-to-dB Conversion
+Preference is **one sort key** (`_preference_key`), and what makes it work is that it is
+**context-free**: no term means "best in my group", so the same tuple orders two copies of one
+acquisition and two copies from different ones. A term relative to the group's own best baseline
+would make cross-acquisition comparison meaningless and force a second key alongside this one. Add
+a signal here and nowhere else.
 
-OPERA products store linear amplitude (float32). `transforms.amplitude_to_db` converts to a
-compact scaled uint16 suitable for storage and model inference:
+The eight terms, and what each is there to stop. The first four ask whether a copy can be
+processed at all and the last four which of the processable ones is best — a copy that cannot be
+processed must never outrank one that can, however good its pixels would have been:
 
-```text
-dB = 20 × log10(amplitude) + 50
-scaled = dB × 200
-result = clip(scaled, 0, 32767).astype(uint16)
-```
+| # | term | what it protects |
+|---|---|---|
+| 1 | read-set completeness | a copy missing a band cannot deliver the date, and the ladder does not recognise that as a read failure |
+| 2 | producer decidable | an undecidable producer refuses the date, and the ladder cannot step down on a refusal |
+| 3 | belongs to this acquisition | a copy naming no pass was clustered by guesswork, so it must not displace one that says which pass it came from |
+| 4 | baseline readable | an unreadable baseline refuses the date too |
+| 5 | processing baseline, descending | newer reprocessing first, by value, so every rung of the ladder stays in baseline order |
+| 6 | owes no offset correction | an uncorrected copy cannot be wrong by the offset; a corrected one is only right if the bucket lists are |
+| 7 | locality, among equal baselines | cheaper egress, but never at the price of an older pixel |
+| 8 | `s2:sequence`, then item id | a total order, so a rerun cannot silently produce a different mosaic |
 
-Constants (`S1_DB_SHIFT = 50`, `S1_DB_SCALE = 200`) are ported from
-`tessera_preprocessing/s1_fast_processor.py`. Zero/negative amplitudes are masked to `1e-10`
-before `log10` to avoid domain errors; they are written back as 0 (nodata) after conversion.
-This is a fully lazy Dask operation — no data is materialised until the Zarr write.
+In full, in that order:
+
+1. **Read-set completeness**, judged over the assets *this* load will request — the configured
+   bands plus the caller's `extra_bands`, not a fixed list and not the broader pruning set, which
+   keeps `scl` regardless. First, because a copy missing one cannot deliver the tile-date at any
+   baseline, and a missing band is not a failure the fallback ladder recognises.
+2. **Whether the producer is decidable**, where it would change a pixel. An undecidable producer
+   refuses its date at or above the correction threshold, and a refusal is not something the
+   ladder can step down on. A copy spanning a harmonised and a raw producer is not undecidable:
+   each source is decided on its own bucket and corrected band by band. Inert below the threshold.
+3. **Whether the copy demonstrably belongs to the acquisition it is ranked in.** A copy naming
+   neither an observation nor an instant was clustered arbitrarily, so it must not displace one
+   that says which pass it came from.
+4. **Whether the baseline is readable**, for producers whose correction depends on it, unknown
+   sorting last. An unreadable baseline refuses the whole date, for the reason given under the
+   baseline correction above, so an older reprocessing that can be corrected beats a newer one
+   that cannot be processed — and it outranks every term below because the ladder recovers from a
+   read error but not from a refusal. Already-harmonised copies are exempt.
+5. **Processing baseline, descending.** Ordered by value rather than "is it best", so every rung
+   of the fallback ladder stays in descending baseline order — a read failure can skip a 04.00
+   copy and hand out a 03.00 one.
+6. **Whether the copy owes an offset correction at all**, where the producer is an item's own
+   property. Below the baseline, for two pixel-level reasons: an already-harmonised copy had its
+   floor applied before resampling where one we correct is floored after, so the two disagree on
+   very dark pixels; and a copy owing nothing cannot be wrong by the offset, while a corrected one
+   is right only if the bucket lists and declared baseline are both honest. A quality-versus-
+   quality preference must not buy a better pixel with an older reprocessing. Inert below the
+   threshold — though not universally: zone 01N in 2017 carries 15 at baseline 05.00, so it does
+   fire on real data. Also inert where the producer is the collection's answer.
+7. **Locality, among equal baselines only.** A copy whose read assets sit in a preferred bucket is
+   cheaper to read, so it wins a tie. Restricting it to ties stops it buying cheaper egress with
+   an older pixel. This is why there are two bucket lists: harmonisation is a **pixel** claim,
+   locality a **cost** claim. They name the same buckets today but their key sets differ by `scl`,
+   so a copy can be harmonised without being local.
+8. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of catalogue
+   response order, so a rerun cannot silently produce a different mosaic — and it makes the key a
+   total order, so no comparison ever falls back to input order.
+
+Two properties of that ordering are easy to get wrong and are held by tests:
+
+- **Locality is judged over the read set, not over every asset.** A real Element 84 item carries
+  its COG bands *and* the original JP2s, across two buckets, so requiring every asset disables
+  the preference altogether. It is judged over the *whole* read set: one local band among many
+  remote ones is not locality, and an item exposing none of them is remote, because absence of
+  evidence is not evidence of locality.
+- **An unreadable baseline sorts LAST, and makes locality inert for that copy.** A missing
+  baseline is an absence of evidence rather than a tie: as a tie it let a copy with no baseline
+  displace a raw copy at 05.00, taking an older reprocessing *and* skipping the correction. Such
+  a copy also refuses its whole date downstream, and the ladder recovers from a read error but
+  not a refusal. An already-harmonised copy is exempt, since no offset decision rests on its
+  baseline and penalising it would hand the tile-date to an older raw reprocessing.
+
+**Which copies are the same acquisition is decided by identity, not by a timestamp.** Two
+reprocessings of one granule share a datatake — mission, sensing start and absolute orbit, in
+`s2:datatake_id` — and differ only in the baseline suffix. They do **not** agree on the catalogue
+`datetime`, which is per-copy and has been seen to differ by more than three minutes between two
+copies of one granule, so a tolerance around that timestamp cannot separate "two reprocessings"
+from "two passes" without getting one wrong. The timestamp window survives only as the fallback
+for a copy naming no datatake. Splitting on a real acquisition protects genuine same-day
+coverage: successive orbits revisit a high-latitude tile the same day, and keying on `(tile,
+solar day)` alone dropped 493 of 2,733 distinct acquisitions as duplicates.
+
+A copy naming **no** datatake joins an identified acquisition its timestamp places it in, before
+it is allowed to start one, and it is matched against *any* member of that acquisition — members
+of one observation do not agree on the timestamp, which is the whole reason identity is primary,
+so closeness to any of them is the available evidence. Without that, one reprocessing declaring
+the datatake while its sibling omitted it were never compared however close their timestamps, and
+both survived to be fused.
+
+**The tile key is read from whichever property the catalogue populates**, `grid:code` or
+`s2:mgrs_tile`, then the item id — all canonicalised to one form, so two catalogues naming one
+tile produce one grouping key. Reading only Earth Search's property would leave every item from a
+catalogue naming the tile elsewhere unkeyable, which makes duplicate selection a silent no-op for
+that whole provider rather than an error.
+
+**Where the producer cannot be read from an item's assets, the collection supplies it**, through
+`known_harmonisation` on `select_preferred_duplicates` — the same value
+`stac.collection_harmonisation` gives the correction path, so the two cannot disagree. This is
+load-bearing rather than an optimisation: a spare judged only on visible assets looks harmless,
+is offered to the ladder, and aborts the ingest when a read failure steps down to it, because the
+recovery loop steps down on a read failure and not on a refusal.
+
+The **fallback ladder** — the rejected copies, in the order a read failure steps down them — is
+built by one global sort over the whole tile-date, using a key with no notion of "best in my
+group". Ranking each acquisition separately and concatenating the results is wrong further down
+the ladder: with one acquisition holding 05.00 and 01.00 spares and another holding 04.00 it
+yields `[05, 01, 04]`, and since the unattributed recovery consumes the head on each retry, the
+second retry takes 01.00 and never reaches 04.00. In the global order an unreadable baseline
+simply sorts last, which is the same protection by a more direct route: a copy whose baseline
+cannot be read is the one whose correction will silently be skipped.
+
+Buckets are compared by parsing the href's host and path rather than by substring, so a lookalike
+host cannot be mistaken for a preferred one. The baseline is matched as a version string rather
+than parsed as a number, so `"NaN"`, `"Infinity"` and every other value that is numeric without
+being a version read as unknown — see `item_baselines.py`.
 
 ### Recording the window an ingest examined
 
