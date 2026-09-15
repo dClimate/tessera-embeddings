@@ -346,32 +346,26 @@ The rest of this section is the mechanism behind that picture.
 
 #### The months where the catalogue entries are heavy
 
-Catalogue entries from roughly **November 2018 to March 2019** are about 100× larger than
-normal. An entry usually carries the tile's bounding rectangle, a couple of hundred bytes; these
-carry the outline of where the imagery actually falls, and since Sentinel-2 builds an image from
-twelve detectors that edge is a fine sawtooth — 98 KB in one measured entry against 0.2 KB. The
-asset list is ~18 KB either way, so the outline is what makes them heavy.
+**Earth Search refuses any request whose response would exceed roughly 6 MB** — AWS Lambda's
+limit on a synchronous response, and the search API sits behind one. Every 502 this campaign has
+seen from that provider is this and nothing else.
 
-The band is a reprocessing gap: ESA reprocessed most of the archive to a version carrying the
-simple rectangle, and those months are the stretch where only the original 02.11 is on offer.
-Sampling one day a month across the boundary:
+What makes it bite unevenly is that items are not all the same size. Catalogue entries from
+roughly **November 2018 to March 2019** are about 100× larger than normal: an entry usually
+carries the tile's bounding rectangle, a couple of hundred bytes, while these carry the outline of
+where the imagery actually falls, and since Sentinel-2 builds an image from twelve detectors that
+edge is a fine sawtooth — 98 KB in one measured entry against 0.2 KB. The asset list is ~18 KB
+either way, so the outline is what makes them heavy. The band is a reprocessing gap: ESA
+reprocessed most of the archive to a version carrying the simple rectangle, and those months are
+the stretch where only the original 02.11 is on offer. It cannot spread, since no current
+processing version produces these outlines, and it could disappear if that stretch is ever
+reprocessed.
 
-| month | typical points per entry | heavy entries | versions available |
-|---|---|---|---|
-| Oct 2018 | 6 | 0 of 50 | 02.09 |
-| **Nov 2018** | **580** | **31 of 50** | **02.11 only** |
-| **Dec 2018** | **531** | **33 of 50** | **02.11 only** |
-| **Feb 2019** | **579** | **30 of 50** | **02.11 only** |
-| Apr 2019 | 6 | 0 of 50 | 02.11, 05.00 |
-| Jun 2023 | 5 | 0 of 50 | 05.09 |
-
-It cannot spread, since no current processing version produces these outlines, and it could
-disappear if that stretch is ever reprocessed. Two consequences in this code: a hundred entries
-is ~2.2 MB outside the band and at or over the ~6 MB response ceiling inside it, so page refusals
-are a 2019 phenomenon; and a month of these entries holds an order of magnitude more bytes than
-the same month in 2024, which is part of why the query streams month by month. Any per-item
-figure — page size, retained bytes, query timing — reads differently here than anywhere else in
-the archive.
+Two consequences in this code: a hundred entries is ~2.2 MB outside the band and at or over the
+ceiling inside it, so page refusals are a 2019 phenomenon; and a month of these entries holds an
+order of magnitude more bytes than the same month in 2024, which is part of why the query streams
+month by month. Any per-item figure — page size, retained bytes, query timing — reads differently
+here than anywhere else in the archive.
 
 `_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry` built by
 `make_logging_retry()` (`_http.py`, shared with the CMR Granule query) and passed into
@@ -393,24 +387,19 @@ and set to 100 for Earth Search. It applies only to providers queried through `c
 (Earth Search, Planetary Computer); the OPERA `cmr-asf` path queries the native CMR Granule API
 instead — see [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
 
-**Why 100 for Earth Search, and what to watch.** Not throughput but the response cap: 250 items
-of `sentinel-2-l2a` is always over it. A hundred averages 4.6 MB, yet the largest page ever
-served was 96% of the cap, so the margin between fine and refused is about a quarter of a
-megabyte and the average is the wrong number to reason from. Lowering it further is not the
-answer — six months of a ten-year archive is a concentrated problem, and the page-size fallback
-below handles it where it happens rather than taxing every query in every year. The cap tracks
-**bytes, not the `limit` value**: 130 items are served at 5.99 MB and 150 refused, while 150 are
-served once unneeded assets are excluded server-side. If first pages ever start returning 502
-this margin is the first thing to check, since a first-page refusal is the one case no
-date-window re-cut can route around.
+**Why 100 for Earth Search, and what to watch.** Not throughput but the cap: 250 items of
+`sentinel-2-l2a` is always over it. A hundred averages 4.6 MB, yet the largest page ever served
+was 96% of the cap, so the margin between fine and refused is about a quarter of a megabyte and
+the average is the wrong number to reason from. Lowering it further is not the answer — six months
+of a ten-year archive is a concentrated problem, and the page-size fallback below handles it where
+it happens rather than taxing every query in every year. If first pages ever start returning 502
+this margin is the first thing to check, since a first-page refusal is the one case no date-window
+re-cut can route around.
 
 **The same cap also refuses pages deep in a walk**, which looks like a separate defect and is
 not. Because item sizes vary the refusal is deterministic in the *request* — cursor and date
-window together — rather than in how deep the walk has got: it has been seen at page 289 of one
-window and page 14 of a shorter one sharing its late bound. Re-sending the byte-identical cursor
-and window at a smaller limit is served, and would be the most direct remedy; it is unavailable
-only because `pystac_client` bakes the limit into a search and cannot resume a cursor at a
-different size.
+window together — rather than in how deep the walk has got, which is why the same refusal has
+appeared at page 289 of one window and page 14 of a shorter one sharing its late bound.
 
 What clears it is either a smaller response or a regrouping that produces one, and `stac.py`
 tries them in cost order.
@@ -426,11 +415,9 @@ fixing the defect.
 
 **A smaller page as the fallback**, halved down to `_MIN_PAGE_SIZE`, because shortening cannot
 reach two refusals: a **first page**, which a shorter window asks identically, and a **single
-day**, the re-cut's floor. Verified live, interleaving with a window cut and returning every item
-with post-sort order and extracted baselines unchanged. A stated overload (429, 503) is never
-answered with a smaller page: that means the provider is busy, and more requests is the wrong
-direction. A refusal neither lever can route around still raises the classified
-`CatalogueQueryError` with its token.
+day**, the re-cut's floor. A stated overload (429, 503) is never answered with a smaller page:
+that means the provider is busy, and more requests is the wrong direction. A refusal neither
+lever can route around still raises the classified `CatalogueQueryError` with its token.
 
 **Concurrency.** The windows are independent searches, so `_fill_window_tree` walks up to
 `_QUERY_WINDOW_WORKERS` (6) of them at once. The worklist is driven from the calling thread and
@@ -439,13 +426,11 @@ rather than merely unobserved. Each thread gets its own `Client`, because `StacA
 `requests.Session` that is not documented thread-safe. Output order comes from
 `_WindowWalk.preorder()` on the finished tree, and the `id` dedupe runs at that assembly step
 rather than as pages arrive, so first-occurrence-wins means first in the **walk** and not first
-off the wire.
-
-Six rather than eight, even though eight is faster: the campaign runs tens of cells against this
-one provider at once, so the setting multiplies the concurrent search streams Element 84 sees,
-and per-page latency degrades with width. A failure does not stop the other windows — every
-window is walked, all failures collected, and the depth-first-earliest raised, so which failure
-surfaces is a function of the query rather than of which task finished first.
+off the wire. Six rather than eight, even though eight is faster: the campaign runs tens of cells
+against this one provider at once, so the setting multiplies the concurrent search streams
+Element 84 sees, and per-page latency degrades with width. A failure does not stop the other
+windows — every window is walked, all failures collected, and the depth-first-earliest raised, so
+which failure surfaces is a function of the query rather than of which task finished first.
 
 The re-partition is a pure re-cut, never a narrowing, and it is exact in both directions: the
 outer bounds are the caller's own date strings handed straight back, and every interior boundary
@@ -458,14 +443,13 @@ whole boundary DAY closes that gap too, but makes every seam re-fetch a full day
 to discard. Items are deduped by `id` across every search a query runs, which absorbs the
 boundary instant and the antimeridian overlap alike.
 
-**Item order.** The re-partition does change the order items are *walked* in — one walk returns
-the window newest-first, the worklist returns window by window in date order. That is safe only
-because `query_stac_items` re-sorts with `solar_day_sort_key`, making the final sequence a
-function of the items rather than of the order the walk produced (see *Cloud cover* below for
-what that sort decides). Verified against an unsplit walk at several part counts; see
-[the ingest campaign record](../../../context_docs/ingest/ingest-performance.md), which also
-records the measurements and the two optimisations that are closed (a larger page, and
-server-side field selection).
+It does change the order items are *walked* in — one walk returns the window newest-first, the
+worklist returns window by window in date order — which is safe only because `query_stac_items`
+re-sorts with `solar_day_sort_key`, making the final sequence a function of the items rather than
+of the order the walk produced (see *Cloud cover* below for what that sort decides).
+
+The cap, the measured margins, the sampling behind the heavy band and the levers that are closed
+are all derived in `context_docs/ingest/ingest-performance.md` §7c.
 
 #### Cloud cover decides which scene wins a pixel
 
@@ -1051,7 +1035,8 @@ next `/vsis3/` open picks up the new credentials.
 
 **Renewal runs on a timer, not on the work loop.** `s1_roi.credential_ticker` re-checks the
 credential's remaining life every `CRED_TICK_INTERVAL_SEC` while batches are being consumed; the
-loop's per-batch and per-date checks remain as a fallback. Loop-driven renewal can only fire
+loop's per-batch and per-date checks remain as a fallback, on `ingest_s1_roi_sar`'s
+`cred_refresh_interval_sec`. Loop-driven renewal can only fire
 *between* units of work, so a unit outliving its margin cannot renew from inside itself — and that
 coupling is self-reinforcing, since failing reads stop the progress that would trigger renewal.
 What a worker receives is also a **snapshot**: the plugin freezes the credential at construction,
