@@ -142,7 +142,8 @@ counts are computed eagerly — one scalar per time step, from SCL for S2 or VV 
 arrays remain lazy and cloud-covered or off-ROI scenes are dropped before any band data is read.
 
 `identify_low_coverage_ds` is the lazy alternative: instead of dropping dates it attaches a
-`valid_coverage` boolean coordinate that downstream tasks can check without reading band data.
+`valid_coverage` boolean coordinate. Evaluating it still reads the quality band over the whole
+ROI — it defers that read and skips the imagery bands, rather than answering from metadata.
 
 ### Zone ingestion (the global campaign) — ADR-011
 
@@ -192,9 +193,11 @@ export-zone-rois  (one task per zone, max_parallel_zones in flight, no barrier)
 
 `validate_zone_roi` is the reason to run this early. Its load-bearing check is **placement**:
 the count of stored chunk objects must equal `live_chunk_count`. That holds because the writer
-skips all-ocean blocks and Zarr elides all-fill chunks, so the set of stored chunks *is* the set
-of live cells — one listing asserts for the whole zone that the mask marks land where the
-coverage bitmap says land is, and nowhere else. It also confirms the chunk grid is recoverable
+skips non-live blocks and Zarr elides all-fill chunks, so the set of stored chunks *is* the set
+of live cells — one listing asserts for the whole zone that the mask is live exactly where the
+coverage bitmap is, and nowhere else. Note that the bitmap is buffered *coverage*, not a
+coastline: it reaches about 11 km offshore and a live tile is written whole, ocean pixels
+included. It also confirms the chunk grid is recoverable
 from the keys, which the cropped ingest's fast path depends on
 (`live_windows.live_chunk_grid_from_keys`). Alongside that: shape, CRS and affine equal the
 zone's `ZoneSpec`, since a wrong origin otherwise surfaces hours later as data on the wrong

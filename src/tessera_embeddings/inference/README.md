@@ -51,7 +51,7 @@ without further explanation.
 | term | what it means |
 |---|---|
 | **mosaic** | The input. Per-date Sentinel-2 reflectance and Sentinel-1 radar, already fetched and written to Zarr stores by the ingest stage. Inference never queries a satellite catalogue. |
-| **tile** (`chunk` in the code) | The unit of work: a 2048 × 2048-pixel square of ground, one year deep. One tile becomes one shard **per output array** — the global layout has eight (`embeddings`, `scales`, three observation counts, three month masks), each written independently — so a tile is eight objects, not one. Count objects per array when sizing anything. |
+| **tile** (`chunk` in the code) | The unit of work: a 2048 × 2048-pixel square of ground, one year deep. One tile becomes one shard **per output array** — the global layout has eight (`embeddings`, `scales`, three observation counts, three month masks), each written independently — so a tile is up to eight objects, not one; an array that is entirely fill, such as the radar counts on an optical-only tile, is elided. Count objects per array when sizing anything. |
 | **actor** | A Ray worker process that reserves `config.num_gpus` of a card and processes whole tiles, one after another, holding the model in VRAM. **One whole GPU is the production default, not a rule**: `num_gpus` is a float, so a fractional value packs several actors onto one card (and shrinks each one's batch — see §7), and the laptop path sets it to `0` and runs on CPU. |
 | **strip** | A horizontal slice of a tile — its full easting (east–west) width, and a range of its northing (north–south) rows. A tile too large to hold in memory is loaded one strip at a time. |
 | **SCL** | Sentinel-2's Scene Classification Layer: the per-pixel mask saying which pixels on which dates are usable, and which are cloud, shadow, snow or no data. Most decisions in this pipeline start from it. |
@@ -162,14 +162,15 @@ would leave them readable; clearing is what makes a re-run's output mean what it
 
 ### 2. Starting the GPU cluster
 
-`_start_ray_cluster()` resolves the cluster YAML at runtime from SSM parameters (security
-group, subnets, instance profile, AMI, SSH key), writes the resolved file to a tempfile and
-runs `ray up`. The flow connects over Ray Client (`ray://head-ip:10001`), and the cluster
-lives inside a context manager that encloses **inference only** — `run_inference_task` is
-inside the `with`, and `_run_assembly` is called after it exits. So the GPU fleet is released
-once the tiles are inferred and staged, and **assembly runs with no graphics cards rented at
-all.** That is the right way round for billing: assembly is the long, cheap tail, and paying
-L40S rates through it would be the single easiest way to waste money on this pipeline.
+`ray_cluster()` resolves the cluster YAML at runtime from SSM parameters (security group,
+subnets, instance profile, AMI, SSH key) through `_resolve_ray_config`, writes the resolved file
+to a tempfile, and hands it to `_start_ray_cluster`, which runs `ray up`. The flow connects over
+Ray Client (`ray://head-ip:10001`), and the cluster lives inside a context manager that encloses
+**inference only** — `run_inference_task` is inside the `with`, and `_run_assembly` is called
+after it exits. So the GPU fleet is released once the tiles are inferred and staged, and
+**assembly runs with no graphics cards rented at all.** That is the right way round for billing:
+assembly is the long, cheap tail, and paying L40S rates through it would be the single easiest
+way to waste money on this pipeline.
 
 - **Head:** m5.2xlarge — Ray's own bookkeeping and the autoscaler, no inference work.
 - **Workers:** g6e.xlarge (one L40S, 4 vCPU, 32 GB RAM), on demand, across several
@@ -610,15 +611,16 @@ half a quantisation step. Since `scale` is the row's own `max|value| / 127`, tha
 `max|value| / 254`, or under 0.4% of the row's largest channel. Non-finite values are rejected
 with a `ValueError` before quantization rather than being silently encoded.
 
-**It happens per bucket, not per tile.** Because each pixel's scale comes only from its own
-128 channels, quantization is per-pixel independent, so `run_inference` compresses each
-bucket's rows with `quantize_rows` the moment they come off the GPU and accumulates
-straight into the narrow int8 and scale buffers. The full `(H, W, 128)` tile is never
-materialised in float32. That is numerically identical to compressing the whole array at
-the end, and it shrinks the resident accumulator about fourfold — from roughly 2 GB to
-0.5 GB at a 2048-pixel tile — while removing an end-of-tile whole-array pass and its
-multi-gigabyte temporaries. `quantize_embeddings` remains as the `(H, W, D)` entry point
-and delegates to `quantize_rows`.
+**It happens per bucket, not per tile.** Because each pixel's scale comes only from its own 128
+channels, quantization is per-pixel independent, so `run_inference` compresses each bucket's
+rows with `quantize_rows_torch` on the GPU itself and copies the int8 codes and scales to the
+host, which is roughly a quarter of the device-to-host traffic the float32 rows would cost;
+`quantize_rows` is the CPU equivalent. The narrow buffers accumulate from there. The full `(H,
+W, 128)` tile is never materialised in float32. That is numerically identical to compressing the
+whole array at the end, and it shrinks the resident accumulator about fourfold — from roughly 2
+GB to 0.5 GB at a 2048-pixel tile — while removing an end-of-tile whole-array pass and its
+multi-gigabyte temporaries. `quantize_embeddings` remains as the `(H, W, D)` entry point and
+delegates to `quantize_rows`.
 
 **What comes out:**
 
@@ -701,11 +703,12 @@ The marker is retracted *before* the rewrite, not after: `to_zarr` replaces a ti
 place, so a marker left from an earlier write would keep vouching for the tile throughout,
 and a listing taken in that window would call a half-replaced tile complete.
 
-**The gate is the listing.** A sibling `.done` object is something a prefix LIST can see,
-so one listing classifies every tile in a run without opening any of them — which is what
-keeps verification and resume cheap at zone scale, where there are hundreds of thousands of
-live tiles. `_list_staged` derives the three-way split from that one listing, and it is the
-only place the split is made, so verification and resume can never disagree:
+**The gate is the listing.** A sibling `.done` object is something a prefix LIST can see, so one
+listing classifies every tile in a run without opening any of them — which is what keeps
+verification and resume cheap. The listing is scoped to one zone-year's `run_id`, not to the
+campaign's ~361,000 live tiles. `_list_staged` derives the three-way split from that one
+listing, and it is the only place the split is made, so verification and resume can never
+disagree:
 
 | state | listing shows | meaning | what happens |
 |---|---|---|---|

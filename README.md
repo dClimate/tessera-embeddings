@@ -19,7 +19,7 @@ no release date to quote.
 
 - [Quickstart — data access](#quickstart--data-access)
 - [What this is](#what-this-is)
-- [One area, or the whole world](#one-area-or-the-whole-world)
+- [One area, or the whole world](docs/single-vs-global.md)
 - [What this isn't](#what-this-isnt)
 - [Installation](#installation)
 - [Quickstart](#quickstart)
@@ -36,13 +36,15 @@ no release date to quote.
 ---
 ## Quickstart — data access
 
-The finished global store is public: a 128-dimensional embedding for every 10 m land pixel,
-one value per year from 2017 to 2025. **No AWS account is needed** — the bucket allows
-anonymous reads. You do need the `icechunk` library, since xarray and Zarr alone cannot
-resolve an Icechunk snapshot.
+The finished global store is public: a 128-dimensional embedding per 10 m land pixel, one
+value per year from 2017 to 2025. Coverage is near-complete rather than total — 14 of 1,080
+zone-years never landed, and a pixel below the quality bar is left empty — so check the year
+against the group's `years_complete` and treat a non-finite `scales` as absent data rather
+than a read failure. **No AWS account is needed** — the bucket allows anonymous reads. You do
+need the `icechunk` library, since xarray and Zarr alone cannot resolve an Icechunk snapshot.
 
 Embeddings are quantised: each pixel-year holds 128 int8 values plus one float32 `scales`
-value, and multiplying the two recovers the original numbers.
+value, and multiplying the two dequantises them, to within about half a scale step.
 
 ```python
 import icechunk, xarray as xr
@@ -71,11 +73,13 @@ carries reader-tuned settings already, and supplying your own replaces them whol
 `chunks=None`, which skips building a Dask graph over the array's 8.67 million chunks, and
 slice with `.sel` or `.isel` before reading any values.
 
-**Prefer plain Zarr?** A Zarr v3 copy is [hosted on Source Coop][sc], no Icechunk needed.
-Groups there are `utm01`–`utm60` (each covering both hemispheres) and spatial coordinates are
-`x`/`y`, but the arrays and the `scales` treatment are the same. Use the `s3://` form below
-rather than the browser URL — plain HTTPS cannot list a directory, so xarray returns an empty
-dataset.
+**Prefer plain Zarr?** A Zarr v3 copy is [hosted on Source Coop][sc], no Icechunk needed —
+though it needs `s3fs`, which ships in this project's `aws` extra rather than the base install.
+Groups there are `utm01`–`utm60` (each covering both hemispheres), spatial coordinates are
+`x`/`y`, and `embeddings` is ordered `(time, band, y, x)` rather than band-last, so anything
+indexing by position needs adjusting; the arrays and the `scales` treatment are the same. Use
+the `s3://` form below rather than the browser URL — plain HTTPS cannot list a directory, so
+xarray returns an empty dataset.
 
 ```python
 import xarray as xr
@@ -399,7 +403,8 @@ without an AWS account.
 
 It currently holds **about 1.6 PB** of embeddings (1.42 PiB, the same figure in binary
 units), and it grows whenever a year is added.
-`Repository.chunk_storage_stats().native_bytes` reports the exact size.
+`Repository.chunk_storage_stats().native_bytes` reports the exact chunk payload, excluding
+manifests and snapshots.
 
 **What "global" means here: land between 59.45°S and 83.65°N**, the extent of the coverage
 registry the campaign is built from. **Antarctica is excluded by decision**, not omitted by

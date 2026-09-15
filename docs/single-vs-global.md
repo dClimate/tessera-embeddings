@@ -473,7 +473,9 @@ the embeddings are int8 and meaningless without `scales`, so any read that retur
 numbers pulls an inner chunk from both arrays. Add the observation counts if you need
 provenance, and you are at roughly 9 MB.
 
-Single-area stores use the same geometry; the two presets are one definition under two names.
+Single-area stores use the same geometry — but those are nominal maxima: `create_kwargs`
+clamps chunks and shards to the array, so a store smaller than one shard has a finer grid and
+a cheaper point read than the figures above.
 
 **Manifests are split by year, so a commit costs one year rather than the whole store.** An
 Icechunk **manifest** is the index that maps every chunk to the object holding it. By default
@@ -573,8 +575,8 @@ describes what that involves.
 
 **What one costs is now measured rather than estimated.** The completed campaign published
 **1,066 of 1,080 cells** — 992 carrying data, for 3,247,400 tile-years and 99.96% of the
-roster, plus 74 published as deliberately empty (72 landless zones and 2 where every tile was
-refused). Only 14 never landed. That cost about **$828,000**
+roster, plus 74 published as deliberately empty (72 landless zone-years, from 8 zones over 9 years,
+and 2 where every tile was refused). Only 14 never landed. That cost about **$828,000**
 at on-demand list prices, using 360,282 graphics-card hours over 36 days of billed compute.
 Graphics cards were only about two thirds of that; storage, object-store requests and the
 container fleet made up most of the rest.
