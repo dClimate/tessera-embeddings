@@ -1519,17 +1519,17 @@ for: OPERA publishes one copy of a granule, so there is nothing to step down to.
 1. **Retry**, through the shared `store_write_retrying` policy — and for a provider refusal that
    arrived after a successful read, retry past the attempt limit, because waiting is the only
    response a refusal has. Radar is the one caller that asks for this.
-1. **Fail the leg under a name the cell can act on** if that wait was not enough
+2. **Fail the leg under a name the cell can act on** if that wait was not enough
    (`ProviderRefusedReadsError`), so the re-dispatch waits on the long schedule. No date is
    skipped and the time axis does not move.
-2. **Give up the date** once that retry is exhausted, if and only if the failure is one the source
+3. **Give up the date** once that retry is exhausted, if and only if the failure is one the source
    is answerable for AND recomputes. One scope, `unreadable`, one remedy: a reprocessed copy at
    the provider. A refusal is deliberately not a second recoverable scope — giving up a date and
    then committing a later one puts the earlier one permanently below the append-only maximum, so
    the re-run meant to recover it is refused instead.
-3. **Name it in the log**, per date and again in an end-of-leg summary. Nothing durable: the day
+4. **Name it in the log**, per date and again in an end-of-leg summary. Nothing durable: the day
    is below the store's newest date by the time the next date commits.
-4. **Stop past `MAX_GIVEN_UP_DATES`**, and stopping is TERMINAL.
+5. **Stop past `MAX_GIVEN_UP_DATES`**, and stopping is TERMINAL.
    `TooManyGivenUpDatesError` is in the leg-retry classifier's non-retryable set, because nothing
    counted toward the ceiling can clear: every date reaching that counter failed for a cause that
    recomputes, so a re-dispatch would re-read the same objects to reach the identical answer.
