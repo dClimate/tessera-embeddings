@@ -26,9 +26,9 @@ The store records all of this in its root attributes, so you can check it agains
 and `optical_min_obs` (`15`), the quality rule described below. Each zone group adds its own
 `crs`, `proj:*` and `spatial:*` metadata, plus `years_complete`.
 
-Sentinel-2 imagery only becomes generally available partway through 2017, so that year rests
+Sentinel-2 L2A imagery only became generally available partway through 2017, so that year rests
 on fewer observations than the rest. It is usable, but check the observation counts before
-leaning on it.
+leaning on it, particularly outside of Europe.
 
 ### What counts as land
 
@@ -57,8 +57,7 @@ north and south: `01N` through `60N`, `01S` through `60S`. Each group is project
 zone's coordinate reference system, so zone 22 north is EPSG:32622 and so on. Two things
 follow. A query spanning several zones has to reproject, since the groups share no grid. And
 there are slight discontinuities along zone boundaries, because each side was projected
-independently, which is immaterial for most analyses and worth a look for anything
-seam-sensitive.
+independently.
 
 Each group carries the attributes and metadata required by the
 [Zarr Spatial](https://github.com/zarr-conventions/spatial) and
@@ -106,28 +105,9 @@ three times on bulk reads.
 You need the Icechunk library; xarray and Zarr alone cannot resolve an Icechunk snapshot. No
 AWS account is needed, because the bucket allows anonymous reads.
 
-### With this library
+### With Icechunk
 
-```python
-import xarray as xr
-from tessera_embeddings.storage.global_store import open_global_repo
-
-repo = open_global_repo(
-    "s3://tessera-embeddings/v1.1/dclimate.icechunk",
-    region="us-west-2", anonymous=True,
-)
-session = repo.readonly_session(branch="main")
-ds = xr.open_zarr(session.store, group="33N", consolidated=False,
-                  decode_coords="all", chunks=None)
-```
-
-Keep `chunks=None`. Without it xarray builds a Dask graph spanning millions of chunks, and
-reading a single pixel through that graph took about three seconds and two gigabytes of
-memory, against a fifth of a second and under 200 MB.
-
-### With plain Icechunk
-
-The helper above saves a few lines of configuration and nothing else.
+To open group `33N`
 
 ```python
 import icechunk, xarray as xr
@@ -145,38 +125,38 @@ ds = xr.open_zarr(session.store, group="33N", consolidated=False,
 Pass no configuration object. The store carries settings already tuned for readers, and
 supplying your own replaces them wholesale.
 
+Note that `chunks=None` skips building a Dask task graph over all 8.67 million chunks in the
+array, which is usually much faster. Slice down to your area of interest with `.sel` or
+`.isel` before reading any values: without Dask the unsliced array has no lazy wrapper, so
+touching it directly attempts the full 66 TiB.
+
 ### Without Icechunk
 
-A plain Zarr v3 hierarchy sits beside the store at
-`s3://tessera-embeddings/v1.1/cambridge.zarr` and opens with xarray alone. It is published
-separately from this pipeline and differs in three ways:
+A plain Zarr v3 hierarchy is hosted on Source Coop at
+<insert_source_coop_url_here> and opens with xarray or Zarr alone. It is an identical
+copy of the dataset published above.
 
-- Groups are named by zone number (`utm01` … `utm60`) and each covers both hemispheres, where
-  this store splits them (`01N`, `01S`).
-- Spatial coordinates are `x` and `y` rather than `easting` and `northing`.
-- It holds only `embeddings` and `scales`. Without the observation counts and monthly
-  coverage arrays, none of the coverage checks below are available to you.
 
 ```python
 import xarray as xr
 
 ds = xr.open_zarr(
-    "s3://tessera-embeddings/v1.1/cambridge.zarr", group="utm33",
+    "s3://tessera-embeddings/v1.1/cambridge.zarr", group="33N",
     storage_options={"anon": True}, consolidated=False, chunks=None,
 )
 ```
 
-Omit `group=` and the call still succeeds, handing back an empty dataset.
+Omit `group=` and the call still succeeds, but it hands back an empty dataset.
 
-## What went into it
+## Input data
 
-Each yearly embedding is computed from 10 bands of Sentinel-2 optical imagery and 2 bands of
-Sentinel-1 radar, using every observation available that year. Coverage is uneven for three
+Each yearly embedding is computed from 10 bands of Sentinel-2 L2A optical imagery and 2 bands of
+Sentinel-1 RTC OPERA radar, using every observation available that year. Coverage is uneven for three
 reasons, and all three show up in the per-pixel counts described below.
 
-Sentinel-2 arrives partway through 2017, as above. Radar disappears over much of the world
-from 2022 to 2024. Sentinel-1B failed in December 2021; its replacement Sentinel-1C launched
-on 5 December 2024 but [opened to users only on 26 March 2025][s1c], with commissioning
+Sentinel-2 L2A arrives partway through 2017, beginning with Europe. Radar coverage becomes spottier over
+much of the world from 2022 to 2024. Sentinel-1B failed in December 2021; its replacement Sentinel-1C
+launched on 5 December 2024 but [opened to users only on 26 March 2025][s1c], with commissioning
 taking priority until that May. About a fifth of the land has no radar for those three years.
 The store shows the gap and the recovery: sampling a live tile in zone 33N gives roughly 24 to
 30 ascending radar observations a year through 2021, exactly zero for 2022, 2023 and 2024,
@@ -199,8 +179,7 @@ There is no radar threshold. A pixel with zero Sentinel-1 observations, ascendin
 descending, is still embedded, and is fed a neutral radar input in place of the missing data.
 Global radar availability is too unpredictable to require: insisting on it would have left
 large parts of the world with no embeddings for several years. Radar-free pixels stay
-identifiable afterwards. We have not compared radar-free embeddings against radar-informed
-ones and do not intend to.
+identifiable afterwards.
 
 ## Telling good coverage from bad
 
